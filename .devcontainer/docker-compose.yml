@@ -1,0 +1,22 @@
+services:
+  devcontainer:
+    env_file: ../.env
+    image: communico:devcontainer
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DOLTGRES_USER: ${DB_USER}
+      DOLTGRES_PASSWORD: ${DB_PASS}
+      DOLTGRES_DB: ${DB_NAME}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - db-data:${DB_DATA_DIR:-/opt/doltgres/data}
+      - ../doltgres/config:/etc/doltgres/servercfg.d
+      - ..:/workspace:cached
+    command: tini -v -- doltgres --config /etc/doltgres/servercfg.d/config.yaml
+
+volumes:
+  db-data:

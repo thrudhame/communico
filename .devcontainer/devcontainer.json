@@ -1,0 +1,14 @@
+// https://containers.dev/guide/dockerfile
+{
+  "name": "communico dev environment",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "denoland.vscode-deno"
+      ]
+    }
+  }
+}
