@@ -6,3 +6,7 @@ cfg_dir: /etc/doltgres/servercfg.d
 data_dir: /opt/doltgres/data
 privilege_file: /opt/doltgres/config/privileges.db
 branch_control_file: /opt/doltgres/config/branch_control.db
+
+system_variables:
+  secure_file_priv: /dev/null
+  max_connections: 1000

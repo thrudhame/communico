@@ -1,0 +1,13 @@
+{
+  "tasks": {
+    "dev": "deno run --watch main.ts",
+    "try": "deno --env --allow-net --allow-env main.ts",
+    "test": "deno test tests/*",
+    "db-init": "echo TODO",
+    "db-start": "doltgres --config /etc/doltgres/servercfg.d/config.yaml"
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@1",
+    "pg": "npm:pg@^8.16.3"
+  }
+}
