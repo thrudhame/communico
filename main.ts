@@ -1,17 +1,17 @@
-import { Pool } from "pg";
+import { Api } from "./api/api.ts";
 
-const pool = new Pool({
-  database: 'postgres', //Deno.env.get('DB_NAME'),
-  host: Deno.env.get('DB_HOST'),
-  user: Deno.env.get('DB_USER'),
-  password: Deno.env.get('DB_PASS'),
+const matrixAPI = new Api('api/endpoints/', '_matrix/');
+await matrixAPI.setup();
+
+const communicoAPI = new Api('api/endpoints/', '_communico/');
+await communicoAPI.setup();
+
+Deno.serve({ port: 80 }, async (request, info) => {
+  const res = await matrixAPI.handle(request, info.remoteAddr);
+  return res ?? Response.error();
 });
 
-Deno.serve(async () => {
-  // Use the database
-  const result = await pool.query("SHOW DATABASES");
-
-  return new Response(JSON.stringify(result.rows), {
-    headers: { "content-type": "application/json" },
-  });
+Deno.serve({ port: 8000 }, async (request, info) => {
+  const res = await communicoAPI.handle(request, info.remoteAddr);
+  return res ?? Response.error();
 });
