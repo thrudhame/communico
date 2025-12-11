@@ -1,17 +1,41 @@
-import { Pool } from "pg";
+import { Application, Router } from "@oak/oak";
 
-const pool = new Pool({
-  database: 'postgres', //Deno.env.get('DB_NAME'),
-  host: Deno.env.get('DB_HOST'),
-  user: Deno.env.get('DB_USER'),
-  password: Deno.env.get('DB_PASS'),
+const router = new Router();
+
+router.get("/", (context) => {
+  context.response.body = { "message": "Hello world" };
 });
 
-Deno.serve(async () => {
-  // Use the database
-  const result = await pool.query("SHOW DATABASES");
+router.get("/message/:id", (context) => {
+  if (context?.params?.id != null) {
+    context.response.body = {
+      message: `Message with id: ${context?.params?.id}`,
+    };
+  }
+});
 
-  return new Response(JSON.stringify(result.rows), {
-    headers: { "content-type": "application/json" },
-  });
+const app = new Application();
+
+// Logger
+app.use(async (ctx, next) => {
+  await next();
+  const rt = ctx.response.headers.get("X-Response-Time");
+  console.log(`${ctx.request.method} ${ctx.request.url} - ${rt}`);
+});
+
+// Timing
+app.use(async (ctx, next) => {
+  const start = Date.now();
+  await next();
+  const ms = Date.now() - start;
+  ctx.response.headers.set("X-Response-Time", `${ms}ms`);
+});
+
+app.use(router.routes());
+app.use(router.allowedMethods());
+
+// app.listen({port: 80});
+Deno.serve({ port: 80 }, async (request, info) => {
+  const res = await app.handle(request, info.remoteAddr);
+  return res ?? Response.error();
 });
