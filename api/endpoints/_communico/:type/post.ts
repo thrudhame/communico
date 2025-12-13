@@ -1,4 +1,12 @@
-export default function (params, payload) {
-  console.log("CONTROL post", params, payload);
-  return 'type + POST';
+import type {
+  TApiComponentOutcome,
+  TApiComponentRequest,
+} from "@communico/api/interfaces";
+
+// deno-lint-ignore require-await
+export default async function (
+  request: TApiComponentRequest,
+): TApiComponentOutcome {
+  console.log("CONTROL" + request.method, request.params, request.body);
+  return [null, "type + POST"];
 }

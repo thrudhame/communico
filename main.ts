@@ -1,9 +1,9 @@
 import { Api } from "./api/api.ts";
 
-const matrixAPI = new Api('api/endpoints/', '_matrix/');
+const matrixAPI = new Api("api/endpoints/", "_matrix/");
 await matrixAPI.setup();
 
-const communicoAPI = new Api('api/endpoints/', '_communico/');
+const communicoAPI = new Api("api/endpoints/", "_communico/");
 await communicoAPI.setup();
 
 Deno.serve({ port: 80 }, async (request, info) => {

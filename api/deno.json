@@ -1,0 +1,7 @@
+{
+  "name": "@communico/api",
+  "exports": {
+    ".": "./api.ts",
+    "./interfaces": "./interfaces.ts"
+  }
+}
