@@ -9,7 +9,6 @@
     "jsr:@std/crypto@1": "1.0.5",
     "jsr:@std/encoding@1": "1.0.10",
     "jsr:@std/encoding@^1.0.10": "1.0.10",
-    "jsr:@std/fs@*": "1.0.20",
     "jsr:@std/fs@^1.0.20": "1.0.20",
     "jsr:@std/http@1": "1.0.22",
     "jsr:@std/internal@^1.0.12": "1.0.12",

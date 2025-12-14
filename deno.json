@@ -5,7 +5,8 @@
     "setup": "deno --env --allow-net --allow-env setup.ts",
     "test": "deno test tests/*",
     "db-init": "echo TODO",
-    "db-start": "doltgres --config /etc/doltgres/servercfg.d/config.yaml"
+    "db-start": "doltgres --config /etc/doltgres/servercfg.d/config.yaml",
+    "debug-proxy": "deno --allow-env --allow-net utils/proxy.ts"
   },
   "imports": {
     "@oak/oak": "jsr:@oak/oak@^17.2.0",
@@ -15,5 +16,10 @@
     "@std/path": "jsr:@std/path@^1.1.3",
     "pg": "npm:pg@^8.16.3"
   },
-  "workspace": ["./api"]
+  "workspace": ["./api", "./utils"],
+  "fmt": {
+    "options": {
+      "singleQuote": true
+    }
+  }
 }

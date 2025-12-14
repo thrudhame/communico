@@ -1,0 +1,6 @@
+{
+  "name": "@communico/utils",
+  "exports": {
+    "./proxy": "./proxy.ts"
+  }
+}
