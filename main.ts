@@ -1,10 +1,12 @@
-import { Api } from "./api/api.ts";
+import { Api } from './api/api.ts';
 
-const matrixAPI = new Api("api/endpoints/", "_matrix/");
-await matrixAPI.setup();
+const matrixAPI = new Api('api/endpoints/', '_matrix/');
+const communicoAPI = new Api('api/endpoints/', '_communico/');
 
-const communicoAPI = new Api("api/endpoints/", "_communico/");
-await communicoAPI.setup();
+await Promise.all([matrixAPI.setup(), communicoAPI.setup()]);
+
+// await matrixAPI.setup();
+// await communicoAPI.setup();
 
 Deno.serve({ port: 80 }, async (request, info) => {
   const res = await matrixAPI.handle(request, info.remoteAddr);

@@ -1,19 +1,19 @@
 import type {
   TApiComponent,
   TApiComponentRequest,
-} from "@communico/api/interfaces";
+} from '@communico/api/interfaces';
 
-import * as path from "@std/path";
-import * as assert from "@std/assert";
-import { pick } from "@std/collections";
-import { walk } from "@std/fs/walk";
+import * as path from '@std/path';
+import * as assert from '@std/assert';
+import { pick } from '@std/collections';
+import { walk } from '@std/fs/walk';
 import {
   Application,
   createHttpError,
   type HTTPMethods,
   Router,
   Status,
-} from "@oak/oak";
+} from '@oak/oak';
 
 export class Api {
   private isHydrated: boolean = false;
@@ -24,7 +24,7 @@ export class Api {
   private readonly basePath: string;
   private readonly prefixPath: string;
 
-  constructor(basePath: string, prefixPath: string = "") {
+  constructor(basePath: string, prefixPath: string = '') {
     this.app = new Application();
     this.router = new Router();
 
@@ -35,7 +35,7 @@ export class Api {
   public async setup() {
     assert.assertFalse(
       this.isHydrated,
-      "Expect .setup to be invoked only once",
+      'Expect .setup to be invoked only once',
     );
 
     await this.#loadEndpoints();
@@ -43,7 +43,7 @@ export class Api {
     // Logger
     this.app.use(async (ctx, next) => {
       await next();
-      const rt = ctx.response.headers.get("X-Response-Time");
+      const rt = ctx.response.headers.get('X-Response-Time');
       console.log(`${ctx.request.method} ${ctx.request.url} - ${rt}`);
     });
 
@@ -52,7 +52,7 @@ export class Api {
       const start = Date.now();
       await next();
       const ms = Date.now() - start;
-      ctx.response.headers.set("X-Response-Time", `${ms}ms`);
+      ctx.response.headers.set('X-Response-Time', `${ms}ms`);
     });
 
     this.app.use(this.router.routes());
@@ -72,13 +72,17 @@ export class Api {
   async #loadEndpoints() {
     const searchPrefix = path.join(this.basePath, this.prefixPath);
 
+    console.log(
+      `> Loading API components from '${this.basePath}' path with prefix: ${this.prefixPath}...`,
+    );
+
     for await (
-      const dirEntry of walk(searchPrefix, { includeDirs: false, exts: ["ts"] })
+      const dirEntry of walk(searchPrefix, { includeDirs: false, exts: ['ts'] })
     ) {
       const apiFile = dirEntry.path;
       const { dir: route, name: method } = pick(
         path.parse(path.relative(this.basePath, dirEntry.path)),
-        ["dir", "name"],
+        ['dir', 'name'],
       );
 
       // deno-lint-ignore no-explicit-any
@@ -102,7 +106,7 @@ export class Api {
 
           try {
             const [error, response] = await api(apiRequest);
-            console.log("response", error, response);
+            console.log('response', error, response);
 
             if (error != null) {
               console.error(error);
@@ -114,12 +118,13 @@ export class Api {
             console.error(e);
             throw createHttpError(
               Status.BadRequest,
-              "The request was bad.",
+              'The request was bad.',
               { expose: false },
             );
           }
         },
       );
+      console.log(`- Registred ${method.toUpperCase()} handler for /${route}`);
     }
   }
 }
