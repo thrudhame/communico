@@ -2,5 +2,9 @@
   "name": "@communico/utils",
   "exports": {
     "./proxy": "./proxy.ts"
+  },
+  "imports": {
+    "@std/fmt": "jsr:@std/fmt@^1.0.8",
+    "@std/io": "jsr:@std/io@^0.225.2"
   }
 }

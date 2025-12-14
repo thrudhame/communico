@@ -1,45 +1,131 @@
+import { Buffer, copy } from '@std/io';
+import { format } from '@std/fmt/duration';
+
+const endpoint = Deno.env.get('ENDPOINT');
+
+// deno-lint-ignore no-explicit-any
+async function toBuffer(log: Buffer, ...texts: any[]): Promise<void> {
+  for (const i in texts) {
+    await log.write(new TextEncoder().encode(texts[i]));
+  }
+}
+
+// deno-lint-ignore no-explicit-any
+async function toBufferLine(log: Buffer, ...texts: any[]): Promise<void> {
+  const lineItems = texts.map((item, index) => {
+    let lineItem = typeof item === 'string' ? item : Deno.inspect(item);
+
+    if (index < texts.length - 1) {
+      lineItem += ' ';
+    }
+
+    return lineItem;
+  });
+
+  return await toBuffer(log, ...lineItems, '\n');
+}
+
+const timer = Date.now();
+
 Deno.serve({ port: 8080 }, async (request) => {
+  const log = new Buffer();
+  const start = Date.now();
+
   const { pathname, search } = new URL(request.url);
-  const url = new URL(pathname, Deno.env.get('ENDPOINT'));
+  // Element X has this weird double slash for this request
+  // and it messes up URL constructor
+  const url = new URL(pathname.replace(/^\/+/, '/'), endpoint);
   url.search = search;
 
-  const headers = new Headers(request.headers);
-  headers.set('Host', url.hostname);
-  headers.set('Accept-Encoding', 'gzip, deflate');
+  await toBufferLine(log, '\n##', request.method, pathname);
 
-  console.log('\n----------------------------------');
-  console.log('>', request.method, pathname);
-  console.log(headers);
+  if (search.length > 0) {
+    await toBufferLine(log, '>', search);
+  }
+
+  await toBufferLine(log, '\n````');
+  await toBufferLine(
+    log,
+    `+ ${format(start - timer, { ignoreZero: true })}`,
+  );
+  await toBufferLine(log, '===');
+  await toBufferLine(log, '>', request.method, pathname, search);
+  await toBufferLine(log, request.headers);
+
+  const headers = new Headers(request.headers);
+  headers.set('host', url.hostname);
+  if (headers.get('accept-encoding')?.match(/\bbr\b/)) {
+    headers.set('accept-encoding', 'gzip, deflate');
+  }
+
+  let requestBody = request.body;
+
+  if (requestBody != null) {
+    await toBufferLine(log, '---');
+    const requestBodyLogger = new TransformStream({
+      transform: async (chunk, controller) => {
+        await toBuffer(log, new TextDecoder().decode(chunk));
+        controller.enqueue(chunk);
+      },
+    });
+
+    requestBody.pipeTo(requestBodyLogger.writable);
+    requestBody = requestBodyLogger.readable;
+  }
 
   const out_response = await fetch(url, {
     method: request.method,
     headers,
-    body: request.body,
+    body: requestBody,
     redirect: 'manual',
   });
 
-  let responseBody = out_response.body;
+  const responseBody = out_response.body;
 
-  console.log('<', out_response.status);
-  console.log(out_response.headers);
-  console.log('---');
+  await toBufferLine(log, '\n***');
+  await toBufferLine(log, '\n<', out_response.status);
+  await toBufferLine(log, out_response.headers);
+  await toBufferLine(log, '---');
+
+  let consumer = responseBody;
+
+  const logger = new TransformStream({
+    transform: async (chunk, controller) => {
+      await toBuffer(log, new TextDecoder().decode(chunk));
+      controller.enqueue(chunk);
+    },
+    flush: async (_controller) => {
+      await toBufferLine(log, '\n===');
+      await toBufferLine(
+        log,
+        `${format(Date.now() - start, { ignoreZero: true })}`,
+      );
+      await toBufferLine(log, '````');
+      await toBufferLine(log, '\n');
+      await copy(log, Deno.stdout);
+      log.reset();
+    },
+  });
 
   if (responseBody != null) {
-    const [toRepond, toLog] = responseBody.tee();
-    responseBody = toRepond;
-
     const contentEncoding = out_response.headers.get('content-encoding');
-    if (contentEncoding === 'deflate' || contentEncoding === 'gzip') {
+    if (
+      contentEncoding != null && ['deflate', 'gzip'].includes(contentEncoding)
+    ) {
       const decompressStream = new DecompressionStream(
         contentEncoding as CompressionFormat,
       );
-      toLog.pipeThrough(decompressStream).pipeTo(Deno.stdout.writable);
+      responseBody.pipeThrough(decompressStream).pipeTo(logger.writable);
     } else {
-      toLog.pipeTo(Deno.stdout.writable);
+      responseBody.pipeTo(logger.writable);
     }
+
+    consumer = logger.readable;
+  } else {
+    consumer = responseBody;
   }
 
-  return new Response(responseBody, {
+  return new Response(consumer, {
     status: out_response.status,
     headers: out_response.headers,
   });
