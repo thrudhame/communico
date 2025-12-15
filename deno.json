@@ -1,4 +1,11 @@
 {
+  "private": true,
+  "name": "Communico",
+  "description": "Matrix Homeserver for the rest of us",
+  "exports": {
+    ".": "./main.ts",
+    "./setup": "./setup.ts"
+  },
   "tasks": {
     "dev": "deno run --env --allow-net --allow-env --allow-read --watch main.ts",
     "start": "deno --env --allow-net --allow-env --allow-read main.ts",

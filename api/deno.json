@@ -1,4 +1,5 @@
 {
+  "private": true,
   "name": "@communico/api",
   "exports": {
     ".": "./api.ts",

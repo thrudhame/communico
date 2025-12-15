@@ -1,4 +1,5 @@
 {
+  "private": true,
   "name": "@communico/utils",
   "exports": {
     "./proxy": "./proxy.ts"

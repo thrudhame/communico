@@ -40,10 +40,10 @@ Deno.serve({ port: 8080 }, async (request) => {
   await toBufferLine(log, '\n##', request.method, pathname);
 
   if (search.length > 0) {
-    await toBufferLine(log, '>', search);
+    await toBufferLine(log, '>', '`' + search + '`');
   }
 
-  await toBufferLine(log, '\n````');
+  await toBufferLine(log, '\n````json');
   await toBufferLine(
     log,
     `+ ${format(start - timer, { ignoreZero: true })}`,
@@ -89,39 +89,51 @@ Deno.serve({ port: 8080 }, async (request) => {
 
   let consumer = responseBody;
 
-  const logger = new TransformStream({
-    transform: async (chunk, controller) => {
-      await toBuffer(log, new TextDecoder().decode(chunk));
-      controller.enqueue(chunk);
-    },
-    flush: async (_controller) => {
-      await toBufferLine(log, '\n===');
-      await toBufferLine(
-        log,
-        `${format(Date.now() - start, { ignoreZero: true })}`,
-      );
-      await toBufferLine(log, '````');
-      await toBufferLine(log, '\n');
-      await copy(log, Deno.stdout);
-      log.reset();
-    },
-  });
+  const responseMediaType = out_response.headers.get('content-type');
+  const [responseContentType, responseContentSubtype] =
+    responseMediaType?.split('/', 2) ?? ['', ''];
 
-  if (responseBody != null) {
-    const contentEncoding = out_response.headers.get('content-encoding');
-    if (
-      contentEncoding != null && ['deflate', 'gzip'].includes(contentEncoding)
-    ) {
-      const decompressStream = new DecompressionStream(
-        contentEncoding as CompressionFormat,
-      );
-      responseBody.pipeThrough(decompressStream).pipeTo(logger.writable);
+  if (
+    responseContentType === 'text' ||
+    (responseContentType === 'application' && responseContentSubtype === 'json')
+  ) {
+    const logger = new TransformStream({
+      transform: async (chunk, controller) => {
+        await toBuffer(log, new TextDecoder().decode(chunk));
+        controller.enqueue(chunk);
+      },
+      flush: async (_controller) => {
+        await toBufferLine(log, '\n===');
+        await toBufferLine(
+          log,
+          `${format(Date.now() - start, { ignoreZero: true })}`,
+        );
+        await toBufferLine(log, '````');
+        await toBufferLine(log, '\n');
+        await copy(log, Deno.stdout);
+        log.reset();
+      },
+    });
+
+    if (responseBody != null) {
+      const contentEncoding = out_response.headers.get('content-encoding');
+      if (
+        contentEncoding != null && ['deflate', 'gzip'].includes(contentEncoding)
+      ) {
+        const decompressStream = new DecompressionStream(
+          contentEncoding as CompressionFormat,
+        );
+        responseBody.pipeThrough(decompressStream).pipeTo(logger.writable);
+      } else {
+        responseBody.pipeTo(logger.writable);
+      }
+
+      consumer = logger.readable;
     } else {
-      responseBody.pipeTo(logger.writable);
+      consumer = responseBody;
     }
-
-    consumer = logger.readable;
   } else {
+    await toBufferLine(log, `[[Content-Type: ${responseMediaType}]]`);
     consumer = responseBody;
   }
 
