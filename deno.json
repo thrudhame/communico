@@ -13,7 +13,7 @@
     "test": "deno test tests/*",
     "db-init": "echo TODO",
     "db-start": "doltgres --config /etc/doltgres/servercfg.d/config.yaml",
-    "debug-proxy": "deno --allow-env --allow-net utils/proxy.ts"
+    "debug-proxy": "deno --allow-env --allow-net --allow-write utils/proxy.ts"
   },
   "imports": {
     "@oak/oak": "jsr:@oak/oak@^17.2.0",

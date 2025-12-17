@@ -1,7 +1,13 @@
-import { Buffer, copy } from '@std/io';
+import { Buffer } from '@std/io';
 import { format } from '@std/fmt/duration';
+import { assert } from 'node:console';
+import path from 'node:path';
 
 const endpoint = Deno.env.get('ENDPOINT');
+const clientName = Deno.env.get('NAME');
+
+assert(endpoint != null, 'Server endpoint must be provided');
+assert(clientName != null, 'client name must be provided');
 
 // deno-lint-ignore no-explicit-any
 async function toBuffer(log: Buffer, ...texts: any[]): Promise<void> {
@@ -25,9 +31,12 @@ async function toBufferLine(log: Buffer, ...texts: any[]): Promise<void> {
   return await toBuffer(log, ...lineItems, '\n');
 }
 
+const baseDir = path.resolve(`./debug/${clientName}/`);
+Deno.mkdirSync(baseDir, { recursive: true });
+
 const timer = Date.now();
 
-Deno.serve({ port: 8080 }, async (request) => {
+Deno.serve({ port: 8000 }, async (request) => {
   const log = new Buffer();
   const start = Date.now();
 
@@ -36,6 +45,11 @@ Deno.serve({ port: 8080 }, async (request) => {
   // and it messes up URL constructor
   const url = new URL(pathname.replace(/^\/+/, '/'), endpoint);
   url.search = search;
+
+  const startingPoint = start - timer;
+  const filename = `${startingPoint}_${request.method}_${
+    pathname.replace(/\//g, '__')
+  }.md`;
 
   await toBufferLine(log, '\n##', request.method, pathname);
 
@@ -110,7 +124,9 @@ Deno.serve({ port: 8080 }, async (request) => {
         );
         await toBufferLine(log, '````');
         await toBufferLine(log, '\n');
-        await copy(log, Deno.stdout);
+        await Deno.writeFile(path.resolve(baseDir, filename), log.bytes());
+        // report file op
+        await Deno.stdout.write(new TextEncoder().encode(`+ ${filename}\n`));
         log.reset();
       },
     });
