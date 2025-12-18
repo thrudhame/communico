@@ -1,4 +1,5 @@
 import { Buffer } from '@std/io';
+import { sprintf } from '@std/fmt/printf';
 import { format } from '@std/fmt/duration';
 import { assert } from 'node:console';
 import path from 'node:path';
@@ -47,7 +48,7 @@ Deno.serve({ port: 8000 }, async (request) => {
   url.search = search;
 
   const startingPoint = start - timer;
-  const filename = `${startingPoint}_${request.method}_${
+  const filename = `${sprintf('%08d', startingPoint)}_${request.method}_${
     pathname.replace(/\//g, '__')
   }.md`;
 
