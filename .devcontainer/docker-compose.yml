@@ -1,5 +1,5 @@
 services:
-  devcontainer:
+  communico:
     env_file: ../.env
     image: communico:devcontainer
     build:

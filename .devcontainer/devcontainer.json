@@ -2,7 +2,7 @@
 {
   "name": "communico dev environment",
   "dockerComposeFile": "docker-compose.yml",
-  "service": "devcontainer",
+  "service": "communico",
   "workspaceFolder": "/workspace",
   "customizations": {
     "vscode": {
