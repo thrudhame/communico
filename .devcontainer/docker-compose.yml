@@ -17,3 +17,10 @@ services:
       - ../doltgres/config:/etc/doltgres/servercfg.d
       - ..:/workspace:cached
     command: sleep infinity
+    # OOM / fork-bomb protection — hard caps for the dev workload
+    # (doltgres x2, deno servers x2, ingest bench). See plans:
+    # dolt-room-engine/execution/README.md "Pre-flight".
+    mem_limit: 8g
+    memswap_limit: 8g
+    pids_limit: 512
+    cpus: 4
