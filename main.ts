@@ -8,7 +8,7 @@ const communicoAPI = new Api('api/endpoints/', '_communico/');
 
 await Promise.all([matrixAPI.setup(), communicoAPI.setup()]);
 
-Deno.serve({ port: 80 }, async (request, info) => {
+Deno.serve({ port: Number(Deno.env.get('APP_A_PORT') ?? '80') }, async (request, info) => {
   const { pathname } = new URL(request.url);
   if (pathname === '/') {
     return new Response(tagLine);
@@ -18,7 +18,7 @@ Deno.serve({ port: 80 }, async (request, info) => {
   return res ?? Response.error();
 });
 
-Deno.serve({ port: 8000 }, async (request, info) => {
+Deno.serve({ port: Number(Deno.env.get('APP_B_PORT') ?? '8000') }, async (request, info) => {
   const { pathname } = new URL(request.url);
   if (pathname === '/') {
     return new Response(tagLine);

@@ -10,8 +10,8 @@
     "dev": "deno run --env --allow-net --allow-env --allow-read --watch main.ts",
     "start": "deno --env --allow-net --allow-env --allow-read main.ts",
     "setup": "deno --env --allow-net --allow-env setup.ts",
-    "test": "deno test tests/*",
-    "db-init": "echo TODO",
+    "test": "deno test --env --allow-net --allow-env --allow-read tests/*",
+    "db-init": "deno run --env --allow-net --allow-env --allow-read db/init.ts",
     "db-start": "doltgres --config /etc/doltgres/servercfg.d/config.yaml",
     "debug-proxy": "PROXY_PORT=8000 deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
   },
