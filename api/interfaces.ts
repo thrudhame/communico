@@ -15,6 +15,8 @@ export interface TApiComponentRequest {
   userAgent: Request["userAgent"];
   // not in oak's request
   params: RouterContext<string>["params"];
+  // URL query string (?a=b) — not in oak's request pick above
+  search: URLSearchParams;
 }
 
 export interface TApiComponentResponseOptions {

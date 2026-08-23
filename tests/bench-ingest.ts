@@ -3,34 +3,20 @@
 // Run: deno run --env --allow-net --allow-env --allow-read tests/bench-ingest.ts
 import {
   createRoom,
-  dbNameFor,
   lookupRoom,
 } from '../api/engine/room.ts';
 import { ingestEvent } from '../api/engine/ingest.ts';
-import { SERVER_DB, withDb } from '../api/engine/db.ts';
+import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!bench:localhost';
 
-async function cleanup() {
-  const dbName = await dbNameFor(ROOM);
-  await withDb(SERVER_DB, async (c) => {
-    await c.query(`DROP DATABASE IF EXISTS ${dbName};`);
-    await c.query('DELETE FROM room_directory WHERE room_id = $1;', [ROOM]);
-    await c.query('DELETE FROM event_index WHERE room_id = $1;', [ROOM]);
-  });
-}
-
-await cleanup();
+await resetRoom(ROOM);
 await createRoom(ROOM, '10', '@dev:localhost');
 const room = (await lookupRoom(ROOM))!;
 
-let prev: string = await withDb(SERVER_DB, async (c) => {
-  const r = await c.query(
-    'SELECT event_id FROM event_index WHERE room_id = $1;',
-    [ROOM],
-  );
-  return String(r.rows[0].event_id);
-});
+// chain off the current extremity (the member event since the
+// matrix-client-demo baseline change)
+let prev = await latestExtremityEventId(ROOM);
 
 async function sendOne(i: number): Promise<number> {
   const t0 = performance.now();

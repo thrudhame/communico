@@ -20,6 +20,24 @@ async function checkoutReadHead(
   }
 }
 
+// Maps a commit to the events row it added (the commit=event invariant:
+// exactly one added row). Returns the parsed canonical_json, or null for
+// non-event commits. Shared by timeline.messages (Mode B) and syncfeed.
+export async function eventAtCommit(
+  c: { query: (sql: string) => Promise<{ rows: Record<string, unknown>[] }> },
+  commitHash: string,
+): Promise<Record<string, unknown> | null> {
+  const d = await c.query(
+    `SELECT * FROM dolt_diff('${commitHash}~', '${commitHash}', 'events');`,
+  );
+  // deno-lint-ignore no-explicit-any
+  for (const dr of d.rows as any[]) {
+    if (dr.diff_type !== 'added') continue;
+    return dr.to_canonical_json as Record<string, unknown>;
+  }
+  return null;
+}
+
 export async function messages(
   dbName: string,
   roomId: string,
@@ -42,14 +60,8 @@ export async function messages(
         const msg = String(row.message);
         if (!msg.startsWith('event ')) continue;
         const ch = String(row.commit_hash);
-        const d = await c.query(
-          `SELECT * FROM dolt_diff('${ch}~', '${ch}', 'events');`,
-        );
-        // deno-lint-ignore no-explicit-any
-        for (const dr of d.rows as any[]) {
-          if (dr.diff_type !== 'added') continue;
-          out.push({ ...(dr.to_canonical_json as object), event_id: '$' + ch });
-        }
+        const pdu = await eventAtCommit(c, ch);
+        if (pdu) out.push({ ...pdu, event_id: '$' + ch });
       }
       return out;
     }

@@ -27,11 +27,16 @@ export async function runSqlFile(c: unknown, path: string): Promise<void> {
   }
 }
 
+export interface CreateRoomResult {
+  createEventId: string;
+  memberEventId: string;
+}
+
 export async function createRoom(
   roomId: string,
   roomVersion: string,
   creator: string,
-): Promise<void> {
+): Promise<CreateRoomResult> {
   const dbName = await dbNameFor(roomId);
   await withDb(SERVER_DB, async (c) => {
     await c.query(`CREATE DATABASE ${ident(dbName)};`);
@@ -44,7 +49,7 @@ export async function createRoom(
     await runSqlFile(c, 'db/room/schema.sql');
     await c.query(`SELECT DOLT_COMMIT('-Am', 'room genesis: schema');`);
   });
-  await ingestEvent(roomId, {
+  const createRes = await ingestEvent(roomId, {
     type: 'm.room.create',
     state_key: '',
     sender: creator,
@@ -52,6 +57,17 @@ export async function createRoom(
     prev_events: [],
     origin_ts: Date.now(),
   });
+  // creator's join — through the normal pipeline (needed for spec-true
+  // state and sync's join map)
+  const memberRes = await ingestEvent(roomId, {
+    type: 'm.room.member',
+    state_key: creator,
+    sender: creator,
+    content: { membership: 'join' },
+    prev_events: [createRes.event_id],
+    origin_ts: Date.now(),
+  });
+  return { createEventId: createRes.event_id, memberEventId: memberRes.event_id };
 }
 
 export interface RoomInfo {

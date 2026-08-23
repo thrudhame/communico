@@ -102,6 +102,7 @@ export class Api {
             method: context.request.method,
             userAgent: context.request.userAgent,
             params: context.params,
+            search: new URL(context.request.url).searchParams,
           };
 
           try {

@@ -1,45 +1,29 @@
 import { assert, assertEquals } from '@std/assert';
 import {
   createRoom,
-  dbNameFor,
   extremities,
   lookupRoom,
 } from '../api/engine/room.ts';
 import { ingestEvent } from '../api/engine/ingest.ts';
 import { messages, stateNow } from '../api/engine/timeline.ts';
-import { SERVER_DB, withDb } from '../api/engine/db.ts';
+import { withDb } from '../api/engine/db.ts';
+import { resetRoom } from './util.ts';
 
 const ROOM = '!t2:localhost';
 
-async function cleanup() {
-  const dbName = await dbNameFor(ROOM);
-  await withDb(SERVER_DB, async (c) => {
-    await c.query(`DROP DATABASE IF EXISTS ${dbName};`);
-    await c.query('DELETE FROM room_directory WHERE room_id = $1;', [ROOM]);
-    await c.query('DELETE FROM event_index WHERE room_id = $1;', [ROOM]);
-  });
-}
 
 Deno.test('fork/merge: 2-prev event lands a 2-parent commit, latest-wins state', async () => {
-  await cleanup();
-  await createRoom(ROOM, '10', '@dev:localhost');
+  await resetRoom(ROOM);
+  const { memberEventId } = await createRoom(ROOM, '10', '@dev:localhost');
   const room = (await lookupRoom(ROOM))!;
   const dbName = room.dbName;
 
-  const createId: string = await withDb(SERVER_DB, async (c) => {
-    const r = await c.query(
-      'SELECT event_id FROM event_index WHERE room_id = $1;',
-      [ROOM],
-    );
-    return String(r.rows[0].event_id);
-  });
-
-  // E1 (message) on top of create
+  // E1 (message) on top of the current extremity (the member event)
   const e1 = await ingestEvent(ROOM, {
     type: 'm.room.message',
     sender: '@dev:localhost',
     content: { body: 'E1', msgtype: 'm.text' },
-    prev_events: [createId],
+    prev_events: [memberEventId],
     origin_ts: 500,
   });
 
