@@ -24,11 +24,13 @@ CREATE TABLE IF NOT EXISTS room_directory (
 -- (phase-1 step 1.3 sanctioned addition for the send endpoint's
 -- extremities -> event_ids lookup; stale after branch deletion, filtered
 -- against live dolt.branches at query time).
+CREATE SEQUENCE IF NOT EXISTS event_seq;
 CREATE TABLE IF NOT EXISTS event_index (
   event_id text PRIMARY KEY,
   room_id text NOT NULL,
   commit_hash text NOT NULL,
-  branch_name text
+  branch_name text,
+  seq bigint DEFAULT nextval('event_seq')
 );
 INSERT INTO users (user_id, display_name) VALUES ('@dev:localhost', 'Dev User')
   ON CONFLICT (user_id) DO NOTHING;
