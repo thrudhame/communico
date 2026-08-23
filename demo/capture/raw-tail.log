@@ -1,0 +1,43 @@
+2026-08-23 18:14:16,155:    DEBUG: matrix-commander: Debug is turned on. debug count=1
+2026-08-23 18:14:16,156:    DEBUG: matrix-commander: Separator is set to "    " of length 4. E.g. Col1    Col2.
+2026-08-23 18:14:16,156:    DEBUG: matrix-commander: Encryption is always enabled. It cannot be turned off. Use --tail to disable it for specific use cases.
+2026-08-23 18:14:16,156:    DEBUG: matrix-commander: --listen set to "tail" because "--tail" is used.
+2026-08-23 18:14:16,156:    DEBUG: matrix-commander: Option --sync is set to full.
+2026-08-23 18:14:16,156:    DEBUG: matrix-commander: All arguments are valid. All checks passed.
+2026-08-23 18:14:16,156:    DEBUG: matrix-commander: Create directory /root/.run for PID file.
+2026-08-23 18:14:16,156:    DEBUG: matrix-commander: Trying to create a PID file to store process id 1.
+2026-08-23 18:14:16,157:    DEBUG: matrix-commander: Successfully created PID file "/root/.run/matrix-commander.03a4c1c4-076b-4469-a011-9d7414c29e25.pid" to store process id 1.
+2026-08-23 18:14:16,157:    DEBUG: matrix-commander: Python version is "3.11.6 (main, Oct  3 2023, 00:00:00) [GCC 12.3.1 20230508 (Red Hat 12.3.1-1)]"
+2026-08-23 18:14:16,157:    DEBUG: matrix-commander: Stdin pipe is assigned to "none".
+2026-08-23 18:14:16,157:    DEBUG: matrix-commander: SSL will be used. Default SSL certificate validation will be done for this connection.
+2026-08-23 18:14:16,158:    DEBUG: matrix-commander: Credentials file was specified with full path. So we suggest that one. file: /data/credentials.json
+2026-08-23 18:14:16,158:    DEBUG: matrix-commander: Store directory "/data/store" was specified by user, it is a directory with a path, but the directory does not exist. 
+2026-08-23 18:14:16,158:    DEBUG: matrix-commander: Store directory was not found anywhere. Hence, we will suggest "/data/store" (local directory) as store directory.
+2026-08-23 18:14:16,158:    DEBUG: matrix-commander: Cleanup: cleaning up.
+2026-08-23 18:14:16,164:    ERROR: matrix-commander: E153: Credentials file was not found. Provide credentials file or use --login to create a credentials file.
+Here is the traceback.
+Traceback (most recent call last):
+  File "/app/matrix_commander/matrix_commander.py", line 10325, in main
+    main_inner(argv)
+  File "/app/matrix_commander/matrix_commander.py", line 10274, in main_inner
+    asyncio.run(async_main())  # do everything in the event loop
+    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.11/asyncio/runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.11/asyncio/base_events.py", line 653, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/app/matrix_commander/matrix_commander.py", line 7269, in async_main
+    await implicit_login()
+  File "/app/matrix_commander/matrix_commander.py", line 7235, in implicit_login
+    client, credentials = await login_using_credentials_file()
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/matrix_commander/matrix_commander.py", line 3924, in login_using_credentials_file
+    raise MatrixCommanderError(
+matrix_commander.MatrixCommanderError: E153: Credentials file was not found. Provide credentials file or use --login to create a credentials file.
+
+2026-08-23 18:14:16,164:     INFO: matrix-commander: 1 error and 0 warnings occurred.

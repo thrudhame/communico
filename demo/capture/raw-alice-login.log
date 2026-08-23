@@ -1,0 +1,6 @@
+2026-08-23 18:59:45,294:     INFO: matrix-commander: The provided login data is: homeserver='http://localhost:80'
+2026-08-23 18:59:45,294:     INFO: matrix-commander:                             user id='@alice:localhost'
+2026-08-23 18:59:45,295:     INFO: matrix-commander:                             device name='demo'
+2026-08-23 18:59:45,295:     INFO: matrix-commander:                             room id='!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost'
+2026-08-23 18:59:45,309:     INFO: matrix-commander: The persistent storage directory /data/store was created for you.
+2026-08-23 18:59:45,388:     INFO: matrix-commander: E233: Log in using method 'password' was successful. Credentials were stored in file '/data/credentials.json'. From now on you can run program 'matrix-commander.py' without log in, as an access token is stored in your credentials file. If you plan on having many credential files, consider moving them to directory '/root/.config/matrix-commander'.

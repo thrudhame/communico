@@ -1,0 +1,37 @@
+2026-08-23 18:59:23,214:  WARNING:  nio.events.misc: Error validating event: 'msgtype' is a required property
+
+Failed validating 'required' in schema['properties']['content']:
+    {'type': 'object',
+     'properties': {'msgtype': {'type': 'string'}},
+     'required': ['msgtype']}
+
+On instance['content']:
+    {'body': 'hello from A'}
+2026-08-23 18:59:23,215:  WARNING:  nio.events.misc: Error validating event: 'msgtype' is a required property
+
+Failed validating 'required' in schema['properties']['content']:
+    {'type': 'object',
+     'properties': {'msgtype': {'type': 'string'}},
+     'required': ['msgtype']}
+
+On instance['content']:
+    {'body': 'hello from A'}
+2026-08-23 18:59:23,217:  WARNING:  nio.events.misc: Error validating event: 'msgtype' is a required property
+
+Failed validating 'required' in schema['properties']['content']:
+    {'type': 'object',
+     'properties': {'msgtype': {'type': 'string'}},
+     'required': ['msgtype']}
+
+On instance['content']:
+    {'body': 'hello from A'}
+2026-08-23 18:59:23,314:  WARNING:  nio.events.misc: Error validating event: 'msgtype' is a required property
+
+Failed validating 'required' in schema['properties']['content']:
+    {'type': 'object',
+     'properties': {'msgtype': {'type': 'string'}},
+     'required': ['msgtype']}
+
+On instance['content']:
+    {'body': 'validator fresh proof'}
+2026-08-23 18:59:23,579:     INFO: matrix-commander: This message was sent: "act1 re-verify after sync swap" to room "!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost" as event "$u28rq0vbllog9kthp4bco09916n38hv5".

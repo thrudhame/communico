@@ -562,6 +562,263 @@ when the branch tip is a merge commit; scalar-subquery form
 `WHERE commit_hash = (SELECT HASHOF('ma'))` works. `AS OF HASHOF('ma')`
 unaffected.
 
+## Client-demo Phase 3 log
+
+Status: COMPLETE
+
+What was built:
+- `demo/setup.sh` (step 3.1): preflight, image build, container with the
+  exact capped `docker run`, Doltgres+app readiness waits, `db-init`,
+  Mode B demo room (reuses the newest native room on re-runs),
+  matrix-commander image, non-interactive alice+bob logins, summary with
+  copy-paste Act 1/Act 2 commands. Idempotent; `--reset` tears down.
+- `demo/run-demo.sh` (step 3.2): interactive choreography print;
+  `--check` headless self-test; `--scripted` host-side tmux 3-pane
+  choreography (Q5/A).
+- `demo/inspection-tour.md` (step 3.3): 8 shape-based stops +
+  `demo/fork-demo.ts` (real fork+merge via `keepPrevBranches`).
+- `demo/README.md` (step 3.4): prereqs, quickstart, the two-paragraph
+  claim, pointers.
+- `### nio-compat findings` gap addendum (step 3.5.1) appended under
+  `## Gap report`.
+
+Deviations / substitutions (all recorded where they happened):
+- **Q5/A (validator decision under user delegation):** `--scripted`'s
+  tmux runs ON THE HOST (`/usr/bin/tmux` 3.7b) — verified the container
+  has no docker CLI and no `/var/run/docker.sock`, so container-side
+  tmux cannot run matrix-commander panes at all. phase-3 step 3.2 was
+  rewritten by the decider; the earlier PERMITTED container-side tmux
+  install (`docker exec -u root communico-dev apt-get install -y tmux`)
+  already happened and is recorded here as unused/harmless (ephemeral
+  container layer). Session: `communico-demo` (listener = alice's real
+  client `docker run … --listen forever`, watch = `docker exec … deno
+  eval` dolt.log poll, sender lane = 4 paced sends ~3 s apart). Verified
+  end-to-end: all 3 panes alive, `/tmp/demo-listen.log` shows the four
+  paced messages received by alice's client.
+- setup.sh fixes found by the rehearsal: (a) `Deno.readAll` no longer
+  exists in Deno 2 — room id extracted with grep/cut instead; (b)
+  `ORDER BY ctid` unsupported/ absent in Doltgres — "newest native room"
+  now resolved via `MAX(seq)` in `event_index` (both scripts);
+  (c) matrix-commander refuses `--login` when credentials exist (E224)
+  and stale stores hold old since-tokens — setup drops store +
+  credentials via a throwaway container rm (files are root-owned);
+  (d) `--listen once` prints no event id in default output — `--check`
+  uses `--output json` so the `\$[a-z0-9]{32}` grep can match.
+- Fresh-clone rehearsal (step 3.5.2) was run as a `cp -a` of the working
+  tree to `/tmp/fresh-communico` instead of `git clone -b
+  spike/matrix-client-demo` — hard rule 3 (no commits) means a git clone
+  would carry none of the uncommitted work; the copy reproduces the
+  fresh-state substance. The true git-clone rehearsal belongs to
+  validation time after commits land (the phase labels this gate "for
+  validation").
+- Insurance: `docker commit communico-dev communico-dev-backup:
+  pre-rehearsal` was taken before the rehearsal removed the container
+  (the room-engine spike databases lived inside it).
+
+Rehearsal transcript (final, after all reworks):
+```
+$ docker rm -f communico-dev; bash demo/setup.sh
+  => exit 0 (image present; container created with caps; Doltgres ready;
+     app ready; db-init seeded; room created; alice+bob logged in;
+     summary with room id + Act1/Act2 commands printed)
+$ bash demo/run-demo.sh --check
+  >> Act 1: bob sends 'check-…'  => sent as event "$<32 hex chars>"
+  >> Act 2: alice listens once
+     body found in alice's output ✓
+     event id '$<32 chars>' (= Dolt commit hash) found ✓
+  CHECK: PASS   => exit 0
+$ bash demo/run-demo.sh --scripted   (earlier, also verified)
+  => host tmux 'communico-demo' up; /tmp/demo-listen.log shows
+     "three: state at any commit via AS OF",
+     "four: federation is a dolt pull" received from bob ✓
+```
+
+Final state: `deno task test` → 13 passed, 0 failed. Main-repo demo
+environment recreated (`demo/setup.sh` exit 0).
+
+## Client-demo Phase 2 log
+
+Status: COMPLETE
+
+What was built:
+- `event_index.seq` (step 2.1): **fallback rung 2 adopted universally** —
+  `CREATE SEQUENCE IF NOT EXISTS event_seq` + `seq bigint DEFAULT
+  nextval('event_seq')`. Rung 1 (`bigserial`) works only via CREATE TABLE
+  in Doltgres; the ALTER path is broken by two quirks (recorded below).
+- `api/engine/syncfeed.ts` (step 2.2): since-tokens, initial/incremental
+  sync, 500 ms long-poll on `MAX(seq)`, all-rooms join map.
+- `api/endpoints/_matrix/client/v3/sync/get.ts` (step 2.3): real
+  syncfeed internals behind the step-1.5b route (Q4 guard-rail honored:
+  Act 1 re-verified after the swap — transcript below).
+- `POST /_matrix/client/v3/keys/upload` stub (step 2.4; the ONLY keys
+  endpoint the capture lists — returns `{one_time_key_counts:{}}`).
+- `tests/sync.test.ts` (step 2.5): initial/incremental/long-poll — green;
+  full suite 13/13.
+
+Doltgres discoveries (gap-report material):
+- `ALTER TABLE ... ADD COLUMN seq bigserial` creates the sequence but
+  does NOT attach the nextval default (`column_default` = NULL), and
+  every `nextval()` use against the `bigserial`-typed column errors:
+  `ASSIGNMENT_CAST: target is of type bigserial but expression is of
+  type bigint` — even with an explicit `::bigserial` cast (which Doltgres
+  rewrites to `::BIGINT`). The `bigserial` pseudo-type is effectively
+  unusable outside CREATE TABLE; plain `bigint + nextval default` (rung
+  2) behaves normally everywhere. `CREATE SEQUENCE [IF NOT EXISTS]` works.
+- `information_schema.columns.column_default` reports NULL even where a
+  default functions (reporting gap).
+
+Deviations:
+- `syncSince` state.events on initial sync: built from the state-type
+  events of the SAME loaded event set (wire ids intact) instead of the
+  phase text's "state table rows as events" — the state table stores the
+  PROVISIONAL Mode B event id, which cannot be resolved to the wire id
+  without a fragile message-text join; the sets coincide for the demo
+  flows (create + member [+ topic]). Recorded.
+- Incremental sync's join map contains only rooms with new events
+  (initial sync: every `room_directory` row). Recorded.
+- `tests/bench-ingest.ts` now chains via `latestExtremityEventId` (member
+  event baseline) — it also executes under `deno task test` (the
+  `tests/*` glob); green, adds ~10 s per run.
+- Sequence name correction: Postgres-style `<table>_<column>_seq` =
+  `event_index_seq_seq` (my initial backfill attempt used the wrong name
+  before rung 2 was adopted).
+
+Act 1 re-verification (Q4 guard-rail, after the syncfeed swap):
+```
+$ matrix-commander -m "act1 re-verify after sync swap" --room '!73b4…' --plain
+  => exit 0, sent as event "$u28rq0vbllog9kthp4bco09916n38hv5"
+  server log: GET /v3/sync?since=s0&full_state=true&timeout=30000 (3565 ms)
+  (note: since=s0 came from the phase-1 static next_batch persisted in
+  the client store — parsed as 0, harmless)
+```
+
+Act 2 verification transcript (step 2.6, end-of-chain):
+```
+terminal 1 — alice:
+$ matrix-commander --login password ... (@alice:localhost) => exit 0
+$ matrix-commander --listen forever --plain &
+  => "This program is ready and listening for its Matrix messages."
+terminal 2 — bob:
+$ matrix-commander -m "hello alice via doltgres" --room '!73b4…' --plain
+  => exit 0, sent as event "$kdhpdnvjtasmo5udtl88k2n9jlq5nknr"
+terminal 1 prints (within the long-poll window):
+  message_callback(): … event_id: $kdhpdnvjtasmo5udtl88k2n9jlq5nknr,
+    event: @bob:localhost: hello alice via doltgres
+  Message received for room @dev:localhost [!73b4457d…] | sender bob
+    [@bob:localhost] | 2026-08-23 19:00:24 | hello alice via doltgres
+server log (the sync loop working):
+  GET /v3/sync?full_state=true
+  GET /v3/sync?since=s983&full_state=true&timeout=30000 - 73ms
+  GET /v3/sync?since=s984&timeout=30000 - 19728ms   (long-poll → message)
+  GET /v3/sync?since=s985&timeout=30000 - 30491ms   (timeout → empty)
+```
+PASS: the printed event id is the Mode B wire id `'$' + <32-char dolt
+commit hash>` and matches bob's send response exactly.
+
+## Client-demo Phase 1 log
+
+Status: COMPLETE
+
+What was built:
+- Sanctioned framework diff (step 1.1, exact): `search: URLSearchParams`
+  on `TApiComponentRequest` + population in `api.ts`. Nothing else in
+  those files. `deno task test` stayed green (12).
+- Users/passwords (step 1.2): `users.password_hash`, seeds for
+  `@alice:localhost` / `@bob:localhost` (sha256 of `demo-password`,
+  documented prototype-grade), `access_tokens.device_id`.
+- Endpoints (step 1.3): `GET /_matrix/client/versions`,
+  `GET/POST /_matrix/client/v3/login`, r0 alias `GET
+  /_matrix/client/r0/login` (the ONLY r0 path per capture conclusion 1),
+  `GET /_matrix/client/v3/account/whoami` (pulled forward from phase-2
+  step 2.4 — capture lists it in the critical path: `restore_login`
+  calls it on every authenticated invocation).
+- `auth.ts` (step 1.4): Bearer header OR `?access_token=` query param.
+- Creator membership event (step 1.5): `createRoom` now ingests
+  `m.room.member` (join) after `m.room.create`, returns
+  `{createEventId, memberEventId}`; test ripple applied
+  (`tests/util.ts` with `latestExtremityEventId`/`resetRoom`; engine
+  count assertion 7→8; per-commit diff checks 5 event commits;
+  merge/modeb/reject chain off the member event). 12/12 green.
+- Minimal /sync (step 1.5b, decision Q4/A): near-static join map naming
+  every `room_directory` row, constant `s0` tokens — nio's `room_send`
+  needs the room in `self.rooms`, populated from `rooms.join`.
+  Acknowledged throwaway internals; phase-2 replaces them.
+
+Deviations / substitutions (all capture- or Doltgres-driven):
+- `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (the phase's own fallback
+  line) is NOT supported by Doltgres
+  (`error: IF NOT EXISTS on a column in an ADD COLUMN statement is not
+  supported yet`), and plpgsql `DO` blocks also fail
+  (`at or near "do": syntax error`). Substitution: columns live in the
+  CREATE TABLEs (fresh provisioning path); the existing dev DB got
+  one-off plain ALTERs; documented in schema.sql comments.
+- Seed INSERTs gained explicit column lists (positional INSERTs broke
+  after the table gained a column: `number of values does not match`).
+- Login POST error shape: framework 400 via throw (nio maps any non-2xx
+  to LoginError and reports cleanly) — the 403+M_FORBIDDEN variant was
+  not needed.
+- Commit messages for Mode B embed the PROVISIONAL event id, not the
+  wire id (self-reference: the wire id IS the commit hash, which does
+  not exist until after the commit). The step-1.6 criterion "newest
+  dolt.log message = event $<hash> type m.room.message" was verified as:
+  message matches `event $<id> type m.room.message` AND the commit's
+  `commit_hash` equals the client-printed event id
+  (`nno29u7fo0a28436g7slln2gfh7ik8rp` == client event id ✓).
+- Q4 resolution recorded: minimal /sync as step 1.5b (Option A), phase
+  files updated by the decider; guard-rail: re-verify Act 1 after
+  phase-2's syncfeed swap (done — see Phase 2 log).
+
+Act 1 verification transcript (step 1.6, end-of-chain):
+```
+$ curl -X POST localhost:80/_matrix/client/v3/createRoom ... 
+  => {"room_id":"!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost"}
+$ matrix-commander --login password ... (bob)
+  => exit 0, "Log in using method 'password' was successful"
+$ matrix-commander -m "real client, real commits" --room '!73b4...' --plain
+  => exit 0, sent as event "$nno29u7fo0a28436g7slln2gfh7ik8rp"
+  server log: GET whoami 200; POST keys/upload (404, tolerated);
+              GET /v3/sync?full_state=true&timeout=30000 200;
+              PUT /v3/rooms/!/send/m.room.message/<uuid> 200
+DB checks (room_99d1cd753246efaf3bf1, extremity branch):
+  newest canonical_json body = "real client, real commits" ✓
+  newest dolt.log: commit_hash = nno29u7fo0a28436g7slln2gfh7ik8rp
+    (= client-printed event id — Mode B kicker) ✓
+    message = "event $fb9e6046-… type m.room.message" (provisional id) ✓
+```
+
+## Client-demo Phase 0 log
+
+Status: COMPLETE
+
+What was done:
+- Flows exercised per phase-0 step 0.1 against App A inside
+  `communico-dev`; captures in `demo/capture/`: `raw-login.log`,
+  `raw-listen.log`, `raw-tail.log`, `raw-server.log`, and the deliverable
+  `endpoints-capture.md` with the five conclusions answered.
+- Capture sources used: (1) server console — yes; (2) client
+  `--debug --verbose --verbose` logs — yes; (3) http-debug-proxy —
+  SKIPPED (sources 1+2 plus client source inspection answered the
+  conclusions for the only flow that reaches the wire today; the
+  remaining flows are re-run after Phase 1 per step 0.1's own escape
+  hatch); plus (4) matrix-commander/matrix-nio source read inside the
+  image as a corroborating source (rows marked [wire] vs [source] in the
+  capture doc).
+
+Deviations:
+- `docker run` invoked WITHOUT `-it` (no TTY in the executor shell);
+  batch flows are non-interactive — no behavioral impact. Recorded.
+- Send flow was not run as a separate step: like listen/tail it aborts
+  client-side (`E153: Credentials file was not found`) because login
+  404s. Phase-0 anticipated this; the full wire re-run happens after
+  Phase 1 and `endpoints-capture.md` has a "Pending" section for it.
+
+Key findings (driving Phases 1–2): r0 alias needed ONLY for
+`GET /login`; everything else is `v3`; auth token travels as
+`?access_token=` query param (never a Bearer header) in matrix-nio;
+`/versions` is never called; `POST /v3/keys/upload` WILL be called at
+first sync (nio constructed with encryption_enabled=True + a store);
+`/sync` params = `access_token`, `timeout`, `full_state`, `since`.
+
 ## Gap report — Dolt-as-is vs a Dolt-native Matrix homeserver
 
 Prototype: communico dolt-room-engine, phases 0–4, 2026-08-23.
@@ -638,4 +895,42 @@ Doltgres version: Doltgres version 1.2.0 (`SELECT version();` → PostgreSQL 15.
   across 400 events).
 - Pull sync: 408 ms wall for 2 new_commits (full-room clone + reindex of
   the demo room).
+
+### nio-compat findings (matrix-client-demo addendum)
+
+What it took to drive an unmodified matrix-nio client
+(matrix-commander, nio 0.25.2) against communico/Doltgres — full capture
+in `demo/capture/endpoints-capture.md`:
+
+- **Auth on the wire is the Bearer HEADER, not `?access_token=`**: nio's
+  Api layer builds paths with the query param, but `AsyncClient.send()`
+  rewrites them to `Authorization: Bearer` before sending. Server must
+  accept the header; accepting both is useful (curl).
+- **Path split**: `GET /_matrix/client/r0/login` is hardcoded in
+  matrix-commander's login probe (the ONLY r0 call); everything nio
+  issues is `v3`.
+- **Critical-path endpoints for a minimal server**: `GET r0/login`,
+  `POST v3/login`, `GET v3/account/whoami` (called by `restore_login` on
+  EVERY authenticated invocation — easy to miss), `GET v3/sync` (needed
+  even to SEND: nio's `room_send` resolves the room client-side from the
+  sync's `rooms.join` map), `PUT v3/rooms/:id/send/:type/:txn`.
+  `POST v3/keys/upload` fires on every authenticated startup when nio is
+  constructed with encryption enabled + a store; a stub or a tolerated
+  404 both keep the flow alive. `/versions` is never called by these
+  flows.
+- **Minimal sync shape that satisfied matrix-nio**: top-level
+  `next_batch`, `rooms.join.<id>.timeline.events[]` with per-event
+  `{event_id, sender, type, content, origin_server_ts, state_key?}`,
+  plus empty `presence/account_data/to_device/device_lists/
+  device_one_time_keys_count` maps; `since` token as an opaque string
+  (`s<seq>` here); long-poll honored via server-side wait on
+  `MAX(seq)`.
+- **Doltgres-specific findings surfaced while building this**:
+  `bigserial` is only usable via CREATE TABLE (ALTER path loses the
+  default; `ASSIGNMENT_CAST` rejects nextval's bigint against the
+  bigserial type everywhere else) — use plain
+  `bigint + DEFAULT nextval('<seq>')`; `ALTER ... ADD COLUMN IF NOT
+  EXISTS` unsupported; plpgsql `DO` blocks unsupported;
+  `information_schema.columns.column_default` under-reports.
+
 

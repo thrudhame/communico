@@ -1,0 +1,50 @@
+2026-08-23 18:37:53,359:    DEBUG: matrix-commander: Debug is turned on. debug count=1
+2026-08-23 18:37:53,360:    DEBUG: matrix-commander: Separator is set to "    " of length 4. E.g. Col1    Col2.
+2026-08-23 18:37:53,360:    DEBUG: matrix-commander: Encryption is always enabled. It cannot be turned off. Use --tail to disable it for specific use cases.
+2026-08-23 18:37:53,360:    DEBUG: matrix-commander: Option --sync is set to full.
+2026-08-23 18:37:53,360:    DEBUG: matrix-commander: All arguments are valid. All checks passed.
+2026-08-23 18:37:53,361:    DEBUG: matrix-commander: Create directory /root/.run for PID file.
+2026-08-23 18:37:53,361:    DEBUG: matrix-commander: Trying to create a PID file to store process id 1.
+2026-08-23 18:37:53,361:    DEBUG: matrix-commander: Successfully created PID file "/root/.run/matrix-commander.e9ccd93f-4e1f-4915-a129-d3b614af71ff.pid" to store process id 1.
+2026-08-23 18:37:53,361:    DEBUG: matrix-commander: Python version is "3.11.6 (main, Oct  3 2023, 00:00:00) [GCC 12.3.1 20230508 (Red Hat 12.3.1-1)]"
+2026-08-23 18:37:53,361:    DEBUG: matrix-commander: Stdin pipe is assigned to "none".
+2026-08-23 18:37:53,361:    DEBUG: matrix-commander: SSL will be used. Default SSL certificate validation will be done for this connection.
+2026-08-23 18:37:53,362:    DEBUG: matrix-commander: Credentials file existed. So this is the one we suggest to use. file: /data/credentials.json
+2026-08-23 18:37:53,363:    DEBUG: matrix-commander: Found an existing store in directory "/data/store" (local or arguments). It will be used.
+2026-08-23 18:37:53,363:    DEBUG: matrix-commander: Starting to read credentials file.
+2026-08-23 18:37:53,363:    DEBUG: matrix-commander: Finished reading credentials file.
+2026-08-23 18:37:53,363:    DEBUG: matrix-commander: About to configure Matrix Async Client.
+2026-08-23 18:37:53,363:    DEBUG: matrix-commander: About to initialize Matrix Async Client.
+2026-08-23 18:37:53,363:    DEBUG: matrix-commander: About to restore login.
+2026-08-23 18:37:53,385:    DEBUG: matrix-commander: Finished restoring login.
+2026-08-23 18:37:53,386:    DEBUG: matrix-commander: Login will be using stored credentials from credentials file "/data/credentials.json". room_id = !73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost, device_id = 968566be57, access_token = 6***2.
+2026-08-23 18:37:53,386:    DEBUG: matrix-commander: About to connect to server to verify connection.
+2026-08-23 18:37:53,463:    DEBUG: matrix-commander: restore_login successful. Successfully logged in as user @bob:localhost via restore_login. Response is: WhoamiResponse(uuid='', start_time=None, end_time=None, timeout=0, transport_response=<ClientResponse(http://localhost/_matrix/client/v3/account/whoami) [200 OK]>
+<CIMultiDictProxy('Content-Type': 'application/json; charset=UTF-8', 'x-response-time': '49ms', 'Content-Length': '53', 'Date': 'Sun, 23 Aug 2026 18:37:53 GMT')>
+, user_id='@bob:localhost', device_id='968566be57', is_guest=False)
+2026-08-23 18:37:53,463:    DEBUG: matrix-commander: Room(s) from --room: ['!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost']
+2026-08-23 18:37:53,464:    DEBUG: matrix-commander: Room(s) from --user: None, no users were specified.
+2026-08-23 18:37:53,464:    DEBUG: matrix-commander: Room(s) or user(s) were provided via command line. Overwriting room id from credentials file with rooms "['!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost']" from command line.
+2026-08-23 18:37:53,464:    DEBUG: matrix-commander: Rooms are: ['!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost']
+2026-08-23 18:37:53,464:    DEBUG: matrix-commander: gs.client.rooms are: {}
+2026-08-23 18:37:53,464:    DEBUG: matrix-commander: Starting keys_upload
+2026-08-23 18:37:53,500:  WARNING:    nio.responses: Error validating response: 'one_time_key_counts' is a required property
+2026-08-23 18:37:53,500:    DEBUG: matrix-commander: Finished keys_upload
+2026-08-23 18:37:53,501:    DEBUG: matrix-commander: Starting sync(full_state=True) to synchronize events with server.
+2026-08-23 18:37:53,554:    DEBUG: matrix-commander: Finished sync() with server.
+2026-08-23 18:37:53,554:    DEBUG: matrix-commander: stdin is ready. Something is definitely piped into program from stdin. Reading message from stdin pipe.
+2026-08-23 18:37:53,554:    DEBUG: matrix-commander: Pipe was definitely used, but pipe might be empty. Trying to read from pipe in any case.
+2026-08-23 18:37:53,554:    DEBUG: matrix-commander: Using data from stdin pipe as message.
+2026-08-23 18:37:53,554:    DEBUG: matrix-commander: Don't read from keyboard because there are messages provided in arguments with -m.
+2026-08-23 18:37:53,554:    DEBUG: matrix-commander: Messages from pipe:         ['']
+2026-08-23 18:37:53,554:    DEBUG: matrix-commander: Messages from keyboard:     []
+2026-08-23 18:37:53,555:    DEBUG: matrix-commander: Messages from command-line: ['real client, real commits']
+2026-08-23 18:37:53,555:    DEBUG: matrix-commander: Sending message in format "text".
+2026-08-23 18:37:53,801:     INFO: matrix-commander: This message was sent: "real client, real commits" to room "!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost" as event "$nno29u7fo0a28436g7slln2gfh7ik8rp".
+2026-08-23 18:37:53,802:    DEBUG: matrix-commander: This message was sent: "real client, real commits" to room "!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost". Response: event_id=$nno29u7fo0a28436g7slln2gfh7ik8rp, room_id=!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost, full response: RoomSendResponse(uuid='', start_time=None, end_time=None, timeout=0, transport_response=<ClientResponse(http://localhost/_matrix/client/v3/rooms/!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost/send/m.room.message/e7c2823a-d257-40c0-8c13-ff0d82513857) [200 OK]>
+<CIMultiDictProxy('Content-Type': 'application/json; charset=UTF-8', 'x-response-time': '242ms', 'Content-Length': '48', 'Date': 'Sun, 23 Aug 2026 18:37:53 GMT')>
+, event_id='$nno29u7fo0a28436g7slln2gfh7ik8rp', room_id='!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost'). 
+2026-08-23 18:37:53,802:    DEBUG: matrix-commander: The message is empty. This message is being dropped and NOT sent.
+2026-08-23 18:37:53,802:    DEBUG: matrix-commander: Message send action finished.
+2026-08-23 18:37:53,805:    DEBUG: matrix-commander: The program matrix-commander.py left the event loop.
+2026-08-23 18:37:53,805:    DEBUG: matrix-commander: Cleanup: cleaning up.

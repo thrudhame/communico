@@ -1,0 +1,27 @@
+2026-08-23 18:29:20,870:    DEBUG: matrix-commander: Debug is turned on. debug count=1
+2026-08-23 18:29:20,872:    DEBUG: matrix-commander: Separator is set to "    " of length 4. E.g. Col1    Col2.
+2026-08-23 18:29:20,873:    DEBUG: matrix-commander: Encryption is always enabled. It cannot be turned off. Use --tail to disable it for specific use cases.
+2026-08-23 18:29:20,873:    DEBUG: matrix-commander: Option --sync is set to full.
+2026-08-23 18:29:20,873:    DEBUG: matrix-commander: All arguments are valid. All checks passed.
+2026-08-23 18:29:20,874:    DEBUG: matrix-commander: Create directory /root/.run for PID file.
+2026-08-23 18:29:20,874:    DEBUG: matrix-commander: Trying to create a PID file to store process id 1.
+2026-08-23 18:29:20,874:    DEBUG: matrix-commander: Successfully created PID file "/root/.run/matrix-commander.088dba22-16f1-4209-bf1d-79bc36bdea1c.pid" to store process id 1.
+2026-08-23 18:29:20,875:    DEBUG: matrix-commander: Python version is "3.11.6 (main, Oct  3 2023, 00:00:00) [GCC 12.3.1 20230508 (Red Hat 12.3.1-1)]"
+2026-08-23 18:29:20,875:    DEBUG: matrix-commander: Stdin pipe is assigned to "none".
+2026-08-23 18:29:20,875:    DEBUG: matrix-commander: SSL will be used. Default SSL certificate validation will be done for this connection.
+2026-08-23 18:29:20,876:    DEBUG: matrix-commander: Credentials file was specified with full path. So we suggest that one. file: /data/credentials.json
+2026-08-23 18:29:20,877:    DEBUG: matrix-commander: Store directory "/data/store" was specified by user, it is a directory with a path, but the directory does not exist. 
+2026-08-23 18:29:20,877:    DEBUG: matrix-commander: Store directory was not found anywhere. Hence, we will suggest "/data/store" (local directory) as store directory.
+2026-08-23 18:29:20,877:    DEBUG: matrix-commander: --login has chosen password method for authentication
+2026-08-23 18:29:20,877:     INFO: matrix-commander: The provided login data is: homeserver='http://localhost:80'
+2026-08-23 18:29:20,877:     INFO: matrix-commander:                             user id='@bob:localhost'
+2026-08-23 18:29:20,877:     INFO: matrix-commander:                             device name='demo'
+2026-08-23 18:29:20,877:     INFO: matrix-commander:                             room id='!73b4457d-1c9a-4fdf-ba39-2b766b8918b7:localhost'
+2026-08-23 18:29:20,891:    DEBUG: matrix-commander: Supported login flows: {'m.login.password'}
+2026-08-23 18:29:20,893:    DEBUG: matrix-commander: Server does not support SSO for login.
+2026-08-23 18:29:20,893:     INFO: matrix-commander: The persistent storage directory /data/store was created for you.
+2026-08-23 18:29:20,970:    DEBUG: matrix-commander: Starting to read credentials file.
+2026-08-23 18:29:20,970:    DEBUG: matrix-commander: Finished reading credentials file.
+2026-08-23 18:29:20,970:     INFO: matrix-commander: E233: Log in using method 'password' was successful. Credentials were stored in file '/data/credentials.json'. From now on you can run program 'matrix-commander.py' without log in, as an access token is stored in your credentials file. If you plan on having many credential files, consider moving them to directory '/root/.config/matrix-commander'.
+2026-08-23 18:29:20,973:    DEBUG: matrix-commander: The program matrix-commander.py left the event loop.
+2026-08-23 18:29:20,973:    DEBUG: matrix-commander: Cleanup: cleaning up.
