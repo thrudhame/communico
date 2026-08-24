@@ -51,7 +51,7 @@ TERMINAL 1 — alice listens (matrix-commander, unmodified image):
     --store /data/store --credentials /data/credentials.json
 
 TERMINAL 2 — bob sends (as many as you like):
-  docker run --rm --network container:$CONTAINER -v /tmp/mc-bob:/data:z -w /data \\
+  docker run --rm --network container:$CONTAINER -v /tmp/mc-bob-send:/data:z -w /data \\
     $MC_IMAGE -m "hello alice via doltgres" --room '$ROOM_ID' --plain \\
     --store /data/store --credentials /data/credentials.json
 
@@ -79,7 +79,7 @@ EOF
   --check)
     BODY="check-$(date +%s)-$RANDOM"
     echo ">> Act 1: bob sends '$BODY'"
-    mc /tmp/mc-bob -m "$BODY" --room "$ROOM_ID" --plain
+    mc /tmp/mc-bob-send -m "$BODY" --room "$ROOM_ID" --plain
     echo ">> Act 2: alice listens once"
     # --output json: the event id only appears in debug/json output, and
     # the check greps for it (\$<32 chars> == the Dolt commit hash)
@@ -102,31 +102,102 @@ EOF
     # Q5/A: host-side tmux (the container has no docker CLI/socket, so
     # container-side tmux cannot run the matrix-commander panes). The
     # recorder attaches with: tmux attach -t communico-demo
+    # Geometry 140x40: sized for regular laptop fullscreen terminals
+    # (~142 cols); a cast is not a video — it needs the viewer's cols.
     command -v tmux >/dev/null || { echo "tmux not found on host" >&2; exit 1; }
     SESSION=communico-demo
     tmux kill-session -t "$SESSION" 2>/dev/null || true
-    # pane 0: alice listening (real client, host-side docker run)
-    tmux new-session -d -s "$SESSION" -x 220 -y 50 \
-      "docker run --rm -it --network container:$CONTAINER -v /tmp/mc-alice:/data:z -w /data $MC_IMAGE --listen forever --plain --store /data/store --credentials /data/credentials.json 2>&1 | tee /tmp/demo-listen.log"
-    # pane 1: watch the room DB's dolt.log (every 2 s)
-    tmux split-window -v -t "$SESSION" \
-      "while true; do docker exec $CONTAINER bash -c 'cd /workspace && deno eval \"
-        import pgpkg from \\\"pg\\\";
-        const root = new pgpkg.Client({host:\\\"127.0.0.1\\\",port:5432,user:\\\"root\\\",password:\\\"secret\\\",database:\\\"postgres\\\"});
-        await root.connect();
-        const db = (await root.query(\\\"SELECT db_name FROM room_directory WHERE room_id=\\\\\\\"$ROOM_ID\\\\\\\"\\\")).rows[0].db_name;
-        await root.end();
-        const c = new pgpkg.Client({host:\\\"127.0.0.1\\\",port:5432,user:\\\"root\\\",password:\\\"secret\\\",database:db});
-        await c.connect();
-        const xb = (await c.query(\\\"SELECT name FROM dolt.branches WHERE name LIKE \\\\\\\"x%\\\\\\\" LIMIT 1;\\\")).rows[0].name;
-        await c.query(\\\"SELECT DOLT_CHECKOUT(\\\\\\\"\\\"+xb+\\\"\\\\\\\");\\\");
-        console.clear(); console.log((await c.query(\\\"SELECT commit_hash, message FROM dolt.log LIMIT 10;\\\")).rows.map(r=>r.commit_hash.slice(0,8)+\\\"  \\\"+r.message).join(\\\"\\\\n\\\"));
-        await c.end();\"' 2>/dev/null; sleep 2; done"
-    # pane 2: sender lane — paced sends, 4 distinct bodies, ~3 s apart
-    tmux split-window -h -t "$SESSION"
-    tmux send-keys -t "$SESSION:0.2" \
-      "sleep 6; for m in 'one: messages become commits' 'two: extremities are branches' 'three: state at any commit via AS OF' 'four: federation is a dolt pull'; do docker run --rm --network container:$CONTAINER -v /tmp/mc-bob:/data:z -w /data $MC_IMAGE -m \"\$m\" --room '$ROOM_ID' --plain --store /data/store --credentials /data/credentials.json; sleep 3; done" Enter
-    echo ">> tmux session '$SESSION' running (host). Attach with:"
+
+    # helper: the watch pane's query, as a real deno script (env-driven —
+    # no shell-escaping games); piped into the container via stdin
+    cat > /tmp/demo-watch.ts <<'TS'
+import pgpkg from 'pg';
+const roomId = Deno.env.get('DEMO_ROOM_ID')!;
+const cfg = { host: '127.0.0.1', port: 5432, user: 'root', password: 'secret' };
+const root = new pgpkg.Client({ ...cfg, database: 'postgres' });
+await root.connect();
+const db = (await root.query('SELECT db_name FROM room_directory WHERE room_id = $1', [roomId])).rows[0].db_name;
+await root.end();
+const c = new pgpkg.Client({ ...cfg, database: db });
+await c.connect();
+const xb = (await c.query(`SELECT name FROM dolt.branches WHERE name LIKE 'x%' LIMIT 1;`)).rows[0].name;
+await c.query(`SELECT DOLT_CHECKOUT('${xb}');`);
+console.clear();
+console.log('room database ' + db + ' — dolt.log (newest first)');
+const rows = (await c.query('SELECT commit_hash, message FROM dolt.log LIMIT 8;')).rows;
+console.log(rows.map((r: { commit_hash: string; message: string }) =>
+  '  ' + r.commit_hash.slice(0, 8) + '  ' + r.message).join('\n'));
+await c.end();
+TS
+
+    # helper: bottom pane — title card (7 s), then dolt.log watch
+    cat > /tmp/demo-watch.sh <<WATCH
+#!/usr/bin/env bash
+clear
+echo
+echo "   communico — a Matrix homeserver where the database is version-controlled"
+echo "   ------------------------------------------------------------------------"
+echo "   Server storage: Doltgres. Every Matrix event lands as a Dolt COMMIT;"
+echo "   the event id a client sees IS the commit hash."
+echo
+echo "   top panes: alice and bob — two unmodified matrix-commander clients"
+echo "              having a conversation through this homeserver"
+echo "   this pane: the room's database — dolt.log, refreshed every 2 s"
+sleep 7
+while true; do
+  docker exec -i -w /workspace -e DEMO_ROOM_ID='$ROOM_ID' $CONTAINER \
+    deno run --allow-net --allow-env - < /tmp/demo-watch.ts 2>/dev/null
+  sleep 2
+done
+WATCH
+
+    # helpers: each top pane is a PARTICIPANT — listener in the
+    # background of the pane + that user's paced sends in the foreground.
+    # Two client sessions per user (listen-store, send-store) so the two
+    # nio processes don't fight over one sqlite file.
+    # Conversation alternates: bob (t~12, t~24) / alice (t~18, t~30).
+    make_participant() { # $1=name $2=listen-store $3=send-store $4=first-sleep $5=msg1 $6=gap $7=msg2 $8=tail
+      cat > "/tmp/demo-$1.sh" <<PART
+#!/usr/bin/env bash
+clear
+# background listener uses its own store
+docker run --rm -i --network container:$CONTAINER -v $2:/data:z -w /data $MC_IMAGE \
+  --listen forever --plain --log-level WARNING WARNING \
+  --store /data/store --credentials /data/credentials.json 2>&1 | tee /tmp/demo-$1-listen.log &
+sleep $4
+# foreground sender uses a separate store (no sqlite fight)
+docker run --rm --network container:$CONTAINER -v $3:/data:z -w /data $MC_IMAGE \
+  -m "$5" --room '$ROOM_ID' --plain --store /data/store --credentials /data/credentials.json
+sleep $6
+docker run --rm --network container:$CONTAINER -v $3:/data:z -w /data $MC_IMAGE \
+  -m "$7" --room '$ROOM_ID' --plain --store /data/store --credentials /data/credentials.json
+$8
+sleep 999
+PART
+      chmod +x "/tmp/demo-$1.sh"
+    }
+    make_participant bob /tmp/mc-bob /tmp/mc-bob-send 12 \
+      'hey alice — every message we send becomes a commit down there' 7 \
+      'room state at any moment is one AS OF query away' ''
+    make_participant alice /tmp/mc-alice /tmp/mc-alice-send 18 \
+      'and the event id IS the commit hash — same 32 chars, check the log' 7 \
+      'and syncing this room to another server is literally a dolt pull' \
+      'echo; echo "-- four messages, four commits — the log below is the room --"'
+    chmod +x /tmp/demo-watch.sh
+
+    # pane 0 (top-left): alice — listening + sending
+    tmux new-session -d -s "$SESSION" -x 140 -y 40 "/tmp/demo-alice.sh"
+    # pane 1 (top-right): bob — listening + sending
+    tmux split-window -h -t "$SESSION:0.0" "/tmp/demo-bob.sh"
+    # pane 2 (bottom, full width, ~45%): title card, then dolt.log watch
+    tmux split-window -v -f -l '45%' -t "$SESSION:0.0" "/tmp/demo-watch.sh"
+    # labels
+    tmux set-option -t "$SESSION" status off
+    tmux set-option -t "$SESSION" pane-border-status top
+    tmux select-pane -t "$SESSION:0.0" -T "alice — unmodified matrix-commander"
+    tmux select-pane -t "$SESSION:0.1" -T "bob — same client, other side"
+    tmux select-pane -t "$SESSION:0.2" -T "the room = a Doltgres database (dolt log)"
+    echo ">> tmux session '$SESSION' running (host, 140x40). Attach with:"
     echo "   tmux attach -t $SESSION"
     ;;
 

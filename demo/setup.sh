@@ -107,27 +107,44 @@ if ! docker image inspect "$MC_IMAGE" >/dev/null 2>&1; then
   echo ">> pulling $MC_IMAGE"
   docker pull "$MC_IMAGE" >/dev/null
 fi
-mkdir -p /tmp/mc-alice /tmp/mc-bob
+mkdir -p /tmp/mc-alice /tmp/mc-bob /tmp/mc-alice-send /tmp/mc-bob-send
 # no stale data (plan Q2): drop persisted client stores — they hold
 # since-tokens from any previous server instance, which would make
 # --listen wait for events that "already happened" on the fresh server.
 # Store files are root-owned (written by the client container), so
 # remove them via a throwaway container.
-docker run --rm -v /tmp/mc-alice:/data:z --entrypoint rm "$MC_IMAGE" -rf /data/store /data/credentials.json || true
-docker run --rm -v /tmp/mc-bob:/data:z --entrypoint rm "$MC_IMAGE" -rf /data/store /data/credentials.json || true
+for d in /tmp/mc-alice /tmp/mc-bob /tmp/mc-alice-send /tmp/mc-bob-send; do
+  docker run --rm -v "$d:/data:z" --entrypoint rm "$MC_IMAGE" -rf /data/store /data/credentials.json || true
+done
 mc() {
   local store=$1; shift
   docker run --rm --network "container:$CONTAINER" \
     -v "$store:/data:z" -w /data "$MC_IMAGE" "$@" \
     --store /data/store --credentials /data/credentials.json >/dev/null
 }
-echo ">> logging in alice + bob (non-interactive)"
+echo ">> logging in alice + bob (listen + send stores each)"
 mc /tmp/mc-alice --login password --homeserver http://localhost:80 \
   --user-login '@alice:localhost' --password 'demo-password' \
-  --device demo --room-default "$ROOM_ID"
+  --device alice-listen --room-default "$ROOM_ID"
+mc /tmp/mc-alice-send --login password --homeserver http://localhost:80 \
+  --user-login '@alice:localhost' --password 'demo-password' \
+  --device alice-send --room-default "$ROOM_ID"
 mc /tmp/mc-bob --login password --homeserver http://localhost:80 \
   --user-login '@bob:localhost' --password 'demo-password' \
-  --device demo --room-default "$ROOM_ID"
+  --device bob-listen --room-default "$ROOM_ID"
+mc /tmp/mc-bob-send --login password --homeserver http://localhost:80 \
+  --user-login '@bob:localhost' --password 'demo-password' \
+  --device bob-send --room-default "$ROOM_ID"
+# Warm-up sync: burn through the current backlog so each user's stored
+# since-token points at "now". Without this, `--listen forever` at demo
+# time replays every historical event across every prior test room on
+# initial sync (our /sync is all-rooms, all-history — see the gap report).
+# Also populates nio's client-side `self.rooms` cache so subsequent sends
+# find the room without needing a fresh full-state sync.
+echo ">> warm-up sync (all four stores)"
+for d in /tmp/mc-alice /tmp/mc-alice-send /tmp/mc-bob /tmp/mc-bob-send; do
+  mc "$d" --listen once --plain
+done
 
 # 7. summary
 cat <<EOF
