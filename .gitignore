@@ -1,3 +1,5 @@
 /auth.db
 .DS_Store
 /debug
+lite/bin/
+lite/web/node_modules/
