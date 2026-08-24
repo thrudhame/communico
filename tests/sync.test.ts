@@ -59,9 +59,12 @@ Deno.test('syncSince: initial, incremental, and long-poll', async () => {
   const max = await maxSeq();
   assertEquals(initial.next_batch, 's' + max);
 
-  // 3. incremental at max: empty join map
+  // 3. incremental at max: join map still contains every room (nio
+  //    self.rooms cache guarantee), but all their timelines are empty
   const empty = await syncSince(max, 0);
-  assertEquals(Object.keys(empty.rooms.join).length, 0);
+  for (const room of Object.values(empty.rooms.join)) {
+    assertEquals((room as { timeline: { events: unknown[] } }).timeline.events.length, 0);
+  }
   assertEquals(empty.next_batch, 's' + max);
 
   // 4. one more message -> exactly 1 event, correct wire id
