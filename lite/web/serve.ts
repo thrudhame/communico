@@ -29,6 +29,7 @@ Deno.serve({ port: PORT }, async (req) => {
         "content-type": MIME[ext] ?? "application/octet-stream",
         "Cross-Origin-Opener-Policy": "same-origin",
         "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cache-Control": "no-store", // dev/test server: never serve stale modules
       },
     });
   } catch {
