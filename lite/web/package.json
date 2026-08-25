@@ -9,6 +9,7 @@
   "keywords": [],
   "type": "commonjs",
   "dependencies": {
-    "@dolthub/doltlite-wasm": "^0.11.53"
+    "@dolthub/doltlite-wasm": "^0.11.53",
+    "wa-sqlite": "^1.0.0"
   }
 }

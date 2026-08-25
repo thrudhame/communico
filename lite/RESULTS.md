@@ -421,7 +421,374 @@ log pane m.room.message commit lines after sends: 2 (delta 2)
 CHECK: PASS
 ```
 
+## P2P LP log
+
+Status: **BLOCKED — plan paused at plan-level option C** (upstream bundle:
+PB2 + PB3 + PB4, all in `## Blockers`). LP gate per the P-D2 revision
+(`LP SPIKES: 3/3 PASS` + `LP2C: 10/10 GENERATIONS CLEAN` + LP3 hash
+equality) cannot pass on @dolthub/doltlite-wasm 0.11.53: LP1 PASS,
+LP2a PASS, LP3 PASS, **LP2C hangs** (PB4). L4 never started.
+
+What was built (all uncommitted per rule 2):
+- `lite/web/lp-spikes.html` + `lp-spikes.js` — LP1, LP2a (positive path),
+  LP2c, LP3 (role pages `?role=a|b`); the live reproduction of all three
+  PB-class findings.
+- `lite/web/sync/transport.js` — transport interface
+  (`createTransport(kind)` → `{join(room,{onPeer,onMessage}) → {send(obj,
+  bytes?), peers(), leave()}}`) + BroadcastChannel adapter (channel
+  `communico-lite:<room>`, hello/hello-ack/bye peer discovery, ArrayBuffer
+  via structured clone, own-echo suppression). Verified by LP3.
+- `lite/web/check-lp.ts` — 3-page astral check enforcing the revised gate.
+
+Discovered/verified API forms (verbatim — the capture-don't-guess record):
+- **Export store**: `sqlite3.capi.sqlite3_js_db_export(db.pointer)` →
+  `Uint8Array` (full store incl. commit graph + refs — equality verified).
+- **Import form 1 (read-only probes only!)**:
+  `sqlite3.capi.sqlite3_deserialize(db.pointer, 'main', ptr, len, len, 3)`
+  with `ptr = sqlite3.wasm.allocFromTypedArray(bytes)` — rc 0, content
+  equal — **but a deserialize'd handle can NEVER be re-exported**
+  (`sqlite3_serialize` → `SQLITE_ERROR`, all flag variants 3/2/1/0; PB3).
+- **Import form 2 (the live-replica route)**:
+  `sqlite3.capi.sqlite3_js_vfs_create_file('unix', path, bytes)` +
+  `new oo1.DB(path)` — content equal, re-exportable, survives commits and
+  adoption chains (until the PB3/PB4 lineage hang). Deprecation warning is
+  cosmetic. MEMFS has NO subdirectories (no `FS`/`Module` handle exposed;
+  `SQLITE_CANTOPEN` on `/sub/dir` paths — root-level files only).
+- **`dolt_hashof_db()` = pure function of (ref set + HEAD)**. HEAD does
+  NOT survive an image (imported handle opens on `main`); convention:
+  `dolt_checkout(<tip branch>)` on the receiver before comparing.
+- **Commit-poison trigger map** (browser, file-backed subject): the
+  one-shot `commit conflict: another connection committed to this branch`
+  fires on the next commit ANYWHERE after (a) `sqlite3_deserialize` onto a
+  handle, or (b) `oo1.DB` open of an existing store image. NOT triggered
+  by: fresh-empty handle open, other handles' commits, checkouts, plain
+  `vfs_create_file`, exports. The failed commit leaves working state
+  INTACT → robust form = retry the `dolt_commit` statement ONLY, once
+  (never re-run the INSERT — it persists; a re-run violates PK).
+- Remotes in WASM (PB2 matrix): `dolt_remote('add',...)` persists the row
+  (noisy `SQL logic error` on `:memory:` receivers); `dolt_fetch/pull/
+  clone` crash at the wasm ABI level (`null function or function
+  signature mismatch` / `table index is out of bounds`). Native v0.11.53
+  CLI: same SQL works; fetched refs land as `refs/remotes/<remote>/*`,
+  reachable via `dolt_log('peerA/main')` and `dolt_hashof('peerA/main')`.
+- `VACUUM INTO` → `VACUUM INTO is not supported for doltlite databases`.
+- `dolt_branch('-D','main')` → `cannot delete the default branch; call
+  dolt_default_branch(<other>) first`.
+- `dolt%` function inventory (34 names, WASM build): `dolt_add
+  dolt_branch dolt_checkout dolt_cherry_pick dolt_clone dolt_commit
+  dolt_config dolt_conflicts_resolve dolt_connect_branch dolt_creds
+  dolt_creds_new dolt_default_branch dolt_fetch dolt_gc dolt_hashof
+  dolt_hashof_catalog dolt_hashof_db dolt_hashof_table dolt_merge
+  dolt_merge_base dolt_pull dolt_push dolt_rebase dolt_remote dolt_reset
+  dolt_revert dolt_tag dolt_verify_constraints dolt_version
+  doltlite_engine doltlite_internal_materialize_default_column`.
+- astral harness lessons: `page.evaluate(fn, {args:[...]})` (NOT
+  variadic); polls against a main-thread-blocked page fail with
+  RetryError (poll in try/catch and keep waiting); serve test servers
+  with `Cache-Control: no-store` (serve.ts updated) — without it Chrome
+  heuristically served a STALE module mid-bisection (false "hang"
+  readings until busted).
+
+LP2a/LP2c spike-local notes: minimal inline branch-first ingest (phase
+permitted engine-lite reuse OR inline SQL — inlined; engine-lite wiring
+was an L4 deliverable that never gated in).
+
+Deviations:
+- LP2a's spike drops the fork negative-control (P-D2: it
+  deterministically hangs this build — PB3; superseded by LP2c's control
+  at generation ~6 on the recycled architecture, which itself hangs
+  earlier — PB4).
+- LP2c's 15 s-per-ingest watchdog is enforced at the check level
+  (check-lp timeout) + per-generation progress lines: a wasm hang never
+  yields to the JS event loop, so no in-page timer can fire
+  mid-statement (recorded).
+- check-lp staggers page creation 500 ms (triple simultaneous wasm
+  compiles contend on the loaded host).
+
+Gate transcript (final state, `deno run -A lite/web/check-lp.ts`, exit 1
+— the LP2C hang IS the gate state):
+```
+---- page1 #results ----
+INFO dolt% functions (34): …(full list in PB2)…
+INFO export: capi.sqlite3_js_db_export(db.pointer) → Uint8Array 10715 bytes
+INFO import form 1: capi.sqlite3_deserialize(…) → hashof_db 8f18cbed… (equal: true); active_branch()='main'
+INFO import form 2: sqlite3_js_vfs_create_file(…) + open → hashof_db 8f18cbed… (equal: true)
+LP1: PASS (hashof_db A=8f18cbedd3c7bcb3c0ba4aacb97ac44ada2ff573 B=8f18cbedd3c7bcb3c0ba4aacb97ac44ada2ff573 EQUAL (both import forms); dolt_log messages + dolt_branches [main,x1] equal; unmerged x1 survived)
+INFO lp2a: bootstrap-clone: hash equality (B on tip branch x2) = true
+INFO lp2a: probe#1: peer tip branch x3, contains B tip = true
+INFO lp2a: after adopt#1: B sees from-alice=true; hashof_db(B)==hashof_db(A): true
+INFO lp2a: probe#2: contains A tip = true
+INFO lp2a: after adopt#2: A sees from-bob=true; re-export of adopted+committed store OK (18416 bytes)
+LP2b: BLOCKED-UPSTREAM (PB2) — dolt_fetch/pull/clone crash at wasm ABI level in @dolthub/doltlite-wasm 0.11.53; …
+LP2a: PASS (linear convergence via superset adoption + handle recycling; final dolt_hashof_db A=5ed8bdabf9a8bde7b43c3a9255147b1b1ff841bb B=5ed8bdabf9a8bde7b43c3a9255147b1b1ff841bb EQUAL)
+LP2C-GEN 1: ok (47 ms; gen-1-c adopted by d; hash 8072fe27)   ← page hangs here (PB4)
+---- LP3 role pages ----
+LP3-HASH-A: bd4ee9b2b72a265a74f3ed5976b510a06821e42fd158b7afd8b21e709ae74c8b
+LP3-HASH-B: bd4ee9b2b72a265a74f3ed5976b510a06821e42fd158b7afd8b21e709ae74c8b
+LP SPIKES 3/3: false; LP2C 10/10: false
+LP3 cross-page hash equality: true
+CHECK: FAIL (exit 1)
+```
+
+## W0 log
+
+Status: IN PROGRESS (W0a COMPLETE).
+
+### W0a — build the amalgamation-lineage artifact (COMPLETE)
+
+- Toolchain: emsdk user-local at `~/tools/emsdk`; emcc 6.0.8
+  (aeb67926e7de656da38bc807d83050af93578758), sdk release
+  `9d70dbe8860ccdd3595f6e6065d94bfb543ae955`.
+- Inputs: `doltlite-amalgamation-0.11.54.zip` sha256
+  `bd0bf68e6b2ebb389af5cb0cce80b0a71e3051043ac091ab0f0ab2f7c6dc5f2a`
+  (contains `doltlite.c` = SQLite 3.54.0 amalgamation + doltlite,
+  `doltlite.h`, `doltliteext.h`); doltlite clone @ v0.11.54
+  (b8f9f72c9b43d9d1e75e3bc51f0380d3f41f56ba); wa-sqlite clone (harness).
+- **Recipe route: R2 (wa-sqlite harness)**, because R1's in-tree search
+  found only: `make -C ext/wasm [dist|npm]` (the broken npm lineage (b)
+  — PB2) and `test/amalgamation_wasm_compile_test.sh` (a compile-only
+  smoke test; its link step exports just `_sqlite3_initialize`, not the
+  full C API the wa-sqlite JS needs). R1 therefore had no usable recipe;
+  the compile-flag SET inside that test script is what PR #2165
+  validated, and its defines were carried into the R2 build.
+- Build details + exact commands: `lite/web/w0/BUILD.md`. Headline: stock
+  wa-sqlite `make dist` flow with `deps/version-3.53.0/sqlite3.c|.h`
+  replaced by the DoltLite amalgamation, `CFILES` without
+  `extension-functions.c` (kept offline), a no-op
+  `RegisterExtensionFunctions` stub added (wa-sqlite's `open_v2` calls it
+  unconditionally), defines `-DSQLITE_WASM -DDOLTLITE_PROLLY=1
+  -DDOLTLITE_VEC1=0 -DVEC1_THREADS=0 -DDOLTLITE_VERSION=\"v0.11.54\"`
+  (wa-sqlite defaults already supply `-DSQLITE_THREADSAFE=0`;
+  `DOLTLITE_ENABLE_REMOTES` left at its default 1).
+- **Deviation recorded (flag list):** the plan's PR-#2165 flag
+  `SQLITE_OS_OTHER=1` does not link in this harness
+  (`wasm-ld: undefined symbol: sqlite3_os_init` — with OS_OTHER the
+  app must supply os_init/os_end; wa-sqlite supplies neither). Dropped;
+  wa-sqlite's default `SQLITE_OS_UNIX` (emscripten MEMFS) is used.
+  (`-DSQLITE_OS_KV=1` → kvvfs os_init was the alternative; not needed.)
+- Acceptance: node — `dolt_version()` = `v0.11.54`, 34 `dolt%` fns incl.
+  the remote five; browser (astral, bare page) — same + a commit visible
+  in `dolt_log`. Artifact: `lite/web/w0/vendor/doltlite.mjs` (138 951 B)
+  + `doltlite.wasm` (1 416 622 B).
+- wa-sqlite JS API surface (recorded): NOT oo1 —
+  `SQLiteESMFactory()` → `_sqlite3_initialize()` →
+  `SQLite.Factory(module)` → `await sqlite3.open_v2('name.db')` →
+  `await sqlite3.exec(db, sql, (row, columns) => …)`. `wa-sqlite@1.0.0`
+  npm (W0b step 1 done early for the probe).
+- Note: the artifact's remote HTTP client is raw POSIX sockets + mbedtls
+  TLS (`src/doltlite_net.h`, `src/doltlite_tls.c`,
+  `src/doltlite_http_remote.c`) — in node these are real sockets
+  (emscripten node env); in a browser, emscripten maps `connect()` over
+  WebSocket to a configured bridge URL, so a raw-TCP relay needs a ws↔tcp
+  bridge or the sanctioned same-origin proxy story in W0c.
+
+### W0b — clone-from-DoltHub in our context (DONE — gate FAILED both runtimes; see WB1)
+
+- `wa-sqlite@1.0.0` installed into `lite/web/package.json` (recorded;
+  additionally `ws` installed with `--no-save` during probing — node_modules
+  only, package.json/lock untouched per rule 3; recorded here).
+- Pages/scripts: `lite/web/w0/clone-test.html|js` (browser),
+  `w0/clone-test-node.mjs` (node), plus `w0/w0a-pagetest.html` (W0a browser
+  acceptance).
+- **Browser (verbatim):**
+  ```
+  module up; cloning https://dolthub.com/dolthub/remote-prod-test …
+  W0B: FAIL could not connect to remote
+  ```
+  Root cause (code-level): the artifact's remote HTTP client is raw POSIX
+  TCP + mbedtls TLS; under emscripten in a browser, `connect()` is wrapped
+  as a WebSocket dial to the target host:port (`ws(s)://dolthub.com:443/…`)
+  — dolthub.com serves no ws endpoint, so the dial fails. NOT a CORS issue
+  (no fetch/XHR ever happens; the transport is sockets).
+- **Node (verbatim)**, two socket backends:
+  - stock (WebSocket-wrap): `W0B-NODE: FAIL could not connect to remote`
+    (emscripten's node path wraps TCP in the `ws` package's WebSocket
+    protocol; an HTTPS port speaks neither).
+  - `-s NODERAWSOCKETS=1` (real `node:net` TCP): **TCP connect SUCCEEDS**
+    to the local relay (instrumented: `tcpconnect result fd=5`) but the
+    HTTP exchange never completes: `read(fd=5) failed errno=6 (Resource
+    temporarily unavailable)` → the C read loop (`doltliteConnRead`)
+    busy-spins on WANT_READ with no yield to the JS event loop, queued
+    writes never flush, deadline expires → `SQLITE_IOERR (10)` →
+    `clone failed`. The ASYNCIFY variant fails IDENTICALLY (the busy loop
+    has no asyncify suspension points). C-level instrumentation was done
+    on a scratch amalgamation copy in /tmp (never shipped; the vendored
+    artifact is the pristine-sources build — verified 0 debug strings).
+- Additional recorded nails: `file://` remotes in the wasm build see only
+  MEMFS (`sqlite3_open_v2('/tmp/…')` → CANTOPEN; the host FS is invisible),
+  so the "filesystem remote client" can't reach host files from node
+  either; and TLS trust roots (`/etc/ssl/certs/…`) are also MEMFS-invisible,
+  so even a completed TCP connect to dolthub.com would fail TLS init.
+- **Verdict: the amalgamation lineage's remote client is compiled in but
+  non-functional under emscripten single-threaded runtimes (browser AND
+  node), on both socket backends.** Whether PR #2165 ever validated remotes
+  in an actual wasm runtime is UNVERIFIED from here — the repo's in-CI wasm
+  tests (`ext/wasm/test-doltlite-*.mjs`) do not touch remotes; all remote
+  tests are native shell tests (`test/remotesrv_http_test.sh` etc.).
+  The plausible working configuration class (NOT attempted — unlisted):
+  pthreads + PROXY_TO_PTHREAD + SharedArrayBuffer build (crossOriginIsolated
+  is already on), or a C-level yield in the WANT_READ loop (doltlite source
+  change = upstream fix track).
+- Gate evaluation: `W0B: PASS` (browser) NOT met; `W0B-NODE: PASS` NOT met
+  → **W0b gate FAILED → STOP-AND-REPORT (WB1)**. W0c's native smoke had
+  already been run as sanity (below) and PASSES; the cross-tab wasm pages
+  are moot (no remote op completes in wasm) and were not built.
+
+### W0c — localhost relay, cross-tab (PARTIAL — native smoke only; see WB1)
+
+- Relay binary: `doltlite-remotesrv` from
+  `doltlite-tools-linux-x64-0.11.54.zip` → `lite/bin/doltlite-remotesrv`
+  (gitignored). ALSO per phase: `lite/bin/doltlite` replaced 0.11.53 →
+  **0.11.54** from the same zip (keeps CLI and wasm pinned; recorded).
+- Relay start: `lite/bin/doltlite-remotesrv -p 8388 /tmp/w0-remotes/`
+  → `doltlite-remotesrv serving /tmp/w0-remotes/ on http://127.0.0.1:8388`
+  (defaults to 127.0.0.1 binding; port 8388 was free). Run it DETACHED
+  (`setsid ... </dev/null >log 2>&1 &`) — a plain `nohup … &` died with the
+  tool's process-group kill mid-session (recorded operational note).
+- **Native relay smoke (0.11.54 CLI) — PASS**, exact working forms:
+  ```
+  SELECT dolt_remote('add','origin','http://127.0.0.1:8388/room.db'); -- → 0
+  SELECT dolt_push('origin','main');   -- → 0 (store file appears in /tmp/w0-remotes/)
+  SELECT dolt_clone('http://127.0.0.1:8388/room.db');  -- fresh db → 0; content + log arrive
+  SELECT dolt_pull('origin','main');   -- → 0; new rows arrive
+  ```
+  Discovered: **`dolt_pull` requires BOTH args on 0.11.54** —
+  `dolt_pull('origin')` → `usage: dolt_pull(remote, branch)`.
+  (Same-version retest note: PB2's native behaviors hold on 0.11.54.)
+  Native clone side-quirk: `dolt_clone` on a file:// URL prints
+  `failed to add origin remote` AFTER fully cloning the content (rc=1 but
+  data complete) — cosmetic, recorded.
+- Relay protocol note (for the future fix): it is a JSON/HTTP API
+  (`GET /room.db` → 404 `{"code":"not_found","sqlite":12,…}` for unknown
+  remotes), NOT a WebSocket server — so emscripten's ws-wrapped TCP from a
+  browser cannot reach it even before CORS (CORS probe moot — recorded as
+  such; the sanctioned `/relay/*` HTTP proxy wouldn't help a raw-TCP
+  client, which is why it wasn't added).
+
+### W0d — THE DECISIVE MEASUREMENTS (NOT RUN — moot, see WB1)
+
+W0d measures "stores growing in place via dolt_fetch/dolt_pull" in the
+browser. Since no remote operation completes in the wasm build (WB1),
+the measurements cannot run. The decisive question — "does the PB4 lineage
+hang exist on the designed fetch path?" — is **UNANSWERED**: the designed
+fetch path doesn't exist in this build. Not a hang finding; an absence
+finding. (If a future build fixes WB1, W0d runs as written.)
+
+### W0e-prep — cross-browser instructions (NOT APPLICABLE — no working page)
+
+There is no page to hand to the human (W0c's relay-test page was never
+written — its browser transport is dead per WB1). When a fixed artifact
+exists, the intended instructions would have been: start the relay
+(`lite/bin/doltlite-remotesrv -p 8388 /tmp/w0-remotes/`) + serve
+(`deno run --allow-net --allow-read lite/web/serve.ts`), open the
+relay-test page with `?role=a` in Chrome and `?role=b` in Firefox, watch
+timelines converge, copy back the two `dolt_hashof_db()` lines. Firefox
+COOP/COEP note: our serve.ts already sends the isolation headers; the
+sync build needs no SharedArrayBuffer anyway (no threads) — nothing
+observed (never ran).
+
 ## Blockers
+
+### MB1 — matrix-sync start gate failed: tree dirty (LP/W0 backlog uncommitted) (STOP-AND-REPORT)
+
+**Exact instruction** (matrix-sync execution README, hard rule 3):
+`git status --short` must show a clean tree on `spike/communico-lite`
+(the LP/W0 backlog committed by the validator before dispatch). Dirty
+tree → STOP-AND-REPORT.
+
+**Observed (2026-08-24, verbatim):**
+```
+$ git status --short
+ M lite/RESULTS.md
+ M lite/web/deno.lock
+ M lite/web/package-lock.json
+ M lite/web/package.json
+ M lite/web/serve.ts
+?? lite/web/check-lp.ts
+?? lite/web/lp-spikes.html
+?? lite/web/lp-spikes.js
+?? lite/web/sync/
+?? lite/web/w0/
+
+$ git log --oneline -3
+96df13e feat: Add in-browser room POC page (L2)
+222a774 feat: Add DoltLite WASM browser spikes (L1)
+7075288 feat: Add DoltLite native capability spikes (L0)
+```
+
+The lite-p2p-sync LP deliverables (transport.js, lp-spikes, check-lp,
+sync/) and the wasm-remotes-w0 deliverables (w0/, RESULTS.md W0 log +
+WB1, package.json/locks wa-sqlite, serve.ts no-store) are all present
+but uncommitted; HEAD is still the L2 commit. Per the rule, MS0 was NOT
+started. This MB entry is the only change made after the gate check
+(same pattern as PB1).
+
+**What I tried:** none beyond the gate check itself — the rule is
+explicit and lists no fallback.
+
+**Resolution needed (validator):** land the backlog per the two plans'
+commit strategies — lite-p2p-sync §4 (`feat: Add P2P sync spikes —
+serialize, file-remote convergence, transport (LP1-3)` — noting the LP
+gate state is recorded-failing at LP2C by design, the spikes/findings
+being the value) and wasm-remotes-w0 §4 (`feat: Add W0 success-path
+spikes — amalgamation-lineage WASM remotes` — explicitly lands even with
+W0d unrun, per its §4 note). Then re-dispatch matrix-sync. This MB1
+entry rides whichever commit carries `lite/RESULTS.md`.
+
+### WB1 — wasm-remotes-w0: the amalgamation-lineage wasm remote client cannot complete an HTTP round trip (STOP-AND-REPORT)
+
+**Exact instruction** (phase-w0 W0b): port `examples/wa-sqlite-clone.mjs`
+against the W0a-vendored artifact — `dolt_clone('https://dolthub.com/
+dolthub/remote-prod-test')` then `dolt_log`; if the browser fails with a
+network/CORS-shaped error, run the same logic under deno/node
+(`W0B-NODE`) to prove the client works.
+
+**Result: BOTH runtimes fail; the gate (`W0B: PASS` OR `W0B-NODE: PASS`
++ browser finding) is unmet.** Full evidence in `## W0 log` (W0b section);
+essentials:
+
+- Browser (headless Chrome, page `lite/web/w0/clone-test.html`):
+  `W0B: FAIL could not connect to remote`. The remote client is raw POSIX
+  sockets + mbedtls TLS; emscripten wraps browser `connect()` as a
+  WebSocket dial to `wss://dolthub.com:443/…` (no such ws endpoint).
+- Node (ws-package WebSocket backend): same failure — ws protocol to a
+  plain HTTPS port.
+- Node (`-s NODERAWSOCKETS=1` build, real `node:net`): instrumented C
+  run — TCP connect succeeds (`tcpconnect result fd=5`), then
+  `read(fd=5) failed errno=6 (Resource temporarily unavailable)` → the
+  C read loop busy-spins on WANT_READ without yielding to the JS event
+  loop (queued writes never flush; server logs show zero bytes received)
+  → `SQLITE_IOERR(10)` → `clone failed`. Asyncify variant: identical
+  (the loop has no suspension points).
+- Corollary gaps: `file://` remotes see only MEMFS (host FS invisible);
+  TLS trust roots unreadable from MEMFS.
+
+**What I tried (in order):** stock-sockets browser build; node with
+`ws` present (`--no-save`, node_modules-only, package.json untouched per
+rule 3); NODERAWSOCKETS build (node:net); ASYNCIFY variant build; a
+DEBUG (assertions) build; C-level instrumentation of a scratch
+amalgamation copy (entry/connect/read fprintfs — the evidence above);
+file:// remote against MEMFS (CANTOPEN) and host FS (invisible).
+**Not tried (unlisted):** pthreads+PROXY_TO_PTHREAD+SAB build;
+websockify-style ws→tcp bridge (also wouldn't fix the read loop);
+patching doltlite's read loop to yield (upstream source change);
+handing W0c/W0d a node-process "tabs" substitution (would be an
+unlisted workaround — W0d's measurements belong to the browser fetch
+path by design).
+
+**Decision needed:** the plan's premise — "remotes already wired on the
+amalgamation lineage" — is only half true: the client is COMPILED IN
+(and PB2's npm-lineage ABI crash is absent here), but no wasm runtime
+can complete a remote round trip with it. Candidate directions for the
+author: (a) the pthreads/PROXY_TO_PTHREAD build attempt (new spike,
+browser-feasible in principle — crossOriginIsolated already on); (b)
+upstream: "amalgamation-lineage remote client deadlocks/emulates-poorly
+under emscripten single-threaded runtimes" bundles naturally with the
+PB2+PB3+PB4 report set; (c) rethink whether L4's sync path should use
+remotes at all vs the LP2a-style byte-shipping (which PB4 hangs
+blocked). NOTE the interaction: PB4 hangs the byte-shipping path; WB1
+blocks the remotes path — the two browser sync roads are both currently
+closed, only at different mile markers.
 
 ### PB1 — lite-p2p-sync start gate failed: L0–L2 work uncommitted on `spike/communico-lite`
 
@@ -471,3 +838,279 @@ split):** validation reruns all green (`run.sh` 6/6, `check-spikes` 4/4,
 `check-poc.ts`). The three plan-§4 commits land now, verified green per
 commit; lite-p2p-sync re-dispatch follows. This RESULTS.md (including this
 entry) rides the L0 commit as the capability/log document.
+
+### PB4 — LP2c outcome: handle-recycling does NOT fix the lineage hang → plan-level option C (upstream bundle + pause)
+
+**Status: outcome reached per P-D2's pre-decided branch.** The LP2c
+longevity probe (10 alternating generations, full recycling discipline:
+adopt = close old handle + write bytes to a fresh MEMFS file + open FRESH
+handle + tip checkout; retry-once on the next commit) **HANGS at
+generation ~2–3**, nondeterministic exact point:
+
+```
+LP2C-GEN 1: ok (117 ms; gen-1-c adopted by d; hash 8072fe27)   ← then dead
+```
+```
+LP2C-GEN 1: ok … LP2C-GEN 2: ok (71 ms; gen-2-d adopted by c; …)  ← then dead
+```
+
+The hang is NOT in the probe/adopt/export steps (sub-step instrumentation
+shows `ingest done → export ok → probe superset=true → recycle done →
+hashes read` all completing) — it strikes inside a later generation's
+commit path, varying run to run, in browser AND node entry alike.
+Chrome's stderr shows NO renderer crash (it's a wasm-layer hang, not a
+crash). Handle-state recycling (P-D2's hypothesis) therefore does NOT
+cover it — the corruption appears to accumulate at MODULE/store-identity
+level across the adopt→commit→export→adopt chain, not per-handle.
+
+**Per P-D2, this outcome = plan-level option C, already decided: bundle
+PB2+PB3+PB4 for upstream, pause the plan; no further fighting (option
+B's open-ended debugging was rejected).** L4 not started (LP gate
+unreachable: LP2C can never print `10/10 GENERATIONS CLEAN` on 0.11.53).
+
+**Deliverable state at stop:** `lite/web/lp-spikes.html|js` IS the live
+reproduction (LP1 PASS, LP2a PASS, LP2b blocked-upstream note, LP2C
+hangs; LP3 verified separately). `check-lp.ts` enforces the revised gate
+(`LP SPIKES: 3/3 PASS` + `LP2C: 10/10 GENERATIONS CLEAN` + LP3
+cross-page hash equality) — currently fails at the LP2C hang, by design
+(it IS the regression detector for the upstream fix). `sync/transport.js`
+(BC adapter) is verified working by the LP3 spike.
+
+**Watchdog mapping (recorded per LP2c's spec):** an in-page 15 s
+per-ingest watchdog is inexpressible for this failure class — a wasm-layer
+hang never yields to the JS event loop, so no JS timer can fire
+mid-statement. The bound is enforced by check-lp's overall timeout plus
+per-generation `LP2C-GEN <n>` lines marking the last clean step.
+
+### PB3 — LP2a composition hangs: write-after-deep-adoption-lineage freeze in the WASM store layer (STOP-AND-REPORT #2)
+
+**Status: RESOLVED by plan decision P-D2 (validator session
+ses_fd2add951ffer9kl2Zf8K1WwZI, 2026-08-24; plan.md §9 + both phase
+files updated by the decider):** "A-modified" — LP2a shrinks to the
+proven positive path (bootstrap + both adoptions + hash equality); the
+fork negative-control does NOT move to L4 (the hang is
+lineage-depth-dependent and L4's linear chat composes the same lineage —
+relocated detection would relocate the hang into the user's chat);
+instead a new bounded probe **LP2c (handle recycling)** tests the
+discipline "adoption always yields a fresh handle" (file route + tip
+checkout + close old + retry-once commit) across 10 alternating
+generations with the fork negative-control at generation ~6. 10/10 clean
+→ recycling becomes a NORMATIVE L4 engine rule; any hang → plan-level
+option C (bundle PB2+PB3 upstream, pause) with no further fighting.
+**PB3 bundles with PB2 for the user's upstream report regardless of
+outcome.**
+
+Original record follows. LP2a's *substance* (linear
+convergence via superset adoption) was demonstrated end-to-end; the full
+spike then hangs deterministically at the negative-control fork ingest, in
+BOTH the browser AND the node entry. Extensive bisection follows.
+
+**What works (all verified, mostly repeatedly):**
+- LP1 PASS: export via `sqlite3.capi.sqlite3_js_db_export(db.pointer)`;
+  import equality (dolt_log/dolt_branches incl. unmerged branch/
+  dolt_hashof_db) via BOTH `sqlite3_deserialize(ptr,len,len,3)` onto
+  ':memory:' AND `sqlite3_js_vfs_create_file('unix',path,bytes)` + open.
+- LP2a through BOTH adoptions (node transcript): bootstrap-clone hash
+  equality ✓; A commits `from-alice`, B probes (superset=true), B adopts
+  (sees `from-alice`, `hashof_db` equal) ✓; B commits `from-bob` on the
+  adopted handle ✓; **B re-exports the adopted+committed store fine**
+  (18416 bytes) ✓; A probes (superset=true), A adopts (sees `from-bob`,
+  `hashof_db` equal) ✓. Linear convergence: ACHIEVED.
+- Poison trigger map (browser probe, file-backed subject):
+  `deserialize onto a handle` and `oo1.DB open of an existing store
+  image` poison the next commit ANYWHERE (one-shot 'commit conflict:
+  another connection committed to this branch'; the failed commit leaves
+  working state intact → retry the COMMIT only, once). NOT triggers:
+  fresh-empty handle open, another handle's commit, checkout, plain
+  `vfs_create_file`, export.
+- `dolt_hashof_db()` = pure function of (ref set + HEAD). HEAD does NOT
+  survive a store image (`active_branch()` resets to 'main' on import) —
+  the receiver must `dolt_checkout(<tip branch>)` before hash comparison.
+- `VACUUM INTO` is NOT supported by DoltLite ("VACUUM INTO is not
+  supported for doltlite databases") — closed as a re-export recovery
+  route.
+- Branch deletion: `dolt_branch('-D','main')` errors "cannot delete the
+  default branch; call dolt_default_branch(<other>) first".
+
+**The defect:** the spike's negative control (P-D1 step 6: fork detection)
+does two more ingests on the deeply-adopted handles. The 5th-generation
+ingest (`fork-alice` on the twice-adopted A handle) **hangs inside the
+wasm layer at the plain `INSERT INTO events …` statement** — not a
+catchable error; the statement never returns (node run: exit 124 via
+timeout; browser: renderer main-thread permanently blocked, page dies to
+CDP). Chrome stderr shows NO renderer crash (it's a hang, not a crash).
+
+**Reproduction attempts to isolate (all in node entry unless noted):**
+- v14 shape (file-adopt → commit → export → open → write, NO branch
+  deletes): PASSES.
+- Same + branch tombstones (`-b`/`-D` history): PASSES.
+- Same + receiver tip-checkout + branch-first checkout(-b) before the
+  write (exact forkA statement shape): PASSES.
+- Full LP2a flow: hangs at the forkA insert — requires the WHOLE composed
+  lineage (2 genesis commits + from-alice + adopt + from-bob + adopt +
+  then the 5th-gen ingest; plus interleaved probe handles).
+- Browser vs node: identical hang point class in both (the browser
+  additionally presents flakier — same store layer under heavier
+  contention).
+
+**Working theory (unproven):** store-identity/shared-registry corruption in
+the beta — an exported image carries a store identity; adopted copies
+opened while the source handle lives are second connections on the same
+identity (cf. the one-shot poison class); by the 5th generation of
+adopt+commit+re-export the write path enters a bad state and loops.
+Minimal repro not yet achieved (all reduced forms pass).
+
+**What this blocks:** the LP2a spike's negative control never completes →
+`LP SPIKES: 3/3 PASS` unreachable → L4 gate closed. The LP2a POSITIVE
+path (superset adoption convergence, both directions, hash equality) is
+proven working (node transcript above; identical code path).
+
+**Deliverable state at stop:** `lite/web/lp-spikes.html|js` (LP1 PASS,
+LP2a composed-but-hanging, LP3 PASS) + `lite/web/sync/transport.js` +
+`lite/web/check-lp.ts` written; LP3 verified end-to-end (BroadcastChannel
+heads→want→store round-trip, SHA-256 store bytes equal across two tabs,
+multiple runs). Nothing committed (rule 2).
+
+### PB2 — LP2 KEYSTONE: file remotes are broken in `@dolthub/doltlite-wasm` 0.11.53 (STOP-AND-REPORT)
+
+**Exact instruction** (phase-lp.md LP2 steps 3–6): write the peer store as
+a file in the WASM VFS, then on the receiving replica
+`SELECT dolt_remote('add','peerA','file:///peerA.db'); SELECT
+dolt_fetch('peerA');`, discover remote-ref naming, heal via the
+WS3-recorded driver merge, and converge to equal `dolt_hashof_db()`.
+
+**Result: file remotes are FUNDAMENTALLY UNAVAILABLE in the WASM build —
+every operation that opens a remote crashes at the wasm ABI level. The
+identical SQL works natively (same version). LP stopped here per
+phase-lp.md step 7; LP1's findings (positive) are recorded below; L4 was
+never started.**
+
+**Environment:** `@dolthub/doltlite-wasm` 0.11.53, astral headless Chrome
+125, page cross-origin-isolated, MEMFS (no OPFS). Contrast binary:
+`lite/bin/doltlite` v0.11.53 native CLI.
+
+**Full error matrix (verbatim, all in-browser unless noted):**
+
+| Operation | Form tried | Result |
+|---|---|---|
+| `dolt_remote('add','peerA','file:///peerA.db')` | local db `:memory:` | throws `SQLITE_ERROR: sqlite3 result code 1: SQL logic error` — **but the remote row persists** in `dolt_remotes` (noise-on-success) |
+| same | local db file-backed (`/b-local.db`) | `0` clean (once); `SQL logic error` on a later run — flaky; row persists either way |
+| same | subdir URL `file:///peers/c.db` | `0` (but see mkdir note below) |
+| `dolt_fetch('peerA')` | via `selectValue` and via `exec` | **`null function or function signature mismatch`** (emscripten ABI crash) |
+| `dolt_fetch('peerA','main')` | 2-arg | **`table index is out of bounds`** (wasm table ABI crash) |
+| `dolt_pull('peerA')` | 1-arg | `usage: dolt_pull(remote, branch)` (proper usage error — parser alive) |
+| `dolt_pull('peerA','main')` | 2-arg | **`table index is out of bounds`** |
+| `dolt_clone('file:///peerA.db')` | 1-arg, into a db with content | `database is not empty — clone into a fresh database` (proper Dolt error — arg parsing + local checks alive) |
+| `dolt_clone('file:///peerA.db')` | 1-arg, into a FRESH just-opened db | **`table index is out of bounds`** |
+| `dolt_fetch` on remote with URL `file:/peerB.db` | single-slash path form | `failed to open remote (URL must start with file:// or http://)` (proper rejection of the bad form — reaches URL validation) |
+
+The pattern: SQL parsing, URL validation, remote-catalog writes, and
+clone's local-target checks all work; the crash fires exactly when the
+machinery would OPEN/transfer the remote store — i.e., the remote IO
+vtable is unwired in the WASM build. Both ABI error flavors observed
+(`null function or function signature mismatch`, `table index is out of
+bounds`) are emscripten-level null/mismatched function-pointer faults,
+not SQL errors.
+
+**Listed fallbacks exhausted:**
+- Path forms `file:///peerA.db` vs `file:/peerB.db`: crash vs proper
+  rejection (above).
+- Different VFS dir (`/peers/…`): **untestable by construction** — this
+  build exposes no Emscripten `FS`/`Module` handle (`sqlite3.FS`,
+  `sqlite3.Module`, `sqlite3.wasm.FS` all `undefined`), so no `mkdir`;
+  `sqlite3_js_vfs_create_file('unix','/peers/c.db',…)` →
+  `SQLITE_CANTOPEN` and even `new oo1.DB('/peers/x.db')` →
+  `SQLITE_CANTOPEN: unable to open database file`. Root-level MEMFS
+  files only. (Moot anyway: fetch crashes on root-level files too.)
+- Local replica `:memory:` vs file-backed: crash either way.
+- `dolt_pull` / `dolt_clone` as alternate remote paths: same ABI crash.
+
+**Native contrast (same version, host CLI, works end-to-end):**
+```sql
+-- on /tmp/lite-spikes/rB.db:
+SELECT dolt_remote('add','peerA','file:///tmp/lite-spikes/rA.db');  -- → 0
+SELECT dolt_fetch('peerA');                                          -- → 0
+SELECT * FROM dolt_remotes;   -- peerA | file:///… | fetch_specs = ["refs/heads/*:refs/remotes/peerA/*"]
+SELECT message FROM dolt_log('peerA/main') LIMIT 2;   -- c2 on A | c1 on A  ✓
+SELECT message FROM dolt_log('remotes/peerA/main');   -- same ✓ (both spellings resolve)
+SELECT dolt_hashof('peerA/main');  -- eaa84ca6aaeab2e78bb5ea86b9ff7a9e548dbb70 ✓
+```
+So the remote-ref naming the plan asks about is recorded NATIVELY:
+fetch materializes `refs/remotes/<remote>/*`, reachable as both
+`'<remote>/<branch>'` and `'remotes/<remote>/<branch>'` in
+`dolt_log`/`dolt_hashof`. None of this is reachable in WASM due to the
+crash.
+
+**LP1 findings (POSITIVE — serialize/deserialize round-trip WORKS in
+WASM, verified before the keystone was reached):**
+- Export: `sqlite3.capi.sqlite3_js_db_export(db.pointer)` →
+  `Uint8Array` (a 3-commit/2-branch replica serialized to 7937 bytes).
+- Import onto a fresh handle:
+  `sqlite3.capi.sqlite3_deserialize(dbB.pointer, 'main', ptr, len, len, 3)`
+  with `ptr = sqlite3.wasm.allocFromTypedArray(bytes)` (flags 1|2 =
+  FREEONCLOSE|RESIZEABLE) → rc 0; imported handle's `dolt_log` messages,
+  `dolt_branches` names (incl. the UNMERGED branch `x1`), and
+  `dolt_hashof_db()` all EQUAL to the source replica
+  (`39d96d55c678050bc8cd6258f13dbd8b48215af5` both sides).
+- Alternate import: `sqlite3.capi.sqlite3_js_vfs_create_file('unix',
+  '/probe-import.db', bytes, len)` (deprecated-but-working; warns to
+  console) then `new oo1.DB('/probe-import.db')` → `dolt_hashof_db()`
+  EQUAL.
+- Commits on a deserialized handle work (`S4 → f58f9153…`).
+- `SELECT name FROM pragma_function_list WHERE name LIKE 'dolt%'` (34
+  names, WASM build): `dolt_add dolt_branch dolt_checkout
+  dolt_cherry_pick dolt_clone dolt_commit dolt_config
+  dolt_conflicts_resolve dolt_connect_branch dolt_creds dolt_creds_new
+  dolt_default_branch dolt_fetch dolt_gc dolt_hashof
+  dolt_hashof_catalog dolt_hashof_db dolt_hashof_table dolt_merge
+  dolt_merge_base dolt_pull dolt_push dolt_rebase dolt_remote
+  dolt_reset dolt_revert dolt_tag dolt_verify_constraints dolt_version
+  doltlite_engine doltlite_internal_materialize_default_column`
+  (catalog/db/table each appear twice in the raw list). So the remotes
+  SYMBOLS are present in WASM; the machinery behind them is what's
+  broken.
+
+**What I tried:** six probe rounds (temporary `lp-probe.js`, deleted;
+also fixed an unrelated flake in my /tmp runner — `server.kill()` on an
+already-dead child now guarded). Sequence highlights: export→deserialize
+equality (LP1 PASS substance), then remote add/fetch on fresh,
+deserialized, and file-backed receivers; both fetch arities; pull;
+clone into empty/non-empty; both URL forms; subdir attempt (blocked by
+missing mkdir, recorded).
+
+**Not tried (out of bounds per rules):** network research on the doltlite
+issue tracker (LP README rule 8 restricts network to npm/jsr/astral),
+patching the wasm package, worker-entry (`sqlite3-worker1-promiser`)
+remotes, any protocol redesign (e.g. re-materializing the peer store as
+the local db and diffing manually) — all are unlisted workarounds and
+belong to the plan author.
+
+**Decision needed:** LP2's choreography depends on `dolt_fetch` against a
+`file://` remote in the same MEMFS. Options for the author (NOT
+implemented): (a) report upstream (this entry is written to be
+paste-ready for the doltlite tracker — the v0.11.53 WASM remote-IO
+vtable appears unwired; native same-version works) and wait for a fixed
+release; (b) sanction a different in-WASM convergence mechanism (e.g.
+deserialize-peer-store + manual `dolt_merge` between two opened stores —
+note merge across db handles is unproven and would itself be a spike);
+(c) re-scope v0 to a non-Dolt reconciliation (out of plan's spirit).
+LP3 (BroadcastChannel transport) is unaffected by this blocker and could
+be built on request, but the LP→L4 gate (`LP SPIKES: 3/3 PASS`) cannot
+pass while LP2 fails.
+
+**RESOLVED 2026-08-24 by plan decision P-D1** (validator session
+ses_fd2add951ffer9kl2Zf8K1WwZI under user delegation; recorded in
+lite-p2p-sync plan.md §9, phase files updated by the decider): option D
++ superset adoption. LP2 splits into **LP2a (ACTIVE)** — probe-handle
+superset check + wholesale adoption of a strictly-containing peer store
+(= Dolt fast-forward semantics using only the LP1-proven
+serialize/deserialize primitives; linear convergence provable now; a
+negative control proves true forks are DETECTED, not adopted) — and
+**LP2b (BLOCKED-UPSTREAM)** — the fetch-based fork heal kept verbatim as
+the future drop-in; the deliverable for that half is the stub seam
+`healFork()` throwing `E_FORK_HEAL_PENDING_UPSTREAM` plus a visible UI
+state; check-p2p heal assertions park behind `--with-heal` (default
+off). Option B (cross-handle merge) rejected on first principles (merge
+operates on refs within one database; no cross-database union primitive
+exists besides the broken remotes). Option C rejected as a spirit
+violation. Upstream report is the user's channel (D5).
