@@ -687,6 +687,404 @@ COOP/COEP note: our serve.ts already sends the isolation headers; the
 sync build needs no SharedArrayBuffer anyway (no threads) — nothing
 observed (never ran).
 
+## MSYNC log
+
+Status: COMPLETE through MS5 (Pages publish prepped; enablement + live
+acceptance are the validator's). Gates: MS0 ✓; MS1 ✓; MS2 ✓; MS4 ✓;
+MS5 ✓ — full regression set green (check-ms0, check-msync incl.
+late-peer, check-poc, check-lp default, check-trystero-load incl. the
+no-param default scenario).
+
+### MS0 — keystone spikes (COMPLETE)
+
+Deliverables: `lite/web/sync/canonical.js` + `sync/eventid.js` (ported
+from `api/engine/canonical.ts`/`eventid.ts`, same test vectors),
+`lite/web/ms-spikes.html|js`, `lite/web/check-ms0.ts`.
+
+**Identity port fidelity (rule 7):** `MS0-VECTORS: PASS` — canonical
+sorted-keys vector byte-exact vs the server test
+(`{"a":{"c":3,"d":[4,{"y":2,"z":1}]},"b":2}`), id shape
+`/^\$[A-Za-z0-9_-]{43}$/`, determinism, redacted-content invariance,
+sender sensitivity, member→membership-only and create→unchanged
+redaction. Browser `crypto.subtle.digest` + `btoa` port, semantics
+unchanged.
+
+**S-branch — THE GATE: PASS.** Recorded route (verbatim outcomes):
+- form 1 `SELECT dolt_branch('xf','<commit-hash>')` → `0`;
+  `dolt_hashof('xf')` == the interior commit ✓ — **THE RECORDED ROUTE**.
+- form 2 (informational) `SELECT dolt_checkout('-b','xf2','<hash>')` →
+  `0`; `active_branch()`=`xf2` at the interior commit ✓ (also works).
+- Fallback F2 (branch-per-event retention) NOT needed — no measurements
+  taken (route exists).
+- The gate scenario itself: e1's branch consumed+deleted, foreign fork
+  event e2b (prev e1) hung on a branch re-materialized at e1's commit →
+  two extremities, each tip's `dolt_at_events` shows the right lineage.
+- Engine note for MS1: consumed-prev branches are re-materialized by the
+  route whenever a foreign fork references an interior commit.
+
+**S-det — PASS (the convergence proof).** Fixture: create, member, msg,
+fork pair (same prev, different senders/ts), 2-prev heal, final msg —
+content-hash ids via the ported identity layer. Store A order
+e0,e1,e2,e3a,e3b,e4,e5; store B order e0,e1,e2,e3b,e3a,e4,e5.
+- `dolt_hashof_table('events')`: A=`3917adb6…` B=`3917adb6…` **EQUAL**
+- `dolt_hashof_table('state')`:  A=`510a1c8b…` B=`510a1c8b…` **EQUAL**
+- state row content identical; both stores' tip `dolt_log` reach BOTH
+  fork commits (2-parent heal verified via the LS3/WS3 driver sequence,
+  `dolt_commit` inside the txn, no trailing COMMIT).
+- Per-replica divergence honestly documented: the same logical event's
+  COMMIT hash DIFFERS across stores (e5: A=`7dca6faa707c`,
+  B=`d1d9581f35fe`) — per-store committer.
+- **Deviation vs the phase NOTE + PB3-record correction (capture-don't-
+  guess):** the phase expected `dolt_hashof_db` to differ across
+  replicas. Observed (spike + two native isolation probes):
+  `dolt_hashof_db()` is **CONTENT-keyed** — equal content + equal HEAD
+  branch name ⇒ equal hash even when commit hashes/messages/committers
+  all differ. (This SUPERSEDES PB3's "pure function of (refs + HEAD)"
+  reading: the PB3-era checkout perturbations were content-changing
+  checkouts; refs/graph are NOT included.) The phase's honesty goal is
+  carried by the per-event commit-hash divergence assert instead;
+  table-level convergence (the design's actual badge) is unaffected.
+
+**S-union — PASS.** Forked moment (e3a+e3b, no heal): union of
+`dolt_at_events(<tip-hash>)` across both extremities, dedup by
+`event_id`, ordered `(origin_ts, event_id)` — all five events exactly
+once; e2 not duplicated.
+
+Transcript (`deno run -A lite/web/check-ms0.ts`, exit 0):
+```
+MS0-VECTORS: PASS (canonical sorted-keys vector exact; id shape/determinism/redaction-invariance/sender-sensitivity; member+create redaction) — sample id $PVJcP-h_DJtPopB6Tr90bB__9CcE29UjtMt_SY0M7Ms
+INFO s-branch: e1 branch x1 consumed+deleted; e1 commit 97f7cea101c86170116b0a8c4efbf2f6cbcf7ab0; now hanging fork event e2b on it
+INFO s-branch: form 1: SELECT dolt_branch('xf','<hash>') → 0; dolt_hashof('xf') = 97f7cea101c86170116b0a8c4efbf2f6cbcf7ab0 (AT the interior commit ✓)
+INFO s-branch: form 2 (informational): dolt_checkout('-b','xf2','<hash>') → 0; active_branch()=xf2; hashof=AT the interior commit ✓
+INFO s-branch: created 'h3' at interior commit 97f7cea1 for prev $bCFQGYzU…
+MS0-SBRANCH: PASS (route: dolt_branch('<name>','<start-commit-hash>'); two extremities x2+xf with correct per-tip lineage; the e1-commit holder branch persists as the fork base)
+INFO s-det: events table hash A=3917adb6dbfecfb0527a08e7d81ad54a8ff5493a B=3917adb6dbfecfb0527a08e7d81ad54a8ff5493a (EQUAL)
+INFO s-det: state  table hash A=510a1c8bb10625de9850d7f2294c4a86f90d4174 B=510a1c8bb10625de9850d7f2294c4a86f90d4174 (EQUAL)
+INFO s-det: e5's commit hash A=7dca6faa707c B=d1d9581f35fe (DIFFER ✓ — per-replica commit graphs diverge by design; convergence proof lives at table level)
+INFO s-det: dolt_hashof_db A=98cfca2c75db B=98cfca2c75db (EQUAL — recorded finding: hashof_db is CONTENT-keyed (commit graph NOT included); verified natively too)
+INFO s-det: both stores' tip dolt_log reach both fork commits (2-parent heal verified)
+MS0-SDET: PASS (ev 3917adb6 st 510a1c8b — equal across both arrival orders; 7 events incl. fork+heal)
+MS0-SUNION: PASS (union across 2 extremity tips: e0,e1,e2,e3a,e3b each exactly once, ordered by (origin_ts,event_id); e2 NOT duplicated)
+MS0: 3/3 PASS
+CHECK: PASS
+```
+
+### MS1 — engine rework + protocol (COMPLETE; longevity clean)
+
+Deliverables: reworked `lite/web/engine-lite.js` (identity = content hash
+via `sync/eventid.js`; `ingestRemote` with verify/known/held; lazy heal;
+union timeline; `tableHashes()`; `extremities()`; holder-branch cleanup
+after use), `lite/web/sync/msync.js` (Protocol v1, exact §3 envelopes),
+`lite/web/msync-longevity.html|js` (two in-page engines, real protocol,
+BroadcastChannel loopback).
+
+Engine notes:
+- Commit messages now embed the FULL event id (`event <id> type <type>`;
+  heal merges suffix `(merge)`) — the commit hash stays receipt-only.
+- `ingestRemote` verify uses the ported `eventIdFor` (identical vectors
+  as the server tests — MS0).
+- Longevity mode runs on `msync-longevity.html` (the `?mode=longevity`
+  concept realized as a dedicated harness page — recorded deviation; the
+  page IS the mode).
+
+Longevity transcript (astral, `msync-longevity.html`):
+```
+INFO same-page BroadcastChannel delivery: WORKS   ← per spec, a posted
+    message reaches every OTHER BC object even within one document
+    (poster excluded) — recorded; two in-page sessions converse.
+INFO join bootstrap: D applied genesis via delta (2 events); table hash equal: true
+MS1-GEN 1..20: ok (113–127 ms per generation — protocol round-trip + commit + apply)
+MS1-LONGEVITY: 20/20 GENERATIONS CLEAN (per-gen ms: first=127 last=114 min=113 max=127)
+INFO stats C: {"sent":43,"received":10,"applied":10,"held":0,"badEvents":0,"merges":0}
+     stats D: {"sent":44,"received":14,"applied":12,"held":0,"badEvents":0,"merges":0}
+```
+Flat profile — no adoption chains anywhere in this plan (events only),
+so the PB3/PB4 defect classes do not apply. Expected flat, observed flat.
+
+### MS2 — the Alice & Bob page (COMPLETE; both checks green)
+
+- `index.html`/`app.js` reworked: Create/Join screen (+ room name),
+  peers count, role badge, transport badge, convergence badge (peer `th`
+  vs mine, green on equal), fork indicator ("N tips — heals on next
+  message"), union timeline with per-row `$<content-hash>` id +
+  `data-prev-count`, log pane labeled "this replica's commits (local
+  receipts)", SQL console retained.
+- **check-poc.ts deviation (recorded, minimal):** the L2 check's
+  assertions targeted the retired identity (`$`+40-hex commit hash).
+  Updated per MS1's normative identity change: sign-in via the Create
+  flow (`#name` + `#room-name` + `#create-btn`), row ids asserted as
+  `/^\$[A-Za-z0-9_-]{43}$/`, assertion 2 checks each id appears in the
+  log pane's commit messages (the commit-message embeds the full event
+  id now). Solo flow substance unchanged: 2 sends, 2 message commits,
+  ids end-of-chain. PASS.
+- check-msync transcript (astral, two pages, BroadcastChannel):
+```
+step 1: A created room
+step 1: B joined, genesis visible, badge green
+step 2: alice→bob delivered; id shape ok: $LFT9ZUFBCsA…
+step 2: bob→alice delivered
+step 3: both timelines show BOTH concurrent messages (union, pre-heal); fork indicator on both
+step 4: timelines identical: true (7 rows)
+step 4: table hashes — A: 9071ae21eda7db96b089c9461822819287f8340d/ba354c1d179d097166bd3841a63be2e218b9ccfb B: 9071ae21eda7db96b089c9461822819287f8340d/ba354c1d179d097166bd3841a63be2e218b9ccfb
+step 4: TABLE HASHES EQUAL ✓ (Merkle-certified convergence)
+CHECK: PASS
+```
+(Note the fork window exercised the MS0-recorded S-branch route on both
+sides: each tab ingested the peer's concurrent send off a holder branch
+at the consumed prev's commit, then B's lazy heal merged them.)
+
+### MS3-prep — Trystero (COMPLETE — human-verified run pending on the user)
+
+- `npm trystero` → **trystero@0.25.3**. Default entry
+  `trystero` → `./dist/index.mjs` → re-exports `@trystero-p2p/nostr`:
+  **the default strategy is NOSTR** (public nostr relays as serverless
+  signaling; WebRTC DataChannels DTLS-encrypted peer-to-peer after
+  discovery). NOT torrent (older docs say torrent — the code is
+  definitive; recorded). Connect quirks: none observable headless (CI
+  never touches it per plan; the human run records the real behavior).
+- `lite/web/sync/trystero.js` — implements the LP3 transport interface
+  (`createTrysteroSession(room, {onPeer,onMessage})` →
+  `{send(obj,bytes?), peers(), leave()}`), wired via
+  `createTransport('trystero')` (already in transport.js from the LP
+  plan; untouched). Two actions: `msg` (JSON), `bin` (bytes — unused by
+  msync v1, kept for interface parity).
+- Loading without a bundler: trystero uses bare specifiers
+  (`@trystero-p2p/nostr`, `@trystero-p2p/core`, `@noble/secp256k1`) —
+  served via an **import map** in `index.html` (dependency graph is
+  shallow and self-contained; no esbuild needed — recorded as the
+  loading choice).
+- **Exact human run (two browsers and ideally two machines):**
+  ```
+  deno run --allow-net --allow-read lite/web/serve.ts   # serves :8787
+  # Browser 1 (e.g. Chrome):
+  #   http://localhost:8787/?transport=trystero
+  #   name=alice, room=<pick a name>, [Create room], send a message
+  # Browser 2 (e.g. Firefox, or another machine — serve port-forwarded
+  #   or the same LAN URL):
+  #   <same URL>; name=bob, room=<same>, [Join room] → "syncing…" →
+  #   genesis appears; badge should turn green on both
+  # Chat both ways; force a fork by sending simultaneously (offline or
+  # just fast); watch "2 tips — heals on next message", then the next
+  # message's row shows prev_count=2 (title/data attr) and badges return
+  # green. Copy back: the two convergence-badge hash lines (or evaluate
+  # __room's table hashes) + anything odd in the log panes.
+  ```
+  Firefox note: no SharedArrayBuffer is needed on this path (single-
+  threaded build); COOP/COEP headers are already sent by serve.ts and
+  are inert here. Nothing observed (the run itself is the human gate).
+- Human L2-era gate still pending too (open `http://localhost:8787/` and
+  play) — the MS2 page now IS that page, so the human run covers both.
+
+## MS2 gate evaluation: `check-msync.ts` exit 0 AND `check-poc.ts` PASS
+(after the recorded identity update) AND MS0's `MS0: 3/3 PASS` →
+**all gates through MS3-prep MET.**
+
+### MS4 — field hardening (COMPLETE; all five checks green)
+
+Fixes the defects from the user's human run (plan §9 F-D1). What changed
+per file:
+
+- `lite/web/sync/trystero.js` — rewritten against the @trystero-p2p FORK
+  API (cited from its shipped `types.d.mts`): `makeAction(ns)` → OBJECT
+  `{send, onMessage, onReceiveProgress}`; `onPeerJoin/Leave` are
+  assignable properties; `selfId` is a module export; handlers receive
+  `(data, context)` with `context.peerId`. (Was: classic-trystero tuple
+  shape — crashed "not iterable" on load.) Header comment updated; the
+  default-strategy note (nostr, via the dist re-export) kept.
+- `lite/web/app.js` — `start()` body wrapped in try/catch: error →
+  `#status = 'failed: ' + message` + buttons re-enabled + console.error
+  (no more discarded-promise silent freeze). Staged statuses:
+  `loading engine (wasm)…` → `creating room…` / `waiting for a peer to
+  sync from…` → `connecting transport…` → cleared on reveal. Creator
+  reveal moved BEFORE transport (room works solo while connecting);
+  `ms.announce()` stays post-connect; join reveal unchanged (first
+  delta).
+- `lite/web/sync/msync.js` — joiner rescue: bootstrap `delta-req` retry
+  UNCAPPED (2 s cadence until `eventIndex.size > 0` or `leave()`; the
+  10-try bail removed) + event-driven rescue (an `onPeer` while
+  unbootstrapped fires an immediate empty-tips delta-req). Handle also
+  gained `leave()` and `peers()` (the latter for the MS4 load smoke's
+  callability assertion; CI checks callability only, never connectivity).
+- `lite/web/engine-lite.js` — the OPFS persistence probe is now raced
+  against a 3 s timeout (`Promise.race`); timeout OR rejection → memory,
+  exactly as before. Recorded path in the headless run: REJECTION, not
+  timeout (the sahpool feature check fails fast where
+  `createSyncAccessHandle` is absent — L1 finding; the timeout race is
+  for environments where it HANGS, not exercised here).
+- `lite/web/check-trystero-load.ts` — NEW load smoke: `/?transport=
+  trystero`, sign in, Create → within 20 s: room revealed, no `failed:`
+  status, zero page EXCEPTIONS (astral mechanism: `pageerror` event
+  listener — console noise from dead public relays is a different
+  channel and is ignored by design), `window.__ms.peers()` callable.
+- `lite/web/check-msync.ts` — added the late-peer scenario FIRST
+  (independent room `msync-late`, pages closed after): C creates and
+  stays silent; D joins ~8 s later; assert bootstrap ≤15 s.
+
+Check transcripts (all fresh, this session):
+
+`deno run -A lite/web/check-trystero-load.ts` → exit 0:
+```
+room view revealed: true
+status text: "connecting transport…"
+window.__ms.peers(): callable (peers: 0)
+page exceptions captured (pageerror): 0 []
+CHECK: PASS
+```
+
+`deno run -A lite/web/check-msync.ts` → exit 0:
+```
+late-peer: C created room, staying silent
+late-peer: D bootstrapped in 655 ms (A silent throughout)
+step 1: A created room
+step 1: B joined, genesis visible, badge green
+step 2: alice→bob delivered; id shape ok: $jL1AiqBhdp6…
+step 2: bob→alice delivered
+step 3: both timelines show BOTH concurrent messages (union, pre-heal); fork indicator on both
+step 4: timelines identical: true (7 rows)
+step 4: table hashes — A: 5f50e23f0b885001dbcc923a3ac72ba3fa9053bc/beaaeb8153f374c5bd155d624ae4ad82bf68ac09 B: 5f50e23f0b885001dbcc923a3ac72ba3fa9053bc/beaaeb8153f374c5bd155d624ae4ad82bf68ac09
+step 4: TABLE HASHES EQUAL ✓ (Merkle-certified convergence)
+CHECK: PASS
+```
+
+`deno run -A lite/web/check-ms0.ts` → exit 0 (`MS0: 3/3 PASS`).
+`deno run -A lite/web/check-poc.ts` → exit 0 (`CHECK: PASS`).
+`deno run -A lite/web/check-lp.ts` (default) → exit 0:
+```
+LP SPIKES: 3/3 PASS
+LP SPIKES 3/3: true; LP2C skip-ack: true
+LP3 cross-page hash equality: true
+CHECK: PASS
+```
+
+### MS5 — publish the demo to GitHub Pages (COMPLETE; Pages enablement is the validator's)
+
+Files (MS5 writables only):
+- `.github/workflows/pages.yml` — NEW, verbatim per phase (actions
+  pinned: checkout@v4, setup-node@v4 (node 22), upload-pages-artifact@v3,
+  deploy-pages@v4). Artifact = whole `lite/web` — the import map and
+  engine load from `./node_modules/...`, which `npm ci` materializes in
+  the runner (no vendoring, no gitignore changes; spike pages ride along
+  by design). Triggers: push to `spike/communico-lite` + manual.
+- `lite/web/app.js` — transport default logic (param wins; localhost/
+  127.0.0.1 → broadcast; any other host → trystero) + join-screen copy
+  line injected from app.js ("Rooms are joinable by name over public
+  relays — pick something unique.") + the welcomed 'suggest' button
+  (fills `room-<4 random hex>`). index.html is NOT in this phase's
+  writable set, so the copy additions are DOM-injected by design.
+  No engine changes; no serve.ts changes (localhost keeps COOP/COEP;
+  Pages won't have them — the OPFS probe self-gates on
+  `crossOriginIsolated`, already proven to fall back to memory).
+- `lite/web/check-trystero-load.ts` — added scenario 2: no `?transport=`
+  on localhost → badge must read `broadcast` (regression-pins the
+  default logic; CI stays network-free).
+
+Check transcripts (all fresh, this session):
+
+`deno run -A lite/web/check-trystero-load.ts` → exit 0:
+```
+room view revealed: true
+status text: ""
+window.__ms.peers(): callable (peers: 0)
+page exceptions captured (pageerror): 0 []
+no-param localhost transport badge: "transport: broadcast"
+scenario 2 (no-param default → broadcast): ok
+CHECK: PASS
+```
+(Scenario 1 note: `#status` read "" this run — cleared post-connect;
+the MS4 assertions are on `failed:` absence, honored.)
+
+`deno run -A lite/web/check-msync.ts` → exit 0:
+```
+late-peer: D bootstrapped in 548 ms (A silent throughout)
+step 1: A created room
+step 1: B joined, genesis visible, badge green
+step 2: alice→bob delivered; id shape ok: $Mqm3ioOQSsD…
+step 2: bob→alice delivered
+step 3: both timelines show BOTH concurrent messages (union, pre-heal); fork indicator on both
+step 4: timelines identical: true (7 rows)
+step 4: table hashes — A: 6f31b0273d67dfb6a81773b6840f71efb0a0912f/30689475af100fafcb004dc93bb2419f5ad68d01 B: 6f31b0273d67dfb6a81773b6840f71efb0a0912f/30689475af100fafcb004dc93bb2419f5ad68d01
+step 4: TABLE HASHES EQUAL ✓ (Merkle-certified convergence)
+CHECK: PASS
+```
+
+`deno run -A lite/web/check-ms0.ts` → exit 0 (`MS0: 3/3 PASS`).
+`deno run -A lite/web/check-poc.ts` → exit 0 (`CHECK: PASS`).
+`deno run -A lite/web/check-lp.ts` (default) → exit 0:
+```
+LP SPIKES: 3/3 PASS
+LP SPIKES 3/3: true; LP2C skip-ack: true
+LP3 cross-page hash equality: true
+CHECK: PASS
+```
+
+**Validator handoff:** Pages enablement (source = GitHub Actions) + the
+live-URL acceptance are the validator's per the phase's recorded
+sequence (fresh five-check run → commits 1–4 per plan §4 → commit 5 =
+the workflow file alone (`ci:`) → push + enable Pages → first workflow
+run watch → two-machine live acceptance). Expected URL:
+`https://<owner>.github.io/communico/`. The user's human-run round-2
+result (badges green, hashes equal) should be appended to the MS4
+section when supplied.
+
+**MS5 URL-layout amendment (user decision, 2026-08-25):** the Pages root
+is a NEW repo folder `www/` instead of `lite/web` — `www/lite/` is the
+curated PUBLIC surface ("not duplication: lite/web is development, www is
+what we serve") built by a workflow copy step, with `www/index.html` as a
+minimal landing page ("your **personal** matrix server", `personal`
+emphasized, link to `./lite/`). The app therefore serves at
+`https://<owner>.github.io/communico/lite/` and the landing page at
+`/communico/`. The workflow's `npm ci` still runs in `lite/web` (source
+of truth); the copy step stages into `www/lite/`: app + spike html/js,
+`sync/`, `w0/` (with its vendored artifact), and a pruned `node_modules`
+(trystero, `@trystero-p2p/{nostr,core}`, `@noble/secp256k1`,
+`@dolthub/doltlite-wasm`, `wa-sqlite`) — no dev files, no RESULTS.md, no
+tests, no package manifests at runtime. Verified by building the staged
+tree locally and driving it headlessly: landing 200, app 200, engine +
+wasm packages 200, and a create-room→send-message smoke on the staged
+site all green. The five checks (which serve `lite/web` on localhost)
+are unaffected by this layout change and were re-run green after it.
+This supersedes the phase's verbatim artifact (`path: lite/web`); the
+validator's `ci:` commit carries the amended workflow + `www/index.html`.
+
+**Human run, round 2 (unchanged from MS3-prep, with two reminders):**
+```
+deno run --allow-net --allow-read lite/web/serve.ts   # serves :8787
+# BOTH browsers must carry ?transport=trystero:
+#   Browser 1: http://localhost:8787/?transport=trystero — name, room, [Create room]
+#   Browser 2 (other browser/machine): same URL — name, same room, [Join room]
+# FIRST verify the transport badge reads "trystero" on both (F-D1 lesson).
+# Then: genesis appears on the joiner; chat both ways; simultaneous sends
+# show the fork indicator; next message heals (prev_count=2); badges green.
+# Copy back: the two badge hash lines + any console exceptions (note:
+# dead public nostr relays logging connection errors are EXPECTED noise,
+# not failures — the load smoke filters exactly that).
+```
+
+**Field validation (user-reported, 2026-08-25):** the round-2 two-browser
+Trystero run **worked** — reported by the user in their own words as
+"that all worked very well, this is why we're pushing it to github now"
+(pasted into the executor chat on request). No specific badge/hash lines
+were captured in the report; the run's success is what green-lit the
+GitHub Pages push (MS5). The on-record acceptance of the live URL
+(`https://<owner>.github.io/communico/`) remains the validator's recorded
+sequence in MS5.
+
+#### Post-additions (ideas recorded, NOT built — 2026-08-25)
+
+- **"Check connection" button (proposed by user, deferred pending go).**
+  Purpose: on-demand assurance that the transport is actually live before
+  anyone types (the F-D1 field lesson). Recommended zero-protocol-change
+  shape: a badge-adjacent button that (1) shows the live `peers()` count
+  from the msync handle and (2) forces an immediate `announce()` (the
+  existing `tips` broadcast) and reports the last peer-`th` gossip
+  timestamp — "data flowed recently" without new traffic. NO new
+  `ping`/`pong` message type: Protocol v1 (plan §3) is normative, and a
+  ping would be a variant requiring a plan-level decision. Limit recorded
+  honestly: forced announce is fire-and-forget, so the button cannot prove
+  OUTBOUND delivery; a true round-trip proof needs a protocol-level
+  ping/pong — to be taken to the plan author, not improvised. Status:
+  idea only; no code written.
+
 ## Blockers
 
 ### MB1 — matrix-sync start gate failed: tree dirty (LP/W0 backlog uncommitted) (STOP-AND-REPORT)
@@ -734,6 +1132,14 @@ being the value) and wasm-remotes-w0 §4 (`feat: Add W0 success-path
 spikes — amalgamation-lineage WASM remotes` — explicitly lands even with
 W0d unrun, per its §4 note). Then re-dispatch matrix-sync. This MB1
 entry rides whichever commit carries `lite/RESULTS.md`.
+
+**RESOLVED 2026-08-24 by the validator session:** backlog landed as
+`f354d6b` (LP spikes; check-lp default gate green with the LP2C
+regression detector behind `--with-lp2c`) and `37fbd00` (W0 spikes +
+this RESULTS.md incl. PB2–PB4/WB1/MB1). Tree clean; HEAD=37fbd00.
+matrix-sync re-dispatched. (Validator side notes: new pedantic host-side
+lint rules appeared; astral import pinned; P-D3/W-D1 pause records added
+to the two superseded plans.)
 
 ### WB1 — wasm-remotes-w0: the amalgamation-lineage wasm remote client cannot complete an HTTP round trip (STOP-AND-REPORT)
 

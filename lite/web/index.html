@@ -3,13 +3,28 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>communico-lite — your own room in the browser</title>
+  <title>communico-lite — Alice &amp; Bob in browsers</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "trystero": "./node_modules/trystero/dist/index.mjs",
+      "@trystero-p2p/nostr": "./node_modules/@trystero-p2p/nostr/dist/index.mjs",
+      "@trystero-p2p/core": "./node_modules/@trystero-p2p/core/dist/index.mjs",
+      "@noble/secp256k1": "./node_modules/@noble/secp256k1/index.js"
+    }
+  }
+  </script>
   <style>
     :root { color-scheme: light dark; }
     body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 2rem; max-width: 1200px; }
     header p.explainer { font-size: 1.05rem; line-height: 1.5; }
-    .session-note { color: #b45309; font-weight: 600; }
     .hidden { display: none; }
+    #join-screen { display: flex; gap: 0.5rem; align-items: center; margin: 1rem 0; flex-wrap: wrap; }
+    #badges { display: flex; gap: 0.75rem; align-items: center; font-size: 0.85rem; margin: 0.4rem 0 0.8rem; flex-wrap: wrap; }
+    .badge { border: 1px solid #8884; border-radius: 999px; padding: 0.1rem 0.6rem; }
+    #convergence.ok { border-color: #16a34a; color: #16a34a; font-weight: 600; }
+    #convergence.diverged { border-color: #b45309; color: #b45309; }
+    #fork-ind { border-color: #b45309; color: #b45309; font-weight: 600; }
     main { display: flex; gap: 2rem; align-items: flex-start; }
     #chat { flex: 1 1 55%; display: flex; flex-direction: column; gap: 0.5rem; }
     #side { flex: 1 1 45%; display: flex; flex-direction: column; gap: 0.5rem; }
@@ -26,28 +41,38 @@
     #sql { font-family: ui-monospace, monospace; min-height: 3.5rem; }
     table.results { border-collapse: collapse; font-size: 0.8rem; }
     table.results th, table.results td { border: 1px solid #8884; padding: 0.2rem 0.5rem; }
-    #signin { display: flex; gap: 0.5rem; margin: 1rem 0; }
     #status { font-size: 0.85rem; opacity: 0.8; }
+    .session-note { color: #b45309; font-weight: 600; }
   </style>
 </head>
 <body>
   <header>
     <h1>communico-lite</h1>
-    <p class="explainer">This chat room is a <strong>version-controlled database running entirely in
-    YOUR browser</strong> (DoltLite WASM — SQLite with Dolt-style commits, branches and merges).
-    Every message is a <strong>commit</strong>; the event id <em>is</em> the commit hash.
-    No server, no account: "sign in" just picks the name stamped on your commits.</p>
-    <p class="session-note hidden" id="session-note">This room is session-scoped: it lives only in
-    this tab's memory and disappears on reload (no persistent storage available in this browser).</p>
+    <p class="explainer">This chat room is a <strong>Matrix event DAG replicated across browser
+    tabs</strong> — each tab keeps its own version-controlled DoltLite database. Event ids are
+    content hashes (identical on every replica); each replica ingests into its own store, one
+    commit per event; the database itself certifies convergence via history-independent table
+    hashes. No server anywhere.</p>
+    <p class="session-note">This room is session-scoped: it lives only in this tab's memory and
+    disappears on reload (no persistent storage available in this browser).</p>
   </header>
 
-  <section id="signin">
+  <section id="join-screen">
     <input id="name" placeholder="display name" autocomplete="off">
-    <button id="signin-btn">sign in</button>
+    <input id="room-name" placeholder="room name" autocomplete="off">
+    <button id="create-btn">Create room</button>
+    <button id="join-btn">Join room</button>
     <span id="status"></span>
   </section>
 
   <main id="room" class="hidden">
+    <div id="badges">
+      <span class="badge" id="peers">peers: 0</span>
+      <span class="badge" id="role">role: —</span>
+      <span class="badge" id="transport">transport: —</span>
+      <span class="badge diverged" id="convergence">th: —</span>
+      <span class="badge hidden" id="fork-ind"></span>
+    </div>
     <section id="chat">
       <h2>timeline</h2>
       <div id="timeline"></div>
@@ -57,9 +82,9 @@
       </div>
     </section>
     <section id="side">
-      <h2>dolt_log (live)</h2>
+      <h2>this replica's commits <small>(local receipts)</small></h2>
       <div id="doltlog"></div>
-      <h2>query your room</h2>
+      <h2>query your replica</h2>
       <div id="sqlbox">
         <textarea id="sql">SELECT * FROM dolt_log;</textarea>
         <button id="runsql">run SQL</button>

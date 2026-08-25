@@ -40,10 +40,11 @@ const fail = (msg: string) => { ok = false; console.error("ASSERT-FAIL:", msg); 
 try {
   const page = await browser.newPage(`${BASE}/`);
 
-  // --- sign in (nominal) ---
+  // --- sign in (nominal): MS2 join screen — solo flow = Create room ---
   await page.evaluate(() => {
     (document.getElementById("name") as HTMLInputElement).value = "poc-tester";
-    document.getElementById("signin-btn")!.click();
+    (document.getElementById("room-name") as HTMLInputElement).value = "poc-solo";
+    document.getElementById("create-btn")!.click();
   });
   const upDeadline = Date.now() + 30_000;
   let signedIn = false;
@@ -98,7 +99,9 @@ try {
   if (!timelineText.includes("first poc message")) fail("body 1 missing from timeline");
   if (!timelineText.includes("second poc message")) fail("body 2 missing from timeline");
 
-  // --- assertion 2: every timeline row's $<hash> id appears in the log pane ---
+  // --- assertion 2 (MS1 identity model): every timeline row's $<content-hash>
+  // id appears in the log pane's commit lines (commit messages embed the full
+  // event id; the commit hash itself is the local receipt) ---
   const rows = await page.evaluate(() =>
     [...document.querySelectorAll("#timeline .msg")].map((d) =>
       (d as HTMLElement).dataset.eventId ?? ""));
@@ -106,12 +109,10 @@ try {
     document.getElementById("doltlog")?.textContent ?? "");
   console.log("timeline rows (event ids):", JSON.stringify(rows));
   for (const id of rows) {
-    if (!id.startsWith("$")) { fail(`row id not a wire id: ${id}`); continue; }
-    const hash = id.slice(1);
-    if (!/^[0-9a-f]{40}$/.test(hash)) fail(`row id does not embed a 40-hex commit hash: ${id}`);
-    else if (!logText.includes(hash)) fail(`event id ${id} missing from log pane`);
+    if (!/^\$[A-Za-z0-9_-]{43}$/.test(id)) { fail(`row id not a content-hash wire id: ${id}`); continue; }
+    if (!logText.includes(id)) fail(`event id ${id} missing from log pane`);
   }
-  console.log("all timeline event ids present in log pane:", rows.every((id) => logText.includes(id.slice(1))));
+  console.log("all timeline event ids present in log pane:", rows.every((id) => logText.includes(id)));
 
   // --- assertion 3: log pane gained exactly 2 new event m.room.message lines ---
   const after = await msgLineCount();

@@ -10,6 +10,7 @@
   "type": "commonjs",
   "dependencies": {
     "@dolthub/doltlite-wasm": "^0.11.53",
+    "trystero": "^0.25.3",
     "wa-sqlite": "^1.0.0"
   }
 }
