@@ -1046,6 +1046,24 @@ are unaffected by this layout change and were re-run green after it.
 This supersedes the phase's verbatim artifact (`path: lite/web`); the
 validator's `ci:` commit carries the amended workflow + `www/index.html`.
 
+**Push outcome (user-authorized, 2026-08-25):** landed as four signed
+commits on `spike/communico-lite` and pushed (`-u`):
+`68d164e` MS0 spikes, `b17524a` MS1 engine+protocol, `45be54e` MS2/MS3
+page + MS4 hardening, `71b2e72` MS5 pages. Every commit verified green
+at checkout in a scratch worktree (MS0: `MS0: 3/3 PASS`; MS1: longevity
+20/20 clean; MS2/MS3+MS4: check-msync + check-poc + check-trystero-load
+all PASS; MS5: workflow + landing present) plus the full five-check set
+green at the tip. Dates monotone, SSH-signed. The push triggered the
+first `pages` workflow run immediately: **build job SUCCESS** (npm ci,
+the curated copy step, artifact upload — the amended workflow content is
+validated), **deploy job FAILED at `actions/deploy-pages@v4`** because
+the repo has no Pages site enabled yet (`GET /repos/…/pages` → 404).
+Remaining is one owner click: repo Settings → Pages → Source =
+**GitHub Actions**; then re-run the failed deploy job (or push again) —
+the site then comes up at `https://thrudhame.github.io/communico/`
+(landing) and `…/communico/lite/` (demo). gh CLI on this machine is
+unauthenticated, so the enable step could not be done from here.
+
 **Human run, round 2 (unchanged from MS3-prep, with two reminders):**
 ```
 deno run --allow-net --allow-read lite/web/serve.ts   # serves :8787

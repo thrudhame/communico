@@ -12,6 +12,7 @@ const $ = (id) => document.getElementById(id);
 let room = null;
 let ms = null;
 let latestPeerTh = null;
+let pendingAnnounce = false; // a message landed before transport was ready
 
 // MS5: transport default — the ?transport= param wins; on localhost we
 // default to BroadcastChannel (same-browser tabs); on any public host
@@ -140,6 +141,7 @@ async function start(role) {
     $('status').textContent = '';
 
     if (role === 'create') ms.announce();
+    if (pendingAnnounce) { ms.announce(); pendingAnnounce = false; }
     // join: the first delta's onChange reveals the room (status cleared there)
   } catch (e) {
     $('status').textContent = 'failed: ' + (e?.message ?? e);
@@ -158,8 +160,15 @@ async function send() {
   if (!body || !room) return;
   input.value = '';
   await ingestEvent(room, { type: 'm.room.message', content: { body, msgtype: 'm.text' } });
-  ms.announceLocalIngest();
-  render();
+  render(); // local truth first — never blocked by transport readiness
+  if (ms) {
+    ms.announceLocalIngest();
+  } else {
+    // transport still connecting (public relays can be slow): the event is
+    // safely committed; announce as soon as startMsync resolves.
+    pendingAnnounce = true;
+    $('status').textContent = 'connecting transport… (message saved locally)';
+  }
 }
 $('send').addEventListener('click', send);
 $('msg').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
