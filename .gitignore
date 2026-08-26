@@ -3,3 +3,4 @@
 /debug
 lite/bin/
 lite/web/node_modules/
+/.envrc
