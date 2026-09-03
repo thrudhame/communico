@@ -1,8 +1,8 @@
 # communico-lite capability matrix & execution log
 
-DoltLite **v0.11.53** (SQLite 3.54.0, 64-bit) — user-local binary at
-`lite/bin/doltlite` (asset `doltlite-tools-linux-x64-0.11.53.zip` from
-github.com/dolthub/doltlite/releases/tag/v0.11.53; no root, no system
+DoltLite **v0.50.3** (SQLite 3.54.0, 64-bit) — user-local binary at
+`lite/bin/doltlite` (asset `doltlite-tools-linux-x64-0.50.3.zip` from
+github.com/dolthub/doltlite/releases/tag/v0.50.3; no root, no system
 install). Native spikes run with `bash lite/spikes/native/run.sh`;
 scratch DBs and per-spike logs in `/tmp/lite-spikes/` (runner recreates
 them fresh each run; LS5 intentionally reuses LS4's db per the phase
@@ -1159,6 +1159,90 @@ Plus a headless live smoke against the deployed /lite-v0/ (uncommitted
 probe script): create room → send → message rendered with content-hash
 ids, transport badge `broadcast`, zero page exceptions →
 `LIVE SMOKE: PASS`. The frozen build serves and runs.
+
+## 0.50.3 revalidation (lite-v1 Phase A)
+
+Upstream: all four bugs from dolthub/doltlite#2563 are fixed in 0.50.3 —
+#2567/#2568/#2570 were one stack-overflow in `chunkStoreOpen` (PR #2573),
+#2569 the WASM HTTP transport (PR #2576). This section is the capture of
+the upgrade; per-check verdicts below, verbatim.
+
+**Environment delta:** native `lite/bin/doltlite` 0.11.54 → **0.50.3**
+(header above updated; `--version` → `DoltLite v0.50.3 (SQLite 3.54.0,
+64-bit)`); `@dolthub/doltlite-wasm` `^0.11.53` → **`^0.50.3`**
+(package.json + package-lock refreshed; `lite/web/deno.lock` tracks the
+range mechanically).
+
+**Native sweep (`bash lite/spikes/native/run.sh`)** — run 1 verbatim:
+```
+binary: /home/user/Projects/communico/lite/bin/doltlite (DoltLite v0.50.3 (SQLite 3.54.0, 64-bit))
+  LS1 missing marker 'version' (log: /tmp/lite-spikes/ls1.log)
+CHECK FAIL version — unexpected: v0.50.3
+SPIKE LS1: FAIL (script exit 1; log: /tmp/lite-spikes/ls1.log)
+SPIKE LS2: PASS
+SPIKE LS3: PASS
+SPIKE LS4: PASS
+SPIKE LS5: PASS
+SPIKE LS6: PASS
+```
+The ONLY divergence across LS1–LS6: LS1's version assertion was pinned to
+`^v0\.11` (the version number itself is the upgrade). Adapted to `^v0\.50`
+(same pin shape as before); every other assertion in the suite —
+config, commit, log columns, branch ops, merge driver, D8 ingest,
+time travel, json1 — passed UNCHANGED. Run 2 verbatim:
+```
+SPIKE LS1: PASS
+SPIKE LS2: PASS
+SPIKE LS3: PASS
+SPIKE LS4: PASS
+SPIKE LS5: PASS
+SPIKE LS6: PASS
+```
+6/6 on 0.50.3. No dialect drift observed.
+
+**Browser sweep (wasm 0.50.3, retry-once workaround STILL IN PLACE —
+removal is the next step):** all six checks green, first try:
+- `check-spikes` → `WASM SPIKES: 4/4 PASS`
+- `check-poc` → `CHECK: PASS` (timeline + log pane, event ids content hashes)
+- `check-lp` (default gate — LP2C flipped in this commit) → verbatim:
+  ```
+  LP2C-GEN 1: ok (32 ms; gen-1-c adopted by d; hash 8072fe27)
+  …
+  LP2C-FORK: DETECTED-NO-HANG (56 ms)
+  …
+  LP2C-GEN 10: ok (41 ms; gen-10-d adopted by c; hash ad30f784)
+  LP2C: 10/10 GENERATIONS CLEAN
+  LP3: PASS (broadcast adapter round-trip heads→want→store; SHA-256 of store bytes equal on both tabs: 5b2cf84a…)
+  LP SPIKES: 3/3 PASS
+  LP3-HASH-A: 5b2cf84a6e611ac63812f5d88c0d71aeec223a5a69442583f269c40f81618463
+  LP3-HASH-B: 5b2cf84a6e611ac63812f5d88c0d71aeec223a5a69442583f269c40f81618463
+  LP SPIKES 3/3: true; LP2C 10/10: true
+  LP3 cross-page hash equality: true
+  CHECK: PASS
+  ```
+  **LP2C 10/10 GENERATIONS CLEAN is the v1a headline**: the PB4 probe that
+  deterministically hung at generation ~2–3 on 0.11.53 now runs all ten
+  generations, and the gen-6 fork negative control reports
+  `DETECTED-NO-HANG`. LP2C is therefore now part of the DEFAULT gate
+  (`check-lp.ts` no longer needs `--with-lp2c`; inverted to `--skip-lp2c`).
+- `check-ms0` → `MS0: 3/3 PASS` → `CHECK: PASS`
+- `check-msync` (incl. late-peer) → verbatim tail:
+  ```
+  late-peer: C created room, staying silent
+  late-peer: D bootstrapped in 400 ms (A silent throughout)
+  step 3: both timelines show BOTH concurrent messages (union, pre-heal); fork indicator on both
+  step 4: timelines identical: true (7 rows)
+  step 4: TABLE HASHES EQUAL ✓ (Merkle-certified convergence)
+  CHECK: PASS
+  ```
+- `check-trystero-load` → `CHECK: PASS` (room reveal, zero page
+  exceptions, no-param badge `broadcast`).
+
+Noise noted (not failures): deno prints
+`Warning: config file file:///…/lite/web/package.json is not a member of
+the workspace at file:///…/communico/. Ignoring the parent workspace
+config.` on the msync/trystero checks — benign workspace-membership
+notice, exit codes unaffected.
 
 ## Blockers
 

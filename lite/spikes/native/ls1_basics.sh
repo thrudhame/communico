@@ -62,7 +62,7 @@ fi
 
 OUT=$("$BIN" "$DB" "SELECT dolt_version();")
 echo "$OUT"
-if echo "$OUT" | grep -q '^v0\.11'; then
+if echo "$OUT" | grep -q '^v0\.50'; then
   ok version "dolt_version() → $OUT"
 else
   fail version "unexpected: $OUT"

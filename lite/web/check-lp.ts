@@ -33,10 +33,11 @@ if (!(await waitForServer(1_000))) {
 }
 
 const browser = await launch();
-// --with-lp2c: run the P-D2 longevity probe (HANGS on 0.11.53 — PB4).
-// Default: skip it; this run doubles as the upstream-fix regression
-// detector once a fixed doltlite-wasm ships (P-D3).
-const WITH_LP2C = Deno.args.includes("--with-lp2c");
+// LP2C (P-D2 longevity probe) is part of the DEFAULT gate since the
+// 0.50.3 upgrade: the upstream stack-overflow fix (dolthub/doltlite#2573)
+// means the probe that deterministically hung 0.11.53 (PB4) must now print
+// 10/10 GENERATIONS CLEAN. --skip-lp2c keeps the old escape hatch.
+const WITH_LP2C = !Deno.args.includes("--skip-lp2c");
 try {
   // LP3 pair first so the handshake is up before page 1 observes.
   // Stagger page creation: simultaneous wasm-module compiles contend.
@@ -79,10 +80,8 @@ try {
   console.log("------------------------");
 
   const spikesOk = /LP SPIKES: 3\/3 PASS/.test(mainText);
-  // LP2C (P-D2 longevity probe) is required ONLY under --with-lp2c: it
-  // deterministically hangs the 0.11.53 wasm build (PB4), so the default
-  // gate skips it and the flagged run is the upstream-fix regression
-  // detector (P-D3).
+  // LP2C is REQUIRED in the default gate since 0.50.3 (upstream fix landed);
+  // --skip-lp2c accepts the page's SKIPPED marker instead.
   const lp2cOk = WITH_LP2C
     ? /LP2C: 10\/10 GENERATIONS CLEAN/.test(mainText)
     : /LP2C: SKIPPED/.test(mainText);
