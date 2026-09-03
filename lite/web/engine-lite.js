@@ -11,9 +11,8 @@
 // explicit-transaction driver (latest-wins, D4); lazy heal (never auto —
 // the next user message takes the two oldest extremities as prevs).
 // WASM rules (L1): ONE long-lived connection per db; no '<file>@<branch>'
-// opens; dolt_checkout on the connection; per-connection dolt_config;
-// retry-once commit (poison rule). This plan ships NO store images and
-// calls NO remotes — the PB2/PB3/PB4 defect classes do not apply.
+// opens; dolt_checkout on the connection; per-connection dolt_config. This
+// plan ships NO store images and calls NO remotes.
 import sqlite3InitModule from './node_modules/@dolthub/doltlite-wasm/sqlite3.mjs';
 import { canonicalJson } from './sync/canonical.js';
 import { eventIdFor } from './sync/eventid.js';
@@ -32,19 +31,6 @@ CREATE TABLE state (
 
 let sqlite3P = null;
 const sqlite3Ready = () => (sqlite3P ??= sqlite3InitModule());
-
-// retry-once commit: the refused commit leaves working state intact, so
-// retry ONLY the commit statement (recorded poison rule).
-function commitRobust(db, msg) {
-  try {
-    return db.selectValue(`SELECT dolt_commit('-Am','${msg}')`);
-  } catch (e) {
-    if (e.message.includes('commit conflict: another connection committed')) {
-      return db.selectValue(`SELECT dolt_commit('-Am','${msg}')`);
-    }
-    throw e;
-  }
-}
 
 async function openStore(name) {
   const sqlite3 = await sqlite3Ready();
@@ -84,7 +70,7 @@ export async function createRoom(displayName, roomName = 'room') {
   db.exec(`SELECT dolt_config('user.name','${self.replaceAll("'", "''")}')`);
   db.exec(`SELECT dolt_config('user.email','${self.replaceAll("'", "''")}')`);
   db.exec(SCHEMA);
-  commitRobust(db, 'schema: events+state');
+  db.selectValue(`SELECT dolt_commit('-Am','schema: events+state')`);
   const room = newRoom(db, self, persistent);
   const createEvt = await ingestEvent(room, {
     type: 'm.room.create', state_key: '',
@@ -105,7 +91,7 @@ export async function joinRoom(displayName, roomName = 'room') {
   db.exec(`SELECT dolt_config('user.name','${self.replaceAll("'", "''")}')`);
   db.exec(`SELECT dolt_config('user.email','${self.replaceAll("'", "''")}')`);
   db.exec(SCHEMA);
-  commitRobust(db, 'schema: events+state');
+  db.selectValue(`SELECT dolt_commit('-Am','schema: events+state')`);
   return newRoom(db, self, persistent);
 }
 
@@ -211,7 +197,7 @@ function ingestCore(room, pdu) {
     try {
       mergeDriver(db, other);
       doInsert();
-      commitRobust(db, `event ${pdu.event_id} type ${pdu.type} (merge)`);
+      db.selectValue(`SELECT dolt_commit('-Am','event ${pdu.event_id} type ${pdu.type} (merge)')`);
       try { db.exec('COMMIT'); } catch { /* dolt_commit finalized the txn (recorded) */ }
     } catch (e) {
       try { db.exec('ROLLBACK'); } catch { /* already finalized */ }
@@ -219,7 +205,7 @@ function ingestCore(room, pdu) {
     }
   } else {
     doInsert();
-    commitRobust(db, `event ${pdu.event_id} type ${pdu.type}`);
+    db.selectValue(`SELECT dolt_commit('-Am','event ${pdu.event_id} type ${pdu.type}')`);
   }
 
   const hash = db.selectValue(`SELECT dolt_hashof('${branch}')`);

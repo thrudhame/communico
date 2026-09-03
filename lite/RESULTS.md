@@ -1244,6 +1244,17 @@ the workspace at file:///…/communico/. Ignoring the parent workspace
 config.` on the msync/trystero checks — benign workspace-membership
 notice, exit codes unaffected.
 
+**Retry-once workaround REMOVED (upstream #2573 fixed the root cause;
+#2570's export-poison class also gone):** `commitRobust` deleted from
+`engine-lite.js` — all four commit sites call `dolt_commit('-Am',…)`
+directly (`grep -c retry lite/web/engine-lite.js` → 0). Full six-check
+sweep re-run on the post-removal tree, verbatim verdicts:
+`check-spikes` 4/4 PASS · `check-poc` PASS · `check-lp` LP SPIKES 3/3 +
+**LP2C 10/10 GENERATIONS CLEAN** (gens 27–56 ms, fork DETECTED-NO-HANG,
+same deterministic generation hashes as the with-workaround run) ·
+`check-ms0` PASS · `check-msync` PASS (TABLE HASHES EQUAL) ·
+`check-trystero-load` PASS. **Green without the crutch.**
+
 ## Blockers
 
 ### MB1 — matrix-sync start gate failed: tree dirty (LP/W0 backlog uncommitted) (STOP-AND-REPORT)
