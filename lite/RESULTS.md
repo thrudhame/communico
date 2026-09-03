@@ -1124,6 +1124,42 @@ sequence in MS5.
   ping/pong — to be taken to the plan author, not improvised. Status:
   idea only; no code written.
 
+## lite-v1 plan — Phase 0: v0 freeze (COMPLETE)
+
+Per `~/Documents/communico/plans/lite-v1/plan.md` (the DoltLite 0.50.3
+upgrade plan, staged v1a + v1b with v0 preserved). Phase 0 freezes the
+current demo forever and makes Pages serve frozen milestones next to the
+ever-latest `/lite/`.
+
+Landed (2026-09-02, two commits + annotated tag, all pushed):
+- `cc35cea` `docs: Record MS5 live-deploy outcome` — the MS5 live-deploy
+  record (+21 lines above) and the root `deno.lock` refresh.
+- `cd8dda8` `ci: Freeze demo milestones — per-tag Pages builds (lite-v0)` —
+  the curated copy step moved into the repo as `lite/web/pages-copy.sh
+  <src> <dst>`; `pages.yml` checks out each frozen tag into `refs/<tag>/`,
+  runs `npm ci` with THAT ref's lockfile, and calls THAT ref's
+  `pages-copy.sh` into `www/lite-<tag>/` (every frozen version carries its
+  own build recipe forward; the tip leg is byte-identical to the old inline
+  copy, verified by diffing the staged trees). `www/index.html` gained a
+  version list (`/lite/` latest · `/lite-v0/` original).
+- tag `lite-v0` → `cd8dda8` ("frozen original demo — doltlite-wasm
+  0.11.53 + msync protocol"). NOTE the deviation from plan §2 ("tip after
+  the docs commit"): tagged one commit later, on the `ci:` commit, because
+  §3's script-from-ref design requires the frozen ref to CONTAIN
+  `pages-copy.sh`; a docs-tip tag would leave the v0 Pages leg with no
+  script to call (executor-resolved, recorded in the ci commit body).
+
+Live verification (2026-09-02, Pages run 33721265163 build ✓ deploy ✓):
+```
+curl -s -o /dev/null -w '%{http_code}' https://thrudhame.github.io/communico/lite-v0/   → 200
+curl -s …/lite-v0/node_modules/@dolthub/doltlite-wasm/package.json | grep '"version"'    → "version": "0.11.53"
+curl -s -o /dev/null -w '%{http_code}' https://thrudhame.github.io/communico/lite/       → 200 (tip unchanged)
+```
+Plus a headless live smoke against the deployed /lite-v0/ (uncommitted
+probe script): create room → send → message rendered with content-hash
+ids, transport badge `broadcast`, zero page exceptions →
+`LIVE SMOKE: PASS`. The frozen build serves and runs.
+
 ## Blockers
 
 ### MB1 — matrix-sync start gate failed: tree dirty (LP/W0 backlog uncommitted) (STOP-AND-REPORT)
