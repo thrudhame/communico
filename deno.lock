@@ -14,9 +14,12 @@
     "jsr:@std/internal@^1.0.12": "1.0.14",
     "jsr:@std/internal@^1.0.14": "1.0.14",
     "jsr:@std/media-types@1": "1.1.0",
+    "jsr:@std/path@*": "1.1.6",
     "jsr:@std/path@1": "1.1.6",
     "jsr:@std/path@^1.1.3": "1.1.6",
     "jsr:@std/path@^1.1.5": "1.1.6",
+    "npm:path-to-regexp@*": "8.2.0",
+    "npm:path-to-regexp@8.2.0": "8.2.0",
     "npm:path-to-regexp@^6.3.0": "6.3.0",
     "npm:pg@*": "8.16.3",
     "npm:pg@^8.16.3": "8.16.3"
@@ -42,7 +45,7 @@
         "jsr:@std/http",
         "jsr:@std/media-types",
         "jsr:@std/path@1",
-        "npm:path-to-regexp"
+        "npm:path-to-regexp@^6.3.0"
       ]
     },
     "@std/assert@1.0.19": {
@@ -91,6 +94,9 @@
   "npm": {
     "path-to-regexp@6.3.0": {
       "integrity": "sha512-Yhpw4T9C6hPpgPeA28us07OJeqZ5EzQTkbfwuhsUg0c237RomFoETJgmp2sa3F/41gfLE6G5cqcYwznmeEeOlQ=="
+    },
+    "path-to-regexp@8.2.0": {
+      "integrity": "sha512-TdrF7fW9Rphjq4RjrW0Kp2AW0Ahwu9sRGTkS6bvDi0SCwZlEZYmcfDbEsTz8RVk0EHIS/Vd1bv3JhG+1xZuAyQ=="
     },
     "pg-cloudflare@1.2.7": {
       "integrity": "sha512-YgCtzMH0ptvZJslLM1ffsY4EuGaU0cx4XSdXLRFae8bPP4dS5xL1tNB3k2o/N64cHJpwU7dxKli/nZ2lUa5fLg=="

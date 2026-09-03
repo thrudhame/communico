@@ -1064,6 +1064,27 @@ the site then comes up at `https://thrudhame.github.io/communico/`
 (landing) and `…/communico/lite/` (demo). gh CLI on this machine is
 unauthenticated, so the enable step could not be done from here.
 
+**Live deployment (2026-08-25/26, user-authorized with token via
+direnv+.envrc — file gitignored in a `chore:` commit):** Pages enabled
+via `gh api` (`build_type: workflow`), then a deploy failure traced to
+the `github-pages` environment's **deployment branch policy allowing
+only `main`** — added `spike/communico-lite` to the policy (recorded as
+the operational gotcha for next time). A dispatched run then went
+**build ✓ deploy ✓**, site live at
+`https://thrudhame.github.io/communico/` (landing: "your **personal**
+matrix server") and `…/lite/` (demo). Live headless smoke found and
+fixed one real bug on slow relays: `send()` announced before rendering
+(`ms.announceLocalIngest()` threw while `ms` was still null during
+trystero join, leaving the message committed but unrendered) — fixed in
+`d95500d` (`fix: Render message before announcing (transport may still
+be connecting)`: render-first, ms-null-safe `pendingAnnounce` flushed on
+transport resolve). Final live verification on the deployed build:
+create room → send → **"hello from GitHub Pages" in the timeline with
+its content-hash id** (`$oAuNs0ctPILm0M3DddajDXPDRbPOYs9F7zM9AuZ-05A`),
+transport badge `trystero`. `.envrc` handling: `/.envrc` added to
+`.gitignore` (user-added token file; never committed, never read into
+output; used only via `direnv exec`).
+
 **Human run, round 2 (unchanged from MS3-prep, with two reminders):**
 ```
 deno run --allow-net --allow-read lite/web/serve.ts   # serves :8787
