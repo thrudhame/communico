@@ -297,6 +297,112 @@ export function extremities(room) {
   });
 }
 
+// ---- dolt-native sync support (v1b; forms proven by the LB spikes) ----
+
+// Full store image for shipping to a peer (LP1-winning form).
+export async function exportStoreImage(room) {
+  const sqlite3 = await sqlite3Ready();
+  return sqlite3.capi.sqlite3_js_db_export(room.db.pointer);
+}
+
+// Branch names the peer must merge after fetching our image: our alive
+// extremity branches (their histories include everything main carries).
+export function aliveBranches(room) {
+  return [...new Set(room.extremityList.map((e) => e.branch))].sort();
+}
+
+function ensurePeerRemote(room, rname, path) {
+  const seen = room.db.selectValue(
+    `SELECT COUNT(*) FROM dolt_remotes WHERE name = '${rname}'`);
+  if (Number(seen) === 0) {
+    room.db.exec(`SELECT dolt_remote('add','${rname}','file://${path}')`);
+  }
+}
+
+// Heal one remote ref into the active branch via the LS3 driver; commits a
+// merge only when the working set actually changed (up-to-date refs are a
+// no-op). Content-change detection reuses the table-hash pair.
+// Fast-forward case (recorded verbatim): an ff-able dolt_merge inside the
+// txn moves the ref immediately and leaves a clean tree, so dolt_commit
+// errors "nothing to commit, working tree clean (use dolt_add to stage
+// changes)" — the heal has already landed; tolerate it.
+function healMerge(room, ref) {
+  const { db } = room;
+  const before = tableHashes(room);
+  db.exec('BEGIN');
+  try {
+    mergeDriver(db, ref);
+    const after = tableHashes(room);
+    if (before.events !== after.events || before.state !== after.state) {
+      try {
+        db.selectValue(`SELECT dolt_commit('-Am','heal: merge ${ref}')`);
+        room.merges++;
+      } catch (e) {
+        if (!/nothing to commit/i.test(e.message)) throw e;
+      }
+    }
+  } finally {
+    try { db.exec('COMMIT'); } catch { /* dolt_commit finalized the txn (recorded) */ }
+  }
+}
+
+// After any remote-adoption the in-memory bookkeeping no longer matches the
+// store (events arrived as commits, not ingests): rebuild the index from the
+// events table and collapse to ONE extremity (the active branch's tip). All
+// events share the tip hash — post-collapse there are no interior prevs, so
+// the per-event hash precision is never needed (recorded limitation).
+function rebuildIndex(room) {
+  const { db } = room;
+  const tipBranch = db.selectValue('SELECT active_branch()');
+  const tipHash = db.selectValue(`SELECT dolt_hashof('${tipBranch}')`);
+  room.eventIndex.clear();
+  let tipEvt = null;
+  for (const r of db.selectObjects(`SELECT event_id, origin_ts FROM events`)) {
+    room.eventIndex.set(r.event_id, { hash: tipHash, branch: tipBranch, alive: true, origin_ts: r.origin_ts });
+    if (!tipEvt || r.origin_ts > tipEvt.origin_ts ||
+        (r.origin_ts === tipEvt.origin_ts && r.event_id > tipEvt.event_id)) {
+      tipEvt = r;
+    }
+  }
+  room.extremityList = tipEvt ? [{ eventId: tipEvt.event_id, branch: tipBranch }] : [];
+}
+
+// Remote-adoption path (the dolt pull): write the peer's store image to a
+// stable per-peer MEMFS file (in-place update — LB1-proven overwrite), fetch
+// from it, then merge each named branch (dolt_branches does NOT enumerate
+// remote refs — LB3b — so the sender names its alive branches explicitly).
+// Empty local store (joiner) bootstraps via dolt_reset --hard onto the first
+// named branch (LB3b), then moves to a working branch so main is never an
+// extremity (main cannot be deleted — PB3).
+export async function adoptStoreImage(room, bytes, peerId, branches) {
+  const sqlite3 = await sqlite3Ready();
+  const safe = String(peerId).replace(/[^A-Za-z0-9_-]/g, '_');
+  const rname = `peer_${safe}`;
+  const path = `/peer-${safe}.db`;
+  sqlite3.capi.sqlite3_js_vfs_create_file('unix', path, bytes, bytes.byteLength);
+  ensurePeerRemote(room, rname, path);
+  room.db.selectValue(`SELECT dolt_fetch('${rname}')`);
+  const list = [...new Set(branches ?? [])].sort();
+  if (!list.length) throw new Error('adoptStoreImage: peer named no branches');
+  if (room.eventIndex.size === 0) {
+    room.db.exec(`SELECT dolt_reset('--hard','${rname}/${list[0]}')`);
+    room.db.exec(`SELECT dolt_checkout('-b','xboot')`);
+    for (const b of list.slice(1)) healMerge(room, `${rname}/${b}`);
+  } else {
+    for (const b of list) healMerge(room, `${rname}/${b}`);
+    // collapse any other alive extremities into the active tip
+    const active = room.db.selectValue('SELECT active_branch()');
+    for (const e of [...room.extremityList]) {
+      if (e.branch !== active && e.branch !== 'main') {
+        healMerge(room, e.branch);
+        try { room.db.exec(`SELECT dolt_branch('-D','${e.branch}')`); } catch { /* best effort */ }
+      }
+    }
+  }
+  rebuildIndex(room);
+  return { applied: true };
+}
+
 export function rawQuery(room, sql) {
   if (!/^\s*(SELECT|PRAGMA)\b/i.test(sql)) {
     throw new Error('read-only: only SELECT/PRAGMA allowed in this console');

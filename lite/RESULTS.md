@@ -1268,6 +1268,113 @@ pages.yml leg `www/lite-v1a/`, landing version list row. The two-browser
 field round on the live URL remains the human-gated step (recipe under
 "Human run, round 2" above, s/localhost:8787/the Pages URL/).
 
+## LB log (lite-v1 Phase B — dolt-native sync)
+
+### LB spikes (`lb-spikes.html|js` + `check-lb.ts`) — LP2b revived on 0.50.3
+
+Gate: fork + heal + late-peer scenarios clean + 10-generation longevity on
+the REMOTE path (#2568 regression watch). Transcript of the final fresh run
+(`deno run -A lite/web/check-lb.ts` → exit 0):
+
+```
+INFO lb1: dolt_fetch('peerA') rc=0
+INFO lb1: dolt_remotes = [{"name":"peerA","url":"file:///peer-lb1a.db","fetch_specs":"[\"refs/heads/*:refs/remotes/peerA/*\"]","params":"{}"}]
+INFO lb1: dolt_log('peerA/main') messages = ["event $lb1-a2","event $lb1-a1","schema genesis","Initialize data repository"]
+INFO lb1: hashof('peerA/main')=9f0642d1… hashof('remotes/peerA/main')=9f0642d1… A tip=9f0642d1…
+INFO lb1: vfs_create_file over existing path: ok
+INFO lb1: after in-place update: peerA/main=95db7cba… (A tip 95db7cba…); log has a3=true
+LB1: PASS (dolt_remote add + dolt_fetch over file:// works in wasm 0.50.3; in-place update → incremental fetch)
+INFO lb2: heal B←peerA/main: driver (commit 6f9a71b1); heal A←peerB/main: driver (commit 7376d558)
+INFO lb2: dolt_hashof_db A=27eb75e8ce15 B=27eb75e8ce15 (tracks working-set content, not refs — merge commits differ, hash still equal)
+LB2: PASS (fork healed via fetch + driver merge both directions; events fdfb2a5b== state d37fd3d1==; topic='topic-by-B' both sides)
+INFO lb3: C merge('peerA/main') → 1da5e7ee…
+LB3: PASS (late-peer bootstrap from bytes + catch-up via dolt_fetch + ff merge; C main == A tip)
+INFO lb3b: dolt_branches after fetch = [{"name":"main","remote":"","branch":""}]
+INFO lb3b: merge of unrelated history returned 54dd3322… (no refusal)
+LB3b: PASS (unrelated-genesis joiner bootstraps via fetch + dolt_reset --hard; tables equal; commits on top work)
+LB4-GEN 1..10: ok (15–35 ms each)
+LB4: 10/10 GENERATIONS CLEAN
+LB SPIKES: 5/5 PASS
+```
+
+Discoveries (all captured, none guessed):
+- `dolt_remote('add',…)` + `dolt_fetch` over `file://` **works in wasm
+  0.50.3** (rc=0 — PB2's ABI-crash class is gone).
+- Refs land as `refs/remotes/<name>/*`; both `'peerA/main'` and
+  `'remotes/peerA/main'` spellings resolve in `dolt_log`/`dolt_hashof`/
+  `dolt_merge`.
+- **`dolt_branches` does NOT enumerate remote-tracking refs** (LB3b:
+  only `main` listed after fetch) → the sync protocol names the peer's
+  alive branches explicitly in the store message.
+- **`vfs_create_file('unix', path, bytes)` overwrites an existing path**
+  (undocumented; discovered in LB1) → peer store files update IN PLACE →
+  subsequent fetches are incremental from dolt's perspective.
+- `dolt_merge` of **unrelated histories does NOT refuse** in 0.50.3
+  (returned a merge hash) — the engine joiner still bootstraps via
+  `dolt_reset('--hard','<remote>/<branch>')` (LB3b: history-agnostic;
+  commits on top work).
+- LB2 convergence: `dolt_hashof_db` came out **equal** across both healed
+  replicas despite distinct merge-commit hashes — tracks working-set
+  content, not refs. The plan's certificate (`dolt_hashof_table`) is the
+  rigorous one.
+- LB4: 10/10 generations clean on the REMOTE path (15–35 ms/gen).
+
+### v1b integration — peer sync via `file://` remote + `dolt_fetch`
+
+- `engine-lite.js` — dolt-native block: `exportStoreImage` /
+  `aliveBranches` / `adoptStoreImage` (per-peer remote, in-place file
+  update, fetch, merge each NAMED branch, collapse other extremities,
+  `rebuildIndex` from the events table) + `healMerge`. Bootstrap (empty
+  store) = `dolt_reset('--hard', …)` + `xboot` working branch (main can
+  never be an extremity — PB3: it cannot be deleted).
+- `sync/dsync.js` — Protocol "dolt v1": `heads` (th gossip) / `want` /
+  `store` (branches + binary store bytes). Bootstrap via 2 s-cadence want
+  (MS4 lesson); one outstanding want per peer, re-armed on fresh heads;
+  store applications serialized; convergence = th equal. "Peer sync is
+  literally dolt pull."
+- `app.js`/`index.html` — `?sync=` selector (**dolt default**, `?sync=msync`
+  keeps the custom protocol selectable — §9.2 ruling) + `sync: dolt|msync`
+  badge next to the transport badge. check-msync pinned `?sync=msync`
+  (keeps the msync regression net after the default flip); check-dsync
+  pins `?sync=dolt` (never silently follows a future default change).
+  **Recorded limitation: the two modes do NOT interoperate** (each
+  envelope ignores the other; mixed-mode rooms don't converge). In dolt
+  mode the fork indicator does not fire — forks heal at the store level
+  (collapse-on-heal); convergence certificate = equal table hashes, same
+  as the plan says.
+
+**The ff-inside-txn defect (captured → root-caused → fixed, red-green).**
+First `check-dsync` run: cross-sends stalled >15 s, yet stores converged
+lazily (table hashes equal at the end, 5 vs 5 rows, DOM behind DB).
+Instrumented probe caught the exact throw:
+```
+SQLITE_ERROR: sqlite3 result code 1: nothing to commit, working tree clean (use dolt_add to stage changes)
+    at healMerge (engine-lite.js) ← adoptStoreImage (engine-lite.js)
+```
+Mechanism: `healMerge` assumed `dolt_merge` inside an explicit txn always
+leaves a staged merge to commit (LS3's conflict case). An **ff-able**
+merge instead moves the ref immediately and leaves a clean tree; the
+table-hash change guard then called `dolt_commit` → "nothing to commit" →
+the adoption threw AFTER the merge had landed → `rebuildIndex`/`onChange`
+skipped → DB converged, DOM never re-rendered. Fix: tolerate the captured
+text (the ff heal already landed); the no-change guard keeps the true
+no-op from erroring. Red-green: check-dsync exit 1 (stall) → fix → exit 0
+(TABLE HASHES EQUAL). Diagnostic sidetrack recorded honestly: the first
+instrumentation line used TS syntax (`as any`) in browser-served
+`dsync.js` — SyntaxError killed `app.js` on the page; two probe runs came
+back empty before that was understood.
+
+### Verdicts (all fresh, this tree)
+
+`bash lite/spikes/native/run.sh` → `SPIKE LS1..LS6: PASS` (6/6).
+`check-spikes` 4/4 PASS · `check-poc` PASS · `check-lp` PASS (LP2C default
+gate) · `check-ms0` 3/3 PASS · `check-msync` PASS (`?sync=msync`) ·
+`check-trystero-load` PASS · `check-lb` 5/5 + LB4 10/10 · `check-dsync`
+PASS (late-peer bootstrap 450 ms; cross-sends "delivered via dolt pull"
+both ways; concurrent sends healed via store merge; timelines identical
+6 rows; **TABLE HASHES EQUAL — Merkle-certified convergence,
+dolt-native**; sync badge `dolt`).
+
 ## Blockers
 
 ### MB1 — matrix-sync start gate failed: tree dirty (LP/W0 backlog uncommitted) (STOP-AND-REPORT)

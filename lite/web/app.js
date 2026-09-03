@@ -3,9 +3,11 @@
 // an own store from events via the sync protocol (empty-tips delta-req).
 import {
   createRoom, joinRoom, ingestEvent, ingestRemote, timeline, doltLog,
-  tableHashes, extremities, rawQuery,
+  tableHashes, extremities, rawQuery, exportStoreImage, aliveBranches,
+  adoptStoreImage,
 } from './engine-lite.js';
 import { startMsync } from './sync/msync.js';
+import { startDsync } from './sync/dsync.js';
 import { createTransport } from './sync/transport.js';
 
 const $ = (id) => document.getElementById(id);
@@ -21,11 +23,19 @@ let pendingAnnounce = false; // a message landed before transport was ready
 const transportKind = new URLSearchParams(location.search).get('transport')
   ?? (['localhost', '127.0.0.1'].includes(location.hostname) ? 'broadcast' : 'trystero');
 
+// v1b (§9.2 ruling): sync mode is selectable — dolt-native (store bytes →
+// file:// remote → dolt_fetch + driver merge) is the default; ?sync=msync
+// keeps the custom event-sync protocol for A/B against v0/v1a.
+const syncKind = new URLSearchParams(location.search).get('sync') ?? 'dolt';
+
 const facade = {
   getRoom: () => room,
   extremities: (r) => extremities(r),
   tableHashes: (r) => tableHashes(r),
   ingestRemote: (r, e) => ingestRemote(r, e),
+  exportStoreImage: (r) => exportStoreImage(r),
+  aliveBranches: (r) => aliveBranches(r),
+  adoptStoreImage: (r, bytes, peerId, branches) => adoptStoreImage(r, bytes, peerId, branches),
 };
 
 function renderTimeline() {
@@ -118,7 +128,8 @@ async function start(role) {
 
     $('status').textContent = 'connecting transport…';
     const transport = createTransport(transportKind);
-    ms = await startMsync({
+    const startSync = syncKind === 'msync' ? startMsync : startDsync;
+    ms = await startSync({
       engine: facade, transport, roomName,
       joiner: role === 'join',
       onChange: () => {
@@ -138,6 +149,7 @@ async function start(role) {
 
     $('role').textContent = `role: ${role === 'create' ? 'creator' : 'joiner'}`;
     $('transport').textContent = `transport: ${transportKind}`;
+    $('syncmode').textContent = `sync: ${syncKind}`;
     $('status').textContent = '';
 
     if (role === 'create') ms.announce();
