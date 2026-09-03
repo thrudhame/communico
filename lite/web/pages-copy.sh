@@ -17,6 +17,7 @@ dst="$2"
 mkdir -p "$dst/node_modules/@trystero-p2p" "$dst/node_modules/@dolthub" "$dst/node_modules/@noble"
 
 cp "$src/index.html" "$src/app.js" "$src/engine-lite.js" \
+   "$src/lb-spikes.html" "$src/lb-spikes.js" \
    "$src/lp-spikes.html" "$src/lp-spikes.js" \
    "$src/ms-spikes.html" "$src/ms-spikes.js" \
    "$src/msync-longevity.html" "$src/msync-longevity.js" \
