@@ -1393,6 +1393,19 @@ Frozen versions cross-checked the same evening: `/lite/` 0.50.3,
 two-browser field round (live URL, trystero transport) remains the
 human-gated step per the MS5 recipe.
 
+**Field-defect addendum — trystero bootstrap (user-reported "can't join
+on the live URL"; fixed `c1d7250`, red-green).** Trystero splits
+envelope/bytes across two adapter actions (`msgA`/`binA`), so a bare
+store image arrives as the synthetic `{t:'bin'}` envelope — dsync only
+handled the BroadcastChannel shape (`{...obj, bytes}` in one envelope),
+so joins stalled (genesis never visible on the joiner). Accept both
+origins; branch list via `engine.branchesInImage` when the transport
+can't carry it. Verified: local trystero join probe FAIL (no genesis on
+joiner) → fix → PASS (`stores: 2, applied: 2`). Red-green at the failing
+transport. Full sweep green on the fix tree (native 6/6, check-spikes
+4/4, check-poc, check-lp (LP2C default), check-ms0, check-dsync
+convergence — identical timelines + equal table hashes).
+
 ## Blockers
 
 ### MB1 — matrix-sync start gate failed: tree dirty (LP/W0 backlog uncommitted) (STOP-AND-REPORT)
