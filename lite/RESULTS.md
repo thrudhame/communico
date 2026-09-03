@@ -1255,6 +1255,19 @@ same deterministic generation hashes as the with-workaround run) ·
 `check-ms0` PASS · `check-msync` PASS (TABLE HASHES EQUAL) ·
 `check-trystero-load` PASS. **Green without the crutch.**
 
+**Live on 0.50.3 + lite-v1a freeze (2026-09-03):** pushed `9e23791` (docs)
++ `3be12f4` (feat) + `cec25bb` (refactor); Pages run 33729535638
+build ✓ deploy ✓. Live probes on `https://thrudhame.github.io/communico/lite/`:
+`/lite/node_modules/@dolthub/doltlite-wasm/package.json` →
+`"version": "0.50.3"`; deployed `engine-lite.js` contains zero `retry`
+occurrences (workaround verified gone on the live build); headless live
+smoke (same uncommitted probe as Phase 0): create room → send →
+content-hash ids rendered, badge `broadcast`, zero page exceptions →
+`LIVE SMOKE v1a: PASS`. v1a then frozen: tag `lite-v1a` → `cec25bb`,
+pages.yml leg `www/lite-v1a/`, landing version list row. The two-browser
+field round on the live URL remains the human-gated step (recipe under
+"Human run, round 2" above, s/localhost:8787/the Pages URL/).
+
 ## Blockers
 
 ### MB1 — matrix-sync start gate failed: tree dirty (LP/W0 backlog uncommitted) (STOP-AND-REPORT)
