@@ -36,6 +36,11 @@ jobs:
       - run: npm ci
         working-directory: refs/lite-v1a/lite/web
       - run: bash refs/lite-v1a/lite/web/pages-copy.sh refs/lite-v1a/lite/web www/lite-v1a
+      - uses: actions/checkout@v4
+        with: { ref: lite-v1b, path: refs/lite-v1b }
+      - run: npm ci
+        working-directory: refs/lite-v1b/lite/web
+      - run: bash refs/lite-v1b/lite/web/pages-copy.sh refs/lite-v1b/lite/web www/lite-v1b
       - uses: actions/upload-pages-artifact@v3
         with: { path: www }
   deploy:

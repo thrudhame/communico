@@ -1375,6 +1375,24 @@ both ways; concurrent sends healed via store merge; timelines identical
 6 rows; **TABLE HASHES EQUAL — Merkle-certified convergence,
 dolt-native**; sync badge `dolt`).
 
+**Live on v1b + lite-v1b freeze (2026-09-03):** pushed `b9bdc18` (LB
+spikes) + `0b324e5` (v1b engine); Pages run 33775251453 build ✓ deploy ✓.
+Live two-page smoke on `https://thrudhame.github.io/communico/lite/`
+(`?transport=broadcast`, default sync mode), verbatim:
+```
+A sync badge: "sync: dolt"
+B bootstrapped via dolt pull (store bytes → fetch → reset)
+B received A's message via dolt-native heal
+table hashes — A: 3489a235…/a37a66f9… B: 3489a235…/a37a66f9…
+TABLE HASHES EQUAL ✓ (live, dolt-native)
+LIVE SMOKE v1b: PASS
+```
+Frozen versions cross-checked the same evening: `/lite/` 0.50.3,
+`/lite-v1a/` 0.50.3, `/lite-v0/` 0.11.53. v1b frozen: tag `lite-v1b` →
+`0b324e5`, pages.yml leg `www/lite-v1b/`, landing version list row. The
+two-browser field round (live URL, trystero transport) remains the
+human-gated step per the MS5 recipe.
+
 ## Blockers
 
 ### MB1 — matrix-sync start gate failed: tree dirty (LP/W0 backlog uncommitted) (STOP-AND-REPORT)
