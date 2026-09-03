@@ -7,11 +7,14 @@
 //   {t:'heads', room, th:{events,state}} — convergence gossip: after every
 //     local ingest, on peer appear, and after every applied store.
 //   {t:'want', room} — request the peer's store image.
-//   {t:'store', room, branches:[aliveBranch…]} + binary store bytes.
-//   (branches are named explicitly: dolt_branches does not enumerate remote
-//   refs — LB3b.)
+//   {t:'store', room, hasBytes:true, branches:[aliveBranch…]} + binary store
+//     bytes. (branches are named explicitly: dolt_branches does not enumerate
+//     remote refs — LB3b. Tristero splits envelope/bytes across two actions,
+//     so a bare payload arrives as the adapter's synthetic {t:'bin'} — the
+//     branch list then comes from branchesInImage on the receiver.)
 // Convergence rule: want when the peer's th differs from ours (or we hold
-// no events); one outstanding want per peer; gossip settles when th equal.
+// no events); one outstanding want per peer, re-armed on fresh heads;
+// gossip settles when th equal.
 // Modes do not interoperate (msync and dolt envelopes ignore each other) —
 // recorded limitation.
 
@@ -44,7 +47,13 @@ export async function startDsync({ engine, transport, roomName, joiner = false, 
     const room = engine.getRoom();
     if (!room || !bytes) return;
     stats.stores++;
-    await engine.adoptStoreImage(room, new Uint8Array(bytes), from, branches);
+    // trystero's bin path carries no branch list — fall back to reading the
+    // peer image's own x-branch names (they are its alive extremity tips).
+    let list = branches;
+    if (!list?.length) {
+      list = await engine.branchesInImage(bytes);
+    }
+    await engine.adoptStoreImage(room, new Uint8Array(bytes), from, list);
     stats.applied++;
     stats.merges = room.merges;
     onChange?.();
@@ -56,14 +65,17 @@ export async function startDsync({ engine, transport, roomName, joiner = false, 
     return !!room && room.eventIndex.size > 0;
   };
 
+    // joiner/pausing semantics (MS4 lesson): a peer appearing while we are
+    // unbootstrapped triggers an immediate want (timer-independent); the
+    // flood below is admission-of-disbelief — arrival means peer.
+  const handlePeer = (peers) => {
+    onPeers?.(peers);
+    if (peers.length && engine.getRoom()) announce();
+    if (joiner && peers.length && !bootstrapped()) send({ t: 'want', room: roomName });
+  };
+
   const session = await transport.join(roomName, {
-    onPeer: (peers) => {
-      onPeers?.(peers);
-      if (peers.length && engine.getRoom()) announce();
-      // joiner rescue (MS4 lesson): a peer appearing while we are
-      // unbootstrapped triggers an immediate want (timer-independent).
-      if (joiner && peers.length && !bootstrapped()) send({ t: 'want', room: roomName });
-    },
+    onPeer: handlePeer,
     onMessage: (obj, bytes, from) => {
       if (!obj || obj.room !== roomName) return;
       const room = engine.getRoom();
@@ -78,10 +90,20 @@ export async function startDsync({ engine, transport, roomName, joiner = false, 
       } else if (obj.t === 'want') {
         if (!room || room.eventIndex.size === 0) return; // nothing worth shipping yet
         engine.exportStoreImage(room).then((img) => {
-          send({ t: 'store', room: roomName, branches: engine.aliveBranches(room) },
+          send({ t: 'store', room: roomName, hasBytes: true, branches: engine.aliveBranches(room) },
             img.buffer.slice(img.byteOffset, img.byteOffset + img.byteLength));
         });
-      } else if (obj.t === 'store') {
+      } else if (obj.t === 'bin' && bytes) {
+        // trystero origin: the adapter splits envelope/bytes across two
+        // actions and synthesizes t:'bin' for a bare payload — the store
+        // case is the only binary sender in this protocol.
+        outstandingWant.delete(from);
+        stats.received++;
+        applying = applying.then(() => applyStore(from, null, bytes))
+          .catch((e) => onHeld?.([{ storeFrom: from, error: String(e?.message ?? e) }]));
+      } else if ((obj.t === 'store' || obj.bytes) && bytes) {
+        // BC origin (bytes inside the envelope) or a store with the
+        // envelope delivered first on trystero.
         outstandingWant.delete(from);
         stats.received++;
         applying = applying.then(() => applyStore(from, obj.branches, bytes))
@@ -90,7 +112,10 @@ export async function startDsync({ engine, transport, roomName, joiner = false, 
     },
   });
 
-  // Joiner bootstrap: uncapped 2 s-cadence want until bootstrapped (MS4).
+  // Joiner bootstrap: flood only while it matters (MS4 lesson, now
+  // load-bearing in dolt mode — a whole store image has to arrive, not one
+  // delta). outstandingWant keeps the request bounded; bootstrapped() ends
+  // the loop once the store lands.
   let left = false;
   if (joiner) {
     const ask = () => {

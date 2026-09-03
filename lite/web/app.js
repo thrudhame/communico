@@ -4,7 +4,7 @@
 import {
   createRoom, joinRoom, ingestEvent, ingestRemote, timeline, doltLog,
   tableHashes, extremities, rawQuery, exportStoreImage, aliveBranches,
-  adoptStoreImage,
+  adoptStoreImage, branchesInImage,
 } from './engine-lite.js';
 import { startMsync } from './sync/msync.js';
 import { startDsync } from './sync/dsync.js';
@@ -36,6 +36,7 @@ const facade = {
   exportStoreImage: (r) => exportStoreImage(r),
   aliveBranches: (r) => aliveBranches(r),
   adoptStoreImage: (r, bytes, peerId, branches) => adoptStoreImage(r, bytes, peerId, branches),
+  branchesInImage: (bytes) => branchesInImage(bytes),
 };
 
 function renderTimeline() {

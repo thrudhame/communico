@@ -403,6 +403,22 @@ export async function adoptStoreImage(room, bytes, peerId, branches) {
   return { applied: true };
 }
 
+// Read the x-branch list out of a store IMAGE (probe — a peer image's alive
+// extremity tips; used when the transport's binary path can't carry the
+// branch list, i.e. trysteros's synthetic t:'bin' envelope).
+export async function branchesInImage(bytes) {
+  const sqlite3 = await sqlite3Ready();
+  const path = `/probe-${crypto.randomUUID()}.db`;
+  sqlite3.capi.sqlite3_js_vfs_create_file('unix', path, bytes, bytes.byteLength);
+  const db = new sqlite3.oo1.DB(path);
+  try {
+    return db.selectObjects(`SELECT name FROM dolt_branches`)
+      .map((r) => r.name).filter((n) => /^x\d+$/.test(n)).sort();
+  } finally {
+    db.close();
+  }
+}
+
 export function rawQuery(room, sql) {
   if (!/^\s*(SELECT|PRAGMA)\b/i.test(sql)) {
     throw new Error('read-only: only SELECT/PRAGMA allowed in this console');
