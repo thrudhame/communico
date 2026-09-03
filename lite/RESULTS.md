@@ -1406,6 +1406,11 @@ transport. Full sweep green on the fix tree (native 6/6, check-spikes
 4/4, check-poc, check-lp (LP2C default), check-ms0, check-dsync
 convergence — identical timelines + equal table hashes).
 
+**Tag re-point (2026-09-03, user-sanctioned):** `lite-v1b` moved from
+`0b324e5` (pre-fix) to `96e9279` so the frozen `/lite-v1b/` build carries
+the D2 trystero bootstrap fix; found by post-execution verification (the
+served `dsync.js` on the frozen URL lacked the fix marker).
+
 ## Blockers
 
 ### MB1 — matrix-sync start gate failed: tree dirty (LP/W0 backlog uncommitted) (STOP-AND-REPORT)
