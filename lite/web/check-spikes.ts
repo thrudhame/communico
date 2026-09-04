@@ -2,6 +2,7 @@
 // the results pre to reach its final line, assert 4/4 PASS, print the full
 // text, exit 0/1. Requires the server: deno run --allow-net --allow-read
 // lite/web/serve.ts  (this script starts it for you if :8787 is closed).
+/// <reference lib="dom" />
 import { launch } from "jsr:@astral/astral";
 
 const BASE = "http://localhost:8787";

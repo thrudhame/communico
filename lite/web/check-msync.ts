@@ -42,7 +42,7 @@ async function waitFor(page: Page, what: string, pred: string, timeoutMs = 10_00
   let v = "";
   while (Date.now() < deadline) {
     try {
-      v = await page.evaluate((p) => String(eval(p)), { args: [pred] });
+      v = await page.evaluate((p: string) => String(eval(p)), { args: [pred] });
     } catch { /* page busy */ }
     if (v === "true") return v;
     await new Promise((r) => setTimeout(r, 250));
@@ -103,7 +103,7 @@ try {
 
   // helper: send a message in a page
   const send = (page: Page, body: string) =>
-    page.evaluate((b) => {
+    page.evaluate((b: string) => {
       (document.getElementById("msg") as HTMLInputElement).value = b;
       document.getElementById("send")!.click();
     }, { args: [body] });

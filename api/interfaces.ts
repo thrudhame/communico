@@ -14,7 +14,9 @@ export interface TApiComponentRequest {
   method: HTTPMethods;
   userAgent: Request["userAgent"];
   // not in oak's request
-  params: RouterContext<string>["params"];
+  // oak ≥17 types route params as possibly-undefined; consumers read
+  // with the house pattern `request.params.x!`
+  params: Record<string, string | undefined>;
   // URL query string (?a=b) — not in oak's request pick above
   search: URLSearchParams;
 }
