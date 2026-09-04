@@ -83,6 +83,6 @@ Deno.test('engine invariant: commit = event', async () => {
   assertEquals(chunk[4].event_id, createEventId);
 
   // single extremity
-  const xb = await extremities(dbName);
+  const xb = await extremities(dbName, ROOM);
   assertEquals(xb.length, 1);
 });

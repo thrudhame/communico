@@ -28,7 +28,7 @@ Deno.test('>2 prev_events: clean rejection (D1), no commit, branches intact', as
     ids.push(r.event_id);
   }
 
-  const xb = await extremities(dbName);
+  const xb = await extremities(dbName, ROOM);
   assertEquals(xb.length, 3, 'three extremity branches');
 
   // commit census across all branches before the attempt
@@ -68,6 +68,10 @@ Deno.test('>2 prev_events: clean rejection (D1), no commit, branches intact', as
   // no new commit appeared; extremity set unchanged
   const after = await totalCommits();
   assertEquals(after, before, 'commit count must be unchanged');
-  const xb2 = await extremities(dbName);
-  assertEquals(xb2.sort(), [...xb].sort(), 'same three extremity branches');
+  const xb2 = await extremities(dbName, ROOM);
+  assertEquals(
+    xb2.map((e) => e.branch).sort(),
+    xb.map((e) => e.branch).sort(),
+    'same three extremity branches',
+  );
 });

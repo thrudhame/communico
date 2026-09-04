@@ -86,13 +86,35 @@ export async function lookupRoom(roomId: string): Promise<RoomInfo | null> {
   });
 }
 
-// Extremities are only x* branches (main is never an extremity).
-export async function extremities(dbName: string): Promise<string[]> {
+// Extremities are only x* branches (main is never an extremity). Returns
+// the tip EVENT id + branch per live extremity (event_index.branch_name
+// join; stale rows are excluded by joining against live dolt.branches).
+export interface Extremity {
+  eventId: string;
+  branch: string;
+}
+
+export async function extremities(
+  dbName: string,
+  roomId: string,
+): Promise<Extremity[]> {
   return await withDb(dbName, async (c) => {
     const r = await c.query('SELECT name FROM dolt.branches;');
     // deno-lint-ignore no-explicit-any
-    return r.rows.map((row: any) => String(row.name)).filter((n: string) =>
-      n.startsWith('x')
+    const xbranches = r.rows.map((row: any) => String(row.name)).filter(
+      (n: string) => n.startsWith('x'),
     );
+    if (xbranches.length === 0) return [];
+    return await withDb(SERVER_DB, async (s) => {
+      const idx = await s.query(
+        'SELECT event_id, branch_name FROM event_index WHERE room_id = $1 AND branch_name = ANY($2);',
+        [roomId, xbranches],
+      );
+      // deno-lint-ignore no-explicit-any
+      return idx.rows.map((row: any) => ({
+        eventId: String(row.event_id),
+        branch: String(row.branch_name),
+      }));
+    });
   });
 }

@@ -48,7 +48,7 @@ Deno.test('fork/merge: 2-prev event lands a 2-parent commit, latest-wins state',
   });
 
   // 2 extremities
-  const xb = await extremities(dbName);
+  const xb = await extremities(dbName, ROOM);
   assertEquals(xb.length, 2, 'two x* extremity branches after the fork');
 
   // E3 merges the fork
@@ -81,7 +81,7 @@ Deno.test('fork/merge: 2-prev event lands a 2-parent commit, latest-wins state',
   assertEquals(topic.content.topic, 'dogs');
 
   // single extremity after the merge
-  const xb2 = await extremities(dbName);
+  const xb2 = await extremities(dbName, ROOM);
   assertEquals(xb2.length, 1, 'one x* extremity after the merge');
 
   // causal order in /messages (newest-first): E3 first, then E2a/E2b,
