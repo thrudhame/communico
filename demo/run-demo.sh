@@ -70,8 +70,10 @@ TERMINAL 3 — watch the conversation become commits (every 2 s):
     await c.end();
   \"'"
 
-Each send prints an event id of the form \$<32 chars> — that IS the Dolt
-commit hash of the message's commit (room version test.communico.dolt.v1).
+Each send prints an event id of the form \$<43 chars> — a content hash
+of the event itself (Matrix reference-hash style, base64url). The id is
+canonical for every room; the Dolt commit hash is the server's per-store
+receipt for it (see event_index).
 Then open demo/inspection-tour.md.
 EOF
     ;;
@@ -82,7 +84,7 @@ EOF
     mc /tmp/mc-bob-send -m "$BODY" --room "$ROOM_ID" --plain
     echo ">> Act 2: alice listens once"
     # --output json: the event id only appears in debug/json output, and
-    # the check greps for it (\$<32 chars> == the Dolt commit hash)
+    # the check greps for it (\$<43 chars> == content-hash event id)
     OUT="$(mc /tmp/mc-alice --listen once --plain --output json 2>&1 || true)"
     PASS=1
     if grep -q "$BODY" <<<"$OUT"; then
@@ -90,10 +92,10 @@ EOF
     else
       echo "   BODY NOT FOUND in alice's output" >&2; PASS=0
     fi
-    if grep -qE '\$[a-z0-9]{32}' <<<"$OUT"; then
-      echo "   event id '\$<32 chars>' (= Dolt commit hash) found ✓"
+    if grep -qE '\$[A-Za-z0-9_-]{43}' <<<"$OUT"; then
+      echo "   event id '\$<43 chars>' (content-hash id) found ✓"
     else
-      echo "   no \$<32 chars> event id in alice's output" >&2; PASS=0
+      echo "   no \$<43 chars> event id in alice's output" >&2; PASS=0
     fi
     if [[ $PASS == 1 ]]; then echo "CHECK: PASS"; else echo "CHECK: FAIL" >&2; exit 1; fi
     ;;
@@ -138,7 +140,8 @@ echo
 echo "   communico — a Matrix homeserver where the database is version-controlled"
 echo "   ------------------------------------------------------------------------"
 echo "   Server storage: Doltgres. Every Matrix event lands as a Dolt COMMIT;"
-echo "   the event id a client sees IS the commit hash."
+echo "   the event id a client sees is a content hash of the event itself;"
+echo "   the commit hash is the server's per-store receipt for it."
 echo
 echo "   top panes: alice and bob — two unmodified matrix-commander clients"
 echo "              having a conversation through this homeserver"
@@ -180,7 +183,7 @@ PART
       'hey alice — every message we send becomes a commit down there' 7 \
       'room state at any moment is one AS OF query away' ''
     make_participant alice /tmp/mc-alice /tmp/mc-alice-send 18 \
-      'and the event id IS the commit hash — same 32 chars, check the log' 7 \
+      'and the event id is a content hash of the event — 43 chars, any store' 7 \
       'and syncing this room to another server is literally a dolt pull' \
       'echo; echo "-- four messages, four commits — the log below is the room --"'
     chmod +x /tmp/demo-watch.sh

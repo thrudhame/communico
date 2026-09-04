@@ -18,7 +18,7 @@ bash demo/run-demo.sh     # prints the 3-terminal choreography (or: --check for 
 `demo/setup.sh` prints the room id and the exact copy-paste commands for
 both acts. `bash demo/run-demo.sh --check` sends via one
 matrix-commander container and greps the listening one for the message
-and its `\$<32 chars>` event id.
+and its `\$<43 chars>` event id.
 
 ## What you are looking at
 
@@ -26,9 +26,11 @@ The homeserver's storage engine IS the version-controlled database. When
 matrix-commander (unmodified, from Docker Hub, matrix-nio SDK) sends a
 message, the homeserver writes it as a Dolt commit in the room's
 database; `dolt.log` on that database literally reads as the
-conversation. The demo room runs the custom room version
-`test.communico.dolt.v1`, so the event id every client displays **is the
-Dolt commit hash** of that message's commit.
+conversation. The event id every client displays is a **content hash of
+the event itself** (Matrix reference-hash style, 43 base64url chars) —
+canonical for every room, verifiable by recomputation, stable across
+stores and engines. The Dolt commit hash is the server's per-store
+receipt for the event; the explicit bijection lives in `event_index`.
 
 Because state lives in commits, things homeservers hand-build are native
 here: room state at any event is `SELECT * FROM state AS OF '<commit>'`,

@@ -1,5 +1,4 @@
 import { ident, SERVER_DB, withDb } from './db.ts';
-import { lookupRoom } from './room.ts';
 
 // Reads (dolt.log / working set) reflect HEAD; a fresh client lands on
 // `main`, which only ever holds the genesis commits — the event history
@@ -43,28 +42,11 @@ export async function messages(
   roomId: string,
   limit = 50,
 ): Promise<unknown[]> {
-  const room = await lookupRoom(roomId);
-  const modeB = room?.roomVersion === 'test.communico.dolt.v1';
   return await withDb(dbName, async (c) => {
     await checkoutReadHead(c);
     const log = await c.query(
       `SELECT commit_hash, message FROM dolt.log LIMIT ${Math.floor(limit)};`,
     );
-
-    if (modeB) {
-      // Mode B: map commits -> events by commit hash directly (phase-3
-      // step 3.1). Each event commit adds exactly one events row (the
-      // invariant); the wire id is '$' + commit hash.
-      const out: unknown[] = [];
-      for (const row of log.rows) {
-        const msg = String(row.message);
-        if (!msg.startsWith('event ')) continue;
-        const ch = String(row.commit_hash);
-        const pdu = await eventAtCommit(c, ch);
-        if (pdu) out.push({ ...pdu, event_id: '$' + ch });
-      }
-      return out;
-    }
 
     const hashes = log.rows.map((r: { commit_hash: string }) => String(r.commit_hash));
     if (hashes.length === 0) return [];

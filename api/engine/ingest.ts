@@ -23,6 +23,16 @@ export interface IngestOptions {
   keepPrevBranches?: boolean;
 }
 
+// Core→hat signal (design §3.6: hats are plugins — the core knows nothing
+// about them; hats subscribe). Emitted once per applied event, after the
+// event_index row lands.
+export type AppliedListener = (roomId: string, eventId: string) => void;
+const appliedListeners = new Set<AppliedListener>();
+export function onEventApplied(l: AppliedListener): () => void {
+  appliedListeners.add(l);
+  return () => appliedListeners.delete(l);
+}
+
 export async function ingestEvent(
   roomId: string,
   ev: IncomingEvent,
@@ -39,39 +49,23 @@ export async function ingestEvent(
   const room = await lookupRoom(roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
 
-  // 3. event ID + stored PDU
-  //    Mode A (any other room_version): real Matrix reference hash over the
-  //    redacted PDU (Phase 2). Mode B: provisional placeholder (Phase 3
-  //    replaces the wire ID with the commit hash; branches are named from
-  //    the provisional ID — D8, since the wire ID doesn't exist pre-commit).
-  let eventId: string;
-  let pdu: Record<string, unknown>;
-  if (room.roomVersion === 'test.communico.dolt.v1') {
-    eventId = '$' + crypto.randomUUID();
-    pdu = {
-      event_id: eventId,
-      room_id: roomId,
-      type: ev.type,
-      sender: ev.sender,
-      content: ev.content,
-      prev_events: ev.prev_events,
-      origin_ts: ev.origin_ts,
-    };
-    if (ev.state_key != null) pdu.state_key = ev.state_key;
-  } else {
-    const unsigned: Record<string, unknown> = {
-      type: ev.type,
-      room_id: roomId,
-      sender: ev.sender,
-      content: ev.content,
-      prev_events: ev.prev_events,
-      origin_server_ts: ev.origin_ts,
-      depth: 0,
-    };
-    if (ev.state_key != null) unsigned.state_key = ev.state_key;
-    eventId = await eventIdFor(unsigned);
-    pdu = { event_id: eventId, ...unsigned };
-  }
+  // 3. event ID + stored PDU — design §4.1.1: the content-hash id
+  //    (eventIdFor over the redacted PDU) is the ONLY identity, for every
+  //    room; the room_version in room_directory is hat-facing metadata and
+  //    never affects identity. The commit hash is a per-store receipt kept
+  //    in event_index.
+  const unsigned: Record<string, unknown> = {
+    type: ev.type,
+    room_id: roomId,
+    sender: ev.sender,
+    content: ev.content,
+    prev_events: ev.prev_events,
+    origin_server_ts: ev.origin_ts,
+    depth: 0,
+  };
+  if (ev.state_key != null) unsigned.state_key = ev.state_key;
+  const eventId = await eventIdFor(unsigned);
+  const pdu: Record<string, unknown> = { event_id: eventId, ...unsigned };
 
   // 4. resolve prevs via the server DB's event_index (D8: the extremity
   //    branch comes from event_index.branch_name, not recomputation)
@@ -179,19 +173,22 @@ export async function ingestEvent(
   });
 
   // 9. event_id <-> commit_hash bijection + current branch (D8).
-  //    Mode B (Phase 3): the WIRE event id is '$'+commit_hash; the events
-  //    row keeps its provisional id (rows are immutable once committed);
-  //    the branch was named from the provisional id at creation time (D8).
-  const wireId = room.roomVersion === 'test.communico.dolt.v1'
-    ? '$' + commitHash
-    : eventId;
+  //    Identity is unified (§4.1.1): the wire id IS the content-hash id
+  //    computed in step 3; the commit hash stays a per-store receipt here.
   await withDb(SERVER_DB, async (c) => {
     await c.query(
       'INSERT INTO event_index (event_id, room_id, commit_hash, branch_name) VALUES ($1, $2, $3, $4);',
-      [wireId, roomId, commitHash, newBranch],
+      [eventId, roomId, commitHash, newBranch],
     );
   });
 
-  // 10.
-  return { event_id: wireId, commit_hash: commitHash };
+  // 10. core→hat signal, then return
+  for (const l of appliedListeners) {
+    try {
+      l(roomId, eventId);
+    } catch (e) {
+      console.error('applied listener error:', e);
+    }
+  }
+  return { event_id: eventId, commit_hash: commitHash };
 }

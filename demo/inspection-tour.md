@@ -46,13 +46,14 @@ SELECT commit_hash, date, message FROM dolt.log;
 One commit per Matrix event, in order. The commit message names the
 event type (`event … type m.room.message`).
 
-## Stop 2 — wire event ids ARE commit hashes (Mode B)
+## Stop 2 — event ids are content hashes; commit hashes are receipts
 
-The room's version is `test.communico.dolt.v1`: the event id the Matrix
-client shows IS the Dolt commit hash. Compare any id from your
-matrix-commander output (`event "$<32 chars>"`) with stop 1's
-`commit_hash` column — they are equal. The server's `event_index` (in the
-server DB) is the explicit bijection:
+The event id the Matrix client shows is a content hash of the event
+itself (Matrix reference-hash style, `$<43 base64url chars>`) —
+canonical for every room, whatever the room version. The Dolt commit
+hash is the server's per-store receipt: it proves the event landed as a
+commit, but never appears on the wire. The server's `event_index` (in
+the server DB) is the explicit bijection:
 
 ```sql
 SELECT event_id, commit_hash, seq FROM event_index

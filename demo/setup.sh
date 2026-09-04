@@ -82,8 +82,9 @@ done
 echo ">> db-init"
 docker exec "$CONTAINER" bash -c 'cd /workspace && deno task db-init'
 
-# 5. demo room (Mode B) — reuse an existing native room if present so
-#    re-runs print a stable room id
+# 5. demo room — reuse an existing native room if present so re-runs
+#    print a stable room id (room_version is hat-facing metadata only;
+#    event identity is content-hash for every room — design §4.1.1)
 ROOM_ID="$(docker exec "$CONTAINER" bash -c \
   "cd /workspace && deno eval \"
     import pgpkg from 'pg';
@@ -94,7 +95,7 @@ ROOM_ID="$(docker exec "$CONTAINER" bash -c \
     await c.end();
   \" 2>/dev/null | tail -1" || true)"
 if [[ -z "$ROOM_ID" ]]; then
-  echo ">> creating Mode B demo room"
+  echo ">> creating demo room"
   ROOM_ID="$(docker exec "$CONTAINER" curl -s -X POST localhost:80/_matrix/client/v3/createRoom \
     -H 'Authorization: Bearer devtoken' \
     -d '{"room_version":"test.communico.dolt.v1"}' \

@@ -10,6 +10,7 @@
 //   named 's' (flag-parse quirk — avoided).
 import { ident, SERVER_DB, withDb } from './db.ts';
 import { dbNameFor, lookupRoom } from './room.ts';
+import { eventAtCommit } from './timeline.ts';
 
 const REMOTE_DIR = '/tmp/communico-remotes';
 
@@ -92,7 +93,7 @@ export async function pullRoom(
 
   // rebuild event_index for the room: walk main + every x* branch's log
   // (event commits live on the x* extremity branches — D8; main only ever
-  // holds genesis commits), upsert '$'+commit_hash rows, then mark tips
+  // holds genesis commits), upsert content-hash-id rows, then mark tips
   let newCommits = 0;
   await withDb(dbName, async (c) => {
     const branches = (await c.query(`SELECT name FROM dolt.branches;`))
@@ -114,13 +115,18 @@ export async function pullRoom(
     );
     await withDb(SERVER_DB, async (s) => {
       for (const hash of eventCommits) {
+        // §4.1.1 unified identity: the wire id is the content-hash id
+        // stored in the event's own row (read out of the commit), never
+        // derived from the commit hash.
+        const pdu = await eventAtCommit(c, hash);
+        if (!pdu || typeof pdu.event_id !== 'string') continue;
         // NOTE: Doltgres runs INSERT ... RETURNING but returns an empty
         // rows array (RETURNING not honored) — count via rowCount, which
         // is correct for ON CONFLICT DO NOTHING (1 inserted / 0 skipped).
         const r = await s.query(
           `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name)
            VALUES ($1, $2, $3, NULL) ON CONFLICT (event_id) DO NOTHING;`,
-          ['$' + hash, roomId, hash],
+          [pdu.event_id, roomId, hash],
         );
         newCommits += r.rowCount ?? 0;
       }
