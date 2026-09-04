@@ -167,10 +167,17 @@ console.log('room database ' + db + ' — dolt.log (newest first)');
 const rows = (await c.query('SELECT commit_hash, message FROM dolt.log LIMIT 8;')).rows;
 console.log(rows.map((r: { commit_hash: string; message: string }) =>
   '  ' + r.commit_hash.slice(0, 8) + '  ' + r.message).join('\n'));
+// §13.2.3: the reveal — re-rendered every cycle once its time has come
+// (the pane's console.clear would erase any one-shot print)
+if (Date.now() >= Number(Deno.env.get('DEMO_WATCH_T0') ?? 0) + 58_000) {
+  console.log();
+  console.log('-- six messages, six commits, three clients — and the third was a browser with no server: a peer, through the lite hat --');
+}
 await c.end();
 TS
 
     # helper: bottom pane — title card (7 s), then dolt.log watch
+    T0_MS=$(( $(date +%s) * 1000 ))
     cat > /tmp/demo-watch.sh <<WATCH
 #!/usr/bin/env bash
 clear
@@ -184,9 +191,12 @@ echo
 echo "   top panes: alice and bob — two unmodified matrix-commander clients"
 echo "              having a conversation through this homeserver"
 echo "   this pane: the room's database — dolt.log, refreshed every 2 s"
+echo "   (a third participant will join — watch who)"
 sleep 7
+# the reveal timestamp travels as env into the watch query (§13.2.3 —
+# printed every render cycle once past t≈58)
 while true; do
-  docker exec -i -w /workspace -e DEMO_ROOM_ID='$ROOM_ID' $CONTAINER \
+  docker exec -i -w /workspace -e DEMO_ROOM_ID='$ROOM_ID' -e DEMO_WATCH_T0='$T0_MS' $CONTAINER \
     deno run --allow-net --allow-env - < /tmp/demo-watch.ts 2>/dev/null
   sleep 2
 done
@@ -201,6 +211,9 @@ WATCH
       cat > "/tmp/demo-$1.sh" <<PART
 #!/usr/bin/env bash
 clear
+# fresh listen log for THIS run (stale lines from earlier runs would
+# otherwise linger in the tee'd file and poison the dry-run checks)
+: > /tmp/demo-$1-listen.log
 # background listener uses its own store
 docker run --rm -i --network container:$CONTAINER -v $2:/data:z -w /data $MC_IMAGE \
   --listen forever --plain --log-level WARNING WARNING \
@@ -223,43 +236,32 @@ PART
     make_participant alice /tmp/mc-alice /tmp/mc-alice-send 18 \
       'and the event id is a content hash of the event — 43 chars, any store' 7 \
       'and syncing this room to another server is literally a dolt pull' \
-      'echo; echo "-- four messages, four commits — the log below is the room --"'
+      'sleep 26; docker run --rm --network container:'$CONTAINER' -v /tmp/mc-alice-send:/data:z -w /data '$MC_IMAGE' \
+        -m "six voices below, one room — and one of us never had a server at all" --room '$ROOM_ID' --plain \
+        --store /data/store --credentials /data/credentials.json'
     chmod +x /tmp/demo-watch.sh
-
-    # helper: fourth pane — Carol, the browser leg (lite hat: msync/ws)
-    cat > /tmp/demo-carol.sh <<CAROL
-#!/usr/bin/env bash
-clear
-echo
-echo "   THIRD PARTICIPANT — a browser peer in the same room"
-echo "   ----------------------------------------------------"
-echo "   communico-lite joins via the server's lite hat (msync over ws):"
-echo
-echo "     http://localhost:8787/?transport=ws&sync=msync&room=$ROOM_ID"
-echo
-echo "   Open that URL in a browser, pick a name (e.g. carol), Join."
-echo "   The page bootstraps the FULL history above from the server's"
-echo "   msync peer — same events, same 43-char content-hash ids — and"
-echo "   syncs live in both directions from there."
-sleep 999
-CAROL
-    chmod +x /tmp/demo-carol.sh
 
     # pane 0 (top-left): alice — listening + sending
     tmux new-session -d -s "$SESSION" -x 140 -y 40 "/tmp/demo-alice.sh"
     # pane 1 (top-right): bob — listening + sending
     tmux split-window -h -t "$SESSION:0.0" "/tmp/demo-bob.sh"
-    # pane 2 (bottom-left, ~45% height): title card, then dolt.log watch
+    # pane 2 (bottom, ~45% height): title card, then dolt.log watch
     tmux split-window -v -f -l '45%' -t "$SESSION:0.0" "/tmp/demo-watch.sh"
-    # pane 3 (bottom-right): the Carol URL for the human round
-    tmux split-window -h -t "$SESSION:0.2" "/tmp/demo-carol.sh"
+    # the ghost — a third participant with NO pane and NO camera: a
+    # headless browser peer (lite hat, msync/ws) whose messages simply
+    # appear in alice's/bob's panes and as commits below (plan §13).
+    # t≈38 answers alice's t≈30 "dolt pull" line; t≈50 precedes the
+    # watch pane's t≈58 reveal.
+    nohup deno run -A demo/carol-ghost.ts "$ROOM_ID" carol 38 \
+      "hi both — I'm in the same room, but I have no server: I'm a peer of yours" 50 \
+      "your six event ids match mine byte for byte — I recomputed them here" \
+      >/tmp/demo-carol.log 2>&1 &
     # labels
     tmux set-option -t "$SESSION" status off
     tmux set-option -t "$SESSION" pane-border-status top
     tmux select-pane -t "$SESSION:0.0" -T "alice — unmodified matrix-commander"
     tmux select-pane -t "$SESSION:0.1" -T "bob — same client, other side"
     tmux select-pane -t "$SESSION:0.2" -T "the room = a Doltgres database (dolt log)"
-    tmux select-pane -t "$SESSION:0.3" -T "carol — a browser in the same room (lite hat)"
     echo ">> tmux session '$SESSION' running (host, 140x40). Attach with:"
     echo "   tmux attach -t $SESSION"
     ;;
