@@ -1,8 +1,9 @@
 // sync/msync.js — matrix-sync Protocol v1 (plan §3 NORMATIVE).
 // Envelope over the LP3 transport interface:
-//   {t:'tips', room, tips:[eventId…], th:{events,state}} — after every
-//     local ingest and every applied delta; th = table hashes (cheap
-//     convergence gossip).
+//   {t:'tips', room, tips:[eventId…], th:{engine,events,state}} — after
+//     every local ingest and every applied delta; th = table hashes
+//     (cheap convergence gossip, ADVISORY: only comparable when
+//     th.engine matches — cross-engine peers can never match).
 //   {t:'delta-req', room, tips:[…]} — on received tips with unknown ids
 //     (or on join with tips:[]).
 //   {t:'delta', room, events:[canonicalEvent…]} — topologically sorted,
@@ -12,6 +13,20 @@
 // ids, equal-th short-circuit, one outstanding delta-req per peer,
 // re-request held events ≤3 rounds.
 // NO store images, NO dolt remotes anywhere — events only.
+//
+// ENGINE SEAM: every engine-state read goes through the facade
+// (engine.*) with await-tolerant calls — sync passthroughs in the
+// browser, async SQL on the server hat. msync never touches room.*
+// internals. Facade contract:
+//   engineName                    — 'doltlite' | 'doltgres' (th tag)
+//   getRoom()                     — room handle | null (sync)
+//   extremities(room)             → [{eventId, branch}]
+//   tableHashes(room)             → {events, state}
+//   ingestRemote(room, evt)       → {applied|held|known|bad}
+//   allEvents(room)               → [canonicalEvent…] (parsed)
+//   hasEvent(room, id)            → bool
+//   eventCount(room)              → number
+//   badEvents(room)/merges(room)  → numbers (stats mirrors)
 
 export async function startMsync({ engine, transport, roomName, joiner = false, onChange, onPeerTh, onHeld, onPeers }) {
   const stats = { sent: 0, received: 0, applied: 0, held: 0, badEvents: 0, merges: 0 };
@@ -26,24 +41,19 @@ export async function startMsync({ engine, transport, roomName, joiner = false, 
     stats.sent++;
   }
 
-  function announce() {
+  async function announce() {
     const room = engine.getRoom();
     if (!room) return;
     send({
       t: 'tips', room: roomName,
-      tips: engine.extremities(room).map((e) => e.eventId),
-      th: engine.tableHashes(room),
+      tips: (await engine.extremities(room)).map((e) => e.eventId),
+      th: { engine: engine.engineName, ...(await engine.tableHashes(room)) },
     });
   }
 
-  function allEvents(room) {
-    return room.db.selectObjects(`SELECT canonical_json FROM events`)
-      .map((r) => JSON.parse(r.canonical_json));
-  }
-
   // past-cone of the given tip ids over the events' prev links
-  function pastCone(room, tipIds) {
-    const byId = new Map(allEvents(room).map((e) => [e.event_id, e]));
+  async function pastCone(room, tipIds) {
+    const byId = new Map((await engine.allEvents(room)).map((e) => [e.event_id, e]));
     const seen = new Set();
     const stack = [...tipIds];
     while (stack.length) {
@@ -75,13 +85,16 @@ export async function startMsync({ engine, transport, roomName, joiner = false, 
     return out; // (any remainder would be a cycle — impossible in a DAG)
   }
 
-  function computeDelta(room, requesterTips) {
-    const all = allEvents(room);
-    const knownToPeer = new Set(requesterTips.filter((id) => room.eventIndex.has(id)));
+  async function computeDelta(room, requesterTips) {
+    const all = await engine.allEvents(room);
+    const knownToPeer = new Set();
+    for (const id of requesterTips) {
+      if (await engine.hasEvent(room, id)) knownToPeer.add(id);
+    }
     if (requesterTips.length === 0 || knownToPeer.size !== requesterTips.length) {
       return topo(all, new Set()); // empty/unknown tips → full history
     }
-    const have = pastCone(room, requesterTips);
+    const have = await pastCone(room, requesterTips);
     return topo(all.filter((e) => !have.has(e.event_id)), have);
   }
 
@@ -107,17 +120,17 @@ export async function startMsync({ engine, transport, roomName, joiner = false, 
     }
     stats.applied += applied;
     stats.held = held.length;
-    stats.badEvents = room.badEvents;
-    stats.merges = room.merges;
+    stats.badEvents = await engine.badEvents(room);
+    stats.merges = await engine.merges(room);
     if (applied > 0) {
       onChange?.();
-      announce(); // apply-then-announce
+      await announce(); // apply-then-announce
     }
     if (held.length) {
       const rounds = (reqRounds.get(from) ?? 0) + 1;
       reqRounds.set(from, rounds);
       if (rounds <= 3) {
-        send({ t: 'delta-req', room: roomName, tips: engine.extremities(room).map((e) => e.eventId) });
+        send({ t: 'delta-req', room: roomName, tips: (await engine.extremities(room)).map((e) => e.eventId) });
       } else {
         onHeld?.(held); // surface: stuck after 3 rounds
       }
@@ -125,9 +138,9 @@ export async function startMsync({ engine, transport, roomName, joiner = false, 
   }
 
   let left = false;
-  const bootstrapped = () => {
+  const bootstrapped = async () => {
     const room = engine.getRoom();
-    return !!room && room.eventIndex.size > 0;
+    return !!room && (await engine.eventCount(room)) > 0;
   };
   const askBootstrap = () => {
     send({ t: 'delta-req', room: roomName, tips: [] }); // cheap by design
@@ -135,32 +148,39 @@ export async function startMsync({ engine, transport, roomName, joiner = false, 
 
   const session = await transport.join(roomName, {
     onPeer: (peers) => {
-      onPeers?.(peers);
-      if (peers.length && engine.getRoom()) announce(); // a newcomer may need our heads
-      // MS4: event-driven joiner rescue — a peer appearing while we are
-      // unbootstrapped triggers an immediate delta-req (timer-independent).
-      if (joiner && peers.length && !bootstrapped()) askBootstrap();
+      void (async () => {
+        onPeers?.(peers);
+        if (peers.length && engine.getRoom()) await announce(); // a newcomer may need our heads
+        // MS4: event-driven joiner rescue — a peer appearing while we are
+        // unbootstrapped triggers an immediate delta-req (timer-independent).
+        if (joiner && peers.length && !(await bootstrapped())) askBootstrap();
+      })().catch((e) => console.error('msync onPeer:', e));
     },
     onMessage: (obj, _bytes, from) => {
-      if (!obj || obj.room !== roomName) return;
-      const room = engine.getRoom();
-      if (obj.t === 'tips') {
-        if (!room) return;
-        onPeerTh?.(from, obj.th);
-        const unknown = (obj.tips ?? []).filter((id) => !room.eventIndex.has(id));
-        if (unknown.length === 0) return; // all known → equal-th short-circuit no-op
-        if (!outstandingReq.has(from)) {
-          outstandingReq.add(from);
-          send({ t: 'delta-req', room: roomName, tips: engine.extremities(room).map((e) => e.eventId) });
+      void (async () => {
+        if (!obj || obj.room !== roomName) return;
+        const room = engine.getRoom();
+        if (obj.t === 'tips') {
+          if (!room) return;
+          onPeerTh?.(from, obj.th, obj.tips ?? []);
+          const unknown = [];
+          for (const id of obj.tips ?? []) {
+            if (!(await engine.hasEvent(room, id))) unknown.push(id);
+          }
+          if (unknown.length === 0) return; // all known → equal-th short-circuit no-op
+          if (!outstandingReq.has(from)) {
+            outstandingReq.add(from);
+            send({ t: 'delta-req', room: roomName, tips: (await engine.extremities(room)).map((e) => e.eventId) });
+          }
+        } else if (obj.t === 'delta-req') {
+          if (!room) return;
+          send({ t: 'delta', room: roomName, events: await computeDelta(room, obj.tips ?? []) });
+        } else if (obj.t === 'delta') {
+          outstandingReq.delete(from);
+          reqRounds.delete(from);
+          await onDelta(from, obj.events ?? []);
         }
-      } else if (obj.t === 'delta-req') {
-        if (!room) return;
-        send({ t: 'delta', room: roomName, events: computeDelta(room, obj.tips ?? []) });
-      } else if (obj.t === 'delta') {
-        outstandingReq.delete(from);
-        reqRounds.delete(from);
-        onDelta(from, obj.events ?? []);
-      }
+      })().catch((e) => console.error('msync onMessage:', e));
     },
   });
 
@@ -169,9 +189,11 @@ export async function startMsync({ engine, transport, roomName, joiner = false, 
   // slow transport discovery is a real race, not a reason to give up.
   if (joiner) {
     const ask = () => {
-      if (left || bootstrapped()) return;
-      askBootstrap();
-      setTimeout(ask, 2000);
+      void (async () => {
+        if (left || (await bootstrapped())) return;
+        askBootstrap();
+        setTimeout(ask, 2000);
+      })().catch((e) => console.error('msync ask:', e));
     };
     ask();
   }

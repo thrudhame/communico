@@ -3,8 +3,8 @@
 // an own store from events via the sync protocol (empty-tips delta-req).
 import {
   createRoom, joinRoom, ingestEvent, ingestRemote, timeline, doltLog,
-  tableHashes, extremities, rawQuery, exportStoreImage, aliveBranches,
-  adoptStoreImage, branchesInImage,
+  tableHashes, extremities, allEvents, hasEvent, eventCount, rawQuery,
+  exportStoreImage, aliveBranches, adoptStoreImage, branchesInImage,
 } from './engine-lite.js';
 import { startMsync } from './sync/msync.js';
 import { startDsync } from './sync/dsync.js';
@@ -13,7 +13,8 @@ import { createTransport } from './sync/transport.js';
 const $ = (id) => document.getElementById(id);
 let room = null;
 let ms = null;
-let latestPeerTh = null;
+let latestPeerTh = null;   // {engine, events, state} — advisory; comparable only when .engine matches
+let latestPeerTips = null; // [eventId] — the convergence badge compares tip SETS (cross-engine safe)
 let pendingAnnounce = false; // a message landed before transport was ready
 
 // MS5: transport default — the ?transport= param wins; on localhost we
@@ -28,11 +29,18 @@ const transportKind = new URLSearchParams(location.search).get('transport')
 // keeps the custom event-sync protocol for A/B against v0/v1a.
 const syncKind = new URLSearchParams(location.search).get('sync') ?? 'dolt';
 
+const ENGINE_NAME = 'doltlite';
 const facade = {
+  engineName: ENGINE_NAME,
   getRoom: () => room,
   extremities: (r) => extremities(r),
   tableHashes: (r) => tableHashes(r),
   ingestRemote: (r, e) => ingestRemote(r, e),
+  allEvents: (r) => allEvents(r),
+  hasEvent: (r, id) => hasEvent(r, id),
+  eventCount: (r) => eventCount(r),
+  badEvents: (r) => r.badEvents,
+  merges: (r) => r.merges,
   exportStoreImage: (r) => exportStoreImage(r),
   aliveBranches: (r) => aliveBranches(r),
   adoptStoreImage: (r, bytes, peerId, branches) => adoptStoreImage(r, bytes, peerId, branches),
@@ -75,17 +83,27 @@ function renderLog() {
 function renderBadges() {
   const th = tableHashes(room);
   const mine = th.events.slice(0, 8);
-  const theirs = latestPeerTh?.events?.slice(0, 8);
   const badge = $('convergence');
-  if (theirs == null) {
+  // Green = tips-SET equality (cross-engine safe — a gres peer's table
+  // hashes live in a different hash universe and can never match ours).
+  // th equality is shown only when the peer runs the same engine.
+  if (latestPeerTips == null) {
     badge.textContent = `th: ${mine} (no peer yet)`;
     badge.className = 'badge diverged';
-  } else if (theirs === mine) {
-    badge.textContent = `th: ${mine} == peer ✓`;
-    badge.className = 'badge ok';
   } else {
-    badge.textContent = `th: mine ${mine} ≠ peer ${theirs}`;
-    badge.className = 'badge diverged';
+    const myTips = extremities(room).map((e) => e.eventId).sort().join(',');
+    const peerTips = [...latestPeerTips].sort().join(',');
+    const sameEngine = latestPeerTh?.engine === ENGINE_NAME;
+    const thNote = sameEngine
+      ? ` · th ${mine}${latestPeerTh?.events?.slice(0, 8) === mine ? ' ==' : ' ≠'} peer`
+      : '';
+    if (myTips === peerTips) {
+      badge.textContent = `tips == peer ✓${thNote}`;
+      badge.className = 'badge ok';
+    } else {
+      badge.textContent = `tips diverged from peer${thNote}`;
+      badge.className = 'badge diverged';
+    }
   }
   const exts = extremities(room);
   const fi = $('fork-ind');
@@ -140,7 +158,7 @@ async function start(role) {
           $('join-screen').classList.add('hidden');
         }
       },
-      onPeerTh: (_from, th) => { latestPeerTh = th; renderBadges(); },
+      onPeerTh: (_from, th, tips) => { latestPeerTh = th; latestPeerTips = tips; renderBadges(); },
       onPeers: (peers) => { $('peers').textContent = `peers: ${peers.length}`; },
       onHeld: (held) => { $('status').textContent = `${held.length} events held (unknown prevs)`; },
     });

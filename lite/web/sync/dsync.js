@@ -4,8 +4,10 @@
 // dolt_fetch, and heals via the LS3 driver merge (engine.adoptStoreImage).
 //
 // Envelope (Protocol "dolt v1"):
-//   {t:'heads', room, th:{events,state}} — convergence gossip: after every
-//     local ingest, on peer appear, and after every applied store.
+//   {t:'heads', room, tips:[eventId…], th:{engine,events,state}} —
+//     convergence gossip: after every local ingest, on peer appear, and
+//     after every applied store. (tips feed the tips-set badge; th is the
+//     convergence trigger, advisory-tagged with the engine name.)
 //   {t:'want', room} — request the peer's store image.
 //   {t:'store', room, hasBytes:true, branches:[aliveBranch…]} + binary store
 //     bytes. (branches are named explicitly: dolt_branches does not enumerate
@@ -34,7 +36,13 @@ export async function startDsync({ engine, transport, roomName, joiner = false, 
   function announce() {
     const room = engine.getRoom();
     if (!room || room.eventIndex.size === 0) return;
-    send({ t: 'heads', room: roomName, th: engine.tableHashes(room) });
+    // tips ride the gossip for the tips-set convergence badge (same
+    // contract as msync's announce); th stays the convergence trigger.
+    send({
+      t: 'heads', room: roomName,
+      tips: engine.extremities(room).map((e) => e.eventId),
+      th: { engine: engine.engineName, ...engine.tableHashes(room) },
+    });
   }
 
   function want(from) {
@@ -81,7 +89,7 @@ export async function startDsync({ engine, transport, roomName, joiner = false, 
       const room = engine.getRoom();
       if (obj.t === 'heads') {
         if (!room) return;
-        onPeerTh?.(from, obj.th);
+        onPeerTh?.(from, obj.th, obj.tips ?? []);
         outstandingWant.delete(from); // fresh gossip re-arms the want
         const mine = engine.tableHashes(room);
         if (!bootstrapped() || obj.th?.events !== mine.events || obj.th?.state !== mine.state) {

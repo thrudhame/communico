@@ -297,6 +297,23 @@ export function extremities(room) {
   });
 }
 
+// ---- msync facade reads (the seam: msync reaches engine state only
+// through these; sync here, async SQL on the server hat) ----
+
+// All events as parsed PDUs (delta computation).
+export function allEvents(room) {
+  return room.db.selectObjects(`SELECT canonical_json FROM events`)
+    .map((r) => JSON.parse(r.canonical_json));
+}
+
+export function hasEvent(room, id) {
+  return room.eventIndex.has(id);
+}
+
+export function eventCount(room) {
+  return room.eventIndex.size;
+}
+
 // ---- dolt-native sync support (v1b; forms proven by the LB spikes) ----
 
 // Full store image for shipping to a peer (LP1-winning form).

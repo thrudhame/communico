@@ -4,7 +4,10 @@
 // equality asserted each gen. Watchdogs: a wasm hang never yields to the
 // event loop, so the 15 s bound is enforced by the caller's timeout +
 // per-gen lines marking the last clean generation (recorded mapping).
-import { createRoom, joinRoom, ingestEvent, ingestRemote, extremities, tableHashes } from './engine-lite.js';
+import {
+  createRoom, joinRoom, ingestEvent, ingestRemote, extremities, tableHashes,
+  allEvents, hasEvent, eventCount,
+} from './engine-lite.js';
 import { startMsync } from './sync/msync.js';
 import { createTransport } from './sync/transport.js';
 
@@ -33,10 +36,16 @@ if (!loopOk) {
 
 function facadeFor(getR) {
   return {
+    engineName: 'doltlite',
     getRoom: getR,
     extremities: (r) => extremities(r),
     tableHashes: (r) => tableHashes(r),
     ingestRemote: (r, e) => ingestRemote(r, e),
+    allEvents: (r) => allEvents(r),
+    hasEvent: (r, id) => hasEvent(r, id),
+    eventCount: (r) => eventCount(r),
+    badEvents: (r) => r.badEvents,
+    merges: (r) => r.merges,
   };
 }
 
