@@ -133,7 +133,12 @@ async function start(role) {
     // MS4: never fail silently — every stage shows its status; any error
     // surfaces verbatim and re-enables the buttons.
     $('status').textContent = 'loading engine (wasm)…';
-    room = role === 'create' ? await createRoom(name, roomName) : await joinRoom(name, roomName);
+    // ws transport = the lite hat: the room NAME is the server room's id,
+    // and our PDUs must carry it (the content-hash id covers room_id).
+    const roomId = transportKind === 'ws' ? roomName : null;
+    room = role === 'create'
+      ? await createRoom(name, roomName, roomId)
+      : await joinRoom(name, roomName, roomId);
     window.__room = room;
 
     $('status').textContent = role === 'create' ? 'creating room…' : 'waiting for a peer to sync from…';
@@ -221,6 +226,13 @@ $('msg').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
   });
   const js = $('join-screen');
   js.append(note, suggest);
+}
+
+// ?room= prefills the room name — the Carol URL hands the server room id
+// to the browser leg (demo/setup.sh prints the full link).
+{
+  const pre = new URLSearchParams(location.search).get('room');
+  if (pre) $('room-name').value = pre;
 }
 
 $('runsql').addEventListener('click', () => {

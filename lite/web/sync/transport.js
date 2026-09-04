@@ -13,7 +13,54 @@
 export function createTransport(kind) {
   if (kind === 'broadcast') return createBroadcastTransport();
   if (kind === 'trystero') return createTrysteroTransport(); // sync/trystero.js (dynamic import)
+  if (kind === 'ws') return createWsTransport();
   throw new Error(`unknown transport kind: ${kind}`);
+}
+
+// 'ws' — the lite-hat transport: the gres server's msync peer is the
+// single peer (id 'server'). One socket per join, JSON envelopes only
+// (msync needs no binary), no reconnect/backoff (demo scope, plan §8).
+function createWsTransport() {
+  return {
+    kind: 'ws',
+    join(room, { onPeer, onMessage }) {
+      const ws = new WebSocket(
+        `ws://${location.hostname}:8000/msync?room=${encodeURIComponent(room)}`,
+      );
+      const id = crypto.randomUUID();
+      let opened = false;
+      return new Promise((resolve, reject) => {
+        ws.onopen = () => {
+          opened = true;
+          onPeer?.(['server']);
+          resolve({
+            id,
+            send(obj) {
+              ws.send(JSON.stringify(obj));
+            },
+            peers: () => (ws.readyState === WebSocket.OPEN ? ['server'] : []),
+            leave() {
+              try { ws.close(); } catch { /* closing anyway */ }
+            },
+          });
+        };
+        ws.onmessage = (ev) => {
+          if (typeof ev.data !== 'string') return;
+          let obj;
+          try {
+            obj = JSON.parse(ev.data);
+          } catch { return; } // non-JSON: not the protocol
+          onMessage?.(obj, undefined, 'server');
+        };
+        ws.onclose = () => {
+          if (opened) onPeer?.([]);
+        };
+        ws.onerror = () => {
+          if (!opened) reject(new Error('ws: connect failed'));
+        };
+      });
+    },
+  };
 }
 
 function createBroadcastTransport() {

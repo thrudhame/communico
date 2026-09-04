@@ -52,9 +52,11 @@ async function openStore(name) {
   return { db, persistent };
 }
 
-function newRoom(db, self, persistent) {
+function newRoom(db, self, persistent, roomId = null) {
   return {
     db, self, persistent,
+    roomId,                // pdu room_id override (a server room's id when
+                           // hatted; null → '!lite:browser' browser mesh)
     seq: 0,
     eventIndex: new Map(),   // eventId → {hash, branch, alive, origin_ts}
     extremityList: [],       // [{eventId, branch}] — alive extremity branches
@@ -64,14 +66,14 @@ function newRoom(db, self, persistent) {
 }
 
 // Create a room (genesis: m.room.create + creator's member join).
-export async function createRoom(displayName, roomName = 'room') {
+export async function createRoom(displayName, roomName = 'room', roomId = null) {
   const { db, persistent } = await openStore(roomName);
   const self = `@${displayName}:browser`;
   db.exec(`SELECT dolt_config('user.name','${self.replaceAll("'", "''")}')`);
   db.exec(`SELECT dolt_config('user.email','${self.replaceAll("'", "''")}')`);
   db.exec(SCHEMA);
   db.selectValue(`SELECT dolt_commit('-Am','schema: events+state')`);
-  const room = newRoom(db, self, persistent);
+  const room = newRoom(db, self, persistent, roomId);
   const createEvt = await ingestEvent(room, {
     type: 'm.room.create', state_key: '',
     content: { creator: self, room_version: 'lite.communico.dolt.v1' },
@@ -84,20 +86,23 @@ export async function createRoom(displayName, roomName = 'room') {
 }
 
 // Join: a joiner builds its OWN store from events — schema only, NO genesis
-// (the full history arrives via the sync protocol's delta).
-export async function joinRoom(displayName, roomName = 'room') {
+// (the full history arrives via the sync protocol's delta). roomId: the
+// remote room's id when hatted (ws transport) — the content-hash id of a
+// room event covers room_id, so a server room's events MUST carry the
+// server's room id or the two engines mint different ids for one event.
+export async function joinRoom(displayName, roomName = 'room', roomId = null) {
   const { db, persistent } = await openStore(roomName);
   const self = `@${displayName}:browser`;
   db.exec(`SELECT dolt_config('user.name','${self.replaceAll("'", "''")}')`);
   db.exec(`SELECT dolt_config('user.email','${self.replaceAll("'", "''")}')`);
   db.exec(SCHEMA);
   db.selectValue(`SELECT dolt_commit('-Am','schema: events+state')`);
-  return newRoom(db, self, persistent);
+  return newRoom(db, self, persistent, roomId);
 }
 
 async function makePdu(room, evt, prevs) {
   const pdu = {
-    type: evt.type, room_id: '!lite:browser', sender: evt.sender ?? room.self,
+    type: evt.type, room_id: room.roomId ?? '!lite:browser', sender: evt.sender ?? room.self,
     content: evt.content, prev_events: prevs,
     origin_server_ts: evt.origin_ts ?? Date.now(), depth: 0,
   };
