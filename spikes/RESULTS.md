@@ -889,6 +889,29 @@ Doltgres version: Doltgres version 1.2.0 (`SELECT version();` → PostgreSQL 15.
   commits and clones (decision D2 — accepted, to be documented for
   operators).
 
+### Gap re-check on Doltgres 1.3.1 (2026-09-04)
+
+Version (verbatim): `Doltgres version 1.3.1`. Demo survives the bump:
+`deno task test` 14/14 PASS, `demo/run-demo.sh --check` 4/4 acts PASS
+(no regression against the room engine). Repro: ad-hoc SQL on a scratch
+`gapcheck` DB (dropped after) + the original spike harnesses
+(`spikes/s3/s4/s7`) against the local doltgres.
+
+| # | Gap | Status on 1.3.1 | Verbatim / evidence |
+|---|---|---|---|
+| 1 | N-parent merge | **STILL REPRODUCES** | `DOLT_MERGE('mb','mc')` → `error: Error: Dolt does not support merging from multiple commits. You probably meant to checkout one and then merge from the other.` (spikes/s4) |
+| 2 | Conflicted merge in autocommit | **STILL REPRODUCES** | `error: Merge conflict detected, @autocommit transaction rolled back. @autocommit must be disabled so that merge conflicts can be resolved using the dolt_conflicts and dolt_schema_conflicts tables before manually committing the transaction.…`; `SELECT * FROM dolt.conflicts` after the error → 0 rows (state lost at the statement boundary). Session-var workaround still required and still works (s3 keystone PASS). |
+| 3 | Planner `max1Row` on merge-tip `HASHOF` | **FIXED IN 1.3.x** | `SELECT * FROM dolt.log WHERE commit_hash = HASHOF('ma');` on a merge tip now returns the row (was: `result max1Row iterator returned more than one row`). Scalar-subquery form still fine. |
+| 4 | `ON CONFLICT DO NOTHING RETURNING` empty rows | **STILL REPRODUCES** | fresh insert `RETURNING k` → rows=0, rowCount=1; conflict insert → rows=0, rowCount=0. |
+| 5 | `DOLT_BRANCH('--remotes')` stray branch `s`; `-r`/`-a` error | **STILL REPRODUCES** | `--remotes` returns `0` and leaves a stray local branch named `s`; `-r` → `error: invalid usage`; `-a` → `error: unknown option 'a'`. `dolt.remote_branches` remains the working path. |
+| 6 | `ALTER TABLE … ADD COLUMN seq bigserial` | **CHANGED (still broken)** | ALTER succeeds but adds NO default (insert yields NULL); no sequence is reachable under any name (`pg_class.relkind='S'` empty; `nextval('t6b_seq_seq')` → `sequence "t6b_seq_seq" does not exist`). The 1.2.0-era `ASSIGNMENT_CAST` error is gone only because the default never lands. Workaround unchanged: `bigint` + `CREATE SEQUENCE` + `DEFAULT nextval()`. |
+| 7 | `ADD COLUMN IF NOT EXISTS`; PL/pgSQL `DO`; `column_default` | **STILL REPRODUCES / CHANGED** | `IF NOT EXISTS on a column in an ADD COLUMN statement is not supported yet`; `DO $$…$$` → `at or near "do": syntax error`. **`column_default` now REPORTS** (`SELECT column_default … WHERE table_name='t7'` → `dflt` — the under-reporting half is FIXED). |
+| 8 | Remote extremity lifecycle | **STILL REPRODUCES (design gap)** | s7 flow + `api/engine/sync.ts` pull unchanged: consumed extremity branches linger on the remote and re-materialize on pull; no push-side branch deletion / advertisement pruning in the file-remote flow. |
+
+Fixed in 1.3.x: gap 3 (planner `max1Row`) outright; the
+`column_default` under-reporting half of gap 7. Everything else stands
+as of 1.3.1.
+
 ### Measurements
 - Sequential ingest: 7.8 events/sec run 1, 7.5 events/sec run 2,
   last-event latency 138.1 ms (run2/run1 ratio 0.96 — mild degradation
