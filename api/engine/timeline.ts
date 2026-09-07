@@ -32,7 +32,12 @@ export async function eventAtCommit(
   // deno-lint-ignore no-explicit-any
   for (const dr of d.rows as any[]) {
     if (dr.diff_type !== 'added') continue;
-    return dr.to_canonical_json as Record<string, unknown>;
+    // F0: canonical_json is verbatim TEXT (not jsonb) — parse it.
+    const v = dr.to_canonical_json as unknown;
+    return (typeof v === 'string' ? JSON.parse(v) : v) as Record<
+      string,
+      unknown
+    >;
   }
   return null;
 }
@@ -72,7 +77,13 @@ export async function messages(
     );
     const byId = new Map(
       // deno-lint-ignore no-explicit-any
-      evs.rows.map((r: any) => [String(r.event_id), r.canonical_json]),
+      evs.rows.map((r: any) => [
+        String(r.event_id),
+        // F0: canonical_json is verbatim TEXT — parse it.
+        typeof r.canonical_json === 'string'
+          ? JSON.parse(r.canonical_json)
+          : r.canonical_json,
+      ]),
     );
 
     // dolt.log is newest-first; commits without an event_index entry

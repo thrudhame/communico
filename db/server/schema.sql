@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS access_tokens (
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
-  room_version text NOT NULL
+  room_version text NOT NULL,
+  stub_era boolean NOT NULL DEFAULT TRUE
 );
 -- branch_name: x* extremity branch currently holding this event's commit
 -- (phase-1 step 1.3 sanctioned addition for the send endpoint's
@@ -30,7 +31,17 @@ CREATE TABLE IF NOT EXISTS event_index (
   room_id text NOT NULL,
   commit_hash text NOT NULL,
   branch_name text,
+  rejected boolean NOT NULL DEFAULT FALSE,
   seq bigint DEFAULT nextval('event_seq')
+);
+-- F0 dev signing key (db-init generates once via ensureServerKey, reuses
+-- forever — never rotates; F1 moves the same key into the tenant table).
+CREATE TABLE IF NOT EXISTS server_signing_key (
+  key_id text PRIMARY KEY,
+  server_name text NOT NULL,
+  pubkey_b64 text NOT NULL,
+  privkey_pkcs8_b64 text NOT NULL,
+  created_ms bigint NOT NULL
 );
 INSERT INTO users (user_id, display_name) VALUES ('@dev:localhost', 'Dev User')
   ON CONFLICT (user_id) DO NOTHING;

@@ -38,11 +38,22 @@ export async function startDsync({ engine, transport, roomName, joiner = false, 
     if (!room || room.eventIndex.size === 0) return;
     // tips ride the gossip for the tips-set convergence badge (same
     // contract as msync's announce); th stays the convergence trigger.
-    send({
-      t: 'heads', room: roomName,
-      tips: engine.extremities(room).map((e) => e.eventId),
-      th: { engine: engine.engineName, ...engine.tableHashes(room) },
-    });
+    // sh is ABSENT on contested keys under the stub — absent, not
+    // different. Async digests float: gossip is timing-tolerant.
+    void (async () => {
+      const sh = await engine.stateHash?.(room);
+      const roomVersion = await engine.roomVersion?.(room);
+      send({
+        t: 'heads', room: roomName,
+        tips: engine.extremities(room).map((e) => e.eventId),
+        th: {
+          engine: engine.engineName,
+          ...await engine.tableHashes(room),
+          ...(sh ? { sh } : {}),
+          ...(roomVersion ? { room_version: roomVersion } : {}),
+        },
+      });
+    })().catch((e) => console.error('dsync announce:', e));
   }
 
   function want(from) {

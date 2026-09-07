@@ -22,7 +22,9 @@
 //   getRoom()                     — room handle | null (sync)
 //   extremities(room)             → [{eventId, branch}]
 //   tableHashes(room)             → {events, state}
-//   ingestRemote(room, evt)       → {applied|held|known|bad}
+//   stateHash(room)               → sh digest | null (absent on contest)
+//   roomVersion(room)             → '11'
+//   ingestRemote(room, evt)       → {applied|held|known|bad|refused}
 //   allEvents(room)               → [canonicalEvent…] (parsed)
 //   hasEvent(room, id)            → bool
 //   eventCount(room)              → number
@@ -44,10 +46,20 @@ export async function startMsync({ engine, transport, roomName, joiner = false, 
   async function announce() {
     const room = engine.getRoom();
     if (!room) return;
+    // th carries the engine-neutral sh digest + room_version (F0-8) next
+    // to the engine-tagged table hashes. sh is ABSENT on contested keys
+    // under the stub — absent, not different.
+    const sh = await engine.stateHash?.(room);
+    const roomVersion = await engine.roomVersion?.(room);
     send({
       t: 'tips', room: roomName,
       tips: (await engine.extremities(room)).map((e) => e.eventId),
-      th: { engine: engine.engineName, ...(await engine.tableHashes(room)) },
+      th: {
+        engine: engine.engineName,
+        ...(await engine.tableHashes(room)),
+        ...(sh ? { sh } : {}),
+        ...(roomVersion ? { room_version: roomVersion } : {}),
+      },
     });
   }
 
@@ -103,10 +115,14 @@ export async function startMsync({ engine, transport, roomName, joiner = false, 
     if (!room) return;
     stats.received += events.length;
     let applied = 0;
+    let stored = 0; // applied + refused-but-stored (F0 stub: rejected
+    // events land in the DAG, out of state — still new tips to render
+    // and gossip; refusal is materialization, never a propagation drop)
     const held = [];
     for (const evt of events) {
       const r = await engine.ingestRemote(room, evt);
-      if (r.applied) applied++;
+      if (r.applied) { applied++; stored++; }
+      else if (r.refused) stored++;
       else if (r.held) held.push(evt);
     }
     // retry held: prevs may have arrived later in the same batch
@@ -115,16 +131,17 @@ export async function startMsync({ engine, transport, roomName, joiner = false, 
       progress = false;
       for (let i = held.length - 1; i >= 0; i--) {
         const r = await engine.ingestRemote(room, held[i]);
-        if (r.applied) { applied++; held.splice(i, 1); progress = true; }
+        if (r.applied) { applied++; stored++; held.splice(i, 1); progress = true; }
+        else if (r.refused) { stored++; held.splice(i, 1); progress = true; }
       }
     }
     stats.applied += applied;
     stats.held = held.length;
     stats.badEvents = await engine.badEvents(room);
     stats.merges = await engine.merges(room);
-    if (applied > 0) {
+    if (stored > 0) {
       onChange?.();
-      await announce(); // apply-then-announce
+      await announce(); // apply-then-announce (stored refusals gossip too)
     }
     if (held.length) {
       const rounds = (reqRounds.get(from) ?? 0) + 1;

@@ -957,3 +957,62 @@ in `demo/capture/endpoints-capture.md`:
   `information_schema.columns.column_default` under-reports.
 
 
+
+## F0 — engine contract (server-foundation phase 1, 2026-09-07)
+
+Branch `server-foundation` off `spike/communico-lite @ 847cb0b`.
+Design authority: plan `~/Documents/communico/plans/server-foundation/plan.md`
++ research `2026-09-03-room-sync-design.md` (§4.1–§4.2) and
+`2026-09-05-identity-transports-design.md` (§3.12, §4.1, §4.4 refined 2026-09-06).
+
+What landed: verbatim-PDU ingest (full v11 shape, real depth with genesis=1,
+≤20 prevs chained as 2-parent fan-in commits, declared auth_events selected by
+the shared rule); per-room policy slot (`api/engine/policy.ts`, registry
+`'11' → v11-stub`) with ONE shared stub source
+(`lite/web/sync/rulebook/v11-stub.js`, server re-exports it); refusing stub
+(membership only, no timestamps, no power levels — declared gap; concurrent
+edits to one state key throw M_UNRESOLVED_CONFLICT, room stays forked);
+latest-wins deleted in both engines; state is the resolver's cache (sole
+writers `api/engine/materialize.ts` + `lite/web/sync/materialize.js`);
+adoption validates (id + content hash + version) then re-resolves from the DAG
+(replay ignores image state — forged rows dropped; conflict returns refusal,
+never throws); `sh` digest + `room_version` in the announce (absent on
+contest, never different); per-version eventid/redaction transcribed from
+https://spec.matrix.org/v1.11/rooms/v11/ (not from memory — R9's
+`notifications` catch honored; full KEEP table in the commit); v11 genesis
+(create without creator, creator-join exempt, PL, join_rules invite);
+persistent server Ed25519 key (db-init generates once, reuses forever);
+signing order content-hash → redact → sign with spec-appendix vectors green
+(JSON signing + both content hashes byte-exact; message signature reproduced
+under legacy strip, diverges under v11 exactly by the origin strip).
+
+Doltgres findings (new): `DOLT_MERGE` auto-commits clean merges (breaks
+commit=event) — `--no-commit` verified, then one event commit; N-way fan-in
+needs intermediate commits (one active merge at a time); `dolt_merge
+--no-commit` also verified on DoltLite-WASM; lite probe DBs open on main
+(genesis only) — read across x* branches.
+
+Verbatim F0 gate (all green 2026-09-07):
+- `deno task check` — clean.
+- `deno task test` — 31 passed, 0 failed (incl. NEW `tests/policy.test.ts`:
+  genesis sequence through the stub; ts=2^53 refused; non-member write
+  state-rejected; concurrent PL → M_UNRESOLVED_CONFLICT; forged state row
+  dropped by `reresolveFromDag`).
+- Lite sweep 8/8: spikes 4/4, poc, lp 3/3, ms0 3/3, msync (9 identical rows,
+  equal table hashes), dsync (8 identical rows, equal table hashes), lb 5/5
+  (+LB4 10/10), trystero-load — all CHECK: PASS.
+- `deno run -A lite/web/check-fork-refusal.ts` — both refuse, no winner,
+  3 extremities each, sh absent both: CHECK: PASS.
+- `deno run -A lite/web/check-adoption-forged.ts` — forged row dropped,
+  6/6 events intact, sh converges: CHECK: PASS.
+- `bash demo/setup.sh --reset && bash demo/run-demo.sh --check` — 4/4
+  (messages only — the stub never fires; demo room v11, depth ≥ 1,
+  43-char ids, stub_era=true; alice/bob seeded invite+join via
+  `demo/seed-membership.ts` — CS invite/join are M4 scope).
+- `grep -rn 'INSERT INTO state' api/engine lite/web/` outside `*materialize*`
+  — empty (the plan-literal `INSERT.*state` pattern has one false positive:
+  the events-table INSERT matching via its `state_key` column).
+
+F0→F1 seam (recorded, never a path): browsers send unsigned PDUs; server
+accepts `signatures: {}` behind `ALLOW_UNSIGNED_LITE=1` (dev `.env` on, M0
+image off, deleted at F1's end).

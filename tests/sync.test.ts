@@ -1,6 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { createRoom } from '../api/engine/room.ts';
-import { ingestEvent } from '../api/engine/ingest.ts';
+import { author, ingestEvent } from '../api/engine/ingest.ts';
 import { syncSince } from '../api/engine/syncfeed.ts';
 import { SERVER_DB, withDb } from '../api/engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
@@ -18,31 +18,40 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 Deno.test('syncSince: initial, incremental, and long-poll', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, 'test.communico.dolt.v1', '@dev:localhost');
+  await createRoom(ROOM, '11', '@dev:localhost');
 
   let prev = await latestExtremityEventId(ROOM);
   for (const body of ['s1', 's2']) {
-    const r = await ingestEvent(ROOM, {
+    const pdu = await author(ROOM, {
       type: 'm.room.message',
       sender: '@dev:localhost',
       content: { body, msgtype: 'm.text' },
       prev_events: [prev],
-      origin_ts: Date.now(),
+      origin_server_ts: Date.now(),
     });
+    const r = await ingestEvent(ROOM, pdu);
     prev = r.event_id;
   }
 
-  // 2. initial sync: create + member + 2 messages, wire ids, seq order
+  // 2. initial sync: create + member + PL + join_rules + 2 messages,
+  // wire ids, seq order
   const initial = await syncSince(null, 0);
   const jr = initial.rooms.join[ROOM] as {
     timeline: { events: { event_id: string; type: string }[] };
     state: { events: unknown[] };
   };
   assert(jr, 'join map must contain the room');
-  assertEquals(jr.timeline.events.length, 4);
+  assertEquals(jr.timeline.events.length, 6);
   assertEquals(
     jr.timeline.events.map((e) => e.type),
-    ['m.room.create', 'm.room.member', 'm.room.message', 'm.room.message'],
+    [
+      'm.room.create',
+      'm.room.member',
+      'm.room.power_levels',
+      'm.room.join_rules',
+      'm.room.message',
+      'm.room.message',
+    ],
   );
   // event ids are the wire ids from event_index
   const idx = await withDb(SERVER_DB, async (c) => {
@@ -54,8 +63,8 @@ Deno.test('syncSince: initial, incremental, and long-poll', async () => {
     return r.rows.map((row: any) => String(row.event_id));
   });
   assertEquals(jr.timeline.events.map((e) => e.event_id), idx);
-  // state events present on initial sync (create + member)
-  assertEquals(jr.state.events.length, 2);
+  // state events present on initial sync (create + member + PL + join_rules)
+  assertEquals(jr.state.events.length, 4);
   const max = await maxSeq();
   assertEquals(initial.next_batch, 's' + max);
 
@@ -68,13 +77,14 @@ Deno.test('syncSince: initial, incremental, and long-poll', async () => {
   assertEquals(empty.next_batch, 's' + max);
 
   // 4. one more message -> exactly 1 event, correct wire id
-  const r4 = await ingestEvent(ROOM, {
+  const pdu4 = await author(ROOM, {
     type: 'm.room.message',
     sender: '@dev:localhost',
     content: { body: 's3', msgtype: 'm.text' },
     prev_events: [prev],
-    origin_ts: Date.now(),
+    origin_server_ts: Date.now(),
   });
+  const r4 = await ingestEvent(ROOM, pdu4);
   const inc = await syncSince(max, 0);
   const jinc = inc.rooms.join[ROOM] as {
     timeline: { events: { event_id: string }[] };
@@ -88,13 +98,14 @@ Deno.test('syncSince: initial, incremental, and long-poll', async () => {
   const t0 = performance.now();
   const pending = syncSince(max2, 5000);
   await sleep(1000);
-  const r5 = await ingestEvent(ROOM, {
+  const pdu5 = await author(ROOM, {
     type: 'm.room.message',
     sender: '@dev:localhost',
     content: { body: 's4', msgtype: 'm.text' },
     prev_events: [r4.event_id],
-    origin_ts: Date.now(),
+    origin_server_ts: Date.now(),
   });
+  const r5 = await ingestEvent(ROOM, pdu5);
   const lp = await pending;
   const elapsed = performance.now() - t0;
   assert(elapsed < 4000, `long-poll took ${elapsed}ms, expected < 4000`);

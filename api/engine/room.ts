@@ -1,5 +1,6 @@
 import { ident, SERVER_DB, withDb } from './db.ts';
-import { ingestEvent } from './ingest.ts';
+import { author, ingestEvent } from './ingest.ts';
+import { getRulebook } from './policy.ts';
 
 async function sha256hex(s: string): Promise<string> {
   const data = new TextEncoder().encode(s);
@@ -32,16 +33,21 @@ export interface CreateRoomResult {
   memberEventId: string;
 }
 
+// v11 genesis (F0): m.room.create (content.room_version, NO creator),
+// creator m.room.member join, m.room.power_levels, m.room.join_rules
+// {invite} — each through author()+ingest (signed, validated, resolved).
+// roomVersion must be a known string ('11'); unknown -> never a default.
 export async function createRoom(
   roomId: string,
   roomVersion: string,
   creator: string,
 ): Promise<CreateRoomResult> {
+  getRulebook(roomVersion);
   const dbName = await dbNameFor(roomId);
   await withDb(SERVER_DB, async (c) => {
     await c.query(`CREATE DATABASE ${ident(dbName)};`);
     await c.query(
-      'INSERT INTO room_directory (room_id, db_name, room_version) VALUES ($1, $2, $3);',
+      'INSERT INTO room_directory (room_id, db_name, room_version, stub_era) VALUES ($1, $2, $3, TRUE);',
       [roomId, dbName, roomVersion],
     );
   });
@@ -49,24 +55,50 @@ export async function createRoom(
     await runSqlFile(c, 'db/room/schema.sql');
     await c.query(`SELECT DOLT_COMMIT('-Am', 'room genesis: schema');`);
   });
-  const createRes = await ingestEvent(roomId, {
+  const createPdu = await author(roomId, {
     type: 'm.room.create',
     state_key: '',
     sender: creator,
-    content: { creator, room_version: roomVersion },
+    content: { room_version: roomVersion },
     prev_events: [],
-    origin_ts: Date.now(),
+    origin_server_ts: Date.now(),
   });
-  // creator's join — through the normal pipeline (needed for spec-true
-  // state and sync's join map)
-  const memberRes = await ingestEvent(roomId, {
+  const createRes = await ingestEvent(roomId, createPdu);
+  // creator's join — through the normal pipeline (the v11 creator-join
+  // exemption covers it: sole prev is the create event)
+  const memberPdu = await author(roomId, {
     type: 'm.room.member',
     state_key: creator,
     sender: creator,
     content: { membership: 'join' },
-    prev_events: [createRes.event_id],
-    origin_ts: Date.now(),
+    origin_server_ts: Date.now(),
   });
+  const memberRes = await ingestEvent(roomId, memberPdu);
+  const plPdu = await author(roomId, {
+    type: 'm.room.power_levels',
+    state_key: '',
+    sender: creator,
+    content: {
+      users: { [creator]: 100 },
+      users_default: 0,
+      events_default: 0,
+      state_default: 50,
+      invite: 100,
+      kick: 100,
+      ban: 100,
+      redact: 100,
+    },
+    origin_server_ts: Date.now(),
+  });
+  await ingestEvent(roomId, plPdu);
+  const jrPdu = await author(roomId, {
+    type: 'm.room.join_rules',
+    state_key: '',
+    sender: creator,
+    content: { join_rule: 'invite' },
+    origin_server_ts: Date.now(),
+  });
+  await ingestEvent(roomId, jrPdu);
   return { createEventId: createRes.event_id, memberEventId: memberRes.event_id };
 }
 

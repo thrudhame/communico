@@ -3,7 +3,8 @@
 // an own store from events via the sync protocol (empty-tips delta-req).
 import {
   createRoom, joinRoom, ingestEvent, ingestRemote, timeline, doltLog,
-  tableHashes, extremities, allEvents, hasEvent, eventCount, rawQuery,
+  tableHashes, stateHash, roomVersion, extremities, allEvents, hasEvent,
+  eventCount, rawQuery,
   exportStoreImage, aliveBranches, adoptStoreImage, branchesInImage,
 } from './engine-lite.js';
 import { startMsync } from './sync/msync.js';
@@ -35,6 +36,8 @@ const facade = {
   getRoom: () => room,
   extremities: (r) => extremities(r),
   tableHashes: (r) => tableHashes(r),
+  stateHash: (r) => stateHash(r),
+  roomVersion: (r) => roomVersion(r),
   ingestRemote: (r, e) => ingestRemote(r, e),
   allEvents: (r) => allEvents(r),
   hasEvent: (r, id) => hasEvent(r, id),
@@ -195,7 +198,14 @@ async function send() {
   const body = input.value.trim();
   if (!body || !room) return;
   input.value = '';
-  await ingestEvent(room, { type: 'm.room.message', content: { body, msgtype: 'm.text' } });
+  // F0 stub: a refused send is still stored in the DAG (rejected, out of
+  // state) and must still render + gossip — refusal is a materialization
+  // decision, never a propagation drop. Surface it in the status line.
+  try {
+    await ingestEvent(room, { type: 'm.room.message', content: { body, msgtype: 'm.text' } });
+  } catch (e) {
+    $('status').textContent = 'send refused, kept locally: ' + String(e?.message ?? e).split(':')[0];
+  }
   render(); // local truth first — never blocked by transport readiness
   if (ms) {
     ms.announceLocalIngest();

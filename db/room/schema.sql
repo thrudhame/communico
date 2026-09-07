@@ -4,7 +4,13 @@ CREATE TABLE events (
   state_key      text,
   sender         text NOT NULL,
   origin_ts      bigint NOT NULL,
-  canonical_json jsonb NOT NULL
+  depth          bigint NOT NULL,
+  prev_events    jsonb NOT NULL DEFAULT '[]',
+  auth_events    jsonb NOT NULL DEFAULT '[]',
+  hashes         jsonb NOT NULL DEFAULT '{}',
+  signatures     jsonb NOT NULL DEFAULT '{}',
+  rejected       boolean NOT NULL DEFAULT FALSE,
+  canonical_json text NOT NULL
 );
 CREATE TABLE state (
   type      text NOT NULL,

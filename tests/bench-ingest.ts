@@ -5,28 +5,28 @@ import {
   createRoom,
   lookupRoom,
 } from '../api/engine/room.ts';
-import { ingestEvent } from '../api/engine/ingest.ts';
+import { author, ingestEvent } from '../api/engine/ingest.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!bench:localhost';
 
 await resetRoom(ROOM);
-await createRoom(ROOM, '10', '@dev:localhost');
+await createRoom(ROOM, '11', '@dev:localhost');
 const room = (await lookupRoom(ROOM))!;
 
-// chain off the current extremity (the member event since the
-// matrix-client-demo baseline change)
+// chain off the current extremity
 let prev = await latestExtremityEventId(ROOM);
 
 async function sendOne(i: number): Promise<number> {
   const t0 = performance.now();
-  const r = await ingestEvent(ROOM, {
+  const pdu = await author(ROOM, {
     type: 'm.room.message',
     sender: '@dev:localhost',
     content: { body: `bench ${i}`, msgtype: 'm.text' },
     prev_events: [prev],
-    origin_ts: Date.now(),
+    origin_server_ts: Date.now(),
   });
+  const r = await ingestEvent(ROOM, pdu);
   prev = r.event_id;
   return performance.now() - t0;
 }

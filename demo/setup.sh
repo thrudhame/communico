@@ -106,7 +106,7 @@ ROOM_ID="$(docker exec "$CONTAINER" bash -c \
     import pgpkg from 'pg';
     const c = new pgpkg.Client({host:'127.0.0.1',port:5432,user:'root',password:'secret',database:'postgres'});
     await c.connect();
-    const r = await c.query(\\\"SELECT room_id FROM event_index WHERE room_id IN (SELECT room_id FROM room_directory WHERE room_version='test.communico.dolt.v1') GROUP BY room_id ORDER BY MAX(seq) DESC LIMIT 1;\\\");
+    const r = await c.query(\\\"SELECT room_id FROM event_index WHERE room_id IN (SELECT room_id FROM room_directory WHERE room_version='11') GROUP BY room_id ORDER BY MAX(seq) DESC LIMIT 1;\\\");
     if (r.rows.length) console.log(r.rows[0].room_id);
     await c.end();
   \" 2>/dev/null | tail -1" || true)"
@@ -114,7 +114,7 @@ if [[ -z "$ROOM_ID" ]]; then
   echo ">> creating demo room"
   ROOM_ID="$(docker exec "$CONTAINER" curl -s -X POST localhost:80/_matrix/client/v3/createRoom \
     -H 'Authorization: Bearer devtoken' \
-    -d '{"room_version":"test.communico.dolt.v1"}' \
+    -d '{"room_version":"11"}' \
     | grep -o '"room_id":"[^"]*"' | head -1 | cut -d'"' -f4)"
 fi
 echo ">> demo room: $ROOM_ID"
@@ -152,6 +152,11 @@ mc /tmp/mc-bob --login password --homeserver http://localhost:80 \
 mc /tmp/mc-bob-send --login password --homeserver http://localhost:80 \
   --user-login '@bob:localhost' --password 'demo-password' \
   --device bob-send --room-default "$ROOM_ID"
+# F0: the demo room is invite-only (v11 genesis) and the stub enforces
+# membership — invite + join the demo users through the engine pipeline
+# (CS invite/join endpoints are M4 scope)
+echo ">> seeding demo membership (invite + join alice, bob)"
+docker exec "$CONTAINER" bash -c "cd /workspace && deno run --env --allow-net --allow-env --allow-read demo/seed-membership.ts '$ROOM_ID'"
 # Warm-up sync: burn through the current backlog so each user's stored
 # since-token points at "now". Without this, `--listen forever` at demo
 # time replays every historical event across every prior test room on

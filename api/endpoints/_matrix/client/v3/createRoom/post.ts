@@ -3,8 +3,10 @@ import type {
   TApiComponentRequest,
 } from '@communico/api/interfaces';
 import { createHttpError, Status } from '@oak/oak';
+import type { HttpError } from '@oak/oak';
 import { authorize } from '../../../../../engine/auth.ts';
 import { createRoom } from '../../../../../engine/room.ts';
+import { SERVER_NAME } from '../../../../../engine/config.ts';
 
 export default async function (
   request: TApiComponentRequest,
@@ -16,19 +18,32 @@ export default async function (
     return [createHttpError(Status.InternalServerError, String(e)), null];
   }
 
-  let body: { room_version?: string } = {};
+  let body: { room_version?: unknown } = {};
   try {
     body = await request.body.json();
   } catch {
     body = {};
   }
-  const roomVersion = body.room_version ?? '10';
+  // F0: default '11'. Non-string/unknown versions are rejected (never a
+  // silent default — Complement 32room-versions); createRoom enforces via
+  // the policy registry.
+  const roomVersion = body.room_version ?? '11';
 
-  const roomId = '!' + crypto.randomUUID() + ':localhost';
+  const roomId = '!' + crypto.randomUUID() + ':' + SERVER_NAME;
   try {
-    await createRoom(roomId, roomVersion, userId);
+    await createRoom(roomId, roomVersion as string, userId);
   } catch (e) {
-    return [createHttpError(Status.InternalServerError, String(e)), null];
+    const msg = String(e);
+    if (msg.includes('M_UNSUPPORTED_ROOM_VERSION')) {
+      return [
+        createHttpError(
+          Status.BadRequest,
+          msg,
+        ) as unknown as HttpError<Status.InternalServerError>,
+        null,
+      ];
+    }
+    return [createHttpError(Status.InternalServerError, msg), null];
   }
   return [null, { room_id: roomId }];
 }

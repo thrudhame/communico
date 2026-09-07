@@ -22,7 +22,7 @@ room_id() {
       import pgpkg from 'pg';
       const c = new pgpkg.Client({host:'127.0.0.1',port:5432,user:'root',password:'secret',database:'postgres'});
       await c.connect();
-      const r = await c.query(\\\"SELECT room_id FROM event_index WHERE room_id IN (SELECT room_id FROM room_directory WHERE room_version='test.communico.dolt.v1') GROUP BY room_id ORDER BY MAX(seq) DESC LIMIT 1;\\\");
+      const r = await c.query(\\\"SELECT room_id FROM event_index WHERE room_id IN (SELECT room_id FROM room_directory WHERE room_version='11') GROUP BY room_id ORDER BY MAX(seq) DESC LIMIT 1;\\\");
       if (r.rows.length) console.log(r.rows[0].room_id);
       await c.end();
     \" 2>/dev/null | tail -1"
