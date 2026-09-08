@@ -4,3 +4,7 @@
 lite/bin/
 lite/web/node_modules/
 /.envrc
+# Complement run artifacts (regenerable; BASELINE.md is the record)
+complement/baseline.jsonl
+complement/work-*
+complement/.test-status

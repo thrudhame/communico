@@ -1,0 +1,145 @@
+# Complement baseline — 2026-09-07T19:05:05.819Z
+
+- checkout: ~/Sources/matrix-org-complement @ 0116400
+- image: communico-complement:local (commit 66e76ac)
+- go test exit: 1 (red tests are the baseline, not a harness error)
+- packages: pass=13 fail=2 skip=0
+- failing tests: 130
+
+## Failing packages
+
+- github.com/matrix-org/complement/tests
+- github.com/matrix-org/complement/tests/csapi
+
+## Failing tests (red to beat)
+
+- github.com/matrix-org/complement/tests/csapi TestChangePasswordPushers
+- github.com/matrix-org/complement/tests TestWriteMDirectAccountData
+- github.com/matrix-org/complement/tests/csapi TestChangePassword
+- github.com/matrix-org/complement/tests TestIsDirectFlagLocal
+- github.com/matrix-org/complement/tests/csapi TestAddAccountData
+- github.com/matrix-org/complement/tests TestIsDirectFlagFederation
+- github.com/matrix-org/complement/tests/csapi TestDeactivateAccount
+- github.com/matrix-org/complement/tests/csapi TestContent
+- github.com/matrix-org/complement/tests/csapi TestContentCSAPIMediaV1
+- github.com/matrix-org/complement/tests TestMediaFilenames
+- github.com/matrix-org/complement/tests/csapi TestDeviceManagement
+- github.com/matrix-org/complement/tests TestMediaWithoutFileName
+- github.com/matrix-org/complement/tests/csapi TestLogin
+- github.com/matrix-org/complement/tests TestMediaWithoutFileNameCSMediaV1
+- github.com/matrix-org/complement/tests/csapi TestLogout
+- github.com/matrix-org/complement/tests TestLocalPngThumbnail
+- github.com/matrix-org/complement/tests/csapi TestPresence
+- github.com/matrix-org/complement/tests TestRemotePngThumbnail
+- github.com/matrix-org/complement/tests/csapi TestProfileAvatarURL
+- github.com/matrix-org/complement/tests TestFederationThumbnail
+- github.com/matrix-org/complement/tests/csapi TestProfileDisplayName
+- github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryLocal
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/q
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/3
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/.
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/_
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/=
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/-
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_//
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/Registration_accepts_non-ascii_passwords
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_{}_returns_a_set_of_flows
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_rejects_usernames_with_special_characters
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/GET_/register/available_returns_available_for_unregistered_user_name
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_rejects_if_user_already_exists
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/Registration_without_a_session_fails
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_returns_the_same_device_id_as_that_in_the_request
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_can_create_a_user
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/POST_/register_downcases_capitals_in_usernames
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/GET_/register/available_returns_M_INVALID_USERNAME_for_invalid_user_name
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel/GET_/register/available_returns_M_USER_IN_USE_for_registered_user_name
+- github.com/matrix-org/complement/tests/csapi TestRegistration/parallel
+- github.com/matrix-org/complement/tests/csapi TestRegistration
+- github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryFederation
+- github.com/matrix-org/complement/tests/csapi TestRequestEncodingFails/POST_rejects_invalid_utf-8_in_JSON
+- github.com/matrix-org/complement/tests/csapi TestRequestEncodingFails
+- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin
+- github.com/matrix-org/complement/tests/csapi TestRoomAlias
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin
+- github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinLocalUser
+- github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias
+- github.com/matrix-org/complement/tests/csapi TestRoomCreate
+- github.com/matrix-org/complement/tests/csapi TestRoomForget
+- github.com/matrix-org/complement/tests/csapi TestFetchEvent
+- github.com/matrix-org/complement/tests/csapi TestFetchHistoricalJoinedEventDenied
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
+- github.com/matrix-org/complement/tests/csapi TestFetchHistoricalSharedEvent
+- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
+- github.com/matrix-org/complement/tests/csapi TestFetchHistoricalInvitedEventFromBetweenInvite
+- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
+- github.com/matrix-org/complement/tests/csapi TestFetchHistoricalInvitedEventFromBeforeInvite
+- github.com/matrix-org/complement/tests TestClientSpacesSummary
+- github.com/matrix-org/complement/tests/csapi TestFetchEventNonWorldReadable
+- github.com/matrix-org/complement/tests TestClientSpacesSummaryJoinRules
+- github.com/matrix-org/complement/tests/csapi TestFetchEventWorldReadable
+- github.com/matrix-org/complement/tests TestFederatedClientSpaces
+- github.com/matrix-org/complement/tests/csapi TestRoomMembers
+- github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs
+- github.com/matrix-org/complement/tests/csapi TestRoomReceipts
+- github.com/matrix-org/complement/tests TestJumpToDateEndpoint
+- github.com/matrix-org/complement/tests/csapi TestRoomReadMarkers
+- github.com/matrix-org/complement/tests TestUnknownEndpoints
+- github.com/matrix-org/complement/tests/csapi TestRoomState
+- github.com/matrix-org/complement/tests/csapi TestSearch
+- github.com/matrix-org/complement/tests/csapi TestServerCapabilities
+- github.com/matrix-org/complement/tests/csapi TestInviteFromIgnoredUsersDoesNotAppearInSync
+- github.com/matrix-org/complement/tests/csapi TestJson
+- github.com/matrix-org/complement/tests/csapi TestFilter
+- github.com/matrix-org/complement/tests/csapi TestEvent
+- github.com/matrix-org/complement/tests/csapi TestAsyncUpload
+- github.com/matrix-org/complement/tests/csapi TestRoomImageRoundtrip
+- github.com/matrix-org/complement/tests/csapi TestMediaConfig
+- github.com/matrix-org/complement/tests/csapi TestMembershipOnEvents
+- github.com/matrix-org/complement/tests/csapi TestPublicRooms/Can_search_public_room_list
+- github.com/matrix-org/complement/tests/csapi TestPublicRooms/Name/topic_keys_are_correct
+- github.com/matrix-org/complement/tests/csapi TestPublicRooms
+- github.com/matrix-org/complement/tests/csapi TestRedact
+- github.com/matrix-org/complement/tests/csapi TestGetRoomMembers
+- github.com/matrix-org/complement/tests/csapi TestGetRoomMembersAtPoint
+- github.com/matrix-org/complement/tests/csapi TestGetFilteredRoomMembers
+- github.com/matrix-org/complement/tests/csapi TestSendAndFetchMessage
+- github.com/matrix-org/complement/tests/csapi TestFetchMessagesFromNonExistentRoom
+- github.com/matrix-org/complement/tests/csapi TestSendMessageWithTxn
+- github.com/matrix-org/complement/tests/csapi TestRoomMessagesLazyLoading
+- github.com/matrix-org/complement/tests/csapi TestRoomMessagesLazyLoadingLocalUser
+- github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation
+- github.com/matrix-org/complement/tests/csapi TestAvatarUrlUpdate
+- github.com/matrix-org/complement/tests/csapi TestDisplayNameUpdate
+- github.com/matrix-org/complement/tests/csapi TestRelations
+- github.com/matrix-org/complement/tests/csapi TestRelationsPagination
+- github.com/matrix-org/complement/tests/csapi TestRelationsPaginationSync
+- github.com/matrix-org/complement/tests/csapi TestThreadsEndpoint
+- github.com/matrix-org/complement/tests/csapi TestTyping
+- github.com/matrix-org/complement/tests/csapi TestLeakyTyping
+- github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade
+- github.com/matrix-org/complement/tests/csapi TestRoomsInvite
+- github.com/matrix-org/complement/tests/csapi TestMembersLocal
+- github.com/matrix-org/complement/tests/csapi TestRoomCreationReportsEventsToMyself
+- github.com/matrix-org/complement/tests/csapi TestSyncLeaveSection
+- github.com/matrix-org/complement/tests/csapi TestGappedSyncLeaveSection
+- github.com/matrix-org/complement/tests/csapi TestArchivedRoomsHistory
+- github.com/matrix-org/complement/tests/csapi TestOlderLeftRoomsNotInLeaveSection
+- github.com/matrix-org/complement/tests/csapi TestLeaveEventVisibility
+- github.com/matrix-org/complement/tests/csapi TestLeaveEventInviteRejection
+- github.com/matrix-org/complement/tests/csapi TestSyncFilter
+- github.com/matrix-org/complement/tests/csapi TestCumulativeJoinLeaveJoinSync
+- github.com/matrix-org/complement/tests/csapi TestTentativeEventualJoiningAfterRejecting
+- github.com/matrix-org/complement/tests/csapi TestSync
+- github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap
+- github.com/matrix-org/complement/tests/csapi TestPresenceSyncDifferentRooms
+- github.com/matrix-org/complement/tests/csapi TestRoomSummary
+- github.com/matrix-org/complement/tests/csapi TestTxnInEvent
+- github.com/matrix-org/complement/tests/csapi TestTxnScopeOnLocalEcho
+- github.com/matrix-org/complement/tests/csapi TestTxnIdempotencyScopedToDevice
+- github.com/matrix-org/complement/tests/csapi TestTxnIdempotency
+- github.com/matrix-org/complement/tests/csapi TestTxnIdWithRefreshToken
+- github.com/matrix-org/complement/tests/csapi TestUrlPreview
+- github.com/matrix-org/complement/tests/csapi TestRoomSpecificUsernameChange
+- github.com/matrix-org/complement/tests/csapi TestRoomSpecificUsernameAtJoin

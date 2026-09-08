@@ -1016,3 +1016,51 @@ Verbatim F0 gate (all green 2026-09-07):
 F0→F1 seam (recorded, never a path): browsers send unsigned PDUs; server
 accepts `signatures: {}` behind `ALLOW_UNSIGNED_LITE=1` (dev `.env` on, M0
 image off, deleted at F1's end).
+
+## M0 — Complement harness (server-foundation phase 2, 2026-09-07)
+
+Branch `server-foundation` (F0 commit `66e76ac` + M0 work). All runs on ark
+VM fork `arch-communico-server-foundation` (user memo 2026-09-07: no testing
+on the laptop; the plan's R10 host-runs approval is superseded — plan §5
+amended).
+
+What landed: `complement/Dockerfile` (deno + doltgres stages, repo copied,
+`EXPOSE 8008 8448`, `HEALTHCHECK` on `GET /_matrix/client/versions`,
+`ENTRYPOINT ["tini","--","/complement/entrypoint.sh"]`); `entrypoint.sh`
+(doltgres with storage inside the image → wait `:5432` → idempotent
+`db-init` (keypair reused) → communico `:8008` with `SERVER_NAME` from env;
+`:8448` TLS cert issued at start with `openssl` per the Complement README
+recipe against the mounted CA, self-signed outside Complement; repeated CMD
+tolerated); `complement/tls-stub.ts` (TLS `:8448`, 404 `M_UNRECOGNIZED` for
+every path — federation is M5; handshake succeeds so Complement fails fast);
+`SERVER_NAME` read once (`api/engine/config.ts`, dev default `localhost`);
+`APP_A_PORT` default `8008` (`demo/setup.sh` publishes it);
+`/versions` gains `unstable_features: {}`; NEW `/v3/capabilities`
+(`m.room_versions`: default `11`, available `{11: stable}` only — 12 when
+its resolver lands; no `m.change_password`); `createRoom` rejects
+non-string/unknown `room_version` (Complement `32room-versions`).
+
+Doltgres/Deno findings (new): `deno cache` in Deno 2.9 takes no
+`--allow-*` flags (build cache silently never happened behind `|| true` —
+runtime re-downloaded per container spawn); Go allows exactly one
+`//go:build` line per file (merge, don't prepend — second line is a build
+error); this Go 1.27 toolchain's vet additionally wants matching `// +build`
+lines (harmless: `go test` builds fine either way — proven by green
+"[no tests to run]" packages); blacklisting `federation_room_join_test.go`
+orphans `testValidationForSendMembershipEndpoint` used by
+`knocking*` (both blacklisted too — verified by package-scoped
+def/use analysis: the only cross-file dep).
+
+Verbatim M0 gate (all green 2026-09-07, on the VM):
+- `bash complement/run.sh` completes without harness error (exit 0);
+  `TestVersionStructure` PASS (`/_matrix/client/versions` 200).
+- `complement/BASELINE.md` written: checkout `0116400`, image from F0
+  commit `66e76ac` — packages pass=13 fail=2, failing tests=130 (the red
+  number to beat: `TestRegistration|TestLogin|TestLogout` red — F1's rung;
+  `TestServerCapabilities` red — needs `/register`; no msc*/federation
+  test ran).
+- Demo re-verified on the VM with M0 ports (`setup.sh --reset`,
+  `run-demo.sh --check` 4/4 incl. the Carol leg).
+
+The F0 unsigned-lite seam stays OFF in the M0 image (`ALLOW_UNSIGNED_LITE`
+unset in the entrypoint); `.env` (seam on) is `.dockerignore`d out.
