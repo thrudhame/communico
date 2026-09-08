@@ -4,18 +4,19 @@ import type {
 } from '@communico/api/interfaces';
 import { createHttpError, Status } from '@oak/oak';
 import { authorize } from '../../../../../../engine/auth.ts';
+import { SERVER_NAME } from '../../../../../../engine/config.ts';
 import { MatrixError } from '../../../../../../engine/matrix-error.ts';
+import { revokeAllTokens } from '../../../../../../engine/tenant.ts';
 
-// POST /_matrix/client/v3/keys/upload — stub (phase-2 step 2.4; the
-// capture lists this endpoint: matrix-commander constructs nio with
-// encryption_enabled=True + a store, so nio uploads device keys on its
-// first sync). E2EE is out of scope; --plain everywhere.
+// POST /_matrix/client/v3/logout/all — invalidate all of the user's tokens.
 export default async function (
   request: TApiComponentRequest,
 ): TApiComponentOutcome {
   try {
-    await authorize(request);
-    return [null, { one_time_key_counts: {} }];
+    const userId = await authorize(request);
+    const localpart = userId.slice(1, userId.lastIndexOf(':'));
+    await revokeAllTokens(SERVER_NAME, localpart);
+    return [null, {}];
   } catch (e) {
     if (e instanceof MatrixError) throw e;
     return [createHttpError(Status.InternalServerError, String(e)), null];

@@ -4,6 +4,7 @@ import type {
 } from '@communico/api/interfaces';
 import { createHttpError, Status } from '@oak/oak';
 import type { HttpError } from '@oak/oak';
+import { MatrixError } from '../../../../../../../../../engine/matrix-error.ts';
 import { authorize } from '../../../../../../../../../engine/auth.ts';
 import { author, ingestEvent } from '../../../../../../../../../engine/ingest.ts';
 import { extremities, lookupRoom } from '../../../../../../../../../engine/room.ts';
@@ -44,6 +45,7 @@ export default async function (
     const res = await ingestEvent(roomId, pdu);
     return [null, { event_id: res.event_id }];
   } catch (e) {
+    if (e instanceof MatrixError) throw e;
     const msg = String(e);
     // The outcome type pins HttpError<500>; semantic statuses ride the
     // message (house pattern — the framework maps the message prefix).

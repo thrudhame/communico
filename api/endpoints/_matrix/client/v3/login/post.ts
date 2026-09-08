@@ -3,63 +3,75 @@ import type {
   TApiComponentRequest,
 } from '@communico/api/interfaces';
 import { createHttpError, Status } from '@oak/oak';
-import { SERVER_DB, withDb } from '../../../../../engine/db.ts';
+import { SERVER_NAME } from '../../../../../engine/config.ts';
+import { MatrixError } from '../../../../../engine/matrix-error.ts';
+import { issueToken, upsertDevice, verifyUserPassword } from '../../../../../engine/tenant.ts';
 
-async function sha256hex(s: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(s),
-  );
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-// m.login.password auth (no token required). Body accepted in both nio
-// (`identifier.user`) and legacy (`user`) shapes — capture rows 1–2.
+// m.login.password (F1 step 18): argon2id verify against the tenant
+// credentials; `identifier.type m.id.user` plus the legacy `user` shape
+// (capture rows 1–2). Failures are 403 M_FORBIDDEN (never user-oracle
+// details beyond the code).
 export default async function (
   request: TApiComponentRequest,
 ): TApiComponentOutcome {
   try {
     const body = await request.body.json();
-    const rawUser: unknown = body?.identifier?.user ?? body?.user;
-    if (
-      body?.type !== 'm.login.password' || typeof rawUser !== 'string' ||
-      typeof body?.password !== 'string'
-    ) {
-      throw new Error('M_BAD_REQUEST: expected m.login.password with user + password');
+    if (body?.type !== 'm.login.password') {
+      throw new MatrixError(400, 'M_BAD_REQUEST', 'expected m.login.password');
     }
-    const userId = rawUser.startsWith('@')
-      ? rawUser
-      : `@${rawUser}:localhost`;
-    const pwHash = await sha256hex(body.password);
-
-    return await withDb(SERVER_DB, async (c) => {
-      const r = await c.query(
-        'SELECT user_id FROM users WHERE user_id = $1 AND password_hash = $2;',
-        [userId, pwHash],
-      );
-      if (r.rows.length === 0) {
-        throw new Error('M_FORBIDDEN: invalid username or password');
+    const ident = body?.identifier as Record<string, unknown> | undefined;
+    let rawUser: unknown;
+    if (ident && typeof ident === 'object') {
+      if (ident.type !== 'm.id.user') {
+        throw new MatrixError(400, 'M_BAD_REQUEST', 'unsupported identifier type');
       }
-      const accessToken = crypto.randomUUID();
-      const deviceId: string = typeof body.device_id === 'string' &&
-          body.device_id.length > 0
-        ? body.device_id
-        : crypto.randomUUID().replaceAll('-', '').slice(0, 10);
-      await c.query(
-        'INSERT INTO access_tokens (token, user_id, device_id) VALUES ($1, $2, $3);',
-        [accessToken, userId, deviceId],
-      );
-      return [null, {
-        user_id: userId,
-        access_token: accessToken,
-        device_id: deviceId,
-        home_server: 'localhost',
-      }];
-    });
+      rawUser = ident.user;
+    } else {
+      rawUser = body?.user;
+    }
+    if (typeof rawUser !== 'string' || typeof body?.password !== 'string') {
+      throw new MatrixError(400, 'M_BAD_REQUEST', 'user + password required');
+    }
+    // Full MXID must name this server; bare localparts are accepted and
+    // downcased (registration downcases too).
+    let localpart: string;
+    if (rawUser.startsWith('@')) {
+      const rest = rawUser.slice(1);
+      const colon = rest.lastIndexOf(':');
+      if (colon < 0) throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
+      localpart = rest.slice(0, colon).toLowerCase();
+      if (rest.slice(colon + 1) !== SERVER_NAME) {
+        throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
+      }
+    } else {
+      localpart = rawUser.toLowerCase();
+    }
+    if (!await verifyUserPassword(SERVER_NAME, localpart, body.password)) {
+      throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
+    }
+    const deviceId: string = typeof body.device_id === 'string' &&
+        body.device_id.length > 0
+      ? body.device_id
+      : crypto.randomUUID().replaceAll('-', '').slice(0, 10);
+    // Login (re)creates the device row — the devices list reflects every
+    // device that holds (or held) a token.
+    await upsertDevice(
+      SERVER_NAME,
+      localpart,
+      deviceId,
+      typeof body.initial_device_display_name === 'string'
+        ? body.initial_device_display_name
+        : undefined,
+    );
+    const accessToken = await issueToken(SERVER_NAME, localpart, deviceId);
+    return [null, {
+      user_id: `@${localpart}:${SERVER_NAME}`,
+      access_token: accessToken,
+      device_id: deviceId,
+      home_server: SERVER_NAME,
+    }];
   } catch (e) {
-    // framework turns this into a 400; nio treats any non-2xx as
-    // LoginError and reports it cleanly (capture-verified behavior)
+    if (e instanceof MatrixError) throw e;
     return [createHttpError(Status.InternalServerError, String(e)), null];
   }
 }

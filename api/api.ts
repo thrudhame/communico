@@ -2,6 +2,7 @@ import type {
   TApiComponent,
   TApiComponentRequest,
 } from '@communico/api/interfaces';
+import { MatrixError } from './engine/matrix-error.ts';
 
 import * as path from '@std/path';
 import * as assert from '@std/assert';
@@ -114,8 +115,27 @@ export class Api {
               throw error;
             }
 
-            context.response.body = response;
+            // Exact `application/json` (no charset): Complement's
+            // MatchResponse asserts the content type verbatim. Objects are
+            // serialized here for full control over oak's inference;
+            // strings (media stubs) pass through untouched, as before.
+            if (response != null && typeof response === 'object') {
+              context.response.body = JSON.stringify(response);
+              context.response.headers.set('Content-Type', 'application/json');
+            } else {
+              context.response.body = response;
+            }
           } catch (e) {
+            // F1: spec-shaped errors carry their own status + body
+            // (M_USER_IN_USE, UIA 401s, …). Everything else stays on the
+            // legacy 400-generic path.
+            if (e instanceof MatrixError) {
+              console.error(e);
+              context.response.status = e.status;
+              context.response.body = JSON.stringify(e.responseBody());
+              context.response.headers.set('Content-Type', 'application/json');
+              return;
+            }
             console.error(e);
             throw createHttpError(
               Status.BadRequest,

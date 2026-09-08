@@ -1,20 +1,15 @@
-CREATE TABLE IF NOT EXISTS users (
-  user_id text PRIMARY KEY,
-  display_name text,
-  password_hash text
-);
+-- db/server/schema.sql — server operational DB (F1). Holds the room
+-- registry and the event index only. Identity lives in the per-tenant DB
+-- (db/tenant/schema.sql); users/access_tokens tables and seeds were
+-- removed in F1 (seeds now register through the real /register path in
+-- db/init.ts). server_signing_key stays as the tenant-key migration source.
 -- Doltgres substitution (recorded in RESULTS.md): neither
 -- `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` nor plpgsql `DO` blocks are
 -- supported, so there is no idempotent ALTER for pre-existing server DBs.
--- Fresh provisioning gets the columns from the CREATE TABLEs above/below;
--- an existing DB gets them once via plain ALTER (no IF NOT EXISTS):
---   ALTER TABLE users ADD COLUMN password_hash text;
---   ALTER TABLE access_tokens ADD COLUMN device_id text;
-CREATE TABLE IF NOT EXISTS access_tokens (
-  token text PRIMARY KEY,
-  user_id text NOT NULL,
-  device_id text
-);
+-- Fresh provisioning gets the columns from the CREATE TABLEs below; an
+-- existing DB gets them once via plain ALTER (no IF NOT EXISTS):
+--   ALTER TABLE room_directory ADD COLUMN stub_era boolean DEFAULT TRUE;
+--   ALTER TABLE event_index ADD COLUMN rejected boolean DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -43,13 +38,3 @@ CREATE TABLE IF NOT EXISTS server_signing_key (
   privkey_pkcs8_b64 text NOT NULL,
   created_ms bigint NOT NULL
 );
-INSERT INTO users (user_id, display_name) VALUES ('@dev:localhost', 'Dev User')
-  ON CONFLICT (user_id) DO NOTHING;
-INSERT INTO access_tokens (token, user_id) VALUES ('devtoken', '@dev:localhost')
-  ON CONFLICT (token) DO NOTHING;
--- demo users; password is 'demo-password' (sha256 hex; PROTOTYPE-GRADE,
--- documented as demo-only — plan §8)
-INSERT INTO users (user_id, display_name, password_hash) VALUES ('@alice:localhost', 'Alice', '41bd876b085d6031cb0e04de35b88d77f83a4ba39f879fee40805ac19e356023')
-  ON CONFLICT (user_id) DO NOTHING;
-INSERT INTO users (user_id, display_name, password_hash) VALUES ('@bob:localhost', 'Bob', '41bd876b085d6031cb0e04de35b88d77f83a4ba39f879fee40805ac19e356023')
-  ON CONFLICT (user_id) DO NOTHING;

@@ -4,6 +4,7 @@ import type {
 } from '@communico/api/interfaces';
 import { createHttpError, Status } from '@oak/oak';
 import { authorize } from '../../../../../engine/auth.ts';
+import { MatrixError } from '../../../../../engine/matrix-error.ts';
 import { syncSince } from '../../../../../engine/syncfeed.ts';
 
 // GET /_matrix/client/v3/sync — phase-2 step 2.3. `since` = 's<digits>';
@@ -17,6 +18,7 @@ export default async function (
   try {
     await authorize(request);
   } catch (e) {
+    if (e instanceof MatrixError) throw e;
     return [createHttpError(Status.InternalServerError, String(e)), null];
   }
   try {

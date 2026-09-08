@@ -4,6 +4,7 @@ import type {
 } from '@communico/api/interfaces';
 import { createHttpError, Status } from '@oak/oak';
 import type { HttpError } from '@oak/oak';
+import { MatrixError } from '../../../../../engine/matrix-error.ts';
 import { authorize } from '../../../../../engine/auth.ts';
 import { createRoom } from '../../../../../engine/room.ts';
 import { SERVER_NAME } from '../../../../../engine/config.ts';
@@ -33,6 +34,7 @@ export default async function (
   try {
     await createRoom(roomId, roomVersion as string, userId);
   } catch (e) {
+    if (e instanceof MatrixError) throw e;
     const msg = String(e);
     if (msg.includes('M_UNSUPPORTED_ROOM_VERSION')) {
       return [

@@ -108,6 +108,62 @@ Deno.test('lite-hat facade: bad / known / held+drain / fork / heal / refused', a
   assertEquals(await facade.eventCount(room), 4 + 1 + 2 + 1 + 1 + 1);
 });
 
+// Tampered-signature vectors (F1 gate): content tampering breaks the id
+// (bad); signature stripping keeps a valid id but has no trust (refused);
+// transplanted signatures from a sibling event fail verification
+// (refused). Nothing forged enters the DAG as applied.
+Deno.test('lite-hat facade: tampered signatures are rejected', async () => {
+  await resetRoom(ROOM);
+  await createRoom(ROOM, '11', '@dev:localhost');
+  const facade = (await getFacadeFor(ROOM))!;
+  const room = facade.getRoom()!;
+  const tip = await latestExtremityEventId(ROOM);
+  // Distinct mints per vector, authored but NOT pre-ingested: same-id
+  // redelivery (even of rejected rows) takes the idempotent path, which
+  // would mask the vectors. First vector ingest consumes the tip branch;
+  // later vectors ride the MS0 re-materialization fork — refusal reasons
+  // are unaffected.
+  const mk = (body: string, ts: number) =>
+    author(ROOM, {
+      type: 'm.room.message',
+      sender: '@dev:localhost',
+      content: { body, msgtype: 'm.text' },
+      prev_events: [tip],
+      origin_server_ts: ts,
+    });
+
+  // (a) content tamper → declared content hash mismatches → the event is
+  // processed as rejected (spec: hash failure redacts before processing),
+  // refused with M_AUTHCHAIN_REJECT, flagged in the index, out of state.
+  const m1 = await mk('tamper-a', 1000);
+  const t1 = structuredClone(m1) as unknown as Record<string, unknown>;
+  (t1.content as Record<string, unknown>).body = 'forged';
+  const r1 = await facade.ingestRemote(room, t1);
+  assert(r1.refused, `tampered content must be refused: ${JSON.stringify(r1)}`);
+  assert(String(r1.reason).includes('M_AUTHCHAIN_REJECT'));
+
+  // (b) stripped signatures → id recomputes, trust does not → refused.
+  const m2 = await mk('tamper-b', 2000);
+  const t2 = structuredClone(m2) as unknown as Record<string, unknown>;
+  t2.signatures = {};
+  const r2 = await facade.ingestRemote(room, t2);
+  assert(r2.refused, `stripped signature must be refused: ${JSON.stringify(r2)}`);
+  assert(String(r2.reason).includes('M_UNAUTHORIZED'));
+
+  // (c) transplanted sibling signature → verification fails → refused.
+  const m3a = await mk('tamper-c1', 3000);
+  const m3b = await mk('tamper-c2', 4000);
+  const t3 = structuredClone(m3b) as unknown as Record<string, unknown>;
+  t3.signatures = structuredClone(m3a.signatures);
+  const r3 = await facade.ingestRemote(room, t3);
+  assert(r3.refused, `transplanted signature must be refused: ${JSON.stringify(r3)}`);
+
+  // an unmolested mint still applies afterwards (fresh prev).
+  const m0 = await mk('pristine', 5000);
+  const r0 = await facade.ingestRemote(room, m0 as unknown as Record<string, unknown>);
+  assert(r0.applied, 'pristine PDU must apply');
+});
+
 // A conflicting heal through the facade surfaces {refused} — and sh goes
 // absent on the contested frontier.
 Deno.test('lite-hat facade: conflicting heal is refused, sh absent', async () => {

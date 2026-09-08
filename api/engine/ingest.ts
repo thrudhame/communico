@@ -3,8 +3,8 @@ import { extremities, lookupRoom } from './room.ts';
 import { mergeDriver } from './mergedriver.ts';
 import { eventIdFor } from './eventid.ts';
 import { canonicalJson } from './canonical.ts';
-import { allowUnsignedLite } from './config.ts';
-import { ensureServerKey, signPdu, verifyPduSignature } from './signing.ts';
+import { signPdu, verifyPduSignature } from './signing.ts';
+import { getTenantKey } from './tenant.ts';
 import { materialize, type StateRowInput } from './materialize.ts';
 import {
   getRulebook,
@@ -13,7 +13,7 @@ import {
   type StateMap,
 } from './policy.ts';
 import type { Pdu } from './pdu.ts';
-import { contentHashOf } from '../../lite/web/sync/signing.js';
+import { contentHashOf, importPublicKeyFromRaw, isKeyName, b32decode } from '../../lite/web/sync/signing.js';
 
 export interface IngestResult {
   event_id: string;
@@ -226,7 +226,7 @@ export async function author(
     signatures: {},
   };
   if (partial.state_key !== undefined) pdu.state_key = partial.state_key;
-  const key = await ensureServerKey();
+  const key = await getTenantKey();
   await signPdu(pdu, room.roomVersion, key);
   if (isCreate) {
     // self-reference resolved post-id (create carries no auth_events).
@@ -271,6 +271,11 @@ export async function ingestEvent(
   // Idempotent redelivery: content-hash ids make ingest naturally
   // idempotent — a known event returns its receipt instead of
   // double-inserting (at-least-once delivery from sync/held drains).
+  // Note: same-id redelivery is NOT re-verified. Distinct ids are
+  // distinct events; same-id bytes that differ can only differ in
+  // non-hashed fields (signatures/unsigned) or redacted-away content —
+  // interchangeable by redaction's design. The DAG keeps first-writer
+  // bytes; nothing re-enters state through this path.
   const existing = await withDb(SERVER_DB, async (c) => {
     const r = await c.query(
       'SELECT commit_hash FROM event_index WHERE event_id = $1;',
@@ -297,25 +302,36 @@ export async function ingestEvent(
     hashOk = false;
   }
 
-  // 5. origin signature when present (F0: the server is the only signer;
-  // unsigned lite PDUs ride the ALLOW_UNSIGNED_LITE seam — off unless the
-  // env says so, off in the M0 image, deleted at F1's end).
+  // 5. origin signature, REQUIRED (F1: the unsigned-lite seam is
+  // deleted — every engine signs). Entries under our own SERVER_NAME
+  // verify against the tenant key; entries under a base32 server_name
+  // verify key-is-name (browser homeservers — nothing to fetch).
+  // Unsigned PDUs are refused, full stop.
   const sigEntries = Object.entries(pdu.signatures ?? {});
   let sigOk = false;
   if (sigEntries.length > 0) {
-    const key = await ensureServerKey();
+    const key = await getTenantKey();
     for (const [srv, keys] of sigEntries) {
-      if (srv !== key.serverName) continue;
-      for (const kid of Object.keys(keys as Record<string, string>)) {
-        if (
-          await verifyPduSignature(pdu, key.publicKey, srv, kid)
-        ) sigOk = true;
+      if (srv === key.serverName) {
+        for (const kid of Object.keys(keys as Record<string, string>)) {
+          if (
+            await verifyPduSignature(pdu, key.publicKey, srv, kid)
+          ) sigOk = true;
+        }
+      } else if (isKeyName(srv)) {
+        const raw = b32decode(srv);
+        if (!raw || raw.length !== 32) continue;
+        const pub = await importPublicKeyFromRaw(raw);
+        for (const kid of Object.keys(keys as Record<string, string>)) {
+          if (
+            await verifyPduSignature(pdu, pub as unknown as CryptoKey, srv, kid)
+          ) sigOk = true;
+        }
       }
     }
-  } else if (allowUnsignedLite()) {
-    sigOk = true;
-  } else {
-    throw new Error('M_UNAUTHORIZED: unsigned PDU (ALLOW_UNSIGNED_LITE off)');
+  }
+  if (!sigOk) {
+    throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
   }
 
   // 6. prev resolution via the server DB's event_index (D8: the extremity

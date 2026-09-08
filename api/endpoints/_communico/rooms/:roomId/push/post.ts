@@ -4,6 +4,7 @@ import type {
 } from '@communico/api/interfaces';
 import { createHttpError, Status } from '@oak/oak';
 import { authorize } from '../../../../../engine/auth.ts';
+import { MatrixError } from '../../../../../engine/matrix-error.ts';
 import { pushRoom } from '../../../../../engine/sync.ts';
 
 export default async function (
@@ -12,6 +13,7 @@ export default async function (
   try {
     await authorize(request);
   } catch (e) {
+    if (e instanceof MatrixError) throw e;
     return [createHttpError(Status.InternalServerError, String(e)), null];
   }
   const roomId = decodeURIComponent(request.params.roomId!);

@@ -3,34 +3,30 @@ import type {
   TApiComponentRequest,
 } from '@communico/api/interfaces';
 import { createHttpError, Status } from '@oak/oak';
-import { SERVER_DB, withDb } from '../../../../../../engine/db.ts';
+import { authorize } from '../../../../../../engine/auth.ts';
+import { MatrixError } from '../../../../../../engine/matrix-error.ts';
+import { lookupToken } from '../../../../../../engine/tenant.ts';
+import { SERVER_NAME } from '../../../../../../engine/config.ts';
 
 // GET /_matrix/client/v3/account/whoami — matrix-commander validates
 // restored credentials with this on every authenticated invocation
 // (capture: wire-observed; nio WhoamiResponse requires user_id,
-// device_id optional).
+// device_id optional). Unknown/missing tokens are proper 401s (F1).
 export default async function (
   request: TApiComponentRequest,
 ): TApiComponentOutcome {
   try {
+    const userId = await authorize(request);
     const header = request.headers.get('Authorization') ?? '';
     const match = /^Bearer (.+)$/.exec(header);
     const token = match?.[1] ?? request.search.get('access_token');
-    if (!token) throw new Error('M_MISSING_TOKEN');
-    return await withDb(SERVER_DB, async (c) => {
-      const r = await c.query(
-        'SELECT user_id, device_id FROM access_tokens WHERE token = $1;',
-        [token],
-      );
-      if (r.rows.length === 0) throw new Error('M_UNKNOWN_TOKEN');
-      return [null, {
-        user_id: String(r.rows[0].user_id),
-        device_id: r.rows[0].device_id == null
-          ? undefined
-          : String(r.rows[0].device_id),
-      }];
-    });
+    const info = token ? await lookupToken(SERVER_NAME, token) : null;
+    return [null, {
+      user_id: userId,
+      device_id: info?.device_id ?? undefined,
+    }];
   } catch (e) {
+    if (e instanceof MatrixError) throw e;
     return [createHttpError(Status.InternalServerError, String(e)), null];
   }
 }

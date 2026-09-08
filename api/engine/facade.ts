@@ -5,8 +5,8 @@
 // PDUs with content-hash ids (§4.1.1).
 //
 // ingestRemote semantics: verify content-hash id by recomputation +
-// origin signature when present (unsigned lite PDUs ride the
-// ALLOW_UNSIGNED_LITE seam); known -> {known}; unknown prevs -> held
+// origin signature (tenant key or key-is-name; unsigned is refused);
+// known -> {known}; unknown prevs -> held
 // queue ({held}, drained after each apply); refusals (auth or
 // M_UNRESOLVED_CONFLICT) -> {refused}, surfaced not swallowed; apply via
 // the core ingest pipeline (full wire PDU passed through — no rebuild).
@@ -141,7 +141,8 @@ async function applyPdu(
         if (
           String(e2).includes('M_UNRESOLVED_CONFLICT') ||
           String(e2).includes('M_AUTHCHAIN_REJECT') ||
-          String(e2).includes('M_STATE_REJECT')
+          String(e2).includes('M_STATE_REJECT') ||
+          String(e2).includes('M_UNAUTHORIZED')
         ) {
           return { applied: false, refused: true, reason: String(e2) };
         }
@@ -150,7 +151,8 @@ async function applyPdu(
     } else if (
       msg.includes('M_UNRESOLVED_CONFLICT') ||
       msg.includes('M_AUTHCHAIN_REJECT') ||
-      msg.includes('M_STATE_REJECT')
+      msg.includes('M_STATE_REJECT') ||
+      msg.includes('M_UNAUTHORIZED')
     ) {
       // Refusals surface — never swallowed, never guessed past.
       return { applied: false, refused: true, reason: msg };

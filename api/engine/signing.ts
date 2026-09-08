@@ -1,13 +1,14 @@
-// api/engine/signing.ts — server-side PDU signing (F0 dev key).
+// api/engine/signing.ts — server-side PDU signing (F1 tenant key).
 // Order per spec (server-server API § "Adding hashes and signatures to
 // outgoing events"): content hash -> redact -> sign. The shared WebCrypto
-// primitives live in lite/web/sync/signing.js; this module adds the
-// persistent server key (db-init generates once, reuses forever — never
-// rotates; F1 moves the same key into the tenant table).
+// primitives live in lite/web/sync/signing.js. The signing key lives in
+// the tenant table (api/engine/tenant.ts — generate-once, reuse-forever;
+// F0's server_signing_key table survives as the migration source).
 import { SERVER_DB, withDb } from './db.ts';
 import { SERVER_NAME } from './config.ts';
 import { eventIdFor, redact } from './eventid.ts';
 import type { Pdu } from './pdu.ts';
+import { nativeNameFor, type TenantKey } from './tenant.ts';
 import {
   b64decode,
   b64encode,
@@ -23,13 +24,10 @@ import {
 
 export const SERVER_KEY_ID = '1';
 
-export interface ServerKey {
-  keyId: string;
-  serverName: string;
-  publicKey: CryptoKey;
-  privateKey: CryptoKey;
-  publicB64: string;
-}
+// F1: the signing key is the tenant key (same slot, same rule —
+// generate-once, reuse-forever). TenantKey carries nativeName extra;
+// structurally it fills this slot.
+export type ServerKey = TenantKey;
 
 export async function ensureServerKey(serverName = SERVER_NAME): Promise<ServerKey> {
   return await withDb(SERVER_DB, async (c) => {
@@ -52,6 +50,7 @@ export async function ensureServerKey(serverName = SERVER_NAME): Promise<ServerK
       return {
         keyId: String(row.key_id),
         serverName: String(row.server_name),
+        nativeName: nativeNameFor(pubRaw),
         publicKey: await importPublicKeyFromRaw(pubRaw),
         privateKey: await importPrivateKeyFromPkcs8(privDer),
         publicB64: String(row.pubkey_b64),
@@ -69,6 +68,7 @@ export async function ensureServerKey(serverName = SERVER_NAME): Promise<ServerK
     return {
       keyId: SERVER_KEY_ID,
       serverName,
+      nativeName: nativeNameFor(pubRaw),
       publicKey: kp.publicKey,
       privateKey: kp.privateKey,
       publicB64: pubB64,
@@ -109,8 +109,8 @@ export async function signPdu(
 
 // Verify an inbound PDU's origin signature when present: redact first
 // (the signature covers the redacted form), then check. Unsigned PDUs
-// are NOT accepted here — the ALLOW_UNSIGNED_LITE seam lives at ingest,
-// which knows the sender engine.
+// are NOT accepted here — ingest refuses them outright (the F0
+// unsigned-lite seam was deleted at F1's end).
 export async function verifyPduSignature(
   pdu: Pdu,
   publicKey: CryptoKey,
