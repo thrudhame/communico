@@ -6,6 +6,8 @@ import {
   tableHashes, stateHash, roomVersion, extremities, allEvents, hasEvent,
   eventCount, rawQuery,
   exportStoreImage, aliveBranches, adoptStoreImage, branchesInImage,
+  ensureIdentity, createProfile, switchProfile, identityInfo, activeMxid,
+  exportIdentity, importIdentity,
 } from './engine-lite.js';
 import { startMsync } from './sync/msync.js';
 import { startDsync } from './sync/dsync.js';
@@ -125,10 +127,42 @@ function render() {
   renderBadges();
 }
 
+async function refreshProfiles() {
+  const info = identityInfo() ?? { serverName: '', profiles: [], active: null };
+  const sel = $('profile');
+  sel.textContent = '';
+  for (const p of info.profiles) {
+    const opt = document.createElement('option');
+    opt.value = p.localpart;
+    opt.textContent = `@${p.localpart} (${p.displayname})`;
+    if (p.localpart === info.active) opt.selected = true;
+    sel.append(opt);
+  }
+  $('my-id').textContent = info.active ? `@${info.active}:${info.serverName}` : info.serverName;
+  window.__identity = info;
+}
+
+async function leaveRoom() {
+  try { ms?.leave(); } catch { /* closing anyway */ }
+  ms = null;
+  room = null;
+  window.__room = null;
+  window.__ms = null;
+  $('room').classList.add('hidden');
+  $('join-screen').classList.remove('hidden');
+  $('create-btn').disabled = false;
+  $('join-btn').disabled = false;
+}
+
 async function start(role) {
   const name = $('name').value.trim();
   const roomName = $('room-name').value.trim();
   if (!name || !roomName) return;
+  // personas: the name field is a localpart (fixed at creation); the same
+  // field seeds the displayname. Rooms belong to the active profile.
+  await ensureIdentity();
+  await createProfile(name, name);
+  await refreshProfiles();
   $('create-btn').disabled = true;
   $('join-btn').disabled = true;
 
@@ -192,6 +226,73 @@ async function start(role) {
 
 $('create-btn').addEventListener('click', () => start('create'));
 $('join-btn').addEventListener('click', () => start('join'));
+$('profile').addEventListener('change', async () => {
+  const lp = $('profile').value;
+  if (!lp) return;
+  await switchProfile(lp);
+  await refreshProfiles();
+  // rooms belong to a profile: leaving keeps the store only for the
+  // session, so a profile switch unloads (re-join bootstraps via sync).
+  if (room && room.profile !== lp) await leaveRoom();
+});
+$('rename-btn').addEventListener('click', async () => {
+  const info = identityInfo();
+  const dn = $('displayname').value.trim();
+  if (!info?.active || !dn) return;
+  await createProfile(info.active, dn);
+  await refreshProfiles();
+});
+$('export-btn').addEventListener('click', async () => {
+  const blob = await exportIdentity();
+  // portability: the whole browser key (every profile moves with it)
+  await navigator.clipboard?.writeText(JSON.stringify(blob)).catch(() => {});
+  $('status').textContent = 'key exported to clipboard (moves every profile)';
+});
+$('import-btn').addEventListener('click', async () => {
+  const raw = window.prompt('paste an exported browser key:');
+  if (!raw) return;
+  try {
+    await importIdentity(JSON.parse(raw));
+    await refreshProfiles();
+    await leaveRoom();
+    $('status').textContent = 'key imported — re-join rooms under its profiles';
+  } catch (e) {
+    $('status').textContent = 'import failed: ' + (e?.message ?? e);
+  }
+});
+$('invite-btn').addEventListener('click', async () => {
+  const target = $('invite-name').value.trim();
+  if (!target || !room || !ms) return;
+  // localpart (this homeserver) or full @user:<key> MXID.
+  const stateKey = target.includes(':') ? target : `@${target}:${identityInfo()?.serverName}`;
+  try {
+    await ingestEvent(room, {
+      type: 'm.room.member', state_key: stateKey,
+      sender: room.self,
+      content: { membership: 'invite' },
+    });
+    render();
+    ms.announceLocalIngest();
+  } catch (e) {
+    $('status').textContent = 'invite refused: ' + String(e?.message ?? e).split(':')[0];
+  }
+});
+$('join-room-btn').addEventListener('click', async () => {
+  if (!room || !ms) return;
+  try {
+    await ingestEvent(room, {
+      type: 'm.room.member', state_key: room.self, sender: room.self,
+      content: {
+        membership: 'join',
+        displayname: identityInfo()?.profiles.find((p) => `@${p.localpart}:${identityInfo()?.serverName}` === room.self)?.displayname ?? room.self,
+      },
+    });
+    render();
+    ms.announceLocalIngest();
+  } catch (e) {
+    $('status').textContent = 'join refused: ' + String(e?.message ?? e).split(':')[0];
+  }
+});
 
 async function send() {
   const input = $('msg');
@@ -244,6 +345,17 @@ $('msg').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
   const pre = new URLSearchParams(location.search).get('room');
   if (pre) $('room-name').value = pre;
 }
+
+// identity bootstraps on page load (mint-on-first-run happens here, so
+// the picker and my-id badge are live before any room is created).
+void (async () => {
+  try {
+    await ensureIdentity();
+    await refreshProfiles();
+  } catch (e) {
+    console.error('identity init:', e);
+  }
+})();
 
 $('runsql').addEventListener('click', () => {
   const out = $('sqlresult');

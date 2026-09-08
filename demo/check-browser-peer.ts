@@ -51,7 +51,9 @@ try {
   Deno.exit(1);
 }
 
-const browser = await launch();
+const browser = await launch(
+  Deno.env.get("CHROME_PATH") ? { path: Deno.env.get("CHROME_PATH") } : undefined,
+); // CHROME_PATH: system Chromium (>=137 for Ed25519) e.g. on test VMs
 try {
   const page = await browser.newPage(
     `${BASE}/?transport=ws&sync=msync&room=${encodeURIComponent(ROOM_ID)}`,

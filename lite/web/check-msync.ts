@@ -51,7 +51,9 @@ async function waitFor(page: Page, what: string, pred: string, timeoutMs = 10_00
   return v;
 }
 
-const browser = await launch();
+const browser = await launch(
+  Deno.env.get("CHROME_PATH") ? { path: Deno.env.get("CHROME_PATH") } : undefined,
+); // CHROME_PATH: system Chromium (>=137 for Ed25519) e.g. on test VMs
 try {
   // 0. LATE-PEER scenario (MS4 step 5.2): B's join starts ~8 s AFTER A
   //    creates, and A stays SILENT (no sends). B must still bootstrap
@@ -168,6 +170,86 @@ try {
   console.log("step 4: table hashes — A:", thAStr, "B:", thBStr);
   if (thAStr !== thBStr) fail(`table hashes differ: A=${thAStr} B=${thBStr}`);
   else console.log("step 4: TABLE HASHES EQUAL ✓ (Merkle-certified convergence)");
+
+  // 5. F1 SIGNED PROFILES: two personas, one browser key. Same browser
+  // (shared localStorage) => same homeserver key; alice creates R2, bob
+  // joins, alice invites, bob joins (member), both send SIGNED as members.
+  {
+    const R2 = "msync-profiles";
+    const pageC = await browser.newPage(`${BASE}/?sync=msync`);
+    await pageC.evaluate((room) => {
+      (document.getElementById("name") as HTMLInputElement).value = "alice";
+      (document.getElementById("room-name") as HTMLInputElement).value = room;
+      document.getElementById("create-btn")!.click();
+    }, { args: [R2] });
+    await waitFor(pageC, "C room ready", `!document.getElementById("room").classList.contains("hidden")`, 30_000);
+    const keyC = await pageC.evaluate(() => (globalThis as any).__identity?.serverName ?? "missing");
+    const pageD = await browser.newPage(`${BASE}/?sync=msync`);
+    await pageD.evaluate((room) => {
+      (document.getElementById("name") as HTMLInputElement).value = "bob";
+      (document.getElementById("room-name") as HTMLInputElement).value = room;
+      document.getElementById("join-btn")!.click();
+    }, { args: [R2] });
+    await waitFor(pageD, "D bootstraps", `(document.getElementById("timeline")?.textContent ?? "").includes("m.room.create")`, 30_000);
+    const keyD = await pageD.evaluate(() => (globalThis as any).__identity?.serverName ?? "missing");
+    if (!keyC || keyC === "missing" || keyC !== keyD) {
+      fail(`profiles are not under one browser key: ${keyC} vs ${keyD}`);
+    } else {
+      console.log(`step 5: one browser key for both personas (${keyC.slice(0, 12)}…)`);
+    }
+    // alice invites bob; bob accepts via join-room; both directions flow
+    await pageC.evaluate(() => {
+      (document.getElementById("invite-name") as HTMLInputElement).value = "bob";
+      document.getElementById("invite-btn")!.click();
+    });
+    await waitFor(pageD, "D sees invite", `(document.getElementById("timeline")?.textContent ?? "").includes("m.room.member")`, 15_000);
+    await pageD.evaluate(() => { document.getElementById("join-room-btn")!.click(); });
+    await waitFor(pageC, "C sees bob's join", `(document.getElementById("timeline")?.textContent ?? "").includes("@bob:")`, 15_000);
+    console.log("step 5: invite + member join through the stub");
+    const sendCD = (page: Page, body: string) =>
+      page.evaluate((b: string) => {
+        (document.getElementById("msg") as HTMLInputElement).value = b;
+        document.getElementById("send")!.click();
+      }, { args: [body] });
+    await sendCD(pageC, "signed-hello-alice");
+    await waitFor(pageD, "D sees alice's message", `(document.getElementById("timeline")?.textContent ?? "").includes("signed-hello-alice")`, 15_000);
+    await sendCD(pageD, "signed-hello-bob");
+    await waitFor(pageC, "C sees bob's message", `(document.getElementById("timeline")?.textContent ?? "").includes("signed-hello-bob")`, 15_000);
+    // every message PDU on both replicas: signed by the one browser key,
+    // two distinct senders, content-hash ids.
+    const sigAudit = (page: Page) =>
+      page.evaluate((key: string) => {
+        const room = (globalThis as any).__room;
+        const rows = room.db.selectObjects("SELECT canonical_json FROM events");
+        const out = [];
+        for (const r of rows) {
+          const pdu = JSON.parse(r.canonical_json);
+          if (pdu.type !== "m.room.message") continue;
+          const sigs = pdu.signatures?.[key] ?? {};
+          out.push({
+            id: pdu.event_id,
+            sender: pdu.sender,
+            signed: Object.keys(sigs).length > 0,
+            idShape: /^\$[A-Za-z0-9_-]{43}$/.test(pdu.event_id),
+          });
+        }
+        return out;
+      }, { args: [keyC] });
+    const auditC = await sigAudit(pageC) as { id: string; sender: string; signed: boolean; idShape: boolean }[];
+    const auditD = await sigAudit(pageD) as { id: string; sender: string; signed: boolean; idShape: boolean }[];
+    const senders = new Set(auditC.map((e) => e.sender));
+    if (auditC.length < 2 || !auditC.every((e) => e.signed && e.idShape)) {
+      fail(`C message PDUs not all signed+shaped: ${JSON.stringify(auditC)}`);
+    } else if (senders.size !== 2 || ![...senders].every((s) => s.endsWith(":" + keyC))) {
+      fail(`C senders are not two personas under one key: ${JSON.stringify([...senders])}`);
+    } else if (JSON.stringify(auditC) !== JSON.stringify(auditD)) {
+      fail("C/D message sets differ after signed convergence");
+    } else {
+      console.log(`step 5: ${auditC.length} message PDUs signed by one key, two personas, converging ✓`);
+    }
+    await pageC.close();
+    await pageD.close();
+  }
 
   console.log(ok ? "CHECK: PASS" : "CHECK: FAIL");
   Deno.exitCode = ok ? 0 : 1;

@@ -33,7 +33,9 @@ if (!(await waitForServer(1_000))) {
   }
 }
 
-const browser = await launch();
+const browser = await launch(
+  Deno.env.get("CHROME_PATH") ? { path: Deno.env.get("CHROME_PATH") } : undefined,
+); // CHROME_PATH: system Chromium (>=137 for Ed25519) e.g. on test VMs
 let ok = true;
 const fail = (msg: string) => { ok = false; console.error("ASSERT-FAIL:", msg); };
 

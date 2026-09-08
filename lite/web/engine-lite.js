@@ -18,14 +18,21 @@
 // plan ships NO store images and calls NO remotes.
 import sqlite3InitModule from './node_modules/@dolthub/doltlite-wasm/sqlite3.mjs';
 import { canonicalJson } from './sync/canonical.js';
-import { eventIdFor } from './sync/eventid.js';
+import { eventIdFor, redact } from './sync/eventid.js';
 import {
   authorized,
   resolveState,
   selectAuthEvents,
   stateKeyOf,
 } from './sync/rulebook/v11-stub.js';
-import { contentHashOf } from './sync/signing.js';
+import {
+  b32decode,
+  b32encode,
+  contentHashOf,
+  isKeyName,
+  signJson,
+  verifyJson,
+} from './sync/signing.js';
 import { isPduShape } from './sync/pdu.js';
 import { materialize } from './sync/materialize.js';
 
@@ -56,6 +63,218 @@ const sqlite3Ready = () => (sqlite3P ??= sqlite3InitModule());
 // second module instance in-process — its binary fetch breaks.
 export function sqlite3Module() {
   return sqlite3Ready();
+}
+
+// ---- Browser homeserver identity (F1 step 20) ----
+//
+// The browser IS a homeserver (ruling R8/R10): it holds one ed25519
+// keypair (minted on first run, persisted — localStorage now, OPFS
+// later); the key lowercased-unpadded-base32 IS its `server_name`.
+// Concurrent personas (Delta-style profiles): N localparts under the one
+// key (`@alice:<lite-b32>`, `@bob:<lite-b32>`), each fixed at creation;
+// `displayname` in the member event is the only renaming. Rooms belong
+// to a profile; every profile's PDUs are signed by the one browser key;
+// portability = the browser key (export/import moves every profile).
+
+const IDENTITY_KEY = 'communico.identity.v1';
+
+// Spec localpart grammar (appendices § User Identifiers), shared with the
+// server's checkLocalpart (api/engine/tenant.ts).
+const LOCALPART_RE = /^[a-z0-9._=\-/+]+$/;
+
+let identityCache = null; // {privateKey, publicKey, serverName, profiles, active}
+
+function persistIdentity(blob) {
+  try {
+    globalThis.localStorage?.setItem(IDENTITY_KEY, JSON.stringify(blob));
+  } catch { /* private mode etc: identity lives for the session only */ }
+}
+
+function loadIdentityBlob() {
+  try {
+    const raw = globalThis.localStorage?.getItem(IDENTITY_KEY);
+    if (!raw) return null;
+    const blob = JSON.parse(raw);
+    if (!blob?.jwk || !Array.isArray(blob.profiles)) return null;
+    return blob;
+  } catch {
+    return null;
+  }
+}
+
+function keyNameFor(rawPub32) {
+  return b32encode(rawPub32).replace(/=+$/, '').toLowerCase();
+}
+
+// Ensure (load or mint) the browser homeserver identity.
+export async function ensureIdentity() {
+  if (identityCache) return identityCache;
+  const blob = loadIdentityBlob();
+  if (blob) {
+    const privateKey = await crypto.subtle.importKey(
+      'jwk', blob.jwk, { name: 'Ed25519' }, true, ['sign']);
+    const pubRaw = b32decode(blob.serverName);
+    const publicKey = await crypto.subtle.importKey(
+      'raw', pubRaw, { name: 'Ed25519' }, true, ['verify']);
+    identityCache = {
+      privateKey, publicKey,
+      serverName: blob.serverName,
+      profiles: blob.profiles,
+      active: blob.active ?? blob.profiles[0]?.localpart ?? null,
+    };
+    return identityCache;
+  }
+  const kp = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, [
+    'sign', 'verify',
+  ]);
+  const pubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+  const serverName = keyNameFor(pubRaw);
+  const jwk = await crypto.subtle.exportKey('jwk', kp.privateKey);
+  const fresh = { jwk, serverName, profiles: [], active: null };
+  persistIdentity(fresh);
+  identityCache = {
+    privateKey: kp.privateKey, publicKey: kp.publicKey,
+    serverName, profiles: [], active: null,
+  };
+  return identityCache;
+}
+
+export function identityInfo() {
+  if (!identityCache) return null;
+  return {
+    serverName: identityCache.serverName,
+    profiles: identityCache.profiles.map((p) => ({ ...p })),
+    active: identityCache.active,
+  };
+}
+
+// Create a persona (localpart fixed at creation) or return the existing
+// one; makes it active. Displayname renames freely (member-event scope).
+// Multi-tab safe: profiles reload-merge from storage on every write, so
+// two tabs creating different personas union instead of clobbering.
+export async function createProfile(localpart, displayname) {
+  const id = await ensureIdentity();
+  const lp = String(localpart).toLowerCase();
+  if (!LOCALPART_RE.test(lp) || lp.length === 0 || lp.length > 255) {
+    throw new Error('M_INVALID_USERNAME: ' + String(localpart));
+  }
+  const fresh = loadIdentityBlob();
+  const merged = new Map((fresh?.profiles ?? []).map((p) => [p.localpart, { ...p }]));
+  for (const p of id.profiles) {
+    if (!merged.has(p.localpart)) merged.set(p.localpart, { ...p });
+  }
+  let p = merged.get(lp);
+  if (!p) {
+    p = { localpart: lp, displayname: displayname ?? lp };
+    merged.set(lp, p);
+  } else if (displayname) {
+    p.displayname = displayname;
+  }
+  id.profiles = [...merged.values()];
+  id.active = lp;
+  persistIdentity({
+    jwk: await crypto.subtle.exportKey('jwk', id.privateKey),
+    serverName: id.serverName,
+    profiles: id.profiles,
+    active: id.active,
+  });
+  return { ...p };
+}
+
+export async function switchProfile(localpart) {
+  const id = await ensureIdentity();
+  const lp = String(localpart).toLowerCase();
+  const fresh = loadIdentityBlob();
+  if (fresh) {
+    const seen = new Set(id.profiles.map((p) => p.localpart));
+    for (const p of fresh.profiles) {
+      if (!seen.has(p.localpart)) id.profiles.push({ ...p });
+    }
+  }
+  const p = id.profiles.find((x) => x.localpart === lp);
+  if (!p) throw new Error('M_NOT_FOUND: unknown profile');
+  id.active = p.localpart;
+  persistIdentity({
+    jwk: await crypto.subtle.exportKey('jwk', id.privateKey),
+    serverName: id.serverName,
+    profiles: id.profiles,
+    active: id.active,
+  });
+  return { ...p };
+}
+
+export function activeMxid() {
+  if (!identityCache?.active) return null;
+  return `@${identityCache.active}:${identityCache.serverName}`;
+}
+
+function serverNameOf(mxid) {
+  const i = String(mxid).indexOf(':');
+  return i < 0 ? '' : String(mxid).slice(i + 1);
+}
+
+// Verify a PDU against the sender's key-is-name key. Returns true when
+// verified; DNS/legacy-named senders have no fetchable key in F1 (no
+// /keys endpoint — M5) and are accepted unverified (the lite hat is the
+// trust channel; recorded). Key-named senders MUST verify or carry no
+// trust at all: unsigned-or-bad from a key name is rejected.
+const peerKeyCache = new Map();
+async function verifyPeerSignature(pdu) {
+  const sender = String(pdu.sender ?? '');
+  const origin = serverNameOf(sender);
+  if (!isKeyName(origin)) return 'unverifiable-origin';
+  const sigs = pdu.signatures?.[origin] ?? {};
+  const kids = Object.keys(sigs);
+  if (kids.length === 0) return 'unsigned';
+  let pub = peerKeyCache.get(origin);
+  if (!pub) {
+    pub = await crypto.subtle.importKey(
+      'raw', b32decode(origin), { name: 'Ed25519' }, true, ['verify']);
+    peerKeyCache.set(origin, pub);
+  }
+  const redacted = redact(pdu, ROOM_VERSION);
+  redacted.signatures = pdu.signatures;
+  for (const kid of kids) {
+    const ok = await verifyJson(redacted, origin, kid, pub);
+    if (ok) return 'ok';
+  }
+  return 'bad-signature';
+}
+
+// Portability: the whole identity (key + profiles) as a portable blob.
+export async function exportIdentity() {
+  const id = await ensureIdentity();
+  return {
+    jwk: await crypto.subtle.exportKey('jwk', id.privateKey),
+    serverName: id.serverName,
+    profiles: id.profiles.map((p) => ({ ...p })),
+  };
+}
+
+export async function importIdentity(blob) {
+  if (!blob?.jwk || typeof blob.serverName !== 'string') {
+    throw new Error('M_BAD_REQUEST: not an identity blob');
+  }
+  const privateKey = await crypto.subtle.importKey(
+    'jwk', blob.jwk, { name: 'Ed25519' }, true, ['sign']);
+  const pubRaw = b32decode(blob.serverName);
+  if (!pubRaw || pubRaw.length !== 32) throw new Error('M_BAD_REQUEST: bad server name');
+  const publicKey = await crypto.subtle.importKey(
+    'raw', pubRaw, { name: 'Ed25519' }, true, ['verify']);
+  const profiles = Array.isArray(blob.profiles) ? blob.profiles : [];
+  identityCache = {
+    privateKey, publicKey,
+    serverName: blob.serverName,
+    profiles,
+    active: profiles[0]?.localpart ?? null,
+  };
+  persistIdentity({
+    jwk: blob.jwk,
+    serverName: blob.serverName,
+    profiles,
+    active: identityCache.active,
+  });
+  return identityInfo();
 }
 
 async function openStore(name) {
@@ -93,23 +312,27 @@ function newRoom(db, self, persistent, roomId = null) {
   };
 }
 
-// Create a room (v11 genesis: m.room.create + creator join + power_levels
-// + join_rules, each authored + ingested through the normal pipeline).
+// Create a room as the ACTIVE profile (v11 genesis: m.room.create +
+// creator join + power_levels + join_rules, each authored + ingested
+// through the normal pipeline). displayName seeds the profile's
+// displayname on first use; rooms belong to the creating profile.
 export async function createRoom(displayName, roomName = 'room', roomId = null) {
+  const profile = await createProfile(displayName, displayName);
+  const self = `@${profile.localpart}:${(await ensureIdentity()).serverName}`;
   const { db, persistent } = await openStore(roomName);
-  const self = `@${displayName}:browser`;
   db.exec(`SELECT dolt_config('user.name','${self.replaceAll("'", "''")}')`);
   db.exec(`SELECT dolt_config('user.email','${self.replaceAll("'", "''")}')`);
   db.exec(SCHEMA);
   db.selectValue(`SELECT dolt_commit('-Am','schema: events+state')`);
   const room = newRoom(db, self, persistent, roomId);
+  room.profile = profile.localpart;
   await ingestEvent(room, {
     type: 'm.room.create', state_key: '',
     content: { room_version: ROOM_VERSION },
   });
   await ingestEvent(room, {
     type: 'm.room.member', state_key: self,
-    content: { membership: 'join', displayname: displayName },
+    content: { membership: 'join', displayname: profile.displayname },
   });
   await ingestEvent(room, {
     type: 'm.room.power_levels', state_key: '',
@@ -125,19 +348,23 @@ export async function createRoom(displayName, roomName = 'room', roomId = null) 
   return room;
 }
 
-// Join: a joiner builds its OWN store from events — schema only, NO genesis
-// (the full history arrives via the sync protocol's delta). roomId: the
-// remote room's id when hatted (ws transport) — the content-hash id of a
-// room event covers room_id, so a server room's events MUST carry the
-// server's room id or the two engines mint different ids for one event.
+// Join as the ACTIVE profile: a joiner builds its OWN store from events —
+// schema only, NO genesis (the full history arrives via the sync
+// protocol's delta). roomId: the remote room's id when hatted (ws
+// transport) — the content-hash id of a room event covers room_id, so a
+// server room's events MUST carry the server's room id or the two engines
+// mint different ids for one event.
 export async function joinRoom(displayName, roomName = 'room', roomId = null) {
+  const profile = await createProfile(displayName, displayName);
+  const self = `@${profile.localpart}:${(await ensureIdentity()).serverName}`;
   const { db, persistent } = await openStore(roomName);
-  const self = `@${displayName}:browser`;
   db.exec(`SELECT dolt_config('user.name','${self.replaceAll("'", "''")}')`);
   db.exec(`SELECT dolt_config('user.email','${self.replaceAll("'", "''")}')`);
   db.exec(SCHEMA);
   db.selectValue(`SELECT dolt_commit('-Am','schema: events+state')`);
-  return newRoom(db, self, persistent, roomId);
+  const room = newRoom(db, self, persistent, roomId);
+  room.profile = profile.localpart;
+  return room;
 }
 
 // Read the working state table into a StateMap (key -> event_id).
@@ -173,8 +400,8 @@ function makeGetEvent(db, extra) {
 }
 
 // Local authoring: full v11 PDU (depth, selected auth_events,
-// content-hash, reference-hash id). Unsigned in F0 (the browser mints
-// its homeserver keypair in F1 and signs here).
+// content-hash, reference-hash id), then redact-and-sign with the
+// browser homeserver key (spec order — F1 step 21, same as the server).
 async function authorPdu(room, evt, prevs) {
   const prevRows = prevs.map((id) => {
     const e = room.eventIndex.get(id);
@@ -208,6 +435,11 @@ async function authorPdu(room, evt, prevs) {
   }
   pdu.hashes = { sha256: await contentHashOf(pdu) };
   pdu.event_id = await eventIdFor(pdu, ROOM_VERSION);
+  // Sign the redacted form with the browser key; attach under our name.
+  const id = await ensureIdentity();
+  const redacted = redact(pdu, ROOM_VERSION);
+  await signJson(redacted, id.serverName, 'ed25519:1', id.privateKey);
+  pdu.signatures = redacted.signatures ?? {};
   return pdu;
 }
 
@@ -233,9 +465,12 @@ export async function ingestEvent(room, evt, prevsOverride) {
   return { event_id: pdu.event_id, hash: room.eventIndex.get(pdu.event_id).hash };
 }
 
-// Remote ingest: verify content hash; known → no-op; unresolvable prev →
-// held (caller re-requests); refusals (auth/conflict) surface as
-// {refused} — never swallowed, never guessed past. Else ingest.
+// Remote ingest: verify content hash AND origin signature; known →
+// no-op; unresolvable prev → held (caller re-requests); refusals
+// (auth/conflict) surface as {refused} — never swallowed, never guessed
+// past. Else ingest. Key-named senders must verify (unsigned-or-bad from
+// a key name is rejected — the tampered-signature vector); DNS/legacy
+// names have no fetchable key in F1 (no /keys — M5) and ride the channel.
 export async function ingestRemote(room, pdu) {
   if (!pdu || typeof pdu.event_id !== 'string' || !isPduShape(pdu)) {
     room.badEvents++; return { applied: false, bad: true };
@@ -254,6 +489,12 @@ export async function ingestRemote(room, pdu) {
   // the v11 wire form has no such field; it is derived).
   const { event_id: _drop, ...noId } = pdu;
   if (await contentHashOf(noId) !== pdu.hashes?.sha256) {
+    room.badEvents++;
+    return { applied: false, bad: true };
+  }
+  // Origin signature (F1 step 20: key-is-name, nothing to fetch).
+  const verdict = await verifyPeerSignature(pdu);
+  if (verdict === 'bad-signature' || verdict === 'unsigned') {
     room.badEvents++;
     return { applied: false, bad: true };
   }
@@ -678,6 +919,13 @@ async function replayDag(allPdus) {
     if (await contentHashOf(noId) !== pdu.hashes?.sha256) {
       throw new Error('M_BAD_IMAGE: content hash mismatch');
     }
+    // Origin signature (key-is-name): key-named senders must verify;
+    // unsigned-or-bad from a key name refuses the image. DNS/legacy
+    // names ride the channel (M5 verifies via /keys).
+    const verdict = await verifyPeerSignature(pdu);
+    if (verdict === 'bad-signature' || verdict === 'unsigned') {
+      throw new Error('M_BAD_IMAGE: origin signature does not verify');
+    }
     const parents = prevs.map((p) => stateAt.get(p) ?? new Map());
     const resolved = resolveState(parents); // throws on conflict
     const ctx = { stateAtPrevs: resolved, getEvent, createEventId };
@@ -768,6 +1016,10 @@ export async function adoptStoreImage(room, bytes, peerId, branches) {
       if (await contentHashOf(noId) !== ev.hashes?.sha256) {
         return { applied: false, refused: 'M_BAD_IMAGE: content hash' };
       }
+      const verdict = await verifyPeerSignature(ev);
+      if (verdict === 'bad-signature' || verdict === 'unsigned') {
+        return { applied: false, refused: 'M_BAD_IMAGE: origin signature' };
+      }
     }
     const imageCreate = imageEvents.find((e) =>
       e.type === 'm.room.create' && (e.prev_events ?? []).length === 0);
@@ -813,7 +1065,14 @@ export async function adoptStoreImage(room, bytes, peerId, branches) {
     }
   } catch (e) {
     const msg = String(e?.message ?? e);
-    if (!/M_UNRESOLVED_CONFLICT/.test(msg)) throw e;
+    // Refusals restore pre-adoption state and surface (no throw escapes
+    // the pipeline): fork conflicts AND bad images (forgery) alike.
+    const m = /M_UNRESOLVED_CONFLICT/.test(msg)
+      ? 'M_UNRESOLVED_CONFLICT'
+      : /M_BAD_IMAGE/.test(msg)
+      ? 'M_BAD_IMAGE'
+      : null;
+    if (!m) throw e;
     // Adopt the DAG, leave the contested keys unmaterialized: restore
     // pre-adoption state on the merged tip and surface the refusal.
     materialize(room.db, preRows);
@@ -824,7 +1083,7 @@ export async function adoptStoreImage(room, bytes, peerId, branches) {
     }
     rebuildIndex(room);
     room.refusals++;
-    return { applied: true, refused: 'M_UNRESOLVED_CONFLICT' };
+    return { applied: true, refused: m };
   }
   rebuildIndex(room);
   return { applied: true };

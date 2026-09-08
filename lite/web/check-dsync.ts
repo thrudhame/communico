@@ -56,7 +56,9 @@ async function waitFor(page: Page, what: string, pred: string, timeoutMs = 10_00
   return v;
 }
 
-const browser = await launch();
+const browser = await launch(
+  Deno.env.get("CHROME_PATH") ? { path: Deno.env.get("CHROME_PATH") } : undefined,
+); // CHROME_PATH: system Chromium (>=137 for Ed25519) e.g. on test VMs
 try {
   // 0. LATE-PEER: C creates and stays SILENT; D joins ~8 s later and must
   //    bootstrap (want → store → dolt_reset --hard; LB3b form) ≤15 s.

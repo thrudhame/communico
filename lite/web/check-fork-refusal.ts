@@ -8,9 +8,11 @@ import {
   adoptStoreImage,
   aliveBranches,
   allEvents,
+  createProfile,
   createRoom,
   exportStoreImage,
   extremities,
+  identityInfo,
   ingestEvent,
   ingestRemote,
   joinRoom,
@@ -29,8 +31,11 @@ const pduOf = (room: unknown, id: string) =>
   )!;
 
 // 1. A creates; alice invites bob; bob joins (all through the stub).
+// Personas share the one browser key (F1 step 20): bob's MXID uses A's
+// minted server name.
 const A = await createRoom('alice', 'fork-a');
-const BOB = '@bob:browser';
+const BOB = `@bob:${identityInfo()?.serverName}`;
+await createProfile('bob', 'bob');
 let tip = extremities(A)[0].eventId;
 const invite = await ingestEvent(A, {
   type: 'm.room.member', state_key: BOB, content: { membership: 'invite' },

@@ -62,6 +62,12 @@
     <input id="room-name" placeholder="room name" autocomplete="off">
     <button id="create-btn">Create room</button>
     <button id="join-btn">Join room</button>
+    <select id="profile" title="personas on this browser homeserver"></select>
+    <input id="displayname" placeholder="rename persona" autocomplete="off">
+    <button id="rename-btn" title="rename the active persona (displayname)">Rename</button>
+    <button id="export-btn" title="export the browser homeserver key (moves every profile)">Export key</button>
+    <button id="import-btn" title="import a browser homeserver key">Import key</button>
+    <span id="my-id" class="badge" title="this browser is its own homeserver"></span>
     <span id="status"></span>
   </section>
 
@@ -80,6 +86,11 @@
       <div id="composer">
         <input id="msg" placeholder="say something" autocomplete="off">
         <button id="send">send</button>
+      </div>
+      <div id="membership">
+        <input id="invite-name" placeholder="persona to invite" autocomplete="off">
+        <button id="invite-btn">invite</button>
+        <button id="join-room-btn" title="accept: send my member join">join room</button>
       </div>
     </section>
     <section id="side">

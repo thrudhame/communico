@@ -16,7 +16,32 @@ export function b64encode(bytes) {
   return btoa(bin).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
 }
 
-// Standard unpadded base64 — for hashes, signatures, keys.
+// Standard base32 encode (RFC 4648, uppercase, padded). Pair with
+// b32decode; callers lowercase/strip for key-names. Byte-identical across
+// engines by construction (single source).
+export function b32encode(bytes) {
+  let out = '';
+  let bits = 0;
+  let value = 0;
+  for (const b of bytes) {
+    value = (value << 8) | b;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    out += B32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  while (out.length % 8 !== 0) out += '=';
+  return out;
+}
+
+// Standard base64 (appendices § Unpadded Base64: RFC 4648 without `=`).
+// Binary values in JSON (hashes, signatures, keys) use the STANDARD
+// alphabet; only event ids use the URL-safe variation (rooms v11 §
+// Event IDs: 62nd/63rd chars `-`/`_` instead of `+`/`/`).
 export function b64encodeStd(bytes) {
   const bin = String.fromCharCode(...bytes);
   return btoa(bin).replace(/=+$/, '');
@@ -101,6 +126,33 @@ export async function verifyJson(obj, entity, keyId, publicKey) {
   } catch {
     return false;
   }
+}
+
+// Standard base32 decode (RFC 4648, case-insensitive, padding optional).
+// Returns null on any illegal character. Used for key-is-name server
+// names (a base32 homeserver name IS the origin ed25519 key).
+const B32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+export function b32decode(s) {
+  const clean = String(s).replace(/=+$/, '').toUpperCase();
+  if (!/^[A-Z2-7]*$/.test(clean)) return null;
+  const out = [];
+  let bits = 0;
+  let value = 0;
+  for (const ch of clean) {
+    value = (value << 5) | B32_ALPHABET.indexOf(ch);
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(out);
+}
+
+// A key-anchored server name: 52 lowercase base32 chars (one DNS label),
+// i.e. an ed25519 public key rendered as a name (design §4.1).
+export function isKeyName(s) {
+  return typeof s === 'string' && /^[a-z2-7]{52}$/.test(s);
 }
 
 // PKCS#8 DER wrap for a 32-byte Ed25519 seed (for importing test-vector

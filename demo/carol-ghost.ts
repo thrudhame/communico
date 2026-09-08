@@ -59,7 +59,9 @@ async function waitReceipt(eventId: string, timeoutMs = 15_000): Promise<boolean
   return landed;
 }
 
-const browser = await launch();
+const browser = await launch(
+  Deno.env.get("CHROME_PATH") ? { path: Deno.env.get("CHROME_PATH") } : undefined,
+); // CHROME_PATH: system Chromium (>=137 for Ed25519) e.g. on test VMs
 try {
   const page = await browser.newPage(
     `http://localhost:8787/?transport=ws&sync=msync&room=${encodeURIComponent(ROOM_ID)}`,

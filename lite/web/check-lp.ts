@@ -32,7 +32,9 @@ if (!(await waitForServer(1_000))) {
   }
 }
 
-const browser = await launch();
+const browser = await launch(
+  Deno.env.get("CHROME_PATH") ? { path: Deno.env.get("CHROME_PATH") } : undefined,
+); // CHROME_PATH: system Chromium (>=137 for Ed25519) e.g. on test VMs
 // LP2C (P-D2 longevity probe) is part of the DEFAULT gate since the
 // 0.50.3 upgrade: the upstream stack-overflow fix (dolthub/doltlite#2573)
 // means the probe that deterministically hung 0.11.53 (PB4) must now print
