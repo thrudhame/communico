@@ -23,7 +23,7 @@ fi
 # 1. preflight
 command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-  for port in 5432 8000 8787; do
+  for port in 5432 8000 8008 8787; do
     if ss -tln 2>/dev/null | grep -q ":${port} "; then
       echo "port ${port} is busy and $CONTAINER is not running" >&2
       exit 1
@@ -45,7 +45,7 @@ else
     --memory=8g --memory-swap=8g --pids-limit=512 --cpus=4 \
     --env-file .env \
     -e DOLTGRES_USER=root -e DOLTGRES_PASSWORD=secret -e DOLTGRES_DB=postgres \
-    -p 5432:5432 -p 8000:8000 -p 8787:8787 \
+    -p 5432:5432 -p 8000:8000 -p 8008:8008 -p 8787:8787 \
     -v "$PWD/doltgres/config:/etc/doltgres/servercfg.d" \
     -v "$PWD:/workspace" \
     "$IMAGE" sleep infinity
@@ -72,9 +72,9 @@ done
 echo ">> starting app (A)"
 docker exec -d "$CONTAINER" bash -c \
   'cd /workspace && exec deno task start > /tmp/app-a.log 2>&1'
-echo ">> waiting for app on :80 (30s budget)"
+echo ">> waiting for app on :8008 (30s budget)"
 for i in $(seq 1 30); do
-  if docker exec "$CONTAINER" curl -sf localhost:80/ >/dev/null 2>&1; then
+  if docker exec "$CONTAINER" curl -sf localhost:8008/ >/dev/null 2>&1; then
     break
   fi
   [[ $i == 30 ]] && { echo "app did not come up" >&2; exit 1; }
@@ -112,7 +112,7 @@ ROOM_ID="$(docker exec "$CONTAINER" bash -c \
   \" 2>/dev/null | tail -1" || true)"
 if [[ -z "$ROOM_ID" ]]; then
   echo ">> creating demo room"
-  ROOM_ID="$(docker exec "$CONTAINER" curl -s -X POST localhost:80/_matrix/client/v3/createRoom \
+  ROOM_ID="$(docker exec "$CONTAINER" curl -s -X POST localhost:8008/_matrix/client/v3/createRoom \
     -H 'Authorization: Bearer devtoken' \
     -d '{"room_version":"11"}' \
     | grep -o '"room_id":"[^"]*"' | head -1 | cut -d'"' -f4)"
@@ -140,16 +140,16 @@ mc() {
     --store /data/store --credentials /data/credentials.json >/dev/null
 }
 echo ">> logging in alice + bob (listen + send stores each)"
-mc /tmp/mc-alice --login password --homeserver http://localhost:80 \
+mc /tmp/mc-alice --login password --homeserver http://localhost:8008 \
   --user-login '@alice:localhost' --password 'demo-password' \
   --device alice-listen --room-default "$ROOM_ID"
-mc /tmp/mc-alice-send --login password --homeserver http://localhost:80 \
+mc /tmp/mc-alice-send --login password --homeserver http://localhost:8008 \
   --user-login '@alice:localhost' --password 'demo-password' \
   --device alice-send --room-default "$ROOM_ID"
-mc /tmp/mc-bob --login password --homeserver http://localhost:80 \
+mc /tmp/mc-bob --login password --homeserver http://localhost:8008 \
   --user-login '@bob:localhost' --password 'demo-password' \
   --device bob-listen --room-default "$ROOM_ID"
-mc /tmp/mc-bob-send --login password --homeserver http://localhost:80 \
+mc /tmp/mc-bob-send --login password --homeserver http://localhost:8008 \
   --user-login '@bob:localhost' --password 'demo-password' \
   --device bob-send --room-default "$ROOM_ID"
 # F0: the demo room is invite-only (v11 genesis) and the stub enforces

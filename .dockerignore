@@ -1,0 +1,12 @@
+# complement image build context: ship only what the server needs.
+.git
+node_modules
+lite/web/node_modules
+.env
+complement/baseline.jsonl
+complement/BASELINE.md
+complement/work-*
+doltgres/data
+/tmp
+*.cast
+*.gif
