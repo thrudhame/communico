@@ -1064,3 +1064,93 @@ Verbatim M0 gate (all green 2026-09-07, on the VM):
 
 The F0 unsigned-lite seam stays OFF in the M0 image (`ALLOW_UNSIGNED_LITE`
 unset in the entrypoint); `.env` (seam on) is `.dockerignore`d out.
+
+## F1 — identity + registration (server-foundation phase 3, 2026-09-07 — in progress)
+
+Branch `server-foundation` (M0 commits `16a95e4` + `6bef9dc` + F1 work). All
+runs on ark VM fork `arch-communico-server-foundation`.
+
+### Credentials shape (BLOCKER-F1-CREDENTIALS ruling: argon2id)
+
+`jsr:@stdext/crypto/hash/argon2` probed on the VM 2026-09-07:
+`hash(data, opts)` / `verify(data, hash, opts)` are **synchronous** (options
+mandatory — omitting them throws `Options could not be parsed` from WASM).
+With `{algorithm:'argon2id', memoryCost:19456, timeCost:2, parallelism:1}`
+(29 ms): returns a **PHC string**
+`$argon2id$v=19$m=19456,t=2,p=1$<salt-b64>$<hash-b64>` — algorithm + params
++ salt encoded in-band. `verify` accepts the PHC with *mismatched* passed
+options (reads params from the PHC — verified `verify-other-opts: true`);
+wrong password → false.
+Consequence: `credentials(localpart, kind='argon2id', hash=<PHC>)`; `salt`
+/ `params` columns stay NULL for argon2id rows (kept in schema for the
+documented `node:crypto`-scrypt fallback — `kind` makes it a migration).
+**No unsalted sha256 anywhere.** OWASP defaults kept (argon2id/19456/2/1).
+
+### Identity implementation (F1 server)
+
+- Tenant DB `tenant_<sha256(SERVER_NAME)[0:20]>`: `tenant` (server_name,
+  native_name = base32(pubkey) 52-char lowercase, pubkey_b64, privkey_enc
+  = pkcs8 b64 — at-rest encryption deferred past F1, recorded here,
+  key_id, created_ms), `users`, `credentials`, `devices`,
+  `access_tokens`, `uia_sessions`. F0 key migrated (same material —
+  signature continuity), never rotated (`E_KEY_MISMATCH` on divergence).
+- UIA `/register`: body validation BEFORE sessions (Complement-read:
+  bad grammar → 400 M_INVALID_USERNAME, taken → 400 M_USER_IN_USE even
+  sessionless); sessions REQUIRED (unknown/absent → 401 + fresh session —
+  never one-shot); dummy + password stages complete; finalize creates
+  user/argon2id/device/token, drops session. `GET /register/available`
+  added (Complement asserts it). `inhibit_login` omits the token.
+- `/login` verifies argon2id (403 M_FORBIDDEN), upserts the device row;
+  `/logout` revokes token + device, `/logout/all` revokes user-wide
+  (Synapse semantics — the logout gate asserts the device list shrinks);
+  `GET /v3/devices` added (gate-required); `whoami` + all `authorize`
+  sites return proper 401s via `MatrixError` (new `api.ts` branch renders
+  `{status, errcode/body}` JSON — existing 400-generic path untouched).
+  `api.ts` serializes JSON bodies itself with exact `application/json`
+  (no charset — Complement MatchResponse asserts it verbatim; string
+  bodies pass through untouched as before).
+- `m.change_password` advertised `{"enabled": false}` (no endpoint —
+  the plan's "no m.change_password" means no endpoint; the capabilities
+  test requires the key present) and `/capabilities` requires auth (401).
+- Seeds register through `registerUser` (argon2id, dev-only labelled);
+  dev keeps fixed `devtoken` for demo/scripts.
+
+### Browser homeserver (F1 step 20)
+
+- One Ed25519 keypair per browser (WebCrypto, minted on first run,
+  localStorage JWK now, OPFS later); server_name = b32(pubkey). Profiles:
+  N localparts fixed at creation, displayname renames, picker, rooms
+  belong to a profile (switch unloads — stores are session-scoped),
+  export/import moves the whole key. Profile writes reload-merge (two
+  tabs creating different personas union).
+- Every PDU signed (content-hash → redact → sign, `ed25519:1` under our
+  name); `ingestRemote` verifies key-is-name peers (unsigned-or-bad from
+  a key name → bad), accepts DNS/legacy origins unverified (no `/keys`
+  until M5 — recorded); adoption probe + replay enforce the same.
+- CHECKS REQUIRE Chromium ≥137 (Ed25519 WebCrypto landed in 137;
+  astral's pinned 125 throws NotSupportedError — root-caused via in-page
+  probe): all browser checks take `CHROME_PATH` env (`launch({path})`).
+
+### F1 gate (all green 2026-09-07/08, on the VM)
+
+- `deno task check` clean; `deno task test` 37/37 (incl. NEW
+  `tests/tenant.test.ts`: key generate-once + 52-char native name, PHC
+  shape + verify, localpart grammar, register/login/token lifecycle,
+  UIA sessions; and tampered-signature vectors in `facade.test.ts`:
+  content-tamper → M_AUTHCHAIN_REJECT, stripped/transplanted sigs →
+  M_UNAUTHORIZED refusal).
+- Complement `TestRegistration|TestLogin|TestLogout` green, 0 failures;
+  `TestServerCapabilities` green after `m.change_password: {enabled:
+  false}` + auth-required fix; `TestVersionStructure` green throughout.
+- Full `complement/run.sh`: M0 red 130 → F1 red 275. NOT a regression:
+  at M0 every test needing registration died at setup (parent-only
+  failures); with registration working the suite penetrates to the next
+  missing piece (media stubs, rooms, E2EE…) and enumerates deeper.
+  Register/Login/Logout/Capabilities/Versions absent from the red list.
+- Demo `--check` 4/4 with alice/bob via password login against tenant
+  credentials; Carol's SIGNED browser PDUs verify key-is-name and relay.
+- `check-msync` profiles leg: one browser key, two personas, invite +
+  member join through the stub, 2 signed PDUs converging, sh equal.
+- `complement/continuity.sh`: same tenant pubkey across container
+  restart; pre-restart event signature verifies post-restart. PASS.
+- Browser sweep re-green post-signing (8/8 + fork-refusal + adoption).
