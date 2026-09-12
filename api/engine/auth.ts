@@ -6,9 +6,9 @@ import { MatrixError } from './matrix-error.ts';
 // Tenant-DB token auth (F1): token from `Authorization: Bearer <token>`
 // OR the `?access_token=` query param (matrix-nio's observed mechanism).
 // Looks the token up in the tenant's access_tokens, returns the full
-// user_id. Throws MatrixError 401s — never 500s. The 20-auth middleware is
-// the usual caller (routes opt out via `export const auth = false`); deep
-// helpers may still call this directly.
+// user_id. Throws MatrixError 401s — never 500s. The shared
+// auth-middleware (placed on each protected folder) is the usual caller;
+// deep helpers may still call this directly.
 export async function authorize(
   request: PathfinderRequest,
 ): Promise<string> {

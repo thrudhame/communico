@@ -1,5 +1,3 @@
-export const auth = false;
-
 // No auth (per spec). matrix-nio's observed flows never call this
 // (capture conclusion 3) — provided for spec shape / other clients.
 // M0: advertises unstable_features (empty — no unstable features).

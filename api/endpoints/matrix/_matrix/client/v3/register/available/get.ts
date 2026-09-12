@@ -3,8 +3,6 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { checkLocalpart, ensureTenant } from '#engine/tenant.ts';
 import { withDb } from '#engine/db.ts';
 
-export const auth = false;
-
 // GET /_matrix/client/v3/register/available?username= — Complement
 // 01register subtests: {available: true}, or 400 M_USER_IN_USE /
 // M_INVALID_USERNAME.

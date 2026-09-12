@@ -12,7 +12,6 @@ import {
 } from '#engine/tenant.ts';
 import { withDb } from '#engine/db.ts';
 
-export const auth = false;
 
 const FLOWS = [{ stages: ['m.login.dummy'] }];
 

@@ -3,8 +3,6 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { issueToken, upsertDevice, verifyUserPassword } from '#engine/tenant.ts';
 import { SERVER_NAME } from '#engine/config.ts';
 
-export const auth = false;
-
 // m.login.password (F1 step 18): argon2id verify against the tenant
 // credentials; `identifier.type m.id.user` plus the legacy `user` shape
 // (capture rows 1–2). Failures are 403 M_FORBIDDEN (never user-oracle
