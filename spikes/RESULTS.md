@@ -1154,3 +1154,53 @@ documented `node:crypto`-scrypt fallback — `kind` makes it a migration).
 - `complement/continuity.sh`: same tenant pubkey across container
   restart; pre-restart event signature verifies post-restart. PASS.
 - Browser sweep re-green post-signing (8/8 + fork-refusal + adoption).
+
+## M1 — HTTP layer on pathfinder 0.2.0 (2026-09-10 → 12)
+
+The whole HTTP layer — both listeners, all 28 endpoint files, the WS
+upgrade, CORS, errors — runs on `jsr:@pathfinder/pathfinder@0.2.0` (the
+published package; the local `links` pin is gone). The tree's final
+shape: two roots (`api/endpoints/matrix/`, `api/endpoints/communico/`)
+with two `pathfinder()` instances on :8008/:8000; directory middleware
+by seat (`00-cors`, `01-timing`, `02-access-log`; `10-json` under
+`_matrix/`); outcome pages at `_matrix/{404,405,500}.ts` in Matrix
+shapes; auth as *placement* — a one-line `20-auth.ts` on each protected
+folder (`account/ capabilities/ createRoom/ devices/ keys/ logout/
+rooms/ sync/`) re-exporting the shared `#engine/auth-middleware.ts`;
+`#`-prefixed per-top-level import aliases (no `../` anywhere server
+side); `/msync` as a root handler on :8000 via `request.upgrade()`;
+`MatrixError extends HttpError` carrying verbatim errcode bodies.
+
+Gate, re-run on the published bytes at promotion: `deno task check`
+clean; `deno task test` 55/55 (incl. the permanent
+`tests/http-contract.test.ts` — miss cases on public vs protected
+ground, CORS on 404/405/500/thrown-HttpError and on the `/msync` 101,
+empty-body vs malformed-JSON, preflight); lite sweep 8/8 (check-msync
+flaked intermittently across passes — the failing leg is browser-local
+BroadcastChannel timing under load, recorded not chased); demo
+`--check` 4/4 with Carol's browser leg crossing `/msync`; Complement
+full run 272 red, **byte-identical by name to the pre-pin run** — and
+three names went red→green at the original swap, all explained:
+`TestUnknownEndpoints/Client-server_endpoints` and `/Unknown_prefix`
+(404s now carry Matrix `M_UNRECOGNIZED` JSON), and
+`createRoom_rejects_..._unknown_versions` (the 400 now carries
+`errcode: M_UNSUPPORTED_ROOM_VERSION` verbatim).
+
+Consumer findings sent upstream during integration (all fixed in
+0.2.0): **(1)** no-match outcome anchors tagged route leaves only, so
+a `404.ts` at a subtree root never fired for misses that passed no leaf
+— fixed by fact entries + the always-dict walk, verified by
+`TestUnknownEndpoints` staying green with outcome files at `_matrix/`.
+**(2)** miss dispatches never enabled middleware body access, so a
+body-reading middleware 500'd on 404/405 — fixed the same way; a 405
+with a body now renders its page with `Allow`, no guard in the
+middleware. **(3)** the empty-body rule: Complement's `/logout` sends
+`Content-Length: 0`, which arrives as a non-null empty stream — an
+empty body is not `M_NOT_JSON`; that rule is communico's own (a POST
+that ignores its body must not fail validation) and is covered by a
+permanent test.
+
+Journey detail (the spike/integrate/cleanup passes, including the
+workarounds later removed) is preserved in the execution reports under
+`~/Documents/communico/plans/pathfinder-{spike,integrate,cleanup}/reports/`
+and the promotion report beside this plan.
