@@ -48,6 +48,7 @@ else
     -p 5432:5432 -p 8000:8000 -p 8008:8008 -p 8787:8787 \
     -v "$PWD/doltgres/config:/etc/doltgres/servercfg.d" \
     -v "$PWD:/workspace" \
+    -v "$PWD/../pathfinder:/pathfinder" \
     "$IMAGE" sleep infinity
 fi
 

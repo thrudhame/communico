@@ -8,3 +8,4 @@ lite/web/node_modules/
 complement/baseline.jsonl
 complement/work-*
 complement/.test-status
+complement/.pathfinder

@@ -1,13 +1,12 @@
-// api/engine/matrix-error.ts — spec-shaped error responses (F1).
-// The endpoint outcome type pins HttpError<500>; Complement asserts real
-// Matrix errcodes (M_USER_IN_USE, M_FORBIDDEN, …) and UIA 401 bodies.
-// Endpoints throw MatrixError; api.ts renders {status, body} and leaves
-// every other error on the legacy 400-generic path (existing endpoints
-// keep their behavior).
-export class MatrixError extends Error {
-  readonly status: number;
+// api/engine/matrix-error.ts — spec-shaped error responses (F1), now on
+// pathfinder's payload-agnostic HttpError (spike): the second super() arg is
+// the response BODY, verbatim — Matrix errcode/error bodies render exactly.
+// The errcode/status/responseBody() fields stay for engine callers and
+// tests (tests/tenant.test.ts).
+import { HttpError } from '@pathfinder/pathfinder';
+
+export class MatrixError extends HttpError {
   readonly errcode: string;
-  readonly body?: Record<string, unknown>;
 
   constructor(
     status: number,
@@ -15,14 +14,12 @@ export class MatrixError extends Error {
     message: string,
     body?: Record<string, unknown>,
   ) {
-    super(`${errcode}: ${message}`);
-    this.status = status;
+    super(status, body ?? { errcode, error: message });
     this.errcode = errcode;
-    this.body = body;
+    this.message = `${errcode}: ${message}`;
   }
 
   responseBody(): Record<string, unknown> {
-    if (this.body) return this.body;
-    return { errcode: this.errcode, error: this.message };
+    return this.body as Record<string, unknown>;
   }
 }

@@ -29,7 +29,7 @@ COPY complement ./complement
 COPY lite/web/sync ./lite/web/sync
 RUN chmod +x /app/complement/entrypoint.sh
 # cache remote deps at build time (no network needed at container start)
-RUN deno cache main.ts db/init.ts complement/tls-stub.ts
+RUN deno cache --min-dep-age 0 main.ts db/init.ts complement/tls-stub.ts
 
 EXPOSE 8008 8448
 HEALTHCHECK --interval=5s --timeout=3s --start-period=60s --retries=5 \
