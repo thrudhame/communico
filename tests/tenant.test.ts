@@ -1,6 +1,6 @@
 import { assert, assertEquals, assertMatch, assertRejects, assertThrows } from '@std/assert';
-import { SERVER_NAME } from '../api/engine/config.ts';
-import { MatrixError } from '../api/engine/matrix-error.ts';
+import { SERVER_NAME } from '#engine/config.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   checkLocalpart,
   completeUiaStages,
@@ -19,8 +19,8 @@ import {
   tenantDbName,
   verifyPassword,
   verifyUserPassword,
-} from '../api/engine/tenant.ts';
-import { b64decode } from '../lite/web/sync/signing.js';
+} from '#engine/tenant.ts';
+import { b64decode } from '#lite/web/sync/signing.js';
 
 const PHC_RE = /^\$argon2id\$v=19\$m=19456,t=2,p=1\$[^$]+\$[^$]+$/;
 
@@ -55,7 +55,7 @@ Deno.test('register/login/token lifecycle', async () => {
   const lp = 'f1user';
   // clean slate for reruns
   const { dbName } = await ensureTenant(SERVER_NAME);
-  const { withDb } = await import('../api/engine/db.ts');
+  const { withDb } = await import('#engine/db.ts');
   await withDb(dbName, async (c) => {
     await c.query('DELETE FROM access_tokens WHERE localpart = $1;', [lp]);
     await c.query('DELETE FROM credentials WHERE localpart = $1;', [lp]);

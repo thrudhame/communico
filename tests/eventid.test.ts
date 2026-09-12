@@ -3,13 +3,13 @@ import {
   assertEquals,
   assertNotEquals,
 } from '@std/assert';
-import { eventIdFor, redact } from '../api/engine/eventid.ts';
+import { eventIdFor, redact } from '#engine/eventid.ts';
 import {
   b64decode,
   contentHashOf,
   importPrivateKeyFromSeed,
   signJson,
-} from '../lite/web/sync/signing.js';
+} from '#lite/web/sync/signing.js';
 
 const PDU = {
   type: 'm.room.message',

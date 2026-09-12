@@ -1,9 +1,9 @@
 import { assertEquals, assertMatch, assertNotEquals } from '@std/assert';
-import { createRoom, lookupRoom } from '../api/engine/room.ts';
-import { author, ingestEvent } from '../api/engine/ingest.ts';
-import { eventIdFor } from '../api/engine/eventid.ts';
-import { messages } from '../api/engine/timeline.ts';
-import { SERVER_DB, withDb } from '../api/engine/db.ts';
+import { createRoom, lookupRoom } from '#engine/room.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
+import { eventIdFor } from '#engine/eventid.ts';
+import { messages } from '#engine/timeline.ts';
+import { SERVER_DB, withDb } from '#engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!t3:localhost';

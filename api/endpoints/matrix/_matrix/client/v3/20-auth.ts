@@ -1,5 +1,5 @@
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
-import { authorize } from '../../../../../engine/auth.ts';
+import { authorize } from '#engine/auth.ts';
 
 // Bearer / ?access_token= auth for /_matrix/client/v3 (F1 semantics, moved
 // from per-endpoint authorize() calls to pathfinder middleware). Throws

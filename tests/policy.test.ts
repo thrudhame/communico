@@ -8,11 +8,11 @@ import {
   createRoom,
   extremities,
   lookupRoom,
-} from '../api/engine/room.ts';
-import { author, ingestEvent } from '../api/engine/ingest.ts';
-import { reresolveFromDag } from '../api/engine/adopt.ts';
-import { stateNow } from '../api/engine/timeline.ts';
-import { SERVER_DB, withDb } from '../api/engine/db.ts';
+} from '#engine/room.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
+import { reresolveFromDag } from '#engine/adopt.ts';
+import { stateNow } from '#engine/timeline.ts';
+import { SERVER_DB, withDb } from '#engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!policy:localhost';

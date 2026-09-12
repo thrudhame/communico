@@ -17,6 +17,12 @@
     "debug-proxy": "PROXY_PORT=8000 deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
   },
   "imports": {
+    "#engine/": "./api/engine/",
+    "#endpoints/": "./api/endpoints/",
+    "#hats/": "./api/hats/",
+    "#lite/": "./lite/",
+    "#root/": "./",
+    "#tests/": "./tests/",
     "@pathfinder/pathfinder": "jsr:@pathfinder/pathfinder@0.2.0",
     "@std/assert": "jsr:@std/assert@1",
     "@std/collections": "jsr:@std/collections@^1.1.3",

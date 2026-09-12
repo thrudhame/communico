@@ -1,6 +1,6 @@
 import { HttpError } from '@pathfinder/pathfinder';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
-import { attachSocket } from '../../../hats/lite/peer.ts';
+import { attachSocket } from '#hats/lite/peer.ts';
 
 // GET /msync?room= — lite hat (design §4.4): browser peers join rooms over
 // msync/ws. Was a raw Deno.upgradeWebSocket intercept in main.ts; now a

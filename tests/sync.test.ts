@@ -1,8 +1,8 @@
 import { assert, assertEquals } from '@std/assert';
-import { createRoom } from '../api/engine/room.ts';
-import { author, ingestEvent } from '../api/engine/ingest.ts';
-import { syncSince } from '../api/engine/syncfeed.ts';
-import { SERVER_DB, withDb } from '../api/engine/db.ts';
+import { createRoom } from '#engine/room.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
+import { syncSince } from '#engine/syncfeed.ts';
+import { SERVER_DB, withDb } from '#engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!t5:localhost';

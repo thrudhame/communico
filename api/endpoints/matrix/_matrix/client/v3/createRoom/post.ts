@@ -1,6 +1,6 @@
-import { MatrixError } from '../../../../../../engine/matrix-error.ts';
-import { createRoom } from '../../../../../../engine/room.ts';
-import { SERVER_NAME } from '../../../../../../engine/config.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { createRoom } from '#engine/room.ts';
+import { SERVER_NAME } from '#engine/config.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
 
 // POST /_matrix/client/v3/createRoom — F0: default version '11'.

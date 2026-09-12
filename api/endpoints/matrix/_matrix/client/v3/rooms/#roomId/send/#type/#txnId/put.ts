@@ -1,6 +1,6 @@
-import { MatrixError } from '../../../../../../../../../../engine/matrix-error.ts';
-import { author, ingestEvent } from '../../../../../../../../../../engine/ingest.ts';
-import { extremities, lookupRoom } from '../../../../../../../../../../engine/room.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
+import { extremities, lookupRoom } from '#engine/room.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
 
 // PUT /_matrix/client/v3/rooms/#roomId/send/#type/#txnId — author + ingest

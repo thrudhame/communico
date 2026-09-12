@@ -1,5 +1,5 @@
-import { SERVER_NAME } from '../../../../../../engine/config.ts';
-import { listDevices } from '../../../../../../engine/tenant.ts';
+import { SERVER_NAME } from '#engine/config.ts';
+import { listDevices } from '#engine/tenant.ts';
 
 // GET /_matrix/client/v3/devices — the caller's devices (F1 logout gate
 // reads this before/after logout). Shape: {devices: [{device_id,

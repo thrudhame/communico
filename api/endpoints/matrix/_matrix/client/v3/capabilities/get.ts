@@ -1,4 +1,4 @@
-import { supportedRoomVersions } from '../../../../../../engine/policy.ts';
+import { supportedRoomVersions } from '#engine/policy.ts';
 
 // M0: server capabilities (Complement 10apidoc/45server-capabilities).
 // Room versions: 11 only ('12' when its resolver lands at M3).

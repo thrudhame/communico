@@ -1,5 +1,5 @@
-import { SERVER_NAME } from '../../../../../../engine/config.ts';
-import { revokeToken } from '../../../../../../engine/tenant.ts';
+import { SERVER_NAME } from '#engine/config.ts';
+import { revokeToken } from '#engine/tenant.ts';
 
 // POST /_matrix/client/v3/logout — invalidate the calling token.
 export default async function (

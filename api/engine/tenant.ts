@@ -17,7 +17,7 @@ import {
   generateSigningKeypair,
   importPrivateKeyFromPkcs8,
   importPublicKeyFromRaw,
-} from '../../lite/web/sync/signing.js';
+} from '#lite/web/sync/signing.js';
 
 async function sha256hex(s: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));

@@ -20,7 +20,7 @@ import {
   importPublicKeyFromRaw,
   signJson,
   verifyJson,
-} from '../../lite/web/sync/signing.js';
+} from '#lite/web/sync/signing.js';
 
 export const SERVER_KEY_ID = '1';
 

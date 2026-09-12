@@ -1,8 +1,8 @@
 import { assert, assertEquals } from '@std/assert';
-import { createRoom } from '../api/engine/room.ts';
-import { author, ingestEvent } from '../api/engine/ingest.ts';
-import { getFacadeFor } from '../api/engine/facade.ts';
-import type { Pdu } from '../api/engine/pdu.ts';
+import { createRoom } from '#engine/room.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
+import { getFacadeFor } from '#engine/facade.ts';
+import type { Pdu } from '#engine/pdu.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!t6:localhost';

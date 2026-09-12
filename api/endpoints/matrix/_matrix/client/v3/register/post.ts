@@ -1,6 +1,6 @@
 import { parseJson } from '@pathfinder/pathfinder/body';
-import { SERVER_NAME } from '../../../../../../engine/config.ts';
-import { MatrixError } from '../../../../../../engine/matrix-error.ts';
+import { SERVER_NAME } from '#engine/config.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   checkLocalpart,
   completeUiaStages,
@@ -9,8 +9,8 @@ import {
   ensureTenant,
   getUiaSession,
   registerUser,
-} from '../../../../../../engine/tenant.ts';
-import { withDb } from '../../../../../../engine/db.ts';
+} from '#engine/tenant.ts';
+import { withDb } from '#engine/db.ts';
 
 export const auth = false;
 

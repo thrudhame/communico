@@ -1,4 +1,4 @@
-import { pullRoom } from '../../../../../../engine/sync.ts';
+import { pullRoom } from '#engine/sync.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
 
 export default async function (request: import('@pathfinder/pathfinder').PathfinderRequest) {

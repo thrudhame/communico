@@ -1,7 +1,7 @@
-import { SERVER_NAME } from '../../../../../../../engine/config.ts';
-import { MatrixError } from '../../../../../../../engine/matrix-error.ts';
-import { checkLocalpart, ensureTenant } from '../../../../../../../engine/tenant.ts';
-import { withDb } from '../../../../../../../engine/db.ts';
+import { SERVER_NAME } from '#engine/config.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { checkLocalpart, ensureTenant } from '#engine/tenant.ts';
+import { withDb } from '#engine/db.ts';
 
 export const auth = false;
 

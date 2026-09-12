@@ -5,9 +5,9 @@
 // pure addition: it composes the core's ingest pipeline and applied
 // signal, and changes nothing about them. The peer outlives sockets —
 // "rooms outlive tabs" (§4.3).
-import { getFacadeFor } from '../../engine/facade.ts';
-import { onEventApplied } from '../../engine/ingest.ts';
-import { startMsync } from '../../../lite/web/sync/msync.js';
+import { getFacadeFor } from '#engine/facade.ts';
+import { onEventApplied } from '#engine/ingest.ts';
+import { startMsync } from '#lite/web/sync/msync.js';
 import {
   createHub,
   hubAddSocket,

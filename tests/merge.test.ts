@@ -3,9 +3,9 @@ import {
   createRoom,
   extremities,
   lookupRoom,
-} from '../api/engine/room.ts';
-import { author, ingestEvent } from '../api/engine/ingest.ts';
-import { withDb } from '../api/engine/db.ts';
+} from '#engine/room.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
+import { withDb } from '#engine/db.ts';
 import { resetRoom } from './util.ts';
 
 const ROOM = '!t2:localhost';

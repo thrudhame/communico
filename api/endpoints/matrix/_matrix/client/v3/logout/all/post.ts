@@ -1,5 +1,5 @@
-import { SERVER_NAME } from '../../../../../../../engine/config.ts';
-import { revokeAllTokens } from '../../../../../../../engine/tenant.ts';
+import { SERVER_NAME } from '#engine/config.ts';
+import { revokeAllTokens } from '#engine/tenant.ts';
 
 // POST /_matrix/client/v3/logout/all — invalidate all of the user's tokens.
 export default async function (

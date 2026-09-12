@@ -4,9 +4,9 @@
 // stays forked, nothing is guessed.
 // Reuses the keepPrevBranches test hook exactly like tests/merge.test.ts.
 // Run (inside the container): deno run --env --allow-net --allow-env --allow-read demo/fork-demo.ts
-import { author, ingestEvent } from '../api/engine/ingest.ts';
-import { lookupRoom } from '../api/engine/room.ts';
-import { latestExtremityEventId } from '../tests/util.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
+import { lookupRoom } from '#engine/room.ts';
+import { latestExtremityEventId } from '#tests/util.ts';
 
 const roomId = Deno.args[0];
 if (!roomId) {

@@ -3,8 +3,8 @@
 // stub-authorized). The CS invite/join endpoints are M4 (30rooms) scope;
 // the demo room is invite-only (v11 genesis), so seeds arrive this way.
 // Run (inside the container): deno run --env --allow-net --allow-env --allow-read demo/seed-membership.ts <roomId>
-import { author, ingestEvent } from '../api/engine/ingest.ts';
-import { lookupRoom } from '../api/engine/room.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
+import { lookupRoom } from '#engine/room.ts';
 
 const roomId = Deno.args[0];
 if (!roomId) {

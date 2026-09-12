@@ -4,8 +4,8 @@
 import {
   createRoom,
   lookupRoom,
-} from '../api/engine/room.ts';
-import { author, ingestEvent } from '../api/engine/ingest.ts';
+} from '#engine/room.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!bench:localhost';

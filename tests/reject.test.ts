@@ -1,7 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
-import { createRoom, extremities, lookupRoom } from '../api/engine/room.ts';
-import { author, ingestEvent } from '../api/engine/ingest.ts';
-import { withDb } from '../api/engine/db.ts';
+import { createRoom, extremities, lookupRoom } from '#engine/room.ts';
+import { author, ingestEvent } from '#engine/ingest.ts';
+import { withDb } from '#engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!t4:localhost';
@@ -125,7 +125,7 @@ Deno.test('3-prev message: chained commits, full DAG, single extremity', async (
   );
   // the event DAG keeps all 3 prevs (read on the heal's own branch —
   // a fresh connection lands on main, which never holds event rows)
-  const { extremities: exts } = await import('../api/engine/room.ts');
+  const { extremities: exts } = await import('#engine/room.ts');
   void exts;
   await withDb(room.dbName, async (c) => {
     const b = await c.query(

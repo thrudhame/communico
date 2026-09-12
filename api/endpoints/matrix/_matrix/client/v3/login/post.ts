@@ -1,7 +1,7 @@
 import { parseJson } from '@pathfinder/pathfinder/body';
-import { MatrixError } from '../../../../../../engine/matrix-error.ts';
-import { issueToken, upsertDevice, verifyUserPassword } from '../../../../../../engine/tenant.ts';
-import { SERVER_NAME } from '../../../../../../engine/config.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { issueToken, upsertDevice, verifyUserPassword } from '#engine/tenant.ts';
+import { SERVER_NAME } from '#engine/config.ts';
 
 export const auth = false;
 

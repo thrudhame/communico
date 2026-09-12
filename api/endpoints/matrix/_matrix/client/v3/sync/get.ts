@@ -1,4 +1,4 @@
-import { syncSince } from '../../../../../../engine/syncfeed.ts';
+import { syncSince } from '#engine/syncfeed.ts';
 
 // GET /_matrix/client/v3/sync — phase-2 step 2.3. `since` = 's<digits>';
 // `timeout` = long-poll budget in ms (default 0, capped at 30000 in

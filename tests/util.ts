@@ -1,6 +1,6 @@
-import { lookupRoom } from '../api/engine/room.ts';
-import { ident, SERVER_DB, withDb } from '../api/engine/db.ts';
-import { clearFacades } from '../api/engine/facade.ts';
+import { lookupRoom } from '#engine/room.ts';
+import { ident, SERVER_DB, withDb } from '#engine/db.ts';
+import { clearFacades } from '#engine/facade.ts';
 
 // Newest extremity's wire event_id: newest-tipped x* branch in the room
 // DB -> its tip hash -> event_index (D8: branch tip == event commit).
@@ -32,7 +32,7 @@ export async function latestExtremityEventId(roomId: string): Promise<string> {
 // Drops the room DB + server rows so content-addressed test rooms can be
 // re-created on reruns.
 export async function resetRoom(roomId: string): Promise<void> {
-  const { dbNameFor } = await import('../api/engine/room.ts');
+  const { dbNameFor } = await import('#engine/room.ts');
   const dbName = await dbNameFor(roomId);
   clearFacades(roomId);
   await withDb(SERVER_DB, async (c) => {

@@ -1,5 +1,5 @@
 import { assertEquals } from '@std/assert';
-import { canonicalJson } from '../api/engine/canonical.ts';
+import { canonicalJson } from '#engine/canonical.ts';
 
 Deno.test('canonicalJson: sorted keys at every level, no whitespace', () => {
   assertEquals(
