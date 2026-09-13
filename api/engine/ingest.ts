@@ -1,4 +1,4 @@
-import { branchNameFor, ident, SERVER_DB, withDb } from './db.ts';
+import { serverDb, branchNameFor, ident, withDb } from './db.ts';
 import { extremities, lookupRoom } from './room.ts';
 import { mergeDriver } from './mergedriver.ts';
 import { eventIdFor } from './eventid.ts';
@@ -125,7 +125,7 @@ async function resolvePrevs(
   prevIds: string[],
 ): Promise<{ id: string; commitHash: string; branch: string | null }[]> {
   const prevs: { id: string; commitHash: string; branch: string | null }[] = [];
-  await withDb(SERVER_DB, async (c) => {
+  await withDb(serverDb(), async (c) => {
     if (prevIds.length === 0) return;
     const r = await c.query(
       'SELECT event_id, commit_hash, branch_name FROM event_index WHERE room_id = $1 AND event_id = ANY($2);',
@@ -276,7 +276,7 @@ export async function ingestEvent(
   // non-hashed fields (signatures/unsigned) or redacted-away content —
   // interchangeable by redaction's design. The DAG keeps first-writer
   // bytes; nothing re-enters state through this path.
-  const existing = await withDb(SERVER_DB, async (c) => {
+  const existing = await withDb(serverDb(), async (c) => {
     const r = await c.query(
       'SELECT commit_hash FROM event_index WHERE event_id = $1;',
       [eventId],
@@ -303,7 +303,7 @@ export async function ingestEvent(
   }
 
   // 5. origin signature, REQUIRED (F1: the unsigned-lite seam is
-  // deleted — every engine signs). Entries under our own SERVER_NAME
+  // deleted — every engine signs). Entries under our own serverName()
   // verify against the tenant key; entries under a base32 server_name
   // verify key-is-name (browser homeservers — nothing to fetch).
   // Unsigned PDUs are refused, full stop.
@@ -524,7 +524,7 @@ export async function ingestEvent(
   // event_id <-> commit_hash bijection + current branch (D8), flagged
   // rejected when refused (prev resolution needs the id; rejected events
   // never enter `state`).
-  await withDb(SERVER_DB, async (c) => {
+  await withDb(serverDb(), async (c) => {
     await c.query(
       'INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected) VALUES ($1, $2, $3, $4, $5);',
       [eventId, roomId, commitHash, newBranch, rejected],

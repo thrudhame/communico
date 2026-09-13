@@ -1,6 +1,6 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { createRoom } from '#engine/room.ts';
-import { SERVER_NAME } from '#engine/config.ts';
+import { serverName } from '#engine/config.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
 
 // POST /_matrix/client/v3/createRoom — F0: default version '11'.
@@ -18,7 +18,7 @@ export default async function (
     else throw e;
   }
   const roomVersion = body.room_version ?? '11';
-  const roomId = '!' + crypto.randomUUID() + ':' + SERVER_NAME;
+  const roomId = '!' + crypto.randomUUID() + ':' + serverName();
   try {
     await createRoom(roomId, roomVersion as string, context.state.user as string);
   } catch (e) {

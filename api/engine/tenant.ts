@@ -5,8 +5,8 @@
 // argon2id credentials — see BLOCKER-F1-CREDENTIALS.md).
 import { encodeBase32 } from '@std/encoding/base32';
 import { hash as argonHash, verify as argonVerify } from '@stdext/crypto/hash/argon2';
-import { ident, SERVER_DB, withDb } from './db.ts';
-import { SERVER_NAME } from './config.ts';
+import { serverDb, ident, withDb } from './db.ts';
+import { serverName } from './config.ts';
 import { runSqlFile } from './room.ts';
 import { MatrixError } from './matrix-error.ts';
 import {
@@ -25,8 +25,8 @@ async function sha256hex(s: string): Promise<string> {
     .map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function tenantDbName(serverName = SERVER_NAME): Promise<string> {
-  return sha256hex(serverName).then((h) => 'tenant_' + h.slice(0, 20));
+export function tenantDbName(dnsName = serverName()): Promise<string> {
+  return sha256hex(dnsName).then((h) => 'tenant_' + h.slice(0, 20));
 }
 
 // Native server name: the tenant key as lowercase unpadded base32, one DNS
@@ -86,10 +86,10 @@ export function checkLocalpart(raw: unknown): string {
 // migrate the F0 dev key, generate fresh when neither exists, and NEVER
 // rotate silently (a restart must not change who the server is).
 export async function ensureTenant(
-  serverName = SERVER_NAME,
+  dnsName = serverName(),
 ): Promise<{ dbName: string; key: TenantKey }> {
-  const dbName = await tenantDbName(serverName);
-  await withDb(SERVER_DB, async (c) => {
+  const dbName = await tenantDbName(dnsName);
+  await withDb(serverDb(), async (c) => {
     try {
       await c.query(`CREATE DATABASE ${ident(dbName)};`);
     } catch (e) {
@@ -103,7 +103,7 @@ export async function ensureTenant(
 
   // F0 dev key (migration source, if present).
   let f0: { keyId: string; pubB64: string; privB64: string } | null = null;
-  await withDb(SERVER_DB, async (c) => {
+  await withDb(serverDb(), async (c) => {
     const t = await c.query(
       'SELECT key_id, pubkey_b64, privkey_pkcs8_b64 FROM server_signing_key LIMIT 1;',
     ).catch(() => ({ rows: [] as unknown[] }));
@@ -120,7 +120,7 @@ export async function ensureTenant(
   const key = await withDb(dbName, async (c) => {
     const existing = await c.query(
       'SELECT server_name, pubkey_b64, privkey_enc, key_id FROM tenant WHERE server_name = $1;',
-      [serverName],
+      [dnsName],
     );
     if (existing.rows.length > 0) {
       const row = existing.rows[0] as Record<string, unknown>;
@@ -162,7 +162,7 @@ export async function ensureTenant(
     await c.query(
       'INSERT INTO tenant (server_name, native_name, pubkey_b64, privkey_enc, key_id, created_ms) VALUES ($1, $2, $3, $4, $5, $6);',
       [
-        serverName,
+        dnsName,
         nativeNameFor(b64decode(pubB64)),
         pubB64,
         privB64,
@@ -172,7 +172,7 @@ export async function ensureTenant(
     );
     return {
       keyId,
-      serverName,
+      serverName: dnsName,
       nativeName: nativeNameFor(b64decode(pubB64)),
       publicKey,
       privateKey,
@@ -182,8 +182,8 @@ export async function ensureTenant(
   return { dbName, key };
 }
 
-export async function getTenantKey(serverName = SERVER_NAME): Promise<TenantKey> {
-  return (await ensureTenant(serverName)).key;
+export async function getTenantKey(dnsName = serverName()): Promise<TenantKey> {
+  return (await ensureTenant(dnsName)).key;
 }
 
 export interface RegisterParams {

@@ -1,4 +1,4 @@
-import { ident, SERVER_DB, withDb } from './db.ts';
+import { serverDb, ident, withDb } from './db.ts';
 import { author, ingestEvent } from './ingest.ts';
 import { getRulebook } from './policy.ts';
 
@@ -44,7 +44,7 @@ export async function createRoom(
 ): Promise<CreateRoomResult> {
   getRulebook(roomVersion);
   const dbName = await dbNameFor(roomId);
-  await withDb(SERVER_DB, async (c) => {
+  await withDb(serverDb(), async (c) => {
     await c.query(`CREATE DATABASE ${ident(dbName)};`);
     await c.query(
       'INSERT INTO room_directory (room_id, db_name, room_version, stub_era) VALUES ($1, $2, $3, TRUE);',
@@ -108,7 +108,7 @@ export interface RoomInfo {
 }
 
 export async function lookupRoom(roomId: string): Promise<RoomInfo | null> {
-  return await withDb(SERVER_DB, async (c) => {
+  return await withDb(serverDb(), async (c) => {
     const r = await c.query(
       'SELECT db_name, room_version FROM room_directory WHERE room_id = $1;',
       [roomId],
@@ -137,7 +137,7 @@ export async function extremities(
       (n: string) => n.startsWith('x'),
     );
     if (xbranches.length === 0) return [];
-    return await withDb(SERVER_DB, async (s) => {
+    return await withDb(serverDb(), async (s) => {
       const idx = await s.query(
         'SELECT event_id, branch_name FROM event_index WHERE room_id = $1 AND branch_name = ANY($2);',
         [roomId, xbranches],

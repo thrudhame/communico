@@ -20,7 +20,7 @@ room_id() {
   docker exec "$CONTAINER" bash -c \
     "cd /workspace && deno eval \"
       import pgpkg from 'pg';
-      const c = new pgpkg.Client({host:'127.0.0.1',port:5432,user:'root',password:'secret',database:'postgres'});
+      const c = new pgpkg.Client({host:Deno.env.get('DB_HOST'),port:Number(Deno.env.get('DB_PORT')),user:Deno.env.get('DB_USER'),password:Deno.env.get('DB_PASS'),database:'postgres'});
       await c.connect();
       const r = await c.query(\\\"SELECT room_id FROM event_index WHERE room_id IN (SELECT room_id FROM room_directory WHERE room_version='11') GROUP BY room_id ORDER BY MAX(seq) DESC LIMIT 1;\\\");
       if (r.rows.length) console.log(r.rows[0].room_id);
@@ -58,11 +58,11 @@ TERMINAL 2 — bob sends (as many as you like):
 TERMINAL 3 — watch the conversation become commits (every 2 s):
   watch -n2 "docker exec $CONTAINER bash -c 'cd /workspace && deno eval \"
     import pgpkg from \\\"pg\\\";
-    const root = new pgpkg.Client({host:\\\"127.0.0.1\\\",port:5432,user:\\\"root\\\",password:\\\"secret\\\",database:\\\"postgres\\\"});
+    const root = new pgpkg.Client({host:Deno.env.get(\\"DB_HOST\\"),port:Number(Deno.env.get(\\"DB_PORT\\")),user:Deno.env.get(\\"DB_USER\\"),password:Deno.env.get(\\"DB_PASS\\"),database:\\"postgres\\"});
     await root.connect();
     const db = (await root.query(\\\"SELECT db_name FROM room_directory WHERE room_id=\\\\\\\"$ROOM_ID\\\\\\\"\\\")).rows[0].db_name;
     await root.end();
-    const c = new pgpkg.Client({host:\\\"127.0.0.1\\\",port:5432,user:\\\"root\\\",password:\\\"secret\\\",database:db});
+    const c = new pgpkg.Client({host:Deno.env.get(\\"DB_HOST\\"),port:Number(Deno.env.get(\\"DB_PORT\\")),user:Deno.env.get(\\"DB_USER\\"),password:Deno.env.get(\\"DB_PASS\\"),database:db});
     await c.connect();
     const xb = (await c.query(\\\"SELECT name FROM dolt.branches WHERE name LIKE \\\\\\\"x%\\\\\\\" LIMIT 1;\\\")).rows[0].name;
     await c.query(\\\"SELECT DOLT_CHECKOUT(\\\\\\\"\\\"+xb+\\\"\\\\\\\");\\\");
@@ -116,7 +116,7 @@ EOF
     cat > /tmp/demo-watch.ts <<'TS'
 import pgpkg from 'pg';
 const roomId = Deno.env.get('DEMO_ROOM_ID')!;
-const cfg = { host: '127.0.0.1', port: 5432, user: 'root', password: 'secret' };
+const cfg = { host: Deno.env.get('DB_HOST')!, port: Number(Deno.env.get('DB_PORT')), user: Deno.env.get('DB_USER')!, password: Deno.env.get('DB_PASS')! };
 const root = new pgpkg.Client({ ...cfg, database: 'postgres' });
 await root.connect();
 const db = (await root.query('SELECT db_name FROM room_directory WHERE room_id = $1', [roomId])).rows[0].db_name;

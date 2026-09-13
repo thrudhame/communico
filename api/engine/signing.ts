@@ -4,8 +4,8 @@
 // primitives live in ./signing-primitives.js (moved from lite). The signing key lives in
 // the tenant table (api/engine/tenant.ts — generate-once, reuse-forever;
 // F0's server_signing_key table survives as the migration source).
-import { SERVER_DB, withDb } from './db.ts';
-import { SERVER_NAME } from './config.ts';
+import { serverDb, withDb } from './db.ts';
+import { serverName } from './config.ts';
 import { eventIdFor, redact } from './eventid.ts';
 import type { Pdu } from './pdu.ts';
 import { nativeNameFor, type TenantKey } from './tenant.ts';
@@ -29,8 +29,8 @@ export const SERVER_KEY_ID = '1';
 // structurally it fills this slot.
 export type ServerKey = TenantKey;
 
-export async function ensureServerKey(serverName = SERVER_NAME): Promise<ServerKey> {
-  return await withDb(SERVER_DB, async (c) => {
+export async function ensureServerKey(dnsName = serverName()): Promise<ServerKey> {
+  return await withDb(serverDb(), async (c) => {
     await c.query(
       `CREATE TABLE IF NOT EXISTS server_signing_key (
          key_id text PRIMARY KEY,
@@ -63,11 +63,11 @@ export async function ensureServerKey(serverName = SERVER_NAME): Promise<ServerK
     const privB64 = b64encode(privDer);
     await c.query(
       'INSERT INTO server_signing_key (key_id, server_name, pubkey_b64, privkey_pkcs8_b64, created_ms) VALUES ($1, $2, $3, $4, $5);',
-      [SERVER_KEY_ID, serverName, pubB64, privB64, Date.now()],
+      [SERVER_KEY_ID, dnsName, pubB64, privB64, Date.now()],
     );
     return {
       keyId: SERVER_KEY_ID,
-      serverName,
+      serverName: dnsName,
       nativeName: nativeNameFor(pubRaw),
       publicKey: kp.publicKey,
       privateKey: kp.privateKey,

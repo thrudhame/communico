@@ -23,7 +23,7 @@ fi
 # 1. preflight
 command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-  for port in 5432 8008; do
+  for port in "${DB_PORT}" "${APP_PORT}"; do
     if ss -tln 2>/dev/null | grep -q ":${port} "; then
       echo "port ${port} is busy and $CONTAINER is not running" >&2
       exit 1
@@ -44,8 +44,8 @@ else
   docker run -d --name "$CONTAINER" \
     --memory=8g --memory-swap=8g --pids-limit=512 --cpus=4 \
     --env-file .env \
-    -e DOLTGRES_USER=root -e DOLTGRES_PASSWORD=secret -e DOLTGRES_DB=postgres \
-    -p 5432:5432 -p 8008:8008 \
+    -e DOLTGRES_USER="${DB_USER}" -e DOLTGRES_PASSWORD="${DB_PASS}" -e DOLTGRES_DB="${DB_NAME}" \
+    -p "${DB_PORT}:5432" -p "${APP_PORT}:${APP_PORT}" \
     -v "$PWD/doltgres/config:/etc/doltgres/servercfg.d" \
     -v "$PWD:/workspace" \
     "$IMAGE" sleep infinity

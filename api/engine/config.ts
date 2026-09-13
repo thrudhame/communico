@@ -1,13 +1,43 @@
-// api/engine/config.ts — server identity config, read once.
-// SERVER_NAME is the single source (M0: default '8008' port, DNS name from
-// env; F1: native base32 name beside it in the tenant row). Dev default
-// 'localhost'.
-function readServerName(): string {
-  return Deno.env.get('SERVER_NAME') ?? 'localhost';
+// api/engine/config.ts — required environment configuration. No in-code
+// fallbacks (ruling 8): a missing value is a startup error, never a silent
+// default. Reads are lazy (memoized on first use) so importing engine
+// modules — in pure tests, or during main.ts's own validation pass —
+// never demands environment variables to exist.
+
+export const REQUIRED_VARS: readonly string[] = [
+  'APP_PORT',
+  'SERVER_NAME',
+  'DB_HOST',
+  'DB_PORT',
+  'DB_USER',
+  'DB_PASS',
+  'DB_NAME',
+];
+
+/** The names that must be in the environment; empty = all present. */
+export function missingRequired(): string[] {
+  return REQUIRED_VARS.filter((n) => Deno.env.get(n) === undefined);
 }
 
-export const SERVER_NAME: string = readServerName();
+/** Read a required variable, or throw naming it. */
+export function required(name: string): string {
+  const value = Deno.env.get(name);
+  if (value === undefined) {
+    throw new Error(`missing required environment variable ${name}`);
+  }
+  return value;
+}
 
+let _serverName: string | undefined;
+
+/** The homeserver's DNS name (single source since M0). */
+export function serverName(): string {
+  return (_serverName ??= required('SERVER_NAME'));
+}
+
+let _appPort: number | undefined;
+
+/** The one listener's port. */
 export function appPort(): number {
-  return Number(Deno.env.get('APP_A_PORT') ?? '8008');
+  return (_appPort ??= Number(required('APP_PORT')));
 }

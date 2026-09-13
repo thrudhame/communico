@@ -1,5 +1,5 @@
 import { lookupToken } from '#engine/tenant.ts';
-import { SERVER_NAME } from '#engine/config.ts';
+import { serverName } from '#engine/config.ts';
 
 // GET /_matrix/client/v3/account/whoami — matrix-commander validates
 // restored credentials with this on every authenticated invocation
@@ -10,7 +10,7 @@ export default async function (
   context: import('@pathfinder/pathfinder').Context,
 ) {
   const token = context.state.token;
-  const info = token ? await lookupToken(SERVER_NAME, token) : null;
+  const info = token ? await lookupToken(serverName(), token) : null;
   return {
     user_id: context.state.user,
     device_id: info?.device_id ?? undefined,

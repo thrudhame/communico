@@ -128,7 +128,7 @@ Deno.test('redact: drops non-v11 top-level keys (origin, membership, prev_state)
 });
 
 // Spec appendix "Cryptographic Test Vectors" (v1.11 appendices):
-// SIGNING_KEY_SEED / SERVER_NAME="domain" / KEY_ID="ed25519:1".
+// SIGNING_KEY_SEED / serverName()="domain" / KEY_ID="ed25519:1".
 const SEED_B64 = 'YJDBA9Xnr2sVqXD9Vj7XVUnmFZcZrlw8Md7kMW+3XA1';
 
 Deno.test('spec vectors: JSON signing of {} and {one,two}', async () => {

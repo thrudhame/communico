@@ -12,7 +12,7 @@ import {
 import { author, ingestEvent } from '#engine/ingest.ts';
 import { reresolveFromDag } from '#engine/adopt.ts';
 import { stateNow } from '#engine/timeline.ts';
-import { SERVER_DB, withDb } from '#engine/db.ts';
+import { serverDb, withDb } from '#engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!policy:localhost';
@@ -116,7 +116,7 @@ Deno.test('policy: non-member write is state-rejected', async () => {
     `unexpected error: ${String(err)}`,
   );
   // rejected: in the DAG (indexed, flagged) but never in state
-  await withDb(SERVER_DB, async (c) => {
+  await withDb(serverDb(), async (c) => {
     const r = await c.query(
       'SELECT rejected FROM event_index WHERE event_id = $1;',
       [pdu.event_id],

@@ -3,7 +3,7 @@ import { createRoom, lookupRoom } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { messages } from '#engine/timeline.ts';
-import { SERVER_DB, withDb } from '#engine/db.ts';
+import { serverDb, withDb } from '#engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!t3:localhost';
@@ -46,7 +46,7 @@ Deno.test('unified identity: content-hash event ids for every room version', asy
   // every event_index row maps content-hash id <-> commit hash (6 rows:
   // create + member + PL + join_rules + 2 messages), ids uniformly
   // 43-char content hashes
-  const rows = await withDb(SERVER_DB, async (c) => {
+  const rows = await withDb(serverDb(), async (c) => {
     const r = await c.query(
       'SELECT event_id, commit_hash FROM event_index WHERE room_id = $1;',
       [ROOM],

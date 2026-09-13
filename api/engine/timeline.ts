@@ -1,4 +1,4 @@
-import { ident, SERVER_DB, withDb } from './db.ts';
+import { serverDb, ident, withDb } from './db.ts';
 
 // Reads (dolt.log / working set) reflect HEAD; a fresh client lands on
 // `main`, which only ever holds the genesis commits — the event history
@@ -57,7 +57,7 @@ export async function messages(
     if (hashes.length === 0) return [];
 
     // commit_hash -> event_id via server DB (single ANY query)
-    const idx = await withDb(SERVER_DB, async (s) => {
+    const idx = await withDb(serverDb(), async (s) => {
       return await s.query(
         'SELECT event_id, commit_hash FROM event_index WHERE room_id = $1 AND commit_hash = ANY($2);',
         [roomId, hashes],

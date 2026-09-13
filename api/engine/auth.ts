@@ -1,5 +1,5 @@
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
-import { SERVER_NAME } from './config.ts';
+import { serverName } from './config.ts';
 import { lookupToken } from './tenant.ts';
 import { MatrixError } from './matrix-error.ts';
 
@@ -16,7 +16,7 @@ export async function authorize(
   const match = /^Bearer (.+)$/.exec(header);
   const token = match?.[1] ?? request.query.get('access_token');
   if (!token) throw new MatrixError(401, 'M_MISSING_TOKEN', 'no Bearer token');
-  const info = await lookupToken(SERVER_NAME, token);
+  const info = await lookupToken(serverName(), token);
   if (!info) {
     throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'token not recognized');
   }

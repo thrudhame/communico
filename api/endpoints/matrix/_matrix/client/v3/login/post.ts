@@ -1,7 +1,7 @@
 import { parseJson } from '@pathfinder/pathfinder/body';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { issueToken, upsertDevice, verifyUserPassword } from '#engine/tenant.ts';
-import { SERVER_NAME } from '#engine/config.ts';
+import { serverName } from '#engine/config.ts';
 
 // m.login.password (F1 step 18): argon2id verify against the tenant
 // credentials; `identifier.type m.id.user` plus the legacy `user` shape
@@ -33,13 +33,13 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
     const colon = rest.lastIndexOf(':');
     if (colon < 0) throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
     localpart = rest.slice(0, colon).toLowerCase();
-    if (rest.slice(colon + 1) !== SERVER_NAME) {
+    if (rest.slice(colon + 1) !== serverName()) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
     }
   } else {
     localpart = rawUser.toLowerCase();
   }
-  if (!await verifyUserPassword(SERVER_NAME, localpart, body.password)) {
+  if (!await verifyUserPassword(serverName(), localpart, body.password)) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
   }
   const deviceId: string = typeof body.device_id === 'string' && body.device_id.length > 0
@@ -48,18 +48,18 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
   // Login (re)creates the device row — the devices list reflects every
   // device that holds (or held) a token.
   await upsertDevice(
-    SERVER_NAME,
+    serverName(),
     localpart,
     deviceId,
     typeof body.initial_device_display_name === 'string'
       ? body.initial_device_display_name
       : undefined,
   );
-  const accessToken = await issueToken(SERVER_NAME, localpart, deviceId);
+  const accessToken = await issueToken(serverName(), localpart, deviceId);
   return {
-    user_id: `@${localpart}:${SERVER_NAME}`,
+    user_id: `@${localpart}:${serverName()}`,
     access_token: accessToken,
     device_id: deviceId,
-    home_server: SERVER_NAME,
+    home_server: serverName(),
   };
 }

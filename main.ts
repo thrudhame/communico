@@ -1,14 +1,18 @@
+import { appPort, missingRequired } from '#engine/config.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 
-// One listener: the Matrix client-server API. The port comes from the
-// environment — no in-code fallback (ruling 8); the full required-config
-// validation (api/engine/config.ts) centralizes this in the next step.
-const appPort = Deno.env.get('APP_PORT');
-if (appPort === undefined || !Number.isInteger(Number(appPort))) {
-  console.error('missing required environment variable APP_PORT');
+// Startup validation (ruling 8): every required variable must exist; all
+// missing ones are listed in one pass, never the first only. Lazy reads
+// in the engine keep this the first thing that runs.
+const missing = missingRequired();
+if (missing.length > 0) {
+  for (const name of missing) {
+    console.error(`missing required environment variable ${name}`);
+  }
   Deno.exit(1);
 }
 
+// One listener: the Matrix client-server API.
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 
-Deno.serve({ port: Number(appPort) }, matrix);
+Deno.serve({ port: appPort() }, matrix);

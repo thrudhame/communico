@@ -64,5 +64,5 @@ TLS_CERT_FILE="$CERT_DIR/server.crt" TLS_KEY_FILE="$CERT_DIR/server.key" \
   deno run --allow-net --allow-read --allow-env "$APP_DIR/complement/tls-stub.ts" \
   > /tmp/tls-stub.log 2>&1 &
 echo ">> starting communico :8008"
-export APP_A_PORT=8008 SERVER_NAME DB_HOST DB_PORT DB_USER DB_PASS DB_NAME
+export SERVER_NAME DB_HOST DB_PORT DB_USER DB_PASS DB_NAME
 exec deno run --allow-net --allow-env --allow-read "$APP_DIR/main.ts"

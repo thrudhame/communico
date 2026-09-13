@@ -2,7 +2,7 @@ import { assertEquals } from '@std/assert';
 import { createRoom, extremities, lookupRoom } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
 import { messages } from '#engine/timeline.ts';
-import { SERVER_DB, withDb } from '#engine/db.ts';
+import { serverDb, withDb } from '#engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
 const ROOM = '!t1:localhost';
@@ -51,7 +51,7 @@ Deno.test('engine invariant: commit = event', async () => {
 
   // each event commit diffs exactly 1 added events row (7 event commits:
   // create, member, PL, join_rules, 3 messages)
-  const commits: string[] = await withDb(SERVER_DB, async (c) => {
+  const commits: string[] = await withDb(serverDb(), async (c) => {
     const r = await c.query(
       'SELECT commit_hash FROM event_index WHERE room_id = $1;',
       [ROOM],

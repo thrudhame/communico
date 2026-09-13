@@ -1,4 +1,4 @@
-import { SERVER_NAME } from '#engine/config.ts';
+import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { checkLocalpart, ensureTenant } from '#engine/tenant.ts';
 import { withDb } from '#engine/db.ts';
@@ -9,7 +9,7 @@ import { withDb } from '#engine/db.ts';
 export default async function (request: import('@pathfinder/pathfinder').PathfinderRequest) {
   const username = request.query.get('username');
   const localpart = checkLocalpart(username);
-  const { dbName } = await ensureTenant(SERVER_NAME);
+  const { dbName } = await ensureTenant(serverName());
   const taken = await withDb(dbName, async (c: import('pg').Client) => {
     const r = await c.query('SELECT localpart FROM users WHERE localpart = $1;', [localpart]);
     return r.rows.length > 0;

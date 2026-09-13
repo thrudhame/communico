@@ -1,13 +1,25 @@
 import pgpkg from 'pg';
+import { required } from './config.ts';
 
 const { Client } = pgpkg;
 
-const CFG = {
-  host: Deno.env.get('DB_HOST') ?? '127.0.0.1',
-  port: Number(Deno.env.get('DB_PORT') ?? '5432'),
-  user: Deno.env.get('DB_USER') ?? 'root',
-  password: Deno.env.get('DB_PASS') ?? 'secret',
-};
+// Lazy (memoized on first connect): importing this module in pure tests
+// never demands the environment (ruling 8 — no fallbacks in code).
+let _cfg: {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+} | undefined;
+
+function cfg() {
+  return (_cfg ??= {
+    host: required('DB_HOST'),
+    port: Number(required('DB_PORT')),
+    user: required('DB_USER'),
+    password: required('DB_PASS'),
+  });
+}
 
 export function ident(s: string): string {
   if (!/^[a-z0-9_]+$/.test(s)) throw new Error(`bad identifier: ${s}`);
@@ -18,7 +30,7 @@ export async function withDb<T>(
   database: string,
   fn: (c: pgpkg.Client) => Promise<T>,
 ): Promise<T> {
-  const c = new Client({ ...CFG, database });
+  const c = new Client({ ...cfg(), database });
   await c.connect();
   try {
     return await fn(c);
@@ -27,7 +39,12 @@ export async function withDb<T>(
   }
 }
 
-export const SERVER_DB = Deno.env.get('DB_NAME') ?? 'postgres';
+let _serverDb: string | undefined;
+
+/** The server-level database (room registry, event index). */
+export function serverDb(): string {
+  return (_serverDb ??= required('DB_NAME'));
+}
 
 export async function branchNameFor(eventId: string): Promise<string> {
   const data = new TextEncoder().encode(eventId);

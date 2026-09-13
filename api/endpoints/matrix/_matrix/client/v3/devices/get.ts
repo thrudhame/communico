@@ -1,4 +1,4 @@
-import { SERVER_NAME } from '#engine/config.ts';
+import { serverName } from '#engine/config.ts';
 import { listDevices } from '#engine/tenant.ts';
 
 // GET /_matrix/client/v3/devices — the caller's devices (F1 logout gate
@@ -10,7 +10,7 @@ export default async function (
 ) {
   const userId = context.state.user as string;
   const localpart = userId.slice(1, userId.lastIndexOf(':'));
-  const devices = await listDevices(SERVER_NAME, localpart);
+  const devices = await listDevices(serverName(), localpart);
   return {
     devices: devices.map((d: { device_id: string; display_name: string | null }) => ({
       device_id: d.device_id,

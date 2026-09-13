@@ -1,5 +1,5 @@
 import { assert, assertEquals, assertMatch, assertRejects, assertThrows } from '@std/assert';
-import { SERVER_NAME } from '#engine/config.ts';
+import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   checkLocalpart,
@@ -25,13 +25,13 @@ import { b64decode } from '#engine/signing-primitives.js';
 const PHC_RE = /^\$argon2id\$v=19\$m=19456,t=2,p=1\$[^$]+\$[^$]+$/;
 
 Deno.test('tenant: key generate-once, native name shape', async () => {
-  const a = await ensureTenant(SERVER_NAME);
-  const b = await ensureTenant(SERVER_NAME);
+  const a = await ensureTenant(serverName());
+  const b = await ensureTenant(serverName());
   assertEquals(a.key.publicB64, b.key.publicB64, 'restart must not rotate');
-  assertEquals(a.dbName, await tenantDbName(SERVER_NAME));
+  assertEquals(a.dbName, await tenantDbName(serverName()));
   assertMatch(a.key.nativeName, /^[a-z2-7]{52}$/);
   assertEquals(a.key.nativeName, nativeNameFor(b64decode(a.key.publicB64)));
-  const k = await getTenantKey(SERVER_NAME);
+  const k = await getTenantKey(serverName());
   assertEquals(k.publicB64, a.key.publicB64);
 });
 
@@ -54,7 +54,7 @@ Deno.test('localpart: downcase + spec grammar', () => {
 Deno.test('register/login/token lifecycle', async () => {
   const lp = 'f1user';
   // clean slate for reruns
-  const { dbName } = await ensureTenant(SERVER_NAME);
+  const { dbName } = await ensureTenant(serverName());
   const { withDb } = await import('#engine/db.ts');
   await withDb(dbName, async (c) => {
     await c.query('DELETE FROM access_tokens WHERE localpart = $1;', [lp]);
@@ -63,46 +63,46 @@ Deno.test('register/login/token lifecycle', async () => {
     await c.query('DELETE FROM users WHERE localpart = $1;', [lp]);
   });
 
-  const reg = await registerUser(SERVER_NAME, {
+  const reg = await registerUser(serverName(), {
     localpart: 'F1User',
     password: 's3cret-pw',
   });
-  assertEquals(reg.user_id, `@f1user:${SERVER_NAME}`);
-  assertEquals(reg.home_server, SERVER_NAME);
+  assertEquals(reg.user_id, `@f1user:${serverName()}`);
+  assertEquals(reg.home_server, serverName());
   assert(reg.access_token && reg.access_token.length > 0);
   assert(reg.device_id.length > 0);
 
   // duplicate → M_USER_IN_USE
   const dup = await assertRejects(
-    () => registerUser(SERVER_NAME, { localpart: lp, password: 'x' }),
+    () => registerUser(serverName(), { localpart: lp, password: 'x' }),
     MatrixError,
   );
   assert(dup.message.includes('M_USER_IN_USE'));
 
   // password verify + token lookup
-  assert(await verifyUserPassword(SERVER_NAME, lp, 's3cret-pw'));
-  assert(!await verifyUserPassword(SERVER_NAME, lp, 'nope'));
-  assert(!await verifyUserPassword(SERVER_NAME, 'nosuchuser', 's3cret-pw'));
-  const info = await lookupToken(SERVER_NAME, reg.access_token!);
-  assertEquals(info?.user_id, `@f1user:${SERVER_NAME}`);
+  assert(await verifyUserPassword(serverName(), lp, 's3cret-pw'));
+  assert(!await verifyUserPassword(serverName(), lp, 'nope'));
+  assert(!await verifyUserPassword(serverName(), 'nosuchuser', 's3cret-pw'));
+  const info = await lookupToken(serverName(), reg.access_token!);
+  assertEquals(info?.user_id, `@f1user:${serverName()}`);
 
   // logout one token, then all (tokens live on separate devices, as
   // separate logins do — revoking one device leaves the other standing)
-  const t2 = await issueToken(SERVER_NAME, lp, 'f1user-second-device');
-  await revokeToken(SERVER_NAME, t2);
-  assertEquals(await lookupToken(SERVER_NAME, t2), null);
-  assert((await lookupToken(SERVER_NAME, reg.access_token!)) !== null);
-  await revokeAllTokens(SERVER_NAME, lp);
-  assertEquals(await lookupToken(SERVER_NAME, reg.access_token!), null);
+  const t2 = await issueToken(serverName(), lp, 'f1user-second-device');
+  await revokeToken(serverName(), t2);
+  assertEquals(await lookupToken(serverName(), t2), null);
+  assert((await lookupToken(serverName(), reg.access_token!)) !== null);
+  await revokeAllTokens(serverName(), lp);
+  assertEquals(await lookupToken(serverName(), reg.access_token!), null);
 });
 
 Deno.test('uia sessions: create/complete/drop', async () => {
-  const s = await createUiaSession(SERVER_NAME, [{ stages: ['m.login.dummy'] }]);
+  const s = await createUiaSession(serverName(), [{ stages: ['m.login.dummy'] }]);
   assert(s.session.length > 0);
-  assertEquals((await getUiaSession(SERVER_NAME, s.session))?.completed, []);
-  const s2 = await completeUiaStages(SERVER_NAME, s.session, ['m.login.dummy']);
+  assertEquals((await getUiaSession(serverName(), s.session))?.completed, []);
+  const s2 = await completeUiaStages(serverName(), s.session, ['m.login.dummy']);
   assert(s2.completed.includes('m.login.dummy'));
-  await dropUiaSession(SERVER_NAME, s.session);
-  assertEquals(await getUiaSession(SERVER_NAME, s.session), null);
-  assertEquals(await getUiaSession(SERVER_NAME, 'no-such-session'), null);
+  await dropUiaSession(serverName(), s.session);
+  assertEquals(await getUiaSession(serverName(), s.session), null);
+  assertEquals(await getUiaSession(serverName(), 'no-such-session'), null);
 });

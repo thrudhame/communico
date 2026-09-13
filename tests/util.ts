@@ -1,5 +1,5 @@
 import { lookupRoom } from '#engine/room.ts';
-import { ident, SERVER_DB, withDb } from '#engine/db.ts';
+import { serverDb, ident, withDb } from '#engine/db.ts';
 
 // Newest extremity's wire event_id: newest-tipped x* branch in the room
 // DB -> its tip hash -> event_index (D8: branch tip == event commit).
@@ -17,7 +17,7 @@ export async function latestExtremityEventId(roomId: string): Promise<string> {
       `SELECT (SELECT HASHOF('${ident(branch)}')) AS h;`,
     );
     const tipHash = String(h.rows[0].h);
-    return await withDb(SERVER_DB, async (s) => {
+    return await withDb(serverDb(), async (s) => {
       const r = await s.query(
         'SELECT event_id FROM event_index WHERE room_id = $1 AND commit_hash = $2;',
         [roomId, tipHash],
@@ -33,7 +33,7 @@ export async function latestExtremityEventId(roomId: string): Promise<string> {
 export async function resetRoom(roomId: string): Promise<void> {
   const { dbNameFor } = await import('#engine/room.ts');
   const dbName = await dbNameFor(roomId);
-  await withDb(SERVER_DB, async (c) => {
+  await withDb(serverDb(), async (c) => {
     await c.query(`DROP DATABASE IF EXISTS ${dbName};`);
     await c.query('DELETE FROM room_directory WHERE room_id = $1;', [roomId]);
     await c.query('DELETE FROM event_index WHERE room_id = $1;', [roomId]);

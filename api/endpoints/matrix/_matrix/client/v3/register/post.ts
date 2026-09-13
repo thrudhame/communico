@@ -1,5 +1,5 @@
 import { parseJson } from '@pathfinder/pathfinder/body';
-import { SERVER_NAME } from '#engine/config.ts';
+import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   checkLocalpart,
@@ -39,7 +39,7 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
   let localpart: string | null = null;
   if (body.username !== undefined) {
     localpart = checkLocalpart(body.username);
-    const { dbName } = await ensureTenant(SERVER_NAME);
+    const { dbName } = await ensureTenant(serverName());
     const taken = await withDb(dbName, async (c: import('pg').Client) => {
       const r = await c.query('SELECT localpart FROM users WHERE localpart = $1;', [localpart]);
       return r.rows.length > 0;
@@ -51,10 +51,10 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
   const authn = (body.auth ?? {}) as Record<string, unknown>;
   const sessionId = body.session ?? authn.session;
   const session = typeof sessionId === 'string'
-    ? await getUiaSession(SERVER_NAME, sessionId)
+    ? await getUiaSession(serverName(), sessionId)
     : null;
   if (!session) {
-    const fresh = await createUiaSession(SERVER_NAME, FLOWS);
+    const fresh = await createUiaSession(serverName(), FLOWS);
     throw new MatrixError(401, 'M_UNAUTHORIZED', 'registration incomplete', {
       flows: fresh.flows,
       session: fresh.session,
@@ -67,7 +67,7 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
     newly.push('m.login.password');
   }
   const updated = newly.length > 0
-    ? await completeUiaStages(SERVER_NAME, session.session, newly)
+    ? await completeUiaStages(serverName(), session.session, newly)
     : session;
 
   const done = updated.completed.includes('m.login.dummy') ||
@@ -89,7 +89,7 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
     throw new MatrixError(400, 'M_BAD_REQUEST', 'password required');
   }
   const inhibit = body.inhibit_login === true;
-  const result = await registerUser(SERVER_NAME, {
+  const result = await registerUser(serverName(), {
     localpart,
     password: body.password,
     deviceId: typeof body.device_id === 'string' ? body.device_id : undefined,
@@ -98,7 +98,7 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
       : undefined,
     accessToken: inhibit ? null : undefined,
   });
-  await dropUiaSession(SERVER_NAME, session.session);
+  await dropUiaSession(serverName(), session.session);
   const out: Record<string, unknown> = {
     user_id: result.user_id,
     device_id: result.device_id,

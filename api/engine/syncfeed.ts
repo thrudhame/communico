@@ -1,7 +1,7 @@
 // Minimal /sync feed (phase-2 step 2.2). since token = 's<lastSeq>';
 // absent => initial sync (everything). Long-poll: poll MAX(seq) every
 // 500 ms until new events or timeout.
-import { SERVER_DB, withDb } from './db.ts';
+import { serverDb, withDb } from './db.ts';
 import { eventAtCommit } from './timeline.ts';
 
 export interface SyncResult {
@@ -44,7 +44,7 @@ async function buildJoin(
   includeState: boolean,
   m: number | null,
 ): Promise<Record<string, unknown>> {
-  const dir = await withDb(SERVER_DB, async (c) => {
+  const dir = await withDb(serverDb(), async (c) => {
     const r = await c.query('SELECT room_id, db_name FROM room_directory;');
     // deno-lint-ignore no-explicit-any
     return r.rows as any[];
@@ -98,7 +98,7 @@ export async function syncSince(
   //    it to keep `self.rooms[]` populated, and a client whose stored
   //    since-token is already past MAX(seq) needs this on EVERY sync
   //    or its next room_send raises KeyError (E151).
-  let m: number | null = await withDb(SERVER_DB, async (c) => {
+  let m: number | null = await withDb(serverDb(), async (c) => {
     const r = await c.query('SELECT MAX(seq) AS m FROM event_index;');
     return r.rows[0].m == null ? null : Number(r.rows[0].m);
   });
@@ -109,14 +109,14 @@ export async function syncSince(
       return { ...emptySync('s' + since), rooms: { join } };
     }
     await sleep(500);
-    m = await withDb(SERVER_DB, async (c) => {
+    m = await withDb(serverDb(), async (c) => {
       const r = await c.query('SELECT MAX(seq) AS m FROM event_index;');
       return r.rows[0].m == null ? null : Number(r.rows[0].m);
     });
   }
 
   // 3. fetch new events (all of them on initial sync)
-  const rows: IdxRow[] = await withDb(SERVER_DB, async (c) => {
+  const rows: IdxRow[] = await withDb(serverDb(), async (c) => {
     const r = since === null
       ? await c.query(
         'SELECT event_id, room_id, commit_hash, seq FROM event_index ORDER BY seq;',
