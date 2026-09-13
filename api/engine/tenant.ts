@@ -752,3 +752,44 @@ export async function listPushers(
     }));
   });
 }
+
+// --- M2: account data ------------------------------------------------------
+
+/** Upsert account data. roomId '' = global. Content stored as JSON text. */
+export async function putAccountData(
+  serverName: string,
+  localpart: string,
+  roomId: string,
+  type: string,
+  content: unknown,
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    await c.query(
+      `INSERT INTO account_data (localpart, room_id, type, content)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (localpart, room_id, type) DO UPDATE SET content = $4;`,
+      [localpart, roomId, type, JSON.stringify(content)],
+    );
+  });
+}
+
+/** The stored content object, or null when unset. */
+export async function getAccountData(
+  serverName: string,
+  localpart: string,
+  roomId: string,
+  type: string,
+): Promise<unknown | null> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      'SELECT content FROM account_data WHERE localpart = $1 AND room_id = $2 AND type = $3;',
+      [localpart, roomId, type],
+    );
+    if (r.rows.length === 0) return null;
+    return typeof r.rows[0].content === 'string'
+      ? JSON.parse(r.rows[0].content)
+      : r.rows[0].content;
+  });
+}
