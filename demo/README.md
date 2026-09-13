@@ -32,18 +32,20 @@ canonical for every room, verifiable by recomputation, stable across
 stores and engines. The Dolt commit hash is the server's per-store
 receipt for the event; the explicit bijection lives in `event_index`.
 
-**The three-party demo** — two unmodified matrix-commander clients, and
-a third voice that is a **browser peer joining through the server's lite
-hat** (msync over WebSocket). The ghost never appears on camera: its
-messages land in alice's and bob's panes and as commits, with
-byte-identical content-hash event ids on both sides of the engine
-boundary:
+**Historical recording (three-party, browser peer parked)** — the gif
+below predates the lite hat's parking: two unmodified matrix-commander
+clients plus a third voice that was a browser peer joining through the
+server's lite hat (msync over WebSocket), byte-identical content-hash
+event ids on both sides of the engine boundary. The browser-peer code is
+parked — prior art on `research/lite`, plan in
+`~/Documents/communico/plans/lite/`:
 
-![three-party demo: alice and bob on matrix-commander, carol the ghost
-(browser peer, lite hat) — one room, one id space, watched in dolt.log](communico-demo-3p.gif)
+![three-party demo recording (browser peer parked, see plans/lite):
+alice and bob on matrix-commander, carol the browser peer — one room,
+one id space, watched in dolt.log](communico-demo-3p.gif)
 
-The two-party original (`communico-demo.gif` / `.cast`) stays as the
-first milestone.
+The two-party original (`communico-demo.gif` / `.cast`) is the demo this
+branch runs today.
 
 Because state lives in commits, things homeservers hand-build are native
 here: room state at any event is `SELECT * FROM state AS OF '<commit>'`,

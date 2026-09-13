@@ -7,7 +7,7 @@ import {
   b64decode,
   importPublicKeyFromRaw,
   verifyJson,
-} from '../lite/web/sync/signing.js';
+} from '#engine/signing-primitives.js';
 import { redact } from '../api/engine/eventid.ts';
 import { lookupRoom } from '../api/engine/room.ts';
 import { withDb } from '../api/engine/db.ts';

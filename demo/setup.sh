@@ -23,7 +23,7 @@ fi
 # 1. preflight
 command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-  for port in 5432 8000 8008 8787; do
+  for port in 5432 8008; do
     if ss -tln 2>/dev/null | grep -q ":${port} "; then
       echo "port ${port} is busy and $CONTAINER is not running" >&2
       exit 1
@@ -45,10 +45,9 @@ else
     --memory=8g --memory-swap=8g --pids-limit=512 --cpus=4 \
     --env-file .env \
     -e DOLTGRES_USER=root -e DOLTGRES_PASSWORD=secret -e DOLTGRES_DB=postgres \
-    -p 5432:5432 -p 8000:8000 -p 8008:8008 -p 8787:8787 \
+    -p 5432:5432 -p 8008:8008 \
     -v "$PWD/doltgres/config:/etc/doltgres/servercfg.d" \
     -v "$PWD:/workspace" \
-    -v "$PWD/../pathfinder:/pathfinder" \
     "$IMAGE" sleep infinity
 fi
 
@@ -79,19 +78,6 @@ for i in $(seq 1 30); do
     break
   fi
   [[ $i == 30 ]] && { echo "app did not come up" >&2; exit 1; }
-  sleep 1
-done
-
-# 3b. the lite page (Carol's browser leg) served from the container;
-#     the page's ws transport talks to the app's /msync endpoint on :8000
-echo ">> serving the lite page on :8787"
-docker exec -d "$CONTAINER" bash -c \
-  'cd /workspace && deno run --allow-net --allow-read lite/web/serve.ts > /tmp/lite-page.log 2>&1'
-for i in $(seq 1 30); do
-  if docker exec "$CONTAINER" curl -sf localhost:8787/ >/dev/null 2>&1; then
-    break
-  fi
-  [[ $i == 30 ]] && { echo "lite page did not come up" >&2; exit 1; }
   sleep 1
 done
 
@@ -190,13 +176,6 @@ Act 2 — real client receives (two terminals):
     docker run --rm --network container:$CONTAINER -v /tmp/mc-bob:/data:z -w /data \\
       $MC_IMAGE -m "hello alice via doltgres" --room '$ROOM_ID' --plain \\
       --store /data/store --credentials /data/credentials.json
-
-Act 3 — a browser joins the same room (lite hat: msync over ws):
-  http://localhost:8787/?transport=ws&sync=msync&room=$ROOM_ID
-  (pick a name — e.g. carol — and Join; she bootstraps the full history
-  from the server's msync peer and syncs live in both directions)
-
-Guided database tour: demo/inspection-tour.md
 Choreography helper:  bash demo/run-demo.sh            (interactive)
                       bash demo/run-demo.sh --check    (headless self-test)
                       bash demo/run-demo.sh --scripted (tmux, for asciinema)

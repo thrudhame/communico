@@ -75,12 +75,6 @@ of the event itself (Matrix reference-hash style, base64url). The id is
 canonical for every room; the Dolt commit hash is the server's per-store
 receipt for it (see event_index).
 
-THIRD PARTICIPANT — Carol in a browser (lite hat: msync over ws):
-  http://localhost:8787/?transport=ws&sync=msync&room=$ROOM_ID
-  She bootstraps the full history from the server's msync peer — same
-  events, same content-hash ids — and syncs live in both directions.
-
-Then open demo/inspection-tour.md.
 EOF
     ;;
 
@@ -102,37 +96,6 @@ EOF
       echo "   event id '\$<43 chars>' (content-hash id) found ✓"
     else
       echo "   no \$<43 chars> event id in alice's output" >&2; PASS=0
-    fi
-
-    echo ">> Act 3: Carol joins from a browser (lite hat: msync over ws)"
-    CAROL_OUT="$(deno run -A demo/check-browser-peer.ts "$ROOM_ID" "$BODY" 2>&1 || true)"
-    echo "$CAROL_OUT" | sed 's/^/   /'
-    BOB_ID="$(grep -oE 'BOB_ID=\$[A-Za-z0-9_-]{43}' <<<"$CAROL_OUT" | head -1 | cut -d= -f2)"
-    CAROL_ID="$(grep -oE 'CAROL_ID=\$[A-Za-z0-9_-]{43}' <<<"$CAROL_OUT" | head -1 | cut -d= -f2)"
-    NONCE="$(grep -oE 'NONCE=\S+' <<<"$CAROL_OUT" | head -1 | cut -d= -f2)"
-    if ! grep -q 'CHECK: PASS' <<<"$CAROL_OUT"; then
-      PASS=0
-    elif [[ -z "$BOB_ID" || -z "$CAROL_ID" || -z "$NONCE" ]]; then
-      echo "   Carol leg printed no ids" >&2; PASS=0
-    # (c) same event, same 43-char content-hash id on both sides of the
-    # engine boundary — bob's id in Carol's store == the id alice saw
-    elif grep -qF "$BOB_ID" <<<"$OUT"; then
-      echo "   bob's event id EQUAL on both sides of the engine boundary ✓"
-    else
-      echo "   bob's event id in Carol's store ($BOB_ID) not in alice's output" >&2; PASS=0
-    fi
-
-    echo ">> Act 4: alice listens once more — Carol's nonce must arrive"
-    OUT2="$(mc /tmp/mc-alice --listen once --plain --output json 2>&1 || true)"
-    if grep -q "$NONCE" <<<"$OUT2"; then
-      echo "   Carol's nonce found in alice's output ✓"
-    else
-      echo "   NONCE NOT FOUND in alice's output" >&2; PASS=0
-    fi
-    if grep -qF "$CAROL_ID" <<<"$OUT2"; then
-      echo "   Carol's event id EQUAL on both sides ✓"
-    else
-      echo "   Carol's event id ($CAROL_ID) not in alice's output" >&2; PASS=0
     fi
 
     if [[ $PASS == 1 ]]; then echo "CHECK: PASS"; else echo "CHECK: FAIL" >&2; exit 1; fi
@@ -171,7 +134,7 @@ console.log(rows.map((r: { commit_hash: string; message: string }) =>
 // (the pane's console.clear would erase any one-shot print)
 if (Date.now() >= Number(Deno.env.get('DEMO_WATCH_T0') ?? 0) + 58_000) {
   console.log();
-  console.log('-- six messages, six commits, three clients — and the third was a browser with no server: a peer, through the lite hat --');
+  console.log('-- six messages, six commits, two clients — real sends landing as Dolt commits --');
 }
 await c.end();
 TS
@@ -247,15 +210,6 @@ PART
     tmux split-window -h -t "$SESSION:0.0" "/tmp/demo-bob.sh"
     # pane 2 (bottom, ~45% height): title card, then dolt.log watch
     tmux split-window -v -f -l '45%' -t "$SESSION:0.0" "/tmp/demo-watch.sh"
-    # the ghost — a third participant with NO pane and NO camera: a
-    # headless browser peer (lite hat, msync/ws) whose messages simply
-    # appear in alice's/bob's panes and as commits below (plan §13).
-    # t≈38 answers alice's t≈30 "dolt pull" line; t≈50 precedes the
-    # watch pane's t≈58 reveal.
-    nohup deno run -A demo/carol-ghost.ts "$ROOM_ID" carol 38 \
-      "hi both — I'm in the same room, but I have no server: I'm a peer of yours" 50 \
-      "your six event ids match mine byte for byte — I recomputed them here" \
-      >/tmp/demo-carol.log 2>&1 &
     # labels
     tmux set-option -t "$SESSION" status off
     tmux set-option -t "$SESSION" pane-border-status top

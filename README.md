@@ -37,9 +37,7 @@ Image contract, blacklist philosophy, and the red number to beat:
 - `api/engine/` — room core: PDU ingest, per-version policy slot,
   tenant identity, sync feeds. `state` is written only by the resolver.
 - `api/endpoints/_matrix/` — Client-Server surface (register, login,
-  rooms, sync, …). `api/hats/lite/` — the browser peer (msync over WS).
-- `lite/web/` — the in-browser homeserver (DoltLite engine, profiles,
-  sync protocols) + headless checks (`check-*.ts`).
+  rooms, sync, …).
 - `db/` — `server/` (room registry, event index), `room/` (per-room
   schema), `tenant/` (per-tenant identity schema).
 - `complement/` — Docker image, entrypoint, blacklist, runner, baseline.

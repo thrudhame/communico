@@ -3,14 +3,12 @@
 // process via pathfinder() and asserts on the wire shapes:
 //   - deep helper throwing HttpError(401, {errcode…}) → verbatim Matrix body
 //   - malformed JSON → 400 {"errcode":"M_NOT_JSON"} (10-json middleware)
-//   - CORS stamped on 404 / 405 / 500 / thrown HttpError / the /msync 101
-//   - request.upgrade(): 101 ships, socket usable, headers stamped in place
+//   - CORS stamped on 404 / 405 / 500 / thrown HttpError
 // No DB needed: every asserted path resolves before any engine query.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
-const communico = await pathfinder({ roots: ['api/endpoints/communico/'] });
 
 const CORS = 'access-control-allow-origin';
 
@@ -215,56 +213,9 @@ Deno.test('500: uncaught error → M_UNKNOWN + CORS (outcome cascade)', async ()
   });
 });
 
-Deno.test('tagline at / on both listeners (text/plain)', async () => {
-  for (const app of [matrix, communico]) {
-    const res = await app(new Request('http://x/'));
-    assertEquals(res.status, 200);
-    assert(res.headers.get('content-type')?.startsWith('text/plain'));
-    assert((await res.text()).startsWith('Communico'));
-  }
-});
-
-Deno.test('/msync upgrade: 101 ships with CORS stamped in place', async () => {
-  const server = Deno.serve({ port: 0 }, communico);
-  const port = (server.addr as Deno.NetAddr).port;
-  const conn = await Deno.connect({ port });
-  try {
-    const key = btoa(
-      String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))),
-    );
-    await conn.write(new TextEncoder().encode(
-      `GET /msync?room=wire-probe HTTP/1.1\r\n` +
-        `Host: localhost:${port}\r\n` +
-        `Upgrade: websocket\r\nConnection: Upgrade\r\n` +
-        `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
-    ));
-    // Read the response head (through \r\n\r\n).
-    const buf = new Uint8Array(4096);
-    let head = '';
-    while (!head.includes('\r\n\r\n')) {
-      const n = await conn.read(buf);
-      if (n === null) break;
-      head += new TextDecoder().decode(buf.subarray(0, n));
-    }
-    const [statusLine, ...headerLines] = head.split('\r\n');
-    assertEquals(statusLine, 'HTTP/1.1 101 Switching Protocols');
-    const headers = new Headers();
-    for (const line of headerLines) {
-      const cut = line.indexOf(':');
-      if (cut > 0) {
-        headers.set(line.slice(0, cut).trim(), line.slice(cut + 1).trim());
-      }
-    }
-    assertEquals(headers.get(CORS), '*', 'CORS stamped on the 101');
-    assert(headers.get('sec-websocket-accept'), 'upgrade performed by host');
-  } finally {
-    conn.close();
-    await server.shutdown();
-  }
-});
-
-Deno.test('/msync without ?room= → 400 (not a 500)', async () => {
-  const res = await communico(new Request('http://x/msync'));
-  assertEquals(res.status, 400);
-  assertEquals(res.headers.get(CORS), '*');
+Deno.test('tagline at / (text/plain)', async () => {
+  const res = await matrix(new Request('http://x/'));
+  assertEquals(res.status, 200);
+  assert(res.headers.get('content-type')?.startsWith('text/plain'));
+  assert((await res.text()).startsWith('Communico'));
 });

@@ -5,9 +5,9 @@ Every Matrix event lands as a commit; forks are branches; heals are
 merges. Identity is keypairs; the wire currency is content-hash event
 ids, never store internals. Dolt does propagation, healing storage, and
 certification; a per-version **rulebook** decides authorization and
-state; thin adapters ("hats") project rooms onto transports.
+state.
 
-## 1. The room engine (`api/engine/`, `lite/web/engine-lite.js`)
+## 1. The room engine (`api/engine/`)
 
 - **PDU in, PDU stored.** Ingest takes a full room-v11 PDU
   (`type/room_id/sender/content/state_key?`, ≤20 `prev_events`,
@@ -30,9 +30,9 @@ state; thin adapters ("hats") project rooms onto transports.
 - **The policy slot.** The core dispatches to the room version's
   rulebook and never implements version logic: `selectAuthEvents`,
   `authorized` (`ok | authchain-reject | state-reject | soft-fail`),
-  `resolveState`, `redaction`. One shared stub source
-  (`lite/web/sync/rulebook/v11-stub.js`) is consumed byte-identically by
-  both engines. Unknown room versions are rejected, never defaulted.
+  `resolveState`, `redaction`. The shared rulebook stub source
+  (`api/engine/rulebook/v11-stub.js`) is one source for all consumers.
+  Unknown room versions are rejected, never defaulted.
 - **The refusing stub (current).** Membership only — no timestamps, no
   power levels (declared gap, M3). The room creator's first join is
   exempt. Concurrent edits to one state key throw
@@ -73,23 +73,14 @@ state; thin adapters ("hats") project rooms onto transports.
   device, `/logout/all` removes them user-wide; `/devices` lists them.
   Tokens are bearer credentials in the tenant DB; unknown/missing
   tokens are proper 401s. Dev seeds register through this same path.
-- The **browser is a homeserver too**: one keypair per browser
-  (persisted), N concurrent **personas** (`@alice:<lite-b32>`,
-  `@bob:<lite-b32>`, localpart fixed at creation, `displayname`
-  renames), rooms belong to a profile, everything signed, key
-  export/import moves all profiles at once.
 
-## 3. Sync (`lite/web/sync/`, `api/hats/lite/`)
+## 3. Sync (parked)
 
-- **msync** — the event-level floor every pair speaks: tips gossip,
-  delta-request, topologically sorted deltas; refused-but-stored events
-  still render and gossip (refusal is materialization, never a
-  propagation drop); held events retry ≤3 rounds.
-- **dsync** — the same-engine fast path: store images over the
-  transport, fetch, mechanical merge, replay + materialize.
-- **The lite hat** lets browsers join server rooms over WebSocket
-  (`?transport=ws&sync=msync`): the server runs an msync peer per room
-  over its engine facade. Same events, same ids, both sides.
+The browser homeserver (communico-lite) and the native sync protocols
+(msync/dsync) are parked — prior art on `research/lite`, plan in
+`~/Documents/communico/plans/lite/`. The server-side pieces that existed
+only for them (the msync peer, the ws endpoint, the engine facade) left
+with this cleanup; the server speaks the Matrix client-server API only.
 
 ## 4. Conformance (`complement/`)
 
@@ -117,8 +108,8 @@ never federate.
 ## 6. Verification
 
 Each phase gates green before the next begins: `deno task check` +
-`deno task test`, the 8 lite checks + fork-refusal + adoption checks,
-`demo/setup.sh --reset && demo/run-demo.sh --check`, a Complement
+`deno task test`, `demo/setup.sh --reset && demo/run-demo.sh --check`,
+a Complement
 number that moves, and container-restart key continuity. All runs
 happen on the ark VM fleet (never the laptop). Evidence per phase in
 `spikes/RESULTS.md`; the plan of record lives outside the repo.

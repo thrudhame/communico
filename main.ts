@@ -1,11 +1,14 @@
 import { pathfinder } from '@pathfinder/pathfinder';
 
-// Two listeners, two roots (plan §9.1): :8008 serves the Matrix client API
-// only, :8000 serves the communico tree (_communico/* + the root-level
-// /msync lite-hat socket). Each instance is its own app with its own
-// Layer-0 /_status subtree. The tagline at / is a root get.ts in each tree.
-const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
-const communico = await pathfinder({ roots: ['api/endpoints/communico/'] });
+// One listener: the Matrix client-server API. The port comes from the
+// environment — no in-code fallback (ruling 8); the full required-config
+// validation (api/engine/config.ts) centralizes this in the next step.
+const appPort = Deno.env.get('APP_PORT');
+if (appPort === undefined || !Number.isInteger(Number(appPort))) {
+  console.error('missing required environment variable APP_PORT');
+  Deno.exit(1);
+}
 
-Deno.serve({ port: Number(Deno.env.get('APP_A_PORT') ?? '8008') }, matrix);
-Deno.serve({ port: Number(Deno.env.get('APP_B_PORT') ?? '8000') }, communico);
+const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
+
+Deno.serve({ port: Number(appPort) }, matrix);

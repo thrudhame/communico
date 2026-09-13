@@ -7,19 +7,18 @@
     "./setup": "./setup.ts"
   },
   "tasks": {
-    "check": "deno check --min-dep-age 0 main.ts api/ tests/*.ts demo/*.ts lite/web/check-*.ts",
+"check": "deno check --min-dep-age 0 main.ts api/ tests/*.ts demo/*.ts",
     "dev": "deno run --min-dep-age 0 --env --allow-net --allow-env --allow-read --watch main.ts",
     "start": "deno --min-dep-age 0 --env --allow-net --allow-env --allow-read main.ts",
     "setup": "deno --min-dep-age 0 --env --allow-net --allow-env setup.ts",
     "test": "deno test --min-dep-age 0 --env --allow-net --allow-env --allow-read tests/*",
     "db-init": "deno run --min-dep-age 0 --env --allow-net --allow-env --allow-read db/init.ts",
     "db-start": "doltgres --config /etc/doltgres/servercfg.d/config.yaml",
-    "debug-proxy": "PROXY_PORT=8000 deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
+    "debug-proxy": "deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
   },
   "imports": {
     "#engine/": "./api/engine/",
     "#endpoints/": "./api/endpoints/",
-    "#hats/": "./api/hats/",
     "#root/": "./",
     "#tests/": "./tests/",
     "@pathfinder/pathfinder": "jsr:@pathfinder/pathfinder@0.2.0",

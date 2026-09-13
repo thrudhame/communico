@@ -1,5 +1,5 @@
 // api/engine/pdu.ts — the v11 Persistent Data Unit shape (F0).
-// Mirrors lite/web/sync/pdu.js (same fields). event_id is DERIVED
+// Event PDU shape shared by every consumer. event_id is DERIVED
 // (eventIdFor over the redacted PDU) and never inside the hashed body.
 export interface Pdu {
   type: string;
