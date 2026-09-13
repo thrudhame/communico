@@ -48,9 +48,12 @@ Image contract, blacklist philosophy, and the red number to beat:
 ## Status and roadmap
 
 Done: v11 PDU engine with refusing stub resolver, Complement harness
-with red baseline, tenant identity (argon2id UIA registration),
-browser homeservers with personas. Deliberately stubbed: real state
-resolution (M3), server-to-server federation (M5, `:8448` serves TLS +
-404 today), E2EE/push/appservices/rate limiting. No merge back to the
-spike line without explicit agreement; pushes are user-gated.
+with red baseline, tenant identity (argon2id UIA registration), and the
+HTTP layer on pathfinder 0.2.0 (M1) — two roots collapsed to the single
+Matrix client-server listener on `APP_PORT`. Deliberately stubbed: real
+state resolution (M3), server-to-server federation (M5, `:8448` serves
+TLS + 404 today), E2EE/push/appservices/rate limiting. The browser
+homeserver (communico-lite) and native sync are parked — prior art on
+`research/lite`, plan in `~/Documents/communico/plans/lite/`. Pushes
+are user-gated.
 

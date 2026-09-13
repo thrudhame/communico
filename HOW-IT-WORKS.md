@@ -99,17 +99,16 @@ container restarts.
 ## 5. What's stubbed (roadmap)
 
 Real v11/v12 resolution behind the same policy slot (M3, incl.
-power-level auth); S2S federation (M5); pathfinder (M1); relay
-`bind/forward`; E2EE/appservices/push/rate limiting; `/_matrix/key/*`
-and `.well-known`; at-rest encryption of tenant private keys; OPFS
-persistence for browser stores. Stub-era rooms are flagged and will
-never federate.
+power-level auth); S2S federation (M5); relay `bind/forward`;
+E2EE/appservices/push/rate limiting; `/_matrix/key/*` and `.well-known`;
+at-rest encryption of tenant private keys. Stub-era rooms are flagged
+and will never federate.
 
 ## 6. Verification
 
 Each phase gates green before the next begins: `deno task check` +
 `deno task test`, `demo/setup.sh --reset && demo/run-demo.sh --check`,
-a Complement
-number that moves, and container-restart key continuity. All runs
-happen on the ark VM fleet (never the laptop). Evidence per phase in
-`spikes/RESULTS.md`; the plan of record lives outside the repo.
+a Complement number that moves, and container-restart key continuity.
+All runs happen on the ark VM fleet (never the laptop). Evidence per
+phase lives in `~/Documents/communico/research/RESULTS.md`; the plan of
+record lives outside the repo.

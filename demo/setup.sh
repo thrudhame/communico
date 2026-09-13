@@ -7,6 +7,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+# the demo reads the dev environment rather than repeating it (.env.example
+# documents the keys; the real environment wins over the file)
+set -a; . ./.env; set +a
 CONTAINER=communico-dev
 IMAGE=communico:devcontainer
 MC_IMAGE=matrixcommander/matrix-commander
