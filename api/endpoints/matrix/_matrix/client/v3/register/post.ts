@@ -3,28 +3,20 @@ import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   checkLocalpart,
-  completeUiaStages,
-  createUiaSession,
-  dropUiaSession,
   ensureTenant,
-  getUiaSession,
   registerUser,
 } from '#engine/tenant.ts';
+import { requireUia, DUMMY_FLOWS } from '#engine/uia.ts';
 import { withDb } from '#engine/db.ts';
 
-
-const FLOWS = [{ stages: ['m.login.dummy'] }];
-
-// POST /_matrix/client/v3/register — UIA (F1 step 17). Complement's
-// contract (read off apidoc_register_test.go, not assumed):
+// POST /_matrix/client/v3/register — UIA (F1 step 17; M2: via the shared
+// requireUia helper). Complement's contract (read off
+// apidoc_register_test.go, not assumed):
 // - bodies are validated BEFORE UIA: bad-grammar username → 400
 //   M_INVALID_USERNAME and taken username → 400 M_USER_IN_USE, even with
 //   no session at all;
-// - otherwise sessions are REQUIRED: unknown/absent session → 401 +
-//   fresh session (never one-shot completion), known session + completed
-//   stages → finalize.
-// Accepted completing stages: m.login.dummy, and m.login.password when a
-// new password is present (at registration both prove the same thing).
+// - otherwise the UIA 401 dance (flows/params/session; params rides the
+//   401 body per spec v1.11) with the dummy flow, then finalize.
 // honoring: inhibit_login, device_id, initial_device_display_name.
 export default async function (request: import('@pathfinder/pathfinder').PathfinderRequest) {
   let body: Record<string, unknown> = {};
@@ -47,37 +39,12 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
     if (taken) throw new MatrixError(400, 'M_USER_IN_USE', 'user in use: ' + localpart);
   }
 
-  // 2. UIA session (required, never one-shot).
-  const authn = (body.auth ?? {}) as Record<string, unknown>;
-  const sessionId = body.session ?? authn.session;
-  const session = typeof sessionId === 'string'
-    ? await getUiaSession(serverName(), sessionId)
-    : null;
-  if (!session) {
-    const fresh = await createUiaSession(serverName(), FLOWS);
-    throw new MatrixError(401, 'M_UNAUTHORIZED', 'registration incomplete', {
-      flows: fresh.flows,
-      session: fresh.session,
-    });
-  }
-
-  const newly: string[] = [];
-  if (authn.type === 'm.login.dummy') newly.push('m.login.dummy');
-  if (authn.type === 'm.login.password' && typeof body.password === 'string') {
-    newly.push('m.login.password');
-  }
-  const updated = newly.length > 0
-    ? await completeUiaStages(serverName(), session.session, newly)
-    : session;
-
-  const done = updated.completed.includes('m.login.dummy') ||
-    updated.completed.includes('m.login.password');
-  if (!done) {
-    throw new MatrixError(401, 'M_UNAUTHORIZED', 'registration incomplete', {
-      flows: updated.flows,
-      session: updated.session,
-    });
-  }
+  // 2. UIA: dummy flow via the shared helper (sessions + completion).
+  await requireUia({
+    serverName: serverName(),
+    body,
+    flows: DUMMY_FLOWS,
+  });
 
   // Finalize: username was grammar-checked pre-UIA (localpart is set);
   // missing username/password here is a 400 (the UIA dance always
@@ -98,7 +65,6 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
       : undefined,
     accessToken: inhibit ? null : undefined,
   });
-  await dropUiaSession(serverName(), session.session);
   const out: Record<string, unknown> = {
     user_id: result.user_id,
     device_id: result.device_id,

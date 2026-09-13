@@ -9,6 +9,11 @@ import { MatrixError } from './matrix-error.ts';
 // user_id. Throws MatrixError 401s — never 500s. The shared
 // auth-middleware (placed on each protected folder) is the usual caller;
 // deep helpers may still call this directly.
+/** The localpart of a full MXID (@localpart:server). */
+export function localpartOf(userId: string): string {
+  return userId.slice(1, userId.lastIndexOf(':'));
+}
+
 export async function authorize(
   request: PathfinderRequest,
 ): Promise<string> {
