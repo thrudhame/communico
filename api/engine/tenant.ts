@@ -523,3 +523,56 @@ export async function dropUiaSession(serverName: string, session: string): Promi
     await c.query('DELETE FROM uia_sessions WHERE session = $1;', [session]);
   });
 }
+
+// --- M2: profile ---------------------------------------------------------
+
+/** The user's profile fields; null = no such user. Keys omitted when unset. */
+export async function getProfile(
+  serverName: string,
+  localpart: string,
+): Promise<{ displayname?: string; avatar_url?: string } | null> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      'SELECT display_name, avatar_url FROM users WHERE localpart = $1;',
+      [localpart],
+    );
+    if (r.rows.length === 0) return null;
+    const out: { displayname?: string; avatar_url?: string } = {};
+    if (r.rows[0].display_name != null) {
+      out.displayname = String(r.rows[0].display_name);
+    }
+    if (r.rows[0].avatar_url != null) {
+      out.avatar_url = String(r.rows[0].avatar_url);
+    }
+    return out;
+  });
+}
+
+export async function setDisplayName(
+  serverName: string,
+  localpart: string,
+  name: string | null,
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    await c.query('UPDATE users SET display_name = $1 WHERE localpart = $2;', [
+      name,
+      localpart,
+    ]);
+  });
+}
+
+export async function setAvatarUrl(
+  serverName: string,
+  localpart: string,
+  url: string | null,
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    await c.query('UPDATE users SET avatar_url = $1 WHERE localpart = $2;', [
+      url,
+      localpart,
+    ]);
+  });
+}
