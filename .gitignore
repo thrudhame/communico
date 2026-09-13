@@ -1,8 +1,7 @@
 /auth.db
 .DS_Store
 /debug
-lite/bin/
-lite/web/node_modules/
+/.env
 /.envrc
 # Complement run artifacts (regenerable; BASELINE.md is the record)
 complement/baseline.jsonl

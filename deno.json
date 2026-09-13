@@ -11,7 +11,7 @@
     "dev": "deno run --min-dep-age 0 --env --allow-net --allow-env --allow-read --watch main.ts",
     "start": "deno --min-dep-age 0 --env --allow-net --allow-env --allow-read main.ts",
     "setup": "deno --min-dep-age 0 --env --allow-net --allow-env setup.ts",
-    "test": "deno test --min-dep-age 0 --env --allow-net --allow-env --allow-read tests/*",
+    "test": "deno test --min-dep-age 0 --env --allow-net --allow-env --allow-read --allow-write --allow-run tests/*",
     "db-init": "deno run --min-dep-age 0 --env --allow-net --allow-env --allow-read db/init.ts",
     "db-start": "doltgres --config /etc/doltgres/servercfg.d/config.yaml",
     "debug-proxy": "deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"

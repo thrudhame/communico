@@ -6,20 +6,21 @@ commit, forward extremities are branches**, and the event id clients see
 is a content hash of the event itself.
 
 Active line: `server-foundation` — engine contract (F0) → Complement
-harness (M0) → identity + registration (F1). See `HOW-IT-WORKS.md` for
-the architecture and `spikes/RESULTS.md` for the evidence log.
+harness (M0) → identity + registration (F1) → HTTP layer on pathfinder
+(M1). See `HOW-IT-WORKS.md` for the architecture; the evidence log lives
+in `~/Documents/communico/research/RESULTS.md`.
 
 ## Quickstart (demo)
 
-Prerequisites: Docker only.
+Prerequisites: Docker only. First run: `cp .env.example .env` (the real
+environment wins over that file; container images take theirs from ENV).
 
 ```bash
 bash demo/setup.sh --reset   # boots Doltgres+server, registers users, creates the room
-bash demo/run-demo.sh --check  # headless self-test: two real clients + a browser peer
+bash demo/run-demo.sh --check  # headless self-test: two real matrix-commander clients
 ```
 
-Details and the three-party choreography: `demo/README.md`, then
-`demo/inspection-tour.md` (queries against your own fresh data).
+Details and choreography: `demo/README.md`.
 
 ## Conformance
 
