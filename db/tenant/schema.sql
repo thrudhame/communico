@@ -1,6 +1,13 @@
 -- db/tenant/schema.sql — per-tenant identity DB (F1). One Doltgres
 -- database per tenant: mirrors db-per-room; tenant = blast radius.
 -- Provisioned by ensureTenant (api/engine/tenant.ts), never by hand.
+--
+-- M2 note: Doltgres has no ALTER … ADD COLUMN IF NOT EXISTS. Tenants
+-- provisioned before M2 need a one-time manual ALTER for the users-table
+-- additions:
+--   ALTER TABLE users ADD COLUMN avatar_url text;
+--   ALTER TABLE users ADD COLUMN deactivated boolean NOT NULL DEFAULT false;
+-- Dev/VM/Complement always provision fresh (demo/setup.sh --reset).
 CREATE TABLE IF NOT EXISTS tenant (
   server_name text PRIMARY KEY,
   native_name text NOT NULL,
@@ -11,7 +18,9 @@ CREATE TABLE IF NOT EXISTS tenant (
 );
 CREATE TABLE IF NOT EXISTS users (
   localpart text PRIMARY KEY,
-  display_name text
+  display_name text,
+  avatar_url text,                                  -- M2
+  deactivated boolean NOT NULL DEFAULT false        -- M2
 );
 -- credentials: argon2id rows store kind + the PHC string (algorithm,
 -- params and salt are encoded in-band — salt/params stay NULL). The
@@ -39,4 +48,39 @@ CREATE TABLE IF NOT EXISTS uia_sessions (
   flows text NOT NULL,
   completed text NOT NULL DEFAULT '[]',
   created_ms bigint NOT NULL
+);
+-- M2: account data. room_id '' = global (PK columns cannot be NULL).
+CREATE TABLE IF NOT EXISTS account_data (
+  localpart text NOT NULL REFERENCES users(localpart),
+  room_id text NOT NULL DEFAULT '',
+  type text NOT NULL,
+  content text NOT NULL,                            -- JSON text; Doltgres jsonb not assumed
+  PRIMARY KEY (localpart, room_id, type)
+);
+-- M2: pushers (storage only; no gateway traffic until Push proper).
+-- After access_tokens: the FK reference must resolve at CREATE time
+-- (runSqlFile executes statements in file order).
+CREATE TABLE IF NOT EXISTS pushers (
+  localpart text NOT NULL REFERENCES users(localpart),
+  app_id text NOT NULL,
+  pushkey text NOT NULL,
+  kind text NOT NULL,
+  app_display_name text NOT NULL,
+  device_display_name text NOT NULL,
+  profile_tag text,
+  lang text NOT NULL,
+  data text NOT NULL,                               -- JSON text
+  access_token text NOT NULL REFERENCES access_tokens(token),
+  PRIMARY KEY (localpart, app_id, pushkey)
+);
+-- M2: media metadata; bytes live at $MEDIA_ROOT/<media_id>.
+CREATE TABLE IF NOT EXISTS media (
+  media_id text PRIMARY KEY,
+  localpart text NOT NULL REFERENCES users(localpart),
+  state text NOT NULL,                              -- 'pending' | 'uploaded'
+  content_type text,
+  filename text,
+  size_bytes bigint,
+  created_ms bigint NOT NULL,
+  uploaded_ms bigint
 );
