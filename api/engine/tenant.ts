@@ -375,6 +375,74 @@ export async function revokeAllTokens(serverName: string, localpart: string): Pr
   });
 }
 
+// --- M2: devices ---------------------------------------------------------
+
+/** One device the localpart owns; null = not found/not owned. */
+export async function getDevice(
+  serverName: string,
+  localpart: string,
+  deviceId: string,
+): Promise<{ device_id: string; display_name: string | null } | null> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      'SELECT device_id, display_name FROM devices WHERE device_id = $1 AND localpart = $2;',
+      [deviceId, localpart],
+    );
+    if (r.rows.length === 0) return null;
+    return {
+      device_id: String(r.rows[0].device_id),
+      display_name: r.rows[0].display_name == null
+        ? null
+        : String(r.rows[0].display_name),
+    };
+  });
+}
+
+/** Rename a device the localpart owns; false = not owned/not found. */
+export async function updateDeviceName(
+  serverName: string,
+  localpart: string,
+  deviceId: string,
+  displayName: string,
+): Promise<boolean> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      'UPDATE devices SET display_name = $1 WHERE device_id = $2 AND localpart = $3;',
+      [displayName, deviceId, localpart],
+    );
+    return r.rowCount > 0;
+  });
+}
+
+/** Delete the named devices of localpart — their tokens and pushers go
+ * with them (a device's tokens' pushers are the user's pushers made by
+ * those tokens; deleting the token deletes what it created). */
+export async function deleteDevices(
+  serverName: string,
+  localpart: string,
+  deviceIds: string[],
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    for (const deviceId of deviceIds) {
+      await c.query(
+        'DELETE FROM pushers WHERE access_token IN (SELECT token FROM access_tokens WHERE device_id = $1 AND localpart = $2);',
+        [deviceId, localpart],
+      );
+      await c.query('DELETE FROM access_tokens WHERE device_id = $1 AND localpart = $2;', [
+        deviceId,
+        localpart,
+      ]);
+      await c.query('DELETE FROM devices WHERE device_id = $1 AND localpart = $2;', [
+        deviceId,
+        localpart,
+      ]);
+    }
+  });
+}
+
 // UIA sessions (persisted: a container restart mid-flow degrades to a
 // client retry, never to a half-registered user — creation is atomic).
 export interface UiaSession {

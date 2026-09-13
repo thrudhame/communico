@@ -46,8 +46,19 @@ Deno.test('empty env → exit 1, stderr names all seven required variables', asy
 });
 
 Deno.test('all seven set → binds APP_PORT and answers GET /_matrix/client/versions', async () => {
-  // Ephemeral-ish port: pick one, probe until the server answers.
-  const port = 30000 + Math.floor(Math.random() * 20000);
+  // Ephemeral-ish port: bind to prove it's free, release, then hand it to
+  // the server (bind-then-use is racy — retry across candidates).
+  let port = 0;
+  for (let i = 0; i < 5 && port === 0; i++) {
+    const candidate = 30000 + Math.floor(Math.random() * 20000);
+    let listener: Deno.Listener | null = null;
+    try {
+      listener = Deno.listen({ port: candidate });
+      port = candidate;
+    } catch { /* in use — try another */ }
+    listener?.close();
+  }
+  assert(port > 0, 'no free port found');
   const cmd = new Deno.Command(DENO, {
     args: ['run', '--allow-env', '--allow-read', '--allow-net', 'main.ts'],
     cwd: new URL('..', import.meta.url).pathname,
@@ -65,10 +76,18 @@ Deno.test('all seven set → binds APP_PORT and answers GET /_matrix/client/vers
     stderr: 'piped',
   });
   const child = cmd.spawn();
+  let exited: { code: number } | null = null;
+  const exitedP = child.status.then((st: { code: number }) => {
+    exited = st;
+  });
   try {
     const deadline = Date.now() + 15_000;
     let answered = false;
     while (Date.now() < deadline) {
+      // Early-exit detection: if the server died (port race, crash) the
+      // assert below names it instead of spinning out the deadline.
+      await Promise.race([new Promise((r) => setTimeout(r, 250)), exitedP]);
+      if (exited !== null) break;
       try {
         const res = await fetch(`http://127.0.0.1:${port}/_matrix/client/versions`);
         if (res.ok) {
@@ -78,11 +97,16 @@ Deno.test('all seven set → binds APP_PORT and answers GET /_matrix/client/vers
           break;
         }
       } catch { /* not up yet */ }
-      await new Promise((r) => setTimeout(r, 250));
     }
+    assert(
+      exited === null,
+      `server exited early (code ${(exited as unknown as { code: number })?.code})`,
+    );
     assert(answered, 'server did not answer /versions with all config set');
   } finally {
-    child.kill('SIGTERM');
+    try {
+      child.kill('SIGTERM');
+    } catch { /* already gone */ }
     await child.status;
   }
 });

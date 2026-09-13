@@ -1,4 +1,5 @@
 import { serverName } from '#engine/config.ts';
+import { localpartOf } from '#engine/auth.ts';
 import { listDevices } from '#engine/tenant.ts';
 
 // GET /_matrix/client/v3/devices — the caller's devices (F1 logout gate
@@ -9,7 +10,7 @@ export default async function (
   context: import('@pathfinder/pathfinder').Context,
 ) {
   const userId = context.state.user as string;
-  const localpart = userId.slice(1, userId.lastIndexOf(':'));
+  const localpart = localpartOf(userId);
   const devices = await listDevices(serverName(), localpart);
   return {
     devices: devices.map((d: { device_id: string; display_name: string | null }) => ({
