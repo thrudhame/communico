@@ -1,6 +1,6 @@
 import { parseJson } from '@pathfinder/pathfinder/body';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { issueToken, upsertDevice, verifyUserPassword } from '#engine/tenant.ts';
+import { isDeactivated, issueToken, upsertDevice, verifyUserPassword } from '#engine/tenant.ts';
 import { serverName } from '#engine/config.ts';
 
 // m.login.password (F1 step 18): argon2id verify against the tenant
@@ -38,6 +38,11 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
     }
   } else {
     localpart = rawUser.toLowerCase();
+  }
+  // M2: deactivated accounts cannot log in (spec: M_USER_DEACTIVATED,
+  // "Typically for endpoints that prove authentication, such as /login").
+  if (await isDeactivated(serverName(), localpart)) {
+    throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account deactivated');
   }
   if (!await verifyUserPassword(serverName(), localpart, body.password)) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');

@@ -324,10 +324,15 @@ export async function revokeToken(serverName: string, token: string): Promise<vo
     const deviceId = r.rows.length && r.rows[0].device_id != null
       ? String(r.rows[0].device_id)
       : null;
+    await c.query('DELETE FROM pushers WHERE access_token = $1;', [token]);
     await c.query('DELETE FROM access_tokens WHERE token = $1;', [token]);
     // Logging out removes the device too (Synapse semantics — the logout
     // gate asserts the device list shrinks).
     if (deviceId) {
+      await c.query(
+        'DELETE FROM pushers WHERE access_token IN (SELECT token FROM access_tokens WHERE device_id = $1);',
+        [deviceId],
+      );
       await c.query('DELETE FROM access_tokens WHERE device_id = $1;', [deviceId]);
       await c.query('DELETE FROM devices WHERE device_id = $1;', [deviceId]);
     }
@@ -370,6 +375,7 @@ export async function listDevices(
 export async function revokeAllTokens(serverName: string, localpart: string): Promise<void> {
   const { dbName } = await ensureTenant(serverName);
   await withDb(dbName, async (c) => {
+    await c.query('DELETE FROM pushers WHERE localpart = $1;', [localpart]);
     await c.query('DELETE FROM access_tokens WHERE localpart = $1;', [localpart]);
     await c.query('DELETE FROM devices WHERE localpart = $1;', [localpart]);
   });
@@ -574,5 +580,175 @@ export async function setAvatarUrl(
       url,
       localpart,
     ]);
+  });
+}
+
+// --- M2: password / deactivation ------------------------------------------
+
+/** Change the password; optionally log out every other device (their
+ * tokens and pushers go with them). keepToken (the caller's) survives. */
+export async function changePassword(
+  serverName: string,
+  localpart: string,
+  newPassword: string,
+  opts: { keepToken?: string; logoutDevices: boolean },
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    await c.query('UPDATE credentials SET hash = $1 WHERE localpart = $2;', [
+      hashPassword(newPassword),
+      localpart,
+    ]);
+    if (!opts.logoutDevices) return;
+    const keepToken = opts.keepToken;
+    let keepDevice: string | null = null;
+    if (keepToken !== undefined) {
+      const r = await c.query(
+        'SELECT device_id FROM access_tokens WHERE token = $1 AND localpart = $2;',
+        [keepToken, localpart],
+      );
+      if (r.rows.length > 0 && r.rows[0].device_id != null) {
+        keepDevice = String(r.rows[0].device_id);
+      }
+    }
+    const t = keepToken !== undefined
+      ? await c.query(
+        'SELECT token FROM access_tokens WHERE localpart = $1 AND token <> $2;',
+        [localpart, keepToken],
+      )
+      : await c.query('SELECT token FROM access_tokens WHERE localpart = $1;', [
+        localpart,
+      ]);
+    // deno-lint-ignore no-explicit-any
+    for (const row of t.rows as any[]) {
+      const token = String(row.token);
+      await c.query('DELETE FROM pushers WHERE access_token = $1;', [token]);
+      await c.query('DELETE FROM access_tokens WHERE token = $1;', [token]);
+    }
+    if (keepDevice !== null) {
+      await c.query(
+        'DELETE FROM devices WHERE localpart = $1 AND device_id <> $2;',
+        [localpart, keepDevice],
+      );
+    } else {
+      await c.query('DELETE FROM devices WHERE localpart = $1;', [localpart]);
+    }
+  });
+}
+
+/** Deactivate: pushers, tokens and devices all go; the user row is marked
+ * deactivated and its profile fields cleared. Later login → 403. */
+export async function deactivateUser(
+  serverName: string,
+  localpart: string,
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    await c.query('DELETE FROM pushers WHERE localpart = $1;', [localpart]);
+  });
+  await revokeAllTokens(serverName, localpart);
+  await withDb(dbName, async (c) => {
+    await c.query(
+      'UPDATE users SET deactivated = true, display_name = NULL, avatar_url = NULL WHERE localpart = $1;',
+      [localpart],
+    );
+  });
+}
+
+export async function isDeactivated(
+  serverName: string,
+  localpart: string,
+): Promise<boolean> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query('SELECT deactivated FROM users WHERE localpart = $1;', [
+      localpart,
+    ]);
+    return r.rows.length > 0 && r.rows[0].deactivated === true;
+  });
+}
+
+// --- M2: pushers (storage only — no gateway traffic) -----------------------
+
+export interface PusherRow {
+  app_id: string;
+  pushkey: string;
+  kind: string;
+  app_display_name: string;
+  device_display_name: string;
+  profile_tag: string | null;
+  lang: string;
+  data: unknown;
+}
+
+/** kind null → delete that (app_id, pushkey); else upsert bound to token. */
+export async function setPusher(
+  serverName: string,
+  localpart: string,
+  token: string,
+  pusher: {
+    app_id: string;
+    pushkey: string;
+    kind: string | null;
+    app_display_name: string;
+    device_display_name: string;
+    profile_tag?: string | null;
+    lang: string;
+    data: unknown;
+  },
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    if (pusher.kind === null) {
+      await c.query(
+        'DELETE FROM pushers WHERE localpart = $1 AND app_id = $2 AND pushkey = $3;',
+        [localpart, pusher.app_id, pusher.pushkey],
+      );
+      return;
+    }
+    await c.query(
+      `INSERT INTO pushers (localpart, app_id, pushkey, kind, app_display_name, device_display_name, profile_tag, lang, data, access_token)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (localpart, app_id, pushkey) DO UPDATE SET
+         kind = $4, app_display_name = $5, device_display_name = $6,
+         profile_tag = $7, lang = $8, data = $9, access_token = $10;`,
+      [
+        localpart,
+        pusher.app_id,
+        pusher.pushkey,
+        pusher.kind,
+        pusher.app_display_name,
+        pusher.device_display_name,
+        pusher.profile_tag ?? null,
+        pusher.lang,
+        JSON.stringify(pusher.data),
+        token,
+      ],
+    );
+  });
+}
+
+/** The caller's pushers — never returns access_token. */
+export async function listPushers(
+  serverName: string,
+  localpart: string,
+): Promise<PusherRow[]> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      'SELECT app_id, pushkey, kind, app_display_name, device_display_name, profile_tag, lang, data FROM pushers WHERE localpart = $1;',
+      [localpart],
+    );
+    // deno-lint-ignore no-explicit-any
+    return (r.rows as any[]).map((row) => ({
+      app_id: String(row.app_id),
+      pushkey: String(row.pushkey),
+      kind: String(row.kind),
+      app_display_name: String(row.app_display_name),
+      device_display_name: String(row.device_display_name),
+      profile_tag: row.profile_tag == null ? null : String(row.profile_tag),
+      lang: String(row.lang),
+      data: typeof row.data === 'string' ? JSON.parse(row.data) : row.data,
+    }));
   });
 }
