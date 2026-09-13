@@ -9,7 +9,7 @@ import {
   contentHashOf,
   importPrivateKeyFromSeed,
   signJson,
-} from '#lite/web/sync/signing.js';
+} from '#engine/signing-primitives.js';
 
 const PDU = {
   type: 'm.room.message',

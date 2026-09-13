@@ -5,7 +5,7 @@
 // Order per spec: content hash -> redact -> sign. Shared by both engines
 // (server imports this from api/engine/signing.ts); WebCrypto Ed25519
 // only — no dependencies.
-import { canonicalJson } from './canonical.js';
+import { canonicalJson } from '#engine/canonical.ts';
 
 // Unpadded base64 (appendices § Unpadded Base64: RFC 4648 without `=`).
 // Binary values in JSON (hashes, signatures, keys) use the STANDARD

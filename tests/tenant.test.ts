@@ -20,7 +20,7 @@ import {
   verifyPassword,
   verifyUserPassword,
 } from '#engine/tenant.ts';
-import { b64decode } from '#lite/web/sync/signing.js';
+import { b64decode } from '#engine/signing-primitives.js';
 
 const PHC_RE = /^\$argon2id\$v=19\$m=19456,t=2,p=1\$[^$]+\$[^$]+$/;
 

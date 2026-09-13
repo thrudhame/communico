@@ -20,7 +20,6 @@
     "#engine/": "./api/engine/",
     "#endpoints/": "./api/endpoints/",
     "#hats/": "./api/hats/",
-    "#lite/": "./lite/",
     "#root/": "./",
     "#tests/": "./tests/",
     "@pathfinder/pathfinder": "jsr:@pathfinder/pathfinder@0.2.0",

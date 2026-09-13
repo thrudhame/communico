@@ -7,7 +7,7 @@ import {
   resolveState as stubResolveState,
   selectAuthEvents as stubSelectAuthEvents,
   stateKeyOf,
-} from '#lite/web/sync/rulebook/v11-stub.js';
+} from '#engine/rulebook/v11-stub.js';
 import type { Pdu } from './pdu.ts';
 
 export type AuthVerdict = 'ok' | 'authchain-reject' | 'state-reject' | 'soft-fail';

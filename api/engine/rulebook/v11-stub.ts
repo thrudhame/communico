@@ -1,6 +1,6 @@
 // api/engine/rulebook/v11-stub.ts — server-side entry to the shared
 // refusing stub. The implementation lives in exactly one source file,
-// lite/web/sync/rulebook/v11-stub.js, consumed by both engines
+// (was lite/web/sync/rulebook/v11-stub.js, moved into the engine; the shim itself is unused)
 // (byte-identical selection is a correctness requirement). This module
 // only re-exports it with server-side types.
 export {
@@ -9,4 +9,4 @@ export {
   selectAuthEvents,
   stateKeyOf,
   version,
-} from '#lite/web/sync/rulebook/v11-stub.js';
+} from '#engine/rulebook/v11-stub.js';

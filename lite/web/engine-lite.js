@@ -24,7 +24,7 @@ import {
   resolveState,
   selectAuthEvents,
   stateKeyOf,
-} from './sync/rulebook/v11-stub.js';
+} from '#engine/rulebook/v11-stub.js';
 import {
   b32decode,
   b32encode,
@@ -32,7 +32,7 @@ import {
   isKeyName,
   signJson,
   verifyJson,
-} from './sync/signing.js';
+} from '#engine/signing-primitives.js';
 import { isPduShape } from './sync/pdu.js';
 import { materialize } from './sync/materialize.js';
 

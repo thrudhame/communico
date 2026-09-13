@@ -1,7 +1,7 @@
 // api/engine/signing.ts — server-side PDU signing (F1 tenant key).
 // Order per spec (server-server API § "Adding hashes and signatures to
 // outgoing events"): content hash -> redact -> sign. The shared WebCrypto
-// primitives live in lite/web/sync/signing.js. The signing key lives in
+// primitives live in ./signing-primitives.js (moved from lite). The signing key lives in
 // the tenant table (api/engine/tenant.ts — generate-once, reuse-forever;
 // F0's server_signing_key table survives as the migration source).
 import { SERVER_DB, withDb } from './db.ts';
@@ -20,7 +20,7 @@ import {
   importPublicKeyFromRaw,
   signJson,
   verifyJson,
-} from '#lite/web/sync/signing.js';
+} from '#engine/signing-primitives.js';
 
 export const SERVER_KEY_ID = '1';
 

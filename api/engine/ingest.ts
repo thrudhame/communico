@@ -13,7 +13,7 @@ import {
   type StateMap,
 } from './policy.ts';
 import type { Pdu } from './pdu.ts';
-import { contentHashOf, importPublicKeyFromRaw, isKeyName, b32decode } from '#lite/web/sync/signing.js';
+import { contentHashOf, importPublicKeyFromRaw, isKeyName, b32decode } from '#engine/signing-primitives.js';
 
 export interface IngestResult {
   event_id: string;
