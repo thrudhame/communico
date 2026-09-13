@@ -31,7 +31,8 @@ RUN chmod +x /app/complement/entrypoint.sh
 # The image's env contract (ruling 8 — infra keeps its numbers): the app
 # reads every variable from the environment; Complement overrides SERVER_NAME
 # per deployment at container start.
-ENV APP_PORT=8008 SERVER_NAME=localhost DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=root DB_PASS=secret DB_NAME=postgres
+ENV APP_PORT=8008 SERVER_NAME=localhost DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=root DB_PASS=secret DB_NAME=postgres MEDIA_ROOT=/data/media MEDIA_MAX_BYTES=52428800
+RUN mkdir -p /data/media
 RUN deno cache main.ts db/init.ts complement/tls-stub.ts
 
 EXPOSE 8008 8448

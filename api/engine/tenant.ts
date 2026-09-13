@@ -793,3 +793,101 @@ export async function getAccountData(
       : r.rows[0].content;
   });
 }
+
+// --- M2: media -------------------------------------------------------------
+// Metadata only — the bytes live on disk under MEDIA_ROOT (plan §3.4).
+
+/** One row of the tenant's media table. */
+export interface MediaRow {
+  media_id: string;
+  localpart: string;
+  state: 'pending' | 'uploaded';
+  content_type: string | null;
+  filename: string | null;
+  size_bytes: number | null;
+  created_ms: number;
+  uploaded_ms: number | null;
+}
+
+/** The metadata an upload records (direct POST or async PUT). */
+export interface MediaMeta {
+  content_type?: string;
+  filename?: string;
+  size_bytes?: number;
+}
+
+/** Insert a media row; 'pending' = id created, bytes not yet stored. */
+export async function createMedia(
+  serverName: string,
+  localpart: string,
+  mediaId: string,
+  state: 'pending' | 'uploaded',
+  meta?: MediaMeta,
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    const createdMs = Date.now();
+    await c.query(
+      `INSERT INTO media (media_id, localpart, state, content_type, filename, size_bytes, created_ms, uploaded_ms)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8);`,
+      [
+        mediaId,
+        localpart,
+        state,
+        meta?.content_type ?? null,
+        meta?.filename ?? null,
+        meta?.size_bytes ?? null,
+        createdMs,
+        state === 'uploaded' ? createdMs : null,
+      ],
+    );
+  });
+}
+
+/** The media row, or null when the id is unknown. */
+export async function getMedia(
+  serverName: string,
+  mediaId: string,
+): Promise<MediaRow | null> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      'SELECT media_id, localpart, state, content_type, filename, size_bytes, created_ms, uploaded_ms FROM media WHERE media_id = $1;',
+      [mediaId],
+    );
+    if (r.rows.length === 0) return null;
+    const row = r.rows[0];
+    return {
+      media_id: String(row.media_id),
+      localpart: String(row.localpart),
+      state: row.state === 'uploaded' ? 'uploaded' as const : 'pending' as const,
+      content_type: row.content_type == null ? null : String(row.content_type),
+      filename: row.filename == null ? null : String(row.filename),
+      size_bytes: row.size_bytes == null ? null : Number(row.size_bytes),
+      created_ms: Number(row.created_ms),
+      uploaded_ms: row.uploaded_ms == null ? null : Number(row.uploaded_ms),
+    };
+  });
+}
+
+/** Finish a pending upload: the bytes are on disk; record the metadata. */
+export async function markUploaded(
+  serverName: string,
+  mediaId: string,
+  meta: MediaMeta,
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    await c.query(
+      `UPDATE media SET state = 'uploaded', content_type = $2, filename = $3,
+       size_bytes = $4, uploaded_ms = $5 WHERE media_id = $1;`,
+      [
+        mediaId,
+        meta.content_type ?? null,
+        meta.filename ?? null,
+        meta.size_bytes ?? null,
+        Date.now(),
+      ],
+    );
+  });
+}

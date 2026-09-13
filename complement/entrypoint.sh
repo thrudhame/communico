@@ -65,4 +65,4 @@ TLS_CERT_FILE="$CERT_DIR/server.crt" TLS_KEY_FILE="$CERT_DIR/server.key" \
   > /tmp/tls-stub.log 2>&1 &
 echo ">> starting communico :8008"
 export SERVER_NAME DB_HOST DB_PORT DB_USER DB_PASS DB_NAME
-exec deno run --allow-net --allow-env --allow-read "$APP_DIR/main.ts"
+exec deno run --allow-net --allow-env --allow-read --allow-write "$APP_DIR/main.ts"

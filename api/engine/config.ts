@@ -12,6 +12,8 @@ export const REQUIRED_VARS: readonly string[] = [
   'DB_USER',
   'DB_PASS',
   'DB_NAME',
+  'MEDIA_ROOT',
+  'MEDIA_MAX_BYTES',
 ];
 
 /** The names that must be in the environment; empty = all present. */

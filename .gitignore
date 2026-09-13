@@ -3,6 +3,7 @@
 /debug
 /.env
 /.envrc
+/.media/
 # Complement run artifacts (regenerable; BASELINE.md is the record)
 complement/baseline.jsonl
 complement/work-*

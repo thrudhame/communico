@@ -8,8 +8,8 @@
   },
   "tasks": {
 "check": "deno check main.ts api/ tests/*.ts demo/*.ts",
-    "dev": "deno run --env --allow-net --allow-env --allow-read --watch main.ts",
-    "start": "deno --env --allow-net --allow-env --allow-read main.ts",
+    "dev": "deno run --env --allow-net --allow-env --allow-read --allow-write --watch main.ts",
+    "start": "deno --env --allow-net --allow-env --allow-read --allow-write main.ts",
     "setup": "deno --env --allow-net --allow-env setup.ts",
     "test": "deno test --env --allow-net --allow-env --allow-read --allow-write --allow-run tests/*",
     "db-init": "deno run --env --allow-net --allow-env --allow-read db/init.ts",
