@@ -7,8 +7,9 @@ is a content hash of the event itself.
 
 Active line: `server-foundation` — engine contract (F0) → Complement
 harness (M0) → identity + registration (F1) → HTTP layer on pathfinder
-(M1). See `HOW-IT-WORKS.md` for the architecture; the evidence log lives
-in `~/Documents/communico/research/RESULTS.md`.
+(M1) → account surface + media (M2). See `HOW-IT-WORKS.md` for the
+architecture; the evidence log lives in
+`~/Documents/communico/research/RESULTS.md`.
 
 ## Quickstart (demo)
 
@@ -37,23 +38,30 @@ Image contract, blacklist philosophy, and the red number to beat:
 
 - `api/engine/` — room core: PDU ingest, per-version policy slot,
   tenant identity, sync feeds. `state` is written only by the resolver.
-- `api/endpoints/_matrix/` — Client-Server surface (register, login,
-  rooms, sync, …).
+- `api/endpoints/matrix/` — Client-Server surface (register, login,
+  rooms, sync, devices, profiles, account, pushers, account data,
+  media, …).
 - `db/` — `server/` (room registry, event index), `room/` (per-room
   schema), `tenant/` (per-tenant identity schema).
 - `complement/` — Docker image, entrypoint, blacklist, runner, baseline.
 - `demo/` — three-party demo scripts and tour.
-- `spikes/` — engineering notes and the phase-by-phase evidence log.
 
 ## Status and roadmap
 
 Done: v11 PDU engine with refusing stub resolver, Complement harness
-with red baseline, tenant identity (argon2id UIA registration), and the
+with red baseline, tenant identity (argon2id UIA registration), the
 HTTP layer on pathfinder 0.2.0 (M1) — two roots collapsed to the single
-Matrix client-server listener on `APP_PORT`. Deliberately stubbed: real
+Matrix client-server listener on `APP_PORT` — and the M2 account
+surface + media: devices, profiles, password change and deactivation
+over a shared UIA helper, pushers (stored, never delivered), account
+data, and the content repository (upload, async create/PUT,
+authenticated + legacy download, config; bytes on disk under
+`MEDIA_ROOT`, metadata in the tenant DB). Deliberately stubbed: real
 state resolution (M3), server-to-server federation (M5, `:8448` serves
-TLS + 404 today), E2EE/push/appservices/rate limiting. The browser
-homeserver (communico-lite) and native sync are parked — prior art on
-`research/lite`, plan in `~/Documents/communico/plans/lite/`. Pushes
-are user-gated.
+TLS + 404 today), E2EE, push delivery/rules, appservices, rate
+limiting, media thumbnails/previews/remote fetch/retention. The legacy
+unauthenticated media download is a documented liability — frozen at a
+later milestone. The browser homeserver (communico-lite) and native
+sync are parked — prior art on `research/lite`, plan in
+`~/Documents/communico/plans/lite/`. Pushes are user-gated.
 

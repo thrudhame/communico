@@ -53,7 +53,7 @@ state.
   a conflict adopts the DAG, holds pre-adoption state, and returns the
   refusal instead of throwing.
 
-## 2. Identity and registration (`db/tenant/`, `api/engine/tenant.ts`)
+## 2. Identity, account surface, media (`db/tenant/`, `api/engine/{tenant,uia,media}.ts`)
 
 - A **tenant** = one identity DB + its room DBs + hat config
   (`tenant_<sha(SERVER_NAME)>`; N = 1 today, and no code cares).
@@ -65,14 +65,45 @@ state.
   (`@alice:<server>`) — custodial, as in Matrix. Passwords are
   **argon2id PHC strings** (OWASP defaults m=19456/t=2/p=1, ~29 ms;
   algorithm+params+salt in-band). No unsalted SHA-256 anywhere.
-- `/register` is real UIA (dummy + password stages, persisted
-  sessions — required, never one-shot; bodies validated before UIA:
-  spec localpart grammar + downcasing, `M_USER_IN_USE`,
-  `inhibit_login`, `device_id`, `/register/available`). `/login`
-  verifies argon2id (403 `M_FORBIDDEN`); `/logout` removes token +
-  device, `/logout/all` removes them user-wide; `/devices` lists them.
-  Tokens are bearer credentials in the tenant DB; unknown/missing
-  tokens are proper 401s. Dev seeds register through this same path.
+- `/register` is real UIA (dummy + password stages, persisted sessions;
+  bodies validated before UIA: spec localpart grammar + downcasing,
+  `M_USER_IN_USE`, `inhibit_login`, `device_id`,
+  `/register/available`). `/login` verifies argon2id (403
+  `M_FORBIDDEN`, 403 `M_USER_DEACTIVATED` after deactivation) and
+  honors `device_id`/`initial_device_display_name`; `/logout` removes
+  token + device, `/logout/all` removes them user-wide. Tokens are
+  bearer credentials in the tenant DB; unknown/missing tokens are
+  proper 401s. Dev seeds register through this same path.
+- **M2 account surface** — all UIA goes through one shared helper
+  (`api/engine/uia.ts`): session or one-shot, a caller/identifier
+  mismatch 403s BEFORE any password verification, a wrong password is
+  a 401 `M_FORBIDDEN` carrying the UIA keys. On top of it: devices
+  (get/list/rename, delete via password UIA — a bodyless DELETE is the
+  spec's first UIA step, not a parse fault), profiles (public read,
+  self-only write, foreign mxc avatar URLs stored verbatim), password
+  change (`logout_devices` default true — other tokens AND their
+  pushers die; the caller's token is kept) and deactivation. Pushers
+  are stored, never delivered — `data.url` is never fetched. Account
+  data (global + per-room) writes/reads the BARE content object;
+  missing reads are 404 `M_NOT_FOUND`.
+- **Media (M2)** — bytes on disk under `MEDIA_ROOT` (a required env
+  var, like `MEDIA_MAX_BYTES`; nine total), metadata in the tenant
+  `media` table. Uploads stream through a counting writer to
+  `<id>.part` — over the limit aborts, deletes the part, and answers
+  413 `M_TOO_LARGE`; success renames to the final path. Async flow:
+  `POST /media/v1/create` mints a pending id (`unused_expires_at` =
+  created + 24 h), `PUT /media/v3/upload/{server}/{id}` fills it (409
+  `M_CANNOT_OVERWRITE_MEDIA` on a second PUT, 403 across users).
+  Downloads: the authenticated `client/v1` route (401 before any
+  lookup) and the legacy unauthenticated one (spec-deprecated — frozen
+  at a later milestone). Served headers per spec v1.16: stored
+  `Content-Type` verbatim, `Content-Disposition` computed from the
+  stored type (26-entry inline allow-list, else `attachment`; RFC 6266
+  filename), the recommended CSP, `Cross-Origin-Resource-Policy:
+  cross-origin`. mxc components are whitelist-checked
+  (`^[A-Za-z0-9_-]+$`) before any lookup — never touch the filesystem
+  with an unvalidated id. No thumbnails, previews, remote fetch, or
+  retention in M2.
 
 ## 3. Sync (parked)
 
@@ -100,9 +131,11 @@ container restarts.
 
 Real v11/v12 resolution behind the same policy slot (M3, incl.
 power-level auth); S2S federation (M5); relay `bind/forward`;
-E2EE/appservices/push/rate limiting; `/_matrix/key/*` and `.well-known`;
-at-rest encryption of tenant private keys. Stub-era rooms are flagged
-and will never federate.
+E2EE; push delivery/rules (M2's pushers are storage-only);
+appservices; rate limiting; media thumbnails, URL previews, remote
+fetch, and retention (M2 is local store-and-serve only);
+`/_matrix/key/*` and `.well-known`; at-rest encryption of tenant
+private keys. Stub-era rooms are flagged and will never federate.
 
 ## 6. Verification
 

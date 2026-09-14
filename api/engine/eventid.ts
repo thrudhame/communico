@@ -1,7 +1,7 @@
 import { canonicalJson } from './canonical.ts';
 
 // Room v11 redaction rules, TRANSCRIBED from the spec during execution
-// (never recalled) — https://spec.matrix.org/v1.11/rooms/v11/ ,
+// (never recalled) — https://spec.matrix.org/v1.16/rooms/v11/ ,
 // section "Client considerations → Redactions" ("Upon receipt of a
 // redaction event, the server must strip off any keys not in the
 // following list"):
