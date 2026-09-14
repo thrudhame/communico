@@ -45,10 +45,22 @@ Deno.test('rule 1: a non-object auth is ignored; a top-level body.session is hon
   });
 });
 
-Deno.test('rules 3+6: one-shot dummy — no session anywhere — creates, completes, drops, returns', async () => {
-  await requireUia({
+Deno.test('rule 3 + the register exception: caller-less UIA requires a session — one-shot dummy gets a fresh-session 401, then the session completes', async () => {
+  // Register (no caller) never one-shots: Complement TestRegistration
+  // "Registration without a session fails" requires the 401 once the
+  // server issues sessions. The 401 body is the rule-2 three-key shape.
+  const err = await uiaError(requireUia({
     serverName: SN,
     body: { auth: { type: 'm.login.dummy' } },
+    flows: DUMMY_FLOWS,
+  }));
+  assertEquals(err.status, 401);
+  const body = err.responseBody();
+  assertEquals(Object.keys(body).sort(), ['flows', 'params', 'session']);
+  // Rule 3: the issued session + dummy completes the flow.
+  await requireUia({
+    serverName: SN,
+    body: { auth: { type: 'm.login.dummy', session: body.session as string } },
     flows: DUMMY_FLOWS,
   });
 });

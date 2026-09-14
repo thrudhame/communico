@@ -7,7 +7,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { serverName } from '#engine/config.ts';
-import { registerTestUser } from './util.ts';
+import { registerTestUser, resetUser } from './util.ts';
 
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 const SN = serverName();
@@ -60,6 +60,29 @@ function pwAuth(localpart: string, password: string, session?: string): Json {
   if (session !== undefined) auth.session = session;
   return auth;
 }
+
+Deno.test('register: dummy auth WITHOUT a session → 401 (session required); with the session → 200', async () => {
+  // Wire pin for the Complement TestRegistration regression caught by the
+  // M2 baseline run: register's UIA session is required, never one-shot
+  // ("Registration without a session fails" — apidoc_register_test.go:299).
+  await resetUser('nosess');
+  const r1 = await call('/_matrix/client/v3/register', {
+    method: 'POST',
+    body: { username: 'nosess', password: 'pw-nosess', auth: { type: 'm.login.dummy' } },
+  });
+  assertEquals(r1.status, 401);
+  assertEquals(typeof r1.body.session, 'string');
+  const r2 = await call('/_matrix/client/v3/register', {
+    method: 'POST',
+    body: {
+      username: 'nosess',
+      password: 'pw-nosess',
+      auth: { type: 'm.login.dummy', session: r1.body.session },
+    },
+  });
+  assertEquals(r2.status, 200);
+  assertEquals(r2.body.user_id, `@nosess:${SN}`);
+});
 
 Deno.test('A1: login honors device_id + display name; GET/list/PUT; unknown → 404', async () => {
   const alice = await registerTestUser('a1alice', 'pw-a1alice');

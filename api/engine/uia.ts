@@ -159,6 +159,15 @@ export async function requireUia(opts: {
     flows.some((f) => f.stages.every((s) => completed.includes(s)));
 
   if (session === null) {
+    // Caller-less UIA (register) requires a persisted session — never
+    // one-shot: a dummy attempt with no session gets a fresh-session 401
+    // (pre-M2 register behavior, which commit "Shared UIA helper" must
+    // preserve; Complement TestRegistration "Registration without a
+    // session fails" requires the 401 once the server issues sessions).
+    if (caller === undefined) {
+      const fresh = await createUiaSession(serverName, flows);
+      throw uiaRequired(fresh, flows, false);
+    }
     // Rule 6: one-shot — no session anywhere; create + complete + drop in
     // the same call (A4/A6 send no session). Without a completed attempt,
     // a fresh session answers the rule-5 401.
