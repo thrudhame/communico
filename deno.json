@@ -7,7 +7,8 @@
     "./setup": "./setup.ts"
   },
   "tasks": {
-"check": "deno check main.ts api/ tests/*.ts demo/*.ts",
+    "check": "deno fmt --check && deno lint && deno check main.ts api/ tests/*.ts tests/rulebook/*.ts demo/*.ts",
+    "fmt": "deno fmt",
     "dev": "deno run --env --allow-net --allow-env --allow-read --allow-write --watch main.ts",
     "start": "deno --env --allow-net --allow-env --allow-read --allow-write main.ts",
     "setup": "deno --env --allow-net --allow-env setup.ts",
@@ -33,7 +34,9 @@
   "workspace": ["./api"],
   "fmt": {
     "options": {
-      "singleQuote": true
-    }
+      "singleQuote": true,
+      "proseWrap": "preserve"
+    },
+    "exclude": ["complement/BASELINE.md"]
   }
 }
