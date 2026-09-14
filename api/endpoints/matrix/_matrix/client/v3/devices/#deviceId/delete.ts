@@ -12,12 +12,21 @@ import type { PathfinderRequest, Context } from '@pathfinder/pathfinder';
 // Management.) The 401 carries flows/params/session per the UIA contract;
 // a wrong password is a 401 M_FORBIDDEN. 404 when the device is unknown or
 // not owned by the caller. Response: {}.
+// A bodyless DELETE is the spec's first UIA step (Complement A1 :129-199)
+// — an absent/empty body is {}, never a parse fault.
 export default async function (request: PathfinderRequest, context: Context) {
   const caller = context.state.user as string;
   const localpart = localpartOf(caller);
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await parseJson(request)) as Record<string, unknown>;
+  } catch (e) {
+    if (e instanceof Error && e.name === 'ParseError') body = {};
+    else throw e;
+  }
   await requireUia({
     serverName: serverName(),
-    body: await parseJson(request) as Record<string, unknown>,
+    body,
     flows: PASSWORD_FLOWS,
     caller,
   });
