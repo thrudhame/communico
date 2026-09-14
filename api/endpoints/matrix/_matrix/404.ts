@@ -1,25 +1,20 @@
 import type { Context } from '@pathfinder/pathfinder';
+import { HttpError } from '@pathfinder/pathfinder';
 import { json } from '@pathfinder/pathfinder/response';
 
-// Matrix-shaped 404 for the whole _matrix tree (replaces the framework's
-// default {"detail"} page). Two sources reach it, told apart by
-// context.miss (pathfinder renders this page for BOTH and does not expose
-// the thrown value — TODO-0.3.0 item 2):
-// - routing miss (context.miss carries the match data) → the address or
-//   method is unknown: M_UNRECOGNIZED, per the M1 contract.
-// - handler-thrown MatrixError(404) (no miss) → the address exists, the
-//   resource does not: M_NOT_FOUND. Every thrown 404 in this tree is
-//   M_NOT_FOUND (media/profile/account-data resources); the thrown error
-//   message is lost to the page, so the reason is generic.
+// Matrix-shaped 404 for the _matrix tree. Two sources, told apart by what
+// pathfinder hands the page (0.2.2): a handler threw → context.error is
+// that HttpError and its body is the answer; a routing miss → no thrown
+// error, the address/method is unknown: M_UNRECOGNIZED (spec: 404 for an
+// unimplemented endpoint).
 // deno-lint-ignore require-await
 export default async function (_request: unknown, context: Context) {
-  return context.miss !== undefined
-    ? json(
-      { errcode: 'M_UNRECOGNIZED', error: 'Unrecognized request' },
-      { status: 404 },
-    )
-    : json(
-      { errcode: 'M_NOT_FOUND', error: 'Not found' },
-      { status: 404 },
-    );
+  const thrown = context.error;
+  if (thrown instanceof HttpError && thrown.body !== undefined) {
+    return json(thrown.body, { status: 404 });
+  }
+  return json(
+    { errcode: 'M_UNRECOGNIZED', error: 'Unrecognized request' },
+    { status: 404 },
+  );
 }
