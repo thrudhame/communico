@@ -1,10 +1,10 @@
-# Complement baseline — 2026-09-14T02:03:37.808Z
+# Complement baseline — 2026-09-14T08:51:49.243Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit 752371e)
+- image: communico-complement:local (commit a570fef)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 224
+- failing tests: 222
 
 ## Failing packages
 
@@ -18,9 +18,9 @@
 - github.com/matrix-org/complement/tests TestIsDirectFlagFederation
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode
@@ -40,23 +40,21 @@
 - github.com/matrix-org/complement/tests TestRemotePngThumbnail/test_/_matrix/client/v1/media_endpoint
 - github.com/matrix-org/complement/tests TestRemotePngThumbnail
 - github.com/matrix-org/complement/tests TestFederationThumbnail
-- github.com/matrix-org/complement/tests/csapi TestRequestEncodingFails/POST_rejects_invalid_utf-8_in_JSON
 - github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryLocal
-- github.com/matrix-org/complement/tests/csapi TestRequestEncodingFails
 - github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryFederation
 - github.com/matrix-org/complement/tests/csapi TestRoomAlias/Parallel/PUT_/directory/room/:room_alias_creates_alias
 - github.com/matrix-org/complement/tests/csapi TestRoomAlias/Parallel/Room_aliases_can_contain_Unicode
-- github.com/matrix-org/complement/tests/csapi TestRoomAlias/Parallel/Only_room_members_can_list_aliases_of_a_room
 - github.com/matrix-org/complement/tests/csapi TestRoomAlias/Parallel/GET_/rooms/:room_id/aliases_lists_aliases
+- github.com/matrix-org/complement/tests/csapi TestRoomAlias/Parallel/Only_room_members_can_list_aliases_of_a_room
 - github.com/matrix-org/complement/tests/csapi TestRoomAlias/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomAlias
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin
 - github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Alias_creators_can_delete_alias_with_no_ops
-- github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Regular_users_can_add_and_delete_aliases_in_the_default_room_configuration
-- github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Deleting_a_non-existent_alias_should_return_a_404
 - github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Users_with_sufficient_power-level_can_delete_other's_aliases
 - github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Users_can't_delete_other's_aliases
+- github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Deleting_a_non-existent_alias_should_return_a_404
 - github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Regular_users_can_add_and_delete_aliases_when_m.room.aliases_is_restricted
+- github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Regular_users_can_add_and_delete_aliases_in_the_default_room_configuration
 - github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Can_delete_canonical_alias
 - github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel/Alias_creators_can_delete_canonical_alias_with_no_ops
 - github.com/matrix-org/complement/tests/csapi TestRoomDeleteAlias/Parallel
@@ -65,26 +63,26 @@
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinLocalUser
 - github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_accepts_present_aliases
 - github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_accepts_present_alt_aliases
+- github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_rejects_alias_pointing_to_different_local_room
 - github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_setting_rejects_deleted_aliases
 - github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_rejects_invalid_aliases#01
 - github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_rejects_alt_alias_pointing_to_different_local_room
-- github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_rejects_alias_pointing_to_different_local_room
 - github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_rejects_missing_aliases#01
-- github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_rejects_missing_aliases
 - github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_rejects_invalid_aliases
+- github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel/m.room.canonical_alias_rejects_missing_aliases
 - github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCanonicalAlias
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/Rooms_can_be_created_with_an_initial_invite_list_(SYN-205)
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_ignores_attempts_to_set_the_room_version_via_creation_content
-- github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_makes_a_room_with_a_name
-- github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_makes_a_room_with_a_topic_and_writes_rich_topic_representation
-- github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_rejects_attempts_to_create_rooms_with_numeric_versions
+- github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_makes_a_room_with_a_name
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_makes_a_room_with_a_topic_via_initial_state_overwritten_by_topic
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_makes_a_room_with_a_topic
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
+- github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_rejects_attempts_to_create_rooms_with_numeric_versions
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_makes_a_room_with_a_topic_via_initial_state
+- github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
 - github.com/matrix-org/complement/tests/csapi TestRoomForget/Parallel/Can't_forget_room_you're_still_in
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
@@ -105,45 +103,45 @@
 - github.com/matrix-org/complement/tests TestClientSpacesSummaryJoinRules
 - github.com/matrix-org/complement/tests/csapi TestFetchHistoricalInvitedEventFromBeforeInvite
 - github.com/matrix-org/complement/tests TestFederatedClientSpaces
-- github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs
 - github.com/matrix-org/complement/tests/csapi TestFetchEventWorldReadable
+- github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs
 - github.com/matrix-org/complement/tests TestJumpToDateEndpoint
 - github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/rooms/:room_id/join_can_join_a_room
-- github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/join/:room_alias_can_join_a_room_with_custom_content
+- github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room_with_custom_content
 - github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/rooms/:room_id/leave_can_leave_a_room
+- github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created
 - github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/rooms/:room_id/invite_can_send_an_invite
 - github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/rooms/:room_id/ban_can_ban_a_user
-- github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created
 - github.com/matrix-org/complement/tests TestUnknownEndpoints/Server-server_endpoints
 - github.com/matrix-org/complement/tests TestUnknownEndpoints/Key_endpoints
+- github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/join/:room_alias_can_join_a_room_with_custom_content
 - github.com/matrix-org/complement/tests TestUnknownEndpoints
-- github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room_with_custom_content
-- github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room
 - github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/join/:room_alias_can_join_a_room
+- github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room
 - github.com/matrix-org/complement/tests/csapi TestRoomMembers/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomMembers
 - github.com/matrix-org/complement/tests/csapi TestRoomReceipts
 - github.com/matrix-org/complement/tests/csapi TestRoomReadMarkers
 - github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.member/:user_id_fetches_my_membership
-- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/POST_/rooms/:room_id/state/m.room.name_sets_name
-- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/joined_members_is_forbidden_after_leaving_room
-- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/publicRooms_lists_newly-created_room
-- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/PUT_/createRoom_with_creation_content
-- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/state_fetches_entire_room_state
-- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/PUT_/rooms/:room_id/state/m.room.topic_sets_topic
-- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.topic_gets_topic
-- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/joined_rooms_lists_newly-created_room
 - github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.name_gets_name
+- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/publicRooms_lists_newly-created_room
+- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/joined_members_is_forbidden_after_leaving_room
+- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/joined_rooms_lists_newly-created_room
 - github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/directory/room/:room_alias_yields_room_ID
 - github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.power_levels_fetches_powerlevels
 - github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/joined_members_fetches_my_membership
+- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/PUT_/createRoom_with_creation_content
 - github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.member/:user_id?format=event_fetches_my_membership_event
+- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/state_fetches_entire_room_state
+- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.topic_gets_topic
+- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/POST_/rooms/:room_id/state/m.room.name_sets_name
+- github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel/PUT_/rooms/:room_id/state/m.room.topic_sets_topic
 - github.com/matrix-org/complement/tests/csapi TestRoomState/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomState
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_search_for_an_event_by_body
+- github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_works_across_an_upgraded_room_and_its_predecessor
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_results_with_recent_ordering_do_not_include_redacted_events
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_results_with_rank_ordering_do_not_include_redacted_events
-- github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_works_across_an_upgraded_room_and_its_predecessor
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_get_context_around_search_results
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_back-paginate_search_results
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel
@@ -194,13 +192,13 @@
 - github.com/matrix-org/complement/tests/csapi TestLeakyTyping
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/joining_a_remote_upgraded_room_carries_over_existing_push_rules
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/joining_a_remote_manually_upgraded_room_carries_over_existing_push_rules
-- github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/upgrading_a_room_carries_over_existing_push_rules_for_local_users
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/manually_upgrading_a_room_carries_over_existing_push_rules_for_local_users
+- github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/upgrading_a_room_carries_over_existing_push_rules_for_local_users
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade
 - github.com/matrix-org/complement/tests/csapi TestRoomsInvite/Parallel/Can_invite_users_to_invite-only_rooms
-- github.com/matrix-org/complement/tests/csapi TestRoomsInvite/Parallel/Users_cannot_invite_themselves_to_a_room
 - github.com/matrix-org/complement/tests/csapi TestRoomsInvite/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created
+- github.com/matrix-org/complement/tests/csapi TestRoomsInvite/Parallel/Users_cannot_invite_themselves_to_a_room
 - github.com/matrix-org/complement/tests/csapi TestRoomsInvite/Parallel/Invited_user_can_see_room_metadata
 - github.com/matrix-org/complement/tests/csapi TestRoomsInvite/Parallel/Users_cannot_invite_a_user_that_is_already_in_the_room
 - github.com/matrix-org/complement/tests/csapi TestRoomsInvite/Parallel/Invited_user_can_reject_invite
