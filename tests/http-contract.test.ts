@@ -4,9 +4,14 @@
 //   - deep helper throwing HttpError(401, {errcode…}) → verbatim Matrix body
 //   - malformed JSON → 400 {"errcode":"M_NOT_JSON"} (10-json middleware)
 //   - CORS stamped on 404 / 405 / 500 / thrown HttpError
-// No DB needed: every asserted path resolves before any engine query.
+//   - 0.2.2 outcome pages: thrown-error bodies survive; invalid UTF-8 →
+//     M_NOT_JSON (fatal decode over body.bytes())
+// Mostly DB-free: every asserted path resolves before any engine query,
+// except the two thrown-body cases (plan pathfinder-0.2.2 §2 #7), which
+// register a user against live doltgres to get a real token.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
+import { registerTestUser } from './util.ts';
 
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 
@@ -229,4 +234,73 @@ Deno.test('profile of a foreign-server user → 404 M_NOT_FOUND before any DB qu
   );
   assertEquals(res.status, 404);
   assertEquals((await res.json()).errcode, 'M_NOT_FOUND');
+});
+
+Deno.test('A8: invalid UTF-8 in a JSON body → 400 M_NOT_JSON (fatal decode over body.bytes())', async () => {
+  // Complement apidoc_request_encoding_test.go:20-28: the raw bytes
+  // { "test":"a\x81" } — 0x81 is invalid UTF-8. text() would decode it
+  // non-fatally (U+FFFD) and JSON.parse would then succeed; 10-json's
+  // fatal TextDecoder catches it before any handler runs.
+  const bytes = new Uint8Array([
+    ...new TextEncoder().encode('{ "test":"a'),
+    0x81,
+    ...new TextEncoder().encode('" }'),
+  ]);
+  const res = await matrix(
+    new Request('http://x/_matrix/client/v3/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: bytes as BodyInit,
+    }),
+  );
+  assertEquals(res.status, 400);
+  assertEquals((await res.json()).errcode, 'M_NOT_JSON');
+});
+
+Deno.test('thrown 404 keeps its own body through the page; a miss stays M_UNRECOGNIZED', async () => {
+  // 0.2.2: context.error carries the thrown HttpError into the outcome
+  // page — the page renders the THROWN body (errcode AND message), not a
+  // fixed fallback. A routing miss (no thrown error) keeps the page text.
+  const u = await registerTestUser('hc404', 'pw-hc404');
+  const res = await matrix(
+    new Request('http://x/_matrix/client/v3/devices/unknown_device', {
+      headers: { Authorization: `Bearer ${u.access_token}` },
+    }),
+  );
+  assertEquals(res.status, 404);
+  assertEquals(await res.json(), { errcode: 'M_NOT_FOUND', error: 'unknown device' });
+  const miss = await matrix(new Request('http://x/_matrix/client/v3/nope'));
+  assertEquals(miss.status, 404);
+  assertEquals((await miss.json()).errcode, 'M_UNRECOGNIZED');
+});
+
+Deno.test('thrown 413 keeps M_TOO_LARGE through the page (not the fixed fallback)', async () => {
+  const dir = await Deno.makeTempDir();
+  const prevRoot = Deno.env.get('MEDIA_ROOT');
+  const prevMax = Deno.env.get('MEDIA_MAX_BYTES');
+  Deno.env.set('MEDIA_ROOT', dir);
+  Deno.env.set('MEDIA_MAX_BYTES', '8');
+  try {
+    const u = await registerTestUser('hc413', 'pw-hc413');
+    const res = await matrix(
+      new Request('http://x/_matrix/media/v3/upload', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${u.access_token}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: new Uint8Array(9) as BodyInit,
+      }),
+    );
+    assertEquals(res.status, 413);
+    assertEquals(await res.json(), {
+      errcode: 'M_TOO_LARGE',
+      error: 'Upload exceeds the server limit',
+    });
+  } finally {
+    if (prevRoot === undefined) Deno.env.delete('MEDIA_ROOT');
+    else Deno.env.set('MEDIA_ROOT', prevRoot);
+    if (prevMax === undefined) Deno.env.delete('MEDIA_MAX_BYTES');
+    else Deno.env.set('MEDIA_MAX_BYTES', prevMax);
+  }
 });
