@@ -219,3 +219,14 @@ Deno.test('tagline at / (text/plain)', async () => {
   assert(res.headers.get('content-type')?.startsWith('text/plain'));
   assert((await res.text()).startsWith('Communico'));
 });
+
+Deno.test('profile of a foreign-server user → 404 M_NOT_FOUND before any DB query', async () => {
+  // Plan §3.8: the server-part check precedes getProfile, so this stays
+  // DB-free like the rest of this file. The thrown 404 renders through
+  // _matrix/404.ts as M_NOT_FOUND (misses remain M_UNRECOGNIZED).
+  const res = await matrix(
+    new Request('http://x/_matrix/client/v3/profile/@nobody:x'),
+  );
+  assertEquals(res.status, 404);
+  assertEquals((await res.json()).errcode, 'M_NOT_FOUND');
+});

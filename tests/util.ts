@@ -39,3 +39,32 @@ export async function resetRoom(roomId: string): Promise<void> {
     await c.query('DELETE FROM event_index WHERE room_id = $1;', [roomId]);
   });
 }
+
+// --- M2 test helpers (plan §3.8) -------------------------------------------
+
+/** Wipe every tenant row for a localpart so wire tests re-register cleanly
+ * on reruns (the tenant.test.ts lifecycle pattern, extended to the M2
+ * tables). Children first — pushers references users AND access_tokens. */
+export async function resetUser(localpart: string): Promise<void> {
+  const { ensureTenant } = await import('#engine/tenant.ts');
+  const { serverName } = await import('#engine/config.ts');
+  const { dbName } = await ensureTenant(serverName());
+  const lp = localpart.toLowerCase();
+  await withDb(dbName, async (c) => {
+    await c.query('DELETE FROM pushers WHERE localpart = $1;', [lp]);
+    await c.query('DELETE FROM account_data WHERE localpart = $1;', [lp]);
+    await c.query('DELETE FROM media WHERE localpart = $1;', [lp]);
+    await c.query('DELETE FROM access_tokens WHERE localpart = $1;', [lp]);
+    await c.query('DELETE FROM devices WHERE localpart = $1;', [lp]);
+    await c.query('DELETE FROM credentials WHERE localpart = $1;', [lp]);
+    await c.query('DELETE FROM users WHERE localpart = $1;', [lp]);
+  });
+}
+
+/** Clean-slate register: resetUser, then registerUser. */
+export async function registerTestUser(localpart: string, password: string) {
+  await resetUser(localpart);
+  const { registerUser } = await import('#engine/tenant.ts');
+  const { serverName } = await import('#engine/config.ts');
+  return await registerUser(serverName(), { localpart, password });
+}
