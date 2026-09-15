@@ -1,14 +1,5 @@
-import {
-  assert,
-  assertEquals,
-  assertMatch,
-  assertRejects,
-} from '@std/assert';
-import {
-  createRoom,
-  extremities,
-  lookupRoom,
-} from '#engine/room.ts';
+import { assert, assertEquals, assertMatch, assertRejects } from '@std/assert';
+import { createRoom, extremities, lookupRoom } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
 import { reresolveFromDag } from '#engine/adopt.ts';
 import { stateNow } from '#engine/timeline.ts';
@@ -18,8 +9,9 @@ import { latestExtremityEventId, resetRoom } from './util.ts';
 const ROOM = '!policy:localhost';
 const ID_SHAPE = /^\$[A-Za-z0-9_-]{43}$/;
 
-// Genesis sequence (create -> join -> PL -> join_rules) passes the stub.
-Deno.test('policy: v11 genesis sequence passes the stub', async () => {
+// Genesis sequence (create -> join -> PL -> join_rules) passes the v11
+// rulebook.
+Deno.test('policy: v11 genesis sequence passes the rulebook', async () => {
   await resetRoom(ROOM);
   const { createEventId, memberEventId } = await createRoom(
     ROOM,
@@ -39,7 +31,9 @@ Deno.test('policy: v11 genesis sequence passes the stub', async () => {
     const branch = String((b.rows as any[])[0].name);
     const h = await c.query(`SELECT HASHOF('${branch}') AS h;`);
     const hash = String(h.rows[0].h);
-    const r = await c.query(`SELECT canonical_json FROM events AS OF '${hash}';`);
+    const r = await c.query(
+      `SELECT canonical_json FROM events AS OF '${hash}';`,
+    );
     // deno-lint-ignore no-explicit-any
     return (r.rows as any[]).map((row) =>
       typeof row.canonical_json === 'string'
@@ -70,7 +64,9 @@ Deno.test('policy: v11 genesis sequence passes the stub', async () => {
     );
   }
   // depths chain 1..4
-  const depths = [...pdus].sort((a, b) => a.depth - b.depth).map((p) => p.depth);
+  const depths = [...pdus].sort((a, b) => a.depth - b.depth).map((p) =>
+    p.depth
+  );
   assertEquals(depths, [1, 2, 3, 4]);
 });
 
@@ -132,8 +128,12 @@ Deno.test('policy: non-member write is state-rejected', async () => {
   );
 });
 
-// Concurrent power-level edits are refused, never merged by timestamp.
-Deno.test('policy: concurrent PL edits raise M_UNRESOLVED_CONFLICT', async () => {
+// Concurrent power-level edits now RESOLVE (M3): the S4 orderings pick the
+// winner — both edits are by the same sender (equal power), so the
+// reverse-topological power ordering ties and origin_server_ts breaks it
+// (earlier first); the later edit applies last and wins the key. The heal
+// then converges to one extremity.
+Deno.test('policy: concurrent PL edits resolve; the heal succeeds; one extremity', async () => {
   await resetRoom(ROOM);
   await createRoom(ROOM, '11', '@dev:localhost');
   const base = await latestExtremityEventId(ROOM);
@@ -154,7 +154,9 @@ Deno.test('policy: concurrent PL edits raise M_UNRESOLVED_CONFLICT', async () =>
     sender: '@dev:localhost',
     content: { users: { '@dev:localhost': 100 }, state_default: 100 },
     prev_events: [base],
-    // a far-later timestamp must NOT win (timestamps decide nothing)
+    // S4 70-71: equal power -> the earlier origin_server_ts orders first,
+    // so this LATER edit legitimately applies last and wins (not a
+    // latest-wins guess — a specified tie-break).
     origin_server_ts: 9999999999999,
   });
   await ingestEvent(ROOM, plb);
@@ -163,26 +165,31 @@ Deno.test('policy: concurrent PL edits raise M_UNRESOLVED_CONFLICT', async () =>
   const xb = await extremities(room.dbName, ROOM);
   assertEquals(xb.length, 2, 'fork stands: two extremities');
 
-  // the heal is refused — no guessed winner (authoring over conflicted
-  // parents throws before anything is stored, ingesting one throws after
-  // storing the DAG — both surface M_UNRESOLVED_CONFLICT)
-  const err = await assertRejects(async () => {
-    const heal = await author(ROOM, {
+  // the heal RESOLVES (the refusing stub is gone): one extremity after
+  const heal = await ingestEvent(
+    ROOM,
+    await author(ROOM, {
       type: 'm.room.message',
       sender: '@dev:localhost',
       content: { body: 'heal', msgtype: 'm.text' },
       prev_events: [pla.event_id!, plb.event_id!],
       origin_server_ts: 3000,
-    });
-    await ingestEvent(ROOM, heal);
-  }, Error);
-  assert(
-    String(err).includes('M_UNRESOLVED_CONFLICT'),
-    `unexpected error: ${String(err)}`,
+    }),
   );
-  // neither side materialized as the winner: both extremities survive
+  void heal;
   const xb2 = await extremities(room.dbName, ROOM);
-  assert(xb2.length >= 2, 'room stays forked after refusal');
+  assertEquals(xb2.length, 1, 'the fork healed to one extremity');
+
+  // the resolved winner is the spec-determined one: PLB (later ts, applied
+  // last) — state_default 100
+  // deno-lint-ignore no-explicit-any
+  const st = (await stateNow(room.dbName)) as any[];
+  const plRow = st.find((r) => r.type === 'm.room.power_levels');
+  assertEquals(plRow?.content?.state_default, 100);
+  // the oracle agrees: incremental state == reresolveFromDag
+  const before = await stateNow(room.dbName);
+  await reresolveFromDag(ROOM);
+  assertEquals(await stateNow(room.dbName), before);
 });
 
 // A forged conflict-free `state` row is dropped by re-resolution (the DAG

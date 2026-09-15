@@ -1,19 +1,18 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
-import {
-  createRoom,
-  extremities,
-  lookupRoom,
-} from '#engine/room.ts';
+import { assertEquals } from '@std/assert';
+import { createRoom, extremities, lookupRoom } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
+import { reresolveFromDag } from '#engine/adopt.ts';
+import { stateNow } from '#engine/timeline.ts';
 import { withDb } from '#engine/db.ts';
 import { resetRoom } from './util.ts';
 
 const ROOM = '!t2:localhost';
 
-// F0: latest-wins is retired as an exploit. A fork over one state key
-// stands; the 2-prev heal is REFUSED with M_UNRESOLVED_CONFLICT — never
-// a guessed winner, nothing dropped.
-Deno.test('fork/heal: concurrent state edits are refused, room stays forked', async () => {
+// M3: latest-wins is retired AND the refusal is gone — concurrent state
+// edits RESOLVE to one topic via the S4 orderings (equal power -> earlier
+// ts orders first, the later applies last and wins), the heal converges,
+// and one extremity remains.
+Deno.test('fork/heal: concurrent state edits resolve to one topic; heal converges; one extremity', async () => {
   await resetRoom(ROOM);
   const { memberEventId } = await createRoom(ROOM, '11', '@dev:localhost');
   void memberEventId;
@@ -59,25 +58,31 @@ Deno.test('fork/heal: concurrent state edits are refused, room stays forked', as
   const xb = await extremities(dbName, ROOM);
   assertEquals(xb.length, 2, 'two x* extremity branches after the fork');
 
-  // the later timestamp must NOT win: the heal is refused outright
-  const err = await assertRejects(async () => {
-    const heal = await author(ROOM, {
+  // the heal RESOLVES: the S4 mainline ordering (equal mainline position,
+  // ts ascending) puts E2b last — 'dogs' wins the key
+  const heal = await ingestEvent(
+    ROOM,
+    await author(ROOM, {
       type: 'm.room.message',
       sender: '@dev:localhost',
       content: { body: 'E3', msgtype: 'm.text' },
       prev_events: [e2a.event_id, e2b.event_id],
       origin_server_ts: 3000,
-    });
-    await ingestEvent(ROOM, heal);
-  }, Error);
-  assert(
-    String(err).includes('M_UNRESOLVED_CONFLICT'),
-    `unexpected error: ${String(err)}`,
+    }),
   );
+  void heal;
 
-  // room stays forked; both sides' events remain in the DAG
+  // one extremity after the merge; the topic is the spec-determined winner
   const xb2 = await extremities(dbName, ROOM);
-  assertEquals(xb2.length, 2, 'two x* extremities after the refusal');
+  assertEquals(xb2.length, 1, 'one x* extremity after the merge');
+  // deno-lint-ignore no-explicit-any
+  const st = (await stateNow(dbName)) as any[];
+  const topicRow = st.find((r) => r.type === 'm.room.topic');
+  assertEquals(topicRow?.content?.topic, 'dogs');
+  // the oracle agrees: incremental state == reresolveFromDag
+  const before = await stateNow(dbName);
+  await reresolveFromDag(ROOM);
+  assertEquals(await stateNow(dbName), before);
 });
 
 // Messages (non-state) over a forked pair still merge: no state key is
