@@ -152,8 +152,7 @@ export async function reresolveFromDag(
     });
   }
 
-  // newest tip first (S2 ordering)
-  tips.sort((a, b) => (a.branch < b.branch ? 1 : -1));
+  // newest tip first (commit-date ordering — see the tips query)
   const newest = tips[0];
   await withDb(room.dbName, async (c) => {
     await c.query(`SELECT DOLT_CHECKOUT('${ident(newest.branch)}');`);

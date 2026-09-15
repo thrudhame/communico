@@ -352,12 +352,27 @@ export async function ingestEvent(
   const depthOk = pdu.depth === computedDepth;
 
   // 8. parent states + the M3 EventStore over the full ancestry (contents,
-  //    rejected flags — S8 check 4 needs the event's own auth events).
+  //    rejected flags — S8 check 4 needs the event's own auth events). The
+  //    store must also cover the OTHER branches: the soft-fail check
+  //    resolves the current state across all extremities, whose lineage
+  //    may hold events absent from this event's parent lineage.
   const parentSets: StateMap[] = [];
   for (const p of prevs) {
     parentSets.push(await parentStateAt(room.dbName, p.commitHash));
   }
-  const hashes = prevs.map((p) => p.commitHash);
+  const xbs = await extremities(room.dbName, roomId);
+  const xbHashes: string[] = [];
+  for (const xb of xbs) {
+    const r = await withDb(serverDb(), async (c) => {
+      const row = await c.query(
+        'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
+        [roomId, xb.eventId],
+      );
+      return row.rows.length ? String(row.rows[0].commit_hash) : null;
+    });
+    if (r) xbHashes.push(r);
+  }
+  const hashes = [...new Set([...prevs.map((p) => p.commitHash), ...xbHashes])];
   const ancestry = await loadAncestry(room.dbName, hashes);
   ancestry.pduById.set(eventId, pdu);
   const store = eventStoreOf(ancestry.pduById, ancestry.rejectedIds);
@@ -393,27 +408,14 @@ export async function ingestEvent(
         verdict = 'state-reject';
       } else {
         // (c) current room state: resolve across the live extremities
-        // (the incoming event is not one of them yet).
-        const xbs = await extremities(room.dbName, roomId);
+        // (the incoming event is not one of them yet); their commit
+        // hashes are already in the store's ancestry load above.
         const xbSets: StateMap[] = [];
-        for (const xb of xbs) {
-          const r = await withDb(serverDb(), async (c) => {
-            const row = await c.query(
-              'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
-              [roomId, xb.eventId],
-            );
-            return row.rows.length ? String(row.rows[0].commit_hash) : null;
-          });
-          if (r) {
-            xbSets.push(await parentStateAt(room.dbName, r));
-          }
+        for (const h of xbHashes) {
+          xbSets.push(await parentStateAt(room.dbName, h));
         }
         const currentRoomState = rulebook.resolveState(xbSets, store);
-        const current = rulebook.checkAuthAgainstState(
-          pdu,
-          currentRoomState,
-          store,
-        );
+        const current = rulebook.checkAuthAgainstState(pdu, currentRoomState, store);
         if (!current.ok) verdict = 'soft-fail';
       }
     }
@@ -493,9 +495,16 @@ export async function ingestEvent(
     for (let i = 0; i < fanin.length; i++) {
       await mergeDriver(c, ident(fanin[i].branch!));
       if (i < fanin.length - 1) {
-        await c.query(`SELECT DOLT_COMMIT('-Am', $1);`, [
-          `fan-in ${i + 2}/${prevs.length} for ${eventId}`,
-        ]);
+        try {
+          await c.query(`SELECT DOLT_COMMIT('-Am', $1);`, [
+            `fan-in ${i + 2}/${prevs.length} for ${eventId}`,
+          ]);
+        } catch (e) {
+          // a fast-forward merge (the merged branch descends from the
+          // current head) leaves nothing to commit — that is fine; the
+          // next merge or the final commit carries on
+          if (!String(e).includes('nothing to commit')) throw e;
+        }
       }
     }
 
