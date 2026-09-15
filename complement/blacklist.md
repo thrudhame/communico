@@ -2,20 +2,19 @@
 
 Two sections, one rationale each. The human file is the source:
 `complement/run.sh` applies the machine form (`//go:build
-!communico_blacklist` atop each listed file in a scratch copy of the
-Complement checkout) and runs `go test -tags communico_blacklist`.
-Files are listed only on positive evidence of a category match —
-everything else RUNS (red or green; red is the honest baseline).
-Case-level exclusions (3PID issuance cases inside `TestRegistration`,
+!communico_blacklist`
+atop each listed file in a scratch copy of the Complement checkout) and runs
+`go test -tags communico_blacklist`. Files are listed only on positive evidence
+of a category match — everything else RUNS (red or green; red is the honest
+baseline). Case-level exclusions (3PID issuance cases inside `TestRegistration`,
 history-surgery and rate-limit cases inside runnable files) cannot be
-build-tagged per file and are triaged in `complement/BASELINE.md`,
-not here.
+build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 
 ## Principled / permanent (will never implement)
 
 - `/_synapse/admin` (Synapse-specific admin/registration API).
 - Unstable-MSC packages (stable Matrix only).
-- 3PID / identity-server / email+msisdn *issuance* and history surgery
+- 3PID / identity-server / email+msisdn _issuance_ and history surgery
   (retention/purge/erasure — native rooms are append-only by ruling):
   case-level, inside runnable files — triaged in BASELINE.md.
 
@@ -39,17 +38,17 @@ not here.
 
 - E2EE (later; Complement-Crypto out of scope).
 - Push (later).
-- Federation — M5 (`50*` + `federation_*`; the :8448 stub serves TLS +
-  404 so Complement fails fast, not on timeouts). Knock/restricted joins
-  ride along: `knocking*` share the `testValidationForSendMembershipEndpoint`
-  helper defined in blacklisted `federation_room_join_test.go` (a second
-  `//go:build` line is illegal in Go, so they are excluded rather than
-  given a duplicate tag).
-- Event authorization beyond membership — M3 (the stub does not check
-  power levels; declared in the design).
-- Room version 12 — M3 (capabilities advertise 11 only until then).
-- Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in
-  BASELINE.md.
+- Federation — M5 (`50*` + `federation_*`; the :8448 stub serves TLS + 404 so
+  Complement fails fast, not on timeouts). Knock/restricted joins ride along:
+  `knocking*` share the `testValidationForSendMembershipEndpoint` helper defined
+  in blacklisted `federation_room_join_test.go` (a second `//go:build` line is
+  illegal in Go, so they are excluded rather than given a duplicate tag).
+- Event authorization beyond membership — M4 (the rulebook is live as of M3; the
+  Complement room tests that would exercise it need the M4 endpoints: `/join`,
+  `/leave`, `/invite`, `/ban`, `/kick`, `PUT /state`).
+- Room version 12 — after M4 (the rulebook carries its switches; `createRoom`
+  room-id derivation pending).
+- Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in BASELINE.md.
 
 - tests/csapi/e2e_key_backup_test.go
 - tests/csapi/upload_keys_test.go
@@ -90,7 +89,7 @@ not here.
 
 ## Never blacklisted
 
-`30rooms`, `31sync`, redaction wire semantics (the engine contract under
-test); `50federation` is scheduled, not principled (it is the only
-external legitimacy signal for stable versions). `/register`, `/login`,
-`/logout` stay runnable (red at M0 — F1's first rung).
+`30rooms`, `31sync`, redaction wire semantics (the engine contract under test);
+`50federation` is scheduled, not principled (it is the only external legitimacy
+signal for stable versions). `/register`, `/login`, `/logout` stay runnable (red
+at M0 — F1's first rung).

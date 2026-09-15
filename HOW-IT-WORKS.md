@@ -29,15 +29,28 @@ state.
   fetch). Unsigned PDUs are refused, full stop.
 - **The policy slot.** The core dispatches to the room version's
   rulebook and never implements version logic: `selectAuthEvents`,
-  `authorized` (`ok | authchain-reject | state-reject | soft-fail`),
-  `resolveState`, `redaction`. The shared rulebook stub source
-  (`api/engine/rulebook/v11-stub.js`) is one source for all consumers.
-  Unknown room versions are rejected, never defaulted.
-- **The refusing stub (current).** Membership only — no timestamps, no
-  power levels (declared gap, M3). The room creator's first join is
-  exempt. Concurrent edits to one state key throw
-  `M_UNRESOLVED_CONFLICT`: the room stays forked, the heal is refused,
-  nothing is guessed. `latest-wins` is retired as an exploit.
+  `checkAuthChain` (rules 1-2 on the event's own auth_events),
+  `checkAuthAgainstState` (rules 3-10 against a given state — reused by
+  soft-fail and the iterative auth checks), `resolveState`, `redaction`.
+  The rulebook is a pure TypeScript package (`api/engine/rulebook/`) with
+  a per-version feature-flag record — every rule branches on a flag,
+  never a version literal. Unknown room versions are rejected, never
+  defaulted.
+- **The real v11 rulebook (current).** All ten authorization rules,
+  transcribed from spec v1.16 with one function per numbered rule; every
+  verdict carries the rule number that decided it. Power levels are
+  enforced (integers only per v10; creator 100 before the first
+  power_levels event; defaults users -> users_default -> 0). Concurrent
+  edits to one state key RESOLVE through state resolution v2: power
+  events ordered by the reverse-topological power ordering, the rest by
+  mainline order, iterative auth checks throughout — concurrent PL edits
+  heal to the spec-determined winner. `latest-wins` is retired as an
+  exploit; so is the refusing stub.
+- **Three-stage ingest (S8).** Every event is checked (a) against its
+  own auth_events, (b) against the state at its prevs (fail -> rejected,
+  flagged, out of state), and (c) against the current room state — a
+  failure there is a SOFT-FAIL: stored verbatim, not an extremity for
+  authoring, excluded from the client-visible timeline.
 - **State is the resolver's cache.** One invariant: *no path writes
   `state` except the resolver* — ingest, heal, and adoption funnel
   through a single `materialize()` per engine (the gate greps it).
@@ -121,7 +134,8 @@ Complement's mounted CA, 404 for every path — federation is M5),
 `SERVER_NAME` from env, self-managed storage, idempotent inits. The
 **blacklist** has two sections — principled/permanent (3PID issuance,
 history surgery, `/_synapse/*`, unstable MSCs) and scheduled (E2EE,
-push, federation/M5, resolution + auth/M3, rate limits/M2) — applied as
+push, federation/M5, room endpoints over the rulebook/M4,
+rate limits/M2) — applied as
 build tags from the human file; case-level exclusions are triaged in
 `BASELINE.md`, never blacklisted (`30rooms`, `31sync`, redaction,
 `50federation`). `continuity.sh` proves the tenant key survives
@@ -129,8 +143,10 @@ container restarts.
 
 ## 5. What's stubbed (roadmap)
 
-Real v11/v12 resolution behind the same policy slot (M3, incl.
-power-level auth); S2S federation (M5); relay `bind/forward`;
+Room version 12 registration behind the same rulebook slot (after M4 —
+the rulebook already carries its switches); room endpoints over the
+rulebook (`/join`, `/leave`, `/invite`, `/ban`, `/kick`, `PUT /state`,
+membership-aware `/sync` — M4); S2S federation (M5); relay `bind/forward`;
 E2EE; push delivery/rules (M2's pushers are storage-only);
 appservices; rate limiting; media thumbnails, URL previews, remote
 fetch, and retention (M2 is local store-and-serve only);
