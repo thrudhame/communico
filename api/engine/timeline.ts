@@ -1,4 +1,4 @@
-import { serverDb, ident, withDb } from './db.ts';
+import { ident, serverDb, withDb } from './db.ts';
 
 // Reads (dolt.log / working set) reflect HEAD; a fresh client lands on
 // `main`, which only ever holds the genesis commits — the event history
@@ -53,13 +53,17 @@ export async function messages(
       `SELECT commit_hash, message FROM dolt.log LIMIT ${Math.floor(limit)};`,
     );
 
-    const hashes = log.rows.map((r: { commit_hash: string }) => String(r.commit_hash));
+    const hashes = log.rows.map((r: { commit_hash: string }) =>
+      String(r.commit_hash)
+    );
     if (hashes.length === 0) return [];
 
-    // commit_hash -> event_id via server DB (single ANY query)
+    // commit_hash -> event_id via server DB (single ANY query); M3:
+    // rejected AND soft-failed events are excluded from the
+    // client-visible timeline (server-server-api.md 556-563, 611-614)
     const idx = await withDb(serverDb(), async (s) => {
       return await s.query(
-        'SELECT event_id, commit_hash FROM event_index WHERE room_id = $1 AND commit_hash = ANY($2);',
+        'SELECT event_id, commit_hash FROM event_index WHERE room_id = $1 AND commit_hash = ANY($2) AND rejected = FALSE AND soft_failed = FALSE;',
         [roomId, hashes],
       );
     });

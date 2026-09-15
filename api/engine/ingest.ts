@@ -1,4 +1,4 @@
-import { serverDb, branchNameFor, ident, withDb } from './db.ts';
+import { branchNameFor, ident, serverDb, withDb } from './db.ts';
 import { extremities, lookupRoom } from './room.ts';
 import { mergeDriver } from './mergedriver.ts';
 import { eventIdFor } from './eventid.ts';
@@ -6,14 +6,14 @@ import { canonicalJson } from './canonical.ts';
 import { signPdu, verifyPduSignature } from './signing.ts';
 import { getTenantKey } from './tenant.ts';
 import { materialize, type StateRowInput } from './materialize.ts';
-import {
-  getRulebook,
-  stateKeyOf,
-  type AuthContext,
-  type StateMap,
-} from './policy.ts';
+import { getRulebook, stateKeyOf, type StateMap } from './policy.ts';
 import type { Pdu } from './pdu.ts';
-import { contentHashOf, importPublicKeyFromRaw, isKeyName, b32decode } from '#engine/signing-primitives.js';
+import {
+  b32decode,
+  contentHashOf,
+  importPublicKeyFromRaw,
+  isKeyName,
+} from '#engine/signing-primitives.js';
 
 export interface IngestResult {
   event_id: string;
@@ -54,32 +54,47 @@ function parseStoredPdu(v: unknown): Pdu {
   return v as Pdu;
 }
 
-// Fetch PDUs for ids, trying each commit hash in order (events rows are
-// immutable; any hash whose history contains the event will serve).
-async function fetchPdus(
+// M3: the EventStore covers the FULL ancestry — resolution walks auth
+// chains arbitrarily deep, so every event reachable from the parent
+// commits is loaded, with its rejected flag (S4 155-164: chain-rejected
+// events are excluded by the rulebook via isRejected).
+interface AncestryStore {
+  pduById: Map<string, Pdu>;
+  rejectedIds: Set<string>;
+}
+
+async function loadAncestry(
   dbName: string,
   hashes: string[],
-  ids: string[],
-): Promise<Map<string, Pdu>> {
-  const out = new Map<string, Pdu>();
-  if (ids.length === 0) return out;
+): Promise<AncestryStore> {
+  const pduById = new Map<string, Pdu>();
+  const rejectedIds = new Set<string>();
   await withDb(dbName, async (c) => {
-    const missing = new Set(ids);
     for (const h of hashes) {
-      if (missing.size === 0) break;
       assertHash(h);
       const r = await c.query(
-        `SELECT event_id, canonical_json FROM events AS OF '${h}' WHERE event_id = ANY($1);`,
-        [[...missing]],
+        `SELECT event_id, canonical_json, rejected FROM events AS OF '${h}';`,
       );
       // deno-lint-ignore no-explicit-any
       for (const row of r.rows as any[]) {
-        out.set(String(row.event_id), parseStoredPdu(row.canonical_json));
-        missing.delete(String(row.event_id));
+        const id = String(row.event_id);
+        if (pduById.has(id)) continue;
+        pduById.set(id, parseStoredPdu(row.canonical_json));
+        if (row.rejected === true) rejectedIds.add(id);
       }
     }
   });
-  return out;
+  return { pduById, rejectedIds };
+}
+
+function eventStoreOf(
+  pduById: Map<string, Pdu>,
+  rejectedIds: Set<string>,
+): import('./rulebook/types.ts').EventStore {
+  return {
+    get: (id) => pduById.get(id),
+    isRejected: (id) => rejectedIds.has(id),
+  };
 }
 
 async function parentStateAt(dbName: string, hash: string): Promise<StateMap> {
@@ -180,46 +195,36 @@ export async function author(
   for (const p of prevs) {
     parentSets.push(await parentStateAt(room.dbName, p.commitHash));
   }
-  // Resolution first: authoring a heal over conflicted parents is refused
-  // here, not guessed (the stub throws M_UNRESOLVED_CONFLICT).
-  const resolved = rulebook.resolveState(parentSets);
   const hashes = prevs.map((p) => p.commitHash);
-  const wanted = new Set<string>(prevIds);
-  for (const s of parentSets) for (const id of s.values()) wanted.add(id);
-  const pduById = await fetchPdus(room.dbName, hashes, [...wanted]);
+  const ancestry = await loadAncestry(room.dbName, hashes);
+  const store = eventStoreOf(ancestry.pduById, ancestry.rejectedIds);
+  // Resolution first: concurrent state edits RESOLVE (M3 — the real v2
+  // algorithm; the refusing stub is gone).
+  const resolved = rulebook.resolveState(parentSets, store);
 
   let createEventId: string;
   if (isCreate) {
     createEventId = '';
   } else {
-    const found = parentSets.length > 0
-      ? parentSets[0].get(stateKeyOf('m.room.create', ''))
-      : undefined;
-    if (!found) throw new Error('M_NO_CREATE: parent state has no create');
+    const found = resolved.get(stateKeyOf('m.room.create', ''));
+    if (!found) throw new Error('M_NO_CREATE: resolved state has no create');
     createEventId = found;
   }
-  const ctx: AuthContext = {
-    stateAtPrevs: resolved,
-    getEvent: (id) => pduById.get(id),
-    createEventId,
-  };
   const pdu: Pdu = {
     type: partial.type,
     room_id: roomId,
     sender: partial.sender,
     content: (partial.content ?? {}) as Record<string, unknown>,
     prev_events: [...prevIds],
-    auth_events: isCreate
-      ? []
-      : rulebook.selectAuthEvents(
-        {
-          type: partial.type,
-          sender: partial.sender,
-          state_key: partial.state_key,
-          content: (partial.content ?? {}) as Record<string, unknown>,
-        } as Pdu,
-        ctx,
-      ),
+    auth_events: isCreate ? [] : rulebook.selectAuthEvents(
+      {
+        type: partial.type,
+        sender: partial.sender,
+        state_key: partial.state_key,
+        content: (partial.content ?? {}) as Record<string, unknown>,
+      } as Pdu,
+      resolved,
+    ),
     depth,
     origin_server_ts: partial.origin_server_ts ?? Date.now(),
     hashes: { sha256: '' },
@@ -259,7 +264,10 @@ export async function ingestEvent(
   // ts=2^53 seize throws here, refused before anything is stored).
   let expect: string;
   try {
-    expect = await eventIdFor(pdu as unknown as Record<string, unknown>, room.roomVersion);
+    expect = await eventIdFor(
+      pdu as unknown as Record<string, unknown>,
+      room.roomVersion,
+    );
   } catch (e) {
     throw new Error('M_BAD_EVENT: ' + String(e));
   }
@@ -343,64 +351,81 @@ export async function ingestEvent(
   const computedDepth = prevs.length === 0 ? 1 : Math.max(...depths) + 1;
   const depthOk = pdu.depth === computedDepth;
 
-  // 8. parent states + validation context.
+  // 8. parent states + the M3 EventStore over the full ancestry (contents,
+  //    rejected flags — S8 check 4 needs the event's own auth events).
   const parentSets: StateMap[] = [];
   for (const p of prevs) {
     parentSets.push(await parentStateAt(room.dbName, p.commitHash));
   }
   const hashes = prevs.map((p) => p.commitHash);
-  const wanted = new Set<string>(prevIds);
-  for (const s of parentSets) for (const id of s.values()) wanted.add(id);
-  const pduById = await fetchPdus(room.dbName, hashes, [...wanted]);
-  pduById.set(eventId, pdu);
+  const ancestry = await loadAncestry(room.dbName, hashes);
+  ancestry.pduById.set(eventId, pdu);
+  const store = eventStoreOf(ancestry.pduById, ancestry.rejectedIds);
   const isCreate = pdu.type === 'm.room.create' && prevIds.length === 0;
-  const createEventId = isCreate
-    ? eventId
-    : parentSets[0]?.get(stateKeyOf('m.room.create', ''));
-  if (!createEventId) throw new Error('M_NO_CREATE: no create in ancestry');
 
-  const ctx: AuthContext = {
-    stateAtPrevs: new Map<string, string>(),
-    getEvent: (id) => pduById.get(id),
-    createEventId,
-  };
+  // 9. resolve parents (M3: resolution ALWAYS returns — the v2
+  //    algorithm).
+  const resolved = rulebook.resolveState(parentSets, store);
 
-  // 9. resolve parents (throws M_UNRESOLVED_CONFLICT — the room stays
-  // forked; the heal is stored below as rejected and the error surfaces).
-  let resolved: StateMap;
-  let conflicted = false;
-  try {
-    resolved = rulebook.resolveState(parentSets);
-  } catch (e) {
-    if (!String(e).includes('M_UNRESOLVED_CONFLICT')) throw e;
-    conflicted = true;
-    resolved = parentSets.length > 0 ? new Map(parentSets[0]) : new Map();
-  }
-  ctx.stateAtPrevs = resolved;
-
-  // 10. auth: declared auth_events must equal the shared selection
-  // (spec check 2.2), then the rulebook's verdict. No timestamp is
-  // consulted; the stub checks membership only (no power levels — M3).
+  // 10. the S8 sequence (server-server-api.md 473-478):
+  //   (a) authorization rules based on the event's auth events (rules 1-2)
+  //       + the declared auth_events must equal the shared selection (rule
+  //       2.2's determinism); failures of the earlier S8 checks (validity,
+  //       signature, depth) surface as chain rejection as in F0.
+  //   (b) authorization rules based on the state before the event
+  //       (rules 3-10) -> 'state-reject'.
+  //   (c) soft-fail: the same rules against the CURRENT room state (the
+  //       resolved state across all forward extremities) — a failure here
+  //       soft-fails the event (stored, not an extremity for authoring,
+  //       excluded from the client-visible timeline; server-server-api.md
+  //       604-621).
   let verdict: 'ok' | 'authchain-reject' | 'state-reject' | 'soft-fail' = 'ok';
   if (!hashOk || !sigOk || !depthOk) {
     verdict = 'authchain-reject';
   } else {
-    const selected = isCreate
-      ? []
-      : rulebook.selectAuthEvents(pdu, ctx);
-    if (!sameIdSet([...declaredAuth], selected)) {
+    const chain = rulebook.checkAuthChain(pdu, store);
+    const selected = rulebook.selectAuthEvents(pdu, resolved);
+    if (!chain.ok || (!isCreate && !sameIdSet([...declaredAuth], selected))) {
       verdict = 'authchain-reject';
     } else {
-      verdict = rulebook.authorized(pdu, ctx);
+      const state = rulebook.checkAuthAgainstState(pdu, resolved, store);
+      if (!state.ok) {
+        verdict = 'state-reject';
+      } else {
+        // (c) current room state: resolve across the live extremities
+        // (the incoming event is not one of them yet).
+        const xbs = await extremities(room.dbName, roomId);
+        const xbSets: StateMap[] = [];
+        for (const xb of xbs) {
+          const r = await withDb(serverDb(), async (c) => {
+            const row = await c.query(
+              'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
+              [roomId, xb.eventId],
+            );
+            return row.rows.length ? String(row.rows[0].commit_hash) : null;
+          });
+          if (r) {
+            xbSets.push(await parentStateAt(room.dbName, r));
+          }
+        }
+        const currentRoomState = rulebook.resolveState(xbSets, store);
+        const current = rulebook.checkAuthAgainstState(
+          pdu,
+          currentRoomState,
+          store,
+        );
+        if (!current.ok) verdict = 'soft-fail';
+      }
     }
   }
-  const rejected = conflicted || verdict !== 'ok';
+  const rejected = verdict === 'authchain-reject' || verdict === 'state-reject';
+  const softFailed = verdict === 'soft-fail';
 
   // 11. resolved state rows (contents from validated PDUs only — a state
   // row without a validated event behind it is never written).
   const rows: StateRowInput[] = [];
   for (const [k, eid] of resolved) {
-    const ep = pduById.get(eid);
+    const ep = ancestry.pduById.get(eid);
     if (!ep) throw new Error('E_STATE_EVENT_MISSING: ' + eid);
     const sep = k.indexOf('\0');
     rows.push({
@@ -432,8 +457,9 @@ export async function ingestEvent(
     // prev branch must be a live extremity, and the D8 invariant must
     // hold (branch tip == the event's commit)
     const branchRows = await c.query('SELECT name FROM dolt.branches;');
-    // deno-lint-ignore no-explicit-any
-    const branchNames = new Set(branchRows.rows.map((r: any) => String(r.name)));
+    const branchNames = new Set(
+      branchRows.rows.map((r: { name: string }) => String(r.name)),
+    );
     for (const p of prevs) {
       if (p.branch === null || !branchNames.has(p.branch)) {
         throw new Error('M_PREV_NOT_EXTREMITY: ' + p.id);
@@ -475,9 +501,9 @@ export async function ingestEvent(
 
     // event row: the received PDU stored VERBATIM as canonical text,
     // plus indexed columns (depth, prev/auth events, hashes,
-    // signatures, rejected). canonical_json is text, not jsonb.
+    // signatures, rejected, soft_failed). canonical_json is text, not jsonb.
     await c.query(
-      'INSERT INTO events (event_id, type, state_key, sender, origin_ts, depth, prev_events, auth_events, hashes, signatures, rejected, canonical_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12);',
+      'INSERT INTO events (event_id, type, state_key, sender, origin_ts, depth, prev_events, auth_events, hashes, signatures, rejected, soft_failed, canonical_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);',
       [
         eventId,
         pdu.type,
@@ -490,6 +516,7 @@ export async function ingestEvent(
         JSON.stringify(pdu.hashes ?? {}),
         JSON.stringify(pdu.signatures ?? {}),
         rejected,
+        softFailed,
         canonicalJson(pdu as unknown as Record<string, unknown>),
       ],
     );
@@ -511,9 +538,7 @@ export async function ingestEvent(
 
     // delete consumed prev branches unless the test hook keeps them;
     // main is never an extremity and stays at the schema-genesis commit.
-    // On conflict refusal the parents stay alive (the room stays forked;
-    // the refused tip joins them — nothing is dropped or guessed).
-    if (!opts.keepPrevBranches && !conflicted) {
+    if (!opts.keepPrevBranches) {
       for (const p of prevs) {
         await c.query(`SELECT DOLT_BRANCH('-D', '${ident(p.branch!)}');`);
       }
@@ -522,17 +547,19 @@ export async function ingestEvent(
   });
 
   // event_id <-> commit_hash bijection + current branch (D8), flagged
-  // rejected when refused (prev resolution needs the id; rejected events
-  // never enter `state`).
+  // rejected/soft-failed as the S8 checks decided (prev resolution needs
+  // the id; rejected/soft-failed events still persist verbatim).
   await withDb(serverDb(), async (c) => {
     await c.query(
-      'INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected) VALUES ($1, $2, $3, $4, $5);',
-      [eventId, roomId, commitHash, newBranch, rejected],
+      'INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed) VALUES ($1, $2, $3, $4, $5, $6);',
+      [eventId, roomId, commitHash, newBranch, rejected, softFailed],
     );
   });
 
-  // core→hat signal, then return — or surface the conflict refusal (the
-  // DAG was adopted; the room stays forked; nothing was guessed).
+  // core→hat signal, then return — or surface the rejection (the event is
+  // in the DAG and flagged; soft-fail does NOT surface: the event is
+  // valid, the server merely declines to relay it — server-server-api.md
+  // 611-614).
   for (const l of appliedListeners) {
     try {
       l(roomId, eventId);
@@ -540,15 +567,11 @@ export async function ingestEvent(
       console.error('applied listener error:', e);
     }
   }
-  if (conflicted) {
-    throw new Error(
-      'M_UNRESOLVED_CONFLICT: concurrent edits to one state key are refused (stub)',
-    );
+  if (verdict === 'authchain-reject') {
+    throw new Error('M_AUTHCHAIN_REJECT: ' + eventId);
   }
-  if (verdict !== 'ok') {
-    throw new Error(
-      (verdict === 'authchain-reject' ? 'M_AUTHCHAIN_REJECT: ' : 'M_STATE_REJECT: ') + eventId,
-    );
+  if (verdict === 'state-reject') {
+    throw new Error('M_STATE_REJECT: ' + eventId);
   }
   return { event_id: eventId, commit_hash: commitHash };
 }

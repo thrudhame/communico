@@ -1,7 +1,8 @@
 import { supportedRoomVersions } from '#engine/policy.ts';
 
 // M0: server capabilities (Complement 10apidoc/45server-capabilities).
-// Room versions: 11 only ('12' when its resolver lands at M3).
+// Room versions: 11 only — v12 is designed for (the rulebook carries its
+// switches) but deliberately unregistered until after M4 (plan §3f).
 // m.change_password is advertised DISABLED (no endpoint exists — the
 // plan's "no m.change_password" means no endpoint, not no key: the
 // capabilities test requires the key present). Auth required (401

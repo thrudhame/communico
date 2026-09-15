@@ -28,7 +28,7 @@ const reject = (rule: string, reason: string): Verdict => ({
   rule,
   reason,
 });
-const allow: Verdict = { ok: true };
+const allow = (rule: string): Verdict => ({ ok: true, rule });
 
 export interface AuthCtx {
   state: StateMap;
@@ -87,7 +87,7 @@ function rule1(pdu: Pdu, recognisedVersions: readonly string[]): Verdict {
     return reject('1.3', 'unrecognised room_version');
   }
   // 1.4: otherwise, allow.
-  return allow;
+  return allow('2');
 }
 
 // The (type, state_key) pairs the auth-events selection algorithm permits
@@ -139,7 +139,9 @@ function rule2(pdu: Pdu, store: EventStore, spec: RoomVersionSpec): Verdict {
     const ev = store.get(id);
     if (!ev) continue; // unresolvable ids handled at 2.2
     const k = stateKeyOf(ev.type, ev.state_key ?? '');
-    if (seen.has(k)) return reject('2.1', `duplicate auth entry for ${k}`);
+    if (seen.has(k)) {
+      return reject('2.1', `duplicate auth entry for ${k}`);
+    }
     seen.add(k);
   }
   // 2.2: entries whose (type, state_key) don't match the auth events
@@ -147,12 +149,11 @@ function rule2(pdu: Pdu, store: EventStore, spec: RoomVersionSpec): Verdict {
   const pairs = selectionPairs(pdu, spec);
   for (const id of declared) {
     const ev = store.get(id);
-    if (!ev) return reject('2.2', `auth entry ${id} cannot be resolved`);
+    if (!ev) {
+      return reject('2.2', `auth entry ${id} cannot be resolved`);
+    }
     if (!pairs.has(stateKeyOf(ev.type, ev.state_key ?? ''))) {
-      return reject(
-        '2.2',
-        `auth entry ${id} (${ev.type}) is outside the selection set`,
-      );
+      return reject('2.2', `auth entry ${id} (${ev.type}) is outside the selection set`);
     }
   }
   // 2.3: entries rejected under the receipt checks -> reject.
@@ -175,7 +176,7 @@ function rule2(pdu: Pdu, store: EventStore, spec: RoomVersionSpec): Verdict {
       }
     }
   }
-  return allow;
+  return allow('1.4');
 }
 
 // Rules 1-2, evaluated in spec order (S8 check 4: "authorization rules
@@ -189,7 +190,7 @@ export function checkAuthChain(
   // Rule 1 is terminal for m.room.create.
   if (pdu.type === 'm.room.create') return rule1(pdu, recognisedVersions);
   const v2 = rule2(pdu, store, spec);
-  return v2.ok ? allow : v2;
+  return v2.ok ? allow('2') : v2;
 }
 
 // Rules 3-10 against a state map (S8 check 5). One function per numbered
@@ -203,6 +204,9 @@ export function checkAuthAgainstState(
   store: EventStore,
   spec: RoomVersionSpec,
 ): Verdict {
+  // Rule 1 is terminal for m.room.create — rules 3-10 never apply to it
+  // (a create that reached rule 3 in the cascade already passed rule 1).
+  if (pdu.type === 'm.room.create') return allow('1.4');
   const ctx: AuthCtx = { state, store, recognisedVersions: [] };
   const plEvent = plEventOf(ctx);
   const createEvent = createEventOf(ctx);
@@ -225,7 +229,7 @@ export function checkAuthAgainstState(
   // Rule 6 (v11.md:219-221) — terminal for m.room.third_party_invite.
   if (pdu.type === 'm.room.third_party_invite') {
     const inviteLevel = namedLevel('invite', parsedPl(plEvent));
-    if (senderLevel >= inviteLevel) return allow;
+    if (senderLevel >= inviteLevel) return allow('6.1');
     return reject('6.1', 'sender below the invite level');
   }
 
@@ -236,10 +240,7 @@ export function checkAuthAgainstState(
     parsedPl(plEvent),
   );
   if (required > senderLevel) {
-    return reject(
-      '7',
-      `required level ${required} > sender level ${senderLevel}`,
-    );
+    return reject('7', `required level ${required} > sender level ${senderLevel}`);
   }
 
   // Rule 8 (v11.md:224-225): a state_key starting with @ must match sender.
@@ -256,7 +257,7 @@ export function checkAuthAgainstState(
   }
 
   // Rule 10 (v11.md:260): otherwise, allow.
-  return allow;
+  return allow('10');
 }
 
 function parsedPl(plEvent: Pdu | null): ParsedPowerLevels | null {
@@ -270,12 +271,12 @@ function parsedPl(plEvent: Pdu | null): ParsedPowerLevels | null {
 // Rule 3 (v11.md:138-140).
 function rule3(pdu: Pdu, ctx: AuthCtx): Verdict {
   const create = createEventOf(ctx);
-  if (!create) return allow; // rule 2.4 already rejected missing creates
+  if (!create) return allow('3'); // rule 2.4 already rejected missing creates
   const federate = create.content?.['m.federate'];
   if (federate === false && domainOf(pdu.sender) !== domainOf(create.sender)) {
     return reject('3', 'room is not federated and sender domain differs');
   }
-  return allow;
+  return allow('3');
 }
 
 // Rule 4 (v11.md:141-217).
@@ -323,7 +324,7 @@ function rule4(
       (pdu.prev_events ?? [])[0] === createId && createEvent &&
       target === createEvent.sender
     ) {
-      return allow;
+      return allow('4.3.1');
     }
     // 4.3.2: sender must match state_key.
     if (pdu.sender !== target) {
@@ -337,7 +338,7 @@ function rule4(
     // invite or join.
     if (joinRule === 'invite' || (joinRule === 'knock' && spec.knockJoinRule)) {
       const cur = membershipOf(ctx, target);
-      if (cur === 'invite' || cur === 'join') return allow;
+      if (cur === 'invite' || cur === 'join') return allow('4.3.4');
     }
     // 4.3.5: join_rule restricted or knock_restricted.
     if (
@@ -346,7 +347,7 @@ function rule4(
     ) {
       const cur = membershipOf(ctx, target);
       // 4.3.5.1: current membership join or invite -> allow.
-      if (cur === 'join' || cur === 'invite') return allow;
+      if (cur === 'join' || cur === 'invite') return allow('4.3.5.1');
       // 4.3.5.2: the authorised user must have invite permission.
       const vu = pdu.content?.join_authorised_via_users_server;
       if (typeof vu !== 'string' || vu.length === 0) {
@@ -357,15 +358,12 @@ function rule4(
         return reject('4.3.5.2', 'authorising user cannot invite');
       }
       // 4.3.5.3: otherwise, allow.
-      return allow;
+      return allow('4.3.5.3');
     }
     // 4.3.6: join_rule public -> allow.
-    if (joinRule === 'public') return allow;
+    if (joinRule === 'public') return allow('4.3.6');
     // 4.3.7: otherwise, reject.
-    return reject(
-      '4.3.7',
-      `join_rule ${String(joinRule)} does not permit join`,
-    );
+    return reject('4.3.7', `join_rule ${String(joinRule)} does not permit join`);
   }
 
   if (membership === 'invite') {
@@ -407,10 +405,7 @@ function rule4(
       }
       // 4.4.1.6: sender must match the third_party_invite's sender.
       if (pdu.sender !== tpiEvent.sender) {
-        return reject(
-          '4.4.1.6',
-          'sender does not match the third_party_invite sender',
-        );
+        return reject('4.4.1.6', 'sender does not match the third_party_invite sender');
       }
       // 4.4.1.7: any signature in signed matching any public key of the
       // third_party_invite event (public_key / public_keys) -> allow.
@@ -436,12 +431,11 @@ function rule4(
           if (typeof k === 'string') publicKeys.push(k);
         }
       }
-      if (sigValues.some((s) => publicKeys.includes(s))) return allow;
+      if (sigValues.some((s) => publicKeys.includes(s))) {
+        return allow('4.4.1.7');
+      }
       // 4.4.1.8: otherwise, reject.
-      return reject(
-        '4.4.1.8',
-        'no signature matches a third_party_invite public key',
-      );
+      return reject('4.4.1.8', 'no signature matches a third_party_invite public key');
     }
     // 4.4.2: the sender's current membership must be join.
     if (senderMembership !== 'join') {
@@ -453,7 +447,9 @@ function rule4(
       return reject('4.4.3', 'target is joined or banned');
     }
     // 4.4.4: sender power >= invite level -> allow.
-    if (senderLevel >= namedLevel('invite', parsedPl(plEvent))) return allow;
+    if (senderLevel >= namedLevel('invite', parsedPl(plEvent))) {
+      return allow('4.4.4');
+    }
     // 4.4.5: otherwise, reject.
     return reject('4.4.5', 'sender below the invite level');
   }
@@ -463,7 +459,9 @@ function rule4(
     // invite, join or knock.
     if (pdu.sender === target) {
       const cur = membershipOf(ctx, target);
-      if (cur === 'invite' || cur === 'join' || cur === 'knock') return allow;
+      if (cur === 'invite' || cur === 'join' || cur === 'knock') {
+        return allow('4.5.1');
+      }
       return reject('4.5.1', 'self-leave without invite/join/knock membership');
     }
     // 4.5.2: the sender's current membership must be join.
@@ -480,7 +478,7 @@ function rule4(
       senderLevel >= namedLevel('kick', parsedPl(plEvent)) &&
       targetLevel < senderLevel
     ) {
-      return allow;
+      return allow('4.5.4');
     }
     // 4.5.5: otherwise, reject.
     return reject('4.5.5', 'kick conditions not met');
@@ -496,7 +494,7 @@ function rule4(
       senderLevel >= namedLevel('ban', parsedPl(plEvent)) &&
       targetLevel < senderLevel
     ) {
-      return allow;
+      return allow('4.6.2');
     }
     // 4.6.3: otherwise, reject.
     return reject('4.6.3', 'ban conditions not met');
@@ -508,10 +506,7 @@ function rule4(
       !(joinRule === 'knock' && spec.knockJoinRule) &&
       !(joinRule === 'knock_restricted' && spec.knockRestrictedJoinRule)
     ) {
-      return reject(
-        '4.7.1',
-        `join_rule ${String(joinRule)} does not accept knocks`,
-      );
+      return reject('4.7.1', `join_rule ${String(joinRule)} does not accept knocks`);
     }
     // 4.7.2: sender must match state_key.
     if (pdu.sender !== target) {
@@ -519,7 +514,7 @@ function rule4(
     }
     // 4.7.3: sender's membership NOT in {ban, invite, join} -> allow.
     if (!['ban', 'invite', 'join'].includes(senderMembership ?? '')) {
-      return allow;
+      return allow('4.7.3');
     }
     // 4.7.4: otherwise, reject.
     return reject('4.7.4', 'sender is already ban/invite/join');
@@ -546,7 +541,7 @@ function rule9(
   }
 
   // 9.4: no previous m.room.power_levels event -> allow.
-  if (!plEvent) return allow;
+  if (!plEvent) return allow('9.4');
 
   const prevParsed = parsePowerLevels(plEvent.content, spec);
   const prev: ParsedPowerLevels = prevParsed.ok
@@ -589,17 +584,11 @@ function rule9(
       if (was === now) continue;
       // changed or removed: the current value must not be greater
       if (was !== undefined && was > senderLevel) {
-        return reject(
-          `9.6.1`,
-          `${mapName}.${k} currently ${was} above sender level`,
-        );
+        return reject('9.6.1', `${mapName}.${k} currently ${was} above sender level`);
       }
       // added or changed: the new value must not be greater
       if (now !== undefined && now > senderLevel) {
-        return reject(
-          `9.7.1`,
-          `${mapName}.${k} set to ${now} above sender level`,
-        );
+        return reject('9.7.1', `${mapName}.${k} set to ${now} above sender level`);
       }
     }
   }
@@ -616,10 +605,7 @@ function rule9(
     // changed or removed, other than the sender's own entry: the current
     // value must be below the sender's level
     if (u !== pdu.sender && was !== undefined && was >= senderLevel) {
-      return reject(
-        '9.8.1',
-        `users.${u} currently ${was} at/above sender level`,
-      );
+      return reject('9.8.1', `users.${u} currently ${was} at/above sender level`);
     }
     // added or changed: the new value must not exceed the sender's level
     if (now !== undefined && now > senderLevel) {
@@ -628,5 +614,5 @@ function rule9(
   }
 
   // 9.10: otherwise, allow.
-  return allow;
+  return allow('9.10');
 }

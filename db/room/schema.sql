@@ -10,6 +10,9 @@ CREATE TABLE events (
   hashes         jsonb NOT NULL DEFAULT '{}',
   signatures     jsonb NOT NULL DEFAULT '{}',
   rejected       boolean NOT NULL DEFAULT FALSE,
+  -- M3: soft-failed events (S8 check 6) persist but are not extremities
+  -- for authoring and are excluded from the client-visible timeline.
+  soft_failed    boolean NOT NULL DEFAULT FALSE,
   canonical_json text NOT NULL
 );
 CREATE TABLE state (

@@ -1,8 +1,8 @@
 // api/engine/rulebook/types.ts — M3: shared types for the pure rulebook
-// package. No Deno.* / #engine / pg imports — this package ships to the
-// browser peer later (room-sync design). The Pdu shape is a STRUCTURAL
-// copy of #engine/pdu.ts (copied, not imported — the engine imports the
-// package, never the reverse).
+// package. No platform, database, or engine imports — this package ships
+// to the browser peer later (room-sync design). The Pdu shape is a
+// STRUCTURAL copy of #engine/pdu.ts (copied, not imported — the engine
+// imports the package, never the reverse).
 
 // v11 Persistent Data Unit (structurally identical to api/engine/pdu.ts;
 // event_id is derived and optional until assigned).
@@ -40,7 +40,7 @@ export interface EventStore {
 }
 
 // Per-version feature flags (plan §3b). Every rule that branches on a
-// version reads a flag — never `identifier === '11'`.
+// version reads a flag — never a version literal.
 export interface RoomVersionSpec {
   identifier: string;
   stateResVariant: 'v2' | 'v2.1';
@@ -69,13 +69,11 @@ export interface RoomVersionSpec {
   authEventsSameRoom: boolean;
 }
 
-// A verdict carries WHICH rule fired, so tests assert the rule number
-// (plan §3a: e.g. '4.3.3').
-export type Verdict = { ok: true } | {
-  ok: false;
-  rule: string;
-  reason: string;
-};
+// A verdict carries WHICH rule fired — allow or reject — so tests assert
+// the rule number (plan §3a: e.g. '4.3.3').
+export type Verdict =
+  | { ok: true; rule: string }
+  | { ok: false; rule: string; reason: string };
 
 // The per-version policy slot (plan §3c) — replaces policy.ts's F0 shape.
 export interface Rulebook {

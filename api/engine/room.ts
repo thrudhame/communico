@@ -1,4 +1,4 @@
-import { serverDb, ident, withDb } from './db.ts';
+import { ident, serverDb, withDb } from './db.ts';
 import { author, ingestEvent } from './ingest.ts';
 import { getRulebook } from './policy.ts';
 
@@ -47,7 +47,7 @@ export async function createRoom(
   await withDb(serverDb(), async (c) => {
     await c.query(`CREATE DATABASE ${ident(dbName)};`);
     await c.query(
-      'INSERT INTO room_directory (room_id, db_name, room_version, stub_era) VALUES ($1, $2, $3, TRUE);',
+      'INSERT INTO room_directory (room_id, db_name, room_version, stub_era) VALUES ($1, $2, $3, FALSE);',
       [roomId, dbName, roomVersion],
     );
   });
@@ -99,28 +99,40 @@ export async function createRoom(
     origin_server_ts: Date.now(),
   });
   await ingestEvent(roomId, jrPdu);
-  return { createEventId: createRes.event_id, memberEventId: memberRes.event_id };
+  return {
+    createEventId: createRes.event_id,
+    memberEventId: memberRes.event_id,
+  };
 }
 
 export interface RoomInfo {
   dbName: string;
   roomVersion: string;
+  // TRUE only for pre-M3 rooms (dev DBs are reset; no migration — plan §3f).
+  stubEra: boolean;
 }
 
 export async function lookupRoom(roomId: string): Promise<RoomInfo | null> {
   return await withDb(serverDb(), async (c) => {
     const r = await c.query(
-      'SELECT db_name, room_version FROM room_directory WHERE room_id = $1;',
+      'SELECT db_name, room_version, stub_era FROM room_directory WHERE room_id = $1;',
       [roomId],
     );
     if (r.rows.length === 0) return null;
-    return { dbName: r.rows[0].db_name, roomVersion: r.rows[0].room_version };
+    return {
+      dbName: r.rows[0].db_name,
+      roomVersion: r.rows[0].room_version,
+      stubEra: Boolean(r.rows[0].stub_era),
+    };
   });
 }
 
 // Extremities are only x* branches (main is never an extremity). Returns
 // the tip EVENT id + branch per live extremity (event_index.branch_name
 // join; stale rows are excluded by joining against live dolt.branches).
+// Soft-failed events (M3, S8 check 6) are excluded — they are not added
+// to the server's list of forward extremities (server-server-api.md
+// 611-614); they still participate in resolution when referenced.
 export interface Extremity {
   eventId: string;
   branch: string;
@@ -139,7 +151,7 @@ export async function extremities(
     if (xbranches.length === 0) return [];
     return await withDb(serverDb(), async (s) => {
       const idx = await s.query(
-        'SELECT event_id, branch_name FROM event_index WHERE room_id = $1 AND branch_name = ANY($2);',
+        'SELECT event_id, branch_name FROM event_index WHERE room_id = $1 AND branch_name = ANY($2) AND rejected = FALSE AND soft_failed = FALSE;',
         [roomId, xbranches],
       );
       // deno-lint-ignore no-explicit-any

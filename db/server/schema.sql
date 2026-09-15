@@ -10,6 +10,8 @@
 -- existing DB gets them once via plain ALTER (no IF NOT EXISTS):
 --   ALTER TABLE room_directory ADD COLUMN stub_era boolean DEFAULT TRUE;
 --   ALTER TABLE event_index ADD COLUMN rejected boolean DEFAULT FALSE;
+--   ALTER TABLE event_index ADD COLUMN soft_failed boolean DEFAULT FALSE;
+-- (room DBs, M3): ALTER TABLE events ADD COLUMN soft_failed boolean DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -27,6 +29,9 @@ CREATE TABLE IF NOT EXISTS event_index (
   commit_hash text NOT NULL,
   branch_name text,
   rejected boolean NOT NULL DEFAULT FALSE,
+  -- M3: soft-failed (S8 check 6) — persisted, not an authoring extremity,
+  -- excluded from the client-visible timeline.
+  soft_failed boolean NOT NULL DEFAULT FALSE,
   seq bigint DEFAULT nextval('event_seq')
 );
 -- F0 dev signing key (db-init generates once via ensureServerKey, reuses

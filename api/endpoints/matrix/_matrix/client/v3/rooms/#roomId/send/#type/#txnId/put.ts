@@ -20,7 +20,9 @@ export default async function (
     const room = await lookupRoom(roomId);
     if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
 
-    const prevEvents = (await extremities(room.dbName, roomId)).map((e: { eventId: string }) => e.eventId);
+    const prevEvents = (await extremities(room.dbName, roomId)).map((
+      e: { eventId: string },
+    ) => e.eventId);
 
     const pdu = await author(roomId, {
       type,
@@ -34,9 +36,6 @@ export default async function (
   } catch (e) {
     if (e instanceof MatrixError) throw e;
     const msg = String(e);
-    if (msg.includes('M_UNRESOLVED_CONFLICT')) {
-      throw new MatrixError(409, 'M_UNRESOLVED_CONFLICT', msg);
-    }
     if (msg.includes('M_STATE_REJECT') || msg.includes('M_AUTHCHAIN_REJECT')) {
       throw new MatrixError(403, 'M_STATE_REJECT', msg);
     }
