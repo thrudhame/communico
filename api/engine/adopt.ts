@@ -11,7 +11,7 @@ import { ident, withDb } from './db.ts';
 import { lookupRoom } from './room.ts';
 import { eventIdFor } from './eventid.ts';
 import { getRulebook, stateKeyOf, type StateMap } from './policy.ts';
-import { materialize, type StateRowInput } from './materialize.ts';
+import { publishCurrentState, type StateRowInput } from './materialize.ts';
 import type { Pdu } from './pdu.ts';
 
 function parseStoredPdu(v: unknown): Pdu {
@@ -30,7 +30,7 @@ export interface ReresolveResult {
   stateRows: number;
 }
 
-// Re-resolve room state from the DAG on the newest extremity tip. Validates
+// Re-resolve room state from the DAG and publish it on `main`. Validates
 // every event (id recompute + declared auth_events + authorized()); skips
 // rejected events (in DAG, out of state); rewrites `state` via
 // materialize() and commits.
@@ -152,20 +152,10 @@ export async function reresolveFromDag(
     });
   }
 
-  // newest tip first (commit-date ordering — see the tips query)
-  const newest = tips[0];
-  await withDb(room.dbName, async (c) => {
-    await c.query(`SELECT DOLT_CHECKOUT('${ident(newest.branch)}');`);
-    await materialize(c, rows);
-    // a no-op re-resolve (state already correct) has nothing to commit —
-    // that is success, not an error
-    try {
-      await c.query(
-        `SELECT DOLT_COMMIT('-Am', 'reresolve: ${rows.length} state rows from ${all.length} events');`,
-      );
-    } catch (e) {
-      if (!String(e).includes('nothing to commit')) throw e;
-    }
-  });
+  await publishCurrentState(
+    room.dbName,
+    rows,
+    `reresolve: ${rows.length} rows from ${all.length} events`,
+  );
   return { eventCount: all.length, stateRows: rows.length };
 }

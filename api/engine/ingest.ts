@@ -5,7 +5,11 @@ import { eventIdFor } from './eventid.ts';
 import { canonicalJson } from './canonical.ts';
 import { signPdu, verifyPduSignature } from './signing.ts';
 import { getTenantKey } from './tenant.ts';
-import { materialize, type StateRowInput } from './materialize.ts';
+import {
+  materialize,
+  publishCurrentState,
+  type StateRowInput,
+} from './materialize.ts';
 import { getRulebook, stateKeyOf, type StateMap } from './policy.ts';
 import type { Pdu } from './pdu.ts';
 import {
@@ -113,6 +117,41 @@ async function parentStateAt(dbName: string, hash: string): Promise<StateMap> {
     }
     return m;
   });
+}
+
+// event_index lookup: the commit an event landed on (null if unknown).
+async function commitHashOf(
+  roomId: string,
+  eventId: string,
+): Promise<string | null> {
+  return await withDb(serverDb(), async (c) => {
+    const row = await c.query(
+      'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
+      [roomId, eventId],
+    );
+    return row.rows.length ? String(row.rows[0].commit_hash) : null;
+  });
+}
+
+// State-map -> state rows (contents from validated PDUs only — a state
+// row without a validated event behind it is never written).
+function stateRowsOf(
+  map: StateMap,
+  pduById: Map<string, Pdu>,
+): StateRowInput[] {
+  const rows: StateRowInput[] = [];
+  for (const [k, eid] of map) {
+    const ep = pduById.get(eid);
+    if (!ep) throw new Error('E_STATE_EVENT_MISSING: ' + eid);
+    const sep = k.indexOf('\0');
+    rows.push({
+      type: k.slice(0, sep),
+      stateKey: k.slice(sep + 1),
+      eventId: eid,
+      content: ep.content ?? {},
+    });
+  }
+  return rows;
 }
 
 async function prevDepths(
@@ -362,14 +401,8 @@ export async function ingestEvent(
   const xbs = await extremities(room.dbName, roomId);
   const xbHashes: string[] = [];
   for (const xb of xbs) {
-    const r = await withDb(serverDb(), async (c) => {
-      const row = await c.query(
-        'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
-        [roomId, xb.eventId],
-      );
-      return row.rows.length ? String(row.rows[0].commit_hash) : null;
-    });
-    if (r) xbHashes.push(r);
+    const h = await commitHashOf(roomId, xb.eventId);
+    if (h) xbHashes.push(h);
   }
   const hashes = [...new Set([...prevs.map((p) => p.commitHash), ...xbHashes])];
   const ancestry = await loadAncestry(room.dbName, hashes);
@@ -427,19 +460,8 @@ export async function ingestEvent(
   const softFailed = verdict === 'soft-fail';
 
   // 11. resolved state rows (contents from validated PDUs only — a state
-  // row without a validated event behind it is never written).
-  const rows: StateRowInput[] = [];
-  for (const [k, eid] of resolved) {
-    const ep = ancestry.pduById.get(eid);
-    if (!ep) throw new Error('E_STATE_EVENT_MISSING: ' + eid);
-    const sep = k.indexOf('\0');
-    rows.push({
-      type: k.slice(0, sep),
-      stateKey: k.slice(sep + 1),
-      eventId: eid,
-      content: ep.content ?? {},
-    });
-  }
+  //    row without a validated event behind it is never written).
+  const rows = stateRowsOf(resolved, ancestry.pduById);
   if (!rejected && pdu.state_key != null) {
     const at = rows.findIndex((r) =>
       r.type === String(pdu.type) && r.stateKey === String(pdu.state_key)
@@ -567,6 +589,24 @@ export async function ingestEvent(
       [eventId, roomId, commitHash, newBranch, rejected, softFailed],
     );
   });
+
+  // 12. republish the room's current state on `main`: resolve across the
+  //     post-event extremity set (extremities() reads the flags just
+  //     written, so a rejected/soft-failed event is excluded and consumed
+  //     prevs are gone). The store already covers every pre-existing
+  //     extremity's ancestry (step 8) plus this pdu.
+  const after = await extremities(room.dbName, roomId);
+  const afterSets: StateMap[] = [];
+  for (const xb of after) {
+    const h = await commitHashOf(roomId, xb.eventId);
+    if (h) afterSets.push(await parentStateAt(room.dbName, h));
+  }
+  const current = rulebook.resolveState(afterSets, store);
+  await publishCurrentState(
+    room.dbName,
+    stateRowsOf(current, ancestry.pduById),
+    `after ${eventId}`,
+  );
 
   // core→hat signal, then return — or surface the rejection (the event is
   // in the DAG and flagged; soft-fail does NOT surface: the event is
