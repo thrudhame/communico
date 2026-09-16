@@ -8,7 +8,6 @@ import type { Context } from '@pathfinder/pathfinder';
 // {pushers: [{app_id, pushkey, kind, app_display_name,
 // device_display_name, profile_tag?, lang, data}]} — access_token is never
 // returned.
-// deno-lint-ignore require-await
 export default async function (_request: unknown, context: Context) {
   const caller = context.state.user as string;
   const pushers = await listPushers(serverName(), localpartOf(caller));

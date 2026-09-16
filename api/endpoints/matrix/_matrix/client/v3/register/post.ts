@@ -1,12 +1,8 @@
 import { parseJson } from '@pathfinder/pathfinder/body';
 import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import {
-  checkLocalpart,
-  ensureTenant,
-  registerUser,
-} from '#engine/tenant.ts';
-import { requireUia, DUMMY_FLOWS } from '#engine/uia.ts';
+import { checkLocalpart, ensureTenant, registerUser } from '#engine/tenant.ts';
+import { DUMMY_FLOWS, requireUia } from '#engine/uia.ts';
 import { withDb } from '#engine/db.ts';
 
 // POST /_matrix/client/v3/register — UIA (F1 step 17; M2: via the shared
@@ -18,7 +14,9 @@ import { withDb } from '#engine/db.ts';
 // - otherwise the UIA 401 dance (flows/params/session; params rides the
 //   401 body per spec v1.11) with the dummy flow, then finalize.
 // honoring: inhibit_login, device_id, initial_device_display_name.
-export default async function (request: import('@pathfinder/pathfinder').PathfinderRequest) {
+export default async function (
+  request: import('@pathfinder/pathfinder').PathfinderRequest,
+) {
   let body: Record<string, unknown> = {};
   try {
     body = (await parseJson(request)) as Record<string, unknown>;
@@ -33,10 +31,15 @@ export default async function (request: import('@pathfinder/pathfinder').Pathfin
     localpart = checkLocalpart(body.username);
     const { dbName } = await ensureTenant(serverName());
     const taken = await withDb(dbName, async (c: import('pg').Client) => {
-      const r = await c.query('SELECT localpart FROM users WHERE localpart = $1;', [localpart]);
+      const r = await c.query(
+        'SELECT localpart FROM users WHERE localpart = $1;',
+        [localpart],
+      );
       return r.rows.length > 0;
     });
-    if (taken) throw new MatrixError(400, 'M_USER_IN_USE', 'user in use: ' + localpart);
+    if (taken) {
+      throw new MatrixError(400, 'M_USER_IN_USE', 'user in use: ' + localpart);
+    }
   }
 
   // 2. UIA: dummy flow via the shared helper (sessions + completion).

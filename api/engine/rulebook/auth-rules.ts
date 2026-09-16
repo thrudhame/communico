@@ -153,7 +153,10 @@ function rule2(pdu: Pdu, store: EventStore, spec: RoomVersionSpec): Verdict {
       return reject('2.2', `auth entry ${id} cannot be resolved`);
     }
     if (!pairs.has(stateKeyOf(ev.type, ev.state_key ?? ''))) {
-      return reject('2.2', `auth entry ${id} (${ev.type}) is outside the selection set`);
+      return reject(
+        '2.2',
+        `auth entry ${id} (${ev.type}) is outside the selection set`,
+      );
     }
   }
   // 2.3: entries rejected under the receipt checks -> reject.
@@ -240,7 +243,10 @@ export function checkAuthAgainstState(
     parsedPl(plEvent),
   );
   if (required > senderLevel) {
-    return reject('7', `required level ${required} > sender level ${senderLevel}`);
+    return reject(
+      '7',
+      `required level ${required} > sender level ${senderLevel}`,
+    );
   }
 
   // Rule 8 (v11.md:224-225): a state_key starting with @ must match sender.
@@ -363,7 +369,10 @@ function rule4(
     // 4.3.6: join_rule public -> allow.
     if (joinRule === 'public') return allow('4.3.6');
     // 4.3.7: otherwise, reject.
-    return reject('4.3.7', `join_rule ${String(joinRule)} does not permit join`);
+    return reject(
+      '4.3.7',
+      `join_rule ${String(joinRule)} does not permit join`,
+    );
   }
 
   if (membership === 'invite') {
@@ -405,7 +414,10 @@ function rule4(
       }
       // 4.4.1.6: sender must match the third_party_invite's sender.
       if (pdu.sender !== tpiEvent.sender) {
-        return reject('4.4.1.6', 'sender does not match the third_party_invite sender');
+        return reject(
+          '4.4.1.6',
+          'sender does not match the third_party_invite sender',
+        );
       }
       // 4.4.1.7: any signature in signed matching any public key of the
       // third_party_invite event (public_key / public_keys) -> allow.
@@ -435,7 +447,10 @@ function rule4(
         return allow('4.4.1.7');
       }
       // 4.4.1.8: otherwise, reject.
-      return reject('4.4.1.8', 'no signature matches a third_party_invite public key');
+      return reject(
+        '4.4.1.8',
+        'no signature matches a third_party_invite public key',
+      );
     }
     // 4.4.2: the sender's current membership must be join.
     if (senderMembership !== 'join') {
@@ -506,7 +521,10 @@ function rule4(
       !(joinRule === 'knock' && spec.knockJoinRule) &&
       !(joinRule === 'knock_restricted' && spec.knockRestrictedJoinRule)
     ) {
-      return reject('4.7.1', `join_rule ${String(joinRule)} does not accept knocks`);
+      return reject(
+        '4.7.1',
+        `join_rule ${String(joinRule)} does not accept knocks`,
+      );
     }
     // 4.7.2: sender must match state_key.
     if (pdu.sender !== target) {
@@ -584,11 +602,17 @@ function rule9(
       if (was === now) continue;
       // changed or removed: the current value must not be greater
       if (was !== undefined && was > senderLevel) {
-        return reject('9.6.1', `${mapName}.${k} currently ${was} above sender level`);
+        return reject(
+          '9.6.1',
+          `${mapName}.${k} currently ${was} above sender level`,
+        );
       }
       // added or changed: the new value must not be greater
       if (now !== undefined && now > senderLevel) {
-        return reject('9.7.1', `${mapName}.${k} set to ${now} above sender level`);
+        return reject(
+          '9.7.1',
+          `${mapName}.${k} set to ${now} above sender level`,
+        );
       }
     }
   }
@@ -605,7 +629,10 @@ function rule9(
     // changed or removed, other than the sender's own entry: the current
     // value must be below the sender's level
     if (u !== pdu.sender && was !== undefined && was >= senderLevel) {
-      return reject('9.8.1', `users.${u} currently ${was} at/above sender level`);
+      return reject(
+        '9.8.1',
+        `users.${u} currently ${was} at/above sender level`,
+      );
     }
     // added or changed: the new value must not exceed the sender's level
     if (now !== undefined && now > senderLevel) {

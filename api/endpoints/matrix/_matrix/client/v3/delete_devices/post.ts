@@ -3,8 +3,8 @@ import { localpartOf } from '#engine/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { serverName } from '#engine/config.ts';
 import { deleteDevices } from '#engine/tenant.ts';
-import { requireUia, PASSWORD_FLOWS } from '#engine/uia.ts';
-import type { PathfinderRequest, Context } from '@pathfinder/pathfinder';
+import { PASSWORD_FLOWS, requireUia } from '#engine/uia.ts';
+import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
 // POST /_matrix/client/v3/delete_devices — "Deletes the given devices, and
 // invalidates any access token associated with them." (spec v1.11, Device
@@ -18,7 +18,11 @@ export default async function (request: PathfinderRequest, context: Context) {
   const deviceIds = body.devices as unknown[];
   for (const d of deviceIds) {
     if (typeof d !== 'string') {
-      throw new MatrixError(400, 'M_BAD_JSON', 'devices must be a list of device ids');
+      throw new MatrixError(
+        400,
+        'M_BAD_JSON',
+        'devices must be a list of device ids',
+      );
     }
   }
   const caller = context.state.user as string;
@@ -28,6 +32,10 @@ export default async function (request: PathfinderRequest, context: Context) {
     flows: PASSWORD_FLOWS,
     caller,
   });
-  await deleteDevices(serverName(), localpartOf(caller), body.devices as string[]);
+  await deleteDevices(
+    serverName(),
+    localpartOf(caller),
+    body.devices as string[],
+  );
   return {};
 }

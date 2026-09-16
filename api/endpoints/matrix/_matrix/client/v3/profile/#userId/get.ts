@@ -12,10 +12,15 @@ import type { PathfinderRequest } from '@pathfinder/pathfinder';
 export default async function (request: PathfinderRequest) {
   const userId = request.params.userId as string;
   const colon = userId.lastIndexOf(':');
-  if (!userId.startsWith('@') || colon < 0 || userId.slice(colon + 1) !== serverName()) {
+  if (
+    !userId.startsWith('@') || colon < 0 ||
+    userId.slice(colon + 1) !== serverName()
+  ) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
   }
   const profile = await getProfile(serverName(), userId.slice(1, colon));
-  if (profile === null) throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
+  if (profile === null) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
+  }
   return profile;
 }

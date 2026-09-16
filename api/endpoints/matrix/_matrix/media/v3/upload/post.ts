@@ -15,7 +15,8 @@ import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 // (plan §3.5). Auth: folder middleware (20-auth.ts).
 export default async function (request: PathfinderRequest, context: Context) {
   const caller = context.state.user as string;
-  const contentType = request.headers.get('Content-Type') ?? 'application/octet-stream';
+  const contentType = request.headers.get('Content-Type') ??
+    'application/octet-stream';
   const filename = request.query.get('filename');
   const mediaId = newMediaId();
   const sizeBytes = await storeUploadBody(request.body.stream, mediaId);

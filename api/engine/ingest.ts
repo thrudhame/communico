@@ -136,7 +136,6 @@ async function prevDepths(
 
 async function resolvePrevs(
   roomId: string,
-  dbName: string,
   prevIds: string[],
 ): Promise<{ id: string; commitHash: string; branch: string | null }[]> {
   const prevs: { id: string; commitHash: string; branch: string | null }[] = [];
@@ -187,7 +186,7 @@ export async function author(
     throw new Error('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
   }
   const isCreate = partial.type === 'm.room.create' && prevIds.length === 0;
-  const prevs = await resolvePrevs(roomId, room.dbName, prevIds);
+  const prevs = await resolvePrevs(roomId, prevIds);
   const depths = await prevDepths(room.dbName, prevs);
   const depth = prevs.length === 0 ? 1 : Math.max(...depths) + 1;
 
@@ -344,7 +343,7 @@ export async function ingestEvent(
 
   // 6. prev resolution via the server DB's event_index (D8: the extremity
   //    branch comes from event_index.branch_name, not recomputation).
-  const prevs = await resolvePrevs(roomId, room.dbName, prevIds);
+  const prevs = await resolvePrevs(roomId, prevIds);
 
   // 7. depth check (genesis = 1: spec positive, empty prevs => 1).
   const depths = await prevDepths(room.dbName, prevs);
@@ -415,7 +414,11 @@ export async function ingestEvent(
           xbSets.push(await parentStateAt(room.dbName, h));
         }
         const currentRoomState = rulebook.resolveState(xbSets, store);
-        const current = rulebook.checkAuthAgainstState(pdu, currentRoomState, store);
+        const current = rulebook.checkAuthAgainstState(
+          pdu,
+          currentRoomState,
+          store,
+        );
         if (!current.ok) verdict = 'soft-fail';
       }
     }

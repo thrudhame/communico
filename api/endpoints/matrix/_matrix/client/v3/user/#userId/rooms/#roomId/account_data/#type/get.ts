@@ -2,7 +2,7 @@ import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { getAccountData } from '#engine/tenant.ts';
 import { localpartOf } from '#engine/auth.ts';
-import type { PathfinderRequest, Context } from '@pathfinder/pathfinder';
+import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
 // GET /_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}
 // — "Get some account data for the client on a given room. This config is
@@ -15,7 +15,11 @@ export default async function (request: PathfinderRequest, context: Context) {
   const caller = context.state.user as string;
   const userId = request.params.userId as string;
   if (userId !== caller) {
-    throw new MatrixError(403, 'M_FORBIDDEN', 'account data is private to its owner');
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'account data is private to its owner',
+    );
   }
   const content = await getAccountData(
     serverName(),
@@ -23,6 +27,8 @@ export default async function (request: PathfinderRequest, context: Context) {
     request.params.roomId as string,
     request.params.type as string,
   );
-  if (content === null) throw new MatrixError(404, 'M_NOT_FOUND', 'account data not found');
+  if (content === null) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'account data not found');
+  }
   return content;
 }

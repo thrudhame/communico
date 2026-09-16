@@ -1,4 +1,10 @@
-import { assert, assertEquals, assertMatch, assertRejects, assertThrows } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertMatch,
+  assertRejects,
+  assertThrows,
+} from '@std/assert';
 import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
@@ -35,7 +41,7 @@ Deno.test('tenant: key generate-once, native name shape', async () => {
   assertEquals(k.publicB64, a.key.publicB64);
 });
 
-Deno.test('credentials: argon2id PHC shape, verify good/bad', async () => {
+Deno.test('credentials: argon2id PHC shape, verify good/bad', () => {
   const phc = hashPassword('demo-password');
   assertMatch(phc, PHC_RE);
   assert(verifyPassword(phc, 'demo-password'));
@@ -97,10 +103,14 @@ Deno.test('register/login/token lifecycle', async () => {
 });
 
 Deno.test('uia sessions: create/complete/drop', async () => {
-  const s = await createUiaSession(serverName(), [{ stages: ['m.login.dummy'] }]);
+  const s = await createUiaSession(serverName(), [{
+    stages: ['m.login.dummy'],
+  }]);
   assert(s.session.length > 0);
   assertEquals((await getUiaSession(serverName(), s.session))?.completed, []);
-  const s2 = await completeUiaStages(serverName(), s.session, ['m.login.dummy']);
+  const s2 = await completeUiaStages(serverName(), s.session, [
+    'm.login.dummy',
+  ]);
   assert(s2.completed.includes('m.login.dummy'));
   await dropUiaSession(serverName(), s.session);
   assertEquals(await getUiaSession(serverName(), s.session), null);

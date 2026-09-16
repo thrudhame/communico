@@ -4,8 +4,6 @@
 // test pins the contract: the real environment wins over .env, .env fills
 // the gaps, and an explicit --env-file loses to the environment too.
 // Pure: subprocess probes, no DB, no server.
-import { assertEquals } from '@std/assert';
-
 const DENO = Deno.execPath();
 
 const PROBE = `console.log('VALUE=' + Deno.env.get('TEST_KEY'));\n`;
@@ -47,7 +45,9 @@ async function runProbe(
 function assertValue(res: { stdout: string; code: number }, expected: string) {
   if (!res.stdout.includes(`VALUE=${expected}`)) {
     throw new Error(
-      `env precedence broke on Deno ${Deno.version.deno}: wanted VALUE=${expected}, got ${JSON.stringify(res.stdout)}`,
+      `env precedence broke on Deno ${Deno.version.deno}: wanted VALUE=${expected}, got ${
+        JSON.stringify(res.stdout)
+      }`,
     );
   }
 }

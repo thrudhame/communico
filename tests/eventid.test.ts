@@ -1,8 +1,4 @@
-import {
-  assert,
-  assertEquals,
-  assertNotEquals,
-} from '@std/assert';
+import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { eventIdFor, redact } from '#engine/eventid.ts';
 import {
   b64decode,
@@ -72,7 +68,10 @@ Deno.test('redact: m.room.member keeps membership + join_authorised, trims third
       membership: 'join',
       displayname: 'X',
       avatar_url: 'mxc://y',
-      third_party_invite: { display_name: 'Z', signed: { mxid: '@c:d', token: 't' } },
+      third_party_invite: {
+        display_name: 'Z',
+        signed: { mxid: '@c:d', token: 't' },
+      },
     },
   }, '11');
   assertEquals(r.content, {
@@ -91,12 +90,17 @@ Deno.test('redact: m.room.power_levels keeps the v11 set — NOT notifications (
   const r = redact({
     type: 'm.room.power_levels',
     content: {
-      ban: 50, invite: 0, notifications: { room: 100 },
-      users: { '@a:b': 100 }, custom: 1,
+      ban: 50,
+      invite: 0,
+      notifications: { room: 100 },
+      users: { '@a:b': 100 },
+      custom: 1,
     },
   }, '11');
   assertEquals(r.content, {
-    ban: 50, invite: 0, users: { '@a:b': 100 },
+    ban: 50,
+    invite: 0,
+    users: { '@a:b': 100 },
   });
 });
 
@@ -118,8 +122,12 @@ Deno.test('redact: m.room.redaction keeps redacts under content (v11)', () => {
 
 Deno.test('redact: drops non-v11 top-level keys (origin, membership, prev_state)', () => {
   const r = redact({
-    type: 'm.room.message', room_id: '!r:x', sender: '@a:b',
-    origin: 'x.org', membership: 'join', prev_state: [],
+    type: 'm.room.message',
+    room_id: '!r:x',
+    sender: '@a:b',
+    origin: 'x.org',
+    membership: 'join',
+    prev_state: [],
     content: { body: 'hi' },
   }, '11');
   assert(!('origin' in r), 'origin must be stripped in v11');
@@ -136,22 +144,32 @@ Deno.test('spec vectors: JSON signing of {} and {one,two}', async () => {
   const empty: Record<string, unknown> = {};
   await signJson(empty, 'domain', 'ed25519:1', priv);
   assertEquals(
-    (empty.signatures as Record<string, Record<string, string>>).domain['ed25519:1'],
+    (empty.signatures as Record<string, Record<string, string>>)
+      .domain['ed25519:1'],
     'K8280/U9SSy9IVtjBuVeLr+HpOB4BQFWbg+UZaADMtTdGYI7Geitb76LTrr5QV/7Xg4ahLwYGYZzuHGZKM5ZAQ',
   );
   const two: Record<string, unknown> = { one: 1, two: 'Two' };
   await signJson(two, 'domain', 'ed25519:1', priv);
   assertEquals(
-    (two.signatures as Record<string, Record<string, string>>).domain['ed25519:1'],
+    (two.signatures as Record<string, Record<string, string>>)
+      .domain['ed25519:1'],
     'KqmLSbO39/Bzb0QIYE82zqLwsA+PDzYIpIRA2sRQ4sL53+sN6/fpNSoqE7BP7vBZhG6kYdD13EIMJpvhJI+6Bw',
   );
 });
 
 Deno.test('spec vectors: event content hashes', async () => {
   const minimal = {
-    room_id: '!x:domain', sender: '@a:domain', origin: 'domain',
-    origin_server_ts: 1000000, signatures: {}, hashes: {}, type: 'X',
-    content: {}, prev_events: [], auth_events: [], depth: 3,
+    room_id: '!x:domain',
+    sender: '@a:domain',
+    origin: 'domain',
+    origin_server_ts: 1000000,
+    signatures: {},
+    hashes: {},
+    type: 'X',
+    content: {},
+    prev_events: [],
+    auth_events: [],
+    depth: 3,
     unsigned: { age_ts: 1000000 },
   };
   assertEquals(
@@ -160,9 +178,14 @@ Deno.test('spec vectors: event content hashes', async () => {
   );
   const message = {
     content: { body: 'Here is the message content' },
-    event_id: '$0:domain', origin: 'domain', origin_server_ts: 1000000,
-    type: 'm.room.message', room_id: '!r:domain', sender: '@u:domain',
-    signatures: {}, unsigned: { age_ts: 1000000 },
+    event_id: '$0:domain',
+    origin: 'domain',
+    origin_server_ts: 1000000,
+    type: 'm.room.message',
+    room_id: '!r:domain',
+    sender: '@u:domain',
+    signatures: {},
+    unsigned: { age_ts: 1000000 },
   };
   assertEquals(
     await contentHashOf(message),

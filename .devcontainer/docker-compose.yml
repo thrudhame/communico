@@ -11,8 +11,8 @@ services:
       DOLTGRES_DB: ${DB_NAME}
       DOLTGRES_DATA_DIR: ${DB_DATA_DIR}
     ports:
-      - "${DB_PORT:-5432}:5432"
-      - "${APP_PORT:-8008}:8008"
+      - '${DB_PORT:-5432}:5432'
+      - '${APP_PORT:-8008}:8008'
     volumes:
       - ../doltgres/config:/etc/doltgres/servercfg.d
       - ..:/workspace:cached

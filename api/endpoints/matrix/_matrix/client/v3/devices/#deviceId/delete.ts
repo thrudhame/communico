@@ -2,9 +2,9 @@ import { parseJson } from '@pathfinder/pathfinder/body';
 import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { deleteDevices, getDevice } from '#engine/tenant.ts';
-import { requireUia, PASSWORD_FLOWS } from '#engine/uia.ts';
+import { PASSWORD_FLOWS, requireUia } from '#engine/uia.ts';
 import { localpartOf } from '#engine/auth.ts';
-import type { PathfinderRequest, Context } from '@pathfinder/pathfinder';
+import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
 // DELETE /_matrix/client/v3/devices/{deviceId} — "This API endpoint uses
 // the User-Interactive Authentication API. Deletes the given device, and
@@ -32,7 +32,9 @@ export default async function (request: PathfinderRequest, context: Context) {
   });
   const deviceId = request.params.deviceId as string;
   const device = await getDevice(serverName(), localpart, deviceId);
-  if (device === null) throw new MatrixError(404, 'M_NOT_FOUND', 'unknown device');
+  if (device === null) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'unknown device');
+  }
   await deleteDevices(serverName(), localpart, [deviceId]);
   return {};
 }

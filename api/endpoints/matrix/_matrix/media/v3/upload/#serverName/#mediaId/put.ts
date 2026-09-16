@@ -20,14 +20,25 @@ export default async function (request: PathfinderRequest, context: Context) {
   const mediaId = request.params.mediaId as string;
   assertLocalMxc(mxcServerName, mediaId);
   const row = await getMedia(serverName(), mediaId);
-  if (row === null) throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media ID');
+  if (row === null) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media ID');
+  }
   if (row.localpart !== localpartOf(caller)) {
-    throw new MatrixError(403, 'M_FORBIDDEN', 'Media belongs to a different user');
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'Media belongs to a different user',
+    );
   }
   if (row.state === 'uploaded') {
-    throw new MatrixError(409, 'M_CANNOT_OVERWRITE_MEDIA', 'Media already uploaded');
+    throw new MatrixError(
+      409,
+      'M_CANNOT_OVERWRITE_MEDIA',
+      'Media already uploaded',
+    );
   }
-  const contentType = request.headers.get('Content-Type') ?? 'application/octet-stream';
+  const contentType = request.headers.get('Content-Type') ??
+    'application/octet-stream';
   const filename = request.query.get('filename');
   const sizeBytes = await storeUploadBody(request.body.stream, mediaId);
   await markUploaded(serverName(), mediaId, {

@@ -18,7 +18,7 @@ state.
   never stored as input, always recomputed on receipt (self-certifying).
 - **Identity layer per version.** `eventIdFor(pdu, roomVersion)` and
   `redact(pdu, roomVersion)` implement v11's redaction table transcribed
-  from the spec (notably: power-levels keeps everything *except*
+  from the spec (notably: power-levels keeps everything _except_
   `notifications`; `origin` is stripped; `redacts` lives under content).
   Canonical JSON enforces the integer range, so a `ts=2^53` seizure is
   refused at the door.
@@ -51,17 +51,17 @@ state.
   flagged, out of state), and (c) against the current room state — a
   failure there is a SOFT-FAIL: stored verbatim, not an extremity for
   authoring, excluded from the client-visible timeline.
-- **State is the resolver's cache.** One invariant: *no path writes
-  `state` except the resolver* — ingest, heal, and adoption funnel
+- **State is the resolver's cache.** One invariant: _no path writes
+  `state` except the resolver_ — ingest, heal, and adoption funnel
   through a single `materialize()` per engine (the gate greps it).
   Rejected events stay in the DAG, flagged, out of state. N-prev fan-in
   chains 2-parent commits (bookkeeping); the event DAG keeps all N.
 - **Convergence gossip.** The announce carries `th = {engine, events,
   state, sh, room_version}` where `sh` is the digest of the announced
   frontier's resolved state over event ids. Contested keys yield an
-  *absent* `sh`, never a different one.
+  _absent_ `sh`, never a different one.
 - **Adoption re-resolves.** Store images are validated event-by-event
-  (id, content hash, signature, version) and then *replayed* from the
+  (id, content hash, signature, version) and then _replayed_ from the
   DAG — image `state` tables are never trusted (forged rows dropped);
   a conflict adopts the DAG, holds pre-adoption state, and returns the
   refusal instead of throwing.

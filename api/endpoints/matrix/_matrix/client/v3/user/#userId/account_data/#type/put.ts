@@ -3,7 +3,7 @@ import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { putAccountData } from '#engine/tenant.ts';
 import { localpartOf } from '#engine/auth.ts';
-import type { PathfinderRequest, Context } from '@pathfinder/pathfinder';
+import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
 // PUT /_matrix/client/v3/user/{userId}/account_data/{type} — "Set some
 // account data for the client. This config is only visible to the user
@@ -15,11 +15,21 @@ export default async function (request: PathfinderRequest, context: Context) {
   const caller = context.state.user as string;
   const userId = request.params.userId as string;
   if (userId !== caller) {
-    throw new MatrixError(403, 'M_FORBIDDEN', 'account data is private to its owner');
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'account data is private to its owner',
+    );
   }
   const content = await parseJson(request);
-  if (content === null || typeof content !== 'object' || Array.isArray(content)) {
-    throw new MatrixError(400, 'M_BAD_JSON', 'account data content must be a JSON object');
+  if (
+    content === null || typeof content !== 'object' || Array.isArray(content)
+  ) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'account data content must be a JSON object',
+    );
   }
   await putAccountData(
     serverName(),

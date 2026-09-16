@@ -29,7 +29,9 @@ export const SERVER_KEY_ID = '1';
 // structurally it fills this slot.
 export type ServerKey = TenantKey;
 
-export async function ensureServerKey(dnsName = serverName()): Promise<ServerKey> {
+export async function ensureServerKey(
+  dnsName = serverName(),
+): Promise<ServerKey> {
   return await withDb(serverDb(), async (c) => {
     await c.query(
       `CREATE TABLE IF NOT EXISTS server_signing_key (
@@ -85,7 +87,9 @@ export async function signPdu(
   roomVersion: string,
   key: ServerKey,
 ): Promise<Pdu> {
-  pdu.hashes = { sha256: await contentHashOf(pdu as unknown as Record<string, unknown>) };
+  pdu.hashes = {
+    sha256: await contentHashOf(pdu as unknown as Record<string, unknown>),
+  };
   pdu.event_id = await eventIdFor(
     pdu as unknown as Record<string, unknown>,
     roomVersion,

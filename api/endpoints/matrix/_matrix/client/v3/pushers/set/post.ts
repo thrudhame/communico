@@ -3,7 +3,7 @@ import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setPusher } from '#engine/tenant.ts';
 import { localpartOf } from '#engine/auth.ts';
-import type { PathfinderRequest, Context } from '@pathfinder/pathfinder';
+import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
 // POST /_matrix/client/v3/pushers/set — "This endpoint updates the pusher
 // associated with app_id and pushkey for the authenticated user."
@@ -17,13 +17,15 @@ export default async function (request: PathfinderRequest, context: Context) {
   const appId = str(body.app_id);
   const pushkey = str(body.pushkey);
   if (appId === null || pushkey === null) {
-    throw new MatrixError(400, 'M_MISSING_PARAM', 'app_id and pushkey are required');
+    throw new MatrixError(
+      400,
+      'M_MISSING_PARAM',
+      'app_id and pushkey are required',
+    );
   }
-  const kind = body.kind === null
-    ? null
-    : (str(body.kind) ?? (() => {
-      throw new MatrixError(400, 'M_MISSING_PARAM', 'kind is required');
-    })());
+  const kind = body.kind === null ? null : (str(body.kind) ?? (() => {
+    throw new MatrixError(400, 'M_MISSING_PARAM', 'kind is required');
+  })());
   let pusher: Parameters<typeof setPusher>[3];
   if (kind === null) {
     pusher = {

@@ -1,5 +1,5 @@
 import { lookupRoom } from '#engine/room.ts';
-import { serverDb, ident, withDb } from '#engine/db.ts';
+import { ident, serverDb, withDb } from '#engine/db.ts';
 
 // Newest extremity's wire event_id: newest-tipped x* branch in the room
 // DB -> its tip hash -> event_index (D8: branch tip == event commit).

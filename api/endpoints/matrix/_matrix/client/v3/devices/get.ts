@@ -13,7 +13,9 @@ export default async function (
   const localpart = localpartOf(userId);
   const devices = await listDevices(serverName(), localpart);
   return {
-    devices: devices.map((d: { device_id: string; display_name: string | null }) => ({
+    devices: devices.map((
+      d: { device_id: string; display_name: string | null },
+    ) => ({
       device_id: d.device_id,
       ...(d.display_name !== null ? { display_name: d.display_name } : {}),
     })),

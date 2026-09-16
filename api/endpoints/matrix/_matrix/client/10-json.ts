@@ -23,14 +23,20 @@ export default async function (request: PathfinderRequest, _context: Context) {
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
   } catch {
-    throw new HttpError(400, { errcode: 'M_NOT_JSON', error: 'Content not JSON.' });
+    throw new HttpError(400, {
+      errcode: 'M_NOT_JSON',
+      error: 'Content not JSON.',
+    });
   }
   if (text.trim() === '') return;
   try {
     JSON.parse(text);
   } catch (error) {
     if (error instanceof SyntaxError) {
-      throw new HttpError(400, { errcode: 'M_NOT_JSON', error: 'Content not JSON.' });
+      throw new HttpError(400, {
+        errcode: 'M_NOT_JSON',
+        error: 'Content not JSON.',
+      });
     }
     throw error;
   }

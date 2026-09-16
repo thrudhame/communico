@@ -6,7 +6,7 @@ import { serverName } from '#engine/config.ts';
 // (capture: wire-observed; nio WhoamiResponse requires user_id,
 // device_id optional). Unknown/missing tokens are proper 401s (F1).
 export default async function (
-  request: import('@pathfinder/pathfinder').PathfinderRequest,
+  _request: import('@pathfinder/pathfinder').PathfinderRequest,
   context: import('@pathfinder/pathfinder').Context,
 ) {
   const token = context.state.token;

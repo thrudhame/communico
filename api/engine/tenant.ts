@@ -4,8 +4,11 @@
 // reuse-forever); hosted users are localparts under it (custodial,
 // argon2id credentials — see BLOCKER-F1-CREDENTIALS.md).
 import { encodeBase32 } from '@std/encoding/base32';
-import { hash as argonHash, verify as argonVerify } from '@stdext/crypto/hash/argon2';
-import { serverDb, ident, withDb } from './db.ts';
+import {
+  hash as argonHash,
+  verify as argonVerify,
+} from '@stdext/crypto/hash/argon2';
+import { ident, serverDb, withDb } from './db.ts';
 import { serverName } from './config.ts';
 import { runSqlFile } from './room.ts';
 import { MatrixError } from './matrix-error.ts';
@@ -20,7 +23,10 @@ import {
 } from '#engine/signing-primitives.js';
 
 async function sha256hex(s: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(s),
+  );
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, '0')).join('');
 }
@@ -77,7 +83,11 @@ export function checkLocalpart(raw: unknown): string {
   }
   const localpart = raw.toLowerCase();
   if (!LOCALPART_RE.test(localpart) || localpart.length > 255) {
-    throw new MatrixError(400, 'M_INVALID_USERNAME', 'invalid username: ' + raw);
+    throw new MatrixError(
+      400,
+      'M_INVALID_USERNAME',
+      'invalid username: ' + raw,
+    );
   }
   return localpart;
 }
@@ -125,7 +135,9 @@ export async function ensureTenant(
     if (existing.rows.length > 0) {
       const row = existing.rows[0] as Record<string, unknown>;
       if (f0 && String(row.pubkey_b64) !== (f0 as { pubB64: string }).pubB64) {
-        throw new Error('E_KEY_MISMATCH: tenant key differs from F0 key — refusing to rotate');
+        throw new Error(
+          'E_KEY_MISMATCH: tenant key differs from F0 key — refusing to rotate',
+        );
       }
       const pubRaw = b64decode(String(row.pubkey_b64));
       const privDer = b64decode(String(row.privkey_enc));
@@ -218,17 +230,24 @@ export async function registerUser(
     ? params.deviceId
     : crypto.randomUUID().replaceAll('-', '').slice(0, 10);
   const result = await withDb(dbName, async (c) => {
-    const taken = await c.query('SELECT localpart FROM users WHERE localpart = $1;', [localpart]);
+    const taken = await c.query(
+      'SELECT localpart FROM users WHERE localpart = $1;',
+      [localpart],
+    );
     if (taken.rows.length > 0) {
       throw new MatrixError(400, 'M_USER_IN_USE', 'user in use: ' + localpart);
     }
-    const displayName = typeof params.displayName === 'string' && params.displayName.length > 0
-      ? params.displayName
-      : localpart;
-    await c.query('INSERT INTO users (localpart, display_name) VALUES ($1, $2);', [
-      localpart,
-      displayName,
-    ]);
+    const displayName =
+      typeof params.displayName === 'string' && params.displayName.length > 0
+        ? params.displayName
+        : localpart;
+    await c.query(
+      'INSERT INTO users (localpart, display_name) VALUES ($1, $2);',
+      [
+        localpart,
+        displayName,
+      ],
+    );
     const phc = hashPassword(params.password);
     await c.query(
       "INSERT INTO credentials (localpart, kind, hash, salt, params) VALUES ($1, 'argon2id', $2, NULL, NULL);",
@@ -241,9 +260,10 @@ export async function registerUser(
     const userId = `@${localpart}:${serverName}`;
     let accessToken: string | undefined;
     if (params.accessToken !== null) {
-      accessToken = typeof params.accessToken === 'string' && params.accessToken.length > 0
-        ? params.accessToken
-        : crypto.randomUUID();
+      accessToken =
+        typeof params.accessToken === 'string' && params.accessToken.length > 0
+          ? params.accessToken
+          : crypto.randomUUID();
       await c.query(
         'INSERT INTO access_tokens (token, localpart, device_id) VALUES ($1, $2, $3) ON CONFLICT (token) DO NOTHING;',
         [accessToken, localpart, deviceId],
@@ -296,7 +316,9 @@ export async function lookupToken(
     return {
       localpart,
       user_id: `@${localpart}:${serverName}`,
-      device_id: r.rows[0].device_id == null ? null : String(r.rows[0].device_id),
+      device_id: r.rows[0].device_id == null
+        ? null
+        : String(r.rows[0].device_id),
     };
   });
 }
@@ -317,10 +339,16 @@ export async function issueToken(
   return token;
 }
 
-export async function revokeToken(serverName: string, token: string): Promise<void> {
+export async function revokeToken(
+  serverName: string,
+  token: string,
+): Promise<void> {
   const { dbName } = await ensureTenant(serverName);
   await withDb(dbName, async (c) => {
-    const r = await c.query('SELECT device_id FROM access_tokens WHERE token = $1;', [token]);
+    const r = await c.query(
+      'SELECT device_id FROM access_tokens WHERE token = $1;',
+      [token],
+    );
     const deviceId = r.rows.length && r.rows[0].device_id != null
       ? String(r.rows[0].device_id)
       : null;
@@ -333,7 +361,9 @@ export async function revokeToken(serverName: string, token: string): Promise<vo
         'DELETE FROM pushers WHERE access_token IN (SELECT token FROM access_tokens WHERE device_id = $1);',
         [deviceId],
       );
-      await c.query('DELETE FROM access_tokens WHERE device_id = $1;', [deviceId]);
+      await c.query('DELETE FROM access_tokens WHERE device_id = $1;', [
+        deviceId,
+      ]);
       await c.query('DELETE FROM devices WHERE device_id = $1;', [deviceId]);
     }
   });
@@ -372,11 +402,16 @@ export async function listDevices(
   });
 }
 
-export async function revokeAllTokens(serverName: string, localpart: string): Promise<void> {
+export async function revokeAllTokens(
+  serverName: string,
+  localpart: string,
+): Promise<void> {
   const { dbName } = await ensureTenant(serverName);
   await withDb(dbName, async (c) => {
     await c.query('DELETE FROM pushers WHERE localpart = $1;', [localpart]);
-    await c.query('DELETE FROM access_tokens WHERE localpart = $1;', [localpart]);
+    await c.query('DELETE FROM access_tokens WHERE localpart = $1;', [
+      localpart,
+    ]);
     await c.query('DELETE FROM devices WHERE localpart = $1;', [localpart]);
   });
 }
@@ -437,14 +472,20 @@ export async function deleteDevices(
         'DELETE FROM pushers WHERE access_token IN (SELECT token FROM access_tokens WHERE device_id = $1 AND localpart = $2);',
         [deviceId, localpart],
       );
-      await c.query('DELETE FROM access_tokens WHERE device_id = $1 AND localpart = $2;', [
-        deviceId,
-        localpart,
-      ]);
-      await c.query('DELETE FROM devices WHERE device_id = $1 AND localpart = $2;', [
-        deviceId,
-        localpart,
-      ]);
+      await c.query(
+        'DELETE FROM access_tokens WHERE device_id = $1 AND localpart = $2;',
+        [
+          deviceId,
+          localpart,
+        ],
+      );
+      await c.query(
+        'DELETE FROM devices WHERE device_id = $1 AND localpart = $2;',
+        [
+          deviceId,
+          localpart,
+        ],
+      );
     }
   });
 }
@@ -511,11 +552,17 @@ export async function completeUiaStages(
     );
     for (const s of stages) completed.add(s);
     const arr = [...completed];
-    await c.query('UPDATE uia_sessions SET completed = $1 WHERE session = $2;', [
-      JSON.stringify(arr),
-      session,
-    ]);
-    const f = await c.query('SELECT flows FROM uia_sessions WHERE session = $1;', [session]);
+    await c.query(
+      'UPDATE uia_sessions SET completed = $1 WHERE session = $2;',
+      [
+        JSON.stringify(arr),
+        session,
+      ],
+    );
+    const f = await c.query(
+      'SELECT flows FROM uia_sessions WHERE session = $1;',
+      [session],
+    );
     const flows = typeof f.rows[0].flows === 'string'
       ? JSON.parse(f.rows[0].flows) as { stages: string[] }[]
       : (f.rows[0].flows as { stages: string[] }[]);
@@ -523,7 +570,10 @@ export async function completeUiaStages(
   });
 }
 
-export async function dropUiaSession(serverName: string, session: string): Promise<void> {
+export async function dropUiaSession(
+  serverName: string,
+  session: string,
+): Promise<void> {
   const { dbName } = await ensureTenant(serverName);
   await withDb(dbName, async (c) => {
     await c.query('DELETE FROM uia_sessions WHERE session = $1;', [session]);
@@ -661,9 +711,12 @@ export async function isDeactivated(
 ): Promise<boolean> {
   const { dbName } = await ensureTenant(serverName);
   return await withDb(dbName, async (c) => {
-    const r = await c.query('SELECT deactivated FROM users WHERE localpart = $1;', [
-      localpart,
-    ]);
+    const r = await c.query(
+      'SELECT deactivated FROM users WHERE localpart = $1;',
+      [
+        localpart,
+      ],
+    );
     return r.rows.length > 0 && r.rows[0].deactivated === true;
   });
 }
@@ -860,7 +913,9 @@ export async function getMedia(
     return {
       media_id: String(row.media_id),
       localpart: String(row.localpart),
-      state: row.state === 'uploaded' ? 'uploaded' as const : 'pending' as const,
+      state: row.state === 'uploaded'
+        ? 'uploaded' as const
+        : 'pending' as const,
       content_type: row.content_type == null ? null : String(row.content_type),
       filename: row.filename == null ? null : String(row.filename),
       size_bytes: row.size_bytes == null ? null : Number(row.size_bytes),

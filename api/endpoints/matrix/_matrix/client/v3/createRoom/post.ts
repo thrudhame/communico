@@ -20,7 +20,11 @@ export default async function (
   const roomVersion = body.room_version ?? '11';
   const roomId = '!' + crypto.randomUUID() + ':' + serverName();
   try {
-    await createRoom(roomId, roomVersion as string, context.state.user as string);
+    await createRoom(
+      roomId,
+      roomVersion as string,
+      context.state.user as string,
+    );
   } catch (e) {
     const msg = String(e);
     if (msg.includes('M_UNSUPPORTED_ROOM_VERSION')) {

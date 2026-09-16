@@ -32,7 +32,7 @@ Deno.test('>20 prev_events: clean rejection (v11 bound), no commit, branches int
     );
     void r;
     // re-read the tip each round is wrong here — all three share [tip]
-    ids.push((await latestExtremityEventId(ROOM)));
+    ids.push(await latestExtremityEventId(ROOM));
   }
 
   const xb = await extremities(dbName, ROOM);
@@ -56,7 +56,10 @@ Deno.test('>20 prev_events: clean rejection (v11 bound), no commit, branches int
   const before = await totalCommits();
 
   // the probe: 21 prevs must be rejected (v11 allows at most 20)
-  const many = [...ids, ...ids, ...ids, ...ids, ...ids, ...ids, ...ids].slice(0, 21);
+  const many = [...ids, ...ids, ...ids, ...ids, ...ids, ...ids, ...ids].slice(
+    0,
+    21,
+  );
   assertEquals(many.length, 21);
   const err = await assertRejects(
     () =>
@@ -131,9 +134,15 @@ Deno.test('3-prev message: chained commits, full DAG, single extremity', async (
     const b = await c.query(
       `SELECT name FROM dolt.branches WHERE name LIKE 'x%' ORDER BY latest_commit_date DESC, name ASC LIMIT 1;`,
     );
-    // deno-lint-ignore no-explicit-any
-    await c.query(`SELECT DOLT_CHECKOUT('${String((b.rows as any[])[0].name)}');`);
-    const r = await c.query('SELECT prev_events FROM events WHERE event_id = $1;', [heal.event_id]);
+    await c.query(
+      `SELECT DOLT_CHECKOUT('${
+        String((b.rows as { name: string }[])[0].name)
+      }');`,
+    );
+    const r = await c.query(
+      'SELECT prev_events FROM events WHERE event_id = $1;',
+      [heal.event_id],
+    );
     // jsonb arrives pre-parsed (array) via pg, TEXT-embedded via doltlite
     const pv = r.rows[0].prev_events;
     const arr = Array.isArray(pv) ? pv : JSON.parse(String(pv));

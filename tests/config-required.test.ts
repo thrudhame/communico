@@ -17,7 +17,9 @@ const REQUIRED = [
   'MEDIA_MAX_BYTES',
 ];
 
-const BASE_ENV: Record<string, string> = { PATH: Deno.env.get('PATH') ?? '/usr/bin' };
+const BASE_ENV: Record<string, string> = {
+  PATH: Deno.env.get('PATH') ?? '/usr/bin',
+};
 
 Deno.test('empty env → exit 1, stderr names all nine required variables', async () => {
   const emptyEnvFile = await Deno.makeTempDir() + '/empty.env';
@@ -65,7 +67,14 @@ Deno.test('all nine set → binds APP_PORT and answers GET /_matrix/client/versi
   // (and the spawn needs --allow-write for it).
   const mediaRoot = await Deno.makeTempDir();
   const cmd = new Deno.Command(DENO, {
-    args: ['run', '--allow-env', '--allow-read', '--allow-net', '--allow-write', 'main.ts'],
+    args: [
+      'run',
+      '--allow-env',
+      '--allow-read',
+      '--allow-net',
+      '--allow-write',
+      'main.ts',
+    ],
     cwd: new URL('..', import.meta.url).pathname,
     env: {
       ...BASE_ENV,
@@ -96,7 +105,9 @@ Deno.test('all nine set → binds APP_PORT and answers GET /_matrix/client/versi
       await Promise.race([new Promise((r) => setTimeout(r, 250)), exitedP]);
       if (exited !== null) break;
       try {
-        const res = await fetch(`http://127.0.0.1:${port}/_matrix/client/versions`);
+        const res = await fetch(
+          `http://127.0.0.1:${port}/_matrix/client/versions`,
+        );
         if (res.ok) {
           const body = await res.json();
           assert(Array.isArray(body.versions));
@@ -107,7 +118,9 @@ Deno.test('all nine set → binds APP_PORT and answers GET /_matrix/client/versi
     }
     assert(
       exited === null,
-      `server exited early (code ${(exited as unknown as { code: number })?.code})`,
+      `server exited early (code ${
+        (exited as unknown as { code: number })?.code
+      })`,
     );
     assert(answered, 'server did not answer /versions with all config set');
   } finally {

@@ -17,7 +17,9 @@ console.log(`server DB '${serverDb()}' provisioned from db/server/schema.sql`);
 await ensureServerKey();
 const { dbName, key } = await ensureTenant(serverName());
 console.log(
-  `tenant DB '${dbName}' ready (native name ${key.nativeName.slice(0, 12)}…, key ed25519:${key.keyId})`,
+  `tenant DB '${dbName}' ready (native name ${
+    key.nativeName.slice(0, 12)
+  }…, key ed25519:${key.keyId})`,
 );
 
 // Dev seeds (dev-only, labelled): alice + bob + dev through registerUser
@@ -43,7 +45,9 @@ for (
     );
   } catch (e) {
     if (String(e).includes('M_USER_IN_USE')) {
-      console.log(`seed @${localpart}:${serverName()} already registered — kept`);
+      console.log(
+        `seed @${localpart}:${serverName()} already registered — kept`,
+      );
     } else {
       throw e;
     }

@@ -64,4 +64,3 @@ unauthenticated media download is a documented liability — frozen at a
 later milestone. The browser homeserver (communico-lite) and native
 sync are parked — prior art on `research/lite`, plan in
 `~/Documents/communico/plans/lite/`. Pushes are user-gated.
-

@@ -2,7 +2,7 @@
 // directly (live doltgres: UIA sessions and credentials are tenant rows).
 // Each rule maps to a Complement assertion (§2 A1/A4/A6).
 import { assert, assertEquals } from '@std/assert';
-import { requireUia, PASSWORD_FLOWS, DUMMY_FLOWS } from '#engine/uia.ts';
+import { DUMMY_FLOWS, PASSWORD_FLOWS, requireUia } from '#engine/uia.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { serverName } from '#engine/config.ts';
 import { registerTestUser } from './util.ts';
@@ -21,7 +21,9 @@ async function uiaError(promise: Promise<void>): Promise<MatrixError> {
 }
 
 Deno.test('rule 2: no auth.type → 401 with EXACTLY {flows, params, session} — no errcode', async () => {
-  const err = await uiaError(requireUia({ serverName: SN, body: {}, flows: DUMMY_FLOWS }));
+  const err = await uiaError(
+    requireUia({ serverName: SN, body: {}, flows: DUMMY_FLOWS }),
+  );
   assertEquals(err.status, 401);
   const body = err.responseBody();
   assertEquals(Object.keys(body).sort(), ['flows', 'params', 'session']);

@@ -268,7 +268,10 @@ Deno.test('thrown 404 keeps its own body through the page; a miss stays M_UNRECO
     }),
   );
   assertEquals(res.status, 404);
-  assertEquals(await res.json(), { errcode: 'M_NOT_FOUND', error: 'unknown device' });
+  assertEquals(await res.json(), {
+    errcode: 'M_NOT_FOUND',
+    error: 'unknown device',
+  });
   const miss = await matrix(new Request('http://x/_matrix/client/v3/nope'));
   assertEquals(miss.status, 404);
   assertEquals((await miss.json()).errcode, 'M_UNRECOGNIZED');

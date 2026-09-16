@@ -23,7 +23,10 @@ export function newMediaId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(18));
   let binary = '';
   for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(
+    /=+$/,
+    '',
+  );
 }
 
 // Spec v1.16, Content repository — Security considerations: "homeservers
@@ -108,9 +111,14 @@ export function contentDisposition(
   contentType: string,
   filename: string | null,
 ): string {
-  const mediaType = (contentType.split(';')[0] ?? contentType).trim().toLowerCase();
-  const disposition = INLINE_CONTENT_TYPES.includes(mediaType) ? 'inline' : 'attachment';
-  return filename === null ? disposition : `${disposition}; ${filenameParameter(filename)}`;
+  const mediaType = (contentType.split(';')[0] ?? contentType).trim()
+    .toLowerCase();
+  const disposition = INLINE_CONTENT_TYPES.includes(mediaType)
+    ? 'inline'
+    : 'attachment';
+  return filename === null
+    ? disposition
+    : `${disposition}; ${filenameParameter(filename)}`;
 }
 
 /**
@@ -136,7 +144,11 @@ export async function storeUploadBody(
       for await (const chunk of stream) {
         size += chunk.byteLength;
         if (size > limit) {
-          throw new MatrixError(413, 'M_TOO_LARGE', 'Upload exceeds the server limit');
+          throw new MatrixError(
+            413,
+            'M_TOO_LARGE',
+            'Upload exceeds the server limit',
+          );
         }
         await writer.write(chunk);
       }
@@ -168,7 +180,11 @@ export async function serveMedia(
   const row = await getMedia(serverName(), mediaId);
   if (row === null) throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media');
   if (row.state !== 'uploaded') {
-    throw new MatrixError(504, 'M_NOT_YET_UPLOADED', 'Content is not yet available');
+    throw new MatrixError(
+      504,
+      'M_NOT_YET_UPLOADED',
+      'Content is not yet available',
+    );
   }
   const file = await Deno.open(`${mediaRoot()}/${mediaId}`, { read: true });
   const contentType = row.content_type ?? 'application/octet-stream';
@@ -184,6 +200,8 @@ export async function serveMedia(
     // such as SharedArrayBuffer when interacting with the media repo.
     'Cross-Origin-Resource-Policy': 'cross-origin',
   });
-  if (row.size_bytes !== null) headers.set('Content-Length', String(row.size_bytes));
+  if (row.size_bytes !== null) {
+    headers.set('Content-Length', String(row.size_bytes));
+  }
   return new Response(file.readable, { headers });
 }

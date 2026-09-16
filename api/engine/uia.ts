@@ -32,8 +32,8 @@ import {
   createUiaSession,
   dropUiaSession,
   getUiaSession,
-  verifyUserPassword,
   type UiaSession,
+  verifyUserPassword,
 } from './tenant.ts';
 
 export const PASSWORD_FLOWS = [{ stages: ['m.login.password'] }];
@@ -44,7 +44,6 @@ export const DUMMY_FLOWS = [{ stages: ['m.login.dummy'] }];
  * body wholesale, so no errcode/error keys ride along unless given. */
 function uiaRequired(
   session: UiaSession,
-  flows: { stages: string[] }[],
   withCompleted: boolean,
 ): MatrixError {
   const body: Record<string, unknown> = {
@@ -88,7 +87,7 @@ export async function requireUia(opts: {
   // three-key 401 (flows, params, session — no errcode).
   if (authType === undefined) {
     if (session === null) session = await createUiaSession(serverName, flows);
-    throw uiaRequired(session, flows, false);
+    throw uiaRequired(session, false);
   }
 
   // Rules 3-4: earn stages from the attempt.
@@ -123,7 +122,9 @@ export async function requireUia(opts: {
     }
     // Caller check fires BEFORE any password verification (order matters —
     // never leak whether another user's password was right).
-    if (caller !== undefined && targetMxid !== undefined && targetMxid !== caller) {
+    if (
+      caller !== undefined && targetMxid !== undefined && targetMxid !== caller
+    ) {
       throw new MatrixError(
         403,
         'M_FORBIDDEN',
@@ -132,15 +133,18 @@ export async function requireUia(opts: {
     }
     const target = targetLocalpart ??
       (caller !== undefined ? localpartOf(caller) : undefined);
-    const password = typeof auth.password === 'string' && auth.password.length > 0
-      ? auth.password
-      : undefined;
+    const password =
+      typeof auth.password === 'string' && auth.password.length > 0
+        ? auth.password
+        : undefined;
     if (target !== undefined && password !== undefined) {
       const ok = await verifyUserPassword(serverName, target, password);
       if (!ok) {
         // Rule 4: session (existing or fresh) kept; the 401 carries the
         // failed attempt's fields (Complement A1 :129-199 step 3, A6 :76-86).
-        if (session === null) session = await createUiaSession(serverName, flows);
+        if (session === null) {
+          session = await createUiaSession(serverName, flows);
+        }
         throw new MatrixError(401, 'M_FORBIDDEN', 'invalid password', {
           errcode: 'M_FORBIDDEN',
           error: 'invalid password',
@@ -166,19 +170,19 @@ export async function requireUia(opts: {
     // session fails" requires the 401 once the server issues sessions).
     if (caller === undefined) {
       const fresh = await createUiaSession(serverName, flows);
-      throw uiaRequired(fresh, flows, false);
+      throw uiaRequired(fresh, false);
     }
     // Rule 6: one-shot — no session anywhere; create + complete + drop in
     // the same call (A4/A6 send no session). Without a completed attempt,
     // a fresh session answers the rule-5 401.
     if (newly.length === 0) {
       const fresh = await createUiaSession(serverName, flows);
-      throw uiaRequired(fresh, flows, true);
+      throw uiaRequired(fresh, true);
     }
     const s = await createUiaSession(serverName, flows);
     const updated = await completeUiaStages(serverName, s.session, newly);
     if (!completesAFlow(updated.completed)) {
-      throw uiaRequired(updated, flows, true);
+      throw uiaRequired(updated, true);
     }
     await dropUiaSession(serverName, updated.session);
     return;
@@ -188,7 +192,7 @@ export async function requireUia(opts: {
     ? await completeUiaStages(serverName, session.session, newly)
     : session;
   if (!completesAFlow(updated.completed)) {
-    throw uiaRequired(updated, flows, true);
+    throw uiaRequired(updated, true);
   }
   await dropUiaSession(serverName, updated.session);
 }

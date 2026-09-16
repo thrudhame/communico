@@ -2,7 +2,7 @@ import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { getDevice } from '#engine/tenant.ts';
 import { localpartOf } from '#engine/auth.ts';
-import type { PathfinderRequest, Context } from '@pathfinder/pathfinder';
+import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
 // GET /_matrix/client/v3/devices/{deviceId} — "Gets information on a single
 // device, by device id." (spec v1.11, Device Management). 404 when the
@@ -18,6 +18,8 @@ export default async function (request: PathfinderRequest, context: Context) {
   }
   return {
     device_id: device.device_id,
-    ...(device.display_name !== null ? { display_name: device.display_name } : {}),
+    ...(device.display_name !== null
+      ? { display_name: device.display_name }
+      : {}),
   };
 }

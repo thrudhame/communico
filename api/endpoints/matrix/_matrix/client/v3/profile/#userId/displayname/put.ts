@@ -14,12 +14,22 @@ export default async function (request: PathfinderRequest) {
   const caller = await authorize(request);
   const userId = request.params.userId as string;
   if (userId !== caller) {
-    throw new MatrixError(403, 'M_FORBIDDEN', 'cannot set another user\u2019s displayname');
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'cannot set another user\u2019s displayname',
+    );
   }
   const body = await parseJson(request) as { displayname?: unknown };
-  if (!('displayname' in body) ||
-    !(typeof body.displayname === 'string' || body.displayname === null)) {
-    throw new MatrixError(400, 'M_BAD_JSON', 'displayname must be a string or null');
+  if (
+    !('displayname' in body) ||
+    !(typeof body.displayname === 'string' || body.displayname === null)
+  ) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'displayname must be a string or null',
+    );
   }
   const colon = userId.lastIndexOf(':');
   await setDisplayName(serverName(), userId.slice(1, colon), body.displayname);

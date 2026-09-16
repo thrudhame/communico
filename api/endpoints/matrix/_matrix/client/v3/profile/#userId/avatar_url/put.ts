@@ -15,12 +15,22 @@ export default async function (request: PathfinderRequest) {
   const caller = await authorize(request);
   const userId = request.params.userId as string;
   if (userId !== caller) {
-    throw new MatrixError(403, 'M_FORBIDDEN', 'cannot set another user\u2019s avatar_url');
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'cannot set another user\u2019s avatar_url',
+    );
   }
   const body = await parseJson(request) as { avatar_url?: unknown };
-  if (!('avatar_url' in body) ||
-    !(typeof body.avatar_url === 'string' || body.avatar_url === null)) {
-    throw new MatrixError(400, 'M_BAD_JSON', 'avatar_url must be a string or null');
+  if (
+    !('avatar_url' in body) ||
+    !(typeof body.avatar_url === 'string' || body.avatar_url === null)
+  ) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'avatar_url must be a string or null',
+    );
   }
   const colon = userId.lastIndexOf(':');
   await setAvatarUrl(serverName(), userId.slice(1, colon), body.avatar_url);

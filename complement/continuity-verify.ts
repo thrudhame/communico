@@ -2,7 +2,6 @@
 // against a (post-restart) tenant pubkey. Env: C_ROOM, C_EVENT, C_PUB.
 // Piped into the container like continuity-query.ts. Prints
 // SIGNATURE-VERIFIES or exits 1.
-import pgpkg from 'pg';
 import {
   b64decode,
   importPublicKeyFromRaw,
@@ -22,7 +21,10 @@ const pdu = await withDb(room.dbName, async (c) => {
     "SELECT name FROM dolt.branches WHERE name LIKE 'x%' ORDER BY latest_commit_date DESC LIMIT 1;",
   );
   await c.query(`SELECT DOLT_CHECKOUT('${String(tips.rows[0].name)}');`);
-  const r = await c.query('SELECT canonical_json FROM events WHERE event_id = $1;', [eventId]);
+  const r = await c.query(
+    'SELECT canonical_json FROM events WHERE event_id = $1;',
+    [eventId],
+  );
   const v = r.rows[0].canonical_json;
   return typeof v === 'string' ? JSON.parse(v) : v;
 });
