@@ -4,6 +4,7 @@ declare module '@pathfinder/pathfinder' {
   interface State {
     user?: string;
     token?: string;
+    device?: string;
   }
 }
 

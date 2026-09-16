@@ -29,6 +29,10 @@ export interface IngestOptions {
   // TEST HOOK ONLY (phase-2 fork test): skip deleting consumed prev
   // branches in step 8 so a second event can reference the same prev.
   keepPrevBranches?: boolean;
+  // M4: transaction idempotency — the sending device + txn id, recorded
+  // on the event_index row (unsigned.transaction_id renders for the same
+  // device only).
+  txn?: { deviceId: string; txnId: string };
 }
 
 // Core→hat signal (design §3.6: hats are plugins — the core knows nothing
@@ -722,8 +726,17 @@ async function ingestEventLocked(
   // the id; rejected/soft-failed events still persist verbatim).
   await withDb(serverDb(), async (c) => {
     await c.query(
-      'INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed) VALUES ($1, $2, $3, $4, $5, $6);',
-      [eventId, roomId, commitHash, newBranch, rejected, softFailed],
+      'INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed, txn_device, txn_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);',
+      [
+        eventId,
+        roomId,
+        commitHash,
+        newBranch,
+        rejected,
+        softFailed,
+        opts.txn?.deviceId ?? null,
+        opts.txn?.txnId ?? null,
+      ],
     );
   });
 

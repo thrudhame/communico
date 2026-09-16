@@ -1,6 +1,6 @@
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 import { serverName } from './config.ts';
-import { lookupToken } from './tenant.ts';
+import { lookupToken, type TokenInfo } from './tenant.ts';
 import { MatrixError } from './matrix-error.ts';
 
 // Tenant-DB token auth (F1): token from `Authorization: Bearer <token>`
@@ -14,9 +14,11 @@ export function localpartOf(userId: string): string {
   return userId.slice(1, userId.lastIndexOf(':'));
 }
 
-export async function authorize(
+// M4: the full token row (user_id + device_id) — the middleware sets
+// context.state.device from it (txn idempotency is device-scoped).
+export async function authorizeFull(
   request: PathfinderRequest,
-): Promise<string> {
+): Promise<TokenInfo> {
   const header = request.headers.get('Authorization') ?? '';
   const match = /^Bearer (.+)$/.exec(header);
   const token = match?.[1] ?? request.query.get('access_token');
@@ -25,5 +27,11 @@ export async function authorize(
   if (!info) {
     throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'token not recognized');
   }
-  return info.user_id;
+  return info;
+}
+
+export async function authorize(
+  request: PathfinderRequest,
+): Promise<string> {
+  return (await authorizeFull(request)).user_id;
 }

@@ -19,12 +19,14 @@ export interface EventIndexRow {
 }
 
 // The client-visible event: event_id, type, sender, content,
-// origin_server_ts, room_id, state_key? and unsigned{age}. The stored PDU
-// stays verbatim — anything derived lives here, never in the DAG.
+// origin_server_ts, room_id, state_key? and unsigned{age,
+// transaction_id?}. unsigned.transaction_id renders only when the viewer
+// IS the sending device (Complement TestTxnScopeOnLocalEcho). The stored
+// PDU stays verbatim — anything derived lives here, never in the DAG.
 export function clientEvent(
   pdu: Pdu,
   row: EventIndexRow,
-  _viewer?: { userId: string; deviceId: string | null },
+  viewer?: { userId: string; deviceId: string | null },
 ): Record<string, unknown> {
   const ev: Record<string, unknown> = {
     event_id: row.event_id,
@@ -35,8 +37,15 @@ export function clientEvent(
     room_id: row.room_id,
   };
   if (pdu.state_key != null) ev.state_key = pdu.state_key;
-  ev.unsigned = {
+  const unsigned: Record<string, unknown> = {
     age: Math.max(0, Date.now() - Number(pdu.origin_server_ts)),
   };
+  if (
+    viewer?.deviceId != null && row.txn_device === viewer.deviceId &&
+    row.txn_id != null
+  ) {
+    unsigned.transaction_id = row.txn_id;
+  }
+  ev.unsigned = unsigned;
   return ev;
 }

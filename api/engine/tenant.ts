@@ -847,6 +847,46 @@ export async function getAccountData(
   });
 }
 
+// --- M4: transaction idempotency -------------------------------------------
+// Scoped to (device, room, txn): a repeat send returns the recorded
+// event_id regardless of content (Complement txnid_test.go).
+
+/** The recorded event_id for a (device, room, txn), or null. */
+export async function lookupTransaction(
+  serverName: string,
+  deviceId: string,
+  roomId: string,
+  txnId: string,
+): Promise<string | null> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      'SELECT event_id FROM transactions WHERE device_id = $1 AND room_id = $2 AND txn_id = $3;',
+      [deviceId, roomId, txnId],
+    );
+    return r.rows.length ? String(r.rows[0].event_id) : null;
+  });
+}
+
+/** Record a (device, room, txn) -> event_id after a successful send. */
+export async function recordTransaction(
+  serverName: string,
+  deviceId: string,
+  roomId: string,
+  txnId: string,
+  eventId: string,
+): Promise<void> {
+  const { dbName } = await ensureTenant(serverName);
+  await withDb(dbName, async (c) => {
+    await c.query(
+      `INSERT INTO transactions (device_id, room_id, txn_id, event_id)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (device_id, room_id, txn_id) DO NOTHING;`,
+      [deviceId, roomId, txnId, eventId],
+    );
+  });
+}
+
 // --- M2: media -------------------------------------------------------------
 // Metadata only — the bytes live on disk under MEDIA_ROOT (plan §3.4).
 
