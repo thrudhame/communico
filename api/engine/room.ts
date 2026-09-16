@@ -162,3 +162,33 @@ export async function extremities(
     });
   });
 }
+
+// The extremity whose history a reader follows mid-fork (the documented
+// "one side's history" simplification). Deterministic and content-based:
+// greatest tip depth, tie → smallest event_id. Never a soft-failed or
+// rejected tip (extremities() excludes them). Current STATE is never read
+// this way — it lives on main (materialize.publishCurrentState).
+export async function headExtremity(
+  dbName: string,
+  roomId: string,
+): Promise<Extremity | null> {
+  const xbs = await extremities(dbName, roomId);
+  if (xbs.length === 0) return null;
+  const withDepth = await withDb(dbName, async (c) => {
+    const out: (Extremity & { depth: number })[] = [];
+    for (const xb of xbs) {
+      const r = await c.query(
+        `SELECT depth FROM events AS OF '${
+          ident(xb.branch)
+        }' WHERE event_id = $1;`,
+        [xb.eventId],
+      );
+      out.push({ ...xb, depth: Number(r.rows[0]?.depth ?? 0) });
+    }
+    return out;
+  });
+  withDepth.sort((a, b) =>
+    b.depth - a.depth || (a.eventId < b.eventId ? -1 : 1)
+  );
+  return withDepth[0];
+}

@@ -1,23 +1,5 @@
 import { ident, serverDb, withDb } from './db.ts';
-
-// Reads (dolt.log / working set) reflect HEAD; a fresh client lands on
-// `main`, which only ever holds the genesis commits — the event history
-// lives on the x* extremity branches. So every read first checks out the
-// extremity branch whose tip is newest (S2: dolt.branches carries
-// latest_commit_date). With multiple extremities (mid-fork) this reads
-// one side's history — recorded prototype simplification; after a merge
-// event lands, the single remaining extremity covers the whole DAG.
-async function checkoutReadHead(
-  c: { query: (sql: string) => Promise<unknown> },
-): Promise<void> {
-  const r = await c.query(
-    `SELECT name FROM dolt.branches WHERE name LIKE 'x%'
-     ORDER BY latest_commit_date DESC, name ASC LIMIT 1;`,
-  ) as { rows: { name: string }[] };
-  if (r.rows.length > 0) {
-    await c.query(`SELECT DOLT_CHECKOUT('${ident(r.rows[0].name)}');`);
-  }
-}
+import { headExtremity } from './room.ts';
 
 // Maps a commit to the events row it added (the commit=event invariant:
 // exactly one added row). Returns the parsed canonical_json, or null for
@@ -48,7 +30,12 @@ export async function messages(
   limit = 50,
 ): Promise<unknown[]> {
   return await withDb(dbName, async (c) => {
-    await checkoutReadHead(c);
+    // History reads follow the head extremity's branch (the documented
+    // mid-fork "one side's history" simplification — deterministic now:
+    // greatest tip depth, tie → smallest event_id, never soft-failed).
+    const head = await headExtremity(dbName, roomId);
+    if (!head) return [];
+    await c.query(`SELECT DOLT_CHECKOUT('${ident(head.branch)}');`);
     const log = await c.query(
       `SELECT commit_hash, message FROM dolt.log LIMIT ${Math.floor(limit)};`,
     );
@@ -101,9 +88,11 @@ export async function messages(
   });
 }
 
+// Current state lives on `main` (republished by ingest / reresolveFromDag
+// whenever the extremity set changes) — readers never pick a branch.
 export async function stateNow(dbName: string): Promise<unknown[]> {
   return await withDb(dbName, async (c) => {
-    await checkoutReadHead(c);
+    await c.query("SELECT DOLT_CHECKOUT('main');");
     const r = await c.query('SELECT * FROM state;');
     return r.rows;
   });
