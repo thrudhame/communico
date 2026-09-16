@@ -1,5 +1,6 @@
+import type pgpkg from 'pg';
 import { branchNameFor, ident, serverDb, withDb } from './db.ts';
-import { extremities, lookupRoom } from './room.ts';
+import { extremities, lookupRoom, type RoomInfo } from './room.ts';
 import { mergeDriver } from './mergedriver.ts';
 import { eventIdFor } from './eventid.ts';
 import { canonicalJson } from './canonical.ts';
@@ -38,6 +39,29 @@ const appliedListeners = new Set<AppliedListener>();
 export function onEventApplied(l: AppliedListener): () => void {
   appliedListeners.add(l);
   return () => appliedListeners.delete(l);
+}
+
+// E5 — per-room ingest mutex: an in-process async lock keyed by room id
+// around ingestEvent's body (from prev resolution through
+// publishCurrentState). Complement subtests are t.Parallel() on one room;
+// two concurrent publishes to `main` would race. Single process, one
+// listener — a module-level Map<roomId, Promise> chain is sufficient.
+const roomLocks = new Map<string, Promise<void>>();
+async function withRoomLock<T>(
+  roomId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = roomLocks.get(roomId) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((r) => (release = r));
+  roomLocks.set(roomId, prev.then(() => mine));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (roomLocks.get(roomId) === mine) roomLocks.delete(roomId);
+  }
 }
 
 export interface AuthorPartial {
@@ -278,6 +302,58 @@ export async function author(
   return pdu;
 }
 
+// E4 helper — delete a prev's branch, then walk back through
+// soft-failed/rejected ancestors: a flagged event never consumed its own
+// prevs, so their branches may still be live; an accepted event already
+// consumed its prevs at ingest time, so the walk stops there. Runs on the
+// room client `c` (the new branch is checked out — the stored PDUs of the
+// whole cited ancestry are readable); event_index supplies branches/flags.
+async function consumeBranchChain(
+  c: pgpkg.Client,
+  roomId: string,
+  prev: { id: string; branch: string | null },
+): Promise<void> {
+  if (prev.branch !== null) {
+    await c.query(`SELECT DOLT_BRANCH('-D', '${ident(prev.branch)}');`);
+  }
+  const flagged = await withDb(serverDb(), async (s) => {
+    const r = await s.query(
+      'SELECT rejected, soft_failed FROM event_index WHERE room_id = $1 AND event_id = $2;',
+      [roomId, prev.id],
+    );
+    return r.rows.length > 0 &&
+      (r.rows[0].rejected === true || r.rows[0].soft_failed === true);
+  });
+  if (!flagged) return;
+  const gp = await c.query(
+    'SELECT prev_events FROM events WHERE event_id = $1;',
+    [prev.id],
+  );
+  if (gp.rows.length === 0) return;
+  const raw = gp.rows[0].prev_events;
+  // jsonb arrives pre-parsed (array) via pg
+  const ids: string[] = Array.isArray(raw) ? raw : JSON.parse(String(raw));
+  const liveRows = await c.query('SELECT name FROM dolt.branches;');
+  const live = new Set(
+    // deno-lint-ignore no-explicit-any
+    (liveRows.rows as any[]).map((b) => String(b.name)),
+  );
+  for (const id of ids) {
+    const branch = await withDb(serverDb(), async (s) => {
+      const r = await s.query(
+        'SELECT branch_name FROM event_index WHERE room_id = $1 AND event_id = $2;',
+        [roomId, id],
+      );
+      return r.rows.length && r.rows[0].branch_name != null
+        ? String(r.rows[0].branch_name)
+        : null;
+    });
+    // already consumed (null) or stale row — only consume live branches
+    if (branch === null || !live.has(branch)) continue;
+    await consumeBranchChain(c, roomId, { id, branch });
+  }
+}
+
 export async function ingestEvent(
   roomId: string,
   pdu: Pdu,
@@ -286,7 +362,7 @@ export async function ingestEvent(
   // 1. room + version gate (unknown -> never a default).
   const room = await lookupRoom(roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
-  const rulebook = getRulebook(room.roomVersion);
+  getRulebook(room.roomVersion);
   const prevIds = pdu.prev_events ?? [];
   const declaredAuth = pdu.auth_events ?? [];
 
@@ -379,6 +455,64 @@ export async function ingestEvent(
   if (!sigOk) {
     throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
   }
+
+  // E5: from prev resolution (step 6) through publishCurrentState, ingest
+  // holds the per-room lock. author() stays outside (pure).
+  return await withRoomLock(roomId, async () => {
+    return await ingestEventLocked(roomId, pdu, opts, {
+      room,
+      eventId,
+      hashOk,
+      sigOk,
+    });
+  });
+}
+
+interface IngestPrecheck {
+  room: RoomInfo;
+  eventId: string;
+  hashOk: boolean;
+  sigOk: boolean;
+}
+
+// author + ingest as one op-level step. E5's lock serializes the publish,
+// not authoring: two concurrent ops on one room author on the same
+// extremity and the loser sees M_PREV_NOT_EXTREMITY (its prev's branch
+// was consumed). That race is not an error worth surfacing — re-author on
+// the new tip and try again (author() recomputes prevs per attempt when
+// partial.prev_events is undefined). Each retry means another op landed —
+// the loop ends when the burst does; 32 attempts is deep cover for a
+// per-room burst, and exhaustion throws (loud, never a hang).
+export async function authorAndIngest(
+  roomId: string,
+  partial: AuthorPartial,
+  opts: IngestOptions = {},
+  attempts = 32,
+): Promise<IngestResult> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    const pdu = await author(roomId, partial);
+    try {
+      return await ingestEvent(roomId, pdu, opts);
+    } catch (e) {
+      lastErr = e;
+      if (!String(e).includes('M_PREV_NOT_EXTREMITY')) throw e;
+    }
+  }
+  throw lastErr;
+}
+
+// Steps 6-12 of ingest, inside the per-room lock (E5).
+async function ingestEventLocked(
+  roomId: string,
+  pdu: Pdu,
+  opts: IngestOptions,
+  pre: IngestPrecheck,
+): Promise<IngestResult> {
+  const { room, eventId, hashOk, sigOk } = pre;
+  const rulebook = getRulebook(room.roomVersion);
+  const prevIds = pdu.prev_events ?? [];
+  const declaredAuth = pdu.auth_events ?? [];
 
   // 6. prev resolution via the server DB's event_index (D8: the extremity
   //    branch comes from event_index.branch_name, not recomputation).
@@ -570,12 +704,15 @@ export async function ingestEvent(
       commitHash = String(Object.values(h.rows[0])[0]);
     }
 
-    // delete consumed prev branches unless the test hook keeps them;
-    // main is never an extremity and stays at the schema-genesis commit.
-    if (!opts.keepPrevBranches) {
-      for (const p of prevs) {
-        await c.query(`SELECT DOLT_BRANCH('-D', '${ident(p.branch!)}');`);
-      }
+    // E4 — Synapse persist_events.py:1052-1111 (_calculate_new_extremities):
+    // only ACCEPTED events consume prevs and become extremities. A
+    // soft-failed/rejected event's branch exists (event history) but its
+    // prevs stay live. When an accepted event cites a soft-failed/rejected
+    // prev, consume that prev and walk back through soft-failed/rejected
+    // ancestors (dangling-extremity handling). main is never an extremity
+    // and stays at the schema-genesis commit.
+    if (!rejected && !softFailed && !opts.keepPrevBranches) {
+      for (const p of prevs) await consumeBranchChain(c, roomId, p);
     }
     return { commitHash, newBranch };
   });
