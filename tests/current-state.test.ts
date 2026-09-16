@@ -14,7 +14,7 @@ const ROOM = '!current-state:localhost';
 
 Deno.test('current state on main: publish, soft-fail stillness, D8 after re-resolve', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   // membership via the engine pipeline: alice (creator) invites bob, bob
   // joins (same shape as soft-fail.test.ts)
   const inviteBase = await latestExtremityEventId(ROOM);

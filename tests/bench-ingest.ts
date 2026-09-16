@@ -8,7 +8,7 @@ import { latestExtremityEventId, resetRoom } from './util.ts';
 const ROOM = '!bench:localhost';
 
 await resetRoom(ROOM);
-await createRoom(ROOM, '11', '@dev:localhost');
+await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
 const room = (await lookupRoom(ROOM))!;
 
 // chain off the current extremity

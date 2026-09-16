@@ -53,7 +53,7 @@ async function randomPrev(
 Deno.test('replay-oracle: ban vs power-level race DAG (engine-built)', async () => {
   const ROOM = '!oracle-banpl:localhost';
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   const base = await latestExtremityEventId(ROOM);
 
   // both branches fork the base; the PL key races
@@ -91,7 +91,7 @@ Deno.test('replay-oracle: ban vs power-level race DAG (engine-built)', async () 
 Deno.test('replay-oracle: three-way fork with a ban DAG (engine-built)', async () => {
   const ROOM = '!oracle-threeway:localhost';
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   const base = await latestExtremityEventId(ROOM);
 
   // three branches: two topics + a ban of an outside user
@@ -141,7 +141,7 @@ Deno.test('replay-oracle: 20 random DAGs of <= 12 events agree with the replay',
   for (let dag = 0; dag < 20; dag++) {
     const ROOM = `!oracle-fuzz-${dag}:localhost`;
     await resetRoom(ROOM);
-    await createRoom(ROOM, '11', '@dev:localhost');
+    await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
     for (let i = 0; i < 12; i++) {
       const prev = await randomPrev(ROOM, rand);
       const roll = rand();

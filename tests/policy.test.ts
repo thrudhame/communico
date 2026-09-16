@@ -9,14 +9,14 @@ import { latestExtremityEventId, resetRoom } from './util.ts';
 const ROOM = '!policy:localhost';
 const ID_SHAPE = /^\$[A-Za-z0-9_-]{43}$/;
 
-// Genesis sequence (create -> join -> PL -> join_rules) passes the v11
-// rulebook.
+// Genesis sequence (create -> join -> PL -> join_rules ->
+// history_visibility -> guest_access) passes the v11 rulebook.
 Deno.test('policy: v11 genesis sequence passes the rulebook', async () => {
   await resetRoom(ROOM);
   const { createEventId, memberEventId } = await createRoom(
     ROOM,
-    '11',
     '@dev:localhost',
+    { roomVersion: '11' },
   );
   assertMatch(createEventId, ID_SHAPE);
   assertMatch(memberEventId, ID_SHAPE);
@@ -63,18 +63,19 @@ Deno.test('policy: v11 genesis sequence passes the rulebook', async () => {
       'genesis events are signed',
     );
   }
-  // depths chain 1..4
+  // depths chain 1..6 (the M4 genesis: create, member, PL, join_rules,
+  // history_visibility, guest_access)
   const depths = [...pdus].sort((a, b) => a.depth - b.depth).map((p) =>
     p.depth
   );
-  assertEquals(depths, [1, 2, 3, 4]);
+  assertEquals(depths, [1, 2, 3, 4, 5, 6]);
 });
 
 // A member forging ts=2^53 is refused (canonical int range) — the seizure
 // that owned any state key forever under latest-wins.
 Deno.test('policy: ts=2^53 seize is refused', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   const prev = await latestExtremityEventId(ROOM);
   const err = await assertRejects(() =>
     author(ROOM, {
@@ -97,7 +98,7 @@ Deno.test('policy: ts=2^53 seize is refused', async () => {
 // A non-member's write is state-rejected (and stays out of state).
 Deno.test('policy: non-member write is state-rejected', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   const prev = await latestExtremityEventId(ROOM);
   const pdu = await author(ROOM, {
     type: 'm.room.message',
@@ -135,7 +136,7 @@ Deno.test('policy: non-member write is state-rejected', async () => {
 // then converges to one extremity.
 Deno.test('policy: concurrent PL edits resolve; the heal succeeds; one extremity', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   const base = await latestExtremityEventId(ROOM);
 
   const pla = await author(ROOM, {
@@ -197,7 +198,7 @@ Deno.test('policy: concurrent PL edits resolve; the heal succeeds; one extremity
 // survive).
 Deno.test('policy: forged adoption state is dropped', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   const room = (await lookupRoom(ROOM))!;
   // forge: a state row with no event behind it (simulates a peer image's
   // forged conflict-free map)
@@ -212,7 +213,7 @@ Deno.test('policy: forged adoption state is dropped', async () => {
     await c.query(`SELECT DOLT_COMMIT('-Am', 'forged state row');`);
   });
   const res = await reresolveFromDag(ROOM);
-  assertEquals(res.eventCount, 4, 'genesis has 4 events');
+  assertEquals(res.eventCount, 6, 'the M4 genesis has 6 events');
   // deno-lint-ignore no-explicit-any
   const st = (await stateNow(room.dbName)) as any[];
   assert(

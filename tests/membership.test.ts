@@ -14,7 +14,7 @@ const ROOM_B = '!membership-b:localhost';
 
 Deno.test('A1: PL 100 via users may lower users_default 100→40', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
 
   // Mirror TestDemotingUsersViaUsersDefault's override outcome: both dev
   // and bob at 100 via users, users_default 100.
@@ -55,7 +55,7 @@ Deno.test('A1: PL 100 via users may lower users_default 100→40', async () => {
 
 Deno.test('A1b: PL {} self-demotion allowed; PL {users:{}} then rejected (rule 9.x)', async () => {
   await resetRoom(ROOM_B);
-  await createRoom(ROOM_B, '11', '@dev:localhost');
+  await createRoom(ROOM_B, '@dev:localhost', { roomVersion: '11' });
 
   // Mirror TestPowerLevels' empty-PL sequence: {users:{dev:100}} -> {} ->
   // {users:{}}. The {} send is a self-demotion and must pass; after it
@@ -96,7 +96,7 @@ Deno.test('A1b: PL {} self-demotion allowed; PL {users:{}} then rejected (rule 9
 
 Deno.test('A2: a never-joined user with PL 100 cannot ban (rule 5)', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   await invite(ROOM, '@dev:localhost', '@bob:localhost');
   await join(ROOM, '@bob:localhost');
 
@@ -121,7 +121,7 @@ Deno.test('A2: a never-joined user with PL 100 cannot ban (rule 5)', async () =>
 
 Deno.test('A3: kick never-present → 403; kick left → 403 (rule 4.5.5)', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
 
   const never = await assertRejects(
     () => kick(ROOM, '@dev:localhost', '@bob:localhost', 'testing'),

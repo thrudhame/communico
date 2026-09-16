@@ -11,11 +11,9 @@ const ID_SHAPE = /^\$[A-Za-z0-9_-]{43}$/;
 
 Deno.test('unified identity: content-hash event ids for every room version', async () => {
   await resetRoom(ROOM);
-  const { createEventId } = await createRoom(
-    ROOM,
-    '11',
-    '@dev:localhost',
-  );
+  const { createEventId } = await createRoom(ROOM, '@dev:localhost', {
+    roomVersion: '11',
+  });
   const room = (await lookupRoom(ROOM))!;
   const dbName = room.dbName;
 
@@ -43,9 +41,9 @@ Deno.test('unified identity: content-hash event ids for every room version', asy
     prev = r.event_id;
   }
 
-  // every event_index row maps content-hash id <-> commit hash (6 rows:
-  // create + member + PL + join_rules + 2 messages), ids uniformly
-  // 43-char content hashes
+  // every event_index row maps content-hash id <-> commit hash (8 rows:
+  // 6 M4 genesis events + 2 messages), ids uniformly 43-char content
+  // hashes
   const rows = await withDb(serverDb(), async (c) => {
     const r = await c.query(
       'SELECT event_id, commit_hash FROM event_index WHERE room_id = $1;',
@@ -54,7 +52,7 @@ Deno.test('unified identity: content-hash event ids for every room version', asy
     // deno-lint-ignore no-explicit-any
     return r.rows as any[];
   });
-  assertEquals(rows.length, 6);
+  assertEquals(rows.length, 8);
   for (const row of rows) {
     assertMatch(String(row.event_id), ID_SHAPE);
     assertNotEquals(String(row.event_id), '$' + String(row.commit_hash));
@@ -66,15 +64,15 @@ Deno.test('unified identity: content-hash event ids for every room version', asy
     event_id: string;
     [k: string]: unknown;
   }[];
-  assertEquals(chunk.length, 6);
+  assertEquals(chunk.length, 8);
   for (const pdu of chunk) {
     assertEquals(await eventIdFor(pdu, '11'), pdu.event_id);
   }
 
-  // messages returns them newest-first: msg2, msg1, join_rules, PL,
-  // member, create
+  // messages returns them newest-first: msg2, msg1, guest_access,
+  // history_visibility, join_rules, PL, member, create
   assertEquals(chunk[0].event_id, ids[2]);
   assertEquals(chunk[1].event_id, ids[1]);
   assertEquals(chunk[2].event_id, ids[0]);
-  assertEquals(chunk[5].event_id, createEventId);
+  assertEquals(chunk[7].event_id, createEventId);
 });

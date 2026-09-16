@@ -1,6 +1,8 @@
 import { ident, serverDb, withDb } from './db.ts';
 import { author, ingestEvent } from './ingest.ts';
 import { getRulebook } from './policy.ts';
+import { serverName } from './config.ts';
+import { MatrixError } from './matrix-error.ts';
 import type { EventIndexRow } from './event-format.ts';
 
 async function sha256hex(s: string): Promise<string> {
@@ -32,18 +34,117 @@ export async function runSqlFile(c: unknown, path: string): Promise<void> {
 export interface CreateRoomResult {
   createEventId: string;
   memberEventId: string;
+  roomAlias?: string;
 }
 
-// v11 genesis (F0): m.room.create (content.room_version, NO creator),
-// creator m.room.member join, m.room.power_levels, m.room.join_rules
-// {invite} — each through author()+ingest (signed, validated, resolved).
-// roomVersion must be a known string ('11'); unknown -> never a default.
+// M4 createRoom options (spec data/api/client-server/create_room.yaml at
+// v1.16 — the event order below follows the plan's §3c list literally).
+export interface CreateRoomOptions {
+  roomVersion?: string; // default '11'
+  preset?: string; // private_chat | trusted_private_chat | public_chat
+  visibility?: string; // public | private (default private)
+  name?: string;
+  topic?: string;
+  invite?: string[];
+  roomAliasName?: string;
+  creationContent?: Record<string, unknown>;
+  initialState?: { type: string; state_key?: string; content: unknown }[];
+  powerLevelContentOverride?: Record<string, unknown>;
+}
+
+function deepMerge(
+  base: Record<string, unknown>,
+  override: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [k, v] of Object.entries(override)) {
+    const b = out[k];
+    if (
+      b !== null && typeof b === 'object' && !Array.isArray(b) &&
+      v !== null && typeof v === 'object' && !Array.isArray(v)
+    ) {
+      out[k] = deepMerge(
+        b as Record<string, unknown>,
+        v as Record<string, unknown>,
+      );
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+const ALIAS_LOCALPART_RE = /^[a-z0-9._=\-/+]+$/;
+
+// v11 genesis, M4 options path (spec create_room.yaml at v1.16): create,
+// creator join, spec-default power levels (every key explicit — tests
+// read them) deep-merged with power_level_content_override, preset
+// events, initial_state, name/topic, invites, canonical alias.
+// Everything validates BEFORE the first write — a bad option is a 400,
+// never a half-created room. A rulebook reject inside createRoom would be
+// a planner error, not a user error: it surfaces as a 500 with the
+// reject marker in the message.
 export async function createRoom(
   roomId: string,
-  roomVersion: string,
   creator: string,
+  opts: CreateRoomOptions = {},
 ): Promise<CreateRoomResult> {
-  getRulebook(roomVersion);
+  // --- validate everything up front ---
+  const roomVersion = opts.roomVersion ?? '11';
+  getRulebook(roomVersion); // unknown -> M_UNSUPPORTED_ROOM_VERSION (never a default)
+  const visibility = opts.visibility ?? 'private';
+  if (visibility !== 'public' && visibility !== 'private') {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'unknown visibility: ' + visibility,
+    );
+  }
+  const preset = opts.preset ??
+    (visibility === 'public' ? 'public_chat' : 'private_chat');
+  if (
+    preset !== 'private_chat' && preset !== 'trusted_private_chat' &&
+    preset !== 'public_chat'
+  ) {
+    throw new MatrixError(400, 'M_INVALID_PARAM', 'unknown preset: ' + preset);
+  }
+  const invite = opts.invite ?? [];
+  for (const u of invite) {
+    if (!/^@[^:\s]+:[^\s]+$/.test(u)) {
+      throw new MatrixError(400, 'M_INVALID_PARAM', 'not a user id: ' + u);
+    }
+  }
+  const initialState = opts.initialState ?? [];
+  for (const e of initialState) {
+    if (
+      typeof e?.type !== 'string' ||
+      (e.state_key !== undefined && typeof e.state_key !== 'string') ||
+      e.content === null || typeof e.content !== 'object' ||
+      Array.isArray(e.content)
+    ) {
+      throw new MatrixError(
+        400,
+        'M_BAD_JSON',
+        'initial_state entries need type + content',
+      );
+    }
+  }
+  let alias: string | undefined;
+  if (opts.roomAliasName !== undefined) {
+    if (!ALIAS_LOCALPART_RE.test(opts.roomAliasName)) {
+      throw new MatrixError(
+        400,
+        'M_INVALID_PARAM',
+        'bad room_alias_name: ' + opts.roomAliasName,
+      );
+    }
+    alias = '#' + opts.roomAliasName + ':' + serverName();
+    if ((await lookupAlias(alias)) !== null) {
+      throw new MatrixError(409, 'M_ROOM_IN_USE', 'alias taken: ' + alias);
+    }
+  }
+
+  // --- provision the room DB + directory row ---
   const dbName = await dbNameFor(roomId);
   await withDb(serverDb(), async (c) => {
     await c.query(`CREATE DATABASE ${ident(dbName)};`);
@@ -56,54 +157,132 @@ export async function createRoom(
     await runSqlFile(c, 'db/room/schema.sql');
     await c.query(`SELECT DOLT_COMMIT('-Am', 'room genesis: schema');`);
   });
-  const createPdu = await author(roomId, {
-    type: 'm.room.create',
-    state_key: '',
-    sender: creator,
-    content: { room_version: roomVersion },
-    prev_events: [],
-    origin_server_ts: Date.now(),
-  });
-  const createRes = await ingestEvent(roomId, createPdu);
-  // creator's join — through the normal pipeline (the v11 creator-join
-  // exemption covers it: sole prev is the create event)
-  const memberPdu = await author(roomId, {
-    type: 'm.room.member',
-    state_key: creator,
-    sender: creator,
-    content: { membership: 'join' },
-    origin_server_ts: Date.now(),
-  });
-  const memberRes = await ingestEvent(roomId, memberPdu);
-  const plPdu = await author(roomId, {
-    type: 'm.room.power_levels',
-    state_key: '',
-    sender: creator,
-    content: {
-      users: { [creator]: 100 },
-      users_default: 0,
-      events_default: 0,
-      state_default: 50,
-      invite: 100,
-      kick: 100,
-      ban: 100,
-      redact: 100,
-    },
-    origin_server_ts: Date.now(),
-  });
-  await ingestEvent(roomId, plPdu);
-  const jrPdu = await author(roomId, {
-    type: 'm.room.join_rules',
-    state_key: '',
-    sender: creator,
-    content: { join_rule: 'invite' },
-    origin_server_ts: Date.now(),
-  });
-  await ingestEvent(roomId, jrPdu);
-  return {
-    createEventId: createRes.event_id,
-    memberEventId: memberRes.event_id,
+
+  const send = async (
+    type: string,
+    stateKey: string,
+    content: Record<string, unknown>,
+  ): Promise<string> => {
+    const pdu = await author(roomId, {
+      type,
+      state_key: stateKey,
+      sender: creator,
+      content,
+      origin_server_ts: Date.now(),
+    });
+    try {
+      return (await ingestEvent(roomId, pdu)).event_id;
+    } catch (e) {
+      const msg = String(e);
+      if (
+        msg.includes('M_STATE_REJECT') || msg.includes('M_AUTHCHAIN_REJECT')
+      ) {
+        throw new Error('E_CREATE_ROOM_REJECT: ' + msg);
+      }
+      throw e;
+    }
   };
+
+  // 1. m.room.create — creation_content minus any room_version key, plus
+  //    the (validated) room_version.
+  const createContent: Record<string, unknown> = {
+    ...(opts.creationContent ?? {}),
+  };
+  delete createContent.room_version;
+  createContent.room_version = roomVersion;
+  const createEventId = await send('m.room.create', '', createContent);
+
+  // 2. creator's join
+  const memberEventId = await send('m.room.member', creator, {
+    membership: 'join',
+  });
+
+  // 3. m.room.power_levels — spec defaults (m.room.power_levels.yaml at
+  //    v1.16), every key explicit, then the override deep-merged on top.
+  //    trusted_private_chat: every invite user gets users[u]=100.
+  let pl: Record<string, unknown> = {
+    ban: 50,
+    events: {},
+    events_default: 0,
+    invite: 0,
+    kick: 50,
+    redact: 50,
+    state_default: 50,
+    users: { [creator]: 100 },
+    users_default: 0,
+    notifications: { room: 50 },
+  };
+  if (opts.powerLevelContentOverride !== undefined) {
+    pl = deepMerge(pl, opts.powerLevelContentOverride);
+  }
+  if (preset === 'trusted_private_chat') {
+    const users = { ...(pl.users as Record<string, unknown>) };
+    for (const u of invite) users[u] = 100;
+    pl.users = users;
+  }
+  await send('m.room.power_levels', '', pl);
+
+  // 4. preset events (create_room.yaml's preset table at v1.16)
+  const presetEvents: [string, Record<string, unknown>][] =
+    preset === 'public_chat'
+      ? [
+        ['m.room.join_rules', { join_rule: 'public' }],
+        ['m.room.history_visibility', { history_visibility: 'shared' }],
+        ['m.room.guest_access', { guest_access: 'forbidden' }],
+      ]
+      : [
+        ['m.room.join_rules', { join_rule: 'invite' }],
+        ['m.room.history_visibility', { history_visibility: 'shared' }],
+        ['m.room.guest_access', { guest_access: 'can_join' }],
+      ];
+  for (const [type, content] of presetEvents) await send(type, '', content);
+
+  // 5. initial_state, in order (content verbatim; state_key default '')
+  for (const e of initialState) {
+    await send(e.type, e.state_key ?? '', e.content as Record<string, unknown>);
+  }
+
+  // 6. name / topic — AFTER initial_state, so they override it (the
+  //    "initial_state overwritten by topic" test). The topic is the rich
+  //    v1.15+ form (m.room.topic.yaml at v1.16: m.topic.m.text[0].body).
+  if (opts.name !== undefined) {
+    await send('m.room.name', '', { name: opts.name });
+  }
+  if (opts.topic !== undefined) {
+    await send('m.room.topic', '', {
+      topic: opts.topic,
+      'm.topic': { 'm.text': [{ body: opts.topic }] },
+    });
+  }
+
+  // 7. invites (sender: the creator)
+  for (const u of invite) {
+    await send('m.room.member', u, { membership: 'invite' });
+  }
+
+  // 8. room_alias_name → the alias row + m.room.canonical_alias
+  if (alias !== undefined) {
+    await withDb(serverDb(), async (c) => {
+      await c.query(
+        'INSERT INTO room_aliases (alias, room_id) VALUES ($1, $2);',
+        [alias, roomId],
+      );
+    });
+    await send('m.room.canonical_alias', '', { alias });
+  }
+
+  // 9. visibility: public → the room_visibility row (the /publicRooms
+  //    listing itself is band C; the row is stored now)
+  if (visibility === 'public') {
+    await withDb(serverDb(), async (c) => {
+      await c.query(
+        'INSERT INTO room_visibility (room_id, visibility) VALUES ($1, $2);',
+        [roomId, 'public'],
+      );
+    });
+  }
+
+  return { createEventId, memberEventId, roomAlias: alias };
 }
 
 export interface RoomInfo {

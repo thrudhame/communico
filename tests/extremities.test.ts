@@ -48,7 +48,7 @@ async function bobJoins(roomId: string): Promise<void> {
 
 Deno.test('E4: a soft-failed event consumes nothing — its prev stays an extremity', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   await bobJoins(ROOM);
 
   // fork point both branches cite; the ban keeps it alive (the hook) so
@@ -103,7 +103,7 @@ Deno.test('E4: a soft-failed event consumes nothing — its prev stays an extrem
 
 Deno.test('E4: a rejected event consumes nothing', async () => {
   await resetRoom(ROOM3);
-  await createRoom(ROOM3, '11', '@dev:localhost');
+  await createRoom(ROOM3, '@dev:localhost', { roomVersion: '11' });
   await bobJoins(ROOM3);
 
   // bob (PL 0) sends a state event — state-reject (state_default 50).

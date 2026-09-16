@@ -11,13 +11,14 @@ Deno.test('engine invariant: commit = event', async () => {
   await resetRoom(ROOM);
   const { createEventId, memberEventId } = await createRoom(
     ROOM,
-    '11',
     '@dev:localhost',
+    { roomVersion: '11' },
   );
   const room = (await lookupRoom(ROOM))!;
   const dbName = room.dbName;
 
-  // first message chains off the CURRENT extremity (the join_rules event)
+  // first message chains off the CURRENT extremity (the guest_access
+  // event — the M4 genesis tail)
   let prev = await latestExtremityEventId(ROOM);
   assertEquals(typeof prev, 'string');
 
@@ -37,8 +38,8 @@ Deno.test('engine invariant: commit = event', async () => {
   }
 
   // commit count: 2 implicit init commits (baseline recorded in
-  // RESULTS.md) + schema genesis + create + member + PL + join_rules +
-  // 3 messages = 10
+  // RESULTS.md) + schema genesis + 6 M4 genesis events (create, member,
+  // PL, join_rules, history_visibility, guest_access) + 3 messages = 12
   await withDb(dbName, async (c) => {
     const xb = await c.query(
       "SELECT name FROM dolt.branches WHERE name LIKE 'x%';",
@@ -46,11 +47,11 @@ Deno.test('engine invariant: commit = event', async () => {
     assertEquals(xb.rows.length, 1, 'exactly ONE x* extremity branch');
     await c.query(`SELECT DOLT_CHECKOUT('${xb.rows[0].name}');`);
     const cnt = await c.query('SELECT count(*) AS c FROM dolt.log;');
-    assertEquals(Number(cnt.rows[0].c), 10);
+    assertEquals(Number(cnt.rows[0].c), 12);
   });
 
-  // each event commit diffs exactly 1 added events row (7 event commits:
-  // create, member, PL, join_rules, 3 messages)
+  // each event commit diffs exactly 1 added events row (9 event commits:
+  // 6 genesis + 3 messages)
   const commits: string[] = await withDb(serverDb(), async (c) => {
     const r = await c.query(
       'SELECT commit_hash FROM event_index WHERE room_id = $1;',
@@ -59,7 +60,7 @@ Deno.test('engine invariant: commit = event', async () => {
     // deno-lint-ignore no-explicit-any
     return r.rows.map((row: any) => String(row.commit_hash));
   });
-  assertEquals(commits.length, 7);
+  assertEquals(commits.length, 9);
   await withDb(dbName, async (c) => {
     for (const h of commits) {
       const d = await c.query(
@@ -74,18 +75,20 @@ Deno.test('engine invariant: commit = event', async () => {
     }
   });
 
-  // messages newest-first (commit order): msg3, msg2, msg1, join_rules,
-  // power_levels, member, create
+  // messages newest-first (commit order): msg3, msg2, msg1, guest_access,
+  // history_visibility, join_rules, power_levels, member, create
   // deno-lint-ignore no-explicit-any
   const chunk = (await messages(dbName, ROOM)) as any[];
-  assertEquals(chunk.length, 7);
+  assertEquals(chunk.length, 9);
   assertEquals(chunk[0].event_id, ids[2]);
   assertEquals(chunk[1].event_id, ids[1]);
   assertEquals(chunk[2].event_id, ids[0]);
-  assertEquals(chunk[3].type, 'm.room.join_rules');
-  assertEquals(chunk[4].type, 'm.room.power_levels');
-  assertEquals(chunk[5].event_id, memberEventId);
-  assertEquals(chunk[6].event_id, createEventId);
+  assertEquals(chunk[3].type, 'm.room.guest_access');
+  assertEquals(chunk[4].type, 'm.room.history_visibility');
+  assertEquals(chunk[5].type, 'm.room.join_rules');
+  assertEquals(chunk[6].type, 'm.room.power_levels');
+  assertEquals(chunk[7].event_id, memberEventId);
+  assertEquals(chunk[8].event_id, createEventId);
 
   // single extremity
   const xb = await extremities(dbName, ROOM);

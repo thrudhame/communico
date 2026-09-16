@@ -14,7 +14,9 @@ const ROOM = '!t2:localhost';
 // and one extremity remains.
 Deno.test('fork/heal: concurrent state edits resolve to one topic; heal converges; one extremity', async () => {
   await resetRoom(ROOM);
-  const { memberEventId } = await createRoom(ROOM, '11', '@dev:localhost');
+  const { memberEventId } = await createRoom(ROOM, '@dev:localhost', {
+    roomVersion: '11',
+  });
   void memberEventId;
   const room = (await lookupRoom(ROOM))!;
   const dbName = room.dbName;
@@ -89,7 +91,7 @@ Deno.test('fork/heal: concurrent state edits resolve to one topic; heal converge
 // contested, so resolution succeeds and the DAG converges.
 Deno.test('fork/heal: uncontested message heal converges', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
 
   const basePdu = await author(ROOM, {
     type: 'm.room.message',

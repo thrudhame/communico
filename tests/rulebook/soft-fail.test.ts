@@ -15,7 +15,7 @@ const ROOM = '!softfail:localhost';
 
 Deno.test("soft-fail: a banned user's concurrent message soft-fails", async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   // membership via the engine pipeline (CS invite/join endpoints are M4):
   // alice (creator) invites bob, bob joins
   const inviteBase = await latestExtremityEventId(ROOM);

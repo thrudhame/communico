@@ -8,7 +8,9 @@ const ROOM = '!t4:localhost';
 
 Deno.test('>20 prev_events: clean rejection (v11 bound), no commit, branches intact', async () => {
   await resetRoom(ROOM);
-  const { memberEventId } = await createRoom(ROOM, '11', '@dev:localhost');
+  const { memberEventId } = await createRoom(ROOM, '@dev:localhost', {
+    roomVersion: '11',
+  });
   void memberEventId;
   const room = (await lookupRoom(ROOM))!;
   const dbName = room.dbName;
@@ -97,7 +99,7 @@ Deno.test('>20 prev_events: clean rejection (v11 bound), no commit, branches int
 // all 3 in prev_events, and converges to one extremity.
 Deno.test('3-prev message: chained commits, full DAG, single extremity', async () => {
   await resetRoom(ROOM);
-  await createRoom(ROOM, '11', '@dev:localhost');
+  await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   const room = (await lookupRoom(ROOM))!;
   const tip = await latestExtremityEventId(ROOM);
   const ids: string[] = [];
