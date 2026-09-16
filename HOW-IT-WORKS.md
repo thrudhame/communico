@@ -56,6 +56,12 @@ state.
   through a single `materialize()` per engine (the gate greps it).
   Rejected events stay in the DAG, flagged, out of state. N-prev fan-in
   chains 2-parent commits (bookkeeping); the event DAG keeps all N.
+- **Current state lives on `main`.** Every `x*` branch is one event's
+  history and carries the state _at that event_ (resolver input via
+  `AS OF`); it is never committed to again (D8: branch tip == event
+  commit, always). Whenever the extremity set changes, the resolver's
+  output across the set is republished on `main` — readers of current
+  state read `main`, nothing else.
 - **Convergence gossip.** The announce carries `th = {engine, events,
   state, sh, room_version}` where `sh` is the digest of the announced
   frontier's resolved state over event ids. Contested keys yield an
