@@ -20,6 +20,10 @@ export async function resetRoom(roomId: string): Promise<void> {
     await c.query(`DROP DATABASE IF EXISTS ${dbName};`);
     await c.query('DELETE FROM room_directory WHERE room_id = $1;', [roomId]);
     await c.query('DELETE FROM event_index WHERE room_id = $1;', [roomId]);
+    // M4: the derived membership index + alias/visibility rows ride along
+    await c.query('DELETE FROM room_membership WHERE room_id = $1;', [roomId]);
+    await c.query('DELETE FROM room_aliases WHERE room_id = $1;', [roomId]);
+    await c.query('DELETE FROM room_visibility WHERE room_id = $1;', [roomId]);
   });
 }
 
