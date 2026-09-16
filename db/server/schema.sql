@@ -12,6 +12,10 @@
 --   ALTER TABLE event_index ADD COLUMN rejected boolean DEFAULT FALSE;
 --   ALTER TABLE event_index ADD COLUMN soft_failed boolean DEFAULT FALSE;
 -- (room DBs, M3): ALTER TABLE events ADD COLUMN soft_failed boolean DEFAULT FALSE;
+-- (M4): ALTER TABLE event_index ADD COLUMN state_commit_hash text;
+--   ALTER TABLE event_index ADD COLUMN redacted_by text;
+--   ALTER TABLE event_index ADD COLUMN txn_device text;
+--   ALTER TABLE event_index ADD COLUMN txn_id text;
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -32,7 +36,50 @@ CREATE TABLE IF NOT EXISTS event_index (
   -- M3: soft-failed (S8 check 6) — persisted, not an authoring extremity,
   -- excluded from the client-visible timeline.
   soft_failed boolean NOT NULL DEFAULT FALSE,
-  seq bigint DEFAULT nextval('event_seq')
+  seq bigint DEFAULT nextval('event_seq'),
+  -- M4 (E1): HASHOF('main') right after this event's publishCurrentState —
+  -- "state at seq N" = state AS OF the state_commit_hash of the last
+  -- R-event with seq <= N.
+  state_commit_hash text,
+  -- M4: the m.room.redaction event that redacted this one (applied at read
+  -- time; the stored PDU stays verbatim).
+  redacted_by text,
+  -- M4: sending device + transaction id for txn idempotency and
+  -- unsigned.transaction_id (same device only).
+  txn_device text,
+  txn_id text
+);
+-- M4 (E2): per-user room lists without scanning room DBs. Derived cache of
+-- `main`, written in the same ingest step that publishes it (from the
+-- published rows' m.room.member entries).
+CREATE TABLE IF NOT EXISTS room_membership (
+  room_id text NOT NULL,
+  user_id text NOT NULL,
+  membership text NOT NULL,
+  event_id text NOT NULL,
+  seq bigint NOT NULL,
+  PRIMARY KEY (room_id, user_id)
+);
+-- M4: alias -> room (createRoom room_alias_name; /join by alias). The
+-- directory surface (PUT/DELETE /directory, /aliases) is band C.
+CREATE TABLE IF NOT EXISTS room_aliases (
+  alias text PRIMARY KEY,
+  room_id text NOT NULL
+);
+-- M4: visibility: public rows (the /publicRooms listing itself is band C).
+CREATE TABLE IF NOT EXISTS room_visibility (
+  room_id text PRIMARY KEY,
+  visibility text NOT NULL
+);
+-- M4 (E3): presence has its own monotone stream (presence_seq); events
+-- stay on event_seq. Sync tokens are s<eventSeq>_p<presenceSeq>.
+CREATE SEQUENCE IF NOT EXISTS presence_seq;
+CREATE TABLE IF NOT EXISTS presence (
+  user_id text PRIMARY KEY,
+  presence text NOT NULL,
+  status_msg text,
+  last_active_ms bigint NOT NULL,
+  seq bigint NOT NULL
 );
 -- F0 dev signing key (db-init generates once via ensureServerKey, reuses
 -- forever — never rotates; F1 moves the same key into the tenant table).

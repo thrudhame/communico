@@ -84,3 +84,20 @@ CREATE TABLE IF NOT EXISTS media (
   created_ms bigint NOT NULL,
   uploaded_ms bigint
 );
+-- M4: stored /sync filters (POST /user/:id/filter). filter_id is the
+-- server-assigned id (serial string); the filter document verbatim.
+CREATE TABLE IF NOT EXISTS filters (
+  localpart text NOT NULL REFERENCES users(localpart),
+  filter_id text NOT NULL,
+  filter jsonb NOT NULL,
+  PRIMARY KEY (localpart, filter_id)
+);
+-- M4: transaction idempotency scoped to (device, room, txn) — a repeat
+-- send returns the recorded event_id regardless of content.
+CREATE TABLE IF NOT EXISTS transactions (
+  device_id text NOT NULL,
+  room_id text NOT NULL,
+  txn_id text NOT NULL,
+  event_id text NOT NULL,
+  PRIMARY KEY (device_id, room_id, txn_id)
+);
