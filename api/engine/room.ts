@@ -192,3 +192,123 @@ export async function headExtremity(
   );
   return withDepth[0];
 }
+
+// --- M4: state-at-position primitives (E1/E2, plan §3b) -------------------
+
+export interface StateRow {
+  type: string;
+  stateKey: string;
+  eventId: string;
+  content: unknown;
+}
+
+// The state_commit_hash of the last non-rejected, non-soft-failed R-event
+// with seq <= the given one; seq === null -> HASHOF('main') (now). null
+// when no such event exists (before the room's first event).
+export async function stateCommitAtSeq(
+  roomId: string,
+  seq: number | null,
+): Promise<string | null> {
+  if (seq === null) {
+    const room = await lookupRoom(roomId);
+    if (!room) return null;
+    return await withDb(room.dbName, async (c) => {
+      const r = await c.query(`SELECT HASHOF('main') AS h;`);
+      return String(r.rows[0].h);
+    });
+  }
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      `SELECT state_commit_hash FROM event_index
+       WHERE room_id = $1 AND seq <= $2 AND rejected = FALSE AND soft_failed = FALSE
+         AND state_commit_hash IS NOT NULL
+       ORDER BY seq DESC LIMIT 1;`,
+      [roomId, seq],
+    );
+    return r.rows.length ? String(r.rows[0].state_commit_hash) : null;
+  });
+}
+
+// The room's state AS OF a `main` commit hash (E1: `main`'s commit history
+// IS the state history).
+export async function stateAt(
+  dbName: string,
+  stateHash: string,
+): Promise<StateRow[]> {
+  if (!/^[a-z0-9]+$/i.test(stateHash)) {
+    throw new Error('E_BAD_HASH: ' + stateHash);
+  }
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      `SELECT type, state_key, event_id, content FROM state AS OF '${stateHash}';`,
+    );
+    // deno-lint-ignore no-explicit-any
+    return (r.rows as any[]).map((row) => ({
+      type: String(row.type),
+      stateKey: String(row.state_key),
+      eventId: String(row.event_id),
+      content: typeof row.content === 'string'
+        ? JSON.parse(row.content)
+        : row.content,
+    }));
+  });
+}
+
+// stateAt at a seq position (null = now); null when the position precedes
+// the room's first event.
+export async function stateAtSeq(
+  roomId: string,
+  seq: number | null,
+): Promise<StateRow[] | null> {
+  const hash = await stateCommitAtSeq(roomId, seq);
+  if (hash === null) return null;
+  const room = await lookupRoom(roomId);
+  if (!room) return null;
+  return await stateAt(room.dbName, hash);
+}
+
+// The user's CURRENT membership row in the room (from the room_membership
+// index — the row exists for any membership value, incl. leave/ban).
+export async function membershipOf(
+  roomId: string,
+  userId: string,
+): Promise<{ membership: string; eventId: string; seq: number } | null> {
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT membership, event_id, seq FROM room_membership WHERE room_id = $1 AND user_id = $2;',
+      [roomId, userId],
+    );
+    return r.rows.length
+      ? {
+        membership: String(r.rows[0].membership),
+        eventId: String(r.rows[0].event_id),
+        seq: Number(r.rows[0].seq),
+      }
+      : null;
+  });
+}
+
+// Every room the user has a membership row in, any value.
+export async function roomsFor(
+  userId: string,
+): Promise<{ roomId: string; membership: string; seq: number }[]> {
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT room_id, membership, seq FROM room_membership WHERE user_id = $1;',
+      [userId],
+    );
+    // deno-lint-ignore no-explicit-any
+    return (r.rows as any[]).map((row) => ({
+      roomId: String(row.room_id),
+      membership: String(row.membership),
+      seq: Number(row.seq),
+    }));
+  });
+}
+
+// Just the room ids the user is currently joined to.
+export async function joinedRooms(userId: string): Promise<string[]> {
+  return (await roomsFor(userId))
+    .filter((r) => r.membership === 'join')
+    .map((r) => r.roomId);
+}

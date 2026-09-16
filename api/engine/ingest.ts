@@ -739,11 +739,38 @@ async function ingestEventLocked(
     if (h) afterSets.push(await parentStateAt(room.dbName, h));
   }
   const current = rulebook.resolveState(afterSets, store);
-  await publishCurrentState(
+  const publishedRows = stateRowsOf(current, ancestry.pduById);
+  const stateHash = await publishCurrentState(
     room.dbName,
-    stateRowsOf(current, ancestry.pduById),
+    publishedRows,
     `after ${eventId}`,
   );
+
+  // E1/E2 — state history: record `main`'s hash right after the publish
+  // as this event's state pointer ("state at seq N" = state AS OF the
+  // state_commit_hash of the last R-event with seq <= N), and fold the
+  // PUBLISHED current-state rows' m.room.member entries into the per-user
+  // membership index (a derived cache of `main`, same writer step).
+  await withDb(serverDb(), async (c) => {
+    await c.query(
+      'UPDATE event_index SET state_commit_hash = $1 WHERE event_id = $2;',
+      [stateHash, eventId],
+    );
+    for (const r of publishedRows) {
+      if (r.type !== 'm.room.member') continue;
+      await c.query(
+        `INSERT INTO room_membership (room_id, user_id, membership, event_id, seq)
+         VALUES ($1,$2,$3,$4,(SELECT seq FROM event_index WHERE event_id=$4))
+         ON CONFLICT (room_id, user_id) DO UPDATE SET membership=EXCLUDED.membership, event_id=EXCLUDED.event_id, seq=EXCLUDED.seq;`,
+        [
+          roomId,
+          r.stateKey,
+          (r.content as { membership?: string }).membership ?? 'leave',
+          r.eventId,
+        ],
+      );
+    }
+  });
 
   // core→hat signal, then return — or surface the rejection (the event is
   // in the DAG and flagged; soft-fail does NOT surface: the event is
