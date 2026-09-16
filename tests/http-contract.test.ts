@@ -225,6 +225,34 @@ Deno.test('tagline at / (text/plain)', async () => {
   assert((await res.text()).startsWith('Communico'));
 });
 
+Deno.test('M4: trailing-slash state key routes — /state/:type/ and /state/:type reach the #type handlers', async () => {
+  // The empty state key arrives as the trailing-slash form; pathfinder
+  // tolerates exactly one trailing slash at leaf acceptance, so both
+  // forms land on the #type route. A 401 (auth placement ran) proves the
+  // route exists — a 404 would mean no route.
+  for (const method of ['GET', 'PUT']) {
+    for (
+      const path of [
+        '/_matrix/client/v3/rooms/!x:y/state/m.room.name/',
+        '/_matrix/client/v3/rooms/!x:y/state/m.room.name',
+      ]
+    ) {
+      const res = await matrix(
+        new Request('http://x' + path, {
+          method,
+          ...(method === 'PUT' ? { body: '{}' } : {}),
+        }),
+      );
+      assertEquals(res.status, 401, `${method} ${path} did not route`);
+    }
+  }
+  // and the explicit-key form routes too
+  const res = await matrix(
+    new Request('http://x/_matrix/client/v3/rooms/!x:y/state/m.room.name/sk'),
+  );
+  assertEquals(res.status, 401);
+});
+
 Deno.test('profile of a foreign-server user → 404 M_NOT_FOUND before any DB query', async () => {
   // Plan §3.8: the server-part check precedes getProfile, so this stays
   // DB-free like the rest of this file. The thrown 404 renders through

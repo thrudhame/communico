@@ -1,6 +1,7 @@
 import { ident, serverDb, withDb } from './db.ts';
 import { author, ingestEvent } from './ingest.ts';
 import { getRulebook } from './policy.ts';
+import type { EventIndexRow } from './event-format.ts';
 
 async function sha256hex(s: string): Promise<string> {
   const data = new TextEncoder().encode(s);
@@ -311,4 +312,62 @@ export async function joinedRooms(userId: string): Promise<string[]> {
   return (await roomsFor(userId))
     .filter((r) => r.membership === 'join')
     .map((r) => r.roomId);
+}
+
+// --- M4: aliases + stream tokens -----------------------------------------
+
+// alias -> room id (createRoom room_alias_name; /join by alias).
+export async function lookupAlias(alias: string): Promise<string | null> {
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT room_id FROM room_aliases WHERE alias = $1;',
+      [alias],
+    );
+    return r.rows.length ? String(r.rows[0].room_id) : null;
+  });
+}
+
+// The full event_index row for one event (the formatter's input shape).
+export async function eventIndexRow(
+  roomId: string,
+  eventId: string,
+): Promise<EventIndexRow | null> {
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT * FROM event_index WHERE room_id = $1 AND event_id = $2;',
+      [roomId, eventId],
+    );
+    if (r.rows.length === 0) return null;
+    const row = r.rows[0];
+    return {
+      event_id: String(row.event_id),
+      room_id: String(row.room_id),
+      commit_hash: String(row.commit_hash),
+      rejected: row.rejected === true,
+      soft_failed: row.soft_failed === true,
+      seq: Number(row.seq),
+      state_commit_hash: row.state_commit_hash == null
+        ? null
+        : String(row.state_commit_hash),
+      redacted_by: row.redacted_by == null ? null : String(row.redacted_by),
+      txn_device: row.txn_device == null ? null : String(row.txn_device),
+      txn_id: row.txn_id == null ? null : String(row.txn_id),
+    };
+  });
+}
+
+// E3: sync token grammar — s<eventSeq>_p<presenceSeq>; legacy s<n> parses
+// as _p0. Tokens are global stream positions: valid across users, and as
+// /messages?from=/to= and /members?at=.
+export function parseStreamToken(
+  raw: string | null,
+): { eSeq: number; pSeq: number } | null {
+  if (raw === null) return null;
+  const m = /^s(\d+)(?:_p(\d+))?$/.exec(raw);
+  if (!m) return null;
+  return { eSeq: Number(m[1]), pSeq: m[2] ? Number(m[2]) : 0 };
+}
+
+export function formatStreamToken(eSeq: number, pSeq: number): string {
+  return `s${eSeq}_p${pSeq}`;
 }

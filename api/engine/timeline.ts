@@ -1,5 +1,27 @@
 import { ident, serverDb, withDb } from './db.ts';
 import { headExtremity } from './room.ts';
+import type { Pdu } from './pdu.ts';
+
+// Load one event's stored PDU by id, AS OF the commit that carries it
+// (event rows live on x* branches — `main` only holds `state`).
+export async function pduById(
+  dbName: string,
+  commitHash: string,
+  eventId: string,
+): Promise<Pdu | null> {
+  if (!/^[a-z0-9]+$/i.test(commitHash)) {
+    throw new Error('E_BAD_HASH: ' + commitHash);
+  }
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      `SELECT canonical_json FROM events AS OF '${commitHash}' WHERE event_id = $1;`,
+      [eventId],
+    );
+    if (r.rows.length === 0) return null;
+    const v = r.rows[0].canonical_json;
+    return (typeof v === 'string' ? JSON.parse(v) : v) as Pdu;
+  });
+}
 
 // Maps a commit to the events row it added (the commit=event invariant:
 // exactly one added row). Returns the parsed canonical_json, or null for
