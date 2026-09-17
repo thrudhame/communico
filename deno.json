@@ -37,6 +37,6 @@
       "singleQuote": true,
       "proseWrap": "preserve"
     },
-    "exclude": ["complement/BASELINE.md"]
+    "exclude": ["complement/BASELINE.md", "complement/BASELINE.prev.md"]
   }
 }
