@@ -253,6 +253,20 @@ Deno.test('M4: trailing-slash state key routes — /state/:type/ and /state/:typ
   assertEquals(res.status, 401);
 });
 
+Deno.test('M4: r0 re-exports answer — /r0/rooms/:id/messages and /joined_members route with auth', async () => {
+  // The r0 files re-export the v3 handlers; the r0/20-auth.ts placement
+  // protects them. 401 (auth ran) proves the route exists.
+  for (
+    const path of [
+      '/_matrix/client/r0/rooms/!x:y/messages',
+      '/_matrix/client/r0/rooms/!x:y/joined_members',
+    ]
+  ) {
+    const res = await matrix(new Request('http://x' + path));
+    assertEquals(res.status, 401, `${path} did not route`);
+  }
+});
+
 Deno.test('profile of a foreign-server user → 404 M_NOT_FOUND before any DB query', async () => {
   // Plan §3.8: the server-part check precedes getProfile, so this stays
   // DB-free like the rest of this file. The thrown 404 renders through

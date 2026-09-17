@@ -22,6 +22,8 @@
     "#endpoints/": "./api/endpoints/",
     "#root/": "./",
     "#tests/": "./tests/",
+    "#endpoints/v3/rooms/messages": "./api/endpoints/matrix/_matrix/client/v3/rooms/%23roomId/messages/get.ts",
+    "#endpoints/v3/rooms/joined_members": "./api/endpoints/matrix/_matrix/client/v3/rooms/%23roomId/joined_members/get.ts",
     "@pathfinder/pathfinder": "jsr:@pathfinder/pathfinder@0.2.2",
     "@std/assert": "jsr:@std/assert@1",
     "@std/collections": "jsr:@std/collections@^1.1.3",
