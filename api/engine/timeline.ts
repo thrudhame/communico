@@ -1,5 +1,11 @@
-import { ident, serverDb, withDb } from './db.ts';
-import { headExtremity } from './room.ts';
+import { serverDb, withDb } from './db.ts';
+import {
+  eventIndexRow,
+  formatStreamToken,
+  lookupRoom,
+  stateAtSeq,
+} from './room.ts';
+import { canSeeEvent } from './visibility.ts';
 import { clientEvent, type EventIndexRow } from './event-format.ts';
 import type { Pdu } from './pdu.ts';
 
@@ -104,70 +110,6 @@ export async function eventAtCommit(
   return null;
 }
 
-export async function messages(
-  dbName: string,
-  roomId: string,
-  limit = 50,
-): Promise<unknown[]> {
-  return await withDb(dbName, async (c) => {
-    // History reads follow the head extremity's branch (the documented
-    // mid-fork "one side's history" simplification — deterministic now:
-    // greatest tip depth, tie → smallest event_id, never soft-failed).
-    const head = await headExtremity(dbName, roomId);
-    if (!head) return [];
-    await c.query(`SELECT DOLT_CHECKOUT('${ident(head.branch)}');`);
-    const log = await c.query(
-      `SELECT commit_hash, message FROM dolt.log LIMIT ${Math.floor(limit)};`,
-    );
-
-    const hashes = log.rows.map((r: { commit_hash: string }) =>
-      String(r.commit_hash)
-    );
-    if (hashes.length === 0) return [];
-
-    // commit_hash -> event_id via server DB (single ANY query); M3:
-    // rejected AND soft-failed events are excluded from the
-    // client-visible timeline (server-server-api.md 556-563, 611-614)
-    const idx = await withDb(serverDb(), async (s) => {
-      return await s.query(
-        'SELECT event_id, commit_hash FROM event_index WHERE room_id = $1 AND commit_hash = ANY($2) AND rejected = FALSE AND soft_failed = FALSE;',
-        [roomId, hashes],
-      );
-    });
-    const byCommit = new Map(
-      // deno-lint-ignore no-explicit-any
-      idx.rows.map((r: any) => [String(r.commit_hash), String(r.event_id)]),
-    );
-    // deno-lint-ignore no-explicit-any
-    const eventIds = [...new Set(idx.rows.map((r: any) => String(r.event_id)))];
-    if (eventIds.length === 0) return [];
-
-    const evs = await c.query(
-      'SELECT event_id, canonical_json FROM events WHERE event_id = ANY($1);',
-      [eventIds],
-    );
-    const byId = new Map(
-      // deno-lint-ignore no-explicit-any
-      evs.rows.map((r: any) => [
-        String(r.event_id),
-        // F0: canonical_json is verbatim TEXT — parse it.
-        typeof r.canonical_json === 'string'
-          ? JSON.parse(r.canonical_json)
-          : r.canonical_json,
-      ]),
-    );
-
-    // dolt.log is newest-first; commits without an event_index entry
-    // (genesis schema commit etc.) are skipped
-    const out: unknown[] = [];
-    for (const row of log.rows) {
-      const eid = byCommit.get(String(row.commit_hash));
-      if (eid && byId.has(eid)) out.push(byId.get(eid));
-    }
-    return out;
-  });
-}
-
 // Current state lives on `main` (republished by ingest / reresolveFromDag
 // whenever the extremity set changes) — readers never pick a branch.
 export async function stateNow(dbName: string): Promise<unknown[]> {
@@ -176,4 +118,143 @@ export async function stateNow(dbName: string): Promise<unknown[]> {
     const r = await c.query('SELECT * FROM state;');
     return r.rows;
   });
+}
+
+// --- M4: /messages (plan §3f) ----------------------------------------------
+
+export interface MessagesWindow {
+  roomId: string;
+  userId: string;
+  deviceId: string | null;
+  // read position: null (joined) or the leave/ban seq — the window clamps
+  // to it (left users read as of their leave; dir=f from >= it is empty)
+  leaveAt: number | null;
+  dir: 'b' | 'f';
+  fromSeq: number | null; // null = the dir's default (b: latest, f: 0)
+  toSeq: number | null;
+  limit: number; // default 10
+  lazyLoadMembers: boolean;
+}
+
+export interface MessagesResult {
+  chunk: Record<string, unknown>[];
+  start: string;
+  end?: string;
+  state?: Record<string, unknown>[];
+}
+
+// Window by seq over event_index (not dolt.log), redaction applied at
+// read, visibility per event (canSeeEvent). Bounds per Synapse's
+// pagination (transcribed at plan §3f): dir=f -> from < x <= to;
+// dir=b -> from >= x > to. The limit cuts the RAW window first (spec: an
+// empty/short chunk does not imply no more events); `end` is omitted when
+// the raw window is exhausted.
+export async function messages(w: MessagesWindow): Promise<MessagesResult> {
+  const room = await lookupRoom(w.roomId);
+  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + w.roomId);
+  const limit = Math.max(0, Math.floor(w.limit));
+  const clamp = (seq: number) =>
+    w.leaveAt === null ? seq : Math.min(seq, w.leaveAt);
+
+  const nowSeq = await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT MAX(seq) AS m FROM event_index WHERE room_id = $1;',
+      [w.roomId],
+    );
+    return r.rows[0].m == null ? 0 : Number(r.rows[0].m);
+  });
+
+  const from = clamp(w.fromSeq ?? (w.dir === 'b' ? nowSeq : 0));
+  const upper = clamp(w.toSeq ?? nowSeq);
+  const lower = w.toSeq ?? -1;
+
+  const rows = await withDb(serverDb(), async (c) => {
+    if (w.dir === 'f') {
+      if (from >= upper) return [];
+      const r = await c.query(
+        `SELECT * FROM event_index
+         WHERE room_id = $1 AND rejected = FALSE AND soft_failed = FALSE
+           AND seq > $2 AND seq <= $3
+         ORDER BY seq ASC LIMIT $4;`,
+        [w.roomId, from, upper, limit + 1],
+      );
+      return r.rows;
+    }
+    const r = await c.query(
+      `SELECT * FROM event_index
+       WHERE room_id = $1 AND rejected = FALSE AND soft_failed = FALSE
+         AND seq <= $2 AND seq > $3
+       ORDER BY seq DESC LIMIT $4;`,
+      [w.roomId, from, lower, limit + 1],
+    );
+    return r.rows;
+  });
+
+  const hasMore = rows.length > limit;
+  // deno-lint-ignore no-explicit-any
+  const windowRows: EventIndexRow[] = rows.slice(0, limit).map((row: any) => ({
+    event_id: String(row.event_id),
+    room_id: String(row.room_id),
+    commit_hash: String(row.commit_hash),
+    rejected: row.rejected === true,
+    soft_failed: row.soft_failed === true,
+    seq: Number(row.seq),
+    state_commit_hash: row.state_commit_hash == null
+      ? null
+      : String(row.state_commit_hash),
+    redacted_by: row.redacted_by == null ? null : String(row.redacted_by),
+    txn_device: row.txn_device == null ? null : String(row.txn_device),
+    txn_id: row.txn_id == null ? null : String(row.txn_id),
+  }));
+
+  const chunk: Record<string, unknown>[] = [];
+  for (const idx of windowRows) {
+    const pdu = await pduById(room.dbName, idx.commit_hash, idx.event_id);
+    if (!pdu) continue;
+    if (
+      !(await canSeeEvent(w.userId, w.roomId, {
+        seq: idx.seq,
+        type: pdu.type,
+        stateKey: pdu.state_key,
+      }))
+    ) {
+      continue;
+    }
+    const ev = await clientEventForRow(room.dbName, room.roomVersion, idx, {
+      userId: w.userId,
+      deviceId: w.deviceId,
+    });
+    if (ev) chunk.push(ev);
+  }
+
+  const result: MessagesResult = {
+    chunk,
+    start: formatStreamToken(from, 0),
+  };
+  if (hasMore && windowRows.length > 0) {
+    const lastSeq = windowRows[windowRows.length - 1].seq;
+    result.end = formatStreamToken(w.dir === 'f' ? lastSeq : lastSeq - 1, 0);
+  }
+
+  if (w.lazyLoadMembers) {
+    const senders = new Set(chunk.map((e) => String(e.sender)));
+    const endSeq = w.dir === 'f'
+      ? (windowRows.length > 0 ? windowRows[windowRows.length - 1].seq : from)
+      : from;
+    const memberRows = ((await stateAtSeq(w.roomId, endSeq)) ?? []).filter(
+      (r) => r.type === 'm.room.member' && senders.has(r.stateKey),
+    );
+    const state: Record<string, unknown>[] = [];
+    for (const r of memberRows) {
+      const idx = await eventIndexRow(w.roomId, r.eventId);
+      if (!idx) continue;
+      const ev = await clientEventForRow(room.dbName, room.roomVersion, idx, {
+        userId: w.userId,
+        deviceId: w.deviceId,
+      });
+      if (ev) state.push(ev);
+    }
+    result.state = state;
+  }
+  return result;
 }

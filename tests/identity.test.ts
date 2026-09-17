@@ -2,7 +2,7 @@ import { assertEquals, assertMatch, assertNotEquals } from '@std/assert';
 import { createRoom, lookupRoom } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
 import { eventIdFor } from '#engine/eventid.ts';
-import { messages } from '#engine/timeline.ts';
+import { pduById } from '#engine/timeline.ts';
 import { serverDb, withDb } from '#engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
@@ -60,10 +60,29 @@ Deno.test('unified identity: content-hash event ids for every room version', asy
 
   // ids are self-certifying: recomputing the content hash from the stored
   // PDU reproduces the id
-  const chunk = (await messages(dbName, ROOM)) as {
-    event_id: string;
-    [k: string]: unknown;
-  }[];
+  const chunk: { event_id: string; [k: string]: unknown }[] = [];
+  {
+    const idx = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        'SELECT event_id, commit_hash FROM event_index WHERE room_id = $1 AND rejected = FALSE AND soft_failed = FALSE ORDER BY seq DESC;',
+        [ROOM],
+      );
+      // deno-lint-ignore no-explicit-any
+      return r.rows as any[];
+    });
+    for (const row of idx) {
+      chunk.push(
+        (await pduById(
+          dbName,
+          String(row.commit_hash),
+          String(row.event_id),
+        ))! as unknown as {
+          event_id: string;
+          [k: string]: unknown;
+        },
+      );
+    }
+  }
   assertEquals(chunk.length, 8);
   for (const pdu of chunk) {
     assertEquals(await eventIdFor(pdu, '11'), pdu.event_id);

@@ -90,9 +90,19 @@ Deno.test("soft-fail: a banned user's concurrent message soft-fails", async () =
 
   // excluded from the client-visible timeline
   const { messages } = await import('#engine/timeline.ts');
-  const visible = await messages(room.dbName, ROOM, 50);
+  const visible = await messages({
+    roomId: ROOM,
+    userId: '@dev:localhost',
+    deviceId: null,
+    leaveAt: null,
+    dir: 'b',
+    fromSeq: null,
+    toSeq: null,
+    limit: 50,
+    lazyLoadMembers: false,
+  });
   assert(
-    !visible.some((m) =>
+    !visible.chunk.some((m) =>
       (m as { event_id?: string }).event_id === msg.event_id
     ),
     'soft-failed event must not be returned by messages()',

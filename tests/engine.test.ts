@@ -1,7 +1,7 @@
 import { assertEquals } from '@std/assert';
 import { createRoom, extremities, lookupRoom } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
-import { messages } from '#engine/timeline.ts';
+import { pduById } from '#engine/timeline.ts';
 import { serverDb, withDb } from '#engine/db.ts';
 import { latestExtremityEventId, resetRoom } from './util.ts';
 
@@ -75,10 +75,25 @@ Deno.test('engine invariant: commit = event', async () => {
     }
   });
 
-  // messages newest-first (commit order): msg3, msg2, msg1, guest_access,
+  // messages newest-first (seq order): msg3, msg2, msg1, guest_access,
   // history_visibility, join_rules, power_levels, member, create
   // deno-lint-ignore no-explicit-any
-  const chunk = (await messages(dbName, ROOM)) as any[];
+  const chunk: any[] = [];
+  {
+    const idx = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        'SELECT event_id, commit_hash FROM event_index WHERE room_id = $1 AND rejected = FALSE AND soft_failed = FALSE ORDER BY seq DESC;',
+        [ROOM],
+      );
+      // deno-lint-ignore no-explicit-any
+      return r.rows as any[];
+    });
+    for (const row of idx) {
+      chunk.push(
+        await pduById(dbName, String(row.commit_hash), String(row.event_id)),
+      );
+    }
+  }
   assertEquals(chunk.length, 9);
   assertEquals(chunk[0].event_id, ids[2]);
   assertEquals(chunk[1].event_id, ids[1]);
