@@ -62,6 +62,26 @@ state.
   commit, always). Whenever the extremity set changes, the resolver's
   output across the set is republished on `main` — readers of current
   state read `main`, nothing else.
+- **State at any point is `main`'s history (E1).** Every ingest records
+  `HASHOF('main')` right after its publish as the event's
+  `state_commit_hash`; "state at seq N in room R" is `state AS OF` the
+  hash of the last non-rejected R-event with seq ≤ N. One primitive
+  serves `/members?at=`, `invite_state`, `unsigned.membership`, the
+  `state` blocks in `/sync`, and left users reading as-of-leave.
+- **Membership has a server-side index (E2).**
+  `room_membership(room_id, user_id, membership, event_id, seq)` is a
+  derived cache of `main`, written in the same ingest step — per-user
+  room lists without scanning room DBs.
+- **Sync tokens are two-stream (E3).** `s<eventSeq>_p<presenceSeq>`
+  (legacy `s<n>` parses as `_p0`) — global stream positions, valid
+  across users and as `/messages?from=`/`/members?at=`.
+- **Extremities follow Synapse's rule (E4).** Rejected and soft-failed
+  events neither become extremities nor consume their prevs; an
+  accepted event citing one consumes its branch and walks back through
+  flagged ancestors (`persist_events.py:1052-1111`).
+- **Ingest is per-room serialized (E5).** An in-process async lock
+  keyed by room id wraps prev resolution through the `main` publish —
+  parallel subtests on one room can't race the publish.
 - **Convergence gossip.** The announce carries `th = {engine, events,
   state, sh, room_version}` where `sh` is the digest of the announced
   frontier's resolved state over event ids. Contested keys yield an
@@ -124,7 +144,53 @@ state.
   with an unvalidated id. No thumbnails, previews, remote fetch, or
   retention in M2.
 
-## 3. Sync (parked)
+## 3. Rooms and sync (M4)
+
+- **Membership goes through the rulebook.** join/leave/invite/ban/kick
+  author `m.room.member` with the right sender/state_key/content and
+  ingest it; rulebook rejects are 403 `M_FORBIDDEN`. Idempotent
+  re-join (already joined → the existing event, no new one), invite
+  target validation (self/already-joined 403, malformed 400), and the
+  kick pre-check (target must be join/invite/knock — the spec's auth
+  rules carry no target-membership condition, so it is an op-layer
+  check, as in Synapse's REST handler). Endpoints:
+  `/join/:idOrAlias` (alias → `room_aliases`, body keys merge into
+  member content) and `/rooms/:id/{join,leave,invite,ban,kick}`.
+- **State is read and written per key.**
+  `GET/PUT /rooms/:id/state/:type/:stateKey` (the trailing-slash form
+  is the empty state key), whole-room `GET /state` (full client events
+  from `main`), `/members` (`?at=`, membership filters),
+  `/joined_members`, `/joined_rooms`. PUT is idempotent for identical
+  content + same sender. Left users read as-of-leave; non-members 403.
+- **`createRoom` speaks the spec's options** (create_room.yaml at
+  v1.16): presets; spec-default power levels written out in full and
+  deep-merged with `power_level_content_override`; `initial_state`
+  before `name`/`topic` (they override it); the `invite` list;
+  `room_alias_name` (409 on conflict) + canonical alias;
+  `creation_content` minus `room_version`; the rich `m.topic` form.
+- **Transactions are idempotent per (device, room, txn)** — a repeat
+  send returns the recorded event id regardless of content;
+  `unsigned.transaction_id` renders for the sending device only.
+- **Redactions are applied at read.** `/redact` checks authorization
+  (own event, or ≥ the `redact` level), authors `m.room.redaction`,
+  and marks the index row; the stored PDU stays verbatim — the client
+  formatter applies the room version's keep-table and attaches
+  `unsigned.redacted_because`.
+- **History visibility is evaluated at the event** (E1 state): the
+  module's rules with `history_visibility` at the event and the
+  viewer's membership there; own membership events always visible.
+  Not visible → 404 on `/event`, filtered from `/messages` and
+  `/sync` timelines. Left users are clamped to their leave.
+- **`/sync` is per-user** with join/invite/leave sections, filters
+  (stored + inline; types, limits, lazy members, include_leave),
+  `limited`/`prev_batch` windows (`prev_batch` = `s<firstReturned-1>`
+  only when the timeline was trimmed to the limit, else the window
+  end — Synapse's rule), state deltas at the timeline start, invite
+  stripped state, summary counts/heroes, presence fan-out (its own
+  stream), device_lists, and `unsigned.membership` per event. `r0`
+  re-exports `joined_members` and `messages`.
+
+## 4. Sync (parked)
 
 The browser homeserver (communico-lite) and the native sync protocols
 (msync/dsync) are parked — prior art on `research/lite`, plan in
@@ -132,7 +198,7 @@ The browser homeserver (communico-lite) and the native sync protocols
 only for them (the msync peer, the ws endpoint, the engine facade) left
 with this cleanup; the server speaks the Matrix client-server API only.
 
-## 4. Conformance (`complement/`)
+## 5. Conformance (`complement/`)
 
 Complement is the compass, not the target: one image (Doltgres +
 communico, `tini`), `:8008` plain HTTP + `:8448` TLS (cert signed by
@@ -140,26 +206,26 @@ Complement's mounted CA, 404 for every path — federation is M5),
 `SERVER_NAME` from env, self-managed storage, idempotent inits. The
 **blacklist** has two sections — principled/permanent (3PID issuance,
 history surgery, `/_synapse/*`, unstable MSCs) and scheduled (E2EE,
-push, federation/M5, room endpoints over the rulebook/M4,
-rate limits/M2) — applied as
+push, federation/M5, rate limits/M2) — applied as
 build tags from the human file; case-level exclusions are triaged in
 `BASELINE.md`, never blacklisted (`30rooms`, `31sync`, redaction,
 `50federation`). `continuity.sh` proves the tenant key survives
 container restarts.
 
-## 5. What's stubbed (roadmap)
+## 6. What's stubbed (roadmap)
 
-Room version 12 registration behind the same rulebook slot (after M4 —
-the rulebook already carries its switches); room endpoints over the
-rulebook (`/join`, `/leave`, `/invite`, `/ban`, `/kick`, `PUT /state`,
-membership-aware `/sync` — M4); S2S federation (M5); relay `bind/forward`;
+Room version 12 registration behind the same rulebook slot (the
+rulebook already carries its switches); band C (typing, receipts,
+room directory/aliases/publicRooms, forget, relations/threads,
+search/upgrade, user_directory, profile→member propagation, ignored
+users, url_preview); S2S federation (M5); relay `bind/forward`;
 E2EE; push delivery/rules (M2's pushers are storage-only);
 appservices; rate limiting; media thumbnails, URL previews, remote
 fetch, and retention (M2 is local store-and-serve only);
 `/_matrix/key/*` and `.well-known`; at-rest encryption of tenant
 private keys. Stub-era rooms are flagged and will never federate.
 
-## 6. Verification
+## 7. Verification
 
 Each phase gates green before the next begins: `deno task check` +
 `deno task test`, `demo/setup.sh --reset && demo/run-demo.sh --check`,

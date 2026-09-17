@@ -43,9 +43,7 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
   `knocking*` share the `testValidationForSendMembershipEndpoint` helper defined
   in blacklisted `federation_room_join_test.go` (a second `//go:build` line is
   illegal in Go, so they are excluded rather than given a duplicate tag).
-- Event authorization beyond membership — M4 (the rulebook is live as of M3; the
-  Complement room tests that would exercise it need the M4 endpoints: `/join`,
-  `/leave`, `/invite`, `/ban`, `/kick`, `PUT /state`).
+- Event authorization — landed M4 (rulebook M3 + room endpoints M4).
 - Room version 12 — after M4 (the rulebook carries its switches; `createRoom`
   room-id derivation pending).
 - Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in BASELINE.md.
@@ -81,10 +79,6 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - tests/federation_upload_keys_test.go
 - tests/knocking_test.go
 - tests/knock_restricted_test.go
-- tests/csapi/power_levels_test.go
-- tests/csapi/room_ban_test.go
-- tests/csapi/room_kick_test.go
-- tests/csapi/room_leave_test.go
 - tests/v12_test.go
 
 ## Never blacklisted
