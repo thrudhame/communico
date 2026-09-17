@@ -269,6 +269,9 @@ export async function registerUser(
         [accessToken, localpart, deviceId],
       );
     }
+    // M4: the presence default row lives in the server DB (full MXID)
+    const { ensurePresenceRow } = await import('./presence.ts');
+    await ensurePresenceRow(userId);
     return {
       user_id: userId,
       access_token: accessToken,

@@ -75,6 +75,9 @@ export default async function (
       : undefined,
   );
   const accessToken = await issueToken(serverName(), localpart, deviceId);
+  // M4: the presence default row (a never-synced joiner still has one)
+  const { ensurePresenceRow } = await import('#engine/presence.ts');
+  await ensurePresenceRow(`@${localpart}:${serverName()}`);
   return {
     user_id: `@${localpart}:${serverName()}`,
     access_token: accessToken,
