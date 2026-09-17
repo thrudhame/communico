@@ -30,5 +30,12 @@ export default async function (
     if (notMembership !== null && ms === notMembership) return false;
     return true;
   });
-  return { chunk: await clientEventsForRows(room.dbName, roomId, rows) };
+  return {
+    chunk: await clientEventsForRows(
+      room.dbName,
+      roomId,
+      rows,
+      room.roomVersion,
+    ),
+  };
 }

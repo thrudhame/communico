@@ -1,5 +1,6 @@
 import { ident, serverDb, withDb } from './db.ts';
 import { headExtremity } from './room.ts';
+import { clientEvent, type EventIndexRow } from './event-format.ts';
 import type { Pdu } from './pdu.ts';
 
 // Load one event's stored PDU by id, AS OF the commit that carries it
@@ -21,6 +22,63 @@ export async function pduById(
     const v = r.rows[0].canonical_json;
     return (typeof v === 'string' ? JSON.parse(v) : v) as Pdu;
   });
+}
+
+// The full client rendering of an event_index row: the stored PDU plus
+// the redaction treatment when redacted_by is set (the redaction event's
+// own client form lands in unsigned.redacted_because). One level deep —
+// a redaction event's own redaction is not followed.
+export async function clientEventForRow(
+  dbName: string,
+  roomVersion: string,
+  row: EventIndexRow,
+  viewer?: { userId: string; deviceId: string | null },
+): Promise<Record<string, unknown> | null> {
+  const pdu = await pduById(dbName, row.commit_hash, row.event_id);
+  if (!pdu) return null;
+  let redaction:
+    | { roomVersion: string; event: Record<string, unknown> }
+    | undefined;
+  if (row.redacted_by != null) {
+    const rIdx = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        'SELECT * FROM event_index WHERE room_id = $1 AND event_id = $2;',
+        [row.room_id, row.redacted_by],
+      );
+      return r.rows.length ? r.rows[0] : null;
+    });
+    if (rIdx) {
+      const rPdu = await pduById(
+        dbName,
+        String(rIdx.commit_hash),
+        row.redacted_by,
+      );
+      if (rPdu) {
+        redaction = {
+          roomVersion,
+          event: clientEvent(rPdu, {
+            event_id: String(rIdx.event_id),
+            room_id: String(rIdx.room_id),
+            commit_hash: String(rIdx.commit_hash),
+            rejected: rIdx.rejected === true,
+            soft_failed: rIdx.soft_failed === true,
+            seq: Number(rIdx.seq),
+            state_commit_hash: rIdx.state_commit_hash == null
+              ? null
+              : String(rIdx.state_commit_hash),
+            redacted_by: rIdx.redacted_by == null
+              ? null
+              : String(rIdx.redacted_by),
+            txn_device: rIdx.txn_device == null
+              ? null
+              : String(rIdx.txn_device),
+            txn_id: rIdx.txn_id == null ? null : String(rIdx.txn_id),
+          }, viewer),
+        };
+      }
+    }
+  }
+  return clientEvent(pdu, row, viewer, redaction);
 }
 
 // Maps a commit to the events row it added (the commit=event invariant:

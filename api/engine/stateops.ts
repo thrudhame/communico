@@ -4,7 +4,6 @@
 import { canonicalJson } from './canonical.ts';
 import { authorAndIngest } from './ingest.ts';
 import { MatrixError } from './matrix-error.ts';
-import { clientEvent } from './event-format.ts';
 import {
   eventIndexRow,
   lookupRoom,
@@ -12,23 +11,25 @@ import {
   stateAtSeq,
   type StateRow,
 } from './room.ts';
-import { pduById } from './timeline.ts';
+import { clientEventForRow, pduById } from './timeline.ts';
 import { readPositionFor } from './visibility.ts';
 
 // Full client events for a set of state rows (a row whose event is
-// missing from the index is skipped — never expected).
+// missing from the index is skipped — never expected). Redaction is
+// applied at read (clientEventForRow).
 export async function clientEventsForRows(
   dbName: string,
   roomId: string,
   rows: StateRow[],
+  roomVersion: string,
 ): Promise<Record<string, unknown>[]> {
   const out: Record<string, unknown>[] = [];
   for (const r of rows) {
     const idx = await eventIndexRow(roomId, r.eventId);
     if (!idx) continue;
-    const pdu = await pduById(dbName, idx.commit_hash, r.eventId);
-    if (!pdu) continue;
-    out.push(clientEvent(pdu, idx));
+    const ev = await clientEventForRow(dbName, roomVersion, idx);
+    if (!ev) continue;
+    out.push(ev);
   }
   return out;
 }
@@ -58,7 +59,12 @@ export async function readStateKey(
     );
   }
   if (format === 'event') {
-    const [ev] = await clientEventsForRows(room.dbName, roomId, [row]);
+    const [ev] = await clientEventsForRows(
+      room.dbName,
+      roomId,
+      [row],
+      room.roomVersion,
+    );
     return ev;
   }
   return row.content;
