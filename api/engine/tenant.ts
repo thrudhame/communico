@@ -850,6 +850,27 @@ export async function getAccountData(
   });
 }
 
+/** M4: the user's GLOBAL account data rows (room_id '') as {type, content}. */
+export async function listGlobalAccountData(
+  serverName: string,
+  localpart: string,
+): Promise<{ type: string; content: unknown }[]> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      `SELECT type, content FROM account_data WHERE localpart = $1 AND room_id = '';`,
+      [localpart],
+    );
+    // deno-lint-ignore no-explicit-any
+    return (r.rows as any[]).map((row) => ({
+      type: String(row.type),
+      content: typeof row.content === 'string'
+        ? JSON.parse(row.content)
+        : row.content,
+    }));
+  });
+}
+
 // --- M4: transaction idempotency -------------------------------------------
 // Scoped to (device, room, txn): a repeat send returns the recorded
 // event_id regardless of content (Complement txnid_test.go).

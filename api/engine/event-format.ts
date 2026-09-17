@@ -19,6 +19,25 @@ export interface EventIndexRow {
   txn_id: string | null;
 }
 
+// Map a raw event_index DB row to the formatter's shape.
+// deno-lint-ignore no-explicit-any
+export function eventIndexRowOf(row: any): EventIndexRow {
+  return {
+    event_id: String(row.event_id),
+    room_id: String(row.room_id),
+    commit_hash: String(row.commit_hash),
+    rejected: row.rejected === true,
+    soft_failed: row.soft_failed === true,
+    seq: Number(row.seq),
+    state_commit_hash: row.state_commit_hash == null
+      ? null
+      : String(row.state_commit_hash),
+    redacted_by: row.redacted_by == null ? null : String(row.redacted_by),
+    txn_device: row.txn_device == null ? null : String(row.txn_device),
+    txn_id: row.txn_id == null ? null : String(row.txn_id),
+  };
+}
+
 // The client-visible event: event_id, type, sender, content,
 // origin_server_ts, room_id, state_key? and unsigned{age,
 // transaction_id?, redacted_because?}. unsigned.transaction_id renders
@@ -32,7 +51,7 @@ export interface EventIndexRow {
 export function clientEvent(
   pdu: Pdu,
   row: EventIndexRow,
-  viewer?: { userId: string; deviceId: string | null },
+  viewer?: { userId: string; deviceId: string | null; membership?: string },
   redaction?: { roomVersion: string; event: Record<string, unknown> },
 ): Record<string, unknown> {
   const redacted = row.redacted_by != null && redaction !== undefined;
@@ -59,6 +78,12 @@ export function clientEvent(
     row.txn_id != null
   ) {
     unsigned.transaction_id = row.txn_id;
+  }
+  // MSC4115: the viewer's membership at the event (the caller computes it
+  // per event — E1 state-at-seq; 'leave' when the viewer has no member
+  // row there).
+  if (viewer?.membership !== undefined) {
+    unsigned.membership = viewer.membership;
   }
   if (redacted) unsigned.redacted_because = redaction!.event;
   ev.unsigned = unsigned;

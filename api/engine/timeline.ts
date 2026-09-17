@@ -38,7 +38,7 @@ export async function clientEventForRow(
   dbName: string,
   roomVersion: string,
   row: EventIndexRow,
-  viewer?: { userId: string; deviceId: string | null },
+  viewer?: { userId: string; deviceId: string | null; membership?: string },
 ): Promise<Record<string, unknown> | null> {
   const pdu = await pduById(dbName, row.commit_hash, row.event_id);
   if (!pdu) return null;

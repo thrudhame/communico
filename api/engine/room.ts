@@ -3,7 +3,7 @@ import { author, ingestEvent } from './ingest.ts';
 import { getRulebook } from './policy.ts';
 import { serverName } from './config.ts';
 import { MatrixError } from './matrix-error.ts';
-import type { EventIndexRow } from './event-format.ts';
+import { type EventIndexRow, eventIndexRowOf } from './event-format.ts';
 
 async function sha256hex(s: string): Promise<string> {
   const data = new TextEncoder().encode(s);
@@ -471,16 +471,19 @@ export async function membershipOf(
 // Every room the user has a membership row in, any value.
 export async function roomsFor(
   userId: string,
-): Promise<{ roomId: string; membership: string; seq: number }[]> {
+): Promise<
+  { roomId: string; membership: string; eventId: string; seq: number }[]
+> {
   return await withDb(serverDb(), async (c) => {
     const r = await c.query(
-      'SELECT room_id, membership, seq FROM room_membership WHERE user_id = $1;',
+      'SELECT room_id, membership, event_id, seq FROM room_membership WHERE user_id = $1;',
       [userId],
     );
     // deno-lint-ignore no-explicit-any
     return (r.rows as any[]).map((row) => ({
       roomId: String(row.room_id),
       membership: String(row.membership),
+      eventId: String(row.event_id),
       seq: Number(row.seq),
     }));
   });
@@ -517,21 +520,7 @@ export async function eventIndexRow(
       [roomId, eventId],
     );
     if (r.rows.length === 0) return null;
-    const row = r.rows[0];
-    return {
-      event_id: String(row.event_id),
-      room_id: String(row.room_id),
-      commit_hash: String(row.commit_hash),
-      rejected: row.rejected === true,
-      soft_failed: row.soft_failed === true,
-      seq: Number(row.seq),
-      state_commit_hash: row.state_commit_hash == null
-        ? null
-        : String(row.state_commit_hash),
-      redacted_by: row.redacted_by == null ? null : String(row.redacted_by),
-      txn_device: row.txn_device == null ? null : String(row.txn_device),
-      txn_id: row.txn_id == null ? null : String(row.txn_id),
-    };
+    return eventIndexRowOf(r.rows[0]);
   });
 }
 
