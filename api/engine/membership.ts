@@ -7,6 +7,7 @@ import { serverName } from './config.ts';
 import { localpartOf } from './auth.ts';
 import { authorAndIngest } from './ingest.ts';
 import { MatrixError } from './matrix-error.ts';
+import { serverDb, withDb } from './db.ts';
 import { lookupRoom, membershipOf } from './room.ts';
 import { getProfile } from './tenant.ts';
 
@@ -127,6 +128,34 @@ export async function ban(
   const content: Record<string, unknown> = { membership: 'ban' };
   if (reason !== undefined) content.reason = reason;
   return await authorMember(roomId, sender, target, content);
+}
+
+// forget (band C D4, spec v1.16 leaving.yaml:80-126): set the forgotten
+// flag on the membership row. Still joined → 400 M_UNKNOWN (the spec's
+// literal errcode and message shape); leave/ban (incl. the
+// invited-then-left row) → forgotten; no row at all → 400 M_UNKNOWN.
+// A live invite row is forgotten too: leaving.yaml:91-92 blocks only
+// joined users ("they must leave the room before calling this API") —
+// the plan enumerates the tested rows; invite is spec-decided here.
+// Any later membership event clears the flag (ingest E2).
+export async function forget(roomId: string, userId: string): Promise<void> {
+  const current = await membershipOf(roomId, userId);
+  if (current?.membership === 'join') {
+    throw new MatrixError(
+      400,
+      'M_UNKNOWN',
+      `User ${userId} is in room ${roomId}`,
+    );
+  }
+  if (current === null) {
+    throw new MatrixError(400, 'M_UNKNOWN', 'no membership to forget');
+  }
+  await withDb(serverDb(), async (c) => {
+    await c.query(
+      'UPDATE room_membership SET forgotten = TRUE WHERE room_id = $1 AND user_id = $2;',
+      [roomId, userId],
+    );
+  });
 }
 
 // kick: a leave authored by someone else. The target must be in the room

@@ -452,10 +452,13 @@ export async function stateAtSeq(
 export async function membershipOf(
   roomId: string,
   userId: string,
-): Promise<{ membership: string; eventId: string; seq: number } | null> {
+): Promise<
+  | { membership: string; eventId: string; seq: number; forgotten: boolean }
+  | null
+> {
   return await withDb(serverDb(), async (c) => {
     const r = await c.query(
-      'SELECT membership, event_id, seq FROM room_membership WHERE room_id = $1 AND user_id = $2;',
+      'SELECT membership, event_id, seq, forgotten FROM room_membership WHERE room_id = $1 AND user_id = $2;',
       [roomId, userId],
     );
     return r.rows.length
@@ -463,6 +466,7 @@ export async function membershipOf(
         membership: String(r.rows[0].membership),
         eventId: String(r.rows[0].event_id),
         seq: Number(r.rows[0].seq),
+        forgotten: r.rows[0].forgotten === true,
       }
       : null;
   });
@@ -472,11 +476,17 @@ export async function membershipOf(
 export async function roomsFor(
   userId: string,
 ): Promise<
-  { roomId: string; membership: string; eventId: string; seq: number }[]
+  {
+    roomId: string;
+    membership: string;
+    eventId: string;
+    seq: number;
+    forgotten: boolean;
+  }[]
 > {
   return await withDb(serverDb(), async (c) => {
     const r = await c.query(
-      'SELECT room_id, membership, event_id, seq FROM room_membership WHERE user_id = $1;',
+      'SELECT room_id, membership, event_id, seq, forgotten FROM room_membership WHERE user_id = $1;',
       [userId],
     );
     // deno-lint-ignore no-explicit-any
@@ -485,6 +495,7 @@ export async function roomsFor(
       membership: String(row.membership),
       eventId: String(row.event_id),
       seq: Number(row.seq),
+      forgotten: row.forgotten === true,
     }));
   });
 }

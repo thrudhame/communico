@@ -6,20 +6,15 @@ import { readPositionFor } from '#engine/visibility.ts';
 // GET /_matrix/client/v3/rooms/#roomId/messages — plan §3f: dir is
 // required (400 M_MISSING_PARAM), from/to are sync tokens (the s…_p…
 // grammar), limit defaults to 10, filter is inline JSON
-// (lazy_load_members). 403 M_FORBIDDEN for an unknown room or a
-// non-member (TestFetchMessagesFromNonExistentRoom).
+// (lazy_load_members). D10: room access is checked BEFORE query params —
+// an unknown, forgotten, or never-member room 403s M_FORBIDDEN even with
+// no dir (the forget test sends no params; Synapse order); dir is only
+// then required.
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
   context: import('@pathfinder/pathfinder').Context,
 ) {
   const roomId = request.params.roomId as string;
-  const dirRaw = request.query.get('dir');
-  if (dirRaw === null) {
-    throw new MatrixError(400, 'M_MISSING_PARAM', 'dir is required');
-  }
-  if (dirRaw !== 'b' && dirRaw !== 'f') {
-    throw new MatrixError(400, 'M_INVALID_PARAM', 'bad dir: ' + dirRaw);
-  }
   if ((await lookupRoom(roomId)) === null) {
     throw new MatrixError(
       403,
@@ -28,6 +23,13 @@ export default async function (
     );
   }
   const leaveAt = await readPositionFor(context.state.user as string, roomId);
+  const dirRaw = request.query.get('dir');
+  if (dirRaw === null) {
+    throw new MatrixError(400, 'M_MISSING_PARAM', 'dir is required');
+  }
+  if (dirRaw !== 'b' && dirRaw !== 'f') {
+    throw new MatrixError(400, 'M_INVALID_PARAM', 'bad dir: ' + dirRaw);
+  }
   const from = parseStreamToken(request.query.get('from'));
   const to = parseStreamToken(request.query.get('to'));
   const limitRaw = request.query.get('limit');

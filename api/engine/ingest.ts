@@ -797,10 +797,19 @@ async function ingestEventLocked(
     );
     for (const r of publishedRows) {
       if (r.type !== 'm.room.member') continue;
+      // D4: a membership event FOR THE USER clears the forgotten flag
+      // (a re-join after /forget makes the room visible again) — that is
+      // THIS event's own state_key. The full-state fold below keeps the
+      // index fresh for everyone else WITHOUT touching the flag:
+      // resetting there would un-forget the room on any later event.
+      const clearsForget = pdu.type === 'm.room.member' &&
+        r.stateKey === String(pdu.state_key ?? '');
       await c.query(
         `INSERT INTO room_membership (room_id, user_id, membership, event_id, seq)
          VALUES ($1,$2,$3,$4,(SELECT seq FROM event_index WHERE event_id=$4))
-         ON CONFLICT (room_id, user_id) DO UPDATE SET membership=EXCLUDED.membership, event_id=EXCLUDED.event_id, seq=EXCLUDED.seq;`,
+         ON CONFLICT (room_id, user_id) DO UPDATE SET membership=EXCLUDED.membership, event_id=EXCLUDED.event_id, seq=EXCLUDED.seq${
+          clearsForget ? ', forgotten=FALSE' : ''
+        };`,
         [
           roomId,
           r.stateKey,

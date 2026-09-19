@@ -17,6 +17,7 @@
 --   ALTER TABLE event_index ADD COLUMN txn_device text;
 --   ALTER TABLE event_index ADD COLUMN txn_id text;
 -- (band C): ALTER TABLE room_aliases ADD COLUMN creator text;
+--   ALTER TABLE room_membership ADD COLUMN forgotten boolean NOT NULL DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -53,12 +54,15 @@ CREATE TABLE IF NOT EXISTS event_index (
 -- M4 (E2): per-user room lists without scanning room DBs. Derived cache of
 -- `main`, written in the same ingest step that publishes it (from the
 -- published rows' m.room.member entries).
+-- band C (D4): forgotten is set by /forget and cleared by any later
+-- membership event for the user in the room (the E2 upsert resets it).
 CREATE TABLE IF NOT EXISTS room_membership (
   room_id text NOT NULL,
   user_id text NOT NULL,
   membership text NOT NULL,
   event_id text NOT NULL,
   seq bigint NOT NULL,
+  forgotten boolean NOT NULL DEFAULT FALSE,
   PRIMARY KEY (room_id, user_id)
 );
 -- M4: alias -> room (createRoom room_alias_name; /join by alias). The

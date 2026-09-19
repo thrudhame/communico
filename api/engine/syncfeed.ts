@@ -387,6 +387,11 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       continue;
     }
     if (m.membership === 'leave' || m.membership === 'ban') {
+      // D4: forgotten rooms vanish from initial and full_state syncs
+      // entirely — but an in-window leave event still comes down an
+      // incremental sync (the forget test's "Leave for forgotten room
+      // shows up in v2 incremental /sync"; Synapse does the same).
+      if (m.forgotten && (i.since === null || i.fullState)) continue;
       // Leave-room selection (synapse/handlers/sync.py, transcribed at
       // execution): initial syncs gate archived rooms on include_leave;
       // incremental (and full_state) syncs include a leave room whenever

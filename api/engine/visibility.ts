@@ -9,7 +9,9 @@ import { membershipOf, stateAtSeq } from './room.ts';
 // Where a user reads the room up to: null (joined: now) or the seq of
 // their leave/ban (left users read as of their leave; invitees as of
 // their invite). 403 M_FORBIDDEN when the user was never a member (the
-// world_readable carve-out lands with canSeeEvent).
+// world_readable carve-out lands with canSeeEvent) — and when the room
+// is forgotten (band C D4: forget hides history; leaving.yaml:86-89 "a
+// user will no longer be able to retrieve history for this room").
 export async function readPositionFor(
   userId: string,
   roomId: string,
@@ -17,6 +19,9 @@ export async function readPositionFor(
   const m = await membershipOf(roomId, userId);
   if (m === null) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'not a member of ' + roomId);
+  }
+  if (m.forgotten) {
+    throw new MatrixError(403, 'M_FORBIDDEN', 'room forgotten: ' + roomId);
   }
   return m.membership === 'join' ? null : m.seq;
 }
