@@ -264,8 +264,8 @@ export async function createRoom(
   if (alias !== undefined) {
     await withDb(serverDb(), async (c) => {
       await c.query(
-        'INSERT INTO room_aliases (alias, room_id) VALUES ($1, $2);',
-        [alias, roomId],
+        'INSERT INTO room_aliases (alias, room_id, creator) VALUES ($1, $2, $3);',
+        [alias, roomId, creator],
       );
     });
     await send('m.room.canonical_alias', '', { alias });

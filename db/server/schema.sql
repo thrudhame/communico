@@ -16,6 +16,7 @@
 --   ALTER TABLE event_index ADD COLUMN redacted_by text;
 --   ALTER TABLE event_index ADD COLUMN txn_device text;
 --   ALTER TABLE event_index ADD COLUMN txn_id text;
+-- (band C): ALTER TABLE room_aliases ADD COLUMN creator text;
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -61,10 +62,12 @@ CREATE TABLE IF NOT EXISTS room_membership (
   PRIMARY KEY (room_id, user_id)
 );
 -- M4: alias -> room (createRoom room_alias_name; /join by alias). The
--- directory surface (PUT/DELETE /directory, /aliases) is band C.
+-- directory surface (PUT/DELETE /directory, /aliases) is band C; creator
+-- feeds the D3 delete-permission rule (creator or sufficient PL).
 CREATE TABLE IF NOT EXISTS room_aliases (
   alias text PRIMARY KEY,
-  room_id text NOT NULL
+  room_id text NOT NULL,
+  creator text
 );
 -- M4: visibility: public rows (the /publicRooms listing itself is band C).
 CREATE TABLE IF NOT EXISTS room_visibility (
