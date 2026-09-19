@@ -29,8 +29,9 @@ export default async function (request: PathfinderRequest, _context: Context) {
     });
   }
   if (text.trim() === '') return;
+  let parsed: unknown;
   try {
-    JSON.parse(text);
+    parsed = JSON.parse(text);
   } catch (error) {
     if (error instanceof SyntaxError) {
       throw new HttpError(400, {
@@ -39,5 +40,16 @@ export default async function (request: PathfinderRequest, _context: Context) {
       });
     }
     throw error;
+  }
+  // D9: valid JSON but not an object is a client fault too — 400
+  // M_BAD_JSON (Complement TestJson's "invalid numbers" cases arrive as a
+  // base64 JSON *string* via WithJSONBody([]byte)). Every client-API
+  // request body is an object; binary media upload lives outside
+  // _matrix/client/.
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new HttpError(400, {
+      errcode: 'M_BAD_JSON',
+      error: 'Content must be a JSON object.',
+    });
   }
 }

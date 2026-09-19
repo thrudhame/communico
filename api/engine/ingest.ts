@@ -3,7 +3,8 @@ import { branchNameFor, ident, serverDb, withDb } from './db.ts';
 import { extremities, lookupRoom, type RoomInfo } from './room.ts';
 import { mergeDriver } from './mergedriver.ts';
 import { eventIdFor } from './eventid.ts';
-import { canonicalJson } from './canonical.ts';
+import { assertCanonicalNumbers, canonicalJson } from './canonical.ts';
+import { MatrixError } from './matrix-error.ts';
 import { signPdu, verifyPduSignature } from './signing.ts';
 import { getTenantKey } from './tenant.ts';
 import {
@@ -246,6 +247,10 @@ export async function author(
   roomId: string,
   partial: AuthorPartial,
 ): Promise<Pdu> {
+  // D9: non-canonical numbers in content are a client fault (400
+  // M_BAD_JSON, spec appendices § Canonical JSON) — refused before
+  // signing, whose canonical pass throws plain Errors (would 500).
+  assertCanonicalNumbers(partial.content);
   const room = await lookupRoom(roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
   const rulebook = getRulebook(room.roomVersion);
@@ -301,6 +306,17 @@ export async function author(
   if (partial.state_key !== undefined) pdu.state_key = partial.state_key;
   const key = await getTenantKey();
   await signPdu(pdu, room.roomVersion, key);
+  // D9: the complete event — canonical-encoded, signatures included —
+  // MUST NOT exceed 65536 bytes (spec client-server-api § Size limits,
+  // v1.16 _index.md lines 2867-2883). Enforced in author() so /send and
+  // PUT /state are both covered.
+  if (new TextEncoder().encode(canonicalJson(pdu)).length > 65536) {
+    throw new MatrixError(
+      413,
+      'M_TOO_LARGE',
+      'event exceeds the 65536-byte limit',
+    );
+  }
   if (isCreate) {
     // self-reference resolved post-id (create carries no auth_events).
     void createEventId;

@@ -3,11 +3,45 @@
 // be integers in [-(2^53)+1, 2^53-1] with no exponents/decimal places,
 // and -0 MUST NOT appear. Out-of-range integers throw (a ts=2^53 seize
 // is refused at ingest, not normalized).
+import { MatrixError } from './matrix-error.ts';
+
 const INT_MIN = -(2 ** 53) + 1;
 const INT_MAX = 2 ** 53 - 1;
 
 export function canonicalJson(value: unknown): string {
   return JSON.stringify(sortValue(value));
+}
+
+// D9 pre-flight over event content: the same number rules as sortValue,
+// thrown as M_BAD_JSON so a non-canonical client body is a 400, never a
+// signing-time 500 (spec appendices § Canonical JSON, v1.16 lines 90-94).
+export function assertCanonicalNumbers(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const v of value) assertCanonicalNumbers(v);
+    return;
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const v of Object.values(value as Record<string, unknown>)) {
+      assertCanonicalNumbers(v);
+    }
+    return;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value)) {
+      throw new MatrixError(
+        400,
+        'M_BAD_JSON',
+        'canonical JSON forbids non-integer numbers',
+      );
+    }
+    if (Object.is(value, -0) || value < INT_MIN || value > INT_MAX) {
+      throw new MatrixError(
+        400,
+        'M_BAD_JSON',
+        'canonical JSON forbids out-of-range integers',
+      );
+    }
+  }
 }
 
 function sortValue(v: unknown): unknown {
