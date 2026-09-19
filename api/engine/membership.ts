@@ -1,8 +1,8 @@
 // api/engine/membership.ts — M4 membership operations (plan §3d). Each op
 // authors an m.room.member with the right sender/state_key/content and
 // ingests it; the rulebook decides authorization (M3). Rulebook rejects
-// map to MatrixError(403, 'M_FORBIDDEN'); the room lock is ingest's (E5),
-// concurrent-op stale prevs are retried by authorAndIngest.
+// map to MatrixError(403, 'M_FORBIDDEN'); authorAndIngest holds the room
+// lock across author+ingest (E5), so concurrent ops never stale-prev.
 import { serverName } from './config.ts';
 import { localpartOf } from './auth.ts';
 import { authorAndIngest } from './ingest.ts';

@@ -45,10 +45,12 @@ export function onEventApplied(l: AppliedListener): () => void {
   return () => appliedListeners.delete(l);
 }
 
-// E5 — per-room ingest mutex: an in-process async lock keyed by room id
-// around ingestEvent's body (from prev resolution through
-// publishCurrentState). Complement subtests are t.Parallel() on one room;
-// two concurrent publishes to `main` would race. Single process, one
+// E5 — per-room mutex: an in-process async lock keyed by room id.
+// ingestEvent holds it from prev resolution through publishCurrentState;
+// authorAndIngest holds it across author() AND ingest (band C §0) — the
+// extremity read in author() and the publish that consumes it are one
+// critical section, so a concurrent op always authors on the live tip.
+// Complement subtests are t.Parallel() on one room; single process, one
 // listener — a module-level Map<roomId, Promise> chain is sufficient.
 const roomLocks = new Map<string, Promise<void>>();
 async function withRoomLock<T>(
@@ -358,11 +360,16 @@ async function consumeBranchChain(
   }
 }
 
-export async function ingestEvent(
+// Steps 1-5 of ingest, outside the per-room lock: room/version gate, wire
+// bounds, self-certifying id, idempotent redelivery, hash + signature
+// checks. 'early' carries the redelivery receipt; 'go' carries the
+// IngestPrecheck for ingestEventLocked.
+async function ingestPrechecks(
   roomId: string,
   pdu: Pdu,
-  opts: IngestOptions = {},
-): Promise<IngestResult> {
+): Promise<
+  { kind: 'early'; result: IngestResult } | { kind: 'go'; pre: IngestPrecheck }
+> {
   // 1. room + version gate (unknown -> never a default).
   const room = await lookupRoom(roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
@@ -409,7 +416,12 @@ export async function ingestEvent(
     );
     return r.rows.length ? String(r.rows[0].commit_hash) : null;
   });
-  if (existing) return { event_id: eventId, commit_hash: existing };
+  if (existing) {
+    return {
+      kind: 'early',
+      result: { event_id: eventId, commit_hash: existing },
+    };
+  }
 
   // 4. content hash (spec: fail -> the event is redacted before further
   // processing; F0 records it rejected — in the DAG, out of state).
@@ -460,15 +472,20 @@ export async function ingestEvent(
     throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
   }
 
+  return { kind: 'go', pre: { room, eventId, hashOk, sigOk } };
+}
+
+export async function ingestEvent(
+  roomId: string,
+  pdu: Pdu,
+  opts: IngestOptions = {},
+): Promise<IngestResult> {
+  const r = await ingestPrechecks(roomId, pdu);
+  if (r.kind === 'early') return r.result;
   // E5: from prev resolution (step 6) through publishCurrentState, ingest
   // holds the per-room lock. author() stays outside (pure).
   return await withRoomLock(roomId, async () => {
-    return await ingestEventLocked(roomId, pdu, opts, {
-      room,
-      eventId,
-      hashOk,
-      sigOk,
-    });
+    return await ingestEventLocked(roomId, pdu, opts, r.pre);
   });
 }
 
@@ -479,31 +496,24 @@ interface IngestPrecheck {
   sigOk: boolean;
 }
 
-// author + ingest as one op-level step. E5's lock serializes the publish,
-// not authoring: two concurrent ops on one room author on the same
-// extremity and the loser sees M_PREV_NOT_EXTREMITY (its prev's branch
-// was consumed). That race is not an error worth surfacing — re-author on
-// the new tip and try again (author() recomputes prevs per attempt when
-// partial.prev_events is undefined). Each retry means another op landed —
-// the loop ends when the burst does; 32 attempts is deep cover for a
-// per-room burst, and exhaustion throws (loud, never a hang).
+// author + ingest as one op-level step, holding the per-room lock across
+// BOTH (band C §0): author() reads the live extremities to pick prevs, so
+// it must sit in the same critical section as the publish that consumes
+// them — a concurrent op then always authors on the new tip, and the
+// M4-era stale-prev retry loop is retired (the race it covered can no
+// longer occur). The lock is not reentrant: this calls
+// ingestPrechecks/ingestEventLocked directly, never ingestEvent.
 export async function authorAndIngest(
   roomId: string,
   partial: AuthorPartial,
   opts: IngestOptions = {},
-  attempts = 32,
 ): Promise<IngestResult> {
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
+  return await withRoomLock(roomId, async () => {
     const pdu = await author(roomId, partial);
-    try {
-      return await ingestEvent(roomId, pdu, opts);
-    } catch (e) {
-      lastErr = e;
-      if (!String(e).includes('M_PREV_NOT_EXTREMITY')) throw e;
-    }
-  }
-  throw lastErr;
+    const r = await ingestPrechecks(roomId, pdu);
+    if (r.kind === 'early') return r.result;
+    return await ingestEventLocked(roomId, pdu, opts, r.pre);
+  });
 }
 
 // Steps 6-12 of ingest, inside the per-room lock (E5).
