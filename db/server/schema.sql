@@ -18,6 +18,10 @@
 --   ALTER TABLE event_index ADD COLUMN txn_id text;
 -- (band C): ALTER TABLE room_aliases ADD COLUMN creator text;
 --   ALTER TABLE room_membership ADD COLUMN forgotten boolean NOT NULL DEFAULT FALSE;
+--   CREATE SEQUENCE receipt_seq;
+--   CREATE TABLE receipts (room_id text, user_id text, receipt_type text,
+--     event_id text, ts_ms bigint, seq bigint,
+--     PRIMARY KEY (room_id, user_id, receipt_type));
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -87,6 +91,20 @@ CREATE TABLE IF NOT EXISTS presence (
   status_msg text,
   last_active_ms bigint NOT NULL,
   seq bigint NOT NULL
+);
+-- band C (D1/D2): receipts get their own persisted stream (receipt_seq);
+-- typing stays in-process (ephemeral by nature). Sync tokens grow to
+-- s<eventSeq>_p<presenceSeq>_t<typingSeq>_r<receiptSeq>; the m.read.private
+-- rows are stored, never broadcast (plan §2; receipts.md:114-115).
+CREATE SEQUENCE IF NOT EXISTS receipt_seq;
+CREATE TABLE IF NOT EXISTS receipts (
+  room_id text NOT NULL,
+  user_id text NOT NULL,
+  receipt_type text NOT NULL,
+  event_id text NOT NULL,
+  ts_ms bigint NOT NULL,
+  seq bigint NOT NULL,
+  PRIMARY KEY (room_id, user_id, receipt_type)
 );
 -- F0 dev signing key (db-init generates once via ensureServerKey, reuses
 -- forever — never rotates; F1 moves the same key into the tenant table).

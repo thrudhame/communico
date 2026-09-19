@@ -22,14 +22,21 @@ import { clientEventForRow, pduById } from './timeline.ts';
 import { canSeeEvent } from './visibility.ts';
 import { getPresence, presenceFor, setPresence } from './presence.ts';
 import type { RoomFilter } from './filters.ts';
-import { listGlobalAccountData } from './tenant.ts';
+import { listGlobalAccountData, listRoomAccountData } from './tenant.ts';
+import {
+  lastTypingChange,
+  sweepTyping,
+  typingIn,
+  typingSeq,
+} from './typing.ts';
+import { receiptSeq, receiptSeqForUser, receiptsSince } from './receipts.ts';
 import { type EventIndexRow, eventIndexRowOf } from './event-format.ts';
 import type { Pdu } from './pdu.ts';
 
 export interface SyncInputs {
   userId: string;
   deviceId: string | null;
-  since: { eSeq: number; pSeq: number } | null;
+  since: { eSeq: number; pSeq: number; tSeq: number; rSeq: number } | null;
   timeoutMs: number;
   filter: RoomFilter;
   fullState: boolean;
@@ -40,21 +47,30 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // The global stream maxima (next_batch) and the per-user relevant maxima
 // (the long-poll wake condition: only rows relevant to this user count).
-async function globalMaxes(): Promise<{ eSeq: number; pSeq: number }> {
+// Band C (D1): four streams — events, presence, typing (in-memory),
+// receipts.
+interface StreamMaxes {
+  eSeq: number;
+  pSeq: number;
+  tSeq: number;
+  rSeq: number;
+}
+
+async function globalMaxes(): Promise<StreamMaxes> {
   return await withDb(serverDb(), async (c) => {
     const e = await c.query('SELECT MAX(seq) AS m FROM event_index;');
     const p = await c.query('SELECT MAX(seq) AS m FROM presence;');
     return {
       eSeq: e.rows[0].m == null ? 0 : Number(e.rows[0].m),
       pSeq: p.rows[0].m == null ? 0 : Number(p.rows[0].m),
+      tSeq: typingSeq(),
+      rSeq: await receiptSeq(),
     };
   });
 }
 
-async function relevantMaxes(
-  userId: string,
-): Promise<{ eSeq: number; pSeq: number }> {
-  return await withDb(serverDb(), async (c) => {
+async function relevantMaxes(userId: string): Promise<StreamMaxes> {
+  const base = await withDb(serverDb(), async (c) => {
     const e = await c.query(
       `SELECT MAX(seq) AS m FROM event_index
        WHERE room_id IN (SELECT room_id FROM room_membership WHERE user_id = $1);`,
@@ -69,11 +85,22 @@ async function relevantMaxes(
        );`,
       [userId],
     );
+    const joined = await c.query(
+      `SELECT room_id FROM room_membership WHERE user_id = $1 AND membership = 'join';`,
+      [userId],
+    );
+    let tMax = 0;
+    // deno-lint-ignore no-explicit-any
+    for (const row of joined.rows as any[]) {
+      tMax = Math.max(tMax, lastTypingChange(String(row.room_id)));
+    }
     return {
       eSeq: e.rows[0].m == null ? 0 : Number(e.rows[0].m),
       pSeq: p.rows[0].m == null ? 0 : Number(p.rows[0].m),
+      tSeq: tMax,
     };
   });
+  return { ...base, rSeq: await receiptSeqForUser(userId) };
 }
 
 // Users joined to a room the syncer is joined to (the presence fan-out
@@ -125,11 +152,13 @@ interface RoomTimelineResult {
 }
 
 // One room's join/leave entry: the windowed timeline + the state block.
+// `now` carries the stream maxima for prev_batch; `end` is the e-side
+// window end (leave rooms read as of their leave).
 async function roomTimeline(
   room: { dbName: string; roomVersion: string },
   roomId: string,
   i: SyncInputs,
-  nowPSeq: number,
+  now: StreamMaxes,
   sinceESeq: number,
   end: number,
   withSummary: boolean,
@@ -176,10 +205,11 @@ async function roomTimeline(
   const limited = rawRows.length > returned.length;
 
   // prev_batch (B1 ruling): trimmed → s<firstReturned-1>; untrimmed (or
-  // trimmed to empty, e.g. limit 0) → s<windowEnd>.
+  // trimmed to empty, e.g. limit 0) → s<windowEnd>. The p/t/r parts ride
+  // the global maxima, exactly as pSeq did at M4.
   const prevBatch = trimmed && returned.length > 0
-    ? formatStreamToken(returned[0].seq - 1, nowPSeq)
-    : formatStreamToken(end, nowPSeq);
+    ? formatStreamToken(returned[0].seq - 1, now.pSeq, now.tSeq, now.rSeq)
+    : formatStreamToken(end, now.pSeq, now.tSeq, now.rSeq);
 
   // Render: visibility per event, unsigned.membership per E1.
   const events: Record<string, unknown>[] = [];
@@ -250,6 +280,40 @@ async function roomTimeline(
 
   if (withSummary) {
     entry.summary = await summaryFor(roomId, i.userId);
+
+    // Ephemeral (band C item 3): m.typing + m.receipt, with NO room_id
+    // on either (TestTyping + TestRoomReceipts pin the absence). Typing:
+    // initial sync emits only a non-empty set; incremental emits
+    // whenever the room's typing moved since the token's _t<n> (a stop
+    // therefore surfaces as user_ids: []). Receipts: rows with
+    // seq > the token's _r<n> (initial: all) as one m.receipt (§3d).
+    const ephemeral: Record<string, unknown>[] = [];
+    if (i.since === null) {
+      const { userIds } = typingIn(roomId);
+      if (userIds.length > 0) {
+        ephemeral.push({ type: 'm.typing', content: { user_ids: userIds } });
+      }
+    } else if (lastTypingChange(roomId) > i.since.tSeq) {
+      const { userIds } = typingIn(roomId);
+      ephemeral.push({ type: 'm.typing', content: { user_ids: userIds } });
+    }
+    const receiptContent = await receiptsSince(roomId, i.since?.rSeq ?? 0);
+    if (receiptContent !== null) {
+      ephemeral.push({ type: 'm.receipt', content: receiptContent });
+    }
+    entry.ephemeral = { events: ephemeral };
+
+    // Room account_data: all current rows on initial sync and whenever
+    // the room appears in a sync — no per-row seq (plan §2; the
+    // m.fully_read test is initial-sync only).
+    const adRows = await listRoomAccountData(
+      serverName(),
+      localpartOf(i.userId),
+      roomId,
+    );
+    entry.account_data = {
+      events: adRows.map((r) => ({ type: r.type, content: r.content })),
+    };
   }
   return { entry, windowJoiners, windowLeavers };
 }
@@ -350,14 +414,22 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     await setPresence(i.userId, i.setPresence);
   }
 
+  // 1b. the typing sweep is the sync's read point (typing.ts) — up front,
+  //     so next_batch's _t<n> covers expiries reflected in this response
+  sweepTyping();
+
   // 2. long-poll: wait until a RELEVANT row passes the since position
-  //    (events in the syncer's rooms; presence of room-sharers), or the
-  //    deadline. Cap 30 s; poll 500 ms.
+  //    (events in the syncer's rooms; presence of room-sharers; typing
+  //    or receipts in joined rooms), or the deadline. Cap 30 s; poll
+  //    500 ms.
   if (i.since !== null) {
     const deadline = Date.now() + Math.min(i.timeoutMs, 30000);
     while (true) {
       const rel = await relevantMaxes(i.userId);
-      if (rel.eSeq > i.since.eSeq || rel.pSeq > i.since.pSeq) break;
+      if (
+        rel.eSeq > i.since.eSeq || rel.pSeq > i.since.pSeq ||
+        rel.tSeq > i.since.tSeq || rel.rSeq > i.since.rSeq
+      ) break;
       if (Date.now() >= deadline) break;
       await sleep(500);
     }
@@ -365,7 +437,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
 
   // 3. now + next_batch
   const now = await globalMaxes();
-  const nextBatch = formatStreamToken(now.eSeq, now.pSeq);
+  const nextBatch = formatStreamToken(now.eSeq, now.pSeq, now.tSeq, now.rSeq);
 
   // 4. room set + sections (by membership at now)
   const memberships = await roomsFor(i.userId);
@@ -405,7 +477,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
         room,
         m.roomId,
         i,
-        now.pSeq,
+        now,
         i.since?.eSeq ?? 0,
         m.seq, // left users read as of their leave
         false,
@@ -417,6 +489,10 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     }
     // join
     if (i.since !== null && !i.fullState) {
+      // Unchanged rooms are omitted in incremental syncs — where
+      // "changed" covers the ephemeral streams too (band C item 3):
+      // a typing change or a new receipt surfaces the room with an
+      // otherwise empty timeline.
       const has = await withDb(serverDb(), async (c) => {
         const r = await c.query(
           `SELECT 1 FROM event_index
@@ -424,15 +500,21 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
              AND seq > $2 AND seq <= $3 LIMIT 1;`,
           [m.roomId, i.since!.eSeq, now.eSeq],
         );
-        return r.rows.length > 0;
+        if (r.rows.length > 0) return true;
+        const rr = await c.query(
+          'SELECT 1 FROM receipts WHERE room_id = $1 AND seq > $2 LIMIT 1;',
+          [m.roomId, i.since!.rSeq],
+        );
+        return rr.rows.length > 0;
       });
-      if (!has) continue; // unchanged room omitted in incremental syncs
+      const typingMoved = lastTypingChange(m.roomId) > i.since.tSeq;
+      if (!has && !typingMoved) continue; // unchanged room omitted
     }
     const { entry, windowJoiners, windowLeavers } = await roomTimeline(
       room,
       m.roomId,
       i,
-      now.pSeq,
+      now,
       i.since?.eSeq ?? 0,
       now.eSeq,
       true,

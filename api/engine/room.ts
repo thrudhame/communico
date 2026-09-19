@@ -538,15 +538,28 @@ export async function eventIndexRow(
 // E3: sync token grammar — s<eventSeq>_p<presenceSeq>; legacy s<n> parses
 // as _p0. Tokens are global stream positions: valid across users, and as
 // /messages?from=/to= and /members?at=.
+// Band C (D1): sync tokens are s<e>_p<p>_t<t>_r<r> — four monotone
+// streams: events, presence, typing (in-memory), receipts. Missing parts
+// parse as 0, so legacy s<e> and s<e>_p<p> tokens keep working.
 export function parseStreamToken(
   raw: string | null,
-): { eSeq: number; pSeq: number } | null {
+): { eSeq: number; pSeq: number; tSeq: number; rSeq: number } | null {
   if (raw === null) return null;
-  const m = /^s(\d+)(?:_p(\d+))?$/.exec(raw);
+  const m = /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?$/.exec(raw);
   if (!m) return null;
-  return { eSeq: Number(m[1]), pSeq: m[2] ? Number(m[2]) : 0 };
+  return {
+    eSeq: Number(m[1]),
+    pSeq: m[2] ? Number(m[2]) : 0,
+    tSeq: m[3] ? Number(m[3]) : 0,
+    rSeq: m[4] ? Number(m[4]) : 0,
+  };
 }
 
-export function formatStreamToken(eSeq: number, pSeq: number): string {
-  return `s${eSeq}_p${pSeq}`;
+export function formatStreamToken(
+  eSeq: number,
+  pSeq: number,
+  tSeq = 0,
+  rSeq = 0,
+): string {
+  return `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}`;
 }
