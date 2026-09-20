@@ -22,7 +22,11 @@ import { clientEventForRow, pduById } from './timeline.ts';
 import { canSeeEvent } from './visibility.ts';
 import { getPresence, presenceFor, setPresence } from './presence.ts';
 import type { RoomFilter } from './filters.ts';
-import { listGlobalAccountData, listRoomAccountData } from './tenant.ts';
+import {
+  getAccountData,
+  listGlobalAccountData,
+  listRoomAccountData,
+} from './tenant.ts';
 import {
   lastTypingChange,
   sweepTyping,
@@ -447,10 +451,33 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const allJoiners = new Set<string>();
   const allLeavers = new Set<string>();
 
+  // Band C (3i): invites from ignored users never reach the client
+  // (ignore_users.md:45-46 — "Servers must not send room invites from
+  // ignored users to clients"). Loaded once per sync.
+  const ignoredRaw = await getAccountData(
+    serverName(),
+    localpartOf(i.userId),
+    '',
+    'm.ignored_user_list',
+  );
+  const ignoredUsers = new Set(
+    Object.keys(
+      ((ignoredRaw as { ignored_users?: Record<string, unknown> } | null)
+        ?.ignored_users ?? {}) as Record<string, unknown>,
+    ),
+  );
+
   for (const m of memberships) {
     const room = await lookupRoom(m.roomId);
     if (!room) continue;
     if (m.membership === 'invite') {
+      if (ignoredUsers.size > 0) {
+        const idx = await eventIndexRow(m.roomId, m.eventId);
+        const inviter = idx
+          ? (await pduById(room.dbName, idx.commit_hash, m.eventId))?.sender
+          : undefined;
+        if (inviter !== undefined && ignoredUsers.has(inviter)) continue;
+      }
       invite[m.roomId] = {
         invite_state: {
           events: await inviteState(room.dbName, m.roomId, i.userId, m.eventId),

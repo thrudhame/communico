@@ -8,7 +8,7 @@ import { localpartOf } from './auth.ts';
 import { authorAndIngest } from './ingest.ts';
 import { MatrixError } from './matrix-error.ts';
 import { serverDb, withDb } from './db.ts';
-import { lookupRoom, membershipOf } from './room.ts';
+import { lookupRoom, membershipOf, roomsFor, stateAtSeq } from './room.ts';
 import { getProfile } from './tenant.ts';
 
 export interface MembershipOpResult {
@@ -128,6 +128,41 @@ export async function ban(
   const content: Record<string, unknown> = { membership: 'ban' };
   if (reason !== undefined) content.reason = reason;
   return await authorMember(roomId, sender, target, content);
+}
+
+// Profile change → member events (band C D5; spec v1.16 client-server-api
+// _index.md:3773-3795 "Events on Change of Profile Information": an
+// m.room.member join event goes to every room the user is joined to).
+// Called from the two profile PUT endpoints after the tenant row updated.
+// Content = the user's CURRENT member content with the one field replaced
+// (null/absent removes the key); avatar_url goes verbatim (the Complement
+// test sends a non-mxc string). join→join by self is rulebook-allowed
+// (rule 4.3), so the fan-out is plain authorMember per joined room.
+export async function propagateProfile(
+  userId: string,
+  field: 'displayname' | 'avatar_url',
+): Promise<void> {
+  const profile = await getProfile(serverName(), localpartOf(userId));
+  const value = field === 'displayname'
+    ? profile?.displayname
+    : profile?.avatar_url;
+  for (const m of await roomsFor(userId)) {
+    if (m.membership !== 'join') continue;
+    const state = (await stateAtSeq(m.roomId, null)) ?? [];
+    const row = state.find(
+      (r) => r.type === 'm.room.member' && r.stateKey === userId,
+    );
+    const content = {
+      ...((row?.content ?? {}) as Record<string, unknown>),
+    };
+    delete content.membership;
+    if (value === undefined || value === null) delete content[field];
+    else content[field] = value;
+    await authorMember(m.roomId, userId, userId, {
+      ...content,
+      membership: 'join',
+    });
+  }
 }
 
 // forget (band C D4, spec v1.16 leaving.yaml:80-126): set the forgotten

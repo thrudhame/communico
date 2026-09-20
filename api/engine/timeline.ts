@@ -134,6 +134,10 @@ export interface MessagesWindow {
   toSeq: number | null;
   limit: number; // default 10
   lazyLoadMembers: boolean;
+  // Band C: the RoomEventFilter's contains_url (room_event_filter.yaml
+  // :53-56 — plan reads it as content.url being a string); undefined =
+  // url not considered.
+  containsUrl?: boolean;
 }
 
 export interface MessagesResult {
@@ -147,8 +151,11 @@ export interface MessagesResult {
 // read, visibility per event (canSeeEvent). Bounds per Synapse's
 // pagination (transcribed at plan §3f): dir=f -> from < x <= to;
 // dir=b -> from >= x > to. The limit cuts the RAW window first (spec: an
-// empty/short chunk does not imply no more events); `end` is omitted when
-// the raw window is exhausted.
+// empty/short chunk does not imply no more events). `end` follows
+// Synapse's rule (pagination.py:668-706, transcribed 2026-09-19): omitted
+// only when the raw page is EMPTY and there is no further page — a
+// non-empty raw page always carries end, even when the client filter
+// emptied the chunk (there might be more in the next batch).
 export async function messages(w: MessagesWindow): Promise<MessagesResult> {
   const room = await lookupRoom(w.roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + w.roomId);
@@ -211,6 +218,11 @@ export async function messages(w: MessagesWindow): Promise<MessagesResult> {
   for (const idx of windowRows) {
     const pdu = await pduById(room.dbName, idx.commit_hash, idx.event_id);
     if (!pdu) continue;
+    if (w.containsUrl !== undefined) {
+      const hasUrl = typeof ((pdu.content ?? {}) as Record<string, unknown>)
+        .url === 'string';
+      if (hasUrl !== w.containsUrl) continue;
+    }
     if (
       !(await canSeeEvent(w.userId, w.roomId, {
         seq: idx.seq,
@@ -231,10 +243,18 @@ export async function messages(w: MessagesWindow): Promise<MessagesResult> {
     chunk,
     start: formatStreamToken(from, 0),
   };
-  if (hasMore && windowRows.length > 0) {
+  if (windowRows.length > 0) {
+    // the raw page is non-empty: end continues past the last raw row
+    // (filter-emptied chunks included — Synapse's rule, see the header)
     const lastSeq = windowRows[windowRows.length - 1].seq;
     result.end = formatStreamToken(w.dir === 'f' ? lastSeq : lastSeq - 1, 0);
+  } else if (hasMore) {
+    // limit 0: nothing was consumed — end is the same position (no
+    // progress, but nothing skipped either)
+    result.end = formatStreamToken(from, 0);
   }
+  // else: raw window empty and no further page — the true start of the
+  // timeline; end is omitted.
 
   if (w.lazyLoadMembers) {
     const senders = new Set(chunk.map((e) => String(e.sender)));

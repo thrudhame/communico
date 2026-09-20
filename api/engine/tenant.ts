@@ -608,17 +608,27 @@ export async function getProfile(
   });
 }
 
+// Band C (D5): the setters return the old/new values so callers (the
+// profile fan-out) can see the change.
 export async function setDisplayName(
   serverName: string,
   localpart: string,
   name: string | null,
-): Promise<void> {
+): Promise<{ oldValue: string | null; newValue: string | null }> {
   const { dbName } = await ensureTenant(serverName);
-  await withDb(dbName, async (c) => {
+  return await withDb(dbName, async (c) => {
+    const prev = await c.query(
+      'SELECT display_name FROM users WHERE localpart = $1;',
+      [localpart],
+    );
+    const oldValue = prev.rows.length && prev.rows[0].display_name != null
+      ? String(prev.rows[0].display_name)
+      : null;
     await c.query('UPDATE users SET display_name = $1 WHERE localpart = $2;', [
       name,
       localpart,
     ]);
+    return { oldValue, newValue: name };
   });
 }
 
@@ -626,13 +636,21 @@ export async function setAvatarUrl(
   serverName: string,
   localpart: string,
   url: string | null,
-): Promise<void> {
+): Promise<{ oldValue: string | null; newValue: string | null }> {
   const { dbName } = await ensureTenant(serverName);
-  await withDb(dbName, async (c) => {
+  return await withDb(dbName, async (c) => {
+    const prev = await c.query(
+      'SELECT avatar_url FROM users WHERE localpart = $1;',
+      [localpart],
+    );
+    const oldValue = prev.rows.length && prev.rows[0].avatar_url != null
+      ? String(prev.rows[0].avatar_url)
+      : null;
     await c.query('UPDATE users SET avatar_url = $1 WHERE localpart = $2;', [
       url,
       localpart,
     ]);
+    return { oldValue, newValue: url };
   });
 }
 

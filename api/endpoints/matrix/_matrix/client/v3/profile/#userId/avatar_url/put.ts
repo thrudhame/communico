@@ -3,6 +3,7 @@ import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setAvatarUrl } from '#engine/tenant.ts';
 import { authorize } from '#engine/auth.ts';
+import { propagateProfile } from '#engine/membership.ts';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 // PUT /_matrix/client/v3/profile/{userId}/avatar_url — "This API sets the
@@ -34,5 +35,7 @@ export default async function (request: PathfinderRequest) {
   }
   const colon = userId.lastIndexOf(':');
   await setAvatarUrl(serverName(), userId.slice(1, colon), body.avatar_url);
+  // D5: fan the change out as member events in every joined room
+  await propagateProfile(userId, 'avatar_url');
   return {};
 }

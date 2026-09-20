@@ -35,11 +35,16 @@ export default async function (
   const limitRaw = request.query.get('limit');
   const limit = limitRaw !== null ? Math.max(0, Number(limitRaw) || 0) : 10;
   let lazyLoadMembers = false;
+  let containsUrl: boolean | undefined;
   const filterRaw = request.query.get('filter');
   if (filterRaw !== null) {
     try {
-      const f = JSON.parse(filterRaw) as { lazy_load_members?: unknown };
+      const f = JSON.parse(filterRaw) as {
+        lazy_load_members?: unknown;
+        contains_url?: unknown;
+      };
       lazyLoadMembers = f?.lazy_load_members === true;
+      if (typeof f?.contains_url === 'boolean') containsUrl = f.contains_url;
     } catch {
       throw new MatrixError(400, 'M_BAD_JSON', 'filter is not valid JSON');
     }
@@ -54,5 +59,6 @@ export default async function (
     toSeq: to?.eSeq ?? null,
     limit,
     lazyLoadMembers,
+    containsUrl,
   });
 }

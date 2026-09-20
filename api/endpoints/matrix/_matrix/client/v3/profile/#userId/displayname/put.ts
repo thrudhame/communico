@@ -3,6 +3,7 @@ import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setDisplayName } from '#engine/tenant.ts';
 import { authorize } from '#engine/auth.ts';
+import { propagateProfile } from '#engine/membership.ts';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 // PUT /_matrix/client/v3/profile/{userId}/displayname — "This API sets the
@@ -33,5 +34,7 @@ export default async function (request: PathfinderRequest) {
   }
   const colon = userId.lastIndexOf(':');
   await setDisplayName(serverName(), userId.slice(1, colon), body.displayname);
+  // D5: fan the change out as member events in every joined room
+  await propagateProfile(userId, 'displayname');
   return {};
 }
