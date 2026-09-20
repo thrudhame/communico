@@ -22,6 +22,8 @@
 --   CREATE TABLE receipts (room_id text, user_id text, receipt_type text,
 --     event_id text, ts_ms bigint, seq bigint,
 --     PRIMARY KEY (room_id, user_id, receipt_type));
+--   CREATE TABLE relations (event_id text PRIMARY KEY, relates_to text,
+--     rel_type text, room_id text, seq bigint);
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -105,6 +107,17 @@ CREATE TABLE IF NOT EXISTS receipts (
   ts_ms bigint NOT NULL,
   seq bigint NOT NULL,
   PRIMARY KEY (room_id, user_id, receipt_type)
+);
+-- band C (D7): child -> parent index for /relations + /threads, written by
+-- ingest when content['m.relates_to'] carries an event_id. seq is the
+-- child's event_index.seq (the s<e> token position — /relations and
+-- /threads paginate on the same grammar as /messages).
+CREATE TABLE IF NOT EXISTS relations (
+  event_id text PRIMARY KEY,
+  relates_to text NOT NULL,
+  rel_type text,
+  room_id text NOT NULL,
+  seq bigint NOT NULL
 );
 -- F0 dev signing key (db-init generates once via ensureServerKey, reuses
 -- forever — never rotates; F1 moves the same key into the tenant table).

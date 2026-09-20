@@ -6,7 +6,11 @@ import {
   stateAtSeq,
 } from './room.ts';
 import { canSeeEvent } from './visibility.ts';
-import { clientEvent, type EventIndexRow } from './event-format.ts';
+import {
+  clientEvent,
+  type EventIndexRow,
+  type ThreadBundle,
+} from './event-format.ts';
 import type { Pdu } from './pdu.ts';
 
 // Load one event's stored PDU by id, AS OF the commit that carries it
@@ -30,15 +34,68 @@ export async function pduById(
   });
 }
 
+// The thread aggregation for one event when it is a thread root (band C
+// D7): latest child, child count, and the viewer's participation
+// (threading.md:199-201 — root sender or any m.thread child sender).
+// null when the event has no m.thread children. The child-row query is
+// inline so relations.ts can depend on THIS module (for /relations and
+// /threads rendering) without a cycle.
+async function threadBundle(
+  dbName: string,
+  row: EventIndexRow,
+  rootSender: string,
+  viewer: string,
+): Promise<{ latestRow: EventIndexRow; bundle: ThreadBundle } | null> {
+  const children = await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      `SELECT event_id, seq FROM relations
+       WHERE room_id = $1 AND relates_to = $2 AND rel_type = 'm.thread'
+       ORDER BY seq DESC;`,
+      [row.room_id, row.event_id],
+    );
+    // deno-lint-ignore no-explicit-any
+    return (r.rows as any[]).map((x) => ({
+      eventId: String(x.event_id),
+      seq: Number(x.seq),
+    }));
+  });
+  if (children.length === 0) return null;
+  const latestRow = await eventIndexRow(row.room_id, children[0].eventId);
+  if (latestRow === null) return null;
+  let participated = rootSender === viewer;
+  if (!participated) {
+    for (const child of children) {
+      const idx = await eventIndexRow(row.room_id, child.eventId);
+      if (idx === null) continue;
+      const childPdu = await pduById(dbName, idx.commit_hash, child.eventId);
+      if (childPdu?.sender === viewer) {
+        participated = true;
+        break;
+      }
+    }
+  }
+  return {
+    latestRow,
+    bundle: {
+      latest_event: {}, // filled by the caller (one-level render)
+      count: children.length,
+      current_user_participated: participated,
+    },
+  };
+}
+
 // The full client rendering of an event_index row: the stored PDU plus
 // the redaction treatment when redacted_by is set (the redaction event's
 // own client form lands in unsigned.redacted_because). One level deep —
-// a redaction event's own redaction is not followed.
+// a redaction event's own redaction is not followed, and a thread root's
+// bundled latest_event carries no bundle of its own (threading.md
+// :190-194).
 export async function clientEventForRow(
   dbName: string,
   roomVersion: string,
   row: EventIndexRow,
   viewer?: { userId: string; deviceId: string | null; membership?: string },
+  bundleThreads = true,
 ): Promise<Record<string, unknown> | null> {
   const pdu = await pduById(dbName, row.commit_hash, row.event_id);
   if (!pdu) return null;
@@ -84,7 +141,30 @@ export async function clientEventForRow(
       }
     }
   }
-  return clientEvent(pdu, row, viewer, redaction);
+  // Band C (D7): bundle unsigned.m.relations.m.thread on thread roots —
+  // one level deep, so the bundled latest_event renders bundle-free.
+  let thread: ThreadBundle | undefined;
+  if (bundleThreads) {
+    const data = await threadBundle(
+      dbName,
+      row,
+      String(pdu.sender),
+      viewer?.userId ?? '',
+    );
+    if (data !== null) {
+      const latest = await clientEventForRow(
+        dbName,
+        roomVersion,
+        data.latestRow,
+        viewer,
+        false,
+      );
+      if (latest !== null) {
+        thread = { ...data.bundle, latest_event: latest };
+      }
+    }
+  }
+  return clientEvent(pdu, row, viewer, redaction, thread);
 }
 
 // Maps a commit to the events row it added (the commit=event invariant:

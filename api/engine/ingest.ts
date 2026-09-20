@@ -764,6 +764,27 @@ async function ingestEventLocked(
         opts.txn?.txnId ?? null,
       ],
     );
+    // D7: the relations index — content['m.relates_to'] with a direct
+    // event_id (rich replies carry theirs under m.in_reply_to instead and
+    // are NOT relations rows). seq is the event's own event_index seq, so
+    // /relations pages on the sync-token grammar (§3e).
+    const relatesTo = (pdu.content ?? {})['m.relates_to'];
+    if (
+      relatesTo !== null && typeof relatesTo === 'object' &&
+      typeof (relatesTo as Record<string, unknown>).event_id === 'string'
+    ) {
+      const rt = relatesTo as Record<string, unknown>;
+      await c.query(
+        `INSERT INTO relations (event_id, relates_to, rel_type, room_id, seq)
+         VALUES ($1, $2, $3, $4, (SELECT seq FROM event_index WHERE event_id = $1));`,
+        [
+          eventId,
+          rt.event_id,
+          typeof rt.rel_type === 'string' ? rt.rel_type : null,
+          roomId,
+        ],
+      );
+    }
   });
 
   // 12. republish the room's current state on `main`: resolve across the

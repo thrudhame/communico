@@ -48,11 +48,22 @@ export function eventIndexRowOf(row: any): EventIndexRow {
 // unsigned.redacted_because (spec _index.md "Redactions" at v1.16). The
 // stored PDU stays verbatim — anything derived lives here, never in the
 // DAG.
+// Band C (D7): the bundled thread aggregation for a thread root
+// (threading.md:142-201) — assembled into unsigned.m.relations.m.thread
+// by clientEvent when the caller passes it (the data comes from the
+// relations index; the render is one level deep).
+export interface ThreadBundle {
+  latest_event: Record<string, unknown>;
+  count: number;
+  current_user_participated: boolean;
+}
+
 export function clientEvent(
   pdu: Pdu,
   row: EventIndexRow,
   viewer?: { userId: string; deviceId: string | null; membership?: string },
   redaction?: { roomVersion: string; event: Record<string, unknown> },
+  thread?: ThreadBundle,
 ): Record<string, unknown> {
   const redacted = row.redacted_by != null && redaction !== undefined;
   const shown = redacted
@@ -86,6 +97,9 @@ export function clientEvent(
     unsigned.membership = viewer.membership;
   }
   if (redacted) unsigned.redacted_because = redaction!.event;
+  if (thread !== undefined) {
+    unsigned['m.relations'] = { 'm.thread': thread };
+  }
   ev.unsigned = unsigned;
   return ev;
 }
