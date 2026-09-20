@@ -7,6 +7,9 @@
 -- additions:
 --   ALTER TABLE users ADD COLUMN avatar_url text;
 --   ALTER TABLE users ADD COLUMN deactivated boolean NOT NULL DEFAULT false;
+-- (band C): ALTER TABLE access_tokens ADD COLUMN expires_ms bigint;
+--   CREATE TABLE refresh_tokens (token text PRIMARY KEY, localpart text,
+--     device_id text, access_token text);
 -- Dev/VM/Complement always provision fresh (demo/setup.sh --reset).
 CREATE TABLE IF NOT EXISTS tenant (
   server_name text PRIMARY KEY,
@@ -41,7 +44,19 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS access_tokens (
   token text PRIMARY KEY,
   localpart text NOT NULL REFERENCES users(localpart),
-  device_id text
+  device_id text,
+  -- band C (D8): informational only — advertised as expires_in_ms at
+  -- login/refresh, never enforced (spec: optional; say so in code)
+  expires_ms bigint
+);
+-- band C (D8): refresh tokens, device-scoped — a /refresh rotates BOTH
+-- tokens for the same device (txn idempotency keeps working), revoking
+-- the old access token and consuming the old refresh row (plan 3h).
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+  token text PRIMARY KEY,
+  localpart text NOT NULL,
+  device_id text,
+  access_token text NOT NULL REFERENCES access_tokens(token)
 );
 CREATE TABLE IF NOT EXISTS uia_sessions (
   session text PRIMARY KEY,

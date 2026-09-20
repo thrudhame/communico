@@ -2,6 +2,7 @@ import { parseJson } from '@pathfinder/pathfinder/body';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   isDeactivated,
+  issueRefreshToken,
   issueToken,
   upsertDevice,
   verifyUserPassword,
@@ -74,14 +75,34 @@ export default async function (
       ? body.initial_device_display_name
       : undefined,
   );
-  const accessToken = await issueToken(serverName(), localpart, deviceId);
+  // Band C (D8): refresh_token: true asks for the refresh flow
+  // (login.yaml:158-161) — the access token then carries an
+  // (informational, never enforced) expiry and a refresh token is issued.
+  const wantsRefresh = body.refresh_token === true;
+  const expiresInMs = 3_600_000;
+  const accessToken = await issueToken(
+    serverName(),
+    localpart,
+    deviceId,
+    wantsRefresh ? Date.now() + expiresInMs : undefined,
+  );
   // M4: the presence default row (a never-synced joiner still has one)
   const { ensurePresenceRow } = await import('#engine/presence.ts');
   await ensurePresenceRow(`@${localpart}:${serverName()}`);
-  return {
+  const result: Record<string, unknown> = {
     user_id: `@${localpart}:${serverName()}`,
     access_token: accessToken,
     device_id: deviceId,
     home_server: serverName(),
   };
+  if (wantsRefresh) {
+    result.expires_in_ms = expiresInMs;
+    result.refresh_token = await issueRefreshToken(
+      serverName(),
+      localpart,
+      deviceId,
+      accessToken,
+    );
+  }
+  return result;
 }

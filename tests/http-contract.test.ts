@@ -11,6 +11,7 @@
 // register a user against live doltgres to get a real token.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
+import { serverName } from '#engine/config.ts';
 import { registerTestUser } from './util.ts';
 
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
@@ -348,4 +349,70 @@ Deno.test('thrown 413 keeps M_TOO_LARGE through the page (not the fixed fallback
     if (prevMax === undefined) Deno.env.delete('MEDIA_MAX_BYTES');
     else Deno.env.set('MEDIA_MAX_BYTES', prevMax);
   }
+});
+
+Deno.test('band C auth mix: GET /directory/room and POST /refresh answer without a token; PUT /directory/room 401s', async () => {
+  const u = await registerTestUser('hc-mix', 'pw-hc-mix');
+  // an alias to resolve: createRoom with room_alias_name
+  const create = await matrix(
+    new Request('http://x/_matrix/client/v3/createRoom', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${u.access_token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ room_alias_name: 'hc-mix' }),
+    }),
+  );
+  assertEquals(create.status, 200);
+
+  // GET /directory/room/<alias> is PUBLIC (directory.yaml:88-159, no
+  // security block) — answers with no Authorization header
+  const alias = encodeURIComponent(`#hc-mix:${serverName()}`);
+  const resolve = await matrix(
+    new Request(`http://x/_matrix/client/v3/directory/room/${alias}`),
+  );
+  assertEquals(resolve.status, 200);
+  assert('room_id' in (await resolve.json()));
+
+  // PUT /directory/room/<alias> is protected (file-level authorize()) —
+  // 401 without a token
+  const alias2 = encodeURIComponent(`#hc-mix-2:${serverName()}`);
+  const put = await matrix(
+    new Request(`http://x/_matrix/client/v3/directory/room/${alias2}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room_id: `!whatever:${serverName()}` }),
+    }),
+  );
+  assertEquals(put.status, 401);
+
+  // POST /refresh is PUBLIC (refresh.yaml:37-39) — the refresh token IS
+  // the authentication; no Authorization header
+  const login = await matrix(
+    new Request('http://x/_matrix/client/v3/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'm.login.password',
+        identifier: { type: 'm.id.user', user: 'hc-mix' },
+        password: 'pw-hc-mix',
+        refresh_token: true,
+      }),
+    }),
+  );
+  assertEquals(login.status, 200);
+  const loginBody = await login.json();
+  assert(typeof loginBody.refresh_token === 'string');
+  const refresh = await matrix(
+    new Request('http://x/_matrix/client/v3/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: loginBody.refresh_token }),
+    }),
+  );
+  assertEquals(refresh.status, 200);
+  const rotated = await refresh.json();
+  assert(typeof rotated.access_token === 'string');
+  assert(typeof rotated.refresh_token === 'string');
 });

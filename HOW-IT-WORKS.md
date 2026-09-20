@@ -190,6 +190,51 @@ state.
   stream), device_lists, and `unsigned.membership` per event. `r0`
   re-exports `joined_members` and `messages`.
 
+### 3.1 Band C — the rest of the client surface
+
+- **The sync token is four streams** (`s<e>_p<p>_t<t>_r<r>`; legacy
+  two-part tokens parse as 0): events, presence, typing (in-process —
+  ephemeral by nature, lost on restart), receipts (persisted on
+  `receipt_seq`). Joined rooms emit `m.typing` and `m.receipt` ephemeral
+  events (never a `room_id`), and typing/receipt movement alone surfaces
+  the room with an empty timeline. `/typing` (own user only),
+  `/receipt` (`m.read`; `m.read.private` stored, never broadcast),
+  `/read_markers` (`m.fully_read` → room account_data).
+- **Aliases and the directory.** `PUT/GET/DELETE /directory/room/:alias`
+  (GET is public), member-only `GET /rooms/:id/aliases`, canonical-alias
+  validation on `PUT /state/m.room.canonical_alias` (syntax →
+  `M_INVALID_PARAM`, missing-or-elsewhere → `M_BAD_ALIAS`), and
+  alias-delete permission = creator-or-sufficient-PL (`m.room.aliases`
+  is never consulted); a deleted alias drops out of the room's
+  canonical_alias event via an auto-authored correction (logged, never
+  fatal). `/publicRooms` (GET public, POST authed) lists
+  `room_visibility = 'public'` rooms joined with live `main` state;
+  `/directory/list` toggles it (joined users only).
+- **Forget.** `POST /rooms/:id/forget` sets `room_membership.forgotten`
+  (still-joined → 400 `M_UNKNOWN`); any later membership event for the
+  user clears it. Forgotten rooms vanish from initial/full_state sync
+  and 403 on history reads; an in-window leave event still comes down an
+  incremental sync. `/messages` checks room access before query params.
+- **Relations.** ingest indexes `content['m.relates_to']` (direct
+  `event_id`) into `relations(event_id, relates_to, rel_type, room_id,
+  seq)`; `/relations` (three path forms) and `/threads` paginate on the
+  sync-token grammar, and thread roots bundle
+  `unsigned.m.relations.m.thread` = {latest_event, count,
+  current_user_participated} one level deep.
+- **Refresh tokens.** `/login` with `refresh_token: true` issues
+  `refresh_token` + (informational, never enforced) `expires_in_ms`;
+  public `POST /refresh` rotates both tokens for the same device — the
+  old access token is revoked and the old refresh token consumed
+  (txn idempotency keeps working).
+- **Small ones.** Profile PUTs fan out an `m.room.member` join event per
+  joined room with the changed field (verbatim avatar); invites from
+  ignored users never reach the syncer; `/messages` honours
+  `filter.contains_url` (and `end` follows Synapse's rule — omitted only
+  when the raw page is empty with no further page); the user directory
+  searches visible users by id or global display name; non-object JSON
+  bodies 400 `M_BAD_JSON`, non-canonical content numbers 400, and events
+  over 65536 canonical bytes 413.
+
 ## 4. Sync (parked)
 
 The browser homeserver (communico-lite) and the native sync protocols

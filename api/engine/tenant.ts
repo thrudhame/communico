@@ -302,6 +302,8 @@ export interface TokenInfo {
   localpart: string;
   user_id: string;
   device_id: string | null;
+  // band C (D8): informational expiry (nullable; never enforced)
+  expires_ms: number | null;
 }
 
 export async function lookupToken(
@@ -311,7 +313,7 @@ export async function lookupToken(
   const { dbName } = await ensureTenant(serverName);
   return await withDb(dbName, async (c) => {
     const r = await c.query(
-      'SELECT localpart, device_id FROM access_tokens WHERE token = $1;',
+      'SELECT localpart, device_id, expires_ms FROM access_tokens WHERE token = $1;',
       [token],
     );
     if (r.rows.length === 0) return null;
@@ -322,6 +324,9 @@ export async function lookupToken(
       device_id: r.rows[0].device_id == null
         ? null
         : String(r.rows[0].device_id),
+      expires_ms: r.rows[0].expires_ms == null
+        ? null
+        : Number(r.rows[0].expires_ms),
     };
   });
 }
@@ -330,16 +335,89 @@ export async function issueToken(
   serverName: string,
   localpart: string,
   deviceId: string,
+  expiresMs?: number,
 ): Promise<string> {
   const { dbName } = await ensureTenant(serverName);
   const token = crypto.randomUUID();
   await withDb(dbName, async (c) => {
     await c.query(
-      'INSERT INTO access_tokens (token, localpart, device_id) VALUES ($1, $2, $3);',
-      [token, localpart, deviceId],
+      'INSERT INTO access_tokens (token, localpart, device_id, expires_ms) VALUES ($1, $2, $3, $4);',
+      [token, localpart, deviceId, expiresMs ?? null],
     );
   });
   return token;
+}
+
+// Band C (D8/3h): refresh tokens. issueRefreshToken pairs a refresh token
+// with the access token it can rotate; consumeRefreshToken revokes the
+// pair's access token, deletes the old refresh row, and issues a NEW
+// access+refresh pair for the SAME device (txn idempotency is
+// device-scoped, so TestTxnIdWithRefreshToken keeps working). Unknown
+// refresh token → 401 M_UNKNOWN_TOKEN (refresh.yaml:89-101).
+const REFRESH_LIFETIME_MS = 3_600_000;
+
+export async function issueRefreshToken(
+  serverName: string,
+  localpart: string,
+  deviceId: string,
+  accessToken: string,
+): Promise<string> {
+  const { dbName } = await ensureTenant(serverName);
+  const token = crypto.randomUUID();
+  await withDb(dbName, async (c) => {
+    await c.query(
+      'INSERT INTO refresh_tokens (token, localpart, device_id, access_token) VALUES ($1, $2, $3, $4);',
+      [token, localpart, deviceId, accessToken],
+    );
+  });
+  return token;
+}
+
+export async function consumeRefreshToken(
+  serverName: string,
+  refreshToken: string,
+): Promise<
+  { accessToken: string; refreshToken: string; expiresInMs: number }
+> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      'SELECT localpart, device_id, access_token FROM refresh_tokens WHERE token = $1;',
+      [refreshToken],
+    );
+    if (r.rows.length === 0) {
+      throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'unknown refresh token');
+    }
+    const localpart = String(r.rows[0].localpart);
+    const deviceId = r.rows[0].device_id == null
+      ? null
+      : String(r.rows[0].device_id);
+    const oldAccess = String(r.rows[0].access_token);
+    // plan 3h: the old access token is revoked and the old refresh token
+    // deleted immediately (spec note: refresh.yaml:34-35 allows the old
+    // refresh token a grace period until the new one is used — the plan's
+    // simpler rotation is what Complement exercises). Child row first:
+    // refresh_tokens references access_tokens.
+    await c.query('DELETE FROM refresh_tokens WHERE token = $1;', [
+      refreshToken,
+    ]);
+    await c.query('DELETE FROM access_tokens WHERE token = $1;', [oldAccess]);
+    const accessToken = crypto.randomUUID();
+    await c.query(
+      'INSERT INTO access_tokens (token, localpart, device_id, expires_ms) VALUES ($1, $2, $3, $4);',
+      [accessToken, localpart, deviceId, Date.now() + REFRESH_LIFETIME_MS],
+    );
+    const newRefresh = crypto.randomUUID();
+    await c.query(
+      'INSERT INTO refresh_tokens (token, localpart, device_id, access_token) VALUES ($1, $2, $3, $4);',
+      [newRefresh, localpart, deviceId, accessToken],
+    );
+    return {
+      accessToken,
+      refreshToken: newRefresh,
+      expiresInMs: REFRESH_LIFETIME_MS,
+    };
+  });
 }
 
 export async function revokeToken(
