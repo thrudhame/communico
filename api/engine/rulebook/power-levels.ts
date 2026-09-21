@@ -14,7 +14,8 @@
 // - required level: content/server-server-api.md:489-495 (Definitions:
 //   "Required Power Level"), named levels 497-502
 // - user-id grammar: content/appendices.md:561-567
-import type { Pdu } from './types.ts';
+import type { Pdu, RoomVersionSpec } from './types.ts';
+import { ruleId } from './rule-ids.ts';
 
 // A parsed, structurally-valid m.room.power_levels content. Optional
 // numeric fields stay optional so readers apply the spec defaults.
@@ -33,9 +34,10 @@ export interface ParsedPowerLevels {
 
 export type PlParse =
   | { ok: true; pl: ParsedPowerLevels }
-  // the failing sub-rule of v11 rule 9 (9.1 / 9.2 / 9.3 — v11.md:226-234;
-  // 9.1/9.2 integer-only via v10.md:221-228)
-  | { ok: false; rule: '9.1' | '9.2' | '9.3' };
+  // the failing sub-rule of the version's PL rule (v11 9.1/9.2/9.3 —
+  // v11.md:226-234; v12 10.1/10.2/10.3 — v12.md:211-218; ruleId()
+  // translates, plan D1)
+  | { ok: false; rule: string };
 
 // v1.16 appendix grammar (content/appendices.md:561-567):
 //   user_id = "@" user_id_localpart ":" server_name
@@ -49,12 +51,10 @@ function isInt(v: unknown): v is number {
 
 // Parse an m.room.power_levels content. Integer-only per the room-version
 // flag (v10+: v10.md:72-74 — invalid -> reject-signal, never coerced).
-// The rule numbers mirror v11.md:226-234 (9.1 scalar ints, 9.2
-// events/notifications object-of-ints, 9.3 users object of valid-user-id
-// -> int).
+// The printed rule numbers come from ruleId() (plan D1).
 export function parsePowerLevels(
   content: Record<string, unknown> | undefined | null,
-  spec: { enforceIntPowerLevels: boolean },
+  spec: RoomVersionSpec,
 ): PlParse {
   const c = content ?? {};
   const scalarKeys = [
@@ -74,7 +74,7 @@ export function parsePowerLevels(
           ? !isInt(v)
           : !(isInt(v) || typeof v === 'string')
       ) {
-        return { ok: false, rule: '9.1' };
+        return { ok: false, rule: ruleId(spec, 'pl.types') };
       }
     }
   }
@@ -82,7 +82,7 @@ export function parsePowerLevels(
     if (k in c && c[k] !== undefined) {
       const v = c[k];
       if (typeof v !== 'object' || v === null || Array.isArray(v)) {
-        return { ok: false, rule: '9.2' };
+        return { ok: false, rule: ruleId(spec, 'pl.events_object') };
       }
       for (const val of Object.values(v)) {
         if (
@@ -90,7 +90,7 @@ export function parsePowerLevels(
             ? !isInt(val)
             : !(isInt(val) || typeof val === 'string')
         ) {
-          return { ok: false, rule: '9.2' };
+          return { ok: false, rule: ruleId(spec, 'pl.events_object') };
         }
       }
     }
@@ -98,16 +98,18 @@ export function parsePowerLevels(
   if ('users' in c && c.users !== undefined) {
     const u = c.users;
     if (typeof u !== 'object' || u === null || Array.isArray(u)) {
-      return { ok: false, rule: '9.3' };
+      return { ok: false, rule: ruleId(spec, 'pl.users_object') };
     }
     for (const [key, val] of Object.entries(u)) {
-      if (!USER_ID_RE.test(key)) return { ok: false, rule: '9.3' };
+      if (!USER_ID_RE.test(key)) {
+        return { ok: false, rule: ruleId(spec, 'pl.users_object') };
+      }
       if (
         spec.enforceIntPowerLevels
           ? !isInt(val)
           : !(isInt(val) || typeof val === 'string')
       ) {
-        return { ok: false, rule: '9.3' };
+        return { ok: false, rule: ruleId(spec, 'pl.users_object') };
       }
     }
   }
@@ -135,10 +137,7 @@ export function userPowerLevel(
   userId: string,
   plEvent: Pdu | null,
   createEvent: Pdu | null,
-  spec: {
-    implicitRoomCreator: boolean;
-    creatorsHaveInfinitePower: boolean;
-  },
+  spec: RoomVersionSpec,
 ): number {
   if (spec.creatorsHaveInfinitePower && createEvent) {
     const extra = createEvent.content?.['additional_creators'];
@@ -151,9 +150,7 @@ export function userPowerLevel(
     if (creators.includes(userId)) return Infinity;
   }
   if (plEvent) {
-    const parsed = parsePowerLevels(plEvent.content, {
-      enforceIntPowerLevels: false,
-    });
+    const parsed = parsePowerLevels(plEvent.content, spec);
     if (parsed.ok) {
       const u = parsed.pl.users[userId];
       if (isInt(u)) return u;

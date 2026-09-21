@@ -146,9 +146,7 @@ export async function deleteAlias(
       createRow.eventId,
     )
     : null;
-  const parsed = plPdu
-    ? parsePowerLevels(plPdu.content, { enforceIntPowerLevels: false })
-    : null;
+  const parsed = plPdu ? parsePowerLevels(plPdu.content, rulebook.spec) : null;
   const pl = parsed?.ok ? parsed.pl : null;
   const level = userPowerLevel(
     requester,

@@ -61,9 +61,7 @@ export async function redactEvent(
     )
     : null;
   const rulebook = getRulebook(room.roomVersion);
-  const parsed = plPdu
-    ? parsePowerLevels(plPdu.content, { enforceIntPowerLevels: false })
-    : null;
+  const parsed = plPdu ? parsePowerLevels(plPdu.content, rulebook.spec) : null;
   const pl = parsed?.ok ? parsed.pl : null;
   const senderLevel = userPowerLevel(
     sender,
