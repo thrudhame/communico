@@ -54,6 +54,11 @@ export interface CreateRoomOptions {
   creationContent?: Record<string, unknown>;
   initialState?: { type: string; state_key?: string; content: unknown }[];
   powerLevelContentOverride?: Record<string, unknown>;
+  // D7: genesis for a replacement room (upgrade.ts) — the create carries
+  // the predecessor via creationContent; the preset default events and
+  // the invite fan-out are skipped (the transferred state and the
+  // existing membership define the room instead).
+  fromUpgrade?: boolean;
 }
 
 function deepMerge(
@@ -324,20 +329,24 @@ export async function createRoom(
   }
   await send('m.room.power_levels', '', pl);
 
-  // 4. preset events (create_room.yaml's preset table at v1.16)
-  const presetEvents: [string, Record<string, unknown>][] =
-    preset === 'public_chat'
-      ? [
-        ['m.room.join_rules', { join_rule: 'public' }],
-        ['m.room.history_visibility', { history_visibility: 'shared' }],
-        ['m.room.guest_access', { guest_access: 'forbidden' }],
-      ]
-      : [
-        ['m.room.join_rules', { join_rule: 'invite' }],
-        ['m.room.history_visibility', { history_visibility: 'shared' }],
-        ['m.room.guest_access', { guest_access: 'can_join' }],
-      ];
-  for (const [type, content] of presetEvents) await send(type, '', content);
+  // 4. preset events (create_room.yaml's preset table at v1.16) — skipped
+  // for a replacement room (fromUpgrade): the transferred state defines
+  // the room (D7)
+  if (opts.fromUpgrade !== true) {
+    const presetEvents: [string, Record<string, unknown>][] =
+      preset === 'public_chat'
+        ? [
+          ['m.room.join_rules', { join_rule: 'public' }],
+          ['m.room.history_visibility', { history_visibility: 'shared' }],
+          ['m.room.guest_access', { guest_access: 'forbidden' }],
+        ]
+        : [
+          ['m.room.join_rules', { join_rule: 'invite' }],
+          ['m.room.history_visibility', { history_visibility: 'shared' }],
+          ['m.room.guest_access', { guest_access: 'can_join' }],
+        ];
+    for (const [type, content] of presetEvents) await send(type, '', content);
+  }
 
   // 5. initial_state, in order (content verbatim; state_key default '')
   for (const e of initialState) {
