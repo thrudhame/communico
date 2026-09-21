@@ -360,33 +360,47 @@ export async function setRuleActions(
 // local users (the TestPushRuleRoomUpgrade contract — Synapse/Dendrite
 // behaviour, room_upgrades.md:81-83's "personalized settings"). Copy, not
 // move: the old room's rules stay (the test asserts both). A user's own
-// rule on the new room wins (copy-if-absent).
+// rule on the new room wins (copy-if-absent). Two passes with plain
+// parameters — no placeholder in a SELECT list (Doltgres).
 export async function migrateRoomRules(
   oldRoomId: string,
   newRoomId: string,
   onlyLocalpart?: string,
 ): Promise<void> {
   const { dbName } = await ensureTenant(serverName());
-  const localparts = await withDb(dbName, async (c) => {
-    await c.query(
-      `INSERT INTO push_rules
-         (localpart, scope, kind, rule_id, priority, actions, conditions, pattern, enabled, is_default, seq)
-       SELECT localpart, scope, kind, $2, priority, actions, conditions, pattern, enabled, is_default, NULL
+  const rows = await withDb(dbName, async (c) => {
+    const r = await c.query(
+      `SELECT localpart, priority, actions, conditions, pattern, enabled, is_default
        FROM push_rules
        WHERE kind = 'room' AND rule_id = $1 ${
-        onlyLocalpart !== undefined ? 'AND localpart = $3' : ''
-      }
-       ON CONFLICT (localpart, scope, kind, rule_id) DO NOTHING;`,
-      onlyLocalpart !== undefined
-        ? [oldRoomId, newRoomId, onlyLocalpart]
-        : [oldRoomId, newRoomId],
-    );
-    const r = await c.query(
-      `SELECT DISTINCT localpart FROM push_rules WHERE kind = 'room' AND rule_id = $2;`,
-      [newRoomId],
+        onlyLocalpart !== undefined ? 'AND localpart = $2' : ''
+      };`,
+      onlyLocalpart !== undefined ? [oldRoomId, onlyLocalpart] : [oldRoomId],
     );
     // deno-lint-ignore no-explicit-any
-    return (r.rows as any[]).map((row) => String(row.localpart));
+    return r.rows as any[];
   });
-  for (const lp of localparts) await stampPushStream(lp);
+  const touched = new Set<string>();
+  await withDb(dbName, async (c) => {
+    for (const row of rows) {
+      await c.query(
+        `INSERT INTO push_rules
+           (localpart, scope, kind, rule_id, priority, actions, conditions, pattern, enabled, is_default, seq)
+         VALUES ($1, 'global', 'room', $2, $3, $4, $5, $6, $7, $8, NULL)
+         ON CONFLICT (localpart, scope, kind, rule_id) DO NOTHING;`,
+        [
+          String(row.localpart),
+          newRoomId,
+          Number(row.priority),
+          String(row.actions),
+          row.conditions == null ? null : String(row.conditions),
+          row.pattern == null ? null : String(row.pattern),
+          row.enabled === true,
+          row.is_default === true,
+        ],
+      );
+      touched.add(String(row.localpart));
+    }
+  });
+  for (const lp of touched) await stampPushStream(lp);
 }

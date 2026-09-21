@@ -11,6 +11,7 @@ import { roomAliases } from './aliases.ts';
 import { authorAndIngest } from './ingest.ts';
 import { eventIndexRow } from './room.ts';
 import { getRulebook } from './policy.ts';
+import { migrateRoomRules } from './pushrules.ts';
 import {
   parsePowerLevels,
   requiredLevel,
@@ -178,6 +179,11 @@ export async function upgradeRoom(
       fromUpgrade: true,
     },
   );
+
+  // D8: push rules migrate for every local user with a room rule on the
+  // old room (the TestPushRuleRoomUpgrade contract; the ingest hooks
+  // below cover the manual and remote cases, this call covers /upgrade)
+  await migrateRoomRules(oldRoomId, res.roomId);
 
   // (4) move local aliases and re-emit the canonical alias in the new
   // room (room_upgrades.md:71).

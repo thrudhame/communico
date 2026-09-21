@@ -245,3 +245,136 @@ Deno.test('pushrules: CRUD + ordering + enabled/actions + sync synthesis + strea
   );
   assertEquals(r405.status, 405);
 });
+
+Deno.test('pushrules migration: /upgrade, manual tombstone+predecessor, and the join hook (D8)', async () => {
+  const alice = await registerTestUser('pm-a', 'pw-pm-a');
+  const alice2 = await registerTestUser('pm-b', 'pw-pm-b');
+  const carol = await registerTestUser('pm-c', 'pw-pm-c');
+  const aTok = alice.access_token!;
+  const a2Tok = alice2.access_token!;
+  const cTok = carol.access_token!;
+
+  const roomRule = (tok: string, roomId: string) =>
+    call(
+      `/_matrix/client/v3/pushrules/global/room/${encodeURIComponent(roomId)}`,
+      {
+        method: 'PUT',
+        token: tok,
+        body: { actions: ['dont_notify'] },
+      },
+    );
+  const roomRuleIds = async (tok: string): Promise<string[]> => {
+    const res = await call('/_matrix/client/v3/pushrules/', { token: tok });
+    return ((res.body.global as Json).room as Json[]).map((r) =>
+      r.rule_id as string
+    ).sort();
+  };
+  const join = async (tok: string, roomId: string) => {
+    assertEquals(
+      (await call(
+        `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`,
+        {
+          method: 'POST',
+          token: tok,
+          body: {},
+        },
+      )).status,
+      200,
+    );
+  };
+
+  // --- /upgrade: rules migrate for ALL local users --------------------------
+  const oldRoom = (await call('/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    token: aTok,
+    body: {
+      room_version: '10',
+      preset: 'public_chat',
+      invite: [alice2.user_id as string],
+    },
+  })).body.room_id as string;
+  await join(a2Tok, oldRoom);
+  assertEquals((await roomRule(aTok, oldRoom)).status, 200);
+  assertEquals((await roomRule(a2Tok, oldRoom)).status, 200);
+  const upgraded = await call(
+    `/_matrix/client/v3/rooms/${encodeURIComponent(oldRoom)}/upgrade`,
+    { method: 'POST', token: aTok, body: { new_version: '11' } },
+  );
+  assertEquals(upgraded.status, 200);
+  const newRoom = upgraded.body.replacement_room as string;
+  await join(a2Tok, newRoom);
+  assertEquals(await roomRuleIds(aTok), [newRoom, oldRoom].sort());
+  assertEquals(await roomRuleIds(a2Tok), [newRoom, oldRoom].sort());
+
+  // m.push_rules arrives via incremental sync for the user whose rules
+  // changed (per-user stream)
+  for (
+    const [tok, probeId] of [[aTok, '!probe-a:localhost'], [
+      a2Tok,
+      '!probe-b:localhost',
+    ]] as const
+  ) {
+    const since = (await sync(tok)).body.next_batch as string;
+    assertEquals((await roomRule(tok, probeId)).status, 200);
+    const res = await sync(tok, `&since=${encodeURIComponent(since)}`);
+    const ad = (res.body.account_data as Json).events as Json[];
+    assert(
+      ad.some((e) => e.type === 'm.push_rules'),
+      'm.push_rules in incremental sync',
+    );
+  }
+
+  // --- manual: create-with-predecessor + tombstone fires the hooks -----------
+  // (fresh users so the ruleset assertions stay exact)
+  const alice3 = await registerTestUser('pm-d', 'pw-pm-d');
+  const alice4 = await registerTestUser('pm-e', 'pw-pm-e');
+  const a3Tok = alice3.access_token!;
+  const a4Tok = alice4.access_token!;
+  const oldRoom2 = (await call('/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    token: a3Tok,
+    body: {
+      room_version: '10',
+      preset: 'public_chat',
+      invite: [alice4.user_id as string],
+    },
+  })).body.room_id as string;
+  await join(a4Tok, oldRoom2);
+  assertEquals((await roomRule(a3Tok, oldRoom2)).status, 200);
+  assertEquals((await roomRule(a4Tok, oldRoom2)).status, 200);
+  const newRoom2 = (await call('/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    token: a3Tok,
+    body: {
+      room_version: '11',
+      preset: 'public_chat',
+      creation_content: { predecessor: { room_id: oldRoom2 } },
+    },
+  })).body.room_id as string;
+  // the create hook already migrated
+  assertEquals(await roomRuleIds(a3Tok), [newRoom2, oldRoom2].sort());
+  assertEquals(
+    (await call(
+      `/_matrix/client/v3/rooms/${
+        encodeURIComponent(oldRoom2)
+      }/state/m.room.tombstone`,
+      {
+        method: 'PUT',
+        token: a3Tok,
+        body: {
+          body: 'This room has been replaced',
+          replacement_room: newRoom2,
+        },
+      },
+    )).status,
+    200,
+  );
+  assertEquals(await roomRuleIds(a4Tok), [newRoom2, oldRoom2].sort());
+
+  // --- the join hook: a rule set on the old room AFTER the upgrade follows
+  //     the user into the new room when they join --------------------------
+  assertEquals((await roomRule(cTok, oldRoom2)).status, 200);
+  assertEquals(await roomRuleIds(cTok), [oldRoom2]);
+  await join(cTok, newRoom2);
+  assertEquals(await roomRuleIds(cTok), [newRoom2, oldRoom2].sort());
+});

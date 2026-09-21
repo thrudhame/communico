@@ -5,6 +5,9 @@ import { mergeDriver } from './mergedriver.ts';
 import { eventIdFor } from './eventid.ts';
 import { assertCanonicalNumbers, canonicalJson } from './canonical.ts';
 import { MatrixError } from './matrix-error.ts';
+import { serverName } from './config.ts';
+import { localpartOf } from './auth.ts';
+import { migrateRoomRules } from './pushrules.ts';
 import { signPdu, verifyPduSignature } from './signing.ts';
 import { getTenantKey } from './tenant.ts';
 import {
@@ -894,6 +897,49 @@ async function ingestEventLocked(
       );
     }
   });
+
+  // D8: push-rule migration hooks, after publish — manual upgrades are
+  // detected exactly the way a client performs them (tombstone in the old
+  // room, predecessor on the new room's create), and a user joining a
+  // room with a predecessor gets their own rules copied (the remote
+  // case; harmless locally). Copy-if-absent everywhere, so the
+  // /upgrade-path's own migrateRoomRules call and these hooks never
+  // double-write.
+  if (!rejected && !softFailed) {
+    if (pdu.type === 'm.room.tombstone') {
+      const target = (pdu.content ?? {}).replacement_room;
+      if (typeof target === 'string') {
+        await migrateRoomRules(roomId, target);
+      }
+    }
+    if (pdu.type === 'm.room.create') {
+      const pred = (pdu.content ?? {}).predecessor as
+        | Record<string, unknown>
+        | undefined;
+      if (typeof pred?.room_id === 'string') {
+        await migrateRoomRules(pred.room_id, roomId);
+      }
+    }
+    if (
+      pdu.type === 'm.room.member' &&
+      (pdu.content ?? {}).membership === 'join'
+    ) {
+      const joiner = String(pdu.state_key ?? '');
+      if (joiner.startsWith('@') && joiner.endsWith(':' + serverName())) {
+        const createId = current.get(stateKeyOf('m.room.create', ''));
+        const createPdu = createId !== undefined
+          ? ancestry.pduById.get(createId) ?? null
+          : null;
+        const pred = createPdu?.content?.predecessor as
+          | Record<string, unknown>
+          | undefined;
+        if (typeof pred?.room_id === 'string') {
+          // push_rules.localpart holds bare localparts — strip the MXID
+          await migrateRoomRules(pred.room_id, roomId, localpartOf(joiner));
+        }
+      }
+    }
+  }
 
   // core→hat signal, then return — or surface the rejection (the event is
   // in the DAG and flagged; soft-fail does NOT surface: the event is
