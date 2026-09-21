@@ -359,7 +359,7 @@ export async function author(
       'event exceeds the 65536-byte limit',
     );
   }
-  // D8: the depth bound (depth_v6.yaml:9-11 — 2^53-1 for v6+;
+  // D8: the depth bound (depth_v6.yaml:18-24 — 2^53-1 for v6+;
   // pdu_v4.yaml:32-35 — 2^63-1 for ≤5). Practically unreachable; the
   // check documents the flag.
   const depthBound = rulebook.spec.depthLimit === 'int53'

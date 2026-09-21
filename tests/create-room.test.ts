@@ -303,7 +303,7 @@ Deno.test('createRoom: creation_content lands minus room_version; version valida
   assertEquals(unknown.body.errcode, 'M_UNSUPPORTED_ROOM_VERSION');
 });
 
-Deno.test('createRoom: v10 writes content.creator; v12 omits it; capabilities list 10/11/12 with default 11', async () => {
+Deno.test('createRoom: v10 writes content.creator; v12 omits it; capabilities list 3–12 with default 11', async () => {
   const alice = await registerTestUser('cr-v10', 'pw-cr-v10');
   const tok = alice.access_token!;
   const aId = alice.user_id as string;
@@ -338,13 +338,21 @@ Deno.test('createRoom: v10 writes content.creator; v12 omits it; capabilities li
   assertEquals('creator' in (create12.body as Json), false);
   assertEquals((create12.body as Json).room_version, '12');
 
-  // /capabilities: registry-driven (D11) — 10/11/12 stable, default 11
+  // /capabilities: registry-driven (D11) — 3–12 stable, default 11
+  // (the older-versions plan, group A)
   const caps = await call('/_matrix/client/v3/capabilities', { token: tok });
   const rv = ((caps.body as Json).capabilities as Json)[
     'm.room_versions'
   ] as Json;
   assertEquals(rv.default, '11');
   assertEquals(rv.available, {
+    '3': 'stable',
+    '4': 'stable',
+    '5': 'stable',
+    '6': 'stable',
+    '7': 'stable',
+    '8': 'stable',
+    '9': 'stable',
     '10': 'stable',
     '11': 'stable',
     '12': 'stable',

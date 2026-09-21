@@ -60,6 +60,12 @@ export default async function (
     if (msg.includes('M_UNSUPPORTED_ROOM_VERSION')) {
       throw new MatrixError(400, 'M_UNSUPPORTED_ROOM_VERSION', msg);
     }
+    // A rulebook reject of a createRoom-authored event (bad
+    // initial_state for the version — e.g. a knock join_rule in a v6
+    // room) is a client fault, never a 500.
+    if (msg.includes('E_CREATE_ROOM_REJECT')) {
+      throw new MatrixError(400, 'M_INVALID_PARAM', msg);
+    }
     throw new MatrixError(500, 'M_UNKNOWN', msg);
   }
 }

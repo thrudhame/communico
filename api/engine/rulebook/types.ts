@@ -83,7 +83,7 @@ export interface RoomVersionSpec {
   // v6-canonical-json.md; ≤5 MUST NOT — v1-canonical-json.md:2-4,
   // appendices.md:103-110)
   strictCanonicalJson: boolean;
-  // the depth bound enforced at authoring (depth_v6.yaml:9-11 int53
+  // the depth bound enforced at authoring (depth_v6.yaml:18-24 int53
   // (v6+); pdu_v4.yaml:32-35 int63 (≤5))
   depthLimit: 'int53' | 'int63';
   // signing-key valid_until_ts enforced when verifying signatures
