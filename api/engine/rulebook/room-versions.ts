@@ -30,6 +30,13 @@ export const V11: RoomVersionSpec = {
   creatorsHaveInfinitePower: false,
   additionalCreators: false,
   enforceIntPowerLevels: true,
+  aliasesAuthRule: false,
+  notificationsInPlRules: true,
+  strictCanonicalJson: true,
+  depthLimit: 'int53',
+  enforceKeyValidity: true,
+  eventIdAlphabet: 'urlsafe',
+  redactsInContent: true,
   knockJoinRule: true,
   restrictedJoinRule: true,
   knockRestrictedJoinRule: true,
@@ -64,4 +71,7 @@ export const V10: RoomVersionSpec = {
   ruleNumbering: 'v10',
   explicitCreator: true,
   redactionRules: 'v9',
+  // ≤10 carries `redacts` top-level on the PDU (pdu_v6.yaml:27-30); the
+  // move to content is v11 (v11.md:70-81)
+  redactsInContent: false,
 };

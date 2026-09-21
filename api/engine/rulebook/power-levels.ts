@@ -49,8 +49,29 @@ function isInt(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v);
 }
 
+// The ≤9 stringy grammar (v1-stringy-power-levels.md:33-40): a single
+// base-10 integer (no floats/decimal points), any number of leading
+// zeroes, an optional single leading + or -, and optional leading or
+// trailing whitespace. The trimmed text must parse to a safe integer —
+// the canonical range applies to the parsed value (appendices.md
+// :103-110; for ≤5 rooms the strictness gate is about acceptance of
+// events, not about PL semantics).
+const STRINGY_LEVEL_RE = /^\s*[+-]?[0-9]+\s*$/;
+
+// A power-level value per the version's grammar: an integer, or (≤9 —
+// !enforceIntPowerLevels) a string matching the grammar. Returns the
+// parsed integer, or null when the value is invalid.
+function parseLevel(v: unknown, spec: RoomVersionSpec): number | null {
+  if (isInt(v)) return v;
+  if (spec.enforceIntPowerLevels || typeof v !== 'string') return null;
+  if (!STRINGY_LEVEL_RE.test(v)) return null;
+  const n = Number(v.trim());
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 // Parse an m.room.power_levels content. Integer-only per the room-version
-// flag (v10+: v10.md:72-74 — invalid -> reject-signal, never coerced).
+// flag (v10+: v10.md:72-74 — invalid -> reject-signal, never coerced);
+// ≤9 accepts the stringy grammar (v1-stringy-power-levels.md:2-40).
 // The printed rule numbers come from ruleId() (plan D1).
 export function parsePowerLevels(
   content: Record<string, unknown> | undefined | null,
@@ -66,32 +87,27 @@ export function parsePowerLevels(
     'kick',
     'invite',
   ] as const;
+  const scalars: Partial<Record<(typeof scalarKeys)[number], number>> = {};
   for (const k of scalarKeys) {
     if (k in c && c[k] !== undefined) {
-      const v = c[k];
-      if (
-        spec.enforceIntPowerLevels
-          ? !isInt(v)
-          : !(isInt(v) || typeof v === 'string')
-      ) {
-        return { ok: false, rule: ruleId(spec, 'pl.types') };
-      }
+      const n = parseLevel(c[k], spec);
+      if (n === null) return { ok: false, rule: ruleId(spec, 'pl.types') };
+      scalars[k] = n;
     }
   }
+  const pl: ParsedPowerLevels = { users: {}, events: {}, notifications: {} };
   for (const k of ['events', 'notifications'] as const) {
     if (k in c && c[k] !== undefined) {
       const v = c[k];
       if (typeof v !== 'object' || v === null || Array.isArray(v)) {
         return { ok: false, rule: ruleId(spec, 'pl.events_object') };
       }
-      for (const val of Object.values(v)) {
-        if (
-          spec.enforceIntPowerLevels
-            ? !isInt(val)
-            : !(isInt(val) || typeof val === 'string')
-        ) {
+      for (const [name, val] of Object.entries(v)) {
+        const n = parseLevel(val, spec);
+        if (n === null) {
           return { ok: false, rule: ruleId(spec, 'pl.events_object') };
         }
+        pl[k][name] = n;
       }
     }
   }
@@ -104,28 +120,14 @@ export function parsePowerLevels(
       if (!USER_ID_RE.test(key)) {
         return { ok: false, rule: ruleId(spec, 'pl.users_object') };
       }
-      if (
-        spec.enforceIntPowerLevels
-          ? !isInt(val)
-          : !(isInt(val) || typeof val === 'string')
-      ) {
+      const n = parseLevel(val, spec);
+      if (n === null) {
         return { ok: false, rule: ruleId(spec, 'pl.users_object') };
       }
+      pl.users[key] = n;
     }
   }
-  const pl: ParsedPowerLevels = {
-    users: (c.users ?? {}) as Record<string, number>,
-    events: (c.events ?? {}) as Record<string, number>,
-    notifications: (c.notifications ?? {}) as Record<string, number>,
-  };
-  for (const k of scalarKeys) {
-    if (k in c && c[k] !== undefined) {
-      const v = c[k];
-      const out = pl as unknown as Record<string, unknown>;
-      if (isInt(v)) out[k] = v;
-      else out[k] = Number(v);
-    }
-  }
+  Object.assign(pl, scalars);
   return { ok: true, pl };
 }
 

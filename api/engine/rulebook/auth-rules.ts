@@ -333,6 +333,13 @@ export function checkAuthAgainstState(
   const v3 = rule3(pdu, ctx, spec);
   if (!v3.ok) return v3;
 
+  // The aliases rule (v1–5 rule 4 — v1-auth-rules.md:44-47; removed in
+  // v6 — v6.md:51-53, where m.room.aliases is ordinary state). Terminal:
+  // an aliases event in v1–5 never reaches the member/PL rules.
+  if (spec.aliasesAuthRule && pdu.type === 'm.room.aliases') {
+    return ruleAliases(pdu, spec);
+  }
+
   // Rule 4 (v11.md:141-217) — terminal for m.room.member.
   if (pdu.type === 'm.room.member') {
     return rule4(pdu, ctx, spec, plEvent, createEvent, senderLevel);
@@ -395,6 +402,28 @@ function parsedPl(
   if (!plEvent) return null;
   const parsed = parsePowerLevels(plEvent.content, spec);
   return parsed.ok ? parsed.pl : null;
+}
+
+// The aliases rule (v1–5 rule 4 — v1-auth-rules.md:44-47): the
+// m.room.aliases event must carry a state_key naming the sender's own
+// domain. Terminal allow — removed in v6 (v6.md:51-53).
+function ruleAliases(pdu: Pdu, spec: RoomVersionSpec): Verdict {
+  // 4.1: no state_key -> reject.
+  if (pdu.state_key === undefined) {
+    return reject(
+      ruleId(spec, 'aliases.no_state_key'),
+      'aliases event without state_key',
+    );
+  }
+  // 4.2: the sender's domain must match the state_key.
+  if (domainOf(pdu.sender) !== pdu.state_key) {
+    return reject(
+      ruleId(spec, 'aliases.domain_mismatch'),
+      'sender domain does not match the state_key',
+    );
+  }
+  // 4.3: otherwise, allow.
+  return allow(ruleId(spec, 'aliases.allow'));
 }
 
 // Rule 3 (v11.md:138-140).
@@ -809,8 +838,13 @@ function rule9(
     }
   }
 
-  // 9.6/9.7 (v11.md:244-251): events/notifications entries.
-  for (const mapName of ['events', 'notifications'] as const) {
+  // 9.6/9.7 (v11.md:244-251): events/notifications entries. The
+  // `notifications` comparison exists from v6 (v6.md:55-58, 195-204);
+  // ≤5 ignores the key (still stored).
+  const mapNames = spec.notificationsInPlRules
+    ? (['events', 'notifications'] as const)
+    : (['events'] as const);
+  for (const mapName of mapNames) {
     const oldMap = prev[mapName] ?? {};
     const newMap = next[mapName] ?? {};
     const keys = new Set([...Object.keys(oldMap), ...Object.keys(newMap)]);

@@ -70,15 +70,40 @@ export interface RoomVersionSpec {
   additionalCreators: boolean;
   // integers only in m.room.power_levels (v10.md:67-74, 221-228)
   enforceIntPowerLevels: boolean;
+  // the v1–5 aliases auth rule (v1-auth-rules.md:44-47; removed in v6 —
+  // v6.md:51-53, where m.room.aliases is ordinary state)
+  aliasesAuthRule: boolean;
+  // the PL auth rules compare `notifications` entries like `events`
+  // (v6+ — v6.md:55-58, 195-204; ≤5 ignores the key)
+  notificationsInPlRules: boolean;
+  // servers strictly enforce canonical JSON on receipt (v6+ —
+  // v6-canonical-json.md; ≤5 MUST NOT — v1-canonical-json.md:2-4,
+  // appendices.md:103-110)
+  strictCanonicalJson: boolean;
+  // the depth bound enforced at authoring (depth_v6.yaml:9-11 int53
+  // (v6+); pdu_v4.yaml:32-35 int63 (≤5))
+  depthLimit: 'int53' | 'int63';
+  // signing-key valid_until_ts enforced when verifying signatures
+  // (v5+ — v5-signing-requirements.md:2-16). Recorded for M5
+  // (federation signature verification); local authoring is unaffected.
+  enforceKeyValidity: boolean;
+  // the event-id base64 alphabet: standard (+ and /) for v3
+  // (v3.md:57-62), URL-safe (- and _) for v4+ (v4-event-ids.md:3-12)
+  eventIdAlphabet: 'std' | 'urlsafe';
+  // m.room.redaction carries `redacts` under content (v11+ —
+  // v11.md:70-81); ≤10 keeps it top-level (pdu_v6.yaml:27-30)
+  redactsInContent: boolean;
   // join_rule `knock` (v7 feature)
   knockJoinRule: boolean;
   // join_rule `restricted` (v8 feature)
   restrictedJoinRule: boolean;
   // join_rule `knock_restricted` (v10 feature)
   knockRestrictedJoinRule: boolean;
-  // the redaction keep-list fragment the version includes: v9-redactions
-  // (v10.md:276) or v11-redactions (v11.md / v12.md:485)
-  redactionRules: 'v9' | 'v11';
+  // the redaction keep-list fragment the version includes:
+  // v1-redactions (v1-redactions.md:5-32 — ≤5), v6-redactions
+  // (v6-redactions.md:5-31 — v6/v7), the v8 inline table (v8.md:42-69),
+  // v9-redactions (v10.md:276), or v11-redactions (v11.md / v12.md:485)
+  redactionRules: 'v1' | 'v6' | 'v8' | 'v9' | 'v11';
   // rule 2.5 (retroactive at v1.16): auth_events room_id must match
   // (v11.md:136-137)
   authEventsSameRoom: boolean;
