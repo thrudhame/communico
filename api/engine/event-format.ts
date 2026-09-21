@@ -64,6 +64,7 @@ export function clientEvent(
   viewer?: { userId: string; deviceId: string | null; membership?: string },
   redaction?: { roomVersion: string; event: Record<string, unknown> },
   thread?: ThreadBundle,
+  opts?: { omitRoomId?: boolean },
 ): Record<string, unknown> {
   const redacted = row.redacted_by != null && redaction !== undefined;
   const shown = redacted
@@ -78,8 +79,11 @@ export function clientEvent(
     sender: shown.sender,
     content: shown.content ?? {},
     origin_server_ts: shown.origin_server_ts,
-    room_id: row.room_id,
   };
+  // room_id comes from the index row (D2 — a v12 create's stored PDU has
+  // none; client_event.yaml:24,48 requires it everywhere EXCEPT /sync,
+  // whose ClientEventWithoutRoomID variant strips it)
+  if (opts?.omitRoomId !== true) ev.room_id = row.room_id;
   if (shown.state_key != null) ev.state_key = shown.state_key;
   const unsigned: Record<string, unknown> = {
     age: Math.max(0, Date.now() - Number(pdu.origin_server_ts)),

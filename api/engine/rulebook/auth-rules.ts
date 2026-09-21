@@ -147,7 +147,9 @@ function rule1(
 const SENDER_RE =
   /^@[0-9a-z.=_/+-]+:(\[[0-9A-Fa-f:.]+\]|[0-9A-Za-z.-]+)(:[0-9]{1,5})?$/;
 
-function validAdditionalCreators(value: unknown): boolean {
+// D4's validator, shared with createRoom (engine side) — the same
+// grammar rule 1.4 applies at ingest.
+export function validAdditionalCreators(value: unknown): boolean {
   if (!Array.isArray(value)) return false;
   return value.every((v) => typeof v === 'string' && SENDER_RE.test(v));
 }

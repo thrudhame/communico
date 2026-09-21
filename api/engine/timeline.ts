@@ -96,6 +96,7 @@ export async function clientEventForRow(
   row: EventIndexRow,
   viewer?: { userId: string; deviceId: string | null; membership?: string },
   bundleThreads = true,
+  opts?: { omitRoomId?: boolean },
 ): Promise<Record<string, unknown> | null> {
   const pdu = await pduById(dbName, row.commit_hash, row.event_id);
   if (!pdu) return null;
@@ -164,7 +165,7 @@ export async function clientEventForRow(
       }
     }
   }
-  return clientEvent(pdu, row, viewer, redaction, thread);
+  return clientEvent(pdu, row, viewer, redaction, thread, opts);
 }
 
 // Maps a commit to the events row it added (the commit=event invariant:

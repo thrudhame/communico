@@ -230,11 +230,18 @@ async function roomTimeline(
       continue;
     }
     const membership = await membershipAtSeq(roomId, i.userId, row.seq);
-    const ev = await clientEventForRow(room.dbName, room.roomVersion, row, {
-      userId: i.userId,
-      deviceId: i.deviceId,
-      membership,
-    });
+    const ev = await clientEventForRow(
+      room.dbName,
+      room.roomVersion,
+      row,
+      {
+        userId: i.userId,
+        deviceId: i.deviceId,
+        membership,
+      },
+      true,
+      { omitRoomId: true }, // /sync strips room_id (D2; sync.yaml's variant)
+    );
     if (ev) events.push(ev);
   }
 
@@ -267,10 +274,17 @@ async function roomTimeline(
   for (const r of stateRows) {
     const idx = await eventIndexRow(roomId, r.eventId);
     if (!idx) continue;
-    const ev = await clientEventForRow(room.dbName, room.roomVersion, idx, {
-      userId: i.userId,
-      deviceId: i.deviceId,
-    });
+    const ev = await clientEventForRow(
+      room.dbName,
+      room.roomVersion,
+      idx,
+      {
+        userId: i.userId,
+        deviceId: i.deviceId,
+      },
+      true,
+      { omitRoomId: true },
+    );
     if (ev) stateEvents.push(ev);
   }
 

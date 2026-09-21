@@ -1,6 +1,8 @@
 import { ident, serverDb, withDb } from './db.ts';
 import { author, ingestEvent } from './ingest.ts';
 import { getRulebook } from './policy.ts';
+import { validAdditionalCreators } from './rulebook/auth-rules.ts';
+import type { Pdu } from './pdu.ts';
 import { serverName } from './config.ts';
 import { MatrixError } from './matrix-error.ts';
 import { type EventIndexRow, eventIndexRowOf } from './event-format.ts';
@@ -32,6 +34,7 @@ export async function runSqlFile(c: unknown, path: string): Promise<void> {
 }
 
 export interface CreateRoomResult {
+  roomId: string;
   createEventId: string;
   memberEventId: string;
   roomAlias?: string;
@@ -46,6 +49,7 @@ export interface CreateRoomOptions {
   name?: string;
   topic?: string;
   invite?: string[];
+  isDirect?: boolean; // is_direct on the invite member events
   roomAliasName?: string;
   creationContent?: Record<string, unknown>;
   initialState?: { type: string; state_key?: string; content: unknown }[];
@@ -144,13 +148,100 @@ export async function createRoom(
     }
   }
 
+  const spec = getRulebook(roomVersion).spec;
+
+  // additional_creators (v12, create_room.yaml:163-174): for
+  // trusted_private_chat the server SHOULD combine the creation_content
+  // list and the invite array, deduplicated; validated per D4 (400).
+  let additionalCreators: string[] | undefined;
+  if (spec.additionalCreators) {
+    const raw = opts.creationContent?.['additional_creators'];
+    if (raw !== undefined && !validAdditionalCreators(raw)) {
+      throw new MatrixError(
+        400,
+        'M_INVALID_PARAM',
+        'additional_creators is not an array of valid user IDs',
+      );
+    }
+    const base = (raw as string[] | undefined) ?? [];
+    const combined = preset === 'trusted_private_chat'
+      ? [...new Set([...base, ...invite])]
+      : base;
+    if (!validAdditionalCreators(combined)) {
+      throw new MatrixError(
+        400,
+        'M_INVALID_PARAM',
+        'additional_creators is not an array of valid user IDs',
+      );
+    }
+    additionalCreators = combined.length > 0 ? combined : undefined;
+    // D3: power_level_content_override.users must not name a creator
+    // (rule 10.4 at ingest; surfaced here as the 400 Complement expects)
+    const creators = [creator, ...(additionalCreators ?? [])];
+    const overrideUsers = opts.powerLevelContentOverride?.users as
+      | Record<string, unknown>
+      | undefined;
+    if (overrideUsers !== undefined) {
+      for (const u of Object.keys(overrideUsers)) {
+        if (creators.includes(u)) {
+          throw new MatrixError(
+            400,
+            'M_INVALID_PARAM',
+            'power_level_content_override.users must not name a room creator',
+          );
+        }
+      }
+    }
+  }
+
+  // --- v12: author the create BEFORE the room exists; the room id is
+  //     derived from it (D2). 3b: on the (astronomical) collision with an
+  //     existing room id, re-author with the next millisecond.
+  let createPdu: Pdu | null = null;
+  const createContent: Record<string, unknown> = {
+    ...(opts.creationContent ?? {}),
+  };
+  delete createContent.room_version; // overwritten (create_room.yaml:167)
+  delete createContent.creator; // overwritten (same; v10 re-adds it)
+  createContent.room_version = roomVersion;
+  if (spec.additionalCreators) {
+    if (additionalCreators !== undefined) {
+      createContent.additional_creators = additionalCreators;
+    } else {
+      delete createContent.additional_creators; // key absent when empty
+    }
+  }
+  let finalRoomId = roomId;
+  if (spec.roomIdFromCreateEvent) {
+    let ts = Date.now();
+    for (;;) {
+      const pdu = await author(roomId, {
+        type: 'm.room.create',
+        state_key: '', // the create is a state event — without it the
+        // ingest never applies it to state (the M_NO_CREATE bug)
+        sender: creator,
+        content: createContent,
+        prev_events: [],
+        origin_server_ts: ts,
+        roomVersion,
+      });
+      const derived = '!' + String(pdu.event_id).slice(1);
+      if ((await lookupRoom(derived)) === null) {
+        createPdu = pdu;
+        finalRoomId = derived;
+        break;
+      }
+      ts += 1;
+    }
+  }
+
   // --- provision the room DB + directory row ---
-  const dbName = await dbNameFor(roomId);
+  const dbName = await dbNameFor(finalRoomId);
   await withDb(serverDb(), async (c) => {
     await c.query(`CREATE DATABASE ${ident(dbName)};`);
     await c.query(
       'INSERT INTO room_directory (room_id, db_name, room_version, stub_era) VALUES ($1, $2, $3, FALSE);',
-      [roomId, dbName, roomVersion],
+      [finalRoomId, dbName, roomVersion],
     );
   });
   await withDb(dbName, async (c) => {
@@ -163,7 +254,7 @@ export async function createRoom(
     stateKey: string,
     content: Record<string, unknown>,
   ): Promise<string> => {
-    const pdu = await author(roomId, {
+    const pdu = await author(finalRoomId, {
       type,
       state_key: stateKey,
       sender: creator,
@@ -171,7 +262,7 @@ export async function createRoom(
       origin_server_ts: Date.now(),
     });
     try {
-      return (await ingestEvent(roomId, pdu)).event_id;
+      return (await ingestEvent(finalRoomId, pdu)).event_id;
     } catch (e) {
       const msg = String(e);
       if (
@@ -183,14 +274,15 @@ export async function createRoom(
     }
   };
 
-  // 1. m.room.create — creation_content minus any room_version key, plus
-  //    the (validated) room_version.
-  const createContent: Record<string, unknown> = {
-    ...(opts.creationContent ?? {}),
-  };
-  delete createContent.room_version;
-  createContent.room_version = roomVersion;
-  const createEventId = await send('m.room.create', '', createContent);
+  // 1. m.room.create — pre-authored for v12 (D2: the room id derives from
+  //    it, so it was authored before the row existed and is ingested now);
+  //    authored inline for the other versions.
+  let createEventId: string;
+  if (createPdu !== null) {
+    createEventId = (await ingestEvent(finalRoomId, createPdu)).event_id;
+  } else {
+    createEventId = await send('m.room.create', '', createContent);
+  }
 
   // 2. creator's join
   const memberEventId = await send('m.room.member', creator, {
@@ -200,22 +292,29 @@ export async function createRoom(
   // 3. m.room.power_levels — spec defaults (m.room.power_levels.yaml at
   //    v1.16), every key explicit, then the override deep-merged on top.
   //    trusted_private_chat: every invite user gets users[u]=100.
+  //    v12 (create_room.yaml:39-52): the creator is NOT listed (infinite
+  //    power), and m.room.tombstone is explicitly above state_default.
   let pl: Record<string, unknown> = {
     ban: 50,
-    events: {},
+    events: spec.creatorsHaveInfinitePower ? { 'm.room.tombstone': 150 } : {},
     events_default: 0,
     invite: 0,
     kick: 50,
     redact: 50,
     state_default: 50,
-    users: { [creator]: 100 },
+    users: spec.creatorsHaveInfinitePower ? {} : { [creator]: 100 },
     users_default: 0,
     notifications: { room: 50 },
   };
   if (opts.powerLevelContentOverride !== undefined) {
     pl = deepMerge(pl, opts.powerLevelContentOverride);
   }
-  if (preset === 'trusted_private_chat') {
+  // trusted_private_chat PL-100s the invitees (v11 semantics); for v12
+  // they are additional_creators instead (create_room.yaml:45-47) and
+  // must NOT appear in users (rule 10.4).
+  if (
+    preset === 'trusted_private_chat' && !spec.creatorsHaveInfinitePower
+  ) {
     const users = { ...(pl.users as Record<string, unknown>) };
     for (const u of invite) users[u] = 100;
     pl.users = users;
@@ -255,9 +354,12 @@ export async function createRoom(
     });
   }
 
-  // 7. invites (sender: the creator)
+  // 7. invites (sender: the creator); is_direct rides along when set
   for (const u of invite) {
-    await send('m.room.member', u, { membership: 'invite' });
+    await send('m.room.member', u, {
+      membership: 'invite',
+      ...(opts.isDirect === true ? { is_direct: true } : {}),
+    });
   }
 
   // 8. room_alias_name → the alias row + m.room.canonical_alias
@@ -265,7 +367,7 @@ export async function createRoom(
     await withDb(serverDb(), async (c) => {
       await c.query(
         'INSERT INTO room_aliases (alias, room_id, creator) VALUES ($1, $2, $3);',
-        [alias, roomId, creator],
+        [alias, finalRoomId, creator],
       );
     });
     await send('m.room.canonical_alias', '', { alias });
@@ -277,12 +379,17 @@ export async function createRoom(
     await withDb(serverDb(), async (c) => {
       await c.query(
         'INSERT INTO room_visibility (room_id, visibility) VALUES ($1, $2);',
-        [roomId, 'public'],
+        [finalRoomId, 'public'],
       );
     });
   }
 
-  return { createEventId, memberEventId, roomAlias: alias };
+  return {
+    roomId: finalRoomId,
+    createEventId,
+    memberEventId,
+    roomAlias: alias,
+  };
 }
 
 export interface RoomInfo {

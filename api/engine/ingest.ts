@@ -78,6 +78,10 @@ export interface AuthorPartial {
   state_key?: string;
   prev_events?: string[];
   origin_server_ts?: number;
+  // D2: the create event is authored BEFORE the room DB/directory row
+  // exists (the v12 room id is derived from it). The hint supplies the
+  // rulebook for exactly that case; when the room row exists it wins.
+  roomVersion?: string;
 }
 
 function assertHash(s: string): void {
@@ -251,25 +255,43 @@ export async function author(
   // M_BAD_JSON, spec appendices § Canonical JSON) — refused before
   // signing, whose canonical pass throws plain Errors (would 500).
   assertCanonicalNumbers(partial.content);
+  // D2: a create event may be authored before the room row exists (the
+  // v12 room id derives from the create) — the version comes from the
+  // hint then; every other path requires the row.
   const room = await lookupRoom(roomId);
-  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
-  const rulebook = getRulebook(room.roomVersion);
+  const roomVersion = room?.roomVersion ??
+    (partial.type === 'm.room.create' && partial.roomVersion !== undefined
+      ? partial.roomVersion
+      : null);
+  if (roomVersion === null) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
+  const rulebook = getRulebook(roomVersion);
   const prevIds = partial.prev_events ??
-    (await extremities(room.dbName, roomId)).map((e) => e.eventId);
+    (room
+      ? (await extremities(room.dbName, roomId)).map((e) => e.eventId)
+      : null);
+  if (prevIds === null) {
+    throw new Error(
+      'E_AUTHOR_NO_ROOM: prev_events required when the room row is absent',
+    );
+  }
   if (prevIds.length > 20) {
     throw new Error('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
   }
   const isCreate = partial.type === 'm.room.create' && prevIds.length === 0;
   const prevs = await resolvePrevs(roomId, prevIds);
-  const depths = await prevDepths(room.dbName, prevs);
+  const depths = room ? await prevDepths(room.dbName, prevs) : [];
   const depth = prevs.length === 0 ? 1 : Math.max(...depths) + 1;
 
   const parentSets: StateMap[] = [];
-  for (const p of prevs) {
-    parentSets.push(await parentStateAt(room.dbName, p.commitHash));
+  if (room) {
+    for (const p of prevs) {
+      parentSets.push(await parentStateAt(room.dbName, p.commitHash));
+    }
   }
   const hashes = prevs.map((p) => p.commitHash);
-  const ancestry = await loadAncestry(room.dbName, hashes);
+  const ancestry = room
+    ? await loadAncestry(room.dbName, hashes)
+    : { pduById: new Map<string, Pdu>(), rejectedIds: new Set<string>() };
   const store = eventStoreOf(ancestry.pduById, ancestry.rejectedIds);
   // Resolution first: concurrent state edits RESOLVE (M3 — the real v2
   // algorithm; the refusing stub is gone).
@@ -285,7 +307,6 @@ export async function author(
   }
   const pdu: Pdu = {
     type: partial.type,
-    room_id: roomId,
     sender: partial.sender,
     content: (partial.content ?? {}) as Record<string, unknown>,
     prev_events: [...prevIds],
@@ -303,9 +324,14 @@ export async function author(
     hashes: { sha256: '' },
     signatures: {},
   };
+  // D2: a v12 create carries NO room_id (v12.md:98-101 — the room ID is
+  // the create's own event id); everything else carries it as today.
+  if (!(rulebook.spec.roomIdFromCreateEvent && isCreate)) {
+    pdu.room_id = roomId;
+  }
   if (partial.state_key !== undefined) pdu.state_key = partial.state_key;
   const key = await getTenantKey();
-  await signPdu(pdu, room.roomVersion, key);
+  await signPdu(pdu, roomVersion, key);
   // D9: the complete event — canonical-encoded, signatures included —
   // MUST NOT exceed 65536 bytes (spec client-server-api § Size limits,
   // v1.16 _index.md lines 2867-2883). Enforced in author() so /send and
@@ -416,6 +442,19 @@ async function ingestPrechecks(
     throw new Error('M_BAD_EVENT: event_id does not recompute');
   }
   const eventId = String(pdu.event_id);
+
+  // D2 defence in depth: for a v12 create, the room ID must be the
+  // create's own event id with ! for $ (v12.md:98-101, 108-109).
+  if (
+    room.roomVersion !== undefined &&
+    getRulebook(room.roomVersion).spec.roomIdFromCreateEvent &&
+    pdu.type === 'm.room.create' &&
+    roomId !== '!' + eventId.slice(1)
+  ) {
+    throw new Error(
+      'E_ROOM_ID_MISMATCH: v12 room id is not the create event id',
+    );
+  }
 
   // Idempotent redelivery: content-hash ids make ingest naturally
   // idempotent — a known event returns its receipt instead of
@@ -591,6 +630,7 @@ async function ingestEventLocked(
   //       excluded from the client-visible timeline; server-server-api.md
   //       604-621).
   let verdict: 'ok' | 'authchain-reject' | 'state-reject' | 'soft-fail' = 'ok';
+  let rejectRule: string | null = null;
   if (!hashOk || !sigOk || !depthOk) {
     verdict = 'authchain-reject';
   } else {
@@ -598,10 +638,12 @@ async function ingestEventLocked(
     const selected = rulebook.selectAuthEvents(pdu, resolved);
     if (!chain.ok || (!isCreate && !sameIdSet([...declaredAuth], selected))) {
       verdict = 'authchain-reject';
+      if (!chain.ok) rejectRule = chain.rule;
     } else {
       const state = rulebook.checkAuthAgainstState(pdu, resolved, store);
       if (!state.ok) {
         verdict = 'state-reject';
+        rejectRule = state.rule;
       } else {
         // (c) current room state: resolve across the live extremities
         // (the incoming event is not one of them yet); their commit
@@ -853,10 +895,16 @@ async function ingestEventLocked(
     }
   }
   if (verdict === 'authchain-reject') {
-    throw new Error('M_AUTHCHAIN_REJECT: ' + eventId);
+    throw new Error(
+      'M_AUTHCHAIN_REJECT: ' + eventId +
+        (rejectRule !== null ? ' (rule ' + rejectRule + ')' : ''),
+    );
   }
   if (verdict === 'state-reject') {
-    throw new Error('M_STATE_REJECT: ' + eventId);
+    throw new Error(
+      'M_STATE_REJECT: ' + eventId +
+        (rejectRule !== null ? ' (rule ' + rejectRule + ')' : ''),
+    );
   }
   return { event_id: eventId, commit_hash: commitHash };
 }

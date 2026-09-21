@@ -1,9 +1,11 @@
 // api/engine/stateops.ts — client-level state read/write (M4 commit 5):
 // the shared logic of the /state routes (both depths) and the state-row
 // → client-event expansion, so the route files stay one-line shims.
-import { canonicalJson } from './canonical.ts';
+import { assertCanonicalNumbers, canonicalJson } from './canonical.ts';
 import { authorAndIngest } from './ingest.ts';
 import { MatrixError } from './matrix-error.ts';
+import { getRulebook } from './policy.ts';
+import { ruleId } from './rulebook/rule-ids.ts';
 import {
   eventIndexRow,
   lookupRoom,
@@ -84,10 +86,22 @@ export async function writeStateKey(
   if (!room) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'room not found: ' + roomId);
   }
+  // m.room.create is terminal at rule 1 — it can never be PUT after
+  // creation (Complement _CannotSendCreateEvent asserts the bare 400).
+  if (type === 'm.room.create') {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'm.room.create cannot be sent after creation',
+    );
+  }
   const m = await membershipOf(roomId, userId);
   if (m?.membership !== 'join') {
     throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);
   }
+  // D9 before the idempotency compare: canonicalJson throws a plain Error
+  // on non-canonical input — the client fault is a 400, not a 500.
+  assertCanonicalNumbers(content);
   const rows = (await stateAtSeq(roomId, null)) ?? [];
   const cur = rows.find((r) => r.type === type && r.stateKey === stateKey);
   if (cur) {
@@ -114,6 +128,18 @@ export async function writeStateKey(
   } catch (e) {
     const msg = String(e);
     if (msg.includes('M_STATE_REJECT') || msg.includes('M_AUTHCHAIN_REJECT')) {
+      // D3: a v12 rule-10.4 reject (PL users naming a creator) is a client
+      // input error — 400, not 403 (Complement + gomatrixserverlib
+      // eventauth.go:811-828). The rule id rides the reject message.
+      const spec = getRulebook(room.roomVersion).spec;
+      if (
+        spec.creatorsHaveInfinitePower &&
+        msg.includes(
+          '(rule ' + ruleId(spec, 'pl.creator_in_users') + ')',
+        )
+      ) {
+        throw new MatrixError(400, 'M_INVALID_PARAM', msg);
+      }
       throw new MatrixError(403, 'M_FORBIDDEN', msg);
     }
     throw e;

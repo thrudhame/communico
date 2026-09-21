@@ -30,6 +30,7 @@ export default async function (
     name: body.name as string | undefined,
     topic: body.topic as string | undefined,
     invite: body.invite as string[] | undefined,
+    isDirect: body.is_direct === true,
     roomAliasName: body.room_alias_name as string | undefined,
     creationContent: body.creation_content as
       | Record<string, unknown>
@@ -41,6 +42,8 @@ export default async function (
       | Record<string, unknown>
       | undefined,
   };
+  // The minted id is the room id for versions that use one; v12 derives
+  // it from the create event instead (createRoom returns the real id).
   const roomId = '!' + crypto.randomUUID() + ':' + serverName();
   try {
     const res = await createRoom(
@@ -48,7 +51,7 @@ export default async function (
       context.state.user as string,
       opts,
     );
-    const out: Record<string, unknown> = { room_id: roomId };
+    const out: Record<string, unknown> = { room_id: res.roomId };
     if (res.roomAlias !== undefined) out.room_alias = res.roomAlias;
     return out;
   } catch (e) {
