@@ -1,10 +1,10 @@
-# Complement baseline — 2026-09-20T03:30:22.068Z
+# Complement baseline — 2026-09-21T13:44:45.758Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
 - image: communico-complement:local (commit 05baa9d)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 75
+- failing tests: 79
 
 ## Failing packages
 
@@ -13,17 +13,15 @@
 
 ## Failing tests (red to beat)
 
-- github.com/matrix-org/complement/tests TestWriteMDirectAccountData
-- github.com/matrix-org/complement/tests TestIsDirectFlagLocal
 - github.com/matrix-org/complement/tests TestIsDirectFlagFederation
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name_over__matrix/client/v1/media/download
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name_over__matrix/client/v1/media/download
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel
 - github.com/matrix-org/complement/tests TestMediaFilenames
 - github.com/matrix-org/complement/tests TestMediaWithoutFileName/parallel/Can_download_without_a_file_name_over_federation
@@ -46,10 +44,10 @@
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinLocalUser
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
+- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
-- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/query_whole_graph
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/max_depth
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/suggested_only
@@ -63,24 +61,30 @@
 - github.com/matrix-org/complement/tests TestUnknownEndpoints/Server-server_endpoints
 - github.com/matrix-org/complement/tests TestUnknownEndpoints/Key_endpoints
 - github.com/matrix-org/complement/tests TestUnknownEndpoints
+- github.com/matrix-org/complement/tests TestMSC4289PrivilegedRoomCreators/admin_with_>PL100_sorts_after_the_room_creator_for_state_resolution
+- github.com/matrix-org/complement/tests TestMSC4289PrivilegedRoomCreators
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_search_for_an_event_by_body
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_works_across_an_upgraded_room_and_its_predecessor
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_results_with_recent_ordering_do_not_include_redacted_events
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_results_with_rank_ordering_do_not_include_redacted_events
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_get_context_around_search_results
+- github.com/matrix-org/complement/tests TestComplementCanCreateValidV12Rooms
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_back-paginate_search_results
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel
 - github.com/matrix-org/complement/tests/csapi TestSearch
+- github.com/matrix-org/complement/tests TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent
+- github.com/matrix-org/complement/tests TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent
+- github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_starts_from_empty_set
+- github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
+- github.com/matrix-org/complement/tests TestMSC4311FullCreateEventOnStrippedState
 - github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation/Visible_shared_history_after_joining_new_room_(backfill)/`messagesRequestLimit`_is_lower_than_the_number_of_messages_backfilled_(assumed)
 - github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation/Visible_shared_history_after_joining_new_room_(backfill)/`messagesRequestLimit`_is_greater_than_the_number_of_messages_backfilled_(in_Synapse,_100)
 - github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation/Visible_shared_history_after_joining_new_room_(backfill)
 - github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation/Visible_shared_history_after_re-joining_room_(backfill)/`messagesRequestLimit`_is_lower_than_the_number_of_messages_backfilled_(assumed)
 - github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation/Visible_shared_history_after_re-joining_room_(backfill)
 - github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation
-- github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/upgrading_a_room_carries_over_existing_push_rules_for_local_users
-- github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/joining_a_remote_manually_upgraded_room_carries_over_existing_push_rules
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/joining_a_remote_upgraded_room_carries_over_existing_push_rules
-- github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/manually_upgrading_a_room_carries_over_existing_push_rules_for_local_users
+- github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/joining_a_remote_manually_upgraded_room_carries_over_existing_push_rules
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade
 - github.com/matrix-org/complement/tests/csapi TestSync/parallel/sync_should_succeed_even_if_the_sync_token_points_to_a_redaction_of_an_unknown_event

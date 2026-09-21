@@ -44,8 +44,9 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
   in blacklisted `federation_room_join_test.go` (a second `//go:build` line is
   illegal in Go, so they are excluded rather than given a duplicate tag).
 - Event authorization — landed M4 (rulebook M3 + room endpoints M4).
-- Room version 12 — after M4 (the rulebook carries its switches; `createRoom`
-  room-id derivation pending).
+- Room version 12 — landed (the v12 plan): v10/v12 registered in the
+  rulebook; the v12 corpus runs. Federation-flavoured v12 tests stay
+  red under the M5 line, not here.
 - Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in BASELINE.md.
 
 - tests/csapi/e2e_key_backup_test.go
@@ -79,7 +80,6 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - tests/federation_upload_keys_test.go
 - tests/knocking_test.go
 - tests/knock_restricted_test.go
-- tests/v12_test.go
 
 ## Never blacklisted
 

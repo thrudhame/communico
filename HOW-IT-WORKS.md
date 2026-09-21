@@ -235,6 +235,38 @@ state.
   bodies 400 `M_BAD_JSON`, non-canonical content numbers 400, and events
   over 65536 canonical bytes 413.
 
+### 3.2 Room versions, upgrades, and push rules
+
+- **Room versions live in the registry** (`10`, `11`, `12`; default
+  `11`). Rule numbering is per version — `ruleId(spec, key)` maps a
+  stable key to the printed number (v12 inserts 1.4 and 2, shifting
+  v11's 2–10 to 3–11); the keep-list for redactions is per version too
+  (v9's list at v10, v11's at v11/v12). v12's create carries no
+  `room_id` (the room id is the create's own event id), creators
+  (sender + `additional_creators`) hold infinite power and are barred
+  from `users` (rule 10.4 → 400), and state resolution is v2.1 (empty
+  seed + the conflicted state subgraph). v10 keeps the explicit
+  `content.creator`. `/capabilities` advertises the registry verbatim.
+- **Upgrades** (`POST /rooms/:id/upgrade`): the upgrader must clear
+  `m.room.tombstone`'s required level; the new create carries
+  `predecessor` (no `event_id` for v12), the old `type`, the version,
+  and non-empty `additional_creators`; transferable state per
+  `room_upgrades.md:54-62` with the power levels transformed for v12
+  (upgrader and new creators dropped from `users`, tombstone floored at
+  150); local aliases move; the old room is tombstoned and its power
+  levels locked down (best-effort). Push rules migrate for every local
+  user — automatically on `/upgrade`, and on the manual shapes (a
+  tombstone with `replacement_room`, a create with `predecessor`, or a
+  join into a room with a `predecessor`).
+- **Push rules (minimal).** `/pushrules` CRUD over the five kinds with
+  `before`/`after` ordering, `/enabled`, `/actions`; server-default
+  rules are not seeded yet. `m.push_rules` is synthesised from the
+  `push_rules` table into sync account data — never stored — and every
+  mutation stamps the `push_rules_stream` marker so a delete that
+  empties the table still moves the sync token. Account data is a sync
+  stream now (`s<e>_p<p>_t<t>_r<r>_a<a>`): incremental syncs deliver
+  changed rows, and long-polls wake on the `a` stream.
+
 ## 4. Sync (parked)
 
 The browser homeserver (communico-lite) and the native sync protocols
