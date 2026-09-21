@@ -112,18 +112,20 @@ export async function signPdu(
 }
 
 // Verify an inbound PDU's origin signature when present: redact first
-// (the signature covers the redacted form), then check. Unsigned PDUs
-// are NOT accepted here — ingest refuses them outright (the F0
-// unsigned-lite seam was deleted at F1's end).
+// (the signature covers the redacted form — PER THE ROOM VERSION's
+// redaction rules, so the version must match the signer's), then check.
+// Unsigned PDUs are NOT accepted here — ingest refuses them outright
+// (the F0 unsigned-lite seam was deleted at F1's end).
 export async function verifyPduSignature(
   pdu: Pdu,
   publicKey: CryptoKey,
   serverName: string,
   keyId: string,
+  roomVersion = '11',
 ): Promise<boolean> {
   let redacted: Record<string, unknown>;
   try {
-    redacted = redact(pdu as unknown as Record<string, unknown>);
+    redacted = redact(pdu as unknown as Record<string, unknown>, roomVersion);
   } catch {
     return false;
   }

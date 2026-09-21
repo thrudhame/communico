@@ -302,3 +302,51 @@ Deno.test('createRoom: creation_content lands minus room_version; version valida
   assertEquals(unknown.status, 400);
   assertEquals(unknown.body.errcode, 'M_UNSUPPORTED_ROOM_VERSION');
 });
+
+Deno.test('createRoom: v10 writes content.creator; v12 omits it; capabilities list 10/11/12 with default 11', async () => {
+  const alice = await registerTestUser('cr-v10', 'pw-cr-v10');
+  const tok = alice.access_token!;
+  const aId = alice.user_id as string;
+
+  // v10: the create carries content.creator (v10.md:114)
+  const v10 = await call('/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    token: tok,
+    body: { room_version: '10' },
+  });
+  assertEquals(v10.status, 200);
+  const create10 = await stateKey(
+    tok,
+    v10.body.room_id as string,
+    'm.room.create',
+  );
+  assertEquals((create10.body as Json).creator, aId);
+  assertEquals((create10.body as Json).room_version, '10');
+
+  // v12: no creator key at all (v11+ derives the creator from the sender)
+  const v12 = await call('/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    token: tok,
+    body: { room_version: '12' },
+  });
+  assertEquals(v12.status, 200);
+  const create12 = await stateKey(
+    tok,
+    v12.body.room_id as string,
+    'm.room.create',
+  );
+  assertEquals('creator' in (create12.body as Json), false);
+  assertEquals((create12.body as Json).room_version, '12');
+
+  // /capabilities: registry-driven (D11) — 10/11/12 stable, default 11
+  const caps = await call('/_matrix/client/v3/capabilities', { token: tok });
+  const rv = ((caps.body as Json).capabilities as Json)[
+    'm.room_versions'
+  ] as Json;
+  assertEquals(rv.default, '11');
+  assertEquals(rv.available, {
+    '10': 'stable',
+    '11': 'stable',
+    '12': 'stable',
+  });
+});

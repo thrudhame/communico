@@ -204,6 +204,9 @@ export async function createRoom(
   delete createContent.room_version; // overwritten (create_room.yaml:167)
   delete createContent.creator; // overwritten (same; v10 re-adds it)
   createContent.room_version = roomVersion;
+  // v10 (D6): the create carries content.creator (v10.md:114 requires it;
+  // create_room.yaml:167 — the server overwrites the key)
+  if (spec.explicitCreator) createContent.creator = creator;
   if (spec.additionalCreators) {
     if (additionalCreators !== undefined) {
       createContent.additional_creators = additionalCreators;

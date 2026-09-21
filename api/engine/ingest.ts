@@ -508,7 +508,13 @@ async function ingestPrechecks(
       if (srv === key.serverName) {
         for (const kid of Object.keys(keys as Record<string, string>)) {
           if (
-            await verifyPduSignature(pdu, key.publicKey, srv, kid)
+            await verifyPduSignature(
+              pdu,
+              key.publicKey,
+              srv,
+              kid,
+              room.roomVersion,
+            )
           ) sigOk = true;
         }
       } else if (isKeyName(srv)) {
@@ -517,7 +523,13 @@ async function ingestPrechecks(
         const pub = await importPublicKeyFromRaw(raw);
         for (const kid of Object.keys(keys as Record<string, string>)) {
           if (
-            await verifyPduSignature(pdu, pub as unknown as CryptoKey, srv, kid)
+            await verifyPduSignature(
+              pdu,
+              pub as unknown as CryptoKey,
+              srv,
+              kid,
+              room.roomVersion,
+            )
           ) sigOk = true;
         }
       }
