@@ -15,6 +15,9 @@ export interface Pdu {
   origin_server_ts: number;
   hashes: { sha256: string };
   signatures: Record<string, Record<string, string>>;
+  // ≤10 redaction events carry the target id top-level (pdu_v6.yaml
+  // :27-30); v11+ moves it under content (v11.md:70-81).
+  redacts?: string;
   unsigned?: Record<string, unknown>;
   event_id?: string;
 }

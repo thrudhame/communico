@@ -81,18 +81,30 @@ export async function redactEvent(
     );
   }
 
-  const content: Record<string, unknown> = { redacts: targetEventId };
+  // D10: the redacts placement is per version — ≤10 top-level on the
+  // PDU with content {reason?} (pdu_v6.yaml:27-30), 11+ under content
+  // (v11.md:70-81).
+  const content: Record<string, unknown> = {};
+  const partial: {
+    type: string;
+    sender: string;
+    content: Record<string, unknown>;
+    origin_server_ts: number;
+    redacts?: string;
+  } = {
+    type: 'm.room.redaction',
+    sender,
+    content,
+    origin_server_ts: Date.now(),
+  };
+  if (rulebook.spec.redactsInContent) content.redacts = targetEventId;
+  else partial.redacts = targetEventId;
   if (reason !== undefined) content.reason = reason;
   let res;
   try {
     res = await authorAndIngest(
       roomId,
-      {
-        type: 'm.room.redaction',
-        sender,
-        content,
-        origin_server_ts: Date.now(),
-      },
+      partial,
       txn ? { txn } : undefined,
     );
   } catch (e) {

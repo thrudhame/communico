@@ -85,6 +85,9 @@ export function clientEvent(
   // whose ClientEventWithoutRoomID variant strips it)
   if (opts?.omitRoomId !== true) ev.room_id = row.room_id;
   if (shown.state_key != null) ev.state_key = shown.state_key;
+  // ≤10 redaction events render their stored top-level redacts
+  // (pdu_v6.yaml:27-30); v11+ keeps it in content (already rendered).
+  if (shown.redacts != null) ev.redacts = shown.redacts;
   const unsigned: Record<string, unknown> = {
     age: Math.max(0, Date.now() - Number(pdu.origin_server_ts)),
   };

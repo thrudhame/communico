@@ -81,6 +81,9 @@ export interface AuthorPartial {
   state_key?: string;
   prev_events?: string[];
   origin_server_ts?: number;
+  // ≤10 m.room.redaction: the target id goes top-level on the PDU
+  // (pdu_v6.yaml:27-30; plan D10). v11+ keeps it in content.
+  redacts?: string;
   // D2: the create event is authored BEFORE the room DB/directory row
   // exists (the v12 room id is derived from it). The hint supplies the
   // rulebook for exactly that case; when the room row exists it wins.
@@ -254,10 +257,6 @@ export async function author(
   roomId: string,
   partial: AuthorPartial,
 ): Promise<Pdu> {
-  // D9: non-canonical numbers in content are a client fault (400
-  // M_BAD_JSON, spec appendices § Canonical JSON) — refused before
-  // signing, whose canonical pass throws plain Errors (would 500).
-  assertCanonicalNumbers(partial.content);
   // D2: a create event may be authored before the room row exists (the
   // v12 room id derives from the create) — the version comes from the
   // hint then; every other path requires the row.
@@ -268,6 +267,17 @@ export async function author(
       : null);
   if (roomVersion === null) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
   const rulebook = getRulebook(roomVersion);
+  // D9: non-canonical numbers in content are a client fault (400
+  // M_BAD_JSON, spec appendices § Canonical JSON) — refused before
+  // signing, whose canonical pass throws plain Errors (would 500).
+  // D7: the gate is strictness itself — v6+ enforces canonical JSON
+  // (v6-canonical-json.md); ≤5 MUST NOT strictly enforce
+  // (v1-canonical-json.md:2-4, appendices.md:103-110). Hashing still
+  // canonicalises either way: local createRoom/send produce canonical
+  // numbers — only acceptance relaxes (remote ingest is M5).
+  if (rulebook.spec.strictCanonicalJson) {
+    assertCanonicalNumbers(partial.content);
+  }
   const prevIds = partial.prev_events ??
     (room
       ? (await extremities(room.dbName, roomId)).map((e) => e.eventId)
@@ -333,6 +343,9 @@ export async function author(
     pdu.room_id = roomId;
   }
   if (partial.state_key !== undefined) pdu.state_key = partial.state_key;
+  // D10: ≤10 redaction events carry the target id top-level
+  // (pdu_v6.yaml:27-30).
+  if (partial.redacts !== undefined) pdu.redacts = partial.redacts;
   const key = await getTenantKey();
   await signPdu(pdu, roomVersion, key);
   // D9: the complete event — canonical-encoded, signatures included —
@@ -344,6 +357,19 @@ export async function author(
       413,
       'M_TOO_LARGE',
       'event exceeds the 65536-byte limit',
+    );
+  }
+  // D8: the depth bound (depth_v6.yaml:9-11 — 2^53-1 for v6+;
+  // pdu_v4.yaml:32-35 — 2^63-1 for ≤5). Practically unreachable; the
+  // check documents the flag.
+  const depthBound = rulebook.spec.depthLimit === 'int53'
+    ? 2 ** 53 - 1
+    : 2 ** 63 - 1;
+  if (depth > depthBound) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'event depth exceeds the room version limit',
     );
   }
   if (isCreate) {

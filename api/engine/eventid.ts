@@ -170,8 +170,10 @@ export function redact(
 // Reference hash (spec server-server API § "Calculating the reference
 // hash for an event"): redact -> remove `signatures` and `unsigned`
 // (hashes is KEPT — it covers the essential fields including content
-// hashes) -> canonical JSON -> SHA-256 -> '$' + unpadded base64url.
+// hashes) -> canonical JSON -> SHA-256 -> '$' + unpadded base64.
 // `event_id` itself is excluded (it is the derived value, never input).
+// The base64 alphabet is per version (plan D9): standard (+ and /) for
+// v3 (v3.md:57-62), URL-safe (- and _) for v4+ (v4-event-ids.md:3-12).
 export async function eventIdFor(
   pdu: Record<string, unknown>,
   roomVersion = '11',
@@ -184,9 +186,11 @@ export async function eventIdFor(
     'SHA-256',
     new TextEncoder().encode(canonicalJson(r)),
   );
-  const b64 = btoa(String.fromCharCode(...new Uint8Array(digest)));
-  return '$' + b64.replaceAll('+', '-').replaceAll('/', '_').replace(
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(digest))).replace(
     /=+$/,
     '',
   );
+  const alphabet = getRulebook(roomVersion).spec.eventIdAlphabet;
+  return '$' +
+    (alphabet === 'std' ? b64 : b64.replaceAll('+', '-').replaceAll('/', '_'));
 }
