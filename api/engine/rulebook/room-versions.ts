@@ -22,6 +22,7 @@ import type { RoomVersionSpec } from './types.ts';
 
 export const V11: RoomVersionSpec = {
   identifier: '11',
+  ruleNumbering: 'v11',
   stateResVariant: 'v2',
   createInAuthEvents: true,
   roomIdFromCreateEvent: false,
@@ -43,6 +44,7 @@ export const V11: RoomVersionSpec = {
 export const V12: RoomVersionSpec = {
   ...V11,
   identifier: '12',
+  ruleNumbering: 'v12',
   stateResVariant: 'v2.1',
   createInAuthEvents: false,
   roomIdFromCreateEvent: true,
@@ -59,6 +61,7 @@ export const V12: RoomVersionSpec = {
 export const V10: RoomVersionSpec = {
   ...V11,
   identifier: '10',
+  ruleNumbering: 'v10',
   explicitCreator: true,
   redactionRules: 'v9',
 };

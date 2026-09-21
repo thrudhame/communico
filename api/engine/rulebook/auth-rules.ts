@@ -520,7 +520,7 @@ function rule4(
     if (joinRule === 'public') return allow(ruleId(spec, 'member.join_public'));
     // 4.3.7: otherwise, reject.
     return reject(
-      '4.3.7',
+      ruleId(spec, 'member.join_reject'),
       `join_rule ${String(joinRule)} does not permit join`,
     );
   }
@@ -580,7 +580,7 @@ function rule4(
       // 4.4.1.6: sender must match the third_party_invite's sender.
       if (pdu.sender !== tpiEvent.sender) {
         return reject(
-          '4.4.1.6',
+          ruleId(spec, 'member.invite_tpi_sender'),
           'sender does not match the third_party_invite sender',
         );
       }
@@ -613,7 +613,7 @@ function rule4(
       }
       // 4.4.1.8: otherwise, reject.
       return reject(
-        '4.4.1.8',
+        ruleId(spec, 'member.invite_tpi_no_sig'),
         'no signature matches a third_party_invite public key',
       );
     }

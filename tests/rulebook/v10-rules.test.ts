@@ -30,10 +30,12 @@ Deno.test('v10 rule 1.4: a create without content.creator is rejected', () => {
   if (!v.ok) assertEquals(v.rule, '1.4');
 });
 
-Deno.test('v10 rule 1.4: a create with content.creator is allowed', () => {
+Deno.test('v10 rule 1.5: a create with content.creator is allowed', () => {
   const v = checkAuthChain(v10Create(), MemStore.from([]), ['10'], V10);
   assertEquals(v.ok, true);
-  if (v.ok) assertEquals(v.rule, '1.4');
+  // v10.md:115 — the allow is 1.5 (1.4 is the creator check); the
+  // pre-ruleNumbering table printed 1.4 for both.
+  if (v.ok) assertEquals(v.rule, '1.5');
 });
 
 // --- the explicit creator drives power and the first join ----------------------

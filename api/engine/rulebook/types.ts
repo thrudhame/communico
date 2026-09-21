@@ -45,6 +45,15 @@ export interface EventStore {
 // version reads a flag — never a version literal.
 export interface RoomVersionSpec {
   identifier: string;
+  // Which printed rule numbering the version's verdicts carry (plan D2 —
+  // seven numberings exist: v1–5 v1-auth-rules.md:16-148/v3-auth-rules.md
+  // :24-149 (aliases rule 4, member 5, PL 10), v6 v6.md:88-213 (member
+  // unknown 4.6), v7 v7.md:155-162 (knock 4.6, unknown 4.7), v8–9
+  // v8-auth-rules.md:30-171 (restricted 4.3.5, knock 4.7, unknown 4.8),
+  // v10 v10.md:106-256, v11 v11.md:113-260, v12 v12.md:94-247). Keys stay
+  // stable; only printed numbers change. Selection is by THIS field,
+  // never by identifier.
+  ruleNumbering: 'v1' | 'v6' | 'v7' | 'v8' | 'v10' | 'v11' | 'v12';
   stateResVariant: 'v2' | 'v2.1';
   // rule 2.4 / auth-events selection: the create event is selected into
   // auth_events (v1.16 note at v11.md:131; v12 removes it — v12.md:100-102)
