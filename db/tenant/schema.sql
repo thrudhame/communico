@@ -10,6 +10,12 @@
 -- (band C): ALTER TABLE access_tokens ADD COLUMN expires_ms bigint;
 --   CREATE TABLE refresh_tokens (token text PRIMARY KEY, localpart text,
 --     device_id text, access_token text);
+-- (v12): ALTER TABLE account_data ADD COLUMN seq bigint;
+--   CREATE SEQUENCE account_data_seq;
+--   CREATE TABLE push_rules (localpart text, scope text, kind text,
+--     rule_id text, priority bigint, actions text, conditions text,
+--     pattern text, enabled boolean, is_default boolean, seq bigint,
+--     PRIMARY KEY (localpart, scope, kind, rule_id));
 -- Dev/VM/Complement always provision fresh (demo/setup.sh --reset).
 CREATE TABLE IF NOT EXISTS tenant (
   server_name text PRIMARY KEY,
@@ -65,12 +71,35 @@ CREATE TABLE IF NOT EXISTS uia_sessions (
   created_ms bigint NOT NULL
 );
 -- M2: account data. room_id '' = global (PK columns cannot be NULL).
+-- v12 plan (D9): seq on the shared account_data_seq stream — incremental
+-- syncs deliver rows with seq > the token's _a<n>, long-polls wake on it.
+CREATE SEQUENCE IF NOT EXISTS account_data_seq;
 CREATE TABLE IF NOT EXISTS account_data (
   localpart text NOT NULL REFERENCES users(localpart),
   room_id text NOT NULL DEFAULT '',
   type text NOT NULL,
   content text NOT NULL,                            -- JSON text; Doltgres jsonb not assumed
+  seq bigint,
   PRIMARY KEY (localpart, room_id, type)
+);
+-- v12 plan (D9): push rules. The store behind /pushrules; m.push_rules is
+-- synthesised from this table on read, never stored as account_data.
+-- spec default rules (.m.rule.*) are NOT seeded here — the push
+-- milestone. seq shares the account_data_seq stream so a rule mutation
+-- moves the sync token's _a<n> (D10).
+CREATE TABLE IF NOT EXISTS push_rules (
+  localpart text NOT NULL REFERENCES users(localpart),
+  scope text NOT NULL,
+  kind text NOT NULL,
+  rule_id text NOT NULL,
+  priority bigint NOT NULL,
+  actions text NOT NULL,                              -- JSON text
+  conditions text,
+  pattern text,
+  enabled boolean NOT NULL DEFAULT TRUE,
+  is_default boolean NOT NULL DEFAULT FALSE,
+  seq bigint,
+  PRIMARY KEY (localpart, scope, kind, rule_id)
 );
 -- M2: pushers (storage only; no gateway traffic until Push proper).
 -- After access_tokens: the FK reference must resolve at CREATE time
