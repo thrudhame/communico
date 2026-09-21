@@ -33,6 +33,17 @@ import { getRulebook } from './policy.ts';
 //   state_default, users, users_default (NO invite).
 // - m.room.history_visibility: history_visibility.
 // - anything else: {} (no m.room.redaction content key).
+//
+// v8 (inline table, v8.md:42-69): the v9 lists EXCEPT m.room.member
+// keeps membership only (no join_authorised_via_users_server — that is
+// the v9 fix, v9.md:21-23).
+//
+// v6-redactions (v6-redactions.md:5-31): the v8 lists EXCEPT
+// m.room.join_rules keeps join_rule only (no allow — restricted rooms
+// are v8).
+//
+// v1-redactions (v1-redactions.md:5-32): the v6 lists PLUS
+// m.room.aliases keeps `aliases` (:30 — ≤5 only).
 
 const KEEP_TOP_V11 = new Set([
   'event_id',
@@ -49,7 +60,9 @@ const KEEP_TOP_V11 = new Set([
   'origin_server_ts',
 ]);
 
-const KEEP_TOP_V9 = new Set([
+// The 15-key top-level list shared by v1/v6/v8/v9
+// (v1-redactions.md:5-19).
+const KEEP_TOP_LEGACY = new Set([
   ...KEEP_TOP_V11,
   'prev_state',
   'origin',
@@ -68,7 +81,9 @@ const PL_KEYS_V11 = new Set([
   'users_default',
 ]);
 
-const PL_KEYS_V9 = new Set([
+// The 8-key PL list shared by v1/v6/v8/v9 (v1-redactions.md:27-29 — no
+// invite, no notifications).
+const PL_KEYS_LEGACY = new Set([
   'ban',
   'events',
   'events_default',
@@ -81,15 +96,17 @@ const PL_KEYS_V9 = new Set([
 
 // Matrix redaction algorithm, dispatched per room version's redaction
 // fragment (spec.redactionRules, plan D6): '11' and '12' share the v11
-// list; '10' uses the v9 list (v10.md:276). Unknown versions throw via
-// the registry (never a default).
+// list; '10' uses the v9 list (v10.md:276); '8' the inline v8 table;
+// '6'/'7' the v6 fragment; '3'-'5' the v1 fragment. Unknown versions
+// throw via the registry (never a default).
 export function redact(
   event: Record<string, unknown>,
   roomVersion = '11',
 ): Record<string, unknown> {
   const rules = getRulebook(roomVersion).spec.redactionRules;
-  const keepTop = rules === 'v9' ? KEEP_TOP_V9 : KEEP_TOP_V11;
-  const plKeys = rules === 'v9' ? PL_KEYS_V9 : PL_KEYS_V11;
+  const legacy = rules !== 'v11';
+  const keepTop = legacy ? KEEP_TOP_LEGACY : KEEP_TOP_V11;
+  const plKeys = legacy ? PL_KEYS_LEGACY : PL_KEYS_V11;
   const out: Record<string, unknown> = {};
   for (const k of Object.keys(event)) {
     if (keepTop.has(k)) out[k] = event[k];
@@ -99,11 +116,15 @@ export function redact(
   if (type === 'm.room.member') {
     const kept: Record<string, unknown> = {};
     if ('membership' in content) kept.membership = content.membership;
-    if ('join_authorised_via_users_server' in content) {
+    // join_authorised_via_users_server survives from v9 (v9.md:21-23).
+    if (
+      (rules === 'v9' || rules === 'v11') &&
+      'join_authorised_via_users_server' in content
+    ) {
       kept.join_authorised_via_users_server =
         content.join_authorised_via_users_server;
     }
-    if (rules !== 'v9') {
+    if (rules === 'v11') {
       const tpi = content.third_party_invite as
         | Record<string, unknown>
         | undefined;
@@ -113,13 +134,19 @@ export function redact(
     }
     out.content = kept;
   } else if (type === 'm.room.create') {
-    out.content = rules === 'v9'
-      ? ('creator' in content ? { creator: content.creator } : {})
-      : content;
+    out.content = rules === 'v11'
+      ? content
+      : ('creator' in content ? { creator: content.creator } : {});
   } else if (type === 'm.room.join_rules') {
     const kept: Record<string, unknown> = {};
     if ('join_rule' in content) kept.join_rule = content.join_rule;
-    if ('allow' in content) kept.allow = content.allow;
+    // `allow` survives from v8 (v8.md:66).
+    if (
+      (rules === 'v8' || rules === 'v9' || rules === 'v11') &&
+      'allow' in content
+    ) {
+      kept.allow = content.allow;
+    }
     out.content = kept;
   } else if (type === 'm.room.power_levels') {
     const pl: Record<string, unknown> = {};
@@ -127,9 +154,12 @@ export function redact(
       if (plKeys.has(k)) pl[k] = content[k];
     }
     out.content = pl;
+  } else if (type === 'm.room.aliases' && rules === 'v1') {
+    // ≤5 only (v1-redactions.md:30; plan 3c).
+    out.content = 'aliases' in content ? { aliases: content.aliases } : {};
   } else if (type === 'm.room.history_visibility') {
     out.content = { history_visibility: content.history_visibility };
-  } else if (type === 'm.room.redaction' && rules !== 'v9') {
+  } else if (type === 'm.room.redaction' && rules === 'v11') {
     out.content = { redacts: content.redacts };
   } else {
     out.content = {};
