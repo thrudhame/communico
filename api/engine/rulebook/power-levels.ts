@@ -129,10 +129,34 @@ export function parsePowerLevels(
   return { ok: true, pl };
 }
 
+// The room's creators (plan D3): v12 = the create event's sender ∪
+// content.additional_creators (v12.md:65-73); v1-10 = content.creator
+// (explicitCreator — v10.md:114 requires the field); v11+ = the sender.
+export function creatorsOf(
+  createEvent: Pdu | null,
+  spec: RoomVersionSpec,
+): string[] {
+  if (!createEvent) return [];
+  if (spec.creatorsHaveInfinitePower) {
+    const extra = createEvent.content?.['additional_creators'];
+    return [
+      createEvent.sender,
+      ...(Array.isArray(extra)
+        ? extra.filter((x): x is string => typeof x === 'string')
+        : []),
+    ];
+  }
+  if (spec.explicitCreator) {
+    const c = createEvent.content?.creator;
+    return typeof c === 'string' ? [c] : [];
+  }
+  return [createEvent.sender];
+}
+
 // The sender's power level (S5): `users[u]` -> `users_default` -> 0; when
-// there is NO PL event the room creator (create sender, v1-11) has 100 and
-// everyone else 0 (m.room.power_levels.yaml:10-14, 99-101). v12 creators
-// hold infinite power (yaml:103-105, v12.md:89-93) — flag-gated, declared.
+// there is NO PL event the room creator (v1-11) has 100 and everyone else
+// 0 (m.room.power_levels.yaml:10-14, 99-101). v12 creators hold infinite
+// power (yaml:103-105, v12.md:89-93) — flag-gated, declared.
 export function userPowerLevel(
   userId: string,
   plEvent: Pdu | null,
@@ -140,14 +164,7 @@ export function userPowerLevel(
   spec: RoomVersionSpec,
 ): number {
   if (spec.creatorsHaveInfinitePower && createEvent) {
-    const extra = createEvent.content?.['additional_creators'];
-    const creators = [
-      createEvent.sender,
-      ...(Array.isArray(extra)
-        ? extra.filter((x): x is string => typeof x === 'string')
-        : []),
-    ];
-    if (creators.includes(userId)) return Infinity;
+    if (creatorsOf(createEvent, spec).includes(userId)) return Infinity;
   }
   if (plEvent) {
     const parsed = parsePowerLevels(plEvent.content, spec);
@@ -161,10 +178,8 @@ export function userPowerLevel(
     // defensive only: fall through to the no-PL-event defaults rather
     // than coerce garbage into a level.
   }
-  if (
-    spec.implicitRoomCreator && createEvent && userId === createEvent.sender
-  ) {
-    return 100; // yaml:13-14, 99-101
+  if (createEvent && creatorsOf(createEvent, spec).includes(userId)) {
+    return 100; // yaml:13-14, 99-101 — the v1-11 creator-100 default
   }
   return 0;
 }

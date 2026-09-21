@@ -8,6 +8,7 @@
 // via the EventStore — S8 check 4, server-server-api.md:473-474). Rules
 // 3-10 are state-dependent (S8 check 5, server-server-api.md:475-476).
 import {
+  creatorsOf,
   namedLevel,
   type ParsedPowerLevels,
   parsePowerLevels,
@@ -84,12 +85,24 @@ function rule1(
       'm.room.create with prev_events',
     );
   }
-  // 1.2: the domain of the room_id must match the domain of the sender.
-  if (domainOf(pdu.room_id) !== domainOf(pdu.sender)) {
-    return reject(
-      ruleId(spec, 'create.room_id_domain'),
-      'room_id domain does not match sender domain',
-    );
+  if (spec.roomIdFromCreateEvent) {
+    // 1.2 (v12.md:98-101): a create carrying a room_id is rejected — the
+    // room ID is the create's own event id with ! for $.
+    if (pdu.room_id !== undefined && pdu.room_id !== '') {
+      return reject(
+        ruleId(spec, 'create.room_id_present'),
+        'm.room.create with room_id',
+      );
+    }
+  } else {
+    // 1.2 (v11.md:117-119): the domain of the room_id must match the
+    // domain of the sender.
+    if (domainOf(pdu.room_id ?? '') !== domainOf(pdu.sender)) {
+      return reject(
+        ruleId(spec, 'create.room_id_domain'),
+        'room_id domain does not match sender domain',
+      );
+    }
   }
   // 1.3: if content.room_version is present and is not a recognised
   // version, reject.
@@ -100,8 +113,32 @@ function rule1(
       'unrecognised room_version',
     );
   }
-  // 1.4: otherwise, allow.
+  if (spec.additionalCreators) {
+    // 1.4 (v12.md:104-106): additional_creators must be an array of
+    // strings, each passing the same user-id validation as sender
+    // (appendices.md:552-555 for the localpart, :451-467 for the domain).
+    const extra = pdu.content?.['additional_creators'];
+    if (extra !== undefined && !validAdditionalCreators(extra)) {
+      return reject(
+        ruleId(spec, 'create.additional_creators'),
+        'additional_creators is not an array of valid user IDs',
+      );
+    }
+  }
+  // 1.4/1.5: otherwise, allow.
   return allow(ruleId(spec, 'create.allow'));
+}
+
+// The user-id grammar applied to sender and additional_creators (D4):
+// @localpart:domain — localpart 1+ of [a-z0-9.=_/-+] (appendices.md
+// :552-555), domain a server name: dns-name / IPv4 / [IPv6], optional
+// :port (appendices.md:451-467).
+const SENDER_RE =
+  /^@[0-9a-z.=_/+-]+:(\[[0-9A-Fa-f:.]+\]|[0-9A-Za-z.-]+)(:[0-9]{1,5})?$/;
+
+function validAdditionalCreators(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  return value.every((v) => typeof v === 'string' && SENDER_RE.test(v));
 }
 
 // The (type, state_key) pairs the auth-events selection algorithm permits
@@ -189,11 +226,15 @@ function rule2(pdu: Pdu, store: EventStore, spec: RoomVersionSpec): Verdict {
     }
   }
   // 2.4: no m.room.create among the entries -> reject (v11.md:131,135).
-  if (!declared.some((id) => store.get(id)?.type === 'm.room.create')) {
-    return reject(
-      ruleId(spec, 'auth.create_missing'),
-      'no m.room.create among auth_events',
-    );
+  // Skipped in v12 — the create is never selected (v12.md:117), so the
+  // sub-list prints 1,2,3,5 (v12.md:110-122).
+  if (spec.createInAuthEvents) {
+    if (!declared.some((id) => store.get(id)?.type === 'm.room.create')) {
+      return reject(
+        ruleId(spec, 'auth.create_missing'),
+        'no m.room.create among auth_events',
+      );
+    }
   }
   // 2.5: any entry with a foreign room_id -> reject (v11.md:136-137,
   // changed-in v1.16; flag-gated per plan §3b).
@@ -221,8 +262,39 @@ export function checkAuthChain(
 ): Verdict {
   // Rule 1 is terminal for m.room.create.
   if (pdu.type === 'm.room.create') return rule1(pdu, recognisedVersions, spec);
+  if (spec.roomIdFromCreateEvent) {
+    // v12 rule 2 (v12.md:108-109): room_id must be an accepted
+    // m.room.create's id with ! for $.
+    const vRoom = ruleRoomId(pdu, store, spec);
+    if (vRoom !== null) return vRoom;
+  }
   const v2 = rule2(pdu, store, spec);
   return v2.ok ? allow(ruleId(spec, 'auth.allow')) : v2;
+}
+
+// v12 rule 2 (v12.md:108-109; plan 3c): the event's room_id must name an
+// accepted (not rejected) m.room.create event with the sigil swapped.
+// null = pass (the cascade continues).
+function ruleRoomId(
+  pdu: Pdu,
+  store: EventStore,
+  spec: RoomVersionSpec,
+): Verdict | null {
+  const id = pdu.room_id;
+  const createId = typeof id === 'string' && id.startsWith('!')
+    ? '$' + id.slice(1)
+    : null;
+  const create = createId !== null ? store.get(createId) : undefined;
+  if (
+    createId === null || create === undefined ||
+    create.type !== 'm.room.create' || store.isRejected(createId)
+  ) {
+    return reject(
+      ruleId(spec, 'room_id.not_create'),
+      'room_id is not an accepted m.room.create event id',
+    );
+  }
+  return null;
 }
 
 // Rules 3-10 against a state map (S8 check 5). One function per numbered
@@ -296,7 +368,7 @@ export function checkAuthAgainstState(
 
   // Rule 9 (v11.md:226-259) — m.room.power_levels specifics.
   if (pdu.type === 'm.room.power_levels') {
-    return rule9(pdu, spec, plEvent, senderLevel);
+    return rule9(pdu, spec, plEvent, createEvent, senderLevel);
   }
 
   // Rule 10 (v11.md:260): otherwise, allow.
@@ -650,17 +722,34 @@ function rule4(
 // Rule 9 (v11.md:226-259) — m.room.power_levels deltas vs the previous PL
 // event. 9.1-9.3 structure via parsePowerLevels (integer-only: v10.md
 // 221-228, flagged); 9.4 no previous PL event -> allow; 9.5-9.9
-// alteration checks; 9.10 otherwise allow.
+// alteration checks; 9.10 otherwise allow. v12 adds 10.4 (v12.md
+// :219-221): `users` must not name a creator.
 function rule9(
   pdu: Pdu,
   spec: RoomVersionSpec,
   plEvent: Pdu | null,
+  createEvent: Pdu | null,
   senderLevel: number,
 ): Verdict {
   // 9.1-9.3: structural checks (rule numbers carried by the parser).
   const parsed = parsePowerLevels(pdu.content, spec);
   if (!parsed.ok) {
     return reject(parsed.rule, 'malformed m.room.power_levels content');
+  }
+
+  if (spec.creatorsHaveInfinitePower) {
+    // 10.4 (v12.md:219-221): the users property must not contain the
+    // create event's sender or any additional_creators.
+    const creators = creatorsOf(createEvent, spec);
+    const users = (pdu.content?.users ?? {}) as Record<string, unknown>;
+    for (const u of Object.keys(users)) {
+      if (creators.includes(u)) {
+        return reject(
+          ruleId(spec, 'pl.creator_in_users'),
+          `users.${u} names a room creator`,
+        );
+      }
+    }
   }
 
   // 9.4: no previous m.room.power_levels event -> allow.

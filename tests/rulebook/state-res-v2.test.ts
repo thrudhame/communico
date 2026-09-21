@@ -277,7 +277,7 @@ Deno.test('state-res: fullConflictedSet — conflicted state set union auth diff
   const store = MemStore.from(events);
   const s1 = stateOf(['$t1', 'm.room.topic', '']);
   const s2 = stateOf(['$t2', 'm.room.topic', '']);
-  const fcs = fullConflictedSet([s1, s2], store);
+  const fcs = fullConflictedSet([s1, s2], store, V11);
   // both topics are conflicted state values; the difference is empty (all
   // auth chains share CREATE/JOIN_A/PL)
   assertEquals(new Set(fcs), new Set(['$t1', '$t2']));

@@ -121,13 +121,64 @@ export function authDifference(
 
 // --- S4 55-57: full conflicted set -------------------------------------------
 
+// v2.1 (v12.md:337-339): the full conflicted set additionally includes
+// the conflicted state subgraph.
 export function fullConflictedSet(
   stateSets: StateMap[],
   store: EventStore,
+  spec: RoomVersionSpec,
 ): Set<string> {
   const { conflicted } = splitUnconflicted(stateSets);
   const diff = authDifference(stateSets, store);
+  if (spec.stateResVariant === 'v2.1') {
+    return new Set([
+      ...conflicted,
+      ...conflictedStateSubgraph(conflicted, store),
+      ...diff,
+    ]);
+  }
   return new Set([...conflicted, ...diff]);
+}
+
+// --- v12.md:330-335: conflicted state subgraph --------------------------------
+
+// The union of all auth_events paths between pairs of conflicted events,
+// endpoints included. A node belongs iff some conflicted event reaches it
+// AND it reaches some conflicted event (3d — two bounded traversals, no
+// exponential path walk).
+export function conflictedStateSubgraph(
+  conflicted: string[],
+  store: EventStore,
+): Set<string> {
+  const seeds = new Set(conflicted);
+  // forward reachability from the seeds (auth_events direction), noting
+  // reverse edges for the second pass
+  const fwd = new Set<string>();
+  const childrenOf = new Map<string, string[]>();
+  const queue = [...seeds];
+  while (queue.length > 0) {
+    const id = queue.pop()!;
+    if (fwd.has(id)) continue;
+    fwd.add(id);
+    for (const a of store.get(id)?.auth_events ?? []) {
+      const kids = childrenOf.get(a) ?? [];
+      kids.push(id);
+      childrenOf.set(a, kids);
+      queue.push(a);
+    }
+  }
+  // nodes from which a conflicted node is reachable (reverse walk)
+  const reaches = new Set<string>();
+  const rqueue = [...seeds];
+  while (rqueue.length > 0) {
+    const id = rqueue.pop()!;
+    if (reaches.has(id)) continue;
+    reaches.add(id);
+    for (const kid of childrenOf.get(id) ?? []) rqueue.push(kid);
+  }
+  const out = new Set<string>();
+  for (const id of fwd) if (reaches.has(id)) out.add(id);
+  return out;
 }
 
 // --- sender power from an event's own auth_events (S4 68-69) ------------------
@@ -318,7 +369,14 @@ export function resolve(
 
   const { unconflicted, conflicted } = splitUnconflicted(stateSets);
   const difference = authDifference(stateSets, store);
-  const fullConflicted = new Set([...conflicted, ...difference]); // S4 55-57
+  // S4 55-57; v2.1 (v12.md:337-339) additionally unions the conflicted
+  // state subgraph (v12.md:330-335).
+  const fullConflicted = new Set([...conflicted, ...difference]);
+  if (spec.stateResVariant === 'v2.1') {
+    for (const id of conflictedStateSubgraph(conflicted, store)) {
+      fullConflicted.add(id);
+    }
+  }
 
   // Step 1: power events in the full conflicted set, enlarged by their
   // auth chains' members that also belong to the set; reverse-topological
@@ -335,8 +393,14 @@ export function resolve(
   }
   const sortedX = reverseTopologicalPowerOrder(x, store, spec);
 
-  // Step 2: iterative auth checks from the unconflicted map.
-  let partial = iterativeAuthChecks(unconflicted, sortedX, store, spec);
+  // Step 2: iterative auth checks from the unconflicted map — v2.1
+  // (v12.md:266-267, 425-427) starts from an EMPTY state map instead.
+  let partial = iterativeAuthChecks(
+    spec.stateResVariant === 'v2.1' ? new Map() : unconflicted,
+    sortedX,
+    store,
+    spec,
+  );
 
   // Step 3: remaining events, mainline-ordered by the partially resolved
   // state's power level.

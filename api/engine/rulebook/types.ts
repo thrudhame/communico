@@ -5,10 +5,12 @@
 // imports the package, never the reverse).
 
 // v11 Persistent Data Unit (structurally identical to api/engine/pdu.ts;
-// event_id is derived and optional until assigned).
+// event_id is derived and optional until assigned). room_id is optional:
+// a v12 m.room.create carries none (v12.md:98-101 — the room ID is the
+// create's own event id); every other event has one.
 export interface Pdu {
   type: string;
-  room_id: string;
+  room_id?: string;
   sender: string;
   content: Record<string, unknown>;
   state_key?: string;
@@ -49,11 +51,14 @@ export interface RoomVersionSpec {
   createInAuthEvents: boolean;
   // room id == the create event's id (v12.md:10, 63-72)
   roomIdFromCreateEvent: boolean;
-  // creator = the create event's sender; no `creator` field (v11.md:85-111
-  // event format; v1-11 creator-100 rule at m.room.power_levels.yaml:99-101)
-  implicitRoomCreator: boolean;
+  // creator is the create event's `content.creator` field (v1-10 —
+  // v10.md:114 requires it; v11+ derives the creator from the sender)
+  explicitCreator: boolean;
   // creators hold infinite power level (v12 — power_levels.yaml:103-105)
   creatorsHaveInfinitePower: boolean;
+  // the create event's content may carry additional_creators (v12 —
+  // v12.md:65-73, 104-106)
+  additionalCreators: boolean;
   // integers only in m.room.power_levels (v10.md:67-74, 221-228)
   enforceIntPowerLevels: boolean;
   // join_rule `knock` (v7 feature)
@@ -62,8 +67,9 @@ export interface RoomVersionSpec {
   restrictedJoinRule: boolean;
   // join_rule `knock_restricted` (v10 feature)
   knockRestrictedJoinRule: boolean;
-  // v3+ redaction handling (content/rooms/fragments/v3-handling-redactions.md)
-  updatedRedactionRules: boolean;
+  // the redaction keep-list fragment the version includes: v9-redactions
+  // (v10.md:276) or v11-redactions (v11.md / v12.md:485)
+  redactionRules: 'v9' | 'v11';
   // rule 2.5 (retroactive at v1.16): auth_events room_id must match
   // (v11.md:136-137)
   authEventsSameRoom: boolean;
