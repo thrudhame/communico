@@ -49,3 +49,16 @@ export const V12: RoomVersionSpec = {
   creatorsHaveInfinitePower: true,
   additionalCreators: true,
 };
+
+// Room version 10 (content/rooms/v10.md): the explicit creator
+// (content.creator required — v10.md:114) and the v9-redactions
+// keep-list (v10.md:276). Everything else as v11: create is selected
+// into auth_events (v10.md:122 note), v2 state-res (v10.md:292), all
+// join rules incl. knock_restricted (v10 feature), auth-events same-room
+// (retroactive at v1.16, plan D6).
+export const V10: RoomVersionSpec = {
+  ...V11,
+  identifier: '10',
+  explicitCreator: true,
+  redactionRules: 'v9',
+};

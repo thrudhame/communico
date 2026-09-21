@@ -1,5 +1,6 @@
 // api/engine/rulebook/index.ts — the rulebook registry (plan §3a): the
 // moved policy.ts surface. Unknown versions never get a default.
+import { v10 } from './v10.ts';
 import { v11 } from './v11.ts';
 import { v12 } from './v12.ts';
 import type { Rulebook } from './types.ts';
@@ -13,10 +14,12 @@ export type {
   StateMap,
   Verdict,
 } from './types.ts';
-export { V11, V12 } from './room-versions.ts';
+export { V10, V11, V12 } from './room-versions.ts';
 
-// '11' -> the real v11 rulebook; '12' -> the v12 rulebook (the v12 plan).
+// '10'/'11'/'12' -> their rulebooks (the v12 plan; the older-versions
+// plan extends the family downward from here).
 const registry = new Map<string, Rulebook>([
+  [v10.spec.identifier, v10],
   [v11.spec.identifier, v11],
   [v12.spec.identifier, v12],
 ]);

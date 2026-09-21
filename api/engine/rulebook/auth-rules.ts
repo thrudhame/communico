@@ -125,6 +125,17 @@ function rule1(
       );
     }
   }
+  if (spec.explicitCreator) {
+    // 1.4 (v10.md:114): content must carry a creator (a user-id string —
+    // the field the version derives the creator from).
+    const creator = pdu.content?.creator;
+    if (typeof creator !== 'string' || creator.length === 0) {
+      return reject(
+        ruleId(spec, 'create.creator_missing'),
+        'm.room.create without a creator property',
+      );
+    }
+  }
   // 1.4/1.5: otherwise, allow.
   return allow(ruleId(spec, 'create.allow'));
 }
@@ -442,12 +453,17 @@ function rule4(
 
   if (membership === 'join') {
     // 4.3.1 (v11.md:149-151): the only previous event is the create and
-    // the state_key is the create's sender (v1.16 wording) — allow.
+    // the state_key is the create's sender (v11+; v12.md:134-135 keeps
+    // the sender, NOT additional_creators) — content.creator for v1-10
+    // (v10.md:143).
     const createId = ctx.state.get(stateKeyOf('m.room.create', ''));
+    const firstJoiner = spec.explicitCreator
+      ? creatorsOf(createEvent, spec)[0]
+      : createEvent?.sender;
     if (
       (pdu.prev_events ?? []).length === 1 && createId !== undefined &&
       (pdu.prev_events ?? [])[0] === createId && createEvent &&
-      target === createEvent.sender
+      target === firstJoiner
     ) {
       return allow(ruleId(spec, 'member.join_create'));
     }

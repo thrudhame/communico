@@ -28,6 +28,26 @@ Deno.test('eventIdFor: deterministic', async () => {
   assertEquals(await eventIdFor(PDU, '11'), await eventIdFor({ ...PDU }, '11'));
 });
 
+// 3a: hashing tolerates an absent room_id (a v12 create carries none) —
+// the id is stable, and differs from the same content WITH a room_id.
+Deno.test('eventIdFor: absent room_id is stable and distinct (v12 create)', async () => {
+  const bare = {
+    type: 'm.room.create',
+    sender: '@dev:localhost',
+    content: { room_version: '12' },
+    prev_events: [],
+    auth_events: [],
+    origin_server_ts: 1000,
+    depth: 1,
+    hashes: { sha256: 'placeholder' },
+  };
+  const a = await eventIdFor(bare, '12');
+  const b = await eventIdFor({ ...bare }, '12');
+  assertEquals(a, b);
+  const withId = await eventIdFor({ ...bare, room_id: '!r:localhost' }, '12');
+  assertNotEquals(a, withId);
+});
+
 Deno.test('eventIdFor: redacted content does not change the ID', async () => {
   const other = await eventIdFor({
     ...PDU,
@@ -52,7 +72,7 @@ Deno.test('eventIdFor: hashes are covered (KEPT in the reference hash)', async (
 Deno.test('eventIdFor: unknown room version throws', async () => {
   let threw = false;
   try {
-    await eventIdFor(PDU, '10');
+    await eventIdFor(PDU, '99');
   } catch (e) {
     threw = String(e).includes('M_UNSUPPORTED_ROOM_VERSION');
   }
