@@ -23,10 +23,13 @@ import { canSeeEvent } from './visibility.ts';
 import { getPresence, presenceFor, setPresence } from './presence.ts';
 import type { RoomFilter } from './filters.ts';
 import {
+  accountDataMax,
   getAccountData,
   listGlobalAccountData,
+  listGlobalAccountDataSince,
   listRoomAccountData,
 } from './tenant.ts';
+import { pushStreamSeq, rulesetFor } from './pushrules.ts';
 import {
   lastTypingChange,
   sweepTyping,
@@ -40,7 +43,9 @@ import type { Pdu } from './pdu.ts';
 export interface SyncInputs {
   userId: string;
   deviceId: string | null;
-  since: { eSeq: number; pSeq: number; tSeq: number; rSeq: number } | null;
+  since:
+    | { eSeq: number; pSeq: number; tSeq: number; rSeq: number; aSeq: number }
+    | null;
   timeoutMs: number;
   filter: RoomFilter;
   fullState: boolean;
@@ -52,15 +57,16 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // The global stream maxima (next_batch) and the per-user relevant maxima
 // (the long-poll wake condition: only rows relevant to this user count).
 // Band C (D1): four streams — events, presence, typing (in-memory),
-// receipts.
+// receipts. v12 (D10): the account-data stream `a` (per-user by nature).
 interface StreamMaxes {
   eSeq: number;
   pSeq: number;
   tSeq: number;
   rSeq: number;
+  aSeq: number;
 }
 
-async function globalMaxes(): Promise<StreamMaxes> {
+async function globalMaxes(userId: string): Promise<StreamMaxes> {
   return await withDb(serverDb(), async (c) => {
     const e = await c.query('SELECT MAX(seq) AS m FROM event_index;');
     const p = await c.query('SELECT MAX(seq) AS m FROM presence;');
@@ -69,6 +75,7 @@ async function globalMaxes(): Promise<StreamMaxes> {
       pSeq: p.rows[0].m == null ? 0 : Number(p.rows[0].m),
       tSeq: typingSeq(),
       rSeq: await receiptSeq(),
+      aSeq: await accountDataMax(serverName(), localpartOf(userId)),
     };
   });
 }
@@ -104,7 +111,11 @@ async function relevantMaxes(userId: string): Promise<StreamMaxes> {
       tSeq: tMax,
     };
   });
-  return { ...base, rSeq: await receiptSeqForUser(userId) };
+  return {
+    ...base,
+    rSeq: await receiptSeqForUser(userId),
+    aSeq: await accountDataMax(serverName(), localpartOf(userId)),
+  };
 }
 
 // Users joined to a room the syncer is joined to (the presence fan-out
@@ -212,8 +223,14 @@ async function roomTimeline(
   // trimmed to empty, e.g. limit 0) → s<windowEnd>. The p/t/r parts ride
   // the global maxima, exactly as pSeq did at M4.
   const prevBatch = trimmed && returned.length > 0
-    ? formatStreamToken(returned[0].seq - 1, now.pSeq, now.tSeq, now.rSeq)
-    : formatStreamToken(end, now.pSeq, now.tSeq, now.rSeq);
+    ? formatStreamToken(
+      returned[0].seq - 1,
+      now.pSeq,
+      now.tSeq,
+      now.rSeq,
+      now.aSeq,
+    )
+    : formatStreamToken(end, now.pSeq, now.tSeq, now.rSeq, now.aSeq);
 
   // Render: visibility per event, unsigned.membership per E1.
   const events: Record<string, unknown>[] = [];
@@ -446,7 +463,8 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       const rel = await relevantMaxes(i.userId);
       if (
         rel.eSeq > i.since.eSeq || rel.pSeq > i.since.pSeq ||
-        rel.tSeq > i.since.tSeq || rel.rSeq > i.since.rSeq
+        rel.tSeq > i.since.tSeq || rel.rSeq > i.since.rSeq ||
+        rel.aSeq > i.since.aSeq
       ) break;
       if (Date.now() >= deadline) break;
       await sleep(500);
@@ -454,8 +472,14 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   }
 
   // 3. now + next_batch
-  const now = await globalMaxes();
-  const nextBatch = formatStreamToken(now.eSeq, now.pSeq, now.tSeq, now.rSeq);
+  const now = await globalMaxes(i.userId);
+  const nextBatch = formatStreamToken(
+    now.eSeq,
+    now.pSeq,
+    now.tSeq,
+    now.rSeq,
+    now.aSeq,
+  );
 
   // 4. room set + sections (by membership at now)
   const memberships = await roomsFor(i.userId);
@@ -614,16 +638,38 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     }
   }
 
-  // 11. account_data: global rows on initial sync only (M2 behaviour)
+  // 11. account_data (D10): initial sync carries every global row +
+  //     m.push_rules always; incremental carries the rows changed since
+  //     the token's _a<n> (the band-C initial-only simplification is
+  //     gone) plus m.push_rules when the push-rule stream moved.
+  //     m.push_rules is SYNTHESISED from the push_rules table, never
+  //     stored (D9).
   const accountData: Record<string, unknown>[] = [];
+  const lp = localpartOf(i.userId);
   if (i.since === null) {
+    for (const row of await listGlobalAccountData(serverName(), lp)) {
+      accountData.push({ type: row.type, content: row.content });
+    }
+    accountData.push({
+      type: 'm.push_rules',
+      content: { global: await rulesetFor(lp) },
+    });
+  } else {
     for (
-      const row of await listGlobalAccountData(
+      const row of await listGlobalAccountDataSince(
         serverName(),
-        localpartOf(i.userId),
+        lp,
+        i.since.aSeq,
       )
     ) {
       accountData.push({ type: row.type, content: row.content });
+    }
+    const pushSeq = await pushStreamSeq(lp);
+    if (pushSeq > i.since.aSeq) {
+      accountData.push({
+        type: 'm.push_rules',
+        content: { global: await rulesetFor(lp) },
+      });
     }
   }
 

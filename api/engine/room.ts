@@ -649,19 +649,25 @@ export async function eventIndexRow(
 // as _p0. Tokens are global stream positions: valid across users, and as
 // /messages?from=/to= and /members?at=.
 // Band C (D1): sync tokens are s<e>_p<p>_t<t>_r<r> — four monotone
-// streams: events, presence, typing (in-memory), receipts. Missing parts
-// parse as 0, so legacy s<e> and s<e>_p<p> tokens keep working.
+// streams: events, presence, typing (in-memory), receipts. v12 (D10):
+// a fifth, _a<a> for the account-data stream. Missing parts parse as 0,
+// so every older shape keeps working.
 export function parseStreamToken(
   raw: string | null,
-): { eSeq: number; pSeq: number; tSeq: number; rSeq: number } | null {
+):
+  | { eSeq: number; pSeq: number; tSeq: number; rSeq: number; aSeq: number }
+  | null {
   if (raw === null) return null;
-  const m = /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?$/.exec(raw);
+  const m = /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?(?:_a(\d+))?$/.exec(
+    raw,
+  );
   if (!m) return null;
   return {
     eSeq: Number(m[1]),
     pSeq: m[2] ? Number(m[2]) : 0,
     tSeq: m[3] ? Number(m[3]) : 0,
     rSeq: m[4] ? Number(m[4]) : 0,
+    aSeq: m[5] ? Number(m[5]) : 0,
   };
 }
 
@@ -670,6 +676,7 @@ export function formatStreamToken(
   pSeq: number,
   tSeq = 0,
   rSeq = 0,
+  aSeq = 0,
 ): string {
-  return `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}`;
+  return `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}_a${aSeq}`;
 }

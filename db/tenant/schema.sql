@@ -16,6 +16,7 @@
 --     rule_id text, priority bigint, actions text, conditions text,
 --     pattern text, enabled boolean, is_default boolean, seq bigint,
 --     PRIMARY KEY (localpart, scope, kind, rule_id));
+--   CREATE TABLE push_rules_stream (localpart text PRIMARY KEY, seq bigint);
 -- Dev/VM/Complement always provision fresh (demo/setup.sh --reset).
 CREATE TABLE IF NOT EXISTS tenant (
   server_name text PRIMARY KEY,
@@ -100,6 +101,13 @@ CREATE TABLE IF NOT EXISTS push_rules (
   is_default boolean NOT NULL DEFAULT FALSE,
   seq bigint,
   PRIMARY KEY (localpart, scope, kind, rule_id)
+);
+-- v12 plan (D9/D10): the push-rule stream marker. Every mutation stamps
+-- it (put/delete/enabled/actions/migrate) — it exists precisely so a
+-- delete that empties the table still moves the token's _a<n>.
+CREATE TABLE IF NOT EXISTS push_rules_stream (
+  localpart text PRIMARY KEY REFERENCES users(localpart),
+  seq bigint
 );
 -- M2: pushers (storage only; no gateway traffic until Push proper).
 -- After access_tokens: the FK reference must resolve at CREATE time

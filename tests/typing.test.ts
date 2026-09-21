@@ -69,10 +69,11 @@ Deno.test('typing: start/stop surfacing, no room_id, timeout 0 registers, no lea
   const putTyping = (body: unknown, tok = aTok, path = typingPath) =>
     call(path, { method: 'PUT', token: tok, body });
 
-  // the sync token is four streams now (D1); a legacy s<n> token parses
+  // the sync token is five streams now (D1 + D10's account-data); a
+  // legacy s<n> token parses
   assertEquals((await sync(bTok, '&since=s0')).status, 200);
   const t0 = (await sync(bTok)).body.next_batch as string;
-  assert(/^s\d+_p\d+_t\d+_r\d+$/.test(t0), t0);
+  assert(/^s\d+_p\d+_t\d+_r\d+_a\d+$/.test(t0), t0);
 
   // typing start surfaces to room members with user_ids: [alice]
   assertEquals((await putTyping({ typing: true, timeout: 10000 })).status, 200);

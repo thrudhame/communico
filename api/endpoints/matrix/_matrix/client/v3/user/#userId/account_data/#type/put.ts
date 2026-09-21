@@ -31,11 +31,23 @@ export default async function (request: PathfinderRequest, context: Context) {
       'account data content must be a JSON object',
     );
   }
+  // 3g: server-controlled types are 405 M_BAD_JSON (account-data.yaml
+  // :98-101 — "controlled by the server; it cannot be modified by
+  // clients"). m.push_rules is synthesised from the push_rules table;
+  // m.fully_read belongs to /read_markers.
+  const type = request.params.type as string;
+  if (type === 'm.push_rules' || type === 'm.fully_read') {
+    throw new MatrixError(
+      405,
+      'M_BAD_JSON',
+      `Cannot set ${type} through this API.`,
+    );
+  }
   await putAccountData(
     serverName(),
     localpartOf(caller),
     '',
-    request.params.type as string,
+    type,
     content,
   );
   return {};

@@ -30,11 +30,22 @@ export default async function (request: PathfinderRequest, context: Context) {
       'account data content must be a JSON object',
     );
   }
+  // 3g: server-controlled types are 405 M_BAD_JSON (account-data.yaml
+  // :268-271 — the room endpoint's own 405). m.fully_read belongs to
+  // /read_markers; m.push_rules is synthesised.
+  const type = request.params.type as string;
+  if (type === 'm.fully_read' || type === 'm.push_rules') {
+    throw new MatrixError(
+      405,
+      'M_BAD_JSON',
+      `Cannot set ${type} through this API.`,
+    );
+  }
   await putAccountData(
     serverName(),
     localpartOf(caller),
     request.params.roomId as string,
-    request.params.type as string,
+    type,
     content,
   );
   return {};

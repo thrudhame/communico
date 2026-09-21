@@ -917,12 +917,60 @@ export async function putAccountData(
 ): Promise<void> {
   const { dbName } = await ensureTenant(serverName);
   await withDb(dbName, async (c) => {
+    // D10: every write takes the next account_data_seq — the sync token's
+    // _a<n> moves, incremental syncs deliver the changed row, long-polls wake
     await c.query(
-      `INSERT INTO account_data (localpart, room_id, type, content)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (localpart, room_id, type) DO UPDATE SET content = $4;`,
+      `INSERT INTO account_data (localpart, room_id, type, content, seq)
+       VALUES ($1, $2, $3, $4, nextval('account_data_seq'))
+       ON CONFLICT (localpart, room_id, type) DO UPDATE SET content = $4, seq = nextval('account_data_seq');`,
       [localpart, roomId, type, JSON.stringify(content)],
     );
+  });
+}
+
+// D10: the syncer's account-data stream position (max seq over account
+// data and the push-rule stream marker — both ride account_data_seq).
+export async function accountDataMax(
+  serverName: string,
+  localpart: string,
+): Promise<number> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const a = await c.query(
+      'SELECT MAX(seq) AS m FROM account_data WHERE localpart = $1;',
+      [localpart],
+    );
+    const p = await c.query(
+      'SELECT seq AS m FROM push_rules_stream WHERE localpart = $1;',
+      [localpart],
+    );
+    return Math.max(
+      a.rows[0].m == null ? 0 : Number(a.rows[0].m),
+      p.rows.length === 0 || p.rows[0].m == null ? 0 : Number(p.rows[0].m),
+    );
+  });
+}
+
+// D10: global account-data rows changed since a stream position
+// (incremental syncs; initial syncs use listGlobalAccountData).
+export async function listGlobalAccountDataSince(
+  serverName: string,
+  localpart: string,
+  aSeq: number,
+): Promise<{ type: string; content: unknown }[]> {
+  const { dbName } = await ensureTenant(serverName);
+  return await withDb(dbName, async (c) => {
+    const r = await c.query(
+      `SELECT type, content FROM account_data WHERE localpart = $1 AND room_id = '' AND seq > $2 ORDER BY seq ASC;`,
+      [localpart, aSeq],
+    );
+    // deno-lint-ignore no-explicit-any
+    return (r.rows as any[]).map((row) => ({
+      type: String(row.type),
+      content: typeof row.content === 'string'
+        ? JSON.parse(row.content)
+        : row.content,
+    }));
   });
 }
 

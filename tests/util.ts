@@ -39,6 +39,9 @@ export async function resetUser(localpart: string): Promise<void> {
   const lp = localpart.toLowerCase();
   await withDb(dbName, async (c) => {
     await c.query('DELETE FROM pushers WHERE localpart = $1;', [lp]);
+    // v12: push rules reference users (children first)
+    await c.query('DELETE FROM push_rules WHERE localpart = $1;', [lp]);
+    await c.query('DELETE FROM push_rules_stream WHERE localpart = $1;', [lp]);
     await c.query('DELETE FROM account_data WHERE localpart = $1;', [lp]);
     await c.query('DELETE FROM media WHERE localpart = $1;', [lp]);
     // M4: txn rows are device-scoped — clear before the devices go
