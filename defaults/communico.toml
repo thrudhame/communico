@@ -1,0 +1,29 @@
+# defaults/communico.toml — shipped, complete, never edited by an operator.
+# Overlay: config/communico.toml (partial) or COMMUNICO_* env; later wins.
+# Node names are [a-z0-9]+ (compounds are one token). Env: COMMUNICO_ + path
+# joined by _, upper-cased. Env overrides leaves only.
+
+[server]
+# Homeserver DNS name. COMMUNICO_SERVER_NAME (formerly SERVER_NAME)
+name = "localhost"
+# The one listener's port. COMMUNICO_SERVER_PORT (formerly APP_PORT)
+port = 8008
+
+[db]
+# Doltgres host. COMMUNICO_DB_HOST
+host = "127.0.0.1"
+# Doltgres port. COMMUNICO_DB_PORT
+port = 5432
+# Doltgres user. COMMUNICO_DB_USER
+user = "root"
+# Doltgres password. COMMUNICO_DB_PASS — override this in config/ or env
+pass = "secret"
+# Server-level database name. COMMUNICO_DB_NAME
+name = "postgres"
+
+[media]
+# Byte-store root (created at startup). COMMUNICO_MEDIA_ROOT
+root = "./.media"
+# Upload limit in bytes (50 MiB — Complement's upload tests).
+# COMMUNICO_MEDIA_MAXBYTES (formerly MEDIA_MAX_BYTES)
+maxbytes = 52428800

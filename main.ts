@@ -1,23 +1,31 @@
-import { appPort, missingRequired } from '#engine/config.ts';
+import { appPort, ConfigError, loadedConfig } from '#engine/config.ts';
 import { mediaRoot } from '#engine/media.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 
-// Startup validation (ruling 8): every required variable must exist; all
-// missing ones are listed in one pass, never the first only. Lazy reads
-// in the engine keep this the first thing that runs.
-const missing = missingRequired();
-if (missing.length > 0) {
-  for (const name of missing) {
-    console.error(`missing required environment variable ${name}`);
+try {
+  const loaded = loadedConfig();
+  const absDefaults = Deno.realPathSync(loaded.defaultsPath);
+  const absConfig = loaded.configPath === null
+    ? 'none'
+    : Deno.realPathSync(loaded.configPath);
+  const envOverrides = Object.entries(loaded.sources)
+    .filter(([, src]) => src === 'env')
+    .map(([node]) => node);
+  console.log(
+    `config: defaults=${absDefaults} config=${absConfig} env-overrides: ${
+      envOverrides.join(', ')
+    }`,
+  );
+} catch (e) {
+  if (e instanceof ConfigError) {
+    for (const problem of e.problems) console.error(problem);
+    Deno.exit(1);
   }
-  Deno.exit(1);
+  throw e;
 }
 
-// Media bytes live on disk under MEDIA_ROOT (plan §3.4) — the root must
-// exist before the first upload.
 await Deno.mkdir(mediaRoot(), { recursive: true });
 
-// One listener: the Matrix client-server API.
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 
 Deno.serve({ port: appPort() }, matrix);

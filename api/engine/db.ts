@@ -1,24 +1,16 @@
 import pgpkg from 'pg';
-import { required } from './config.ts';
+import { config } from './config.ts';
 
 const { Client } = pgpkg;
 
-// Lazy (memoized on first connect): importing this module in pure tests
-// never demands the environment (ruling 8 — no fallbacks in code).
-let _cfg: {
-  host: string;
-  port: number;
-  user: string;
-  password: string;
-} | undefined;
-
 function cfg() {
-  return (_cfg ??= {
-    host: required('DB_HOST'),
-    port: Number(required('DB_PORT')),
-    user: required('DB_USER'),
-    password: required('DB_PASS'),
-  });
+  const db = config().db;
+  return {
+    host: db.host,
+    port: db.port,
+    user: db.user,
+    password: db.pass,
+  };
 }
 
 export function ident(s: string): string {
@@ -39,11 +31,9 @@ export async function withDb<T>(
   }
 }
 
-let _serverDb: string | undefined;
-
 /** The server-level database (room registry, event index). */
 export function serverDb(): string {
-  return (_serverDb ??= required('DB_NAME'));
+  return config().db.name;
 }
 
 export async function branchNameFor(eventId: string): Promise<string> {

@@ -1,8 +1,8 @@
 // api/engine/config.ts — TOML defaults, config overlay, COMMUNICO_* env.
 // No in-code fallbacks (ruling 8): a missing or mistyped leaf is a
-// startup error listing every problem, never a silent default. Reads are
-// lazy so importing engine modules in pure tests never touches the
-// filesystem.
+// startup error listing every problem, never a silent default. loadConfig
+// is pure given its paths; config() loads lazily from conventional paths
+// + Deno.env on first use.
 import { parse } from '@std/toml';
 import { join } from '@std/path';
 import {
@@ -319,42 +319,64 @@ export function formatShellExports(config: Config): string {
   return lines.join('\n') + '\n';
 }
 
-export const REQUIRED_VARS: readonly string[] = [
-  'APP_PORT',
-  'SERVER_NAME',
-  'DB_HOST',
-  'DB_PORT',
-  'DB_USER',
-  'DB_PASS',
-  'DB_NAME',
-  'MEDIA_ROOT',
-  'MEDIA_MAX_BYTES',
-];
+export type LoadedConfig = {
+  config: Config;
+  sources: Record<string, Source>;
+  defaultsPath: string;
+  configPath: string | null;
+};
 
-/** The names that must be in the environment; empty = all present. */
-export function missingRequired(): string[] {
-  return REQUIRED_VARS.filter((n) => Deno.env.get(n) === undefined);
+let _loaded: LoadedConfig | undefined;
+let _base: Config | undefined;
+
+function ensureLoaded(): LoadedConfig {
+  if (_loaded) return _loaded;
+  const env = Deno.env.toObject();
+  const { defaultsPath, configPath } = resolvePaths(Deno.cwd(), env);
+  const { config, sources } = loadConfig({ defaultsPath, configPath, env });
+  _base = structuredClone(config);
+  _loaded = { config, sources, defaultsPath, configPath };
+  return _loaded;
 }
 
-/** Read a required variable, or throw naming it. */
-export function required(name: string): string {
-  const value = Deno.env.get(name);
-  if (value === undefined) {
-    throw new Error(`missing required environment variable ${name}`);
+/** Memoized accessor. Pure tests that only call loadConfig never hit this. */
+export function config(): Config {
+  return ensureLoaded().config;
+}
+
+export function loadedConfig(): LoadedConfig {
+  return ensureLoaded();
+}
+
+export type ConfigPatch = {
+  server?: { name?: string; port?: number };
+  db?: {
+    host?: string;
+    port?: number;
+    user?: string;
+    pass?: string;
+    name?: string;
+  };
+  media?: { root?: string; maxbytes?: number };
+};
+
+/** Deep-merge over the originally loaded config. Legal under tests/ only. */
+export function setConfigForTests(partial: ConfigPatch): void {
+  ensureLoaded();
+  const merged = structuredClone(_base) as Record<string, unknown>;
+  for (const [path] of leaves(SCHEMA)) {
+    const value = getByPath(partial, path);
+    if (value !== undefined) setByPath(merged, path, value);
   }
-  return value;
+  _loaded = { ..._loaded!, config: merged as Config };
 }
-
-let _serverName: string | undefined;
 
 /** The homeserver's DNS name (single source since M0). */
 export function serverName(): string {
-  return (_serverName ??= required('SERVER_NAME'));
+  return config().server.name;
 }
-
-let _appPort: number | undefined;
 
 /** The one listener's port. */
 export function appPort(): number {
-  return (_appPort ??= Number(required('APP_PORT')));
+  return config().server.port;
 }

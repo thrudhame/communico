@@ -2,16 +2,15 @@
 // byte-equality, verbatim content type, async create/put/409, pending→504,
 // no-token v1 download → 401, over-limit → 413, foreign server → 404, and
 // the M3 config number. In-process pathfinder against live doltgres; the
-// bytes land in a per-run temp MEDIA_ROOT (set before the first
-// mediaRoot() call — it memoizes) with a tiny limit so the 413 is cheap.
+// bytes land in a per-run temp media root (setConfigForTests before the
+// first mediaRoot() call) with a tiny limit so the 413 is cheap.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { serverName } from '#engine/config.ts';
+import { serverName, setConfigForTests } from '#engine/config.ts';
 import { registerTestUser } from './util.ts';
 
 const MEDIA_DIR = await Deno.makeTempDir();
-Deno.env.set('MEDIA_ROOT', MEDIA_DIR);
-Deno.env.set('MEDIA_MAX_BYTES', '64');
+setConfigForTests({ media: { root: MEDIA_DIR, maxbytes: 64 } });
 
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 const SN = serverName();

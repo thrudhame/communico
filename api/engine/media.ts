@@ -2,20 +2,18 @@
 // under MEDIA_ROOT, metadata in the tenant DB (media table). One source
 // for media-id minting, mxc sanitisation, upload streaming, and the
 // download headers. Spec target: Matrix v1.16 (amendment-1).
-import { required, serverName } from './config.ts';
+import { config, serverName } from './config.ts';
 import { getMedia } from './tenant.ts';
 import { MatrixError } from './matrix-error.ts';
 
-let _mediaRoot: string | undefined;
-
-/** The media-byte root directory (memoized; created at startup). */
+/** The media-byte root directory (created at startup). */
 export function mediaRoot(): string {
-  return (_mediaRoot ??= required('MEDIA_ROOT'));
+  return config().media.root;
 }
 
 /** The upload limit in bytes (advertised as `m.upload.size`). */
 export function mediaMaxBytes(): number {
-  return Number(required('MEDIA_MAX_BYTES'));
+  return config().media.maxbytes;
 }
 
 /** A new media id: 24 base64url chars from 18 random bytes (plan §3.4). */

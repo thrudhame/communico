@@ -11,7 +11,7 @@
     "fmt": "deno fmt",
     "dev": "deno run --env --allow-net --allow-env --allow-read --allow-write --watch main.ts",
     "start": "deno --env --allow-net --allow-env --allow-read --allow-write main.ts",
-    "setup": "deno --env --allow-net --allow-env setup.ts",
+    "setup": "deno --env --allow-net --allow-env --allow-read setup.ts",
     "test": "deno test --env --allow-net --allow-env --allow-read --allow-write --allow-run tests/*.ts tests/rulebook/*.ts",
     "db-init": "deno run --env --allow-net --allow-env --allow-read db/init.ts",
     "db-start": "doltgres --config /etc/doltgres/servercfg.d/config.yaml",

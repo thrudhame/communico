@@ -4,6 +4,8 @@
 /.env
 /.envrc
 /.media/
+# Operator overlay — the folder is tracked (config/.gitkeep); the TOML is not
+config/*.toml
 # Complement run artifacts (regenerable; BASELINE.md is the record)
 complement/baseline.jsonl
 complement/work-*

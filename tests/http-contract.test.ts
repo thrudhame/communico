@@ -11,7 +11,7 @@
 // register a user against live doltgres to get a real token.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { serverName } from '#engine/config.ts';
+import { serverName, setConfigForTests } from '#engine/config.ts';
 import { registerTestUser } from './util.ts';
 
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
@@ -322,10 +322,7 @@ Deno.test('thrown 404 keeps its own body through the page; a miss stays M_UNRECO
 
 Deno.test('thrown 413 keeps M_TOO_LARGE through the page (not the fixed fallback)', async () => {
   const dir = await Deno.makeTempDir();
-  const prevRoot = Deno.env.get('MEDIA_ROOT');
-  const prevMax = Deno.env.get('MEDIA_MAX_BYTES');
-  Deno.env.set('MEDIA_ROOT', dir);
-  Deno.env.set('MEDIA_MAX_BYTES', '8');
+  setConfigForTests({ media: { root: dir, maxbytes: 8 } });
   try {
     const u = await registerTestUser('hc413', 'pw-hc413');
     const res = await matrix(
@@ -344,10 +341,7 @@ Deno.test('thrown 413 keeps M_TOO_LARGE through the page (not the fixed fallback
       error: 'Upload exceeds the server limit',
     });
   } finally {
-    if (prevRoot === undefined) Deno.env.delete('MEDIA_ROOT');
-    else Deno.env.set('MEDIA_ROOT', prevRoot);
-    if (prevMax === undefined) Deno.env.delete('MEDIA_MAX_BYTES');
-    else Deno.env.set('MEDIA_MAX_BYTES', prevMax);
+    setConfigForTests({});
   }
 });
 

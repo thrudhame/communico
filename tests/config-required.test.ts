@@ -1,38 +1,54 @@
-// tests/config-required.test.ts — pins ruling 8 the same way
-// env-precedence pins ruling 3: a missing variable is a startup error that
-// lists EVERY missing name in one pass (never a silent default), and with
-// all nine set the server binds APP_PORT and answers the Matrix surface.
+// tests/config-required.test.ts — a defaults file missing a leaf and
+// mistyped on another lists EVERY problem in one pass (never a silent
+// default); with a complete tree the server binds COMMUNICO_SERVER_PORT
+// and answers the Matrix surface.
 import { assert, assertEquals } from '@std/assert';
+import { dirname } from '@std/path';
 
 const DENO = Deno.execPath();
-const REQUIRED = [
-  'APP_PORT',
-  'SERVER_NAME',
-  'DB_HOST',
-  'DB_PORT',
-  'DB_USER',
-  'DB_PASS',
-  'DB_NAME',
-  'MEDIA_ROOT',
-  'MEDIA_MAX_BYTES',
-];
+const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 
-const BASE_ENV: Record<string, string> = {
-  PATH: Deno.env.get('PATH') ?? '/usr/bin',
-};
+const pathEnv = Deno.env.get('PATH');
+if (pathEnv === undefined) throw new Error('PATH is required to spawn deno');
+const BASE_ENV: Record<string, string> = { PATH: pathEnv };
 
-Deno.test('empty env → exit 1, stderr names all nine required variables', async () => {
-  const emptyEnvFile = await Deno.makeTempDir() + '/empty.env';
-  await Deno.writeTextFile(emptyEnvFile, '');
-  // Deno auto-loads .env from cwd — the empty --env-file makes the
-  // environment genuinely empty (env-file loses to the process env, which
-  // carries nothing here).
+async function writeTree(files: Record<string, string>): Promise<string> {
+  const dir = await Deno.makeTempDir();
+  for (const [rel, body] of Object.entries(files)) {
+    const path = `${dir}/${rel}`;
+    await Deno.mkdir(dirname(path), { recursive: true });
+    await Deno.writeTextFile(path, body);
+  }
+  return dir;
+}
+
+Deno.test('incomplete defaults → exit 1, stderr lists every problem', async () => {
+  const dir = await writeTree({
+    'defaults/communico.toml': `[server]
+name = "localhost"
+port = "x"
+
+[db]
+host = "127.0.0.1"
+port = 5432
+user = "root"
+pass = "secret"
+name = "postgres"
+
+[media]
+root = "./.media"
+`,
+  });
   const cmd = new Deno.Command(DENO, {
-    args: ['run', '--allow-env', '--allow-read', '--allow-net', 'main.ts'],
-    cwd: new URL('..', import.meta.url).pathname,
-    // clearEnv + no --env: the environment is genuinely empty (Deno.Command
-    // otherwise MERGES env into the parent's, which carries the .env values
-    // under the test task).
+    args: [
+      'run',
+      `--config=${REPO}/deno.json`,
+      '--allow-env',
+      '--allow-read',
+      '--allow-net',
+      `${REPO}/main.ts`,
+    ],
+    cwd: dir,
     clearEnv: true,
     env: BASE_ENV,
     stdout: 'piped',
@@ -41,17 +57,20 @@ Deno.test('empty env → exit 1, stderr names all nine required variables', asyn
   const out = await cmd.output();
   const stderr = new TextDecoder().decode(out.stderr);
   assertEquals(out.code, 1, `stderr: ${stderr}`);
-  for (const name of REQUIRED) {
-    assert(
-      stderr.includes(`missing required environment variable ${name}`),
-      `stderr missing ${name}: ${stderr}`,
-    );
-  }
+  assert(
+    stderr.includes('media.maxbytes') &&
+      stderr.includes('COMMUNICO_MEDIA_MAXBYTES'),
+    `stderr missing media.maxbytes: ${stderr}`,
+  );
+  assert(
+    stderr.includes('server.port') &&
+      stderr.includes('COMMUNICO_SERVER_PORT') &&
+      stderr.includes('expected int'),
+    `stderr missing server.port: ${stderr}`,
+  );
 });
 
-Deno.test('all nine set → binds APP_PORT and answers GET /_matrix/client/versions', async () => {
-  // Ephemeral-ish port: bind to prove it's free, release, then hand it to
-  // the server (bind-then-use is racy — retry across candidates).
+Deno.test('complete tree → binds COMMUNICO_SERVER_PORT and answers GET /_matrix/client/versions', async () => {
   let port = 0;
   for (let i = 0; i < 5 && port === 0; i++) {
     const candidate = 30000 + Math.floor(Math.random() * 20000);
@@ -63,8 +82,6 @@ Deno.test('all nine set → binds APP_PORT and answers GET /_matrix/client/versi
     listener?.close();
   }
   assert(port > 0, 'no free port found');
-  // main.ts mkdirs MEDIA_ROOT at startup — a temp dir keeps the repo clean
-  // (and the spawn needs --allow-write for it).
   const mediaRoot = await Deno.makeTempDir();
   const cmd = new Deno.Command(DENO, {
     args: [
@@ -75,18 +92,11 @@ Deno.test('all nine set → binds APP_PORT and answers GET /_matrix/client/versi
       '--allow-write',
       'main.ts',
     ],
-    cwd: new URL('..', import.meta.url).pathname,
+    cwd: REPO,
     env: {
       ...BASE_ENV,
-      APP_PORT: String(port),
-      SERVER_NAME: 'localhost',
-      DB_HOST: '127.0.0.1',
-      DB_PORT: '5432',
-      DB_USER: 'root',
-      DB_PASS: 'secret',
-      DB_NAME: 'postgres',
-      MEDIA_ROOT: mediaRoot,
-      MEDIA_MAX_BYTES: '52428800',
+      COMMUNICO_SERVER_PORT: String(port),
+      COMMUNICO_MEDIA_ROOT: mediaRoot,
     },
     stdout: 'piped',
     stderr: 'piped',
@@ -100,8 +110,6 @@ Deno.test('all nine set → binds APP_PORT and answers GET /_matrix/client/versi
     const deadline = Date.now() + 15_000;
     let answered = false;
     while (Date.now() < deadline) {
-      // Early-exit detection: if the server died (port race, crash) the
-      // assert below names it instead of spinning out the deadline.
       await Promise.race([new Promise((r) => setTimeout(r, 250)), exitedP]);
       if (exited !== null) break;
       try {
@@ -122,7 +130,7 @@ Deno.test('all nine set → binds APP_PORT and answers GET /_matrix/client/versi
         (exited as unknown as { code: number })?.code
       })`,
     );
-    assert(answered, 'server did not answer /versions with all config set');
+    assert(answered, 'server did not answer /versions with complete config');
   } finally {
     try {
       child.kill('SIGTERM');
