@@ -1,10 +1,10 @@
-# Complement baseline — 2026-09-21T13:44:45.758Z
+# Complement baseline — 2026-09-22T02:38:35.330Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
 - image: communico-complement:local (commit 05baa9d)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 79
+- failing tests: 86
 
 ## Failing packages
 
@@ -18,8 +18,8 @@
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel
@@ -39,15 +39,20 @@
 - github.com/matrix-org/complement/tests TestFederationThumbnail
 - github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryLocal
 - github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryFederation
+- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin/Join_should_succeed_when_joined_to_allowed_room
+- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin/Join_should_fail_when_left_allowed_room
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_succeed_when_joined_to_allowed_room
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_fail_when_left_allowed_room
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_succeed_when_invited
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinLocalUser
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
-- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
-- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
+- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
+- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/query_whole_graph
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/max_depth
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/suggested_only
@@ -56,6 +61,8 @@
 - github.com/matrix-org/complement/tests TestClientSpacesSummary
 - github.com/matrix-org/complement/tests TestClientSpacesSummaryJoinRules
 - github.com/matrix-org/complement/tests TestFederatedClientSpaces
+- github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs/restricted_room_includes_allowed_room_ids
+- github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs/non-restricted_room_omits_allowed_room_ids
 - github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs
 - github.com/matrix-org/complement/tests TestJumpToDateEndpoint
 - github.com/matrix-org/complement/tests TestUnknownEndpoints/Server-server_endpoints
@@ -68,10 +75,10 @@
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_results_with_recent_ordering_do_not_include_redacted_events
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_results_with_rank_ordering_do_not_include_redacted_events
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_get_context_around_search_results
-- github.com/matrix-org/complement/tests TestComplementCanCreateValidV12Rooms
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_back-paginate_search_results
 - github.com/matrix-org/complement/tests/csapi TestSearch/parallel
 - github.com/matrix-org/complement/tests/csapi TestSearch
+- github.com/matrix-org/complement/tests TestComplementCanCreateValidV12Rooms
 - github.com/matrix-org/complement/tests TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent
 - github.com/matrix-org/complement/tests TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent
 - github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_starts_from_empty_set

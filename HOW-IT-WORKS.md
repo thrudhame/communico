@@ -237,16 +237,27 @@ state.
 
 ### 3.2 Room versions, upgrades, and push rules
 
-- **Room versions live in the registry** (`10`, `11`, `12`; default
-  `11`). Rule numbering is per version — `ruleId(spec, key)` maps a
-  stable key to the printed number (v12 inserts 1.4 and 2, shifting
-  v11's 2–10 to 3–11); the keep-list for redactions is per version too
-  (v9's list at v10, v11's at v11/v12). v12's create carries no
+- **Room versions live in the registry** (`3`–`12`; default `11`).
+  Every version is one rulebook behind the policy slot, driven by the
+  flags on its `RoomVersionSpec` — never a version literal. Rule
+  numbering is per version — `ruleId(spec, key)` maps a stable key to
+  the printed number, selected by `spec.ruleNumbering` (seven
+  numberings: v1–5, v6, v7, v8–9, v10, v11, v12); the redaction
+  keep-list is per version too (`redactionRules`: v1/v6/v8/v9/v11).
+  The legacy switches: the aliases auth rule (v1–5), stringy power
+  levels (≤9), `notifications` in the PL rules (6+), strict canonical
+  JSON and the 2⁵³ depth limit (6+), signing-key validity (5+;
+  recorded, the effect is federation — M5), the v3 standard-base64
+  event-id alphabet, top-level `redacts` (≤10), knock (7+),
+  restricted (8+), knock_restricted (v10). v12's create carries no
   `room_id` (the room id is the create's own event id), creators
   (sender + `additional_creators`) hold infinite power and are barred
   from `users` (rule 10.4 → 400), and state resolution is v2.1 (empty
-  seed + the conflicted state subgraph). v10 keeps the explicit
-  `content.creator`. `/capabilities` advertises the registry verbatim.
+  seed + the conflicted state subgraph). v10 and older keep the
+  explicit `content.creator`. `/capabilities` advertises the registry
+  verbatim. Group B (v1/v2 — opaque event ids, pair-format
+  auth/prev events, state resolution v1) is deferred: only if a need
+  appears, after M5.
 - **Upgrades** (`POST /rooms/:id/upgrade`): the upgrader must clear
   `m.room.tombstone`'s required level; the new create carries
   `predecessor` (no `event_id` for v12), the old `type`, the version,
@@ -291,8 +302,7 @@ container restarts.
 
 ## 6. What's stubbed (roadmap)
 
-Room version 12 registration behind the same rulebook slot (the
-rulebook already carries its switches); band C (typing, receipts,
+Band C (typing, receipts,
 room directory/aliases/publicRooms, forget, relations/threads,
 search/upgrade, user_directory, profile→member propagation, ignored
 users, url_preview); S2S federation (M5); relay `bind/forward`;
