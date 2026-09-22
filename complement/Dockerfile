@@ -25,14 +25,13 @@ COPY doltgres/config /etc/doltgres/servercfg.d
 COPY deno.json deno.lock main.ts setup.ts ./
 COPY api ./api
 COPY db ./db
+COPY defaults ./defaults
 COPY complement ./complement
 RUN chmod +x /app/complement/entrypoint.sh
-# cache remote deps at build time (no network needed at container start)
-# The image's env contract (ruling 8 — infra keeps its numbers): the app
-# reads every variable from the environment; Complement overrides SERVER_NAME
-# per deployment at container start.
-ENV APP_PORT=8008 SERVER_NAME=localhost DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=root DB_PASS=secret DB_NAME=postgres MEDIA_ROOT=/data/media MEDIA_MAX_BYTES=52428800
-RUN mkdir -p /data/media
+RUN mkdir -p /app/config /app/.media
+# TLS paths are Complement-image-only (not config leaves). Set explicitly
+# so tls-stub.ts has no in-code fallbacks.
+ENV TLS_CERT_FILE=/run/complement/server.crt TLS_KEY_FILE=/run/complement/server.key
 RUN deno cache main.ts db/init.ts complement/tls-stub.ts
 
 EXPOSE 8008 8448

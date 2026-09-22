@@ -3,8 +3,14 @@
 // 404 M_UNRECOGNIZED for every path (federation is M5; the handshake must
 // succeed so Complement fails fast on 404s, not on timeouts).
 // Env: TLS_CERT_FILE, TLS_KEY_FILE (written by entrypoint.sh).
-const certFile = Deno.env.get('TLS_CERT_FILE') ?? '/run/complement/server.crt';
-const keyFile = Deno.env.get('TLS_KEY_FILE') ?? '/run/complement/server.key';
+const certFile = Deno.env.get('TLS_CERT_FILE');
+if (certFile === undefined) {
+  throw new Error('missing required environment variable TLS_CERT_FILE');
+}
+const keyFile = Deno.env.get('TLS_KEY_FILE');
+if (keyFile === undefined) {
+  throw new Error('missing required environment variable TLS_KEY_FILE');
+}
 
 const cert = await Deno.readTextFile(certFile);
 const key = await Deno.readTextFile(keyFile);

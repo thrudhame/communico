@@ -6,8 +6,9 @@
 # doltgres reuses its data dir, the cert is reissued, inits are no-ops).
 set -euo pipefail
 
-SERVER_NAME="${SERVER_NAME:-localhost}"
 APP_DIR="/app"
+# Complement's contract, not ours: Complement sets SERVER_NAME per homeserver.
+export COMMUNICO_SERVER_NAME="$SERVER_NAME"
 
 echo ">> entrypoint: SERVER_NAME=$SERVER_NAME"
 
@@ -32,7 +33,6 @@ done
 # the container environment is the whole config here.
 echo ">> db-init"
 cd "$APP_DIR"
-export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=root DB_PASS=secret DB_NAME=postgres
 deno run --allow-net --allow-env --allow-read db/init.ts
 
 CERT_DIR="/run/complement"
@@ -64,5 +64,4 @@ TLS_CERT_FILE="$CERT_DIR/server.crt" TLS_KEY_FILE="$CERT_DIR/server.key" \
   deno run --allow-net --allow-read --allow-env "$APP_DIR/complement/tls-stub.ts" \
   > /tmp/tls-stub.log 2>&1 &
 echo ">> starting communico :8008"
-export SERVER_NAME DB_HOST DB_PORT DB_USER DB_PASS DB_NAME
 exec deno run --allow-net --allow-env --allow-read --allow-write "$APP_DIR/main.ts"

@@ -1,3 +1,6 @@
+# Interpolation reads COMMUNICO_* from the devcontainer's .env (copy
+# .env.example). No compose default fallbacks — a missing value fails
+# loud; the shipped defaults/communico.toml is the app's source of truth.
 services:
   communico:
     env_file: ../.env
@@ -6,13 +9,13 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      DOLTGRES_USER: ${DB_USER}
-      DOLTGRES_PASSWORD: ${DB_PASS}
-      DOLTGRES_DB: ${DB_NAME}
+      DOLTGRES_USER: ${COMMUNICO_DB_USER}
+      DOLTGRES_PASSWORD: ${COMMUNICO_DB_PASS}
+      DOLTGRES_DB: ${COMMUNICO_DB_NAME}
       DOLTGRES_DATA_DIR: ${DB_DATA_DIR}
     ports:
-      - '${DB_PORT:-5432}:5432'
-      - '${APP_PORT:-8008}:8008'
+      - '${COMMUNICO_DB_PORT}:5432'
+      - '${COMMUNICO_SERVER_PORT}:8008'
     volumes:
       - ../doltgres/config:/etc/doltgres/servercfg.d
       - ..:/workspace:cached
