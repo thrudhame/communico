@@ -203,3 +203,78 @@ export async function resolveFilter(
   }
   return roomFilterOf(doc);
 }
+
+// RoomEventFilter (room_event_filter.yaml + event_filter.yaml at v1.16)
+// as applied to a single event. rooms/not_rooms are a room-scope concern
+// (search D3); this predicate covers types/senders/contains_url.
+export interface RoomEventFilter {
+  limit?: number;
+  types?: string[];
+  not_types?: string[];
+  senders?: string[];
+  not_senders?: string[];
+  rooms?: string[];
+  not_rooms?: string[];
+  contains_url?: boolean;
+}
+
+export function roomEventFilterOf(raw: unknown): RoomEventFilter {
+  const out: RoomEventFilter = {};
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  const r = raw as Record<string, unknown>;
+  if (
+    typeof r.limit === 'number' && Number.isInteger(r.limit) && r.limit > 0
+  ) {
+    out.limit = r.limit;
+  }
+  const strList = (v: unknown): string[] | undefined =>
+    Array.isArray(v) && v.every((e) => typeof e === 'string')
+      ? v as string[]
+      : undefined;
+  const types = strList(r.types);
+  if (types) out.types = types;
+  const notTypes = strList(r.not_types);
+  if (notTypes) out.not_types = notTypes;
+  const senders = strList(r.senders);
+  if (senders) out.senders = senders;
+  const notSenders = strList(r.not_senders);
+  if (notSenders) out.not_senders = notSenders;
+  const rooms = strList(r.rooms);
+  if (rooms) out.rooms = rooms;
+  const notRooms = strList(r.not_rooms);
+  if (notRooms) out.not_rooms = notRooms;
+  if (typeof r.contains_url === 'boolean') out.contains_url = r.contains_url;
+  return out;
+}
+
+export function eventMatchesRoomEventFilter(
+  _row: unknown,
+  pdu: { type: string; sender: string; content?: Record<string, unknown> },
+  filter: RoomEventFilter,
+): boolean {
+  if (filter.types !== undefined && !filter.types.includes(pdu.type)) {
+    return false;
+  }
+  if (
+    filter.not_types !== undefined && filter.not_types.includes(pdu.type)
+  ) {
+    return false;
+  }
+  if (
+    filter.senders !== undefined && !filter.senders.includes(pdu.sender)
+  ) {
+    return false;
+  }
+  if (
+    filter.not_senders !== undefined &&
+    filter.not_senders.includes(pdu.sender)
+  ) {
+    return false;
+  }
+  if (filter.contains_url !== undefined) {
+    const hasUrl =
+      typeof ((pdu.content ?? {}) as Record<string, unknown>).url === 'string';
+    if (hasUrl !== filter.contains_url) return false;
+  }
+  return true;
+}
