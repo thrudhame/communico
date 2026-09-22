@@ -7,9 +7,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-# the demo reads the dev environment rather than repeating it (.env.example
-# documents the keys; the real environment wins over the file)
-set -a; . ./.env; set +a
+eval "$(deno task -q config -- --shell)"
 CONTAINER=communico-dev
 IMAGE=communico:devcontainer
 MC_IMAGE=matrixcommander/matrix-commander
@@ -26,7 +24,7 @@ fi
 # 1. preflight
 command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-  for port in "${DB_PORT}" "${APP_PORT}"; do
+  for port in "${COMMUNICO_DB_PORT}" "${COMMUNICO_SERVER_PORT}"; do
     if ss -tln 2>/dev/null | grep -q ":${port} "; then
       echo "port ${port} is busy and $CONTAINER is not running" >&2
       exit 1
@@ -46,9 +44,8 @@ else
   echo ">> starting $CONTAINER"
   docker run -d --name "$CONTAINER" \
     --memory=8g --memory-swap=8g --pids-limit=512 --cpus=4 \
-    --env-file .env \
-    -e DOLTGRES_USER="${DB_USER}" -e DOLTGRES_PASSWORD="${DB_PASS}" -e DOLTGRES_DB="${DB_NAME}" \
-    -p "${DB_PORT}:5432" -p "${APP_PORT}:${APP_PORT}" \
+    -e DOLTGRES_USER="${COMMUNICO_DB_USER}" -e DOLTGRES_PASSWORD="${COMMUNICO_DB_PASS}" -e DOLTGRES_DB="${COMMUNICO_DB_NAME}" \
+    -p "${COMMUNICO_DB_PORT}:5432" -p "${COMMUNICO_SERVER_PORT}:${COMMUNICO_SERVER_PORT}" \
     -v "$PWD/doltgres/config:/etc/doltgres/servercfg.d" \
     -v "$PWD:/workspace" \
     "$IMAGE" sleep infinity
@@ -61,9 +58,11 @@ docker exec -d "$CONTAINER" bash -c \
 echo ">> waiting for Doltgres (30s budget)"
 for i in $(seq 1 30); do
   if docker exec "$CONTAINER" bash -c \
-    "cd /workspace && deno eval \"
+    "cd /workspace && deno eval --allow-net --allow-env --allow-read \"
       import pgpkg from 'pg';
-      const c = new pgpkg.Client({host:'127.0.0.1',port:5432,user:'root',password:'secret',database:'postgres'});
+      import { config } from '#engine/config.ts';
+      const db = config().db;
+      const c = new pgpkg.Client({host:db.host,port:db.port,user:db.user,password:db.pass,database:db.name});
       await c.connect(); await c.query('SELECT 1'); await c.end();
     \" >/dev/null 2>&1"; then
     break
@@ -75,9 +74,9 @@ done
 echo ">> starting app (A)"
 docker exec -d "$CONTAINER" bash -c \
   'cd /workspace && exec deno task start > /tmp/app-a.log 2>&1'
-echo ">> waiting for app on :8008 (30s budget)"
+echo ">> waiting for app on :${COMMUNICO_SERVER_PORT} (30s budget)"
 for i in $(seq 1 30); do
-  if docker exec "$CONTAINER" curl -sf localhost:8008/ >/dev/null 2>&1; then
+  if docker exec "$CONTAINER" curl -sf "localhost:${COMMUNICO_SERVER_PORT}/" >/dev/null 2>&1; then
     break
   fi
   [[ $i == 30 ]] && { echo "app did not come up" >&2; exit 1; }
@@ -92,9 +91,11 @@ docker exec "$CONTAINER" bash -c 'cd /workspace && deno task db-init'
 #    print a stable room id (room_version is hat-facing metadata only;
 #    event identity is content-hash for every room — design §4.1.1)
 ROOM_ID="$(docker exec "$CONTAINER" bash -c \
-  "cd /workspace && deno eval \"
+  "cd /workspace && deno eval --allow-net --allow-env --allow-read \"
     import pgpkg from 'pg';
-    const c = new pgpkg.Client({host:'127.0.0.1',port:5432,user:'root',password:'secret',database:'postgres'});
+    import { config } from '#engine/config.ts';
+    const db = config().db;
+    const c = new pgpkg.Client({host:db.host,port:db.port,user:db.user,password:db.pass,database:db.name});
     await c.connect();
     const r = await c.query(\\\"SELECT room_id FROM event_index WHERE room_id IN (SELECT room_id FROM room_directory WHERE room_version='11') GROUP BY room_id ORDER BY MAX(seq) DESC LIMIT 1;\\\");
     if (r.rows.length) console.log(r.rows[0].room_id);
@@ -102,7 +103,7 @@ ROOM_ID="$(docker exec "$CONTAINER" bash -c \
   \" 2>/dev/null | tail -1" || true)"
 if [[ -z "$ROOM_ID" ]]; then
   echo ">> creating demo room"
-  ROOM_ID="$(docker exec "$CONTAINER" curl -s -X POST localhost:8008/_matrix/client/v3/createRoom \
+  ROOM_ID="$(docker exec "$CONTAINER" curl -s -X POST "localhost:${COMMUNICO_SERVER_PORT}/_matrix/client/v3/createRoom" \
     -H 'Authorization: Bearer devtoken' \
     -d '{"room_version":"11"}' \
     | grep -o '"room_id":"[^"]*"' | head -1 | cut -d'"' -f4)"
@@ -130,16 +131,16 @@ mc() {
     --store /data/store --credentials /data/credentials.json >/dev/null
 }
 echo ">> logging in alice + bob (listen + send stores each)"
-mc /tmp/mc-alice --login password --homeserver http://localhost:8008 \
+mc /tmp/mc-alice --login password --homeserver "http://localhost:${COMMUNICO_SERVER_PORT}" \
   --user-login '@alice:localhost' --password 'demo-password' \
   --device alice-listen --room-default "$ROOM_ID"
-mc /tmp/mc-alice-send --login password --homeserver http://localhost:8008 \
+mc /tmp/mc-alice-send --login password --homeserver "http://localhost:${COMMUNICO_SERVER_PORT}" \
   --user-login '@alice:localhost' --password 'demo-password' \
   --device alice-send --room-default "$ROOM_ID"
-mc /tmp/mc-bob --login password --homeserver http://localhost:8008 \
+mc /tmp/mc-bob --login password --homeserver "http://localhost:${COMMUNICO_SERVER_PORT}" \
   --user-login '@bob:localhost' --password 'demo-password' \
   --device bob-listen --room-default "$ROOM_ID"
-mc /tmp/mc-bob-send --login password --homeserver http://localhost:8008 \
+mc /tmp/mc-bob-send --login password --homeserver "http://localhost:${COMMUNICO_SERVER_PORT}" \
   --user-login '@bob:localhost' --password 'demo-password' \
   --device bob-send --room-default "$ROOM_ID"
 # F0: the demo room is invite-only (v11 genesis) and the stub enforces

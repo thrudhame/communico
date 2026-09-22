@@ -10,6 +10,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+eval "$(deno task -q config -- --shell)"
 COMPLEMENT_SRC="${COMPLEMENT_SRC:-$HOME/Sources/matrix-org-complement}"
 IMAGE="${COMPLEMENT_IMAGE:-communico-complement:local}"
 RUN_FILTER=""

@@ -8,6 +8,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+eval "$(deno task -q config -- --shell)"
 CONTAINER=communico-dev
 MC_IMAGE=matrixcommander/matrix-commander
 
@@ -18,9 +19,11 @@ die_unless_up() {
 
 room_id() {
   docker exec "$CONTAINER" bash -c \
-    "cd /workspace && deno eval \"
+    "cd /workspace && deno eval --allow-net --allow-env --allow-read \"
       import pgpkg from 'pg';
-      const c = new pgpkg.Client({host:Deno.env.get('DB_HOST'),port:Number(Deno.env.get('DB_PORT')),user:Deno.env.get('DB_USER'),password:Deno.env.get('DB_PASS'),database:'postgres'});
+      import { config } from '#engine/config.ts';
+      const db = config().db;
+      const c = new pgpkg.Client({host:db.host,port:db.port,user:db.user,password:db.pass,database:db.name});
       await c.connect();
       const r = await c.query(\\\"SELECT room_id FROM event_index WHERE room_id IN (SELECT room_id FROM room_directory WHERE room_version='11') GROUP BY room_id ORDER BY MAX(seq) DESC LIMIT 1;\\\");
       if (r.rows.length) console.log(r.rows[0].room_id);
@@ -56,13 +59,15 @@ TERMINAL 2 — bob sends (as many as you like):
     --store /data/store --credentials /data/credentials.json
 
 TERMINAL 3 — watch the conversation become commits (every 2 s):
-  watch -n2 "docker exec $CONTAINER bash -c 'cd /workspace && deno eval \"
+  watch -n2 "docker exec $CONTAINER bash -c 'cd /workspace && deno eval --allow-net --allow-env --allow-read \"
     import pgpkg from \\\"pg\\\";
-    const root = new pgpkg.Client({host:Deno.env.get(\\"DB_HOST\\"),port:Number(Deno.env.get(\\"DB_PORT\\")),user:Deno.env.get(\\"DB_USER\\"),password:Deno.env.get(\\"DB_PASS\\"),database:\\"postgres\\"});
+    import { config } from \\\"#engine/config.ts\\\";
+    const cfg = config().db;
+    const root = new pgpkg.Client({host:cfg.host,port:cfg.port,user:cfg.user,password:cfg.pass,database:cfg.name});
     await root.connect();
     const db = (await root.query(\\\"SELECT db_name FROM room_directory WHERE room_id=\\\\\\\"$ROOM_ID\\\\\\\"\\\")).rows[0].db_name;
     await root.end();
-    const c = new pgpkg.Client({host:Deno.env.get(\\"DB_HOST\\"),port:Number(Deno.env.get(\\"DB_PORT\\")),user:Deno.env.get(\\"DB_USER\\"),password:Deno.env.get(\\"DB_PASS\\"),database:db});
+    const c = new pgpkg.Client({host:cfg.host,port:cfg.port,user:cfg.user,password:cfg.pass,database:db});
     await c.connect();
     const xb = (await c.query(\\\"SELECT name FROM dolt.branches WHERE name LIKE \\\\\\\"x%\\\\\\\" LIMIT 1;\\\")).rows[0].name;
     await c.query(\\\"SELECT DOLT_CHECKOUT(\\\\\\\"\\\"+xb+\\\"\\\\\\\");\\\");
@@ -115,18 +120,20 @@ EOF
     # no shell-escaping games); piped into the container via stdin
     cat > /tmp/demo-watch.ts <<'TS'
 import pgpkg from 'pg';
+import { config } from '#engine/config.ts';
 const roomId = Deno.env.get('DEMO_ROOM_ID')!;
-const cfg = { host: Deno.env.get('DB_HOST')!, port: Number(Deno.env.get('DB_PORT')), user: Deno.env.get('DB_USER')!, password: Deno.env.get('DB_PASS')! };
-const root = new pgpkg.Client({ ...cfg, database: 'postgres' });
+const cfg = config().db;
+const conn = { host: cfg.host, port: cfg.port, user: cfg.user, password: cfg.pass };
+const root = new pgpkg.Client({ ...conn, database: cfg.name });
 await root.connect();
-const db = (await root.query('SELECT db_name FROM room_directory WHERE room_id = $1', [roomId])).rows[0].db_name;
+const roomDb = (await root.query('SELECT db_name FROM room_directory WHERE room_id = $1', [roomId])).rows[0].db_name;
 await root.end();
-const c = new pgpkg.Client({ ...cfg, database: db });
+const c = new pgpkg.Client({ ...conn, database: roomDb });
 await c.connect();
 const xb = (await c.query(`SELECT name FROM dolt.branches WHERE name LIKE 'x%' LIMIT 1;`)).rows[0].name;
 await c.query(`SELECT DOLT_CHECKOUT('${xb}');`);
 console.clear();
-console.log('room database ' + db + ' — dolt.log (newest first)');
+console.log('room database ' + roomDb + ' — dolt.log (newest first)');
 const rows = (await c.query('SELECT commit_hash, message FROM dolt.log LIMIT 8;')).rows;
 console.log(rows.map((r: { commit_hash: string; message: string }) =>
   '  ' + r.commit_hash.slice(0, 8) + '  ' + r.message).join('\n'));
@@ -160,7 +167,7 @@ sleep 7
 # printed every render cycle once past t≈58)
 while true; do
   docker exec -i -w /workspace -e DEMO_ROOM_ID='$ROOM_ID' -e DEMO_WATCH_T0='$T0_MS' $CONTAINER \
-    deno run --allow-net --allow-env - < /tmp/demo-watch.ts 2>/dev/null
+    deno run --allow-net --allow-env --allow-read - < /tmp/demo-watch.ts 2>/dev/null
   sleep 2
 done
 WATCH
