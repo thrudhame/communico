@@ -303,6 +303,50 @@ Deno.test('createRoom: creation_content lands minus room_version; version valida
   assertEquals(unknown.body.errcode, 'M_UNSUPPORTED_ROOM_VERSION');
 });
 
+Deno.test('createRoom: a knock initial_state join_rule in a v6 room is legal state; the knock member event rejects', async () => {
+  // The spec's auth rules never validate join_rule VALUES (the schema
+  // enum is version-agnostic — m.room.join_rules.yaml:25-30; Synapse
+  // behaves the same, event_auth.py:723-761). The value only gates
+  // member events: a knock in a v6 room rejects (knock is a v7
+  // feature).
+  const alice = await registerTestUser('cr-v6-knock', 'pw-cr-v6-knock');
+  const tok = alice.access_token!;
+  const cr = await call('/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    token: tok,
+    body: {
+      room_version: '6',
+      initial_state: [
+        {
+          type: 'm.room.join_rules',
+          state_key: '',
+          content: { join_rule: 'knock' },
+        },
+      ],
+    },
+  });
+  assertEquals(cr.status, 200);
+  const roomId = cr.body.room_id as string;
+
+  const bob = await registerTestUser('cr-v6-knocker', 'pw-cr-v6-knocker');
+  // alice (joined) sends the knock for bob — a non-joined sender never
+  // reaches the rulebook over /state (writeStateKey gates membership).
+  // v6 has no knock rule: member.knock_rule fires (v6 numbering 4.6).
+  const knock = await call(
+    `/_matrix/client/v3/rooms/${
+      encodeURIComponent(roomId)
+    }/state/m.room.member/${encodeURIComponent(bob.user_id as string)}`,
+    {
+      method: 'PUT',
+      token: tok,
+      body: { membership: 'knock' },
+    },
+  );
+  assertEquals(knock.status, 403);
+  assertEquals(knock.body.errcode, 'M_FORBIDDEN');
+  assertEquals((knock.body.error as string).includes('rule 4.6'), true);
+});
+
 Deno.test('createRoom: v10 writes content.creator; v12 omits it; capabilities list 3–12 with default 11', async () => {
   const alice = await registerTestUser('cr-v10', 'pw-cr-v10');
   const tok = alice.access_token!;
