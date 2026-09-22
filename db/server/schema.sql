@@ -24,6 +24,9 @@
 --     PRIMARY KEY (room_id, user_id, receipt_type));
 --   CREATE TABLE relations (event_id text PRIMARY KEY, relates_to text,
 --     rel_type text, room_id text, seq bigint);
+-- (search): CREATE TABLE search_index (event_id text PRIMARY KEY,
+--   room_id text NOT NULL, seq bigint NOT NULL, key text NOT NULL,
+--   sender text NOT NULL, origin_ts bigint NOT NULL, body_lower text NOT NULL);
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -118,6 +121,18 @@ CREATE TABLE IF NOT EXISTS relations (
   rel_type text,
   room_id text NOT NULL,
   seq bigint NOT NULL
+);
+-- Search (D1): one row per accepted m.room.message/name/topic event.
+-- body_lower is the indexed value, lower-cased, NUL → space. Written by
+-- ingest beside the relations insert; rejected/soft-failed events skip.
+CREATE TABLE IF NOT EXISTS search_index (
+  event_id text PRIMARY KEY,
+  room_id text NOT NULL,
+  seq bigint NOT NULL,
+  key text NOT NULL,
+  sender text NOT NULL,
+  origin_ts bigint NOT NULL,
+  body_lower text NOT NULL
 );
 -- F0 dev signing key (db-init generates once via ensureServerKey, reuses
 -- forever — never rotates; F1 moves the same key into the tenant table).

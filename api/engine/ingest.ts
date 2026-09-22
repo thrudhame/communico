@@ -99,6 +99,48 @@ function parseStoredPdu(v: unknown): Pdu {
   return v as Pdu;
 }
 
+// Indexed search text of a PDU (search.md:27-32): body/name/topic only.
+// Value is lower-cased with NUL → space (D1). null = not indexed.
+export function searchTextOf(
+  pdu: Pdu,
+): { key: string; text: string } | null {
+  const content = pdu.content ?? {};
+  let key: string | null = null;
+  let raw: string | null = null;
+  if (pdu.type === 'm.room.message' && typeof content.body === 'string') {
+    key = 'content.body';
+    raw = content.body;
+  } else if (pdu.type === 'm.room.name' && typeof content.name === 'string') {
+    key = 'content.name';
+    raw = content.name;
+  } else if (pdu.type === 'm.room.topic') {
+    raw = topicTextOf(content);
+    if (raw !== null) key = 'content.topic';
+  }
+  if (key === null || raw === null) return null;
+  return { key, text: raw.replaceAll('\u0000', ' ').toLowerCase() };
+}
+
+function topicTextOf(content: Record<string, unknown>): string | null {
+  const mTopic = content['m.topic'];
+  if (mTopic !== null && typeof mTopic === 'object' && !Array.isArray(mTopic)) {
+    const mText = (mTopic as Record<string, unknown>)['m.text'];
+    if (Array.isArray(mText)) {
+      for (const entry of mText) {
+        if (
+          entry === null || typeof entry !== 'object' || Array.isArray(entry)
+        ) continue;
+        const rec = entry as Record<string, unknown>;
+        if (typeof rec.body !== 'string') continue;
+        if (rec.mimetype === undefined || rec.mimetype === 'text/plain') {
+          return rec.body;
+        }
+      }
+    }
+  }
+  return typeof content.topic === 'string' ? content.topic : null;
+}
+
 // M3: the EventStore covers the FULL ancestry — resolution walks auth
 // chains arbitrarily deep, so every event reachable from the parent
 // commits is loaded, with its rejected flag (S4 155-164: chain-rejected
@@ -867,6 +909,25 @@ async function ingestEventLocked(
           roomId,
         ],
       );
+    }
+    // Search index (D1): accepted (not rejected, not soft-failed)
+    // message/name/topic events. seq is the event's own event_index seq.
+    if (!rejected && !softFailed) {
+      const indexed = searchTextOf(pdu);
+      if (indexed !== null) {
+        await c.query(
+          `INSERT INTO search_index (event_id, room_id, seq, key, sender, origin_ts, body_lower)
+           VALUES ($1, $2, (SELECT seq FROM event_index WHERE event_id = $1), $3, $4, $5, $6);`,
+          [
+            eventId,
+            roomId,
+            indexed.key,
+            pdu.sender,
+            pdu.origin_server_ts,
+            indexed.text,
+          ],
+        );
+      }
     }
   });
 
