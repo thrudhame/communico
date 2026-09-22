@@ -416,3 +416,11 @@ Deno.test('band C auth mix: GET /directory/room and POST /refresh answer without
   assert(typeof rotated.access_token === 'string');
   assert(typeof rotated.refresh_token === 'string');
 });
+
+Deno.test('POST /search without a token → 401', async () => {
+  const res = await matrix(
+    new Request('http://x/_matrix/client/v3/search', { method: 'POST' }),
+  );
+  assertEquals(res.status, 401);
+  assertEquals((await res.json()).errcode, 'M_MISSING_TOKEN');
+});

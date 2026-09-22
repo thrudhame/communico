@@ -1,10 +1,10 @@
-# Complement baseline — 2026-09-22T02:38:35.330Z
+# Complement baseline — 2026-09-22T09:41:34.764Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
 - image: communico-complement:local (commit 05baa9d)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 86
+- failing tests: 78
 
 ## Failing packages
 
@@ -47,8 +47,8 @@
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_succeed_when_invited
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinLocalUser
-- github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
+- github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
@@ -70,14 +70,6 @@
 - github.com/matrix-org/complement/tests TestUnknownEndpoints
 - github.com/matrix-org/complement/tests TestMSC4289PrivilegedRoomCreators/admin_with_>PL100_sorts_after_the_room_creator_for_state_resolution
 - github.com/matrix-org/complement/tests TestMSC4289PrivilegedRoomCreators
-- github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_search_for_an_event_by_body
-- github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_works_across_an_upgraded_room_and_its_predecessor
-- github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_results_with_recent_ordering_do_not_include_redacted_events
-- github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Search_results_with_rank_ordering_do_not_include_redacted_events
-- github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_get_context_around_search_results
-- github.com/matrix-org/complement/tests/csapi TestSearch/parallel/Can_back-paginate_search_results
-- github.com/matrix-org/complement/tests/csapi TestSearch/parallel
-- github.com/matrix-org/complement/tests/csapi TestSearch
 - github.com/matrix-org/complement/tests TestComplementCanCreateValidV12Rooms
 - github.com/matrix-org/complement/tests TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent
 - github.com/matrix-org/complement/tests TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent

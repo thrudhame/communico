@@ -278,6 +278,22 @@ state.
   stream now (`s<e>_p<p>_t<t>_r<r>_a<a>`): incremental syncs deliver
   changed rows, and long-polls wake on the `a` stream.
 
+### 3.3 Search
+
+- **Index.** ingest writes `search_index` for accepted (not rejected,
+  not soft-failed) `m.room.message` (`content.body`), `m.room.name`
+  (`content.name`), and `m.room.topic` (`content.topic` or the
+  `text/plain` entry of `content['m.topic']['m.text']`). The stored
+  value is lower-cased, NUL → space.
+- **Matching** is in JS: every whitespace-split, lower-cased token
+  must be a substring of `body_lower` (AND). SQL only scopes by room
+  and key.
+- **`count`** is the number of matching, visible, non-redacted rows
+  before paging.
+- **`order_by: rank`** (default) sorts by token-occurrence / word-count
+  then seq desc, and **omits `next_batch`**. **`recent`** pages on seq;
+  `next_batch` is emitted iff the page is full.
+
 ## 4. Sync (parked)
 
 The browser homeserver (communico-lite) and the native sync protocols
@@ -302,10 +318,7 @@ container restarts.
 
 ## 6. What's stubbed (roadmap)
 
-Band C (typing, receipts,
-room directory/aliases/publicRooms, forget, relations/threads,
-search/upgrade, user_directory, profile→member propagation, ignored
-users, url_preview); S2S federation (M5); relay `bind/forward`;
+Band C leftovers (url_preview); S2S federation (M5); relay `bind/forward`;
 E2EE; push delivery/rules (M2's pushers are storage-only);
 appservices; rate limiting; media thumbnails, URL previews, remote
 fetch, and retention (M2 is local store-and-serve only);
