@@ -125,8 +125,8 @@ state.
   are stored, never delivered — `data.url` is never fetched. Account
   data (global + per-room) writes/reads the BARE content object;
   missing reads are 404 `M_NOT_FOUND`.
-- **Media (M2)** — bytes on disk under `MEDIA_ROOT` (a required env
-  var, like `MEDIA_MAX_BYTES`; nine total), metadata in the tenant
+- **Media (M2)** — bytes on disk under `media.root` (`COMMUNICO_MEDIA_ROOT`;
+  `media.maxbytes` is the upload limit), metadata in the tenant
   `media` table. Uploads stream through a counting writer to
   `<id>.part` — over the limit aborts, deletes the part, and answers
   413 `M_TOO_LARGE`; success renames to the final path. Async flow:
@@ -302,12 +302,74 @@ The browser homeserver (communico-lite) and the native sync protocols
 only for them (the msync peer, the ws endpoint, the engine facade) left
 with this cleanup; the server speaks the Matrix client-server API only.
 
+## Configuration
+
+One source of truth: a TOML file. Six rulings:
+
+1. **Format: TOML** (`@std/toml`).
+2. **Layers and paths.** `defaults/communico.toml` — tracked, complete
+   (every leaf present), commented, never edited by an operator.
+   `config/communico.toml` — git-ignored, partial, the operator's
+   changes, the one folder mounted in Docker. `COMMUNICO_CONFIG=<path>` —
+   an alternative overlay when `config/` is inconvenient. Separate
+   folders so a Docker volume on `config/` never shadows the shipped
+   defaults.
+3. **Merge.** Leaf-wise, `defaults → config → env`; later wins.
+4. **Env mapping.** Prefix `COMMUNICO_`, single `_` = one level, node
+   names `[a-z0-9]+` (compounds are one token). Env overrides leaves
+   only: an env var naming a section, or an unknown node, is a startup
+   error. Examples: `COMMUNICO_SERVER_NAME` → `server.name`;
+   `COMMUNICO_MEDIA_MAXBYTES` → `media.maxbytes` (formerly
+   `MEDIA_MAX_BYTES`).
+5. **Types are strict.** Booleans `true`/`false` only; integers must
+   parse whole; lists comma-separated; anything else → startup error
+   naming the variable. Missing leaf, unknown leaf (in any layer),
+   mis-typed value → startup fails **listing every problem at once**,
+   each with node path and env name.
+6. **No defaults in code.** The shipped defaults file _is_ the explicit
+   statement. `.env` loading stays Deno's `--env`; `.env.example` only
+   demonstrates the env syntax.
+
+The tree (today's nine leaves):
+
+```toml
+[server]
+name = "localhost"        # COMMUNICO_SERVER_NAME   (was SERVER_NAME)
+port = 8008               # COMMUNICO_SERVER_PORT   (was APP_PORT)
+
+[db]
+host = "127.0.0.1"        # COMMUNICO_DB_HOST
+port = 5432               # COMMUNICO_DB_PORT
+user = "root"             # COMMUNICO_DB_USER
+pass = "secret"           # COMMUNICO_DB_PASS
+name = "postgres"         # COMMUNICO_DB_NAME
+
+[media]
+root = "./.media"         # COMMUNICO_MEDIA_ROOT
+maxbytes = 52428800       # COMMUNICO_MEDIA_MAXBYTES (was MEDIA_MAX_BYTES)
+```
+
+Startup failure shape (stderr, then `exit 1`; no partial start):
+
+```
+config: media.maxbytes (COMMUNICO_MEDIA_MAXBYTES): missing — add it to defaults/communico.toml
+config: server.port (COMMUNICO_SERVER_PORT): expected int, got "x" (from env)
+config: COMMUNICO_MEDIA: names a section, not a value
+config: config/communico.toml: unknown node media.limit
+```
+
+Docker: `defaults/` is copied into the image; `config/` is an empty dir
+so `-v host:/app/config` overlays without hiding defaults.
+`COMMUNICO_CONFIG` is the alternative for `/etc/communico/communico.toml`
+layouts. Complement sets `SERVER_NAME`; the image entrypoint maps it to
+`COMMUNICO_SERVER_NAME` (Complement's contract, not ours).
+
 ## 5. Conformance (`complement/`)
 
 Complement is the compass, not the target: one image (Doltgres +
 communico, `tini`), `:8008` plain HTTP + `:8448` TLS (cert signed by
 Complement's mounted CA, 404 for every path — federation is M5),
-`SERVER_NAME` from env, self-managed storage, idempotent inits. The
+`COMMUNICO_SERVER_NAME` from Complement's `SERVER_NAME`, self-managed storage, idempotent inits. The
 **blacklist** has two sections — principled/permanent (3PID issuance,
 history surgery, `/_synapse/*`, unstable MSCs) and scheduled (E2EE,
 push, federation/M5, rate limits/M2) — applied as

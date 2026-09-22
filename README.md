@@ -13,8 +13,9 @@ architecture; the evidence log lives in
 
 ## Quickstart (demo)
 
-Prerequisites: Docker only. First run: `cp .env.example .env` (the real
-environment wins over that file; container images take theirs from ENV).
+Prerequisites: Docker only. Runs on the shipped `defaults/communico.toml`.
+To change something, create `config/communico.toml` with just the leaves
+you want, or set `COMMUNICO_*` (see `.env.example` for the env syntax).
 
 ```bash
 bash demo/setup.sh --reset   # boots Doltgres+server, registers users, creates the room
@@ -51,12 +52,12 @@ Image contract, blacklist philosophy, and the red number to beat:
 Done: v11 PDU engine with refusing stub resolver, Complement harness
 with red baseline, tenant identity (argon2id UIA registration), the
 HTTP layer on pathfinder 0.2.0 (M1) — two roots collapsed to the single
-Matrix client-server listener on `APP_PORT` — and the M2 account
+Matrix client-server listener on `server.port` — and the M2 account
 surface + media: devices, profiles, password change and deactivation
 over a shared UIA helper, pushers (stored, never delivered), account
 data, and the content repository (upload, async create/PUT,
 authenticated + legacy download, config; bytes on disk under
-`MEDIA_ROOT`, metadata in the tenant DB). Deliberately stubbed: real
+`media.root`, metadata in the tenant DB). Deliberately stubbed: real
 state resolution (M3), server-to-server federation (M5, `:8448` serves
 TLS + 404 today), E2EE, push delivery/rules, appservices, rate
 limiting, media thumbnails/previews/remote fetch/retention. The legacy
