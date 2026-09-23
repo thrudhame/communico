@@ -3,7 +3,7 @@
 // HTTPS: Deno.connect to the IP, Deno.startTls({ hostname }) so SNI and
 // cert verification use the name, not the address. Never fetch(url) by
 // hostname. Max 5 redirects; 10 s per hop; size cap streamed.
-import { MatrixError } from '../matrix-error.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import { type Cidr, cidrContains, parseCidr, parseIp } from './cidr.ts';
 
 export type GuardOpts = {
