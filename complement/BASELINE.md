@@ -1,10 +1,10 @@
-# Complement baseline — 2026-09-22T09:41:34.764Z
+# Complement baseline — 2026-09-23T01:48:48.309Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit 05baa9d)
+- image: communico-complement:local (commit 7dda306)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 78
+- failing tests: 76
 
 ## Failing packages
 
@@ -14,8 +14,8 @@
 ## Failing tests (red to beat)
 
 - github.com/matrix-org/complement/tests TestIsDirectFlagFederation
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
@@ -47,8 +47,8 @@
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_succeed_when_invited
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinLocalUser
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
@@ -72,7 +72,6 @@
 - github.com/matrix-org/complement/tests TestMSC4289PrivilegedRoomCreators
 - github.com/matrix-org/complement/tests TestComplementCanCreateValidV12Rooms
 - github.com/matrix-org/complement/tests TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent
-- github.com/matrix-org/complement/tests TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent
 - github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_starts_from_empty_set
 - github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
 - github.com/matrix-org/complement/tests TestMSC4311FullCreateEventOnStrippedState
@@ -82,12 +81,11 @@
 - github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation/Visible_shared_history_after_re-joining_room_(backfill)/`messagesRequestLimit`_is_lower_than_the_number_of_messages_backfilled_(assumed)
 - github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation/Visible_shared_history_after_re-joining_room_(backfill)
 - github.com/matrix-org/complement/tests/csapi TestMessagesOverFederation
-- github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/joining_a_remote_upgraded_room_carries_over_existing_push_rules
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/joining_a_remote_manually_upgraded_room_carries_over_existing_push_rules
+- github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel/joining_a_remote_upgraded_room_carries_over_existing_push_rules
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade/parallel
 - github.com/matrix-org/complement/tests/csapi TestPushRuleRoomUpgrade
 - github.com/matrix-org/complement/tests/csapi TestSync/parallel/sync_should_succeed_even_if_the_sync_token_points_to_a_redaction_of_an_unknown_event
 - github.com/matrix-org/complement/tests/csapi TestSync/parallel
 - github.com/matrix-org/complement/tests/csapi TestSync
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap
-- github.com/matrix-org/complement/tests/csapi TestUrlPreview
