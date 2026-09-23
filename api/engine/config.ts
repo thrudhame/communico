@@ -14,6 +14,7 @@ import {
   SCHEMA,
   type Schema,
 } from './config-schema.ts';
+import { parseCidr } from './preview/cidr.ts';
 
 export type { Config } from './config-schema.ts';
 export { envNameOf, leaves, SCHEMA } from './config-schema.ts';
@@ -299,6 +300,27 @@ export function loadConfig(opts: {
     );
   }
 
+  const preview = built.preview;
+  if (
+    preview !== null && typeof preview === 'object' && !Array.isArray(preview)
+  ) {
+    const p = preview as Record<string, unknown>;
+    for (const leaf of ['blocklist', 'allowlist']) {
+      const list = p[leaf];
+      if (!Array.isArray(list)) continue;
+      for (const item of list) {
+        if (typeof item !== 'string') continue;
+        if (parseCidr(item) === null) {
+          problems.push(
+            `config: preview.${leaf} (${
+              envNameOf(['preview', leaf])
+            }): malformed CIDR ${display(item)}`,
+          );
+        }
+      }
+    }
+  }
+
   if (problems.length > 0) throw new ConfigError(problems);
   return { config: built as Config, sources };
 }
@@ -358,6 +380,12 @@ export type ConfigPatch = {
     name?: string;
   };
   media?: { root?: string; maxbytes?: number };
+  preview?: {
+    enabled?: boolean;
+    maxbytes?: number;
+    blocklist?: string[];
+    allowlist?: string[];
+  };
 };
 
 /** Deep-merge over the originally loaded config. Legal under tests/ only. */

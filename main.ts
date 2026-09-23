@@ -16,6 +16,14 @@ try {
       envOverrides.join(', ')
     }`,
   );
+  if (
+    loaded.config.preview.enabled &&
+    loaded.config.preview.blocklist.length === 0
+  ) {
+    console.log(
+      'preview: enabled with an empty blocklist — every address is reachable',
+    );
+  }
 } catch (e) {
   if (e instanceof ConfigError) {
     for (const problem of e.problems) console.error(problem);

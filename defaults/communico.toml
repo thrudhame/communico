@@ -27,3 +27,41 @@ root = "./.media"
 # Upload limit in bytes (50 MiB — Complement's upload tests).
 # COMMUNICO_MEDIA_MAXBYTES (formerly MEDIA_MAX_BYTES)
 maxbytes = 52428800
+
+[preview]
+# URL previews (GET /_matrix/client/v1/media/preview_url). Off until the
+# operator opts in. COMMUNICO_PREVIEW_ENABLED
+enabled = false
+# Fetch size cap in bytes (10 MiB — Synapse's default, written explicitly).
+# COMMUNICO_PREVIEW_MAXBYTES
+maxbytes = 10485760
+# Addresses the HS must not fetch. Synapse's DEFAULT_IP_RANGE_BLOCKLIST
+# (config/server.py) plus 0.0.0.0/8 and ::/128, which Synapse always adds
+# — here they are just list entries, nothing baked into code. An empty
+# list with enabled = true starts (and logs once); it does not refuse.
+# COMMUNICO_PREVIEW_BLOCKLIST
+blocklist = [
+  "127.0.0.0/8",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "100.64.0.0/10",
+  "192.0.0.0/24",
+  "169.254.0.0/16",
+  "192.88.99.0/24",
+  "198.18.0.0/15",
+  "192.0.2.0/24",
+  "198.51.100.0/24",
+  "203.0.113.0/24",
+  "224.0.0.0/4",
+  "0.0.0.0/8",
+  "::1/128",
+  "fe80::/10",
+  "fc00::/7",
+  "2001:db8::/32",
+  "ff00::/8",
+  "fec0::/10",
+  "::/128",
+]
+# Wins over blocklist per CIDR match. COMMUNICO_PREVIEW_ALLOWLIST
+allowlist = []

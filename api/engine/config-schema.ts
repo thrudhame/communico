@@ -24,6 +24,12 @@ export const SCHEMA = {
     root: 'string',
     maxbytes: 'int',
   },
+  preview: {
+    enabled: 'bool',
+    maxbytes: 'int',
+    blocklist: 'list',
+    allowlist: 'list',
+  },
 } as const satisfies Schema;
 
 type TypeOf<T extends LeafType> = T extends 'string' ? string

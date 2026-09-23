@@ -25,6 +25,12 @@ name = "postgres"
 [media]
 root = "./.media"
 maxbytes = 52428800
+
+[preview]
+enabled = false
+maxbytes = 10485760
+blocklist = []
+allowlist = []
 `;
 
 async function writeTree(
@@ -261,6 +267,67 @@ Deno.test('absent config/communico.toml is fine', async () => {
     env: {},
   });
   assertEquals(loaded.config.server.port, 8008);
+});
+
+Deno.test('[preview] enabled bool strictness; blocklist list; malformed CIDR', async () => {
+  const dir = await writeTree({ 'defaults/communico.toml': FULL });
+  const defaultsPath = `${dir}/defaults/communico.toml`;
+  const enabled = loadConfig({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_PREVIEW_ENABLED: 'true' },
+  });
+  assertEquals(enabled.config.preview.enabled, true);
+  assertEquals(enabled.sources['preview.enabled'], 'env');
+  const badBool = loadFail({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_PREVIEW_ENABLED: 'TRUE' },
+  });
+  assert(
+    badBool.some((p) =>
+      p.includes('preview.enabled') &&
+      p.includes('COMMUNICO_PREVIEW_ENABLED') &&
+      p.includes('expected bool')
+    ),
+    `bool: ${badBool.join('\n')}`,
+  );
+  const listed = loadConfig({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_PREVIEW_BLOCKLIST: '127.0.0.0/8, 10.0.0.0/8' },
+  });
+  assertEquals(listed.config.preview.blocklist, [
+    '127.0.0.0/8',
+    '10.0.0.0/8',
+  ]);
+  const overlayDir = await writeTree({
+    'defaults/communico.toml': FULL,
+    'config/communico.toml': '[preview]\nblocklist = ["not-a-cidr"]\n',
+  });
+  const malformed = loadFail({
+    defaultsPath: `${overlayDir}/defaults/communico.toml`,
+    configPath: `${overlayDir}/config/communico.toml`,
+    env: {},
+  });
+  assert(
+    malformed.some((p) =>
+      p.includes('preview.blocklist') &&
+      p.includes('COMMUNICO_PREVIEW_BLOCKLIST') &&
+      p.includes('malformed CIDR') &&
+      p.includes('not-a-cidr')
+    ),
+    `cidr: ${malformed.join('\n')}`,
+  );
+  const empty = loadConfig({
+    defaultsPath,
+    configPath: null,
+    env: {},
+  });
+  assertEquals(empty.config.preview.blocklist, []);
+  assertEquals(empty.config.preview.allowlist, []);
+  assertEquals(empty.config.preview.enabled, false);
+  assertEquals(empty.config.preview.maxbytes, 10485760);
 });
 
 Deno.test('--shell printer quoting', async () => {

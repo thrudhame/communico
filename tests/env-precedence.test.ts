@@ -30,6 +30,12 @@ name = "postgres"
 [media]
 root = "./.media"
 maxbytes = 52428800
+
+[preview]
+enabled = false
+maxbytes = 10485760
+blocklist = []
+allowlist = []
 `;
 
 const CONFIG_PROBE =
