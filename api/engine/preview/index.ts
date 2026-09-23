@@ -1,8 +1,8 @@
-import { localpartOf } from '../auth.ts';
-import { config, serverName } from '../config.ts';
-import { MatrixError } from '../matrix-error.ts';
-import { mediaMaxBytes, newMediaId, storeUploadBody } from '../media.ts';
-import { createMedia } from '../tenant.ts';
+import { localpartOf } from '#engine/auth.ts';
+import { config, serverName } from '#engine/config.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { mediaMaxBytes, newMediaId, storeUploadBody } from '#engine/media.ts';
+import { createMedia } from '#engine/tenant.ts';
 import { imageDimensions } from './dimensions.ts';
 import { guardedGet } from './guard.ts';
 import { openGraphFor } from './og.ts';
