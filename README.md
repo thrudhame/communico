@@ -16,6 +16,10 @@ architecture; the evidence log lives in
 Prerequisites: Docker only. Runs on the shipped `defaults/communico.toml`.
 To change something, create `config/communico.toml` with just the leaves
 you want, or set `COMMUNICO_*` (see `.env.example` for the env syntax).
+URL previews are **off** by default (`[preview] enabled = false`). To
+enable them, set `enabled = true`; `blocklist` is the operator's IP
+policy (Synapse's private/unroutable ranges in the shipped defaults)
+so the homeserver will not fetch those addresses.
 
 ```bash
 bash demo/setup.sh --reset   # boots Doltgres+server, registers users, creates the room
@@ -60,7 +64,7 @@ authenticated + legacy download, config; bytes on disk under
 `media.root`, metadata in the tenant DB). Deliberately stubbed: real
 state resolution (M3), server-to-server federation (M5, `:8448` serves
 TLS + 404 today), E2EE, push delivery/rules, appservices, rate
-limiting, media thumbnails/previews/remote fetch/retention. The legacy
+limiting, media thumbnails/retention. The legacy
 unauthenticated media download is a documented liability — frozen at a
 later milestone. The browser homeserver (communico-lite) and native
 sync are parked — prior art on `research/lite`, plan in

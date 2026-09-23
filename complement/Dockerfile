@@ -32,6 +32,10 @@ RUN mkdir -p /app/config /app/.media
 # TLS paths are Complement-image-only (not config leaves). Set explicitly
 # so tls-stub.ts has no in-code fallbacks.
 ENV TLS_CERT_FILE=/run/complement/server.crt TLS_KEY_FILE=/run/complement/server.key
+# Previews on for Complement (TestUrlPreview). The harness subnet
+# allowlist is passed at run time via COMPLEMENT_SHARE_ENV_PREFIX, not
+# baked in here.
+ENV COMMUNICO_PREVIEW_ENABLED=true
 RUN deno cache main.ts db/init.ts complement/tls-stub.ts
 
 EXPOSE 8008 8448

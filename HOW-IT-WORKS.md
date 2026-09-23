@@ -141,8 +141,8 @@ state.
   filename), the recommended CSP, `Cross-Origin-Resource-Policy:
   cross-origin`. mxc components are whitelist-checked
   (`^[A-Za-z0-9_-]+$`) before any lookup — never touch the filesystem
-  with an unvalidated id. No thumbnails, previews, remote fetch, or
-  retention in M2.
+  with an unvalidated id. No thumbnails or retention in M2. URL
+  previews are a separate `[preview]` switch (off by default).
 
 ## 3. Rooms and sync (M4)
 
@@ -181,6 +181,11 @@ state.
   viewer's membership there; own membership events always visible.
   Not visible → 404 on `/event`, filtered from `/messages` and
   `/sync` timelines. Left users are clamped to their leave.
+- **`/context` returns events around one event** plus the room state
+  at the last event returned (`event_context.yaml` at v1.16). `limit`
+  (default 10) splits `floor(n/2)` before / `n−before` after; the
+  filter applies to before/after/state, not to `event`. An invisible
+  anchor is 404 `M_NOT_FOUND`. Left users are clamped as `/messages`.
 - **`/sync` is per-user** with join/invite/leave sections, filters
   (stored + inline; types, limits, lazy members, include_leave),
   `limited`/`prev_batch` windows (`prev_batch` = `s<firstReturned-1>`
@@ -330,7 +335,7 @@ One source of truth: a TOML file. Six rulings:
    statement. `.env` loading stays Deno's `--env`; `.env.example` only
    demonstrates the env syntax.
 
-The tree (today's nine leaves):
+The tree (today's thirteen leaves):
 
 ```toml
 [server]
@@ -347,7 +352,26 @@ name = "postgres"         # COMMUNICO_DB_NAME
 [media]
 root = "./.media"         # COMMUNICO_MEDIA_ROOT
 maxbytes = 52428800       # COMMUNICO_MEDIA_MAXBYTES (was MEDIA_MAX_BYTES)
+
+[preview]
+enabled = false           # COMMUNICO_PREVIEW_ENABLED
+maxbytes = 10485760       # COMMUNICO_PREVIEW_MAXBYTES (10 MiB)
+blocklist = [ … ]         # COMMUNICO_PREVIEW_BLOCKLIST (Synapse CIDRs)
+allowlist = []            # COMMUNICO_PREVIEW_ALLOWLIST (wins per CIDR)
 ```
+
+## URL previews
+
+Off by default (`preview.enabled = false`): the route answers 403
+`M_FORBIDDEN`. Enable it and every outbound fetch goes through the
+guard: parse → resolve hostname → every address must sit outside
+`blocklist − allowlist` (allowlist wins) → connect **to a checked IP**
+with `Host` / TLS SNI = the original hostname (HTTPS is
+`Deno.connect` to the IP then `Deno.startTls({ hostname })`, never
+`fetch(url)` by name) → stream with the size cap → follow redirects
+by hand, re-running the guard, max 5. An empty blocklist with
+`enabled = true` starts and logs once (`every address is reachable`);
+it is not a refusal.
 
 Startup failure shape (stderr, then `exit 1`; no partial start):
 
@@ -380,10 +404,9 @@ container restarts.
 
 ## 6. What's stubbed (roadmap)
 
-Band C leftovers (url_preview); S2S federation (M5); relay `bind/forward`;
+S2S federation (M5); relay `bind/forward`;
 E2EE; push delivery/rules (M2's pushers are storage-only);
-appservices; rate limiting; media thumbnails, URL previews, remote
-fetch, and retention (M2 is local store-and-serve only);
+appservices; rate limiting; media thumbnails and retention;
 `/_matrix/key/*` and `.well-known`; at-rest encryption of tenant
 private keys. Stub-era rooms are flagged and will never federate.
 

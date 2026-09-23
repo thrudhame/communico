@@ -67,14 +67,25 @@ echo "   tags applied: $APPLIED, missing: $SKIPPED_MISSING"
 # 3. run Complement (go-test failures are red baseline, not harness errors).
 # -timeout 3h: the csapi package runs its tests sequentially and every test
 # spawns a fresh container (~8s); the default 10m go timeout would kill it.
+# Preview allowlist: the docker bridge subnet (host.docker.internal lives
+# there). Discover it; never invent a CIDR.
+BRIDGE_SUBNET="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Subnet}}')"
+if [[ -z "$BRIDGE_SUBNET" ]]; then
+  echo "docker bridge subnet not discoverable from run.sh — stop and ask" >&2
+  exit 1
+fi
+echo ">> preview allowlist (docker bridge): $BRIDGE_SUBNET"
+export COMPLEMENT_SHARE_ENV_PREFIX=PASS_
+export PASS_COMMUNICO_PREVIEW_ENABLED=true
+export PASS_COMMUNICO_PREVIEW_ALLOWLIST="$BRIDGE_SUBNET"
 echo ">> running Complement (filter: ${RUN_FILTER:-all})"
 set +e
 (
   cd "$WORK"
   if [[ -n "$RUN_FILTER" ]]; then
-    COMPLEMENT_BASE_IMAGE="$IMAGE" go test -tags communico_blacklist -timeout 3h -run "$RUN_FILTER" -json ./tests/... 2>&1 | tee "$REPO_ROOT/complement/baseline.jsonl"
+    COMPLEMENT_BASE_IMAGE="$IMAGE" COMPLEMENT_SHARE_ENV_PREFIX=PASS_ go test -tags communico_blacklist -timeout 3h -run "$RUN_FILTER" -json ./tests/... 2>&1 | tee "$REPO_ROOT/complement/baseline.jsonl"
   else
-    COMPLEMENT_BASE_IMAGE="$IMAGE" go test -tags communico_blacklist -timeout 3h -json ./tests/... 2>&1 | tee "$REPO_ROOT/complement/baseline.jsonl"
+    COMPLEMENT_BASE_IMAGE="$IMAGE" COMPLEMENT_SHARE_ENV_PREFIX=PASS_ go test -tags communico_blacklist -timeout 3h -json ./tests/... 2>&1 | tee "$REPO_ROOT/complement/baseline.jsonl"
   fi
   echo "${PIPESTATUS[0]}" > "$REPO_ROOT/complement/.test-status"
 )
