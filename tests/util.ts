@@ -29,6 +29,17 @@ export async function resetRoom(roomId: string): Promise<void> {
 
 // --- M2 test helpers (plan §3.8) -------------------------------------------
 
+/** Wipe the federation runtime tables (server keys, docs, changes, pending)
+ * so acquisition/gate tests start from first contact. */
+export async function resetFederationTables(): Promise<void> {
+  await withDb(serverDb(), async (c) => {
+    await c.query('DELETE FROM server_key_changes;');
+    await c.query('DELETE FROM server_key_docs;');
+    await c.query('DELETE FROM server_keys;');
+    await c.query('DELETE FROM federation_pending;');
+  });
+}
+
 /** Wipe every tenant row for a localpart so wire tests re-register cleanly
  * on reruns (the tenant.test.ts lifecycle pattern, extended to the M2
  * tables). Children first — pushers references users AND access_tokens. */

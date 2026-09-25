@@ -143,3 +143,46 @@ CREATE TABLE IF NOT EXISTS server_signing_key (
   privkey_pkcs8_b64 text NOT NULL,
   created_ms bigint NOT NULL
 );
+-- M5a: federation runtime data (config = how the process runs; who we know /
+-- refuse / remember = database). Remembered signing keys per server, the
+-- verbatim fetched documents (served by our notary endpoint), and every
+-- key-material change.
+CREATE TABLE IF NOT EXISTS server_keys (
+  server_name text NOT NULL,
+  key_id text NOT NULL,
+  pubkey_b64 text NOT NULL,
+  valid_until_ts bigint NOT NULL, -- as fetched, capped at fetched_ms + 7d
+  fetched_ms bigint NOT NULL,
+  expired_ts bigint,              -- from old_verify_keys, else NULL (events-only key)
+  PRIMARY KEY (server_name, key_id)
+);
+CREATE TABLE IF NOT EXISTS server_key_docs (
+  server_name text PRIMARY KEY,
+  key_json text NOT NULL,         -- the verbatim fetched, self-signed document
+  fetched_ms bigint NOT NULL,
+  via text NOT NULL               -- 'direct' | 'witness:<name>' | 'accepted'
+);
+CREATE TABLE IF NOT EXISTS server_key_changes (
+  server_name text NOT NULL,
+  seen_ms bigint NOT NULL,
+  old_keys text NOT NULL,         -- JSON {key_id: pubkey_b64} previously remembered
+  new_keys text NOT NULL,         -- JSON from the new document
+  status text NOT NULL,           -- 'noted' (accept/warn) | 'blocking' | 'accepted' | 'forgotten'
+  acknowledged_old boolean NOT NULL, -- the new document also repeats a remembered pair
+  candidate_json text,            -- for 'blocking': {via, doc} — the candidate lives ONLY here
+  PRIMARY KEY (server_name, seen_ms)
+);
+-- The door log: inbound knocks, outbound intent, witness disagreements.
+-- Rows with verified = FALSE are capped at federation.pendingmax (oldest
+-- last_ms evicted on insert) and pruned after federation.pendingdays;
+-- writes for one name coalesce within federation.keyfailminutes.
+CREATE TABLE IF NOT EXISTS federation_pending (
+  name text NOT NULL,
+  kind text NOT NULL,             -- 'inbound' | 'outbound' | 'disagreement'
+  verified boolean NOT NULL,
+  first_ms bigint NOT NULL,
+  last_ms bigint NOT NULL,
+  count bigint NOT NULL,
+  detail text,
+  PRIMARY KEY (name, kind)
+);
