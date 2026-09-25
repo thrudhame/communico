@@ -50,6 +50,15 @@ async function aliasOwner(alias: string): Promise<string | null> {
 // PUT /directory/room/{alias}: create the mapping. 409 M_ROOM_IN_USE
 // when taken (Complement's TestRoomAlias contract). Check-then-insert;
 // a lost race re-checks rather than guessing at driver error strings.
+/** True when an alias's domain is this server (name/domain part after
+ *  the last colon). The lookups 'known'/'none' branches use it. */
+export function aliasIsLocal(alias: string): boolean {
+  const colon = alias.lastIndexOf(':');
+  return colon > 1 &&
+    alias.slice(colon + 1) === serverName() &&
+    alias.startsWith('#');
+}
+
 export async function createAlias(
   alias: string,
   roomId: string,
