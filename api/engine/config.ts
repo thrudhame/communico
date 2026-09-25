@@ -321,6 +321,59 @@ export function loadConfig(opts: {
     }
   }
 
+  const federation = built.federation;
+  if (
+    federation !== null && typeof federation === 'object' &&
+    !Array.isArray(federation)
+  ) {
+    const f = federation as Record<string, unknown>;
+    const envOf = (leaf: string) => envNameOf(['federation', leaf]);
+    const enumLeaf = (leaf: string, allowed: string[]) => {
+      const v = f[leaf];
+      if (typeof v === 'string' && !allowed.includes(v)) {
+        problems.push(
+          `config: federation.${leaf} (${envOf(leaf)}): expected one of ${
+            allowed.join(', ')
+          }, got ${display(v)}`,
+        );
+      }
+    };
+    enumLeaf('keychange', ['accept', 'warn', 'block']);
+    enumLeaf('mode', ['open', 'closed']);
+    enumLeaf('lookups', ['known', 'none']);
+    const kvh = f.keyvalidityhours;
+    if (typeof kvh === 'number' && kvh > 168) {
+      problems.push(
+        `config: federation.keyvalidityhours (${
+          envOf('keyvalidityhours')
+        }): spec cap is 168 (7 days), got ${kvh}`,
+      );
+    }
+    const witnesses = f.witnesses;
+    if (typeof witnesses === 'number' && witnesses < 1) {
+      problems.push(
+        `config: federation.witnesses (${
+          envOf('witnesses')
+        }): expected >= 1, got ${witnesses}`,
+      );
+    }
+    const cacerts = f.cacerts;
+    if (Array.isArray(cacerts)) {
+      for (const item of cacerts) {
+        if (typeof item !== 'string') continue;
+        try {
+          Deno.openSync(item, { read: true }).close();
+        } catch {
+          problems.push(
+            `config: federation.cacerts (${
+              envOf('cacerts')
+            }): file not readable: ${display(item)}`,
+          );
+        }
+      }
+    }
+  }
+
   if (problems.length > 0) throw new ConfigError(problems);
   return { config: built as Config, sources };
 }
@@ -385,6 +438,29 @@ export type ConfigPatch = {
     maxbytes?: number;
     blocklist?: string[];
     allowlist?: string[];
+  };
+  federation?: {
+    enabled?: boolean;
+    port?: number;
+    cert?: string;
+    key?: string;
+    cacerts?: string[];
+    keyvalidityhours?: number;
+    keychange?: string;
+    mode?: string;
+    wellknown?: string;
+    wellknownmaxage?: number;
+    connectms?: number;
+    timeoutms?: number;
+    maxbytes?: number;
+    wellknownhours?: number;
+    wellknownmaxhours?: number;
+    wellknownerrorhours?: number;
+    keyfailminutes?: number;
+    witnesses?: number;
+    pendingmax?: number;
+    pendingdays?: number;
+    lookups?: string;
   };
 };
 

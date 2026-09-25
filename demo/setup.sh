@@ -12,6 +12,15 @@ CONTAINER=communico-dev
 IMAGE=communico:devcontainer
 MC_IMAGE=matrixcommander/matrix-commander
 
+# federation dev cert: self-signed pair in config/ (gitignored) when absent
+if [[ ! -f config/federation.crt || ! -f config/federation.key ]]; then
+  echo ">> issuing self-signed federation dev cert for ${COMMUNICO_SERVER_NAME}"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -subj "/CN=${COMMUNICO_SERVER_NAME}" \
+    -addext "subjectAltName=DNS:${COMMUNICO_SERVER_NAME}" \
+    -keyout config/federation.key -out config/federation.crt 2>/dev/null
+fi
+
 if [[ "${1:-}" == "--reset" ]]; then
   echo ">> --reset: removing container and client state"
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true

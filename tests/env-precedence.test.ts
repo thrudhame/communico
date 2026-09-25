@@ -36,6 +36,29 @@ enabled = false
 maxbytes = 10485760
 blocklist = []
 allowlist = []
+
+[federation]
+enabled = true
+port = 8448
+cert = "config/federation.crt"
+key = "config/federation.key"
+cacerts = []
+keyvalidityhours = 168
+keychange = "warn"
+mode = "open"
+wellknown = ""
+wellknownmaxage = 86400
+connectms = 5000
+timeoutms = 30000
+maxbytes = 1048576
+wellknownhours = 24
+wellknownmaxhours = 48
+wellknownerrorhours = 1
+keyfailminutes = 5
+witnesses = 3
+pendingmax = 10000
+pendingdays = 30
+lookups = "known"
 `;
 
 const CONFIG_PROBE =

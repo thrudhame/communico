@@ -31,6 +31,29 @@ enabled = false
 maxbytes = 10485760
 blocklist = []
 allowlist = []
+
+[federation]
+enabled = true
+port = 8448
+cert = "config/federation.crt"
+key = "config/federation.key"
+cacerts = []
+keyvalidityhours = 168
+keychange = "warn"
+mode = "open"
+wellknown = ""
+wellknownmaxage = 86400
+connectms = 5000
+timeoutms = 30000
+maxbytes = 1048576
+wellknownhours = 24
+wellknownmaxhours = 48
+wellknownerrorhours = 1
+keyfailminutes = 5
+witnesses = 3
+pendingmax = 10000
+pendingdays = 30
+lookups = "known"
 `;
 
 async function writeTree(
@@ -328,6 +351,133 @@ Deno.test('[preview] enabled bool strictness; blocklist list; malformed CIDR', a
   assertEquals(empty.config.preview.allowlist, []);
   assertEquals(empty.config.preview.enabled, false);
   assertEquals(empty.config.preview.maxbytes, 10485760);
+});
+
+Deno.test('[federation] 21 leaves, env names, enum/cap validation', async () => {
+  const dir = await writeTree({ 'defaults/communico.toml': FULL });
+  const defaultsPath = `${dir}/defaults/communico.toml`;
+  const loaded = loadConfig({ defaultsPath, configPath: null, env: {} });
+  const f = loaded.config.federation;
+  assertEquals(f.enabled, true);
+  assertEquals(f.port, 8448);
+  assertEquals(f.cert, 'config/federation.crt');
+  assertEquals(f.key, 'config/federation.key');
+  assertEquals(f.cacerts, []);
+  assertEquals(f.keyvalidityhours, 168);
+  assertEquals(f.keychange, 'warn');
+  assertEquals(f.mode, 'open');
+  assertEquals(f.wellknown, '');
+  assertEquals(f.wellknownmaxage, 86400);
+  assertEquals(f.connectms, 5000);
+  assertEquals(f.timeoutms, 30000);
+  assertEquals(f.maxbytes, 1048576);
+  assertEquals(f.wellknownhours, 24);
+  assertEquals(f.wellknownmaxhours, 48);
+  assertEquals(f.wellknownerrorhours, 1);
+  assertEquals(f.keyfailminutes, 5);
+  assertEquals(f.witnesses, 3);
+  assertEquals(f.pendingmax, 10000);
+  assertEquals(f.pendingdays, 30);
+  assertEquals(f.lookups, 'known');
+
+  const fromEnv = loadConfig({
+    defaultsPath,
+    configPath: null,
+    env: {
+      COMMUNICO_FEDERATION_MODE: 'closed',
+      COMMUNICO_FEDERATION_KEYCHANGE: 'block',
+      COMMUNICO_FEDERATION_LOOKUPS: 'none',
+      COMMUNICO_FEDERATION_WITNESSES: '5',
+    },
+  });
+  assertEquals(fromEnv.config.federation.mode, 'closed');
+  assertEquals(fromEnv.config.federation.keychange, 'block');
+  assertEquals(fromEnv.config.federation.lookups, 'none');
+  assertEquals(fromEnv.config.federation.witnesses, 5);
+  assertEquals(fromEnv.sources['federation.mode'], 'env');
+
+  const badKeychange = loadFail({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_KEYCHANGE: 'yolo' },
+  });
+  assert(
+    badKeychange.some((p) =>
+      p.includes('federation.keychange') &&
+      p.includes('COMMUNICO_FEDERATION_KEYCHANGE') &&
+      p.includes('accept, warn, block')
+    ),
+    `keychange: ${badKeychange.join('\n')}`,
+  );
+  const badMode = loadFail({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_MODE: 'half-open' },
+  });
+  assert(
+    badMode.some((p) =>
+      p.includes('federation.mode') && p.includes('open, closed')
+    ),
+    `mode: ${badMode.join('\n')}`,
+  );
+  const badLookups = loadFail({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_LOOKUPS: 'proxy' },
+  });
+  assert(
+    badLookups.some((p) =>
+      p.includes('federation.lookups') && p.includes('known, none')
+    ),
+    `lookups: ${badLookups.join('\n')}`,
+  );
+  const overCap = loadFail({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_KEYVALIDITYHOURS: '169' },
+  });
+  assert(
+    overCap.some((p) =>
+      p.includes('federation.keyvalidityhours') && p.includes('168')
+    ),
+    `cap: ${overCap.join('\n')}`,
+  );
+  const noWitnesses = loadFail({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_WITNESSES: '0' },
+  });
+  assert(
+    noWitnesses.some((p) =>
+      p.includes('federation.witnesses') && p.includes('>= 1')
+    ),
+    `witnesses: ${noWitnesses.join('\n')}`,
+  );
+});
+
+Deno.test('[federation] cacerts must be readable files', async () => {
+  const caFile = await Deno.makeTempFile();
+  const dir = await writeTree({ 'defaults/communico.toml': FULL });
+  const defaultsPath = `${dir}/defaults/communico.toml`;
+  const ok = loadConfig({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_CACERTS: caFile },
+  });
+  assertEquals(ok.config.federation.cacerts, [caFile]);
+  const missing = loadFail({
+    defaultsPath,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_CACERTS: `${dir}/no-such-ca.crt` },
+  });
+  assert(
+    missing.some((p) =>
+      p.includes('federation.cacerts') &&
+      p.includes('COMMUNICO_FEDERATION_CACERTS') &&
+      p.includes('not readable')
+    ),
+    `cacerts: ${missing.join('\n')}`,
+  );
 });
 
 Deno.test('--shell printer quoting', async () => {

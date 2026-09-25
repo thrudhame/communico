@@ -65,3 +65,79 @@ blocklist = [
 ]
 # Wins over blocklist per CIDR match. COMMUNICO_PREVIEW_ALLOWLIST
 allowlist = []
+
+[federation]
+# Server-to-server API on/off. Off = no :8448 listener; /_matrix/federation,
+# /_matrix/key and /.well-known/matrix/server answer 404; no outbound
+# federation requests. COMMUNICO_FEDERATION_ENABLED
+enabled = true
+# TLS listener port (spec default). COMMUNICO_FEDERATION_PORT
+port = 8448
+# PEM certificate + key for :8448. Read when the listener opens (main.ts);
+# a missing file with enabled = true is a startup error, not a fallback.
+# demo/setup.sh issues a self-signed pair here for local dev.
+# COMMUNICO_FEDERATION_CERT / COMMUNICO_FEDERATION_KEY
+cert = "config/federation.crt"
+key = "config/federation.key"
+# Extra CA bundles (PEM paths) trusted for outbound TLS IN ADDITION to
+# Deno's bundled root store (not the OS store — `trust anchor` on the host
+# does not reach us). Complement: /complement/ca/ca.crt.
+# COMMUNICO_FEDERATION_CACERTS
+cacerts = []
+# Own key document validity; spec cap 7 days
+# (data/api/server-server/definitions/keys.yaml:96-99).
+# COMMUNICO_FEDERATION_KEYVALIDITYHOURS
+keyvalidityhours = 168
+# When a server we know presents signing-key MATERIAL we have not seen and
+# its document does not carry the remembered key: "accept" (store and go
+# on — what every other server does), "warn" (go on, record the change,
+# surface it in `federation-peer pending`), "block" (pause that server —
+# its requests and events wait — until `federation-key accept` or removal).
+# COMMUNICO_FEDERATION_KEYCHANGE
+keychange = "warn"
+# Who we federate with. "open": anyone not in federation_blocks; strangers'
+# keys are learned from servers we know first, then directly. "closed":
+# only servers in federation_peers; strangers get 403 and a pending row.
+# COMMUNICO_FEDERATION_MODE
+mode = "open"
+# Value served at /.well-known/matrix/server as m.server; empty = not
+# served (404). COMMUNICO_FEDERATION_WELLKNOWN
+wellknown = ""
+# Cache-Control max-age (seconds) on our own /.well-known answer.
+# COMMUNICO_FEDERATION_WELLKNOWNMAXAGE
+wellknownmaxage = 86400
+# Outbound: TCP connect budget and whole-request budget, ms. Discovery
+# hops (.well-known, SRV, key fetch) must fail fast — Complement's
+# two-server tests resolve `hs1` with no .well-known and no SRV.
+# COMMUNICO_FEDERATION_CONNECTMS / COMMUNICO_FEDERATION_TIMEOUTMS
+connectms = 5000
+timeoutms = 30000
+# Response size cap for federation fetches (key documents, .well-known,
+# query answers). COMMUNICO_FEDERATION_MAXBYTES
+maxbytes = 1048576
+# Remote .well-known cache: default when no Cache-Control, hard max, and
+# how long a failed lookup is remembered (SS:129-133 recommends caching
+# errors with backoff). COMMUNICO_FEDERATION_WELLKNOWNHOURS /
+# WELLKNOWNMAXHOURS / WELLKNOWNERRORHOURS
+wellknownhours = 24
+wellknownmaxhours = 48
+wellknownerrorhours = 1
+# How long a FAILED key fetch for a name is remembered before we dial it
+# again (bounds what a flood of forged origins can make us do).
+# COMMUNICO_FEDERATION_KEYFAILMINUTES
+keyfailminutes = 5
+# How many vouched-for roster peers are asked (in parallel, by seniority)
+# about a stranger's key before we consider dialing it ourselves.
+# COMMUNICO_FEDERATION_WITNESSES
+witnesses = 3
+# The door log (federation_pending) for unverified claims in closed mode:
+# hard row cap (oldest evicted) and expiry in days.
+# COMMUNICO_FEDERATION_PENDINGMAX / PENDINGDAYS
+pendingmax = 10000
+pendingdays = 30
+# Anonymous lookups of remote users/aliases (the spec's public
+# /profile/{userId} and /directory/room/{alias}): "known" answers only
+# from what we already hold (users and rooms we share); "none" does not
+# answer them. We never ask a remote server on an anonymous caller's
+# behalf — that would make us an open proxy. COMMUNICO_FEDERATION_LOOKUPS
+lookups = "known"
