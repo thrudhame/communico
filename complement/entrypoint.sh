@@ -57,11 +57,14 @@ else
     -subj "/CN=$SERVER_NAME" 2>/dev/null
 fi
 
-# 4. :8448 TLS stub (background) + communico :8008 (foreground).
-# The F0 unsigned-lite seam stays OFF here (ALLOW_UNSIGNED_LITE unset).
-echo ">> starting :8448 TLS stub"
-TLS_CERT_FILE="$CERT_DIR/server.crt" TLS_KEY_FILE="$CERT_DIR/server.key" \
-  deno run --allow-net --allow-read --allow-env "$APP_DIR/complement/tls-stub.ts" \
-  > /tmp/tls-stub.log 2>&1 &
+# 4. federation config exports (cert/key path is Complement-image-only,
+# like it was for the stub; cacerts set only when the CA is mounted) +
+# communico :8008 (foreground) with :8448 on the same app.
+echo ">> exporting federation config"
+export COMMUNICO_FEDERATION_CERT="/run/complement/server.crt"
+export COMMUNICO_FEDERATION_KEY="/run/complement/server.key"
+if [[ -f /complement/ca/ca.crt ]]; then
+  export COMMUNICO_FEDERATION_CACERTS="/complement/ca/ca.crt"
+fi
 echo ">> starting communico :8008"
 exec deno run --allow-net --allow-env --allow-read --allow-write "$APP_DIR/main.ts"

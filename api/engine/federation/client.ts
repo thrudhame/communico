@@ -42,6 +42,10 @@ export function resetCaCertsForTests(): void {
 export async function federationRequest(
   req: FederationRequest,
 ): Promise<FederationResponse> {
+  // disabled ⇒ refuse to dial at all
+  if (!config().federation.enabled) {
+    throw new MatrixError(502, 'M_UNKNOWN', 'federation disabled');
+  }
   const endpoint = await resolve(req.destination);
   const key = await getTenantKey();
   const keyId = 'ed25519:' + key.keyId;

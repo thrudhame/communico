@@ -1,5 +1,11 @@
-import { appPort, ConfigError, loadedConfig } from '#engine/config.ts';
+import { appPort, config, ConfigError, loadedConfig } from '#engine/config.ts';
 import { mediaRoot } from '#engine/media.ts';
+import { wireFederationTransport } from '#engine/federation/client.ts';
+import {
+  listBlocks,
+  listPeers,
+  listPending,
+} from '#engine/federation/peers.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 
 try {
@@ -24,6 +30,38 @@ try {
       'preview: enabled with an empty blocklist — every address is reachable',
     );
   }
+  const fed = loaded.config.federation;
+  if (fed.enabled) {
+    // existence checked here, not at config load (tests and the demo load
+    // config without a certificate)
+    try {
+      await Deno.lstat(fed.cert);
+      await Deno.lstat(fed.key);
+    } catch {
+      console.error(
+        `federation.cert (COMMUNICO_FEDERATION_CERT): file not found: ${fed.cert} — provide a certificate or set federation.enabled = false`,
+      );
+      Deno.exit(1);
+    }
+    const absCert = Deno.realPathSync(fed.cert);
+    // counts read the runtime tables; before db-init provisions them
+    // (the demo starts the app first) the reads fail — render '?'
+    const safeCount = async (fn: () => Promise<unknown[]>): Promise<string> => {
+      try {
+        return String((await fn()).length);
+      } catch {
+        return '?';
+      }
+    };
+    const peers = await safeCount(listPeers);
+    const blocks = await safeCount(listBlocks);
+    const pending = await safeCount(listPending);
+    console.log(
+      `federation: enabled port=${fed.port} mode=${fed.mode} cert=${absCert} cacerts=${fed.cacerts.length} peers=${peers} blocks=${blocks} pending=${pending}`,
+    );
+  } else {
+    console.log('federation: disabled');
+  }
 } catch (e) {
   if (e instanceof ConfigError) {
     for (const problem of e.problems) console.error(problem);
@@ -32,8 +70,23 @@ try {
   throw e;
 }
 
+if (config().federation.enabled) {
+  wireFederationTransport();
+}
+
 await Deno.mkdir(mediaRoot(), { recursive: true });
 
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 
 Deno.serve({ port: appPort() }, matrix);
+
+if (config().federation.enabled) {
+  const { cert, key, port } = config().federation;
+  // the same app on both listeners (Synapse's single-listener shape;
+  // Complement probes /_matrix/federation/* and /_matrix/key/* on 8008)
+  Deno.serve({
+    port,
+    cert: await Deno.readTextFile(cert),
+    key: await Deno.readTextFile(key),
+  }, matrix);
+}

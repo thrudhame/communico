@@ -29,14 +29,14 @@ COPY defaults ./defaults
 COPY complement ./complement
 RUN chmod +x /app/complement/entrypoint.sh
 RUN mkdir -p /app/config /app/.media
-# TLS paths are Complement-image-only (not config leaves). Set explicitly
-# so tls-stub.ts has no in-code fallbacks.
-ENV TLS_CERT_FILE=/run/complement/server.crt TLS_KEY_FILE=/run/complement/server.key
-# Previews on for Complement (TestUrlPreview). The harness subnet
-# allowlist is passed at run time via COMPLEMENT_SHARE_ENV_PREFIX, not
-# baked in here.
+# Federation: cert/key config points into /run/complement (issued at run
+# time); the CA is mounted by the harness. Previews on for Complement
+# (TestUrlPreview). The harness subnet allowlist is passed at run time via
+# COMPLEMENT_SHARE_ENV_PREFIX, not baked in here.
+ENV COMMUNICO_FEDERATION_CERT=/run/complement/server.crt
+ENV COMMUNICO_FEDERATION_KEY=/run/complement/server.key
 ENV COMMUNICO_PREVIEW_ENABLED=true
-RUN deno cache main.ts db/init.ts complement/tls-stub.ts
+RUN deno cache main.ts db/init.ts
 
 EXPOSE 8008 8448
 HEALTHCHECK --interval=5s --timeout=3s --start-period=60s --retries=5 \
