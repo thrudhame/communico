@@ -8,7 +8,7 @@
     "./setup": "./setup.ts"
   },
   "tasks": {
-    "check": "deno fmt --check && deno lint && deno check main.ts api/ tests/*.ts tests/rulebook/*.ts demo/*.ts tools/config.ts tools/federation-key.ts tools/federation-peer.ts tools/federation-block.ts",
+    "check": "deno fmt --check && deno lint && deno check main.ts api/ tests/*.ts tests/rulebook/*.ts demo/*.ts tools/config.ts tools/federation-key.ts tools/federation-peer.ts tools/federation-block.ts tools/federation-cert.ts",
     "fmt": "deno fmt",
     "dev": "deno run --env --allow-net --allow-env --allow-read --allow-write --watch main.ts",
     "start": "deno --env --allow-net --allow-env --allow-read --allow-write main.ts",
@@ -20,7 +20,8 @@
     "config": "deno run --env --allow-env --allow-read tools/config.ts",
     "federation-key": "deno run --env --allow-net --allow-env --allow-read tools/federation-key.ts",
     "federation-peer": "deno run --env --allow-net --allow-env --allow-read tools/federation-peer.ts",
-    "federation-block": "deno run --env --allow-net --allow-env --allow-read tools/federation-block.ts"
+    "federation-block": "deno run --env --allow-net --allow-env --allow-read tools/federation-block.ts",
+    "federation-cert": "deno run --env --allow-net --allow-env --allow-read --allow-write --allow-run tools/federation-cert.ts"
   },
   "imports": {
     "#engine/": "./api/engine/",

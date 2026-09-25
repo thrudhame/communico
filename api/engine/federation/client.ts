@@ -7,7 +7,8 @@ import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { getTenantKey } from '#engine/tenant.ts';
 import { signJson } from '#engine/signing-primitives.js';
-import { http1Request } from '#engine/net/http1.ts';
+import { http1Request, type Http1Response } from '#engine/net/http1.ts';
+import { dialNodeTls } from './dial-node-tls.ts';
 import { resolve } from './resolve.ts';
 import { buildXMatrixHeader } from './xmatrix.ts';
 import { setKeysDeps } from './keys.ts';
@@ -42,15 +43,6 @@ export async function federationRequest(
   req: FederationRequest,
 ): Promise<FederationResponse> {
   const endpoint = await resolve(req.destination);
-  if (endpoint.trust.kind !== 'ca') {
-    // pinned / key-is-name peers dial over node:tls — the spike passed;
-    // wired in the dedicated commit, deliberately a 502 before it
-    throw new MatrixError(
-      502,
-      'M_UNKNOWN',
-      'pinned/keyname dialer is not wired yet',
-    );
-  }
   const key = await getTenantKey();
   const keyId = 'ed25519:' + key.keyId;
   const obj: Record<string, unknown> = {
@@ -76,22 +68,41 @@ export async function federationRequest(
   });
   const headers: Record<string, string> = { Authorization: auth };
   if (body !== null) headers['Content-Type'] = 'application/json';
-  const tls = endpoint.sni === null
-    ? { sni: null, caCerts: caCerts() }
-    : { sni: endpoint.sni, caCerts: caCerts() };
-  const res = await http1Request({
-    connectIp: endpoint.connectIp,
-    port: endpoint.port,
-    tls,
-    hostHeader: endpoint.hostHeader,
-    method: req.method,
-    path: req.path,
-    headers,
-    body,
-    connectMs: config().federation.connectms,
-    timeoutMs: config().federation.timeoutms,
-    maxBytes: config().federation.maxbytes,
-  });
+  let res: Http1Response;
+  if (endpoint.trust.kind === 'ca') {
+    const tls = endpoint.sni === null
+      ? { sni: null, caCerts: caCerts() }
+      : { sni: endpoint.sni, caCerts: caCerts() };
+    res = await http1Request({
+      connectIp: endpoint.connectIp,
+      port: endpoint.port,
+      tls,
+      hostHeader: endpoint.hostHeader,
+      method: req.method,
+      path: req.path,
+      headers,
+      body,
+      connectMs: config().federation.connectms,
+      timeoutMs: config().federation.timeoutms,
+      maxBytes: config().federation.maxbytes,
+    });
+  } else {
+    // pinned / key-is-name → the node:tls dialer (roster trust kind)
+    res = await dialNodeTls({
+      connectIp: endpoint.connectIp,
+      port: endpoint.port,
+      sni: endpoint.sni,
+      hostHeader: endpoint.hostHeader,
+      trust: endpoint.trust,
+      method: req.method,
+      path: req.path,
+      headers,
+      body,
+      connectMs: config().federation.connectms,
+      timeoutMs: config().federation.timeoutms,
+      maxBytes: config().federation.maxbytes,
+    });
+  }
   if (res.status >= 200 && res.status < 300) {
     let json: unknown = null;
     if (res.body.length > 0) {

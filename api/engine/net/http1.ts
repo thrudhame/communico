@@ -33,13 +33,49 @@ export type Http1Response = {
 
 const HEADER_CAP = 64 * 1024;
 
+export type Http1WireOpts = {
+  method: string;
+  path: string;
+  hostHeader: string;
+  headers: Record<string, string>;
+  body: Uint8Array | null;
+  maxBytes: number;
+};
+
+// The request/response half of http1Request, over ANY connection with the
+// read/write/close shape — Deno.conns (plain and TLS) and the node:tls
+// adapter for pinned/key-is-name peers satisfy it alike.
+export type WireConn = {
+  read: (p: Uint8Array) => Promise<number | null>;
+  write: (p: Uint8Array) => Promise<number>;
+  close: () => void;
+};
+
+export async function http1Wire(
+  conn: WireConn,
+  opts: Http1WireOpts,
+): Promise<Http1Response> {
+  let head = opts.method + ' ' + opts.path + ' HTTP/1.1\r\n' +
+    'Host: ' + opts.hostHeader + '\r\n';
+  for (const [name, value] of Object.entries(opts.headers)) {
+    head += name + ': ' + value + '\r\n';
+  }
+  if (opts.body !== null) {
+    head += 'Content-Length: ' + String(opts.body.length) + '\r\n';
+  }
+  head += 'Connection: close\r\n\r\n';
+  await conn.write(new TextEncoder().encode(head));
+  if (opts.body !== null) await conn.write(opts.body);
+  return await readHttp(conn, opts.maxBytes);
+}
+
 function connectHost(ip: string): string {
   if (ip.includes(':') && !ip.startsWith('[')) return '[' + ip + ']';
   return ip;
 }
 
 async function readAtLeast(
-  conn: Deno.Conn,
+  conn: WireConn,
   buf: Uint8Array,
   filled: number,
   want: number,
@@ -54,7 +90,7 @@ async function readAtLeast(
 }
 
 async function readHttp(
-  conn: Deno.Conn,
+  conn: WireConn,
   maxBytes: number,
 ): Promise<Http1Response> {
   const headBuf = new Uint8Array(HEADER_CAP);
@@ -143,7 +179,7 @@ async function readHttp(
 }
 
 async function readChunked(
-  conn: Deno.Conn,
+  conn: WireConn,
   leftover: Uint8Array,
   maxBytes: number,
 ): Promise<Uint8Array> {
@@ -239,7 +275,7 @@ export async function http1Request(
       clearTimeout(connectTimer);
     }
     conn = tcp;
-    let stream: Deno.Conn = tcp;
+    let stream: WireConn = tcp;
     if (req.tls !== null) {
       const tls = await Deno.startTls(tcp, {
         hostname: req.tls.sni !== null ? req.tls.sni : req.connectIp,
@@ -249,18 +285,14 @@ export async function http1Request(
       stream = tls;
       conn = tls;
     }
-    let head = req.method + ' ' + req.path + ' HTTP/1.1\r\n' +
-      'Host: ' + req.hostHeader + '\r\n';
-    for (const [name, value] of Object.entries(req.headers)) {
-      head += name + ': ' + value + '\r\n';
-    }
-    if (req.body !== null) {
-      head += 'Content-Length: ' + String(req.body.length) + '\r\n';
-    }
-    head += 'Connection: close\r\n\r\n';
-    await stream.write(new TextEncoder().encode(head));
-    if (req.body !== null) await stream.write(req.body);
-    return await readHttp(stream, req.maxBytes);
+    return await http1Wire(stream, {
+      method: req.method,
+      path: req.path,
+      hostHeader: req.hostHeader,
+      headers: req.headers,
+      body: req.body,
+      maxBytes: req.maxBytes,
+    });
   } catch (e) {
     if (e instanceof MatrixError) throw e;
     if (Date.now() >= deadline) {
