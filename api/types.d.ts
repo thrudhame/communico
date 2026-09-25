@@ -5,6 +5,8 @@ declare module '@pathfinder/pathfinder' {
     user?: string;
     token?: string;
     device?: string;
+    // X-Matrix federation: the verified origin server name
+    origin?: string;
   }
 }
 

@@ -27,10 +27,12 @@ export type FakeRequest = {
 
 export type FakeServer = {
   port: number;
-  name: string; // 'localhost'
+  name: string; // 'localhost' or 'localhost:port'
   keyId: string;
   publicB64: string;
   requests: FakeRequest[];
+  // sign any JSON object as this server (for building inbound requests)
+  sign: (obj: Record<string, unknown>) => Promise<Record<string, unknown>>;
   close: () => Promise<void>;
 };
 
@@ -163,6 +165,11 @@ export async function startFakeServer(opts: {
     keyId,
     publicB64,
     requests,
+    sign: async (obj) =>
+      (await signJson(obj, selfName, keyId, kp.privateKey)) as Record<
+        string,
+        unknown
+      >,
     close: async () => {
       await server.shutdown();
     },

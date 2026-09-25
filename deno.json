@@ -2,6 +2,7 @@
   "private": true,
   "name": "Communico",
   "description": "Matrix Homeserver for the rest of us",
+  "version": "0.1.0-dev",
   "exports": {
     ".": "./main.ts",
     "./setup": "./setup.ts"

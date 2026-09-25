@@ -62,6 +62,11 @@ export async function resetUser(localpart: string): Promise<void> {
       'DELETE FROM transactions WHERE device_id IN (SELECT device_id FROM devices WHERE localpart = $1);',
       [lp],
     );
+    // refresh_tokens reference access_tokens — children first
+    await c.query(
+      'DELETE FROM refresh_tokens WHERE access_token IN (SELECT token FROM access_tokens WHERE localpart = $1);',
+      [lp],
+    );
     await c.query('DELETE FROM filters WHERE localpart = $1;', [lp]);
     await c.query('DELETE FROM access_tokens WHERE localpart = $1;', [lp]);
     await c.query('DELETE FROM devices WHERE localpart = $1;', [lp]);

@@ -503,3 +503,26 @@ Deno.test('GET /_matrix/key/v2/unknown → 404; PUT /_matrix/key/v2/query → 40
   assertEquals(put.status, 405);
   assertEquals((await put.json()).errcode, 'M_UNRECOGNIZED');
 });
+
+// --- M5a: the /_matrix/federation/ tree — /version public ---------------
+
+Deno.test('GET /_matrix/federation/v1/version answers the implementation + version; PUT → 405', async () => {
+  const res = await matrix(
+    new Request('http://x/_matrix/federation/v1/version'),
+  );
+  assertEquals(res.status, 200);
+  const body = await res.json();
+  assertEquals(body.server.name, 'communico');
+  assert(typeof body.server.version === 'string');
+  const put = await matrix(
+    new Request('http://x/_matrix/federation/v1/version', { method: 'PUT' }),
+  );
+  assertEquals(put.status, 405);
+});
+
+Deno.test('GET /_matrix/federation/unknown → 404', async () => {
+  const res = await matrix(
+    new Request('http://x/_matrix/federation/unknown'),
+  );
+  assertEquals(res.status, 404);
+});

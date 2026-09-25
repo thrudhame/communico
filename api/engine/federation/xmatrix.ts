@@ -28,21 +28,23 @@ export function buildXMatrixHeader(p: XMatrixParams): string {
   ];
   return 'X-Matrix ' + parts.filter((x) => x !== null).join(',');
 }
-
 // Parse the auth-param list after the X-Matrix scheme token: k=v pairs,
-// values quoted with backslash escapes or bare tokens. Windows-style
-// backslashes survive: escaped pairs are unescaped one level.
-function parseAuthParams(raw: string): Record<string, string> {
+// values quoted with backslash escapes or bare tokens. A request MAY
+// carry several Authorization headers — fetch Headers joins them on
+// commas; a second scheme token starts a NEW candidate, so the joined
+// strings are split on scheme boundaries before parsing (each candidate
+// needs origin+key+sig anyway). Escaped pairs are unescaped one level.
+function splitSchemes(raw: string): string[] {
+  return raw.split(/,(?=\s*X-Matrix\s)/i).filter((p) => p.length > 0);
+}
+
+function parseParamBlock(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
   let rest = raw.trim();
   while (rest.length > 0) {
     const eq = rest.indexOf('=');
     if (eq < 0) break;
-    let name = '';
-    for (const ch of rest.slice(0, eq)) {
-      if (ch !== ',') name += ch;
-    }
-    name = name.trim().toLowerCase();
+    const name = rest.slice(0, eq).trim().toLowerCase();
     rest = rest.slice(eq + 1).trimStart();
     let value = '';
     if (rest.startsWith('"')) {
@@ -70,7 +72,7 @@ function parseAuthParams(raw: string): Record<string, string> {
       rest = rest.slice(i);
       value = value.trim();
     }
-    if (name.length > 0 && out[name] === undefined) out[name] = value;
+    if (name.length > 0) out[name] = value;
     const comma = rest.indexOf(',');
     rest = comma < 0 ? '' : rest.slice(comma + 1).trim();
   }
@@ -80,25 +82,28 @@ function parseAuthParams(raw: string): Record<string, string> {
 export function parseXMatrixHeaders(all: string[]): XMatrixParams[] {
   const out: XMatrixParams[] = [];
   for (const header of all) {
-    const space = header.indexOf(' ');
-    if (space < 0) continue;
-    if (header.slice(0, space).toLowerCase() !== 'x-matrix') continue;
-    const params = parseAuthParams(header.slice(space + 1));
-    const sig = params.sig !== undefined ? params.sig : params.signature;
-    if (
-      typeof params.origin === 'string' && params.origin.length > 0 &&
-      typeof sig === 'string' && sig.length > 0 &&
-      typeof params.key === 'string' && params.key.length > 0
-    ) {
-      out.push({
-        origin: params.origin,
-        destination: typeof params.destination === 'string' &&
-            params.destination.length > 0
-          ? params.destination
-          : null,
-        key: params.key,
-        signature: sig,
-      });
+    for (const b of splitSchemes(header)) {
+      const block = b.trim();
+      const space = block.indexOf(' ');
+      if (space < 0) continue;
+      if (block.slice(0, space).toLowerCase() !== 'x-matrix') continue;
+      const params = parseParamBlock(block.slice(space + 1));
+      const sig = params.sig !== undefined ? params.sig : params.signature;
+      if (
+        typeof params.origin === 'string' && params.origin.length > 0 &&
+        typeof sig === 'string' && sig.length > 0 &&
+        typeof params.key === 'string' && params.key.length > 0
+      ) {
+        out.push({
+          origin: params.origin,
+          destination: typeof params.destination === 'string' &&
+              params.destination.length > 0
+            ? params.destination
+            : null,
+          key: params.key,
+          signature: sig,
+        });
+      }
     }
   }
   return out;
