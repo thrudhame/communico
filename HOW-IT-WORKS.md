@@ -391,24 +391,32 @@ layouts. Complement sets `SERVER_NAME`; the image entrypoint maps it to
 ## 5. Conformance (`complement/`)
 
 Complement is the compass, not the target: one image (Doltgres +
-communico, `tini`), `:8008` plain HTTP + `:8448` TLS (cert signed by
-Complement's mounted CA, 404 for every path — federation is M5),
-`COMMUNICO_SERVER_NAME` from Complement's `SERVER_NAME`, self-managed storage, idempotent inits. The
+communico, `tini`), `:8008` plain HTTP + `:8448` TLS serving the same app
+(cert signed from a CA the harness mounts; the M5a trust ladder's first
+rung works from bundle CA), `COMMUNICO_SERVER_NAME` from Complement's
+`SERVER_NAME`, self-managed storage, idempotent inits. The
 **blacklist** has two sections — principled/permanent (3PID issuance,
-history surgery, `/_synapse/*`, unstable MSCs) and scheduled (E2EE,
-push, federation/M5, rate limits/M2) — applied as
-build tags from the human file; case-level exclusions are triaged in
-`BASELINE.md`, never blacklisted (`30rooms`, `31sync`, redaction,
-`50federation`). `continuity.sh` proves the tenant key survives
-container restarts.
+history surgery, `/_synapse/*`, unstable MSCs, **not-a-proxy**:
+`TestOutboundFederationProfile` and
+`TestRemoteAliasRequestsUnderstandUnicode` stay red on purpose) and
+scheduled (E2EE, push, federation M5c remainder, rate limits/M2) —
+applied as build tags from the human file; case-level exclusions are
+triaged in `BASELINE.md`, never blacklisted (`30rooms`, `31sync`,
+redaction, `50federation`). `continuity.sh` proves the tenant key
+survives container restarts.
 
 ## 6. What's stubbed (roadmap)
 
-S2S federation (M5); relay `bind/forward`;
-E2EE; push delivery/rules (M2's pushers are storage-only);
+S2S federation beyond M5a's stateless surface (rooms/policy are
+M5b/M5c); relay `bind/forward`; E2EE; push delivery/rules;
 appservices; rate limiting; media thumbnails and retention;
-`/_matrix/key/*` and `.well-known`; at-rest encryption of tenant
-private keys. Stub-era rooms are flagged and will never federate.
+at-rest encryption of tenant private keys. Federation server
+trust: the M5a ladder (config pointer `[federation]`, rungs
+1–5 from the design record) — our key document is served, inbound
+X-Matrix is authenticated, strangers' keys are learned witnesses-first,
+addresses resolve by the spec ladder with roster overrides; admission
+(blocks → closed-mode roster → pending log) gates every origin.
+Stub-era rooms are flagged and will never federate.
 
 ## 7. Verification
 

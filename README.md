@@ -61,10 +61,14 @@ surface + media: devices, profiles, password change and deactivation
 over a shared UIA helper, pushers (stored, never delivered), account
 data, and the content repository (upload, async create/PUT,
 authenticated + legacy download, config; bytes on disk under
-`media.root`, metadata in the tenant DB). Deliberately stubbed: real
-state resolution (M3), server-to-server federation (M5, `:8448` serves
-TLS + 404 today), E2EE, push delivery/rules, appservices, rate
-limiting, media thumbnails/retention. The legacy
+`media.root`, metadata in the tenant DB). Federation is on: `[federation]`
+config defaults to enabled — our key document is served at `:8448` and
+`:8008`, inbound requests are X-Matrix-authenticated against remembered
+keys, strangers' keys are learned witnesses-first (roster notaries, then a
+direct fetch in open mode), and admission (blocks → closed-mode roster →
+pending log) gates every origin. Deliberately stubbed: the federation
+room/policy surface (M5b/M5c), E2EE, push delivery/rules, appservices,
+rate limiting, media thumbnails/retention. The legacy
 unauthenticated media download is a documented liability — frozen at a
 later milestone. The browser homeserver (communico-lite) and native
 sync are parked — prior art on `research/lite`, plan in

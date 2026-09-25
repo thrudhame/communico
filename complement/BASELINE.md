@@ -1,4 +1,4 @@
-# Complement baseline — 2026-09-23T01:48:48.309Z
+# Complement baseline — 2026-09-24T20:56:24.273Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
 - image: communico-complement:local (commit 7dda306)
@@ -14,8 +14,11 @@
 ## Failing tests (red to beat)
 
 - github.com/matrix-org/complement/tests TestIsDirectFlagFederation
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
+- github.com/matrix-org/complement/tests TestOutboundFederationProfile/Outbound_federation_can_query_profile_data
+- github.com/matrix-org/complement/tests TestOutboundFederationProfile
+- github.com/matrix-org/complement/tests TestRemoteAliasRequestsUnderstandUnicode
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
@@ -48,9 +51,9 @@
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinLocalUser
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
+- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/query_whole_graph
@@ -65,9 +68,6 @@
 - github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs/non-restricted_room_omits_allowed_room_ids
 - github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs
 - github.com/matrix-org/complement/tests TestJumpToDateEndpoint
-- github.com/matrix-org/complement/tests TestUnknownEndpoints/Server-server_endpoints
-- github.com/matrix-org/complement/tests TestUnknownEndpoints/Key_endpoints
-- github.com/matrix-org/complement/tests TestUnknownEndpoints
 - github.com/matrix-org/complement/tests TestMSC4289PrivilegedRoomCreators/admin_with_>PL100_sorts_after_the_room_creator_for_state_resolution
 - github.com/matrix-org/complement/tests TestMSC4289PrivilegedRoomCreators
 - github.com/matrix-org/complement/tests TestComplementCanCreateValidV12Rooms

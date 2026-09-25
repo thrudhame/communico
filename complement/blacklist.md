@@ -17,6 +17,14 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - 3PID / identity-server / email+msisdn _issuance_ and history surgery
   (retention/purge/erasure — native rooms are append-only by ruling):
   case-level, inside runnable files — triaged in BASELINE.md.
+- **Not a proxy** (M5a user ruling, `plans/m5-federation/design.md`):
+  the spec's anonymous client lookups (`/profile/{userId}`,
+  `/directory/room/{alias}`) are answered **only from what we hold** —
+  never a request on an anonymous caller's behalf. Two tests inside the
+  otherwise-runnable federation files stay red on purpose:
+  `TestOutboundFederationProfile` and
+  `TestRemoteAliasRequestsUnderstandUnicode` expect hs1 to query a server
+  it has never met on a stranger's word.
 
 - tests/csapi/admin_test.go
 - tests/msc2836/msc2836_test.go
@@ -60,12 +68,9 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - tests/federation_acl_test.go
 - tests/federation_device_list_update_test.go
 - tests/federation_event_auth_test.go
-- tests/federation_keys_test.go
 - tests/federation_media_content_test.go
 - tests/federation_presence_test.go
-- tests/federation_query_profile_test.go
 - tests/federation_redaction_test.go
-- tests/federation_room_alias_test.go
 - tests/federation_room_ban_test.go
 - tests/federation_room_event_auth_test.go
 - tests/federation_room_get_missing_events_test.go
