@@ -418,3 +418,88 @@ Deno.test('POST /search without a token → 401', async () => {
   assertEquals(res.status, 401);
   assertEquals((await res.json()).errcode, 'M_MISSING_TOKEN');
 });
+
+// --- M5a: the /_matrix/key/ tree (public — no auth placement) -----------
+
+Deno.test('GET /_matrix/key/v2/server answers our signed document (and on the deprecated #keyId path)', async () => {
+  for (
+    const path of [
+      '/_matrix/key/v2/server',
+      '/_matrix/key/v2/server/ed25519:1',
+    ]
+  ) {
+    const res = await matrix(new Request('http://x' + path));
+    assertEquals(res.status, 200);
+    const doc = await res.json();
+    assertEquals(doc.server_name, serverName());
+    const ids = Object.keys(doc.verify_keys);
+    assertEquals(ids.length, 1);
+    assert(ids[0].startsWith('ed25519:'), `key id: ${ids[0]}`);
+    assertEquals(Object.keys(doc.signatures), [serverName()]);
+  }
+});
+
+Deno.test('GET /_matrix/key/v2/query/{name} answers {server_keys: []} on miss — no fetch', async () => {
+  const res = await matrix(
+    new Request('http://x/_matrix/key/v2/query/no-such-server.test'),
+  );
+  assertEquals(res.status, 200);
+  assertEquals(await res.json(), { server_keys: [] });
+});
+
+Deno.test('GET /_matrix/key/v2/query/{name} serves the cached document with our signature added (DB)', async () => {
+  const { makeServer, seedServer } = await import(
+    './federation/doc-helper.ts'
+  );
+  const { resetFederationTables } = await import('./util.ts');
+  const s = await makeServer('held.test');
+  await resetFederationTables();
+  const doc = await seedServer(s);
+  const res = await matrix(
+    new Request('http://x/_matrix/key/v2/query/held.test'),
+  );
+  assertEquals(res.status, 200);
+  const body = await res.json();
+  assertEquals(body.server_keys.length, 1);
+  const answer = body.server_keys[0];
+  assertEquals(answer.server_name, 'held.test');
+  // origin's self-signature AND our notary signature both present
+  assert(answer.signatures['held.test'] !== undefined);
+  assert(answer.signatures[serverName()] !== undefined);
+  assert(
+    typeof answer.signatures[serverName()]['ed25519:1'] === 'string',
+  );
+  assertEquals(answer.valid_until_ts, doc.valid_until_ts);
+});
+
+Deno.test('POST /_matrix/key/v2/query answers per requested name (DB)', async () => {
+  const { makeServer, seedServer } = await import(
+    './federation/doc-helper.ts'
+  );
+  const s = await makeServer('held2.test');
+  const doc = await seedServer(s);
+  const res = await matrix(
+    new Request('http://x/_matrix/key/v2/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        server_keys: { 'held2.test': { 'ed25519:1': {} } },
+      }),
+    }),
+  );
+  assertEquals(res.status, 200);
+  const body = await res.json();
+  assertEquals(body.server_keys.length, 1);
+  assertEquals(body.server_keys[0].valid_until_ts, doc.valid_until_ts);
+});
+
+Deno.test('GET /_matrix/key/v2/unknown → 404; PUT /_matrix/key/v2/query → 405', async () => {
+  const miss = await matrix(new Request('http://x/_matrix/key/v2/unknown'));
+  assertEquals(miss.status, 404);
+  assertEquals((await miss.json()).errcode, 'M_UNRECOGNIZED');
+  const put = await matrix(
+    new Request('http://x/_matrix/key/v2/query', { method: 'PUT' }),
+  );
+  assertEquals(put.status, 405);
+  assertEquals((await put.json()).errcode, 'M_UNRECOGNIZED');
+});
