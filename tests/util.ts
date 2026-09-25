@@ -37,6 +37,8 @@ export async function resetFederationTables(): Promise<void> {
     await c.query('DELETE FROM server_key_docs;');
     await c.query('DELETE FROM server_keys;');
     await c.query('DELETE FROM federation_pending;');
+    await c.query('DELETE FROM federation_peers;');
+    await c.query('DELETE FROM federation_blocks;');
   });
 }
 

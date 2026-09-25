@@ -7,7 +7,7 @@
     "./setup": "./setup.ts"
   },
   "tasks": {
-    "check": "deno fmt --check && deno lint && deno check main.ts api/ tests/*.ts tests/rulebook/*.ts demo/*.ts tools/config.ts tools/federation-key.ts",
+    "check": "deno fmt --check && deno lint && deno check main.ts api/ tests/*.ts tests/rulebook/*.ts demo/*.ts tools/config.ts tools/federation-key.ts tools/federation-peer.ts tools/federation-block.ts",
     "fmt": "deno fmt",
     "dev": "deno run --env --allow-net --allow-env --allow-read --allow-write --watch main.ts",
     "start": "deno --env --allow-net --allow-env --allow-read --allow-write main.ts",
@@ -17,7 +17,9 @@
     "db-start": "doltgres --config /etc/doltgres/servercfg.d/config.yaml",
     "debug-proxy": "deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy",
     "config": "deno run --env --allow-env --allow-read tools/config.ts",
-    "federation-key": "deno run --env --allow-net --allow-env --allow-read tools/federation-key.ts"
+    "federation-key": "deno run --env --allow-net --allow-env --allow-read tools/federation-key.ts",
+    "federation-peer": "deno run --env --allow-net --allow-env --allow-read tools/federation-peer.ts",
+    "federation-block": "deno run --env --allow-net --allow-env --allow-read tools/federation-block.ts"
   },
   "imports": {
     "#engine/": "./api/engine/",

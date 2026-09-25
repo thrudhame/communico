@@ -186,3 +186,21 @@ CREATE TABLE IF NOT EXISTS federation_pending (
   detail text,
   PRIMARY KEY (name, kind)
 );
+-- The roster: servers we know. Grows by operator tool, by authenticated
+-- user intent (open mode), and by admin approval of an inbound knock.
+CREATE TABLE IF NOT EXISTS federation_peers (
+  name text PRIMARY KEY,          -- server name as it appears in ids
+  host text,                      -- optional address override; NULL = resolve by the ladder
+  port integer,
+  trust text NOT NULL,            -- 'ca' | 'pinned' | 'keyname'
+  pin_spki_sha256 text,           -- for 'pinned': hex SHA-256 of the SubjectPublicKeyInfo
+  added_ms bigint NOT NULL,
+  added_by text NOT NULL,         -- 'operator' | '@user:ours' (user intent) | 'approval'
+  note text
+);
+-- Server-name globs we refuse, both directions.
+CREATE TABLE IF NOT EXISTS federation_blocks (
+  pattern text PRIMARY KEY,       -- server-name glob
+  added_ms bigint NOT NULL,
+  note text
+);
