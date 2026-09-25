@@ -3,7 +3,10 @@
 // HTTPS: Deno.connect to the IP, Deno.startTls({ hostname }) so SNI and
 // cert verification use the name, not the address. Never fetch(url) by
 // hostname. Max 5 redirects; 10 s per hop; size cap streamed.
+// The connection mechanics live in #engine/net/http1.ts — this file is
+// the SSRF policy on top.
 import { MatrixError } from '#engine/matrix-error.ts';
+import { http1Request } from '#engine/net/http1.ts';
 import { type Cidr, cidrContains, parseCidr, parseIp } from './cidr.ts';
 
 export type GuardOpts = {
@@ -23,7 +26,6 @@ export type GuardedBody = {
 
 const MAX_REDIRECTS = 5;
 const HOP_MS = 10_000;
-const HEADER_CAP = 64 * 1024;
 
 function blocked(ip: string, block: Cidr[], allow: Cidr[]): boolean {
   for (const c of allow) {
@@ -48,11 +50,6 @@ async function resolveAll(host: string): Promise<string[]> {
   return out;
 }
 
-function connectHost(ip: string): string {
-  if (ip.includes(':') && !ip.startsWith('[')) return '[' + ip + ']';
-  return ip;
-}
-
 function defaultPort(https: boolean): number {
   return https ? 443 : 80;
 }
@@ -66,175 +63,6 @@ function hostHeader(u: URL, https: boolean): string {
   const def = defaultPort(https);
   if (Number(u.port) === def) return u.hostname;
   return u.hostname + ':' + u.port;
-}
-
-async function readAtLeast(
-  conn: Deno.Conn,
-  buf: Uint8Array,
-  filled: number,
-  want: number,
-): Promise<number> {
-  let n = filled;
-  while (n < want) {
-    const got = await conn.read(buf.subarray(n));
-    if (got === null) break;
-    n += got;
-  }
-  return n;
-}
-
-async function readHttp(
-  conn: Deno.Conn,
-  maxBytes: number,
-): Promise<{ status: number; headers: Headers; body: Uint8Array }> {
-  const headBuf = new Uint8Array(HEADER_CAP);
-  let n = 0;
-  let sep = -1;
-  while (n < HEADER_CAP) {
-    const got = await conn.read(headBuf.subarray(n));
-    if (got === null) break;
-    n += got;
-    const text = new TextDecoder('latin1').decode(headBuf.subarray(0, n));
-    sep = text.indexOf('\r\n\r\n');
-    if (sep >= 0) break;
-  }
-  if (sep < 0) {
-    throw new MatrixError(502, 'M_UNKNOWN', 'upstream headers too large');
-  }
-  const headText = new TextDecoder('latin1').decode(
-    headBuf.subarray(0, sep),
-  );
-  const leftover = headBuf.subarray(sep + 4, n);
-  const lines = headText.split('\r\n');
-  const statusLine = lines[0];
-  const sm = /^HTTP\/\d\.\d\s+(\d{3})/.exec(statusLine);
-  if (sm === null) {
-    throw new MatrixError(502, 'M_UNKNOWN', 'bad upstream status line');
-  }
-  const status = Number(sm[1]);
-  const headers = new Headers();
-  for (let i = 1; i < lines.length; i++) {
-    const colon = lines[i].indexOf(':');
-    if (colon < 0) continue;
-    headers.append(
-      lines[i].slice(0, colon).trim(),
-      lines[i].slice(colon + 1).trim(),
-    );
-  }
-  const clRaw = headers.get('content-length');
-  if (clRaw !== null) {
-    const cl = Number(clRaw);
-    if (!Number.isFinite(cl) || cl < 0) {
-      throw new MatrixError(502, 'M_UNKNOWN', 'bad content-length');
-    }
-    if (cl > maxBytes) {
-      throw new MatrixError(502, 'M_TOO_LARGE', 'Content is too large');
-    }
-    const body = new Uint8Array(cl);
-    body.set(leftover.subarray(0, Math.min(leftover.length, cl)));
-    let filled = Math.min(leftover.length, cl);
-    filled = await readAtLeast(conn, body, filled, cl);
-    if (filled < cl) {
-      throw new MatrixError(502, 'M_UNKNOWN', 'upstream body truncated');
-    }
-    return { status, headers, body };
-  }
-  const te = headers.get('transfer-encoding');
-  if (te !== null && te.toLowerCase().includes('chunked')) {
-    return {
-      status,
-      headers,
-      body: await readChunked(conn, leftover, maxBytes),
-    };
-  }
-  const parts: Uint8Array[] = [];
-  let total = leftover.length;
-  if (total > maxBytes) {
-    throw new MatrixError(502, 'M_TOO_LARGE', 'Content is too large');
-  }
-  if (leftover.length > 0) parts.push(new Uint8Array(leftover));
-  const tmp = new Uint8Array(16 * 1024);
-  while (total <= maxBytes) {
-    const got = await conn.read(tmp);
-    if (got === null) break;
-    total += got;
-    if (total > maxBytes) {
-      throw new MatrixError(502, 'M_TOO_LARGE', 'Content is too large');
-    }
-    parts.push(tmp.slice(0, got));
-  }
-  const body = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    body.set(p, off);
-    off += p.length;
-  }
-  return { status, headers, body };
-}
-
-async function readChunked(
-  conn: Deno.Conn,
-  leftover: Uint8Array,
-  maxBytes: number,
-): Promise<Uint8Array> {
-  let pending = leftover;
-  const takeLine = async (): Promise<string> => {
-    while (true) {
-      const text = new TextDecoder('latin1').decode(pending);
-      const idx = text.indexOf('\r\n');
-      if (idx >= 0) {
-        const line = text.slice(0, idx);
-        pending = pending.subarray(idx + 2);
-        return line;
-      }
-      const tmp = new Uint8Array(1024);
-      const got = await conn.read(tmp);
-      if (got === null) {
-        throw new MatrixError(502, 'M_UNKNOWN', 'truncated chunked body');
-      }
-      const next = new Uint8Array(pending.length + got);
-      next.set(pending);
-      next.set(tmp.subarray(0, got), pending.length);
-      pending = next;
-      if (pending.length > HEADER_CAP) {
-        throw new MatrixError(502, 'M_UNKNOWN', 'chunk size line too long');
-      }
-    }
-  };
-  const parts: Uint8Array[] = [];
-  let total = 0;
-  while (true) {
-    const line = await takeLine();
-    const size = parseInt(line.split(';', 1)[0], 16);
-    if (!Number.isFinite(size) || size < 0) {
-      throw new MatrixError(502, 'M_UNKNOWN', 'bad chunk size');
-    }
-    if (size === 0) break;
-    total += size;
-    if (total > maxBytes) {
-      throw new MatrixError(502, 'M_TOO_LARGE', 'Content is too large');
-    }
-    while (pending.length < size + 2) {
-      const tmp = new Uint8Array(Math.max(size + 2 - pending.length, 1024));
-      const got = await conn.read(tmp);
-      if (got === null) {
-        throw new MatrixError(502, 'M_UNKNOWN', 'truncated chunked body');
-      }
-      const next = new Uint8Array(pending.length + got);
-      next.set(pending);
-      next.set(tmp.subarray(0, got), pending.length);
-      pending = next;
-    }
-    parts.push(pending.slice(0, size));
-    pending = pending.subarray(size + 2);
-  }
-  const body = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    body.set(p, off);
-    off += p.length;
-  }
-  return body;
 }
 
 async function hopGet(
@@ -276,76 +104,47 @@ async function hopGet(
   }
   const ip = addrs[0];
   const port = parsed.port === '' ? defaultPort(https) : Number(parsed.port);
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), HOP_MS);
-  let conn: Deno.Conn | null = null;
-  try {
-    const tcp = await Deno.connect({
-      hostname: connectHost(ip),
-      port,
-      signal: ac.signal,
-    });
-    conn = tcp;
-    let stream: Deno.Conn = tcp;
-    if (https) {
-      const tls = await Deno.startTls(tcp, { hostname: parsed.hostname });
-      await tls.handshake();
-      stream = tls;
-      conn = tls;
+  const lang = opts.acceptLanguage;
+  const headers: Record<string, string> = { Accept: '*/*' };
+  if (lang !== null && lang.length > 0) {
+    headers['Accept-Language'] = lang;
+  }
+  const res = await http1Request({
+    connectIp: ip,
+    port,
+    tls: https ? { sni: parsed.hostname, caCerts: [] } : null,
+    hostHeader: hostHeader(parsed, https),
+    method: 'GET',
+    path: requestPath(parsed),
+    headers,
+    body: null,
+    connectMs: HOP_MS,
+    timeoutMs: HOP_MS,
+    maxBytes: opts.maxBytes,
+  });
+  if (res.status >= 300 && res.status < 400) {
+    const loc = res.headers.get('location');
+    if (loc === null || loc.length === 0) {
+      throw new MatrixError(502, 'M_UNKNOWN', 'redirect without Location');
     }
-    const lang = opts.acceptLanguage;
-    const req = 'GET ' + requestPath(parsed) + ' HTTP/1.1\r\n' +
-      'Host: ' + hostHeader(parsed, https) + '\r\n' +
-      'Accept: */*\r\n' +
-      (lang !== null && lang.length > 0
-        ? 'Accept-Language: ' + lang + '\r\n'
-        : '') +
-      'Connection: close\r\n\r\n';
-    await stream.write(new TextEncoder().encode(req));
-    const { status, headers, body } = await readHttp(stream, opts.maxBytes);
-    if (status >= 300 && status < 400) {
-      const loc = headers.get('location');
-      if (loc === null || loc.length === 0) {
-        throw new MatrixError(502, 'M_UNKNOWN', 'redirect without Location');
-      }
-      const next = new URL(loc, parsed).href;
-      stream.close();
-      conn = null;
-      return await hopGet(next, hop + 1, opts, block, allow);
-    }
-    if (status < 200 || status >= 300) {
-      throw new MatrixError(
-        502,
-        'M_UNKNOWN',
-        'upstream returned ' + status,
-      );
-    }
-    const ct = headers.get('content-type');
-    return {
-      status,
-      headers,
-      body,
-      url: parsed.href,
-      contentType: ct !== null ? ct : 'application/octet-stream',
-    };
-  } catch (e) {
-    if (e instanceof MatrixError) throw e;
-    if (ac.signal.aborted) {
-      throw new MatrixError(502, 'M_UNKNOWN', 'upstream timeout');
-    }
+    const next = new URL(loc, parsed).href;
+    return await hopGet(next, hop + 1, opts, block, allow);
+  }
+  if (res.status < 200 || res.status >= 300) {
     throw new MatrixError(
       502,
       'M_UNKNOWN',
-      'upstream connection failed',
+      'upstream returned ' + res.status,
     );
-  } finally {
-    clearTimeout(timer);
-    if (conn !== null) {
-      try {
-        conn.close();
-      } catch { /* already closed */ }
-    }
   }
+  const ct = res.headers.get('content-type');
+  return {
+    status: res.status,
+    headers: res.headers,
+    body: res.body,
+    url: parsed.href,
+    contentType: ct !== null ? ct : 'application/octet-stream',
+  };
 }
 
 export async function guardedGet(
