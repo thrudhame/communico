@@ -114,6 +114,9 @@ export async function handleTransaction(
       } catch {
         continue;
       }
+      // the wire form has no event_id (v3+, transported out-of-band) —
+      // restore it: the signature covers the redacted form WITH it
+      (pdu as unknown as Record<string, unknown>).event_id = eventId;
       try {
         if (room === null) {
           // no room_directory row (and no pending out-of-band invite —
