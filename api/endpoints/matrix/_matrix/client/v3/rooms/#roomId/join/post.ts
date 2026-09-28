@@ -1,7 +1,4 @@
-import { MatrixError } from '#engine/matrix-error.ts';
 import { join } from '#engine/membership.ts';
-import { lookupRoom } from '#engine/room.ts';
-import { joinRemoteRoom } from '#engine/federation/joins.ts';
 import { domainOf } from '#engine/federation/pdu.ts';
 import { serverName } from '#engine/config.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
@@ -21,15 +18,11 @@ export default async function (
     string,
     unknown
   >;
-  const room = await lookupRoom(roomId);
-  if (room !== null) {
-    const res = await join(roomId, userId, body);
-    return { room_id: res.roomId };
-  }
-  const candidates = [domainOf(roomId)].filter((d) => d !== serverName());
-  if (candidates.length === 0) {
-    throw new MatrixError(404, 'M_NOT_FOUND', 'room not found: ' + roomId);
-  }
-  const res = await joinRemoteRoom(roomId, userId, candidates, body);
+  // membership.join dispatches: live → local; archived → reopen or
+  // remote; never held → the remote dance (the room id's domain and the
+  // inviter's server among the candidates)
+  const res = await join(roomId, userId, body, {
+    via: [domainOf(roomId)].filter((d) => d !== serverName()),
+  });
   return { room_id: res.roomId };
 }

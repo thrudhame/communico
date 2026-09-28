@@ -29,6 +29,7 @@ import {
   queueTyping,
 } from './edus.ts';
 import { toWire } from './pdu.ts';
+import { registerRejectInvitePerformer } from './invites.ts';
 
 // --- intent performers (ruling F) ----------------------------------------
 // Intent rows never enter a /send batch: an intent is attempted by the
@@ -68,6 +69,8 @@ let senderStarted = false;
 export function startSender(): void {
   if (senderStarted) return;
   senderStarted = true;
+  // commit 9's reject-invite performer, on commit 3's registry
+  registerRejectInvitePerformer();
   // the wake path tolerates a missing outbox table (the app boots before
   // db-init on a fresh container; a pre-existing DB may lack the M5b
   // tables until the documented ALTER — either way, rows never lost:

@@ -37,6 +37,7 @@ import {
   typingSeq,
 } from './typing.ts';
 import { receiptSeq, receiptSeqForUser, receiptsSince } from './receipts.ts';
+import { inviteFor } from './federation/invites.ts';
 import { type EventIndexRow, eventIndexRowOf } from './event-format.ts';
 import type { Pdu } from './pdu.ts';
 
@@ -426,6 +427,12 @@ async function inviteState(
       state_key: r.stateKey,
       content: r.content,
       sender: pdu.sender,
+      // MSC-4311's "full create event" shape (narrowed conformance note,
+      // CS:2830-2832 lets a server include more): the create entry keeps
+      // origin_server_ts, in both the local and the out-of-band paths
+      ...(r.type === 'm.room.create'
+        ? { origin_server_ts: Number(pdu.origin_server_ts) }
+        : {}),
     });
   }
   return out;
@@ -506,6 +513,56 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   );
 
   for (const m of memberships) {
+    // M5b (§3.8 step 4): the out-of-band branch BEFORE the room lookup —
+    // a membership with a federation_invites row has no room_directory
+    // row and would never render. rooms.invite renders the stored
+    // stripped list + the invite event stripped; a rejected out-of-band
+    // invite renders in rooms.leave the same way; both go through the
+    // ignored-inviter filter and advance the stream by their
+    // room_membership.seq.
+    if (m.membership === 'invite' || m.membership === 'leave') {
+      const oob = await inviteFor(m.roomId, i.userId);
+      if (oob !== null) {
+        const stored = JSON.parse(oob.eventJson) as Record<string, unknown>;
+        const stripped = JSON.parse(oob.inviteRoomState) as Record<
+          string,
+          unknown
+        >[];
+        const inviter = typeof stored.sender === 'string'
+          ? stored.sender
+          : undefined;
+        if (
+          inviter !== undefined && ignoredUsers.size > 0 &&
+          ignoredUsers.has(inviter)
+        ) {
+          continue;
+        }
+        const events = [
+          ...stripped,
+          {
+            type: stored.type,
+            state_key: stored.state_key,
+            content: stored.content,
+            sender: stored.sender,
+          },
+        ];
+        if (m.membership === 'invite' && oob.status === 'pending') {
+          invite[m.roomId] = { invite_state: { events } };
+        } else {
+          // a rejected out-of-band invite reads as a leave
+          const include = i.since === null
+            ? i.filter.includeLeave
+            : m.seq > i.since.eSeq;
+          if (include) {
+            leave[m.roomId] = {
+              timeline: { events: [], limited: false, prev_batch: '' },
+              state: { events },
+            };
+          }
+        }
+        continue;
+      }
+    }
     const room = await lookupRoom(m.roomId);
     if (!room) continue;
     if (m.membership === 'invite') {

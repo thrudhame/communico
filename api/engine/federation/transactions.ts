@@ -25,6 +25,7 @@ import {
 import { lookupRoom, serversInRoom } from '#engine/room.ts';
 import { dispatchEdu } from './edus.ts';
 import { fetchMissingPrevs } from './missing.ts';
+import { acceptRescind } from './invites.ts';
 import type { Pdu } from '#engine/pdu.ts';
 
 // The M5c hook point (SS:1236-1279): server ACLs check the origin
@@ -119,9 +120,14 @@ export async function handleTransaction(
       (pdu as unknown as Record<string, unknown>).event_id = eventId;
       try {
         if (room === null) {
-          // no room_directory row (and no pending out-of-band invite —
-          // commit 9's rescind arm is the one exception, §3.8 step 7)
-          results[eventId] = { error: 'unknown room' };
+          // no room_directory row — except an m.room.member leave/ban
+          // for a user with an out-of-band invite (§3.8 step 7's
+          // rescind): a remote rejection, not an error
+          if (await acceptRescind(roomId, pdu)) {
+            results[eventId] = {};
+          } else {
+            results[eventId] = { error: 'unknown room' };
+          }
           continue;
         }
         if (!(await serversInRoom(roomId)).includes(serverName())) {

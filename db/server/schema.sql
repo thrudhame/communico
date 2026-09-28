@@ -49,6 +49,11 @@
 --   failures_total bigint NOT NULL DEFAULT 0, unreachable_since_ms bigint,
 --   next_attempt_ms bigint NOT NULL DEFAULT 0, last_attempt_ms bigint,
 --   last_success_ms bigint, last_inbound_ms bigint, last_error text);
+-- (M5b invites): CREATE TABLE federation_invites (room_id text NOT NULL,
+--   user_id text NOT NULL, event_id text NOT NULL, room_version text NOT NULL,
+--   event_json text NOT NULL, invite_room_state text NOT NULL,
+--   origin text NOT NULL, received_ms bigint NOT NULL, status text NOT NULL,
+--   PRIMARY KEY (room_id, user_id));
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -275,6 +280,21 @@ CREATE TABLE IF NOT EXISTS federation_txns (
   received_ms bigint NOT NULL,
   response text NOT NULL,
   PRIMARY KEY (origin, txn_id)
+);
+-- M5b: invites to our users into rooms we do not hold (out-of-band).
+-- No room DB is provisioned for an invite — the row + a room_membership
+-- row are the whole state; /sync renders from the stored stripped list.
+CREATE TABLE IF NOT EXISTS federation_invites (
+  room_id text NOT NULL,
+  user_id text NOT NULL,
+  event_id text NOT NULL,
+  room_version text NOT NULL,
+  event_json text NOT NULL,           -- the invite event with both signatures
+  invite_room_state text NOT NULL,    -- JSON array of stripped events (may be [])
+  origin text NOT NULL,               -- the inviting server
+  received_ms bigint NOT NULL,
+  status text NOT NULL,               -- 'pending' | 'rejecting' (intent queued, ruling F) | 'rejected' | 'joined'
+  PRIMARY KEY (room_id, user_id)
 );
 -- M5b (D2): the durable outbox — one row per (event × destination),
 -- written in the same server-DB transaction as the event's index row

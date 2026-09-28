@@ -26,6 +26,13 @@ import {
 import { getProfile } from './tenant.ts';
 import { authChain } from './rulebook/state-res-v2.ts';
 import { joinRemoteRoom } from './federation/joins.ts';
+import {
+  inviteFor,
+  inviteRemote,
+  markInviteJoined,
+  rejectInviteRemote,
+} from './federation/invites.ts';
+import { domainOf } from './federation/pdu.ts';
 import type { Pdu } from './pdu.ts';
 import type { StateRowInput } from './materialize.ts';
 
@@ -115,10 +122,15 @@ export async function join(
   }
   // archived or unknown: the server list decides whom to ask (§3.6b) —
   // via/server_name first, then the held room's servers from the last
-  // known state
+  // known state, and the inviter's server when we hold a pending invite
+  // (§3.8, wired in commit 9)
   const via = opts.via ?? opts.serverName ?? [];
   const held = room !== null ? await serversInRoom(roomId) : [];
-  const others = [...new Set([...via, ...held])].filter((d) =>
+  const invite = await inviteFor(roomId, userId);
+  const inviter = invite !== null && invite.status === 'pending'
+    ? [invite.origin]
+    : [];
+  const others = [...new Set([...via, ...inviter, ...held])].filter((d) =>
     d !== serverName()
   );
   if (others.length === 0) {
@@ -131,10 +143,13 @@ export async function join(
         'no servers to join through',
       );
     }
-    return await joinArchived(roomId, userId, extraContent);
+    const reopened = await joinArchived(roomId, userId, extraContent);
+    await markInviteJoined(roomId, userId);
+    return reopened;
   }
   // others → the remote dance
   const res = await joinRemoteRoom(roomId, userId, others, extraContent);
+  await markInviteJoined(roomId, userId);
   return { roomId: res.roomId, eventId: res.eventId, created: true };
 }
 
@@ -283,15 +298,27 @@ async function joinArchived(
   });
 }
 
-// leave: self only (sender == state_key). Never a member -> 403.
+// leave: self only (sender == state_key). Never a member -> 403. M5b
+// (§3.8 step 6): on a federation_invites room (an out-of-band invite we
+// have not accepted) this is the REJECT — local effect at once + the
+// retried intent (ruling F; no silent local-only fallback).
 export async function leave(
   roomId: string,
   userId: string,
   reason?: string,
 ): Promise<MembershipOpResult> {
   const current = await membershipOf(roomId, userId);
-  if (current === null) {
-    throw new MatrixError(403, 'M_FORBIDDEN', 'never a member of ' + roomId);
+  if (current === null || current.membership === 'invite') {
+    // an out-of-band invite (a room we do not hold) → the REJECT (§3.8
+    // step 6, ruling F)
+    const invite = await inviteFor(roomId, userId);
+    if (invite !== null && invite.status !== 'joined') {
+      await rejectInviteRemote(roomId, userId);
+      return { roomId, eventId: invite.eventId, created: false };
+    }
+    if (current === null) {
+      throw new MatrixError(403, 'M_FORBIDDEN', 'never a member of ' + roomId);
+    }
   }
   const content: Record<string, unknown> = { membership: 'leave' };
   if (reason !== undefined) content.reason = reason;
@@ -301,7 +328,9 @@ export async function leave(
 const USER_ID_RE = /^@[^:\s]+:[^\s]+$/;
 
 // invite: sender invites the target. Self-invite -> 403; target already
-// joined -> 403; malformed target -> 400 M_INVALID_PARAM.
+// joined -> 403; malformed target -> 400 M_INVALID_PARAM. M5b (§3.8): a
+// REMOTE target goes over federation (admit → author → /v2/invite →
+// merge → ingest as our own); a local target authors into the room.
 export async function invite(
   roomId: string,
   sender: string,
@@ -321,6 +350,10 @@ export async function invite(
       'M_FORBIDDEN',
       target + ' is already in the room',
     );
+  }
+  if (domainOf(target) !== serverName()) {
+    const res = await inviteRemote(roomId, sender, target, reason);
+    return { roomId, eventId: res.eventId, created: true };
   }
   const content: Record<string, unknown> = { membership: 'invite' };
   if (reason !== undefined) content.reason = reason;

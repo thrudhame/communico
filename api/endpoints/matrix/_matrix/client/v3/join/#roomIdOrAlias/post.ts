@@ -1,7 +1,6 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { join } from '#engine/membership.ts';
-import { lookupAlias, lookupRoom } from '#engine/room.ts';
-import { joinRemoteRoom } from '#engine/federation/joins.ts';
+import { lookupAlias } from '#engine/room.ts';
 import { domainOf } from '#engine/federation/pdu.ts';
 import { federationRequest } from '#engine/federation/client.ts';
 import { serverName } from '#engine/config.ts';
@@ -70,21 +69,11 @@ export default async function (
   // api/client/membership/join.rs:69)
   remoteCandidates.push(domainOf(roomId));
 
-  const room = await lookupRoom(roomId);
-  if (room !== null) {
-    // held (live or archived): membership.join dispatches per §3.6b
-    const res = await join(roomId, userId, body, {
-      via: remoteCandidates,
-    });
-    return { room_id: res.roomId };
-  }
-  // never held: the remote dance (or the plain 404 when nobody is listed)
-  const candidates = [...new Set(remoteCandidates)].filter((d) =>
-    d !== serverName()
-  );
-  if (candidates.length === 0) {
-    throw new MatrixError(404, 'M_NOT_FOUND', 'no servers to join through');
-  }
-  const res = await joinRemoteRoom(roomId, userId, candidates, body);
+  // held or not: membership.join dispatches per §3.6b (live → local;
+  // archived → reopen or remote by the server list; never held → the
+  // remote dance with the inviter's server among the candidates)
+  const res = await join(roomId, userId, body, {
+    via: [...new Set(remoteCandidates)].filter((d) => d !== serverName()),
+  });
   return { room_id: res.roomId };
 }
