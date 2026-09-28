@@ -545,7 +545,13 @@ export async function groundingOf(
       [roomId, eventId],
     );
     if (r.rows.length === 0) return 'unknown';
-    if (r.rows[0].rejected_reason === 'ungrounded') return 'placeholder';
+    // 'ungrounded' placeholders and 'unverifiable' stores ground nothing
+    if (
+      r.rows[0].rejected_reason === 'ungrounded' ||
+      r.rows[0].rejected_reason === 'unverifiable'
+    ) {
+      return 'placeholder';
+    }
     if (r.rows[0].seq == null && r.rows[0].branch_name == null) {
       return 'evidence';
     }

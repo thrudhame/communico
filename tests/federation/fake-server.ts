@@ -30,6 +30,8 @@ export type FakeServer = {
   name: string; // 'localhost' or 'localhost:port'
   keyId: string;
   publicB64: string;
+  // the fake's own keypair — for redact-then-signing events as this server
+  kp: CryptoKeyPair;
   requests: FakeRequest[];
   // sign any JSON object as this server (for building inbound requests)
   sign: (obj: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -180,6 +182,7 @@ export async function startFakeServer(opts: {
     name: selfName,
     keyId,
     publicB64,
+    kp,
     requests,
     sign: async (obj) =>
       (await signJson(obj, selfName, keyId, kp.privateKey)) as Record<

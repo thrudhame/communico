@@ -312,11 +312,15 @@ async function resolvePrevs(
       const row = byId.get(pid);
       if (!row) throw new Error('M_UNKNOWN_PREV: ' + pid);
       // M5b (ruling B): an ungrounded prev does not ground children — its
-      // state is a placeholder, not history. A child citing it is unknown
-      // for grounding and goes the same way (stored 'ungrounded' on the
-      // /send path; re-evaluates on its own redelivery). Prevs rejected
-      // for 'auth'/'state' ARE grounding (their state is real).
-      if (row.rejected_reason === 'ungrounded') {
+      // state is a placeholder, not history; nor does an 'unverifiable'
+      // one (its auth chain could not be fetched — TestCorruptedAuthChain).
+      // A child citing either is unknown for grounding and goes the same
+      // way. Prevs rejected for 'auth'/'state' ARE grounding (their state
+      // is real).
+      if (
+        row.rejected_reason === 'ungrounded' ||
+        row.rejected_reason === 'unverifiable'
+      ) {
         throw new Error('M_UNKNOWN_PREV: ' + pid);
       }
       prevs.push({
@@ -832,8 +836,11 @@ export async function storeUngroundedLocked(
   const eventId = String(pdu.event_id);
   const missingPrevIds: string[] = [];
   await withDb(serverDb(), async (c) => {
+    // 'ungrounded'/'unverifiable' prevs count as MISSING for grounding —
+    // their state is a placeholder, not history (ruling B)
     const r = await c.query(
-      'SELECT event_id FROM event_index WHERE room_id = $1 AND event_id = ANY($2);',
+      `SELECT event_id FROM event_index WHERE room_id = $1 AND event_id = ANY($2)
+         AND (rejected_reason IS NULL OR rejected_reason NOT IN ('ungrounded', 'unverifiable'));`,
       [roomId, pdu.prev_events ?? []],
     );
     const known = new Set(
@@ -921,6 +928,528 @@ export async function storeUngroundedLocked(
       );
     }
   });
+}
+
+// M5b (§3.4): a prev fetched via /state_ids + /event lands 'after'
+// (live — clients see it) with the FETCHED state as its before-state
+// (the remote's state at the event — Synapse
+// federation_event.py:1188-1230): one "pack" commit on the prev's own
+// x* branch carries the fetched evidence events (so ancestry loading
+// from the prev's lineage finds them and DOLT_GC never takes them —
+// r5, fable), the prev's own commit rides on top with the fetched state
+// applied. The caller holds the room lock.
+export async function ingestPrevWithFetchedStateLocked(
+  roomId: string,
+  prev: Pdu,
+  fetchedEvents: Pdu[],
+  fetchedState: StateRowInput[],
+  origin: string,
+): Promise<IngestResult> {
+  const room = await lookupRoom(roomId);
+  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
+  const rulebook = getRulebook(room.roomVersion);
+  const eventId = String(prev.event_id);
+
+  // auth of the prev against the fetched state (rules 3–10) and its
+  // auth chain (rules 1–2) — the store covers the pack AND the room's
+  // held history (the prev's auth events usually name events we hold)
+  const fetchedMap: StateMap = new Map();
+  for (const r of fetchedState) {
+    fetchedMap.set(stateKeyOf(r.type, r.stateKey), r.eventId);
+  }
+  const pduById = new Map<string, Pdu>();
+  // held history: the live extremities' commits carry every earlier
+  // event on their lineages (the chapter's own commits hold only the
+  // materialized state)
+  const xbs = await extremities(room.dbName, roomId);
+  const heldHashes: string[] = [];
+  for (const xb of xbs) {
+    const h = await commitHashOf(roomId, xb.eventId);
+    if (h !== null) heldHashes.push(h);
+  }
+  if (heldHashes.length > 0) {
+    const held = await loadAncestry(room.dbName, heldHashes);
+    for (const [id, p] of held.pduById) pduById.set(id, p);
+  }
+  for (const e of fetchedEvents) pduById.set(String(e.event_id), e);
+  pduById.set(eventId, prev);
+  const store = eventStoreOf(pduById, new Set());
+  const chain = rulebook.checkAuthChain(prev, store);
+  let rejected = false;
+  let rejectRule: string | null = null;
+  if (!chain.ok) {
+    rejected = true;
+    rejectRule = chain.rule;
+  } else {
+    const st = rulebook.checkAuthAgainstState(prev, fetchedMap, store);
+    if (!st.ok) {
+      rejected = true;
+      rejectRule = st.rule;
+    }
+  }
+  const rejectedReason = rejected
+    ? (rejectRule !== null && rejectRule.startsWith('3') ? 'state' : 'auth')
+    : null;
+  void rejectedReason;
+
+  const { packCommit, prevCommit, xBranch } = await withDb(
+    room.dbName,
+    async (c) => {
+      const xBranch = await branchNameFor(eventId);
+      assertHash(room.genesisCommit);
+      await c.query(
+        `SELECT DOLT_BRANCH('${ident(xBranch)}', '${room.genesisCommit}');`,
+      );
+      await c.query(`SELECT DOLT_CHECKOUT('${ident(xBranch)}');`);
+      // the pack: every fetched event on this lineage
+      for (const e of fetchedEvents) {
+        await c.query(
+          'INSERT INTO events (event_id, type, state_key, sender, origin_ts, depth, prev_events, auth_events, hashes, signatures, rejected, soft_failed, canonical_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);',
+          [
+            String(e.event_id),
+            e.type,
+            e.state_key ?? null,
+            e.sender,
+            e.origin_server_ts,
+            e.depth,
+            JSON.stringify(e.prev_events ?? []),
+            JSON.stringify(e.auth_events ?? []),
+            JSON.stringify(e.hashes ?? {}),
+            JSON.stringify(e.signatures ?? {}),
+            false,
+            false,
+            canonicalJson(e as unknown as Record<string, unknown>),
+          ],
+        );
+      }
+      await materialize(c, fetchedState);
+      const pr = await c.query(`SELECT DOLT_COMMIT('-Am', $1);`, [
+        `fetched state before ${eventId}`,
+      ]);
+      const packCommit = String(Object.values(pr.rows[0])[0] ?? '');
+      // the prev itself
+      await c.query(
+        'INSERT INTO events (event_id, type, state_key, sender, origin_ts, depth, prev_events, auth_events, hashes, signatures, rejected, soft_failed, canonical_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);',
+        [
+          eventId,
+          prev.type,
+          prev.state_key ?? null,
+          prev.sender,
+          prev.origin_server_ts,
+          prev.depth,
+          JSON.stringify(prev.prev_events ?? []),
+          JSON.stringify(prev.auth_events ?? []),
+          JSON.stringify(prev.hashes ?? {}),
+          JSON.stringify(prev.signatures ?? {}),
+          rejected,
+          false,
+          canonicalJson(prev as unknown as Record<string, unknown>),
+        ],
+      );
+      const rows = [...fetchedState];
+      if (!rejected && prev.state_key != null) {
+        const at = rows.findIndex((r) =>
+          r.type === String(prev.type) && r.stateKey === String(prev.state_key)
+        );
+        const row: StateRowInput = {
+          type: String(prev.type),
+          stateKey: String(prev.state_key),
+          eventId,
+          content: prev.content ?? {},
+        };
+        if (at >= 0) rows[at] = row;
+        else rows.push(row);
+      }
+      await materialize(c, rows);
+      const rr = await c.query(`SELECT DOLT_COMMIT('-Am', $1);`, [
+        `event ${eventId} type ${String(prev.type)}`,
+      ]);
+      const prevCommit = String(Object.values(rr.rows[0])[0] ?? '');
+      return { packCommit, prevCommit, xBranch };
+    },
+  );
+
+  // index rows: the fetched events as 'evidence' at the pack commit
+  // (seq NULL, no branch); the prev live (seq, era, branch)
+  const currentChapter = room.currentChapter;
+  await withDb(serverDb(), async (c) => {
+    for (const e of fetchedEvents) {
+      await c.query(
+        `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed,
+           rejected_reason, origin, added_ms, era, seq)
+         VALUES ($1, $2, $3, NULL, FALSE, FALSE, NULL, $4, $5, NULL, NULL)
+         ON CONFLICT (event_id) DO NOTHING;`,
+        [String(e.event_id), roomId, packCommit, origin, Date.now()],
+      );
+    }
+    await c.query(
+      `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed,
+         rejected_reason, origin, added_ms, era)
+       VALUES ($1, $2, $3, $4, $5, FALSE, $6, $7, $8, $9)
+       ON CONFLICT (event_id) DO UPDATE SET commit_hash = $3, branch_name = $4, rejected = $5, rejected_reason = $6, era = $9, seq = DEFAULT;`,
+      [
+        eventId,
+        roomId,
+        prevCommit,
+        rejected ? null : xBranch,
+        rejected,
+        rejected
+          ? (rejectRule !== null && rejectRule.startsWith('3')
+            ? 'state'
+            : 'auth')
+          : null,
+        origin,
+        Date.now(),
+        currentChapter,
+      ],
+    );
+    await c.query(
+      'DELETE FROM event_index_waiting WHERE room_id = $1 AND event_id = $2;',
+      [roomId, eventId],
+    );
+  });
+  const prevSeq = await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT seq FROM event_index WHERE event_id = $1;',
+      [
+        eventId,
+      ],
+    );
+    return r.rows[0].seq == null ? null : Number(r.rows[0].seq);
+  });
+
+  // publish + fold + the re-check trigger, as for any live event
+  if (!rejected && currentChapter !== null) {
+    const resolved = new Map(fetchedMap);
+    if (prev.state_key != null) {
+      resolved.set(
+        stateKeyOf(String(prev.type), String(prev.state_key)),
+        eventId,
+      );
+    }
+    const publishedRows = stateRowsOf(resolved, pduById);
+    const stateHash = await publishCurrentState(
+      room.dbName,
+      currentChapter,
+      publishedRows,
+      `after ${eventId}`,
+    );
+    await withDb(serverDb(), async (c) => {
+      await c.query(
+        'UPDATE event_index SET state_commit_hash = $1 WHERE event_id = $2;',
+        [stateHash, eventId],
+      );
+    });
+    await foldMembership(roomId, publishedRows, prev, prevSeq);
+  }
+  for (const l of appliedListeners) {
+    try {
+      l(roomId, eventId);
+    } catch (e) {
+      console.error('applied listener error:', e);
+    }
+  }
+  if (rejected) {
+    throw new Error(
+      (rejectRule !== null && rejectRule.startsWith('3')
+        ? 'M_STATE_REJECT: '
+        : 'M_AUTHCHAIN_REJECT: ') +
+        eventId +
+        (rejectRule !== null ? ' (rule ' + rejectRule + ')' : ''),
+    );
+  }
+  return { event_id: eventId, commit_hash: prevCommit };
+}
+
+// M5b (§3.4, TestCorruptedAuthChain): an event whose auth events could
+// not be fetched is stored rejected 'unverifiable' — the reference
+// resolves, it is never rendered, and it grounds nothing (its state is
+// unknowable). No expiry — a standing record, not a placeholder. The
+// CALLER holds the room lock.
+export async function storeUnverifiableLocked(
+  roomId: string,
+  pdu: Pdu,
+  origin: string,
+): Promise<void> {
+  const room = await lookupRoom(roomId);
+  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
+  const eventId = String(pdu.event_id);
+  const newBranch = await branchNameFor(eventId);
+  const commitHash = await withDb(room.dbName, async (c) => {
+    assertHash(room.genesisCommit);
+    await c.query(
+      `SELECT DOLT_BRANCH('${ident(newBranch)}', '${room.genesisCommit}');`,
+    );
+    await c.query(`SELECT DOLT_CHECKOUT('${ident(newBranch)}');`);
+    await c.query(
+      'INSERT INTO events (event_id, type, state_key, sender, origin_ts, depth, prev_events, auth_events, hashes, signatures, rejected, soft_failed, canonical_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);',
+      [
+        eventId,
+        pdu.type,
+        pdu.state_key ?? null,
+        pdu.sender,
+        pdu.origin_server_ts,
+        pdu.depth,
+        JSON.stringify(pdu.prev_events ?? []),
+        JSON.stringify(pdu.auth_events ?? []),
+        JSON.stringify(pdu.hashes ?? {}),
+        JSON.stringify(pdu.signatures ?? {}),
+        true, // rejected
+        false,
+        canonicalJson(pdu as unknown as Record<string, unknown>),
+      ],
+    );
+    // the room's current published state as a marker state table — this
+    // is NOT grounding (groundingOf answers 'placeholder' for it)
+    const head = await chapterHead(roomId);
+    if (head !== null) {
+      const tip = await c.query(`SELECT HASHOF('${ident(head)}') AS h;`);
+      const stateRows = await c.query(
+        `SELECT type, state_key, event_id, content FROM state AS OF '${
+          String(tip.rows[0].h)
+        }';`,
+      );
+      await materialize(
+        c,
+        // deno-lint-ignore no-explicit-any
+        (stateRows.rows as any[]).map((r) => ({
+          type: String(r.type),
+          stateKey: String(r.state_key),
+          eventId: String(r.event_id),
+          content: typeof r.content === 'string'
+            ? JSON.parse(r.content)
+            : r.content,
+        })),
+      );
+    }
+    const res = await c.query(`SELECT DOLT_COMMIT('-Am', $1);`, [
+      `unverifiable ${eventId} type ${String(pdu.type)}`,
+    ]);
+    return String(Object.values(res.rows[0])[0] ?? '');
+  });
+  await withDb(serverDb(), async (c) => {
+    await c.query(
+      `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed,
+         rejected_reason, origin, added_ms, seq, era)
+       VALUES ($1, $2, $3, $4, TRUE, FALSE, 'unverifiable', $5, $6, NULL, NULL)
+       ON CONFLICT (event_id) DO NOTHING;`,
+      [eventId, roomId, commitHash, newBranch, origin, Date.now()],
+    );
+  });
+}
+
+// --- ruling B: the placeholder re-check driver -------------------------------
+
+// After ANY event gains real grounding — accepted, or stored rejected
+// for 'auth'/'state' (those have real state and do ground children) —
+// ingest looks up placeholders waiting for it (one indexed SELECT on the
+// side table — P4 ruling) and queues the room's driver. Re-checks run
+// AFTER the current lock is released (each is a normal locked ingest of
+// its own — prechecks may fetch a key, network never under a lock),
+// oldest added_ms first; an accepted one queues the same lookup for ITS
+// waiters (its own tail fires). Re-send re-checks too (precheck 5).
+const recheckRunning = new Map<string, boolean>();
+
+async function readStoredPdu(
+  roomId: string,
+  commitHash: string,
+  eventId: string,
+): Promise<Pdu | null> {
+  const room = await lookupRoom(roomId);
+  if (!room) return null;
+  return await withDb(room.dbName, async (c) => {
+    assertHash(commitHash);
+    const r = await c.query(
+      `SELECT canonical_json FROM events AS OF '${commitHash}' WHERE event_id = $1;`,
+      [eventId],
+    ).catch(() => ({ rows: [] }));
+    if (r.rows.length === 0) return null;
+    return (typeof r.rows[0].canonical_json === 'string'
+      ? JSON.parse(String(r.rows[0].canonical_json))
+      : r.rows[0].canonical_json) as Pdu;
+  }).catch(() => null);
+}
+
+async function queuePlaceholderRechecks(roomId: string): Promise<void> {
+  if (recheckRunning.get(roomId) === true) return;
+  recheckRunning.set(roomId, true);
+  try {
+    for (;;) {
+      const job = await withDb(serverDb(), async (c) => {
+        const r = await c.query(
+          `SELECT w.event_id, w.missing_prev, i.rejected_reason, i.origin, i.commit_hash, i.added_ms
+           FROM event_index_waiting w
+           JOIN event_index i ON i.room_id = w.room_id AND i.event_id = w.event_id
+           WHERE w.room_id = $1
+           ORDER BY i.added_ms LIMIT 1;`,
+          [roomId],
+        );
+        if (r.rows.length === 0) return null;
+        const o = r.rows[0] as Record<string, unknown>;
+        return {
+          eventId: String(o.event_id),
+          missingPrev: String(o.missing_prev),
+          rejectedReason: o.rejected_reason == null
+            ? null
+            : String(o.rejected_reason),
+          origin: o.origin == null ? '' : String(o.origin),
+          commitHash: String(o.commit_hash),
+        };
+      });
+      if (job === null) return;
+      await recheckOne(roomId, job);
+    }
+  } finally {
+    recheckRunning.delete(roomId);
+  }
+}
+
+async function recheckOne(
+  roomId: string,
+  job: {
+    eventId: string;
+    missingPrev: string;
+    rejectedReason: string | null;
+    origin: string;
+    commitHash: string;
+  },
+): Promise<void> {
+  // a waiting REDACTION of an unknown target (§3.3): accepted and stored
+  // when it arrived; its effect lands when the target arrives
+  if (job.rejectedReason === null) {
+    const pdu = await readStoredPdu(roomId, job.commitHash, job.eventId);
+    if (pdu?.type === 'm.room.redaction') {
+      await withDb(serverDb(), async (c) => {
+        await c.query(
+          'UPDATE event_index SET redacted_by = $1 WHERE event_id = $2;',
+          [job.eventId, job.missingPrev],
+        );
+      });
+    }
+    await withDb(serverDb(), async (c) => {
+      await c.query(
+        'DELETE FROM event_index_waiting WHERE room_id = $1 AND event_id = $2;',
+        [roomId, job.eventId],
+      );
+    });
+    return;
+  }
+  if (job.rejectedReason !== 'ungrounded') {
+    await withDb(serverDb(), async (c) => {
+      await c.query(
+        'DELETE FROM event_index_waiting WHERE room_id = $1 AND event_id = $2;',
+        [roomId, job.eventId],
+      );
+    });
+    return;
+  }
+  // a placeholder: re-ingest (its deterministic branch is deleted before
+  // the re-ingest creates it again — precheck 5's fall-through)
+  const pdu = await readStoredPdu(roomId, job.commitHash, job.eventId);
+  if (pdu === null) {
+    await withDb(serverDb(), async (c) => {
+      await c.query(
+        'DELETE FROM event_index_waiting WHERE room_id = $1 AND event_id = $2;',
+        [roomId, job.eventId],
+      );
+    });
+    return;
+  }
+  try {
+    await ingestEvent(roomId, pdu, {
+      remote: { origin: job.origin, position: 'after' },
+    });
+  } catch (e) {
+    if (String(e).includes('M_UNKNOWN_PREV')) {
+      // still ungrounded — refresh the waiting set to what is missing NOW
+      const still: string[] = [];
+      await withDb(serverDb(), async (c) => {
+        const r = await c.query(
+          'SELECT event_id FROM event_index WHERE room_id = $1 AND event_id = ANY($2);',
+          [roomId, pdu.prev_events ?? []],
+        );
+        const known = new Set(
+          // deno-lint-ignore no-explicit-any
+          r.rows.map((row: any) => String(row.event_id)),
+        );
+        for (const pid of pdu.prev_events ?? []) {
+          if (!known.has(pid)) still.push(pid);
+        }
+      });
+      await withDb(serverDb(), async (c) => {
+        await c.query(
+          'DELETE FROM event_index_waiting WHERE room_id = $1 AND event_id = $2;',
+          [roomId, job.eventId],
+        );
+        for (const pid of still) {
+          await c.query(
+            'INSERT INTO event_index_waiting (room_id, missing_prev, event_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;',
+            [roomId, pid, job.eventId],
+          );
+        }
+      });
+    } else {
+      console.error(`federation: re-check of ${job.eventId} failed:`, e);
+    }
+  }
+}
+
+// ruling B expiry: lapsed placeholders leave — row, branch, waiting
+// rows — so a later delivery is a first delivery. Runs on the room's
+// next write (ingestEventLocked) and at startup; logged, not alerted.
+export async function sweepExpiredPlaceholders(
+  roomId?: string,
+): Promise<number> {
+  const now = Date.now();
+  const lapsed = await withDb(serverDb(), async (c) => {
+    const r = roomId === undefined
+      ? await c.query(
+        `SELECT event_id, room_id, branch_name FROM event_index
+         WHERE rejected_reason = 'ungrounded' AND expires_ms IS NOT NULL AND expires_ms <= $1;`,
+        [now],
+      )
+      : await c.query(
+        `SELECT event_id, room_id, branch_name FROM event_index
+         WHERE rejected_reason = 'ungrounded' AND expires_ms IS NOT NULL AND expires_ms <= $1 AND room_id = $2;`,
+        [now, roomId],
+      );
+    // deno-lint-ignore no-explicit-any
+    return (r.rows as any[]).map((row) => ({
+      eventId: String(row.event_id),
+      roomId: String(row.room_id),
+      branchName: row.branch_name == null ? null : String(row.branch_name),
+    }));
+  });
+  for (const row of lapsed) {
+    const dbName = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        'SELECT db_name FROM room_directory WHERE room_id = $1;',
+        [row.roomId],
+      );
+      return r.rows.length === 0 ? null : String(r.rows[0].db_name);
+    });
+    if (dbName !== null && row.branchName !== null) {
+      const branch = row.branchName;
+      await withDb(dbName, async (c) => {
+        await c.query(`SELECT DOLT_BRANCH('-D', '${ident(branch)}');`)
+          .catch(() => {});
+      });
+    }
+    await withDb(serverDb(), async (c) => {
+      await c.query(
+        'DELETE FROM event_index WHERE room_id = $1 AND event_id = $2;',
+        [row.roomId, row.eventId],
+      );
+      await c.query(
+        'DELETE FROM event_index_waiting WHERE room_id = $1 AND event_id = $2;',
+        [row.roomId, row.eventId],
+      );
+    });
+    console.warn(
+      `federation: expired ungrounded placeholder ${row.eventId} in ${row.roomId}`,
+    );
+  }
+  return lapsed.length;
 }
 
 // M5b (§3.2): one outbox row per destination — domains of members
@@ -1042,6 +1571,11 @@ export async function ingestEventLocked(
   // room's CURRENT chapter; 'before'/'evidence' rows are positioned by
   // their callers (commits 8/10) and never enter the live stream.
   const currentChapter = room.currentChapter;
+
+  // ruling B expiry: lapsed placeholders leave on the room's next write
+  if (opts.remote) {
+    await sweepExpiredPlaceholders(roomId);
+  }
 
   // 6. prev resolution via the server DB's event_index (D8: the extremity
   //    branch comes from event_index.branch_name, not recomputation).
@@ -1338,6 +1872,11 @@ export async function ingestEventLocked(
             isLive ? currentChapter : null,
           ],
         );
+        // grounded now (or re-flagged) — the waiting rows are spent
+        await c.query(
+          'DELETE FROM event_index_waiting WHERE room_id = $1 AND event_id = $2;',
+          [roomId, eventId],
+        );
       } else {
         await c.query(
           `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed, txn_device, txn_id,
@@ -1501,6 +2040,52 @@ export async function ingestEventLocked(
         );
       });
     }
+  }
+
+  // ruling B (§3.2/§3.3): an event that gains real grounding — accepted,
+  // or stored rejected for 'auth'/'state' — wakes its waiters: queued
+  // placeholder re-checks run after this lock releases, and an accepted
+  // redaction whose target just arrived is applied. A redaction whose
+  // target we STILL do not hold is itself stored with a waiting row (its
+  // effect lands when the target arrives, via the same driver).
+  if (!softFailed && pdu.type === 'm.room.redaction' && !rejected) {
+    const target = typeof (pdu.content ?? {}).redacts === 'string'
+      ? String((pdu.content ?? {}).redacts)
+      : typeof pdu.redacts === 'string'
+      ? pdu.redacts
+      : null;
+    if (target !== null) {
+      await withDb(serverDb(), async (c) => {
+        const held = await c.query(
+          'SELECT 1 FROM event_index WHERE room_id = $1 AND event_id = $2;',
+          [roomId, target],
+        );
+        if (held.rows.length > 0) {
+          await c.query(
+            'UPDATE event_index SET redacted_by = $1 WHERE event_id = $2;',
+            [eventId, target],
+          );
+        } else {
+          await c.query(
+            'INSERT INTO event_index_waiting (room_id, missing_prev, event_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;',
+            [roomId, target, eventId],
+          );
+        }
+      });
+    }
+  }
+  if (
+    !softFailed &&
+    (!rejected || rejectedReason === 'auth' || rejectedReason === 'state')
+  ) {
+    const hasWaiters = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        'SELECT 1 FROM event_index_waiting WHERE room_id = $1 AND missing_prev = $2 LIMIT 1;',
+        [roomId, eventId],
+      );
+      return r.rows.length > 0;
+    });
+    if (hasWaiters) void queuePlaceholderRechecks(roomId);
   }
 
   // D8: push-rule migration hooks, after publish — manual upgrades are

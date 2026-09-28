@@ -24,6 +24,7 @@ import {
 } from '#engine/ingest.ts';
 import { lookupRoom, serversInRoom } from '#engine/room.ts';
 import { dispatchEdu } from './edus.ts';
+import { fetchMissingPrevs } from './missing.ts';
 import type { Pdu } from '#engine/pdu.ts';
 
 // The M5c hook point (SS:1236-1279): server ACLs check the origin
@@ -89,8 +90,11 @@ export async function handleTransaction(
     list.push(pdu);
     byRoom.set(roomId, list);
   }
-
   const results: Record<string, Record<string, never> | { error: string }> = {};
+  // the transaction-wide budget for missing-prev fetching (design point
+  // D — when it is spent, the remaining PDUs with unknown prevs go
+  // straight to the 'ungrounded' terminal and the answer goes out)
+  const budget = { until: Date.now() + config().federation.missingbudgetms };
   await Promise.all([...byRoom.entries()].map(async ([roomId, roomPdus]) => {
     const room = await lookupRoom(roomId);
     // PDUs of one room in transaction order; the lock wraps only the
@@ -130,21 +134,35 @@ export async function handleTransaction(
           results[eventId] = {}; // known event — "successfully handled"
           continue;
         }
+        // §3.4: the bounded fetch chain, UNLOCKED, then one locked retry;
+        // a prev still unknown lands the 'ungrounded' terminal
+        let landed = false;
         await withRoomLock(roomId, async () => {
           try {
             await ingestEventLocked(roomId, pdu, {
               remote: { origin, position: 'after' },
             }, pre.pre);
+            landed = true;
           } catch (e) {
-            if (String(e).includes('M_UNKNOWN_PREV')) {
-              // the terminal rule (commit 4): stored 'ungrounded' — the
-              // fetch chain inserts in front of this in commit 5 (§3.4)
-              await storeUngroundedLocked(roomId, pdu, origin);
-            } else {
-              throw e;
-            }
+            if (!String(e).includes('M_UNKNOWN_PREV')) throw e;
           }
         });
+        if (!landed) {
+          await fetchMissingPrevs(roomId, pdu, origin, budget);
+          await withRoomLock(roomId, async () => {
+            try {
+              await ingestEventLocked(roomId, pdu, {
+                remote: { origin, position: 'after' },
+              }, pre.pre);
+            } catch (e) {
+              if (String(e).includes('M_UNKNOWN_PREV')) {
+                await storeUngroundedLocked(roomId, pdu, origin);
+              } else {
+                throw e;
+              }
+            }
+          });
+        }
         results[eventId] = {};
       } catch (e) {
         const msg = String(e);

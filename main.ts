@@ -2,6 +2,7 @@ import { appPort, config, ConfigError, loadedConfig } from '#engine/config.ts';
 import { mediaRoot } from '#engine/media.ts';
 import { wireFederationTransport } from '#engine/federation/client.ts';
 import { startSender } from '#engine/federation/sender.ts';
+import { sweepExpiredPlaceholders } from '#engine/ingest.ts';
 import {
   listBlocks,
   listPeers,
@@ -73,6 +74,10 @@ try {
 
 if (config().federation.enabled) {
   wireFederationTransport();
+  // ruling B expiry: lapsed 'ungrounded' placeholders leave at startup
+  // (and on each room's next write); the table may not exist yet on a
+  // fresh container's first boot (db-init runs after the app)
+  void sweepExpiredPlaceholders().catch(() => {});
   startSender();
 }
 

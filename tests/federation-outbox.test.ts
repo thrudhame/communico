@@ -351,9 +351,9 @@ Deno.test('outbox: notifyPeerAlive resets the ladder and wakes the queue', async
   await withSetup(async ({ sends, steer, dest }) => {
     steer.status = 500;
     await devSays('backed off');
-    await waitFor(() => sends.length >= 1, 3000);
+    // the failure lands a tick after the request — wait on IT
+    await waitFor(async () => (await peerStatus(dest)).failures >= 1, 5000);
     const st1 = await peerStatus(dest);
-    assert(st1.failures >= 1, JSON.stringify(st1));
     assert(st1.unreachableSinceMs !== null);
     // inbound contact: ladder to zero, the queue wakes
     steer.status = 200;
