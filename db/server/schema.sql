@@ -27,11 +27,35 @@
 -- (search): CREATE TABLE search_index (event_id text PRIMARY KEY,
 --   room_id text NOT NULL, seq bigint NOT NULL, key text NOT NULL,
 --   sender text NOT NULL, origin_ts bigint NOT NULL, body_lower text NOT NULL);
+-- (M5b): ALTER TABLE room_directory ADD COLUMN current_chapter text;
+--   ALTER TABLE room_directory ADD COLUMN genesis_commit text;
+--   ALTER TABLE room_directory ADD COLUMN purgeable_ms bigint;
+--   ALTER TABLE event_index ADD COLUMN rejected_reason text;
+--   ALTER TABLE event_index ADD COLUMN origin text;
+--   ALTER TABLE event_index ADD COLUMN expires_ms bigint;
+--   ALTER TABLE event_index ADD COLUMN added_ms bigint;
+--   ALTER TABLE event_index ADD COLUMN era text;
+--   ALTER TABLE event_index ADD COLUMN branch_pos bigint;
+--   CREATE TABLE event_index_waiting (room_id text NOT NULL,
+--     missing_prev text NOT NULL, event_id text NOT NULL,
+--     PRIMARY KEY (room_id, missing_prev, event_id));
+--   CREATE INDEX event_index_reason ON event_index (room_id, rejected_reason);
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
   room_version text NOT NULL,
-  stub_era boolean NOT NULL DEFAULT TRUE
+  stub_era boolean NOT NULL DEFAULT TRUE,
+  -- M5b (the book): the live stay's branch name ('chapter<2k+1>') —
+  -- NULL = archived (the server's last local member left). main is the
+  -- room's SYSTEM branch — it carries the schema genesis commit and
+  -- never holds content (P5 ruling, probes.md).
+  current_chapter text,
+  -- the 'room genesis: schema' commit hash, stored at provision — every
+  -- chapter branch starts here (there is no content branch to read it from).
+  genesis_commit text,
+  -- set when every local user has forgotten the room; the operator's
+  -- `rooms -- purge` drops it (never a built-in timer).
+  purgeable_ms bigint
 );
 -- branch_name: x* extremity branch currently holding this event's commit
 -- (phase-1 step 1.3 sanctioned addition for the send endpoint's
@@ -58,8 +82,37 @@ CREATE TABLE IF NOT EXISTS event_index (
   -- M4: sending device + transaction id for txn idempotency and
   -- unsigned.transaction_id (same device only).
   txn_device text,
-  txn_id text
+  txn_id text,
+  -- M5b: NULL (accepted) | 'auth' | 'state' | 'ungrounded' |
+  -- 'unverifiable' | 'oversized' — the machine standing beside the
+  -- rejected flag (which stays for the existing readers).
+  rejected_reason text,
+  -- M5b: the server that delivered the event to us (NULL = authored here).
+  origin text,
+  -- M5b: 'ungrounded' placeholders only — removed when past (ruling B).
+  expires_ms bigint,
+  -- M5b: when the row was written (re-check order, report views).
+  added_ms bigint,
+  -- M5b: the chapter this event belongs to (live events: their stay's
+  -- 'chapter<2k+1>'; history rows: the stay that discovered them).
+  era text,
+  -- M5b: history rows only — commit position on their even chapter
+  -- (0 = root = the most recent history event; larger = older).
+  branch_pos bigint
 );
+-- M5b: seq is two-state — > 0 = arrived live (the /sync "what's new"
+-- stream), NULL = history or evidence (never news). The DEFAULT keeps
+-- live inserts unchanged; history/evidence inserts pass explicit NULL.
+-- M5b (P4 ruling, probes.md): Doltgres has no jsonb containment, so the
+-- re-check lookup for 'ungrounded' placeholders is a plain side table —
+-- one row per (placeholder event × still-missing prev id).
+CREATE TABLE IF NOT EXISTS event_index_waiting (
+  room_id text NOT NULL,
+  missing_prev text NOT NULL,
+  event_id text NOT NULL,
+  PRIMARY KEY (room_id, missing_prev, event_id)
+);
+CREATE INDEX IF NOT EXISTS event_index_reason ON event_index (room_id, rejected_reason);
 -- M4 (E2): per-user room lists without scanning room DBs. Derived cache of
 -- `main`, written in the same ingest step that publishes it (from the
 -- published rows' m.room.member entries).

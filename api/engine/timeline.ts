@@ -1,5 +1,6 @@
-import { serverDb, withDb } from './db.ts';
+import { ident, serverDb, withDb } from './db.ts';
 import {
+  chapterHeadForDb,
   eventIndexRow,
   formatStreamToken,
   lookupRoom,
@@ -191,11 +192,15 @@ export async function eventAtCommit(
   return null;
 }
 
-// Current state lives on `main` (republished by ingest / reresolveFromDag
-// whenever the extremity set changes) — readers never pick a branch.
+// Current state lives on the current chapter (M5b, the book — main is
+// the room's system branch): republished by ingest / reresolveFromDag
+// whenever the extremity set changes; an archived room reads as of its
+// close (chapterHeadForDb).
 export async function stateNow(dbName: string): Promise<unknown[]> {
+  const head = await chapterHeadForDb(dbName);
+  if (head === null) return [];
   return await withDb(dbName, async (c) => {
-    await c.query("SELECT DOLT_CHECKOUT('main');");
+    await c.query(`SELECT DOLT_CHECKOUT('${ident(head)}');`);
     const r = await c.query('SELECT * FROM state;');
     return r.rows;
   });

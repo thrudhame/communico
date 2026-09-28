@@ -54,6 +54,18 @@ witnesses = 3
 pendingmax = 10000
 pendingdays = 30
 lookups = "known"
+missingwaitms = 750
+missinglimit = 10
+missingbudgetms = 8000
+missingmax = 20
+backfillbatch = 50
+backfillmax = 100
+bulkmaxbytes = 67108864
+backoffstartmillihours = 125
+backoffmaxmillihours = 256000
+refusedmillihours = 256000
+ungroundedmillihours = 256000
+txnhours = 24
 `;
 
 async function writeTree(
@@ -353,7 +365,7 @@ Deno.test('[preview] enabled bool strictness; blocklist list; malformed CIDR', a
   assertEquals(empty.config.preview.maxbytes, 10485760);
 });
 
-Deno.test('[federation] 21 leaves, env names, enum/cap validation', async () => {
+Deno.test('[federation] 33 leaves, env names, enum/cap validation', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const defaultsPath = `${dir}/defaults/communico.toml`;
   const loaded = loadConfig({ defaultsPath, configPath: null, env: {} });
@@ -379,6 +391,18 @@ Deno.test('[federation] 21 leaves, env names, enum/cap validation', async () => 
   assertEquals(f.pendingmax, 10000);
   assertEquals(f.pendingdays, 30);
   assertEquals(f.lookups, 'known');
+  assertEquals(f.missingwaitms, 750);
+  assertEquals(f.missinglimit, 10);
+  assertEquals(f.missingbudgetms, 8000);
+  assertEquals(f.missingmax, 20);
+  assertEquals(f.backfillbatch, 50);
+  assertEquals(f.backfillmax, 100);
+  assertEquals(f.bulkmaxbytes, 67108864);
+  assertEquals(f.backoffstartmillihours, 125);
+  assertEquals(f.backoffmaxmillihours, 256000);
+  assertEquals(f.refusedmillihours, 256000);
+  assertEquals(f.ungroundedmillihours, 256000);
+  assertEquals(f.txnhours, 24);
 
   const fromEnv = loadConfig({
     defaultsPath,
@@ -452,6 +476,106 @@ Deno.test('[federation] 21 leaves, env names, enum/cap validation', async () => 
       p.includes('federation.witnesses') && p.includes('>= 1')
     ),
     `witnesses: ${noWitnesses.join('\n')}`,
+  );
+});
+
+Deno.test('[federation] M5b delivery/history leaves: ordering + ladder validation', async () => {
+  const mk = async () => {
+    const dir = await writeTree({ 'defaults/communico.toml': FULL });
+    return `${dir}/defaults/communico.toml`;
+  };
+  // ordering: missinglimit <= missingmax
+  let dp = await mk();
+  let problems = loadFail({
+    defaultsPath: dp,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_MISSINGLIMIT: '21' },
+  });
+  assert(
+    problems.some((p) =>
+      p.includes('federation.missinglimit') && p.includes('missingmax')
+    ),
+    `missinglimit>max: ${problems.join('\n')}`,
+  );
+  // ordering: backfillbatch <= backfillmax
+  dp = await mk();
+  problems = loadFail({
+    defaultsPath: dp,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_BACKFILLBATCH: '101' },
+  });
+  assert(
+    problems.some((p) =>
+      p.includes('federation.backfillbatch') && p.includes('backfillmax')
+    ),
+    `backfillbatch>max: ${problems.join('\n')}`,
+  );
+  // ordering: missingwaitms < missingbudgetms
+  dp = await mk();
+  problems = loadFail({
+    defaultsPath: dp,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_MISSINGWAITMS: '8000' },
+  });
+  assert(
+    problems.some((p) =>
+      p.includes('federation.missingwaitms') && p.includes('missingbudgetms')
+    ),
+    `wait>=budget: ${problems.join('\n')}`,
+  );
+  // the ladder rule: ceiling must be start × 2^k — 168000 is not a rung
+  // and the error names the neighbours (128000 / 256000)
+  dp = await mk();
+  problems = loadFail({
+    defaultsPath: dp,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_BACKOFFMAXMILLIHOURS: '168000' },
+  });
+  assert(
+    problems.some((p) =>
+      p.includes('federation.backoffmaxmillihours') &&
+      p.includes('128000') && p.includes('256000')
+    ),
+    `ladder: ${problems.join('\n')}`,
+  );
+  // a rung passes (128000 = 125 × 2^10)
+  dp = await mk();
+  const ok = loadConfig({
+    defaultsPath: dp,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_BACKOFFMAXMILLIHOURS: '128000' },
+  });
+  assertEquals(ok.config.federation.backoffmaxmillihours, 128000);
+  // ungroundedmillihours allows 0 (drop); negatives refused
+  dp = await mk();
+  const zero = loadConfig({
+    defaultsPath: dp,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_UNGROUNDEDMILLIHOURS: '0' },
+  });
+  assertEquals(zero.config.federation.ungroundedmillihours, 0);
+  dp = await mk();
+  problems = loadFail({
+    defaultsPath: dp,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_UNGROUNDEDMILLIHOURS: '-1' },
+  });
+  assert(
+    problems.some((p) => p.includes('federation.ungroundedmillihours')),
+    `ungrounded<0: ${problems.join('\n')}`,
+  );
+  // >= 1 on the rest
+  dp = await mk();
+  problems = loadFail({
+    defaultsPath: dp,
+    configPath: null,
+    env: { COMMUNICO_FEDERATION_REFUSEDMILLIHOURS: '0' },
+  });
+  assert(
+    problems.some((p) =>
+      p.includes('federation.refusedmillihours') && p.includes('>= 1')
+    ),
+    `refused<1: ${problems.join('\n')}`,
   );
 });
 

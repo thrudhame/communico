@@ -1,8 +1,13 @@
 import type pgpkg from 'pg';
 import { branchNameFor, ident, serverDb, withDb } from './db.ts';
-import { extremities, lookupRoom, type RoomInfo } from './room.ts';
+import {
+  extremities,
+  lookupRoom,
+  type RoomInfo,
+  serversInRoom,
+} from './room.ts';
 import { mergeDriver } from './mergedriver.ts';
-import { eventIdFor } from './eventid.ts';
+import { eventIdFor, redact } from './eventid.ts';
 import { assertCanonicalNumbers, canonicalJson } from './canonical.ts';
 import { MatrixError } from './matrix-error.ts';
 import { serverName } from './config.ts';
@@ -37,6 +42,17 @@ export interface IngestOptions {
   // on the event_index row (unsigned.transaction_id renders for the same
   // device only).
   txn?: { deviceId: string; txnId: string };
+  // M5b: the event arrived over federation. Absent = authored here (the
+  // strict local checks apply unchanged). origin = the delivering server;
+  // onBehalfOf = accepted on another server's behalf (send_join /
+  // send_leave / returned invite — outbox fan-out, commit 3); position =
+  // 'after' (live, the /sync stream) | 'before' (fetched history, commit
+  // 10) | 'evidence' (join snapshot / auth chains — held, never news).
+  remote?: {
+    origin: string;
+    onBehalfOf?: true;
+    position: 'after' | 'before' | 'evidence';
+  };
 }
 
 // Core→hat signal (design §3.6: hats are plugins — the core knows nothing
@@ -56,8 +72,12 @@ export function onEventApplied(l: AppliedListener): () => void {
 // critical section, so a concurrent op always authors on the live tip.
 // Complement subtests are t.Parallel() on one room; single process, one
 // listener — a module-level Map<roomId, Promise> chain is sufficient.
+// M5b: exported for the federation/ package — the transaction handler,
+// the missing-prev chain and the join snapshot hold the room lock
+// themselves and call the locked-internal entry points (the lock is NOT
+// reentrant; network I/O never runs under it).
 const roomLocks = new Map<string, Promise<void>>();
-async function withRoomLock<T>(
+export async function withRoomLock<T>(
   roomId: string,
   fn: () => Promise<T>,
 ): Promise<T> {
@@ -259,12 +279,24 @@ async function prevDepths(
 async function resolvePrevs(
   roomId: string,
   prevIds: string[],
-): Promise<{ id: string; commitHash: string; branch: string | null }[]> {
-  const prevs: { id: string; commitHash: string; branch: string | null }[] = [];
+): Promise<
+  {
+    id: string;
+    commitHash: string;
+    branch: string | null;
+    era: string | null;
+  }[]
+> {
+  const prevs: {
+    id: string;
+    commitHash: string;
+    branch: string | null;
+    era: string | null;
+  }[] = [];
   await withDb(serverDb(), async (c) => {
     if (prevIds.length === 0) return;
     const r = await c.query(
-      'SELECT event_id, commit_hash, branch_name FROM event_index WHERE room_id = $1 AND event_id = ANY($2);',
+      'SELECT event_id, commit_hash, branch_name, era, rejected_reason FROM event_index WHERE room_id = $1 AND event_id = ANY($2);',
       [roomId, prevIds],
     );
     // deno-lint-ignore no-explicit-any
@@ -275,10 +307,19 @@ async function resolvePrevs(
     for (const pid of prevIds) {
       const row = byId.get(pid);
       if (!row) throw new Error('M_UNKNOWN_PREV: ' + pid);
+      // M5b (ruling B): an ungrounded prev does not ground children — its
+      // state is a placeholder, not history. A child citing it is unknown
+      // for grounding and goes the same way (stored 'ungrounded' on the
+      // /send path; re-evaluates on its own redelivery). Prevs rejected
+      // for 'auth'/'state' ARE grounding (their state is real).
+      if (row.rejected_reason === 'ungrounded') {
+        throw new Error('M_UNKNOWN_PREV: ' + pid);
+      }
       prevs.push({
         id: pid,
         commitHash: String(row.commit_hash),
         branch: row.branch_name == null ? null : String(row.branch_name),
+        era: row.era == null ? null : String(row.era),
       });
     }
   });
@@ -427,21 +468,26 @@ export async function author(
 // consumed its prevs at ingest time, so the walk stops there. Runs on the
 // room client `c` (the new branch is checked out — the stored PDUs of the
 // whole cited ancestry are readable); event_index supplies branches/flags.
+// M5b (era isolation, §3.6a): a branch is consumed only when its event
+// belongs to the CURRENT chapter — a post-re-join event citing an old-era
+// prev branches from that commit but never deletes the archive's branch.
 async function consumeBranchChain(
   c: pgpkg.Client,
   roomId: string,
   prev: { id: string; branch: string | null },
+  currentChapter: string,
 ): Promise<void> {
   if (prev.branch !== null) {
     await c.query(`SELECT DOLT_BRANCH('-D', '${ident(prev.branch)}');`);
   }
   const flagged = await withDb(serverDb(), async (s) => {
     const r = await s.query(
-      'SELECT rejected, soft_failed FROM event_index WHERE room_id = $1 AND event_id = $2;',
+      'SELECT rejected, soft_failed, era FROM event_index WHERE room_id = $1 AND event_id = $2;',
       [roomId, prev.id],
     );
     return r.rows.length > 0 &&
-      (r.rows[0].rejected === true || r.rows[0].soft_failed === true);
+      (r.rows[0].rejected === true || r.rows[0].soft_failed === true) &&
+      String(r.rows[0].era ?? '') === currentChapter;
   });
   if (!flagged) return;
   const gp = await c.query(
@@ -460,46 +506,119 @@ async function consumeBranchChain(
   for (const id of ids) {
     const branch = await withDb(serverDb(), async (s) => {
       const r = await s.query(
-        'SELECT branch_name FROM event_index WHERE room_id = $1 AND event_id = $2;',
-        [roomId, id],
+        'SELECT branch_name FROM event_index WHERE room_id = $1 AND event_id = $2 AND era = $3;',
+        [roomId, id, currentChapter],
       );
       return r.rows.length && r.rows[0].branch_name != null
         ? String(r.rows[0].branch_name)
         : null;
     });
-    // already consumed (null) or stale row — only consume live branches
+    // already consumed (null), another era's archive, or stale row —
+    // only consume live branches of the current chapter
     if (branch === null || !live.has(branch)) continue;
-    await consumeBranchChain(c, roomId, { id, branch });
+    await consumeBranchChain(c, roomId, { id, branch }, currentChapter);
   }
 }
 
 // Steps 1-5 of ingest, outside the per-room lock: room/version gate, wire
 // bounds, self-certifying id, idempotent redelivery, hash + signature
 // checks. 'early' carries the redelivery receipt; 'go' carries the
-// IngestPrecheck for ingestEventLocked.
-async function ingestPrechecks(
+// IngestPrecheck for ingestEventLocked. M5b: exported for the
+// federation/ package — callers must hold the room lock (withRoomLock)
+// before pairing this with ingestEventLocked.
+export async function ingestPrechecks(
   roomId: string,
   pdu: Pdu,
+  opts: IngestOptions = {},
 ): Promise<
   { kind: 'early'; result: IngestResult } | { kind: 'go'; pre: IngestPrecheck }
 > {
-  // 1. room + version gate (unknown -> never a default).
+  // 1. room + version gate (unknown -> never a default). For remote
+  //    events the caller already made the room exist (join snapshot /
+  //    provisioning), so M_ROOM_NOT_FOUND here is a bug, not a wire case.
   const room = await lookupRoom(roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
-  getRulebook(room.roomVersion);
+  const rulebook = getRulebook(room.roomVersion);
   const prevIds = pdu.prev_events ?? [];
   const declaredAuth = pdu.auth_events ?? [];
 
-  // 2. wire bounds (spec PDU: <=20 prev_events, <=10 auth_events).
-  if (prevIds.length > 20) {
+  // 2. wire bounds + the M5b remote format checks (SS:464-469, step 1
+  //    "valid event"). Local events keep today's behaviour (author()
+  //    enforces the caps it can violate); the remote additions run only
+  //    for opts.remote.
+  if (prevIds.length > 20 && opts.remote?.position !== 'before') {
     throw new Error('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
   }
-  if (declaredAuth.length > 10) {
+  if (declaredAuth.length > 10 && opts.remote?.position !== 'before') {
     throw new Error('M_TOO_MANY_AUTH_EVENTS: v11 allows at most 10');
   }
+  let oversized = false;
+  if (opts.remote) {
+    // required fields (pdu_base.yaml:67-74; + room_id for ≤ v11 —
+    // components/room_id_before_v12.yaml:22-23)
+    if (
+      typeof pdu.type !== 'string' || typeof pdu.sender !== 'string' ||
+      typeof pdu.depth !== 'number' || !Number.isInteger(pdu.depth) ||
+      pdu.depth < 0 ||
+      typeof pdu.origin_server_ts !== 'number' ||
+      (pdu.content === null || typeof pdu.content !== 'object')
+    ) {
+      throw new Error('M_BAD_EVENT: missing or malformed required fields');
+    }
+    if (
+      !rulebook.spec.roomIdFromCreateEvent && typeof pdu.room_id !== 'string'
+    ) {
+      throw new Error('M_BAD_EVENT: room_id required before v12');
+    }
+    // depth bounded only (components/depth_v6.yaml:19-25 — the only MUST)
+    const depthBound = rulebook.spec.depthLimit === 'int53'
+      ? 2 ** 53 - 1
+      : 2 ** 63 - 1;
+    if (pdu.depth > depthBound) {
+      throw new Error('M_BAD_EVENT: depth exceeds the room version limit');
+    }
+    // whole canonical event ≤ 65536 bytes (CS:2869-2871) — a format
+    // failure: the PDU is invalid, dropped.
+    if (
+      new TextEncoder().encode(
+        canonicalJson(pdu as unknown as Record<string, unknown>),
+      ).length > 65536
+    ) {
+      throw new Error('M_TOO_LARGE: event exceeds the 65536-byte limit');
+    }
+    // per-key limits (CS:2874-2878; appendices identifier grammars):
+    // type/state_key ≤ 255, sender/room_id/event_id ≤ their grammar caps
+    // — measured in BYTES for strictByteLimits versions (v11+), else
+    // codepoints. A failure in a LENIENT version is stored rejected
+    // 'oversized' (Synapse federation_event.py:1852-1868); a failure in a
+    // strict version is a format failure — dropped.
+    const measure = (s: string): number =>
+      rulebook.spec.strictByteLimits
+        ? new TextEncoder().encode(s).length
+        : [...s].length;
+    const keyFail = (typeof pdu.type === 'string' && measure(pdu.type) > 255) ||
+      (pdu.state_key !== undefined && measure(String(pdu.state_key)) > 255);
+    if (keyFail) {
+      if (rulebook.spec.strictByteLimits) {
+        throw new Error('M_BAD_EVENT: type/state_key exceed 255 bytes');
+      }
+      oversized = true;
+    }
+    for (const id of [pdu.sender, pdu.room_id, pdu.event_id]) {
+      if (typeof id === 'string' && new TextEncoder().encode(id).length > 255) {
+        throw new Error('M_BAD_EVENT: identifier exceeds its grammar limit');
+      }
+    }
+  }
 
-  // 3. self-certifying id (also enforces the canonical int range — a
-  // ts=2^53 seize throws here, refused before anything is stored).
+  // 3. `unsigned` stripped on receipt (not covered by signatures —
+  //    appendices.md:341-343 — nor by the content hash, SS:1355-1361):
+  //    we never store another server's unsigned. invite_room_state on an
+  //    invite is read by §3.8 BEFORE this strip.
+  delete (pdu as unknown as Record<string, unknown>).unsigned;
+
+  // 4. self-certifying id (also enforces the canonical int range — a
+  //    ts=2^53 seize throws here, refused before anything is stored).
   let expect: string;
   try {
     expect = await eventIdFor(
@@ -535,25 +654,41 @@ async function ingestPrechecks(
   // non-hashed fields (signatures/unsigned) or redacted-away content —
   // interchangeable by redaction's design. The DAG keeps first-writer
   // bytes; nothing re-enters state through this path.
+  // M5b (ruling B): an 'ungrounded' placeholder re-delivered over
+  // federation falls THROUGH for a real re-ingest (its index row is
+  // updated in place; the placeholder branch is deleted before the
+  // re-ingest creates it again).
   const existing = await withDb(serverDb(), async (c) => {
     const r = await c.query(
-      'SELECT commit_hash FROM event_index WHERE event_id = $1;',
+      'SELECT commit_hash, rejected_reason FROM event_index WHERE event_id = $1;',
       [eventId],
     );
-    return r.rows.length ? String(r.rows[0].commit_hash) : null;
+    return r.rows.length
+      ? {
+        commitHash: String(r.rows[0].commit_hash),
+        rejectedReason: r.rows[0].rejected_reason == null
+          ? null
+          : String(r.rows[0].rejected_reason),
+      }
+      : null;
   });
-  if (existing) {
+  const redeliverUngrounded = existing !== null &&
+    existing.rejectedReason === 'ungrounded' && opts.remote !== undefined;
+  if (existing && !redeliverUngrounded) {
     return {
       kind: 'early',
-      result: { event_id: eventId, commit_hash: existing },
+      result: { event_id: eventId, commit_hash: existing.commitHash },
     };
   }
 
-  // 4. content hash (spec: fail -> the event is redacted before further
-  // processing; F0 records it rejected — in the DAG, out of state).
-  // The v11 wire form has no `event_id` field (it is the derived
-  // reference hash, transported out-of-band); strip our annotation
-  // before hashing, as at signing time.
+  // 5. content hash (spec: fail -> the event is redacted before further
+  //    processing; F0 records it rejected — in the DAG, out of state).
+  //    M5b (SS:471-472, SS:1328-1336): a REMOTE event whose hash fails is
+  //    replaced by the redacted copy we calculate — today's
+  //    hashOk=false -> authchain-reject is kept for local events only.
+  //    The v11 wire form has no `event_id` field (it is the derived
+  //    reference hash, transported out-of-band); strip our annotation
+  //    before hashing, as at signing time.
   let hashOk = false;
   try {
     const { event_id: _drop, ...noId } = pdu as unknown as Record<
@@ -565,12 +700,24 @@ async function ingestPrechecks(
   } catch {
     hashOk = false;
   }
+  if (!hashOk && opts.remote) {
+    const redacted = redact(
+      pdu as unknown as Record<string, unknown>,
+      room.roomVersion,
+    );
+    for (const k of Object.keys(pdu)) {
+      delete (pdu as unknown as Record<string, unknown>)[k];
+    }
+    Object.assign(pdu, redacted);
+    hashOk = true;
+  }
 
-  // 5. origin signature, REQUIRED (F1: the unsigned-lite seam is
-  // deleted — every engine signs). Entries under our own serverName()
-  // verify against the tenant key; entries under a base32 server_name
-  // verify key-is-name (browser homeservers — nothing to fetch).
-  // Unsigned PDUs are refused, full stop.
+  // 6. origin signature, REQUIRED (F1: the unsigned-lite seam is
+  //    deleted — every engine signs). Entries under our own serverName()
+  //    verify against the tenant key; entries under a base32 server_name
+  //    verify key-is-name (browser homeservers — nothing to fetch).
+  //    Unsigned PDUs are refused, full stop. (M5b commit 2: remote
+  //    senders verify through getVerifyKey with the room's witnesses.)
   const sigEntries = Object.entries(pdu.signatures ?? {});
   let sigOk = false;
   if (sigEntries.length > 0) {
@@ -610,7 +757,10 @@ async function ingestPrechecks(
     throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
   }
 
-  return { kind: 'go', pre: { room, eventId, hashOk, sigOk } };
+  return {
+    kind: 'go',
+    pre: { room, eventId, hashOk, sigOk, oversized, redeliverUngrounded },
+  };
 }
 
 export async function ingestEvent(
@@ -618,7 +768,7 @@ export async function ingestEvent(
   pdu: Pdu,
   opts: IngestOptions = {},
 ): Promise<IngestResult> {
-  const r = await ingestPrechecks(roomId, pdu);
+  const r = await ingestPrechecks(roomId, pdu, opts);
   if (r.kind === 'early') return r.result;
   // E5: from prev resolution (step 6) through publishCurrentState, ingest
   // holds the per-room lock. author() stays outside (pure).
@@ -632,6 +782,13 @@ interface IngestPrecheck {
   eventId: string;
   hashOk: boolean;
   sigOk: boolean;
+  // M5b: a lenient-version per-key size failure — stored rejected
+  // 'oversized' (never a drop; strict versions throw in prechecks).
+  oversized: boolean;
+  // M5b (ruling B): an 'ungrounded' placeholder re-delivered over
+  // federation — the index row is updated in place and the placeholder
+  // branch deleted before the re-ingest creates it again.
+  redeliverUngrounded: boolean;
 }
 
 // author + ingest as one op-level step, holding the per-room lock across
@@ -648,32 +805,104 @@ export async function authorAndIngest(
 ): Promise<IngestResult> {
   return await withRoomLock(roomId, async () => {
     const pdu = await author(roomId, partial);
-    const r = await ingestPrechecks(roomId, pdu);
+    const r = await ingestPrechecks(roomId, pdu, opts);
     if (r.kind === 'early') return r.result;
     return await ingestEventLocked(roomId, pdu, opts, r.pre);
   });
 }
 
-// Steps 6-12 of ingest, inside the per-room lock (E5).
-async function ingestEventLocked(
+// E2 fold — the PUBLISHED current-state rows' m.room.member entries into
+// the per-user membership index (a derived cache of the chapter, same
+// writer step as the publish). M5b (r4-c): the fold KEEPS an existing
+// row's seq when its event_id is unchanged, and stamps a row only when
+// the membership event changes — with the member event's own seq when it
+// has one, the triggering event's otherwise (a plain COALESCE would
+// re-stamp every NULL-seq snapshot member on every later publish, and
+// re-stamping every row would replay every old leaver in every
+// incremental sync). The old-vs-new event_id comparison is done in JS:
+// Doltgres's ON CONFLICT applies the SET clauses before evaluating a
+// CASE on the table's columns, so an inline CASE always sees the NEW
+// value (probe, 2026-09-27).
+async function foldMembership(
+  roomId: string,
+  publishedRows: StateRowInput[],
+  pdu: Pdu,
+  triggeringSeq: number | null,
+): Promise<void> {
+  await withDb(serverDb(), async (c) => {
+    for (const r of publishedRows) {
+      if (r.type !== 'm.room.member') continue;
+      // D4: a membership event FOR THE USER clears the forgotten flag
+      // (a re-join after /forget makes the room visible again) — that is
+      // THIS event's own state_key. The full-state fold below keeps the
+      // index fresh for everyone else WITHOUT touching the flag:
+      // resetting there would un-forget the room on any later event.
+      const clearsForget = pdu.type === 'm.room.member' &&
+        r.stateKey === String(pdu.state_key ?? '');
+      const own = await c.query(
+        'SELECT seq FROM event_index WHERE event_id = $1;',
+        [r.eventId],
+      );
+      const ownSeq = own.rows.length > 0 && own.rows[0].seq != null
+        ? Number(own.rows[0].seq)
+        : null;
+      const existing = await c.query(
+        'SELECT event_id, seq FROM room_membership WHERE room_id = $1 AND user_id = $2;',
+        [roomId, r.stateKey],
+      );
+      const keep = existing.rows.length > 0 &&
+        String(existing.rows[0].event_id) === r.eventId;
+      const seq = keep
+        ? Number(existing.rows[0].seq)
+        : (ownSeq ?? triggeringSeq);
+      await c.query(
+        `INSERT INTO room_membership (room_id, user_id, membership, event_id, seq)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (room_id, user_id) DO UPDATE SET membership=EXCLUDED.membership, event_id=EXCLUDED.event_id, seq=EXCLUDED.seq${
+          clearsForget ? ', forgotten=FALSE' : ''
+        };`,
+        [
+          roomId,
+          r.stateKey,
+          (r.content as { membership?: string }).membership ?? 'leave',
+          r.eventId,
+          seq,
+        ],
+      );
+    }
+  });
+}
+// Steps 6-12 of ingest, inside the per-room lock (E5). M5b: exported for
+// the federation/ package — callers MUST hold the room lock
+// (withRoomLock); network I/O never runs under it.
+export async function ingestEventLocked(
   roomId: string,
   pdu: Pdu,
   opts: IngestOptions,
   pre: IngestPrecheck,
 ): Promise<IngestResult> {
-  const { room, eventId, hashOk, sigOk } = pre;
+  const { room, eventId, hashOk, sigOk, oversized, redeliverUngrounded } = pre;
   const rulebook = getRulebook(room.roomVersion);
   const prevIds = pdu.prev_events ?? [];
   const declaredAuth = pdu.auth_events ?? [];
+  const position = opts.remote?.position ?? 'after';
+  // The chapter this event belongs to (M5b): live events carry the
+  // room's CURRENT chapter; 'before'/'evidence' rows are positioned by
+  // their callers (commits 8/10) and never enter the live stream.
+  const currentChapter = room.currentChapter;
 
   // 6. prev resolution via the server DB's event_index (D8: the extremity
   //    branch comes from event_index.branch_name, not recomputation).
   const prevs = await resolvePrevs(roomId, prevIds);
 
-  // 7. depth check (genesis = 1: spec positive, empty prevs => 1).
+  // 7. depth check (genesis = 1: spec positive, empty prevs => 1). M5b:
+  //    computed only for LOCAL events — remote events passed the bound in
+  //    precheck 2 (components/depth_v6.yaml:19-25 is the only MUST on
+  //    depth; pdu_v3.yaml:28-34 describes what a *sender* puts there and
+  //    no room version's auth rules check it).
   const depths = await prevDepths(room.dbName, prevs);
   const computedDepth = prevs.length === 0 ? 1 : Math.max(...depths) + 1;
-  const depthOk = pdu.depth === computedDepth;
+  const depthOk = opts.remote ? true : pdu.depth === computedDepth;
 
   // 8. parent states + the M3 EventStore over the full ancestry (contents,
   //    rejected flags — S8 check 4 needs the event's own auth events). The
@@ -714,12 +943,27 @@ async function ingestEventLocked(
   //       604-621).
   let verdict: 'ok' | 'authchain-reject' | 'state-reject' | 'soft-fail' = 'ok';
   let rejectRule: string | null = null;
-  if (!hashOk || !sigOk || !depthOk) {
+  if (oversized) {
+    // M5b: a lenient-version per-key size failure — stored rejected
+    // 'oversized' (Synapse federation_event.py:1852-1868).
+    verdict = 'state-reject';
+  } else if (!hashOk || !sigOk || !depthOk) {
     verdict = 'authchain-reject';
   } else {
     const chain = rulebook.checkAuthChain(pdu, store);
-    const selected = rulebook.selectAuthEvents(pdu, resolved);
-    if (!chain.ok || (!isCreate && !sameIdSet([...declaredAuth], selected))) {
+    // M5b: for REMOTE events the declared auth_events are checked by
+    // rules 1–2 only — spec rule 2 *is* the "right (type, state_key)
+    // set" check D1 asked for, so "compare as a set, never reject for a
+    // mismatch with our own selection" and "rules 1–2 only" are the same
+    // outcome. selectAuthEvents is still computed for local authoring.
+    const selected = opts.remote
+      ? null
+      : rulebook.selectAuthEvents(pdu, resolved);
+    if (
+      !chain.ok ||
+      (!isCreate && selected !== null &&
+        !sameIdSet([...declaredAuth], selected))
+    ) {
       verdict = 'authchain-reject';
       if (!chain.ok) rejectRule = chain.rule;
     } else {
@@ -747,6 +991,17 @@ async function ingestEventLocked(
   }
   const rejected = verdict === 'authchain-reject' || verdict === 'state-reject';
   const softFailed = verdict === 'soft-fail';
+  // M5b: the machine standing beside the rejected flag. 'unverifiable'
+  // (snapshot/history events whose signature or hash failed but that are
+  // referenced) and 'ungrounded' are written by their own paths (commits
+  // 4/5/8); the relaxed remote checks can only land 'auth'/'state' here.
+  const rejectedReason: string | null = oversized
+    ? 'oversized'
+    : verdict === 'authchain-reject'
+    ? 'auth'
+    : verdict === 'state-reject'
+    ? 'state'
+    : null;
 
   // 11. resolved state rows (contents from validated PDUs only — a state
   //    row without a validated event behind it is never written).
@@ -770,44 +1025,48 @@ async function ingestEventLocked(
     // the whole merge->resolve->commit sequence stays on this one client.
     await c.query('SET dolt_allow_commit_conflicts = 1;');
 
-    // prev branch must be a live extremity, and the D8 invariant must
-    // hold (branch tip == the event's commit)
-    const branchRows = await c.query('SELECT name FROM dolt.branches;');
-    const branchNames = new Set(
-      branchRows.rows.map((r: { name: string }) => String(r.name)),
-    );
-    for (const p of prevs) {
-      if (p.branch === null || !branchNames.has(p.branch)) {
-        throw new Error('M_PREV_NOT_EXTREMITY: ' + p.id);
-      }
-      const h = await c.query(
-        `SELECT (SELECT HASHOF('${ident(p.branch)}')) AS h;`,
-      );
-      if (String(h.rows[0].h) !== p.commitHash) {
-        throw new Error('E_BRANCH_POINTER_DRIFT: ' + p.id);
-      }
-    }
-
-    // base checkout, then D8 branch-first: create + check out the NEW
-    // extremity branch BEFORE any merge or write — ingest NEVER commits
-    // while a prev branch is checked out, so prev pointers never move.
-    // N prevs chain as 2-parent commits (bookkeeping); the event DAG
-    // keeps all N in prev_events, and resolution ran over the full set.
-    if (prevs.length === 0) {
-      await c.query(`SELECT DOLT_CHECKOUT('main');`);
-    } else {
-      await c.query(`SELECT DOLT_CHECKOUT('${ident(prevs[0].branch!)}');`);
-    }
+    // M5b (D1): branch from the prev's COMMIT HASH, not its live branch —
+    // a late fork is a branch from an older commit (P1: DOLT_BRANCH takes
+    // a hash; the branch-membership check and E_BRANCH_POINTER_DRIFT are
+    // gone). A zero-prev event (the create) starts from the current
+    // chapter, which sits at the genesis commit.
     const newBranch = await branchNameFor(eventId);
-    await c.query(`SELECT DOLT_CHECKOUT('-b', '${ident(newBranch)}');`);
+    if (redeliverUngrounded) {
+      // ruling B: the placeholder's deterministic branch is deleted
+      // before the re-ingest creates it again from the real prev.
+      const branchRows = await c.query('SELECT name FROM dolt.branches;');
+      const names = new Set(
+        branchRows.rows.map((r: { name: string }) => String(r.name)),
+      );
+      if (names.has(newBranch)) {
+        await c.query(`SELECT DOLT_BRANCH('-D', '${ident(newBranch)}');`);
+      }
+    }
+    if (prevs.length === 0) {
+      if (currentChapter === null) {
+        throw new Error(
+          'E_ROOM_ARCHIVED: zero-prev ingest on an archived room',
+        );
+      }
+      await c.query(`SELECT DOLT_CHECKOUT('${ident(currentChapter)}');`);
+      await c.query(`SELECT DOLT_CHECKOUT('-b', '${ident(newBranch)}');`);
+    } else {
+      assertHash(prevs[0].commitHash);
+      await c.query(
+        `SELECT DOLT_BRANCH('${ident(newBranch)}', '${prevs[0].commitHash}');`,
+      );
+      await c.query(`SELECT DOLT_CHECKOUT('${ident(newBranch)}');`);
+    }
     // N-way fan-in chains 2-parent commits on the new branch (Dolt holds
     // one active merge at a time — each merge but the last is committed
     // as bookkeeping; only the final commit carries the event and is
     // indexed). The event DAG keeps all N in prev_events, and resolution
-    // already ran over the full parent set.
+    // already ran over the full parent set. M5b: the fan-in merges the
+    // other prevs' COMMIT HASHES (P1-m — mergeDriver takes any ref).
     const fanin = prevs.slice(1);
     for (let i = 0; i < fanin.length; i++) {
-      await mergeDriver(c, ident(fanin[i].branch!));
+      assertHash(fanin[i].commitHash);
+      await mergeDriver(c, fanin[i].commitHash);
       if (i < fanin.length - 1) {
         try {
           await c.query(`SELECT DOLT_COMMIT('-Am', $1);`, [
@@ -864,126 +1123,202 @@ async function ingestEventLocked(
     // soft-failed/rejected event's branch exists (event history) but its
     // prevs stay live. When an accepted event cites a soft-failed/rejected
     // prev, consume that prev and walk back through soft-failed/rejected
-    // ancestors (dangling-extremity handling). main is never an extremity
-    // and stays at the schema-genesis commit.
+    // ancestors (dangling-extremity handling). M5b: consumption runs only
+    // for prevs whose branch still exists AND belongs to the current
+    // chapter — a prev already consumed has none to delete, and an
+    // old-era prev's branch is the archive's, never ours to take (§3.6a).
     if (!rejected && !softFailed && !opts.keepPrevBranches) {
-      for (const p of prevs) await consumeBranchChain(c, roomId, p);
+      const liveRows = await c.query('SELECT name FROM dolt.branches;');
+      const live = new Set(
+        liveRows.rows.map((r: { name: string }) => String(r.name)),
+      );
+      for (const p of prevs) {
+        if (p.branch === null || !live.has(p.branch)) continue;
+        if (p.era !== currentChapter) continue;
+        await consumeBranchChain(c, roomId, p, currentChapter ?? '');
+      }
     }
     return { commitHash, newBranch };
   });
 
   // event_id <-> commit_hash bijection + current branch (D8), flagged
   // rejected/soft-failed as the S8 checks decided (prev resolution needs
-  // the id; rejected/soft-failed events still persist verbatim).
-  await withDb(serverDb(), async (c) => {
-    await c.query(
-      'INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed, txn_device, txn_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);',
-      [
-        eventId,
-        roomId,
-        commitHash,
-        newBranch,
-        rejected,
-        softFailed,
-        opts.txn?.deviceId ?? null,
-        opts.txn?.txnId ?? null,
-      ],
-    );
-    // D7: the relations index — content['m.relates_to'] with a direct
-    // event_id (rich replies carry theirs under m.in_reply_to instead and
-    // are NOT relations rows). seq is the event's own event_index seq, so
-    // /relations pages on the sync-token grammar (§3e).
-    const relatesTo = (pdu.content ?? {})['m.relates_to'];
-    if (
-      relatesTo !== null && typeof relatesTo === 'object' &&
-      typeof (relatesTo as Record<string, unknown>).event_id === 'string'
-    ) {
-      const rt = relatesTo as Record<string, unknown>;
+  // the id; rejected/soft-failed events still persist verbatim). M5b:
+  // the row also carries the standing reason, the delivering server, the
+  // write time, and the event's POSITION — 'after' (live) takes the
+  // stream's next seq and the current chapter as its era; 'before' /
+  // 'evidence' are seq NULL (never news) with their branch fields set by
+  // their own paths (commits 8/10). A redelivered 'ungrounded'
+  // placeholder is UPDATED in place (ruling B).
+  const isLive = position === 'after';
+  const eventSeq = await withDb(serverDb(), async (c) => {
+    if (redeliverUngrounded) {
       await c.query(
-        `INSERT INTO relations (event_id, relates_to, rel_type, room_id, seq)
-         VALUES ($1, $2, $3, $4, (SELECT seq FROM event_index WHERE event_id = $1));`,
+        `UPDATE event_index SET commit_hash = $3, branch_name = $4, rejected = $5, soft_failed = $6,
+           rejected_reason = $7, origin = $8, expires_ms = NULL, added_ms = $9,
+           era = $10, seq = DEFAULT, state_commit_hash = NULL
+         WHERE event_id = $1 AND room_id = $2;`,
         [
           eventId,
-          rt.event_id,
-          typeof rt.rel_type === 'string' ? rt.rel_type : null,
           roomId,
+          commitHash,
+          isLive ? newBranch : null,
+          rejected,
+          softFailed,
+          rejectedReason,
+          opts.remote?.origin ?? null,
+          Date.now(),
+          isLive ? currentChapter : null,
+        ],
+      );
+    } else {
+      await c.query(
+        `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed, txn_device, txn_id,
+           rejected_reason, origin, added_ms, era${isLive ? '' : ', seq'})
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12${
+          isLive ? '' : ', NULL'
+        });`,
+        [
+          eventId,
+          roomId,
+          commitHash,
+          isLive ? newBranch : null,
+          rejected,
+          softFailed,
+          opts.txn?.deviceId ?? null,
+          opts.txn?.txnId ?? null,
+          rejectedReason,
+          opts.remote?.origin ?? null,
+          Date.now(),
+          isLive ? currentChapter : null,
         ],
       );
     }
-    // Search index (D1): accepted (not rejected, not soft-failed)
-    // message/name/topic events. seq is the event's own event_index seq.
-    if (!rejected && !softFailed) {
-      const indexed = searchTextOf(pdu);
-      if (indexed !== null) {
+    const sq = await c.query(
+      'SELECT seq FROM event_index WHERE event_id = $1;',
+      [eventId],
+    );
+    return sq.rows[0].seq == null ? null : Number(sq.rows[0].seq);
+  });
+  // M5b: the derived writes (relations, search_index, room_membership)
+  // run only for POSITIONED events (seq IS NOT NULL) — history rows are
+  // readable through the chapter walk but are not indexed for /relations
+  // or /search in M5b (§8).
+  if (eventSeq !== null) {
+    await withDb(serverDb(), async (c) => {
+      // D7: the relations index — content['m.relates_to'] with a direct
+      // event_id (rich replies carry theirs under m.in_reply_to instead and
+      // are NOT relations rows). seq is the event's own event_index seq, so
+      // /relations pages on the sync-token grammar (§3e).
+      const relatesTo = (pdu.content ?? {})['m.relates_to'];
+      if (
+        relatesTo !== null && typeof relatesTo === 'object' &&
+        typeof (relatesTo as Record<string, unknown>).event_id === 'string'
+      ) {
+        const rt = relatesTo as Record<string, unknown>;
         await c.query(
-          `INSERT INTO search_index (event_id, room_id, seq, key, sender, origin_ts, body_lower)
-           VALUES ($1, $2, (SELECT seq FROM event_index WHERE event_id = $1), $3, $4, $5, $6);`,
+          `INSERT INTO relations (event_id, relates_to, rel_type, room_id, seq)
+         VALUES ($1, $2, $3, $4, (SELECT seq FROM event_index WHERE event_id = $1));`,
           [
             eventId,
+            rt.event_id,
+            typeof rt.rel_type === 'string' ? rt.rel_type : null,
             roomId,
-            indexed.key,
-            pdu.sender,
-            pdu.origin_server_ts,
-            indexed.text,
           ],
         );
       }
-    }
-  });
-
-  // 12. republish the room's current state on `main`: resolve across the
-  //     post-event extremity set (extremities() reads the flags just
-  //     written, so a rejected/soft-failed event is excluded and consumed
-  //     prevs are gone). The store already covers every pre-existing
-  //     extremity's ancestry (step 8) plus this pdu.
-  const after = await extremities(room.dbName, roomId);
-  const afterSets: StateMap[] = [];
-  for (const xb of after) {
-    const h = await commitHashOf(roomId, xb.eventId);
-    if (h) afterSets.push(await parentStateAt(room.dbName, h));
+      // Search index (D1): accepted (not rejected, not soft-failed)
+      // message/name/topic events. seq is the event's own event_index seq.
+      if (!rejected && !softFailed) {
+        const indexed = searchTextOf(pdu);
+        if (indexed !== null) {
+          await c.query(
+            `INSERT INTO search_index (event_id, room_id, seq, key, sender, origin_ts, body_lower)
+           VALUES ($1, $2, (SELECT seq FROM event_index WHERE event_id = $1), $3, $4, $5, $6);`,
+            [
+              eventId,
+              roomId,
+              indexed.key,
+              pdu.sender,
+              pdu.origin_server_ts,
+              indexed.text,
+            ],
+          );
+        }
+      }
+    });
   }
-  const current = rulebook.resolveState(afterSets, store);
-  const publishedRows = stateRowsOf(current, ancestry.pduById);
-  const stateHash = await publishCurrentState(
-    room.dbName,
-    publishedRows,
-    `after ${eventId}`,
-  );
 
-  // E1/E2 — state history: record `main`'s hash right after the publish
-  // as this event's state pointer ("state at seq N" = state AS OF the
-  // state_commit_hash of the last R-event with seq <= N), and fold the
-  // PUBLISHED current-state rows' m.room.member entries into the per-user
-  // membership index (a derived cache of `main`, same writer step).
-  await withDb(serverDb(), async (c) => {
-    await c.query(
-      'UPDATE event_index SET state_commit_hash = $1 WHERE event_id = $2;',
-      [stateHash, eventId],
-    );
-    for (const r of publishedRows) {
-      if (r.type !== 'm.room.member') continue;
-      // D4: a membership event FOR THE USER clears the forgotten flag
-      // (a re-join after /forget makes the room visible again) — that is
-      // THIS event's own state_key. The full-state fold below keeps the
-      // index fresh for everyone else WITHOUT touching the flag:
-      // resetting there would un-forget the room on any later event.
-      const clearsForget = pdu.type === 'm.room.member' &&
-        r.stateKey === String(pdu.state_key ?? '');
-      await c.query(
-        `INSERT INTO room_membership (room_id, user_id, membership, event_id, seq)
-         VALUES ($1,$2,$3,$4,(SELECT seq FROM event_index WHERE event_id=$4))
-         ON CONFLICT (room_id, user_id) DO UPDATE SET membership=EXCLUDED.membership, event_id=EXCLUDED.event_id, seq=EXCLUDED.seq${
-          clearsForget ? ', forgotten=FALSE' : ''
-        };`,
-        [
-          roomId,
-          r.stateKey,
-          (r.content as { membership?: string }).membership ?? 'leave',
-          r.eventId,
-        ],
-      );
+  // 12. republish the room's current state on the CURRENT CHAPTER (M5b —
+  //     main is the system branch and never holds content): resolve
+  //     across the post-event extremity set (extremities() reads the
+  //     flags just written and filters to the current chapter's era, so a
+  //     rejected/soft-failed event is excluded and consumed prevs are
+  //     gone). The store already covers every pre-existing extremity's
+  //     ancestry (step 8) plus this pdu. Live events only — 'before' /
+  //     'evidence' rows never move the live chapter.
+  let stateHash: string | null = null;
+  let publishedRows: StateRowInput[] = [];
+  let current: StateMap = new Map();
+  if (isLive) {
+    if (currentChapter === null) {
+      throw new Error('E_ROOM_ARCHIVED: publish on an archived room');
     }
-  });
+    const after = await extremities(room.dbName, roomId);
+    const afterSets: StateMap[] = [];
+    for (const xb of after) {
+      const h = await commitHashOf(roomId, xb.eventId);
+      if (h) afterSets.push(await parentStateAt(room.dbName, h));
+    }
+    current = rulebook.resolveState(afterSets, store);
+    publishedRows = stateRowsOf(current, ancestry.pduById);
+    stateHash = await publishCurrentState(
+      room.dbName,
+      currentChapter,
+      publishedRows,
+      `after ${eventId}`,
+    );
+  }
+
+  // E1/E2 — state history: record the chapter's hash right after the
+  // publish as this event's state pointer ("state at seq N" = state AS OF
+  // the state_commit_hash of the last R-event with seq <= N), and fold
+  // the PUBLISHED current-state rows' m.room.member entries into the
+  // per-user membership index (a derived cache of the chapter, same
+  // writer step).
+  if (isLive && stateHash !== null) {
+    await withDb(serverDb(), async (c) => {
+      await c.query(
+        'UPDATE event_index SET state_commit_hash = $1 WHERE event_id = $2;',
+        [stateHash, eventId],
+      );
+    });
+  }
+  if (isLive && stateHash !== null) {
+    await foldMembership(roomId, publishedRows, pdu, eventSeq);
+  }
+
+  // M5b (§3.6a): the server's LAST LOCAL MEMBER leaving closes the stay —
+  // after that leave's publish and its index rows are written (the leave
+  // must still be deliverable; commit 3 adds its outbox rows). Closing is
+  // clearing current_chapter — nothing is renamed or moved; the stay's
+  // branch simply stops growing and its x* branches stay (they hold the
+  // events' commits) but are inert under the era-filtered extremities().
+  if (
+    isLive && !rejected && !softFailed && pdu.type === 'm.room.member' &&
+    ((pdu.content ?? {}).membership === 'leave' ||
+      (pdu.content ?? {}).membership === 'ban') &&
+    String(pdu.state_key ?? '').endsWith(':' + serverName())
+  ) {
+    if (!(await serversInRoom(roomId)).includes(serverName())) {
+      await withDb(serverDb(), async (c) => {
+        await c.query(
+          'UPDATE room_directory SET current_chapter = NULL WHERE room_id = $1;',
+          [roomId],
+        );
+      });
+    }
+  }
 
   // D8: push-rule migration hooks, after publish — manual upgrades are
   // detected exactly the way a client performs them (tombstone in the old
@@ -991,8 +1326,8 @@ async function ingestEventLocked(
   // room with a predecessor gets their own rules copied (the remote
   // case; harmless locally). Copy-if-absent everywhere, so the
   // /upgrade-path's own migrateRoomRules call and these hooks never
-  // double-write.
-  if (!rejected && !softFailed) {
+  // double-write. Live events only.
+  if (isLive && !rejected && !softFailed) {
     if (pdu.type === 'm.room.tombstone') {
       const target = (pdu.content ?? {}).replacement_room;
       if (typeof target === 'string') {
@@ -1052,4 +1387,228 @@ async function ingestEventLocked(
     );
   }
   return { event_id: eventId, commit_hash: commitHash };
+}
+
+// M5b (§3.6 steps 8–9, §3.6b): the join-snapshot path — a room's stay
+// opens with the snapshot as its ROOT COMMIT and the join on top. The
+// caller holds the room lock (withRoomLock — the lock is not reentrant)
+// and has already: provisioned the room when absent, allocated the
+// chapter pair (the history chapter empty at genesis; `chapter` = the
+// new stay, created at genesis_commit), checked the snapshot (step 7),
+// and authored/signed the join. This function: (ii) auths the join
+// against the root commit's state (rules 3–10); (iii) branches x<join>
+// from the root and commits the join there; (iv) sets current_chapter
+// and writes the join's index row (live: fresh positive seq, era = the
+// new stay) — the join is the stay's only extremity; (v) publishes the
+// stay's first state commit onto the stay branch and records the state
+// pointer + the membership fold. No outbox rows (the resident fans out —
+// commit 3 wires deliveries for local events).
+export async function ingestJoinSnapshotLocked(
+  roomId: string,
+  args: {
+    // the new stay branch, already created at genesis_commit
+    chapter: string;
+    // snapshot/auth-chain events for the root commit (accepted events —
+    // rejected ones are inserted by commit 8 with their flags)
+    rootEvents: { pdu: Pdu; eventId: string }[];
+    // the snapshot's materialized state (state AFTER the snapshot)
+    rootStateRows: StateRowInput[];
+    // the signed join (event_id computed)
+    join: Pdu;
+    rootMessage: string;
+    // the resident server; NULL for the local reopen (§3.6b)
+    origin: string | null;
+    // true → write 'evidence' index rows for rootEvents (a remote
+    // snapshot's NEW events, commit 8); false = already held (the local
+    // reopen — their rows and positions stay untouched)
+    newEvidence: boolean;
+  },
+): Promise<IngestResult> {
+  const room = await lookupRoom(roomId);
+  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
+  const rulebook = getRulebook(room.roomVersion);
+  const joinId = String(args.join.event_id);
+
+  // (ii) auth of the join against the root commit's state (rules 3–10)
+  const rootState: StateMap = new Map();
+  for (const r of args.rootStateRows) {
+    rootState.set(stateKeyOf(r.type, r.stateKey), r.eventId);
+  }
+  const pduById = new Map<string, Pdu>();
+  for (const e of args.rootEvents) pduById.set(e.eventId, e.pdu);
+  pduById.set(joinId, args.join);
+  const store = eventStoreOf(pduById, new Set());
+  const auth = rulebook.checkAuthAgainstState(args.join, rootState, store);
+  if (!auth.ok) {
+    throw new Error(
+      'M_STATE_REJECT: ' + joinId + ' (rule ' + (auth.rule ?? '?') + ')',
+    );
+  }
+
+  const { rootHash, joinCommit, xBranch } = await withDb(
+    room.dbName,
+    async (c) => {
+      await c.query('SET dolt_allow_commit_conflicts = 1;');
+      // the root commit on the new stay branch
+      await c.query(`SELECT DOLT_CHECKOUT('${ident(args.chapter)}');`);
+      for (const e of args.rootEvents) {
+        await c.query(
+          'INSERT INTO events (event_id, type, state_key, sender, origin_ts, depth, prev_events, auth_events, hashes, signatures, rejected, soft_failed, canonical_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);',
+          [
+            e.eventId,
+            e.pdu.type,
+            e.pdu.state_key ?? null,
+            e.pdu.sender,
+            e.pdu.origin_server_ts,
+            e.pdu.depth,
+            JSON.stringify(e.pdu.prev_events ?? []),
+            JSON.stringify(e.pdu.auth_events ?? []),
+            JSON.stringify(e.pdu.hashes ?? {}),
+            JSON.stringify(e.pdu.signatures ?? {}),
+            false,
+            false,
+            canonicalJson(e.pdu as unknown as Record<string, unknown>),
+          ],
+        );
+      }
+      await materialize(c, args.rootStateRows);
+      await c.query(`SELECT DOLT_COMMIT('-Am', $1);`, [args.rootMessage]);
+      const rh = await c.query(`SELECT HASHOF('HEAD');`);
+      const rootHash = String(Object.values(rh.rows[0])[0]);
+
+      // (iii) the join on its own x* branch from the root
+      const xBranch = await branchNameFor(joinId);
+      await c.query(`SELECT DOLT_BRANCH('${ident(xBranch)}', '${rootHash}');`);
+      await c.query(`SELECT DOLT_CHECKOUT('${ident(xBranch)}');`);
+      await c.query(
+        'INSERT INTO events (event_id, type, state_key, sender, origin_ts, depth, prev_events, auth_events, hashes, signatures, rejected, soft_failed, canonical_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);',
+        [
+          joinId,
+          args.join.type,
+          args.join.state_key ?? null,
+          args.join.sender,
+          args.join.origin_server_ts,
+          args.join.depth,
+          JSON.stringify(args.join.prev_events ?? []),
+          JSON.stringify(args.join.auth_events ?? []),
+          JSON.stringify(args.join.hashes ?? {}),
+          JSON.stringify(args.join.signatures ?? {}),
+          false,
+          false,
+          canonicalJson(args.join as unknown as Record<string, unknown>),
+        ],
+      );
+      // the x* commit's state = the root state with the join applied
+      const afterRows = args.rootStateRows.filter((r) =>
+        !(r.type === String(args.join.type) &&
+          r.stateKey === String(args.join.state_key ?? ''))
+      );
+      if (args.join.state_key != null) {
+        afterRows.push({
+          type: String(args.join.type),
+          stateKey: String(args.join.state_key),
+          eventId: joinId,
+          content: args.join.content ?? {},
+        });
+      }
+      await materialize(c, afterRows);
+      const res = await c.query(`SELECT DOLT_COMMIT('-Am', $1);`, [
+        `event ${joinId} type ${String(args.join.type)}`,
+      ]);
+      let joinCommit = res.rows[0]
+        ? String(Object.values(res.rows[0])[0] ?? '')
+        : '';
+      if (joinCommit === '') {
+        const h = await c.query(`SELECT HASHOF('HEAD');`);
+        joinCommit = String(Object.values(h.rows[0])[0]);
+      }
+      return { rootHash, joinCommit, xBranch };
+    },
+  );
+
+  // (iv) current_chapter + the join's index row (live: fresh positive
+  // seq, era = the new stay) — and, for a remote snapshot, the
+  // 'evidence' rows of the snapshot's new events (seq NULL, no branch,
+  // commit_hash = the root).
+  await withDb(serverDb(), async (c) => {
+    await c.query(
+      'UPDATE room_directory SET current_chapter = $2 WHERE room_id = $1;',
+      [roomId, args.chapter],
+    );
+    await c.query(
+      `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed,
+         rejected_reason, origin, added_ms, era)
+       VALUES ($1, $2, $3, $4, FALSE, FALSE, NULL, $5, $6, $7);`,
+      [
+        joinId,
+        roomId,
+        joinCommit,
+        xBranch,
+        args.origin,
+        Date.now(),
+        args.chapter,
+      ],
+    );
+    if (args.newEvidence) {
+      for (const e of args.rootEvents) {
+        await c.query(
+          `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed,
+             rejected_reason, origin, added_ms, era, seq)
+           VALUES ($1, $2, $3, NULL, FALSE, FALSE, NULL, $4, $5, NULL, NULL)
+           ON CONFLICT (event_id) DO NOTHING;`,
+          [e.eventId, roomId, rootHash, args.origin, Date.now()],
+        );
+      }
+    }
+  });
+  const joinSeq = await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT seq FROM event_index WHERE event_id = $1;',
+      [joinId],
+    );
+    return r.rows[0].seq == null ? null : Number(r.rows[0].seq);
+  });
+
+  // (v) publish the stay's first state commit ONTO the stay branch (the
+  // join is the stay's only extremity) + the state pointer + the fold.
+  const afterSets: StateMap[] = [rootState];
+  for (const [k, eid] of rootState) void k, void eid;
+  const published = rulebook.resolveState(afterSets, store);
+  const publishedRows = stateRowsOf(published, pduById);
+  if (args.join.state_key != null) {
+    const at = publishedRows.findIndex((r) =>
+      r.type === String(args.join.type) &&
+      r.stateKey === String(args.join.state_key)
+    );
+    const row: StateRowInput = {
+      type: String(args.join.type),
+      stateKey: String(args.join.state_key),
+      eventId: joinId,
+      content: args.join.content ?? {},
+    };
+    if (at >= 0) publishedRows[at] = row;
+    else publishedRows.push(row);
+  }
+  const stateHash = await publishCurrentState(
+    room.dbName,
+    args.chapter,
+    publishedRows,
+    `after ${joinId}`,
+  );
+  await withDb(serverDb(), async (c) => {
+    await c.query(
+      'UPDATE event_index SET state_commit_hash = $1 WHERE event_id = $2;',
+      [stateHash, joinId],
+    );
+  });
+  await foldMembership(roomId, publishedRows, args.join, joinSeq);
+
+  for (const l of appliedListeners) {
+    try {
+      l(roomId, joinId);
+    } catch (e) {
+      console.error('applied listener error:', e);
+    }
+  }
+  return { event_id: joinId, commit_hash: joinCommit };
 }

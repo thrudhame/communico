@@ -93,6 +93,11 @@ export interface RoomVersionSpec {
   // the event-id base64 alphabet: standard (+ and /) for v3
   // (v3.md:57-62), URL-safe (- and _) for v4+ (v4-event-ids.md:3-12)
   eventIdAlphabet: 'std' | 'urlsafe';
+  // per-key size limits measured in BYTES (v11+ — state_key/type ≤ 255
+  // bytes, CS:2874-2877); ≤ v10 measures them in codepoints (Synapse
+  // switched at v11; gomatrixserverlib StrictEventByteLimits — true for
+  // v11/v12 only). Recorded for M5b federation receipt checks.
+  strictByteLimits: boolean;
   // m.room.redaction carries `redacts` under content (v11+ —
   // v11.md:70-81); ≤10 keeps it top-level (pdu_v6.yaml:27-30)
   redactsInContent: boolean;

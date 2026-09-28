@@ -5,11 +5,27 @@
 // lock across author+ingest (E5), so concurrent ops never stale-prev.
 import { serverName } from './config.ts';
 import { localpartOf } from './auth.ts';
-import { authorAndIngest } from './ingest.ts';
+import {
+  author,
+  authorAndIngest,
+  ingestJoinSnapshotLocked,
+  withRoomLock,
+} from './ingest.ts';
 import { MatrixError } from './matrix-error.ts';
-import { serverDb, withDb } from './db.ts';
-import { lookupRoom, membershipOf, roomsFor, stateAtSeq } from './room.ts';
+import { ident, serverDb, withDb } from './db.ts';
+import {
+  chapterHead,
+  extremities,
+  lookupRoom,
+  membershipOf,
+  roomsFor,
+  stateAt,
+  stateAtSeq,
+} from './room.ts';
 import { getProfile } from './tenant.ts';
+import { authChain } from './rulebook/state-res-v2.ts';
+import type { Pdu } from './pdu.ts';
+import type { StateRowInput } from './materialize.ts';
 
 export interface MembershipOpResult {
   roomId: string;
@@ -50,6 +66,11 @@ async function authorMember(
 // join: sender == state_key == the user; content from the profile
 // (displayname/avatar_url) with the request body keys merged on top.
 // Already joined -> the existing event, no new one (idempotent re-join).
+// M5b (§3.6b): an ARCHIVED room (the server's last local member left)
+// reopens through the join-snapshot path — whom to ask is the room's
+// server list, and for a purely local room that is only ourselves: the
+// snapshot is the previous stay's tip state and the join is authored on
+// its extremities, opening a brand-new chapter pair. No federation.
 export async function join(
   roomId: string,
   userId: string,
@@ -58,6 +79,11 @@ export async function join(
   const current = await membershipOf(roomId, userId);
   if (current?.membership === 'join') {
     return { roomId, eventId: current.eventId, created: false };
+  }
+  const room = await lookupRoom(roomId);
+  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
+  if (room.currentChapter === null) {
+    return await joinArchived(roomId, userId, extraContent);
   }
   const profile = await getProfile(serverName(), localpartOf(userId));
   const content: Record<string, unknown> = {
@@ -71,6 +97,150 @@ export async function join(
     membership: 'join',
   };
   return await authorMember(roomId, userId, userId, content);
+}
+
+// §3.6b "ask nobody / only ourselves": the local reopen. The snapshot is
+// the previous stay's tip state (chapterHead), its auth_chain ours to
+// compute, and the join's prev_events are that stay's extremities (its
+// x* tips — grounded, positioned events). From here §3.6 steps 7–9 run
+// unchanged: a new chapter pair, the root commit from the snapshot, our
+// signed join on top, new current_chapter. The new history chapter is
+// complete at birth (its would-be first event is already held in the
+// previous stay), so nothing is ever fetched into it.
+async function joinArchived(
+  roomId: string,
+  userId: string,
+  extraContent?: Record<string, unknown>,
+): Promise<MembershipOpResult> {
+  const room = await lookupRoom(roomId);
+  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
+  return await withRoomLock(roomId, async () => {
+    const oldHead = await chapterHead(roomId);
+    if (oldHead === null) {
+      throw new Error('E_NO_STAY: archived room has no stay branch');
+    }
+    const oldTip = await withDb(room.dbName, async (c) => {
+      const r = await c.query(`SELECT HASHOF('${ident(oldHead)}') AS h;`);
+      return String(r.rows[0].h);
+    });
+    // the snapshot = the state at the previous stay's tip; the root
+    // commit carries the snapshot events + their auth chain (ancestry
+    // loading from the new branch must find them — r4, astra). The
+    // events live on their own x* commits (a chapter tip holds only the
+    // materialized state), so the load goes through event_index's
+    // commit hashes — each x* lineage carries its full ancestry.
+    const stateRows = (await stateAt(room.dbName, oldTip)) ?? [];
+    const { rootEvents, rootStateRows } = await (async () => {
+      const hashes: string[] = [];
+      for (const sr of stateRows) {
+        const ch = await withDb(serverDb(), async (s) => {
+          const r = await s.query(
+            'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
+            [roomId, sr.eventId],
+          );
+          return r.rows.length ? String(r.rows[0].commit_hash) : null;
+        });
+        if (ch === null) {
+          throw new Error('E_STATE_EVENT_MISSING: ' + sr.eventId);
+        }
+        hashes.push(ch);
+      }
+      const pduById = new Map<string, Pdu>();
+      const rejectedIds = new Set<string>();
+      await withDb(room.dbName, async (c) => {
+        for (const h of new Set(hashes)) {
+          const r = await c.query(
+            `SELECT event_id, canonical_json, rejected FROM events AS OF '${h}';`,
+          );
+          // deno-lint-ignore no-explicit-any
+          for (const row of r.rows as any[]) {
+            const id = String(row.event_id);
+            if (!pduById.has(id)) {
+              pduById.set(
+                id,
+                typeof row.canonical_json === 'string'
+                  ? JSON.parse(row.canonical_json)
+                  : row.canonical_json,
+              );
+            }
+            if (row.rejected === true) rejectedIds.add(id);
+          }
+        }
+      });
+      const store = {
+        get: (id: string) => pduById.get(id),
+        isRejected: (id: string) => rejectedIds.has(id),
+      };
+      const ids = stateRows.map((sr) => sr.eventId);
+      const chain = authChain(ids, store);
+      const rootEvents: { pdu: Pdu; eventId: string }[] = [];
+      for (const id of new Set([...ids, ...chain])) {
+        const pdu = pduById.get(id);
+        if (!pdu) throw new Error('E_STATE_EVENT_MISSING: ' + id);
+        rootEvents.push({ pdu, eventId: id });
+      }
+      const rootStateRows: StateRowInput[] = stateRows.map((sr) => ({
+        type: sr.type,
+        stateKey: sr.stateKey,
+        eventId: sr.eventId,
+        content: sr.content,
+      }));
+      return { rootEvents, rootStateRows };
+    })();
+    // the join, authored on the old stay's extremities (its x* tips —
+    // grounded, positioned events)
+    const oldX = await extremities(room.dbName, roomId, oldHead);
+    const profile = await getProfile(serverName(), localpartOf(userId));
+    const content: Record<string, unknown> = {
+      ...(profile?.displayname !== undefined
+        ? { displayname: profile.displayname }
+        : {}),
+      ...(profile?.avatar_url !== undefined
+        ? { avatar_url: profile.avatar_url }
+        : {}),
+      ...(extraContent ?? {}),
+      membership: 'join',
+    };
+    const joinPdu = await author(roomId, {
+      type: 'm.room.member',
+      state_key: userId,
+      sender: userId,
+      content,
+      prev_events: oldX.map((e) => e.eventId),
+      origin_server_ts: Date.now(),
+    });
+    // allocate the chapter pair (n = highest existing + 1 — always even)
+    const { hist, stay } = await withDb(room.dbName, async (c) => {
+      const r = await c.query('SELECT name FROM dolt.branches;');
+      let best = -1;
+      // deno-lint-ignore no-explicit-any
+      for (const row of r.rows as any[]) {
+        const m = /^chapter(\d+)$/.exec(String(row.name));
+        if (m && Number(m[1]) > best) best = Number(m[1]);
+      }
+      const n = best + 1;
+      const hist = `chapter${n}`;
+      const stay = `chapter${n + 1}`;
+      await c.query(
+        `SELECT DOLT_BRANCH('${ident(hist)}', '${room.genesisCommit}');`,
+      );
+      await c.query(
+        `SELECT DOLT_BRANCH('${ident(stay)}', '${room.genesisCommit}');`,
+      );
+      return { hist, stay };
+    });
+    void hist; // the history chapter is complete at birth (§3.6b)
+    const res = await ingestJoinSnapshotLocked(roomId, {
+      chapter: stay,
+      rootEvents,
+      rootStateRows,
+      join: joinPdu,
+      rootMessage: `snapshot before ${String(joinPdu.event_id)} (local reopen)`,
+      origin: null,
+      newEvidence: false,
+    });
+    return { roomId, eventId: res.event_id, created: true };
+  });
 }
 
 // leave: self only (sender == state_key). Never a member -> 403.

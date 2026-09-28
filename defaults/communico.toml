@@ -141,3 +141,47 @@ pendingdays = 30
 # answer them. We never ask a remote server on an anonymous caller's
 # behalf — that would make us an open proxy. COMMUNICO_FEDERATION_LOOKUPS
 lookups = "known"
+# Missing prev_events on a pushed PDU: how long to wait for them to arrive
+# on their own before asking (the sender usually pushes them next), how many
+# events one get_missing_events may return to us, and the whole-transaction
+# budget for such fetching — when it is spent, the remaining PDUs with
+# unknown prevs are stored ungrounded and the answer goes out (a sender
+# waits ~10 s for /send). COMMUNICO_FEDERATION_MISSINGWAITMS / MISSINGLIMIT
+# / MISSINGBUDGETMS
+missingwaitms = 750
+missinglimit = 10
+missingbudgetms = 8000
+# Serving get_missing_events: hard cap on a requester's `limit`.
+# COMMUNICO_FEDERATION_MISSINGMAX
+missingmax = 20
+# Backfill: how many events we ask for per scroll-back step, and the cap on
+# a requester's `limit` when we serve /backfill.
+# COMMUNICO_FEDERATION_BACKFILLBATCH / BACKFILLMAX
+backfillbatch = 50
+backfillmax = 100
+# Room transfers (send_join state, /state, /backfill answers) are far larger
+# than key documents; separate response cap for them, bytes.
+# COMMUNICO_FEDERATION_BULKMAXBYTES
+bulkmaxbytes = 67108864
+# Outbound delivery. The pause after a failed transaction starts here and
+# doubles on every failure (125 → 250 → 500 → 1000 → 2000 … millihours, i.e.
+# 7.5 min → 15 → 30 → 1 h → 2 h …) up to the ceiling; any request the
+# destination makes to us resets it. The ceiling must be start × 2^k (256 h
+# is; 168 h is not — startup names the neighbouring rungs). Whole numbers in
+# MILLIHOURS: one unit for everything about delivery and expiry.
+# COMMUNICO_FEDERATION_BACKOFFSTARTMILLIHOURS / BACKOFFMAXMILLIHOURS
+backoffstartmillihours = 125
+backoffmaxmillihours = 256000
+# Undelivered rows (destination unreachable or refusing) are retried on the
+# ladder and kept this long; when it lapses they are removed and the admin
+# is told (federation-peer pending). COMMUNICO_FEDERATION_REFUSEDMILLIHOURS
+refusedmillihours = 256000
+# An event whose parents we could not obtain is kept this long as a
+# "couldn't check yet" placeholder and re-checked when its parent arrives or
+# it is re-sent; 0 = do not store such events at all (drop, as Synapse does).
+# COMMUNICO_FEDERATION_UNGROUNDEDMILLIHOURS
+ungroundedmillihours = 256000
+# Inbound transactions: how long a (origin, txnId) → response pair is kept so
+# a retried transaction gets the same answer, hours (a cache, not an
+# obligation). COMMUNICO_FEDERATION_TXNHOURS
+txnhours = 24

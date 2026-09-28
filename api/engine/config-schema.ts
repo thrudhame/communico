@@ -52,6 +52,18 @@ export const SCHEMA = {
     pendingmax: 'int',
     pendingdays: 'int',
     lookups: 'string',
+    missingwaitms: 'int',
+    missinglimit: 'int',
+    missingbudgetms: 'int',
+    missingmax: 'int',
+    backfillbatch: 'int',
+    backfillmax: 'int',
+    bulkmaxbytes: 'int',
+    backoffstartmillihours: 'int',
+    backoffmaxmillihours: 'int',
+    refusedmillihours: 'int',
+    ungroundedmillihours: 'int',
+    txnhours: 'int',
   },
 } as const satisfies Schema;
 

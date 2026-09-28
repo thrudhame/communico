@@ -1,7 +1,9 @@
 // tests/current-state.test.ts — the room's current resolved state lives on
-// `main` (plan current-state-on-main §1): ingest publishes it, a
-// soft-failed event never moves it, re-resolution keeps it, and no x*
-// branch tip ever drifts from its event's commit (D8). Live doltgres.
+// the current chapter (M5b, the book — main is the room's system branch;
+// before M5b this read `main`, plan current-state-on-main §1): ingest
+// publishes it, a soft-failed event never moves it, re-resolution keeps
+// it, and no x* branch tip ever drifts from its event's commit (D8).
+// Live doltgres.
 import { assert, assertEquals } from '@std/assert';
 import { createRoom, headExtremity, lookupRoom } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
@@ -12,7 +14,7 @@ import { latestExtremityEventId, resetRoom } from '#tests/util.ts';
 
 const ROOM = '!current-state:localhost';
 
-Deno.test('current state on main: publish, soft-fail stillness, D8 after re-resolve', async () => {
+Deno.test('current state on the chapter: publish, soft-fail stillness, D8 after re-resolve', async () => {
   await resetRoom(ROOM);
   await createRoom(ROOM, '@dev:localhost', { roomVersion: '11' });
   // membership via the engine pipeline: alice (creator) invites bob, bob
@@ -45,14 +47,16 @@ Deno.test('current state on main: publish, soft-fail stillness, D8 after re-reso
   // fork point: the tip both branches will cite
   const base = await latestExtremityEventId(ROOM);
   const room = (await lookupRoom(ROOM))!;
-  const mainHash = async (): Promise<string> =>
+  const chapterHash = async (): Promise<string> =>
     await withDb(room.dbName, async (c) => {
-      const r = await c.query(`SELECT (SELECT HASHOF('main')) AS h;`);
+      const r = await c.query(
+        `SELECT (SELECT HASHOF('${ident(room.currentChapter!)}')) AS h;`,
+      );
       return String(r.rows[0].h);
     });
 
   // branch A: alice bans bob — ingest must publish the resolved state
-  const beforeBan = await mainHash();
+  const beforeBan = await chapterHash();
   const ban = await author(ROOM, {
     type: 'm.room.member',
     state_key: '@bob:localhost',
@@ -62,10 +66,10 @@ Deno.test('current state on main: publish, soft-fail stillness, D8 after re-reso
     origin_server_ts: 2000,
   });
   await ingestEvent(ROOM, ban, { keepPrevBranches: true });
-  const afterBan = await mainHash();
+  const afterBan = await chapterHash();
 
-  // (2a) main moved across the ban ingest
-  assert(beforeBan !== afterBan, 'HASHOF(main) must change across the ban');
+  // (2a) the chapter moved across the ban ingest
+  assert(beforeBan !== afterBan, 'HASHOF(chapter) must change across the ban');
 
   // (1) stateNow shows the ban WITHOUT re-resolution — ingest published it
   // deno-lint-ignore no-explicit-any
@@ -83,10 +87,14 @@ Deno.test('current state on main: publish, soft-fail stillness, D8 after re-reso
     origin_server_ts: 2001,
   });
   await ingestEvent(ROOM, msg, { keepPrevBranches: true });
-  const afterMsg = await mainHash();
+  const afterMsg = await chapterHash();
 
-  // (2b) main did NOT move across the soft-failed message
-  assertEquals(afterMsg, afterBan, 'a soft-failed event must not move main');
+  // (2b) the chapter did NOT move across the soft-failed message
+  assertEquals(
+    afterMsg,
+    afterBan,
+    'a soft-failed event must not move the chapter',
+  );
 
   // (3) the oracle: re-resolution leaves stateNow unchanged, and every x*
   // branch tip still equals its event's commit (D8 after re-resolve)

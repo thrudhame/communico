@@ -59,6 +59,18 @@ witnesses = 3
 pendingmax = 10000
 pendingdays = 30
 lookups = "known"
+missingwaitms = 750
+missinglimit = 10
+missingbudgetms = 8000
+missingmax = 20
+backfillbatch = 50
+backfillmax = 100
+bulkmaxbytes = 67108864
+backoffstartmillihours = 125
+backoffmaxmillihours = 256000
+refusedmillihours = 256000
+ungroundedmillihours = 256000
+txnhours = 24
 `;
 
 const CONFIG_PROBE =

@@ -36,6 +36,7 @@ export const V11: RoomVersionSpec = {
   depthLimit: 'int53',
   enforceKeyValidity: true,
   eventIdAlphabet: 'urlsafe',
+  strictByteLimits: true,
   redactsInContent: true,
   knockJoinRule: true,
   restrictedJoinRule: true,
@@ -74,6 +75,9 @@ export const V10: RoomVersionSpec = {
   // ≤10 carries `redacts` top-level on the PDU (pdu_v6.yaml:27-30); the
   // move to content is v11 (v11.md:70-81)
   redactsInContent: false,
+  // ≤10 measures the per-key size limits in codepoints, not bytes
+  // (Synapse switched at v11; gomatrixserverlib StrictEventByteLimits)
+  strictByteLimits: false,
 };
 
 // Room versions 3–9 (the older-versions plan, group A): every one is

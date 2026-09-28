@@ -357,6 +357,99 @@ export function loadConfig(opts: {
         }): expected >= 1, got ${witnesses}`,
       );
     }
+    // M5b delivery/history family: ordering rules across the leaves and
+    // the backoff ceiling's ladder rule (plan §3.1).
+    const intLeaf = (leaf: string): number | null => {
+      const v = f[leaf];
+      return typeof v === 'number' ? v : null;
+    };
+    for (
+      const leaf of [
+        'missingwaitms',
+        'missinglimit',
+        'missingbudgetms',
+        'missingmax',
+        'backfillbatch',
+        'backfillmax',
+        'bulkmaxbytes',
+        'backoffstartmillihours',
+        'backoffmaxmillihours',
+        'refusedmillihours',
+        'txnhours',
+      ]
+    ) {
+      const v = intLeaf(leaf);
+      if (v !== null && v < 1) {
+        problems.push(
+          `config: federation.${leaf} (${
+            envOf(leaf)
+          }): expected >= 1, got ${v}`,
+        );
+      }
+    }
+    const ungrounded = intLeaf('ungroundedmillihours');
+    if (ungrounded !== null && ungrounded < 0) {
+      problems.push(
+        `config: federation.ungroundedmillihours (${
+          envOf('ungroundedmillihours')
+        }): expected >= 0, got ${ungrounded}`,
+      );
+    }
+    const missinglimit = intLeaf('missinglimit');
+    const missingmax = intLeaf('missingmax');
+    if (
+      missinglimit !== null && missingmax !== null && missinglimit > missingmax
+    ) {
+      problems.push(
+        `config: federation.missinglimit (${
+          envOf('missinglimit')
+        }): expected <= federation.missingmax (${missingmax}), got ${missinglimit}`,
+      );
+    }
+    const backfillbatch = intLeaf('backfillbatch');
+    const backfillmax = intLeaf('backfillmax');
+    if (
+      backfillbatch !== null && backfillmax !== null &&
+      backfillbatch > backfillmax
+    ) {
+      problems.push(
+        `config: federation.backfillbatch (${
+          envOf('backfillbatch')
+        }): expected <= federation.backfillmax (${backfillmax}), got ${backfillbatch}`,
+      );
+    }
+    const missingwaitms = intLeaf('missingwaitms');
+    const missingbudgetms = intLeaf('missingbudgetms');
+    if (
+      missingwaitms !== null && missingbudgetms !== null &&
+      missingwaitms >= missingbudgetms
+    ) {
+      problems.push(
+        `config: federation.missingwaitms (${
+          envOf('missingwaitms')
+        }): expected < federation.missingbudgetms (${missingbudgetms}), got ${missingwaitms}`,
+      );
+    }
+    const backoffStart = intLeaf('backoffstartmillihours');
+    const backoffMax = intLeaf('backoffmaxmillihours');
+    if (
+      backoffStart !== null && backoffMax !== null && backoffStart >= 1 &&
+      backoffMax >= 1
+    ) {
+      // the ceiling must be a rung on the ladder: start × 2^k, k >= 0
+      const ratio = backoffMax / backoffStart;
+      const k = Math.log2(ratio);
+      if (!Number.isInteger(ratio) || !Number.isInteger(k) || k < 0) {
+        const kLow = Math.max(0, Math.floor(Math.log2(Math.max(ratio, 1e-9))));
+        const low = backoffStart * 2 ** kLow;
+        const high = backoffStart * 2 ** (kLow + 1);
+        problems.push(
+          `config: federation.backoffmaxmillihours (${
+            envOf('backoffmaxmillihours')
+          }): must be backoffstartmillihours × 2^k (${backoffStart} × 2^k) — the neighbouring rungs are ${low} and ${high}, got ${backoffMax}`,
+        );
+      }
+    }
     const cacerts = f.cacerts;
     if (Array.isArray(cacerts)) {
       for (const item of cacerts) {
@@ -461,6 +554,18 @@ export type ConfigPatch = {
     pendingmax?: number;
     pendingdays?: number;
     lookups?: string;
+    missingwaitms?: number;
+    missinglimit?: number;
+    missingbudgetms?: number;
+    missingmax?: number;
+    backfillbatch?: number;
+    backfillmax?: number;
+    bulkmaxbytes?: number;
+    backoffstartmillihours?: number;
+    backoffmaxmillihours?: number;
+    refusedmillihours?: number;
+    ungroundedmillihours?: number;
+    txnhours?: number;
   };
 };
 

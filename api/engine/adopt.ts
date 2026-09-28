@@ -8,7 +8,7 @@
 // Computes everything BEFORE writing: a failed validation aborts before
 // adopted state is visible.
 import { ident, withDb } from './db.ts';
-import { lookupRoom } from './room.ts';
+import { extremities, lookupRoom } from './room.ts';
 import { eventIdFor } from './eventid.ts';
 import { getRulebook, stateKeyOf, type StateMap } from './policy.ts';
 import { publishCurrentState, type StateRowInput } from './materialize.ts';
@@ -41,21 +41,19 @@ export async function reresolveFromDag(
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
   const rulebook = getRulebook(room.roomVersion);
 
-  // union across alive extremity tips
+  // union across alive extremity tips — M5b (era isolation, §3.6a):
+  // through the era-filtered extremities(), never an own enumeration of
+  // the x* set, so an old stay's branches never count.
   const tips: { branch: string; hash: string }[] = await withDb(
     room.dbName,
     async (c) => {
-      const b = await c.query('SELECT name FROM dolt.branches;');
-      // deno-lint-ignore no-explicit-any
-      const xb = (b.rows as any[]).map((r) => String(r.name)).filter((
-        n: string,
-      ) => n.startsWith('x'));
+      const xb = await extremities(room.dbName, roomId);
       const out: { branch: string; hash: string }[] = [];
-      for (const name of xb) {
+      for (const { branch } of xb) {
         const h = await c.query(
-          `SELECT (SELECT HASHOF('${ident(name)}')) AS h;`,
+          `SELECT (SELECT HASHOF('${ident(branch)}')) AS h;`,
         );
-        out.push({ branch: name, hash: String(h.rows[0].h) });
+        out.push({ branch, hash: String(h.rows[0].h) });
       }
       return out;
     },
@@ -152,8 +150,12 @@ export async function reresolveFromDag(
     });
   }
 
+  if (room.currentChapter === null) {
+    throw new Error('E_ROOM_ARCHIVED: reresolve on an archived room');
+  }
   await publishCurrentState(
     room.dbName,
+    room.currentChapter,
     rows,
     `reresolve: ${rows.length} rows from ${all.length} events`,
   );

@@ -1,6 +1,6 @@
 import { ident, serverDb, withDb } from './db.ts';
 import { author, ingestEvent } from './ingest.ts';
-import { getRulebook } from './policy.ts';
+import { getRulebook, stateKeyOf, type StateMap } from './policy.ts';
 import { validAdditionalCreators } from './rulebook/auth-rules.ts';
 import type { Pdu } from './pdu.ts';
 import { serverName } from './config.ts';
@@ -243,19 +243,10 @@ export async function createRoom(
     }
   }
 
-  // --- provision the room DB + directory row ---
-  const dbName = await dbNameFor(finalRoomId);
-  await withDb(serverDb(), async (c) => {
-    await c.query(`CREATE DATABASE ${ident(dbName)};`);
-    await c.query(
-      'INSERT INTO room_directory (room_id, db_name, room_version, stub_era) VALUES ($1, $2, $3, FALSE);',
-      [finalRoomId, dbName, roomVersion],
-    );
-  });
-  await withDb(dbName, async (c) => {
-    await runSqlFile(c, 'db/room/schema.sql');
-    await c.query(`SELECT DOLT_COMMIT('-Am', 'room genesis: schema');`);
-  });
+  // --- provision the room DB + directory row (the book: main is the
+  //     room's SYSTEM branch — schema genesis only, never content;
+  //     chapter0 + chapter1 start at the genesis commit) ---
+  await provisionRoom(finalRoomId, roomVersion);
 
   const send = async (
     type: string,
@@ -409,12 +400,53 @@ export interface RoomInfo {
   roomVersion: string;
   // TRUE only for pre-M3 rooms (dev DBs are reset; no migration — plan §3f).
   stubEra: boolean;
+  // M5b (the book): the live stay's branch ('chapter<2k+1>'); NULL =
+  // archived (the server's last local member left; the room stays
+  // readable through chapterHead).
+  currentChapter: string | null;
+  // the 'room genesis: schema' commit hash on main (the room's system
+  // branch) — every chapter branch starts here.
+  genesisCommit: string;
+}
+
+// M5b: provisioning shared by createRoom, the remote join and the
+// out-of-band invite paths (§3.2). Creates the room database, commits
+// the schema on `main` (the room's system branch — P5 ruling: main
+// carries the genesis commit and never holds content), records the
+// genesis commit, and opens the book: chapter0 (history, empty) and
+// chapter1 (the first stay) at the genesis commit, current_chapter =
+// 'chapter1'.
+export async function provisionRoom(
+  roomId: string,
+  roomVersion: string,
+  stubEra = false,
+): Promise<{ dbName: string; genesisCommit: string }> {
+  const dbName = await dbNameFor(roomId);
+  await withDb(serverDb(), async (c) => {
+    await c.query(`CREATE DATABASE ${ident(dbName)};`);
+  });
+  const genesisCommit = await withDb(dbName, async (c) => {
+    await runSqlFile(c, 'db/room/schema.sql');
+    await c.query(`SELECT DOLT_COMMIT('-Am', 'room genesis: schema');`);
+    const g = await c.query(`SELECT HASHOF('main') AS h;`);
+    const genesis = String(g.rows[0].h);
+    await c.query(`SELECT DOLT_BRANCH('chapter0', '${genesis}');`);
+    await c.query(`SELECT DOLT_BRANCH('chapter1', '${genesis}');`);
+    return genesis;
+  });
+  await withDb(serverDb(), async (c) => {
+    await c.query(
+      'INSERT INTO room_directory (room_id, db_name, room_version, stub_era, current_chapter, genesis_commit) VALUES ($1, $2, $3, $4, $5, $6);',
+      [roomId, dbName, roomVersion, stubEra, 'chapter1', genesisCommit],
+    );
+  });
+  return { dbName, genesisCommit };
 }
 
 export async function lookupRoom(roomId: string): Promise<RoomInfo | null> {
   return await withDb(serverDb(), async (c) => {
     const r = await c.query(
-      'SELECT db_name, room_version, stub_era FROM room_directory WHERE room_id = $1;',
+      'SELECT db_name, room_version, stub_era, current_chapter, genesis_commit FROM room_directory WHERE room_id = $1;',
       [roomId],
     );
     if (r.rows.length === 0) return null;
@@ -422,16 +454,215 @@ export async function lookupRoom(roomId: string): Promise<RoomInfo | null> {
       dbName: r.rows[0].db_name,
       roomVersion: r.rows[0].room_version,
       stubEra: Boolean(r.rows[0].stub_era),
+      currentChapter: r.rows[0].current_chapter == null
+        ? null
+        : String(r.rows[0].current_chapter),
+      genesisCommit: String(r.rows[0].genesis_commit),
     };
   });
 }
 
-// Extremities are only x* branches (main is never an extremity). Returns
-// the tip EVENT id + branch per live extremity (event_index.branch_name
-// join; stale rows are excluded by joining against live dolt.branches).
-// Soft-failed events (M3, S8 check 6) are excluded — they are not added
-// to the server's list of forward extremities (server-server-api.md
-// 611-614); they still participate in resolution when referenced.
+// M5b: the genesis commit recorded at provision (every chapter branch
+// starts there; there is no content branch to derive it from).
+export async function genesisCommit(roomId: string): Promise<string | null> {
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT genesis_commit FROM room_directory WHERE room_id = $1;',
+      [roomId],
+    );
+    return r.rows.length && r.rows[0].genesis_commit != null
+      ? String(r.rows[0].genesis_commit)
+      : null;
+  });
+}
+
+// The highest-numbered chapter branch in a room database, odd (a stay)
+// or even (a history chapter); null when the room has none.
+async function highestChapter(
+  dbName: string,
+  parity: 'odd' | 'even',
+): Promise<string | null> {
+  return await withDb(dbName, async (c) => {
+    const r = await c.query('SELECT name FROM dolt.branches;');
+    let best = -1;
+    // deno-lint-ignore no-explicit-any
+    for (const row of r.rows as any[]) {
+      const m = /^chapter(\d+)$/.exec(String(row.name));
+      if (!m) continue;
+      const n = Number(m[1]);
+      if (parity === 'odd' && n % 2 !== 1) continue;
+      if (parity === 'even' && n % 2 !== 0) continue;
+      if (n > best) best = n;
+    }
+    return best < 0 ? null : `chapter${best}`;
+  });
+}
+
+// M5b (§3.6a): every "state now" read goes through the chapter head —
+// the live stay (current_chapter) when set, else the highest-numbered
+// odd chapter (an archived room reads as of its close).
+export async function chapterHead(roomId: string): Promise<string | null> {
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT db_name, current_chapter FROM room_directory WHERE room_id = $1;',
+      [roomId],
+    );
+    if (r.rows.length === 0) return null;
+    if (r.rows[0].current_chapter != null) {
+      return String(r.rows[0].current_chapter);
+    }
+    return await highestChapter(String(r.rows[0].db_name), 'odd');
+  });
+}
+
+// stateNow's variant (it is keyed by the room database, not the room id).
+export async function chapterHeadForDb(dbName: string): Promise<string | null> {
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT current_chapter FROM room_directory WHERE db_name = $1;',
+      [dbName],
+    );
+    if (r.rows.length === 0) return null;
+    if (r.rows[0].current_chapter != null) {
+      return String(r.rows[0].current_chapter);
+    }
+    return await highestChapter(dbName, 'odd');
+  });
+}
+
+// M5b (§3.10, grounded ≠ held): a prev is grounded only if it has a
+// commit of its own whose state is the state AT that event — a live
+// event's x* commit or a history commit. Snapshot evidence rows point at
+// the join's root commit (join-time state, not their own) and ungrounded
+// placeholders at a placeholder state — neither grounds anything.
+export async function groundingOf(
+  roomId: string,
+  eventId: string,
+): Promise<'own' | 'evidence' | 'placeholder' | 'unknown'> {
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT rejected_reason, seq, branch_name FROM event_index WHERE room_id = $1 AND event_id = $2;',
+      [roomId, eventId],
+    );
+    if (r.rows.length === 0) return 'unknown';
+    if (r.rows[0].rejected_reason === 'ungrounded') return 'placeholder';
+    if (r.rows[0].seq == null && r.rows[0].branch_name == null) {
+      return 'evidence';
+    }
+    return 'own';
+  });
+}
+
+// M5b: the distinct server domains of the room's JOINED members (a
+// membership fact from the room's state index — never a chapter fact).
+export async function serversInRoom(roomId: string): Promise<string[]> {
+  return await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      `SELECT user_id FROM room_membership WHERE room_id = $1 AND membership = 'join';`,
+      [roomId],
+    );
+    const domains = new Set<string>();
+    // deno-lint-ignore no-explicit-any
+    for (const row of r.rows as any[]) {
+      const uid = String(row.user_id);
+      const at = uid.indexOf(':');
+      if (at >= 0) domains.add(uid.slice(at + 1));
+    }
+    return [...domains];
+  });
+}
+
+export async function serverInRoom(
+  roomId: string,
+  name: string,
+): Promise<boolean> {
+  return (await serversInRoom(roomId)).includes(name);
+}
+
+// M5b (§3.2): the state BEFORE an event — resolved across its prevs'
+// commit states exactly as ingest steps 8–9 do (used by /state,
+// /state_ids and the server-visibility filter). For the join event of a
+// remote room the "before" state is the root commit's.
+export async function stateBefore(
+  roomId: string,
+  eventId: string,
+): Promise<StateMap> {
+  const room = await lookupRoom(roomId);
+  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
+  const rulebook = getRulebook(room.roomVersion);
+  return await withDb(room.dbName, async (c) => {
+    const er = await c.query(
+      'SELECT prev_events FROM events WHERE event_id = $1;',
+      [eventId],
+    );
+    if (er.rows.length === 0) throw new Error('M_NOT_FOUND: ' + eventId);
+    const raw = er.rows[0].prev_events;
+    const prevIds: string[] = Array.isArray(raw)
+      ? raw
+      : JSON.parse(String(raw));
+    const parentSets: StateMap[] = [];
+    const hashes: string[] = [];
+    for (const pid of prevIds) {
+      const ch = await withDb(serverDb(), async (s) => {
+        const r = await s.query(
+          'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
+          [roomId, pid],
+        );
+        return r.rows.length ? String(r.rows[0].commit_hash) : null;
+      });
+      if (ch === null) continue;
+      hashes.push(ch);
+      const m: StateMap = new Map();
+      const sr = await c.query(
+        `SELECT type, state_key, event_id FROM state AS OF '${ch}';`,
+      );
+      // deno-lint-ignore no-explicit-any
+      for (const row of sr.rows as any[]) {
+        m.set(
+          stateKeyOf(String(row.type), String(row.state_key ?? '')),
+          String(row.event_id),
+        );
+      }
+      parentSets.push(m);
+    }
+    const pduById = new Map<string, Pdu>();
+    const rejectedIds = new Set<string>();
+    for (const h of hashes) {
+      const rr = await c.query(
+        `SELECT event_id, canonical_json, rejected FROM events AS OF '${h}';`,
+      );
+      // deno-lint-ignore no-explicit-any
+      for (const row of rr.rows as any[]) {
+        const id = String(row.event_id);
+        if (!pduById.has(id)) {
+          pduById.set(
+            id,
+            typeof row.canonical_json === 'string'
+              ? JSON.parse(row.canonical_json)
+              : row.canonical_json,
+          );
+        }
+        if (row.rejected === true) rejectedIds.add(id);
+      }
+    }
+    const store = {
+      get: (id: string) => pduById.get(id),
+      isRejected: (id: string) => rejectedIds.has(id),
+    };
+    return rulebook.resolveState(parentSets, store);
+  });
+}
+
+// Extremities are only x* branches (chapters are never extremities).
+// Returns the tip EVENT id + branch per live extremity (event_index.
+// branch_name join; stale rows are excluded by joining against live
+// dolt.branches). Soft-failed events (M3, S8 check 6) are excluded —
+// they are not added to the server's list of forward extremities
+// (server-server-api.md 611-614); they still participate in resolution
+// when referenced. M5b (era isolation, §3.6a): only the given era's
+// branches count — the default is the room's CURRENT chapter, so an
+// archived room (current_chapter NULL) has no live extremities and an
+// old stay's x* branches never leak into the new stay.
 export interface Extremity {
   eventId: string;
   branch: string;
@@ -440,6 +671,7 @@ export interface Extremity {
 export async function extremities(
   dbName: string,
   roomId: string,
+  era?: string,
 ): Promise<Extremity[]> {
   return await withDb(dbName, async (c) => {
     const r = await c.query('SELECT name FROM dolt.branches;');
@@ -449,10 +681,15 @@ export async function extremities(
     );
     if (xbranches.length === 0) return [];
     return await withDb(serverDb(), async (s) => {
-      const idx = await s.query(
-        'SELECT event_id, branch_name FROM event_index WHERE room_id = $1 AND branch_name = ANY($2) AND rejected = FALSE AND soft_failed = FALSE;',
-        [roomId, xbranches],
-      );
+      const idx = era !== undefined
+        ? await s.query(
+          'SELECT event_id, branch_name FROM event_index WHERE room_id = $1 AND branch_name = ANY($2) AND rejected = FALSE AND soft_failed = FALSE AND era = $3;',
+          [roomId, xbranches, era],
+        )
+        : await s.query(
+          'SELECT event_id, branch_name FROM event_index WHERE room_id = $1 AND branch_name = ANY($2) AND rejected = FALSE AND soft_failed = FALSE AND era = (SELECT current_chapter FROM room_directory WHERE room_id = $1);',
+          [roomId, xbranches],
+        );
       // deno-lint-ignore no-explicit-any
       return idx.rows.map((row: any) => ({
         eventId: String(row.event_id),
@@ -466,7 +703,7 @@ export async function extremities(
 // "one side's history" simplification). Deterministic and content-based:
 // greatest tip depth, tie → smallest event_id. Never a soft-failed or
 // rejected tip (extremities() excludes them). Current STATE is never read
-// this way — it lives on main (materialize.publishCurrentState).
+// this way — it lives on the current chapter (materialize.publishCurrentState).
 export async function headExtremity(
   dbName: string,
   roomId: string,
@@ -502,8 +739,9 @@ export interface StateRow {
 }
 
 // The state_commit_hash of the last non-rejected, non-soft-failed R-event
-// with seq <= the given one; seq === null -> HASHOF('main') (now). null
-// when no such event exists (before the room's first event).
+// with seq <= the given one; seq === null -> HASHOF(chapterHead) (now —
+// the live stay's tip, or the archived stay's tip for a room we left).
+// null when no such event exists (before the room's first event).
 export async function stateCommitAtSeq(
   roomId: string,
   seq: number | null,
@@ -511,8 +749,10 @@ export async function stateCommitAtSeq(
   if (seq === null) {
     const room = await lookupRoom(roomId);
     if (!room) return null;
+    const head = await chapterHead(roomId);
+    if (head === null) return null;
     return await withDb(room.dbName, async (c) => {
-      const r = await c.query(`SELECT HASHOF('main') AS h;`);
+      const r = await c.query(`SELECT HASHOF('${ident(head)}') AS h;`);
       return String(r.rows[0].h);
     });
   }
@@ -528,8 +768,8 @@ export async function stateCommitAtSeq(
   });
 }
 
-// The room's state AS OF a `main` commit hash (E1: `main`'s commit history
-// IS the state history).
+// The room's state AS OF a chapter commit hash (E1, M5b: the live
+// chapter's commit history IS the state history).
 export async function stateAt(
   dbName: string,
   stateHash: string,
