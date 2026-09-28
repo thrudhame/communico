@@ -42,9 +42,15 @@ export type KeysDeps = {
     serverName: string,
     minimumValidUntilTs: number,
   ) => Promise<unknown>;
-  // roster witnesses by seniority (commit 5: peers.ts)
-  listWitnesses: () => Promise<string[]>;
+  // roster witnesses by seniority (commit 5: peers.ts), then — M5b — the
+  // event's room's servers when ctx carries a roomId
+  listWitnesses: (ctx?: WitnessCtx) => Promise<string[]>;
 };
+
+// M5b (§3.2): the witness set widens with the servers of the room the
+// key is needed for. excludeName = the server being looked up (it never
+// witnesses for itself).
+export type WitnessCtx = { roomId?: string; excludeName?: string };
 
 let _deps: KeysDeps | null = null;
 
@@ -245,14 +251,16 @@ const warnedOnce = new Set<string>(); // name|fingerprint, per process
 export async function acquireKeyDoc(
   name: string,
   minimumValidUntilTs: number,
+  ctx?: { roomId?: string },
 ): Promise<KeyDoc> {
-  return await acquireKeyDocWith(name, minimumValidUntilTs, keysDeps());
+  return await acquireKeyDocWith(name, minimumValidUntilTs, keysDeps(), ctx);
 }
 
 export async function acquireKeyDocWith(
   name: string,
   minimumValidUntilTs: number,
   deps: KeysDeps,
+  ctx?: { roomId?: string },
 ): Promise<KeyDoc> {
   // rung 4: a key-is-name server IS its ed25519 key — nothing to fetch
   if (isKeyName(name)) {
@@ -271,7 +279,7 @@ export async function acquireKeyDocWith(
   }
   const existing = inFlight.get(name);
   if (existing !== undefined) return await existing;
-  const p = doAcquire(name, minimumValidUntilTs, deps);
+  const p = doAcquire(name, minimumValidUntilTs, deps, ctx);
   inFlight.set(name, p);
   try {
     return await p;
@@ -284,6 +292,7 @@ async function doAcquire(
   name: string,
   minimumValidUntilTs: number,
   deps: KeysDeps,
+  ctx?: { roomId?: string },
 ): Promise<KeyDoc> {
   try {
     // cache: a stored document that still serves the caller's horizon
@@ -296,7 +305,10 @@ async function doAcquire(
     let candidate: { doc: KeyDoc; via: string } | null = null;
 
     // witnesses first — a single usable answer is single-source trust
-    const peers = (await deps.listWitnesses()).slice(
+    const peers = (await deps.listWitnesses({
+      roomId: ctx?.roomId,
+      excludeName: name,
+    })).slice(
       0,
       config().federation.witnesses,
     );
@@ -433,6 +445,7 @@ export async function getVerifyKey(
   keyId: string,
   minimumValidUntilTs: number,
   purpose: 'request' | 'event',
+  ctx?: { roomId?: string },
 ): Promise<CryptoKey> {
   return await getVerifyKeyWith(
     name,
@@ -440,6 +453,7 @@ export async function getVerifyKey(
     minimumValidUntilTs,
     purpose,
     keysDeps(),
+    ctx,
   );
 }
 
@@ -449,6 +463,7 @@ export async function getVerifyKeyWith(
   minimumValidUntilTs: number,
   purpose: 'request' | 'event',
   deps: KeysDeps,
+  ctx?: { roomId?: string },
 ): Promise<CryptoKey> {
   if (isKeyName(name)) {
     if (keyId !== 'ed25519:0') {
@@ -458,7 +473,7 @@ export async function getVerifyKeyWith(
   }
   const hit = await cachedVerifyKey(name, keyId, minimumValidUntilTs, purpose);
   if (hit !== null) return hit;
-  await acquireKeyDocWith(name, minimumValidUntilTs, deps);
+  await acquireKeyDocWith(name, minimumValidUntilTs, deps, ctx);
   const again = await cachedVerifyKey(
     name,
     keyId,

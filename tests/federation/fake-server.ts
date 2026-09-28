@@ -43,6 +43,12 @@ export async function startFakeServer(opts: {
   keyDocs?: Record<string, unknown>;
   // our app's key doc getter — the test hands an in-process app call
   ourKeyDoc: () => Promise<unknown>;
+  // M5b: custom routes, consulted BEFORE the built-ins — return a
+  // Response to handle, null to fall through (the fake-room builder
+  // hangs its room endpoints here)
+  handlers?: (
+    req: FakeRequest & { url: URL; json(): unknown },
+  ) => Response | Promise<Response> | null;
 }): Promise<FakeServer> {
   const kp = (await generateSigningKeypair()) as unknown as CryptoKeyPair;
   const publicB64 = b64encodeStd(await exportPublicKeyRaw(kp.publicKey));
@@ -129,13 +135,21 @@ export async function startFakeServer(opts: {
     try {
       origin = await verifyInbound(request, bodyBytes);
     } catch { /* unparseable — recorded unverified */ }
-    requests.push({
+    const recorded: FakeRequest & { url: URL; json(): unknown } = {
       method: request.method,
       path: url.pathname + url.search,
       origin,
       verified: origin !== null,
       body: bodyBytes,
-    });
+      url,
+      json: () =>
+        bodyBytes === null
+          ? null
+          : JSON.parse(new TextDecoder().decode(bodyBytes)),
+    };
+    requests.push(recorded);
+    const custom = await opts.handlers?.(recorded);
+    if (custom) return custom;
     if (url.pathname === '/_matrix/key/v2/server') {
       return Response.json(await keyDoc());
     }

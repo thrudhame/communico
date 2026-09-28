@@ -28,6 +28,8 @@ import {
   importPublicKeyFromRaw,
   isKeyName,
 } from '#engine/signing-primitives.js';
+import { getVerifyKey } from './federation/keys.ts';
+import { checkRemoteFormat, domainOf } from './federation/pdu.ts';
 
 export interface IngestResult {
   event_id: string;
@@ -554,63 +556,13 @@ export async function ingestPrechecks(
   }
   let oversized = false;
   if (opts.remote) {
-    // required fields (pdu_base.yaml:67-74; + room_id for ≤ v11 —
-    // components/room_id_before_v12.yaml:22-23)
-    if (
-      typeof pdu.type !== 'string' || typeof pdu.sender !== 'string' ||
-      typeof pdu.depth !== 'number' || !Number.isInteger(pdu.depth) ||
-      pdu.depth < 0 ||
-      typeof pdu.origin_server_ts !== 'number' ||
-      (pdu.content === null || typeof pdu.content !== 'object')
-    ) {
-      throw new Error('M_BAD_EVENT: missing or malformed required fields');
-    }
-    if (
-      !rulebook.spec.roomIdFromCreateEvent && typeof pdu.room_id !== 'string'
-    ) {
-      throw new Error('M_BAD_EVENT: room_id required before v12');
-    }
-    // depth bounded only (components/depth_v6.yaml:19-25 — the only MUST)
-    const depthBound = rulebook.spec.depthLimit === 'int53'
-      ? 2 ** 53 - 1
-      : 2 ** 63 - 1;
-    if (pdu.depth > depthBound) {
-      throw new Error('M_BAD_EVENT: depth exceeds the room version limit');
-    }
-    // whole canonical event ≤ 65536 bytes (CS:2869-2871) — a format
-    // failure: the PDU is invalid, dropped.
-    if (
-      new TextEncoder().encode(
-        canonicalJson(pdu as unknown as Record<string, unknown>),
-      ).length > 65536
-    ) {
-      throw new Error('M_TOO_LARGE: event exceeds the 65536-byte limit');
-    }
-    // per-key limits (CS:2874-2878; appendices identifier grammars):
-    // type/state_key ≤ 255, sender/room_id/event_id ≤ their grammar caps
-    // — measured in BYTES for strictByteLimits versions (v11+), else
-    // codepoints. A failure in a LENIENT version is stored rejected
-    // 'oversized' (Synapse federation_event.py:1852-1868); a failure in a
-    // strict version is a format failure — dropped.
-    const measure = (s: string): number =>
-      rulebook.spec.strictByteLimits
-        ? new TextEncoder().encode(s).length
-        : [...s].length;
-    const keyFail = (typeof pdu.type === 'string' && measure(pdu.type) > 255) ||
-      (pdu.state_key !== undefined && measure(String(pdu.state_key)) > 255);
-    if (keyFail) {
-      if (rulebook.spec.strictByteLimits) {
-        throw new Error('M_BAD_EVENT: type/state_key exceed 255 bytes');
-      }
-      oversized = true;
-    }
-    for (const id of [pdu.sender, pdu.room_id, pdu.event_id]) {
-      if (typeof id === 'string' && new TextEncoder().encode(id).length > 255) {
-        throw new Error('M_BAD_EVENT: identifier exceeds its grammar limit');
-      }
-    }
+    // M5b (SS:464-469, step 1 "valid event"): the remote format checks
+    // live in federation/pdu.ts — a format failure is a drop (thrown), a
+    // lenient-version per-key size failure comes back as 'oversized'.
+    oversized = checkRemoteFormat(pdu, rulebook.spec, {
+      exemptPrevAuthLimits: opts.remote.position === 'before',
+    }).oversized;
   }
-
   // 3. `unsigned` stripped on receipt (not covered by signatures —
   //    appendices.md:341-343 — nor by the content hash, SS:1355-1361):
   //    we never store another server's unsigned. invite_room_state on an
@@ -750,6 +702,45 @@ export async function ingestPrechecks(
             )
           ) sigOk = true;
         }
+      }
+    }
+  }
+  // 7. M5b (SS:470, step 2): a REMOTE event must carry a verifying
+  //    signature from the SENDER'S server (SS:1318-1326; v11.md:85) —
+  //    forwarding by any origin is allowed, so the spec names the
+  //    sender's server, not the deliverer; signing is what binds. The
+  //    key comes from the remembered-keys path with the room's servers
+  //    as extra witnesses ({ roomId }); validity per the room version's
+  //    enforceKeyValidity (v5-signing-requirements.md:2-16). A failure
+  //    or an unobtainable key is a drop, never a deferral.
+  if (!sigOk && opts.remote) {
+    const senderDomain = domainOf(String(pdu.sender));
+    const minValidUntil = rulebook.spec.enforceKeyValidity
+      ? Number(pdu.origin_server_ts)
+      : 0;
+    for (const kid of Object.keys(pdu.signatures?.[senderDomain] ?? {})) {
+      try {
+        const key = await getVerifyKey(
+          senderDomain,
+          kid,
+          minValidUntil,
+          'event',
+          { roomId },
+        );
+        if (
+          await verifyPduSignature(
+            pdu,
+            key,
+            senderDomain,
+            kid,
+            room.roomVersion,
+          )
+        ) {
+          sigOk = true;
+          break;
+        }
+      } catch {
+        // key unobtainable under this id — try the next
       }
     }
   }

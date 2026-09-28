@@ -113,14 +113,44 @@ export async function listPeers(): Promise<PeerRow[]> {
 
 // seniority: oldest first. Operator/approval rows only, keyname rows are
 // not notaries for others (their own document is unreachable by nature).
-export async function listWitnesses(): Promise<string[]> {
+// M5b (§3.2, trust-ladder rung 5): the event's ROOM'S servers join the
+// witness set after the roster witnesses — only while we are in the room
+// (a room we left nominates nobody), ordered by the seq of each server's
+// earliest joined member event (seniority in the room), minus ourselves
+// and the name being looked up.
+export async function listWitnesses(
+  ctx?: { roomId?: string; excludeName?: string },
+): Promise<string[]> {
   const peers = await listPeers();
-  return peers
+  const roster = peers
     .filter((p) =>
       (p.added_by === 'operator' || p.added_by === 'approval') &&
       p.trust !== 'keyname'
     )
     .map((p) => p.name);
+  if (ctx?.roomId === undefined) return roster;
+  const ours = config().server.name;
+  const seniority = new Map<string, number>();
+  await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      `SELECT user_id, seq FROM room_membership WHERE room_id = $1 AND membership = 'join' ORDER BY seq ASC;`,
+      [ctx.roomId!],
+    );
+    // deno-lint-ignore no-explicit-any
+    for (const row of r.rows as any[]) {
+      const uid = String(row.user_id);
+      const at = uid.indexOf(':');
+      if (at < 0) continue;
+      const domain = uid.slice(at + 1);
+      if (!seniority.has(domain)) seniority.set(domain, Number(row.seq));
+    }
+  });
+  if (!seniority.has(ours)) return roster; // we are not in the room
+  const roomServers = [...seniority.entries()]
+    .filter(([d]) => d !== ours && d !== ctx.excludeName && !roster.includes(d))
+    .sort((a, b) => a[1] - b[1])
+    .map(([d]) => d);
+  return [...roster, ...roomServers];
 }
 
 // --- blocks (server-name globs) ------------------------------------------
