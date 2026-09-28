@@ -96,6 +96,17 @@ export async function resolveAlias(
   if (row === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
   }
+  // M5b (§3.6a): a purgeable room is hidden from every read
+  const purgeable = await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT 1 FROM room_directory WHERE room_id = $1 AND purgeable_ms IS NOT NULL;',
+      [row],
+    );
+    return r.rows.length > 0;
+  });
+  if (purgeable) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
+  }
   return { room_id: row, servers: [serverName()] };
 }
 

@@ -30,6 +30,7 @@ import {
 } from '#engine/signing-primitives.js';
 import { getVerifyKey } from './federation/keys.ts';
 import { checkRemoteFormat, domainOf } from './federation/pdu.ts';
+import { writeRows as writeOutboxRows } from './federation/outbox.ts';
 
 export interface IngestResult {
   event_id: string;
@@ -802,6 +803,46 @@ export async function authorAndIngest(
   });
 }
 
+// M5b (§3.2): one outbox row per destination — domains of members
+// JOINED in the state BEFORE the event (SS's ban reasoning; Synapse
+// sender/__init__.py:654-664) ∪ the target's domain for an m.room.member
+// leave/ban with a remote state_key (the leaving/kicked/banned server
+// must hear it even if it has no member left in the state before) −
+// ourselves − the on-behalf origin (the resident fans its own joiner
+// out; invites are not in the union — the invitee's server is told
+// through /invite, §3.8).
+function deliveryDestinations(
+  resolved: StateMap,
+  pduById: Map<string, Pdu>,
+  pdu: Pdu,
+  onBehalfOrigin: string | null,
+): string[] {
+  const domains = new Set<string>();
+  for (const [k, eid] of resolved) {
+    if (!k.startsWith('m.room.member')) continue;
+    const ep = pduById.get(eid);
+    if (!ep) continue;
+    if (
+      ((ep.content ?? {}) as { membership?: string }).membership !== 'join'
+    ) {
+      continue;
+    }
+    const sk = k.slice('m.room.member'.length + 1);
+    const at = sk.indexOf(':');
+    if (at >= 0) domains.add(sk.slice(at + 1));
+  }
+  if (pdu.type === 'm.room.member' && pdu.state_key != null) {
+    const ms = ((pdu.content ?? {}) as { membership?: string }).membership;
+    if (ms === 'leave' || ms === 'ban') {
+      const at = String(pdu.state_key).indexOf(':');
+      if (at >= 0) domains.add(String(pdu.state_key).slice(at + 1));
+    }
+  }
+  domains.delete(serverName());
+  if (onBehalfOrigin !== null) domains.delete(onBehalfOrigin);
+  return [...domains];
+}
+
 // E2 fold — the PUBLISHED current-state rows' m.room.member entries into
 // the per-user membership index (a derived cache of the chapter, same
 // writer step as the publish). M5b (r4-c): the fold KEEPS an existing
@@ -1142,48 +1183,79 @@ export async function ingestEventLocked(
   // their own paths (commits 8/10). A redelivered 'ungrounded'
   // placeholder is UPDATED in place (ruling B).
   const isLive = position === 'after';
+  // M5b (§3.2, D2): the outbox rows ride the SAME server-DB transaction
+  // as the index row (P2) — a crash cannot store the event and forget
+  // the obligation. One row per destination when the event is accepted
+  // and ours to deliver (authored here, or on another server's behalf).
+  const deliverTo = isLive && !rejected && !softFailed &&
+      (opts.remote === undefined || opts.remote.onBehalfOf === true)
+    ? deliveryDestinations(
+      resolved,
+      ancestry.pduById,
+      pdu,
+      opts.remote?.origin ?? null,
+    )
+    : [];
   const eventSeq = await withDb(serverDb(), async (c) => {
-    if (redeliverUngrounded) {
-      await c.query(
-        `UPDATE event_index SET commit_hash = $3, branch_name = $4, rejected = $5, soft_failed = $6,
+    await c.query('BEGIN;');
+    try {
+      if (redeliverUngrounded) {
+        await c.query(
+          `UPDATE event_index SET commit_hash = $3, branch_name = $4, rejected = $5, soft_failed = $6,
            rejected_reason = $7, origin = $8, expires_ms = NULL, added_ms = $9,
            era = $10, seq = DEFAULT, state_commit_hash = NULL
          WHERE event_id = $1 AND room_id = $2;`,
-        [
-          eventId,
-          roomId,
-          commitHash,
-          isLive ? newBranch : null,
-          rejected,
-          softFailed,
-          rejectedReason,
-          opts.remote?.origin ?? null,
-          Date.now(),
-          isLive ? currentChapter : null,
-        ],
-      );
-    } else {
-      await c.query(
-        `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed, txn_device, txn_id,
+          [
+            eventId,
+            roomId,
+            commitHash,
+            isLive ? newBranch : null,
+            rejected,
+            softFailed,
+            rejectedReason,
+            opts.remote?.origin ?? null,
+            Date.now(),
+            isLive ? currentChapter : null,
+          ],
+        );
+      } else {
+        await c.query(
+          `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed, txn_device, txn_id,
            rejected_reason, origin, added_ms, era${isLive ? '' : ', seq'})
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12${
-          isLive ? '' : ', NULL'
-        });`,
-        [
-          eventId,
-          roomId,
-          commitHash,
-          isLive ? newBranch : null,
-          rejected,
-          softFailed,
-          opts.txn?.deviceId ?? null,
-          opts.txn?.txnId ?? null,
-          rejectedReason,
-          opts.remote?.origin ?? null,
-          Date.now(),
-          isLive ? currentChapter : null,
-        ],
-      );
+            isLive ? '' : ', NULL'
+          });`,
+          [
+            eventId,
+            roomId,
+            commitHash,
+            isLive ? newBranch : null,
+            rejected,
+            softFailed,
+            opts.txn?.deviceId ?? null,
+            opts.txn?.txnId ?? null,
+            rejectedReason,
+            opts.remote?.origin ?? null,
+            Date.now(),
+            isLive ? currentChapter : null,
+          ],
+        );
+      }
+      if (deliverTo.length > 0) {
+        await writeOutboxRows(
+          c,
+          deliverTo.map((destination) => ({
+            destination,
+            roomId,
+            kind: 'event' as const,
+            eventId,
+          })),
+        );
+      }
+      await c.query('COMMIT;');
+    } catch (e) {
+      await c.query('ROLLBACK;');
+      throw e;
     }
     const sq = await c.query(
       'SELECT seq FROM event_index WHERE event_id = $1;',

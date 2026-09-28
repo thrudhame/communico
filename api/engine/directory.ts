@@ -46,8 +46,10 @@ export async function publicRooms(opts: {
     ? Math.max(0, Number.parseInt(opts.since, 10) || 0)
     : 0;
   const roomIds = await withDb(serverDb(), async (c) => {
+    // M5b (§3.6a): a purgeable room is hidden from every read
     const r = await c.query(
-      `SELECT room_id FROM room_visibility WHERE visibility = 'public';`,
+      `SELECT room_id FROM room_visibility WHERE visibility = 'public'
+         AND room_id NOT IN (SELECT room_id FROM room_directory WHERE purgeable_ms IS NOT NULL);`,
     );
     // deno-lint-ignore no-explicit-any
     return (r.rows as any[]).map((row) => String(row.room_id));

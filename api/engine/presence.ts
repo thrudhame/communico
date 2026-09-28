@@ -14,6 +14,18 @@ export interface PresenceRow {
 
 const PRESENCES = new Set(['online', 'offline', 'unavailable']);
 
+// M5b: change listeners for the federation EDU queues (sender.ts).
+type PresenceListener = (
+  userId: string,
+  presence: string,
+  statusMsg: string | null,
+) => void;
+const listeners = new Set<PresenceListener>();
+export function onPresenceChange(l: PresenceListener): () => void {
+  listeners.add(l);
+  return () => listeners.delete(l);
+}
+
 // The register/login-time default row (offline) — a never-synced joiner
 // still has one to fan out.
 export async function ensurePresenceRow(userId: string): Promise<void> {
@@ -45,6 +57,13 @@ export async function setPresence(
       [userId, presence, statusMsg ?? null, Date.now()],
     );
   });
+  for (const l of listeners) {
+    try {
+      l(userId, presence, statusMsg ?? null);
+    } catch (e) {
+      console.error('presence listener error:', e);
+    }
+  }
 }
 
 // The user's row, or the spec's default (offline) when none exists.

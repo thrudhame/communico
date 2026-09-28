@@ -34,6 +34,8 @@ export type FakeServer = {
   // sign any JSON object as this server (for building inbound requests)
   sign: (obj: Record<string, unknown>) => Promise<Record<string, unknown>>;
   close: () => Promise<void>;
+  // the fake's own document for seeding the remembered-keys tables
+  keyDoc: () => Promise<Record<string, unknown>>;
 };
 
 type OurKey = { serverName: string; keyId: string; pub: CryptoKey };
@@ -187,5 +189,6 @@ export async function startFakeServer(opts: {
     close: async () => {
       await server.shutdown();
     },
+    keyDoc,
   };
 }

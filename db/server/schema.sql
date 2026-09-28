@@ -40,6 +40,15 @@
 --     missing_prev text NOT NULL, event_id text NOT NULL,
 --     PRIMARY KEY (room_id, missing_prev, event_id));
 --   CREATE INDEX event_index_reason ON event_index (room_id, rejected_reason);
+-- (M5b outbox): CREATE TABLE federation_outbox (id bigserial PRIMARY KEY,
+--   destination text NOT NULL, room_id text NOT NULL, kind text NOT NULL,
+--   event_id text, intent text, added_ms bigint NOT NULL,
+--   expires_ms bigint NOT NULL, inflight_txn text, inflight_ts bigint);
+--   CREATE TABLE federation_peer_status (destination text PRIMARY KEY,
+--   failures integer NOT NULL DEFAULT 0, attempts_total bigint NOT NULL DEFAULT 0,
+--   failures_total bigint NOT NULL DEFAULT 0, unreachable_since_ms bigint,
+--   next_attempt_ms bigint NOT NULL DEFAULT 0, last_attempt_ms bigint,
+--   last_success_ms bigint, last_inbound_ms bigint, last_error text);
 CREATE TABLE IF NOT EXISTS room_directory (
   room_id text PRIMARY KEY,
   db_name text NOT NULL,
@@ -231,7 +240,7 @@ CREATE TABLE IF NOT EXISTS server_key_changes (
 -- writes for one name coalesce within federation.keyfailminutes.
 CREATE TABLE IF NOT EXISTS federation_pending (
   name text NOT NULL,
-  kind text NOT NULL,             -- 'inbound' | 'outbound' | 'disagreement'
+  kind text NOT NULL,             -- 'inbound' | 'outbound' | 'disagreement' | 'refused' (M5b: a delivery record)
   verified boolean NOT NULL,
   first_ms bigint NOT NULL,
   last_ms bigint NOT NULL,
@@ -256,4 +265,38 @@ CREATE TABLE IF NOT EXISTS federation_blocks (
   pattern text PRIMARY KEY,       -- server-name glob
   added_ms bigint NOT NULL,
   note text
+);
+-- M5b (D2): the durable outbox — one row per (event × destination),
+-- written in the same server-DB transaction as the event's index row
+-- (P2). insertion order = send order. Rows leave by exactly three doors:
+-- success, the operator's prune, or the refusedmillihours expiry (with
+-- the admin alerted). inflight_txn/inflight_ts freeze the in-flight
+-- batch: a restart resends exactly that transaction, same id, same ts.
+CREATE TABLE IF NOT EXISTS federation_outbox (
+  id bigserial PRIMARY KEY,
+  destination text NOT NULL,
+  room_id text NOT NULL,
+  kind text NOT NULL,                 -- 'event' (deliver a PDU) | 'intent' (perform a dance: today only 'reject-invite')
+  event_id text,                      -- kind = 'event': the PDU to deliver
+  intent text,                        -- kind = 'intent': JSON {what, ...candidates}
+  added_ms bigint NOT NULL,
+  expires_ms bigint NOT NULL,         -- added_ms + refusedmillihours·3600; lapsed rows are removed and the admin told
+  inflight_txn text,                  -- event rows: the txnId of the frozen batch this row is part of while it is being sent
+  inflight_ts bigint                  -- event rows: the frozen transaction's origin_server_ts (resent unchanged)
+);
+-- M5b: per-destination delivery memory (NOT the roster — a server can be
+-- in a room without being a roster row). failures drives the backoff
+-- ladder; the totals are lifetime (D2: every attempt recorded);
+-- last_inbound_ms is the inbound-contact reset.
+CREATE TABLE IF NOT EXISTS federation_peer_status (
+  destination text PRIMARY KEY,
+  failures integer NOT NULL DEFAULT 0,
+  attempts_total bigint NOT NULL DEFAULT 0,
+  failures_total bigint NOT NULL DEFAULT 0,
+  unreachable_since_ms bigint,
+  next_attempt_ms bigint NOT NULL DEFAULT 0,
+  last_attempt_ms bigint,
+  last_success_ms bigint,
+  last_inbound_ms bigint,
+  last_error text
 );

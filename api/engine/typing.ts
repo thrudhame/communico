@@ -12,6 +12,20 @@ const typing = new Map<string, Map<string, number>>();
 const lastChangeT = new Map<string, number>();
 let t = 0;
 
+// M5b: change listeners for the federation EDU queues (sender.ts).
+// Fired on explicit set calls only — expiry is ephemeral by nature and
+// the remote's own TTL covers it.
+type TypingListener = (
+  roomId: string,
+  userId: string,
+  isTyping: boolean,
+) => void;
+const listeners = new Set<TypingListener>();
+export function onTypingChange(l: TypingListener): () => void {
+  listeners.add(l);
+  return () => listeners.delete(l);
+}
+
 function bump(roomId: string): void {
   t += 1;
   lastChangeT.set(roomId, t);
@@ -47,6 +61,13 @@ export function setTyping(
     typing.get(roomId)?.delete(userId);
   }
   bump(roomId);
+  for (const l of listeners) {
+    try {
+      l(roomId, userId, isTyping);
+    } catch (e) {
+      console.error('typing listener error:', e);
+    }
+  }
 }
 
 // Sweep every room's expired entries. syncfeed calls this up front, so

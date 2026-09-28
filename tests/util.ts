@@ -29,8 +29,9 @@ export async function resetRoom(roomId: string): Promise<void> {
 
 // --- M2 test helpers (plan §3.8) -------------------------------------------
 
-/** Wipe the federation runtime tables (server keys, docs, changes, pending)
- * so acquisition/gate tests start from first contact. */
+/** Wipe the federation runtime tables (server keys, docs, changes, pending,
+ * roster, blocks, outbox, delivery status) so acquisition/gate/delivery
+ * tests start from first contact. */
 export async function resetFederationTables(): Promise<void> {
   await withDb(serverDb(), async (c) => {
     await c.query('DELETE FROM server_key_changes;');
@@ -39,6 +40,8 @@ export async function resetFederationTables(): Promise<void> {
     await c.query('DELETE FROM federation_pending;');
     await c.query('DELETE FROM federation_peers;');
     await c.query('DELETE FROM federation_blocks;');
+    await c.query('DELETE FROM federation_outbox;');
+    await c.query('DELETE FROM federation_peer_status;');
   });
 }
 

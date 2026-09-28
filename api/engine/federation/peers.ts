@@ -5,6 +5,7 @@
 // user's invite — design, concilium round 2).
 import { config } from '#engine/config.ts';
 import { serverDb, withDb } from '#engine/db.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 
 export type PeerRow = {
   name: string;
@@ -19,7 +20,9 @@ export type PeerRow = {
 
 export type PendingRow = {
   name: string;
-  kind: 'inbound' | 'outbound' | 'disagreement';
+  // M5b: 'refused' joins the door log — a delivery record (refusals,
+  // expired rows), NOT a knock; approve refuses it (nothing to admit)
+  kind: 'inbound' | 'outbound' | 'disagreement' | 'refused';
   verified: boolean;
   first_ms: number;
   last_ms: number;
@@ -220,7 +223,7 @@ export async function listBlocks(): Promise<BlockRow[]> {
  */
 export async function recordPending(
   name: string,
-  kind: 'inbound' | 'outbound' | 'disagreement',
+  kind: 'inbound' | 'outbound' | 'disagreement' | 'refused',
   verified: boolean,
   detail: string | null,
 ): Promise<void> {
@@ -297,6 +300,20 @@ export async function approvePending(
   host: string | null,
   port: number | null,
 ): Promise<void> {
+  // a 'refused' row is a delivery record, not a knock — nothing to admit
+  await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      "SELECT 1 FROM federation_pending WHERE name = $1 AND kind = 'refused';",
+      [name],
+    );
+    if (r.rows.length > 0) {
+      throw new MatrixError(
+        400,
+        'M_INVALID_PARAM',
+        `${name} has a delivery record, not a knock — see federation-outbox list`,
+      );
+    }
+  });
   const existing = await lookupPeer(name);
   if (existing !== null) return;
   await addPeer({

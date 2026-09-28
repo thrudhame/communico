@@ -10,28 +10,26 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { serverDb, withDb } from '#engine/db.ts';
 import { serverName } from '#engine/config.ts';
-import {
-  createRoom,
-  groundingOf,
-  lookupRoom,
-  stateAtSeq,
-} from '#engine/room.ts';
+import { createRoom, groundingOf } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
 import { signPdu } from '#engine/signing.ts';
 import { getTenantKey } from '#engine/tenant.ts';
 import { type KeysDeps, setKeysDeps } from '#engine/federation/keys.ts';
 import { wireFederationTransport } from '#engine/federation/client.ts';
 import { listWitnesses } from '#engine/federation/peers.ts';
-import { contentHashOf, signJson } from '#engine/signing-primitives.js';
-import { eventIdFor, redact } from '#engine/eventid.ts';
 import {
   latestExtremityEventId,
   resetFederationTables,
   resetRoom,
 } from './util.ts';
 import { makeRoomServer } from './federation/fake-room.ts';
+import {
+  createIdOf,
+  remoteEvent,
+  remoteJoin,
+  storedCanonicalOf,
+} from './federation/room-events.ts';
 import { makeDoc, seedServer } from './federation/doc-helper.ts';
-import type { Pdu } from '#engine/pdu.ts';
 
 const ROOM = '!fed-ingest:localhost';
 const ROOM4 = '!fed-ingest-v4:localhost';
@@ -45,110 +43,6 @@ function stubDeps(over: Partial<KeysDeps> = {}): KeysDeps {
       (() => Promise.reject(new Error('no witnesses in test'))),
     listWitnesses: over.listWitnesses ?? (() => Promise.resolve([])),
   };
-}
-
-// The room's create event id — the rule-2.4 minimum auth set for every
-// remote event below.
-async function createIdOf(roomId: string): Promise<string> {
-  const id = ((await stateAtSeq(roomId, null)) ?? []).find((r) =>
-    r.type === 'm.room.create'
-  )?.eventId;
-  if (!id) throw new Error('no create in ' + roomId);
-  return id;
-}
-
-// A remote user joins the (public) room — rule 5 needs membership before
-// their messages land.
-async function remoteJoin(
-  roomId: string,
-  srv: { name: string; keyId: string; kp: CryptoKeyPair },
-  version: string,
-  userId: string,
-  prevId: string,
-): Promise<string> {
-  const join = await remoteEvent(roomId, srv, version, {
-    type: 'm.room.member',
-    sender: userId,
-    state_key: userId,
-    content: { membership: 'join' },
-    prev_events: [prevId],
-  });
-  await ingestEvent(roomId, join, {
-    remote: { origin: srv.name, position: 'after' },
-  });
-  return String(join.event_id);
-}
-
-// Build a remote event for the local room, hashed, id'd and signed with
-// the given server key — the fake-remote shape the pipeline receives.
-async function remoteEvent(
-  roomId: string,
-  server: { name: string; keyId: string; kp: CryptoKeyPair },
-  version: string,
-  partial: {
-    type: string;
-    sender: string;
-    content?: Record<string, unknown>;
-    state_key?: string;
-    prev_events: string[];
-    auth_events?: string[];
-    depth?: number;
-    origin_server_ts?: number;
-  },
-): Promise<Pdu> {
-  const pdu: Pdu = {
-    type: partial.type,
-    sender: partial.sender,
-    room_id: roomId,
-    content: (partial.content ?? {}) as Record<string, unknown>,
-    prev_events: partial.prev_events,
-    auth_events: partial.auth_events ?? [await createIdOf(roomId)],
-    depth: partial.depth ?? 99,
-    origin_server_ts: partial.origin_server_ts ?? Date.now(),
-    hashes: { sha256: '' },
-    signatures: {},
-  };
-  if (partial.state_key !== undefined) pdu.state_key = partial.state_key;
-  const { event_id: _a, signatures: _b, hashes: _c, ...forHash } =
-    pdu as unknown as Record<string, unknown>;
-  void _a, void _b, void _c;
-  (pdu.hashes as { sha256: string }).sha256 = await contentHashOf(forHash);
-  (pdu as unknown as Record<string, unknown>).event_id = await eventIdFor(
-    pdu as unknown as Record<string, unknown>,
-    version,
-  );
-  // redact-then-sign (spec § hash_and_sign_event): the signature covers
-  // the REDACTED form + hashes, so it verifies on redacted copies
-  const redacted = redact(pdu as unknown as Record<string, unknown>, version);
-  await signJson(redacted, server.name, server.keyId, server.kp.privateKey);
-  pdu.signatures = (redacted.signatures ?? {}) as Record<
-    string,
-    Record<string, string>
-  >;
-  return pdu;
-}
-
-// The stored canonical form, read AS OF the event's own commit (events
-// live on their x* branches; the default branch never carries content).
-async function storedCanonicalOf(
-  roomId: string,
-  eventId: string,
-): Promise<string> {
-  const room = (await lookupRoom(roomId))!;
-  return await withDb(room.dbName, async (c) => {
-    const idx = await withDb(serverDb(), async (s) => {
-      const r = await s.query(
-        'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
-        [roomId, eventId],
-      );
-      return String(r.rows[0].commit_hash);
-    });
-    const r = await c.query(
-      `SELECT canonical_json FROM events AS OF '${idx}' WHERE event_id = $1;`,
-      [eventId],
-    );
-    return String(r.rows[0].canonical_json);
-  });
 }
 
 async function indexRow(roomId: string, eventId: string) {
@@ -296,11 +190,9 @@ Deno.test('ingest remote: commit-hash branching, relaxed depth/auth-set, sender-
   });
   const tip4 = await latestExtremityEventId(ROOM4);
   const join4 = await remoteJoin(ROOM4, stale, '4', '@old:stale.test', tip4);
-  const create4 = ((await stateAtSeq(ROOM4, null)) ?? []).find((r) =>
-    r.type === 'm.room.create'
-  )?.eventId;
+  const create4 = await createIdOf(ROOM4);
   const old4 = await remoteEvent(ROOM4, stale, '4', {
-    auth_events: [create4!],
+    auth_events: [create4],
     type: 'm.room.message',
     sender: '@old:stale.test',
     content: { msgtype: 'm.text', body: 'v4 lenient' },
@@ -430,11 +322,9 @@ Deno.test('ingest remote: size limits — bytes (v11+) vs codepoints (≤ v10), 
   });
   const tip10 = await latestExtremityEventId(ROOM10);
   const join10 = await remoteJoin(ROOM10, srv, '10', '@rudy:size.test', tip10);
-  const create10 = ((await stateAtSeq(ROOM10, null)) ?? []).find((r) =>
-    r.type === 'm.room.create'
-  )?.eventId;
+  const create10 = await createIdOf(ROOM10);
   const lenient = await remoteEvent(ROOM10, srv, '10', {
-    auth_events: [create10!],
+    auth_events: [create10],
     type: 'my.room.breaker',
     sender: '@rudy:size.test',
     state_key: bigKey,
@@ -448,7 +338,7 @@ Deno.test('ingest remote: size limits — bytes (v11+) vs codepoints (≤ v10), 
   // rejected 'oversized'
   const hugeKey = '💥'.repeat(300); // 300 codepoints
   const huge = await remoteEvent(ROOM10, srv, '10', {
-    auth_events: [create10!],
+    auth_events: [create10],
     type: 'my.room.breaker',
     sender: '@rudy:size.test',
     state_key: hugeKey,

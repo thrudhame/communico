@@ -34,6 +34,17 @@ export interface MembershipOpResult {
   created: boolean;
 }
 
+// M5b (r6, astra): purgeable_ms is cleared by any join or invite
+// acceptance — an active room is never on the offered (purgatory) list.
+export async function clearPurgeable(roomId: string): Promise<void> {
+  await withDb(serverDb(), async (c) => {
+    await c.query(
+      'UPDATE room_directory SET purgeable_ms = NULL WHERE room_id = $1;',
+      [roomId],
+    );
+  });
+}
+
 // Author + ingest the member event (prev_events = the live extremities,
 // recomputed per attempt); a rulebook reject surfaces as 403 M_FORBIDDEN,
 // never a 500.
@@ -53,6 +64,10 @@ async function authorMember(
       content,
       origin_server_ts: Date.now(),
     });
+    // M5b (r6, astra): an active room never carries a deletion marker
+    if (content.membership === 'join' || content.membership === 'invite') {
+      await clearPurgeable(roomId);
+    }
     return { roomId, eventId: res.event_id, created: true };
   } catch (e) {
     const msg = String(e);
@@ -239,6 +254,7 @@ async function joinArchived(
       origin: null,
       newEvidence: false,
     });
+    await clearPurgeable(roomId);
     return { roomId, eventId: res.event_id, created: true };
   });
 }
@@ -360,6 +376,22 @@ export async function forget(roomId: string, userId: string): Promise<void> {
       'UPDATE room_membership SET forgotten = TRUE WHERE room_id = $1 AND user_id = $2;',
       [roomId, userId],
     );
+  });
+  // M5b (§3.6a "Drop", ruling §9-10): when EVERY local user has
+  // forgotten the room, mark it purgeable — the operator's `rooms --
+  // purge` drops it (never a built-in timer, never on leave alone).
+  await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      `SELECT count(*) AS n FROM room_membership
+       WHERE room_id = $1 AND forgotten = FALSE AND user_id LIKE '%:' || $2;`,
+      [roomId, serverName()],
+    );
+    if (Number(r.rows[0].n) === 0) {
+      await c.query(
+        'UPDATE room_directory SET purgeable_ms = $2 WHERE room_id = $1 AND purgeable_ms IS NULL;',
+        [roomId, Date.now()],
+      );
+    }
   });
 }
 

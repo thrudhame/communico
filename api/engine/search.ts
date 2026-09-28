@@ -224,10 +224,21 @@ async function walkPredecessors(
     const pred = ((create?.content ?? {}) as {
       predecessor?: { room_id?: unknown };
     }).predecessor;
-    const next: string | null = pred !== null && typeof pred === 'object' &&
+    let next: string | null = pred !== null && typeof pred === 'object' &&
         typeof pred.room_id === 'string'
       ? pred.room_id
       : null;
+    // M5b (§3.6a): a purgeable room is hidden from every read
+    if (next !== null) {
+      const purgeable = await withDb(serverDb(), async (c) => {
+        const r = await c.query(
+          'SELECT 1 FROM room_directory WHERE room_id = $1 AND purgeable_ms IS NOT NULL;',
+          [next],
+        );
+        return r.rows.length > 0;
+      });
+      if (purgeable) next = null;
+    }
     if (next === null) return;
     if (joined.has(next) && !notRooms.has(next)) out.add(next);
     current = next;

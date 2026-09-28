@@ -1,6 +1,7 @@
 import { appPort, config, ConfigError, loadedConfig } from '#engine/config.ts';
 import { mediaRoot } from '#engine/media.ts';
 import { wireFederationTransport } from '#engine/federation/client.ts';
+import { startSender } from '#engine/federation/sender.ts';
 import {
   listBlocks,
   listPeers,
@@ -72,6 +73,7 @@ try {
 
 if (config().federation.enabled) {
   wireFederationTransport();
+  startSender();
 }
 
 await Deno.mkdir(mediaRoot(), { recursive: true });

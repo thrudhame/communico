@@ -6,6 +6,20 @@
 // simply never read back out.
 import { serverDb, withDb } from './db.ts';
 
+// M5b: change listeners for the federation EDU queues (sender.ts).
+// m.read.private is never broadcast (the header), so it never fires.
+type ReceiptListener = (
+  roomId: string,
+  userId: string,
+  receiptType: 'm.read' | 'm.read.private',
+  eventId: string,
+) => void;
+const listeners = new Set<ReceiptListener>();
+export function onReceiptChange(l: ReceiptListener): () => void {
+  listeners.add(l);
+  return () => listeners.delete(l);
+}
+
 // POST /rooms/:id/receipt/m.read/:eventId — upsert the marker. ts_ms is
 // server-set (receipts.yaml:83-84).
 export async function setReceipt(
@@ -24,6 +38,15 @@ export async function setReceipt(
       [roomId, userId, receiptType, eventId, Date.now()],
     );
   });
+  if (receiptType !== 'm.read.private') {
+    for (const l of listeners) {
+      try {
+        l(roomId, userId, receiptType, eventId);
+      } catch (e) {
+        console.error('receipt listener error:', e);
+      }
+    }
+  }
 }
 
 // The current stream position (next_batch's _r<n>).
