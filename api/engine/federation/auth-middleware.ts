@@ -16,6 +16,8 @@ import { admit } from './gate.ts';
 import { assertFederationEnabled } from './keydoc.ts';
 import { getVerifyKey } from './keys.ts';
 import { lookupPeer, recordPending } from './peers.ts';
+import { notifyPeerAlive } from './outbox.ts';
+import { wakeDestination } from './sender.ts';
 import { parseXMatrixHeaders } from './xmatrix.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
@@ -89,8 +91,12 @@ export default async function (
     if (!ok) continue;
     // 7. authenticated — and only NOW the first contact is recorded (open
     // mode, no roster row: nothing durable on a stranger's word before
-    // this point)
+    // this point). M5b: inbound contact resets the destination's delivery
+    // backoff and wakes its queue (D2 — every authenticated endpoint,
+    // not just /send; Synapse _base.py:140-155).
     context.state.origin = candidate.origin;
+    await notifyPeerAlive(candidate.origin);
+    wakeDestination(candidate.origin);
     const peer = await lookupPeer(candidate.origin);
     if (peer === null) {
       await recordPending(candidate.origin, 'inbound', true, uri);

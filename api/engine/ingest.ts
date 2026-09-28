@@ -1,6 +1,7 @@
 import type pgpkg from 'pg';
 import { branchNameFor, ident, serverDb, withDb } from './db.ts';
 import {
+  chapterHead,
   extremities,
   lookupRoom,
   type RoomInfo,
@@ -10,7 +11,7 @@ import { mergeDriver } from './mergedriver.ts';
 import { eventIdFor, redact } from './eventid.ts';
 import { assertCanonicalNumbers, canonicalJson } from './canonical.ts';
 import { MatrixError } from './matrix-error.ts';
-import { serverName } from './config.ts';
+import { config, serverName } from './config.ts';
 import { localpartOf } from './auth.ts';
 import { migrateRoomRules } from './pushrules.ts';
 import { signPdu, verifyPduSignature } from './signing.ts';
@@ -800,6 +801,125 @@ export async function authorAndIngest(
     const r = await ingestPrechecks(roomId, pdu, opts);
     if (r.kind === 'early') return r.result;
     return await ingestEventLocked(roomId, pdu, opts, r.pre);
+  });
+}
+
+// M5b (§3.2, D1, ruling B): an event whose prevs we lack is stored
+// rejected 'ungrounded' — "couldn't check yet" is not a verdict (the
+// spec has no such rejection; Dendrite stores it; Complement's
+// TestUnrejectRejectedEvents requires a re-sent event to re-evaluate).
+// The placeholder's own x* branch starts at the genesis commit (rejected
+// events have branches and are not extremities); its `state` table is
+// the room's current published state, documented as a placeholder (NOT
+// grounding — spec SS:560-563 asks for "state calculated as normal",
+// which is impossible without the prev). The row carries expires_ms
+// (removed when past; a later delivery is then a first delivery) and the
+// still-missing prev ids in event_index_waiting (the re-check lookup —
+// P4 ruling). ungroundedmillihours = 0 = drop instead (Synapse's
+// behaviour, chosen by the admin). The CALLER holds the room lock.
+export async function storeUngroundedLocked(
+  roomId: string,
+  pdu: Pdu,
+  origin: string,
+): Promise<void> {
+  if (config().federation.ungroundedmillihours === 0) {
+    throw new Error(
+      'M_UNKNOWN_PREV: ' + String((pdu.prev_events ?? [])[0] ?? ''),
+    );
+  }
+  const room = await lookupRoom(roomId);
+  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
+  const eventId = String(pdu.event_id);
+  const missingPrevIds: string[] = [];
+  await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT event_id FROM event_index WHERE room_id = $1 AND event_id = ANY($2);',
+      [roomId, pdu.prev_events ?? []],
+    );
+    const known = new Set(
+      // deno-lint-ignore no-explicit-any
+      r.rows.map((row: any) => String(row.event_id)),
+    );
+    for (const pid of pdu.prev_events ?? []) {
+      if (!known.has(pid)) missingPrevIds.push(pid);
+    }
+  });
+  if (missingPrevIds.length === 0) {
+    throw new Error('E_UNGROUNDED_NOTHING_MISSING: ' + eventId);
+  }
+  const newBranch = await branchNameFor(eventId);
+  const commitHash = await withDb(room.dbName, async (c) => {
+    assertHash(room.genesisCommit);
+    await c.query(
+      `SELECT DOLT_BRANCH('${ident(newBranch)}', '${room.genesisCommit}');`,
+    );
+    await c.query(`SELECT DOLT_CHECKOUT('${ident(newBranch)}');`);
+    await c.query(
+      'INSERT INTO events (event_id, type, state_key, sender, origin_ts, depth, prev_events, auth_events, hashes, signatures, rejected, soft_failed, canonical_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);',
+      [
+        eventId,
+        pdu.type,
+        pdu.state_key ?? null,
+        pdu.sender,
+        pdu.origin_server_ts,
+        pdu.depth,
+        JSON.stringify(pdu.prev_events ?? []),
+        JSON.stringify(pdu.auth_events ?? []),
+        JSON.stringify(pdu.hashes ?? {}),
+        JSON.stringify(pdu.signatures ?? {}),
+        true, // rejected — a placeholder is never in state
+        false,
+        canonicalJson(pdu as unknown as Record<string, unknown>),
+      ],
+    );
+    // the room's CURRENT published state as the placeholder's state table
+    const head = await chapterHead(roomId);
+    if (head !== null) {
+      const tip = await c.query(`SELECT HASHOF('${ident(head)}') AS h;`);
+      const stateRows = await c.query(
+        `SELECT type, state_key, event_id, content FROM state AS OF '${
+          String(tip.rows[0].h)
+        }';`,
+      );
+      await materialize(
+        c,
+        // deno-lint-ignore no-explicit-any
+        (stateRows.rows as any[]).map((r) => ({
+          type: String(r.type),
+          stateKey: String(r.state_key),
+          eventId: String(r.event_id),
+          content: typeof r.content === 'string'
+            ? JSON.parse(r.content)
+            : r.content,
+        })),
+      );
+    }
+    const res = await c.query(`SELECT DOLT_COMMIT('-Am', $1);`, [
+      `ungrounded ${eventId} type ${String(pdu.type)}`,
+    ]);
+    return String(Object.values(res.rows[0])[0] ?? '');
+  });
+  await withDb(serverDb(), async (c) => {
+    await c.query(
+      `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed,
+         rejected_reason, origin, expires_ms, added_ms, seq, era)
+       VALUES ($1, $2, $3, $4, TRUE, FALSE, 'ungrounded', $5, $6, $7, NULL, NULL);`,
+      [
+        eventId,
+        roomId,
+        commitHash,
+        newBranch,
+        origin,
+        Date.now() + config().federation.ungroundedmillihours * 3_600,
+        Date.now(),
+      ],
+    );
+    for (const missing of missingPrevIds) {
+      await c.query(
+        'INSERT INTO event_index_waiting (room_id, missing_prev, event_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;',
+        [roomId, missing, eventId],
+      );
+    }
   });
 }
 

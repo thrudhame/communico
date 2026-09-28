@@ -40,21 +40,30 @@ export async function ensurePresenceRow(userId: string): Promise<void> {
 }
 
 // PUT /presence/:id/status and /sync's set_presence share this: a full
-// status set (an omitted status_msg clears), bumping presence_seq.
+// status set (an omitted status_msg clears), bumping presence_seq. M5b:
+// a remote presence riding an EDU carries last_active_ago /
+// currently_active (§3.3, m.presence.yaml:33-71).
 export async function setPresence(
   userId: string,
   presence: string,
   statusMsg?: string,
+  opts: { lastActiveAgo?: number; currentlyActive?: boolean } = {},
 ): Promise<void> {
   if (!PRESENCES.has(presence)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'bad presence: ' + presence);
   }
+  void opts.currentlyActive; // rendered from last_active_ms at read (syncfeed)
   await withDb(serverDb(), async (c) => {
     await c.query(
       `INSERT INTO presence (user_id, presence, status_msg, last_active_ms, seq)
        VALUES ($1, $2, $3, $4, nextval('presence_seq'))
        ON CONFLICT (user_id) DO UPDATE SET presence = EXCLUDED.presence, status_msg = EXCLUDED.status_msg, last_active_ms = EXCLUDED.last_active_ms, seq = EXCLUDED.seq;`,
-      [userId, presence, statusMsg ?? null, Date.now()],
+      [
+        userId,
+        presence,
+        statusMsg ?? null,
+        Date.now() - (opts.lastActiveAgo ?? 0),
+      ],
     );
   });
   for (const l of listeners) {

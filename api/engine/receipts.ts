@@ -21,13 +21,16 @@ export function onReceiptChange(l: ReceiptListener): () => void {
 }
 
 // POST /rooms/:id/receipt/m.read/:eventId — upsert the marker. ts_ms is
-// server-set (receipts.yaml:83-84).
+// server-set (receipts.yaml:83-84) — except a remote receipt riding an
+// EDU, which carries the origin's ts (§3.3, m.receipt.yaml:36-87).
 export async function setReceipt(
   roomId: string,
   userId: string,
   receiptType: 'm.read' | 'm.read.private',
   eventId: string,
+  opts: { ts?: number; threadId?: string | null } = {},
 ): Promise<void> {
+  void opts.threadId; // threads are stored per event, not per receipt (§3e)
   await withDb(serverDb(), async (c) => {
     await c.query(
       `INSERT INTO receipts (room_id, user_id, receipt_type, event_id, ts_ms, seq)
@@ -35,7 +38,7 @@ export async function setReceipt(
        ON CONFLICT (room_id, user_id, receipt_type)
        DO UPDATE SET event_id = EXCLUDED.event_id, ts_ms = EXCLUDED.ts_ms,
                      seq = nextval('receipt_seq');`,
-      [roomId, userId, receiptType, eventId, Date.now()],
+      [roomId, userId, receiptType, eventId, opts.ts ?? Date.now()],
     );
   });
   if (receiptType !== 'm.read.private') {

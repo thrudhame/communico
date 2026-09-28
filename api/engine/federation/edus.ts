@@ -166,3 +166,99 @@ export function resetEdusForTests(): void {
   receiptQ.clear();
   presenceQ.clear();
 }
+
+// ---------------------------------------------------------------- inbound --
+
+// Inbound EDUs (§3.3 step 4): dispatch on edu_type; unknown types are
+// ignored silently (Synapse federation_server.py:1612-1637) and errors
+// in one EDU never fail the transaction (the caller logs and continues).
+// EVERY EDU's users must belong to `origin` (typing SS:1085-1088,
+// presence SS:1094-1099, receipts SS:1105-1110) or the EDU is ignored.
+import { domainOf } from './pdu.ts';
+import { membershipOf } from '#engine/room.ts';
+import { setTyping } from '#engine/typing.ts';
+import { setReceipt } from '#engine/receipts.ts';
+import { setPresence } from '#engine/presence.ts';
+import { serverDb, withDb } from '#engine/db.ts';
+
+// the remote typing TTL — Synapse's 30 s (typing.py)
+const REMOTE_TYPING_TTL_MS = 30_000;
+
+export async function dispatchEdu(origin: string, raw: unknown): Promise<void> {
+  const edu = raw as { edu_type?: unknown; content?: unknown };
+  const type = typeof edu.edu_type === 'string' ? edu.edu_type : '';
+  const content = (edu.content ?? {}) as Record<string, unknown>;
+  if (type === 'm.typing') {
+    const roomId = typeof content.room_id === 'string' ? content.room_id : null;
+    const userId = typeof content.user_id === 'string' ? content.user_id : null;
+    if (roomId === null || userId === null) return;
+    if (domainOf(userId) !== origin) return; // users belong to origin
+    const m = await membershipOf(roomId, userId);
+    if (m?.membership !== 'join') return; // joined users only
+    setTyping(roomId, userId, content.typing === true, REMOTE_TYPING_TTL_MS);
+    return;
+  }
+  if (type === 'm.receipt') {
+    // content: { <roomId>: { 'm.read': { <userId>: { event_ids, data } } } }
+    for (const [roomId, perRoom] of Object.entries(content)) {
+      const reads = (perRoom as Record<string, unknown>)['m.read'] as
+        | Record<string, { event_ids?: unknown; data?: unknown }>
+        | undefined;
+      if (reads === undefined || typeof reads !== 'object') continue;
+      for (const [userId, mark] of Object.entries(reads)) {
+        if (domainOf(userId) !== origin) continue;
+        const eventIds = Array.isArray(mark.event_ids) ? mark.event_ids : [];
+        if (eventIds.length === 0 || typeof eventIds[0] !== 'string') continue;
+        const data = (mark.data ?? {}) as { ts?: unknown; thread_id?: unknown };
+        await setReceipt(roomId, userId, 'm.read', String(eventIds[0]), {
+          ts: typeof data.ts === 'number' ? data.ts : undefined,
+          threadId: typeof data.thread_id === 'string' ? data.thread_id : null,
+        });
+      }
+    }
+    return;
+  }
+  if (type === 'm.presence') {
+    const push = Array.isArray(content.push) ? content.push : [];
+    for (const entry of push) {
+      const p = entry as {
+        user_id?: unknown;
+        presence?: unknown;
+        status_msg?: unknown;
+        last_active_ago?: unknown;
+        currently_active?: unknown;
+      };
+      if (typeof p.user_id !== 'string' || typeof p.presence !== 'string') {
+        continue;
+      }
+      if (domainOf(p.user_id) !== origin) continue;
+      // only for users sharing a room with a local user
+      const shares = await withDb(serverDb(), async (c) => {
+        const r = await c.query(
+          `SELECT 1 FROM room_membership m1
+           JOIN room_membership m2 ON m1.room_id = m2.room_id
+           WHERE m1.user_id = $1 AND m1.membership = 'join'
+             AND m2.membership = 'join' AND m2.user_id LIKE '%:' || $2
+           LIMIT 1;`,
+          [p.user_id, serverName()],
+        );
+        return r.rows.length > 0;
+      });
+      if (!shares) continue;
+      await setPresence(
+        p.user_id,
+        p.presence,
+        typeof p.status_msg === 'string' ? p.status_msg : undefined,
+        {
+          lastActiveAgo: typeof p.last_active_ago === 'number'
+            ? p.last_active_ago
+            : undefined,
+          currentlyActive: p.currently_active === true,
+        },
+      );
+    }
+    return;
+  }
+  // m.device_list_update, m.signing_key_update, m.direct_to_device and
+  // anything else: ignored (E2EE milestone), no error
+}

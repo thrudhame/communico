@@ -266,6 +266,16 @@ CREATE TABLE IF NOT EXISTS federation_blocks (
   added_ms bigint NOT NULL,
   note text
 );
+-- M5b: inbound (origin, txnId) → response, kept txnhours so a retried
+-- transaction gets the same answer (a cache, not an obligation — pruned
+-- on insert).
+CREATE TABLE IF NOT EXISTS federation_txns (
+  origin text NOT NULL,
+  txn_id text NOT NULL,
+  received_ms bigint NOT NULL,
+  response text NOT NULL,
+  PRIMARY KEY (origin, txn_id)
+);
 -- M5b (D2): the durable outbox — one row per (event × destination),
 -- written in the same server-DB transaction as the event's index row
 -- (P2). insertion order = send order. Rows leave by exactly three doors:

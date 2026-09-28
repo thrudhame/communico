@@ -42,6 +42,7 @@ export async function resetFederationTables(): Promise<void> {
     await c.query('DELETE FROM federation_blocks;');
     await c.query('DELETE FROM federation_outbox;');
     await c.query('DELETE FROM federation_peer_status;');
+    await c.query('DELETE FROM federation_txns;');
   });
 }
 
