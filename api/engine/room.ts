@@ -596,9 +596,18 @@ export async function stateBefore(
   const room = await lookupRoom(roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
   const rulebook = getRulebook(room.roomVersion);
+  const commit = await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
+      [roomId, eventId],
+    );
+    return r.rows.length === 0 ? null : String(r.rows[0].commit_hash);
+  });
+  if (commit === null) throw new Error('M_NOT_FOUND: ' + eventId);
   return await withDb(room.dbName, async (c) => {
+    // the event's row lives on its own x* commit — read AS OF it
     const er = await c.query(
-      'SELECT prev_events FROM events WHERE event_id = $1;',
+      `SELECT prev_events FROM events AS OF '${commit}' WHERE event_id = $1;`,
       [eventId],
     );
     if (er.rows.length === 0) throw new Error('M_NOT_FOUND: ' + eventId);
