@@ -559,6 +559,36 @@ export async function groundingOf(
   });
 }
 
+// M5b (§3.6c): allocate the next chapter pair at the genesis commit —
+// n = the highest existing chapter number + 1 (always even): chapter<n>
+// history (empty tables), chapter<n+1> the new stay. Used by the local
+// reopen (§3.6b) and the remote re-join (§3.6 step 8).
+export async function allocateChapterPair(
+  roomId: string,
+): Promise<{ hist: string; stay: string }> {
+  const room = await lookupRoom(roomId);
+  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
+  return await withDb(room.dbName, async (c) => {
+    const r = await c.query('SELECT name FROM dolt.branches;');
+    let best = -1;
+    // deno-lint-ignore no-explicit-any
+    for (const row of r.rows as any[]) {
+      const m = /^chapter(\d+)$/.exec(String(row.name));
+      if (m && Number(m[1]) > best) best = Number(m[1]);
+    }
+    const n = best + 1;
+    const hist = `chapter${n}`;
+    const stay = `chapter${n + 1}`;
+    await c.query(
+      `SELECT DOLT_BRANCH('${ident(hist)}', '${room.genesisCommit}');`,
+    );
+    await c.query(
+      `SELECT DOLT_BRANCH('${ident(stay)}', '${room.genesisCommit}');`,
+    );
+    return { hist, stay };
+  });
+}
+
 // M5b: the distinct server domains of the room's JOINED members (a
 // membership fact from the room's state index — never a chapter fact).
 export async function serversInRoom(roomId: string): Promise<string[]> {

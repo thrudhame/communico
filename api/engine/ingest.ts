@@ -2176,9 +2176,10 @@ export async function ingestJoinSnapshotLocked(
   args: {
     // the new stay branch, already created at genesis_commit
     chapter: string;
-    // snapshot/auth-chain events for the root commit (accepted events —
-    // rejected ones are inserted by commit 8 with their flags)
-    rootEvents: { pdu: Pdu; eventId: string }[];
+    // snapshot/auth-chain events for the root commit — `rejected` rides
+    // for events that failed the snapshot's own auth check (§3.6 step 7:
+    // stored with 'auth')
+    rootEvents: { pdu: Pdu; eventId: string; rejected?: boolean }[];
     // the snapshot's materialized state (state AFTER the snapshot)
     rootStateRows: StateRowInput[];
     // the signed join (event_id computed)
@@ -2233,7 +2234,7 @@ export async function ingestJoinSnapshotLocked(
             JSON.stringify(e.pdu.auth_events ?? []),
             JSON.stringify(e.pdu.hashes ?? {}),
             JSON.stringify(e.pdu.signatures ?? {}),
-            false,
+            e.rejected === true,
             false,
             canonicalJson(e.pdu as unknown as Record<string, unknown>),
           ],
@@ -2322,9 +2323,17 @@ export async function ingestJoinSnapshotLocked(
         await c.query(
           `INSERT INTO event_index (event_id, room_id, commit_hash, branch_name, rejected, soft_failed,
              rejected_reason, origin, added_ms, era, seq)
-           VALUES ($1, $2, $3, NULL, FALSE, FALSE, NULL, $4, $5, NULL, NULL)
+           VALUES ($1, $2, $3, NULL, $4, FALSE, $5, $6, $7, NULL, NULL)
            ON CONFLICT (event_id) DO NOTHING;`,
-          [e.eventId, roomId, rootHash, args.origin, Date.now()],
+          [
+            e.eventId,
+            roomId,
+            rootHash,
+            e.rejected === true,
+            e.rejected === true ? 'auth' : null,
+            args.origin,
+            Date.now(),
+          ],
         );
       }
     }

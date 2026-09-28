@@ -7,7 +7,12 @@ import { serverDb, withDb } from './db.ts';
 import { serverName } from './config.ts';
 import { MatrixError } from './matrix-error.ts';
 import { authorAndIngest } from './ingest.ts';
-import { eventIndexRow, lookupRoom, stateAtSeq } from './room.ts';
+import {
+  eventIndexRow,
+  lookupRoom,
+  serversInRoom,
+  stateAtSeq,
+} from './room.ts';
 import { pduById } from './timeline.ts';
 import { getRulebook } from './policy.ts';
 import {
@@ -96,7 +101,9 @@ export async function resolveAlias(
   if (row === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
   }
-  // M5b (§3.6a): a purgeable room is hidden from every read
+  // M5b (§3.6a): a purgeable room is hidden from every read; the servers
+  // answer is the room's servers — ours drops out on its own when we
+  // leave (the leave is in the state); empty → 404
   const purgeable = await withDb(serverDb(), async (c) => {
     const r = await c.query(
       'SELECT 1 FROM room_directory WHERE room_id = $1 AND purgeable_ms IS NOT NULL;',
@@ -107,7 +114,11 @@ export async function resolveAlias(
   if (purgeable) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
   }
-  return { room_id: row, servers: [serverName()] };
+  const servers = await serversInRoom(row);
+  if (servers.length === 0) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
+  }
+  return { room_id: row, servers };
 }
 
 export async function roomAliases(roomId: string): Promise<string[]> {

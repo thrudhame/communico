@@ -345,7 +345,12 @@ export async function createFakeRoom(opts: {
     }),
     acceptSendJoin: async (join) => {
       // v2 answer per joins-v2.yaml:160-220 with the fake's signature
-      // added (SS:881-885); the join lands in the room
+      // added (SS:881-885); the join lands in the room — hashed first,
+      // like any event the room serves
+      const { event_id: _a, signatures: _b, hashes: _c, ...forHash } =
+        join as unknown as Record<string, unknown>;
+      void _a, void _b, void _c;
+      join.hashes = { sha256: await contentHashOf(forHash) };
       const signed = await sign(join);
       const id = String(signed.event_id);
       events.set(id, signed);
@@ -384,6 +389,10 @@ export async function createFakeRoom(opts: {
       origin_server_ts: Date.now(),
     }),
     acceptSendLeave: async (leave) => {
+      const { event_id: _a, signatures: _b, hashes: _c, ...forHash } =
+        leave as unknown as Record<string, unknown>;
+      void _a, void _b, void _c;
+      leave.hashes = { sha256: await contentHashOf(forHash) };
       const signed = await sign(leave);
       const id = String(signed.event_id);
       events.set(id, signed);

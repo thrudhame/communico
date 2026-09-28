@@ -19,11 +19,13 @@ import {
   lookupRoom,
   membershipOf,
   roomsFor,
+  serversInRoom,
   stateAt,
   stateAtSeq,
 } from './room.ts';
 import { getProfile } from './tenant.ts';
 import { authChain } from './rulebook/state-res-v2.ts';
+import { joinRemoteRoom } from './federation/joins.ts';
 import type { Pdu } from './pdu.ts';
 import type { StateRowInput } from './materialize.ts';
 
@@ -81,37 +83,59 @@ async function authorMember(
 // join: sender == state_key == the user; content from the profile
 // (displayname/avatar_url) with the request body keys merged on top.
 // Already joined -> the existing event, no new one (idempotent re-join).
-// M5b (§3.6b): an ARCHIVED room (the server's last local member left)
-// reopens through the join-snapshot path — whom to ask is the room's
-// server list, and for a purely local room that is only ourselves: the
-// snapshot is the previous stay's tip state and the join is authored on
-// its extremities, opening a brand-new chapter pair. No federation.
+// M5b (§3.6/§3.6b): a room we never held joins over federation
+// (joinRemoteRoom); an ARCHIVED room asks its server list — others →
+// the remote dance; only ourselves / nobody → the local reopen
+// (joinArchived, commit 1's).
 export async function join(
   roomId: string,
   userId: string,
   extraContent?: Record<string, unknown>,
+  opts: { via?: string[]; serverName?: string[] } = {},
 ): Promise<MembershipOpResult> {
   const current = await membershipOf(roomId, userId);
   if (current?.membership === 'join') {
     return { roomId, eventId: current.eventId, created: false };
   }
   const room = await lookupRoom(roomId);
-  if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
-  if (room.currentChapter === null) {
+  if (room !== null && room.currentChapter !== null) {
+    // a live room — the plain local join
+    const profile = await getProfile(serverName(), localpartOf(userId));
+    const content: Record<string, unknown> = {
+      ...(profile?.displayname !== undefined
+        ? { displayname: profile.displayname }
+        : {}),
+      ...(profile?.avatar_url !== undefined
+        ? { avatar_url: profile.avatar_url }
+        : {}),
+      ...(extraContent ?? {}),
+      membership: 'join',
+    };
+    return await authorMember(roomId, userId, userId, content);
+  }
+  // archived or unknown: the server list decides whom to ask (§3.6b) —
+  // via/server_name first, then the held room's servers from the last
+  // known state
+  const via = opts.via ?? opts.serverName ?? [];
+  const held = room !== null ? await serversInRoom(roomId) : [];
+  const others = [...new Set([...via, ...held])].filter((d) =>
+    d !== serverName()
+  );
+  if (others.length === 0) {
+    // only ourselves / nobody → the local reopen (a room we never held
+    // has nobody to ask and no snapshot either)
+    if (room === null) {
+      throw new MatrixError(
+        404,
+        'M_NOT_FOUND',
+        'no servers to join through',
+      );
+    }
     return await joinArchived(roomId, userId, extraContent);
   }
-  const profile = await getProfile(serverName(), localpartOf(userId));
-  const content: Record<string, unknown> = {
-    ...(profile?.displayname !== undefined
-      ? { displayname: profile.displayname }
-      : {}),
-    ...(profile?.avatar_url !== undefined
-      ? { avatar_url: profile.avatar_url }
-      : {}),
-    ...(extraContent ?? {}),
-    membership: 'join',
-  };
-  return await authorMember(roomId, userId, userId, content);
+  // others → the remote dance
+  const res = await joinRemoteRoom(roomId, userId, others, extraContent);
+  return { roomId: res.roomId, eventId: res.eventId, created: true };
 }
 
 // §3.6b "ask nobody / only ourselves": the local reopen. The snapshot is
