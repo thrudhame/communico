@@ -2,11 +2,18 @@ import { ident, serverDb, withDb } from './db.ts';
 import {
   chapterHeadForDb,
   eventIndexRow,
-  formatStreamToken,
   lookupRoom,
   stateAtSeq,
 } from './room.ts';
 import { canSeeEvent } from './visibility.ts';
+import {
+  backfill,
+  type Cursor,
+  cursorForToken,
+  formatCursorToken,
+  step,
+  walkStart,
+} from './federation/history.ts';
 import {
   clientEvent,
   type EventIndexRow,
@@ -127,7 +134,11 @@ export async function clientEventForRow(
             commit_hash: String(rIdx.commit_hash),
             rejected: rIdx.rejected === true,
             soft_failed: rIdx.soft_failed === true,
-            seq: Number(rIdx.seq),
+            seq: rIdx.seq == null ? null : Number(rIdx.seq),
+            era: rIdx.era == null ? null : String(rIdx.era),
+            branch_pos: rIdx.branch_pos == null
+              ? null
+              : Number(rIdx.branch_pos),
             state_commit_hash: rIdx.state_commit_hash == null
               ? null
               : String(rIdx.state_commit_hash),
@@ -206,18 +217,19 @@ export async function stateNow(dbName: string): Promise<unknown[]> {
   });
 }
 
-// --- M4: /messages (plan §3f) ----------------------------------------------
+// --- M4: /messages (plan §3f); M5b: the chapter walk (§3.10) -----------
 
 export interface MessagesWindow {
   roomId: string;
   userId: string;
   deviceId: string | null;
-  // read position: null (joined) or the leave/ban seq — the window clamps
-  // to it (left users read as of their leave; dir=f from >= it is empty)
+  // read position: null (joined) or the leave/ban seq — the walk starts
+  // in the chapter of the user's latest membership event and never
+  // enters a newer chapter or its history branch (r5, qwen)
   leaveAt: number | null;
   dir: 'b' | 'f';
-  fromSeq: number | null; // null = the dir's default (b: latest, f: 0)
-  toSeq: number | null;
+  fromToken: string | null; // c<n>_<offset> or a legacy s<n>/sync token
+  toToken: string | null;
   limit: number; // default 10
   lazyLoadMembers: boolean;
   // Band C: the RoomEventFilter's contains_url (room_event_filter.yaml
@@ -233,77 +245,107 @@ export interface MessagesResult {
   state?: Record<string, unknown>[];
 }
 
-// Window by seq over event_index (not dolt.log), redaction applied at
-// read, visibility per event (canSeeEvent). Bounds per Synapse's
-// pagination (transcribed at plan §3f): dir=f -> from < x <= to;
-// dir=b -> from >= x > to. The limit cuts the RAW window first (spec: an
-// empty/short chunk does not imply no more events). `end` follows
-// Synapse's rule (pagination.py:668-706, transcribed 2026-09-19): omitted
-// only when the raw page is EMPTY and there is no further page — a
-// non-empty raw page always carries end, even when the client filter
-// emptied the chunk (there might be more in the next batch).
+// Time order across the book: newer = higher chapter; within a stay,
+// higher seq; within a history chapter, LOWER branch_pos (0 = most
+// recent). Returns < 0 when a is older than b.
+function compareCursors(a: Cursor, b: Cursor): number {
+  if (a.chapter !== b.chapter) return a.chapter - b.chapter;
+  if (a.chapter % 2 === 1) return a.offset - b.offset;
+  return b.offset - a.offset;
+}
+
+// The window is a loop over step() (§3.10): the raw page fills to the
+// limit, ends at the create (end omitted), or stops at a frontier — ONE
+// backfill per request, and if the gap is still open afterwards the
+// request ends with the frontier cursor so the client comes back.
+// Visibility per event (canSeeEvent), redaction at read, the chunk
+// shaped by clientEventForRow as before.
 export async function messages(w: MessagesWindow): Promise<MessagesResult> {
   const room = await lookupRoom(w.roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + w.roomId);
   const limit = Math.max(0, Math.floor(w.limit));
-  const clamp = (seq: number) =>
-    w.leaveAt === null ? seq : Math.min(seq, w.leaveAt);
 
-  const nowSeq = await withDb(serverDb(), async (c) => {
-    const r = await c.query(
-      'SELECT MAX(seq) AS m FROM event_index WHERE room_id = $1;',
-      [w.roomId],
-    );
-    return r.rows[0].m == null ? 0 : Number(r.rows[0].m);
-  });
-
-  const from = clamp(w.fromSeq ?? (w.dir === 'b' ? nowSeq : 0));
-  const upper = clamp(w.toSeq ?? nowSeq);
-  const lower = w.toSeq ?? -1;
-
-  const rows = await withDb(serverDb(), async (c) => {
-    if (w.dir === 'f') {
-      if (from >= upper) return [];
+  // the clamp chapter for a left user: the chapter of their latest
+  // membership event — the walk never enters a newer one
+  let clampChapter: number | null = null;
+  if (w.leaveAt !== null) {
+    const eraRow = await withDb(serverDb(), async (c) => {
       const r = await c.query(
-        `SELECT * FROM event_index
-         WHERE room_id = $1 AND rejected = FALSE AND soft_failed = FALSE
-           AND seq > $2 AND seq <= $3
-         ORDER BY seq ASC LIMIT $4;`,
-        [w.roomId, from, upper, limit + 1],
+        'SELECT era FROM event_index WHERE room_id = $1 AND seq = $2;',
+        [w.roomId, w.leaveAt],
       );
-      return r.rows;
+      return r.rows.length && r.rows[0].era != null
+        ? String(r.rows[0].era)
+        : null;
+    });
+    if (eraRow !== null) {
+      const m = /^chapter(\d+)$/.exec(eraRow);
+      if (m) clampChapter = Number(m[1]);
     }
-    const r = await c.query(
-      `SELECT * FROM event_index
-       WHERE room_id = $1 AND rejected = FALSE AND soft_failed = FALSE
-         AND seq <= $2 AND seq > $3
-       ORDER BY seq DESC LIMIT $4;`,
-      [w.roomId, from, lower, limit + 1],
-    );
-    return r.rows;
-  });
+  }
 
-  const hasMore = rows.length > limit;
-  // deno-lint-ignore no-explicit-any
-  const windowRows: EventIndexRow[] = rows.slice(0, limit).map((row: any) => ({
-    event_id: String(row.event_id),
-    room_id: String(row.room_id),
-    commit_hash: String(row.commit_hash),
-    rejected: row.rejected === true,
-    soft_failed: row.soft_failed === true,
-    seq: Number(row.seq),
-    state_commit_hash: row.state_commit_hash == null
-      ? null
-      : String(row.state_commit_hash),
-    redacted_by: row.redacted_by == null ? null : String(row.redacted_by),
-    txn_device: row.txn_device == null ? null : String(row.txn_device),
-    txn_id: row.txn_id == null ? null : String(row.txn_id),
-  }));
+  // the start cursor
+  let cursor: Cursor | null = null;
+  if (w.fromToken !== null) {
+    cursor = await cursorForToken(w.roomId, w.fromToken, w.dir);
+  }
+  if (cursor === null) {
+    if (w.dir === 'b') {
+      cursor = clampChapter !== null
+        ? { chapter: clampChapter, offset: w.leaveAt! + 1 }
+        : await walkStart(w.roomId);
+    } else {
+      // forward from the room's beginning (the deepest position of the
+      // deepest chapter); a left user starts at their leave point
+      cursor = clampChapter !== null
+        ? { chapter: clampChapter, offset: Number.MAX_SAFE_INTEGER }
+        : { chapter: 0, offset: Number.MAX_SAFE_INTEGER };
+    }
+  }
+  if (cursor === null) {
+    return { chunk: [], start: w.fromToken ?? '' };
+  }
+  const toCursor = w.toToken !== null
+    ? await cursorForToken(w.roomId, w.toToken, w.dir)
+    : null;
+
+  const windowRows: { row: EventIndexRow; cursor: Cursor }[] = [];
+  let endCursor: Cursor | null = null;
+  let backfilled = false;
+  for (;;) {
+    if (windowRows.length >= limit) break;
+    const r = await step(w.roomId, cursor, w.dir);
+    if (r.kind === 'end') break;
+    if (r.kind === 'frontier') {
+      if (backfilled) {
+        endCursor = r.cursor;
+        break;
+      }
+      backfilled = true;
+      const bf = await backfill(w.roomId, r.cursor.chapter, r.prevIds);
+      if (bf === 'open') {
+        // nobody answered — the gap stays open; end at the frontier
+        endCursor = r.cursor;
+        break;
+      }
+      continue; // re-step after the fill
+    }
+    if (clampChapter !== null && r.cursor.chapter > clampChapter) break;
+    if (toCursor !== null) {
+      const cmp = compareCursors(r.cursor, toCursor);
+      if (w.dir === 'f' && cmp > 0) break;
+      if (w.dir === 'b' && cmp <= 0) break;
+    }
+    cursor = r.cursor;
+    windowRows.push({ row: r.row, cursor: r.cursor });
+  }
 
   const chunk: Record<string, unknown>[] = [];
-  for (const idx of windowRows) {
+  let hitCreate = false;
+  for (const { row: idx } of windowRows) {
     const pdu = await pduById(room.dbName, idx.commit_hash, idx.event_id);
     if (!pdu) continue;
+    if (pdu.type === 'm.room.create') hitCreate = true;
     if (w.containsUrl !== undefined) {
       const hasUrl = typeof ((pdu.content ?? {}) as Record<string, unknown>)
         .url === 'string';
@@ -314,6 +356,7 @@ export async function messages(w: MessagesWindow): Promise<MessagesResult> {
         seq: idx.seq,
         type: pdu.type,
         stateKey: pdu.state_key,
+        stateCommitHash: idx.state_commit_hash,
       }))
     ) {
       continue;
@@ -327,29 +370,30 @@ export async function messages(w: MessagesWindow): Promise<MessagesResult> {
 
   const result: MessagesResult = {
     chunk,
-    start: formatStreamToken(from, 0),
+    start: w.fromToken ?? '',
   };
-  if (windowRows.length > 0) {
-    // the raw page is non-empty: end continues past the last raw row
-    // (filter-emptied chunks included — Synapse's rule, see the header)
-    const lastSeq = windowRows[windowRows.length - 1].seq;
-    result.end = formatStreamToken(w.dir === 'f' ? lastSeq : lastSeq - 1, 0);
-  } else if (hasMore) {
-    // limit 0: nothing was consumed — end is the same position (no
-    // progress, but nothing skipped either)
-    result.end = formatStreamToken(from, 0);
+  if (hitCreate) {
+    // the walk's end — no more events → no end (§3.10)
+  } else if (endCursor !== null) {
+    // the frontier cursor, so the client comes back for more
+    result.end = formatCursorToken(endCursor);
+  } else if (windowRows.length > 0) {
+    // the raw page is non-empty: end continues past the last raw row —
+    // the walk's current cursor IS the resume position (the next step
+    // from it moves past the last returned event on either parity)
+    result.end = formatCursorToken(cursor);
   }
-  // else: raw window empty and no further page — the true start of the
-  // timeline; end is omitted.
 
   if (w.lazyLoadMembers) {
     const senders = new Set(chunk.map((e) => String(e.sender)));
-    const endSeq = w.dir === 'f'
-      ? (windowRows.length > 0 ? windowRows[windowRows.length - 1].seq : from)
-      : from;
-    const memberRows = ((await stateAtSeq(w.roomId, endSeq)) ?? []).filter(
-      (r) => r.type === 'm.room.member' && senders.has(r.stateKey),
-    );
+    const endRow = w.dir === 'f'
+      ? (windowRows.length > 0 ? windowRows[windowRows.length - 1].row : null)
+      : (windowRows.length > 0 ? windowRows[0].row : null);
+    const memberRows = endRow !== null && endRow.seq !== null
+      ? ((await stateAtSeq(w.roomId, endRow.seq)) ?? []).filter((r) =>
+        r.type === 'm.room.member' && senders.has(r.stateKey)
+      )
+      : [];
     const state: Record<string, unknown>[] = [];
     for (const r of memberRows) {
       const idx = await eventIndexRow(w.roomId, r.eventId);

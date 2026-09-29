@@ -9,10 +9,11 @@ import {
   eventMatchesRoomEventFilter,
   type RoomEventFilter,
 } from './filters.ts';
-import { eventIndexRow, lookupRoom, membershipOf, stateAtSeq } from './room.ts';
+import { eventIndexRow, lookupRoom, membershipOf, stateAt } from './room.ts';
 import { clientEventsForRows } from './stateops.ts';
 import { clientEventForRow, messages, pduById } from './timeline.ts';
 import { canSeeEvent } from './visibility.ts';
+import { cursorOfEvent, formatCursorToken } from './federation/history.ts';
 
 export interface EventContextOpts {
   limit: number;
@@ -76,14 +77,19 @@ export async function eventContext(
 
   const beforeLimit = Math.floor(opts.limit / 2);
   const afterLimit = opts.limit - beforeLimit;
+  // M5b (§3.10): the neighbourhood either side of the pivot's cursor
+  const pivot = await cursorOfEvent(roomId, eventId);
+  if (pivot === null) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'event not found: ' + eventId);
+  }
   const before = await messages({
     roomId,
     userId,
     deviceId,
     leaveAt,
     dir: 'b',
-    fromSeq: idx.seq - 1,
-    toSeq: null,
+    fromToken: formatCursorToken(pivot),
+    toToken: null,
     limit: beforeLimit,
     lazyLoadMembers: false,
   });
@@ -93,8 +99,8 @@ export async function eventContext(
     deviceId,
     leaveAt,
     dir: 'f',
-    fromSeq: idx.seq,
-    toSeq: null,
+    fromToken: formatCursorToken(pivot),
+    toToken: null,
     limit: afterLimit,
     lazyLoadMembers: false,
   });
@@ -112,17 +118,20 @@ export async function eventContext(
     throw new MatrixError(404, 'M_NOT_FOUND', 'event not found: ' + eventId);
   }
 
-  let lastSeq = idx.seq;
+  // the endpoint's state from that event's OWN state_commit_hash (§3.10)
+  let stateHash = idx.state_commit_hash;
   if (eventsAfter.length > 0) {
     const lastId = eventsAfter[eventsAfter.length - 1].event_id;
     if (typeof lastId === 'string') {
       const lastIdx = await eventIndexRow(roomId, lastId);
-      if (lastIdx !== null) lastSeq = lastIdx.seq;
+      if (lastIdx !== null && lastIdx.state_commit_hash !== null) {
+        stateHash = lastIdx.state_commit_hash;
+      }
     }
   }
-
-  const stateAt = await stateAtSeq(roomId, lastSeq);
-  const stateRows = stateAt !== null ? stateAt : [];
+  const stateRows = stateHash !== null
+    ? await stateAt(room.dbName, stateHash)
+    : [];
   let state = await clientEventsForRows(
     room.dbName,
     roomId,

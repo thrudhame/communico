@@ -4,7 +4,7 @@
 // module (content/client-server-api/modules/history_visibility.md at
 // v1.16 — the server-behaviour rules are transcribed in canSeeEvent).
 import { MatrixError } from './matrix-error.ts';
-import { membershipOf, stateAtSeq } from './room.ts';
+import { lookupRoom, membershipOf, stateAt, stateAtSeq } from './room.ts';
 
 // Where a user reads the room up to: null (joined: now) or the seq of
 // their leave/ban (left users read as of their leave; invitees as of
@@ -42,12 +42,27 @@ export async function readPositionFor(
 export async function canSeeEvent(
   userId: string,
   roomId: string,
-  event: { seq: number; type: string; stateKey?: string },
+  event: {
+    seq: number | null;
+    type: string;
+    stateKey?: string;
+    // M5b (§3.10): a history event's visibility is evaluated at its OWN
+    // state commit (history rows have no seq to look up)
+    stateCommitHash?: string | null;
+  },
 ): Promise<boolean> {
   if (event.type === 'm.room.member' && event.stateKey === userId) {
     return true;
   }
-  const state = (await stateAtSeq(roomId, event.seq)) ?? [];
+  let state;
+  if (event.seq === null && event.stateCommitHash != null) {
+    const room = await lookupRoom(roomId);
+    if (!room) return false;
+    const atCommit = await stateAt(room.dbName, event.stateCommitHash);
+    state = atCommit == null ? [] : atCommit;
+  } else {
+    state = (await stateAtSeq(roomId, event.seq)) ?? [];
+  }
   const hvRow = state.find((r) => r.type === 'm.room.history_visibility');
   const hv = ((hvRow?.content ?? {}) as { history_visibility?: string })
     .history_visibility ?? 'shared';

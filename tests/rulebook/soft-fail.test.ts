@@ -96,8 +96,8 @@ Deno.test("soft-fail: a banned user's concurrent message soft-fails", async () =
     deviceId: null,
     leaveAt: null,
     dir: 'b',
-    fromSeq: null,
-    toSeq: null,
+    fromToken: null,
+    toToken: null,
     limit: 50,
     lazyLoadMembers: false,
   });

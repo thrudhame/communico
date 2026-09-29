@@ -419,22 +419,47 @@ async function checkSnapshot(
     // servers and the resident)
     const senderDomain = domainOf(String(pdu.sender));
     let sigOk = false;
-    for (const kid of Object.keys(pdu.signatures?.[senderDomain] ?? {})) {
-      try {
-        const key = await getVerifyKey(
-          senderDomain,
-          kid,
-          spec.enforceKeyValidity ? Number(pdu.origin_server_ts) : 0,
-          'event',
-          { roomId },
-        );
+    if (senderDomain === serverName()) {
+      // our own event in the snapshot (a re-join's carries it) — verify
+      // with the tenant key, never a self-dial
+      const key = await getTenantKey();
+      const ownSigs = pdu.signatures == null ? {} : pdu.signatures;
+      const ownKids = ownSigs[senderDomain] == null
+        ? {}
+        : ownSigs[senderDomain];
+      for (const kid of Object.keys(ownKids)) {
         if (
-          await verifyPduSignature(pdu, key, senderDomain, kid, roomVersion)
+          await verifyPduSignature(
+            pdu,
+            key.publicKey,
+            senderDomain,
+            kid,
+            roomVersion,
+          )
         ) {
           sigOk = true;
           break;
         }
-      } catch { /* try the next key id */ }
+      }
+    }
+    if (!sigOk) {
+      for (const kid of Object.keys(pdu.signatures?.[senderDomain] ?? {})) {
+        try {
+          const key = await getVerifyKey(
+            senderDomain,
+            kid,
+            spec.enforceKeyValidity ? Number(pdu.origin_server_ts) : 0,
+            'event',
+            { roomId },
+          );
+          if (
+            await verifyPduSignature(pdu, key, senderDomain, kid, roomVersion)
+          ) {
+            sigOk = true;
+            break;
+          }
+        } catch { /* try the next key id */ }
+      }
     }
     // the resident's signature also vouches (it signs the snapshot's
     // events when forwarding)

@@ -222,10 +222,11 @@ async function roomTimeline(
 
   // prev_batch (B1 ruling): trimmed → s<firstReturned-1>; untrimmed (or
   // trimmed to empty, e.g. limit 0) → s<windowEnd>. The p/t/r parts ride
-  // the global maxima, exactly as pSeq did at M4.
+  // the global maxima, exactly as pSeq did at M4. (The raw window is
+  // seq-selected, so every returned row carries a seq.)
   const prevBatch = trimmed && returned.length > 0
     ? formatStreamToken(
-      returned[0].seq - 1,
+      returned[0].seq! - 1,
       now.pSeq,
       now.tSeq,
       now.rSeq,
@@ -247,7 +248,7 @@ async function roomTimeline(
     ) {
       continue;
     }
-    const membership = await membershipAtSeq(roomId, i.userId, row.seq);
+    const membership = await membershipAtSeq(roomId, i.userId, row.seq!);
     const ev = await clientEventForRow(
       room.dbName,
       room.roomVersion,
@@ -267,7 +268,7 @@ async function roomTimeline(
   // incremental → the delta between since.eSeq and the timeline start
   // (rows whose event_id differ). An empty timeline's "start" is the
   // window end (a left room's leave point carries its state).
-  const timelineStartSeq = returned.length > 0 ? returned[0].seq - 1 : end;
+  const timelineStartSeq = returned.length > 0 ? returned[0].seq! - 1 : end;
   let stateRows: StateRow[];
   if (i.since === null || i.fullState) {
     stateRows = (await stateAtSeq(roomId, timelineStartSeq)) ?? [];

@@ -801,7 +801,42 @@ export async function stateCommitAtSeq(
       return String(r.rows[0].h);
     });
   }
+  // M5b (§3.10, r5 astra): chapter-aware — the last event with seq ≤ N
+  // IN THE SAME CHAPTER as N's event, else that chapter's root commit
+  // (the snapshot). This is what makes /sync's "state at
+  // firstReturned.seq − 1" right at a chapter boundary: never the
+  // previous era's state.
   return await withDb(serverDb(), async (c) => {
+    const eraRow = await c.query(
+      'SELECT era FROM event_index WHERE room_id = $1 AND seq = $2;',
+      [roomId, seq],
+    );
+    const era = eraRow.rows.length && eraRow.rows[0].era != null
+      ? String(eraRow.rows[0].era)
+      : null;
+    if (era !== null) {
+      const r = await c.query(
+        `SELECT state_commit_hash FROM event_index
+         WHERE room_id = $1 AND seq <= $2 AND era = $3 AND rejected = FALSE AND soft_failed = FALSE
+           AND state_commit_hash IS NOT NULL
+         ORDER BY seq DESC LIMIT 1;`,
+        [roomId, seq, era],
+      );
+      if (r.rows.length) return String(r.rows[0].state_commit_hash);
+      // before the chapter's first positioned event → its root commit
+      // (the snapshot: the first commit on the stay branch after genesis)
+      const room = await lookupRoom(roomId);
+      if (room === null) return null;
+      return await withDb(room.dbName, async (rc) => {
+        await rc.query(`SELECT DOLT_CHECKOUT('${ident(era)}');`);
+        const rl = await rc.query(
+          `SELECT commit_hash FROM dolt.log WHERE commit_order >
+             (SELECT commit_order FROM dolt.log WHERE commit_hash = '${room.genesisCommit}')
+           ORDER BY commit_order ASC LIMIT 1;`,
+        );
+        return rl.rows.length ? String(rl.rows[0].commit_hash) : null;
+      });
+    }
     const r = await c.query(
       `SELECT state_commit_hash FROM event_index
        WHERE room_id = $1 AND seq <= $2 AND rejected = FALSE AND soft_failed = FALSE

@@ -1,15 +1,15 @@
 import { MatrixError } from '#engine/matrix-error.ts';
-import { lookupRoom, parseStreamToken } from '#engine/room.ts';
+import { lookupRoom } from '#engine/room.ts';
 import { messages } from '#engine/timeline.ts';
 import { readPositionFor } from '#engine/visibility.ts';
 
 // GET /_matrix/client/v3/rooms/#roomId/messages — plan §3f: dir is
-// required (400 M_MISSING_PARAM), from/to are sync tokens (the s…_p…
-// grammar), limit defaults to 10, filter is inline JSON
-// (lazy_load_members). D10: room access is checked BEFORE query params —
-// an unknown, forgotten, or never-member room 403s M_FORBIDDEN even with
-// no dir (the forget test sends no params; Synapse order); dir is only
-// then required.
+// required (400 M_MISSING_PARAM), from/to are tokens (M5b: c<n>_<offset>
+// or a legacy s<n>/sync token), limit defaults to 10, filter is inline
+// JSON (lazy_load_members). D10: room access is checked BEFORE query
+// params — an unknown, forgotten, or never-member room 403s M_FORBIDDEN
+// even with no dir (the forget test sends no params; Synapse order);
+// dir is only then required.
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
   context: import('@pathfinder/pathfinder').Context,
@@ -30,8 +30,6 @@ export default async function (
   if (dirRaw !== 'b' && dirRaw !== 'f') {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'bad dir: ' + dirRaw);
   }
-  const from = parseStreamToken(request.query.get('from'));
-  const to = parseStreamToken(request.query.get('to'));
   const limitRaw = request.query.get('limit');
   const limit = limitRaw !== null ? Math.max(0, Number(limitRaw) || 0) : 10;
   let lazyLoadMembers = false;
@@ -55,8 +53,8 @@ export default async function (
     deviceId: (context.state.device as string | undefined) ?? null,
     leaveAt,
     dir: dirRaw,
-    fromSeq: from?.eSeq ?? null,
-    toSeq: to?.eSeq ?? null,
+    fromToken: request.query.get('from'),
+    toToken: request.query.get('to'),
     limit,
     lazyLoadMembers,
     containsUrl,

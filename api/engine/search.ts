@@ -333,8 +333,8 @@ async function contextFor(
     deviceId,
     leaveAt: null,
     dir: 'b',
-    fromSeq: hit.seq - 1,
-    toSeq: null,
+    fromToken: `s${hit.seq - 1}`,
+    toToken: null,
     limit: ctx.beforeLimit,
     lazyLoadMembers: false,
   });
@@ -344,8 +344,8 @@ async function contextFor(
     deviceId,
     leaveAt: null,
     dir: 'f',
-    fromSeq: hit.seq,
-    toSeq: null,
+    fromToken: `s${hit.seq}`,
+    toToken: null,
     limit: ctx.afterLimit,
     lazyLoadMembers: false,
   });
@@ -379,7 +379,7 @@ async function profilesFor(
     const lastId = after[after.length - 1].event_id;
     if (typeof lastId === 'string') {
       const idx = await eventIndexRow(hit.roomId, lastId);
-      if (idx) atSeq = idx.seq;
+      if (idx && idx.seq !== null) atSeq = idx.seq;
     }
   }
   const state = (await stateAtSeq(hit.roomId, atSeq)) ?? [];

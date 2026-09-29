@@ -12,7 +12,12 @@ export interface EventIndexRow {
   commit_hash: string;
   rejected: boolean;
   soft_failed: boolean;
-  seq: number;
+  // M5b: two-state — > 0 live (the /sync stream), NULL history/evidence
+  seq: number | null;
+  // M5b: the chapter this event belongs to (live events), and the
+  // history row's commit position on its even chapter
+  era: string | null;
+  branch_pos: number | null;
   state_commit_hash: string | null;
   redacted_by: string | null;
   txn_device: string | null;
@@ -28,7 +33,9 @@ export function eventIndexRowOf(row: any): EventIndexRow {
     commit_hash: String(row.commit_hash),
     rejected: row.rejected === true,
     soft_failed: row.soft_failed === true,
-    seq: Number(row.seq),
+    seq: row.seq == null ? null : Number(row.seq),
+    era: row.era == null ? null : String(row.era),
+    branch_pos: row.branch_pos == null ? null : Number(row.branch_pos),
     state_commit_hash: row.state_commit_hash == null
       ? null
       : String(row.state_commit_hash),

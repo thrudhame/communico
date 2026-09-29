@@ -128,6 +128,8 @@ Deno.test('txn idempotency: (device, room, txn) → same event id, content ignor
     rejected: false,
     soft_failed: false,
     seq: 1,
+    era: null,
+    branch_pos: null,
     state_commit_hash: null,
     redacted_by: null,
     txn_device: device,
