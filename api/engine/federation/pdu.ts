@@ -4,10 +4,10 @@
 // reference hash, transported out-of-band) and minus `unsigned` (never
 // covered by signatures — appendices.md:341-343 — nor by the content
 // hash, SS:1355-1361). toWire is the ONE place that strips.
-import { getRulebook } from '../policy.ts';
-import { canonicalJson } from '../canonical.ts';
-import type { Pdu } from '../pdu.ts';
-import type { RoomVersionSpec } from '../rulebook/types.ts';
+import { getRulebook } from '#engine/policy.ts';
+import { canonicalJson } from '#engine/canonical.ts';
+import type { Pdu } from '#engine/pdu.ts';
+import type { RoomVersionSpec } from '#engine/rulebook/types.ts';
 
 // The server-name part of an identifier (user/room/event id): everything
 // after the FIRST ':' (server names may themselves carry :port).
@@ -42,8 +42,8 @@ export function checkRemoteFormat(
   spec: RoomVersionSpec,
   opts: { exemptPrevAuthLimits: boolean },
 ): { oversized: boolean } {
-  const prevIds = pdu.prev_events ?? [];
-  const declaredAuth = pdu.auth_events ?? [];
+  const prevIds = pdu.prev_events == null ? [] : pdu.prev_events;
+  const declaredAuth = pdu.auth_events == null ? [] : pdu.auth_events;
   if (!opts.exemptPrevAuthLimits) {
     if (prevIds.length > 20) {
       throw new Error('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');

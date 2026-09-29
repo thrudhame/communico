@@ -63,7 +63,7 @@ export async function writeRows(
         r.destination,
         r.roomId,
         r.kind,
-        r.eventId ?? null,
+        r.eventId == null ? null : r.eventId,
         r.intent === undefined ? null : JSON.stringify(r.intent),
         Date.now(),
         expiresMs,

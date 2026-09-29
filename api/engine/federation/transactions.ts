@@ -42,7 +42,7 @@ export async function handleTransaction(
   txnId: string,
   rawBody: unknown,
 ): Promise<TxnResult> {
-  const body = (rawBody ?? {}) as {
+  const body = (rawBody == null ? {} : rawBody) as {
     origin?: unknown;
     origin_server_ts?: unknown;
     pdus?: unknown;
@@ -87,7 +87,8 @@ export async function handleTransaction(
       roomId = '!' + String(pdu.event_id).slice(1);
     }
     if (roomId === null) continue; // no computable room — no result entry
-    const list = byRoom.get(roomId) ?? [];
+    const held = byRoom.get(roomId);
+    const list = held == null ? [] : held;
     list.push(pdu);
     byRoom.set(roomId, list);
   }
@@ -110,7 +111,7 @@ export async function handleTransaction(
       try {
         eventId = await eventIdFor(
           pdu as unknown as Record<string, unknown>,
-          room?.roomVersion ?? '11',
+          room == null ? '11' : room.roomVersion,
         );
       } catch {
         continue;

@@ -235,9 +235,15 @@ async function loop(destination: string): Promise<void> {
     let txnTs = Date.now();
     if (batch.frozen) {
       txnId = batch.rows[0].inflightTxn;
-      txnTs = batch.rows[0].inflightTs ?? txnTs;
+      const inflightTs = batch.rows[0].inflightTs;
+      txnTs = inflightTs == null ? txnTs : inflightTs;
       // the frozen batch's EDUs ride again, in-memory only (D2)
-      edus = txnId !== null ? (frozenEdus.get(txnId) ?? []) : [];
+      if (txnId !== null) {
+        const frozen = frozenEdus.get(txnId);
+        edus = frozen == null ? [] : frozen;
+      } else {
+        edus = [];
+      }
     } else {
       edus = drainEdus(destination, 100);
     }
@@ -280,7 +286,8 @@ async function loop(destination: string): Promise<void> {
       const body = res.json as
         | { pdus?: Record<string, { error?: string }> }
         | null;
-      for (const [id, verdict] of Object.entries(body?.pdus ?? {})) {
+      const verdicts = body == null || body.pdus == null ? {} : body.pdus;
+      for (const [id, verdict] of Object.entries(verdicts)) {
         if (verdict?.error !== undefined) {
           console.warn(
             `sender[${destination}]: receiver rejected ${id}: ${verdict.error}`,
@@ -318,7 +325,7 @@ async function pduOf(
         typeof rr.rows[0].canonical_json === 'string'
           ? JSON.parse(String(rr.rows[0].canonical_json))
           : rr.rows[0].canonical_json,
-        room ?? '11',
+        room == null ? '11' : room,
       );
     });
   });
@@ -351,7 +358,9 @@ async function handleSendFailure(
   const err = e as { status?: number; errcode?: string; message?: string };
   await outbox.recordFailure(
     destination,
-    `${err.status ?? 'net'} ${err.message ?? String(e)}`,
+    `${err.status == null ? 'net' : err.status} ${
+      err.message == null ? String(e) : err.message
+    }`,
     backoffMs(status.failures + 1),
   );
   // a refusal (4xx with a Matrix body) also writes the 'refused' pending
@@ -361,8 +370,8 @@ async function handleSendFailure(
   ) {
     await outbox.recordRefusal(destination, {
       code: err.status,
-      errcode: err.errcode ?? null,
-      error: err.message ?? String(e),
+      errcode: err.errcode == null ? null : err.errcode,
+      error: err.message == null ? String(e) : err.message,
       txnId,
     }, 0);
   }
@@ -396,7 +405,7 @@ async function attemptIntent(
   destination: string,
   row: outbox.OutboxRow,
 ): Promise<void> {
-  const intent = row.intent ?? {};
+  const intent = row.intent == null ? {} : row.intent;
   const what = typeof intent.what === 'string' ? intent.what : '';
   const performer = performers.get(what);
   if (performer === undefined) {
@@ -430,7 +439,7 @@ async function attemptIntent(
     const status = await outbox.peerStatus(destination);
     await outbox.recordFailure(
       destination,
-      (e as Error).message ?? String(e),
+      (e as Error).message == null ? String(e) : (e as Error).message,
       backoffMs(status.failures + 1),
     );
     if (next !== null && next !== destination) {

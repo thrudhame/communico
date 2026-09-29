@@ -56,7 +56,7 @@ export async function fetchMissingPrevs(
   origin: string,
   budget: { until: number },
 ): Promise<void> {
-  const prevIds = pdu.prev_events ?? [];
+  const prevIds = pdu.prev_events == null ? [] : pdu.prev_events;
   const missing = await unknownPrevIds(roomId, prevIds);
   if (missing.length === 0) return;
   const key = roomId + '|' + missing[0];
@@ -103,7 +103,10 @@ async function doFetch(
       unlisten();
     }
   }
-  let still = await unknownPrevIds(roomId, pdu.prev_events ?? []);
+  let still = await unknownPrevIds(
+    roomId,
+    pdu.prev_events == null ? [] : pdu.prev_events,
+  );
   if (still.length === 0) return;
 
   // 2. ONE get_missing_events (backfill.yaml:71-141): earliest = our
@@ -135,7 +138,8 @@ async function doFetch(
             }),
           ),
         });
-        const answered = ((res.json as { events?: unknown[] })?.events ?? [])
+        const ej = res.json as { events?: unknown[] } | null;
+        const answered = (ej == null || ej.events == null ? [] : ej.events)
           .map((e) => e as Pdu);
         // the wire form has no event_id (v3+ — transported out-of-band);
         // compute it before ingest
@@ -161,7 +165,10 @@ async function doFetch(
       }
     }
   }
-  still = await unknownPrevIds(roomId, pdu.prev_events ?? []);
+  still = await unknownPrevIds(
+    roomId,
+    pdu.prev_events == null ? [] : pdu.prev_events,
+  );
   if (still.length === 0) return;
 
   // 3. /state_ids + /event for the still-missing prevs (at most
@@ -194,8 +201,10 @@ async function fetchPrevWithState(
       body: null,
     });
     const j = res.json as { pdu_ids?: unknown[]; auth_chain_ids?: unknown[] };
-    pduIds = (j.pdu_ids ?? []).map(String);
-    authChainIds = (j.auth_chain_ids ?? []).map(String);
+    pduIds = (j.pdu_ids == null ? [] : j.pdu_ids).map(String);
+    authChainIds = (j.auth_chain_ids == null ? [] : j.auth_chain_ids).map(
+      String,
+    );
   } catch {
     return; // the prev stays missing — the caller's terminal decides
   }
@@ -262,7 +271,7 @@ async function fetchPrevWithState(
       type: String(ev.type),
       stateKey: String(ev.state_key),
       eventId: id,
-      content: ev.content ?? {},
+      content: ev.content == null ? {} : ev.content,
     });
   }
   await withRoomLock(roomId, async () => {
@@ -288,12 +297,14 @@ async function fetchEvent(
       path: `/_matrix/federation/v1/event/${encodeURIComponent(eventId)}`,
       body: null,
     });
-    const pdus = ((res.json as { pdus?: unknown[] })?.pdus ?? []) as Pdu[];
+    const pj = res.json as { pdus?: unknown[] } | null;
+    const pdus = (pj == null || pj.pdus == null ? [] : pj.pdus) as Pdu[];
     if (pdus.length === 0) return null;
     const pdu = pdus[0];
+    const roomForVersion = await lookupRoom(roomId);
     (pdu as unknown as Record<string, unknown>).event_id = await eventIdFor(
       pdu as unknown as Record<string, unknown>,
-      (await lookupRoom(roomId))?.roomVersion ?? '11',
+      roomForVersion == null ? '11' : roomForVersion.roomVersion,
     );
     if (String(pdu.event_id) !== eventId) return null;
     return pdu;

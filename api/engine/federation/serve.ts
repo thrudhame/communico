@@ -96,7 +96,9 @@ async function visibleToServer(
   let visibility = 'shared';
   if (visId !== undefined) {
     const vis = await pduAt(roomId, visId);
-    const v = (vis?.content ?? {}) as { history_visibility?: unknown };
+    const v = (vis == null || vis.content == null ? {} : vis.content) as {
+      history_visibility?: unknown;
+    };
     if (typeof v.history_visibility === 'string') {
       visibility = v.history_visibility;
     }
@@ -109,8 +111,9 @@ async function visibleToServer(
     const mxid = k.slice('m.room.member'.length + 1);
     if (!mxid.endsWith(':' + origin)) continue;
     const m = await pduAt(roomId, eid);
-    const membership = ((m?.content ?? {}) as { membership?: unknown })
-      .membership;
+    const membership = ((m == null || m.content == null ? {} : m.content) as {
+      membership?: unknown;
+    }).membership;
     if (visibility === 'invited') {
       if (membership === 'invite' || membership === 'join') return 'full';
     } else if (visibility === 'joined') {
@@ -256,7 +259,8 @@ export async function serveEventAuth(
   const chain = authChain([eventId], store);
   const out: Pdu[] = [];
   for (const id of chain) {
-    const p = pduById.get(id) ?? (await pduAt(roomId, id));
+    const heldPdu = pduById.get(id);
+    const p = heldPdu == null ? await pduAt(roomId, id) : heldPdu;
     if (p !== null) {
       pduById.set(id, p);
       out.push(p);
@@ -297,7 +301,7 @@ export async function serveBackfill(
       const pdu = await pduAt(roomId, id);
       if (pdu === null) continue;
       out.push(await wireVisible(roomId, origin, pdu, room.roomVersion));
-      next.push(...(pdu.prev_events ?? []));
+      next.push(...(pdu.prev_events == null ? [] : pdu.prev_events));
     }
     frontier = next;
   }
@@ -349,8 +353,10 @@ export async function serveGetMissingEvents(
       seen.add(id);
       const pdu = await pduAt(roomId, id);
       if (pdu === null) continue; // an event we do not hold — the walk stops
-      out.push({ pdu, depth: Number(pdu.depth ?? 0) });
-      if (!earliest.has(id)) next.push(...(pdu.prev_events ?? []));
+      out.push({ pdu, depth: Number(pdu.depth == null ? 0 : pdu.depth) });
+      if (!earliest.has(id)) {
+        next.push(...(pdu.prev_events == null ? [] : pdu.prev_events));
+      }
     }
     frontier = next;
   }

@@ -55,7 +55,8 @@ async function strippedState(
   roomId: string,
   inviter: string,
 ): Promise<Record<string, unknown>[]> {
-  const rows = (await stateAtSeq(roomId, null)) ?? [];
+  const currentRows = await stateAtSeq(roomId, null);
+  const rows = currentRows == null ? [] : currentRows;
   const out: Record<string, unknown>[] = [];
   for (const r of rows) {
     const isInviterMember = r.type === 'm.room.member' &&
@@ -167,7 +168,11 @@ export async function inviteRemote(
     // only 400 M_MISSING_PARAM becomes a 5xx to our client
     // (invites-v2.yaml:171-173); network failure → 502
     if (err.status === 400 && err.errcode === 'M_MISSING_PARAM') {
-      throw new MatrixError(502, 'M_UNKNOWN', err.message ?? 'M_MISSING_PARAM');
+      throw new MatrixError(
+        502,
+        'M_UNKNOWN',
+        err.message == null ? 'M_MISSING_PARAM' : err.message,
+      );
     }
     if (err.status === undefined) {
       throw new MatrixError(502, 'M_UNKNOWN', `network failure: ${String(e)}`);
@@ -190,7 +195,9 @@ export async function inviteRemote(
   // their signature covers the form they received — the wire form, NO
   // event_id — so verify BEFORE restoring it
   let theirSigOk = false;
-  for (const kid of Object.keys(merged.signatures?.[remote] ?? {})) {
+  const mergedSigs = merged.signatures == null ? {} : merged.signatures;
+  const remoteKids = mergedSigs[remote] == null ? {} : mergedSigs[remote];
+  for (const kid of Object.keys(remoteKids)) {
     try {
       const key = await getVerifyKey(remote, kid, 0, 'event', { roomId });
       if (
@@ -206,9 +213,12 @@ export async function inviteRemote(
   }
   (merged as unknown as Record<string, unknown>).event_id = eventId;
   // merge signatures (ours is already on the event — author signed it)
-  const ours = (pdu.signatures ?? {}) as Record<string, Record<string, string>>;
+  const ours = (pdu.signatures == null ? {} : pdu.signatures) as Record<
+    string,
+    Record<string, string>
+  >;
   merged.signatures = {
-    ...(merged.signatures ?? {}),
+    ...(merged.signatures == null ? {} : merged.signatures),
     ...ours,
   } as Record<string, Record<string, string>>;
   // ingest as our own (we authored it — the strict local checks apply),
@@ -263,7 +273,7 @@ export async function receiveInvite(
   raw: unknown,
   origin: string,
 ): Promise<Record<string, unknown>> {
-  const body = (raw ?? {}) as {
+  const body = (raw == null ? {} : raw) as {
     room_version?: unknown;
     event?: unknown;
     invite_room_state?: unknown;
@@ -290,7 +300,8 @@ export async function receiveInvite(
   // validation (invites-v2.yaml:157-169)
   if (
     pdu.type !== 'm.room.member' ||
-    ((pdu.content ?? {}) as { membership?: unknown }).membership !== 'invite'
+    ((pdu.content == null ? {} : pdu.content) as { membership?: unknown })
+        .membership !== 'invite'
   ) {
     throw new MatrixError(
       400,
@@ -298,7 +309,7 @@ export async function receiveInvite(
       'expected an m.room.member invite',
     );
   }
-  const target = String(pdu.state_key ?? '');
+  const target = String(pdu.state_key == null ? '' : pdu.state_key);
   if (!target.endsWith(':' + serverName())) {
     throw new MatrixError(400, 'M_BAD_JSON', 'state_key is not a local user');
   }
@@ -322,7 +333,9 @@ export async function receiveInvite(
   (pdu as unknown as Record<string, unknown>).event_id = eventId;
   // the origin's signature must verify
   let sigOk = false;
-  for (const kid of Object.keys(pdu.signatures?.[origin] ?? {})) {
+  const inviteSigs = pdu.signatures == null ? {} : pdu.signatures;
+  const originKids = inviteSigs[origin] == null ? {} : inviteSigs[origin];
+  for (const kid of Object.keys(originKids)) {
     try {
       const key = await getVerifyKey(origin, kid, Date.now(), 'request');
       if (await verifyPduSignature(pdu, key, origin, kid, roomVersion)) {
@@ -453,7 +466,7 @@ async function performRejectInvite(
   destination: string,
   intent: Record<string, unknown>,
 ): Promise<void> {
-  const userId = String(intent.user_id ?? '');
+  const userId = String(intent.user_id == null ? '' : intent.user_id);
   const invite = await inviteForByUser(userId);
   if (invite === null) return; // nothing to reject (already joined?)
   const roomId = invite.roomId;
@@ -473,9 +486,11 @@ async function performRejectInvite(
     sender: userId,
     room_id: roomId,
     content: { membership: 'leave' },
-    prev_events: (template.prev_events ?? []) as string[],
-    auth_events: (template.auth_events ?? []) as string[],
-    depth: Number(template.depth ?? 1),
+    prev_events:
+      (template.prev_events == null ? [] : template.prev_events) as string[],
+    auth_events:
+      (template.auth_events == null ? [] : template.auth_events) as string[],
+    depth: Number(template.depth == null ? 1 : template.depth),
     origin_server_ts: Date.now(),
     hashes: { sha256: '' },
     signatures: {},
@@ -558,13 +573,14 @@ export async function acceptRescind(
   pdu: Pdu,
 ): Promise<boolean> {
   if (pdu.type !== 'm.room.member') return false;
-  const membership = ((pdu.content ?? {}) as { membership?: unknown })
-    .membership;
+  const membership = ((pdu.content == null ? {} : pdu.content) as {
+    membership?: unknown;
+  }).membership;
   if (membership !== 'leave' && membership !== 'ban') return false;
-  const target = String(pdu.state_key ?? '');
+  const target = String(pdu.state_key == null ? '' : pdu.state_key);
   const invite = await inviteFor(roomId, target);
   if (invite === null || invite.status === 'joined') return false;
-  const sender = String(pdu.sender ?? '');
+  const sender = String(pdu.sender == null ? '' : pdu.sender);
   let allowed: boolean;
   if (domainOf(sender) === invite.origin) {
     allowed = true;
@@ -575,9 +591,12 @@ export async function acceptRescind(
       unknown
     >[];
     const pl = stripped.find((e) => e.type === 'm.room.power_levels');
-    const users = ((pl?.content ?? {}) as { users?: Record<string, number> })
-      .users ?? {};
-    allowed = (users[sender] ?? 0) > 0;
+    const plUsers = ((pl == null || pl.content == null ? {} : pl.content) as {
+      users?: Record<string, number>;
+    }).users;
+    const users = plUsers == null ? {} : plUsers;
+    const senderPower = users[sender] == null ? 0 : users[sender];
+    allowed = senderPower > 0;
   }
   if (!allowed) return false;
   await withDb(serverDb(), async (c) => {

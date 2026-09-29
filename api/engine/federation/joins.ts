@@ -29,7 +29,8 @@ async function statePdus(
 ): Promise<{ pdus: Record<string, unknown>[]; byId: Map<string, Pdu> }> {
   const room = await lookupRoom(roomId);
   if (room === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
-  const rows = (await stateAtSeq(roomId, null)) ?? [];
+  const currentRows = await stateAtSeq(roomId, null);
+  const rows = currentRows == null ? [] : currentRows;
   const byId = new Map<string, Pdu>();
   await withDb(room.dbName, async (c) => {
     for (const row of rows) {
@@ -90,9 +91,12 @@ async function joinTemplate(
   }
   // the user must not be banned; under invite-only rules they need an
   // invite; restricted is M5c (400 M_UNABLE_TO_AUTHORISE_JOIN)
-  const state = (await stateAtSeq(roomId, null)) ?? [];
+  const currentState = await stateAtSeq(roomId, null);
+  const state = currentState == null ? [] : currentState;
   const jr = state.find((r) => r.type === 'm.room.join_rules');
-  const joinRule = ((jr?.content ?? {}) as { join_rule?: unknown }).join_rule;
+  const joinRule = ((jr == null || jr.content == null ? {} : jr.content) as {
+    join_rule?: unknown;
+  }).join_rule;
   if (joinRule === 'restricted') {
     throw new MatrixError(
       400,
@@ -103,8 +107,10 @@ async function joinTemplate(
   const memberRow = state.find((r) =>
     r.type === 'm.room.member' && r.stateKey === userId
   );
-  const current = ((memberRow?.content ?? {}) as { membership?: unknown })
-    .membership;
+  const current =
+    ((memberRow == null || memberRow.content == null
+      ? {}
+      : memberRow.content) as { membership?: unknown }).membership;
   if (current === 'ban') {
     throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is banned`);
   }
@@ -138,8 +144,8 @@ async function joinTemplate(
     sender: userId,
     room_id: roomId,
     content: { membership },
-    prev_events: pdu.prev_events ?? [],
-    auth_events: pdu.auth_events ?? [],
+    prev_events: pdu.prev_events == null ? [] : pdu.prev_events,
+    auth_events: pdu.auth_events == null ? [] : pdu.auth_events,
     depth: Number(pdu.depth),
     origin: serverName(),
     origin_server_ts: Number(pdu.origin_server_ts),
@@ -191,7 +197,8 @@ async function sendMembership(
   }
   if (
     pdu.type !== 'm.room.member' || pdu.state_key !== pdu.sender ||
-    ((pdu.content ?? {}) as { membership?: unknown }).membership !== membership
+    ((pdu.content == null ? {} : pdu.content) as { membership?: unknown })
+        .membership !== membership
   ) {
     throw new MatrixError(
       400,
@@ -222,7 +229,10 @@ async function sendMembership(
   // verifying and ingesting
   (pdu as unknown as Record<string, unknown>).event_id = eventId;
   // the origin's signature must verify
-  const entries = Object.entries(pdu.signatures?.[origin] ?? {});
+  const originSigs = pdu.signatures == null ? {} : pdu.signatures;
+  const entries = Object.entries(
+    originSigs[origin] == null ? {} : originSigs[origin],
+  );
   let sigOk = false;
   for (const [kid] of entries) {
     try {
@@ -418,16 +428,16 @@ async function checkSnapshot(
     // signature of the SENDER'S server (witnesses include the room's
     // servers and the resident)
     const senderDomain = domainOf(String(pdu.sender));
+    const senderSigsAll = pdu.signatures == null ? {} : pdu.signatures;
+    const senderSigs = senderSigsAll[senderDomain] == null
+      ? {}
+      : senderSigsAll[senderDomain];
     let sigOk = false;
     if (senderDomain === serverName()) {
       // our own event in the snapshot (a re-join's carries it) — verify
       // with the tenant key, never a self-dial
       const key = await getTenantKey();
-      const ownSigs = pdu.signatures == null ? {} : pdu.signatures;
-      const ownKids = ownSigs[senderDomain] == null
-        ? {}
-        : ownSigs[senderDomain];
-      for (const kid of Object.keys(ownKids)) {
+      for (const kid of Object.keys(senderSigs)) {
         if (
           await verifyPduSignature(
             pdu,
@@ -443,7 +453,7 @@ async function checkSnapshot(
       }
     }
     if (!sigOk) {
-      for (const kid of Object.keys(pdu.signatures?.[senderDomain] ?? {})) {
+      for (const kid of Object.keys(senderSigs)) {
         try {
           const key = await getVerifyKey(
             senderDomain,
@@ -464,7 +474,11 @@ async function checkSnapshot(
     // the resident's signature also vouches (it signs the snapshot's
     // events when forwarding)
     if (!sigOk) {
-      for (const kid of Object.keys(pdu.signatures?.[resident] ?? {})) {
+      const residentSigs = pdu.signatures == null ? {} : pdu.signatures;
+      const residentKids = residentSigs[resident] == null
+        ? {}
+        : residentSigs[resident];
+      for (const kid of Object.keys(residentKids)) {
         try {
           const key = await getVerifyKey(resident, kid, 0, 'event', {
             roomId,
@@ -492,10 +506,15 @@ async function checkSnapshot(
   if (creates.length !== 1) {
     throw new MatrixError(502, 'M_UNKNOWN', 'snapshot has no single create');
   }
-  const createContent = (creates[0].pdu.content ?? {}) as {
-    room_version?: unknown;
-  };
-  if (String(createContent.room_version ?? '') !== roomVersion) {
+  const createContent =
+    (creates[0].pdu.content == null ? {} : creates[0].pdu.content) as {
+      room_version?: unknown;
+    };
+  if (
+    String(
+      createContent.room_version == null ? '' : createContent.room_version,
+    ) !== roomVersion
+  ) {
     throw new MatrixError(
       502,
       'M_UNKNOWN',
@@ -520,7 +539,8 @@ async function checkSnapshot(
   // the snapshot's state rows = the ACCEPTED state events
   const stateRows: StateRowInput[] = [];
   for (const raw of state) {
-    const id = String((raw as Record<string, unknown>).event_id ?? '');
+    const rawId = (raw as Record<string, unknown>).event_id;
+    const id = String(rawId == null ? '' : rawId);
     const e = events.find((x) => x.eventId === id);
     if (e === undefined || e.rejected === true) continue;
     if (e.pdu.state_key === undefined) continue;
@@ -528,7 +548,7 @@ async function checkSnapshot(
       type: String(e.pdu.type),
       stateKey: String(e.pdu.state_key),
       eventId: e.eventId,
-      content: e.pdu.content ?? {},
+      content: e.pdu.content == null ? {} : e.pdu.content,
     });
   }
   return { events, stateRows };
@@ -561,7 +581,9 @@ export async function joinRemoteRoom(
         body: null,
       });
       const template = mk.json as Record<string, unknown>;
-      const roomVersion = String(template.room_version ?? '11');
+      const roomVersion = String(
+        template.room_version == null ? '11' : template.room_version,
+      );
       // 5. build the event from the template: our origin/ts, keep
       //    prev/auth/depth, drop any hashes/signatures/unsigned, fill
       //    content from our profile, hash, id, sign with the tenant key
@@ -578,12 +600,16 @@ export async function joinRemoteRoom(
           ...(profile?.avatar_url !== undefined
             ? { avatar_url: profile.avatar_url }
             : {}),
-          ...(extraContent ?? {}),
+          ...(extraContent == null ? {} : extraContent),
           membership: 'join',
         },
-        prev_events: (template.prev_events ?? []) as string[],
-        auth_events: (template.auth_events ?? []) as string[],
-        depth: Number(template.depth ?? 1),
+        prev_events: (template.prev_events == null
+          ? []
+          : template.prev_events) as string[],
+        auth_events: (template.auth_events == null
+          ? []
+          : template.auth_events) as string[],
+        depth: Number(template.depth == null ? 1 : template.depth),
         origin_server_ts: Date.now(),
         hashes: { sha256: '' },
         signatures: {},
@@ -606,7 +632,9 @@ export async function joinRemoteRoom(
         });
         resp = res.json as Record<string, unknown>;
       } catch (e) {
-        if (!isEndpointUnknown(e)) throw e;
+        if (!isEndpointUnknown(e)) {
+          throw e;
+        }
         const res = await federationRequest({
           destination: candidate,
           method: 'PUT',
@@ -618,11 +646,18 @@ export async function joinRemoteRoom(
           ),
         });
         const arr = res.json as unknown[];
-        resp = (arr[1] ?? {}) as Record<string, unknown>;
+        resp = (arr[1] == null ? {} : arr[1]) as Record<string, unknown>;
       }
       // 7. the snapshot checks
-      const state = (resp.state ?? []) as Record<string, unknown>[];
-      const authChain = (resp.auth_chain ?? []) as Record<string, unknown>[];
+      const state = (resp.state == null ? [] : resp.state) as Record<
+        string,
+        unknown
+      >[];
+      const authChain =
+        (resp.auth_chain == null ? [] : resp.auth_chain) as Record<
+          string,
+          unknown
+        >[];
       const checked = await checkSnapshot(
         roomId,
         roomVersion,
@@ -648,7 +683,9 @@ export async function joinRemoteRoom(
         if (returned !== undefined) {
           const rp = returned as unknown as Pdu;
           (rp as unknown as Record<string, unknown>).event_id = eventId;
-          for (const kid of Object.keys(rp.signatures?.[candidate] ?? {})) {
+          const rpSigs = rp.signatures == null ? {} : rp.signatures;
+          const rpKids = rpSigs[candidate] == null ? {} : rpSigs[candidate];
+          for (const kid of Object.keys(rpKids)) {
             try {
               const rk = await getVerifyKey(candidate, kid, 0, 'event', {
                 roomId,
@@ -659,7 +696,9 @@ export async function joinRemoteRoom(
                 join = rp;
                 break;
               }
-            } catch { /* next */ }
+            } catch {
+              /* next */
+            }
           }
         }
         await ingestJoinSnapshotLocked(roomId, {

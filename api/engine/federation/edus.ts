@@ -55,7 +55,8 @@ export function queueTyping(
     typingQ.set(destination, q);
   }
   const key = roomId + '|' + userId;
-  if ((q.get(key)?.seq ?? -1) > seq) return;
+  const seen = q.get(key);
+  if (seen !== undefined && seen.seq > seq) return;
   q.set(key, {
     seq,
     edu: {
@@ -77,7 +78,8 @@ export function queueReceipt(
     receiptQ.set(destination, q);
   }
   const key = mark.roomId + '|' + mark.userId;
-  if ((q.get(key)?.seq ?? -1) > seq) return;
+  const seen = q.get(key);
+  if (seen !== undefined && seen.seq > seq) return;
   q.set(key, { seq, mark });
 }
 
@@ -92,7 +94,8 @@ export function queuePresence(
     q = new Map();
     presenceQ.set(destination, q);
   }
-  if ((q.get(push.user_id)?.seq ?? -1) > seq) return;
+  const seenPush = q.get(push.user_id);
+  if (seenPush !== undefined && seenPush.seq > seq) return;
   q.set(push.user_id, { seq, push });
 }
 
@@ -187,7 +190,10 @@ const REMOTE_TYPING_TTL_MS = 30_000;
 export async function dispatchEdu(origin: string, raw: unknown): Promise<void> {
   const edu = raw as { edu_type?: unknown; content?: unknown };
   const type = typeof edu.edu_type === 'string' ? edu.edu_type : '';
-  const content = (edu.content ?? {}) as Record<string, unknown>;
+  const content = (edu.content == null ? {} : edu.content) as Record<
+    string,
+    unknown
+  >;
   if (type === 'm.typing') {
     const roomId = typeof content.room_id === 'string' ? content.room_id : null;
     const userId = typeof content.user_id === 'string' ? content.user_id : null;
@@ -209,7 +215,10 @@ export async function dispatchEdu(origin: string, raw: unknown): Promise<void> {
         if (domainOf(userId) !== origin) continue;
         const eventIds = Array.isArray(mark.event_ids) ? mark.event_ids : [];
         if (eventIds.length === 0 || typeof eventIds[0] !== 'string') continue;
-        const data = (mark.data ?? {}) as { ts?: unknown; thread_id?: unknown };
+        const data = (mark.data == null ? {} : mark.data) as {
+          ts?: unknown;
+          thread_id?: unknown;
+        };
         await setReceipt(roomId, userId, 'm.read', String(eventIds[0]), {
           ts: typeof data.ts === 'number' ? data.ts : undefined,
           threadId: typeof data.thread_id === 'string' ? data.thread_id : null,
