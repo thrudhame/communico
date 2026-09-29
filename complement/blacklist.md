@@ -46,11 +46,15 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 
 - E2EE (later; Complement-Crypto out of scope).
 - Push (later).
-- Federation — M5 (`50*` + `federation_*`; the :8448 stub serves TLS + 404 so
-  Complement fails fast, not on timeouts). Knock/restricted joins ride along:
-  `knocking*` share the `testValidationForSendMembershipEndpoint` helper defined
-  in blacklisted `federation_room_join_test.go` (a second `//go:build` line is
-  illegal in Go, so they are excluded rather than given a duplicate tag).
+- Federation — rooms landed in M5b (the room-federation files run: joins,
+  sends, missing events, invites, event auth, redaction, sync, unreject,
+  bans, presence, typing). What stays listed: **M5c territory**
+  (`federation_acl`, `knocking`, `knock_restricted`), media
+  (`federation_media_content`), devices/E2EE (`federation_device_list_update`,
+  `federation_to_device`, `federation_upload_keys`). The knocking files share
+  the `testValidationForSendMembershipEndpoint` helper defined in
+  `federation_room_join_test.go` — compilable again now that the join file
+  runs, so they are listed for their own category (M5c), not as ride-alongs.
 - Event authorization — landed M4 (rulebook M3 + room endpoints M4).
 - Room version 12 — landed (the v12 plan): v10/v12 registered in the
   rulebook; the v12 corpus runs. Federation-flavoured v12 tests stay
@@ -67,21 +71,8 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - tests/csapi/thread_notifications_test.go
 - tests/federation_acl_test.go
 - tests/federation_device_list_update_test.go
-- tests/federation_event_auth_test.go
 - tests/federation_media_content_test.go
-- tests/federation_presence_test.go
-- tests/federation_redaction_test.go
-- tests/federation_room_ban_test.go
-- tests/federation_room_event_auth_test.go
-- tests/federation_room_get_missing_events_test.go
-- tests/federation_room_invite_test.go
-- tests/federation_room_join_test.go
-- tests/federation_room_send_test.go
-- tests/federation_rooms_invite_test.go
-- tests/federation_room_typing_test.go
-- tests/federation_sync_test.go
 - tests/federation_to_device_test.go
-- tests/federation_unreject_rejected_test.go
 - tests/federation_upload_keys_test.go
 - tests/knocking_test.go
 - tests/knock_restricted_test.go

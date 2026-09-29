@@ -526,3 +526,97 @@ Deno.test('GET /_matrix/federation/unknown → 404', async () => {
   );
   assertEquals(res.status, 404);
 });
+
+// --- M5b: the room federation routes — X-Matrix gated -------------------
+
+Deno.test('M5b room routes: no X-Matrix → 401 M_UNAUTHORIZED', async () => {
+  const routes: [string, string][] = [
+    ['PUT', '/_matrix/federation/v1/send/txn1'],
+    ['GET', '/_matrix/federation/v1/make_join/!r:x/@u:x'],
+    ['PUT', '/_matrix/federation/v1/send_join/!r:x/$e'],
+    ['PUT', '/_matrix/federation/v2/send_join/!r:x/$e'],
+    ['GET', '/_matrix/federation/v1/make_leave/!r:x/@u:x'],
+    ['PUT', '/_matrix/federation/v1/send_leave/!r:x/$e'],
+    ['PUT', '/_matrix/federation/v2/send_leave/!r:x/$e'],
+    ['PUT', '/_matrix/federation/v2/invite/!r:x/$e'],
+    ['GET', '/_matrix/federation/v1/state/!r:x'],
+    ['GET', '/_matrix/federation/v1/state_ids/!r:x'],
+    ['GET', '/_matrix/federation/v1/event/$e'],
+    ['GET', '/_matrix/federation/v1/event_auth/!r:x/$e'],
+    ['GET', '/_matrix/federation/v1/backfill/!r:x'],
+    ['POST', '/_matrix/federation/v1/get_missing_events/!r:x'],
+  ];
+  for (const [method, path] of routes) {
+    const res = await matrix(new Request('http://x' + path, { method }));
+    assertEquals(res.status, 401, `${method} ${path}`);
+    const body = await res.json();
+    assertEquals(body.errcode, 'M_UNAUTHORIZED', `${method} ${path}`);
+  }
+});
+
+Deno.test('M5b room routes: a signed wrong method → 405', async () => {
+  const { makeServer, seedServer } = await import(
+    './federation/doc-helper.ts'
+  );
+  const { resetFederationTables } = await import('./util.ts');
+  const { wireFederationTransport } = await import(
+    '#engine/federation/client.ts'
+  );
+  const { signJson } = await import('#engine/signing-primitives.js');
+  const s = await makeServer('methods.test');
+  await resetFederationTables();
+  await seedServer(s);
+  wireFederationTransport();
+  const call = (method: string, path: string): Promise<Response> => {
+    const obj: Record<string, unknown> = {
+      method,
+      uri: path,
+      origin: s.name,
+      destination: serverName(),
+    };
+    return signJson(obj, s.name, s.keyId, s.kp.privateKey).then((signed) => {
+      const sig = (signed.signatures as Record<string, Record<string, string>>)[
+        s.name
+      ][s.keyId];
+      return matrix(
+        new Request('http://x' + path, {
+          method,
+          headers: {
+            Authorization:
+              `X-Matrix origin="${s.name}",key="${s.keyId}",sig="${sig}"`,
+          },
+        }),
+      );
+    });
+  };
+  // PUT on the GET-only routes
+  for (
+    const path of [
+      '/_matrix/federation/v1/make_join/!r:x/@u:x',
+      '/_matrix/federation/v1/make_leave/!r:x/@u:x',
+      '/_matrix/federation/v1/state/!r:x',
+      '/_matrix/federation/v1/state_ids/!r:x',
+      '/_matrix/federation/v1/event/$e',
+      '/_matrix/federation/v1/event_auth/!r:x/$e',
+      '/_matrix/federation/v1/backfill/!r:x',
+    ]
+  ) {
+    const res = await call('PUT', path);
+    assertEquals(res.status, 405, `PUT ${path}`);
+  }
+  // GET on the PUT/POST-only routes
+  for (
+    const path of [
+      '/_matrix/federation/v1/send/txn1',
+      '/_matrix/federation/v1/send_join/!r:x/$e',
+      '/_matrix/federation/v1/send_leave/!r:x/$e',
+      '/_matrix/federation/v2/send_join/!r:x/$e',
+      '/_matrix/federation/v2/send_leave/!r:x/$e',
+      '/_matrix/federation/v2/invite/!r:x/$e',
+      '/_matrix/federation/v1/get_missing_events/!r:x',
+    ]
+  ) {
+    const res = await call('GET', path);
+    assertEquals(res.status, 405, `GET ${path}`);
+  }
+});

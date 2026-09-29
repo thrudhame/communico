@@ -66,8 +66,14 @@ config defaults to enabled — our key document is served at `:8448` and
 `:8008`, inbound requests are X-Matrix-authenticated against remembered
 keys, strangers' keys are learned witnesses-first (roster notaries, then a
 direct fetch in open mode), and admission (blocks → closed-mode roster →
-pending log) gates every origin. Deliberately stubbed: the federation
-room/policy surface (M5b/M5c), E2EE, push delivery/rules, appservices,
+pending log) gates every origin. Rooms federate: we join remote rooms
+over `via` and others join ours (make/send join and leave, v1+v2), state
+and history are served to the room's servers, missed events are chased
+(get_missing_events, state_ids, backfill into history chapters the
+timeline reads seamlessly), and delivery is a durable outbox with frozen
+retries, a backoff ladder, and admin-visible refusals. Deliberately
+stubbed: the federation policy surface (ACLs, knocking — M5c), E2EE,
+push delivery/rules, appservices,
 rate limiting, media thumbnails/retention. The legacy
 unauthenticated media download is a documented liability — frozen at a
 later milestone. The browser homeserver (communico-lite) and native

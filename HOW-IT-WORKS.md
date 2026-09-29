@@ -299,6 +299,63 @@ state.
   then seq desc, and **omits `next_batch`**. **`recent`** pages on seq;
   `next_batch` is emitted iff the page is full.
 
+## Rooms over federation (M5b)
+
+- **The room database is a book of chapters, no `main`.** Branches are
+  `chapter0, chapter1, chapter2, …` in time order: **even = history**
+  (grows toward the past; root = the most recent history event, each
+  commit the event-parent of the one below so pages have no seam),
+  **odd = a stay** (grows toward the future). A stay and the history
+  chapter before it are created together at join; a locally created
+  room starts as `chapter0` (empty — nothing preceded us) + `chapter1`.
+  `room_directory.current_chapter` names the live stay; the last local
+  leave closes it (`NULL`, archived — still readable). Re-joining
+  allocates the next pair.
+- **Positions are three-state** (`event_index`): live events get
+  `seq = nextval` (the `/sync` "what's new" stream) and
+  `era = their stay`; fetched history gets `seq NULL`,
+  `branch_name = 'chapter<2k>'`, `branch_pos` = its commit position,
+  `era = the stay that discovered it` — history is never news;
+  evidence (join snapshots, auth chains, `/state_ids` answers) sits at
+  `seq NULL` with no branch until a backfill promotes it onto one.
+- **A remote join's snapshot is the room's root commit.** The
+  make_join/send_join dance ends with the snapshot's state as the new
+  stay's first commit and the join event as its sole live event; every
+  later event commits on top. Serving the other direction (make/send
+  join and leave v1+v2, `/state`, `/state_ids`, `/event`, `/event_auth`,
+  `/backfill`, `/get_missing_events`) filters by what the requesting
+  server may see (membership in the state before the event).
+- **Missing prevs have a ladder, not a hole.** An inbound event whose
+  prevs we lack waits briefly (a concurrent delivery may ground it),
+  then one `get_missing_events`, then `/state_ids` + `/event` for what
+  is still unknown — all inside a per-transaction budget; past it the
+  event is stored `'ungrounded'` (re-checked when a matching parent
+  arrives by any route or on re-send; expired placeholders are removed;
+  `ungroundedmillihours = 0` drops outright).
+- **Backfill fetches into the even chapters.** When the reading walk
+  (`/messages`, `/context` — one `step` primitive, `c<chapter>_<offset>`
+  tokens, legacy `s<n>` mapped by lookup) reaches a frontier — a tip
+  whose prev is not grounded — it asks the room's senior server once
+  per request. The page is vetted (format, hash, sender signature —
+  our own events riding the page verify with the tenant key, never a
+  self-dial), state is computed forward from `/state_ids` at the
+  oldest event or resolved from grounded prevs, and commits are written
+  newest-first (parent-on-child). The first fetched event we already
+  hold ends the fetching for good: the overlap belongs to the earlier
+  chapter, nothing is relocated.
+- **Delivery is durable: the outbox.** Accepted events we authored (or
+  took on behalf) write one row per destination in the same server-DB
+  write as the index row. One transaction in flight per destination —
+  frozen on failure, retried with the same id/body/EDUs; every non-2xx
+  backs off on a millihour ladder (`backoffstartmillihours` doubling to
+  `backoffmaxmillihours`, validated `start × 2^k`), any authenticated
+  inbound contact resets it. Refusals are kept, not dropped: a
+  `refused` pending entry alerts the admin; rows expire after
+  `refusedmillihours` unless the operator retries or prunes
+  (`deno task federation-outbox`). Typing/receipt/presence EDUs are
+  coalesced in memory and ride the next batch; reject-invite is an
+  intent row on the same ladder with its own performer.
+
 ## 4. Sync (parked)
 
 The browser homeserver (communico-lite) and the native sync protocols
@@ -407,8 +464,8 @@ survives container restarts.
 
 ## 6. What's stubbed (roadmap)
 
-S2S federation beyond M5a's stateless surface (rooms/policy are
-M5b/M5c); relay `bind/forward`; E2EE; push delivery/rules;
+S2S federation policy (ACLs, knocking/restricted joins — M5c; rooms
+landed in M5b); relay `bind/forward`; E2EE; push delivery/rules;
 appservices; rate limiting; media thumbnails and retention;
 at-rest encryption of tenant private keys. Federation server
 trust: the M5a ladder (config pointer `[federation]`, rungs

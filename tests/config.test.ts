@@ -626,3 +626,31 @@ Deno.test('--shell printer quoting', async () => {
     `port: ${shell}`,
   );
 });
+
+Deno.test('46 leaves total across the sections (the surface tripwire)', async () => {
+  const dir = await writeTree({ 'defaults/communico.toml': FULL });
+  const loaded = loadConfig({
+    defaultsPath: `${dir}/defaults/communico.toml`,
+    configPath: null,
+    env: {},
+  });
+  const sections = loaded.config as unknown as Record<
+    string,
+    Record<string, unknown>
+  >;
+  const counts = Object.entries(sections).map((
+    [name, leaves],
+  ): [string, number] => [name, Object.keys(leaves).length]);
+  assertEquals(counts, [
+    ['server', 2],
+    ['db', 5],
+    ['media', 2],
+    ['preview', 4],
+    ['federation', 33],
+  ]);
+  assertEquals(
+    counts.reduce((total, [, n]) => total + n, 0),
+    46,
+    'the whole config surface is 46 leaves — a new leaf belongs in the plan, not just the schema',
+  );
+});
