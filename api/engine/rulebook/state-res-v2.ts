@@ -239,8 +239,16 @@ export function reverseTopologicalPowerOrder(
       break;
     }
     ready.sort((x, y) => {
-      const ex = byId.get(x)!;
-      const ey = byId.get(y)!;
+      const ex = byId.get(x);
+      const ey = byId.get(y);
+      // an event the store does not hold orders last, deterministically
+      // (a sparse store over federation — powerFromAuthEvents and
+      // mainlinePosition already tolerate the gap; the comparator must too)
+      if (ex === undefined || ey === undefined) {
+        if (ex === undefined && ey !== undefined) return 1;
+        if (ex !== undefined && ey === undefined) return -1;
+        return x < y ? -1 : x > y ? 1 : 0;
+      }
       const px = powerFromAuthEvents(ex, store, spec);
       const py = powerFromAuthEvents(ey, store, spec);
       if (px !== py) return py - px; // greater power first
@@ -313,8 +321,14 @@ export function mainlineOrder(
     const px = mainlinePosition(x, p0, store);
     const py = mainlinePosition(y, p0, store);
     if (px !== py) return py - px; // greater position first
-    const ex = byId.get(x)!;
-    const ey = byId.get(y)!;
+    const ex = byId.get(x);
+    const ey = byId.get(y);
+    // an event the store does not hold orders last, deterministically
+    if (ex === undefined || ey === undefined) {
+      if (ex === undefined && ey !== undefined) return 1;
+      if (ex !== undefined && ey === undefined) return -1;
+      return x < y ? -1 : x > y ? 1 : 0;
+    }
     if (ex.origin_server_ts !== ey.origin_server_ts) {
       return ex.origin_server_ts - ey.origin_server_ts;
     }
