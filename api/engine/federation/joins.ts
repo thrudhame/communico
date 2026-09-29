@@ -134,21 +134,25 @@ async function joinTemplate(
     content: { membership },
     origin_server_ts: Date.now(),
   });
-  // the template is the partial WITHOUT signing (joins-v1.yaml:130-153):
-  // every field author() fills EXCEPT event_id, hashes, signatures,
-  // unsigned; room_id rides even on v12 (only the create lacks it,
-  // v12.md:96-109) — and `origin` names the resident
+  // the answer wraps the template (joins-v1.yaml:55-81, leaving-v1.yaml:
+  // the same): { room_version, event } — the event is the partial
+  // WITHOUT signing: every field author() fills EXCEPT event_id, hashes,
+  // signatures, unsigned; room_id rides even on v12 (only the create
+  // lacks it, v12.md:96-109) — and `origin` names the resident
   return {
-    type: 'm.room.member',
-    state_key: userId,
-    sender: userId,
-    room_id: roomId,
-    content: { membership },
-    prev_events: pdu.prev_events == null ? [] : pdu.prev_events,
-    auth_events: pdu.auth_events == null ? [] : pdu.auth_events,
-    depth: Number(pdu.depth),
-    origin: serverName(),
-    origin_server_ts: Number(pdu.origin_server_ts),
+    room_version: room.roomVersion,
+    event: {
+      type: 'm.room.member',
+      state_key: userId,
+      sender: userId,
+      room_id: roomId,
+      content: { membership },
+      prev_events: pdu.prev_events == null ? [] : pdu.prev_events,
+      auth_events: pdu.auth_events == null ? [] : pdu.auth_events,
+      depth: Number(pdu.depth),
+      origin: serverName(),
+      origin_server_ts: Number(pdu.origin_server_ts),
+    },
   };
 }
 
@@ -580,10 +584,15 @@ export async function joinRemoteRoom(
         }?ver=${supportedRoomVersions().map(encodeURIComponent).join('&ver=')}`,
         body: null,
       });
-      const template = mk.json as Record<string, unknown>;
+      // the spec's wrapper (joins-v1.yaml:55-81): room_version + event
+      const mkBody = mk.json as { room_version?: unknown; event?: unknown };
       const roomVersion = String(
-        template.room_version == null ? '11' : template.room_version,
+        mkBody.room_version == null ? '11' : mkBody.room_version,
       );
+      const template = (mkBody.event == null ? {} : mkBody.event) as Record<
+        string,
+        unknown
+      >;
       // 5. build the event from the template: our origin/ts, keep
       //    prev/auth/depth, drop any hashes/signatures/unsigned, fill
       //    content from our profile, hash, id, sign with the tenant key

@@ -478,7 +478,12 @@ async function performRejectInvite(
     }`,
     body: null,
   });
-  const template = mk.json as Record<string, unknown>;
+  // the spec's wrapper (leaving-v1.yaml): room_version + event
+  const mkBody = mk.json as { event?: unknown };
+  const template = (mkBody.event == null ? {} : mkBody.event) as Record<
+    string,
+    unknown
+  >;
   const roomVersion = invite.roomVersion;
   const pdu: Pdu = {
     type: 'm.room.member',

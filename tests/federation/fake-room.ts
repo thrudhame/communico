@@ -329,19 +329,23 @@ export async function createFakeRoom(opts: {
       return out.sort((a, b) => a.depth - b.depth);
     },
     makeJoinTemplate: (userId) => ({
-      type: 'm.room.member',
-      state_key: userId,
-      sender: userId,
-      room_id: roomId,
-      content: { membership: 'join' },
-      prev_events: extremityIds(),
-      auth_events: [
-        state.get('m.room.create' + ''),
-        state.get('m.room.power_levels' + ''),
-      ].filter((x): x is string => typeof x === 'string'),
-      depth: maxDepth + 1,
-      origin: server.name,
-      origin_server_ts: Date.now(),
+      // the spec's wrapper (joins-v1.yaml): room_version + event
+      room_version: opts.version,
+      event: {
+        type: 'm.room.member',
+        state_key: userId,
+        sender: userId,
+        room_id: roomId,
+        content: { membership: 'join' },
+        prev_events: extremityIds(),
+        auth_events: [
+          state.get('m.room.create' + ''),
+          state.get('m.room.power_levels' + ''),
+        ].filter((x): x is string => typeof x === 'string'),
+        depth: maxDepth + 1,
+        origin: server.name,
+        origin_server_ts: Date.now(),
+      },
     }),
     acceptSendJoin: async (join) => {
       // v2 answer per joins-v2.yaml:160-220 with the fake's signature
@@ -373,20 +377,24 @@ export async function createFakeRoom(opts: {
       };
     },
     makeLeaveTemplate: (userId) => ({
-      type: 'm.room.member',
-      state_key: userId,
-      sender: userId,
-      room_id: roomId,
-      content: { membership: 'leave' },
-      prev_events: extremityIds(),
-      auth_events: [
-        state.get('m.room.create' + ''),
-        state.get('m.room.power_levels' + ''),
-        state.get('m.room.member' + userId),
-      ].filter((x): x is string => typeof x === 'string'),
-      depth: maxDepth + 1,
-      origin: server.name,
-      origin_server_ts: Date.now(),
+      // the spec's wrapper (leaving-v1.yaml): room_version + event
+      room_version: opts.version,
+      event: {
+        type: 'm.room.member',
+        state_key: userId,
+        sender: userId,
+        room_id: roomId,
+        content: { membership: 'leave' },
+        prev_events: extremityIds(),
+        auth_events: [
+          state.get('m.room.create' + ''),
+          state.get('m.room.power_levels' + ''),
+          state.get('m.room.member' + userId),
+        ].filter((x): x is string => typeof x === 'string'),
+        depth: maxDepth + 1,
+        origin: server.name,
+        origin_server_ts: Date.now(),
+      },
     }),
     acceptSendLeave: async (leave) => {
       const { event_id: _a, signatures: _b, hashes: _c, ...forHash } =

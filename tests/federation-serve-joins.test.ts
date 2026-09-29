@@ -98,7 +98,9 @@ Deno.test('make_join: template fields; 400 ver; 403 domain; 404 room; 403 banned
     }?ver=11`,
   );
   assertEquals(res.status, 200);
-  const t = res.body as Json;
+  const body = res.body as Json;
+  assertEquals(body.room_version, '11'); // the spec's wrapper
+  const t = body.event as Json;
   assertEquals(t.type, 'm.room.member');
   assertEquals(t.state_key, ZOE);
   assertEquals(t.sender, ZOE);
@@ -281,8 +283,11 @@ Deno.test('send_join v1 answers [200, {...}]; send_leave v1/v2; make_leave 403 f
     }?ver=11`,
   );
   assertEquals(ml.status, 200);
-  assertEquals((ml.body as Json).content !== undefined, true);
-  assertEquals(((ml.body as Json).content as Json).membership, 'leave');
+  const mlBody = ml.body as Json;
+  assertEquals(mlBody.room_version, '11'); // the spec's wrapper
+  const mlEvent = mlBody.event as Json;
+  assertEquals(mlEvent.content !== undefined, true);
+  assertEquals((mlEvent.content as Json).membership, 'leave');
 
   const leave = await remoteEvent(ROOM, srv, '11', {
     type: 'm.room.member',
