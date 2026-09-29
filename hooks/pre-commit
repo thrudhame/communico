@@ -1,0 +1,56 @@
+#!/bin/sh
+# communico pre-commit gate — the plan's standing invariants (six greps)
+# plus `deno task check`. Enabled repo-wide via:
+#   git config core.hooksPath hooks
+# (one-time, local to the clone; the hooks/ directory is versioned).
+# The greps read the worktree, like every simple pre-commit hook.
+set -u
+fail=0
+
+n=$(grep -rn "from '\.\./" api/ tests/ | wc -l)
+if [ "$n" -ne 0 ]; then
+  echo "pre-commit: relative parent imports in api//tests/ (use #engine/ aliases):" >&2
+  grep -rn "from '\.\./" api/ tests/ >&2
+  fail=1
+fi
+
+n=$(grep -rn 'INSERT INTO state' api/ | grep -v materialize.ts | wc -l)
+if [ "$n" -ne 0 ]; then
+  echo "pre-commit: raw INSERT INTO state outside materialize.ts:" >&2
+  grep -rn 'INSERT INTO state' api/ | grep -v materialize.ts >&2
+  fail=1
+fi
+
+n=$(grep -rn 'auth = false\|context.state.user ??' api/ | wc -l)
+if [ "$n" -ne 0 ]; then
+  echo "pre-commit: auth-bypass patterns in api/:" >&2
+  grep -rn 'auth = false\|context.state.user ??' api/ >&2
+  fail=1
+fi
+
+n=$(grep -rnE "Deno\.|#engine/db|from 'pg'" api/engine/rulebook/ | wc -l)
+if [ "$n" -ne 0 ]; then
+  echo "pre-commit: I/O inside the rulebook (it must stay pure):" >&2
+  grep -rnE "Deno\.|#engine/db|from 'pg'" api/engine/rulebook/ >&2
+  fail=1
+fi
+
+n=$(grep -nE "('|\")[0-9]+(\.[0-9]+)*('|\")" api/engine/rulebook/auth-rules.ts | wc -l)
+if [ "$n" -ne 0 ]; then
+  echo "pre-commit: literal rule numbers in auth-rules.ts (use ruleId(spec, ...)):" >&2
+  grep -nE "('|\")[0-9]+(\.[0-9]+)*('|\")" api/engine/rulebook/auth-rules.ts >&2
+  fail=1
+fi
+
+n=$(grep -rn '??' api/engine/federation/ api/engine/net/ | wc -l)
+if [ "$n" -ne 0 ]; then
+  echo "pre-commit: '??' in federation//net/ (explicit '== null ? :' ternaries only):" >&2
+  grep -rn '??' api/engine/federation/ api/engine/net/ >&2
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  exit 1
+fi
+
+exec deno task check
