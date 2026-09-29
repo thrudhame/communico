@@ -49,12 +49,14 @@ if [[ -f /complement/ca/ca.crt && -f /complement/ca/ca.key ]]; then
     -out "$CERT_DIR/server.csr" 2>/dev/null
   openssl x509 -req -in "$CERT_DIR/server.csr" \
     -CA /complement/ca/ca.crt -CAkey /complement/ca/ca.key -CAcreateserial \
+    -extfile <(printf 'subjectAltName=DNS:%s' "$SERVER_NAME") \
     -out "$CERT_DIR/server.crt" -days 2 -sha256 2>/dev/null
 else
   echo ">> no Complement CA mounted — self-signed :8448 cert (dev only)"
   openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -days 2 \
-    -subj "/CN=$SERVER_NAME" 2>/dev/null
+    -subj "/CN=$SERVER_NAME" \
+    -addext "subjectAltName=DNS:$SERVER_NAME" 2>/dev/null
 fi
 
 # 4. federation config exports (cert/key path is Complement-image-only,
