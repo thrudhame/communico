@@ -87,17 +87,25 @@ export async function signPdu(
   roomVersion: string,
   key: ServerKey,
 ): Promise<Pdu> {
+  // hash over the id-less form too (the v11+ wire form has no event_id —
+  // a re-signed/counter-signed event carries one, and it is not hashed)
+  const { event_id: _dropId, ...forHash } = pdu as unknown as Record<
+    string,
+    unknown
+  >;
+  void _dropId;
   pdu.hashes = {
-    sha256: await contentHashOf(pdu as unknown as Record<string, unknown>),
+    sha256: await contentHashOf(forHash),
   };
-  pdu.event_id = await eventIdFor(
-    pdu as unknown as Record<string, unknown>,
-    roomVersion,
-  );
+  // the id rides out-of-band in every version we support (v3+ reference
+  // hashes): the signature payload never carries it — not on a first
+  // signing and not when counter-signing (send_join) or re-signing an
+  // event that already has one
   const redacted = redact(
     pdu as unknown as Record<string, unknown>,
     roomVersion,
   );
+  delete redacted.event_id;
   await signJson(
     redacted,
     key.serverName,
@@ -108,6 +116,10 @@ export async function signPdu(
     string,
     Record<string, string>
   >;
+  pdu.event_id = await eventIdFor(
+    pdu as unknown as Record<string, unknown>,
+    roomVersion,
+  );
   return pdu;
 }
 
@@ -129,6 +141,10 @@ export async function verifyPduSignature(
   } catch {
     return false;
   }
+  // the id rides out-of-band in every version we support (v3+ reference
+  // hashes): it is never part of the signature payload, whatever the
+  // caller restored for storage — strip it (signPdu signs without it)
+  delete redacted.event_id;
   // verify against the redacted copy (full signatures map retained for lookup)
   redacted.signatures = pdu.signatures as unknown as Record<
     string,

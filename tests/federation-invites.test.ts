@@ -105,8 +105,16 @@ async function withHost<T>(fn: (h: Host) => Promise<T>): Promise<T> {
         invite_room_state: Json[];
       };
       h.inviteRequests.push(body);
-      // the fake signs the invite as the invitee's server
-      const signed = await h.fake.sign(body.event);
+      // the fake signs the invite as the invitee's server — over the
+      // redacted form without the id, like any v3+ signer
+      const { redact } = await import('#engine/eventid.ts');
+      const redacted = redact(body.event as Record<string, unknown>, '11');
+      delete redacted.event_id;
+      const signedRedacted = await h.fake.sign(redacted);
+      const signed = {
+        ...(body.event as Record<string, unknown>),
+        signatures: signedRedacted.signatures,
+      };
       return Response.json({ event: signed });
     }
     if (path.startsWith('/_matrix/federation/v1/make_leave/')) {

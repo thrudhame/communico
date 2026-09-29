@@ -124,12 +124,15 @@ export async function createFakeRoom(opts: {
   async function sign(pdu: Pdu): Promise<Pdu> {
     // redact-then-sign (spec § hash_and_sign_event): the signature covers
     // the REDACTED form + hashes, so it verifies on redacted copies;
-    // signatures are copied back to the full event
+    // signatures are copied back to the full event. The id rides
+    // out-of-band in every version we speak (v3+ reference hashes) — it
+    // is never part of the signature payload, like gomatrixserverlib
     const { redact } = await import('#engine/eventid.ts');
     const redacted = redact(
       pdu as unknown as Record<string, unknown>,
       opts.version,
     );
+    delete redacted.event_id;
     await signJson(redacted, server.name, server.keyId, server.kp.privateKey);
     pdu.signatures = (redacted.signatures ?? {}) as Record<
       string,

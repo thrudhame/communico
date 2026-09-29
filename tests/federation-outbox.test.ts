@@ -37,7 +37,7 @@ import { resetEdusForTests } from '#engine/federation/edus.ts';
 import { type FakeServer, startFakeServer } from './federation/fake-server.ts';
 import { createIdOf } from './federation/room-events.ts';
 import { contentHashOf } from '#engine/signing-primitives.js';
-import { eventIdFor } from '#engine/eventid.ts';
+import { eventIdFor, redact } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import {
   latestExtremityEventId,
@@ -143,7 +143,15 @@ async function withSetup<T>(
     join as unknown as Record<string, unknown>,
     '11',
   );
-  await fake.sign(join as unknown as Record<string, unknown>);
+  // the fake signs as its server — over the redacted form without the
+  // id, like any v3+ signer
+  const joinRedacted = redact(join as unknown as Record<string, unknown>, '11');
+  delete joinRedacted.event_id;
+  const joinSigned = await fake.sign(joinRedacted);
+  join.signatures = joinSigned.signatures as Record<
+    string,
+    Record<string, string>
+  >;
   await ingestEvent(ROOM, join, {
     remote: { origin: dest, position: 'after' },
   });

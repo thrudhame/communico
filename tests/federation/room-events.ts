@@ -87,8 +87,10 @@ export async function remoteEvent(
     version,
   );
   // redact-then-sign (spec § hash_and_sign_event): the signature covers
-  // the REDACTED form + hashes, so it verifies on redacted copies
+  // the REDACTED form + hashes, so it verifies on redacted copies; the id
+  // rides out-of-band (v3+ reference hashes) — never part of the payload
   const redacted = redact(pdu as unknown as Record<string, unknown>, version);
+  delete redacted.event_id;
   await signJson(redacted, server.name, server.keyId, server.kp.privateKey);
   pdu.signatures = (redacted.signatures ?? {}) as Record<
     string,
