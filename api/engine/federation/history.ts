@@ -28,6 +28,7 @@ import {
   chapterHead,
   groundingOf,
   lookupRoom,
+  parseStreamToken,
   serversInRoom,
 } from '#engine/room.ts';
 import { ident } from '#engine/db.ts';
@@ -310,9 +311,12 @@ export async function cursorForToken(
 ): Promise<Cursor | null> {
   const m = /^c(\d+)_(\d+)$/.exec(token);
   if (m) return { chapter: Number(m[1]), offset: Number(m[2]) };
-  const s = /^s(\d+)$/.exec(token);
-  if (s) {
-    const n = Number(s[1]);
+  // the legacy grammar is the event-stream part of any /sync token
+  // (s<e>_p<p>_t<t>_r<r>_a<a> — what /sync mints as next_batch and
+  // prev_batch), never just the bare s<n>
+  const st = parseStreamToken(token);
+  if (st !== null) {
+    const n = st.eSeq;
     return await withDb(serverDb(), async (c) => {
       const r = await c.query(
         `SELECT era, seq FROM event_index
@@ -333,7 +337,13 @@ export async function cursorForToken(
       return { chapter: Number(cm[1]), offset: dir === 'b' ? seq + 1 : seq };
     });
   }
-  return null;
+  // neither form: a client error, not a silent restart from the
+  // beginning (the silence is what hid dropped from/to)
+  throw new MatrixError(
+    400,
+    'M_INVALID_PARAM',
+    `unknown pagination token: ${token}`,
+  );
 }
 
 // --- the frontier + the backfill client -----------------------------------------
