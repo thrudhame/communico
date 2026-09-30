@@ -312,10 +312,14 @@ export async function messages(w: MessagesWindow): Promise<MessagesResult> {
   const windowRows: { row: EventIndexRow; cursor: Cursor }[] = [];
   let endCursor: Cursor | null = null;
   let backfilled = false;
+  let walkEnded = false;
   for (;;) {
     if (windowRows.length >= limit) break;
     const r = await step(w.roomId, cursor, w.dir);
-    if (r.kind === 'end') break;
+    if (r.kind === 'end') {
+      walkEnded = true;
+      break;
+    }
     if (r.kind === 'frontier') {
       if (backfilled) {
         endCursor = r.cursor;
@@ -341,15 +345,23 @@ export async function messages(w: MessagesWindow): Promise<MessagesResult> {
   }
 
   const chunk: Record<string, unknown>[] = [];
-  let hitCreate = false;
+  // `end` is decided on the FILTERED result: any raw row dropped from the
+  // chunk (contains_url, visibility, redaction) means the client must be
+  // able to ask again and learn there is nothing more
+  let filteredAny = false;
   for (const { row: idx } of windowRows) {
     const pdu = await pduById(room.dbName, idx.commit_hash, idx.event_id);
-    if (!pdu) continue;
-    if (pdu.type === 'm.room.create') hitCreate = true;
+    if (!pdu) {
+      filteredAny = true;
+      continue;
+    }
     if (w.containsUrl !== undefined) {
       const hasUrl = typeof ((pdu.content ?? {}) as Record<string, unknown>)
         .url === 'string';
-      if (hasUrl !== w.containsUrl) continue;
+      if (hasUrl !== w.containsUrl) {
+        filteredAny = true;
+        continue;
+      }
     }
     if (
       !(await canSeeEvent(w.userId, w.roomId, {
@@ -359,6 +371,7 @@ export async function messages(w: MessagesWindow): Promise<MessagesResult> {
         stateCommitHash: idx.state_commit_hash,
       }))
     ) {
+      filteredAny = true;
       continue;
     }
     const ev = await clientEventForRow(room.dbName, room.roomVersion, idx, {
@@ -366,14 +379,24 @@ export async function messages(w: MessagesWindow): Promise<MessagesResult> {
       deviceId: w.deviceId,
     });
     if (ev) chunk.push(ev);
+    else filteredAny = true;
+  }
+  // the walk's true end: the create event is the last raw row of this
+  // window AND the client received everything before it
+  let createIsLastRaw = false;
+  if (windowRows.length > 0) {
+    const last = windowRows[windowRows.length - 1].row;
+    const lastPdu = await pduById(room.dbName, last.commit_hash, last.event_id);
+    createIsLastRaw = lastPdu !== null && lastPdu.type === 'm.room.create';
   }
 
   const result: MessagesResult = {
     chunk,
     start: w.fromToken ?? '',
   };
-  if (hitCreate) {
-    // the walk's end — no more events → no end (§3.10)
+  if ((walkEnded || createIsLastRaw) && !filteredAny) {
+    // no more events → no end (§3.10): the walk ended, or the create is
+    // the window's last raw row and the client received everything
   } else if (endCursor !== null) {
     // the frontier cursor, so the client comes back for more
     result.end = formatCursorToken(endCursor);
