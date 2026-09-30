@@ -47,6 +47,21 @@ async function unknownPrevIds(
   });
 }
 
+// prevs that do not ground the pdu: truly unknown OR held as a
+// placeholder/evidence (a placeholder is still missing from the timeline
+// — get_missing_events fires for it too; the Complement BadJSON case's
+// message3 cites a placeholder)
+async function ungroundedPrevIds(
+  roomId: string,
+  prevIds: string[],
+): Promise<string[]> {
+  const out: string[] = [];
+  for (const id of prevIds) {
+    if ((await groundingOf(roomId, id)) !== 'own') out.push(id);
+  }
+  return out;
+}
+
 // one in-flight chain per (room, prev) — a burst of PDUs citing the
 // same prev shares the one fetch
 const inFlight = new Map<string, Promise<void>>();
@@ -58,7 +73,7 @@ export async function fetchMissingPrevs(
   budget: { until: number },
 ): Promise<void> {
   const prevIds = pdu.prev_events == null ? [] : pdu.prev_events;
-  const missing = await unknownPrevIds(roomId, prevIds);
+  const missing = await ungroundedPrevIds(roomId, prevIds);
   if (missing.length === 0) return;
   const key = roomId + '|' + missing[0];
   const existing = inFlight.get(key);
@@ -104,7 +119,7 @@ async function doFetch(
       unlisten();
     }
   }
-  const still = await unknownPrevIds(
+  const still = await ungroundedPrevIds(
     roomId,
     pdu.prev_events == null ? [] : pdu.prev_events,
   );
