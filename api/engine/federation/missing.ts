@@ -167,6 +167,7 @@ async function doFetch(
             );
         }
         answered.sort((a, b) => a.depth - b.depth);
+        const formatDropped: Pdu[] = [];
         for (const ev of answered) {
           try {
             await ingestEvent(roomId, ev, {
@@ -187,12 +188,34 @@ async function doFetch(
               // never asks /state_ids for it — the BadJSON case forbids
               // the fallthrough); verbatim because a format-bad event
               // cannot be re-canonicalized
+              formatDropped.push(ev);
               await withRoomLock(roomId, async () => {
                 await storeUnverifiableLocked(roomId, ev, origin, {
                   verbatim: true,
                 });
               });
             }
+          }
+        }
+        // a format drop can leave the pushed pdu's prev dangling under
+        // the CITED id (the event was authored under different redaction
+        // rules — a v5-built event in a v11 room — so our computed id
+        // differs from the citation): tombstone the cited prev as
+        // 'unverifiable' too, or the chase asks /state_ids for it forever
+        // (…BadJSONForRoomVersion6 forbids the call)
+        const prevIds = pdu.prev_events == null ? [] : pdu.prev_events;
+        if (formatDropped.length > 0 && prevIds.length === 1) {
+          const cited = prevIds[0];
+          if ((await groundingOf(roomId, cited)) === 'unknown') {
+            const tombstone = {
+              ...formatDropped[0],
+              event_id: cited,
+            } as Pdu;
+            await withRoomLock(roomId, async () => {
+              await storeUnverifiableLocked(roomId, tombstone, origin, {
+                verbatim: true,
+              });
+            });
           }
         }
       } catch {
