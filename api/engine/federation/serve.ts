@@ -353,18 +353,23 @@ export async function serveGetMissingEvents(
   const latest = (Array.isArray(body.latest_events) ? body.latest_events : [])
     .map(String);
   const out: { pdu: Pdu; depth: number }[] = [];
-  const seen = new Set<string>();
-  let frontier = [...latest];
+  // BOTH boundaries are excluded (Synapse event_federation.py:2236-2258):
+  // earliest is pre-seen (never emitted, never walked past); latest only
+  // seeds the walk with its prevs — the answer is strictly between
+  // (TestInboundCanReturnMissingEvents)
+  const seen = new Set<string>([...earliest, ...latest]);
+  let frontier: string[] = [];
+  for (const id of latest) {
+    const pdu = await pduAt(roomId, id);
+    if (pdu !== null) {
+      frontier.push(...(pdu.prev_events == null ? [] : pdu.prev_events));
+    }
+  }
   while (frontier.length > 0 && out.length < cap) {
     const next: string[] = [];
     for (const id of frontier) {
       if (seen.has(id)) continue;
       seen.add(id);
-      // the earliest_events are the boundary the requester already HAS —
-      // excluded from the answer, and the walk stops at them
-      // (TestInboundCanReturnMissingEvents: the first answer event is the
-      // creator's join, never the create)
-      if (earliest.has(id)) continue;
       const pdu = await pduAt(roomId, id);
       if (pdu === null) continue; // an event we do not hold — the walk stops
       out.push({ pdu, depth: Number(pdu.depth == null ? 0 : pdu.depth) });

@@ -175,14 +175,14 @@ Deno.test('serve: /state, /state_ids, /event, /event_auth, /backfill, /get_missi
   assertEquals((bpdus[0].content as Json).body, 'second');
   assertEquals((bpdus[1].content as Json).body, 'first');
 
-  // /get_missing_events: forward order; the earliest (what the requester
-  // already has) is EXCLUDED, the latest included
+  // /get_missing_events: forward order; BOTH boundaries excluded (the
+  // answer is strictly between — Synapse event_federation.py:2236-2258)
   const missing = await fedGet(
     `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`,
     {
       method: 'POST',
       body: {
-        earliest_events: [m1],
+        earliest_events: [joinTip],
         latest_events: [m2],
         limit: 10,
         min_depth: 0,
@@ -192,17 +192,25 @@ Deno.test('serve: /state, /state_ids, /event, /event_auth, /backfill, /get_missi
   assertEquals(missing.status, 200);
   const events = missing.body.events as Json[];
   assertEquals(events.length, 1);
-  assertEquals((events[0].content as Json).body, 'second');
+  assertEquals((events[0].content as Json).body, 'first');
 
-  // the cap: limit 1 → one event
+  // the cap: limit 1 → the one event closest to latest (the answer is
+  // forward-ordered from the walk back; five candidates between create
+  // and m2, one returned)
   const capped = await fedGet(
     `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`,
     {
       method: 'POST',
-      body: { earliest_events: [m1], latest_events: [m2], limit: 1 },
+      body: {
+        earliest_events: [await createIdOf(ROOM)],
+        latest_events: [m2],
+        limit: 1,
+      },
     },
   );
-  assertEquals((capped.body.events as Json[]).length, 1);
+  const cappedEvents = capped.body.events as Json[];
+  assertEquals(cappedEvents.length, 1);
+  assertEquals((cappedEvents[0].content as Json).body, 'first');
   void joinTip;
 });
 
