@@ -266,9 +266,13 @@ async function roomTimeline(
 
   // state.events: initial/full_state → state at the timeline start;
   // incremental → the delta between since.eSeq and the timeline start
-  // (rows whose event_id differ). An empty timeline's "start" is the
-  // window end (a left room's leave point carries its state).
-  const timelineStartSeq = returned.length > 0 ? returned[0].seq! - 1 : end;
+  // (rows whose event_id differ). The start IS the first returned
+  // event's own position — its state effect is included (sync.yaml:223-228:
+  // "all state up to the start of the timeline";
+  // TestSyncOmitsStateChangeOnFilteredEvents's s2 must appear). An empty
+  // timeline's "start" is the window end (a left room's leave point
+  // carries its state).
+  const timelineStartSeq = returned.length > 0 ? returned[0].seq! : end;
   let stateRows: StateRow[];
   if (i.since === null || i.fullState) {
     stateRows = (await stateAtSeq(roomId, timelineStartSeq)) ?? [];

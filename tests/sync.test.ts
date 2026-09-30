@@ -321,3 +321,66 @@ Deno.test('sync: unsigned.prev_content on a state change — the join after an i
   assertEquals((unsigned.prev_content as Json).is_direct, true);
   assertEquals(unsigned.prev_sender, alice.user_id);
 });
+
+Deno.test('sync: state at the timeline start includes the start event’s own effect (the s2 fork shape)', async () => {
+  const alice = await registerTestUser('sy-s2-a', 'pw-sy-s2-a');
+  const A = alice.access_token!;
+  const roomId = await createRoom(A, { preset: 'public_chat' });
+  const { author, ingestEvent } = await import('#engine/ingest.ts');
+  const { latestExtremityEventId } = await import('./util.ts');
+  const e1 = await (async () => {
+    const tip = await latestExtremityEventId(roomId);
+    const pdu = await author(roomId, {
+      type: 'm.room.message',
+      sender: alice.user_id,
+      content: { msgtype: 'm.text', body: 'E1' },
+      prev_events: [tip],
+    });
+    await ingestEvent(roomId, pdu);
+    return String(pdu.event_id);
+  })();
+  // E3, E4 in order
+  for (const body of ['E3', 'E4']) {
+    const tip = await latestExtremityEventId(roomId);
+    const pdu = await author(roomId, {
+      type: 'm.room.message',
+      sender: alice.user_id,
+      content: { msgtype: 'm.text', body },
+      prev_events: [tip],
+    });
+    await ingestEvent(roomId, pdu);
+  }
+  // s2 (the room name) forks off E1 and arrives LATE
+  const s2 = await author(roomId, {
+    type: 'm.room.name',
+    state_key: '',
+    sender: alice.user_id,
+    content: { name: 'I am the room name, S2' },
+    prev_events: [e1],
+  });
+  await ingestEvent(roomId, s2);
+  const s2Id = String(s2.event_id);
+  // E5 merges, of a filtered type
+  const e5 = await author(roomId, {
+    type: 'please_filter_me',
+    sender: alice.user_id,
+    content: { msgtype: 'm.text', body: 'E5' },
+    prev_events: [await latestExtremityEventId(roomId)],
+  });
+  await ingestEvent(roomId, e5);
+
+  const sync = await call(
+    '/_matrix/client/v3/sync?timeout=0&filter=' +
+      encodeURIComponent(
+        '{"room":{"timeline":{"not_types":["please_filter_me"],"limit":1}}}',
+      ),
+    { token: A },
+  );
+  assertEquals(sync.status, 200);
+  const room = ((sync.body.rooms as Json).join as Json)[roomId] as Json;
+  const stateEvents = ((room.state as Json).events as Json[]) ?? [];
+  assert(
+    stateEvents.some((e) => e.event_id === s2Id),
+    `s2 in state.events: ${JSON.stringify(stateEvents.map((e) => e.event_id))}`,
+  );
+});
