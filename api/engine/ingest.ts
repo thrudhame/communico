@@ -4,6 +4,7 @@ import {
   chapterHead,
   extremities,
   lookupRoom,
+  membershipOf,
   type RoomInfo,
   serversInRoom,
 } from './room.ts';
@@ -1571,6 +1572,22 @@ export async function ingestEventLocked(
   // room's CURRENT chapter; 'before'/'evidence' rows are positioned by
   // their callers (commits 8/10) and never enter the live stream.
   const currentChapter = room.currentChapter;
+  // §3.4 (fix pass): a leave/reject by a LOCAL user whose membership is
+  // invite or knock may land on a CLOSED stay (the last joined local
+  // member left) — it does not reopen (current_chapter stays NULL); the
+  // event's era, its prevs' consumption, and the publish branch are the
+  // newest stay's
+  const archivedReject = currentChapter === null &&
+    pdu.type === 'm.room.member' &&
+    ((pdu.content ?? {}) as { membership?: unknown }).membership ===
+      'leave' &&
+    String(pdu.state_key ?? '').endsWith(':' + serverName()) &&
+    ['invite', 'knock'].includes(
+      (await membershipOf(roomId, String(pdu.state_key)))?.membership ?? '',
+    );
+  const eraChapter = archivedReject
+    ? await chapterHead(roomId)
+    : currentChapter;
 
   // ruling B expiry: lapsed placeholders leave on the room's next write
   if (opts.remote) {
@@ -1599,7 +1616,7 @@ export async function ingestEventLocked(
   for (const p of prevs) {
     parentSets.push(await parentStateAt(room.dbName, p.commitHash));
   }
-  const xbs = await extremities(room.dbName, roomId);
+  const xbs = await extremities(room.dbName, roomId, eraChapter ?? undefined);
   const xbHashes: string[] = [];
   for (const xb of xbs) {
     const h = await commitHashOf(roomId, xb.eventId);
@@ -1820,8 +1837,8 @@ export async function ingestEventLocked(
       );
       for (const p of prevs) {
         if (p.branch === null || !live.has(p.branch)) continue;
-        if (p.era !== currentChapter) continue;
-        await consumeBranchChain(c, roomId, p, currentChapter ?? '');
+        if (p.era !== eraChapter) continue;
+        await consumeBranchChain(c, roomId, p, eraChapter ?? '');
       }
     }
     return { commitHash, newBranch };
@@ -1869,7 +1886,7 @@ export async function ingestEventLocked(
             rejectedReason,
             opts.remote?.origin ?? null,
             Date.now(),
-            isLive ? currentChapter : null,
+            isLive ? eraChapter : null,
           ],
         );
         // grounded now (or re-flagged) — the waiting rows are spent
@@ -1896,7 +1913,7 @@ export async function ingestEventLocked(
             rejectedReason,
             opts.remote?.origin ?? null,
             Date.now(),
-            isLive ? currentChapter : null,
+            isLive ? eraChapter : null,
           ],
         );
       }
@@ -1983,10 +2000,10 @@ export async function ingestEventLocked(
   let publishedRows: StateRowInput[] = [];
   let current: StateMap = new Map();
   if (isLive) {
-    if (currentChapter === null) {
+    if (eraChapter === null) {
       throw new Error('E_ROOM_ARCHIVED: publish on an archived room');
     }
-    const after = await extremities(room.dbName, roomId);
+    const after = await extremities(room.dbName, roomId, eraChapter);
     const afterSets: StateMap[] = [];
     for (const xb of after) {
       const h = await commitHashOf(roomId, xb.eventId);
@@ -1996,7 +2013,7 @@ export async function ingestEventLocked(
     publishedRows = stateRowsOf(current, ancestry.pduById);
     stateHash = await publishCurrentState(
       room.dbName,
-      currentChapter,
+      eraChapter,
       publishedRows,
       `after ${eventId}`,
     );

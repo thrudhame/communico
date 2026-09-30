@@ -62,6 +62,7 @@ async function authorMember(
   sender: string,
   stateKey: string,
   content: Record<string, unknown>,
+  prevs?: string[],
 ): Promise<MembershipOpResult> {
   const room = await lookupRoom(roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
@@ -71,6 +72,7 @@ async function authorMember(
       state_key: stateKey,
       sender,
       content,
+      ...(prevs !== undefined ? { prev_events: prevs } : {}),
       origin_server_ts: Date.now(),
     });
     // M5b (r6, astra): an active room never carries a deletion marker
@@ -80,7 +82,11 @@ async function authorMember(
     return { roomId, eventId: res.event_id, created: true };
   } catch (e) {
     const msg = String(e);
-    if (msg.includes('M_STATE_REJECT') || msg.includes('M_AUTHCHAIN_REJECT')) {
+    if (
+      msg.includes('M_STATE_REJECT') || msg.includes('M_AUTHCHAIN_REJECT') ||
+      msg.includes('M_NO_CREATE') || msg.includes('E_ROOM_ARCHIVED')
+    ) {
+      // never a 500 on a client path (fix pass §3.4)
       throw new MatrixError(403, 'M_FORBIDDEN', msg);
     }
     throw e;
@@ -322,7 +328,21 @@ export async function leave(
   }
   const content: Record<string, unknown> = { membership: 'leave' };
   if (reason !== undefined) content.reason = reason;
-  return await authorMember(roomId, userId, userId, content);
+  // an invited user's reject lands even when the stay is closed (the
+  // last joined local member left): parent it on the newest stay's
+  // tips — the ingest carve-out lets it into the closed stay without
+  // reopening it (fix pass §3.4)
+  let prevs: string[] | undefined;
+  if (current?.membership === 'invite') {
+    const room = await lookupRoom(roomId);
+    const head = room === null ? null : await chapterHead(roomId);
+    if (room !== null && head !== null) {
+      prevs = (await extremities(room.dbName, roomId, head)).map((e) =>
+        e.eventId
+      );
+    }
+  }
+  return await authorMember(roomId, userId, userId, content, prevs);
 }
 
 const USER_ID_RE = /^@[^:\s]+:[^\s]+$/;
