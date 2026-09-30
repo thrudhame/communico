@@ -1,5 +1,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { createRoom, type CreateRoomOptions } from '#engine/room.ts';
+import { inviteRemote } from '#engine/federation/invites.ts';
+import { domainOf } from '#engine/federation/pdu.ts';
 import { serverName } from '#engine/config.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
 
@@ -51,6 +53,22 @@ export default async function (
       context.state.user as string,
       opts,
     );
+    // remote invitees: the /v2/invite dance per target (createRoom
+    // authored the local ones; the federation invite lands the event in
+    // the room with the invitee's signature merged)
+    for (const u of opts.invite ?? []) {
+      if (domainOf(u) !== serverName()) {
+        await inviteRemote(
+          res.roomId,
+          context.state.user as string,
+          u,
+          undefined,
+          {
+            isDirect: opts.isDirect,
+          },
+        );
+      }
+    }
     const out: Record<string, unknown> = { room_id: res.roomId };
     if (res.roomAlias !== undefined) out.room_alias = res.roomAlias;
     return out;

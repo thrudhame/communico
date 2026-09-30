@@ -12,7 +12,12 @@ import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { serverDb, withDb } from '#engine/db.ts';
 import { serverName, setConfigForTests } from '#engine/config.ts';
-import { createRoom, lookupRoom, membershipOf } from '#engine/room.ts';
+import {
+  createRoom,
+  lookupRoom,
+  membershipOf,
+  stateAtSeq,
+} from '#engine/room.ts';
 import { invite, join } from '#engine/membership.ts';
 import { listOutbox } from '#engine/federation/outbox.ts';
 import { startSender } from '#engine/federation/sender.ts';
@@ -592,5 +597,39 @@ Deno.test('rescind: the inviter’s leave for the out-of-band invite is a remote
     });
     assertEquals(rejected, 'rejected');
     assertEquals((await membershipOf(h.room.roomId, DEV))?.membership, 'leave');
+  });
+});
+
+Deno.test('inviter: createRoom fans remote invitees out over /v2/invite with is_direct', async () => {
+  await withHost(async (h) => {
+    const zoe = `@zoe:${h.fake.name}`;
+    const res = await matrix(
+      new Request('http://x/_matrix/client/v3/createRoom', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${DEV_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          preset: 'private_chat',
+          invite: [zoe],
+          is_direct: true,
+        }),
+      }),
+    );
+    assertEquals(res.status, 200);
+    const { room_id: roomId } = await res.json() as { room_id: string };
+    // the /v2/invite went to the fake with is_direct in the content
+    assertEquals(h.inviteRequests.length, 1);
+    const req = h.inviteRequests[0];
+    assertEquals((req.event as Json).state_key, zoe);
+    assertEquals(((req.event as Json).content as Json).is_direct, true);
+    // the event is in our room's state with is_direct
+    const rows = await stateAtSeq(roomId, null);
+    const invRow = rows?.find((r) =>
+      r.type === 'm.room.member' && r.stateKey === zoe
+    );
+    assert(invRow !== undefined, 'the invite is in the room state');
+    assertEquals((invRow.content as Json).is_direct, true);
   });
 });

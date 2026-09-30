@@ -127,6 +127,7 @@ export async function inviteRemote(
   sender: string,
   target: string,
   reason?: string,
+  opts?: { isDirect?: boolean },
 ): Promise<{ eventId: string }> {
   const remote = domainOf(target);
   const room = await lookupRoom(roomId);
@@ -137,6 +138,7 @@ export async function inviteRemote(
   // commit-hash branching makes a stale prev harmless
   const content: Record<string, unknown> = { membership: 'invite' };
   if (reason !== undefined) content.reason = reason;
+  if (opts?.isDirect === true) content.is_direct = true;
   const pdu = await author(roomId, {
     type: 'm.room.member',
     state_key: target,

@@ -357,8 +357,12 @@ export async function createRoom(
     });
   }
 
-  // 7. invites (sender: the creator); is_direct rides along when set
+  // 7. invites (sender: the creator); is_direct rides along when set.
+  //    LOCAL invitees only — a remote invitee is an /v2/invite dance
+  //    (federation/invites.ts), which the CALLER performs after the room
+  //    exists (the CS endpoint does; room.ts must not import federation)
   for (const u of invite) {
+    if (u.indexOf(':', 1) >= 0 && !u.endsWith(':' + serverName())) continue;
     await send('m.room.member', u, {
       membership: 'invite',
       ...(opts.isDirect === true ? { is_direct: true } : {}),
