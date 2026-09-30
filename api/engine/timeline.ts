@@ -4,8 +4,10 @@ import {
   eventIndexRow,
   lookupRoom,
   stateAtSeq,
+  stateBefore,
 } from './room.ts';
 import { canSeeEvent } from './visibility.ts';
+import { stateKeyOf } from './policy.ts';
 import {
   backfill,
   type Cursor,
@@ -177,7 +179,34 @@ export async function clientEventForRow(
       }
     }
   }
-  return clientEvent(pdu, row, viewer, redaction, thread, opts);
+  // unsigned.prev_content/prev_sender (CS _index.md "Room events"): the
+  // state event this one replaced — the same (type, state_key) in the
+  // state BEFORE it; is_direct and friends ride the previous content
+  let prev: { content: Record<string, unknown>; sender: string } | undefined;
+  if (pdu.state_key != null) {
+    const before = await stateBefore(row.room_id, row.event_id);
+    const prevId = before.get(stateKeyOf(String(pdu.type), pdu.state_key));
+    if (prevId !== undefined && prevId !== row.event_id) {
+      const prevIdx = await eventIndexRow(row.room_id, prevId);
+      const prevPdu = prevIdx !== null
+        ? await pduById(dbName, prevIdx.commit_hash, prevId)
+        : null;
+      if (prevPdu !== null) {
+        prev = {
+          content: (prevPdu.content ?? {}) as Record<string, unknown>,
+          sender: String(prevPdu.sender),
+        };
+      }
+    }
+  }
+  return clientEvent(
+    pdu,
+    row,
+    viewer,
+    redaction,
+    thread,
+    prev === undefined ? opts : { ...opts, prev },
+  );
 }
 
 // Maps a commit to the events row it added (the commit=event invariant:

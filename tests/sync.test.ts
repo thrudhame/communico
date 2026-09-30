@@ -287,3 +287,37 @@ Deno.test("sync: unsigned.membership flips at the viewer's own join", async () =
   }
   assert(seenJoin, "bob's join not in the timeline");
 });
+
+Deno.test('sync: unsigned.prev_content on a state change — the join after an invite carries the invite (is_direct)', async () => {
+  const alice = await registerTestUser('sy-pc-a', 'pw-sy-pc-a');
+  const bob = await registerTestUser('sy-pc-b', 'pw-sy-pc-b');
+  const A = alice.access_token!;
+  const B = bob.access_token!;
+  const roomId = await createRoom(A, {
+    preset: 'private_chat',
+    invite: [bob.user_id],
+    is_direct: true,
+  });
+  await call(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    token: B,
+    body: {},
+  });
+  const sync = await call('/_matrix/client/v3/sync?timeout=0', { token: B });
+  const timeline = (((sync.body.rooms as Json).join as Json)[roomId] as Json)
+    .timeline as Json;
+  const events = (timeline.events as Json[]) ?? [];
+  const join = events.find((e) =>
+    e.type === 'm.room.member' && e.state_key === bob.user_id &&
+    (e.content as Json).membership === 'join'
+  );
+  assert(join !== undefined, `bob's join in the timeline: ${events.length}`);
+  const unsigned = join.unsigned as Json;
+  assertEquals(
+    (unsigned.prev_content as Json).membership,
+    'invite',
+    'prev_content is the invite',
+  );
+  assertEquals((unsigned.prev_content as Json).is_direct, true);
+  assertEquals(unsigned.prev_sender, alice.user_id);
+});

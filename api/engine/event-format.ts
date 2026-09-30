@@ -71,7 +71,12 @@ export function clientEvent(
   viewer?: { userId: string; deviceId: string | null; membership?: string },
   redaction?: { roomVersion: string; event: Record<string, unknown> },
   thread?: ThreadBundle,
-  opts?: { omitRoomId?: boolean },
+  opts?: {
+    omitRoomId?: boolean;
+    // the state event this one replaced (unsigned.prev_content /
+    // prev_sender, CS _index.md "Room events") — the caller resolves it
+    prev?: { content: Record<string, unknown>; sender: string };
+  },
 ): Record<string, unknown> {
   const redacted = row.redacted_by != null && redaction !== undefined;
   const shown = redacted
@@ -111,6 +116,10 @@ export function clientEvent(
     unsigned.membership = viewer.membership;
   }
   if (redacted) unsigned.redacted_because = redaction!.event;
+  if (opts?.prev !== undefined) {
+    unsigned.prev_content = opts.prev.content;
+    unsigned.prev_sender = opts.prev.sender;
+  }
   if (thread !== undefined) {
     unsigned['m.relations'] = { 'm.thread': thread };
   }
