@@ -6,7 +6,11 @@
 /.media/
 # Operator overlay — the folder is tracked (config/.gitkeep); the TOML is not
 config/*.toml
+# Dev federation keypair (demo/setup.sh regenerates)
+config/federation.crt
+config/federation.key
 # Complement run artifacts (regenerable; BASELINE.md is the record)
 complement/baseline.jsonl
+complement/BASELINE.prev.md
 complement/work-*
 complement/.test-status

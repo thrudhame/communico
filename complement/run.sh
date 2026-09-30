@@ -23,6 +23,21 @@ command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
 [[ -d "$COMPLEMENT_SRC" ]] || { echo "Complement checkout missing: $COMPLEMENT_SRC" >&2; exit 1; }
 PINNED="$(git -C "$COMPLEMENT_SRC" rev-parse --short HEAD)"
 
+# the baseline must be traceable to the tree it ran from: a real checkout,
+# clean, and the header records exactly its commit (the committed 7dda306
+# header — a stale checkout under an rsync'd tree — is how the untraceable
+# baseline slipped through)
+if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "run.sh: $REPO_ROOT is not a git checkout — refusing (untraceable baseline)" >&2
+  exit 1
+fi
+TREE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
+  echo "run.sh: $REPO_ROOT has uncommitted changes — refusing (untraceable baseline):" >&2
+  git -C "$REPO_ROOT" status --short >&2
+  exit 1
+fi
+
 # 1. build the image
 echo ">> building $IMAGE"
 docker build -t "$IMAGE" -f complement/Dockerfile .
@@ -120,6 +135,6 @@ const out = `# Complement baseline — ${now}\n\n` +
   (failedTests.map((t) => `- ${t}`).join("\n") || "(none)") + `\n`;
 await Deno.writeTextFile("complement/BASELINE.md", out);
 console.log(`baseline: ${pass} pass-pkgs, ${fail} fail-pkgs, ${skip} skip-pkgs, ${failedTests.length} failing tests`);
-' "$PINNED" "$IMAGE" "$(git rev-parse --short HEAD)" "$TEST_STATUS"
+' "$PINNED" "$IMAGE" "$TREE_COMMIT" "$TEST_STATUS"
 rm -f complement/.test-status
 echo ">> wrote complement/BASELINE.md"
