@@ -598,28 +598,21 @@ export async function acceptRescind(
   const invite = await inviteFor(roomId, target);
   if (invite === null || invite.status === 'joined') return false;
   const sender = String(pdu.sender == null ? '' : pdu.sender);
-  let allowed: boolean;
-  if (domainOf(sender) === invite.origin) {
-    allowed = true;
-  } else {
-    // a sender with power in the stripped state (PL > 0 there)
-    const stripped = JSON.parse(invite.inviteRoomState) as Record<
-      string,
-      unknown
-    >[];
-    const pl = stripped.find((e) => e.type === 'm.room.power_levels');
-    const plUsers = ((pl == null || pl.content == null ? {} : pl.content) as {
-      users?: Record<string, number>;
-    }).users;
-    const users = plUsers == null ? {} : plUsers;
-    const senderPower = users[sender] == null ? 0 : users[sender];
-    allowed = senderPower > 0;
-  }
-  if (!allowed) return false;
+  // honor the rescission only from the original inviter (tuwunel
+  // handle_incoming_pdu.rs:296-299 — "Honor the rescission only from the
+  // original inviter"; the Complement non-invitee case: a powerful
+  // third party's kick does not rescind)
+  const stored = JSON.parse(invite.eventJson) as Record<string, unknown>;
+  const inviter = typeof stored.sender === 'string' ? stored.sender : null;
+  if (inviter === null || sender !== inviter) return false;
   await withDb(serverDb(), async (c) => {
     await c.query(
-      `UPDATE federation_invites SET status = 'rejected' WHERE room_id = $1 AND user_id = $2;`,
-      [roomId, target],
+      `UPDATE federation_invites SET status = 'rejected', event_json = $3 WHERE room_id = $1 AND user_id = $2;`,
+      [
+        roomId,
+        target,
+        JSON.stringify(pdu as unknown as Record<string, unknown>),
+      ],
     );
     await c.query(
       `INSERT INTO room_membership (room_id, user_id, membership, event_id, seq)

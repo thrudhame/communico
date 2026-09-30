@@ -641,6 +641,106 @@ Deno.test('rescind: the inviter’s leave for the out-of-band invite is a remote
   });
 });
 
+Deno.test('rescind: a third party’s leave does NOT rescind — only the original inviter’s (the non-invitee case)', async () => {
+  await withHost(async (h) => {
+    // the fake's zoe invites dev
+    const inviteEvent = await h.room.addEvent({
+      type: 'm.room.member',
+      sender: `@zoe:${h.fake.name}`,
+      state_key: DEV,
+      content: { membership: 'invite' },
+    });
+    const wire = h.room.wire(inviteEvent);
+    const eventId = String(inviteEvent.event_id);
+    const target = `/_matrix/federation/v2/invite/${
+      encodeURIComponent(h.room.roomId)
+    }/${encodeURIComponent(eventId)}`;
+    const obj: Json = {
+      method: 'PUT',
+      uri: target,
+      origin: h.fake.name,
+      destination: serverName(),
+      content: { room_version: '11', event: wire, invite_room_state: [] },
+    };
+    const signed = await signJson(
+      obj,
+      h.fake.name,
+      h.fake.keyId,
+      h.fake.kp.privateKey,
+    );
+    const sig = (signed.signatures as Record<string, Record<string, string>>)[
+      h.fake.name
+    ][h.fake.keyId];
+    const res = await matrix(
+      new Request(`http://x${target}`, {
+        method: 'PUT',
+        headers: {
+          Authorization:
+            `X-Matrix origin="${h.fake.name}",key="${h.fake.keyId}",sig="${sig}"`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(obj.content),
+      }),
+    );
+    assertEquals(res.status, 200);
+    // a leave for dev from RUDY (not the inviter) — honored by nobody
+    const kick = await h.room.addEvent({
+      type: 'm.room.member',
+      sender: `@rudy:${h.fake.name}`,
+      state_key: DEV,
+      content: { membership: 'leave' },
+    });
+    const txnPath = `/_matrix/federation/v1/send/non-invitee-txn`;
+    const txnBody = {
+      origin: h.fake.name,
+      origin_server_ts: Date.now(),
+      pdus: [h.room.wire(kick)],
+    };
+    const txnObj: Json = {
+      method: 'PUT',
+      uri: txnPath,
+      origin: h.fake.name,
+      destination: serverName(),
+      content: txnBody,
+    };
+    const txnSigned = await signJson(
+      txnObj,
+      h.fake.name,
+      h.fake.keyId,
+      h.fake.kp.privateKey,
+    );
+    const txnSig =
+      (txnSigned.signatures as Record<string, Record<string, string>>)[
+        h.fake.name
+      ][h.fake.keyId];
+    const sendRes = await matrix(
+      new Request(`http://x${txnPath}`, {
+        method: 'PUT',
+        headers: {
+          Authorization:
+            `X-Matrix origin="${h.fake.name}",key="${h.fake.keyId}",sig="${txnSig}"`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(txnBody),
+      }),
+    );
+    assertEquals(sendRes.status, 200);
+    // the invite survives: still pending, still invited
+    const pending = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        'SELECT status FROM federation_invites WHERE room_id = $1 AND user_id = $2;',
+        [h.room.roomId, DEV],
+      );
+      return String(r.rows[0].status);
+    });
+    assertEquals(pending, 'pending');
+    assertEquals(
+      (await membershipOf(h.room.roomId, DEV))?.membership,
+      'invite',
+    );
+  });
+});
+
 Deno.test('inviter: createRoom fans remote invitees out over /v2/invite with is_direct', async () => {
   await withHost(async (h) => {
     const zoe = `@zoe:${h.fake.name}`;
