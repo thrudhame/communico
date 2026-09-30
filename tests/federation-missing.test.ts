@@ -24,7 +24,11 @@ import {
   resetRoom,
 } from './util.ts';
 import { type FakeServer, startFakeServer } from './federation/fake-server.ts';
-import { remoteEvent, remoteJoin } from './federation/room-events.ts';
+import {
+  createIdOf,
+  remoteEvent,
+  remoteJoin,
+} from './federation/room-events.ts';
 import type { Pdu } from '#engine/pdu.ts';
 
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
@@ -395,5 +399,64 @@ Deno.test('missing: expiry removes the placeholder (a later delivery is a first 
     const swept = await sweepExpiredPlaceholders(ROOM);
     assertEquals(swept, 1);
     assertEquals(await groundingOf(ROOM, String(orphan.event_id)), 'unknown');
+  });
+});
+
+Deno.test('missing: a pulled event with its own missing prev waits as a placeholder; /state_ids names the gap tip behind it', async () => {
+  await withSetup(async ({ fake, answer, stateIds, eventAnswers }) => {
+    const tip = await latestExtremityEventId(ROOM);
+    // the chain: pushed → near → far → tip (held); the answer carries
+    // only `near`, whose own prev (far) is missing
+    const far = await remoteMsg(fake, 'far', [tip], { depth: 50 });
+    const near = await remoteMsg(fake, 'near', [String(far.event_id)], {
+      depth: 51,
+    });
+    answer.events = [near];
+    // a real /state_ids answer carries the room's state rows (create +
+    // the sender's member — spec rule 5 wants the sender joined); both
+    // are held, their rows land in the pack's materialized state
+    const createId = await createIdOf(ROOM);
+    const currentRows = await stateAtSeq(ROOM, null);
+    const rudyJoinId = currentRows === null
+      ? null
+      : currentRows.find((r) =>
+        r.type === 'm.room.member' && r.stateKey === `@rudy:${fake.name}`
+      )?.eventId ?? null;
+    assert(rudyJoinId !== null, "rudy's join is in the state");
+    stateIds.set(String(far.event_id), {
+      pdu_ids: [createId, rudyJoinId],
+      auth_chain_ids: [],
+    });
+    eventAnswers.set(String(far.event_id), far);
+    const pushed = await remoteMsg(fake, 'pushed', [String(near.event_id)], {
+      depth: 52,
+    });
+    const stateIdRequests: string[] = [];
+    const origGet = stateIds.get.bind(stateIds);
+    stateIds.get = (k: string) => {
+      stateIdRequests.push(k);
+      return origGet(k);
+    };
+    await fetchMissingPrevs(ROOM, pushed, fake.name, {
+      until: Date.now() + 8000,
+    });
+    // near waited as a placeholder, never dropped; the /state_ids call
+    // named the FAR event (the gap tip), never the held one
+    assert(
+      stateIdRequests.includes(String(far.event_id)),
+      `state_ids for far: ${JSON.stringify(stateIdRequests)}`,
+    );
+    assert(
+      !stateIdRequests.includes(String(near.event_id)),
+      `state_ids never for the held near: ${JSON.stringify(stateIdRequests)}`,
+    );
+    // far packed, then the chain grounds through it (the re-check
+    // driver runs after the pack's lock releases)
+    await waitGrounding(String(far.event_id), 'own');
+    await waitGrounding(String(near.event_id), 'own');
+    await ingestEvent(ROOM, pushed, {
+      remote: { origin: fake.name, position: 'after' },
+    });
+    assertEquals(await groundingOf(ROOM, String(pushed.event_id)), 'own');
   });
 });

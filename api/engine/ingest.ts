@@ -1159,6 +1159,19 @@ export async function ingestPrevWithFetchedStateLocked(
         (rejectRule !== null ? ' (rule ' + rejectRule + ')' : ''),
     );
   }
+  // ruling B: the pack grounds the prev — its waiters re-check (the same
+  // tail the plain ingest path runs; without it a pack's children wait
+  // for their expiry)
+  if (!rejected || rejectedReason === 'auth' || rejectedReason === 'state') {
+    const hasWaiters = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        'SELECT 1 FROM event_index_waiting WHERE room_id = $1 AND missing_prev = $2 LIMIT 1;',
+        [roomId, eventId],
+      );
+      return r.rows.length > 0;
+    });
+    if (hasWaiters) void queuePlaceholderRechecks(roomId);
+  }
   return { event_id: eventId, commit_hash: prevCommit };
 }
 

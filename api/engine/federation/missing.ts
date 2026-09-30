@@ -19,10 +19,11 @@ import {
   ingestEvent,
   ingestPrevWithFetchedStateLocked,
   onEventApplied,
+  storeUngroundedLocked,
   storeUnverifiableLocked,
   withRoomLock,
 } from '#engine/ingest.ts';
-import { extremities, lookupRoom } from '#engine/room.ts';
+import { extremities, groundingOf, lookupRoom } from '#engine/room.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { federationRequest } from './client.ts';
 import type { StateRowInput } from '#engine/materialize.ts';
@@ -103,7 +104,7 @@ async function doFetch(
       unlisten();
     }
   }
-  let still = await unknownPrevIds(
+  const still = await unknownPrevIds(
     roomId,
     pdu.prev_events == null ? [] : pdu.prev_events,
   );
@@ -156,8 +157,17 @@ async function doFetch(
             await ingestEvent(roomId, ev, {
               remote: { origin, position: 'after' },
             });
-          } catch {
-            // dropped — its descendants stay ungrounded
+          } catch (e) {
+            if (String(e).includes('M_UNKNOWN_PREV')) {
+              // a pulled event whose own prevs are missing is not dropped
+              // — it waits as a placeholder, and step 3 chases the gap
+              // tip behind it (Synapse's pulled-event model); only
+              // format/signature failures drop (…BadJSONForRoomVersion6)
+              await withRoomLock(roomId, async () => {
+                await storeUngroundedLocked(roomId, ev, origin);
+              });
+            }
+            // else: dropped — its descendants stay ungrounded
           }
         }
       } catch {
@@ -165,19 +175,60 @@ async function doFetch(
       }
     }
   }
-  still = await unknownPrevIds(
-    roomId,
-    pdu.prev_events == null ? [] : pdu.prev_events,
-  );
-  if (still.length === 0) return;
-
-  // 3. /state_ids + /event for the still-missing prevs (at most
-  //    missinglimit state fetches per pushed PDU, the whole chain inside
-  //    the transaction's budget)
-  for (const prevId of still) {
+  // 3. /state_ids + /event for the GAP TIPS (at most missinglimit state
+  //    fetches per pushed PDU, the whole chain inside the transaction's
+  //    budget): a prev we HOLD as a placeholder is never /state_ids'd —
+  //    the missing point behind it is (Synapse's pulled-event model;
+  //    TestCorruptedAuthChain pins the far event, not the near one)
+  const gapTips: string[] = [];
+  const chased = new Set<string>();
+  const chase = async (ids: string[]): Promise<void> => {
+    for (const id of ids) {
+      if (chased.has(id) || gapTips.length >= fed.missinglimit) continue;
+      chased.add(id);
+      const g = await groundingOf(roomId, id);
+      if (g === 'own') continue;
+      if (g === 'unknown') {
+        gapTips.push(id);
+      } else {
+        await chase(await prevIdsOf(roomId, id));
+      }
+    }
+  };
+  await chase(pdu.prev_events == null ? [] : pdu.prev_events);
+  for (const tip of gapTips) {
     if (budgetLeft() <= 0) return;
-    await fetchPrevWithState(roomId, prevId, origin, budget);
+    await fetchPrevWithState(roomId, tip, origin, budget);
   }
+}
+
+// the event's own prev ids, read from its commit (a placeholder's chain
+// is what the chase walks)
+async function prevIdsOf(
+  roomId: string,
+  eventId: string,
+): Promise<string[]> {
+  const room = await lookupRoom(roomId);
+  if (room === null) return [];
+  const commit = await withDb(serverDb(), async (c) => {
+    const r = await c.query(
+      'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
+      [roomId, eventId],
+    );
+    return r.rows.length === 0 ? null : String(r.rows[0].commit_hash);
+  });
+  if (commit === null) return [];
+  return await withDb(room.dbName, async (c) => {
+    const r = await c.query(
+      `SELECT prev_events FROM events AS OF '${commit}' WHERE event_id = $1;`,
+      [eventId],
+    );
+    if (r.rows.length === 0) return [];
+    const raw = r.rows[0].prev_events;
+    return Array.isArray(raw)
+      ? raw.map(String)
+      : (JSON.parse(String(raw)) as unknown[]).map(String);
+  });
 }
 
 async function fetchPrevWithState(
