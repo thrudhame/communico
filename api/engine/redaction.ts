@@ -33,7 +33,12 @@ export async function redactEvent(
   const targetPdu = targetIdx
     ? await pduById(room.dbName, targetIdx.commit_hash, targetEventId)
     : null;
-  if (!targetPdu) {
+  // an unknown target does not stop the redaction: it is authored and
+  // federated, and the room's servers apply it where it is held (the
+  // ingest path stores the redaction with a waiting row — ruling B;
+  // TestFederationRedactSendsWithoutEvent). The "own event" discount is
+  // unprovable then — the PL redact level applies
+  if (targetPdu === null && targetIdx !== null) {
     throw new MatrixError(
       404,
       'M_NOT_FOUND',
@@ -70,7 +75,7 @@ export async function redactEvent(
     rulebook.spec,
   );
   const eventLevel = requiredLevel('m.room.redaction', undefined, pl);
-  const required = targetPdu.sender === sender
+  const required = targetPdu !== null && targetPdu.sender === sender
     ? eventLevel
     : Math.max(eventLevel, namedLevel('redact', pl));
   if (senderLevel < required) {

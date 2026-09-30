@@ -152,3 +152,41 @@ Deno.test('redact: a non-author below the redact level gets 403; own event needs
   );
   assertEquals(ok.status, 200);
 });
+
+Deno.test('redact: an unknown target is authored and federated, not 404 (TestFederationRedactSendsWithoutEvent)', async () => {
+  const alice = await registerTestUser('red-u', 'pw-red-u');
+  const tok = alice.access_token!;
+  const roomRes = await call('/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    token: tok,
+    body: {},
+  });
+  const roomId = roomRes.body.room_id as string;
+
+  // an event id we do not hold (a remote's event, or its v1-style form)
+  const unknownId = '$does-not-exist:anywhere.test';
+  const res = await call(
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/redact/${
+      encodeURIComponent(unknownId)
+    }/ru1`,
+    { method: 'PUT', token: tok, body: { reason: 'moderation' } },
+  );
+  assertEquals(res.status, 200, JSON.stringify(res.body));
+  const redactionId = res.body.event_id as string;
+  assert(typeof redactionId === 'string' && redactionId.length > 0);
+
+  // the redaction event exists in the room, targeting the unknown id
+  const fetched = await call(
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/event/${
+      encodeURIComponent(redactionId)
+    }`,
+    { token: tok },
+  );
+  assertEquals(fetched.status, 200);
+  assertEquals(fetched.body.type, 'm.room.redaction');
+  assertEquals(
+    (fetched.body.content as Json).redacts,
+    unknownId,
+    'v11 carries redacts under content',
+  );
+});
