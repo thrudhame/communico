@@ -301,13 +301,17 @@ state.
 
 ## Rooms over federation (M5b)
 
-- **The room database is a book of chapters, no `main`.** Branches are
+- **The room database is a book of chapters; `main` is the system
+  branch.** Branches are
   `chapter0, chapter1, chapter2, …` in time order: **even = history**
   (grows toward the past; root = the most recent history event, each
   commit the event-parent of the one below so pages have no seam),
   **odd = a stay** (grows toward the future). A stay and the history
   chapter before it are created together at join; a locally created
   room starts as `chapter0` (empty — nothing preceded us) + `chapter1`.
+  `main` exists but holds only the schema genesis commit — never
+  content (the P5 ruling: it cannot be deleted on a running Doltgres,
+  so it is the room's system branch, not a content one).
   `room_directory.current_chapter` names the live stay; the last local
   leave closes it (`NULL`, archived — still readable). Re-joining
   allocates the next pair.
