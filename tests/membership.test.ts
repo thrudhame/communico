@@ -141,3 +141,39 @@ Deno.test('A3: kick never-present → 403; kick left → 403 (rule 4.5.5)', asyn
   assertEquals(left.status, 403);
   assertEquals(left.errcode, 'M_FORBIDDEN');
 });
+
+Deno.test('A4: unban is the leave-from-ban — banned target unbanned, then invite + join work; not-banned → 400', async () => {
+  await resetRoom(ROOM);
+  await createRoom(ROOM, '@dev:localhost', {
+    roomVersion: '11',
+    preset: 'public_chat',
+  });
+  const { unban } = await import('#engine/membership.ts');
+  const { membershipOf } = await import('#engine/room.ts');
+  await join(ROOM, '@bob:localhost');
+  await ban(ROOM, '@dev:localhost', '@bob:localhost', 'out');
+  assertEquals((await membershipOf(ROOM, '@bob:localhost'))?.membership, 'ban');
+  // not-banned → 400 M_BAD_STATE
+  const err = await assertRejects(() =>
+    unban(ROOM, '@dev:localhost', '@dev:localhost')
+  );
+  assertEquals((err as MatrixError).status, 400);
+  assertEquals((err as MatrixError).errcode, 'M_BAD_STATE');
+  // the unban: a leave from ban
+  await unban(ROOM, '@dev:localhost', '@bob:localhost', 'back');
+  assertEquals(
+    (await membershipOf(ROOM, '@bob:localhost'))?.membership,
+    'leave',
+  );
+  // invite + join work again (the TestUnbanViaInvite flow)
+  await invite(ROOM, '@dev:localhost', '@bob:localhost');
+  assertEquals(
+    (await membershipOf(ROOM, '@bob:localhost'))?.membership,
+    'invite',
+  );
+  await join(ROOM, '@bob:localhost');
+  assertEquals(
+    (await membershipOf(ROOM, '@bob:localhost'))?.membership,
+    'join',
+  );
+});

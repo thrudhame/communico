@@ -393,6 +393,28 @@ export async function ban(
   return await authorMember(roomId, sender, target, content);
 }
 
+// unban: the spec's leave-from-ban (banning.yaml:90-135) — a member-leave
+// for the target, authored by the sender (kick power, rulebook decides).
+// The target must be banned (400 M_BAD_STATE otherwise, Synapse's shape).
+export async function unban(
+  roomId: string,
+  sender: string,
+  target: string,
+  reason?: string,
+): Promise<MembershipOpResult> {
+  const current = await membershipOf(roomId, target);
+  if (current?.membership !== 'ban') {
+    throw new MatrixError(
+      400,
+      'M_BAD_STATE',
+      `${target} is not banned from ${roomId}`,
+    );
+  }
+  const content: Record<string, unknown> = { membership: 'leave' };
+  if (reason !== undefined) content.reason = reason;
+  return await authorMember(roomId, sender, target, content);
+}
+
 // Profile change → member events (band C D5; spec v1.16 client-server-api
 // _index.md:3773-3795 "Events on Change of Profile Information": an
 // m.room.member join event goes to every room the user is joined to).
