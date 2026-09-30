@@ -647,7 +647,12 @@ export async function ingestPrechecks(
   //    hashOk=false -> authchain-reject is kept for local events only.
   //    The v11 wire form has no `event_id` field (it is the derived
   //    reference hash, transported out-of-band); strip our annotation
-  //    before hashing, as at signing time.
+  //    before hashing, as at signing time. A hash that cannot be
+  //    COMPUTED at all (content that does not canonicalize — floats) is
+  //    not a mismatch: the event is malformed and dropped, never
+  //    redact-accepted (…BadJSONForRoomVersion6 — Synapse discards the
+  //    bad data; the signature over the stripped form would otherwise
+  //    verify and the bad event would ground its children)
   let hashOk = false;
   try {
     const { event_id: _drop, ...noId } = pdu as unknown as Record<
@@ -656,8 +661,10 @@ export async function ingestPrechecks(
     >;
     void _drop;
     hashOk = (await contentHashOf(noId)) === pdu.hashes?.sha256;
-  } catch {
-    hashOk = false;
+  } catch (e) {
+    throw new Error(
+      'M_BAD_EVENT: content cannot be canonicalized — ' + String(e),
+    );
   }
   if (!hashOk && opts.remote) {
     const redacted = redact(
