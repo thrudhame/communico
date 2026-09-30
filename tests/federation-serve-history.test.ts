@@ -9,7 +9,7 @@ import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { withDb } from '#engine/db.ts';
 import { serverName } from '#engine/config.ts';
-import { createRoom } from '#engine/room.ts';
+import { createRoom, stateAtSeq } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
 import { wireFederationTransport } from '#engine/federation/client.ts';
 import { signJson } from '#engine/signing-primitives.js';
@@ -20,11 +20,16 @@ import {
 } from './util.ts';
 import { makeRoomServer } from './federation/fake-room.ts';
 import { seedServer } from './federation/doc-helper.ts';
-import { remoteJoin } from './federation/room-events.ts';
+import {
+  createIdOf,
+  remoteEvent,
+  remoteJoin,
+} from './federation/room-events.ts';
 
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 const ROOM = '!fed-serve:localhost';
 const ROOM_JOINED = '!fed-serve-joined:localhost';
+const ROOM_REC = '!fed-serve-rec:localhost';
 
 type Json = Record<string, unknown>;
 const srv = await makeRoomServer('remote.test');
@@ -300,4 +305,110 @@ Deno.test('serve: not-in-room 403 and the visibility filter', async () => {
   );
   void srv;
   void withDb;
+});
+
+Deno.test('serve: /event_auth returns the recursive chain (depth > 1)', async () => {
+  await resetFederationTables();
+  await seedServer(srv);
+  wireFederationTransport();
+  const tip = await setupRoom(ROOM_REC);
+  const rudy = `@rudy:${srv.name}`;
+  // explicit auth chains (remoteEvent's default is [create] only)
+  const createId = await createIdOf(ROOM_REC);
+  const currentRows = await stateAtSeq(ROOM_REC, null);
+  const plId = currentRows === null
+    ? null
+    : currentRows.find((r) => r.type === 'm.room.power_levels')?.eventId ??
+      null;
+  assert(createId !== null && plId !== null, 'create + PL ids');
+  // rudy joins, leaves, rejoins — the rejoin's chain must recurse through
+  // the leave to the first join (and to dev's member through both)
+  const join1 = await remoteEvent(ROOM_REC, srv, '11', {
+    type: 'm.room.member',
+    sender: rudy,
+    state_key: rudy,
+    content: { membership: 'join' },
+    prev_events: [tip],
+    auth_events: [createId, plId],
+  });
+  await ingestEvent(ROOM_REC, join1, {
+    remote: { origin: srv.name, position: 'after' },
+  });
+  const join1Id = String(join1.event_id);
+  const leave = await remoteEvent(ROOM_REC, srv, '11', {
+    type: 'm.room.member',
+    sender: rudy,
+    state_key: rudy,
+    content: { membership: 'leave' },
+    prev_events: [join1Id],
+    auth_events: [createId, plId, join1Id],
+  });
+  await ingestEvent(ROOM_REC, leave, {
+    remote: { origin: srv.name, position: 'after' },
+  });
+  const leaveId = String(leave.event_id);
+  const join2 = await remoteEvent(ROOM_REC, srv, '11', {
+    type: 'm.room.member',
+    sender: rudy,
+    state_key: rudy,
+    content: { membership: 'join' },
+    prev_events: [leaveId],
+    auth_events: [createId, plId, leaveId],
+  });
+  await ingestEvent(ROOM_REC, join2, {
+    remote: { origin: srv.name, position: 'after' },
+  });
+  const join2Id = String(join2.event_id);
+  // a join_rules change AFTER the rejoin — never in the rejoin's chain
+  const jr = await author(ROOM_REC, {
+    type: 'm.room.join_rules',
+    state_key: '',
+    sender: '@dev:localhost',
+    content: { join_rule: 'invite' },
+    prev_events: [join2Id],
+  });
+  await ingestEvent(ROOM_REC, jr);
+
+  const auth = await fedGet(
+    `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM_REC)}/${
+      encodeURIComponent(join2Id)
+    }`,
+  );
+  assertEquals(auth.status, 200);
+  const chain = auth.body.auth_chain as Json[];
+  // the closure: create, PL, dev's member, the first join, the leave —
+  // never the seed (join2) and never the later join_rules change
+  assertEquals(chain.length, 5, JSON.stringify(chain.map((p) => p.type)));
+  const isMemberFor = (p: Json, who: string, ms: string) =>
+    p.type === 'm.room.member' && p.state_key === who &&
+    (p.content as Json).membership === ms;
+  assertEquals(
+    chain.filter((p) => p.type === 'm.room.create').length,
+    1,
+    'one create',
+  );
+  assertEquals(
+    chain.filter((p) => p.type === 'm.room.power_levels').length,
+    1,
+    'one power_levels',
+  );
+  assertEquals(
+    chain.filter((p) => isMemberFor(p, '@dev:localhost', 'join')).length,
+    1,
+    "dev's member, through every branch of the chain",
+  );
+  assertEquals(
+    chain.filter((p) => isMemberFor(p, rudy, 'join')).length,
+    1,
+    'the first join (the seed is excluded)',
+  );
+  assertEquals(
+    chain.filter((p) => isMemberFor(p, rudy, 'leave')).length,
+    1,
+    'the leave, recursed through',
+  );
+  assert(
+    !chain.some((p) => p.type === 'm.room.join_rules'),
+    'the later join_rules change is not in the chain',
+  );
 });

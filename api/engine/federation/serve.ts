@@ -85,6 +85,33 @@ async function pduAt(
   });
 }
 
+// Load the full auth closure of the seeds: authChain's store is
+// synchronous, so the recursion must find every event already loaded —
+// with only the seeds in the store the walk stops at depth 1 (the
+// Complement event_auth cases: 4 events where the chain is 6, 3 where
+// it is >100)
+async function loadAuthClosure(
+  roomId: string,
+  seedIds: string[],
+): Promise<Map<string, Pdu>> {
+  const pduById = new Map<string, Pdu>();
+  let frontier = [...seedIds];
+  while (frontier.length > 0) {
+    const next: string[] = [];
+    for (const id of frontier) {
+      if (pduById.has(id)) continue;
+      const pdu = await pduAt(roomId, id);
+      if (pdu === null) continue;
+      pduById.set(id, pdu);
+      for (const a of pdu.auth_events == null ? [] : pdu.auth_events) {
+        if (!pduById.has(a)) next.push(a);
+      }
+    }
+    frontier = next;
+  }
+  return pduById;
+}
+
 // visibleToServer per the header: 'full' | 'redacted'
 async function visibleToServer(
   roomId: string,
@@ -153,23 +180,13 @@ export async function serveState(
   const room = await lookupRoom(roomId);
   if (room === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
   const before = await stateBefore(roomId, eventId);
-  const pduById = new Map<string, Pdu>();
   const ids = [...before.values()];
-  for (const id of ids) {
-    const pdu = await pduAt(roomId, id);
-    if (pdu !== null) pduById.set(id, pdu);
-  }
+  const pduById = await loadAuthClosure(roomId, ids);
   const store = {
     get: (id: string) => pduById.get(id),
     isRejected: () => false,
   };
   const chain = authChain(ids, store);
-  for (const id of chain) {
-    if (!pduById.has(id)) {
-      const pdu = await pduAt(roomId, id);
-      if (pdu !== null) pduById.set(id, pdu);
-    }
-  }
   return {
     pdus: ids
       .map((id) => pduById.get(id))
@@ -197,12 +214,8 @@ export async function serveStateIds(
     throw new MatrixError(404, 'M_NOT_FOUND', eventId);
   }
   const before = await stateBefore(roomId, eventId);
-  const pduById = new Map<string, Pdu>();
   const ids = [...before.values()];
-  for (const id of ids) {
-    const pdu = await pduAt(roomId, id);
-    if (pdu !== null) pduById.set(id, pdu);
-  }
+  const pduById = await loadAuthClosure(roomId, ids);
   const store = {
     get: (id: string) => pduById.get(id),
     isRejected: () => false,
@@ -250,7 +263,7 @@ export async function serveEventAuth(
   if (room === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
   const pdu = await pduAt(roomId, eventId);
   if (pdu === null) throw new MatrixError(404, 'M_NOT_FOUND', eventId);
-  const pduById = new Map<string, Pdu>();
+  const pduById = await loadAuthClosure(roomId, [eventId]);
   pduById.set(eventId, pdu);
   const store = {
     get: (id: string) => pduById.get(id),
@@ -259,12 +272,8 @@ export async function serveEventAuth(
   const chain = authChain([eventId], store);
   const out: Pdu[] = [];
   for (const id of chain) {
-    const heldPdu = pduById.get(id);
-    const p = heldPdu == null ? await pduAt(roomId, id) : heldPdu;
-    if (p !== null) {
-      pduById.set(id, p);
-      out.push(p);
-    }
+    const p = pduById.get(id);
+    if (p !== undefined) out.push(p);
   }
   return {
     auth_chain: out.map((p) => toWire(p, room.roomVersion)),
