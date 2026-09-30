@@ -47,7 +47,7 @@ async function stateKey(
   );
 }
 
-Deno.test('createRoom: presets set join_rules/history_visibility/guest_access', async () => {
+Deno.test('createRoom: presets set join_rules/history_visibility (guest_access never preset-emitted)', async () => {
   const alice = await registerTestUser('cr-preset', 'pw-cr-preset');
   const tok = alice.access_token!;
 
@@ -64,9 +64,9 @@ Deno.test('createRoom: presets set join_rules/history_visibility/guest_access', 
   assertEquals((await stateKey(tok, pubId, 'm.room.history_visibility')).body, {
     history_visibility: 'shared',
   });
-  assertEquals((await stateKey(tok, pubId, 'm.room.guest_access')).body, {
-    guest_access: 'forbidden',
-  });
+  // no guest_access event — 'forbidden' is the default, never preset-
+  // emitted (Synapse room.py; the spec table's column is the default)
+  assertEquals((await stateKey(tok, pubId, 'm.room.guest_access')).status, 404);
 
   // default preset: visibility absent -> private_chat
   const priv = await call('/_matrix/client/v3/createRoom', {
@@ -78,9 +78,10 @@ Deno.test('createRoom: presets set join_rules/history_visibility/guest_access', 
   assertEquals((await stateKey(tok, privId, 'm.room.join_rules')).body, {
     join_rule: 'invite',
   });
-  assertEquals((await stateKey(tok, privId, 'm.room.guest_access')).body, {
-    guest_access: 'can_join',
-  });
+  assertEquals(
+    (await stateKey(tok, privId, 'm.room.guest_access')).status,
+    404,
+  );
 
   // visibility: public without a preset -> public_chat
   const vis = await call('/_matrix/client/v3/createRoom', {

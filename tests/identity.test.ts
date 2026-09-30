@@ -52,7 +52,7 @@ Deno.test('unified identity: content-hash event ids for every room version', asy
     // deno-lint-ignore no-explicit-any
     return r.rows as any[];
   });
-  assertEquals(rows.length, 8);
+  assertEquals(rows.length, 7);
   for (const row of rows) {
     assertMatch(String(row.event_id), ID_SHAPE);
     assertNotEquals(String(row.event_id), '$' + String(row.commit_hash));
@@ -83,15 +83,15 @@ Deno.test('unified identity: content-hash event ids for every room version', asy
       );
     }
   }
-  assertEquals(chunk.length, 8);
+  assertEquals(chunk.length, 7);
   for (const pdu of chunk) {
     assertEquals(await eventIdFor(pdu, '11'), pdu.event_id);
   }
 
-  // messages returns them newest-first: msg2, msg1, guest_access,
-  // history_visibility, join_rules, PL, member, create
+  // messages returns them newest-first: msg2, msg1, history_visibility,
+  // join_rules, PL, member, create
   assertEquals(chunk[0].event_id, ids[2]);
   assertEquals(chunk[1].event_id, ids[1]);
   assertEquals(chunk[2].event_id, ids[0]);
-  assertEquals(chunk[7].event_id, createEventId);
+  assertEquals(chunk[6].event_id, createEventId);
 });

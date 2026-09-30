@@ -17,7 +17,7 @@ Deno.test('engine invariant: commit = event', async () => {
   const room = (await lookupRoom(ROOM))!;
   const dbName = room.dbName;
 
-  // first message chains off the CURRENT extremity (the guest_access
+  // first message chains off the CURRENT extremity (the history_visibility
   // event — the M4 genesis tail)
   let prev = await latestExtremityEventId(ROOM);
   assertEquals(typeof prev, 'string');
@@ -38,8 +38,8 @@ Deno.test('engine invariant: commit = event', async () => {
   }
 
   // commit count: 2 implicit init commits (baseline recorded in
-  // RESULTS.md) + schema genesis + 6 M4 genesis events (create, member,
-  // PL, join_rules, history_visibility, guest_access) + 3 messages = 12
+  // RESULTS.md) + schema genesis + 5 M4 genesis events (create, member,
+  // PL, join_rules, history_visibility) + 3 messages = 11
   await withDb(dbName, async (c) => {
     const xb = await c.query(
       "SELECT name FROM dolt.branches WHERE name LIKE 'x%';",
@@ -47,7 +47,7 @@ Deno.test('engine invariant: commit = event', async () => {
     assertEquals(xb.rows.length, 1, 'exactly ONE x* extremity branch');
     await c.query(`SELECT DOLT_CHECKOUT('${xb.rows[0].name}');`);
     const cnt = await c.query('SELECT count(*) AS c FROM dolt.log;');
-    assertEquals(Number(cnt.rows[0].c), 12);
+    assertEquals(Number(cnt.rows[0].c), 11);
   });
 
   // each event commit diffs exactly 1 added events row (9 event commits:
@@ -60,7 +60,7 @@ Deno.test('engine invariant: commit = event', async () => {
     // deno-lint-ignore no-explicit-any
     return r.rows.map((row: any) => String(row.commit_hash));
   });
-  assertEquals(commits.length, 9);
+  assertEquals(commits.length, 8);
   await withDb(dbName, async (c) => {
     for (const h of commits) {
       const d = await c.query(
@@ -75,7 +75,7 @@ Deno.test('engine invariant: commit = event', async () => {
     }
   });
 
-  // messages newest-first (seq order): msg3, msg2, msg1, guest_access,
+  // messages newest-first (seq order): msg3, msg2, msg1, history_visibility,
   // history_visibility, join_rules, power_levels, member, create
   // deno-lint-ignore no-explicit-any
   const chunk: any[] = [];
@@ -94,16 +94,15 @@ Deno.test('engine invariant: commit = event', async () => {
       );
     }
   }
-  assertEquals(chunk.length, 9);
+  assertEquals(chunk.length, 8);
   assertEquals(chunk[0].event_id, ids[2]);
   assertEquals(chunk[1].event_id, ids[1]);
   assertEquals(chunk[2].event_id, ids[0]);
-  assertEquals(chunk[3].type, 'm.room.guest_access');
-  assertEquals(chunk[4].type, 'm.room.history_visibility');
-  assertEquals(chunk[5].type, 'm.room.join_rules');
-  assertEquals(chunk[6].type, 'm.room.power_levels');
-  assertEquals(chunk[7].event_id, memberEventId);
-  assertEquals(chunk[8].event_id, createEventId);
+  assertEquals(chunk[3].type, 'm.room.history_visibility');
+  assertEquals(chunk[4].type, 'm.room.join_rules');
+  assertEquals(chunk[5].type, 'm.room.power_levels');
+  assertEquals(chunk[6].event_id, memberEventId);
+  assertEquals(chunk[7].event_id, createEventId);
 
   // single extremity
   const xb = await extremities(dbName, ROOM);

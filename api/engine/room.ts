@@ -329,12 +329,10 @@ export async function createRoom(
         ? [
           ['m.room.join_rules', { join_rule: 'public' }],
           ['m.room.history_visibility', { history_visibility: 'shared' }],
-          ['m.room.guest_access', { guest_access: 'forbidden' }],
         ]
         : [
           ['m.room.join_rules', { join_rule: 'invite' }],
           ['m.room.history_visibility', { history_visibility: 'shared' }],
-          ['m.room.guest_access', { guest_access: 'can_join' }],
         ];
     for (const [type, content] of presetEvents) await send(type, '', content);
   }
