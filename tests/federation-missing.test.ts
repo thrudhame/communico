@@ -488,6 +488,11 @@ Deno.test('missing: a format-dropped answer event is terminal — no /state_ids 
       `no /state_ids after the format drop: ${JSON.stringify(stateIdCalls)}`,
     );
     assertEquals(
+      await groundingOf(ROOM, String(bad.event_id)),
+      'placeholder',
+      "the bad event is stored 'unverifiable' — a standing record",
+    );
+    assertEquals(
       await groundingOf(ROOM, String(pushed.event_id)),
       'unknown',
       'the dependent stays ungrounded (never stored)',

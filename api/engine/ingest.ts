@@ -1184,6 +1184,7 @@ export async function storeUnverifiableLocked(
   roomId: string,
   pdu: Pdu,
   origin: string,
+  opts?: { verbatim?: boolean },
 ): Promise<void> {
   const room = await lookupRoom(roomId);
   if (!room) throw new Error('M_ROOM_NOT_FOUND: ' + roomId);
@@ -1210,7 +1211,11 @@ export async function storeUnverifiableLocked(
         JSON.stringify(pdu.signatures ?? {}),
         true, // rejected
         false,
-        canonicalJson(pdu as unknown as Record<string, unknown>),
+        // a format-bad event (the BadJSON case) cannot be re-canonicalized
+        // — stored verbatim, never rendered either way
+        opts?.verbatim === true
+          ? JSON.stringify(pdu as unknown as Record<string, unknown>)
+          : canonicalJson(pdu as unknown as Record<string, unknown>),
       ],
     );
     // the room's current published state as a marker state table — this
