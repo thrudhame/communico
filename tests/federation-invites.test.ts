@@ -633,3 +633,103 @@ Deno.test('inviter: createRoom fans remote invitees out over /v2/invite with is_
     assertEquals((invRow.content as Json).is_direct, true);
   });
 });
+
+Deno.test('remote reject after the stay closed: send_leave of an invited user lands on the archived room (the empty-room case)', async () => {
+  await withHost(async (h) => {
+    const zoe = `@zoe:${h.fake.name}`;
+    await createRoom(ROOM, '@dev:localhost', {
+      roomVersion: '11',
+      preset: 'public_chat',
+    });
+    // zoe is invited over the dance (the /v2/invite to the fake)
+    await invite(ROOM, DEV, zoe);
+    // dev (the sole joined local member) leaves — the stay closes
+    const { leave: engineLeave } = await import('#engine/membership.ts');
+    await engineLeave(ROOM, DEV);
+    const chapterOf = async () =>
+      await withDb(serverDb(), async (c) => {
+        const r = await c.query(
+          'SELECT current_chapter FROM room_directory WHERE room_id = $1;',
+          [ROOM],
+        );
+        return r.rows[0].current_chapter == null
+          ? null
+          : String(r.rows[0].current_chapter);
+      });
+    assertEquals(await chapterOf(), null, 'stay closed');
+
+    // zoe rejects over federation: make_leave, then send_leave v1 of the
+    // signed leave — the archived resident must accept it
+    const tip = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        `SELECT event_id FROM event_index WHERE room_id = $1 AND seq IS NOT NULL
+         ORDER BY seq DESC LIMIT 1;`,
+        [ROOM],
+      );
+      return String(r.rows[0].event_id);
+    });
+    const { remoteEvent } = await import('./federation/room-events.ts');
+    const leave = await remoteEvent(
+      ROOM,
+      {
+        name: h.fake.name,
+        keyId: h.fake.keyId,
+        kp: h.fake.kp,
+      },
+      '11',
+      {
+        type: 'm.room.member',
+        sender: zoe,
+        state_key: zoe,
+        content: { membership: 'leave' },
+        prev_events: [tip],
+      },
+    );
+    const leaveId = String(leave.event_id);
+    const wire = { ...(leave as unknown as Json) };
+    delete wire.event_id;
+    delete wire.unsigned;
+    const path = `/_matrix/federation/v1/send_leave/${
+      encodeURIComponent(ROOM)
+    }/${encodeURIComponent(leaveId)}`;
+    const obj: Json = {
+      method: 'PUT',
+      uri: path,
+      origin: h.fake.name,
+      destination: serverName(),
+      content: wire,
+    };
+    const signed = await signJson(
+      obj,
+      h.fake.name,
+      h.fake.keyId,
+      h.fake.kp.privateKey,
+    );
+    const sig = (signed.signatures as Record<string, Record<string, string>>)[
+      h.fake.name
+    ][h.fake.keyId];
+    const res = await matrix(
+      new Request(`http://x${path}`, {
+        method: 'PUT',
+        headers: {
+          Authorization:
+            `X-Matrix origin="${h.fake.name}",key="${h.fake.keyId}",sig="${sig}"`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(wire),
+      }),
+    );
+    assertEquals(res.status, 200, await res.text());
+    // the leave landed on the newest stay's era; the stay stays closed
+    const row = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        'SELECT era, seq FROM event_index WHERE room_id = $1 AND event_id = $2;',
+        [ROOM, leaveId],
+      );
+      return r.rows[0];
+    });
+    assertEquals(String(row.era), 'chapter1');
+    assert(row.seq !== null, 'the leave is live');
+    assertEquals(await chapterOf(), null, 'no reopen');
+  });
+});

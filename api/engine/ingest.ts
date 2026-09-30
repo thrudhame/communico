@@ -1585,16 +1585,16 @@ export async function ingestEventLocked(
   // room's CURRENT chapter; 'before'/'evidence' rows are positioned by
   // their callers (commits 8/10) and never enter the live stream.
   const currentChapter = room.currentChapter;
-  // §3.4 (fix pass): a leave/reject by a LOCAL user whose membership is
+  // §3.4 (fix pass): a leave/reject by a user whose membership is
   // invite or knock may land on a CLOSED stay (the last joined local
   // member left) — it does not reopen (current_chapter stays NULL); the
   // event's era, its prevs' consumption, and the publish branch are the
-  // newest stay's
+  // newest stay's. Local rejects (CS /leave) and remote ones (send_leave
+  // for an invited user, TestFederationRoomsInvite's empty room) alike
   const archivedReject = currentChapter === null &&
     pdu.type === 'm.room.member' &&
     ((pdu.content ?? {}) as { membership?: unknown }).membership ===
       'leave' &&
-    String(pdu.state_key ?? '').endsWith(':' + serverName()) &&
     ['invite', 'knock'].includes(
       (await membershipOf(roomId, String(pdu.state_key)))?.membership ?? '',
     );

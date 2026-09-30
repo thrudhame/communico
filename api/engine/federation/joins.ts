@@ -194,8 +194,13 @@ async function sendMembership(
   if (room === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
   if (!(await serverInRoom(roomId, serverName()))) {
     // a room WE left is a room we are not in (§3.6a): a non-member
-    // cannot act as resident for anyone
-    throw new MatrixError(404, 'M_NOT_FOUND', roomId);
+    // cannot act as resident for anyone — for a JOIN. A leave/reject
+    // brings nobody in: the archived resident still processes it (the
+    // empty-room reject, TestFederationRoomsInvite)
+    const archived = room.currentChapter === null;
+    if (!archived || membership === 'join') {
+      throw new MatrixError(404, 'M_NOT_FOUND', roomId);
+    }
   }
   const pdu = raw as Pdu;
   // validation (joins-v1.yaml:226-390 / leaving-v2.yaml:21-136;
