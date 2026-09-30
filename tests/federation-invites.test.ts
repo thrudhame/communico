@@ -13,7 +13,7 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { serverDb, withDb } from '#engine/db.ts';
 import { serverName, setConfigForTests } from '#engine/config.ts';
 import { createRoom, lookupRoom, membershipOf } from '#engine/room.ts';
-import { invite, join, leave } from '#engine/membership.ts';
+import { invite, join } from '#engine/membership.ts';
 import { listOutbox } from '#engine/federation/outbox.ts';
 import { startSender } from '#engine/federation/sender.ts';
 import {
@@ -439,8 +439,24 @@ Deno.test('invitee reject: local rooms.leave at once + the intent performs make/
       }),
     );
     assertEquals(res.status, 200);
-    // reject: local effect at once
-    await leave(h.room.roomId, DEV);
+    // reject over the CLIENT endpoint (an out-of-band invite room is not
+    // in room_directory — the endpoint must not 404 it; fix pass §3.6c)
+    const csLeave = await matrix(
+      new Request(
+        `http://x/_matrix/client/v3/rooms/${
+          encodeURIComponent(h.room.roomId)
+        }/leave`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${DEV_TOKEN}`,
+            'Content-Type': 'application/json',
+          },
+          body: '{}',
+        },
+      ),
+    );
+    assertEquals(csLeave.status, 200, await csLeave.text());
     assertEquals((await membershipOf(h.room.roomId, DEV))?.membership, 'leave');
     const rejecting = await withDb(serverDb(), async (c) => {
       const r = await c.query(
