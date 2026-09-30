@@ -77,7 +77,10 @@ async function joinTemplate(
   }
   const room = await lookupRoom(roomId);
   if (room === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
-  if (!ver.includes(room.roomVersion)) {
+  // the version gate applies only when the requester offered a list —
+  // make_leave has no ver parameter at all (leaving-v1.yaml) and an
+  // absent ver on make_join is no constraint, never a 400
+  if (ver.length > 0 && !ver.includes(room.roomVersion)) {
     throw new MatrixError(
       400,
       'M_INCOMPATIBLE_ROOM_VERSION',

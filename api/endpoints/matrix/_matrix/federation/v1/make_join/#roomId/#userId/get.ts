@@ -24,6 +24,6 @@ export default async function (
     request.params.roomId as string,
     request.params.userId as string,
     origin,
-    ver.length === 0 ? ['1'] : ver,
+    ver,
   );
 }

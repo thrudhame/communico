@@ -289,6 +289,18 @@ Deno.test('send_join v1 answers [200, {...}]; send_leave v1/v2; make_leave 403 f
   assertEquals(mlEvent.content !== undefined, true);
   assertEquals((mlEvent.content as Json).membership, 'leave');
 
+  // make_leave WITHOUT ver — the spec has no ver parameter here
+  // (leaving-v1.yaml); absent is no constraint, never a 400
+  // (TestFederationRejectInvite's gomatrixserverlib sends none)
+  const mlNoVer = await fedCall(
+    'GET',
+    `/_matrix/federation/v1/make_leave/${encodeURIComponent(ROOM)}/${
+      encodeURIComponent(ZOE)
+    }`,
+  );
+  assertEquals(mlNoVer.status, 200);
+  assertEquals((mlNoVer.body as Json).room_version, '11');
+
   const leave = await remoteEvent(ROOM, srv, '11', {
     type: 'm.room.member',
     sender: ZOE,
