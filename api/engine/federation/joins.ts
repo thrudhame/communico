@@ -11,7 +11,13 @@ import { serverDb, withDb } from '#engine/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
 import { domainOf, toWire } from './pdu.ts';
-import { lookupRoom, serverInRoom, stateAtSeq } from '#engine/room.ts';
+import {
+  chapterHead,
+  extremities,
+  lookupRoom,
+  serverInRoom,
+  stateAtSeq,
+} from '#engine/room.ts';
 import { authChain } from '#engine/rulebook/state-res-v2.ts';
 import { loadAuthClosure } from './serve.ts';
 import { eventIdFor } from '#engine/eventid.ts';
@@ -131,11 +137,24 @@ async function joinTemplate(
   if (membership === 'leave' && current === undefined) {
     throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is not in the room`);
   }
+  // an archived room (the last joined local member left) has no live
+  // extremities — the template's parents are the newest stay's tips
+  // (the §3.4 carve-out ingests the dance's event into the closed stay)
+  let prevs: string[] | undefined;
+  if (room.currentChapter === null) {
+    const head = await chapterHead(roomId);
+    if (head !== null) {
+      prevs = (await extremities(room.dbName, roomId, head)).map((e) =>
+        e.eventId
+      );
+    }
+  }
   const pdu = await author(roomId, {
     type: 'm.room.member',
     state_key: userId,
     sender: userId,
     content: { membership },
+    ...(prevs !== undefined ? { prev_events: prevs } : {}),
     origin_server_ts: Date.now(),
   });
   // the answer wraps the template (joins-v1.yaml:55-81, leaving-v1.yaml:

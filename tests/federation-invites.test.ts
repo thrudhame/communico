@@ -658,16 +658,40 @@ Deno.test('remote reject after the stay closed: send_leave of an invited user la
       });
     assertEquals(await chapterOf(), null, 'stay closed');
 
-    // zoe rejects over federation: make_leave, then send_leave v1 of the
-    // signed leave — the archived resident must accept it
-    const tip = await withDb(serverDb(), async (c) => {
-      const r = await c.query(
-        `SELECT event_id FROM event_index WHERE room_id = $1 AND seq IS NOT NULL
-         ORDER BY seq DESC LIMIT 1;`,
-        [ROOM],
-      );
-      return String(r.rows[0].event_id);
-    });
+    // zoe rejects over federation: make_leave (the template must author
+    // on the archived stay's tips), then send_leave v1 of the signed
+    // leave — the archived resident must accept both
+    const mkPath = `/_matrix/federation/v1/make_leave/${
+      encodeURIComponent(ROOM)
+    }/${encodeURIComponent(zoe)}`;
+    const mkObj: Json = {
+      method: 'GET',
+      uri: mkPath,
+      origin: h.fake.name,
+      destination: serverName(),
+    };
+    const mkSigned = await signJson(
+      mkObj,
+      h.fake.name,
+      h.fake.keyId,
+      h.fake.kp.privateKey,
+    );
+    const mkSig =
+      (mkSigned.signatures as Record<string, Record<string, string>>)[
+        h.fake.name
+      ][h.fake.keyId];
+    const mk = await matrix(
+      new Request(`http://x${mkPath}`, {
+        headers: {
+          Authorization:
+            `X-Matrix origin="${h.fake.name}",key="${h.fake.keyId}",sig="${mkSig}"`,
+        },
+      }),
+    );
+    const mkText = await mk.text();
+    assertEquals(mk.status, 200, mkText);
+    const mkBody = JSON.parse(mkText) as Json;
+    const template = mkBody.event as Json;
     const { remoteEvent } = await import('./federation/room-events.ts');
     const leave = await remoteEvent(
       ROOM,
@@ -682,7 +706,9 @@ Deno.test('remote reject after the stay closed: send_leave of an invited user la
         sender: zoe,
         state_key: zoe,
         content: { membership: 'leave' },
-        prev_events: [tip],
+        prev_events: template.prev_events as string[],
+        auth_events: template.auth_events as string[],
+        depth: Number(template.depth),
       },
     );
     const leaveId = String(leave.event_id);
