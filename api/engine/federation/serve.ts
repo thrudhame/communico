@@ -360,12 +360,15 @@ export async function serveGetMissingEvents(
     for (const id of frontier) {
       if (seen.has(id)) continue;
       seen.add(id);
+      // the earliest_events are the boundary the requester already HAS —
+      // excluded from the answer, and the walk stops at them
+      // (TestInboundCanReturnMissingEvents: the first answer event is the
+      // creator's join, never the create)
+      if (earliest.has(id)) continue;
       const pdu = await pduAt(roomId, id);
       if (pdu === null) continue; // an event we do not hold — the walk stops
       out.push({ pdu, depth: Number(pdu.depth == null ? 0 : pdu.depth) });
-      if (!earliest.has(id)) {
-        next.push(...(pdu.prev_events == null ? [] : pdu.prev_events));
-      }
+      next.push(...(pdu.prev_events == null ? [] : pdu.prev_events));
     }
     frontier = next;
   }

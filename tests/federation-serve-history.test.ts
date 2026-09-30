@@ -175,7 +175,8 @@ Deno.test('serve: /state, /state_ids, /event, /event_auth, /backfill, /get_missi
   assertEquals((bpdus[0].content as Json).body, 'second');
   assertEquals((bpdus[1].content as Json).body, 'first');
 
-  // /get_missing_events: forward order, stops at the earliest (m1)
+  // /get_missing_events: forward order; the earliest (what the requester
+  // already has) is EXCLUDED, the latest included
   const missing = await fedGet(
     `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`,
     {
@@ -190,9 +191,8 @@ Deno.test('serve: /state, /state_ids, /event, /event_auth, /backfill, /get_missi
   );
   assertEquals(missing.status, 200);
   const events = missing.body.events as Json[];
-  assertEquals(events.length, 2);
-  assertEquals((events[0].content as Json).body, 'first');
-  assertEquals((events[1].content as Json).body, 'second');
+  assertEquals(events.length, 1);
+  assertEquals((events[0].content as Json).body, 'second');
 
   // the cap: limit 1 → one event
   const capped = await fedGet(
