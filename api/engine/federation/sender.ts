@@ -99,6 +99,7 @@ function wireEduFeeds(): void {
       for (const d of servers) {
         if (d === serverName()) continue;
         queueEduTyping(d, roomId, userId, isTyping, seq);
+        wakeDestination(d); // an EDU-only batch rides the next /send
       }
     });
   });
@@ -108,6 +109,7 @@ function wireEduFeeds(): void {
       for (const d of servers) {
         if (d === serverName()) continue;
         queueEduReceipt(d, roomId, userId, eventId, seq);
+        wakeDestination(d);
       }
     });
   });
@@ -117,6 +119,7 @@ function wireEduFeeds(): void {
       for (const d of servers) {
         if (d === serverName()) continue;
         queueEduPresence(d, userId, presence, statusMsg, seq);
+        wakeDestination(d);
       }
     });
   });

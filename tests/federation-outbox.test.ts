@@ -13,6 +13,7 @@ import { setConfigForTests } from '#engine/config.ts';
 import { createRoom } from '#engine/room.ts';
 import { author, ingestEvent } from '#engine/ingest.ts';
 import { setTyping } from '#engine/typing.ts';
+import { setPresence } from '#engine/presence.ts';
 import { setReceipt } from '#engine/receipts.ts';
 import { addBlock, removeBlock } from '#engine/federation/peers.ts';
 import { acquireKeyDocWith, type KeysDeps } from '#engine/federation/keys.ts';
@@ -262,25 +263,28 @@ Deno.test('outbox: destinations = joined domains before the event ∪ leave targ
 Deno.test('outbox: frozen retry — same txnId, ts, PDUs and EDUs; PDUs only after a restart', async () => {
   await withSetup(async ({ sends, steer, dest }) => {
     steer.status = 500;
-    // an EDU rides with the first attempt: dev types, then says
-    setTyping(ROOM, '@dev:localhost', true);
+    // the frozen batch: a PDU on its own (an EDU-only batch ahead of it
+    // would hold the queue on the ladder — the EDU wake path is the
+    // EDU-only test's, below)
     await devSays('retry me');
-    await waitFor(() => sends.length >= 1, 3000);
-    const first = sends[0];
-    assertEquals(first.edus.length, 1);
-    assertEquals(first.edus[0].edu_type, 'm.typing');
+    await waitFor(() => sends.some((s) => s.pdus.length > 0), 3000);
+    const first = sends.find((s) => s.pdus.length > 0)!;
     // the retry (after the tiny ladder step) resends the SAME transaction
-    await waitFor(() => sends.length >= 2, 8000);
-    const second = sends[1];
-    assertEquals(second.txnId, first.txnId);
+    await waitFor(
+      () => sends.filter((s) => s.txnId === first.txnId).length >= 2,
+      8000,
+    );
+    const second = sends.filter((s) => s.txnId === first.txnId)[1];
     assertEquals(second.origin_server_ts, first.origin_server_ts);
     assertEquals(second.pdus, first.pdus);
     assertEquals(second.edus, first.edus);
     // a restart: the frozen batch's EDUs were never persisted — PDUs only
     resetSenderForTests();
-    await waitFor(() => sends.length >= 3, 12000);
-    const third = sends[2];
-    assertEquals(third.txnId, first.txnId);
+    await waitFor(
+      () => sends.filter((s) => s.txnId === first.txnId).length >= 3,
+      12000,
+    );
+    const third = sends.filter((s) => s.txnId === first.txnId)[2];
     assertEquals(third.pdus, first.pdus);
     assertEquals(third.edus, []);
     // success now: rows deleted
@@ -447,6 +451,39 @@ Deno.test('outbox: intent rows on their own path — stub performer, candidate a
       return (r.rows as any[]).map((row) => String(row.name));
     });
     assert(roster.includes('second.test'), JSON.stringify(roster));
+  });
+});
+
+Deno.test('outbox: an EDU-only change wakes the sender — typing and presence deliver within 1 s, no PDUs', async () => {
+  await withSetup(async ({ sends, dest }) => {
+    const beforeTyping = sends.length;
+    setTyping(ROOM, '@dev:localhost', true);
+    await waitFor(() => sends.length > beforeTyping, 1000);
+    const typingSend = sends[sends.length - 1];
+    assertEquals(typingSend.pdus.length, 0, 'no PDUs in an EDU-only txn');
+    const typing = typingSend.edus.filter((e) => e.edu_type === 'm.typing');
+    assertEquals(typing.length, 1);
+    assertEquals(
+      (typing[0].content as Record<string, unknown>).user_id,
+      '@dev:localhost',
+    );
+    assertEquals(
+      (typing[0].content as Record<string, unknown>).typing,
+      true,
+    );
+
+    const beforePresence = sends.length;
+    await setPresence('@dev:localhost', 'online');
+    await waitFor(() => sends.length > beforePresence, 1000);
+    const presenceSend = sends[sends.length - 1];
+    assertEquals(presenceSend.pdus.length, 0, 'no PDUs in an EDU-only txn');
+    const pres = presenceSend.edus.filter((e) => e.edu_type === 'm.presence');
+    assertEquals(pres.length, 1);
+    const push = (pres[0].content as { push: Record<string, unknown>[] }).push;
+    assertEquals(push.length, 1);
+    assertEquals(push[0].user_id, '@dev:localhost');
+    assertEquals(push[0].presence, 'online');
+    void dest;
   });
 });
 
