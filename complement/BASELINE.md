@@ -1,7 +1,7 @@
-# Complement baseline — 2026-09-29T03:48:44.698Z
+# Complement baseline — 2026-09-30T08:53:23.075Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit 7dda306)
+- image: communico-complement:local (commit a12b807b3db6ee099d9a33431f4e7ca4f3ef09c6)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
 - failing tests: 92
@@ -41,17 +41,17 @@
 - github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Invited_user_can_reject_invite_over_federation
 - github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Non-invitee_user_cannot_rescind_invite_over_federation
 - github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Inviter_user_can_rescind_invite_over_federation
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Remote_invited_user_can_see_room_metadata
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Invited_user_can_reject_invite_over_federation_several_times
 - github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Invited_user_can_reject_invite_over_federation_for_empty_room
+- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Invited_user_can_reject_invite_over_federation_several_times
+- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Remote_invited_user_can_see_room_metadata
 - github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel
 - github.com/matrix-org/complement/tests TestFederationRoomsInvite
 - github.com/matrix-org/complement/tests TestSyncOmitsStateChangeOnFilteredEvents
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode
