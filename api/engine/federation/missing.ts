@@ -132,6 +132,11 @@ async function doFetch(
   //    _process_pulled_events with backfilled=False); an answered event
   //    that fails is dropped and its descendants stay ungrounded
   //    (TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6).
+  // answered events dropped for format/signature: terminal for the
+  // chase — the remote's copy is unusable, so /state_ids for the same
+  // event would return the same bad event (the BadJSON case forbids the
+  // fallthrough)
+  const droppedForFormat = new Set<string>();
   if (budgetLeft() > 0) {
     const room = await lookupRoom(roomId);
     if (room !== null) {
@@ -181,8 +186,10 @@ async function doFetch(
               await withRoomLock(roomId, async () => {
                 await storeUngroundedLocked(roomId, ev, origin);
               });
+            } else {
+              // dropped for format/signature — terminal for the chase
+              droppedForFormat.add(String(ev.event_id));
             }
-            // else: dropped — its descendants stay ungrounded
           }
         }
       } catch {
@@ -204,6 +211,9 @@ async function doFetch(
       const g = await groundingOf(roomId, id);
       if (g === 'own') continue;
       if (g === 'unknown') {
+        // format-dropped by the answer it rode in on: terminal — the
+        // remote's copy is unusable, /state_ids would return the same
+        if (droppedForFormat.has(id)) continue;
         gapTips.push(id);
       } else {
         await chase(await prevIdsOf(roomId, id));

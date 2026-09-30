@@ -460,3 +460,37 @@ Deno.test('missing: a pulled event with its own missing prev waits as a placehol
     assertEquals(await groundingOf(ROOM, String(pushed.event_id)), 'own');
   });
 });
+
+Deno.test('missing: a format-dropped answer event is terminal — no /state_ids fallthrough for it (the BadJSON case)', async () => {
+  await withSetup(async ({ fake, answer, stateIds }) => {
+    const tip = await latestExtremityEventId(ROOM);
+    // a bad event: signed fine, then its content gains a float — the
+    // format check (canonical numbers) rejects it before any signature
+    // check, exactly the BadJSON-for-the-version shape
+    const bad = await remoteMsg(fake, 'bad', [tip], { depth: 50 });
+    ((bad.content ?? {}) as Record<string, unknown>).score = 1.5;
+    answer.events = [bad];
+    const stateIdCalls: string[] = [];
+    const origGet = stateIds.get.bind(stateIds);
+    stateIds.get = (k: string) => {
+      stateIdCalls.push(k);
+      return origGet(k);
+    };
+    const pushed = await remoteMsg(fake, 'pushed', [String(bad.event_id)], {
+      depth: 51,
+    });
+    await fetchMissingPrevs(ROOM, pushed, fake.name, {
+      until: Date.now() + 8000,
+    });
+    assertEquals(
+      stateIdCalls.length,
+      0,
+      `no /state_ids after the format drop: ${JSON.stringify(stateIdCalls)}`,
+    );
+    assertEquals(
+      await groundingOf(ROOM, String(pushed.event_id)),
+      'unknown',
+      'the dependent stays ungrounded (never stored)',
+    );
+  });
+});
