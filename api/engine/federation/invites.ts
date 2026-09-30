@@ -532,11 +532,21 @@ async function performRejectInvite(
       ),
     });
   }
-  // delivered: the row becomes 'rejected'
+  // delivered: the row becomes 'rejected', and the SIGNED LEAVE becomes
+  // the rendered event — the out-of-band leave section of /sync carries
+  // it in state.events (SyncLeftFrom wants a leave event there)
   await withDb(serverDb(), async (c) => {
     await c.query(
-      `UPDATE federation_invites SET status = 'rejected' WHERE room_id = $1 AND user_id = $2;`,
-      [roomId, userId],
+      `UPDATE federation_invites SET status = 'rejected', event_json = $3 WHERE room_id = $1 AND user_id = $2;`,
+      [
+        roomId,
+        userId,
+        JSON.stringify(pdu as unknown as Record<string, unknown>),
+      ],
+    );
+    await c.query(
+      `UPDATE room_membership SET event_id = $3 WHERE room_id = $1 AND user_id = $2;`,
+      [roomId, userId, eventId],
     );
   });
 }

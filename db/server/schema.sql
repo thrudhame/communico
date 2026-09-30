@@ -289,7 +289,7 @@ CREATE TABLE IF NOT EXISTS federation_invites (
   user_id text NOT NULL,
   event_id text NOT NULL,
   room_version text NOT NULL,
-  event_json text NOT NULL,           -- the invite event with both signatures
+  event_json text NOT NULL,           -- the invite event with both signatures; on 'rejected', the signed leave (what /sync renders)
   invite_room_state text NOT NULL,    -- JSON array of stripped events (may be [])
   origin text NOT NULL,               -- the inviting server
   received_ms bigint NOT NULL,

@@ -446,6 +446,14 @@ Deno.test('invitee reject: local rooms.leave at once + the intent performs make/
     assertEquals(res.status, 200);
     // reject over the CLIENT endpoint (an out-of-band invite room is not
     // in room_directory — the endpoint must not 404 it; fix pass §3.6c)
+    const beforeReject = await matrix(
+      new Request('http://x/_matrix/client/v3/sync?timeout=0', {
+        headers: { Authorization: `Bearer ${DEV_TOKEN}` },
+      }),
+    );
+    const rejectingSince = String(
+      (await beforeReject.json() as Json).next_batch,
+    );
     const csLeave = await matrix(
       new Request(
         `http://x/_matrix/client/v3/rooms/${
@@ -487,6 +495,39 @@ Deno.test('invitee reject: local rooms.leave at once + the intent performs make/
       return String(r.rows[0].status);
     });
     assertEquals(rejected, 'rejected');
+    // the signed leave is what /sync renders: the out-of-band leave
+    // section carries it in state.events (SyncLeftFrom's shape)
+    const rendered = await withDb(serverDb(), async (c) => {
+      const r = await c.query(
+        'SELECT event_json FROM federation_invites WHERE room_id = $1 AND user_id = $2;',
+        [h.room.roomId, DEV],
+      );
+      return JSON.parse(String(r.rows[0].event_json)) as Json;
+    });
+    assertEquals(rendered.type, 'm.room.member');
+    assertEquals((rendered.content as Json).membership, 'leave');
+    const sync = await matrix(
+      new Request(
+        'http://x/_matrix/client/v3/sync?timeout=0&since=' +
+          encodeURIComponent(rejectingSince),
+        {
+          headers: { Authorization: `Bearer ${DEV_TOKEN}` },
+        },
+      ),
+    );
+    const syncBody = await sync.json() as Json;
+    const leaveEntry =
+      (((syncBody.rooms as Json).leave as Json)[h.room.roomId] as Json) ??
+        {};
+    const stateEvents =
+      ((leaveEntry.state as Json | undefined)?.events as Json[]) ?? [];
+    assert(
+      stateEvents.some((e) =>
+        e.type === 'm.room.member' &&
+        (e.content as Json).membership === 'leave'
+      ),
+      `a leave event in state.events: ${JSON.stringify(leaveEntry)}`,
+    );
     assertEquals(
       (await listOutbox(h.fake.name)).length,
       0,
