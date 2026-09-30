@@ -13,6 +13,7 @@ import { author, ingestEvent } from '#engine/ingest.ts';
 import { domainOf, toWire } from './pdu.ts';
 import { lookupRoom, serverInRoom, stateAtSeq } from '#engine/room.ts';
 import { authChain } from '#engine/rulebook/state-res-v2.ts';
+import { loadAuthClosure } from './serve.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { getTenantKey } from '#engine/tenant.ts';
 import { signPdu, verifyPduSignature } from '#engine/signing.ts';
@@ -254,8 +255,11 @@ async function sendMembership(
   }
 
   // the snapshot BEFORE the ingest: state + the auth chains of those
-  // events and of the join
+  // events and of the join — the FULL closure (the state events alone
+  // stop the recursion at depth 1 — TestCorruptedAuthChain's >100)
   const { pdus: state, byId } = await statePdus(roomId);
+  const closure = await loadAuthClosure(roomId, [...byId.keys(), eventId]);
+  for (const [id, p] of closure) byId.set(id, p);
   const store = {
     get: (id: string) => byId.get(id),
     isRejected: () => false,

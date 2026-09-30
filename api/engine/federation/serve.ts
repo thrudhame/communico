@@ -90,7 +90,7 @@ async function pduAt(
 // with only the seeds in the store the walk stops at depth 1 (the
 // Complement event_auth cases: 4 events where the chain is 6, 3 where
 // it is >100)
-async function loadAuthClosure(
+export async function loadAuthClosure(
   roomId: string,
   seedIds: string[],
 ): Promise<Map<string, Pdu>> {
