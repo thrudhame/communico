@@ -181,15 +181,38 @@ export async function clientEventForRow(
   }
   // unsigned.prev_content/prev_sender (CS _index.md "Room events"): the
   // state event this one replaced — the same (type, state_key) in the
-  // state BEFORE it; is_direct and friends ride the previous content
+  // state BEFORE it; is_direct and friends ride the previous content.
+  // The single-prev case (nearly every event) is four indexed queries —
+  // never a full state resolution per rendered event
   let prev: { content: Record<string, unknown>; sender: string } | undefined;
   if (pdu.state_key != null) {
-    const before = await stateBefore(row.room_id, row.event_id);
-    const prevId = before.get(stateKeyOf(String(pdu.type), pdu.state_key));
-    if (prevId !== undefined && prevId !== row.event_id) {
-      const prevIdx = await eventIndexRow(row.room_id, prevId);
+    const prevEventId = await (async (): Promise<string | null> => {
+      const prevIds = (pdu.prev_events == null ? [] : pdu.prev_events)
+        .map(String);
+      if (prevIds.length === 1) {
+        const prevCommit = await withDb(serverDb(), async (c) => {
+          const r = await c.query(
+            'SELECT commit_hash FROM event_index WHERE room_id = $1 AND event_id = $2;',
+            [row.room_id, prevIds[0]],
+          );
+          return r.rows.length === 0 ? null : String(r.rows[0].commit_hash);
+        });
+        if (prevCommit === null) return null;
+        return await withDb(dbName, async (c) => {
+          const r = await c.query(
+            `SELECT event_id FROM state AS OF '${prevCommit}' WHERE type = $1 AND state_key = $2;`,
+            [String(pdu.type), pdu.state_key as string],
+          );
+          return r.rows.length === 0 ? null : String(r.rows[0].event_id);
+        });
+      }
+      const before = await stateBefore(row.room_id, row.event_id);
+      return before.get(stateKeyOf(String(pdu.type), pdu.state_key)) ?? null;
+    })();
+    if (prevEventId !== null && prevEventId !== row.event_id) {
+      const prevIdx = await eventIndexRow(row.room_id, prevEventId);
       const prevPdu = prevIdx !== null
-        ? await pduById(dbName, prevIdx.commit_hash, prevId)
+        ? await pduById(dbName, prevIdx.commit_hash, prevEventId)
         : null;
       if (prevPdu !== null) {
         prev = {
