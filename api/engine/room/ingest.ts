@@ -11,8 +11,15 @@
 // stored too (standing rejected), never published, never extremities (G11).
 import { canonicalJson } from '#engine/canonical.ts';
 import { eventIdFor } from '#engine/eventid.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { getRulebook, type StateMap } from '#engine/rulebook/index.ts';
+import {
+  namedLevel,
+  parsePowerLevels,
+  requiredLevel,
+  userPowerLevel,
+} from '#engine/rulebook/power-levels.ts';
 import { contentHashOf } from '#engine/signing-primitives.js';
 import {
   buildInTx,
@@ -24,6 +31,10 @@ import {
 } from '#engine/room/build.ts';
 import type { EventRow, Room, RoomTx } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
+import {
+  redactionEffectAllowed,
+  redactionTarget,
+} from '#engine/room/redaction.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { StateChange } from '#engine/room/state.ts';
 
@@ -381,6 +392,37 @@ export async function ingestInTx(
     }
   }
 
+  // Redaction effect (G13): separate from the event's acceptance. The
+  // effect applies per the room version's rules, evaluated at the
+  // redaction's own before-state; an unknown target waits (R10) for the
+  // recheck driver.
+  if (standing === 'accepted' && pdu.type === 'm.room.redaction') {
+    const target = redactionTarget(pdu);
+    if (target !== null) {
+      const targetRow = await tx.events.get(target);
+      if (targetRow === null) {
+        await tx.waits.add({
+          missing: target,
+          waiting: eventId,
+          kind: 'redaction',
+          since: Date.now(),
+          expires: null,
+          state: 'pending',
+        });
+      } else if (
+        await redactionEffectAllowed(
+          tx,
+          rulebook.spec,
+          pdu,
+          targetRow,
+          beforeGroup,
+        )
+      ) {
+        await tx.changes.append('redaction', eventId, { target });
+      }
+    }
+  }
+
   // Delivery intent (R11): remote server names with joined members in the
   // state after the event, excluding this server.
   if (standing === 'accepted') {
@@ -431,4 +473,89 @@ export async function ingestInTx(
   const stored = await tx.events.get(eventId);
   if (stored === null) throw new Error('E_STORE: ' + eventId);
   return { eventId, standing, reason, rule, event: stored };
+}
+
+async function statePduOf(
+  tx: RoomTx,
+  group: number,
+  type: string,
+  stateKey: string,
+): Promise<Pdu | null> {
+  const id = await tx.state.groupKey(group, type, stateKey);
+  if (id === null) return null;
+  const row = await tx.events.get(id);
+  return row === null ? null : (JSON.parse(row.pdu) as Pdu);
+}
+
+// The client-shaped redact operation (old redactEvent): the gate at the
+// CURRENT state — one's own event needs the m.room.redaction event level;
+// others' events — and unknown targets, where the own-event discount is
+// unprovable — need the redact level as well. Distinct from the ingest
+// effect check (G13): the op gate is the C-S contract the stage-5
+// endpoint will expose; a rulebook reject maps to 403, never a 500.
+export async function redactEvent(
+  room: Room,
+  sender: string,
+  targetEventId: string,
+  signer: Signer,
+  reason?: string,
+): Promise<{ eventId: string }> {
+  const gate = await room.tx(async (tx) => {
+    const stay = await tx.segments.openStay();
+    if (stay === null) {
+      throw new Error('E_ROOM_ARCHIVED: no open stay for ' + room.id);
+    }
+    const version = await roomVersionOf(tx, stay.id);
+    const spec = getRulebook(version).spec;
+    const group = await tx.state.current(stay.id);
+    const plPdu = group === null
+      ? null
+      : await statePduOf(tx, group, 'm.room.power_levels', '');
+    const createPdu = group === null
+      ? null
+      : await statePduOf(tx, group, 'm.room.create', '');
+    const parsed = plPdu === null
+      ? null
+      : parsePowerLevels(plPdu.content, spec);
+    const pl = parsed !== null && parsed.ok ? parsed.pl : null;
+    const senderLevel = userPowerLevel(sender, plPdu, createPdu, spec);
+    const target = await tx.events.get(targetEventId);
+    const targetPdu = target === null ? null : (JSON.parse(target.pdu) as Pdu);
+    const eventLevel = requiredLevel('m.room.redaction', undefined, pl);
+    const required = targetPdu !== null && targetPdu.sender === sender
+      ? eventLevel
+      : Math.max(eventLevel, namedLevel('redact', pl));
+    return { required, senderLevel, version };
+  });
+  if (gate.senderLevel < gate.required) {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      `redact requires level ${gate.required}, sender has ${gate.senderLevel}`,
+    );
+  }
+  const content: Record<string, unknown> = {};
+  const partial: BuildPartial = {
+    type: 'm.room.redaction',
+    sender,
+    content,
+    origin_server_ts: Date.now(),
+  };
+  if (getRulebook(gate.version).spec.redactsInContent) {
+    content.redacts = targetEventId;
+  } else {
+    partial.redacts = targetEventId;
+  }
+  if (reason !== undefined) content.reason = reason;
+  const res = await sendLocal(room, partial, signer);
+  if (res.standing === 'rejected') {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      `redaction rejected (${res.reason}${
+        res.rule === null ? '' : ', rule ' + res.rule
+      })`,
+    );
+  }
+  return { eventId: res.eventId };
 }
