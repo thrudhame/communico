@@ -156,6 +156,14 @@ export type FetchCalls = {
   }[];
   stateIds: string[]; // `at` event ids asked
   eventAuth: string[]; // event ids asked
+  backfill: { from: string[]; limit: number; via: string }[];
+  makeJoin: {
+    roomId: string;
+    userId: string;
+    versions: string[];
+    via: string;
+  }[];
+  sendJoin: { roomId: string; eventId: string | undefined; via: string }[];
 };
 
 // A Fetcher over scripted answers, recording every call. Answers go out
@@ -165,17 +173,32 @@ export function fakeFetcher(script: {
   stateIds?: Map<string, { pduIds: string[]; authChainIds: string[] }>;
   event?: Map<string, Pdu | null>;
   eventAuth?: Map<string, Pdu[]>;
+  backfill?: Pdu[] | ((from: string[], limit: number) => Pdu[]);
+  makeJoin?:
+    | { roomVersion: string; event: Pdu }
+    | ((
+      userId: string,
+    ) => { roomVersion: string; event: Pdu });
+  sendJoin?:
+    | { state: Pdu[]; authChain: Pdu[]; event?: Pdu }
+    | ((
+      event: Pdu,
+    ) => { state: Pdu[]; authChain: Pdu[]; event?: Pdu });
   // Hooks for staleness tests: run while the fetch is in flight.
   onMissingEvents?: () => Promise<void>;
   onEvent?: (id: string) => Promise<void>;
   onStateIds?: (at: string) => Promise<void>;
   onEventAuth?: (id: string) => Promise<void>;
+  onBackfill?: () => Promise<void>;
 }): { fetcher: Fetcher; calls: FetchCalls } {
   const calls: FetchCalls = {
     event: [],
     missingEvents: [],
     stateIds: [],
     eventAuth: [],
+    backfill: [],
+    makeJoin: [],
+    sendJoin: [],
   };
   return {
     calls,
@@ -204,6 +227,43 @@ export function fakeFetcher(script: {
         if (script.onEventAuth !== undefined) await script.onEventAuth(id);
         const answer = script.eventAuth?.get(id);
         return answer === undefined ? null : answer.map(wireOf);
+      },
+      backfill: async (_roomId, from, limit, via) => {
+        calls.backfill.push({ from: [...from], limit, via });
+        if (script.onBackfill !== undefined) await script.onBackfill();
+        const answer = typeof script.backfill === 'function'
+          ? script.backfill(from, limit)
+          : script.backfill ?? [];
+        return answer.map(wireOf);
+      },
+      makeJoin: (roomId, userId, versions, via) => {
+        calls.makeJoin.push({ roomId, userId, versions: [...versions], via });
+        const answer = typeof script.makeJoin === 'function'
+          ? script.makeJoin(userId)
+          : script.makeJoin;
+        if (answer === undefined) {
+          throw new Error('fakeFetcher: no make_join answer scripted');
+        }
+        return Promise.resolve({
+          roomVersion: answer.roomVersion,
+          event: wireOf(answer.event),
+        });
+      },
+      sendJoin: (roomId, event, via) => {
+        calls.sendJoin.push({ roomId, eventId: event.event_id, via });
+        const answer = typeof script.sendJoin === 'function'
+          ? script.sendJoin(event)
+          : script.sendJoin;
+        if (answer === undefined) {
+          throw new Error('fakeFetcher: no send_join answer scripted');
+        }
+        return Promise.resolve({
+          state: answer.state.map(wireOf),
+          authChain: answer.authChain.map(wireOf),
+          ...(answer.event === undefined
+            ? {}
+            : { event: wireOf(answer.event) }),
+        });
       },
     },
   };

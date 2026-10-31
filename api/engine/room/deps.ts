@@ -1,7 +1,8 @@
 // api/engine/room/deps.ts — the injected interfaces of the remote ingest
-// path (3c-1): all network and key access arrives through these, so the
-// room core never does I/O of its own. The real federation client and key
-// store arrive in stage 4; tests use the fakes in tests/fixtures/.
+// (3c-1) and history/join (3c-2) paths: all network and key access
+// arrives through these, so the room core never does I/O of its own.
+// The real federation client and key store arrive in stage 4; tests use
+// the fakes in tests/fixtures/.
 import type { Pdu } from '#engine/pdu.ts';
 
 // KeyResolver: verify one signature entry of an event at a time. The
@@ -50,6 +51,36 @@ export interface Fetcher {
   // GET /_matrix/federation/v1/event_auth/{roomId}/{eventId} — the
   // complete auth chain of the event (event_auth.yaml).
   eventAuth(roomId: string, id: string, via: string): Promise<Pdu[] | null>;
+  // GET /_matrix/federation/v1/backfill/{roomId}?v=…&limit= — the PDUs
+  // preceding the `from` ids (themselves included), up to limit
+  // (backfill.yaml). The prev/auth count limits MUST NOT be validated on
+  // these (backfill.yaml's note — verify.ts's exemption).
+  backfill(
+    roomId: string,
+    from: string[],
+    limit: number,
+    via: string,
+  ): Promise<Pdu[]>;
+  // GET /_matrix/federation/v1/make_join/{roomId}/{userId}?ver=… — the
+  // resident's template: the room's version and the unsigned member
+  // event skeleton (joins-v1.yaml).
+  makeJoin(
+    roomId: string,
+    userId: string,
+    versions: string[],
+    via: string,
+  ): Promise<{ roomVersion: string; event: Pdu }>;
+  // PUT /_matrix/federation/v2/send_join/{roomId}/{eventId} — the
+  // resident's snapshot: the resolved state PRIOR to the join, its auth
+  // chain and the resident-signed join (joins-v2.yaml; the v1 dance is
+  // the client's concern — stage 4). `event` is our signed join WITH
+  // its computed event_id (the transport strips it for the wire and
+  // carries it on the path).
+  sendJoin(
+    roomId: string,
+    event: Pdu,
+    via: string,
+  ): Promise<{ state: Pdu[]; authChain: Pdu[]; event?: Pdu }>;
 }
 
 // The bounds and identity the remote ingest needs (plan §2 row 3): the
