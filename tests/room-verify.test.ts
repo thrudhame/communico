@@ -1,0 +1,234 @@
+// tests/room-verify.test.ts — the one verification path (G9/G10):
+// format guards, recomputed ids, unsigned strip, content-hash redaction,
+// the sender-domain signature through the resolver, key validity per
+// room version, and the lenient/strict size limits.
+import { assert, assertEquals, assertRejects } from '@std/assert';
+import type { Pdu } from '#engine/pdu.ts';
+import { identify, verify } from '#engine/room/verify.ts';
+import {
+  fakeKeyResolver,
+  makeRemoteServer,
+  remoteEvent,
+} from './fixtures/remote.ts';
+
+const ROOM = '!verify:test';
+
+async function msg(
+  server: Awaited<ReturnType<typeof makeRemoteServer>>,
+  body: string,
+  version = '11',
+  opts: { state_key?: string; type?: string } = {},
+): Promise<Pdu> {
+  return await remoteEvent(ROOM, server, version, {
+    type: opts.type ?? 'm.room.message',
+    sender: `@rudy:${server.name}`,
+    state_key: opts.state_key,
+    content: opts.type === undefined ? { msgtype: 'm.text', body } : {},
+    prev_events: ['$prev'],
+  });
+}
+
+Deno.test('verify: a good event verifies; unsigned is stripped from the verified form', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const event = await msg(server, 'hello');
+  (event as unknown as Record<string, unknown>).unsigned = { evil: true };
+  const keys = fakeKeyResolver(server);
+  const verified = await verify(event, '11', keys, { roomId: ROOM });
+  assertEquals(verified.eventId, String(event.event_id));
+  assertEquals(verified.oversized, false);
+  assert(!('unsigned' in verified.pdu), 'unsigned never survives');
+});
+
+Deno.test('verify: format guards refuse malformed events before storage', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const keys = fakeKeyResolver(server);
+  const base = () => msg(server, 'x');
+  // missing required fields
+  const noSender = await base();
+  delete (noSender as unknown as Record<string, unknown>).sender;
+  await assertRejects(() => verify(noSender, '11', keys), Error, 'M_BAD_EVENT');
+  // >20 prev_events
+  const manyPrevs = await base();
+  manyPrevs.prev_events = Array.from({ length: 21 }, (_, i) => `$p${i}`);
+  await assertRejects(
+    () => verify(manyPrevs, '11', keys),
+    Error,
+    'M_TOO_MANY_PREV_EVENTS',
+  );
+  // >10 auth_events
+  const manyAuth = await base();
+  manyAuth.auth_events = Array.from({ length: 11 }, (_, i) => `$a${i}`);
+  await assertRejects(
+    () => verify(manyAuth, '11', keys),
+    Error,
+    'M_TOO_MANY_AUTH_EVENTS',
+  );
+  // room_id required before v12
+  const noRoom = await base();
+  delete (noRoom as unknown as Record<string, unknown>).room_id;
+  await assertRejects(() => verify(noRoom, '11', keys), Error, 'room_id');
+  // depth bound
+  const deep = await base();
+  deep.depth = 2 ** 53;
+  await assertRejects(() => verify(deep, '11', keys), Error, 'depth');
+  // non-string state_key
+  const badKey = await msg(server, 'x', '11', {
+    state_key: 'k',
+    type: 'm.room.topic',
+  });
+  (badKey as unknown as Record<string, unknown>).state_key = 42;
+  await assertRejects(() => verify(badKey, '11', keys), Error, 'state_key');
+});
+
+Deno.test('verify: the event id is recomputed, never trusted; uncanonicalizable content drops', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const keys = fakeKeyResolver(server);
+  const tampered = await msg(server, 'x');
+  tampered.event_id = '$wrong';
+  await assertRejects(
+    () => verify(tampered, '11', keys),
+    Error,
+    'does not recompute',
+  );
+  // a float in content cannot canonicalize (the BadJSON shape)
+  const bad = await msg(server, 'x');
+  bad.content.score = 1.5;
+  await assertRejects(() => verify(bad, '11', keys), Error, 'M_BAD_EVENT');
+  // the wire form (no event_id) is fine — the id is computed
+  const wire = await msg(server, 'x');
+  delete (wire as unknown as Record<string, unknown>).event_id;
+  const verified = await verify(wire, '11', keys, { roomId: ROOM });
+  assert(verified.eventId.startsWith('$'));
+});
+
+Deno.test('verify: a content-hash mismatch stores the redacted copy we calculated', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const keys = fakeKeyResolver(server);
+  const tampered = await msg(server, 'original');
+  tampered.content.body = 'tampered'; // the hash no longer matches
+  const verified = await verify(tampered, '11', keys, { roomId: ROOM });
+  const stored = JSON.stringify(verified.pdu);
+  assert(!stored.includes('tampered'), stored);
+  assert(!stored.includes('original'), stored);
+  // the event id still recomputes to the signed one
+  assertEquals(verified.eventId, String(tampered.event_id));
+});
+
+Deno.test('verify: a bad signature or the wrong sender domain is refused before storage', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const keys = fakeKeyResolver(server);
+  // garbage signature value
+  const badSig = await msg(server, 'x');
+  (badSig.signatures as Record<string, Record<string, string>>)[
+    'remote.test'
+  ]['ed25519:1'] = 'AAAA';
+  await assertRejects(
+    () => verify(badSig, '11', keys),
+    Error,
+    'M_UNAUTHORIZED',
+  );
+  // signed by another server than the sender's domain (the victim
+  // sender from the start — the reference hash covers it)
+  const other = await makeRemoteServer('other.test');
+  const forged = await remoteEvent(ROOM, other, '11', {
+    type: 'm.room.message',
+    sender: '@rudy:remote.test',
+    content: { msgtype: 'm.text', body: 'wrong signer' },
+    prev_events: ['$prev'],
+  });
+  const allKeys = fakeKeyResolver(server, other);
+  await assertRejects(
+    () => verify(forged, '11', allKeys),
+    Error,
+    'M_UNAUTHORIZED',
+  );
+  // no key anywhere for the sender's domain
+  const stranger = await makeRemoteServer('stranger.test');
+  const noKey = await msg(stranger, 'x');
+  await assertRejects(
+    () => verify(noKey, '11', fakeKeyResolver(server)),
+    Error,
+    'M_UNAUTHORIZED',
+  );
+});
+
+Deno.test('verify: key validity is enforced per room version', async () => {
+  const stale = await makeRemoteServer('stale.test', { validUntilMs: 500 });
+  const keys = fakeKeyResolver(stale);
+  // v11 enforces key validity at the event's origin_server_ts: a document
+  // valid only before it fails
+  const old = await remoteEvent(ROOM, stale, '11', {
+    type: 'm.room.message',
+    sender: '@old:stale.test',
+    content: { msgtype: 'm.text', body: 'expired key' },
+    prev_events: ['$prev'],
+    origin_server_ts: 1000,
+  });
+  await assertRejects(() => verify(old, '11', keys), Error, 'M_UNAUTHORIZED');
+  // v4 has no validity rule: the same key verifies
+  const v4 = await remoteEvent(ROOM, stale, '4', {
+    type: 'm.room.message',
+    sender: '@old:stale.test',
+    content: { msgtype: 'm.text', body: 'v4 lenient' },
+    prev_events: ['$prev'],
+    origin_server_ts: 1000,
+  });
+  const verified = await verify(v4, '4', keys, { roomId: ROOM });
+  assert(verified.eventId.startsWith('$'));
+});
+
+Deno.test('verify: size limits — bytes (v11+) vs codepoints (≤ v10); oversized comes back, never dropped', async () => {
+  const server = await makeRemoteServer('size.test');
+  const keys = fakeKeyResolver(server);
+  const bigKey = '💥'.repeat(70); // 280 bytes, 70 codepoints
+  // strict version: dropped
+  const dropped = await msg(server, 'x', '11', {
+    state_key: bigKey,
+    type: 'my.room.breaker',
+  });
+  await assertRejects(() => verify(dropped, '11', keys), Error, '255 bytes');
+  // lenient version: the same key passes (codepoints)
+  const lenient = await msg(server, 'x', '10', {
+    state_key: bigKey,
+    type: 'my.room.breaker',
+  });
+  const ok = await verify(lenient, '10', keys, { roomId: ROOM });
+  assertEquals(ok.oversized, false);
+  // and a >255-CODEPOINT key in the lenient version comes back oversized
+  const hugeKey = '💥'.repeat(300);
+  const huge = await msg(server, 'x', '10', {
+    state_key: hugeKey,
+    type: 'my.room.breaker',
+  });
+  const flagged = await verify(huge, '10', keys, { roomId: ROOM });
+  assertEquals(flagged.oversized, true);
+});
+
+Deno.test('verify: a v12 create must match the room context it names', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const keys = fakeKeyResolver(server);
+  const create = await remoteEvent('!whatever:remote.test', server, '12', {
+    type: 'm.room.create',
+    sender: '@rudy:remote.test',
+    state_key: '',
+    content: { room_version: '12' },
+    prev_events: [],
+    omitRoomId: true,
+  });
+  const rightRoom = '!' + String(create.event_id).slice(1);
+  const ok = await verify(create, '12', keys, { roomId: rightRoom });
+  assertEquals(ok.eventId, String(create.event_id));
+  await assertRejects(
+    () => verify(create, '12', keys, { roomId: '!elsewhere:test' }),
+    Error,
+    'E_ROOM_ID_MISMATCH',
+  );
+});
+
+Deno.test('verify: identify alone answers the id and the size verdict', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const event = await msg(server, 'x');
+  const pre = await identify(event, '11', { roomId: ROOM });
+  assertEquals(pre.eventId, String(event.event_id));
+  assertEquals(pre.oversized, false);
+});

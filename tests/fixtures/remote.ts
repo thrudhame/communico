@@ -89,6 +89,9 @@ export async function remoteEvent(
     auth_events?: string[];
     depth?: number;
     origin_server_ts?: number;
+    // A v12 m.room.create carries no room_id (v12.md:98-101) — omit it
+    // at BUILD time (it is part of the hashed event when present).
+    omitRoomId?: boolean;
   },
 ): Promise<Pdu> {
   const pdu: Pdu = {
@@ -104,6 +107,7 @@ export async function remoteEvent(
     signatures: {},
   };
   if (partial.state_key !== undefined) pdu.state_key = partial.state_key;
+  if (partial.omitRoomId === true) delete pdu.room_id;
   const {
     event_id: _dropId,
     signatures: _dropSig,
