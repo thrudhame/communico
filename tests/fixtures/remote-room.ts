@@ -3,12 +3,15 @@
 // /event answers computed from the DAG. State maps are resolved with
 // the REAL rulebook over the fake's own events, so the fake's answers
 // always agree with what the room core computes.
+import { canonicalJson } from '#engine/canonical.ts';
+import { redact } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import {
   type EventStore,
   getRulebook,
   type StateMap,
 } from '#engine/rulebook/index.ts';
+import { b64encodeStd } from '#engine/signing-primitives.js';
 import {
   makeRemoteServer,
   remoteEvent,
@@ -45,6 +48,16 @@ export type FakeRoom = {
   // auth chain of that state's events (events.yaml).
   stateIdsAt(at: string): { pduIds: string[]; authChainIds: string[] } | null;
   event(id: string): Pdu | null;
+  // The /make_join answer: the resident's template for the user
+  // (joins-v1.yaml) — unsigned, unhashed.
+  makeJoinAnswer(userId: string): { roomVersion: string; event: Pdu };
+  // The resident's send_join: counter-signs the join, answers the state
+  // PRIOR to it plus the auth chain and the signed copy, and applies it
+  // to the DAG (joins-v2.yaml).
+  acceptSendJoin(
+    join: Pdu,
+    tamper?: (resp: { state: Pdu[]; authChain: Pdu[]; event: Pdu }) => void,
+  ): Promise<{ state: Pdu[]; authChain: Pdu[]; event: Pdu }>;
 };
 
 function keyOf(type: string, stateKey: string): string {
@@ -235,6 +248,70 @@ export async function makeFakeRoom(opts: {
     },
     event(id) {
       return events.get(id) ?? null;
+    },
+    makeJoinAnswer(userId) {
+      const before = resolveBefore([tip]);
+      const probe = {
+        type: 'm.room.member',
+        sender: userId,
+        state_key: userId,
+        content: { membership: 'join' },
+      } as unknown as Pdu;
+      return {
+        roomVersion: version,
+        event: {
+          type: 'm.room.member',
+          state_key: userId,
+          sender: userId,
+          room_id: opts.roomId,
+          content: { membership: 'join' },
+          prev_events: [tip],
+          auth_events: rulebook.selectAuthEvents(probe, before),
+          depth: events.get(tip)!.depth + 1,
+          origin_server_ts: Date.now(),
+        } as unknown as Pdu,
+      };
+    },
+    async acceptSendJoin(join, tamper) {
+      // the state PRIOR to the join (joins-v2.yaml) plus its auth chain
+      const before = resolveBefore(join.prev_events ?? []);
+      const state = [...before.values()].map((id) => events.get(id)!);
+      const authChain = authChainClosure([
+        ...before.values(),
+        ...(join.auth_events ?? []),
+      ]).map((id) => events.get(id)!);
+      // counter-sign: the resident vouches for the joiner's event
+      const counterSigned = structuredClone(join) as Pdu;
+      const redacted = redact(
+        counterSigned as unknown as Record<string, unknown>,
+        version,
+      );
+      delete redacted.event_id;
+      delete redacted.signatures;
+      const sig = await crypto.subtle.sign(
+        { name: 'Ed25519' },
+        server.kp.privateKey,
+        new TextEncoder().encode(canonicalJson(redacted)),
+      );
+      counterSigned.signatures = {
+        ...(counterSigned.signatures ?? {}),
+        [server.name]: { [server.keyId]: b64encodeStd(new Uint8Array(sig)) },
+      };
+      const resp = { state, authChain, event: counterSigned };
+      if (tamper !== undefined) tamper(resp);
+      // apply to the DAG
+      const id = String(counterSigned.event_id);
+      events.set(id, counterSigned);
+      const after = new Map(before);
+      if (counterSigned.state_key !== undefined) {
+        after.set(
+          keyOf(String(counterSigned.type), String(counterSigned.state_key)),
+          id,
+        );
+      }
+      afterOf.set(id, after);
+      tip = id;
+      return resp;
     },
   };
   void join;

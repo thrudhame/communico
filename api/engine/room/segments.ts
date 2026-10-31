@@ -95,6 +95,23 @@ export async function closeSegment(conn: Conn, id: number): Promise<void> {
   ]);
 }
 
+// Name the event a stay was opened by (a remote join): set once, right
+// after the opening event's ingest — the stay is created first so the
+// ingest has somewhere to land, then it names its opener.
+export async function setOpenedBy(
+  conn: Conn,
+  id: number,
+  event: string,
+): Promise<void> {
+  const updated = await conn.execute(
+    'UPDATE segments SET opened_by = ? WHERE id = ? AND opened_by IS NULL',
+    [event, id],
+  );
+  if (updated === 0) {
+    throw new Error(`segment ${id} already has an opened_by event`);
+  }
+}
+
 export async function getSegment(
   conn: Conn,
   id: number,

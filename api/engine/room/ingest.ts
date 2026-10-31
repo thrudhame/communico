@@ -54,7 +54,7 @@ import {
   redactionTarget,
 } from '#engine/room/redaction.ts';
 import type { Signer } from '#engine/room/signer.ts';
-import type { StateChange } from '#engine/room/state.ts';
+import { mapEntries } from '#engine/room/state.ts';
 import { oversizedOf } from '#engine/room/verify.ts';
 
 export type Standing = 'accepted' | 'rejected' | 'soft_failed';
@@ -90,19 +90,6 @@ function sameIdSet(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
   const set = new Set(a);
   return b.every((x) => set.has(x));
-}
-
-function mapEntries(map: StateMap): StateChange[] {
-  const out: StateChange[] = [];
-  for (const [k, event] of map) {
-    const sep = k.indexOf('\0');
-    out.push({
-      type: k.slice(0, sep),
-      state_key: k.slice(sep + 1),
-      event,
-    });
-  }
-  return out;
 }
 
 function membershipOfPdu(pdu: string): string | null {
@@ -377,7 +364,15 @@ export async function ingestInTx(
         reason = 'state';
         rule = state.rule;
       } else {
-        const current = await stateBefore(tx, extremityGroups, rulebook, store);
+        // The current resolved state of the live stay: the published
+        // pointer (the resolution over the frontier is what publication
+        // records), which is also correct at a stay's birth — the
+        // opening group (an imported snapshot) before the first
+        // publication (3c-2 joins).
+        const currentGroup = await tx.state.current(stay.id);
+        const current = currentGroup === null
+          ? new Map()
+          : await tx.state.groupMap(currentGroup);
         if (!rulebook.checkAuthAgainstState(pdu, current, store).ok) {
           standing = 'soft_failed';
         }
@@ -495,7 +490,10 @@ export async function ingestInTx(
 
   // Publication (R6/R7): the live stay's current state is the single
   // extremity's after-group or the resolution over the new frontier —
-  // published only when it changed.
+  // published only when it changed. The resolution's store is seeded
+  // from the NEW frontier's after-maps: the just-ingested event itself
+  // (when it is a state event in the frontier) must be in the resolver's
+  // store or its fork is lost (the masked bug the pointer read exposed).
   let publishedGroup: number | null = null;
   if (standing === 'accepted') {
     const newFrontier = await tx.extremities.frontier(stay.id);
@@ -508,11 +506,18 @@ export async function ingestInTx(
       currentGroup = only.group;
     } else {
       const groups: number[] = [];
+      const pubSeeds = new Set<string>();
       for (const id of newFrontier) {
         const after = await tx.state.eventStateAfter(id);
-        if (after !== null) groups.push(after.group);
+        if (after !== null) {
+          groups.push(after.group);
+          for (const value of (await tx.state.groupMap(after.group)).values()) {
+            pubSeeds.add(value);
+          }
+        }
       }
-      const resolved = await stateBefore(tx, groups, rulebook, store);
+      const pubStore = await loadRulebookStore(tx, [...pubSeeds]);
+      const resolved = await stateBefore(tx, groups, rulebook, pubStore);
       currentGroup = await tx.materialize.newGroup(null, mapEntries(resolved));
     }
     if (await tx.materialize.publish(changePos, stay.id, currentGroup)) {

@@ -178,12 +178,18 @@ export function fakeFetcher(script: {
     | { roomVersion: string; event: Pdu }
     | ((
       userId: string,
-    ) => { roomVersion: string; event: Pdu });
+      via: string,
+    ) =>
+      | { roomVersion: string; event: Pdu }
+      | Promise<{ roomVersion: string; event: Pdu }>);
   sendJoin?:
     | { state: Pdu[]; authChain: Pdu[]; event?: Pdu }
     | ((
       event: Pdu,
-    ) => { state: Pdu[]; authChain: Pdu[]; event?: Pdu });
+      via: string,
+    ) =>
+      | { state: Pdu[]; authChain: Pdu[]; event?: Pdu }
+      | Promise<{ state: Pdu[]; authChain: Pdu[]; event?: Pdu }>);
   // Hooks for staleness tests: run while the fetch is in flight.
   onMissingEvents?: () => Promise<void>;
   onEvent?: (id: string) => Promise<void>;
@@ -236,34 +242,34 @@ export function fakeFetcher(script: {
           : script.backfill ?? [];
         return answer.map(wireOf);
       },
-      makeJoin: (roomId, userId, versions, via) => {
+      makeJoin: async (roomId, userId, versions, via) => {
         calls.makeJoin.push({ roomId, userId, versions: [...versions], via });
         const answer = typeof script.makeJoin === 'function'
-          ? script.makeJoin(userId)
+          ? await script.makeJoin(userId, via)
           : script.makeJoin;
         if (answer === undefined) {
           throw new Error('fakeFetcher: no make_join answer scripted');
         }
-        return Promise.resolve({
+        return {
           roomVersion: answer.roomVersion,
           event: wireOf(answer.event),
-        });
+        };
       },
-      sendJoin: (roomId, event, via) => {
+      sendJoin: async (roomId, event, via) => {
         calls.sendJoin.push({ roomId, eventId: event.event_id, via });
         const answer = typeof script.sendJoin === 'function'
-          ? script.sendJoin(event)
+          ? await script.sendJoin(event, via)
           : script.sendJoin;
         if (answer === undefined) {
           throw new Error('fakeFetcher: no send_join answer scripted');
         }
-        return Promise.resolve({
+        return {
           state: answer.state.map(wireOf),
           authChain: answer.authChain.map(wireOf),
           ...(answer.event === undefined
             ? {}
             : { event: wireOf(answer.event) }),
-        });
+        };
       },
     },
   };

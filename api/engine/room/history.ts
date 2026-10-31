@@ -31,7 +31,7 @@ import {
 import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
-import type { StateChange } from '#engine/room/state.ts';
+import { mapEntries } from '#engine/room/state.ts';
 import { verify } from '#engine/room/verify.ts';
 
 export type BackfillDeps = { keys: KeyResolver; fetcher: Fetcher };
@@ -53,19 +53,6 @@ type Classification =
   | { kind: 'dag' }
   | { kind: 'imported'; boundary: StateMap }
   | { kind: 'evidence' };
-
-function mapEntries(map: StateMap): StateChange[] {
-  const out: StateChange[] = [];
-  for (const [k, event] of map) {
-    const sep = k.indexOf('\0');
-    out.push({
-      type: k.slice(0, sep),
-      state_key: k.slice(sep + 1),
-      event,
-    });
-  }
-  return out;
-}
 
 // A deterministic topological order over the page DAG (Kahn; the ready
 // set ordered by (depth, event id)): parents always precede children —

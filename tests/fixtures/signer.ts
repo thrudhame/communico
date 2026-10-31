@@ -1,12 +1,12 @@
 // tests/fixtures/signer.ts — a fixed test signer: one deterministic
 // ed25519 key (a constant seed), so signatures are stable across runs.
-// Nothing verifies in 3b, so no public key is needed.
 import {
   b64encodeStd,
   generateSigningKeypair,
   importPrivateKeyFromSeed,
 } from '#engine/signing-primitives.js';
 import type { Signer } from '#engine/room/signer.ts';
+import type { RemoteServer } from '#tests/fixtures/remote.ts';
 
 export async function testSigner(serverName = 'test'): Promise<Signer> {
   const key = await importPrivateKeyFromSeed(new Uint8Array(32).fill(7));
@@ -21,6 +21,30 @@ export async function testSigner(serverName = 'test'): Promise<Signer> {
       );
       return b64encodeStd(new Uint8Array(sig));
     },
+  };
+}
+
+// The same key as a RemoteServer, so the fake KeyResolver can verify
+// OUR OWN events riding a snapshot/page back to us (the stage-4 key
+// store will cover the tenant key the same way).
+export async function testRemoteServer(
+  serverName = 'test',
+): Promise<RemoteServer> {
+  const privateKey = await importPrivateKeyFromSeed(
+    new Uint8Array(32).fill(7),
+  );
+  const jwk = await crypto.subtle.exportKey('jwk', privateKey);
+  const publicKey = await crypto.subtle.importKey(
+    'jwk',
+    { kty: 'OKP', crv: 'Ed25519', x: jwk.x },
+    { name: 'Ed25519' },
+    true,
+    ['verify'],
+  );
+  return {
+    name: serverName,
+    keyId: 'ed25519:test',
+    kp: { privateKey, publicKey },
   };
 }
 

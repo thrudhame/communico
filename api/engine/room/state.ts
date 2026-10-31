@@ -12,6 +12,20 @@ export type StateChange = {
 
 export type StateMap = Map<string, string>; // type + '\0' + state_key → event id
 
+// A state map as a change batch (a base snapshot's entries).
+export function mapEntries(map: StateMap): StateChange[] {
+  const out: StateChange[] = [];
+  for (const [k, event] of map) {
+    const sep = k.indexOf('\0');
+    out.push({
+      type: k.slice(0, sep),
+      state_key: k.slice(sep + 1),
+      event,
+    });
+  }
+  return out;
+}
+
 // The full map of a group as entries: the nearest snapshot plus every
 // delta down to the group, oldest first; a delta's NULL event removes.
 export async function groupEntries(

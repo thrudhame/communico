@@ -76,6 +76,8 @@ function bind(conn: Conn) {
         status?: string;
       }) => segments.createSegment(conn, options),
       close: (id: number) => segments.closeSegment(conn, id),
+      setOpenedBy: (id: number, event: string) =>
+        segments.setOpenedBy(conn, id, event),
       get: (id: number) => segments.getSegment(conn, id),
       list: () => segments.listSegments(conn),
       openStay: () => segments.openStay(conn),

@@ -166,10 +166,10 @@ export async function stateBefore(
   return rulebook.resolveState(maps, resolver);
 }
 
-// Shared finalization (buildInTx / buildCreate): canonical-number guard,
-// content hash, redact-then-sign, reference-hash id, size and depth caps
-// (old author's D8/D9).
-async function finalize(
+// Shared finalization (buildInTx / buildCreate / join.ts's template
+// build): canonical-number guard, content hash, redact-then-sign,
+// reference-hash id, size and depth caps (old author's D8/D9).
+export async function finalizeBuilt(
   pdu: Pdu,
   rulebook: Rulebook,
   signer: Signer,
@@ -268,7 +268,7 @@ export async function buildInTx(
   }
   if (partial.state_key !== undefined) pdu.state_key = partial.state_key;
   if (partial.redacts !== undefined) pdu.redacts = partial.redacts;
-  return await finalize(pdu, rulebook, signer);
+  return await finalizeBuilt(pdu, rulebook, signer);
 }
 
 // Build an m.room.create outside any room transaction: the v12 room id is
@@ -303,5 +303,5 @@ export async function buildCreate(
     }
     pdu.room_id = args.roomId;
   }
-  return await finalize(pdu, rulebook, signer);
+  return await finalizeBuilt(pdu, rulebook, signer);
 }
