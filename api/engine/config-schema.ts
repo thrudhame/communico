@@ -17,6 +17,13 @@ export const SCHEMA = {
     root: 'string',
     maxbytes: 'int',
   },
+  store: {
+    dir: 'string',
+    library: 'string',
+    checkpointlogbytes: 'int',
+    maxopenfiles: 'int',
+    idleseconds: 'int',
+  },
   preview: {
     enabled: 'bool',
     maxbytes: 'int',

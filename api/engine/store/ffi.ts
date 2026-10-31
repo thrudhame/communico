@@ -1,5 +1,7 @@
 // api/engine/store/ffi.ts — the sole native boundary. Replies are owned JSON;
 // every call (including free) runs off the JavaScript thread.
+import type { BuildInfo } from '#engine/store/build.ts';
+
 export type Value = null | string | number | Uint8Array;
 export type Row = Record<string, Value>;
 export type BeginMode = 'deferred' | 'immediate' | 'concurrent';
@@ -56,6 +58,11 @@ const definitions = {
     nonblocking: true,
   },
   ffi_free: { parameters: ['pointer'], result: 'void', nonblocking: true },
+  ffi_build_info: {
+    parameters: [],
+    result: 'pointer',
+    nonblocking: true,
+  },
 } as const;
 
 const encoder = new TextEncoder();
@@ -205,5 +212,9 @@ export class Turso {
     if (this.files || this.calls) throw new Error('native library is in use');
     this.closed = true;
     this.library.close();
+  }
+
+  buildInfo(): Promise<BuildInfo> {
+    return this.value(() => this.library.symbols.ffi_build_info());
   }
 }
