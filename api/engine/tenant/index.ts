@@ -1,11 +1,18 @@
 // api/engine/tenant/index.ts — the typed tenant handle: one tenant file,
 // holding the tenant's identity (generate-once ed25519 keypair, never
 // silently rotated), the native server name derived from the key, and the
-// event signer (stage 3b's Signer). The store must have been opened with
-// the tenant schema provider (R14).
+// event signer (stage 3b's Signer). One transaction per tx() call, every
+// data operation exposed inside it under its module's short name. The
+// store must have been opened with the tenant schema provider (R14).
 import type { Store } from '#engine/store/index.ts';
+import type { Conn } from '#engine/store/db.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { tenantSchema } from '#engine/tenant/schema.ts';
+import * as auth from '#engine/tenant/auth.ts';
+import * as devices from '#engine/tenant/devices.ts';
+import * as pushers from '#engine/tenant/pushers.ts';
+import * as uia from '#engine/tenant/uia.ts';
+import * as users from '#engine/tenant/users.ts';
 import {
   b32encode,
   b64decode,
@@ -18,6 +25,9 @@ import {
 } from '#engine/signing-primitives.js';
 
 export { tenantSchema };
+export type { DeviceRow } from '#engine/tenant/devices.ts';
+export type { ProfileRow } from '#engine/tenant/users.ts';
+export type { UiaSession } from '#engine/tenant/uia.ts';
 
 // Native server name: the tenant key as lowercase unpadded base32, one
 // DNS label (52 chars for ed25519) — as in doltgres:api/engine/tenant.ts.
@@ -36,6 +46,7 @@ export type Tenant = {
   readonly publicB64: string;
   // The real event signer (stage 3b) from the tenant key.
   signer(): Signer;
+  tx<T>(fn: (tenant: TenantTx) => Promise<T>): Promise<T>;
 };
 
 type IdentityRow = {
@@ -45,6 +56,90 @@ type IdentityRow = {
   privkey_enc: string;
   key_id: string;
 };
+
+function bind(conn: Conn) {
+  return {
+    users: {
+      exists: (localpart: string) => users.userExists(conn, localpart),
+      insert: (localpart: string, displayName: string) =>
+        users.insertUser(conn, localpart, displayName),
+      byLocalpart: (localpart: string) =>
+        users.userByLocalpart(conn, localpart),
+      setDisplayName: (localpart: string, name: string | null) =>
+        users.setUserDisplayName(conn, localpart, name),
+      setAvatarUrl: (localpart: string, url: string | null) =>
+        users.setUserAvatarUrl(conn, localpart, url),
+      markDeactivated: (localpart: string) =>
+        users.markDeactivated(conn, localpart),
+    },
+    credentials: {
+      set: (localpart: string, phc: string) =>
+        users.setCredential(conn, localpart, phc),
+      hash: (localpart: string) => users.credentialHash(conn, localpart),
+    },
+    devices: {
+      upsert: (
+        deviceId: string,
+        localpart: string,
+        displayName: string | null,
+      ) => devices.upsertDeviceRow(conn, deviceId, localpart, displayName),
+      byId: (deviceId: string, localpart: string) =>
+        devices.deviceById(conn, deviceId, localpart),
+      ofUser: (localpart: string) => devices.devicesOfUser(conn, localpart),
+      rename: (deviceId: string, localpart: string, displayName: string) =>
+        devices.renameDevice(conn, deviceId, localpart, displayName),
+      delete: (deviceId: string) => devices.deleteDevice(conn, deviceId),
+      deleteOwned: (deviceId: string, localpart: string) =>
+        devices.deleteDeviceOwned(conn, deviceId, localpart),
+      deleteForUser: (localpart: string) =>
+        devices.deleteDevicesOfUser(conn, localpart),
+    },
+    tokens: {
+      insert: (
+        hash: string,
+        localpart: string,
+        deviceId: string | null,
+        expiresMs: number | null,
+      ) => auth.insertAccessToken(conn, hash, localpart, deviceId, expiresMs),
+      byHash: (hash: string) => auth.accessTokenByHash(conn, hash),
+      ofUser: (localpart: string) => auth.accessTokensOfUser(conn, localpart),
+      ofDevice: (deviceId: string) => auth.accessTokensOfDevice(conn, deviceId),
+      delete: (hash: string) => auth.deleteAccessToken(conn, hash),
+      deleteForUser: (localpart: string) =>
+        auth.deleteAccessTokensOfUser(conn, localpart),
+    },
+    refresh: {
+      insert: (
+        hash: string,
+        localpart: string,
+        deviceId: string | null,
+        accessHash: string,
+      ) => auth.insertRefreshToken(conn, hash, localpart, deviceId, accessHash),
+      byHash: (hash: string) => auth.refreshTokenByHash(conn, hash),
+      delete: (hash: string) => auth.deleteRefreshToken(conn, hash),
+      deleteForAccessToken: (accessHash: string) =>
+        auth.deleteRefreshForAccessToken(conn, accessHash),
+      deleteForUser: (localpart: string) =>
+        auth.deleteRefreshTokensOfUser(conn, localpart),
+    },
+    uia: {
+      insert: (session: string, flows: { stages: string[] }[]) =>
+        uia.insertUiaSession(conn, session, flows),
+      byId: (session: string) => uia.uiaSessionById(conn, session),
+      complete: (session: string, stages: string[]) =>
+        uia.completeUiaSessionStages(conn, session, stages),
+      drop: (session: string) => uia.deleteUiaSession(conn, session),
+    },
+    pushers: {
+      deleteForToken: (accessHash: string) =>
+        pushers.deletePushersForToken(conn, accessHash),
+      deleteForUser: (localpart: string) =>
+        pushers.deletePushersOfUser(conn, localpart),
+    },
+  };
+}
+
+export type TenantTx = ReturnType<typeof bind>;
 
 export async function openTenant(
   store: Store,
@@ -109,5 +204,6 @@ export async function openTenant(
         return b64encodeStd(new Uint8Array(signature));
       },
     }),
+    tx: (fn) => db.tx((conn) => fn(bind(conn))),
   };
 }
