@@ -14,6 +14,8 @@ import * as state from '#engine/room/state.ts';
 import * as waits from '#engine/room/waits.ts';
 
 export { roomSchema };
+export { formatCursor, parseCursor } from '#engine/room/segments.ts';
+export type { WalkCursor, WalkStep } from '#engine/room/segments.ts';
 export type { EventRow, Status, Walk } from '#engine/room/events.ts';
 export type { StateChange, StateMap } from '#engine/room/state.ts';
 export type { Segment } from '#engine/room/segments.ts';
@@ -49,6 +51,7 @@ function bind(conn: Conn) {
         state.groupKey(conn, group, type, stateKey),
       eventStateBefore: (event: string) => state.eventStateBefore(conn, event),
       eventStateAfter: (event: string) => state.eventStateAfter(conn, event),
+      eventReadState: (event: string) => state.eventReadState(conn, event),
       publishedAt: (stay: number, pos: number) =>
         state.publishedAt(conn, stay, pos),
       current: (stay: number) => state.current(conn, stay),
@@ -94,6 +97,10 @@ function bind(conn: Conn) {
         dir: 'f' | 'b',
         limit: number,
       ) => segments.positionsPage(conn, segment, from, dir, limit),
+      walkStart: () => segments.walkStart(conn),
+      step: (cursor: segments.WalkCursor, dir: 'f' | 'b') =>
+        segments.stepPosition(conn, cursor, dir),
+      nextStayOf: (stay: number) => segments.nextStayOf(conn, stay),
     },
     extremities: {
       frontier: (stay: number) => extremities.frontier(conn, stay),
@@ -117,6 +124,7 @@ function bind(conn: Conn) {
         changes.appendChange(conn, kind, event, data),
       after: (pos: number, limit: number) =>
         changes.changesAfter(conn, pos, limit),
+      posOf: (event: string) => changes.changePosOf(conn, event),
     },
   };
 }

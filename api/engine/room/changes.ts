@@ -44,3 +44,17 @@ export async function changesAfter(
   );
   return rows.map(changeOf);
 }
+
+// The change position of an event's live-ingest entry ('event' or
+// 'transition' — the kinds a publication can hang off; history entries
+// never map to publications).
+export async function changePosOf(
+  conn: Conn,
+  event: string,
+): Promise<number | null> {
+  const rows = await conn.query(
+    `SELECT pos FROM changes WHERE event = ? AND kind IN ('event', 'transition') ORDER BY pos DESC LIMIT 1`,
+    [event],
+  );
+  return rows.length === 0 ? null : Number(rows[0].pos);
+}

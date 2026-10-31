@@ -139,6 +139,19 @@ export function eventStateAfter(
   return eventStateRef(conn, event, 'after_group');
 }
 
+// The read contract for "state at an event" (G6): the event's OWN
+// stored refs, never the room's current state as a fallback. NULL when
+// the state is genuinely unknown (evidence/pending) — never a fake.
+export async function eventReadState(
+  conn: Conn,
+  event: string,
+): Promise<{ before: EventStateRef; after: EventStateRef } | null> {
+  const before = await eventStateBefore(conn, event);
+  const after = await eventStateAfter(conn, event);
+  if (before === null || after === null) return null;
+  return { before, after };
+}
+
 // State at live position N: the latest publication ≤ N in the stay, or the
 // stay's opening group when nothing was published yet (a new stay's state).
 export async function publishedAt(
