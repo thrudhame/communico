@@ -8,9 +8,14 @@ import type { Store } from '#engine/store/index.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { tenantSchema } from '#engine/tenant/schema.ts';
+import * as accountdata from '#engine/tenant/accountdata.ts';
 import * as auth from '#engine/tenant/auth.ts';
 import * as devices from '#engine/tenant/devices.ts';
+import * as filters from '#engine/tenant/filters.ts';
+import * as media from '#engine/tenant/media.ts';
 import * as pushers from '#engine/tenant/pushers.ts';
+import * as pushrules from '#engine/tenant/pushrules.ts';
+import * as txns from '#engine/tenant/txns.ts';
 import * as uia from '#engine/tenant/uia.ts';
 import * as users from '#engine/tenant/users.ts';
 import {
@@ -25,7 +30,11 @@ import {
 } from '#engine/signing-primitives.js';
 
 export { tenantSchema };
+export type { AccountDataRow } from '#engine/tenant/accountdata.ts';
 export type { DeviceRow } from '#engine/tenant/devices.ts';
+export type { MediaMeta, MediaRow } from '#engine/tenant/media.ts';
+export type { PusherInput, PusherRow } from '#engine/tenant/pushers.ts';
+export type { PushRule, RuleRow } from '#engine/tenant/pushrules.ts';
 export type { ProfileRow } from '#engine/tenant/users.ts';
 export type { UiaSession } from '#engine/tenant/uia.ts';
 
@@ -135,6 +144,129 @@ function bind(conn: Conn) {
         pushers.deletePushersForToken(conn, accessHash),
       deleteForUser: (localpart: string) =>
         pushers.deletePushersOfUser(conn, localpart),
+      delete: (localpart: string, appId: string, pushkey: string) =>
+        pushers.deletePusherRow(conn, localpart, appId, pushkey),
+      upsert: (
+        localpart: string,
+        pusher: pushers.PusherInput & { kind: string },
+        accessHash: string,
+      ) => pushers.upsertPusherRow(conn, localpart, pusher, accessHash),
+      ofUser: (localpart: string) => pushers.pushersOfUser(conn, localpart),
+    },
+    counters: {
+      next: (name: string) => accountdata.nextCounter(conn, name),
+      nextStream: () => accountdata.nextStreamSeq(conn),
+    },
+    accountData: {
+      put: (
+        localpart: string,
+        roomId: string,
+        type: string,
+        content: string,
+        seq: number,
+      ) =>
+        accountdata.putAccountDataRow(
+          conn,
+          localpart,
+          roomId,
+          type,
+          content,
+          seq,
+        ),
+      get: (localpart: string, roomId: string, type: string) =>
+        accountdata.accountDataRow(conn, localpart, roomId, type),
+      ofRoom: (localpart: string, roomId: string) =>
+        accountdata.accountDataOfRoom(conn, localpart, roomId),
+      globalSince: (localpart: string, aSeq: number) =>
+        accountdata.globalAccountDataSince(conn, localpart, aSeq),
+      maxSeq: (localpart: string) =>
+        accountdata.accountDataMaxSeq(conn, localpart),
+    },
+    pushRules: {
+      kindRows: (localpart: string, kind: string) =>
+        pushrules.kindRows(conn, localpart, kind),
+      byId: (localpart: string, kind: string, ruleId: string) =>
+        pushrules.ruleById(conn, localpart, kind, ruleId),
+      put: (
+        localpart: string,
+        kind: string,
+        ruleId: string,
+        priority: number,
+        actions: string,
+        conditions: string | null,
+        pattern: string | null,
+        seq: number,
+      ) =>
+        pushrules.putRuleRow(
+          conn,
+          localpart,
+          kind,
+          ruleId,
+          priority,
+          actions,
+          conditions,
+          pattern,
+          seq,
+        ),
+      delete: (localpart: string, kind: string, ruleId: string) =>
+        pushrules.deleteRuleRow(conn, localpart, kind, ruleId),
+      setEnabled: (
+        localpart: string,
+        kind: string,
+        ruleId: string,
+        enabled: boolean,
+      ) => pushrules.setRuleEnabledRow(conn, localpart, kind, ruleId, enabled),
+      setActions: (
+        localpart: string,
+        kind: string,
+        ruleId: string,
+        actions: string,
+      ) => pushrules.setRuleActionsRow(conn, localpart, kind, ruleId, actions),
+      setPriority: (
+        localpart: string,
+        kind: string,
+        ruleId: string,
+        priority: number,
+      ) => pushrules.setRulePriority(conn, localpart, kind, ruleId, priority),
+      roomRulesOf: (roomId: string, onlyLocalpart?: string) =>
+        pushrules.roomRulesOf(conn, roomId, onlyLocalpart),
+      copyRoomRule: (
+        localpart: string,
+        newRoomId: string,
+        row: pushrules.RuleRow,
+      ) => pushrules.copyRoomRule(conn, localpart, newRoomId, row),
+      stampStream: (localpart: string, seq: number) =>
+        pushrules.stampPushStream(conn, localpart, seq),
+      streamSeq: (localpart: string) =>
+        pushrules.pushStreamSeqRow(conn, localpart),
+    },
+    filters: {
+      count: (localpart: string) => filters.countFilters(conn, localpart),
+      insert: (localpart: string, filterId: string, filter: string) =>
+        filters.insertFilter(conn, localpart, filterId, filter),
+      byId: (localpart: string, filterId: string) =>
+        filters.filterById(conn, localpart, filterId),
+    },
+    media: {
+      insert: (
+        localpart: string,
+        mediaId: string,
+        state: 'pending' | 'uploaded',
+        meta: media.MediaMeta,
+      ) => media.insertMedia(conn, localpart, mediaId, state, meta),
+      byId: (mediaId: string) => media.mediaById(conn, mediaId),
+      markUploaded: (mediaId: string, meta: media.MediaMeta) =>
+        media.markMediaUploaded(conn, mediaId, meta),
+    },
+    txns: {
+      lookup: (deviceId: string, roomId: string, txnId: string) =>
+        txns.transactionById(conn, deviceId, roomId, txnId),
+      record: (
+        deviceId: string,
+        roomId: string,
+        txnId: string,
+        eventId: string,
+      ) => txns.insertTransaction(conn, deviceId, roomId, txnId, eventId),
     },
   };
 }
