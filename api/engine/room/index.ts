@@ -102,6 +102,7 @@ function bind(conn: Conn) {
       add: (wait: waits.Wait) => waits.addWait(conn, wait),
       for: (missing: string) => waits.waitsFor(conn, missing),
       of: (waiting: string) => waits.waitsOf(conn, waiting),
+      all: () => waits.allWaits(conn),
       expired: (now: number) => waits.expiredWaits(conn, now),
       remove: (missing: string, waiting: string, kind: string) =>
         waits.removeWait(conn, missing, waiting, kind),

@@ -56,6 +56,14 @@ export async function waitsOf(conn: Conn, waiting: string): Promise<Wait[]> {
   return rows.map(waitOf);
 }
 
+// Every wait of the room, oldest first — the recheck driver's scan.
+export async function allWaits(conn: Conn): Promise<Wait[]> {
+  const rows = await conn.query(
+    'SELECT * FROM waits ORDER BY since, waiting, missing, kind',
+  );
+  return rows.map(waitOf);
+}
+
 export async function expiredWaits(conn: Conn, now: number): Promise<Wait[]> {
   const rows = await conn.query(
     'SELECT * FROM waits WHERE expires IS NOT NULL AND expires <= ? ORDER BY expires, missing, waiting',

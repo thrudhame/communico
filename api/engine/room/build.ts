@@ -96,6 +96,22 @@ export async function resolvePrevs(
   return { ids, afterGroups, depths };
 }
 
+// The cited prevs that do not ground an event: unknown, or held without
+// a genuine after-state — pending and evidence events carry bytes, not
+// state-at-event (G2).
+export async function ungroundedPrevs(
+  tx: RoomTx,
+  prevIds: readonly string[],
+): Promise<string[]> {
+  const missing: string[] = [];
+  for (const id of prevIds) {
+    const row = await tx.events.get(id);
+    const after = row === null ? null : await tx.state.eventStateAfter(id);
+    if (row === null || after === null) missing.push(id);
+  }
+  return missing;
+}
+
 // The rulebook's synchronous EventStore over the bounded recursive auth
 // closure of the seeds, with rejected flags (S4 155-194).
 export async function loadRulebookStore(

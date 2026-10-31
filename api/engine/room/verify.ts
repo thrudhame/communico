@@ -114,6 +114,18 @@ function checkFormat(pdu: Pdu, spec: RoomVersionSpec): boolean {
   return oversized;
 }
 
+// The lenient-version size verdict over a stored (verified) PDU —
+// deterministic, no verification needed (the resume driver recomputes
+// it; the flag is never persisted). Strict versions always answer false:
+// such an event would have been dropped at receipt, never stored.
+export function oversizedOf(pdu: Pdu, roomVersion: string): boolean {
+  const spec = getRulebook(roomVersion).spec;
+  if (spec.strictByteLimits) return false;
+  const measure = (s: string): number => [...s].length;
+  return measure(String(pdu.type)) > 255 ||
+    (pdu.state_key !== undefined && measure(String(pdu.state_key)) > 255);
+}
+
 // Checks 1 + id: format guards, unsigned strip, the recomputed event id
 // and the v12 room-id defence. `roomId` is the room context for the v12
 // create check (a v12 room id IS the create's event id — v12.md:98-101).
@@ -138,6 +150,9 @@ export async function identify(
   if (pdu.event_id !== undefined && pdu.event_id !== eventId) {
     throw new Error('M_BAD_EVENT: event_id does not recompute');
   }
+  // the wire form has no event_id (v3+, transported out-of-band) —
+  // restore the computed one: the stored PDU carries its derived id
+  pdu.event_id = eventId;
   if (
     spec.roomIdFromCreateEvent && pdu.type === 'm.room.create' &&
     opts.roomId !== undefined && opts.roomId !== '!' + eventId.slice(1)

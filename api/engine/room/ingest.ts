@@ -1,14 +1,30 @@
-// api/engine/room/ingest.ts — local ingest (3b): one room transaction per
-// event, under the per-room lock. The pipeline (requirements §4.1/§4.3,
-// old ingest's locked steps): version gate and format guards, idempotent
-// redelivery, prev grounding, state before (single-prev aliases the
-// parent's after-group — never a resolution), auth chain / state / current
-// (soft-fail) checks, standing, event + edges + status + event-state refs,
-// extremities (accepted events consume their prevs, walking back through
-// flagged ancestors), positions, the change log (event, publication via
-// the event's change pos, membership change, delivery intent), and the
-// current-state publication through materialize(). Rejected events are
-// stored too (standing rejected), never published, never extremities (G11).
+// api/engine/room/ingest.ts — local ingest (3b) and the shared locked
+// pipeline remote ingest composes (3c-1): one room transaction per
+// event/batch, under the per-room lock. The pipeline (requirements
+// §4.1/§4.3, old ingest's locked steps): version gate and format guards,
+// idempotent redelivery, prev grounding, state before (single-prev
+// aliases the parent's after-group — never a resolution), auth chain /
+// state / current (soft-fail) checks, standing, event + edges + status +
+// event-state refs, extremities (accepted events consume their prevs,
+// walking back through flagged ancestors), positions, the change log
+// (event, publication via the event's change pos, membership change,
+// delivery intent), and the current-state publication through
+// materialize(). Rejected events are stored too (standing rejected),
+// never published, never extremities (G11).
+//
+// The remote shape (opts.remote): depth and declared-auth-set checks are
+// relaxed (old steps 7/10 — remote events passed the bounds in
+// verify.ts and rules 1–2 only apply), verify()'s oversized verdict is a
+// stored state-reject, the delivering server is recorded as the status
+// origin, no delivery intent is emitted (we do not forward remote
+// events), prevs that stay missing land the event `pending` with waits
+// rows (R10 — or dropped when ungroundedMs is 0), a pending redelivery
+// falls through to a real re-ingest (ruling B), and a gap tip recovered
+// with a fetched state uses it as the imported before-state boundary
+// only when its own prevs are genuinely absent (R5/G1; with grounded
+// parents held, their after-states resolve instead — P15). resumeWaits
+// is the recheck driver: a later arrival of what a wait missed re-runs
+// it (old ruling B).
 import { canonicalJson } from '#engine/canonical.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -28,7 +44,9 @@ import {
   resolvePrevs,
   roomVersionOf,
   stateBefore,
+  ungroundedPrevs,
 } from '#engine/room/build.ts';
+import type { Grounding } from '#engine/room/events.ts';
 import type { EventRow, Room, RoomTx } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import {
@@ -37,6 +55,7 @@ import {
 } from '#engine/room/redaction.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { StateChange } from '#engine/room/state.ts';
+import { oversizedOf } from '#engine/room/verify.ts';
 
 export type Standing = 'accepted' | 'rejected' | 'soft_failed';
 
@@ -45,7 +64,26 @@ export type IngestLocalResult = {
   standing: Standing;
   reason: 'auth' | 'state' | null;
   rule: string | null;
+  grounding: Grounding;
+  // False only for the remote terminal drop (ungroundedMs = 0): the
+  // event is not stored at all (old ruling B).
+  stored: boolean;
+  // True when the result is the idempotency receipt of an event the
+  // room already held grounded (no second write).
+  receipt: boolean;
   event: EventRow;
+};
+
+// The remote shape of an ingest (3c-1): the delivering server, our own
+// server name (the I15 stay closure), verify()'s lenient-size verdict,
+// the terminal rule for events whose prevs stay missing, and — for a
+// gap tip recovered via /state_ids — the imported before-state boundary.
+export type RemoteIngest = {
+  origin: string;
+  self: string;
+  oversized: boolean;
+  ungroundedMs: number;
+  boundary?: StateMap;
 };
 
 function sameIdSet(a: readonly string[], b: readonly string[]): boolean {
@@ -85,11 +123,15 @@ export async function sendLocal(
   partial: BuildPartial,
   signer: Signer,
 ): Promise<IngestLocalResult> {
-  return await withRoomLock(room.id, () =>
+  const result = await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
       const pdu = await buildInTx(tx, room.id, partial, signer);
       return await ingestInTx(tx, room.id, pdu);
     }));
+  // A wait naming this event (a redaction target, a missing prev) is
+  // re-run now that it has arrived (R10 — the 3c recheck driver).
+  await maybeResume(room, result.eventId, signer.serverName);
+  return result;
 }
 
 // Ingest an already-built local PDU: the per-room lock and the room
@@ -99,19 +141,39 @@ export async function ingestLocal(
   room: Room,
   pdu: Pdu,
 ): Promise<IngestLocalResult> {
-  return await withRoomLock(
+  const result = await withRoomLock(
     room.id,
     () => room.tx((tx) => ingestInTx(tx, room.id, pdu)),
   );
+  const servers = Object.keys(pdu.signatures ?? {});
+  if (servers.length === 1) await maybeResume(room, result.eventId, servers[0]);
+  return result;
+}
+
+// The recheck trigger: an event that gained waiters re-runs them after
+// the current lock is released (each recheck is a locked ingest of its
+// own; network never runs here).
+async function maybeResume(
+  room: Room,
+  eventId: string,
+  self: string,
+): Promise<void> {
+  const hasWaiters = await room.tx(async (tx) =>
+    (await tx.waits.for(eventId)).length > 0
+  );
+  if (hasWaiters) await resumeWaits(room, { self });
 }
 
 // The tx-scoped core: the caller holds the room lock and composes (the
-// genesis stay creation, createRoom's sequence, rollback tests).
+// genesis stay creation, createRoom's sequence, remote batches, rollback
+// tests).
 export async function ingestInTx(
   tx: RoomTx,
   roomId: string,
   pdu: Pdu,
+  opts: { remote?: RemoteIngest } = {},
 ): Promise<IngestLocalResult> {
+  const remote = opts.remote ?? null;
   const isCreate = pdu.type === 'm.room.create' &&
     (pdu.prev_events ?? []).length === 0;
   const stay = await tx.segments.openStay();
@@ -158,59 +220,106 @@ export async function ingestInTx(
   }
 
   // Idempotent redelivery (requirements §4.3 I2): the original receipt,
-  // no re-verification.
+  // no re-verification. A remote redelivery of a PENDING event falls
+  // through to a real re-ingest (ruling B — the first-writer bytes are
+  // kept, the record is re-evaluated).
   const existing = await tx.events.get(eventId);
+  let pendingRedelivery = false;
   if (existing !== null) {
     const status = await tx.events.getStatus(eventId);
     if (status === null) {
       throw new Error('E_STATUS_MISSING: ' + eventId);
     }
-    return {
-      eventId,
-      standing: status.standing,
-      reason: null,
-      rule: null,
-      event: existing,
-    };
+    if (remote !== null && status.grounding === 'pending') {
+      pendingRedelivery = true;
+    } else {
+      return {
+        eventId,
+        standing: status.standing,
+        reason: null,
+        rule: null,
+        grounding: status.grounding,
+        stored: true,
+        receipt: true,
+        event: existing,
+      };
+    }
   }
 
-  let hashOk = false;
-  try {
-    const { event_id: _drop, ...noId } = pdu as unknown as Record<
-      string,
-      unknown
-    >;
-    void _drop;
-    hashOk = (await contentHashOf(noId)) === pdu.hashes?.sha256;
-  } catch (e) {
-    throw new Error(
-      'M_BAD_EVENT: content cannot be canonicalized — ' + String(e),
-    );
+  // The content-hash and signature-presence guards are the LOCAL path's
+  // (3b: events are signed in-process by the injected signer; a hash
+  // mismatch is a stored auth-reject). Remote PDUs were verified before
+  // the lock (verify.ts: a hash mismatch was already redacted, the
+  // signature already proven — G9/G10).
+  let hashOk = true;
+  let self: string;
+  if (remote !== null) {
+    self = remote.self;
+  } else {
+    hashOk = false;
+    try {
+      const { event_id: _drop, ...noId } = pdu as unknown as Record<
+        string,
+        unknown
+      >;
+      void _drop;
+      hashOk = (await contentHashOf(noId)) === pdu.hashes?.sha256;
+    } catch (e) {
+      throw new Error(
+        'M_BAD_EVENT: content cannot be canonicalized — ' + String(e),
+      );
+    }
+    // 3b events are signed in-process by the injected signer; ingest
+    // verifies the id and content hash and requires a signature entry.
+    const signatureServers = Object.keys(pdu.signatures ?? {});
+    if (signatureServers.length === 0) {
+      throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
+    }
+    if (signatureServers.length !== 1) {
+      throw new Error(
+        'E_LOCAL_SIGNATURE: a local event carries exactly one signature server',
+      );
+    }
+    self = signatureServers[0];
   }
-  // 3b events are signed in-process by the injected signer; ingest
-  // verifies the id and content hash and requires a signature entry.
-  // (Remote signature verification is 3c, G9.)
-  const signatureServers = Object.keys(pdu.signatures ?? {});
-  if (signatureServers.length === 0) {
-    throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
-  }
-  if (signatureServers.length !== 1) {
-    throw new Error(
-      'E_LOCAL_SIGNATURE: a local event carries exactly one signature server',
-    );
-  }
-  const self = signatureServers[0];
 
   // Prev grounding and the local depth check (a mismatch is a stored
-  // auth-reject, as in the old shared pipeline).
-  const prevs = await resolvePrevs(tx, prevIds);
+  // auth-reject, as in the old shared pipeline). A REMOTE event whose
+  // prevs stay missing is not an error: it waits as pending (R10) or is
+  // dropped (ungroundedMs = 0, old ruling B); its depth is bounded but
+  // never recomputed (old step 7). A gap tip's fetched boundary is used
+  // only when its prevs are genuinely absent (R5 imported, G1) — with
+  // grounded parents held, their after-states resolve instead (P15).
+  let prevs: { ids: string[]; afterGroups: number[]; depths: number[] };
+  let boundary: StateMap | undefined;
+  if (remote !== null) {
+    const missing = await ungroundedPrevs(tx, prevIds);
+    if (missing.length === 0) {
+      prevs = await resolvePrevs(tx, prevIds);
+    } else if (remote.boundary !== undefined) {
+      boundary = remote.boundary;
+      prevs = { ids: [], afterGroups: [], depths: [] };
+    } else {
+      return await storePending(
+        tx,
+        pdu,
+        eventId,
+        missing,
+        remote,
+        pendingRedelivery,
+      );
+    }
+  } else {
+    prevs = await resolvePrevs(tx, prevIds);
+  }
   const computedDepth = prevs.ids.length === 0
     ? 1
     : Math.max(...prevs.depths) + 1;
-  const depthOk = pdu.depth === computedDepth;
+  const depthOk = remote !== null ? true : pdu.depth === computedDepth;
 
-  // The rulebook store: the bounded auth closure over the prevs' and the
-  // current extremities' state ids plus the declared auth ids.
+  // The rulebook store: the bounded auth closure over the prevs' (or the
+  // imported boundary's) and the current extremities' state ids plus the
+  // declared auth ids.
   const extremityIds = await tx.extremities.frontier(stay.id);
   const extremityGroups: number[] = [];
   for (const id of extremityIds) {
@@ -221,22 +330,39 @@ export async function ingestInTx(
   for (const group of [...prevs.afterGroups, ...extremityGroups]) {
     for (const id of (await tx.state.groupMap(group)).values()) seeds.add(id);
   }
+  if (boundary !== undefined) {
+    for (const id of boundary.values()) seeds.add(id);
+  }
   const store = await loadRulebookStore(tx, [...seeds]);
 
-  const before = await stateBefore(tx, prevs.afterGroups, rulebook, store);
+  // The state before: the single prev's after-group aliased, the
+  // resolution over all prevs — or the gap tip's imported boundary (the
+  // remote's answer, never recomputed from absent prevs, G1).
+  const before = boundary !== undefined
+    ? boundary
+    : await stateBefore(tx, prevs.afterGroups, rulebook, store);
   const priorGroup = await tx.state.current(stay.id);
 
-  // The S8 sequence: auth chain (with the local declared-set determinism
-  // check) -> state -> soft-fail against the current resolved state.
+  // The S8 sequence: auth chain -> state -> soft-fail against the
+  // current resolved state. For remote events the declared-set
+  // determinism check is relaxed (rules 1–2 only — our selection is
+  // still computed for local authoring) and verify()'s oversized verdict
+  // is a stored state-reject (never a drop).
   let standing: Standing = 'accepted';
   let reason: 'auth' | 'state' | null = null;
   let rule: string | null = null;
-  if (!hashOk || !depthOk) {
+  if (remote !== null && remote.oversized) {
+    standing = 'rejected';
+    reason = 'state';
+    rule = 'oversized';
+  } else if (!hashOk || !depthOk) {
     standing = 'rejected';
     reason = 'auth';
   } else {
     const chain = rulebook.checkAuthChain(pdu, store);
-    const selected = isCreate ? null : rulebook.selectAuthEvents(pdu, before);
+    const selected = remote !== null || isCreate
+      ? null
+      : rulebook.selectAuthEvents(pdu, before);
     if (
       !chain.ok ||
       (selected !== null && !sameIdSet(declaredAuth, selected))
@@ -260,14 +386,18 @@ export async function ingestInTx(
   }
 
   // Event-state refs (R5): a single parent's before-ref aliases its
-  // after-group; a resolved before-map lands as a fresh snapshot. The
-  // after-map is the before-map plus the event's own key — for accepted
-  // AND soft-failed state events (a soft-failed state event is in its own
-  // after-state even though it is never published); rejected events get
-  // the pass-through map.
+  // after-group; a resolved before-map or an imported boundary lands as
+  // a fresh snapshot (provenance dag / imported — G1: the boundary is
+  // stored, never inferred from absent prevs). The after-map is the
+  // before-map plus the event's own key — for accepted AND soft-failed
+  // state events (a soft-failed state event is in its own after-state
+  // even though it is never published); rejected events get the
+  // pass-through map.
   let beforeGroup: number;
-  if (prevs.afterGroups.length === 0) {
-    beforeGroup = await tx.materialize.newGroup(null, []);
+  if (boundary !== undefined || prevs.afterGroups.length === 0) {
+    beforeGroup = boundary !== undefined
+      ? await tx.materialize.newGroup(null, mapEntries(boundary))
+      : await tx.materialize.newGroup(null, []);
   } else if (prevs.afterGroups.length === 1) {
     beforeGroup = prevs.afterGroups[0];
   } else {
@@ -281,17 +411,35 @@ export async function ingestInTx(
   }
 
   // Storage (R1/R2): the canonical PDU as truth, its standing, its refs.
-  await tx.events.insert(
-    eventId,
-    canonicalJson(pdu as unknown as Record<string, unknown>),
-  );
+  // A pending redelivery keeps the first-writer bytes (the row exists);
+  // its refs move from none to genuine groups (placeholder recovery, R2).
+  if (existing === null) {
+    await tx.events.insert(
+      eventId,
+      canonicalJson(pdu as unknown as Record<string, unknown>),
+    );
+  }
   await tx.events.setStatus(eventId, {
     standing,
     grounding: 'grounded',
-    origin: null,
+    origin: remote?.origin ?? null,
     received_ts: Date.now(),
   });
-  await tx.materialize.setEventState(eventId, beforeGroup, afterGroup, 'dag');
+  await tx.materialize.setEventState(
+    eventId,
+    beforeGroup,
+    afterGroup,
+    boundary !== undefined ? 'imported' : 'dag',
+  );
+  if (pendingRedelivery) {
+    // grounded now — the prev waits are spent (the redaction waits this
+    // event may own are the resume driver's, not ours)
+    for (const wait of await tx.waits.of(eventId)) {
+      if (wait.kind === 'prev') {
+        await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
+      }
+    }
+  }
 
   // Extremities (R9): only accepted events consume prevs and join the
   // frontier; an accepted child of a soft-failed/rejected event walks back
@@ -318,11 +466,13 @@ export async function ingestInTx(
   }
 
   // Positions: accepted events land on the stay's timeline in arrival
-  // order; rejected/soft-failed events are change-log entries only.
+  // order; rejected/soft-failed events are change-log entries only. A
+  // pending event that now grounds is a standing/grounding TRANSITION
+  // (R11) carrying the full payload, not a new event.
   const offset = standing === 'accepted'
     ? await tx.segments.appendPosition(stay.id, eventId)
     : null;
-  const changePos = await tx.changes.append('event', eventId, {
+  const payload = {
     standing,
     reason,
     rule,
@@ -333,7 +483,15 @@ export async function ingestInTx(
     origin_server_ts: pdu.origin_server_ts,
     stay: stay.id,
     offset,
-  });
+    grounding: 'grounded',
+    origin: remote?.origin ?? null,
+  };
+  const changePos = pendingRedelivery
+    ? await tx.changes.append('transition', eventId, {
+      from: { standing: 'rejected', grounding: 'pending' },
+      ...payload,
+    })
+    : await tx.changes.append('event', eventId, payload);
 
   // Publication (R6/R7): the live stay's current state is the single
   // extremity's after-group or the resolution over the new frontier —
@@ -426,9 +584,9 @@ export async function ingestInTx(
   // Delivery intent (R11): servers with joined members in the state
   // before OR after the event, plus — for a membership event — the
   // target user's server, excluding this server (the 3c-1 formula; the
-  // old-code contract is requirements §4.3 I11). Remote-origin events get
-  // no delivery intent (we do not forward them).
-  if (standing === 'accepted') {
+  // old-code contract is requirements §4.3 I11). LOCAL events only:
+  // remote-origin events get no delivery intent (we do not forward them).
+  if (standing === 'accepted' && remote === null) {
     const afterMap = new Map(before);
     if (stateKey !== null) {
       afterMap.set(String(pdu.type) + '\0' + stateKey, eventId);
@@ -480,7 +638,202 @@ export async function ingestInTx(
 
   const stored = await tx.events.get(eventId);
   if (stored === null) throw new Error('E_STORE: ' + eventId);
-  return { eventId, standing, reason, rule, event: stored };
+  return {
+    eventId,
+    standing,
+    reason,
+    rule,
+    grounding: 'grounded',
+    stored: true,
+    receipt: false,
+    event: stored,
+  };
+}
+
+// The pending terminal (R10): a remote event whose prevs stay missing is
+// stored rejected with grounding pending and a waits row per missing prev
+// (old ruling B — "couldn't check yet" is not a verdict; a later arrival
+// of the missing event re-runs it). ungroundedMs = 0 is the terminal
+// drop: nothing is stored (Synapse's behaviour, chosen by the admin).
+async function storePending(
+  tx: RoomTx,
+  pdu: Pdu,
+  eventId: string,
+  missing: string[],
+  remote: RemoteIngest,
+  redelivery: boolean,
+): Promise<IngestLocalResult> {
+  const canonical = canonicalJson(pdu as unknown as Record<string, unknown>);
+  const row: EventRow = {
+    id: eventId,
+    pdu: canonical,
+    type: String(pdu.type),
+    state_key: pdu.state_key ?? null,
+    sender: String(pdu.sender),
+    depth: pdu.depth,
+    origin_ts: pdu.origin_server_ts,
+  };
+  if (remote.ungroundedMs === 0) {
+    return {
+      eventId,
+      standing: 'rejected',
+      reason: null,
+      rule: null,
+      grounding: 'pending',
+      stored: false,
+      receipt: false,
+      event: row,
+    };
+  }
+  if (redelivery) {
+    // still ungrounded on a redelivery — refresh the waiting set
+    await tx.waits.removeOf(eventId);
+  } else {
+    await tx.events.insert(eventId, canonical);
+    await tx.changes.append('event', eventId, {
+      standing: 'rejected',
+      reason: null,
+      rule: null,
+      type: row.type,
+      state_key: row.state_key,
+      sender: row.sender,
+      depth: row.depth,
+      origin_server_ts: row.origin_ts,
+      stay: null,
+      offset: null,
+      grounding: 'pending',
+      origin: remote.origin,
+    });
+  }
+  await tx.events.setStatus(eventId, {
+    standing: 'rejected',
+    grounding: 'pending',
+    origin: remote.origin,
+    received_ts: Date.now(),
+  });
+  for (const m of missing) {
+    await tx.waits.add({
+      missing: m,
+      waiting: eventId,
+      kind: 'prev',
+      since: Date.now(),
+      expires: Date.now() + remote.ungroundedMs,
+      state: 'pending',
+    });
+  }
+  const stored = await tx.events.get(eventId);
+  return {
+    eventId,
+    standing: 'rejected',
+    reason: null,
+    rule: null,
+    grounding: 'pending',
+    stored: true,
+    receipt: false,
+    event: stored === null ? row : stored,
+  };
+}
+
+// The recheck driver (R10, old ruling B): waiting work is re-run when
+// what it missed arrives — a pending event whose prevs all ground now is
+// re-ingested (each in its own locked transaction, oldest first; an
+// accepted one re-runs ITS waiters in turn) and a waiting redaction
+// whose target is now held gets its effect evaluated. No fetching here
+// (the network is the caller's layer); a still-ungrounded event keeps
+// waiting, and a failure leaves the wait in place (logged, not fatal).
+export async function resumeWaits(
+  room: Room,
+  deps: { self: string },
+): Promise<number> {
+  const processed = new Set<string>();
+  let resumed = 0;
+  for (;;) {
+    const job = await room.tx(async (tx) => {
+      for (const wait of await tx.waits.all()) {
+        if (processed.has(wait.waiting + '|' + wait.kind)) continue;
+        if (wait.kind === 'prev') {
+          const status = await tx.events.getStatus(wait.waiting);
+          if (status === null || status.grounding !== 'pending') {
+            await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
+            continue;
+          }
+          const row = await tx.events.get(wait.waiting);
+          if (row === null) {
+            await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
+            continue;
+          }
+          const prevIds = (JSON.parse(row.pdu) as Pdu).prev_events ?? [];
+          const missing = await ungroundedPrevs(tx, prevIds);
+          if (missing.length > 0) continue;
+          return { kind: 'prev' as const, eventId: wait.waiting };
+        }
+        if (wait.kind === 'redaction') {
+          if ((await tx.events.get(wait.missing)) === null) continue;
+          return {
+            kind: 'redaction' as const,
+            eventId: wait.waiting,
+            target: wait.missing,
+          };
+        }
+      }
+      return null;
+    });
+    if (job === null) return resumed;
+    processed.add(job.eventId + '|' + job.kind);
+    try {
+      if (job.kind === 'prev') {
+        await withRoomLock(room.id, () =>
+          room.tx(async (tx) => {
+            const row = await tx.events.get(job.eventId);
+            const status = await tx.events.getStatus(job.eventId);
+            const stay = await tx.segments.openStay();
+            if (row === null || status === null || stay === null) return;
+            const version = await roomVersionOf(tx, stay.id);
+            const pdu = JSON.parse(row.pdu) as Pdu;
+            await ingestInTx(tx, room.id, pdu, {
+              remote: {
+                origin: status.origin ?? '',
+                self: deps.self,
+                // recomputed — the flag is a deterministic function of
+                // the verified bytes and the version, never persisted
+                oversized: oversizedOf(pdu, version),
+                ungroundedMs: 0,
+              },
+            });
+          }));
+      } else {
+        await withRoomLock(room.id, () =>
+          room.tx(async (tx) => {
+            const row = await tx.events.get(job.eventId);
+            const target = await tx.events.get(job.target);
+            if (row === null || target === null) return;
+            const before = await tx.state.eventStateBefore(job.eventId);
+            if (before === null) return;
+            const stay = await tx.segments.openStay();
+            if (stay === null) return;
+            const version = await roomVersionOf(tx, stay.id);
+            const pdu = JSON.parse(row.pdu) as Pdu;
+            if (
+              await redactionEffectAllowed(
+                tx,
+                getRulebook(version).spec,
+                pdu,
+                target,
+                before.group,
+              )
+            ) {
+              await tx.changes.append('redaction', job.eventId, {
+                target: job.target,
+              });
+            }
+            await tx.waits.remove(job.target, job.eventId, 'redaction');
+          }));
+      }
+      resumed++;
+    } catch (e) {
+      console.error(`resumeWaits: ${job.kind} ${job.eventId} failed:`, e);
+    }
+  }
 }
 
 async function statePduOf(
