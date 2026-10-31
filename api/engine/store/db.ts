@@ -7,6 +7,8 @@ import {
   Turso,
   type Value,
 } from '#engine/store/ffi.ts';
+import { Gate } from '#engine/store/gate.ts';
+import { databaseFiles } from '#engine/store/layout.ts';
 
 export class Conn {
   private active = true;
@@ -40,6 +42,7 @@ export class Conn {
 }
 
 export class Db {
+  readonly gate: Gate;
   private static readonly openFiles = new Map<string, Promise<Db>>();
   private idle: number[] = [];
   private connections = 0;
@@ -54,10 +57,30 @@ export class Db {
     readonly ffi: Turso,
     readonly path: string,
     private readonly handle: number,
-  ) {}
+    checkpointlogbytes: number,
+  ) {
+    this.gate = new Gate(path, checkpointlogbytes, async (started) => {
+      const connection = await this.acquire();
+      try {
+        const result = this.ffi.checkpoint(connection, 'TRUNCATE');
+        started();
+        return await result;
+      } finally {
+        this.idle.push(connection);
+        this.notify();
+      }
+    });
+  }
 
-  static async open(ffi: Turso, path: string): Promise<Db> {
+  static async open(
+    ffi: Turso,
+    path: string,
+    checkpointlogbytes: number,
+  ): Promise<Db> {
     path = resolve(path);
+    if (path !== databaseFiles(dirname(path)).database) {
+      throw new Error('database file must be named data.db');
+    }
     try {
       path = await Deno.realPath(path);
     } catch (error) {
@@ -67,13 +90,17 @@ export class Db {
     const existing = this.openFiles.get(path);
     if (existing) {
       const db = await existing;
-      if (db.ffi !== ffi || db.closing) {
+      if (
+        db.ffi !== ffi || db.closing || db.gate.threshold !== checkpointlogbytes
+      ) {
         throw new Error('database already owned by another library or closing');
       }
       db.references++;
       return db;
     }
-    const opened = ffi.open(path).then((handle) => new Db(ffi, path, handle));
+    const opened = ffi.open(path).then((handle) =>
+      new Db(ffi, path, handle, checkpointlogbytes)
+    );
     this.openFiles.set(path, opened);
     try {
       return await opened;
@@ -117,9 +144,11 @@ export class Db {
       throw new Error('database is closing or closed');
     }
     this.users++;
+    await this.gate.enter();
     let handle: number | undefined;
     let connection: Conn | undefined;
     let reusable = true;
+    let committed = false;
     try {
       handle = await this.acquire();
       connection = new Conn(this.ffi, handle);
@@ -127,6 +156,7 @@ export class Db {
       try {
         const result = await fn(connection);
         await this.ffi.commit(handle);
+        committed = true;
         return result;
       } catch (error) {
         try {
@@ -154,8 +184,12 @@ export class Db {
           }
         }
       } finally {
-        this.users--;
-        this.notify();
+        try {
+          await this.gate.leave(committed);
+        } finally {
+          this.users--;
+          this.notify();
+        }
       }
     }
   }

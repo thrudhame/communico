@@ -67,9 +67,9 @@ Deno.test('store FFI: MVCC/FULL, values, checkpoint and explicit engine errors',
 Deno.test('store Db: transaction commit, rollback, released Conn and canonical ownership', async () => {
   const dir = await Deno.makeTempDir();
   const ffi = new Turso('./.native/libturso_ffi.so');
-  const db = await Db.open(ffi, dir + '/data.db');
+  const db = await Db.open(ffi, dir + '/data.db', 4120000);
   try {
-    const same = await Db.open(ffi, dir + '/./data.db');
+    const same = await Db.open(ffi, dir + '/./data.db', 4120000);
     assertEquals(same, db);
     await same.close();
     await db.exec('CREATE TABLE rows_test(id INTEGER PRIMARY KEY, value TEXT)');
