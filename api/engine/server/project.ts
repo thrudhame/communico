@@ -35,8 +35,27 @@ const BATCH = 500;
 // startup roll-forward retries.
 let queue: Promise<void> = Promise.resolve();
 
+// Projection listeners (the federation sender's wake, 4c-2): registered
+// like the room hooks, fired after each completed projection. A listener
+// never breaks the projection — errors are logged.
+const projectedListeners: ((store: Store, roomId: string) => void)[] = [];
+
+export function onProjected(
+  fn: (store: Store, roomId: string) => void,
+): void {
+  projectedListeners.push(fn);
+}
+
 export function project(store: Store, roomId: string): Promise<void> {
-  const run = queue.then(() => projectNow(store, roomId));
+  const run = queue.then(() => projectNow(store, roomId)).then(() => {
+    for (const fn of projectedListeners) {
+      try {
+        fn(store, roomId);
+      } catch (error) {
+        console.error(`projection listener failed for ${roomId}:`, error);
+      }
+    }
+  });
   queue = run.then(
     () => undefined,
     () => undefined,
