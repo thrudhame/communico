@@ -1,8 +1,10 @@
 // api/engine/store/create.ts — publish only a closed, reopened, verified and
 // fsynced database. Failed creation is deliberately left for startup sweep.
+// Schema providers own each database kind's domain tables; the store owns
+// the meta table and refuses a missing row or a version mismatch (R14).
 import { basename, join } from '@std/path';
 import { Db } from '#engine/store/db.ts';
-import { Turso } from '#engine/store/ffi.ts';
+import { type Row, Turso } from '#engine/store/ffi.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 
 export type CreateOptions = {
@@ -11,6 +13,63 @@ export type CreateOptions = {
   verify: (db: Db) => Promise<void>;
   beforeRename?: (temporary: string, final: string) => Promise<void>;
 };
+
+// A schema provider owns one database kind's domain tables. Safe create
+// applies it in the `.new` stage and every open checks the recorded
+// `meta.schema_version` against it — a mismatch or a missing row refuses
+// the open (R14; no migrations yet). Version 0 is the empty placeholder.
+export type SchemaProvider = {
+  readonly version: number;
+  apply(db: Db): Promise<void>;
+};
+
+export const EMPTY_SCHEMA: SchemaProvider = {
+  version: 0,
+  apply: () => Promise.resolve(),
+};
+
+export const META_SCHEMA =
+  'CREATE TABLE meta(k TEXT PRIMARY KEY NOT NULL, v TEXT NOT NULL)';
+
+export async function applySchema(
+  db: Db,
+  provider: SchemaProvider,
+): Promise<void> {
+  if (!Number.isSafeInteger(provider.version) || provider.version < 0) {
+    throw new TypeError('schema version must be a non-negative safe integer');
+  }
+  await db.exec(META_SCHEMA);
+  await provider.apply(db);
+  await db.execute('INSERT INTO meta VALUES(?, ?)', [
+    'schema_version',
+    String(provider.version),
+  ]);
+}
+
+export async function checkSchema(
+  db: Db,
+  provider: SchemaProvider,
+): Promise<void> {
+  let rows: Row[];
+  try {
+    rows = await db.query('SELECT v FROM meta WHERE k = ?', ['schema_version']);
+  } catch (error) {
+    throw new Error(
+      `database has no schema meta table: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  if (rows.length !== 1) {
+    throw new Error('database has no schema version row');
+  }
+  if (rows[0].v !== String(provider.version)) {
+    throw new Error(
+      `schema version mismatch: database has ${JSON.stringify(rows[0].v)}, ` +
+        `provider wants ${JSON.stringify(String(provider.version))}`,
+    );
+  }
+}
 
 async function sync(path: string): Promise<void> {
   const file = await Deno.open(path, { read: true });

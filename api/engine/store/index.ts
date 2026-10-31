@@ -1,9 +1,18 @@
 // api/engine/store/index.ts — the store's public face. Startup order is the
 // crash-safety contract: sweep interrupted publications, then open the
-// server file, then let the later stages roll forward before serving.
+// server file, then let the later stages roll forward before serving. Each
+// database kind takes a schema provider (R14); the server file always
+// carries the store's watermark tables under the provider's own tables.
 import { join } from '@std/path';
 import { checkBuildInfo } from '#engine/store/build.ts';
-import { createDatabase, sweep } from '#engine/store/create.ts';
+import {
+  applySchema,
+  checkSchema,
+  createDatabase,
+  EMPTY_SCHEMA,
+  type SchemaProvider,
+  sweep,
+} from '#engine/store/create.ts';
 import { Db } from '#engine/store/db.ts';
 import { type GateStats } from '#engine/store/gate.ts';
 import { Turso } from '#engine/store/ffi.ts';
@@ -21,6 +30,12 @@ export type StoreConfig = {
   checkpointlogbytes: number;
   maxopenfiles: number;
   idleseconds: number;
+};
+
+export type StoreSchemas = {
+  room?: SchemaProvider;
+  tenant?: SchemaProvider;
+  server?: SchemaProvider;
 };
 
 export type StoreStats = {
@@ -63,7 +78,10 @@ export class Store implements StartupStore {
   }
 }
 
-export async function openStore(config: StoreConfig): Promise<Store> {
+export async function openStore(
+  config: StoreConfig,
+  options: { schemas?: StoreSchemas } = {},
+): Promise<Store> {
   const ffi = new Turso(config.library);
   let serverDb: Db | undefined;
   let pool: Pool | undefined;
@@ -71,6 +89,13 @@ export async function openStore(config: StoreConfig): Promise<Store> {
     checkBuildInfo(await ffi.buildInfo());
     await sweep(join(config.dir, 'rooms'));
     await sweep(join(config.dir, 'tenants'));
+    const serverProvider: SchemaProvider = {
+      version: (options.schemas?.server ?? EMPTY_SCHEMA).version,
+      apply: async (db) => {
+        await ensureWatermarks(db);
+        await (options.schemas?.server ?? EMPTY_SCHEMA).apply(db);
+      },
+    };
     const serverPath = databaseFiles(serverDirectory(config.dir)).database;
     let present = false;
     try {
@@ -82,17 +107,19 @@ export async function openStore(config: StoreConfig): Promise<Store> {
       await Deno.mkdir(config.dir, { recursive: true });
       await createDatabase(ffi, config.dir, 'server', {
         checkpointlogbytes: config.checkpointlogbytes,
-        schema: (db) => ensureWatermarks(db),
-        verify: async (db) => {
-          await db.query('SELECT source, position FROM watermarks');
-        },
+        schema: (db) => applySchema(db, serverProvider),
+        verify: (db) => checkSchema(db, serverProvider),
       });
     }
     serverDb = await Db.open(ffi, serverPath, config.checkpointlogbytes);
+    await checkSchema(serverDb, serverProvider);
     pool = new Pool(ffi, config.dir, {
       checkpointlogbytes: config.checkpointlogbytes,
       maxopenfiles: config.maxopenfiles,
       idleseconds: config.idleseconds,
+    }, {
+      rooms: options.schemas?.room,
+      tenants: options.schemas?.tenant,
     });
     const store = new Store(ffi, serverDb, pool);
     for (const hook of startupHooks()) await hook(store);

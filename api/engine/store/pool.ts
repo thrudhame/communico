@@ -1,7 +1,15 @@
 // api/engine/store/pool.ts — the open-file pool. One entry per room/tenant
 // file; eviction never touches a file in use or one whose gate is paused.
+// Creation applies the kind's schema provider inside the `.new` stage and
+// every open checks the recorded schema version (R14).
 import { join } from '@std/path';
-import { createDatabase } from '#engine/store/create.ts';
+import {
+  applySchema,
+  checkSchema,
+  createDatabase,
+  EMPTY_SCHEMA,
+  type SchemaProvider,
+} from '#engine/store/create.ts';
 import { Db } from '#engine/store/db.ts';
 import type { Turso } from '#engine/store/ffi.ts';
 import {
@@ -28,13 +36,19 @@ export class Pool {
   private readonly entries = new Map<string, Entry>();
   readonly errors: Error[] = [];
   private readonly sweeper: ReturnType<typeof setInterval>;
+  private readonly providers: Record<FileKind, SchemaProvider>;
   private closed = false;
 
   constructor(
     private readonly ffi: Turso,
     private readonly root: string,
     private readonly options: PoolOptions,
+    providers: Partial<Record<FileKind, SchemaProvider>> = {},
   ) {
+    this.providers = {
+      rooms: providers.rooms ?? EMPTY_SCHEMA,
+      tenants: providers.tenants ?? EMPTY_SCHEMA,
+    };
     if (
       !Number.isSafeInteger(options.maxopenfiles) || options.maxopenfiles < 1
     ) {
@@ -118,10 +132,17 @@ export class Pool {
         );
       }
       await Deno.mkdir(parent, { recursive: true });
+      const provider = this.providers[kind];
       await createDatabase(this.ffi, parent, key, {
         checkpointlogbytes: this.options.checkpointlogbytes,
-        schema: (db) => recordId(db, id),
-        verify: (db) => checkId(db, id),
+        schema: async (db) => {
+          await recordId(db, id);
+          await applySchema(db, provider);
+        },
+        verify: async (db) => {
+          await checkId(db, id);
+          await checkSchema(db, provider);
+        },
       });
     }
     const db = await Db.open(
@@ -131,6 +152,7 @@ export class Pool {
     );
     try {
       await checkId(db, id);
+      await checkSchema(db, this.providers[kind]);
     } catch (error) {
       await db.close();
       throw error;
