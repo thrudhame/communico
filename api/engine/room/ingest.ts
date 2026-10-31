@@ -423,19 +423,27 @@ export async function ingestInTx(
     }
   }
 
-  // Delivery intent (R11): remote server names with joined members in the
-  // state after the event, excluding this server.
+  // Delivery intent (R11): servers with joined members in the state
+  // before OR after the event, plus — for a membership event — the
+  // target user's server, excluding this server (the 3c-1 formula; the
+  // old-code contract is requirements §4.3 I11). Remote-origin events get
+  // no delivery intent (we do not forward them).
   if (standing === 'accepted') {
     const afterMap = new Map(before);
     if (stateKey !== null) {
       afterMap.set(String(pdu.type) + '\0' + stateKey, eventId);
     }
     const destinations = new Set<string>();
-    for (const [key, id] of afterMap) {
-      if (!key.startsWith('m.room.member\0')) continue;
-      const row = await tx.events.get(id);
-      if (row === null || membershipOfPdu(row.pdu) !== 'join') continue;
-      destinations.add(domainOf(key.slice('m.room.member\0'.length)));
+    for (const map of [before, afterMap]) {
+      for (const [key, id] of map) {
+        if (!key.startsWith('m.room.member\0')) continue;
+        const row = await tx.events.get(id);
+        if (row === null || membershipOfPdu(row.pdu) !== 'join') continue;
+        destinations.add(domainOf(key.slice('m.room.member\0'.length)));
+      }
+    }
+    if (pdu.type === 'm.room.member' && stateKey !== null) {
+      destinations.add(domainOf(stateKey));
     }
     destinations.delete(self);
     await tx.changes.append('delivery', eventId, {

@@ -529,7 +529,7 @@ Deno.test('ingest: redelivery returns the original receipt — no second write',
   });
 });
 
-Deno.test('ingest: delivery intent follows joined remote members (state after the event)', async () => {
+Deno.test('ingest: delivery intent — joined servers before ∪ after the event, plus the membership target', async () => {
   await withStore(async (store) => {
     const g = await genesis(store, {
       roomId: '!ing13:test',
@@ -547,7 +547,8 @@ Deno.test('ingest: delivery intent follows joined remote members (state after th
       await g.room.tx(async (tx) =>
         (await tx.changes.after(0, 100)).filter((c) => c.kind === 'delivery')
       );
-    // bob's own join delivers to his server (he is joined in its after-state)
+    // bob's own join delivers to his server (joined in its after-state
+    // and the membership target)
     const forJoin = (await deliveries()).find((c) => c.event === join.eventId);
     assertEquals(JSON.parse(forJoin!.data).destinations, ['remote.test']);
     // a message while bob is joined also delivers there
@@ -559,9 +560,9 @@ Deno.test('ingest: delivery intent follows joined remote members (state after th
     }, g.signer);
     const forMsg = (await deliveries()).find((c) => c.event === msg.eventId);
     assertEquals(JSON.parse(forMsg!.data).destinations, ['remote.test']);
-    // bob leaves; his leave and later messages no longer deliver to his
-    // server (the plan's after-the-event formula; the old-code difference
-    // is recorded in notes.md)
+    // bob leaves: his server was joined in the state BEFORE the leave (and
+    // is the membership target), so the leave still reaches it; later
+    // messages no longer deliver there
     const leave = await sendLocal(g.room, {
       type: 'm.room.member',
       sender: '@bob:remote.test',
@@ -572,7 +573,7 @@ Deno.test('ingest: delivery intent follows joined remote members (state after th
     const forLeave = (await deliveries()).find((c) =>
       c.event === leave.eventId
     );
-    assertEquals(JSON.parse(forLeave!.data).destinations, []);
+    assertEquals(JSON.parse(forLeave!.data).destinations, ['remote.test']);
     const later = await sendLocal(g.room, {
       type: 'm.room.message',
       sender: g.creator,
@@ -583,6 +584,46 @@ Deno.test('ingest: delivery intent follows joined remote members (state after th
       c.event === later.eventId
     );
     assertEquals(JSON.parse(forLater!.data).destinations, []);
+  });
+});
+
+Deno.test('ingest: delivery intent — kick/ban of a remote member reaches his server', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, {
+      roomId: '!ing13b:test',
+      joinRule: 'public',
+    });
+    await bobJoins(g, '@bob:remote.test', 1000);
+    const deliveries = async () =>
+      await g.room.tx(async (tx) =>
+        (await tx.changes.after(0, 100)).filter((c) => c.kind === 'delivery')
+      );
+    // dev kicks bob: bob's server is joined in the state before the kick
+    // and is the membership target — it must hear it even though the
+    // after-state has nobody left of that server (requirements §4.3 I11)
+    const kick = await sendLocal(g.room, {
+      type: 'm.room.member',
+      sender: g.creator,
+      state_key: '@bob:remote.test',
+      content: { membership: 'leave', reason: 'out' },
+      origin_server_ts: 1002,
+    }, g.signer);
+    assertEquals(kick.standing, 'accepted');
+    const forKick = (await deliveries()).find((c) => c.event === kick.eventId);
+    assertEquals(JSON.parse(forKick!.data).destinations, ['remote.test']);
+    // banning a user whose server has no joined member anywhere in
+    // before/after still reaches the target's server (the
+    // membership-target clause)
+    const ban = await sendLocal(g.room, {
+      type: 'm.room.member',
+      sender: g.creator,
+      state_key: '@zoe:elsewhere.test',
+      content: { membership: 'ban', reason: 'never again' },
+      origin_server_ts: 1003,
+    }, g.signer);
+    assertEquals(ban.standing, 'accepted');
+    const forBan = (await deliveries()).find((c) => c.event === ban.eventId);
+    assertEquals(JSON.parse(forBan!.data).destinations, ['elsewhere.test']);
   });
 });
 
