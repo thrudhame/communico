@@ -29,6 +29,7 @@ import {
   ungroundedPrevs,
 } from '#engine/room/build.ts';
 import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
+import { projectAfterWrite } from '#engine/room/hooks.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { mapEntries } from '#engine/room/state.ts';
@@ -301,7 +302,7 @@ export async function backfill(
     groundedPage.add(item.eventId);
   }
 
-  return await withRoomLock(room.id, () =>
+  const written = await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
       // Revalidation (G8): the fetch phase ran unlocked.
       const stay = args.stay === undefined
@@ -575,4 +576,6 @@ export async function backfill(
         positioned,
       } satisfies BackfillResult;
     }));
+  await projectAfterWrite(room.store, room.id);
+  return written;
 }

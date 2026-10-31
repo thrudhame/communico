@@ -11,7 +11,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { validAdditionalCreators } from '#engine/rulebook/auth-rules.ts';
 import { buildCreate } from '#engine/room/build.ts';
-import { registerCreatedRoom } from '#engine/room/hooks.ts';
+import { projectAfterWrite, registerCreatedRoom } from '#engine/room/hooks.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { ingestInTx, sendLocal } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -346,6 +346,9 @@ export async function createRoom(
     });
   }
 
+  // The create event's ingest went through ingestInTx directly (not
+  // sendLocal) — one projection covers the whole sequence.
+  await projectAfterWrite(store, finalRoomId);
   return {
     roomId: finalRoomId,
     createEventId,

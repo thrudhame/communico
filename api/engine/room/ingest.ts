@@ -47,6 +47,7 @@ import {
   ungroundedPrevs,
 } from '#engine/room/build.ts';
 import type { Grounding } from '#engine/room/events.ts';
+import { projectAfterWrite } from '#engine/room/hooks.ts';
 import type { EventRow, Room, RoomTx } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import {
@@ -118,6 +119,7 @@ export async function sendLocal(
   // A wait naming this event (a redaction target, a missing prev) is
   // re-run now that it has arrived (R10 — the 3c recheck driver).
   await maybeResume(room, result.eventId, signer.serverName);
+  await projectAfterWrite(room.store, room.id);
   return result;
 }
 
@@ -134,6 +136,7 @@ export async function ingestLocal(
   );
   const servers = Object.keys(pdu.signatures ?? {});
   if (servers.length === 1) await maybeResume(room, result.eventId, servers[0]);
+  await projectAfterWrite(room.store, room.id);
   return result;
 }
 

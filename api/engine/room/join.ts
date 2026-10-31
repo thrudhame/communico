@@ -25,7 +25,7 @@ import {
 } from '#engine/rulebook/index.ts';
 import { finalizeBuilt } from '#engine/room/build.ts';
 import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
-import { registerCreatedRoom } from '#engine/room/hooks.ts';
+import { projectAfterWrite, registerCreatedRoom } from '#engine/room/hooks.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -401,5 +401,6 @@ async function joinVia(
       }
       await tx.segments.setOpenedBy(stayId, eventId);
     }));
+  await projectAfterWrite(store, args.roomId);
   return { roomId: args.roomId, eventId };
 }

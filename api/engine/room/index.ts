@@ -133,6 +133,9 @@ export type RoomTx = ReturnType<typeof bind>;
 
 export type Room = {
   readonly id: string;
+  // The opening store — the server stage's projection hook reaches the
+  // server file through it (room/hooks.ts).
+  readonly store: Store;
   tx<T>(fn: (room: RoomTx) => Promise<T>): Promise<T>;
 };
 
@@ -144,6 +147,7 @@ export async function openRoom(
   const db: Db = await store.room(roomId, options);
   return {
     id: roomId,
+    store,
     tx: (fn) => db.tx((conn) => fn(bind(conn))),
   };
 }
