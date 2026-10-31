@@ -4,12 +4,15 @@
 # Exit 0 when the HARNESS worked (image built, go test ran, baseline written)
 # — red tests are the recorded baseline, not a harness error. The go test
 # exit code is recorded in BASELINE.md.
-# Prereqs (verified on this host): Go 1.27, Docker 29.7, Complement checkout
-# at ~/Sources/matrix-org-complement. Host runs approved (R10).
+# VM-only; requires Go, Docker, Deno and a Complement checkout.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+if [[ ! -f complement/Dockerfile || ! -f complement/entrypoint.sh || ! -f main.ts ]]; then
+  echo "Complement runtime is not restored on this branch; see README.md." >&2
+  exit 2
+fi
 eval "$(deno task -q config -- --shell)"
 COMPLEMENT_SRC="${COMPLEMENT_SRC:-$HOME/Sources/matrix-org-complement}"
 IMAGE="${COMPLEMENT_IMAGE:-communico-complement:local}"

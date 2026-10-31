@@ -13,13 +13,6 @@ export const SCHEMA = {
     name: 'string',
     port: 'int',
   },
-  db: {
-    host: 'string',
-    port: 'int',
-    user: 'string',
-    pass: 'string',
-    name: 'string',
-  },
   media: {
     root: 'string',
     maxbytes: 'int',

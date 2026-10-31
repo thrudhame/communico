@@ -9,20 +9,8 @@ name = "localhost"
 # The one listener's port. COMMUNICO_SERVER_PORT (formerly APP_PORT)
 port = 8008
 
-[db]
-# Doltgres host. COMMUNICO_DB_HOST
-host = "127.0.0.1"
-# Doltgres port. COMMUNICO_DB_PORT
-port = 5432
-# Doltgres user. COMMUNICO_DB_USER
-user = "root"
-# Doltgres password. COMMUNICO_DB_PASS — override this in config/ or env
-pass = "secret"
-# Server-level database name. COMMUNICO_DB_NAME
-name = "postgres"
-
 [media]
-# Byte-store root (created at startup). COMMUNICO_MEDIA_ROOT
+# Byte-store root for the later content repository. COMMUNICO_MEDIA_ROOT
 root = "./.media"
 # Upload limit in bytes (50 MiB — Complement's upload tests).
 # COMMUNICO_MEDIA_MAXBYTES (formerly MEDIA_MAX_BYTES)
@@ -73,9 +61,7 @@ allowlist = []
 enabled = true
 # TLS listener port (spec default). COMMUNICO_FEDERATION_PORT
 port = 8448
-# PEM certificate + key for :8448. Read when the listener opens (main.ts);
-# a missing file with enabled = true is a startup error, not a fallback.
-# demo/setup.sh issues a self-signed pair here for local dev.
+# PEM certificate + key for the federation listener when it is restored.
 # COMMUNICO_FEDERATION_CERT / COMMUNICO_FEDERATION_KEY
 cert = "config/federation.crt"
 key = "config/federation.key"

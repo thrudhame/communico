@@ -15,13 +15,6 @@ const FULL = `[server]
 name = "localhost"
 port = 8008
 
-[db]
-host = "127.0.0.1"
-port = 5432
-user = "root"
-pass = "secret"
-name = "postgres"
-
 [media]
 root = "./.media"
 maxbytes = 52428800
@@ -208,13 +201,6 @@ Deno.test('missing leaf in defaults lists node path and env name', async () => {
 name = "localhost"
 port = 8008
 
-[db]
-host = "127.0.0.1"
-port = 5432
-user = "root"
-pass = "secret"
-name = "postgres"
-
 [media]
 root = "./.media"
 `,
@@ -239,13 +225,6 @@ Deno.test('multiple problems reported together', async () => {
     'defaults/communico.toml': `[server]
 name = "localhost"
 port = "x"
-
-[db]
-host = "127.0.0.1"
-port = 5432
-user = "root"
-pass = "secret"
-name = "postgres"
 
 [media]
 root = "./.media"
@@ -607,8 +586,8 @@ Deno.test('[federation] cacerts must be readable files', async () => {
 Deno.test('--shell printer quoting', async () => {
   const dir = await writeTree({
     'defaults/communico.toml': FULL.replace(
-      'pass = "secret"',
-      'pass = "it\'s secret"',
+      'name = "localhost"',
+      `name = "it's localhost"`,
     ),
   });
   const loaded = loadConfig({
@@ -618,7 +597,7 @@ Deno.test('--shell printer quoting', async () => {
   });
   const shell = formatShellExports(loaded.config);
   assert(
-    shell.includes(`export COMMUNICO_DB_PASS='it'\\''s secret'`),
+    shell.includes(`export COMMUNICO_SERVER_NAME='it'\\''s localhost'`),
     `quoting: ${shell}`,
   );
   assert(
@@ -627,7 +606,7 @@ Deno.test('--shell printer quoting', async () => {
   );
 });
 
-Deno.test('46 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('41 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -643,14 +622,13 @@ Deno.test('46 leaves total across the sections (the surface tripwire)', async ()
   ): [string, number] => [name, Object.keys(leaves).length]);
   assertEquals(counts, [
     ['server', 2],
-    ['db', 5],
     ['media', 2],
     ['preview', 4],
     ['federation', 33],
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    46,
-    'the whole config surface is 46 leaves — a new leaf belongs in the plan, not just the schema',
+    41,
+    'the whole config surface is 41 leaves — a new leaf belongs in the plan, not just the schema',
   );
 });

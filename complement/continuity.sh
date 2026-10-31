@@ -6,6 +6,12 @@
 # the pubkey is identical and the pre-restart signature still verifies.
 # Usage: bash complement/continuity.sh (needs docker; VM-only per memo).
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+if [[ ! -f complement/Dockerfile || ! -f complement/entrypoint.sh || ! -f main.ts || ! -f complement/continuity-query.ts || ! -f complement/continuity-verify.ts ]]; then
+  echo "Continuity runtime and query helpers are not restored on this branch; see README.md." >&2
+  exit 2
+fi
 
 NAME="${CONTINUITY_NAME:-cc-continuity}"
 SERVER_NAME="${CONTINUITY_SERVER:-cont.local}"

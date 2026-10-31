@@ -1,81 +1,27 @@
 # communico
 
-I communicate — a Matrix homeserver where the database is
-version-controlled: **a room is a Doltgres database, an event is a
-commit, forward extremities are branches**, and the event id clients see
-is a content hash of the event itself.
+A Matrix homeserver rebuilding its core on Turso.
 
-Active line: `server-foundation` — engine contract (F0) → Complement
-harness (M0) → identity + registration (F1) → HTTP layer on pathfinder
-(M1) → account surface + media (M2). See `HOW-IT-WORKS.md` for the
-architecture; the evidence log lives in
-`~/Documents/communico/research/RESULTS.md`.
+This branch currently contains reused, database-independent pieces: the
+rulebook, canonical JSON, event IDs and redaction, signing primitives,
+transport helpers, configuration loading, pure endpoint sources and test
+harnesses. It does not yet contain a runnable homeserver.
 
-## Quickstart (demo)
+The former Doltgres implementation and its integration tests remain on
+`doltgres` at `2d3944abaed7571fd8fe24a532860bd134a46d15`.
 
-Prerequisites: Docker only. Runs on the shipped `defaults/communico.toml`.
-To change something, create `config/communico.toml` with just the leaves
-you want, or set `COMMUNICO_*` (see `.env.example` for the env syntax).
-URL previews are **off** by default (`[preview] enabled = false`). To
-enable them, set `enabled = true`; `blocklist` is the operator's IP
-policy (Synapse's private/unroutable ranges in the shipped defaults)
-so the homeserver will not fetch those addresses.
+## Checks
 
-```bash
-bash demo/setup.sh --reset   # boots Doltgres+server, registers users, creates the room
-bash demo/run-demo.sh --check  # headless self-test: two real matrix-commander clients
-```
+Run inside the authorized project test VM:
 
-Details and choreography: `demo/README.md`.
+- `deno task check`
+- `deno task test`
+- `sh hooks/pre-commit`
 
-## Conformance
+Configuration uses `defaults/communico.toml`, an optional
+`config/communico.toml` overlay and `COMMUNICO_*` environment overrides.
+`deno task config` prints the merged settings; it does not initialize storage.
 
-```bash
-bash complement/run.sh            # full Complement baseline → complement/BASELINE.md
-bash complement/run.sh -run 'TestRegistration|TestLogin|TestLogout'
-```
-
-Image contract, blacklist philosophy, and the red number to beat:
-`complement/blacklist.md`. Key continuity across restarts:
-`bash complement/continuity.sh`.
-
-## Repo map
-
-- `api/engine/` — room core: PDU ingest, per-version policy slot,
-  tenant identity, sync feeds. `state` is written only by the resolver.
-- `api/endpoints/matrix/` — Client-Server surface (register, login,
-  rooms, sync, devices, profiles, account, pushers, account data,
-  media, …).
-- `db/` — `server/` (room registry, event index), `room/` (per-room
-  schema), `tenant/` (per-tenant identity schema).
-- `complement/` — Docker image, entrypoint, blacklist, runner, baseline.
-- `demo/` — three-party demo scripts and tour.
-
-## Status and roadmap
-
-Done: v11 PDU engine with refusing stub resolver, Complement harness
-with red baseline, tenant identity (argon2id UIA registration), the
-HTTP layer on pathfinder 0.2.0 (M1) — two roots collapsed to the single
-Matrix client-server listener on `server.port` — and the M2 account
-surface + media: devices, profiles, password change and deactivation
-over a shared UIA helper, pushers (stored, never delivered), account
-data, and the content repository (upload, async create/PUT,
-authenticated + legacy download, config; bytes on disk under
-`media.root`, metadata in the tenant DB). Federation is on: `[federation]`
-config defaults to enabled — our key document is served at `:8448` and
-`:8008`, inbound requests are X-Matrix-authenticated against remembered
-keys, strangers' keys are learned witnesses-first (roster notaries, then a
-direct fetch in open mode), and admission (blocks → closed-mode roster →
-pending log) gates every origin. Rooms federate: we join remote rooms
-over `via` and others join ours (make/send join and leave, v1+v2), state
-and history are served to the room's servers, missed events are chased
-(get_missing_events, state_ids, backfill into history chapters the
-timeline reads seamlessly), and delivery is a durable outbox with frozen
-retries, a backoff ladder, and admin-visible refusals. Deliberately
-stubbed: the federation policy surface (ACLs, knocking — M5c), E2EE,
-push delivery/rules, appservices,
-rate limiting, media thumbnails/retention. The legacy
-unauthenticated media download is a documented liability — frozen at a
-later milestone. The browser homeserver (communico-lite) and native
-sync are parked — prior art on `research/lite`, plan in
-`~/Documents/communico/plans/lite/`. Pushes are user-gated.
+The Complement runner, blacklist and historical baseline are retained for
+restoration. Its runtime image and continuity query helpers must be rebuilt
+before the harness can run on this branch.

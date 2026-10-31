@@ -20,13 +20,6 @@ const FULL = `[server]
 name = "localhost"
 port = 8008
 
-[db]
-host = "127.0.0.1"
-port = 5432
-user = "root"
-pass = "secret"
-name = "postgres"
-
 [media]
 root = "./.media"
 maxbytes = 52428800

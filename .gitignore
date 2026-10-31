@@ -1,4 +1,3 @@
-/auth.db
 .DS_Store
 /debug
 /.env
@@ -6,7 +5,7 @@
 /.media/
 # Operator overlay — the folder is tracked (config/.gitkeep); the TOML is not
 config/*.toml
-# Dev federation keypair (demo/setup.sh regenerates)
+# Local development TLS material (not shipped)
 config/federation.crt
 config/federation.key
 # Complement run artifacts (regenerable; BASELINE.md is the record)

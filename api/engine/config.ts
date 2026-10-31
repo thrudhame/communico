@@ -518,13 +518,6 @@ export function loadedConfig(): LoadedConfig {
 
 export type ConfigPatch = {
   server?: { name?: string; port?: number };
-  db?: {
-    host?: string;
-    port?: number;
-    user?: string;
-    pass?: string;
-    name?: string;
-  };
   media?: { root?: string; maxbytes?: number };
   preview?: {
     enabled?: boolean;
