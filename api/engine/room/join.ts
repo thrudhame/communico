@@ -25,6 +25,7 @@ import {
 } from '#engine/rulebook/index.ts';
 import { finalizeBuilt } from '#engine/room/build.ts';
 import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
+import { registerCreatedRoom } from '#engine/room/hooks.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -319,8 +320,11 @@ async function joinVia(
   }
 
   // 5. the room file (safe create when absent — validation has passed),
-  //    then ONE transaction (G11)
+  //    then ONE transaction (G11). room-first: the registry follows the
+  //    file's existence (a crash between the two is the startup
+  //    discovery's window).
   const room = await openRoom(store, args.roomId, { create: true });
+  await registerCreatedRoom(store, args.roomId);
   await withRoomLock(args.roomId, () =>
     room.tx(async (tx) => {
       // revalidation (G8): a live stay means the room is already joined

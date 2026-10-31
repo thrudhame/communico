@@ -1,0 +1,35 @@
+// api/engine/server/startup.ts — the store startup hook (R12, plan §2
+// row 4): discovery, then project() for every registered room until each
+// watermark equals its room's last change position. installServerHooks is
+// explicit: the composition root (stage 5) and the tests call it; without
+// it the room writes stand alone and a later startup catches up.
+import { setRoomHooks } from '#engine/room/hooks.ts';
+import { project } from '#engine/server/project.ts';
+import { discover, listRooms, registerRoom } from '#engine/server/registry.ts';
+import { serverSchema } from '#engine/server/schema.ts';
+import type { Store } from '#engine/store/index.ts';
+import { onStartup, type StartupStore } from '#engine/store/watermark.ts';
+
+export function installServerHooks(): void {
+  setRoomHooks({ project, register: registerRoom });
+  onStartup(rollForward);
+}
+
+async function rollForward(store: StartupStore): Promise<void> {
+  const concrete = store as Store;
+  const server = await concrete.server();
+  // A store opened without the server schema (engine tests) has nothing
+  // to roll forward.
+  const version = await server.query(
+    `SELECT v FROM meta WHERE k = 'schema_version'`,
+  );
+  if (
+    version.length !== 1 || version[0].v !== String(serverSchema.version)
+  ) {
+    return;
+  }
+  await discover(concrete);
+  for (const roomId of await listRooms(concrete)) {
+    await project(concrete, roomId);
+  }
+}

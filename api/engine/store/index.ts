@@ -63,6 +63,11 @@ export class Store implements StartupStore {
     return this.pool.acquire('tenants', id, options);
   }
 
+  // The room ids recorded on disk (the server stage's startup discovery).
+  rooms(): Promise<string[]> {
+    return this.pool.list('rooms');
+  }
+
   stats(): StoreStats {
     return {
       openFiles: this.pool.size,
