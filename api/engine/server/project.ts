@@ -15,6 +15,7 @@
 // exactly those events.
 import type { Change } from '#engine/room/changes.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
+import type { Pdu } from '#engine/pdu.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { advance, get } from '#engine/store/watermark.ts';
@@ -89,6 +90,13 @@ type Prepared =
       payload: EventPayload;
       relation: { relatesTo: string; relType: string | null } | null;
       search: { key: string; text: string } | null;
+      // The publication this change carries (when it moves the stay's
+      // published state): the m.room.member diff against the previous
+      // published group — memberships follow the published state, not
+      // only membership events (a fork resolution can flip a member
+      // without a new membership event; the old fold caught it by
+      // walking every published member row on every publish).
+      publication: { user: string; to: string | null; toId: string | null }[];
     }
     | {
       kind: 'membership';
@@ -114,6 +122,57 @@ function eventPayloadOf(change: Change): EventPayload {
 // search. Exactly the accepted events (the room positions no other).
 function isLive(payload: EventPayload): boolean {
   return payload.standing === 'accepted' && payload.stay !== null;
+}
+
+// The publication diff at a change position: when the stay's published
+// state moved at this change (a publication hangs off the event's change
+// pos), the m.room.member keys that changed between the previous
+// published group and the new one — added, removed, value- or
+// event-flipped. An unchanged key is never re-stamped: the old fold's
+// keep-its-seq rule falls out of the diff (it re-stamped every row whose
+// event id moved and kept the rest). `to`/`toId` null means the key left
+// the published state — the same 'leave' the reads default to without a
+// row (MSC4115), mirrored by the membership path's delete.
+async function memberDiff(
+  room: Room,
+  stay: number | null,
+  pos: number,
+): Promise<{ user: string; to: string | null; toId: string | null }[]> {
+  if (stay === null) return [];
+  return await room.tx(async (tx) => {
+    const groupNow = await tx.state.publishedAt(stay, pos);
+    const groupPrev = await tx.state.publishedAt(stay, pos - 1);
+    if (groupNow === null || groupNow === groupPrev) return [];
+    const nowMap = await tx.state.groupMap(groupNow);
+    const prevMap = groupPrev === null
+      ? new Map<string, string>()
+      : await tx.state.groupMap(groupPrev);
+    const prefix = 'm.room.member\0';
+    const users = new Set<string>();
+    for (const key of nowMap.keys()) {
+      if (key.startsWith(prefix)) users.add(key.slice(prefix.length));
+    }
+    for (const key of prevMap.keys()) {
+      if (key.startsWith(prefix)) users.add(key.slice(prefix.length));
+    }
+    const out: { user: string; to: string | null; toId: string | null }[] = [];
+    for (const user of users) {
+      const fromId = prevMap.get(prefix + user) ?? null;
+      const toId = nowMap.get(prefix + user) ?? null;
+      if (fromId === toId) continue;
+      let to: string | null = null;
+      if (toId !== null) {
+        const row = await tx.events.get(toId);
+        if (row === null) {
+          throw new Error(`published member event missing: ${toId}`);
+        }
+        const membership = (JSON.parse(row.pdu) as Pdu).content?.membership;
+        to = typeof membership === 'string' ? membership : 'leave';
+      }
+      out.push({ user, to, toId });
+    }
+    return out;
+  });
 }
 
 // The read phase on the room file: every fact the server transaction
@@ -164,7 +223,17 @@ async function prepare(
             search = searchTextOf(payload, pdu);
           }
         }
-        out.push({ change, kind: change.kind, payload, relation, search });
+        const publication = change.kind === 'history'
+          ? []
+          : await memberDiff(room, payload.stay, change.pos);
+        out.push({
+          change,
+          kind: change.kind,
+          payload,
+          relation,
+          search,
+          publication,
+        });
         break;
       }
       case 'membership': {
@@ -353,6 +422,7 @@ async function apply(
         ],
       );
       if (isLive(item.payload)) await applyLive(tx, roomId, item);
+      await applyPublication(tx, roomId, change.pos, item.publication);
       return;
     }
     case 'transition': {
@@ -376,6 +446,7 @@ async function apply(
         ],
       );
       if (isLive(item.payload)) await applyLive(tx, roomId, item);
+      await applyPublication(tx, roomId, change.pos, item.publication);
       return;
     }
     case 'history': {
@@ -450,6 +521,58 @@ async function apply(
       return;
     }
   }
+}
+
+// The membership writes of a publication diff, in the same projection tx
+// as the feed row the publication hangs off (applied after it). Removed
+// keys delete the row; the others upsert with the member event's own seq
+// — or the triggering change's feed position when the member event has
+// no seq of its own (history/evidence) — exactly the old fold's
+// ownSeq ?? triggeringSeq. Deterministic on replay: the diff, the seq
+// lookups and the upsert all recompute from unchanged inputs.
+async function applyPublication(
+  tx: Conn,
+  roomId: string,
+  pos: number,
+  diff: { user: string; to: string | null; toId: string | null }[],
+): Promise<void> {
+  for (const d of diff) {
+    if (d.to === null) {
+      await tx.execute(
+        'DELETE FROM memberships WHERE user = ? AND room = ?',
+        [d.user, roomId],
+      );
+      continue;
+    }
+    const seq = (await seqOf(tx, roomId, d.toId!)) ??
+      (await feedSeqAtPos(tx, roomId, pos));
+    if (seq === null) {
+      // a publication hangs off an accepted (positioned, feed-rowed)
+      // change — never null
+      throw new Error(`publication at pos ${pos} without a feed row`);
+    }
+    await tx.execute(
+      `INSERT INTO memberships(user, room, membership, event, seq)
+       VALUES(?,?,?,?,?)
+       ON CONFLICT(user, room) DO UPDATE SET
+         membership = excluded.membership,
+         event = excluded.event, seq = excluded.seq`,
+      [d.user, roomId, d.to, d.toId, seq],
+    );
+  }
+}
+
+async function feedSeqAtPos(
+  tx: Conn,
+  roomId: string,
+  pos: number,
+): Promise<number | null> {
+  const rows = await tx.query(
+    'SELECT seq FROM feed WHERE room = ? AND pos = ?',
+    [roomId, pos],
+  );
+  if (rows.length === 0) return null;
+  return Number(rows[0].seq);
 }
 
 // The feed write shared by 'event' and 'transition': the row is idempotent

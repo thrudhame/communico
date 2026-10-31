@@ -17,7 +17,7 @@ import { project, sourceOf } from '#engine/server/project.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { get } from '#engine/store/watermark.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
-import { bobJoins, genesis } from './fixtures/genesis.ts';
+import { bobJoins, genesis, PL_DEFAULTS } from './fixtures/genesis.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -134,6 +134,128 @@ Deno.test('project: a genesis room lands indexed, feed and membership rows; repl
     await project(store, g.roomId);
     await project(store, g.roomId);
     assertEquals(await counts(), before);
+  });
+});
+
+// The 4c-1 projection gap: a fork resolution can flip a member WITHOUT a
+// new membership event (here: a power-levels event on a fork branch
+// un-authorizes a ban on the other, so the published member state falls
+// back to the shared join). The room emits no membership change for the
+// trigger; the projection must follow the published group's member diff
+// anyway (the old fold walked every published member row on every
+// publish). Unchanged keys are never re-stamped; replay is idempotent.
+Deno.test('project: memberships follow the published state across a fork flip without a membership event', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!p-fork:test' });
+    const bob = '@bob:test';
+    const eve = '@eve:test';
+    const bobJoinId = await bobJoins(g, bob, 1000);
+    const eveJoinId = await bobJoins(g, eve, 1002);
+    // eve at 50 bans bob on one branch (ts 400/500; 50 suffices to ban,
+    // and 50 < 100 lets the creator demote her back — rule 9.8)
+    const promote = await sendLocal(g.room, {
+      type: 'm.room.power_levels',
+      sender: g.creator,
+      state_key: '',
+      content: {
+        ...PL_DEFAULTS(g.creator),
+        users: { [g.creator]: 100, [eve]: 50 },
+      },
+      prev_events: [eveJoinId],
+      origin_server_ts: 400,
+    }, g.signer);
+    assertEquals(promote.standing, 'accepted');
+    const ban = await sendLocal(g.room, {
+      type: 'm.room.member',
+      sender: eve,
+      state_key: bob,
+      content: { membership: 'ban' },
+      prev_events: [promote.eventId],
+      origin_server_ts: 500,
+    }, g.signer);
+    assertEquals(ban.standing, 'accepted');
+    await project(store, g.roomId);
+    // the membership-event path: the ban landed through its own change
+    let bobRows = await rows(
+      store,
+      'SELECT membership, event, seq FROM memberships WHERE room = ? AND user = ?',
+      [g.roomId, bob],
+    );
+    assertEquals(bobRows.length, 1);
+    assertEquals(bobRows[0].membership, 'ban');
+    assertEquals(bobRows[0].event, ban.eventId);
+    const banSeq = await rows(
+      store,
+      'SELECT seq FROM feed WHERE room = ? AND event = ?',
+      [g.roomId, ban.eventId],
+    );
+    assertEquals(Number(bobRows[0].seq), Number(banSeq[0].seq));
+
+    // the fork flip: demoting eve on the OTHER branch (a power-levels
+    // event — never a membership change) makes the resolution drop the
+    // ban; the published member state falls back to bob's shared join
+    const demote = await sendLocal(g.room, {
+      type: 'm.room.power_levels',
+      sender: g.creator,
+      state_key: '',
+      content: PL_DEFAULTS(g.creator),
+      prev_events: [eveJoinId],
+      origin_server_ts: 600,
+    }, g.signer);
+    assertEquals(demote.standing, 'accepted');
+    // the premise: the published state flipped with no membership change
+    await g.room.tx(async (tx) => {
+      const stay = await tx.segments.openStay();
+      const group = await tx.state.current(stay!.id);
+      assertEquals(
+        await tx.state.groupKey(group!, 'm.room.member', bob),
+        bobJoinId,
+      );
+      const changes = await tx.changes.after(0, 10000);
+      assert(
+        changes.filter((c) => c.kind === 'membership').every((c) =>
+          c.event !== demote.eventId
+        ),
+        'the demote emitted a membership change',
+      );
+    });
+    await project(store, g.roomId);
+    bobRows = await rows(
+      store,
+      'SELECT membership, event, seq FROM memberships WHERE room = ? AND user = ?',
+      [g.roomId, bob],
+    );
+    assertEquals(bobRows.length, 1);
+    assertEquals(bobRows[0].membership, 'join');
+    assertEquals(bobRows[0].event, bobJoinId);
+    // the member event's OWN seq, not the demote's (old ownSeq rule)
+    const bobJoinSeq = await rows(
+      store,
+      'SELECT seq FROM feed WHERE room = ? AND event = ?',
+      [g.roomId, bobJoinId],
+    );
+    assertEquals(Number(bobRows[0].seq), Number(bobJoinSeq[0].seq));
+    // an unchanged key is never re-stamped: eve's row is exactly her join
+    const eveRows = await rows(
+      store,
+      'SELECT membership, event, seq FROM memberships WHERE room = ? AND user = ?',
+      [g.roomId, eve],
+    );
+    assertEquals(eveRows.length, 1);
+    assertEquals(eveRows[0].membership, 'join');
+    assertEquals(eveRows[0].event, eveJoinId);
+
+    // replay: the whole projection runs again and changes nothing
+    const snapshot = async () =>
+      await rows(
+        store,
+        'SELECT user, membership, event, seq FROM memberships WHERE room = ? ORDER BY user',
+        [g.roomId],
+      );
+    const before = await snapshot();
+    await project(store, g.roomId);
+    await project(store, g.roomId);
+    assertEquals(await snapshot(), before);
   });
 });
 
