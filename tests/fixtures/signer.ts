@@ -3,6 +3,7 @@
 // Nothing verifies in 3b, so no public key is needed.
 import {
   b64encodeStd,
+  generateSigningKeypair,
   importPrivateKeyFromSeed,
 } from '#engine/signing-primitives.js';
 import type { Signer } from '#engine/room/signer.ts';
@@ -19,6 +20,29 @@ export async function testSigner(serverName = 'test'): Promise<Signer> {
         new TextEncoder().encode(canonical),
       );
       return b64encodeStd(new Uint8Array(sig));
+    },
+  };
+}
+
+// A random keypair with its public half, for tests that verify the
+// signature a build produces.
+export async function randomSigner(
+  serverName = 'test',
+): Promise<{ signer: Signer; publicKey: CryptoKey }> {
+  const pair = (await generateSigningKeypair()) as CryptoKeyPair;
+  return {
+    publicKey: pair.publicKey,
+    signer: {
+      serverName,
+      keyId: 'ed25519:test',
+      sign: async (canonical: string) => {
+        const sig = await crypto.subtle.sign(
+          { name: 'Ed25519' },
+          pair.privateKey,
+          new TextEncoder().encode(canonical),
+        );
+        return b64encodeStd(new Uint8Array(sig));
+      },
     },
   };
 }
