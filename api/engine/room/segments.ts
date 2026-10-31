@@ -115,6 +115,28 @@ export async function openStay(conn: Conn): Promise<Segment | null> {
   return rows.length === 0 ? null : segmentOf(rows[0]);
 }
 
+// The history segment belonging to a stay (created by the first backfill
+// that stay discovers; a stay has at most one).
+export async function historyOf(
+  conn: Conn,
+  stay: number,
+): Promise<Segment | null> {
+  const rows = await conn.query(
+    `SELECT * FROM segments WHERE kind = 'history' AND prev = ?`,
+    [stay],
+  );
+  return rows.length === 0 ? null : segmentOf(rows[0]);
+}
+
+// The latest stay of the room — the open one, else the newest closed one
+// (an archived room reads through its last stay).
+export async function latestStay(conn: Conn): Promise<Segment | null> {
+  const rows = await conn.query(
+    `SELECT * FROM segments WHERE kind = 'stay' ORDER BY id DESC LIMIT 1`,
+  );
+  return rows.length === 0 ? null : segmentOf(rows[0]);
+}
+
 export async function positionOf(
   conn: Conn,
   event: string,

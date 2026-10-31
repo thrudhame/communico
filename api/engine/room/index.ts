@@ -79,6 +79,8 @@ function bind(conn: Conn) {
       get: (id: number) => segments.getSegment(conn, id),
       list: () => segments.listSegments(conn),
       openStay: () => segments.openStay(conn),
+      historyOf: (stay: number) => segments.historyOf(conn, stay),
+      latestStay: () => segments.latestStay(conn),
       positionOf: (event: string) => segments.positionOf(conn, event),
       appendPosition: (segment: number, event: string) =>
         segments.appendPosition(conn, segment, event),

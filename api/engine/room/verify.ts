@@ -52,15 +52,23 @@ function domainOf(userId: string): string {
 
 // Check 1: the wire bounds and the per-version format checks (old
 // federation/pdu.ts checkRemoteFormat). A hard failure throws; the
-// lenient size case is returned. The backfill count exemption is 3c-2's.
-function checkFormat(pdu: Pdu, spec: RoomVersionSpec): boolean {
+// lenient size case is returned. The backfill count exemption
+// (backfill.yaml's note: prev/auth counts MUST NOT be validated on a
+// backfill response) is the caller's option — /backfill answers only.
+function checkFormat(
+  pdu: Pdu,
+  spec: RoomVersionSpec,
+  exemptPrevAuthLimits: boolean,
+): boolean {
   const prevIds = pdu.prev_events ?? [];
   const declaredAuth = pdu.auth_events ?? [];
-  if (prevIds.length > 20) {
-    throw new Error('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
-  }
-  if (declaredAuth.length > 10) {
-    throw new Error('M_TOO_MANY_AUTH_EVENTS: v11 allows at most 10');
+  if (!exemptPrevAuthLimits) {
+    if (prevIds.length > 20) {
+      throw new Error('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
+    }
+    if (declaredAuth.length > 10) {
+      throw new Error('M_TOO_MANY_AUTH_EVENTS: v11 allows at most 10');
+    }
   }
   if (
     typeof pdu.type !== 'string' || typeof pdu.sender !== 'string' ||
@@ -128,14 +136,15 @@ export function oversizedOf(pdu: Pdu, roomVersion: string): boolean {
 
 // Checks 1 + id: format guards, unsigned strip, the recomputed event id
 // and the v12 room-id defence. `roomId` is the room context for the v12
-// create check (a v12 room id IS the create's event id — v12.md:98-101).
+// create check (a v12 room id IS the create's event id — v12.md:98-101);
+// `exemptPrevAuthLimits` is the /backfill answer exemption.
 export async function identify(
   pdu: Pdu,
   roomVersion: string,
-  opts: { roomId?: string } = {},
+  opts: { roomId?: string; exemptPrevAuthLimits?: boolean } = {},
 ): Promise<Identified> {
   const spec = getRulebook(roomVersion).spec; // unknown: never a default
-  const oversized = checkFormat(pdu, spec);
+  const oversized = checkFormat(pdu, spec, opts.exemptPrevAuthLimits === true);
   // `unsigned` stripped on receipt — never stored (appendices.md:341-343)
   delete pdu.unsigned;
   let eventId: string;
@@ -165,12 +174,14 @@ export async function identify(
 }
 
 // The full path: identify + the content hash (check 3, redacting on
-// mismatch) + the originating-server signature (check 2).
+// mismatch) + the originating-server signature (check 2). The
+// `exemptPrevAuthLimits` option is the /backfill answer exemption
+// (backfill.yaml's note).
 export async function verify(
   pdu: Pdu,
   roomVersion: string,
   keys: KeyResolver,
-  opts: { roomId?: string } = {},
+  opts: { roomId?: string; exemptPrevAuthLimits?: boolean } = {},
 ): Promise<Verified> {
   const spec = getRulebook(roomVersion).spec;
   const { eventId, oversized } = await identify(pdu, roomVersion, opts);
