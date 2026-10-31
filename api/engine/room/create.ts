@@ -260,7 +260,9 @@ export async function createRoom(
       room.tx(async (tx) => {
         const empty = await tx.materialize.newGroup(null, []);
         await tx.segments.create({ kind: 'stay', opening_group: empty });
-        const res = await ingestInTx(tx, finalRoomId, createPdu);
+        const res = await ingestInTx(tx, finalRoomId, createPdu, {
+          self: signer.serverName,
+        });
         if (res.standing !== 'accepted') {
           throw new Error('E_CREATE_ROOM_REJECT: create ' + res.reason);
         }

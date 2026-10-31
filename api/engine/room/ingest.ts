@@ -114,7 +114,7 @@ export async function sendLocal(
   const result = await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
       const pdu = await buildInTx(tx, room.id, partial, signer);
-      return await ingestInTx(tx, room.id, pdu);
+      return await ingestInTx(tx, room.id, pdu, { self: signer.serverName });
     }));
   // A wait naming this event (a redaction target, a missing prev) is
   // re-run now that it has arrived (R10 — the 3c recheck driver).
@@ -125,17 +125,19 @@ export async function sendLocal(
 
 // Ingest an already-built local PDU: the per-room lock and the room
 // transaction are acquired here (R13). Everything the event writes commits
-// or rolls back together (G11).
+// or rolls back together (G11). `self` is the authoring Signer's server,
+// explicit (R16): the event must carry a signature by it; extra caller-
+// verified signatures (a countersigned invite) are allowed.
 export async function ingestLocal(
   room: Room,
   pdu: Pdu,
+  self: string,
 ): Promise<IngestLocalResult> {
   const result = await withRoomLock(
     room.id,
-    () => room.tx((tx) => ingestInTx(tx, room.id, pdu)),
+    () => room.tx((tx) => ingestInTx(tx, room.id, pdu, { self })),
   );
-  const servers = Object.keys(pdu.signatures ?? {});
-  if (servers.length === 1) await maybeResume(room, result.eventId, servers[0]);
+  await maybeResume(room, result.eventId, self);
   await projectAfterWrite(room.store, room.id);
   return result;
 }
@@ -156,12 +158,14 @@ async function maybeResume(
 
 // The tx-scoped core: the caller holds the room lock and composes (the
 // genesis stay creation, createRoom's sequence, remote batches, rollback
-// tests).
+// tests). The local path takes `self` explicitly (R16): the event must
+// carry a signature by it — extra caller-verified signatures are allowed
+// (the countersigned invite; the caller proves them before ingesting).
 export async function ingestInTx(
   tx: RoomTx,
   roomId: string,
   pdu: Pdu,
-  opts: { remote?: RemoteIngest } = {},
+  opts: { remote?: RemoteIngest; self?: string } = {},
 ): Promise<IngestLocalResult> {
   const remote = opts.remote ?? null;
   const isCreate = pdu.type === 'm.room.create' &&
@@ -246,6 +250,15 @@ export async function ingestInTx(
   if (remote !== null) {
     self = remote.self;
   } else {
+    // R16: self is EXPLICIT (the authoring Signer's server), never
+    // inferred from the signatures map — a countersigned invite carries
+    // the invitee's signature beside ours.
+    if (opts.self === undefined) {
+      throw new Error(
+        'E_SELF_REQUIRED: local ingest takes its own server explicitly',
+      );
+    }
+    self = opts.self;
     hashOk = false;
     try {
       const { event_id: _drop, ...noId } = pdu as unknown as Record<
@@ -260,17 +273,12 @@ export async function ingestInTx(
       );
     }
     // 3b events are signed in-process by the injected signer; ingest
-    // verifies the id and content hash and requires a signature entry.
+    // verifies the id and content hash and requires a signature entry BY
+    // SELF. Additional signatures are allowed — the caller verified them.
     const signatureServers = Object.keys(pdu.signatures ?? {});
-    if (signatureServers.length === 0) {
+    if (!signatureServers.includes(self)) {
       throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
     }
-    if (signatureServers.length !== 1) {
-      throw new Error(
-        'E_LOCAL_SIGNATURE: a local event carries exactly one signature server',
-      );
-    }
-    self = signatureServers[0];
   }
 
   // Prev grounding and the local depth check (a mismatch is a stored

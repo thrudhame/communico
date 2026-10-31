@@ -57,7 +57,9 @@ export async function genesis(
     room.tx(async (tx) => {
       const empty = await tx.materialize.newGroup(null, []);
       await tx.segments.create({ kind: 'stay', opening_group: empty });
-      const created = await ingestInTx(tx, roomId, create);
+      const created = await ingestInTx(tx, roomId, create, {
+        self: signer.serverName,
+      });
       assertEquals(created.standing, 'accepted');
     }));
   let tip = (await sendLocal(room, {
