@@ -259,6 +259,8 @@ function bind(conn: Conn) {
         media.markMediaUploaded(conn, mediaId, meta),
     },
     txns: {
+      forEvent: (deviceId: string, roomId: string, eventId: string) =>
+        txns.transactionIdForEvent(conn, deviceId, roomId, eventId),
       lookup: (deviceId: string, roomId: string, txnId: string) =>
         txns.transactionById(conn, deviceId, roomId, txnId),
       record: (

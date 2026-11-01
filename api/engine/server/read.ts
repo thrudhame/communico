@@ -8,6 +8,18 @@
 import type { Database as Db } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
 
+export async function redactionOf(
+  db: Db,
+  roomId: string,
+  eventId: string,
+): Promise<string | null> {
+  const rows = await db.query(
+    'SELECT event FROM redactions WHERE room = ? AND target = ?',
+    [roomId, eventId],
+  );
+  return rows.length === 0 ? null : String(rows[0].event);
+}
+
 // --- the feed --------------------------------------------------------------
 
 export type FeedRow = {
