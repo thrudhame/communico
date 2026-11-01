@@ -41,6 +41,29 @@ export class Conn {
   }
 }
 
+// A logical database capability, safe to retain. Its owner acquires the
+// physical file for each operation; only the storage layer owns raw Dbs.
+export interface Database {
+  readonly path: string;
+  tx<T>(
+    fn: (connection: Conn) => Promise<T>,
+    options?: { mode?: BeginMode },
+  ): Promise<T>;
+  query(sql: string, values?: readonly Value[]): Promise<Row[]>;
+  execute(sql: string, values?: readonly Value[]): Promise<number>;
+  exec(sql: string): Promise<void>;
+}
+
+export function operations(tx: Database['tx'], path: string): Database {
+  return {
+    path,
+    tx,
+    query: (sql, values = []) => tx((conn) => conn.query(sql, values)),
+    execute: (sql, values = []) => tx((conn) => conn.execute(sql, values)),
+    exec: (sql) => tx((conn) => conn.exec(sql), { mode: 'deferred' }),
+  };
+}
+
 export class Db {
   readonly gate: Gate;
   private static readonly openFiles = new Map<string, Promise<Db>>();

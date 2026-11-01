@@ -5,7 +5,7 @@
 // evidence: syncfeed.ts's window query and roomsFor/membershipOf
 // (room.ts), relations.ts's relationRows, search.ts's candidates +
 // matchTokens/rankOf, federation/outbox.ts's eventBatchFor.
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
 
 // --- the feed --------------------------------------------------------------

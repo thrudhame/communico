@@ -2,7 +2,7 @@
 // publications and OOB invitation transitions allocate inside the same tx
 // as their writes. A rollback rolls back the cursor too; replay allocates
 // nothing. This queue serializes the two writers without retaining a Db.
-import type { Conn, Db } from '#engine/store/db.ts';
+import type { Conn, Database as Db } from '#engine/store/db.ts';
 
 const writers = new Map<string, Promise<void>>();
 

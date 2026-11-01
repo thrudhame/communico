@@ -8,7 +8,7 @@
 // behind (booleans are INTEGER 0/1; the tuple-IN workaround becomes one
 // rowid pass).
 import { config } from '#engine/config.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 
 export type PeerRow = {
   name: string;

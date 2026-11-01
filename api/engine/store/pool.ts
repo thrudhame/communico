@@ -10,7 +10,7 @@ import {
   EMPTY_SCHEMA,
   type SchemaProvider,
 } from '#engine/store/create.ts';
-import { Db } from '#engine/store/db.ts';
+import { type Database, Db, operations } from '#engine/store/db.ts';
 import type { Turso } from '#engine/store/ffi.ts';
 import {
   checkId,
@@ -30,6 +30,13 @@ export type PoolOptions = {
 type Entry = {
   db: Db;
   lastUsed: number;
+  leases: number;
+};
+
+export type Lease = {
+  readonly db: Database;
+  readonly events: EventTarget;
+  release(): Promise<void>;
 };
 
 export class Pool {
@@ -38,6 +45,17 @@ export class Pool {
   private readonly sweeper: ReturnType<typeof setInterval>;
   private readonly providers: Record<FileKind, SchemaProvider>;
   private closed = false;
+  private queue: Promise<unknown> = Promise.resolve();
+  private readonly released: (() => void)[] = [];
+  private closing?: Promise<void>;
+
+  // Opening, leasing and eviction share one metadata critical section.
+  // File operations run OUTSIDE it, protected by their lease count.
+  private locked<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.queue.then(fn);
+    this.queue = result.catch(() => undefined);
+    return result;
+  }
 
   constructor(
     private readonly ffi: Turso,
@@ -71,7 +89,8 @@ export class Pool {
   }
 
   private evictable(entry: Entry): boolean {
-    return !entry.db.inUse && !entry.db.gate.stats().closed;
+    return entry.leases === 0 && !entry.db.inUse &&
+      !entry.db.gate.stats().closed;
   }
 
   private async drop(key: string, entry: Entry): Promise<void> {
@@ -86,13 +105,19 @@ export class Pool {
   }
 
   private idleSweep(): void {
-    const cutoff = Date.now() - this.options.idleseconds * 1000;
-    for (const [key, entry] of this.entries) {
-      if (entry.lastUsed < cutoff && this.evictable(entry)) {
-        // The timer must not reject unhandled; drop records close failures.
-        void this.drop(key, entry);
+    void this.locked(async () => {
+      if (this.closed) return;
+      const cutoff = Date.now() - this.options.idleseconds * 1000;
+      for (const [key, entry] of this.entries) {
+        if (entry.lastUsed < cutoff && this.evictable(entry)) {
+          await this.drop(key, entry);
+        }
       }
-    }
+    }).catch((error) =>
+      this.errors.push(
+        error instanceof Error ? error : new Error(String(error)),
+      )
+    );
   }
 
   private async evictToLimit(): Promise<void> {
@@ -145,16 +170,52 @@ export class Pool {
     kind: FileKind,
     id: string,
     options: { create?: boolean } = {},
-  ): Promise<Db> {
-    if (this.closed) throw new Error('open-file pool is closed');
-    const key = await keyFor(id);
-    const existing = this.entries.get(key);
-    if (existing) {
-      existing.lastUsed = Date.now();
+  ): Promise<Lease> {
+    return await this.locked(async () => {
+      if (this.closed) throw new Error('open-file pool is closed');
+      const fileKey = await keyFor(id);
+      const key = kind + ':' + fileKey;
+      let entry = this.entries.get(key);
+      if (entry === undefined) {
+        entry = {
+          db: await this.open(kind, id, fileKey, options),
+          leases: 0,
+          lastUsed: Date.now(),
+        };
+      }
+      entry.leases++;
+      entry.lastUsed = Date.now();
       this.entries.delete(key);
-      this.entries.set(key, existing);
-      return existing.db;
-    }
+      this.entries.set(key, entry);
+      await this.evictToLimit();
+      let released = false;
+      const leased = entry;
+      return {
+        events: leased.db.gate,
+        db: operations((fn, txOptions) => {
+          if (released) throw new Error('database lease has been released');
+          return leased.db.tx(fn, txOptions);
+        }, leased.db.path),
+        release: async () => {
+          if (released) return;
+          released = true;
+          await this.locked(async () => {
+            leased.leases--;
+            leased.lastUsed = Date.now();
+            await this.evictToLimit();
+            for (const wake of this.released.splice(0)) wake();
+          });
+        },
+      };
+    });
+  }
+
+  private async open(
+    kind: FileKind,
+    id: string,
+    key: string,
+    options: { create?: boolean },
+  ): Promise<Db> {
     const parent = join(this.root, kind);
     const dir = directory(this.root, kind, key);
     const files = databaseFiles(dir);
@@ -196,17 +257,32 @@ export class Pool {
       await db.close();
       throw error;
     }
-    this.entries.set(key, { db, lastUsed: Date.now() });
-    await this.evictToLimit();
     return db;
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closing !== undefined) return this.closing;
     this.closed = true;
     clearInterval(this.sweeper);
-    for (const [key, entry] of [...this.entries].reverse()) {
-      await this.drop(key, entry);
+    this.closing = this.finishClose();
+    return this.closing;
+  }
+
+  private async finishClose(): Promise<void> {
+    for (;;) {
+      const waiting = await this.locked(async () => {
+        if ([...this.entries.values()].some((entry) => entry.leases > 0)) {
+          return {
+            wait: new Promise<void>((resolve) => this.released.push(resolve)),
+          };
+        }
+        for (const [key, entry] of [...this.entries].reverse()) {
+          await this.drop(key, entry);
+        }
+        return null;
+      });
+      if (waiting === null) return;
+      await waiting.wait;
     }
   }
 }

@@ -11,7 +11,7 @@
 // doltgres; the server file's Db is explicit (no global database).
 import { config } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import {
   addBlock,
   addPeer,

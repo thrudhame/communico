@@ -18,7 +18,7 @@
 // the kept in-process typing module, receipts/presence are per-instance
 // maps; the durable tables are stage 5's.
 import { membershipOf } from '#engine/server/read.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { setTyping, typingIn } from '#engine/typing.ts';
 import { domainOf } from './pdu.ts';
 

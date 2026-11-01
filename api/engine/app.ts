@@ -19,7 +19,7 @@ import { type Sender, startSender } from '#engine/federation/sender.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import {
   openStore,
   type Store,

@@ -10,14 +10,15 @@ const store = await openStore({
   maxopenfiles: 8,
   idleseconds: 300,
 });
-const db = await store.room('!crash:test', { create: true });
+const lease = await store.leaseRoom('!crash:test', { create: true });
+const db = lease.db;
 await db.exec(
   'CREATE TABLE IF NOT EXISTS rows(id INTEGER PRIMARY KEY, body TEXT)',
 );
-db.gate.addEventListener('checkpoint', () => {
+lease.events.addEventListener('checkpoint', () => {
   console.log(JSON.stringify({ barrier: 'start' }));
 });
-db.gate.addEventListener('checkpointend', () => {
+lease.events.addEventListener('checkpointend', () => {
   console.log(JSON.stringify({ barrier: 'end' }));
 });
 const body = 'crash-row-'.repeat(16);

@@ -13,11 +13,12 @@ import {
   type SchemaProvider,
   sweep,
 } from '#engine/store/create.ts';
-import { Db } from '#engine/store/db.ts';
+import { type Database, Db, operations } from '#engine/store/db.ts';
+import type { FileKind } from '#engine/store/layout.ts';
 import { type GateStats } from '#engine/store/gate.ts';
 import { Turso } from '#engine/store/ffi.ts';
 import { databaseFiles, serverDirectory } from '#engine/store/layout.ts';
-import { Pool } from '#engine/store/pool.ts';
+import { type Lease, Pool } from '#engine/store/pool.ts';
 import {
   ensureWatermarks,
   startupHooks,
@@ -45,22 +46,57 @@ export type StoreStats = {
 };
 
 export class Store implements StartupStore {
+  private stopped = false;
   constructor(
     private readonly ffi: Turso,
     private readonly serverDb: Db,
     private readonly pool: Pool,
   ) {}
 
-  server(): Promise<Db> {
-    return Promise.resolve(this.serverDb);
+  server(): Promise<Database> {
+    return Promise.resolve(operations((fn, options) => {
+      if (this.stopped) throw new Error('store is closed');
+      return this.serverDb.tx(fn, options);
+    }, this.serverDb.path));
   }
 
-  room(id: string, options: { create?: boolean } = {}): Promise<Db> {
+  async room(
+    id: string,
+    options: { create?: boolean } = {},
+  ): Promise<Database> {
+    return await this.database('rooms', id, options);
+  }
+
+  async tenant(
+    id: string,
+    options: { create?: boolean } = {},
+  ): Promise<Database> {
+    return await this.database('tenants', id, options);
+  }
+
+  // Explicit multi-transaction operation (e.g. a checkpoint-observed bulk
+  // writer). The caller must release in finally; shutdown drains leases.
+  leaseRoom(id: string, options: { create?: boolean } = {}): Promise<Lease> {
     return this.pool.acquire('rooms', id, options);
   }
 
-  tenant(id: string, options: { create?: boolean } = {}): Promise<Db> {
-    return this.pool.acquire('tenants', id, options);
+  private async database(
+    kind: FileKind,
+    id: string,
+    options: { create?: boolean },
+  ): Promise<Database> {
+    // Preserve open/create validation without retaining the opening lease.
+    const initial = await this.pool.acquire(kind, id, options);
+    const path = initial.db.path;
+    await initial.release();
+    return operations(async (fn, txOptions) => {
+      const lease = await this.pool.acquire(kind, id);
+      try {
+        return await lease.db.tx(fn, txOptions);
+      } finally {
+        await lease.release();
+      }
+    }, path);
   }
 
   // The room ids recorded on disk (the server stage's startup discovery).
@@ -77,6 +113,7 @@ export class Store implements StartupStore {
   }
 
   async close(): Promise<void> {
+    this.stopped = true;
     await this.pool.close();
     await this.serverDb.close();
     this.ffi.close();

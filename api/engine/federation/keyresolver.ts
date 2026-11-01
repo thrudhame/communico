@@ -10,7 +10,7 @@
 import { redact } from '#engine/eventid.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
 import type { Signer } from '#engine/room/signer.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { verifyJson } from '#engine/signing-primitives.js';
 import { keyStore } from './keys.ts';
 

@@ -33,7 +33,7 @@ import { ingestLocal } from '#engine/room/ingest.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { getRulebook, supportedRoomVersions } from '#engine/rulebook/index.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { federationRequest } from './client.ts';

@@ -1,7 +1,7 @@
 // tests/federation/doc-helper.ts — mint self-signed server key documents
 // and seed them into the remembered-keys tables for federation tests.
 // (doltgres tests/federation/doc-helper.ts, restored on the KeyStore.)
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,

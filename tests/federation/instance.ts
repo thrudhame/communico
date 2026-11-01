@@ -40,7 +40,7 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openTenant, type Tenant } from '#engine/tenant/index.ts';
 import { domainOf, toWire } from '#engine/federation/pdu.ts';

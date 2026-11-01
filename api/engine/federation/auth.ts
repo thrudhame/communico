@@ -13,7 +13,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { b64decode } from '#engine/signing-primitives.js';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { admit } from './gate.ts';
 import { assertFederationEnabled } from './keydoc.ts';
 import type { KeyStore } from './keys.ts';
