@@ -19,6 +19,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { advance, get } from '#engine/store/watermark.ts';
+import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 
 // The watermark source naming a room's change log (storage plan's
 // sources() enumerates these; tests already use this shape).
@@ -73,7 +74,7 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
     if (batch.length === 0) return;
     const prepared = await prepare(room, store, roomId, batch);
     const addedMs = Date.now();
-    await server.tx(async (tx) => {
+    await eventStreamTx(server, async (tx) => {
       for (const item of prepared) await apply(tx, roomId, item, addedMs);
       await advance(tx, source, batch[batch.length - 1].pos);
     });
@@ -603,11 +604,14 @@ async function applyLive(
   roomId: string,
   item: Prepared & { kind: 'event' | 'transition' | 'history' },
 ): Promise<void> {
-  await tx.execute(
-    `INSERT INTO feed(room, pos, event, stay) VALUES(?,?,?,?)
-     ON CONFLICT(room, pos) DO NOTHING`,
-    [roomId, item.change.pos, item.change.event, item.payload.stay],
-  );
+  const existing = await feedSeqAtPos(tx, roomId, item.change.pos);
+  if (existing === null) {
+    const seq = await nextEventSeq(tx);
+    await tx.execute(
+      'INSERT INTO feed(seq, room, pos, event, stay) VALUES(?,?,?,?,?)',
+      [seq, roomId, item.change.pos, item.change.event, item.payload.stay],
+    );
+  }
   await tx.execute(
     `UPDATE event_index SET seq = (
        SELECT seq FROM feed WHERE room = ? AND pos = ?

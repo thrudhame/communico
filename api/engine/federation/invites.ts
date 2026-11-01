@@ -35,6 +35,7 @@ import type { Signer } from '#engine/room/signer.ts';
 import { getRulebook, supportedRoomVersions } from '#engine/rulebook/index.ts';
 import type { Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
+import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { federationRequest } from './client.ts';
 import { admit } from './gate.ts';
 import { domainOf, toWire } from './pdu.ts';
@@ -264,6 +265,7 @@ export type StoredInvite = {
   origin: string;
   receivedMs: number;
   status: string;
+  seq: number;
 };
 
 // deno-lint-ignore no-explicit-any
@@ -278,6 +280,7 @@ function inviteOf(row: any): StoredInvite {
     origin: String(row.origin),
     receivedMs: Number(row.received_ms),
     status: String(row.status),
+    seq: Number(row.seq),
   };
 }
 
@@ -426,24 +429,28 @@ export async function receiveInvite(
   // too, invites-v2.yaml:40-42); otherwise the out-of-band row so the
   // invitee sees it
   if (!(await participating(deps.store, roomId))) {
-    await deps.server.execute(
-      `INSERT INTO federation_invites(room_id, user_id, event_id, room_version, event_json, invite_room_state, origin, received_ms, status)
-       VALUES(?,?,?,?,?,?,?,?,'pending')
+    await eventStreamTx(deps.server, async (tx) => {
+      const seq = await nextEventSeq(tx);
+      await tx.execute(
+        `INSERT INTO federation_invites(room_id, user_id, event_id, room_version, event_json, invite_room_state, origin, received_ms, status, seq)
+       VALUES(?,?,?,?,?,?,?,?,'pending',?)
        ON CONFLICT(room_id, user_id) DO UPDATE SET event_id = excluded.event_id,
          room_version = excluded.room_version, event_json = excluded.event_json,
          invite_room_state = excluded.invite_room_state, origin = excluded.origin,
-         received_ms = excluded.received_ms, status = 'pending'`,
-      [
-        roomId,
-        target,
-        eventId,
-        roomVersion,
-        JSON.stringify(pdu),
-        JSON.stringify(stripped),
-        origin,
-        Date.now(),
-      ],
-    );
+          received_ms = excluded.received_ms, status = 'pending', seq = excluded.seq`,
+        [
+          roomId,
+          target,
+          eventId,
+          roomVersion,
+          JSON.stringify(pdu),
+          JSON.stringify(stripped),
+          origin,
+          Date.now(),
+          seq,
+        ],
+      );
+    });
   }
   return { event: toWire(pdu, roomVersion) };
 }
@@ -481,10 +488,13 @@ export async function rejectInviteRemote(
     throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
   }
   const candidates = candidatesOf(invite, deps.self);
-  await deps.server.execute(
-    "UPDATE federation_invites SET status = 'rejecting' WHERE room_id = ? AND user_id = ?",
-    [roomId, userId],
-  );
+  await eventStreamTx(deps.server, async (tx) => {
+    const seq = await nextEventSeq(tx);
+    await tx.execute(
+      "UPDATE federation_invites SET status = 'rejecting', seq = ? WHERE room_id = ? AND user_id = ?",
+      [seq, roomId, userId],
+    );
+  });
   // nothing ingested an event — wake the first candidate's loop directly
   deps.wake(candidates[0]);
 }
@@ -566,14 +576,18 @@ async function performRejectInvite(
   // delivered: the row becomes 'rejected', and the SIGNED LEAVE becomes
   // the rendered event — the out-of-band leave section of /sync carries
   // it in state.events (stage 5; SyncLeftFrom wants a leave event there)
-  await deps.server.execute(
-    "UPDATE federation_invites SET status = 'rejected', event_json = ? WHERE room_id = ? AND user_id = ?",
-    [
-      JSON.stringify(signed as unknown as Record<string, unknown>),
-      roomId,
-      userId,
-    ],
-  );
+  await eventStreamTx(deps.server, async (tx) => {
+    const seq = await nextEventSeq(tx);
+    await tx.execute(
+      "UPDATE federation_invites SET status = 'rejected', event_json = ?, seq = ? WHERE room_id = ? AND user_id = ?",
+      [
+        JSON.stringify(signed as unknown as Record<string, unknown>),
+        seq,
+        roomId,
+        userId,
+      ],
+    );
+  });
 }
 
 // The sender's intent provider: 'rejecting' invites are the durable
@@ -642,14 +656,18 @@ export async function acceptRescind(
   const stored = JSON.parse(invite.eventJson) as Record<string, unknown>;
   const inviter = typeof stored.sender === 'string' ? stored.sender : null;
   if (inviter === null || sender !== inviter) return false;
-  await deps.server.execute(
-    "UPDATE federation_invites SET status = 'rejected', event_json = ? WHERE room_id = ? AND user_id = ?",
-    [
-      JSON.stringify(pdu as unknown as Record<string, unknown>),
-      roomId,
-      target,
-    ],
-  );
+  await eventStreamTx(deps.server, async (tx) => {
+    const seq = await nextEventSeq(tx);
+    await tx.execute(
+      "UPDATE federation_invites SET status = 'rejected', event_json = ?, seq = ? WHERE room_id = ? AND user_id = ?",
+      [
+        JSON.stringify(pdu as unknown as Record<string, unknown>),
+        seq,
+        roomId,
+        target,
+      ],
+    );
+  });
   return true;
 }
 
@@ -675,8 +693,16 @@ export async function markInviteJoined(
   userId: string,
   deps: InviteDeps,
 ): Promise<void> {
-  await deps.server.execute(
-    "UPDATE federation_invites SET status = 'joined' WHERE room_id = ? AND user_id = ? AND status = 'pending'",
-    [roomId, userId],
-  );
+  await eventStreamTx(deps.server, async (tx) => {
+    const rows = await tx.query(
+      "SELECT 1 FROM federation_invites WHERE room_id = ? AND user_id = ? AND status = 'pending'",
+      [roomId, userId],
+    );
+    if (rows.length === 0) return;
+    const seq = await nextEventSeq(tx);
+    await tx.execute(
+      "UPDATE federation_invites SET status = 'joined', seq = ? WHERE room_id = ? AND user_id = ? AND status = 'pending'",
+      [seq, roomId, userId],
+    );
+  });
 }
