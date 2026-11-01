@@ -16,6 +16,7 @@ import {
   inviteIntentProvider,
 } from '#engine/federation/invites.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
+import { type KeyStore, keyStore } from '#engine/federation/keys.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -33,6 +34,7 @@ export type App = {
   readonly server: Db;
   // The tenant of the configured server name (one server, one tenant).
   readonly tenant: Tenant;
+  readonly federationKeys: KeyStore;
   // The delivery worker — null until startFederationServices (federation
   // disabled, or an endpoint-test app).
   sender: Sender | null;
@@ -69,6 +71,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       store,
       server,
       tenant,
+      federationKeys: keyStore(server, { signer: tenant.signer() }),
       sender: null,
       close: async () => {
         stopRuleMigration();
