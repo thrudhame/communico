@@ -3,6 +3,27 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { closeApp, openApp } from '#engine/app.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 
+/** Preserve old test cases as named steps, sharing one fresh store per
+ * file and closing all resources within the enclosing test. */
+export function httpSuite(name: string, roots?: string[]) {
+  const cases: { name: string; fn: () => Promise<void> }[] = [];
+  let http: Awaited<ReturnType<typeof startHttp>>;
+  Deno.test(name, async (t) => {
+    http = await startHttp(roots);
+    try {
+      for (const test of cases) await t.step(test.name, test.fn);
+    } finally {
+      await http.close();
+    }
+  });
+  return {
+    test: (name: string, fn: () => Promise<void>) => cases.push({ name, fn }),
+    matrix: (request: Request) => http.matrix(request),
+    registerTestUser: (localpart: string, password: string) =>
+      http.registerTestUser(localpart, password),
+  };
+}
+
 export async function startHttp(roots = ['api/endpoints/matrix/']) {
   const dir = await Deno.makeTempDir({ prefix: 'http-app-' });
   const app = await openApp({

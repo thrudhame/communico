@@ -1,0 +1,39 @@
+import { parseJson } from '@pathfinder/pathfinder/body';
+import { theApp } from '#engine/app.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { deleteDevices, getDevice } from '#engine/tenant/devices.ts';
+import { PASSWORD_FLOWS, requireUia } from '#engine/tenant/uia.ts';
+import { localpartOf } from '#engine/tenant/auth.ts';
+import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
+
+// DELETE /_matrix/client/v3/devices/{deviceId} — "This API endpoint uses
+// the User-Interactive Authentication API. Deletes the given device, and
+// invalidates any access token associated with it." (spec v1.11, Device
+// Management.) The 401 carries flows/params/session per the UIA contract;
+// a wrong password is a 401 M_FORBIDDEN. 404 when the device is unknown or
+// not owned by the caller. Response: {}.
+// A bodyless DELETE is the spec's first UIA step (Complement A1 :129-199)
+// — an absent/empty body is {}, never a parse fault.
+export default async function (request: PathfinderRequest, context: Context) {
+  const caller = context.state.user as string;
+  const localpart = localpartOf(caller);
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await parseJson(request)) as Record<string, unknown>;
+  } catch (e) {
+    if (e instanceof Error && e.name === 'ParseError') body = {};
+    else throw e;
+  }
+  await requireUia(theApp().tenant, {
+    body,
+    flows: PASSWORD_FLOWS,
+    caller,
+  });
+  const deviceId = request.params.deviceId as string;
+  const device = await getDevice(theApp().tenant, localpart, deviceId);
+  if (device === null) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'unknown device');
+  }
+  await deleteDevices(theApp().tenant, localpart, [deviceId]);
+  return {};
+}
