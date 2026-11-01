@@ -22,12 +22,8 @@ import { requireRoom, type StateRow } from './room.ts';
 import { clientEventsForRows } from './state.ts';
 import { canSeeEvent } from './visibility.ts';
 
-export function parseStreamToken(raw: string | null) {
-  const m = raw === null
-    ? null
-    : /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?(?:_a(\d+))?$/.exec(raw);
-  return m === null ? null : { eSeq: Number(m[1]) };
-}
+import { parseStreamToken } from './tokens.ts';
+export { parseStreamToken } from './tokens.ts';
 
 export async function cursorForToken(
   room: Room,
