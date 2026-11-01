@@ -319,3 +319,142 @@ test('A6: deactivate — flows include m.login.password; wrong pw 401 M_FORBIDDE
   assertEquals(login.status, 403);
   assertEquals(login.body.errcode, 'M_USER_DEACTIVATED');
 });
+
+test('A2+A3: profile displayname/avatar_url — authed self-write, UNauthed read, foreign mxc verbatim, other-user write → 403', async () => {
+  const u = await registerTestUser('a2user', 'pw-a2user');
+  const other = await registerTestUser('a2other', 'pw-a2other');
+  const mx = u.user_id;
+  const put = await call(`/_matrix/client/v3/profile/${mx}/displayname`, {
+    method: 'PUT',
+    token: u.access_token,
+    body: { displayname: 'my_display_name' },
+  });
+  assertEquals(put.status, 200);
+  const get = await call(`/_matrix/client/v3/profile/${mx}/displayname`);
+  assertEquals(get.status, 200);
+  assertEquals(get.body, { displayname: 'my_display_name' });
+  const putA = await call(`/_matrix/client/v3/profile/${mx}/avatar_url`, {
+    method: 'PUT',
+    token: u.access_token,
+    body: { avatar_url: 'mxc://example.com/SEsfnsuifSDFSSEF' },
+  });
+  assertEquals(putA.status, 200);
+  const getA = await call(`/_matrix/client/v3/profile/${mx}/avatar_url`);
+  assertEquals(getA.body, { avatar_url: 'mxc://example.com/SEsfnsuifSDFSSEF' });
+  const forbidden = await call(`/_matrix/client/v3/profile/${mx}/displayname`, {
+    method: 'PUT',
+    token: other.access_token,
+    body: { displayname: 'nope' },
+  });
+  assertEquals(forbidden.status, 403);
+  assertEquals(forbidden.body.errcode, 'M_FORBIDDEN');
+});
+
+test("A5: pushers — set never fetches data.url; logged-out tokens' pushers die, the caller's survives", async () => {
+  const u = await registerTestUser('a5user', 'pw-a5');
+  const second = await call('/_matrix/client/v3/login', {
+    method: 'POST',
+    body: loginBody('a5user', 'pw-a5'),
+  });
+  assertEquals(second.status, 200);
+  const pusher = {
+    data: { url: 'https://dummy.url/_matrix/push/v1/notify' },
+    profile_tag: 'tag',
+    kind: 'http',
+    app_id: 'complement',
+    app_display_name: 'complement display name',
+    device_display_name: 'device display name',
+    pushkey: 'a_push_key',
+    lang: 'en',
+  };
+  const set1 = await call('/_matrix/client/v3/pushers/set', {
+    method: 'POST',
+    token: second.body.access_token as string,
+    body: pusher,
+  });
+  assertEquals(set1.status, 200);
+  const ch = await call('/_matrix/client/v3/account/password', {
+    method: 'POST',
+    token: u.access_token,
+    body: { auth: pwAuth('a5user', 'pw-a5'), new_password: 'pw-a5b' },
+  });
+  assertEquals(ch.status, 200);
+  const list0 = await call('/_matrix/client/v3/pushers', {
+    token: u.access_token,
+  });
+  assertEquals((list0.body.pushers as unknown[]).length, 0);
+  const set2 = await call('/_matrix/client/v3/pushers/set', {
+    method: 'POST',
+    token: u.access_token,
+    body: pusher,
+  });
+  assertEquals(set2.status, 200);
+  const ch2 = await call('/_matrix/client/v3/account/password', {
+    method: 'POST',
+    token: u.access_token,
+    body: { auth: pwAuth('a5user', 'pw-a5b'), new_password: 'pw-a5c' },
+  });
+  assertEquals(ch2.status, 200);
+  const list1 = await call('/_matrix/client/v3/pushers', {
+    token: u.access_token,
+  });
+  const pushers = list1.body.pushers as Json[];
+  assertEquals(pushers.length, 1);
+  assertEquals(pushers[0].app_id, 'complement');
+  assertEquals(pushers[0].pushkey, 'a_push_key');
+  assertEquals(pushers[0].kind, 'http');
+  assertEquals(pushers[0].app_display_name, 'complement display name');
+  assertEquals(pushers[0].device_display_name, 'device display name');
+  assertEquals(pushers[0].profile_tag, 'tag');
+  assertEquals(pushers[0].lang, 'en');
+  assertEquals(pushers[0].data, {
+    url: 'https://dummy.url/_matrix/push/v1/notify',
+  });
+});
+
+test('A7: account data — bare content, overwrite, per-room, missing → 404, other user → 403', async () => {
+  const u = await registerTestUser('a7user', 'pw-a7');
+  const other = await registerTestUser('a7other', 'pw-a7o');
+  const base = `/_matrix/client/v3/user/${u.user_id}/account_data/test.key`;
+  assertEquals((await call(base, { token: u.access_token })).status, 404);
+  assertEquals(
+    (await call(base, {
+      method: 'PUT',
+      token: u.access_token,
+      body: { value: 'first' },
+    })).status,
+    200,
+  );
+  const g1 = await call(base, { token: u.access_token });
+  assertEquals(g1.status, 200);
+  assertEquals(g1.body, { value: 'first' });
+  await call(base, {
+    method: 'PUT',
+    token: u.access_token,
+    body: { value: 'second' },
+  });
+  assertEquals((await call(base, { token: u.access_token })).body, {
+    value: 'second',
+  });
+  // Room id is opaque: this stage restores storage only, not /createRoom.
+  const roomId = '!account-data-opaque:localhost';
+  const rbase =
+    `/_matrix/client/v3/user/${u.user_id}/rooms/${roomId}/account_data/test.key`;
+  assertEquals(
+    (await call(rbase, {
+      method: 'PUT',
+      token: u.access_token,
+      body: { value: 'room-first' },
+    })).status,
+    200,
+  );
+  assertEquals((await call(rbase, { token: u.access_token })).body, {
+    value: 'room-first',
+  });
+  const forbidden = await call(
+    `/_matrix/client/v3/user/${other.user_id}/account_data/test.key`,
+    { token: u.access_token },
+  );
+  assertEquals(forbidden.status, 403);
+  assertEquals(forbidden.body.errcode, 'M_FORBIDDEN');
+});
