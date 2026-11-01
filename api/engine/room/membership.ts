@@ -9,6 +9,10 @@ import type { Pdu } from '#engine/pdu.ts';
 import type { Room } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import type { Signer } from '#engine/room/signer.ts';
+import { buildInTx } from '#engine/room/build.ts';
+import { ingestInTx } from '#engine/room/ingest.ts';
+import { withRoomLock } from '#engine/room/lock.ts';
+import { projectAfterWrite } from '#engine/room/hooks.ts';
 
 export type MembershipOpResult = {
   roomId: string;
@@ -56,7 +60,12 @@ async function authorMember(
     state_key: stateKey,
     content,
     origin_server_ts: Date.now(),
-  }, signer);
+  }, signer).catch((e) => {
+    if (
+      String(e).includes('E_ROOM_ARCHIVED') || String(e).includes('M_NO_CREATE')
+    ) throw new MatrixError(403, 'M_FORBIDDEN', String(e));
+    throw e;
+  });
   if (res.standing === 'rejected') {
     throw new MatrixError(
       403,
@@ -195,4 +204,61 @@ export async function unban(
   const content: Record<string, unknown> = { membership: 'leave' };
   if (reason !== undefined) content.reason = reason;
   return await authorMember(room, sender, target, content, signer);
+}
+
+// Self-only archived reopen (§3.6b): the previous stay is the held
+// snapshot; the join cites its grounded tips. No network or fake history.
+export async function reopen(
+  room: Room,
+  userId: string,
+  signer: Signer,
+  content: Record<string, unknown>,
+): Promise<MembershipOpResult> {
+  const result = await withRoomLock(room.id, () =>
+    room.tx(async (tx) => {
+      if (await tx.segments.openStay() !== null) {
+        throw new MatrixError(
+          400,
+          'M_BAD_STATE',
+          'already joined to ' + room.id,
+        );
+      }
+      const last = await tx.segments.latestStay();
+      const group = last === null ? null : await tx.state.current(last.id);
+      if (last === null || group === null) {
+        throw new MatrixError(403, 'M_FORBIDDEN', 'no snapshot to reopen');
+      }
+      const prevs = await tx.extremities.frontier(last.id);
+      const stay = await tx.segments.create({
+        kind: 'stay',
+        prev: last.id,
+        opening_group: group,
+      });
+      await tx.segments.create({
+        kind: 'history',
+        prev: stay,
+        status: 'complete',
+      });
+      const pdu = await buildInTx(tx, room.id, {
+        type: 'm.room.member',
+        sender: userId,
+        state_key: userId,
+        content: { ...content, membership: 'join' },
+        prev_events: prevs,
+      }, signer);
+      const res = await ingestInTx(tx, room.id, pdu, {
+        self: signer.serverName,
+      });
+      if (res.standing !== 'accepted') {
+        throw new MatrixError(
+          403,
+          'M_FORBIDDEN',
+          `membership rejected (${res.reason}, rule ${res.rule})`,
+        );
+      }
+      await tx.segments.setOpenedBy(stay, res.eventId);
+      return { roomId: room.id, eventId: res.eventId, created: true };
+    }));
+  await projectAfterWrite(room.store, room.id);
+  return result;
 }

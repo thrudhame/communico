@@ -1,0 +1,226 @@
+import { theApp } from '#engine/app.ts';
+import { serverName } from '#engine/config.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { domainOf } from '#engine/federation/pdu.ts';
+import { federationRequest } from '#engine/federation/client.ts';
+import { productionFetcher } from '#engine/federation/fetcher.ts';
+import {
+  inviteFor,
+  inviteRemote,
+  markInviteJoined,
+  rejectInviteRemote,
+} from '#engine/federation/invites.ts';
+import { joinRemote } from '#engine/room/join.ts';
+import * as local from '#engine/room/membership.ts';
+import { lookupAlias } from '#engine/server/aliases.ts';
+import { membershipOf, roomsFor } from '#engine/server/read.ts';
+import {
+  clearPurgeable,
+  forget as markForgotten,
+} from '#engine/server/membership.ts';
+import { getProfile } from '#engine/tenant/users.ts';
+import { lookupRoom, requireRoom, stateAtSeq } from './room.ts';
+import { inviteDeps } from './write.ts';
+
+export async function serversInRoom(roomId: string): Promise<string[]> {
+  const members = (await stateAtSeq(roomId, null)).filter((r) =>
+    r.type === 'm.room.member' && r.content.membership === 'join'
+  );
+  return [...new Set(members.map((r) => domainOf(r.stateKey)))].sort();
+}
+
+export async function join(
+  roomId: string,
+  userId: string,
+  extra: Record<string, unknown> = {},
+  opts: { via?: string[] } = {},
+) {
+  const app = theApp();
+  const signer = app.tenant.signer();
+  const current = await membershipOf(app.server, roomId, userId);
+  if (current?.membership === 'join') {
+    return { roomId, eventId: current.eventId, created: false };
+  }
+  const profile = await getProfile(
+    app.tenant,
+    userId.slice(1, userId.indexOf(':')),
+  );
+  const content = { ...profile, ...extra, membership: 'join' };
+  const room = await lookupRoom(roomId);
+  let result;
+  if (room !== null && await room.tx((tx) => tx.segments.openStay()) !== null) {
+    result = await local.join(room, userId, signer, content);
+  } else {
+    const deps = inviteDeps();
+    const invitation = await inviteFor(roomId, userId, deps);
+    const held = room === null ? [] : await serversInRoom(roomId);
+    const via = [
+      ...new Set([
+        ...(opts.via ?? []),
+        ...(invitation?.status === 'pending' ? [invitation.origin] : []),
+        ...held,
+      ]),
+    ].filter((s) => s !== serverName());
+    if (via.length === 0) {
+      if (room === null) {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'no servers to join through');
+      }
+      result = await local.reopen(room, userId, signer, content);
+    } else {
+      const remote = await joinRemote(app.store, {
+        roomId,
+        user: userId,
+        via,
+        signer,
+        content,
+        deps: {
+          keys: deps.keys,
+          fetcher: productionFetcher(app.server, signer),
+          self: serverName(),
+        },
+      });
+      result = { ...remote, created: true };
+    }
+    await markInviteJoined(roomId, userId, deps);
+  }
+  await clearPurgeable(app.server, roomId, userId);
+  return result;
+}
+
+export async function joinByIdOrAlias(
+  id: string,
+  userId: string,
+  content: Record<string, unknown>,
+  via: string[],
+) {
+  const app = theApp();
+  let roomId = id;
+  const candidates: string[] = [];
+  if (id.startsWith('#')) {
+    const mapped = await lookupAlias(app.server, id);
+    if (mapped !== null) roomId = mapped;
+    else {
+      const destination = domainOf(id);
+      if (destination === serverName()) {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'unknown alias: ' + id);
+      }
+      const res = await federationRequest(app.server, app.tenant.signer(), {
+        destination,
+        method: 'GET',
+        path: '/_matrix/federation/v1/query/directory?room_alias=' +
+          encodeURIComponent(id),
+        body: null,
+      });
+      const answer = res.json as { room_id?: unknown; servers?: unknown };
+      if (typeof answer.room_id !== 'string') {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'unknown alias: ' + id);
+      }
+      roomId = answer.room_id;
+      candidates.push(
+        destination,
+        ...(Array.isArray(answer.servers) ? answer.servers.map(String) : []),
+      );
+    }
+  }
+  candidates.push(...via);
+  if (roomId.includes(':')) candidates.push(domainOf(roomId));
+  return await join(roomId, userId, content, {
+    via: [...new Set(candidates)].filter((s) => s !== serverName()),
+  });
+}
+
+export async function leave(roomId: string, userId: string, reason?: string) {
+  const app = theApp();
+  const deps = inviteDeps();
+  const invitation = await inviteFor(roomId, userId, deps);
+  const room = await lookupRoom(roomId);
+  const current = await membershipOf(app.server, roomId, userId);
+  if (
+    (current === null || current.membership === 'invite') &&
+    invitation !== null && invitation.status !== 'joined'
+  ) {
+    await rejectInviteRemote(roomId, userId, deps);
+    return { roomId, eventId: invitation.eventId, created: false };
+  }
+  if (room === null) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'room not found: ' + roomId);
+  }
+  return await local.leave(room, userId, app.tenant.signer(), reason);
+}
+
+export async function memberOperation(
+  op: 'invite' | 'kick' | 'ban' | 'unban',
+  roomId: string,
+  userId: string,
+  target: string,
+  reason?: string,
+) {
+  const room = await requireRoom(roomId);
+  const app = theApp();
+  let result;
+  if (op === 'invite' && domainOf(target) !== serverName()) {
+    if (!/^@[^:\s]+:[^\s]+$/.test(target)) {
+      throw new MatrixError(400, 'M_INVALID_PARAM', 'not a user id: ' + target);
+    }
+    if (
+      target === userId ||
+      (await membershipOf(app.server, roomId, target))?.membership === 'join'
+    ) throw new MatrixError(403, 'M_FORBIDDEN', 'cannot invite this user');
+    result = await inviteRemote(
+      roomId,
+      userId,
+      target,
+      reason,
+      undefined,
+      inviteDeps(),
+    );
+  } else {result = await local[op](
+      room,
+      userId,
+      target,
+      app.tenant.signer(),
+      reason,
+    );}
+  if (op === 'invite') await clearPurgeable(app.server, roomId, target);
+  return result;
+}
+
+export async function forget(roomId: string, userId: string) {
+  await markForgotten(theApp().server, roomId, userId, serverName());
+}
+export async function joinedRooms(userId: string) {
+  return (await roomsFor(theApp().server, userId)).filter((m) =>
+    m.membership === 'join'
+  ).map((m) => m.roomId);
+}
+
+export async function propagateProfile(
+  userId: string,
+  field: 'displayname' | 'avatar_url',
+) {
+  const app = theApp();
+  const profile = await getProfile(
+    app.tenant,
+    userId.slice(1, userId.indexOf(':')),
+  );
+  const value = profile?.[field];
+  for (const roomId of await joinedRooms(userId)) {
+    const row = (await stateAtSeq(roomId, null)).find((r) =>
+      r.type === 'm.room.member' && r.stateKey === userId
+    );
+    const content = { ...(row?.content ?? {}) };
+    if (value == null) delete content[field];
+    else content[field] = value;
+    const room = await requireRoom(roomId);
+    const { sendLocal } = await import('#engine/room/ingest.ts');
+    const res = await sendLocal(room, {
+      type: 'm.room.member',
+      state_key: userId,
+      sender: userId,
+      content,
+    }, app.tenant.signer());
+    if (res.standing === 'rejected') {
+      throw new MatrixError(403, 'M_FORBIDDEN', 'profile membership rejected');
+    }
+  }
+}
