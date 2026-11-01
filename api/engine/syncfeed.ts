@@ -19,6 +19,9 @@ import {
 } from '#engine/tenant/accountdata.ts';
 import { pushStreamSeq, rulesetFor } from '#engine/tenant/pushrules.ts';
 import type { RoomFilter } from '#engine/tenant/filters.ts';
+import { onProjected } from '#engine/server/project.ts';
+import { onEventStream } from '#engine/server/stream.ts';
+import { onTenantStream } from '#engine/tenant/streams.ts';
 
 export interface SyncInputs {
   userId: string;
@@ -62,9 +65,20 @@ async function roomTimeline(
     Number.MAX_SAFE_INTEGER,
     end,
   );
-  const limit = 10;
-  const trimmed = raw.length > limit;
-  const returned = trimmed ? raw.slice(-limit) : raw;
+  const pdus = await room.tx((tx) => tx.events.list(raw.map((r) => r.event)));
+  const typeMatches = (
+    type: string,
+    f: { types?: string[]; not_types?: string[] },
+  ) =>
+    (f.types === undefined || f.types.includes(type)) &&
+    !f.not_types?.includes(type);
+  const filtered = raw.filter((r) => {
+    const pdu = pdus.get(r.event);
+    return pdu !== undefined && typeMatches(pdu.type, i.filter.timeline);
+  });
+  const limit = i.filter.timeline.limit ?? 10;
+  const trimmed = filtered.length > limit;
+  const returned = trimmed ? filtered.slice(filtered.length - limit) : filtered;
   const events: Record<string, unknown>[] = [];
   for (const row of returned) {
     const pduRow = await room.tx((tx) => tx.events.get(row.event));
@@ -104,6 +118,13 @@ async function roomTimeline(
     );
   }
   const stateEvents: Record<string, unknown>[] = [];
+  stateRows = stateRows.filter((r) => typeMatches(r.type, i.filter.state));
+  if (i.filter.state.lazy_load_members) {
+    const senders = new Set(events.map((ev) => String(ev.sender)));
+    stateRows = stateRows.filter((r) =>
+      r.type !== 'm.room.member' || senders.has(r.stateKey)
+    );
+  }
   for (const row of stateRows) {
     const ev = await renderEvent(room, row.eventId, {
       userId: i.userId,
@@ -170,9 +191,60 @@ async function roomTimeline(
   return { entry, joiners, leavers };
 }
 
+async function relevantChanged(i: SyncInputs): Promise<boolean> {
+  if (i.since === null) return true;
+  const app = theApp();
+  const rows = await app.server.query(
+    `SELECT MAX(seq) AS m FROM (
+       SELECT f.seq FROM feed f JOIN memberships m ON m.room = f.room WHERE m.user = ?
+       UNION ALL SELECT seq FROM federation_invites WHERE user_id = ?
+     )`,
+    [i.userId, i.userId],
+  );
+  return Number(rows[0].m ?? 0) > i.since.eSeq ||
+    await accountDataMax(app.tenant, localpartOf(i.userId)) > i.since.aSeq;
+}
+
+async function waitForRelevant(i: SyncInputs): Promise<void> {
+  if (i.since === null || i.timeoutMs <= 0) return;
+  const app = theApp();
+  const deadline = Date.now() + Math.min(i.timeoutMs, 30000);
+  while (Date.now() < deadline) {
+    let wake!: () => void;
+    const changed = new Promise<void>((resolve) => {
+      wake = resolve;
+    });
+    // Arm BEFORE reading maxima: a commit between the read and await
+    // remains signalled. Unrelated writes only trigger a relevance recheck.
+    const removers = [
+      onProjected((store) => {
+        if (store === app.store) wake();
+      }),
+      onEventStream((path) => {
+        if (path === app.server.path) wake();
+      }),
+      onTenantStream((store, tenant) => {
+        if (store === app.store && tenant === app.tenant.serverName) wake();
+      }),
+    ];
+    const timer = setTimeout(
+      wake,
+      Math.min(500, Math.max(0, deadline - Date.now())),
+    );
+    try {
+      if (await relevantChanged(i)) return;
+      await changed;
+    } finally {
+      clearTimeout(timer);
+      for (const remove of removers) remove();
+    }
+  }
+}
+
 export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const app = theApp();
   const lp = localpartOf(i.userId);
+  await waitForRelevant(i);
   const now: StreamToken = {
     eSeq: await eventStreamMax(app.server),
     pSeq: 0,

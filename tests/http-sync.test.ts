@@ -27,6 +27,7 @@ import { testRemoteServer, testSigner } from '#tests/fixtures/signer.ts';
 import { joinRemote } from '#engine/room/join.ts';
 import { backfill } from '#engine/room/history.ts';
 import { PL_DEFAULTS } from '#tests/fixtures/genesis.ts';
+import { storeFilter } from '#engine/tenant/filters.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP sync');
@@ -396,4 +397,156 @@ suite.test('backfilled history never appears as new in HTTP sync', async () => {
     stored !== null,
     'history really was stored, not dropped to avoid sync',
   );
+});
+
+suite.test('timeline limits, type filters, stored filters, zero limit and lazy-loaded member state', async () => {
+  const app = theApp();
+  const alice = await suite.registerTestUser('sy-filter', 'pw');
+  const signer = app.tenant.signer();
+  const { roomId } = await createRoom(app.store, {
+    creator: alice.user_id,
+    invite: ['@filter-bob:localhost'],
+  }, signer);
+  const room = await openRoom(app.store, roomId);
+  for (let n = 0; n < 15; n++) {
+    await sendLocal(room, {
+      type: 'm.room.message',
+      sender: alice.user_id,
+      content: { body: 'm' + n },
+    }, signer);
+  }
+  const limited = await sync(
+    alice.access_token!,
+    '&filter=' + encodeURIComponent('{"room":{"timeline":{"limit":10}}}'),
+  );
+  const tl = roomSection(limited, 'join', roomId)!.timeline as Json;
+  assertEquals((tl.events as Json[]).length, 10);
+  assertEquals(tl.limited, true);
+  assert(tl.prev_batch !== limited.next_batch);
+  const id = await storeFilter(app.tenant, 'sy-filter', {
+    room: {
+      timeline: { types: ['m.room.message'], limit: 1 },
+      state: { lazy_load_members: true },
+    },
+  });
+  const stored = roomSection(
+    await sync(alice.access_token!, '&filter=' + id),
+    'join',
+    roomId,
+  )!;
+  assertEquals(
+    ((stored.timeline as Json).events as Json[]).map((e) =>
+      (e.content as Json).body
+    ),
+    ['m14'],
+  );
+  const members = ((stored.state as Json).events as Json[]).filter((e) =>
+    e.type === 'm.room.member'
+  );
+  assertEquals(members.map((e) => e.state_key), [alice.user_id]);
+  const empty = await sync(
+    alice.access_token!,
+    '&filter=' + encodeURIComponent('{"room":{"timeline":{"limit":0}}}'),
+  );
+  const zero = roomSection(empty, 'join', roomId)!.timeline as Json;
+  assertEquals(zero.events, []);
+  assertEquals(zero.prev_batch, empty.next_batch);
+  // The s2 fork shape: a late state change is the first returned event,
+  // and its own effect belongs in state even when the later event is filtered.
+  const name = await sendLocal(room, {
+    type: 'm.room.name',
+    state_key: '',
+    sender: alice.user_id,
+    content: { name: 'S2' },
+  }, signer);
+  await sendLocal(room, {
+    type: 'please_filter_me',
+    sender: alice.user_id,
+    content: {},
+  }, signer);
+  const filtered = roomSection(
+    await sync(
+      alice.access_token!,
+      '&filter=' +
+        encodeURIComponent(
+          '{"room":{"timeline":{"not_types":["please_filter_me"],"limit":1}}}',
+        ),
+    ),
+    'join',
+    roomId,
+  )!;
+  assert(
+    ((filtered.state as Json).events as Json[]).some((e) =>
+      e.event_id === name.eventId
+    ),
+  );
+});
+
+suite.test('long poll wakes on relevant projections and committed tenant changes, not unrelated users', async () => {
+  const app = theApp();
+  const alice = await suite.registerTestUser('sy-wait', 'pw');
+  const bob = await suite.registerTestUser('sy-unrelated', 'pw');
+  const signer = app.tenant.signer();
+  const { roomId } = await createRoom(
+    app.store,
+    { creator: alice.user_id },
+    signer,
+  );
+  const room = await openRoom(app.store, roomId);
+  let before = await sync(alice.access_token!);
+  const longPoll = (since: unknown) =>
+    suite.matrix(
+      new Request(
+        'http://x/_matrix/client/v3/sync?timeout=3000&since=' + since,
+        { headers: { Authorization: `Bearer ${alice.access_token}` } },
+      ),
+    ).then((r) => r.json() as Promise<Json>);
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  let finished = false;
+  let waiting = longPoll(before.next_batch).then((body) => {
+    finished = true;
+    return body;
+  });
+  await sleep(60);
+  await putAccountData(app.tenant, 'sy-unrelated', '', 'other.test', {});
+  await sleep(60);
+  assertEquals(
+    finished,
+    false,
+    'unrelated account data must not complete this sync',
+  );
+  let start = performance.now();
+  const sent = await sendLocal(room, {
+    type: 'm.room.message',
+    sender: alice.user_id,
+    content: { body: 'wake' },
+  }, signer);
+  const projected = await waiting;
+  assert(
+    performance.now() - start < 450,
+    'projection wake must beat the polling fallback',
+  );
+  assert(
+    ((roomSection(projected, 'join', roomId)!.timeline as Json)
+      .events as Json[]).some((e) => e.event_id === sent.eventId),
+  );
+  before = projected;
+  finished = false;
+  waiting = longPoll(before.next_batch).then((body) => {
+    finished = true;
+    return body;
+  });
+  await sleep(60);
+  start = performance.now();
+  await putAccountData(app.tenant, 'sy-wait', '', 'wake.test', { value: 2 });
+  const account = await waiting;
+  assert(
+    performance.now() - start < 450,
+    'tenant wake must beat the polling fallback',
+  );
+  assertEquals((account.account_data as Json).events, [{
+    type: 'wake.test',
+    content: { value: 2 },
+  }]);
+  void bob;
 });

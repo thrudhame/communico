@@ -18,6 +18,7 @@ import * as pushrules from '#engine/tenant/pushrules.ts';
 import * as txns from '#engine/tenant/txns.ts';
 import * as uia from '#engine/tenant/uia.ts';
 import * as users from '#engine/tenant/users.ts';
+import { tenantStreamCommitted } from '#engine/tenant/streams.ts';
 import {
   b32encode,
   b64decode,
@@ -66,7 +67,7 @@ type IdentityRow = {
   key_id: string;
 };
 
-function bind(conn: Conn) {
+function bind(conn: Conn, changed: () => void = () => {}) {
   return {
     users: {
       exists: (localpart: string) => users.userExists(conn, localpart),
@@ -155,7 +156,10 @@ function bind(conn: Conn) {
     },
     counters: {
       next: (name: string) => accountdata.nextCounter(conn, name),
-      nextStream: () => accountdata.nextStreamSeq(conn),
+      nextStream: () => {
+        changed();
+        return accountdata.nextStreamSeq(conn);
+      },
     },
     accountData: {
       put: (
@@ -338,6 +342,15 @@ export async function openTenant(
         return b64encodeStd(new Uint8Array(signature));
       },
     }),
-    tx: (fn) => db.tx((conn) => fn(bind(conn))),
+    tx: async (fn) => {
+      let changed = false;
+      const result = await db.tx((conn) =>
+        fn(bind(conn, () => {
+          changed = true;
+        }))
+      );
+      if (changed) tenantStreamCommitted(store, serverName);
+      return result;
+    },
   };
 }

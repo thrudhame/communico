@@ -5,6 +5,14 @@
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 
 const writers = new Map<string, Promise<void>>();
+const listeners = new Set<(path: string) => void>();
+
+export function onEventStream(fn: (path: string) => void): () => void {
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+  };
+}
 
 export async function eventStreamTx<T>(
   db: Db,
@@ -15,7 +23,9 @@ export async function eventStreamTx<T>(
   const settled = run.then(() => undefined, () => undefined);
   writers.set(db.path, settled);
   try {
-    return await run;
+    const result = await run;
+    for (const fn of listeners) fn(db.path);
+    return result;
   } finally {
     if (writers.get(db.path) === settled) writers.delete(db.path);
   }
