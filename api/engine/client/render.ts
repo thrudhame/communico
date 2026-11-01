@@ -6,6 +6,7 @@ import type { Room } from '#engine/room/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { transactionForEvent } from '#engine/tenant/txns.ts';
 import { redactionOf } from '#engine/server/read.ts';
+import { relationsOf } from '#engine/server/read.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 
 export type Viewer = {
@@ -19,7 +20,7 @@ export async function renderEvent(
   room: Room,
   eventId: string,
   viewer?: Viewer,
-  opts?: { omitRoomId?: boolean },
+  opts?: { omitRoomId?: boolean; bundleThreads?: boolean },
 ): Promise<Record<string, unknown> | null> {
   const loaded = await room.tx(async (tx) => {
     const row = await tx.events.get(eventId);
@@ -99,5 +100,30 @@ export async function renderEvent(
     unsigned.redacted_because = redactedBecause;
   }
   event.unsigned = unsigned;
+  if (opts?.bundleThreads !== false) {
+    const children = await relationsOf(server, room.id, eventId, 'm.thread');
+    if (children.length > 0) {
+      const latest = await renderEvent(
+        room,
+        children[children.length - 1].eventId,
+        viewer,
+        { bundleThreads: false },
+      );
+      let participated = viewer?.userId === pdu.sender;
+      for (const child of children) {
+        const row = await room.tx((tx) => tx.events.get(child.eventId));
+        if (row?.sender === viewer?.userId) participated = true;
+      }
+      if (latest !== null) {
+        unsigned['m.relations'] = {
+          'm.thread': {
+            latest_event: latest,
+            count: children.length,
+            current_user_participated: participated,
+          },
+        };
+      }
+    }
+  }
   return event;
 }

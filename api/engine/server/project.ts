@@ -39,19 +39,24 @@ let queue: Promise<void> = Promise.resolve();
 // Projection listeners (the federation sender's wake, 4c-2): registered
 // like the room hooks, fired after each completed projection. A listener
 // never breaks the projection — errors are logged.
-const projectedListeners: ((store: Store, roomId: string) => void)[] = [];
+const projectedListeners:
+  ((store: Store, roomId: string) => void | Promise<void>)[] = [];
 
 export function onProjected(
-  fn: (store: Store, roomId: string) => void,
-): void {
+  fn: (store: Store, roomId: string) => void | Promise<void>,
+): () => void {
   projectedListeners.push(fn);
+  return () => {
+    const at = projectedListeners.indexOf(fn);
+    if (at !== -1) projectedListeners.splice(at, 1);
+  };
 }
 
 export function project(store: Store, roomId: string): Promise<void> {
-  const run = queue.then(() => projectNow(store, roomId)).then(() => {
+  const run = queue.then(() => projectNow(store, roomId)).then(async () => {
     for (const fn of projectedListeners) {
       try {
-        fn(store, roomId);
+        await fn(store, roomId);
       } catch (error) {
         console.error(`projection listener failed for ${roomId}:`, error);
       }

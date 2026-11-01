@@ -9,6 +9,7 @@
 // app store (4b), engine tests keep opening schema-less stores without
 // it.
 import { config, serverName } from '#engine/config.ts';
+import { installRuleMigration } from '#engine/client/rule-migration.ts';
 import { type EduQueues, eduQueues } from '#engine/federation/edus.ts';
 import {
   type InviteDeps,
@@ -63,12 +64,14 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   try {
     const tenant = await openTenant(store, serverName(), { create: true });
     const server = await store.server();
+    const stopRuleMigration = await installRuleMigration(store, tenant);
     const app: App = {
       store,
       server,
       tenant,
       sender: null,
       close: async () => {
+        stopRuleMigration();
         await app.sender?.stop();
         app.sender = null;
         await store.close();

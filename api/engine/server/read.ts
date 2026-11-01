@@ -201,6 +201,17 @@ export async function relationsOf(
   }));
 }
 
+export async function threadRootsOf(db: Db, roomId: string) {
+  const rows = await db.query(
+    "SELECT relates_to,MAX(seq) AS latest FROM relations WHERE room=? AND rel_type='m.thread' GROUP BY relates_to ORDER BY latest DESC",
+    [roomId],
+  );
+  return rows.map((r) => ({
+    eventId: String(r.relates_to),
+    latestSeq: Number(r.latest),
+  }));
+}
+
 // --- search ----------------------------------------------------------------
 
 export const SEARCH_KEYS = ['content.body', 'content.name', 'content.topic'];

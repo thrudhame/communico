@@ -61,3 +61,29 @@ export async function validateCanonicalAliasContent(
     }
   }
 }
+
+export async function aliasRecord(db: Db, alias: string) {
+  const rows = await db.query(
+    'SELECT room_id,creator FROM aliases WHERE alias=?',
+    [alias],
+  );
+  return rows.length === 0 ? null : {
+    roomId: String(rows[0].room_id),
+    creator: rows[0].creator === null ? null : String(rows[0].creator),
+  };
+}
+export async function roomAliases(db: Db, roomId: string) {
+  return (await db.query(
+    'SELECT alias FROM aliases WHERE room_id=? ORDER BY alias',
+    [roomId],
+  )).map((r) => String(r.alias));
+}
+export async function removeAlias(db: Db, alias: string) {
+  await db.execute('DELETE FROM aliases WHERE alias=?', [alias]);
+}
+export async function moveAliases(db: Db, oldRoom: string, newRoom: string) {
+  await db.execute('UPDATE aliases SET room_id=? WHERE room_id=?', [
+    newRoom,
+    oldRoom,
+  ]);
+}
