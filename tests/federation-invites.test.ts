@@ -488,6 +488,13 @@ Deno.test('reject: local effect at once + the intent performs make/send_leave ag
           );
           // the intent performs make_leave + send_leave against the fake
           await waitFor(() => h.sendLeaveCalls.length >= 1, 10000);
+          // Receipt precedes the response and the sender's durable completion.
+          await waitFor(
+            async () =>
+              (await inviteFor(h.room.roomId, '@dev:test', deps))?.status ===
+                'rejected',
+            10000,
+          );
           assert(h.makeLeaveCalls.includes('@dev:test'));
           assertEquals(
             (await inviteFor(h.room.roomId, '@dev:test', deps))?.status,
@@ -622,6 +629,12 @@ Deno.test('reject: an unreachable inviter leaves the dance queued; the second ca
           // dead.test fails; the dance does NOT fall back to local-only —
           // the second candidate (from the stripped state) performs it
           await waitFor(() => sendLeaveCalls.length >= 1, 20000);
+          await waitFor(
+            async () =>
+              (await inviteFor(room.roomId, '@dev:test', deps))?.status ===
+                'rejected',
+            20000,
+          );
           assertEquals(
             (await inviteFor(room.roomId, '@dev:test', deps))?.status,
             'rejected',
