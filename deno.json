@@ -5,7 +5,8 @@
   "version": "0.1.0-dev",
   "tasks": {
     "native": "sh tools/native-build.sh",
-    "check": "deno fmt --check && deno lint && deno check api/ tests/ tools/config.ts",
+    "check": "deno fmt --check && deno lint && deno check main.ts api/ tests/ tools/config.ts",
+    "start": "deno --env --allow-net --allow-env --allow-read --allow-write --allow-ffi main.ts",
     "fmt": "deno fmt",
     "test": "deno test --allow-net --allow-env --allow-read --allow-write --allow-run --allow-ffi tests/*.test.ts tests/rulebook/*.test.ts",
     "config": "deno run --allow-env --allow-read tools/config.ts",
