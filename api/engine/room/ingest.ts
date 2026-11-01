@@ -87,6 +87,9 @@ export type RemoteIngest = {
   oversized: boolean;
   ungroundedMs: number;
   boundary?: StateMap;
+  // Resident-side send_join/send_leave: forward to the other room servers.
+  // The only closed-stay write is an invited remote user's self-rejection.
+  residentMembership?: boolean;
 };
 
 function sameIdSet(a: readonly string[], b: readonly string[]): boolean {
@@ -167,7 +170,11 @@ export async function ingestInTx(
   const remote = opts.remote ?? null;
   const isCreate = pdu.type === 'm.room.create' &&
     (pdu.prev_events ?? []).length === 0;
-  const stay = await stayForEvent(tx, pdu as BuildPartial);
+  const stay = remote === null ||
+      (remote.residentMembership === true &&
+        domainOf(pdu.sender) === remote.origin && remote.origin !== remote.self)
+    ? await stayForEvent(tx, pdu as BuildPartial)
+    : await tx.segments.openStay();
   if (stay === null) {
     throw new Error('E_ROOM_ARCHIVED: no open stay for ' + roomId);
   }
@@ -599,7 +606,10 @@ export async function ingestInTx(
   // target user's server, excluding this server (the 3c-1 formula; the
   // old-code contract is requirements §4.3 I11). LOCAL events only:
   // remote-origin events get no delivery intent (we do not forward them).
-  if (standing === 'accepted' && remote === null) {
+  if (
+    standing === 'accepted' &&
+    (remote === null || remote.residentMembership === true)
+  ) {
     const afterMap = new Map(before);
     if (stateKey !== null) {
       afterMap.set(String(pdu.type) + '\0' + stateKey, eventId);
@@ -617,6 +627,7 @@ export async function ingestInTx(
       destinations.add(domainOf(stateKey));
     }
     destinations.delete(self);
+    if (remote !== null) destinations.delete(remote.origin);
     await tx.changes.append('delivery', eventId, {
       destinations: [...destinations].sort(),
     });

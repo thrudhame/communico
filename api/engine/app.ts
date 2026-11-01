@@ -10,7 +10,12 @@
 // it.
 import { config, serverName } from '#engine/config.ts';
 import { installRuleMigration } from '#engine/client/rule-migration.ts';
-import { type EduQueues, eduQueues } from '#engine/federation/edus.ts';
+import {
+  type EduQueues,
+  eduQueues,
+  type EduState,
+  eduState,
+} from '#engine/federation/edus.ts';
 import {
   type InviteDeps,
   inviteIntentProvider,
@@ -35,6 +40,7 @@ export type App = {
   // The tenant of the configured server name (one server, one tenant).
   readonly tenant: Tenant;
   readonly federationKeys: KeyStore;
+  readonly federationEdus: EduState;
   // The delivery worker — null until startFederationServices (federation
   // disabled, or an endpoint-test app).
   sender: Sender | null;
@@ -72,6 +78,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       server,
       tenant,
       federationKeys: keyStore(server, { signer: tenant.signer() }),
+      federationEdus: eduState(server, tenant.serverName),
       sender: null,
       close: async () => {
         stopRuleMigration();
