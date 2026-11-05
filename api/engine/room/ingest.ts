@@ -26,6 +26,7 @@
 // is the recheck driver: a later arrival of what a wait missed re-runs
 // it (old ruling B).
 import { canonicalJson } from '#engine/canonical.ts';
+import { domainOf } from '#engine/ids.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -97,11 +98,6 @@ function sameIdSet(a: readonly string[], b: readonly string[]): boolean {
 function membershipOfPdu(pdu: string): string | null {
   const membership = (JSON.parse(pdu) as Pdu).content?.membership;
   return typeof membership === 'string' ? membership : null;
-}
-
-function domainOf(userId: string): string {
-  const at = userId.indexOf(':');
-  return at === -1 ? userId : userId.slice(at + 1);
 }
 
 // Build + ingest as one critical section (old authorAndIngest): the build

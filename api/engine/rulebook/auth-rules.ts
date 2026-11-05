@@ -7,6 +7,7 @@
 // Rules 1-2 are state-independent (they read the event's own auth_events
 // via the EventStore — S8 check 4, server-server-api.md:473-474). Rules
 // 3-10 are state-dependent (S8 check 5, server-server-api.md:475-476).
+import { domainOf } from '#engine/ids.ts';
 import {
   creatorsOf,
   namedLevel,
@@ -37,12 +38,6 @@ export interface AuthCtx {
   store: EventStore;
   // registry knowledge for rule 1.3 ("a recognised version")
   recognisedVersions: readonly string[];
-}
-
-function domainOf(id: string): string {
-  // "the domain of the room_id / sender" — everything after the first ':'
-  const i = id.indexOf(':');
-  return i === -1 ? id : id.slice(i + 1);
 }
 
 function membershipOf(ctx: AuthCtx, userId: string): string | undefined {

@@ -4,6 +4,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { setAvatarUrl } from '#engine/tenant/users.ts';
 import { propagateProfile } from '#engine/client/membership.ts';
 import { authorize } from '#engine/auth-context.ts';
+import { localpartOf } from '#engine/ids.ts';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 // PUT /_matrix/client/v3/profile/{userId}/avatar_url — "This API sets the
@@ -33,8 +34,7 @@ export default async function (request: PathfinderRequest) {
       'avatar_url must be a string or null',
     );
   }
-  const colon = userId.lastIndexOf(':');
-  await setAvatarUrl(theApp().tenant, userId.slice(1, colon), body.avatar_url);
+  await setAvatarUrl(theApp().tenant, localpartOf(userId), body.avatar_url);
   await propagateProfile(userId, 'avatar_url');
   return {};
 }

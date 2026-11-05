@@ -6,6 +6,7 @@
 import type { Conn } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
+import { splitId } from '#engine/ids.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { verifyUserPassword } from '#engine/tenant/users.ts';
 
@@ -178,11 +179,10 @@ export async function requireUia(
     if (rawUser !== undefined) {
       const lower = rawUser.toLowerCase();
       if (lower.startsWith('@')) {
-        const rest = lower.slice(1);
-        const colon = rest.lastIndexOf(':');
-        if (colon >= 0) {
-          targetLocalpart = rest.slice(0, colon);
-          targetMxid = `@${rest}`;
+        const parts = splitId(lower);
+        if (parts.server !== null) {
+          targetLocalpart = parts.localpart;
+          targetMxid = lower;
         }
       } else {
         targetLocalpart = lower;

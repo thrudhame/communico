@@ -26,6 +26,7 @@
 // WITHOUT re-verification; a pending redelivery falls through) is the
 // caller's composition: identify() supplies the recomputed id for it.
 import { canonicalJson } from '#engine/canonical.ts';
+import { domainOf } from '#engine/ids.ts';
 import { eventIdFor, redact } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { getRulebook, type RoomVersionSpec } from '#engine/rulebook/index.ts';
@@ -44,11 +45,6 @@ export type Verified = Identified & {
   // a content-hash mismatch — replaced by its redacted form.
   pdu: Pdu;
 };
-
-function domainOf(userId: string): string {
-  const at = userId.indexOf(':');
-  return at === -1 ? userId : userId.slice(at + 1);
-}
 
 // Check 1: the wire bounds and the per-version format checks (old
 // federation/pdu.ts checkRemoteFormat). A hard failure throws; the

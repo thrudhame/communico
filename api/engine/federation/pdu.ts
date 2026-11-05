@@ -9,12 +9,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { RoomVersionSpec } from '#engine/rulebook/types.ts';
 
-// The server-name part of an identifier (user/room/event id): everything
-// after the FIRST ':' (server names may themselves carry :port).
-export function domainOf(id: string): string {
-  const at = id.indexOf(':');
-  return at < 0 ? id : id.slice(at + 1);
-}
+export { domainOf } from '#engine/ids.ts';
 
 // The wire form of a stored PDU for the given room version.
 export function toWire(

@@ -2,6 +2,7 @@
 // A separate watermark prevents later traffic from re-copying a rule the
 // user deleted. Startup completes an interrupted tenant-first migration.
 import { openRoom } from '#engine/room/index.ts';
+import { localpartOf } from '#engine/ids.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { listRooms } from '#engine/server/registry.ts';
 import { advance, get } from '#engine/store/watermark.ts';
@@ -60,7 +61,7 @@ async function catchUp(store: Store, tenant: Tenant, roomId: string) {
             tenant,
             predecessor,
             roomId,
-            pdu.state_key.slice(1, pdu.state_key.indexOf(':')),
+            localpartOf(pdu.state_key),
           );
         }
       }

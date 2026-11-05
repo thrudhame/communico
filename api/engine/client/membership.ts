@@ -1,5 +1,6 @@
 import { theApp } from '#engine/app.ts';
 import { serverName } from '#engine/config.ts';
+import { localpartOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { domainOf } from '#engine/federation/pdu.ts';
 import { federationRequest } from '#engine/federation/client.ts';
@@ -43,7 +44,7 @@ export async function join(
   }
   const profile = await getProfile(
     app.tenant,
-    userId.slice(1, userId.indexOf(':')),
+    localpartOf(userId),
   );
   const content = { ...profile, ...extra, membership: 'join' };
   const room = await lookupRoom(roomId);
@@ -201,7 +202,7 @@ export async function propagateProfile(
   const app = theApp();
   const profile = await getProfile(
     app.tenant,
-    userId.slice(1, userId.indexOf(':')),
+    localpartOf(userId),
   );
   const value = profile?.[field];
   for (const roomId of await joinedRooms(userId)) {

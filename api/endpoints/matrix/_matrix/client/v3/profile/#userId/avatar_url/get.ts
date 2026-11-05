@@ -2,6 +2,7 @@ import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { getProfile } from '#engine/tenant/users.ts';
 import { theApp } from '#engine/app.ts';
+import { splitId } from '#engine/ids.ts';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 // GET /_matrix/client/v3/profile/{userId}/avatar_url — spec v1.11.
@@ -9,12 +10,12 @@ import type { PathfinderRequest } from '@pathfinder/pathfinder';
 // remote lookup returns with federation serving (5b).
 export default async function (request: PathfinderRequest) {
   const userId = request.params.userId as string;
-  const colon = userId.lastIndexOf(':');
-  const local = userId.startsWith('@') && colon > 0 &&
-    userId.slice(colon + 1) === serverName();
+  const parts = splitId(userId);
+  const local = userId.startsWith('@') && parts.server !== null &&
+    parts.server === serverName();
   let profile: Record<string, unknown> | null = null;
   if (local) {
-    profile = await getProfile(theApp().tenant, userId.slice(1, colon));
+    profile = await getProfile(theApp().tenant, parts.localpart);
   }
   if (profile === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');

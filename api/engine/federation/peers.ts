@@ -8,6 +8,7 @@
 // behind (booleans are INTEGER 0/1; the tuple-IN workaround becomes one
 // rowid pass).
 import { config } from '#engine/config.ts';
+import { splitId } from '#engine/ids.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 
 export type PeerRow = {
@@ -143,9 +144,9 @@ export async function listWitnesses(
   );
   for (const row of rows) {
     const uid = String(row.user);
-    const at = uid.indexOf(':');
-    if (at < 0) continue;
-    const domain = uid.slice(at + 1);
+    const parts = splitId(uid);
+    if (parts.server === null) continue;
+    const domain = parts.server;
     if (!seniority.has(domain)) seniority.set(domain, Number(row.seq));
   }
   if (!seniority.has(ours)) return roster; // we are not in the room

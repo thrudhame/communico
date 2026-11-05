@@ -1,5 +1,6 @@
 import { theApp } from '#engine/app.ts';
 import { serverName } from '#engine/config.ts';
+import { localpartOf, splitId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   aliasRecord,
@@ -22,8 +23,8 @@ import { joinedRooms, serversInRoom } from './membership.ts';
 import { writeStateKey } from './write.ts';
 
 export function aliasIsLocal(alias: string) {
-  const colon = alias.lastIndexOf(':');
-  return colon > 1 && alias.slice(colon + 1) === serverName() &&
+  const parts = splitId(alias);
+  return parts.localpart.length > 0 && parts.server === serverName() &&
     alias.startsWith('#');
 }
 export async function createAlias(
@@ -32,8 +33,7 @@ export async function createAlias(
   creator: string,
 ) {
   if (
-    !/^#[^:]+:[^:]+$/.test(alias) ||
-    alias.slice(alias.indexOf(':') + 1) !== serverName()
+    !aliasIsLocal(alias)
   ) throw new MatrixError(400, 'M_INVALID_PARAM', 'Room alias invalid');
   await requireRoom(roomId);
   if (await lookupAlias(theApp().server, alias) !== null) {
@@ -250,7 +250,7 @@ export async function searchUsers(searcher: string, term: string, limit = 10) {
     if (!user.endsWith(':' + serverName())) continue;
     const profile = await getProfile(
       theApp().tenant,
-      user.slice(1, user.indexOf(':')),
+      localpartOf(user),
     );
     if (
       !user.toLowerCase().includes(needle) &&
