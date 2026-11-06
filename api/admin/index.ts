@@ -3,22 +3,16 @@ import { dirname, resolve } from '@std/path';
 import type { App } from '#engine/app.ts';
 import { adminSocket, serverName } from '#engine/config.ts';
 import metadata from '#root/deno.json' with { type: 'json' };
-
-export class AdminError extends Error {
-  constructor(readonly code: string, message: string, readonly status = 400) {
-    super(message);
-  }
-}
-
-export type Operation = (
-  body: Record<string, unknown>,
-) => Promise<unknown> | unknown;
+import { AdminError, type Operation } from '#root/api/admin/protocol.ts';
+import { federationOperations } from '#root/api/admin/federation.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 
 export function adminHandler(
   app: App,
 ): (request: Request) => Promise<Response> {
   const started = performance.now();
   const operations: Record<string, Operation> = {
+    ...federationOperations(app),
     '/v1/status': () => ({
       server: serverName(),
       version: metadata.version,
@@ -44,17 +38,22 @@ export function adminHandler(
       if (body === null || typeof body !== 'object' || Array.isArray(body)) {
         throw new AdminError('BAD_REQUEST', 'expected a JSON object');
       }
+      const result = await operations[path](body as Record<string, unknown>);
       return Response.json({
         ok: true,
-        result: await operations[path](body as Record<string, unknown>),
+        result: result === undefined ? null : result,
       });
     } catch (error) {
-      const known = error instanceof AdminError;
+      const known = error instanceof AdminError || error instanceof MatrixError;
       if (!known) console.error('admin:', error);
       return Response.json({
         ok: false,
         error: {
-          code: known ? error.code : 'INTERNAL',
+          code: error instanceof MatrixError
+            ? error.errcode
+            : error instanceof AdminError
+            ? error.code
+            : 'INTERNAL',
           message: known ? error.message : 'admin operation failed',
         },
       }, { status: known ? error.status : 500 });

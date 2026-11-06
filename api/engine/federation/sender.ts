@@ -281,6 +281,22 @@ export type IntentProvider = (
   destination: string,
 ) => Promise<IntentJob | null>;
 
+export type ReviewIntent = {
+  id: string;
+  destination: string;
+  kind: 'intent';
+  eventId: null;
+  intent: { what: string; user_id: string; candidates: string[] };
+  addedMs: number;
+  expiresMs: null;
+  inflightTxn: null;
+};
+
+export type ReviewableIntentProvider = IntentProvider & {
+  review(): Promise<ReviewIntent[]>;
+  prune(destination: string): Promise<number>;
+};
+
 // --- the sender ---------------------------------------------------------------
 
 export type SenderDeps = {
@@ -296,6 +312,11 @@ export type Sender = {
   contactHook(): (origin: string) => void;
   setIntentProvider(provider: IntentProvider | null): void;
   stop(): Promise<void>;
+  snapshot(): ReadonlyArray<
+    { destination: string; txnId: string; rows: readonly string[] }
+  >;
+  reviewIntents(): Promise<ReviewIntent[] | null>;
+  pruneIntents(destination: string): Promise<number | null>;
 };
 
 function backoffMs(failures: number): number {
@@ -329,6 +350,7 @@ export function startSender(deps: SenderDeps): Sender {
   const wakers = new Map<string, () => void>();
   // the derived transaction's EDUs, in-memory while the process lives
   const frozenEdus = new Map<string, Edu[]>();
+  const inFlight = new Map<string, { txnId: string; rows: string[] }>();
   let eduTxnCounter = 0;
   let intentProvider: IntentProvider | null = null;
   let stopped = false;
@@ -495,6 +517,10 @@ export function startSender(deps: SenderDeps): Sender {
       if (stopped) return;
       let res;
       try {
+        inFlight.set(destination, {
+          txnId,
+          rows: batch.map((row) => `${row.room}:${row.pos}`),
+        });
         res = await federationRequest(server, deps.signer, {
           destination,
           method: 'PUT',
@@ -554,6 +580,8 @@ export function startSender(deps: SenderDeps): Sender {
           }
         });
         continue;
+      } finally {
+        inFlight.delete(destination);
       }
       // Persistence errors are not transport failures. Roll back the delivery
       // outcome as a unit, leaving the derived batch available after restart.
@@ -601,6 +629,20 @@ export function startSender(deps: SenderDeps): Sender {
 
   return {
     wake,
+    snapshot: () =>
+      [...inFlight].map(([destination, value]) => ({
+        destination,
+        txnId: value.txnId,
+        rows: value.rows.slice(),
+      })),
+    reviewIntents: async () =>
+      intentProvider !== null && 'review' in intentProvider
+        ? await (intentProvider as ReviewableIntentProvider).review()
+        : null,
+    pruneIntents: async (destination) =>
+      intentProvider !== null && 'prune' in intentProvider
+        ? await (intentProvider as ReviewableIntentProvider).prune(destination)
+        : null,
     contactHook: () => (origin: string) => {
       void serverP.then((server) => notifyPeerAlive(server, origin)).catch(
         () => {},
