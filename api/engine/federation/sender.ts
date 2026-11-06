@@ -335,15 +335,17 @@ export function startSender(deps: SenderDeps): Sender {
   const loops = new Set<Promise<void>>();
 
   function sleep(ms: number, destination: string): Promise<void> {
+    // The stopped latch and registration are synchronous: stop either drains
+    // this wait or prevents it from starting, even after an earlier await.
+    if (stopped) return Promise.resolve();
     return new Promise((resolve) => {
-      const t = setTimeout(() => {
+      const finish = () => {
+        clearTimeout(t);
         wakers.delete(destination);
         resolve();
-      }, ms);
-      wakers.set(destination, () => {
-        clearTimeout(t);
-        resolve();
-      });
+      };
+      const t = setTimeout(finish, ms);
+      wakers.set(destination, finish);
     });
   }
 
@@ -392,6 +394,7 @@ export function startSender(deps: SenderDeps): Sender {
     job: IntentJob,
   ): Promise<void> {
     const server = await serverP;
+    if (stopped) return;
     try {
       await job.run();
     } catch (e) {
@@ -435,6 +438,7 @@ export function startSender(deps: SenderDeps): Sender {
       // 0. expiry FIRST (r4, muse): lapsed rows surface even deep in
       //    backoff
       await sweepExpired(destination);
+      if (stopped) return;
       // intents: their own path, one attempt per wake
       if (intentProvider !== null) {
         const server = await serverP;
@@ -471,6 +475,7 @@ export function startSender(deps: SenderDeps): Sender {
         ts = Date.now();
       }
       let edus: Edu[];
+      if (stopped) return;
       if (batch.length > 0 && frozenEdus.has(txnId)) {
         // a retry in this process: the frozen batch's EDUs ride again
         edus = frozenEdus.get(txnId) as Edu[];
@@ -487,6 +492,7 @@ export function startSender(deps: SenderDeps): Sender {
         const pdu = await pduOf(row.room, row.event);
         if (pdu !== null) pdus.push(pdu);
       }
+      if (stopped) return;
       let res;
       try {
         res = await federationRequest(server, deps.signer, {

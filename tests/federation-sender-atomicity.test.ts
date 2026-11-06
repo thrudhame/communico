@@ -97,7 +97,7 @@ for (const outcome of ['expiry', '4xx', '5xx', 'success'] as const) {
       setConfigForTests({
         federation: {
           cacerts: ['tests/fixtures/tls/ca.crt'],
-          backoffstartmillihours: 1,
+          backoffstartmillihours: 1000,
         },
       });
       resetCaCertsForTests();
