@@ -1,10 +1,10 @@
-# Complement baseline — 2026-09-30T08:53:23.075Z
+# Complement baseline — 2026-11-06T01:30:04.185Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit a12b807b3db6ee099d9a33431f4e7ca4f3ef09c6)
+- image: communico-complement:local (commit 2d6a8f6fd40a6df89f7fce43397df0a3263a9299)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 92
+- failing tests: 71
 
 ## Failing packages
 
@@ -13,45 +13,26 @@
 
 ## Failing tests (red to beat)
 
-- github.com/matrix-org/complement/tests TestEventAuth/returns_the_auth_chain_for_the_requested_event
-- github.com/matrix-org/complement/tests TestEventAuth
-- github.com/matrix-org/complement/tests TestRemotePresence/Presence_changes_are_also_reported_to_remote_room_members
-- github.com/matrix-org/complement/tests TestRemotePresence/Presence_changes_to_UNAVAILABLE_are_reported_to_remote_room_members
-- github.com/matrix-org/complement/tests TestRemotePresence
 - github.com/matrix-org/complement/tests TestOutboundFederationProfile/Outbound_federation_can_query_profile_data
 - github.com/matrix-org/complement/tests TestOutboundFederationProfile
-- github.com/matrix-org/complement/tests TestFederationRedactSendsWithoutEvent
 - github.com/matrix-org/complement/tests TestRemoteAliasRequestsUnderstandUnicode
-- github.com/matrix-org/complement/tests TestUnbanViaInvite
+- github.com/matrix-org/complement/tests TestInboundFederationRejectsEventsWithRejectedAuthEvents
 - github.com/matrix-org/complement/tests TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
-- github.com/matrix-org/complement/tests TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_world_readable_visibility
-- github.com/matrix-org/complement/tests TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_shared_visibility
-- github.com/matrix-org/complement/tests TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_invited_visibility
-- github.com/matrix-org/complement/tests TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_joined_visibility
-- github.com/matrix-org/complement/tests TestInboundCanReturnMissingEvents
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
-- github.com/matrix-org/complement/tests TestCorruptedAuthChain
-- github.com/matrix-org/complement/tests TestFederationRejectInvite
+- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents//send_join_response_missing_signatures_shouldn't_block_room_join
+- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents//send_join_response_with_bad_signatures_shouldn't_block_room_join
+- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents//send_join_response_with_unobtainable_keys_shouldn't_block_room_join
+- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents//send_join_response_with_state_with_unverifiable_auth_events_shouldn't_block_room_join
+- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents
 - github.com/matrix-org/complement/tests TestJoinFederatedRoomFromApplicationServiceBridgeUser
-- github.com/matrix-org/complement/tests TestNetworkPartitionOrdering
-- github.com/matrix-org/complement/tests TestRemoteTyping
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Invited_user_has_'is_direct'_flag_in_prev_content_after_joining
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Invited_user_can_reject_invite_over_federation
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Non-invitee_user_cannot_rescind_invite_over_federation
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Inviter_user_can_rescind_invite_over_federation
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Invited_user_can_reject_invite_over_federation_for_empty_room
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Invited_user_can_reject_invite_over_federation_several_times
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel/Remote_invited_user_can_see_room_metadata
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite/Parallel
-- github.com/matrix-org/complement/tests TestFederationRoomsInvite
-- github.com/matrix-org/complement/tests TestSyncOmitsStateChangeOnFilteredEvents
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
+- github.com/matrix-org/complement/tests TestUnrejectRejectedEvents
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode
@@ -71,27 +52,23 @@
 - github.com/matrix-org/complement/tests TestRemotePngThumbnail
 - github.com/matrix-org/complement/tests TestFederationThumbnail
 - github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryLocal
-- github.com/matrix-org/complement/tests/csapi TestRoomImageRoundtrip
 - github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryFederation
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin/Join_should_succeed_when_joined_to_allowed_room
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin/Join_should_fail_when_left_allowed_room
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_succeed_when_joined_to_allowed_room
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_fail_when_left_allowed_room
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_succeed_when_invited
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinLocalUser
 - github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
 - github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
-- github.com/matrix-org/complement/tests/csapi TestSendAndFetchMessage
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/query_whole_graph
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/max_depth
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/suggested_only
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/pagination
 - github.com/matrix-org/complement/tests TestClientSpacesSummary/redact_link
 - github.com/matrix-org/complement/tests TestClientSpacesSummary
-- github.com/matrix-org/complement/tests/csapi TestRoomMessagesLazyLoading
 - github.com/matrix-org/complement/tests TestClientSpacesSummaryJoinRules
 - github.com/matrix-org/complement/tests TestFederatedClientSpaces
 - github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs/restricted_room_includes_allowed_room_ids
@@ -99,9 +76,11 @@
 - github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs
 - github.com/matrix-org/complement/tests TestJumpToDateEndpoint
 - github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_starts_from_empty_set
-- github.com/matrix-org/complement/tests/csapi TestRoomsInvite/Parallel/Invited_user_can_reject_invite_for_empty_room
-- github.com/matrix-org/complement/tests/csapi TestRoomsInvite/Parallel
-- github.com/matrix-org/complement/tests/csapi TestRoomsInvite
+- github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
+- github.com/matrix-org/complement/tests/csapi TestLeaveEventVisibility
+- github.com/matrix-org/complement/tests/csapi TestSync/parallel/sync_should_succeed_even_if_the_sync_token_points_to_a_redaction_of_an_unknown_event
+- github.com/matrix-org/complement/tests/csapi TestSync/parallel
+- github.com/matrix-org/complement/tests/csapi TestSync
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap/incremental
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap/full
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap
