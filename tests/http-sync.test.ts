@@ -215,6 +215,119 @@ suite.test('invite snapshots, summary, join prev_content and membership cuts, le
   );
 });
 
+for (const membership of ['leave', 'ban']) {
+  suite.test(`${membership} timeline carries the membership delta once and stops at departure`, async () => {
+    const app = theApp();
+    const alice = await suite.registerTestUser(
+      'sy-delta-a-' + membership,
+      'pw',
+    );
+    const bob = await suite.registerTestUser('sy-delta-b-' + membership, 'pw');
+    const signer = app.tenant.signer();
+    const { roomId } = await createRoom(app.store, {
+      creator: alice.user_id,
+      preset: 'public_chat',
+      initial_state: [{
+        type: 'm.room.history_visibility',
+        state_key: '',
+        content: { history_visibility: 'joined' },
+      }],
+    }, signer);
+    const room = await openRoom(app.store, roomId);
+    await join(room, bob.user_id, signer);
+    const before = await sync(bob.access_token!);
+    const departed = membership === 'leave'
+      ? await leave(room, bob.user_id, signer)
+      : await sendLocal(room, {
+        type: 'm.room.member',
+        state_key: bob.user_id,
+        sender: alice.user_id,
+        content: { membership },
+      }, signer);
+    await sendLocal(room, {
+      type: 'm.room.name',
+      state_key: '',
+      sender: alice.user_id,
+      content: { name: 'after departure' },
+    }, signer);
+    const query = '&since=' + before.next_batch;
+    const after = roomSection(
+      await sync(bob.access_token!, query),
+      'leave',
+      roomId,
+    )!;
+    assertEquals(
+      ((after.timeline as Json).events as Json[]).map((e) => e.event_id),
+      [departed.eventId],
+    );
+    assertEquals((after.state as Json).events, []);
+    const filtered = roomSection(
+      await sync(
+        bob.access_token!,
+        query + '&filter=' + encodeURIComponent(
+          '{"room":{"timeline":{"not_types":["m.room.member"]}}}',
+        ),
+      ),
+      'leave',
+      roomId,
+    )!;
+    assertEquals((filtered.timeline as Json).events, []);
+    assertEquals(
+      ((filtered.state as Json).events as Json[]).map((e) => e.event_id),
+      [departed.eventId],
+      'a membership omitted from timeline still belongs in state at departure',
+    );
+  });
+}
+
+suite.test('joined state deltas exclude returned state events but retain filtered updates and full snapshots', async () => {
+  const app = theApp();
+  const alice = await suite.registerTestUser('sy-delta-state', 'pw');
+  const signer = app.tenant.signer();
+  const { roomId } = await createRoom(app.store, {
+    creator: alice.user_id,
+    preset: 'public_chat',
+  }, signer);
+  const room = await openRoom(app.store, roomId);
+  const before = await sync(alice.access_token!);
+  const name = await sendLocal(room, {
+    type: 'm.room.name',
+    state_key: '',
+    sender: alice.user_id,
+    content: { name: 'incremental name' },
+  }, signer);
+  const query = '&since=' + before.next_batch;
+  const entry = async (suffix = '') =>
+    roomSection(
+      await sync(alice.access_token!, query + suffix),
+      'join',
+      roomId,
+    )!;
+  const after = await entry();
+  assertEquals(
+    ((after.timeline as Json).events as Json[]).map((e) => e.event_id),
+    [name.eventId],
+  );
+  assertEquals((after.state as Json).events, []);
+  const filtered = await entry(
+    '&filter=' + encodeURIComponent(
+      '{"room":{"timeline":{"not_types":["m.room.name"]}}}',
+    ),
+  );
+  assertEquals((filtered.timeline as Json).events, []);
+  assertEquals(
+    ((filtered.state as Json).events as Json[]).map((e) => e.event_id),
+    [name.eventId],
+  );
+  const snapshot = await entry('&full_state=true');
+  assert(
+    ((snapshot.state as Json).events as Json[]).some((e) =>
+      e.event_id === name.eventId
+    ),
+    'full_state remains the inclusive published snapshot',
+  );
+});
+
 suite.test('OOB invitation and rejection advance tokens once; ignored invitations stay hidden', async () => {
   const app = theApp();
   const user = await suite.registerTestUser('sy-oob', 'pw');

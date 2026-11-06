@@ -128,8 +128,13 @@ async function roomTimeline(
         r,
       ) => [r.type + '\0' + r.stateKey, r.eventId]),
     );
+    // A delta supplies state not already delivered by the timeline. Keep
+    // the inclusive publication (fork resolution may change other keys),
+    // but subtract only events actually rendered, after filtering/visibility.
+    const inTimeline = new Set(events.map((event) => event.event_id));
     stateRows = atStart.filter((r) =>
-      previous.get(r.type + '\0' + r.stateKey) !== r.eventId
+      previous.get(r.type + '\0' + r.stateKey) !== r.eventId &&
+      !inTimeline.has(r.eventId)
     );
   }
   const stateEvents: Record<string, unknown>[] = [];
