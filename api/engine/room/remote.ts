@@ -19,11 +19,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { StateMap } from '#engine/rulebook/index.ts';
-import {
-  loadRulebookStore,
-  roomVersionOf,
-  ungroundedPrevs,
-} from '#engine/room/build.ts';
+import { loadRulebookStore, roomVersionOf } from '#engine/room/build.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { projectAfterWrite } from '#engine/room/hooks.ts';
 import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
@@ -119,10 +115,30 @@ async function fetchMissing(
   budget: { until: number },
   acc: FetchAcc,
 ): Promise<void> {
+  // Recovery sees the same verified union as the locked ingest. Supplied
+  // parents are not missing: walk through them to the actual unresolved
+  // edge. Bytes alone are not grounding; only a persisted after-state or
+  // a fetched boundary can end that walk.
   const missingNow = async (): Promise<string[]> =>
-    await room.tx(async (tx) =>
-      await ungroundedPrevs(tx, item.pdu.prev_events ?? [])
-    );
+    await room.tx(async (tx) => {
+      const missing: string[] = [];
+      const seen = new Set<string>();
+      const visit = async (ids: readonly string[]): Promise<void> => {
+        for (const id of ids) {
+          if (seen.has(id)) continue;
+          seen.add(id);
+          if (
+            acc.boundaries.has(id) ||
+            (await tx.state.eventStateAfter(id)) !== null
+          ) continue;
+          const supplied = acc.live.get(id);
+          if (supplied === undefined) missing.push(id);
+          else await visit(supplied.pdu.prev_events ?? []);
+        }
+      };
+      await visit(item.pdu.prev_events ?? []);
+      return missing;
+    });
   const budgetLeft = () => budget.until - Date.now();
   let missing = await missingNow();
   if (missing.length === 0) return;
@@ -164,12 +180,14 @@ async function fetchMissing(
     for (const raw of answered) {
       try {
         const v = await verify(raw, version, deps.keys, { roomId: room.id });
-        acc.live.set(v.eventId, {
-          index: -1,
-          pdu: v.pdu,
-          eventId: v.eventId,
-          oversized: v.oversized,
-        });
+        if (!acc.live.has(v.eventId)) {
+          acc.live.set(v.eventId, {
+            index: -1,
+            pdu: v.pdu,
+            eventId: v.eventId,
+            oversized: v.oversized,
+          });
+        }
       } catch {
         dropped++;
       }
@@ -189,7 +207,7 @@ async function fetchMissing(
   const chase = async (ids: readonly string[]): Promise<void> => {
     for (const id of ids) {
       if (
-        chased.has(id) || acc.terminal.has(id) ||
+        chased.has(id) || acc.terminal.has(id) || acc.boundaries.has(id) ||
         gapTips.length >= deps.limits.limit
       ) {
         continue;
@@ -414,7 +432,7 @@ export async function ingestRemote(
   // The unlocked fetch phase: gather what is missing before the lock,
   // inside the whole-batch budget (R13 — network never under the lock)
   const acc: FetchAcc = {
-    live: new Map(),
+    live: new Map(items.map((item) => [item.eventId, item])),
     evidence: new Map(),
     corrupted: new Map(),
     boundaries: new Map(),
