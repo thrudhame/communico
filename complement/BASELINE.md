@@ -1,10 +1,10 @@
-# Complement baseline — 2026-11-06T01:30:04.185Z
+# Complement baseline — 2026-11-06T09:32:49.668Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit 2d6a8f6fd40a6df89f7fce43397df0a3263a9299)
+- image: communico-complement:local (commit e2d5256f9e95c6e17477b02e07b8b06416b84356)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 71
+- failing tests: 60
 
 ## Failing packages
 
@@ -16,26 +16,20 @@
 - github.com/matrix-org/complement/tests TestOutboundFederationProfile/Outbound_federation_can_query_profile_data
 - github.com/matrix-org/complement/tests TestOutboundFederationProfile
 - github.com/matrix-org/complement/tests TestRemoteAliasRequestsUnderstandUnicode
-- github.com/matrix-org/complement/tests TestInboundFederationRejectsEventsWithRejectedAuthEvents
 - github.com/matrix-org/complement/tests TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
-- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents//send_join_response_missing_signatures_shouldn't_block_room_join
-- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents//send_join_response_with_bad_signatures_shouldn't_block_room_join
-- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents//send_join_response_with_unobtainable_keys_shouldn't_block_room_join
-- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents//send_join_response_with_state_with_unverifiable_auth_events_shouldn't_block_room_join
-- github.com/matrix-org/complement/tests TestJoinFederatedRoomWithUnverifiableEvents
 - github.com/matrix-org/complement/tests TestJoinFederatedRoomFromApplicationServiceBridgeUser
 - github.com/matrix-org/complement/tests TestUnrejectRejectedEvents
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel
 - github.com/matrix-org/complement/tests TestMediaFilenames
 - github.com/matrix-org/complement/tests TestMediaWithoutFileName/parallel/Can_download_without_a_file_name_over_federation
@@ -76,11 +70,6 @@
 - github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs
 - github.com/matrix-org/complement/tests TestJumpToDateEndpoint
 - github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_starts_from_empty_set
-- github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
-- github.com/matrix-org/complement/tests/csapi TestLeaveEventVisibility
-- github.com/matrix-org/complement/tests/csapi TestSync/parallel/sync_should_succeed_even_if_the_sync_token_points_to_a_redaction_of_an_unknown_event
-- github.com/matrix-org/complement/tests/csapi TestSync/parallel
-- github.com/matrix-org/complement/tests/csapi TestSync
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap/incremental
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap/full
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap
