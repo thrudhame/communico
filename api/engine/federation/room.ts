@@ -30,6 +30,10 @@ export async function currentSnapshot(tx: RoomTx) {
 }
 
 export async function pduAt(tx: RoomTx, id: string): Promise<Pdu | null> {
+  // One boundary for every federation read, including send_join's state and
+  // auth closure. Standing is not publication: all verified standings serve.
+  const status = await tx.events.getStatus(id);
+  if (status === null || status.grounding === 'pending') return null;
   const row = await tx.events.get(id);
   return row === null ? null : JSON.parse(row.pdu) as Pdu;
 }
@@ -44,10 +48,14 @@ export async function authClosure(tx: RoomTx, seeds: string[]) {
     );
   }
   const rows = await tx.events.list([...new Set([...seeds, ...walk.ids])]);
+  const statuses = await tx.events.statuses([...rows.keys()]);
   return {
     ids: walk.ids,
     pdus: new Map(
-      [...rows].map(([id, row]) => [id, JSON.parse(row.pdu) as Pdu]),
+      [...rows].filter(([id]) => {
+        const status = statuses.get(id);
+        return status !== undefined && status.grounding !== 'pending';
+      }).map(([id, row]) => [id, JSON.parse(row.pdu) as Pdu]),
     ),
   };
 }

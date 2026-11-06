@@ -4,6 +4,12 @@ import { acceptRescind, type InviteDeps } from './invites.ts';
 import { productionFetcher } from './fetcher.ts';
 import { productionKeyResolver } from './keyresolver.ts';
 import type { TransactionDeps } from './transactions.ts';
+import type { ServeDeps } from './serve.ts';
+
+export function serveDeps(): ServeDeps {
+  const app = theApp();
+  return { store: app.store, server: app.server, self: app.tenant.serverName };
+}
 
 export function inviteDeps(): InviteDeps {
   const app = theApp();
