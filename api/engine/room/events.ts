@@ -4,6 +4,7 @@
 // is the ingest layer's composition). Edge order preserves PDU list order.
 import type { Conn } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
+import type { EdgeKind, EdgeOverlay } from '#engine/room/edges.ts';
 
 export type EventRow = {
   id: string;
@@ -38,17 +39,25 @@ const GROUNDINGS: ReadonlySet<string> = new Set([
 
 // Edge ids come from the stored PDU: prev_events/auth_events as string
 // arrays, tolerating the legacy [id, {hashes}] pairs of old event formats.
-function edgeIds(value: unknown): string[] {
+export function edgeIds(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map((entry) =>
     typeof entry === 'string' ? entry : String((entry as unknown[])[0])
   );
 }
 
+function remember(cache: EdgeOverlay | undefined, id: string, pdu: string) {
+  if (cache === undefined) return;
+  const parsed = JSON.parse(pdu);
+  cache.set(id, 'prev', edgeIds(parsed.prev_events));
+  cache.set(id, 'auth', edgeIds(parsed.auth_events));
+}
+
 export async function insertEvent(
   conn: Conn,
   id: string,
   pdu: string,
+  cache?: EdgeOverlay,
 ): Promise<void> {
   const parsed: Record<string, unknown> = JSON.parse(pdu);
   const { type, sender, depth, origin_server_ts: originTs } = parsed;
@@ -79,6 +88,7 @@ export async function insertEvent(
       [id, auth, ord],
     );
   }
+  remember(cache, id, pdu);
 }
 
 function eventOf(row: Row): EventRow {
@@ -96,9 +106,13 @@ function eventOf(row: Row): EventRow {
 export async function getEvent(
   conn: Conn,
   id: string,
+  cache?: EdgeOverlay,
 ): Promise<EventRow | null> {
   const rows = await conn.query('SELECT * FROM events WHERE id = ?', [id]);
-  return rows.length === 0 ? null : eventOf(rows[0]);
+  if (rows.length === 0) return null;
+  const event = eventOf(rows[0]);
+  remember(cache, event.id, event.pdu);
+  return event;
 }
 
 function* chunks(ids: readonly string[]): Generator<string[]> {
@@ -110,6 +124,7 @@ function* chunks(ids: readonly string[]): Generator<string[]> {
 export async function getEvents(
   conn: Conn,
   ids: readonly string[],
+  cache?: EdgeOverlay,
 ): Promise<Map<string, EventRow>> {
   const found = new Map<string, EventRow>();
   for (const chunk of chunks(ids)) {
@@ -120,13 +135,21 @@ export async function getEvents(
     );
     for (const row of rows) {
       const event = eventOf(row);
+      remember(cache, event.id, event.pdu);
       found.set(event.id, event);
     }
   }
   return found;
 }
 
-export async function prevsOf(conn: Conn, event: string): Promise<string[]> {
+export async function prevsOf(
+  conn: Conn,
+  event: string,
+  cache?: EdgeOverlay,
+): Promise<string[]> {
+  if (cache !== undefined) {
+    return [...(await forwardEdges(conn, [event], 'prev', cache)).get(event)!];
+  }
   const rows = await conn.query(
     'SELECT prev FROM prev_edges WHERE event = ? ORDER BY ord',
     [event],
@@ -134,7 +157,14 @@ export async function prevsOf(conn: Conn, event: string): Promise<string[]> {
   return rows.map((row) => String(row.prev));
 }
 
-export async function authsOf(conn: Conn, event: string): Promise<string[]> {
+export async function authsOf(
+  conn: Conn,
+  event: string,
+  cache?: EdgeOverlay,
+): Promise<string[]> {
+  if (cache !== undefined) {
+    return [...(await forwardEdges(conn, [event], 'auth', cache)).get(event)!];
+  }
   const rows = await conn.query(
     'SELECT auth FROM auth_edges WHERE event = ? ORDER BY ord',
     [event],
@@ -227,6 +257,46 @@ export async function statuses(
 // are visited but never expanded; `truncated` marks an unfinished walk.
 export type Walk = { ids: string[]; truncated: boolean };
 
+async function forwardEdges(
+  conn: Conn,
+  ids: readonly string[],
+  kind: EdgeKind,
+  cache: EdgeOverlay,
+) {
+  const found = new Map<string, readonly string[]>();
+  const missing: string[] = [];
+  for (const id of ids) {
+    const edges = cache.get(id, kind);
+    if (edges === undefined) missing.push(id);
+    else found.set(id, edges);
+  }
+  for (const chunk of chunks(missing)) {
+    const marks = chunk.map(() => '?').join(',');
+    // LEFT JOIN distinguishes an existing zero-edge event from an unknown id.
+    // Cache only the former: later evidence may supply the unknown event.
+    const rows = await conn.query(
+      `SELECT e.id AS event, edges.${kind} AS target FROM events e LEFT JOIN ${kind}_edges edges ON edges.event = e.id WHERE e.id IN (${marks}) ORDER BY e.id, edges.ord`,
+      chunk,
+    );
+    const held = new Map<string, string[]>();
+    for (const row of rows) {
+      const id = String(row.event);
+      let edges = held.get(id);
+      if (edges === undefined) {
+        edges = [];
+        held.set(id, edges);
+      }
+      if (row.target !== null) edges.push(String(row.target));
+    }
+    for (const id of chunk) {
+      const edges = held.get(id);
+      found.set(id, edges ?? []);
+      if (edges !== undefined) cache.set(id, kind, edges);
+    }
+  }
+  return found;
+}
+
 async function walk(
   conn: Conn,
   seeds: readonly string[],
@@ -234,6 +304,7 @@ async function walk(
   limit: number,
   table: 'prev_edges' | 'auth_edges',
   column: 'prev' | 'auth',
+  cache?: EdgeOverlay,
 ): Promise<Walk> {
   if (!Number.isSafeInteger(limit) || limit < 1) {
     throw new TypeError('walk limit must be a positive safe integer');
@@ -255,15 +326,24 @@ async function walk(
     if (truncated) break;
     const expandable = fresh.filter((id) => !stops.has(id));
     const next = new Set<string>();
-    for (const chunk of chunks(expandable)) {
-      const marks = chunk.map(() => '?').join(',');
-      const rows = await conn.query(
-        `SELECT ${column} AS target FROM ${table} WHERE event IN (${marks})`,
-        chunk,
-      );
-      for (const row of rows) {
-        const target = String(row.target);
-        if (!visited.has(target)) next.add(target);
+    if (cache !== undefined) {
+      for (
+        const edges of (await forwardEdges(conn, expandable, column, cache))
+          .values()
+      ) {
+        for (const target of edges) if (!visited.has(target)) next.add(target);
+      }
+    } else {
+      for (const chunk of chunks(expandable)) {
+        const marks = chunk.map(() => '?').join(',');
+        const rows = await conn.query(
+          `SELECT ${column} AS target FROM ${table} WHERE event IN (${marks})`,
+          chunk,
+        );
+        for (const row of rows) {
+          const target = String(row.target);
+          if (!visited.has(target)) next.add(target);
+        }
       }
     }
     frontier = [...next].sort();
@@ -275,8 +355,9 @@ export function authClosure(
   conn: Conn,
   seeds: readonly string[],
   limit: number,
+  cache?: EdgeOverlay,
 ): Promise<Walk> {
-  return walk(conn, seeds, new Set(), limit, 'auth_edges', 'auth');
+  return walk(conn, seeds, new Set(), limit, 'auth_edges', 'auth', cache);
 }
 
 export function ancestors(
@@ -284,6 +365,7 @@ export function ancestors(
   seeds: readonly string[],
   stopAt: readonly string[],
   limit: number,
+  cache?: EdgeOverlay,
 ): Promise<Walk> {
-  return walk(conn, seeds, new Set(stopAt), limit, 'prev_edges', 'prev');
+  return walk(conn, seeds, new Set(stopAt), limit, 'prev_edges', 'prev', cache);
 }

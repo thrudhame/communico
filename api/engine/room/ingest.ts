@@ -47,6 +47,7 @@ import {
   stateBefore,
   stayForEvent,
   ungroundedPrevs,
+  withRulebookEvent,
 } from '#engine/room/build.ts';
 import type { Grounding } from '#engine/room/events.ts';
 import { projectAfterWrite } from '#engine/room/hooks.ts';
@@ -532,7 +533,15 @@ export async function ingestInTx(
           }
         }
       }
-      const pubStore = await loadRulebookStore(tx, [...pubSeeds]);
+      // Every new frontier key was already in the authorization seeds, except
+      // this accepted event. Extend that same closure instead of loading it
+      // again. Standing changes remain transaction-local, never edge-cached.
+      const pubStore = withRulebookEvent(
+        store,
+        eventId,
+        existing === null ? pdu : JSON.parse(existing.pdu) as Pdu,
+        [...pubSeeds],
+      );
       const resolved = await stateBefore(tx, groups, rulebook, pubStore);
       currentGroup = await tx.materialize.newGroup(null, mapEntries(resolved));
     }

@@ -19,6 +19,7 @@ import {
   type StateMap,
 } from '#engine/rulebook/index.ts';
 import type { RoomTx } from '#engine/room/index.ts';
+import { edgeIds } from '#engine/room/events.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { contentHashOf } from '#engine/signing-primitives.js';
 
@@ -139,6 +140,36 @@ export async function loadRulebookStore(
     get: (id) => pdus.get(id),
     isRejected: (id) => rejected.has(id),
   };
+}
+
+// Publication reuses authorization's already-loaded graph, extended by the
+// newly accepted event. Its seeds can differ, so preserve the closure guard
+// (including unknown ids) with an in-memory walk, never another DB load.
+export function withRulebookEvent(
+  store: EventStore,
+  eventId: string,
+  pdu: Pdu,
+  seeds: readonly string[],
+  limit = AUTH_CLOSURE_LIMIT,
+): EventStore {
+  const extended: EventStore = {
+    get: (id) => id === eventId ? pdu : store.get(id),
+    isRejected: (id) => id === eventId ? false : store.isRejected(id),
+  };
+  const visited = new Set<string>();
+  const queue = [...seeds];
+  for (let i = 0; i < queue.length; i++) {
+    const id = queue[i];
+    if (visited.has(id)) continue;
+    if (visited.size >= limit) {
+      throw new Error(`E_AUTH_CLOSURE: auth closure exceeds ${limit} events`);
+    }
+    visited.add(id);
+    for (const auth of edgeIds(extended.get(id)?.auth_events)) {
+      if (!visited.has(auth)) queue.push(auth);
+    }
+  }
+  return extended;
 }
 
 // The state before an event citing the given prevs: the single prev's

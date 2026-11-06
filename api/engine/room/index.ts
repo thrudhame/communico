@@ -6,6 +6,7 @@ import type { Store } from '#engine/store/index.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
 import * as changes from '#engine/room/changes.ts';
 import * as events from '#engine/room/events.ts';
+import { type EdgeOverlay, roomEdges } from '#engine/room/edges.ts';
 import * as extremities from '#engine/room/extremities.ts';
 import * as materialize from '#engine/room/materialize.ts';
 import * as segments from '#engine/room/segments.ts';
@@ -25,24 +26,25 @@ export type { Change } from '#engine/room/changes.ts';
 // Count only resolutions in committed attempts, not abandoned snapshots.
 export const resolutionProbe = { resolutions: 0 };
 
-function bind(conn: Conn) {
+function bind(conn: Conn, edges: EdgeOverlay) {
   return {
     diagnostics: { resolutions: 0 },
     events: {
-      insert: (id: string, pdu: string) => events.insertEvent(conn, id, pdu),
-      get: (id: string) => events.getEvent(conn, id),
-      list: (ids: readonly string[]) => events.getEvents(conn, ids),
-      prevsOf: (event: string) => events.prevsOf(conn, event),
-      authsOf: (event: string) => events.authsOf(conn, event),
+      insert: (id: string, pdu: string) =>
+        events.insertEvent(conn, id, pdu, edges),
+      get: (id: string) => events.getEvent(conn, id, edges),
+      list: (ids: readonly string[]) => events.getEvents(conn, ids, edges),
+      prevsOf: (event: string) => events.prevsOf(conn, event, edges),
+      authsOf: (event: string) => events.authsOf(conn, event, edges),
       childrenOf: (prev: string) => events.childrenOf(conn, prev),
       authChildrenOf: (auth: string) => events.authChildrenOf(conn, auth),
       authClosure: (seeds: readonly string[], limit: number) =>
-        events.authClosure(conn, seeds, limit),
+        events.authClosure(conn, seeds, limit, edges),
       ancestors: (
         seeds: readonly string[],
         stopAt: readonly string[],
         limit: number,
-      ) => events.ancestors(conn, seeds, stopAt, limit),
+      ) => events.ancestors(conn, seeds, stopAt, limit, edges),
       getStatus: (event: string) => events.getStatus(conn, event),
       setStatus: (event: string, status: events.Status) =>
         events.setStatus(conn, event, status),
@@ -153,11 +155,19 @@ export async function openRoom(
     id: roomId,
     store,
     tx: async (fn) => {
-      const { result, resolutions } = await db.tx(async (conn) => {
-        const tx = bind(conn);
-        const result = await fn(tx);
-        return { result, resolutions: tx.diagnostics.resolutions };
+      const cutoff = roomEdges.cutoff();
+      const { result, resolutions, edges } = await db.tx(async (conn) => {
+        const edges = roomEdges.attempt(store, roomId, cutoff);
+        const tx = bind(conn, edges);
+        try {
+          const result = await fn(tx);
+          return { result, resolutions: tx.diagnostics.resolutions, edges };
+        } finally {
+          // Cache hits must not let an escaped RoomTx outlive its Conn.
+          edges.release();
+        }
       });
+      edges.commit();
       resolutionProbe.resolutions += resolutions;
       return result;
     },
