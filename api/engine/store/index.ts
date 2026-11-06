@@ -93,9 +93,10 @@ export class Store implements StartupStore {
     // Preserve open/create validation without retaining the opening lease.
     const initial = await this.pool.acquire(kind, id, options);
     const path = initial.db.path;
+    const incarnation = initial.incarnation;
     await initial.release();
     return operations(async (fn, txOptions) => {
-      const lease = await this.pool.acquire(kind, id);
+      const lease = await this.pool.acquire(kind, id, { incarnation });
       try {
         return await lease.db.tx(fn, txOptions);
       } finally {
@@ -107,6 +108,17 @@ export class Store implements StartupStore {
   // The room ids recorded on disk (the server stage's startup discovery).
   rooms(): Promise<string[]> {
     return this.pool.list('rooms');
+  }
+
+  /** The engine owns deletion intent/projection; storage owns file retirement. */
+  retireRoom(id: string): Promise<void> {
+    if (this.stopped) throw new Error('store is closed');
+    return this.pool.retire('rooms', id);
+  }
+
+  removeRoom(id: string): Promise<void> {
+    if (this.stopped) throw new Error('store is closed');
+    return this.pool.remove('rooms', id);
   }
 
   stats(): StoreStats {

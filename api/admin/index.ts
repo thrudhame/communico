@@ -5,6 +5,7 @@ import { adminSocket, serverName } from '#engine/config.ts';
 import metadata from '#root/deno.json' with { type: 'json' };
 import { AdminError, type Operation } from '#root/api/admin/protocol.ts';
 import { federationOperations } from '#root/api/admin/federation.ts';
+import { roomOperations } from '#root/api/admin/rooms.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 
 export function adminHandler(
@@ -13,6 +14,7 @@ export function adminHandler(
   const started = performance.now();
   const operations: Record<string, Operation> = {
     ...federationOperations(app),
+    ...roomOperations(app),
     '/v1/status': () => ({
       server: serverName(),
       version: metadata.version,

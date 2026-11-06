@@ -33,6 +33,19 @@ export class EdgeCache {
     return this.generation;
   }
 
+  /** A file was retired: escaped overlays cannot certify a new incarnation. */
+  forgetOwner(owner: object): void {
+    const token = this.owners.get(owner);
+    if (token === undefined) return;
+    const rooms = this.rooms.get(token);
+    if (rooms !== undefined) {
+      for (const room of [...rooms.values()]) {
+        for (const entry of [...room.values()]) this.remove(entry);
+      }
+    }
+    this.owners.set(owner, Symbol());
+  }
+
   attempt(owner: object, room: string, cutoff: number): EdgeOverlay {
     let token = this.owners.get(owner);
     if (token === undefined) {

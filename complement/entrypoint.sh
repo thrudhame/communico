@@ -37,4 +37,4 @@ if [[ -f /complement/ca/ca.crt ]]; then
   export COMMUNICO_FEDERATION_CACERTS="/complement/ca/ca.crt"
 fi
 echo ">> starting communico :8008"
-exec deno run --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys=uid,umask "$APP_DIR/main.ts"
+exec deno run --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys=uid,umask --allow-run=openssl "$APP_DIR/main.ts"

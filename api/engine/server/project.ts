@@ -20,6 +20,7 @@ import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { advance, get } from '#engine/store/watermark.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
+import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 
 // The watermark source naming a room's change log (storage plan's
 // sources() enumerates these; tests already use this shape).
@@ -53,7 +54,8 @@ export function onProjected(
 }
 
 export function project(store: Store, roomId: string): Promise<void> {
-  const run = queue.then(() => projectNow(store, roomId)).then(async () => {
+  return withProjectionLock(async () => {
+    await projectNow(store, roomId);
     for (const fn of projectedListeners) {
       try {
         await fn(store, roomId);
@@ -62,6 +64,11 @@ export function project(store: Store, roomId: string): Promise<void> {
       }
     }
   });
+}
+
+/** Room lifecycle operations use the same serialization as projection. */
+export function withProjectionLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = queue.then(fn);
   queue = run.then(
     () => undefined,
     () => undefined,
@@ -75,8 +82,19 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
   const source = sourceOf(roomId);
   for (;;) {
     const mark = await get(server, source);
-    const batch = await room.tx((tx) => tx.changes.after(mark, BATCH));
+    let batch = await room.tx((tx) => tx.changes.after(mark, BATCH));
     if (batch.length === 0) return;
+    const drop = batch.findIndex((change) => change.kind === 'drop');
+    if (drop === 0) {
+      await finishRoomRemoval(
+        store,
+        roomId,
+        JSON.parse(batch[0].data) as Removal,
+        batch[0].pos,
+      );
+      return;
+    }
+    if (drop > 0) batch = batch.slice(0, drop);
     const prepared = await prepare(room, store, roomId, batch);
     const addedMs = Date.now();
     await eventStreamTx(server, async (tx) => {
