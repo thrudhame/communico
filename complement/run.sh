@@ -41,7 +41,12 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
   exit 1
 fi
 
-# 1. build the image
+# 1. build the image (the qualified native library is built in the VM,
+# never fetched or compiled inside the runtime image).
+if [[ ! -f .native/libturso_ffi.so ]]; then
+  echo "run.sh: native library missing - run deno task native in the project VM first" >&2
+  exit 1
+fi
 echo ">> building $IMAGE"
 docker build -t "$IMAGE" -f complement/Dockerfile .
 
