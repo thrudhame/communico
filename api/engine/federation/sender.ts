@@ -22,7 +22,7 @@ import { openRoom } from '#engine/room/index.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { outboxDue, type OutboxDueRow } from '#engine/server/read.ts';
-import type { Database as Db } from '#engine/store/db.ts';
+import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { b64encodeStd, sha256ofString } from '#engine/signing-primitives.js';
 import { federationRequest } from './client.ts';
@@ -122,7 +122,7 @@ function peerStatusOf(row: any): PeerStatus {
 }
 
 export async function peerStatus(
-  server: Db,
+  server: Pick<Db, 'query'>,
   destination: string,
 ): Promise<PeerStatus> {
   const rows = await server.query(
@@ -153,7 +153,7 @@ export async function listPeerStatus(server: Db): Promise<PeerStatus[]> {
 }
 
 export async function recordSuccess(
-  server: Db,
+  server: Pick<Db, 'execute'>,
   destination: string,
 ): Promise<void> {
   const now = Date.now();
@@ -171,12 +171,12 @@ export async function recordSuccess(
 // Any non-2xx (ruling E): the ladder advances; rows are KEPT (the batch
 // rows' attempts/next_attempt_ms mirror the ladder step).
 export async function recordFailure(
-  server: Db,
+  server: Pick<Db, 'execute'>,
   destination: string,
   error: string,
   backoffMs: number,
+  now = Date.now(),
 ): Promise<void> {
-  const now = Date.now();
   await server.execute(
     `INSERT INTO peer_status(destination, failures, attempts_total, failures_total, unreachable_since_ms, next_attempt_ms, last_attempt_ms, last_error)
      VALUES(?, 1, 1, 1, ?, ?, ?, ?)
@@ -216,7 +216,7 @@ export async function notifyPeerAlive(
 // refusals are one row; the detail carries the last refusal and how many
 // rows have expired undelivered.
 export async function recordRefusal(
-  server: Db,
+  server: Db | Conn,
   destination: string,
   last: {
     code: number | null;
@@ -364,31 +364,27 @@ export function startSender(deps: SenderDeps): Sender {
   async function sweepExpired(destination: string): Promise<void> {
     const server = await serverP;
     const cutoff = Date.now() - config().federation.refusedmillihours * 3_600;
-    const expired = await server.query(
-      "SELECT room, pos FROM outbox WHERE destination = ? AND state = 'pending' AND added_ms <= ? ORDER BY room, pos",
-      [destination, cutoff],
-    );
-    if (expired.length === 0) return;
-    // an expired row inside the derived batch retires it by construction
-    // (the body changes → a new transaction id — the old r4/astra ruling)
-    for (const row of expired) {
-      await server.execute(
-        "UPDATE outbox SET state = 'failed' WHERE destination = ? AND room = ? AND pos = ?",
-        [destination, String(row.room), Number(row.pos)],
+    await server.tx(async (tx) => {
+      // Selection and publication share the transaction, including a concurrent
+      // operator retry's refreshed lifespan. A changed body retires its txn id.
+      const expired = await tx.execute(
+        "UPDATE outbox SET state = 'failed' WHERE destination = ? AND state = 'pending' AND added_ms <= ?",
+        [destination, cutoff],
       );
-    }
-    await recordRefusal(
-      server,
-      destination,
-      {
-        code: null,
-        errcode: null,
-        error:
-          `expired ${expired.length} undelivered row(s) after the refusedmillihours lifespan`,
-        txnId: null,
-      },
-      expired.length,
-    );
+      if (expired === 0) return;
+      await recordRefusal(
+        tx,
+        destination,
+        {
+          code: null,
+          errcode: null,
+          error:
+            `expired ${expired} undelivered row(s) after the refusedmillihours lifespan`,
+          txnId: null,
+        },
+        expired,
+      );
+    });
   }
 
   async function attemptIntent(
@@ -491,8 +487,9 @@ export function startSender(deps: SenderDeps): Sender {
         const pdu = await pduOf(row.room, row.event);
         if (pdu !== null) pdus.push(pdu);
       }
+      let res;
       try {
-        const res = await federationRequest(server, deps.signer, {
+        res = await federationRequest(server, deps.signer, {
           destination,
           method: 'PUT',
           path: `/_matrix/federation/v1/send/${encodeURIComponent(txnId)}`,
@@ -506,26 +503,6 @@ export function startSender(deps: SenderDeps): Sender {
           ),
           maxBytes: config().federation.bulkmaxbytes,
         });
-        // 2xx — delivered: mark the batch's rows sent, reset the ladder
-        for (const row of batch) {
-          await server.execute(
-            "UPDATE outbox SET state = 'sent' WHERE room = ? AND pos = ? AND destination = ?",
-            [row.room, row.pos, destination],
-          );
-        }
-        frozenEdus.delete(txnId);
-        await recordSuccess(server, destination);
-        const body = res.json as
-          | { pdus?: Record<string, { error?: string }> }
-          | null;
-        const verdicts = body == null || body.pdus == null ? {} : body.pdus;
-        for (const [id, verdict] of Object.entries(verdicts)) {
-          if (verdict?.error !== undefined) {
-            console.warn(
-              `sender[${destination}]: receiver rejected ${id}: ${verdict.error}`,
-            );
-          }
-        }
       } catch (e) {
         const err = e as {
           status?: number;
@@ -533,39 +510,65 @@ export function startSender(deps: SenderDeps): Sender {
           message?: string;
         };
         const now = Date.now();
-        const fresh = await peerStatus(server, destination);
-        const backoff = backoffMs(fresh.failures + 1);
-        await recordFailure(
-          server,
-          destination,
-          `${err.status == null ? 'net' : err.status} ${
-            err.message == null ? String(e) : err.message
-          }`,
-          backoff,
-        );
-        // the batch rows mirror the ladder step
+        await server.tx(async (tx) => {
+          const fresh = await peerStatus(tx, destination);
+          const backoff = backoffMs(fresh.failures + 1);
+          await recordFailure(
+            tx,
+            destination,
+            `${err.status == null ? 'net' : err.status} ${
+              err.message == null ? String(e) : err.message
+            }`,
+            backoff,
+            now,
+          );
+          // The peer ladder and all its row mirrors publish together.
+          for (const row of batch) {
+            await tx.execute(
+              "UPDATE outbox SET attempts = attempts + 1, next_attempt_ms = ? WHERE room = ? AND pos = ? AND destination = ? AND state = 'pending'",
+              [now + backoff, row.room, row.pos, destination],
+            );
+          }
+          // A 4xx also publishes the operator's refusal in this transaction.
+          if (
+            typeof err.status === 'number' && err.status >= 400 &&
+            err.status < 500
+          ) {
+            await recordRefusal(
+              tx,
+              destination,
+              {
+                code: err.status,
+                errcode: err.errcode == null ? null : err.errcode,
+                error: err.message == null ? String(e) : err.message,
+                txnId,
+              },
+              0,
+            );
+          }
+        });
+        continue;
+      }
+      // Persistence errors are not transport failures. Roll back the delivery
+      // outcome as a unit, leaving the derived batch available after restart.
+      await server.tx(async (tx) => {
         for (const row of batch) {
-          await server.execute(
-            "UPDATE outbox SET attempts = attempts + 1, next_attempt_ms = ? WHERE room = ? AND pos = ? AND destination = ? AND state = 'pending'",
-            [now + backoff, row.room, row.pos, destination],
+          await tx.execute(
+            "UPDATE outbox SET state = 'sent' WHERE room = ? AND pos = ? AND destination = ?",
+            [row.room, row.pos, destination],
           );
         }
-        // a refusal (4xx with a Matrix body) also writes the 'refused'
-        // pending entry so the admin sees it at once (ruling E)
-        if (
-          typeof err.status === 'number' && err.status >= 400 &&
-          err.status < 500
-        ) {
-          await recordRefusal(
-            server,
-            destination,
-            {
-              code: err.status,
-              errcode: err.errcode == null ? null : err.errcode,
-              error: err.message == null ? String(e) : err.message,
-              txnId,
-            },
-            0,
+        await recordSuccess(tx, destination);
+      });
+      frozenEdus.delete(txnId);
+      const body = res.json as
+        | { pdus?: Record<string, { error?: string }> }
+        | null;
+      const verdicts = body == null || body.pdus == null ? {} : body.pdus;
+      for (const [id, verdict] of Object.entries(verdicts)) {
+        if (verdict?.error !== undefined) {
+          console.warn(
+            `sender[${destination}]: receiver rejected ${id}: ${verdict.error}`,
           );
         }
       }
