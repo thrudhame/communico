@@ -256,12 +256,12 @@ async function joinVia(
     if (eventPdu.state_key === undefined) continue;
     snapshot.set(String(eventPdu.type) + '\0' + String(eventPdu.state_key), id);
   }
-  // the returned join: recomputed id must match ours and the resident's
-  // signature must verify (it vouches for the event it accepted); else
-  // the response is refused. The sender-domain signature is OURS — the
-  // joiner's, already proven at build time — so the resident's entry is
-  // the one checked here.
+  // The returned join must match ours. A verifying resident signature
+  // selects that copy; otherwise keep our signed join. The countersigned
+  // copy is required only for restricted authorisation (joins-v2.yaml).
+  // Decide from OUR content, even when the response omits the event.
   let join = signed;
+  let vouched = false;
   if (resp.event !== undefined) {
     const returned = resp.event;
     let identifiedId: string;
@@ -278,7 +278,6 @@ async function joinVia(
     const residentSigs = (returned.signatures as
       | Record<string, Record<string, string>>
       | undefined)?.[candidate] ?? {};
-    let vouched = false;
     for (const keyId of Object.keys(residentSigs)) {
       try {
         if (
@@ -297,10 +296,12 @@ async function joinVia(
         // key unobtainable under this id — try the next
       }
     }
-    if (!vouched) {
-      throw badResponse('the returned join is not vouched by the resident');
-    }
-    join = returned;
+    if (vouched) join = returned;
+  }
+  if (
+    signed.content?.join_authorised_via_users_server !== undefined && !vouched
+  ) {
+    throw badResponse('the returned join is not vouched by the resident');
   }
   // the join against the snapshot: its auth events and the state before
   const joinStore: EventStore = {

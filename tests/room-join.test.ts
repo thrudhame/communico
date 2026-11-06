@@ -73,6 +73,123 @@ async function frontierOf(room: Room): Promise<string[]> {
   });
 }
 
+for (const restricted of [false, true]) {
+  Deno.test(`join remote: returned join signature ${restricted ? 'required when restricted' : 'optional otherwise'}`, async (t) => {
+    for (
+      const answer of [
+        'omitted',
+        'unsigned',
+        'invalid signature',
+        'unobtainable key',
+        'signed',
+        'mismatched id',
+      ]
+    ) {
+      await t.step(answer, async () => {
+        await withStore(async (store) => {
+          const fr = await makeFakeRoom({
+            roomId: '!returned:remote.test',
+            joinRule: restricted ? 'restricted' : 'public',
+          });
+          const keys = fakeKeyResolver(fr.server, await testRemoteServer());
+          let ours: Pdu;
+          let returned: Pdu;
+          const { fetcher } = fakeFetcher({
+            makeJoin: (user) => {
+              const template = fr.makeJoinAnswer(user);
+              if (restricted) {
+                const authoriser = fr.afterOf.get(fr.tipId)!.get(
+                  'm.room.member\0' + fr.creator,
+                )!;
+                template.event.auth_events!.push(authoriser);
+              }
+              return template;
+            },
+            sendJoin: async (event) => {
+              ours = structuredClone(event);
+              const response = await fr.acceptSendJoin(event);
+              // Synapse returns the event even without a resident signature.
+              if (answer === 'unsigned') {
+                response.event.signatures = structuredClone(event.signatures);
+              } else if (answer === 'invalid signature') {
+                response.event.signatures![fr.server.name] = {
+                  [fr.server.keyId]: 'invalid',
+                };
+              } else if (answer === 'unobtainable key') {
+                response.event.signatures![fr.server.name] = {
+                  'ed25519:unobtainable': 'invalid',
+                };
+              } else if (answer === 'mismatched id') {
+                response.event.content = { membership: 'leave' };
+              }
+              returned = structuredClone(response.event);
+              return answer === 'omitted'
+                ? { state: response.state, authChain: response.authChain }
+                : response;
+            },
+          });
+          const join = () =>
+            joinRemote(store, {
+              roomId: fr.roomId,
+              user: ANNA,
+              via: [fr.server.name],
+              signer,
+              content: restricted
+                ? { join_authorised_via_users_server: fr.creator }
+                : { displayname: 'Anna' },
+              deps: {
+                fetcher,
+                self: 'test',
+                keys: {
+                  verifyEventSignature: (args) => {
+                    if (args.keyId === 'ed25519:unobtainable') {
+                      throw new Error('key fetch failed');
+                    }
+                    return keys.verifyEventSignature(args);
+                  },
+                },
+              },
+            });
+          const signer = await testSigner();
+          if (
+            answer === 'mismatched id' || (restricted && answer !== 'signed')
+          ) {
+            const error = await assertRejects(join, MatrixError);
+            assertEquals(error.status, 502);
+            assertEquals(
+              error.responseBody().error,
+              answer === 'mismatched id'
+                ? 'the returned join does not match ours'
+                : 'the returned join is not vouched by the resident',
+            );
+            await assertRejects(() => openRoom(store, fr.roomId));
+            return;
+          }
+          const result = await join();
+          const room = await openRoom(store, fr.roomId);
+          await room.tx(async (tx) => {
+            const stored = (await tx.events.get(result.eventId))!;
+            assertEquals(
+              JSON.parse(stored.pdu),
+              answer === 'signed' ? returned! : ours!,
+            );
+            assertEquals(
+              (await tx.events.getStatus(result.eventId))?.standing,
+              'accepted',
+            );
+            const stay = (await tx.segments.openStay())!;
+            const current = (await tx.state.current(stay.id))!;
+            assertEquals(
+              await tx.state.groupKey(current, 'm.room.member', ANNA),
+              result.eventId,
+            );
+          });
+        });
+      });
+    }
+  });
+}
+
 Deno.test('join remote: the snapshot becomes the imported boundary of a new stay', async () => {
   await withStore(async (store) => {
     const fr = await makeFakeRoom({ roomId: '!j1:remote.test' });
