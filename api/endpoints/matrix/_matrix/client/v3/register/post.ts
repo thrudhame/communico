@@ -7,6 +7,7 @@ import {
 } from '#engine/tenant/users.ts';
 import { DUMMY_FLOWS, requireUia } from '#engine/tenant/uia.ts';
 import { theApp } from '#engine/app.ts';
+import { ensurePresenceRow } from '#engine/server/ephemeral.ts';
 
 // POST /_matrix/client/v3/register — UIA (F1 step 17; M2: via the shared
 // requireUia helper). Complement's contract (read off
@@ -63,6 +64,7 @@ export default async function (
       : undefined,
     accessToken: inhibit ? null : undefined,
   });
+  await ensurePresenceRow(theApp().server, result.user_id);
   const out: Record<string, unknown> = {
     user_id: result.user_id,
     device_id: result.device_id,

@@ -16,6 +16,7 @@ import {
   type EduState,
   eduState,
 } from '#engine/federation/edus.ts';
+import { wireEphemeral } from '#engine/federation/ephemeral.ts';
 import {
   type InviteDeps,
   inviteIntentProvider,
@@ -122,7 +123,14 @@ export function startFederationServices(app: App): void {
     wake: (destination) => sender.wake(destination),
   };
   sender.setIntentProvider(inviteIntentProvider(inviteDeps));
-  app.sender = sender;
+  const unwire = wireEphemeral(app.server, name, queues);
+  app.sender = {
+    ...sender,
+    stop: async () => {
+      await unwire();
+      await sender.stop();
+    },
+  };
 }
 
 /** Close the running app (sender stopped, store closed) and forget it. */

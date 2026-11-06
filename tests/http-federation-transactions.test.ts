@@ -263,15 +263,15 @@ test('send: typing, receipt and presence EDUs update producer state only for the
   assertEquals(result.status, 200);
   const edus = theApp().federationEdus;
   assertEquals(edus.typingOf(s.id).userIds, [user()]);
-  assertEquals(edus.receiptsIn(s.id), [{
+  assertEquals(await edus.receiptsIn(s.id), [{
     userId: user(),
     eventId: String(target.event_id),
     ts: 1234567890,
     threadId: null,
   }]);
-  assertEquals(edus.presenceOf(user())?.presence, 'online');
-  assertEquals(edus.presenceOf(user())?.status_msg, 'on the wire');
-  assertEquals(edus.presenceOf(foreign), null);
+  assertEquals((await edus.presenceOf(user()))?.presence, 'online');
+  assertEquals((await edus.presenceOf(user()))?.status_msg, 'on the wire');
+  assertEquals(await edus.presenceOf(foreign), null);
 });
 
 test('send: authenticated contact resets the real sender backoff', async () => {

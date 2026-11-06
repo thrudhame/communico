@@ -22,6 +22,21 @@ import type { RoomFilter } from '#engine/tenant/filters.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { onEventStream } from '#engine/server/stream.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
+import {
+  getPresence,
+  onEphemeral,
+  receiptsSince,
+  setPresence,
+  sharedUsers,
+  streamMax,
+} from '#engine/server/ephemeral.ts';
+import {
+  lastTypingChange,
+  onTypingChange,
+  sweepTyping,
+  typingIn,
+  typingSeq,
+} from '#engine/typing.ts';
 
 export interface SyncInputs {
   userId: string;
@@ -152,6 +167,27 @@ async function roomTimeline(
     unread_notifications: {},
   };
   if (summary) {
+    const ephemeral: Record<string, unknown>[] = [];
+    const typing = typingIn(room.id);
+    if (
+      i.since === null
+        ? typing.userIds.length > 0
+        : lastTypingChange(room.id) > i.since.tSeq
+    ) {
+      ephemeral.push({
+        type: 'm.typing',
+        content: { user_ids: typing.userIds },
+      });
+    }
+    const receipts = await receiptsSince(
+      app.server,
+      room.id,
+      i.since?.rSeq ?? 0,
+    );
+    if (receipts !== null) {
+      ephemeral.push({ type: 'm.receipt', content: receipts });
+    }
+    entry.ephemeral = { events: ephemeral };
     const members = await app.server.query(
       "SELECT user, membership FROM memberships WHERE room = ? AND membership IN ('join','invite') ORDER BY CASE membership WHEN 'join' THEN 0 ELSE 1 END, user",
       [room.id],
@@ -193,6 +229,7 @@ async function roomTimeline(
 
 async function relevantChanged(i: SyncInputs): Promise<boolean> {
   if (i.since === null) return true;
+  sweepTyping();
   const app = theApp();
   const rows = await app.server.query(
     `SELECT MAX(seq) AS m FROM (
@@ -201,8 +238,25 @@ async function relevantChanged(i: SyncInputs): Promise<boolean> {
      )`,
     [i.userId, i.userId],
   );
-  return Number(rows[0].m ?? 0) > i.since.eSeq ||
-    await accountDataMax(app.tenant, localpartOf(i.userId)) > i.since.aSeq;
+  if (
+    Number(rows[0].m ?? 0) > i.since.eSeq ||
+    await accountDataMax(app.tenant, localpartOf(i.userId)) > i.since.aSeq
+  ) return true;
+  const joined = await roomsFor(app.server, i.userId);
+  if (
+    joined.some((m) =>
+      m.membership === 'join' && lastTypingChange(m.roomId) > i.since!.tSeq
+    )
+  ) return true;
+  const receipts = await app.server.query(
+    "SELECT MAX(r.seq) AS m FROM receipts r JOIN memberships m ON m.room=r.room_id WHERE m.user=? AND m.membership='join'",
+    [i.userId],
+  );
+  if (Number(receipts[0].m ?? 0) > i.since.rSeq) return true;
+  for (const u of await sharedUsers(app.server, i.userId)) {
+    if ((await getPresence(app.server, u)).seq > i.since.pSeq) return true;
+  }
+  return false;
 }
 
 async function waitForRelevant(i: SyncInputs): Promise<void> {
@@ -217,6 +271,10 @@ async function waitForRelevant(i: SyncInputs): Promise<void> {
     // Arm BEFORE reading maxima: a commit between the read and await
     // remains signalled. Unrelated writes only trigger a relevance recheck.
     const removers = [
+      onTypingChange(() => wake()),
+      onEphemeral((server) => {
+        if (server.path === app.server.path) wake();
+      }),
       onProjected((store) => {
         if (store === app.store) wake();
       }),
@@ -244,12 +302,17 @@ async function waitForRelevant(i: SyncInputs): Promise<void> {
 export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const app = theApp();
   const lp = localpartOf(i.userId);
+  if (i.setPresence !== undefined) {
+    await setPresence(app.server, i.userId, i.setPresence);
+  }
+  sweepTyping();
   await waitForRelevant(i);
+  sweepTyping();
   const now: StreamToken = {
     eSeq: await eventStreamMax(app.server),
-    pSeq: 0,
-    tSeq: 0,
-    rSeq: 0,
+    pSeq: await streamMax(app.server, 'presence'),
+    tSeq: typingSeq(),
+    rSeq: await streamMax(app.server, 'receipts'),
     aSeq: await accountDataMax(app.tenant, lp),
   };
   const nextBatch = formatStreamToken(
@@ -339,7 +402,14 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
         1,
         now.eSeq,
       );
-      if (!changed.length) continue;
+      const receipts = await app.server.query(
+        'SELECT 1 FROM receipts WHERE room_id=? AND seq>? LIMIT 1',
+        [m.roomId, i.since.rSeq],
+      );
+      if (
+        !changed.length && !receipts.length &&
+        lastTypingChange(m.roomId) <= i.since.tSeq
+      ) continue;
     }
     const result = await roomTimeline(
       room,
@@ -351,6 +421,29 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     (left ? leave : join)[m.roomId] = result.entry;
     for (const u of result.joiners) allJoiners.add(u);
     for (const u of result.leavers) allLeavers.add(u);
+  }
+  const presenceEvents = new Map<string, Record<string, unknown>>();
+  const shared = await sharedUsers(app.server, i.userId);
+  const includePresence = async (u: string) => {
+    const row = await getPresence(app.server, u);
+    const content: Record<string, unknown> = { presence: row.presence };
+    if (row.statusMsg !== null) content.status_msg = row.statusMsg;
+    if (row.presence !== 'offline' && row.lastActiveMs > 0) {
+      content.last_active_ago = Math.max(0, Date.now() - row.lastActiveMs);
+    }
+    presenceEvents.set(u, { type: 'm.presence', sender: u, content });
+  };
+  for (const u of shared) {
+    if (
+      i.since === null ||
+      (await getPresence(app.server, u)).seq > i.since.pSeq ||
+      allJoiners.has(i.userId)
+    ) await includePresence(u);
+  }
+  if (i.since !== null) {
+    for (const u of allJoiners) {
+      await includePresence(u);
+    }
   }
   const deviceChanged: string[] = [], deviceLeft: string[] = [];
   if (i.since !== null) {
@@ -375,7 +468,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   return {
     next_batch: nextBatch,
     rooms: { join, invite, leave },
-    presence: { events: [] },
+    presence: { events: [...presenceEvents.values()] },
     account_data: { events: accountData },
     to_device: { events: [] },
     device_lists: { changed: deviceChanged, left: deviceLeft },

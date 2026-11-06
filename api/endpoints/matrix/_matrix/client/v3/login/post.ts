@@ -6,6 +6,7 @@ import { upsertDevice } from '#engine/tenant/devices.ts';
 import { theApp } from '#engine/app.ts';
 import { serverName } from '#engine/config.ts';
 import { splitId } from '#engine/ids.ts';
+import { ensurePresenceRow } from '#engine/server/ephemeral.ts';
 
 // m.login.password (F1 step 18): argon2id verify against the tenant
 // credentials; `identifier.type m.id.user` plus the legacy `user` shape
@@ -83,7 +84,7 @@ export default async function (
     deviceId,
     wantsRefresh ? Date.now() + expiresInMs : undefined,
   );
-  // Presence producers return with /sync and presence (5a-3).
+  await ensurePresenceRow(theApp().server, `@${localpart}:${serverName()}`);
   const result: Record<string, unknown> = {
     user_id: `@${localpart}:${serverName()}`,
     access_token: accessToken,

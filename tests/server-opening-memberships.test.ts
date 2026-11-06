@@ -256,7 +256,7 @@ Deno.test('F4: imported remote membership passes inbound EDU checks and server d
         edu_type: 'm.presence',
         content: { push: [{ user_id: s.fr.creator, presence: 'online' }] },
       });
-      assertEquals(edus.presenceOf(s.fr.creator)?.presence, 'online');
+      assertEquals((await edus.presenceOf(s.fr.creator))?.presence, 'online');
       assertEquals(
         await joinedUsers(s.server, s.room.id),
         [ANNA, BOB, EVE, GONE, s.fr.creator].sort(),
