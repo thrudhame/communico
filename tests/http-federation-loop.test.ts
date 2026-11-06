@@ -180,6 +180,21 @@ Deno.test('HTTP/TLS loop: create -> invite -> join -> messages -> backfill -> co
       alice.token,
     );
     assertEquals(membership.body.membership, 'join');
+    // Stage 5b restores public remote profiles from the real received member
+    // event. Both local and remote identifiers here carry a server port.
+    const bobProfile = 'profile/' + enc(bob.user);
+    assertEquals(await b.call(bobProfile), {
+      status: 200,
+      body: { displayname: 'bob' },
+    });
+    assertEquals(await a.call(bobProfile), {
+      status: 200,
+      body: { displayname: 'bob' },
+    });
+    assertEquals((await a.call(bobProfile + '/displayname')).body, {
+      displayname: 'bob',
+    });
+    assertEquals((await a.call(bobProfile + '/avatar_url')).body, {});
     const eventPath = (id: string) => base + '/event/' + enc(id);
     assertEquals((await b.call(eventPath(old), bob.token)).status, 404);
     const fromA = await say(a, alice.token, 'message A -> B');
