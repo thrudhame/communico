@@ -218,6 +218,9 @@ export async function finalizeBuilt(
   if (rulebook.spec.strictCanonicalJson) {
     assertCanonicalNumbers(pdu.content);
   }
+  // Authored events name us before hashing/signing, including template builds.
+  // Received events use verification/countersigning, never this finalizer.
+  pdu.origin = signer.serverName;
   // The v11+ wire form has no event_id field: it is derived, never hashed
   // or signed. It is absent at build time.
   pdu.hashes = { sha256: await contentHashOf(pdu) };

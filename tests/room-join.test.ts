@@ -21,6 +21,7 @@ import {
   makeFakeRoom,
 } from './fixtures/remote-room.ts';
 import { testRemoteServer, testSigner } from './fixtures/signer.ts';
+import { assertAuthored } from './fixtures/authored.ts';
 
 const config = (dir: string) => ({
   dir,
@@ -50,7 +51,10 @@ const ANNA = '@anna:test';
 async function joinDepsFor(fr: FakeRoom) {
   const { fetcher, calls } = fakeFetcher({
     makeJoin: (userId) => fr.makeJoinAnswer(userId),
-    sendJoin: (event) => fr.acceptSendJoin(event),
+    sendJoin: async (event) => {
+      await assertAuthored(event);
+      return await fr.acceptSendJoin(event);
+    },
   });
   return {
     calls,
