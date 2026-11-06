@@ -1,9 +1,9 @@
 // tests/room-join.test.ts — joining a room hosted elsewhere (3c-2):
 // the returned snapshot becomes the imported boundary of a new stay
 // (sole extremity, evidence, publication, membership change); via
-// fail-over on network failure and 404, abort on 403; a snapshot with
-// an unauthorized state event is refused and no room file is created;
-// a returned join that does not match ours is refused.
+// fail-over on network failure and 404, abort on 403; unusable snapshot
+// events are excluded without blocking an otherwise authorized join;
+// missing critical auth or a returned join that does not match is refused.
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import type { Pdu } from '#engine/pdu.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -235,7 +235,7 @@ Deno.test('join remote: fail-over on network failure and 404; abort on 403', asy
   });
 });
 
-Deno.test('join remote: an unauthorized state event or a mismatched join refuses the response — no room file', async () => {
+Deno.test('join remote: rejected state is excluded; a mismatched join refuses the response', async () => {
   await withStore(async (store) => {
     const signer = await testSigner();
     const selfKeys = await testRemoteServer();
@@ -259,21 +259,29 @@ Deno.test('join remote: an unauthorized state event or a mismatched join refuses
           resp.state.push(badTopic);
         }),
     });
-    const errA = await assertRejects(() =>
-      joinRemote(store, {
-        roomId: frA.roomId,
-        user: ANNA,
-        via: [frA.server.name],
-        signer,
-        deps: {
-          keys: fakeKeyResolver(frA.server, selfKeys),
-          fetcher: tamperedA.fetcher,
-          self: 'test',
-        },
-      })
-    );
-    assert(String(errA).includes('M_UNKNOWN'), String(errA));
-    await assertRejects(() => openRoom(store, frA.roomId));
+    const resultA = await joinRemote(store, {
+      roomId: frA.roomId,
+      user: ANNA,
+      via: [frA.server.name],
+      signer,
+      deps: {
+        keys: fakeKeyResolver(frA.server, selfKeys),
+        fetcher: tamperedA.fetcher,
+        self: 'test',
+      },
+    });
+    const roomA = await openRoom(store, frA.roomId);
+    await roomA.tx(async (tx) => {
+      assertEquals(
+        (await tx.events.getStatus(String(badTopic.event_id)))?.standing,
+        'rejected',
+      );
+      const before = (await tx.state.eventStateBefore(resultA.eventId))!;
+      assertEquals(
+        await tx.state.groupKey(before.group, 'm.room.topic', ''),
+        null,
+      );
+    });
 
     // room B: the returned join does not match ours — a keep-listed
     // field is tampered, so the recomputed id differs
@@ -304,4 +312,170 @@ Deno.test('join remote: an unauthorized state event or a mismatched join refuses
     assert(String(errB).includes('M_UNKNOWN'), String(errB));
     await assertRejects(() => openRoom(store, frB.roomId));
   });
+});
+
+Deno.test('join remote: unusable snapshot events do not block an authorized join', async (t) => {
+  for (
+    const failure of [
+      'missing signature',
+      'bad signature',
+      'unobtainable key',
+      'malformed',
+      'unverifiable auth',
+    ]
+  ) {
+    await t.step(failure, async () => {
+      await withStore(async (store) => {
+        const fr = await makeFakeRoom({ roomId: '!unusable:remote.test' });
+        const bad = await fr.addEvent({
+          type: failure === 'unverifiable auth'
+            ? 'm.room.member'
+            : 'm.room.name',
+          state_key: failure === 'unverifiable auth' ? fr.creator : '',
+          content: failure === 'unverifiable auth'
+            ? { membership: 'join' }
+            : { name: 'unusable' },
+        });
+        let dependent: Pdu | undefined;
+        let descendant: Pdu | undefined;
+        if (failure === 'unverifiable auth') {
+          dependent = await fr.addEvent({
+            type: 'm.room.member',
+            state_key: fr.creator,
+            content: { membership: 'leave' },
+          });
+          assert(dependent.auth_events?.includes(String(bad.event_id)));
+          // A second rejected descendant must not re-enter the imported state.
+          descendant = await fr.addEvent({
+            type: 'm.room.topic',
+            state_key: '',
+            content: { topic: 'depends on rejected leave' },
+          });
+          assert(descendant.auth_events?.includes(String(dependent.event_id)));
+        }
+        const badId = String(bad.event_id);
+        const keys = fakeKeyResolver(fr.server, await testRemoteServer());
+        const { fetcher } = fakeFetcher({
+          makeJoin: (user) => fr.makeJoinAnswer(user),
+          sendJoin: (event) =>
+            fr.acceptSendJoin(event, (resp) => {
+              for (const pdu of [...resp.state, ...resp.authChain]) {
+                if (pdu.event_id !== badId) continue;
+                if (failure === 'malformed') {
+                  pdu.depth = -1;
+                } else if (failure === 'missing signature') {
+                  pdu.signatures = {};
+                } else {
+                  pdu.signatures = {
+                    [fr.server.name]: {
+                      [
+                        failure === 'unobtainable key'
+                          ? 'ed25519:unobtainable'
+                          : fr.server.keyId
+                      ]: 'invalid',
+                    },
+                  };
+                }
+              }
+            }),
+        });
+        const result = await joinRemote(store, {
+          roomId: fr.roomId,
+          user: ANNA,
+          via: [fr.server.name],
+          signer: await testSigner(),
+          deps: {
+            fetcher,
+            self: 'test',
+            keys: {
+              verifyEventSignature: (args) => {
+                if (args.keyId === 'ed25519:unobtainable') {
+                  throw new Error('key fetch failed');
+                }
+                return keys.verifyEventSignature(args);
+              },
+            },
+          },
+        });
+        const room = await openRoom(store, fr.roomId);
+        await room.tx(async (tx) => {
+          assertEquals(await tx.events.get(badId), null);
+          const before = (await tx.state.eventStateBefore(result.eventId))!;
+          const after = (await tx.state.eventStateAfter(result.eventId))!;
+          for (const group of [before.group, after.group]) {
+            assertEquals(
+              await tx.state.groupKey(group, 'm.room.name', ''),
+              null,
+            );
+            assertEquals(
+              await tx.state.groupKey(group, 'm.room.topic', ''),
+              null,
+            );
+            if (dependent) {
+              assertEquals(
+                await tx.state.groupKey(group, 'm.room.member', fr.creator),
+                null,
+              );
+            }
+          }
+          for (const pdu of [dependent, descendant]) {
+            if (!pdu) continue;
+            assertEquals(
+              (await tx.events.getStatus(String(pdu.event_id)))?.standing,
+              'rejected',
+            );
+            assertEquals(
+              (await tx.events.getStatus(String(pdu.event_id)))?.grounding,
+              'evidence',
+            );
+          }
+          assertEquals(
+            await tx.state.groupKey(after.group, 'm.room.member', ANNA),
+            result.eventId,
+          );
+          assertEquals(
+            (await tx.events.getStatus(result.eventId))?.standing,
+            'accepted',
+          );
+        });
+      });
+    });
+  }
+});
+
+Deno.test('join remote: unusable critical state still refuses the response without a room file', async (t) => {
+  const signer = await testSigner();
+  const selfKeys = await testRemoteServer();
+  for (const type of ['m.room.create', 'm.room.join_rules']) {
+    await t.step(type, async () => {
+      await withStore(async (store) => {
+        const fr = await makeFakeRoom({ roomId: '!critical:remote.test' });
+        const { fetcher } = fakeFetcher({
+          makeJoin: (user) => fr.makeJoinAnswer(user),
+          sendJoin: (event) =>
+            fr.acceptSendJoin(event, (resp) => {
+              for (const pdu of [...resp.state, ...resp.authChain]) {
+                if (pdu.type === type) pdu.signatures = {};
+              }
+            }),
+        });
+        const error = await assertRejects(() =>
+          joinRemote(store, {
+            roomId: fr.roomId,
+            user: ANNA,
+            via: [fr.server.name],
+            signer,
+            deps: {
+              fetcher,
+              self: 'test',
+              keys: fakeKeyResolver(fr.server, selfKeys),
+            },
+          })
+        );
+        assert(error instanceof MatrixError);
+        assertEquals(error.status, 502);
+        await assertRejects(() => openRoom(store, fr.roomId));
+      });
+    });
+  }
 });

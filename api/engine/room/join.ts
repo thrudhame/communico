@@ -1,8 +1,9 @@
 // api/engine/room/join.ts — joining a room hosted elsewhere (3c-2):
 // make_join → build the join from the resident's template → sign →
 // send_join → the returned snapshot is validated BEFORE anything is
-// written (every state/auth-chain event through the ONE verification
-// path and checked against its auth events; the returned join must
+// written (state/auth-chain events through the ONE verification path:
+// unverifiable events dropped, auth failures rejected and excluded from
+// the snapshot; the returned join must
 // match ours; the room file is only created after validation passes —
 // plan §3). Then one room transaction under the per-room lock: the
 // auth chain and state events stored as `evidence` (R2 — bytes, never
@@ -47,18 +48,23 @@ export type JoinResult = { roomId: string; eventId: string };
 // carries our first join): their sender-domain key is not resolvable
 // through the injected resolver, so — as in the old snapshot semantics
 // — the RESIDENT's signature also proves the event (it vouches for the
-// snapshot it serves). Both failing refuses the response.
+// snapshot it serves). Both failing drops only this event; the usable
+// snapshot and join authorization decide whether the response suffices.
 async function verifySnapshotEvent(
   raw: Pdu,
   roomVersion: string,
   candidate: string,
   roomId: string,
   keys: KeyResolver,
-): Promise<{ eventId: string; pdu: Pdu }> {
+): Promise<{ eventId: string; pdu: Pdu } | null> {
   try {
     return await verify(raw, roomVersion, keys, { roomId });
-  } catch (senderFailure) {
-    const identified = await identify(raw, roomVersion, { roomId });
+  } catch {
+    // A resident signature cannot rescue a malformed event.
+    const identified = await identify(raw, roomVersion, { roomId }).catch(() =>
+      null
+    );
+    if (identified === null) return null;
     const residentSigs = (raw.signatures as
       | Record<string, Record<string, string>>
       | undefined)?.[candidate] ?? {};
@@ -79,7 +85,7 @@ async function verifySnapshotEvent(
         // key unobtainable under this id — try the next
       }
     }
-    throw senderFailure;
+    return null;
   }
 }
 
@@ -181,10 +187,9 @@ async function joinVia(
   // 3. send_join — the answer is untrusted input
   const resp = await deps.fetcher.sendJoin(args.roomId, signed, candidate);
 
-  // 4. validate BEFORE anything is written: every returned event
-  //    through the ONE verification path (G9) and checked against its
-  //    auth events; the returned join must match ours; the join must
-  //    be authorized by the snapshot
+  // 4. validate BEFORE anything is written: individual receipt failures
+  //    drop events, auth failures reject them. Only accepted state enters
+  //    the boundary; the join must still be authorized by that snapshot.
   const pack = new Map<string, Pdu>();
   const stateEventIds: string[] = [];
   for (const raw of resp.state ?? []) {
@@ -195,6 +200,7 @@ async function joinVia(
       args.roomId,
       deps.keys,
     );
+    if (v === null) continue;
     if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
     stateEventIds.push(v.eventId);
   }
@@ -206,27 +212,22 @@ async function joinVia(
       args.roomId,
       deps.keys,
     );
+    if (v === null) continue;
     if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
   }
-  // per-event auth checks in (depth, id) order: a rejected STATE event
-  // refuses the response; a rejected auth-chain-only event is excluded
+  // Per-event auth checks in (depth, id) order, regardless of the source
+  // array: rejected evidence is stored but never imported as state.
   const rejected = new Map<string, string>();
   const packStore: EventStore = {
     get: (id) => pack.get(id),
     isRejected: (id) => rejected.has(id),
   };
-  const stateIdSet = new Set(stateEventIds);
   const ordered = [...pack.entries()].sort(([a, pa], [b, pb]) =>
     pa.depth !== pb.depth ? pa.depth - pb.depth : a < b ? -1 : 1
   );
   for (const [id, eventPdu] of ordered) {
     const chain = rulebook.checkAuthChain(eventPdu, packStore);
     if (!chain.ok) {
-      if (stateIdSet.has(id)) {
-        throw badResponse(
-          `snapshot state event not authorized (${chain.rule}): ${id}`,
-        );
-      }
       rejected.set(id, chain.rule);
     }
   }
