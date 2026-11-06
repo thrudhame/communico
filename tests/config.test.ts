@@ -15,6 +15,9 @@ const FULL = `[server]
 name = "localhost"
 port = 8008
 
+[admin]
+socket = ""
+
 [media]
 root = "./.media"
 maxbytes = 52428800
@@ -613,7 +616,7 @@ Deno.test('--shell printer quoting', async () => {
   );
 });
 
-Deno.test('46 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('47 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -629,6 +632,7 @@ Deno.test('46 leaves total across the sections (the surface tripwire)', async ()
   ): [string, number] => [name, Object.keys(leaves).length]);
   assertEquals(counts, [
     ['server', 2],
+    ['admin', 1],
     ['media', 2],
     ['store', 5],
     ['preview', 4],
@@ -636,7 +640,7 @@ Deno.test('46 leaves total across the sections (the surface tripwire)', async ()
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    46,
-    'the whole config surface is 46 leaves — a new leaf belongs in the plan, not just the schema',
+    47,
+    'the whole config surface is 47 leaves - a new leaf belongs in the plan, not just the schema',
   );
 });

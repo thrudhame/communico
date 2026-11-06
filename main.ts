@@ -7,6 +7,7 @@ import {
 } from '#engine/federation/peers.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { mediaRoot } from '#engine/media.ts';
+import { startAdmin } from '#root/api/admin/index.ts';
 
 try {
   const loaded = loadedConfig();
@@ -54,6 +55,13 @@ try {
 
 await Deno.mkdir(mediaRoot(), { recursive: true });
 const app = await openApp();
+let admin: Awaited<ReturnType<typeof startAdmin>>;
+try {
+  admin = await startAdmin(app);
+} catch (error) {
+  await closeApp();
+  throw error;
+}
 
 if (config().federation.enabled) {
   const fed = config().federation;
@@ -99,6 +107,7 @@ async function shutdown(): Promise<void> {
   if (stopping) return;
   stopping = true;
   await Promise.allSettled(servers.map((server) => server.shutdown()));
+  await admin.shutdown();
   await closeApp();
   console.log('shutdown: store closed');
   Deno.exit(0);

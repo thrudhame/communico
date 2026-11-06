@@ -13,6 +13,9 @@ export const SCHEMA = {
     name: 'string',
     port: 'int',
   },
+  admin: {
+    socket: 'string',
+  },
   media: {
     root: 'string',
     maxbytes: 'int',

@@ -4,7 +4,7 @@
 // is pure given its paths; config() loads lazily from conventional paths
 // + Deno.env on first use.
 import { parse } from '@std/toml';
-import { join } from '@std/path';
+import { dirname, join, resolve } from '@std/path';
 import {
   type Config,
   envNameOf,
@@ -518,6 +518,7 @@ export function loadedConfig(): LoadedConfig {
 
 export type ConfigPatch = {
   server?: { name?: string; port?: number };
+  admin?: { socket?: string };
   media?: { root?: string; maxbytes?: number };
   preview?: {
     enabled?: boolean;
@@ -581,4 +582,11 @@ export function serverName(): string {
 /** The one listener's port. */
 export function appPort(): number {
   return config().server.port;
+}
+
+/** Shared by the listener and operator clients; never opens the store. */
+export function adminSocket(c: Config = config()): string {
+  return c.admin.socket === ''
+    ? join(dirname(resolve(c.store.dir)), 'admin.sock')
+    : resolve(c.admin.socket);
 }

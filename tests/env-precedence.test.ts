@@ -20,6 +20,9 @@ const FULL = `[server]
 name = "localhost"
 port = 8008
 
+[admin]
+socket = ""
+
 [media]
 root = "./.media"
 maxbytes = 52428800
