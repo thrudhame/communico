@@ -114,18 +114,27 @@ export async function ungroundedPrevs(
 }
 
 // The rulebook's synchronous EventStore over the bounded recursive auth
-// closure of the seeds, with rejected flags (S4 155-194).
+// closure of the seeds, with rejected flags (S4 155-194). The room create
+// is an invariant dependency: v12 refers to it through room_id instead of
+// auth_events, including when an evidence/history check has no state seeds.
 export async function loadRulebookStore(
   tx: RoomTx,
   seeds: readonly string[],
 ): Promise<EventStore> {
-  const walk = await tx.events.authClosure(seeds, AUTH_CLOSURE_LIMIT);
+  const roots = new Set(seeds);
+  const stay = await tx.segments.latestStay();
+  const current = stay === null ? null : await tx.state.current(stay.id);
+  const create = current === null
+    ? null
+    : await tx.state.groupKey(current, 'm.room.create', '');
+  if (create !== null) roots.add(create);
+  const walk = await tx.events.authClosure([...roots], AUTH_CLOSURE_LIMIT);
   if (walk.truncated) {
     throw new Error(
       `E_AUTH_CLOSURE: auth closure exceeds ${AUTH_CLOSURE_LIMIT} events`,
     );
   }
-  const ids = [...new Set([...seeds, ...walk.ids])];
+  const ids = [...new Set([...roots, ...walk.ids])];
   const rows = await tx.events.list(ids);
   const standings = await tx.events.statuses(ids);
   const pdus = new Map<string, Pdu>();
