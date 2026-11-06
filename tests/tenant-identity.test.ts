@@ -4,11 +4,18 @@
 // name is the base32 of the key, and the signer's output verifies with
 // the stored public key. The old tenantDbName assertion is dropped — the
 // store's layout owns file keys now.
-import { assert, assertEquals, assertMatch, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertMatch,
+  assertNotEquals,
+  assertRejects,
+} from '@std/assert';
 import { openStore, type Store } from '#engine/store/index.ts';
 import {
   nativeNameFor,
   openTenant,
+  signingKeyVersionFor,
   tenantSchema,
 } from '#engine/tenant/index.ts';
 import { b64decode } from '#engine/signing-primitives.js';
@@ -64,7 +71,7 @@ Deno.test('tenant: key generate-once, reused across reopen; native name from the
     }
     assertMatch(nativeName, /^[a-z2-7]{52}$/);
     assertEquals(nativeName, nativeNameFor(b64decode(publicB64)));
-    assertEquals(keyId, 'ed25519:1');
+    assertMatch(keyId, /^ed25519:[a-zA-Z0-9_]+$/);
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
@@ -75,7 +82,7 @@ Deno.test('tenant: signer output verifies with the stored public key', async () 
     const tenant = await openTenant(store, 'a.test', { create: true });
     const signer = tenant.signer();
     assertEquals(signer.serverName, 'a.test');
-    assertEquals(signer.keyId, 'ed25519:1');
+    assertEquals(signer.keyId, tenant.keyId);
     const canonical = '{"a":1}';
     const signature = await signer.sign(canonical);
     const publicKey = await crypto.subtle.importKey(
@@ -105,4 +112,38 @@ Deno.test('tenant: open without create on a missing file refuses', async () => {
       Deno.errors.NotFound,
     );
   });
+});
+
+Deno.test('tenant: fresh stores for the same server name get distinct signing key ids', async () => {
+  await withStore(async (first) => {
+    await withStore(async (second) => {
+      const oldTenant = await openTenant(first, 'same.test', { create: true });
+      const newTenant = await openTenant(second, 'same.test', { create: true });
+      assertNotEquals(newTenant.publicB64, oldTenant.publicB64);
+      assertNotEquals(newTenant.keyId, oldTenant.keyId);
+      // The persisted suffix, not a reader-generated value, owns the identity.
+      for (
+        const [store, tenant] of [[first, oldTenant], [
+          second,
+          newTenant,
+        ]] as const
+      ) {
+        const db = await store.tenant('same.test');
+        const rows = await db.tx((conn) =>
+          conn.query('SELECT key_id FROM tenant')
+        );
+        assertEquals('ed25519:' + rows[0].key_id, tenant.keyId);
+        assertMatch(tenant.keyId, /^ed25519:[a-zA-Z0-9_]+$/);
+      }
+    });
+  });
+});
+
+Deno.test('tenant: signing key version uses the spec alphabet for a fixed hyphen-producing hash', async () => {
+  // Ed25519 public key from the fixed seed consisting of 32 bytes of 15.
+  // Its SHA256 starts 795ed5ffe903; base64url starts eV7V_-kD (invalid '-').
+  const raw = b64decode('2b8hSHSKhcidparY7gsPwtEF_TnUGkx5ZTY1TwrikAw');
+  const version = await signingKeyVersionFor(raw);
+  assertMatch('ed25519:' + version, /^ed25519:[a-zA-Z0-9_]+$/);
+  assertEquals(version, '795ed5ffe903');
 });

@@ -20,7 +20,10 @@ const get = (path: string) => matrix(new Request('http://x' + path));
 
 test('our key document and deprecated key-id path are signed and public', async () => {
   for (
-    const path of ['/_matrix/key/v2/server', '/_matrix/key/v2/server/ed25519:1']
+    const path of [
+      '/_matrix/key/v2/server',
+      '/_matrix/key/v2/server/' + theApp().tenant.keyId,
+    ]
   ) {
     const res = await get(path);
     assertEquals(res.status, 200);
@@ -28,7 +31,7 @@ test('our key document and deprecated key-id path are signed and public', async 
     assertEquals(doc.server_name, serverName());
     const ids = Object.keys(doc.verify_keys);
     assertEquals(ids.length, 1);
-    assert(ids[0].startsWith('ed25519:'));
+    assertEquals(ids, [theApp().tenant.keyId]);
     assertEquals(Object.keys(doc.signatures), [serverName()]);
     assert(
       await verifyJson(
