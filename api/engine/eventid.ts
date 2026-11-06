@@ -1,5 +1,6 @@
 import { canonicalJson } from './canonical.ts';
 import { getRulebook } from './policy.ts';
+import { b64encode, b64encodeStd } from '#engine/signing-primitives.js';
 
 // Redaction keep-lists, TRANSCRIBED from the spec during execution
 // (never recalled). v11-redactions (v11.md / v12.md:485):
@@ -186,11 +187,7 @@ export async function eventIdFor(
     'SHA-256',
     new TextEncoder().encode(canonicalJson(r)),
   );
-  const b64 = btoa(String.fromCharCode(...new Uint8Array(digest))).replace(
-    /=+$/,
-    '',
-  );
   const alphabet = getRulebook(roomVersion).spec.eventIdAlphabet;
-  return '$' +
-    (alphabet === 'std' ? b64 : b64.replaceAll('+', '-').replaceAll('/', '_'));
+  const encode = alphabet === 'std' ? b64encodeStd : b64encode;
+  return '$' + encode(new Uint8Array(digest));
 }

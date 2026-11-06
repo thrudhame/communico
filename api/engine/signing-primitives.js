@@ -7,10 +7,9 @@
 // only — no dependencies.
 import { canonicalJson } from '#engine/canonical.ts';
 
-// Unpadded base64 (appendices § Unpadded Base64: RFC 4648 without `=`).
-// Binary values in JSON (hashes, signatures, keys) use the STANDARD
-// alphabet; only event ids use the URL-safe variation (rooms v11 §
-// Event IDs: 62nd/63rd chars `-`/`_` instead of `+`/`/`).
+// Shared byte-to-identifier encoder: unpadded base64url (RFC 4648 section 5).
+// Generated transaction/media ids and v4+ event ids use this alphabet so
+// decoded URL paths and queries cannot turn bytes into separators.
 export function b64encode(bytes) {
   const bin = String.fromCharCode(...bytes);
   return btoa(bin).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
@@ -38,10 +37,8 @@ export function b32encode(bytes) {
   return out;
 }
 
-// Standard base64 (appendices § Unpadded Base64: RFC 4648 without `=`).
-// Binary values in JSON (hashes, signatures, keys) use the STANDARD
-// alphabet; only event ids use the URL-safe variation (rooms v11 §
-// Event IDs: 62nd/63rd chars `-`/`_` instead of `+`/`/`).
+// Standard unpadded Base64 for protocol hashes, signatures and key material,
+// plus legacy v3 event ids. Do not use for generated opaque identifiers.
 export function b64encodeStd(bytes) {
   const bin = String.fromCharCode(...bytes);
   return btoa(bin).replace(/=+$/, '');

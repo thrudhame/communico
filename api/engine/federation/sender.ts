@@ -24,7 +24,7 @@ import { onProjected } from '#engine/server/project.ts';
 import { outboxDue, type OutboxDueRow } from '#engine/server/read.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
-import { b64encodeStd, sha256ofString } from '#engine/signing-primitives.js';
+import { b64encode, sha256ofString } from '#engine/signing-primitives.js';
 import { federationRequest } from './client.ts';
 import { isBlocked, recordPending } from './peers.ts';
 
@@ -317,7 +317,7 @@ async function deriveTxn(
 ): Promise<{ txnId: string; ts: number }> {
   const ts = rows.reduce((m, r) => Math.max(m, r.addedMs), 0);
   const keys = rows.map((r) => `${r.room}:${r.pos}`).join('\n');
-  const hash = b64encodeStd(
+  const hash = b64encode(
     await sha256ofString(`${destination}\n${ts}\n${keys}`),
   );
   return { txnId: `${ts}-${hash.slice(0, 22)}`, ts };
