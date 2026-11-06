@@ -22,8 +22,12 @@ export type { Segment } from '#engine/room/segments.ts';
 export type { Wait } from '#engine/room/waits.ts';
 export type { Change } from '#engine/room/changes.ts';
 
+// Count only resolutions in committed attempts, not abandoned snapshots.
+export const resolutionProbe = { resolutions: 0 };
+
 function bind(conn: Conn) {
   return {
+    diagnostics: { resolutions: 0 },
     events: {
       insert: (id: string, pdu: string) => events.insertEvent(conn, id, pdu),
       get: (id: string) => events.getEvent(conn, id),
@@ -148,6 +152,14 @@ export async function openRoom(
   return {
     id: roomId,
     store,
-    tx: (fn) => db.tx((conn) => fn(bind(conn))),
+    tx: async (fn) => {
+      const { result, resolutions } = await db.tx(async (conn) => {
+        const tx = bind(conn);
+        const result = await fn(tx);
+        return { result, resolutions: tx.diagnostics.resolutions };
+      });
+      resolutionProbe.resolutions += resolutions;
+      return result;
+    },
   };
 }

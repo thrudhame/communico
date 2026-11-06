@@ -343,12 +343,13 @@ export async function openTenant(
       },
     }),
     tx: async (fn) => {
-      let changed = false;
-      const result = await db.tx((conn) =>
-        fn(bind(conn, () => {
+      const { result, changed } = await db.tx(async (conn) => {
+        let changed = false;
+        const result = await fn(bind(conn, () => {
           changed = true;
-        }))
-      );
+        }));
+        return { result, changed };
+      });
       if (changed) tenantStreamCommitted(store, serverName);
       return result;
     },

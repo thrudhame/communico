@@ -24,7 +24,7 @@ import { contentHashOf } from '#engine/signing-primitives.js';
 
 // Counts rulebook resolveState calls (the plan's instrumented guardrail:
 // a single-prev linear ingest performs no resolution).
-export const resolutionProbe = { resolutions: 0 };
+export { resolutionProbe } from '#engine/room/index.ts';
 
 // The auth closure feeding the rulebook is a bounded indexed walk (R3);
 // a truncated walk is a loud failure, never a silent partial store.
@@ -162,7 +162,7 @@ export async function stateBefore(
       maps.flatMap((map) => [...map.values()]),
     )
     : store;
-  resolutionProbe.resolutions++;
+  tx.diagnostics.resolutions++;
   return rulebook.resolveState(maps, resolver);
 }
 

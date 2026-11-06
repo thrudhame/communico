@@ -13,7 +13,12 @@ import {
   type SchemaProvider,
   sweep,
 } from '#engine/store/create.ts';
-import { type Database, Db, operations } from '#engine/store/db.ts';
+import {
+  type ConflictStats,
+  type Database,
+  Db,
+  operations,
+} from '#engine/store/db.ts';
 import type { FileKind } from '#engine/store/layout.ts';
 import { type GateStats } from '#engine/store/gate.ts';
 import { Turso } from '#engine/store/ffi.ts';
@@ -42,7 +47,7 @@ export type StoreSchemas = {
 export type StoreStats = {
   openFiles: number;
   poolErrors: readonly Error[];
-  server: GateStats;
+  server: GateStats & { conflicts: ConflictStats };
 };
 
 export class Store implements StartupStore {
@@ -108,7 +113,10 @@ export class Store implements StartupStore {
     return {
       openFiles: this.pool.size,
       poolErrors: this.pool.errors.slice(),
-      server: this.serverDb.gate.stats(),
+      server: {
+        ...this.serverDb.gate.stats(),
+        conflicts: this.serverDb.conflictStats(),
+      },
     };
   }
 

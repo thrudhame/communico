@@ -194,6 +194,7 @@ export async function ingestInTx(
   }
   // unsigned is stripped on receipt — never stored (it is covered by
   // neither the signatures nor the content hash).
+  pdu = { ...pdu };
   delete pdu.unsigned;
   let expect: string;
   try {

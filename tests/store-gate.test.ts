@@ -1,5 +1,5 @@
-// tests/store-gate.test.ts — real concurrent commits and reader drain. Conflicts
-// are returned to the caller; only this workload explicitly retries its writes.
+// tests/store-gate.test.ts - real concurrent commits and reader drain. The
+// store owns conflict retries, including across checkpoint barriers.
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { Db } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
@@ -35,7 +35,6 @@ Deno.test('store gate: eight concurrent writers, 16000 rows and bounded logical 
   const files = databaseFiles(dir);
   const db = await Db.open(ffi, files.database, 65536);
   let measured = 0;
-  let conflicts = 0;
   db.gate.addEventListener('open', () => {
     if (db.gate.stats().completed > measured) {
       assert(Deno.statSync(files.log).size < 65536);
@@ -55,23 +54,10 @@ Deno.test('store gate: eight concurrent writers, 16000 rows and bounded logical 
     await db.execute('DELETE FROM rows_test WHERE id = -1');
     await Promise.all(Array.from({ length: 8 }, async (_, writer) => {
       for (let row = 0; row < 2000; row++) {
-        const deadline = performance.now() + 30000;
-        for (;;) {
-          try {
-            await db.execute('INSERT INTO rows_test VALUES(?,?)', [
-              writer * 2000 + row,
-              'x'.repeat(128),
-            ]);
-            break;
-          } catch (error) {
-            if (
-              !(error instanceof StoreError) || !error.busy ||
-              performance.now() > deadline
-            ) throw error;
-            conflicts++;
-            await delay(1);
-          }
-        }
+        await db.execute('INSERT INTO rows_test VALUES(?,?)', [
+          writer * 2000 + row,
+          'x'.repeat(128),
+        ]);
       }
     }));
     assertEquals(
@@ -88,7 +74,8 @@ Deno.test('store gate: eight concurrent writers, 16000 rows and bounded logical 
     assertEquals(stats.closed, false);
     assertEquals(stats.exhausted, 0);
     assert(stats.pauseMs > 0);
-    console.log(JSON.stringify({ ...stats, callerConflicts: conflicts }));
+    assertEquals(db.conflictStats().exhausted, 0);
+    console.log(JSON.stringify({ ...stats, conflicts: db.conflictStats() }));
   } finally {
     await db.close();
     ffi.close();

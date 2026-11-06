@@ -426,15 +426,16 @@ export async function ingestRemote(
   }
 
   // One room transaction for the accepted batch, under the per-room lock
-  const grounded: string[] = [];
   const outcomeIndex = new Map<string, number[]>();
   for (const item of items) {
     const indexes = outcomeIndex.get(item.eventId) ?? [];
     indexes.push(item.index);
     outcomeIndex.set(item.eventId, indexes);
   }
-  await withRoomLock(room.id, () =>
+  const committed = await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
+      const grounded: string[] = [];
+      const results = new Map<number, RemoteOutcome>();
       // Revalidation (G8): the fetch phase ran unlocked — the stay, the
       // version and the extremities are re-read inside the lock
       const stay = await tx.segments.openStay();
@@ -534,15 +535,17 @@ export async function ingestRemote(
             error: null,
           };
         for (const index of outcomeIndex.get(item.eventId) ?? []) {
-          outcomes[index] = result;
+          results.set(index, result);
         }
       }
+      return { grounded, results };
     }));
+  for (const [index, result] of committed.results) outcomes[index] = result;
 
   // A later arrival re-runs what waited for it (R10 — each recheck is a
   // locked ingest of its own, after this lock released)
   const hasWaiters = await room.tx(async (tx) => {
-    for (const id of grounded) {
+    for (const id of committed.grounded) {
       if ((await tx.waits.for(id)).length > 0) return true;
     }
     return false;
