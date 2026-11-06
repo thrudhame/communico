@@ -16,6 +16,7 @@ WORKDIR /app
 COPY deno.json deno.lock main.ts ./
 COPY api ./api
 COPY defaults ./defaults
+COPY tools ./tools
 COPY complement ./complement
 # Build with `deno task native` in the project VM before docker build.
 # openStore validates ffi_build_info against #engine/store/build.ts.
