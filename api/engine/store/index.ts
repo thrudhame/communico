@@ -129,6 +129,7 @@ export async function openStore(
   let pool: Pool | undefined;
   try {
     checkBuildInfo(await ffi.buildInfo());
+    await sweep(config.dir);
     await sweep(join(config.dir, 'rooms'));
     await sweep(join(config.dir, 'tenants'));
     const serverProvider: SchemaProvider = {

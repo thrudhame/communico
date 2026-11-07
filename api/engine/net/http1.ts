@@ -281,9 +281,9 @@ export async function http1Request(
         hostname: req.tls.sni !== null ? req.tls.sni : req.connectIp,
         caCerts: req.tls.caCerts,
       });
+      conn = tls;
       await tls.handshake();
       stream = tls;
-      conn = tls;
     }
     return await http1Wire(stream, {
       method: req.method,
