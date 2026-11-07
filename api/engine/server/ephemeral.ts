@@ -3,6 +3,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
+import { isJoined } from '#engine/server/read.ts';
 
 export type PresenceRow = {
   presence: string;
@@ -135,9 +136,10 @@ export async function setReceipt(
   receiptType: 'm.read' | 'm.read.private',
   eventId: string,
   opts: { ts?: number; threadId?: string | null } = {},
-): Promise<void> {
+): Promise<boolean> {
   const ts = opts.ts ?? Date.now();
   const row = await eventStreamTx(server, async (tx) => {
+    if (!await isJoined(tx, roomId, userId)) return null;
     const seq = await next(tx, 'receipts');
     await tx.execute(
       `INSERT INTO receipts(room_id,user_id,receipt_type,event_id,ts_ms,seq) VALUES(?,?,?,?,?,?)
@@ -146,8 +148,10 @@ export async function setReceipt(
     );
     return { userId, eventId, ts, seq };
   });
+  if (row === null) return false;
   // doltgres stored no per-thread receipt; private rows never federate.
   notify(server, { kind: 'receipt', roomId, receiptType, row });
+  return true;
 }
 export async function receiptRows(
   server: Db,

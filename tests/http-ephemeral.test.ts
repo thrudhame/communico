@@ -3,7 +3,7 @@ import { assert, assertEquals } from '@std/assert';
 import { theApp } from '#engine/app.ts';
 import { httpSuite } from '#tests/http-app.ts';
 import { eduQueues } from '#engine/federation/edus.ts';
-import { fedCaller } from '#tests/http-federation.ts';
+import { fedCaller, remoteServer } from '#tests/http-federation.ts';
 import { seedServer } from '#tests/federation/doc-helper.ts';
 import { wireEphemeral } from '#engine/federation/ephemeral.ts';
 import { startSender } from '#engine/federation/sender.ts';
@@ -200,6 +200,124 @@ suite.test('receipts and read markers round-trip; private receipts stay stored a
     })).status,
     400,
   );
+});
+
+suite.test('room ephemeral admission rejects absent, invited and departed users across client producers', async () => {
+  const a = await suite.registerTestUser('ep-admit-a', 'pw');
+  const b = await suite.registerTestUser('ep-admit-b', 'pw');
+  const { roomId, base } = await roomFor(a, b);
+  const outsider = await suite.registerTestUser('ep-admit-out', 'pw');
+  const before = await sync(a.access_token!);
+  const denied = async (user: typeof outsider) => {
+    const results = await Promise.all([
+      call(
+        base + '/receipt/m.read/%24forbidden',
+        user.access_token!,
+        'POST',
+        {},
+      ),
+      call(
+        base + '/receipt/m.read.private/%24forbidden',
+        user.access_token!,
+        'POST',
+        {},
+      ),
+      call(base + '/read_markers', user.access_token!, 'POST', {
+        'm.read': '$forbidden',
+      }),
+      call(
+        base + '/typing/' + encodeURIComponent(user.user_id),
+        user.access_token!,
+        'PUT',
+        { typing: true },
+      ),
+    ]);
+    assertEquals(
+      results.map((r) => [r.status, r.body.errcode]),
+      Array(4).fill([403, 'M_FORBIDDEN']),
+    );
+  };
+  await denied(outsider);
+  assertEquals(
+    (await call(base + '/invite', a.access_token!, 'POST', {
+      user_id: outsider.user_id,
+    })).status,
+    200,
+  );
+  await denied(outsider);
+  assertEquals(
+    (await call(base + '/leave', b.access_token!, 'POST', {})).status,
+    200,
+  );
+  await denied(b);
+  assertEquals(
+    (await call(base + '/ban', a.access_token!, 'POST', {
+      user_id: outsider.user_id,
+    })).status,
+    200,
+  );
+  await denied(outsider);
+  assertEquals(
+    await theApp().server.query(
+      'SELECT user_id FROM receipts WHERE room_id=?',
+      [roomId],
+    ),
+    [],
+  );
+  const after = await sync(a.access_token!, '&since=' + before.next_batch);
+  assertEquals(eventOf(after, roomId, 'm.receipt'), undefined);
+  assertEquals(eventOf(after, roomId, 'm.typing'), undefined);
+});
+
+suite.test('inbound receipt admission cannot retain arbitrary room-user pairs or advance the stream', async () => {
+  const app = theApp();
+  const a = await suite.registerTestUser('ep-fed-deny', 'pw');
+  const created = await call(
+    '/_matrix/client/v3/createRoom',
+    a.access_token!,
+    'POST',
+    {},
+  );
+  const roomId = String(created.body.room_id);
+  const remote = await remoteServer('ep-unjoined.test');
+  const fed = fedCaller(suite.matrix, remote);
+  const before = await sync(a.access_token!);
+  const content: Json = {};
+  for (let i = 0; i < 12; i++) {
+    const room = i === 0 ? roomId : '!arbitrary-' + i + ':' + remote.name;
+    content[room] = {
+      'm.read': {
+        ['@unjoined-' + i + ':' + remote.name]: {
+          event_ids: ['$forbidden'],
+          data: { ts: i },
+        },
+      },
+    };
+  }
+  const response = await fed(
+    'PUT',
+    '/_matrix/federation/v1/send/deny-arbitrary-receipts',
+    {
+      origin: remote.name,
+      origin_server_ts: Date.now(),
+      pdus: [],
+      edus: [{ edu_type: 'm.receipt', content }],
+    },
+  );
+  assertEquals(response, { status: 200, body: { pdus: {} } });
+  assertEquals(
+    await app.server.query(
+      'SELECT user_id FROM receipts WHERE user_id LIKE ?',
+      ['%:' + remote.name],
+    ),
+    [],
+  );
+  const after = await sync(a.access_token!, '&since=' + before.next_batch);
+  assertEquals(
+    String(after.next_batch).match(/_r\d+/)?.[0],
+    String(before.next_batch).match(/_r\d+/)?.[0],
+  );
+  assertEquals(eventOf(after, roomId, 'm.receipt'), undefined);
 });
 
 suite.test('presence joins fan out both ways; status/set_presence validation and relevant wake', async () => {

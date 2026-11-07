@@ -119,6 +119,19 @@ export async function membershipOf(
 
 // --- event → room ----------------------------------------------------------
 
+// Selected membership admission for producers, usable inside their owning
+// transaction so a receipt cannot race a projected membership transition.
+export async function isJoined(
+  db: Pick<Db, 'query'>,
+  roomId: string,
+  userId: string,
+): Promise<boolean> {
+  return (await db.query(
+    "SELECT 1 FROM memberships WHERE room=? AND user=? AND membership='join'",
+    [roomId, userId],
+  )).length !== 0;
+}
+
 export async function roomOf(db: Db, eventId: string): Promise<string | null> {
   const rows = await db.query('SELECT room FROM event_index WHERE event = ?', [
     eventId,
