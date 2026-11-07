@@ -55,7 +55,10 @@ export async function resolveAlias(alias: string) {
 export async function powerFor(roomId: string, user: string, type: string) {
   const room = await requireRoom(roomId),
     spec = getRulebook(await versionOf(room)).spec;
-  const rows = await stateAtSeq(roomId, null);
+  const rows = await stateAtSeq(roomId, null, [
+    ['m.room.power_levels', ''],
+    ['m.room.create', ''],
+  ]);
   const pdu = async (type: string) => {
     const id = rows.find((r) => r.type === type && r.stateKey === '')?.eventId;
     const row = id === undefined
@@ -84,9 +87,10 @@ export async function deleteAlias(alias: string, user: string) {
       'not the alias creator and insufficient power level',
     );
   }
-  const canon = (await stateAtSeq(row.roomId, null)).find((r) =>
-    r.type === 'm.room.canonical_alias' && r.stateKey === ''
-  );
+  const canon =
+    (await stateAtSeq(row.roomId, null, [['m.room.canonical_alias', '']])).find(
+      (r) => r.type === 'm.room.canonical_alias' && r.stateKey === '',
+    );
   await removeAlias(db, alias);
   if (canon !== undefined) {
     const content = { ...canon.content };
@@ -123,7 +127,7 @@ export async function deleteAlias(alias: string, user: string) {
 export async function roomAliases(roomId: string, user: string) {
   await requireRoom(roomId);
   const m = await membershipOf(theApp().server, roomId, user),
-    state = await stateAtSeq(roomId, null);
+    state = await stateAtSeq(roomId, null, [['m.room.history_visibility', '']]);
   if (
     m?.membership !== 'join' &&
     !state.some((r) =>
@@ -176,7 +180,15 @@ export async function publicRooms(
       : Math.max(0, parseInt(opts.since, 10) || 0);
   const all: Record<string, unknown>[] = [];
   for (const id of await directory.listedRooms(theApp().server)) {
-    const state = await stateAtSeq(id, null);
+    const state = await stateAtSeq(id, null, [
+      ['m.room.name', ''],
+      ['m.room.topic', ''],
+      ['m.room.canonical_alias', ''],
+      ['m.room.history_visibility', ''],
+      ['m.room.guest_access', ''],
+      ['m.room.join_rules', ''],
+      ['m.room.avatar', ''],
+    ]);
     const value = (type: string, key: string) => {
       const v = state.find((r) => r.type === type && r.stateKey === '')
         ?.content[key];
@@ -233,8 +245,9 @@ export async function searchUsers(searcher: string, term: string, limit = 10) {
   const candidates = new Set<string>(),
     publicIds = new Set(await directory.listedRooms(theApp().server));
   for (const id of await directory.allMemberRooms(theApp().server)) {
+    if (publicIds.has(id)) continue;
     if (
-      (await stateAtSeq(id, null)).some((r) =>
+      (await stateAtSeq(id, null, [['m.room.join_rules', '']])).some((r) =>
         r.type === 'm.room.join_rules' && r.content.join_rule === 'public'
       )
     ) publicIds.add(id);
