@@ -264,7 +264,7 @@ Deno.test('ingest: E4 — a rejected event consumes nothing and never enters sta
       origin_server_ts: 3000,
     }, g.signer);
     assertEquals(rejected.standing, 'rejected');
-    assertEquals(rejected.reason, 'state');
+    assertEquals(rejected.reason, 'auth');
     // stored, flagged, but out of the published state and the frontier
     await g.room.tx(async (tx) => {
       assert((await tx.events.get(rejected.eventId)) !== null);
