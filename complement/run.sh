@@ -101,48 +101,119 @@ echo ">> preview allowlist (docker bridge): $BRIDGE_SUBNET"
 export COMPLEMENT_SHARE_ENV_PREFIX=PASS_
 export PASS_COMMUNICO_PREVIEW_ENABLED=true
 export PASS_COMMUNICO_PREVIEW_ALLOWLIST="$BRIDGE_SUBNET"
-echo ">> running Complement (filter: ${RUN_FILTER:-all})"
-set +e
+# The table owns both default-pass exclusions and each setting's environment.
+# Values are env arguments, never shell code. Each row names a top-level test.
+TESTS=()
+SETTINGS=()
+declare -A SEEN=()
+while read -r test settings; do
+  [[ -z "$test" || "$test" == \#* ]] && continue
+  [[ "$test" =~ ^Test[A-Za-z0-9_]+$ && -n "$settings" ]] || { echo "invalid per-test setting: $test $settings" >&2; exit 1; }
+  [[ -z "${SEEN[$test]:-}" ]] || { echo "duplicate per-test setting: $test" >&2; exit 1; }
+  read -r -a overrides <<< "$settings"
+  for override in "${overrides[@]}"; do
+    [[ "$override" =~ ^PASS_COMMUNICO_[A-Z0-9_]+=.+$ ]] || { echo "invalid environment override: $override" >&2; exit 1; }
+  done
+  SEEN[$test]=1
+  TESTS+=("$test")
+  SETTINGS+=("$settings")
+done < complement/settings.tsv
+
+# Enumerate the compiled top-level tests once. This lets each settings pass
+# keep the user's original -run expression (including subtest paths), while
+# -skip excludes every other test. Go owns all regexp matching in both passes.
 (
   cd "$WORK"
-  if [[ -n "$RUN_FILTER" ]]; then
-    COMPLEMENT_BASE_IMAGE="$IMAGE" COMPLEMENT_SHARE_ENV_PREFIX=PASS_ go test -tags communico_blacklist -timeout 3h -run "$RUN_FILTER" -json ./tests/... 2>&1 | tee "$REPO_ROOT/complement/baseline.jsonl"
-  else
-    COMPLEMENT_BASE_IMAGE="$IMAGE" COMPLEMENT_SHARE_ENV_PREFIX=PASS_ go test -tags communico_blacklist -timeout 3h -json ./tests/... 2>&1 | tee "$REPO_ROOT/complement/baseline.jsonl"
-  fi
-  echo "${PIPESTATUS[0]}" > "$REPO_ROOT/complement/.test-status"
-)
-set -e
-TEST_STATUS="$(cat complement/.test-status)"
-echo ">> go test exit: $TEST_STATUS (recorded; harness exit stays 0)"
+  COMPLEMENT_BASE_IMAGE="$IMAGE" go test -tags communico_blacklist -list '^Test' ./tests/...
+) > "$WORK/list.log" 2>&1
+mapfile -t ALL_TESTS < <(grep -E '^Test[A-Za-z0-9_]+$' "$WORK/list.log" | sort -u)
+for test in "${TESTS[@]}"; do
+  printf '%s\n' "${ALL_TESTS[@]}" | grep -Fx "$test" >/dev/null || { echo "configured test missing: $test" >&2; exit 1; }
+done
+skip_pattern() {
+  local joined
+  joined="$(IFS='|'; echo "$*")"
+  if [[ -n "$joined" ]]; then printf '^(%s)$' "$joined"; else printf '^$'; fi
+}
+: > "$WORK/runs.tsv"
+: > complement/baseline.jsonl
+TEST_STATUS=0
+run_pass() {
+  local label=$1 test=$2 settings=$3 skip=$4 status
+  local overrides=() filter=()
+  [[ -z "$settings" ]] || read -r -a overrides <<< "$settings"
+  [[ -z "$RUN_FILTER" ]] || filter=(-run "$RUN_FILTER")
+  echo ">> running Complement ($label; filter: ${RUN_FILTER:-all}; settings: ${settings:-defaults})"
+  set +e
+  (
+    cd "$WORK"
+    env "${overrides[@]}" COMPLEMENT_BASE_IMAGE="$IMAGE" go test -count=1 -tags communico_blacklist -timeout 3h "${filter[@]}" -skip "$skip" -json ./tests/... 2>&1 | tee "$REPO_ROOT/$WORK/baseline-$label.jsonl"
+    exit "${PIPESTATUS[0]}"
+  )
+  status=$?
+  set -e
+  cat "$WORK/baseline-$label.jsonl" >> complement/baseline.jsonl
+  printf '%s\t%s\t%s\t%s\n' "$label" "$test" "$settings" "$status" >> "$WORK/runs.tsv"
+  [[ "$status" == 0 ]] || TEST_STATUS=$status
+  echo ">> $label go test exit: $status (recorded; harness exit stays 0)"
+}
+run_pass default '*' '' "$(skip_pattern "${TESTS[@]}")"
+for i in "${!TESTS[@]}"; do
+  excluded=()
+  for test in "${ALL_TESTS[@]}"; do
+    [[ "$test" == "${TESTS[$i]}" ]] || excluded+=("$test")
+  done
+  run_pass "settings-$((i + 1))" "${TESTS[$i]}" "${SETTINGS[$i]}" "$(skip_pattern "${excluded[@]}")"
+done
 
 # 4. tally to BASELINE.md (failures vs blacklist-skips distinguished)
 deno eval --allow-read --allow-write '
 const lines = (await Deno.readTextFile("complement/baseline.jsonl")).trim().split("\n");
 let pass = 0, fail = 0, skip = 0;
-const failedPkgs = new Set();
-const failedTests = [];
+const packages = new Map();
+const tests = new Map();
 for (const line of lines) {
   let ev;
   try { ev = JSON.parse(line); } catch { continue; }
-  if (ev.Action === "pass" && !ev.Test) pass++;
-  if (ev.Action === "fail" && !ev.Test) { fail++; failedPkgs.add(ev.Package); }
-  if (ev.Action === "skip" && !ev.Test) skip++;
-  if (ev.Action === "fail" && ev.Test) failedTests.push(`${ev.Package} ${ev.Test}`);
+  if (!["pass", "fail", "skip"].includes(ev.Action)) continue;
+  if (ev.Test) {
+    const key = `${ev.Package} ${ev.Test}`;
+    if (tests.has(key)) throw new Error(`duplicate terminal result: ${key}`);
+    tests.set(key, ev.Action);
+  } else {
+    const prior = packages.get(ev.Package);
+    packages.set(ev.Package, prior === "fail" || ev.Action === "fail" ? "fail" :
+      prior === "pass" || ev.Action === "pass" ? "pass" : "skip");
+  }
 }
+const failedPkgs = [...packages].filter(([, a]) => a === "fail").map(([p]) => p);
+const failedTests = [...tests].filter(([, a]) => a === "fail").map(([t]) => t);
+for (const action of packages.values()) {
+  if (action === "pass") pass++;
+  if (action === "fail") fail++;
+  if (action === "skip") skip++;
+}
+const runs = (await Deno.readTextFile(Deno.args[4])).trim().split("\n")
+  .map((line) => line.split("\t"));
 const now = new Date().toISOString();
-const out = `# Complement baseline — ${now}\n\n` +
+const out = `# Complement baseline - ${now}\n\n` +
   `- checkout: ~/Sources/matrix-org-complement @ ${Deno.args[0]}\n` +
   `- image: ${Deno.args[1]} (commit ${Deno.args[2]})\n` +
   `- go test exit: ${Deno.args[3]} (red tests are the baseline, not a harness error)\n` +
   `- packages: pass=${pass} fail=${fail} skip=${skip}\n` +
   `- failing tests: ${failedTests.length}\n\n` +
+  `## Per-setting runs\n\n` +
+  `The same image and checkout are used for every pass; the user filter applies to all passes.\n` +
+  `Package totals above count each package once, failing if any pass fails.\n\n` +
+  `| # | Pass | Test | Environment override | Go test exit |\n|---|---|---|---|---|\n` +
+  runs.map(([label, test, settings, status], i) =>
+    `| ${i + 1} | ${label} | ${test === "*" ? "All except configured tests" : test} | ${settings || "Defaults"} | ${status} |`).join("\n") + `\n\n` +
   `## Failing packages\n\n` +
   ([...failedPkgs].map((p) => `- ${p}`).join("\n") || "(none)") + `\n\n` +
   `## Failing tests (red to beat)\n\n` +
   (failedTests.map((t) => `- ${t}`).join("\n") || "(none)") + `\n`;
 await Deno.writeTextFile("complement/BASELINE.md", out);
 console.log(`baseline: ${pass} pass-pkgs, ${fail} fail-pkgs, ${skip} skip-pkgs, ${failedTests.length} failing tests`);
-' "$PINNED" "$IMAGE" "$TREE_COMMIT" "$TEST_STATUS"
+' "$PINNED" "$IMAGE" "$TREE_COMMIT" "$TEST_STATUS" "$WORK/runs.tsv"
 rm -f complement/.test-status
 echo ">> wrote complement/BASELINE.md"
