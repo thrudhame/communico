@@ -444,7 +444,7 @@ function searchTextOf(
     if (raw !== null) key = 'content.topic';
   }
   if (key === null || raw === null) return null;
-  return { key, text: raw.replaceAll(' ', ' ').toLowerCase() };
+  return { key, text: raw.replaceAll('\u0000', ' ').toLowerCase() };
 }
 
 function topicTextOf(content: Record<string, unknown>): string | null {
