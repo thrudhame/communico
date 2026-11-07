@@ -62,7 +62,7 @@ function parseAttrs(raw: string): Record<string, string> {
         if (i < raw.length) i++;
       } else {
         const start = i;
-        while (i < raw.length && !/[\s/>]/.test(raw[i])) i++;
+        while (i < raw.length && !/[\s>]/.test(raw[i])) i++;
         value = raw.slice(start, i);
       }
       out[name] = unescape(value).trim();

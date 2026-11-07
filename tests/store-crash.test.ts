@@ -11,8 +11,6 @@ import { integrityCheck } from '#engine/store/create.ts';
 const CHILD = new URL('./fixtures/store-crash-child.ts', import.meta.url)
   .pathname;
 const LIBRARY = './.native/libturso_ffi.so';
-const delay = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 type ChildEvent = { row?: number; barrier?: 'start' | 'end' };
 
@@ -81,7 +79,7 @@ Deno.test('store crash: 30 SIGKILLs, reopen passes integrity and keeps every rep
         LIBRARY,
       ],
       stdout: 'piped',
-      stderr: 'piped',
+      stderr: 'inherit',
     }).spawn();
     const reader = linesOf(child.stdout);
     let barrierOpen = false;
@@ -91,10 +89,13 @@ Deno.test('store crash: 30 SIGKILLs, reopen passes integrity and keeps every rep
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     const deadline = Date.now() + deadlineMs;
     for (;;) {
+      let readTimer: ReturnType<typeof setTimeout> | undefined;
       const next = await Promise.race([
         reader.next(),
-        delay(60000).then(() => 'timeout' as const),
-      ]);
+        new Promise<'timeout'>((resolve) => {
+          readTimer = setTimeout(() => resolve('timeout'), 60000);
+        }),
+      ]).finally(() => clearTimeout(readTimer));
       if (next === 'timeout' || next.done === true) break;
       const event = next.value;
       if (event.row !== undefined) reported.add(event.row);
