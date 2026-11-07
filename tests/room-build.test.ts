@@ -257,7 +257,11 @@ Deno.test('buildCreate: v11 carries room_id; v12 omits it; signature verifies', 
   );
   assertEquals('room_id' in v12, false);
   // the v12 room id derives from the create's event id (v12.md:98-101)
-  assertEquals('!' + v12.event_id!.slice(1), '!' + v12.event_id!.slice(1));
+  assert(/^\$[A-Za-z0-9_-]{43}$/.test(String(v12.event_id)));
+  assertEquals(
+    v12.event_id,
+    await eventIdFor(v12 as unknown as Record<string, unknown>, '12'),
+  );
 });
 
 Deno.test('buildCreate: non-canonical content numbers are a client fault', async () => {

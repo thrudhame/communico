@@ -67,13 +67,19 @@ export async function insertEvent(
     'INSERT INTO events(id, pdu, type, state_key, sender, depth, origin_ts) VALUES(?,?,?,?,?,?,?)',
     [id, pdu, type, stateKey, sender, depth, originTs],
   );
+  const seenPrevs = new Set<string>();
   for (const [ord, prev] of edgeIds(parsed.prev_events).entries()) {
+    if (seenPrevs.has(prev)) continue;
+    seenPrevs.add(prev);
     await conn.execute(
       'INSERT INTO prev_edges(event, prev, ord) VALUES(?,?,?)',
       [id, prev, ord],
     );
   }
+  const seenAuth = new Set<string>();
   for (const [ord, auth] of edgeIds(parsed.auth_events).entries()) {
+    if (seenAuth.has(auth)) continue;
+    seenAuth.add(auth);
     await conn.execute(
       'INSERT INTO auth_edges(event, auth, ord) VALUES(?,?,?)',
       [id, auth, ord],

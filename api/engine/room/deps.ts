@@ -83,6 +83,18 @@ export interface Fetcher {
   ): Promise<{ state: Pdu[]; authChain: Pdu[]; event?: Pdu }>;
 }
 
+// Recovery reads use null for unreachable evidence. Normalize only the
+// injected network call, never the surrounding storage/auth processing.
+export async function fetchOrNull<T>(
+  read: () => Promise<T | null>,
+): Promise<T | null> {
+  try {
+    return await read();
+  } catch {
+    return null;
+  }
+}
+
 // The bounds and identity the remote ingest needs (plan §2 row 3): the
 // [federation] missing-event leaves (existing config), the terminal rule
 // for events whose prevs stay missing (ungroundedmillihours, in ms; 0

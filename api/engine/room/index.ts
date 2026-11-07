@@ -139,6 +139,16 @@ export type Room = {
   tx<T>(fn: (room: RoomTx) => Promise<T>): Promise<T>;
 };
 
+// Initialization runs in one transaction in the store's unpublished file.
+// Only the receipt escapes; ordinary room handles open after publication.
+export function initializeRoom<T>(
+  store: Store,
+  roomId: string,
+  fn: (tx: RoomTx) => Promise<T>,
+): Promise<T> {
+  return store.initializeRoom(roomId, (db) => db.tx((conn) => fn(bind(conn))));
+}
+
 export async function openRoom(
   store: Store,
   roomId: string,
