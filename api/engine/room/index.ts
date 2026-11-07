@@ -58,6 +58,8 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       eventStateBefore: (event: string) => state.eventStateBefore(conn, event),
       eventStateAfter: (event: string) => state.eventStateAfter(conn, event),
       eventReadState: (event: string) => state.eventReadState(conn, event),
+      publishedGroupsAfter: (event: string) =>
+        state.publishedGroupsAfter(conn, event),
       publishedAt: (stay: number, pos: number) =>
         state.publishedAt(conn, stay, pos),
       current: (stay: number) => state.current(conn, stay),
