@@ -380,7 +380,7 @@ suite.test('presence joins fan out both ways; status/set_presence validation and
   await sync(b.access_token!, '&set_presence=unavailable');
   const got = await call(status(b.user_id), a.access_token!);
   assertEquals(got.body.presence, 'unavailable');
-  assertEquals(got.body.status_msg, undefined);
+  assertEquals(got.body.status_msg, 'ready');
   const before = await sync(a.access_token!);
   let done = false;
   const waiting = call(
@@ -399,6 +399,64 @@ suite.test('presence joins fan out both ways; status/set_presence validation and
   const result = await waiting;
   assert(performance.now() - start < 450);
   assert(presence(result.body).some((e) => e.sender === b.user_id));
+});
+
+suite.test('sync presence changes preserve status and identical concurrent syncs do not rewrite or wake peers', async () => {
+  const a = await suite.registerTestUser('ep-presence-stable-a', 'pw');
+  const b = await suite.registerTestUser('ep-presence-stable-b', 'pw');
+  await roomFor(a, b);
+  const path = '/_matrix/client/v3/presence/' + encodeURIComponent(a.user_id) +
+    '/status';
+  await call(path, a.access_token!, 'PUT', {
+    presence: 'online',
+    status_msg: 'ready',
+  });
+  await sync(b.access_token!, '&set_presence=online');
+  const original = await theApp().server.query(
+    'SELECT * FROM presence WHERE user_id=?',
+    [a.user_id],
+  );
+  await Promise.all(
+    Array.from(
+      { length: 4 },
+      () => sync(a.access_token!, '&set_presence=online'),
+    ),
+  );
+  assertEquals(
+    await theApp().server.query('SELECT * FROM presence WHERE user_id=?', [
+      a.user_id,
+    ]),
+    original,
+  );
+  const before = await sync(b.access_token!);
+  let finished = false;
+  const waiting = call(
+    '/_matrix/client/v3/sync?timeout=1000&set_presence=online&since=' +
+      before.next_batch,
+    b.access_token!,
+  ).then((r) => {
+    finished = true;
+    return r;
+  });
+  let stayedPending = false;
+  try {
+    await sync(a.access_token!, '&set_presence=online');
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    stayedPending = !finished;
+    await sync(a.access_token!, '&set_presence=unavailable');
+  } finally {
+    const changed = await waiting;
+    assertEquals(
+      stayedPending,
+      true,
+      'identical set_presence cannot wake a co-member',
+    );
+    const observed = ((changed.body.presence as Json).events as Json[]).find((
+      e,
+    ) => e.sender === a.user_id);
+    assertEquals((observed?.content as Json)?.presence, 'unavailable');
+    assertEquals((observed?.content as Json)?.status_msg, 'ready');
+  }
 });
 
 suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, never private or remote echoes', async () => {

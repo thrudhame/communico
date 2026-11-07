@@ -26,7 +26,7 @@ import {
   getPresence,
   onEphemeral,
   receiptsSince,
-  setPresence,
+  setPresenceValue,
   sharedUsers,
   streamMax,
 } from '#engine/server/ephemeral.ts';
@@ -297,7 +297,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const app = theApp();
   const lp = localpartOf(i.userId);
   if (i.setPresence !== undefined) {
-    await setPresence(app.server, i.userId, i.setPresence);
+    await setPresenceValue(app.server, i.userId, i.setPresence);
   }
   sweepTyping();
   await waitForRelevant(i);

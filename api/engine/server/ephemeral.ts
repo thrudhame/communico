@@ -70,19 +70,50 @@ export async function setPresence(
   statusMsg?: string,
   opts: { lastActiveAgo?: number; currentlyActive?: boolean } = {},
 ): Promise<void> {
+  await writePresence(server, userId, presence, statusMsg ?? null, opts, false);
+}
+
+// A presence-only intent preserves the separately owned status message and
+// does nothing when the value already matches, including concurrent callers.
+export async function setPresenceValue(
+  server: Db,
+  userId: string,
+  presence: string,
+): Promise<void> {
+  await writePresence(server, userId, presence, undefined, {}, true);
+}
+
+async function writePresence(
+  server: Db,
+  userId: string,
+  presence: string,
+  statusMsg: string | null | undefined,
+  opts: { lastActiveAgo?: number; currentlyActive?: boolean },
+  skipUnchanged: boolean,
+): Promise<void> {
   if (!['online', 'offline', 'unavailable'].includes(presence)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'bad presence: ' + presence);
   }
   const lastActiveMs = Date.now() - (opts.lastActiveAgo ?? 0);
   const row = await eventStreamTx(server, async (tx) => {
+    let status = statusMsg;
+    if (skipUnchanged) {
+      const current = (await tx.query(
+        'SELECT presence,status_msg FROM presence WHERE user_id=?',
+        [userId],
+      ))[0];
+      if (current?.presence === presence) return null;
+      status = current?.status_msg == null ? null : String(current.status_msg);
+    }
     const seq = await next(tx, 'presence');
     await tx.execute(
       `INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq) VALUES(?,?,?,?,?)
       ON CONFLICT(user_id) DO UPDATE SET presence=excluded.presence,status_msg=excluded.status_msg,last_active_ms=excluded.last_active_ms,seq=excluded.seq`,
-      [userId, presence, statusMsg ?? null, lastActiveMs, seq],
+      [userId, presence, status ?? null, lastActiveMs, seq],
     );
-    return { presence, statusMsg: statusMsg ?? null, lastActiveMs, seq };
+    return { presence, statusMsg: status ?? null, lastActiveMs, seq };
   });
+  if (row === null) return;
   notify(server, { kind: 'presence', userId, row });
 }
 export async function ensurePresenceRow(
