@@ -27,16 +27,22 @@ export async function listOperatorRooms(
   const result: OperatorRoom[] = [];
   for (const row of rows) {
     const roomId = String(row.room_id);
-    const room = await openRoom(app.store, roomId);
-    const info = await room.tx(async (tx) => {
-      const open = await tx.segments.openStay();
-      const latest = open ?? await tx.segments.latestStay();
-      if (latest === null) throw new Error(`room has no stay: ${roomId}`);
-      return {
-        room_version: await roomVersionOf(tx, latest.id),
-        current_stay: open === null ? null : open.id,
-      };
-    });
+    let info;
+    try {
+      const room = await openRoom(app.store, roomId);
+      info = await room.tx(async (tx) => {
+        const open = await tx.segments.openStay();
+        const latest = open ?? await tx.segments.latestStay();
+        if (latest === null) throw new Error(`room has no stay: ${roomId}`);
+        return {
+          room_version: await roomVersionOf(tx, latest.id),
+          current_stay: open === null ? null : open.id,
+        };
+      });
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) continue;
+      throw error;
+    }
     result.push({
       room_id: roomId,
       ...info,
