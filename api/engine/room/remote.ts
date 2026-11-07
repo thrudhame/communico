@@ -20,6 +20,8 @@ import { eventIdFor } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { StateMap } from '#engine/rulebook/index.ts';
 import {
+  authorizedBoundary,
+  checkDeclaredAuth,
   loadRulebookStore,
   roomVersionOf,
   ungroundedPrevs,
@@ -29,16 +31,9 @@ import { projectAfterWrite } from '#engine/room/hooks.ts';
 import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
+import { orderEvents } from '#engine/room/order.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { identify, verify } from '#engine/room/verify.ts';
-
-function byDepthThenId(
-  a: { eventId: string; pdu: Pdu },
-  b: { eventId: string; pdu: Pdu },
-): number {
-  if (a.pdu.depth !== b.pdu.depth) return a.pdu.depth - b.pdu.depth;
-  return a.eventId < b.eventId ? -1 : 1;
-}
 
 export type RemoteOutcomeKind =
   | 'accepted'
@@ -450,7 +445,6 @@ export async function ingestRemote(
       const merged = new Map<string, VerifiedItem>();
       for (const [id, item] of acc.live) merged.set(id, item);
       for (const item of items) merged.set(item.eventId, item);
-      const ordered = [...merged.values()].sort(byDepthThenId);
 
       // Evidence: verified fetched events, stored with grounding evidence
       // after their own auth check against their auth events (held +
@@ -460,65 +454,85 @@ export async function ingestRemote(
         ...acc.evidence,
         ...acc.corrupted,
       ]);
-      const held = await loadRulebookStore(tx, [
-        ...pack.keys(),
-        ...[...pack.values()].flatMap((pdu) => pdu.auth_events ?? []),
-      ]);
-      const store = {
-        get: (id: string) => pack.get(id) ?? held.get(id),
-        isRejected: (id: string) => held.isRejected(id),
-      };
-      for (const [id, pdu] of pack) {
-        if (merged.has(id)) continue; // fully ingested beats evidence
-        if ((await tx.events.get(id)) !== null) continue; // first-writer
-        const corrupted = acc.corrupted.has(id);
-        const chain = corrupted ? null : rulebook.checkAuthChain(pdu, store);
-        const rejected = corrupted || chain === null || !chain.ok;
-        await tx.events.insert(
-          id,
-          canonicalJson(pdu as unknown as Record<string, unknown>),
-        );
-        await tx.events.setStatus(id, {
-          standing: rejected ? 'rejected' : 'accepted',
-          grounding: 'evidence',
-          origin,
-          received_ts: Date.now(),
-        });
-        await tx.changes.append('event', id, {
-          standing: rejected ? 'rejected' : 'accepted',
-          reason: rejected && !corrupted ? 'auth' : null,
-          rule: corrupted
-            ? 'unverifiable'
-            : chain !== null && !chain.ok
-            ? chain.rule
-            : null,
-          type: String(pdu.type),
-          state_key: pdu.state_key ?? null,
-          sender: String(pdu.sender),
-          depth: pdu.depth,
-          origin_server_ts: pdu.origin_server_ts,
-          stay: null,
-          offset: null,
-          grounding: 'evidence',
-          origin,
-        });
+      const candidates = new Map<string, VerifiedItem>();
+      for (const [eventId, pdu] of pack) {
+        candidates.set(eventId, { eventId, pdu, index: -1, oversized: false });
       }
-
-      // Every event through the shared locked pipeline: auth events,
-      // state before (resolved from its prevs — or the imported boundary
-      // for a gap tip), current state → soft-fail; accepted ones update
-      // extremities, event-state refs, current state via materialize,
-      // the change log
+      for (const [id, item] of merged) candidates.set(id, item);
+      const ordered = orderEvents([...candidates.values()], [
+        'prev_events',
+        'auth_events',
+      ], (item) => [...(acc.boundaries.get(item.eventId)?.values() ?? [])]);
+      const localRejected = new Set<string>(candidates.keys());
+      const store = await loadRulebookStore(
+        tx,
+        [
+          ...pack.keys(),
+          ...[...pack.values()].flatMap((pdu) => pdu.auth_events ?? []),
+          ...[...acc.boundaries.values()].flatMap((map) => [...map.values()]),
+        ],
+        [...candidates.values()].map((item) => item.pdu),
+        localRejected,
+      );
       for (const item of ordered) {
+        const { eventId: id, pdu } = item;
+        localRejected.delete(id);
+        const boundary = acc.boundaries.get(id);
+        const needsBoundary = boundary !== undefined &&
+          (await ungroundedPrevs(tx, pdu.prev_events ?? [])).length > 0;
+        const invalidBoundary = needsBoundary &&
+          !authorizedBoundary(boundary, store);
+        if (!merged.has(id) || invalidBoundary) {
+          if ((await tx.events.get(id)) !== null) continue; // first-writer
+          const corrupted = acc.corrupted.has(id) || invalidBoundary;
+          const chain = corrupted
+            ? null
+            : checkDeclaredAuth(pdu, rulebook, store);
+          const rejected = corrupted || chain === null || !chain.ok;
+          if (rejected) localRejected.add(id);
+          await tx.events.insert(
+            id,
+            canonicalJson(pdu as unknown as Record<string, unknown>),
+          );
+          await tx.events.setStatus(id, {
+            standing: rejected ? 'rejected' : 'accepted',
+            grounding: 'evidence',
+            origin,
+            received_ts: Date.now(),
+          });
+          await tx.changes.append('event', id, {
+            standing: rejected ? 'rejected' : 'accepted',
+            reason: rejected && !corrupted ? 'auth' : null,
+            rule: corrupted
+              ? 'unverifiable'
+              : chain !== null && !chain.ok
+              ? chain.rule
+              : null,
+            type: String(pdu.type),
+            state_key: pdu.state_key ?? null,
+            sender: String(pdu.sender),
+            depth: pdu.depth,
+            origin_server_ts: pdu.origin_server_ts,
+            stay: null,
+            offset: null,
+            grounding: 'evidence',
+            origin,
+          });
+          if (!merged.has(id)) continue;
+        }
+        // Invalid imported state leaves the event as non-grounding evidence.
+        // The normal receipt path reports its stored rejection; children
+        // remain pending instead of inheriting that invalid state.
         const res = await ingestInTx(tx, room.id, item.pdu, {
           remote: {
             origin,
             self: deps.self,
             oversized: item.oversized,
             ungroundedMs: deps.ungroundedMs,
-            boundary: acc.boundaries.get(item.eventId),
+            boundary: invalidBoundary ? undefined : boundary,
           },
         });
+        if (res.standing === 'rejected') localRejected.add(id);
         if (res.grounding === 'grounded') grounded.push(item.eventId);
         const result = res.receipt
           ? outcomeOf(item.eventId, 'known')
