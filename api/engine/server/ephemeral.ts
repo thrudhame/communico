@@ -14,6 +14,7 @@ export type PresenceRow = {
 export type ReceiptRow = {
   userId: string;
   receiptType: 'm.read' | 'm.read.private';
+  threadId: string | null;
   eventId: string;
   ts: number;
   seq: number;
@@ -170,18 +171,26 @@ export async function setReceipt(
   opts: { ts?: number; threadId?: string | null } = {},
 ): Promise<boolean> {
   const ts = opts.ts ?? Date.now();
+  const threadId = opts.threadId ?? null;
+  if (threadId === '') {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'thread_id must be non-empty',
+    );
+  }
   const row = await eventStreamTx(server, async (tx) => {
     if (!await isJoined(tx, roomId, userId)) return null;
     const seq = await next(tx, 'receipts');
     await tx.execute(
-      `INSERT INTO receipts(room_id,user_id,receipt_type,event_id,ts_ms,seq) VALUES(?,?,?,?,?,?)
-      ON CONFLICT(room_id,user_id,receipt_type) DO UPDATE SET event_id=excluded.event_id,ts_ms=excluded.ts_ms,seq=excluded.seq`,
-      [roomId, userId, receiptType, eventId, ts, seq],
+      `INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_id,ts_ms,seq) VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_id=excluded.event_id,ts_ms=excluded.ts_ms,seq=excluded.seq`,
+      [roomId, userId, receiptType, threadId ?? '', eventId, ts, seq],
     );
-    return { userId, receiptType, eventId, ts, seq };
+    return { userId, receiptType, threadId, eventId, ts, seq };
   });
   if (row === null) return false;
-  // doltgres stored no per-thread receipt; private rows never federate.
+  // Private rows wake their owner, but federation only consumes public rows.
   notify(server, { kind: 'receipt', roomId, receiptType, row });
   return true;
 }
@@ -214,6 +223,7 @@ export async function receiptRows(
   return rows.map((r) => ({
     userId: String(r.user_id),
     receiptType: String(r.receipt_type) as ReceiptRow['receiptType'],
+    threadId: r.thread_id === '' ? null : String(r.thread_id),
     eventId: String(r.event_id),
     ts: Number(r.ts_ms),
     seq: Number(r.seq),
@@ -224,16 +234,28 @@ export async function receiptsSince(
   roomId: string,
   viewer: string,
   since: number,
-): Promise<Record<string, unknown> | null> {
+): Promise<Record<string, unknown>[]> {
   const rows = await receiptRows(server, roomId, since, viewer);
-  if (!rows.length) return null;
-  const content: Record<string, Record<string, Record<string, unknown>>> = {};
+  // Batch separately by thread: the wire map cannot hold both an unthreaded
+  // and a main receipt at the same event/type/user key in one event.
+  const threads = new Map<
+    string | null,
+    Record<string, Record<string, Record<string, unknown>>>
+  >();
   for (const row of rows) {
+    let content = threads.get(row.threadId);
+    if (content === undefined) {
+      content = {};
+      threads.set(row.threadId, content);
+    }
     content[row.eventId] ??= {};
     content[row.eventId][row.receiptType] ??= {};
-    content[row.eventId][row.receiptType][row.userId] = { ts: row.ts };
+    content[row.eventId][row.receiptType][row.userId] = {
+      ts: row.ts,
+      ...(row.threadId === null ? {} : { thread_id: row.threadId }),
+    };
   }
-  return content;
+  return [...threads.values()];
 }
 
 // One visibility predicate for payloads and long-poll relevance. The default

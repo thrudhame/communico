@@ -603,7 +603,25 @@ suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, 
               'm.read': {
                 [remoteUser]: {
                   event_ids: ['$remote-read'],
-                  data: { ts: 123 },
+                  data: { ts: 123, thread_id: '$remote-root' },
+                },
+              },
+            },
+          },
+        }, {
+          edu_type: 'm.receipt',
+          content: {
+            [fr.roomId]: {
+              'm.read': {
+                [remoteUser]: {
+                  event_ids: ['$remote-main'],
+                  data: { ts: 124, thread_id: 'main' },
+                },
+              },
+              'm.read.private': {
+                [remoteUser]: {
+                  event_ids: ['$remote-private'],
+                  data: { ts: 125 },
                 },
               },
             },
@@ -636,7 +654,23 @@ suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, 
       (((receiptEv.content as Json)[
         '$remote-read'
       ] as Json)['m.read'] as Json)[remoteUser],
-      { ts: 123 },
+      { ts: 123, thread_id: '$remote-root' },
+    );
+    const mainReceipt = ephemeral(inbound, fr.roomId).find((e) =>
+      e.type === 'm.receipt' &&
+      (e.content as Json)['$remote-main'] !== undefined
+    );
+    assert(mainReceipt !== undefined);
+    assertEquals(
+      (((mainReceipt.content as Json)['$remote-main'] as Json)[
+        'm.read'
+      ] as Json)[remoteUser],
+      { ts: 124, thread_id: 'main' },
+    );
+    assert(
+      !JSON.stringify(ephemeral(inbound, fr.roomId)).includes(
+        '$remote-private',
+      ),
     );
     assert(
       ((inbound.presence as Json).events as Json[]).some((e) =>
@@ -654,7 +688,52 @@ suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, 
       base + '/receipt/m.read/%24local-read',
       user.access_token!,
       'POST',
-      {},
+      { thread_id: 'main' },
+    );
+    const localRoot = await call(
+      base + '/send/m.room.message/edu-thread-root',
+      user.access_token!,
+      'PUT',
+      {
+        msgtype: 'm.text',
+        body: 'outbound thread root',
+      },
+    );
+    assertEquals(localRoot.status, 200);
+    const rootId = String(localRoot.body.event_id);
+    const localReply = await call(
+      base + '/send/m.room.message/edu-thread-reply',
+      user.access_token!,
+      'PUT',
+      {
+        msgtype: 'm.text',
+        body: 'outbound thread reply',
+        'm.relates_to': { rel_type: 'm.thread', event_id: rootId },
+      },
+    );
+    assertEquals(localReply.status, 200);
+    const replyId = String(localReply.body.event_id);
+    assertEquals(
+      (await call(
+        base + '/receipt/m.read/' + encodeURIComponent(replyId),
+        user.access_token!,
+        'POST',
+        {
+          thread_id: rootId,
+        },
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await call(
+        base + '/receipt/m.read.private/' + encodeURIComponent(replyId),
+        user.access_token!,
+        'POST',
+        {
+          thread_id: rootId,
+        },
+      )).status,
+      200,
     );
     await call(
       base + '/receipt/m.read.private/%24private',
@@ -670,11 +749,19 @@ suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, 
       { presence: 'online' },
     );
     const all = () => received.flatMap((r) => (r.edus ?? []) as Json[]);
+    const outboundMarks = () =>
+      all().filter((e) => e.edu_type === 'm.receipt').map((e) =>
+        ((((e.content as Json)[fr.roomId] as Json)?.['m.read'] as Json)
+          ?.[user.user_id]) as Json | undefined
+      ).filter((m): m is Json => m !== undefined);
     const deadline = Date.now() + 5000;
     while (
       !['m.typing', 'm.receipt', 'm.presence'].every((t) =>
         all().some((e) => e.edu_type === t)
-      )
+      ) || !outboundMarks().some((m) =>
+        (m.data as Json).thread_id === 'main'
+      ) ||
+      !outboundMarks().some((m) => (m.data as Json).thread_id === rootId)
     ) {
       assert(Date.now() < deadline, JSON.stringify(received));
       await new Promise((r) => setTimeout(r, 20));
@@ -684,6 +771,14 @@ suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, 
     assert(!wire.includes('$remote-read'));
     assert(!wire.includes(remoteUser));
     assert(wire.includes('$local-read'));
+    assert(wire.includes('"thread_id":"main"'));
+    assert(
+      outboundMarks().some((m) =>
+        (m.data as Json).thread_id === rootId &&
+        (m.event_ids as string[]).includes(replyId)
+      ),
+      'the TLS counterpart must receive the actual thread-root receipt metadata',
+    );
   } finally {
     await unwire();
     await sender.stop();

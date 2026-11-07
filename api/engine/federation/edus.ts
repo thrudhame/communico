@@ -3,7 +3,7 @@
 // OUTGOING: per-destination queues fed by the producers (typing today;
 // receipts/presence when stage 5 lands theirs) — LOCAL USERS ONLY (the
 // injected predicate) — coalesced per key: one typing state per
-// (room, user), the latest receipt per (room, user), the latest presence
+// (room, user), the latest receipt per (room, user, thread), the latest presence
 // per user. ≤ 100 ride one transaction; the rest wait for the next.
 // Unpersisted, stale in seconds; a restart loses them and that is
 // correct. The frozen-retry EDU cache lives in sender.ts. Per-instance
@@ -116,7 +116,7 @@ export function eduQueues(
       q = new Map();
       receiptQ.set(destination, q);
     }
-    const key = mark.roomId + '|' + mark.userId;
+    const key = JSON.stringify([mark.roomId, mark.userId, mark.threadId]);
     const seen = q.get(key);
     if (seen !== undefined && seen.seq > seq) return;
     q.set(key, { seq, mark });
@@ -141,8 +141,8 @@ export function eduQueues(
   }
 
   // Drain up to `limit` EDUs for a destination (the rest stay queued):
-  // typing as-is; receipts merged into ONE m.receipt (content keyed by
-  // room, m.receipt.yaml:36-87); presence merged into ONE m.presence
+  // typing as-is; receipts grouped by thread into m.receipt EDUs (content
+  // keyed by room/user cannot carry two threads at once); presence into ONE m.presence
   // push list (m.presence.yaml:33-71).
   function drain(destination: string, limit: number): Edu[] {
     const out: Edu[] = [];
@@ -157,12 +157,19 @@ export function eduQueues(
     }
     const rq = receiptQ.get(destination);
     if (rq !== undefined && out.length < limit) {
-      const byRoom = new Map<
+      type RoomReads = Map<
         string,
         Map<string, { event_ids: string[]; data: Record<string, unknown> }>
-      >();
+      >;
+      const byThread = new Map<string | null, RoomReads>();
       for (const [k, entry] of rq) {
         const mark = entry.mark;
+        let byRoom = byThread.get(mark.threadId);
+        if (byRoom === undefined) {
+          if (out.length + byThread.size >= limit) continue;
+          byRoom = new Map();
+          byThread.set(mark.threadId, byRoom);
+        }
         let room = byRoom.get(mark.roomId);
         if (room === undefined) {
           room = new Map();
@@ -177,7 +184,7 @@ export function eduQueues(
         rq.delete(k);
       }
       if (rq.size === 0) receiptQ.delete(destination);
-      if (byRoom.size > 0) {
+      for (const byRoom of byThread.values()) {
         const content: Record<string, unknown> = {};
         for (const [roomId, users] of byRoom) {
           content[roomId] = {
@@ -266,6 +273,7 @@ export function eduState(server: Db, self: string): EduState {
           ts?: unknown;
           thread_id?: unknown;
         };
+        if (data.thread_id === '') continue;
         await setReceipt(
           server,
           roomId,
@@ -353,7 +361,7 @@ export function eduState(server: Db, self: string): EduState {
         userId: row.userId,
         eventId: row.eventId,
         ts: row.ts,
-        threadId: null,
+        threadId: row.threadId,
       }));
     },
   };

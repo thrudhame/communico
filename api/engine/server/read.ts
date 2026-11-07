@@ -226,6 +226,31 @@ export async function threadRootsOf(db: Db, roomId: string) {
   }));
 }
 
+/** Receipt membership follows at most three relation hops. Roots themselves
+ * and non-thread relations to roots are on main; participation is separate. */
+export async function threadOfEvent(
+  db: Db,
+  roomId: string,
+  eventId: string,
+): Promise<string> {
+  const visited = new Set<string>();
+  let current = eventId;
+  for (let hops = 0; hops < 3 && !visited.has(current); hops++) {
+    visited.add(current);
+    const rows = await db.query(
+      `SELECT r.relates_to, r.rel_type FROM relations r
+       JOIN event_index p ON p.event=r.relates_to AND p.room=r.room
+       WHERE r.room=? AND r.event=?
+       AND NOT EXISTS (SELECT 1 FROM redactions WHERE target=r.event)`,
+      [roomId, current],
+    );
+    if (rows.length === 0) return 'main';
+    if (rows[0].rel_type === 'm.thread') return String(rows[0].relates_to);
+    current = String(rows[0].relates_to);
+  }
+  return 'main';
+}
+
 // --- search ----------------------------------------------------------------
 
 export const SEARCH_KEYS = ['content.body', 'content.name', 'content.topic'];

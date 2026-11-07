@@ -180,8 +180,8 @@ async function roomTimeline(
       i.userId,
       i.since?.rSeq ?? 0,
     );
-    if (receipts !== null) {
-      ephemeral.push({ type: 'm.receipt', content: receipts });
+    for (const content of receipts) {
+      ephemeral.push({ type: 'm.receipt', content });
     }
     entry.ephemeral = { events: ephemeral };
     const members = await app.server.query(
