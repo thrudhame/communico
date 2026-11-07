@@ -7,6 +7,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { transactionForEvent } from '#engine/tenant/txns.ts';
 import { redactionOf, relationsOf } from '#engine/server/read.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
+import { canSeeEvent } from './visibility.ts';
 
 export type Viewer = {
   userId: string;
@@ -16,6 +17,18 @@ export type Viewer = {
 };
 
 export async function renderEvent(
+  room: Room,
+  eventId: string,
+  viewer: Viewer,
+  opts?: { omitRoomId?: boolean; bundleThreads?: boolean },
+): Promise<Record<string, unknown> | null> {
+  if (!await canSeeEvent(viewer.userId, room, eventId)) return null;
+  return await renderStateEvent(room, eventId, viewer, opts);
+}
+
+// Published state snapshots have their own admission/cut contract, including
+// imported evidence. They share formatting, not timeline visibility.
+export async function renderStateEvent(
   room: Room,
   eventId: string,
   viewer?: Viewer,
@@ -99,8 +112,15 @@ export async function renderEvent(
     unsigned.redacted_because = redactedBecause;
   }
   event.unsigned = unsigned;
-  if (opts?.bundleThreads !== false) {
-    const children = await relationsOf(server, room.id, eventId, 'm.thread');
+  if (opts?.bundleThreads !== false && viewer !== undefined) {
+    const children = [];
+    for (
+      const child of await relationsOf(server, room.id, eventId, 'm.thread')
+    ) {
+      if (await canSeeEvent(viewer.userId, room, child.eventId)) {
+        children.push(child);
+      }
+    }
     if (children.length > 0) {
       const latest = await renderEvent(
         room,

@@ -1,7 +1,7 @@
 import { relationsPage } from '#engine/client/relations.ts';
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
-  _context: import('@pathfinder/pathfinder').Context,
+  context: import('@pathfinder/pathfinder').Context,
 ) {
   return await relationsPage(
     request.params.roomId as string,
@@ -15,5 +15,6 @@ export default async function (
       limit: request.query.get('limit'),
       from: request.query.get('from'),
     },
+    context.state.user as string,
   );
 }

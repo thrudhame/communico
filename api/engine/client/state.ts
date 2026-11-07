@@ -6,14 +6,14 @@ import {
   stateAtSeq,
   type StateRow,
 } from './room.ts';
-import { renderEvent } from './render.ts';
+import { renderStateEvent } from './render.ts';
 export { writeStateKey } from './write.ts';
 
 export async function clientEventsForRows(roomId: string, rows: StateRow[]) {
   const room = await requireRoom(roomId);
   const out: Record<string, unknown>[] = [];
   for (const row of rows) {
-    const ev = await renderEvent(room, row.eventId);
+    const ev = await renderStateEvent(room, row.eventId);
     if (ev !== null) out.push(ev);
   }
   return out;

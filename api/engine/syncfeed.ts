@@ -3,7 +3,7 @@
 // published state, never the last event's own DAG state.
 import { theApp } from '#engine/app.ts';
 import { heldRoom, stateAtSeq, type StateRow } from '#engine/client/read.ts';
-import { renderEvent } from '#engine/client/render.ts';
+import { renderEvent, renderStateEvent } from '#engine/client/render.ts';
 import { formatStreamToken, type StreamToken } from '#engine/client/tokens.ts';
 import type { Room } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -96,21 +96,10 @@ async function roomTimeline(
   const returned = trimmed ? filtered.slice(filtered.length - limit) : filtered;
   const events: Record<string, unknown>[] = [];
   for (const row of returned) {
-    const pduRow = await room.tx((tx) => tx.events.get(row.event));
-    if (pduRow === null) continue;
-    const pdu = JSON.parse(pduRow.pdu) as Pdu;
     const at = await stateAtSeq(room, row.seq, row.stay);
     const membership = at.find((s) =>
       s.type === 'm.room.member' && s.stateKey === i.userId
     )?.content.membership ?? 'leave';
-    const hv = at.find((s) =>
-      s.type === 'm.room.history_visibility'
-    )?.content.history_visibility ?? 'shared';
-    if (
-      !(pdu.type === 'm.room.member' && pdu.state_key === i.userId) &&
-      hv !== 'world_readable' && membership !== 'join' && hv !== 'shared' &&
-      !(hv === 'invited' && membership === 'invite')
-    ) continue;
     const event = await renderEvent(room, row.event, {
       userId: i.userId,
       deviceId: i.deviceId,
@@ -146,7 +135,7 @@ async function roomTimeline(
     );
   }
   for (const row of stateRows) {
-    const ev = await renderEvent(room, row.eventId, {
+    const ev = await renderStateEvent(room, row.eventId, {
       userId: i.userId,
       deviceId: i.deviceId,
       tenant: app.tenant,
