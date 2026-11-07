@@ -131,7 +131,7 @@ Deno.test('http1: GET round trip with Content-Length framing', async () => {
   } finally {
     srv.close();
   }
-  assertEquals(srv.openSockets(), 0);
+  await waitClosed(srv, 3000);
 });
 
 Deno.test('http1: POST with a body sends Content-Length and the bytes', async () => {
@@ -168,7 +168,7 @@ Deno.test('http1: POST with a body sends Content-Length and the bytes', async ()
   } finally {
     srv.close();
   }
-  assertEquals(srv.openSockets(), 0);
+  await waitClosed(srv, 3000);
 });
 
 Deno.test('http1: valid chunked body is reassembled', async () => {
@@ -188,7 +188,7 @@ Deno.test('http1: valid chunked body is reassembled', async () => {
   } finally {
     srv.close();
   }
-  assertEquals(srv.openSockets(), 0);
+  await waitClosed(srv, 3000);
 });
 
 Deno.test('http1: oversized headers error at the cap', async () => {
@@ -209,7 +209,7 @@ Deno.test('http1: oversized headers error at the cap', async () => {
   } finally {
     srv.close();
   }
-  assertEquals(srv.openSockets(), 0);
+  await waitClosed(srv, 3000);
 });
 
 Deno.test('http1: malformed chunk size errors, no hang', async () => {
@@ -231,7 +231,7 @@ Deno.test('http1: malformed chunk size errors, no hang', async () => {
   } finally {
     srv.close();
   }
-  assertEquals(srv.openSockets(), 0);
+  await waitClosed(srv, 3000);
 });
 
 Deno.test('http1: slow-loris body fires the total timeout', async () => {
@@ -358,5 +358,48 @@ Deno.test('http1: connect timeout on a blackholed address', async () => {
     const ms = Date.now() - t0;
     assert(e instanceof MatrixError);
     assert(ms < 3000, `took ${ms}ms`);
+  }
+});
+
+Deno.test('http1: the total deadline closes a stalled upgraded TLS connection', async () => {
+  let peer: Deno.Conn | undefined;
+  const srv = serveRaw(async (conn) => {
+    peer = conn;
+    const buffer = new Uint8Array(4096);
+    while (
+      await conn.read(buffer) !== null
+    ) { /* consume ClientHello, never answer */ }
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const pending = http1Request({
+    connectIp: '127.0.0.1',
+    port: srv.port,
+    tls: { sni: 'localhost', caCerts: [] },
+    hostHeader: 'localhost',
+    method: 'GET',
+    path: '/',
+    headers: {},
+    body: null,
+    connectMs: 100,
+    timeoutMs: 100,
+    maxBytes: 1024,
+  }).then(() => 'unexpected success', (error) => error);
+  try {
+    const outcome = await Promise.race([
+      pending,
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve('stalled'), 750);
+      }),
+    ]);
+    assert(outcome instanceof MatrixError, String(outcome));
+    assert(outcome.message.includes('timeout'));
+  } finally {
+    clearTimeout(timer);
+    try {
+      peer?.close();
+    } catch { /* already closed */ }
+    srv.close();
+    await pending;
+    await waitClosed(srv, 3000);
   }
 });

@@ -199,6 +199,13 @@ function powerFromAuthEvents(
     if (a.type === 'm.room.power_levels') plEvent = a;
     if (a.type === 'm.room.create') createEvent = a;
   }
+  if (spec.roomIdFromCreateEvent && event.room_id?.startsWith('!')) {
+    const createId = '$' + event.room_id.slice(1);
+    const create = store.get(createId);
+    if (create?.type === 'm.room.create' && !store.isRejected(createId)) {
+      createEvent = create;
+    }
+  }
   return userPowerLevel(event.sender, plEvent, createEvent, spec);
 }
 
@@ -361,6 +368,17 @@ export function iterativeAuthChecks(
       if (!ae || store.isRejected(a)) continue;
       const k = stateKeyOf(ae.type, ae.state_key ?? '');
       if (!checkState.has(k)) checkState.set(k, a);
+    }
+    if (spec.roomIdFromCreateEvent && ev.room_id?.startsWith('!')) {
+      const createId = '$' + ev.room_id.slice(1);
+      const create = store.get(createId);
+      const key = stateKeyOf('m.room.create', '');
+      if (
+        !checkState.has(key) && create?.type === 'm.room.create' &&
+        !store.isRejected(createId)
+      ) {
+        checkState.set(key, createId);
+      }
     }
     const verdict = checkAuthAgainstState(ev, checkState, store, spec);
     if (verdict.ok && ev.state_key !== undefined) {

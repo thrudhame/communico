@@ -90,10 +90,14 @@ export class Db {
     const existing = this.openFiles.get(path);
     if (existing) {
       const db = await existing;
+      if (db.closingTask !== undefined) {
+        await db.closingTask;
+        return await this.open(ffi, path, checkpointlogbytes);
+      }
       if (
-        db.ffi !== ffi || db.closing || db.gate.threshold !== checkpointlogbytes
+        db.ffi !== ffi || db.gate.threshold !== checkpointlogbytes
       ) {
-        throw new Error('database already owned by another library or closing');
+        throw new Error('database already owned by another library');
       }
       db.references++;
       return db;

@@ -111,3 +111,43 @@ Deno.test('store Db: transaction commit, rollback, released Conn and canonical o
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test('store Db: reopen waits for the closing canonical owner', async () => {
+  const dir = await Deno.makeTempDir();
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const db = await Db.open(ffi, dir + '/data.db', 4120000);
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>((resolve) => release = resolve);
+  const started = new Promise<void>((resolve) => entered = resolve);
+  const reading = db.tx(async (tx) => {
+    await tx.query('SELECT 1');
+    entered();
+    await held;
+  });
+  await started;
+  const closing = db.close();
+  const opening = Db.open(ffi, dir + '/./data.db', 4120000);
+  // Attach rejection handling immediately, before the closing owner drains.
+  const result = opening.then((value) => ({ value }), (error) => ({ error }));
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    release();
+    await reading;
+    await closing;
+    const reopened = await result;
+    if ('error' in reopened) throw reopened.error;
+    assert(reopened.value !== db, 'new owner after shutdown');
+    try {
+      assertEquals(await reopened.value.query('SELECT 1 AS n'), [{ n: 1 }]);
+    } finally {
+      await reopened.value.close();
+    }
+  } finally {
+    release();
+    await reading;
+    await closing;
+    ffi.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
