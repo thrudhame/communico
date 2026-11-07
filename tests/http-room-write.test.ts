@@ -37,6 +37,26 @@ const roomPath = (id: string) => 'rooms/' + encodeURIComponent(id);
 const state = (id: string, type: string, key = '') =>
   roomPath(id) + '/state/' + type + '/' + encodeURIComponent(key);
 
+test('createRoom: malformed and non-object bodies are refused before any room write', async () => {
+  const user = await registerTestUser('cr-bad-body', 'pw');
+  const before = await theApp().store.rooms();
+  for (const raw of ['{', 'null', '[]', '1', 'true', '"text"']) {
+    const response = await matrix(
+      new Request('http://x/_matrix/client/v3/createRoom', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + user.access_token },
+        body: raw,
+      }),
+    );
+    assertEquals(response.status, 400);
+    assertEquals(
+      (await response.json()).errcode,
+      raw === '{' ? 'M_NOT_JSON' : 'M_BAD_JSON',
+    );
+    assertEquals(await theApp().store.rooms(), before);
+  }
+});
+
 test('createRoom: presets, explicit default power levels, override merge and trusted invitees', async () => {
   const a = await registerTestUser('cr-preset', 'pw');
   const A = a.access_token;

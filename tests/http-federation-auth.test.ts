@@ -93,6 +93,15 @@ test('wrong destination refused, absent destination and signature spelling accep
   }
 });
 
+test('malformed signature bytes return 401 and do not mask a valid candidate', async () => {
+  const bad = `X-Matrix origin="${origin.name}",key="${origin.keyId}",sig="%"`;
+  assertEquals(await call(bad), { status: 401, code: 'M_UNAUTHORIZED' });
+  assertEquals(await call(bad + ',' + await header()), {
+    status: 404,
+    code: 'M_UNRECOGNIZED',
+  });
+});
+
 test('multiple candidates, unknown origin and exact raw URI', async () => {
   const bad = 'X-Matrix origin="localhost:1",key="ed25519:1",sig="AAAA"';
   assertEquals(await call(bad + ',' + await header()), {
