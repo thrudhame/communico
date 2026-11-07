@@ -461,15 +461,6 @@ export function startSender(deps: SenderDeps): Sender {
       //    backoff
       await sweepExpired(destination);
       if (stopped) return;
-      // intents: their own path, one attempt per wake
-      if (intentProvider !== null) {
-        const server = await serverP;
-        const job = await intentProvider(server, destination);
-        if (job !== null) {
-          await attemptIntent(destination, job);
-          continue;
-        }
-      }
       // 1. backoff skip (the peer ladder is the timing source)
       const server = await serverP;
       const status = await peerStatus(server, destination);
@@ -477,6 +468,14 @@ export function startSender(deps: SenderDeps): Sender {
       if (wait > 0) {
         await sleep(wait, destination);
         continue;
+      }
+      // Every delivery path uses the peer ladder, including retained intents.
+      if (intentProvider !== null) {
+        const job = await intentProvider(server, destination);
+        if (job !== null) {
+          await attemptIntent(destination, job);
+          continue;
+        }
       }
       // a block added later stops the loop; rows left in place for the
       // operator's prune
