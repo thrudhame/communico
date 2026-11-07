@@ -173,6 +173,7 @@ export type RegisterParams = {
   password: string;
   deviceId?: string;
   displayName?: string;
+  deviceDisplayName?: string;
   // Fixed token override (dev seeds). null = inhibit_login (no token).
   // undefined = mint a random token.
   accessToken?: string | null;
@@ -220,7 +221,11 @@ export async function registerUser(
     }
     await tx.users.insert(localpart, displayName);
     await tx.credentials.set(localpart, hashPassword(params.password));
-    await tx.devices.upsert(deviceId, localpart, displayName);
+    await tx.devices.upsert(
+      deviceId,
+      localpart,
+      params.deviceDisplayName ?? displayName,
+    );
     if (accessHash !== null) {
       await tx.tokens.insert(accessHash, localpart, deviceId, null);
     }
