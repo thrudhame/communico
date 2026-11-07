@@ -41,6 +41,7 @@ import { contentHashOf } from '#engine/signing-primitives.js';
 import {
   buildInTx,
   type BuildPartial,
+  checkDeclaredAuth,
   loadRulebookStore,
   resolvePrevs,
   roomVersionOf,
@@ -337,7 +338,7 @@ export async function ingestInTx(
   if (boundary !== undefined) {
     for (const id of boundary.values()) seeds.add(id);
   }
-  const store = await loadRulebookStore(tx, [...seeds]);
+  const store = await loadRulebookStore(tx, [...seeds], [pdu]);
 
   // The state before: the single prev's after-group aliased, the
   // resolution over all prevs — or the gap tip's imported boundary (the
@@ -349,8 +350,8 @@ export async function ingestInTx(
 
   // The S8 sequence: auth chain -> state -> soft-fail against the
   // current resolved state. For remote events the declared-set
-  // determinism check is relaxed (rules 1–2 only — our selection is
-  // still computed for local authoring) and verify()'s oversized verdict
+  // determinism check is relaxed (the declared set must authorize the event,
+  // but need not equal our local selection) and verify()'s oversized verdict
   // is a stored state-reject (never a drop).
   let standing: Standing = 'accepted';
   let reason: 'auth' | 'state' | null = null;
@@ -363,7 +364,7 @@ export async function ingestInTx(
     standing = 'rejected';
     reason = 'auth';
   } else {
-    const chain = rulebook.checkAuthChain(pdu, store);
+    const chain = checkDeclaredAuth(pdu, rulebook, store);
     const selected = remote !== null || isCreate
       ? null
       : rulebook.selectAuthEvents(pdu, before);
