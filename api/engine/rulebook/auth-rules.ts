@@ -187,7 +187,10 @@ function selectionPairs(pdu: Pdu, spec: RoomVersionSpec): Set<string> {
       }
     }
     const viaUser = pdu.content?.join_authorised_via_users_server;
-    if (typeof viaUser === 'string' && viaUser.length > 0) {
+    if (
+      membership === 'join' && spec.restrictedJoinRule &&
+      typeof viaUser === 'string' && viaUser.length > 0
+    ) {
       pairs.add(stateKeyOf('m.room.member', viaUser));
     }
   }
@@ -468,7 +471,10 @@ function rule4(
   // here we verify the event carries a signature entry for that server.
   // Full cross-server key verification is federation (M5).
   const viaUser = pdu.content?.join_authorised_via_users_server;
-  if (viaUser !== undefined && typeof viaUser === 'string') {
+  if (
+    spec.restrictedJoinRule && viaUser !== undefined &&
+    typeof viaUser === 'string'
+  ) {
     const viaDomain = domainOf(viaUser);
     const sigs = pdu.signatures ?? {};
     if (!(viaDomain in sigs)) {
@@ -533,6 +539,12 @@ function rule4(
         return reject(
           ruleId(spec, 'member.join_restricted_via'),
           'no join_authorised_via_users_server',
+        );
+      }
+      if (membershipOf(ctx, vu) !== 'join') {
+        return reject(
+          ruleId(spec, 'member.join_restricted_via'),
+          'authorising user is not joined',
         );
       }
       const vuLevel = userPowerLevel(vu, plEvent, createEvent, spec);
@@ -613,31 +625,12 @@ function rule4(
           'sender does not match the third_party_invite sender',
         );
       }
-      // 4.4.1.7: any signature in signed matching any public key of the
-      // third_party_invite event (public_key / public_keys) -> allow.
-      const sigValues: string[] = [];
-      const signed = t.signed as {
-        signatures?: Record<string, Record<string, string>>;
-      };
-      if (signed.signatures && typeof signed.signatures === 'object') {
-        for (const keys of Object.values(signed.signatures)) {
-          if (keys && typeof keys === 'object') {
-            for (const v of Object.values(keys)) {
-              if (typeof v === 'string') sigValues.push(v);
-            }
-          }
-        }
-      }
-      const publicKeys: string[] = [];
-      if (typeof tpiEvent.content?.public_key === 'string') {
-        publicKeys.push(tpiEvent.content.public_key);
-      }
-      if (Array.isArray(tpiEvent.content?.public_keys)) {
-        for (const k of tpiEvent.content.public_keys) {
-          if (typeof k === 'string') publicKeys.push(k);
-        }
-      }
-      if (sigValues.some((s) => publicKeys.includes(s))) {
+      // 4.4.1.7: the engine verified this member event's signed object
+      // against this exact state key event, before entering the pure rules.
+      if (
+        pdu.event_id !== undefined && tpiId !== undefined &&
+        ctx.store.thirdPartyInviteVerified?.(pdu.event_id, tpiId) === true
+      ) {
         return allow(ruleId(spec, 'member.invite_tpi_sig'));
       }
       // 4.4.1.8: otherwise, reject.
