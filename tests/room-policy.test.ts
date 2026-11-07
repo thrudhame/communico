@@ -86,7 +86,7 @@ Deno.test('policy: non-member write is state-rejected', async () => {
       origin_server_ts: 1000,
     }, g.signer);
     assertEquals(r.standing, 'rejected');
-    assertEquals(r.reason, 'state');
+    assertEquals(r.reason, 'auth');
     assert(r.rule !== null, 'a rule must be recorded');
     // in the DAG (stored, flagged) but never in the published state and
     // never an extremity

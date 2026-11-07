@@ -33,6 +33,7 @@ import { type Sender, startSender } from '#engine/federation/sender.ts';
 import { receiveTransaction } from '#engine/federation/transactions.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
+import { getRulebook } from '#engine/rulebook/index.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { openRoom, type Room, roomSchema } from '#engine/room/index.ts';
@@ -106,8 +107,8 @@ function remoteDepsOf(server: Db, signer: Signer, self: string): RemoteDeps {
 }
 
 // The resident's make_join/make_leave template over the room core (old
-// joins.ts's shape): the live extremities, depth past them, the create +
-// power levels (+ the subject's member event for a leave) as auth.
+// joins.ts's shape): live extremities, depth past them and the rulebook's
+// selected auth events, including the join rule and subject's invitation.
 async function membershipTemplate(
   room: Room,
   userId: string,
@@ -128,22 +129,15 @@ async function membershipTemplate(
       }
     }
     const group = await tx.state.current(stay.id);
-    const auth: string[] = [];
-    if (group !== null) {
-      for (
-        const [type, key] of [['m.room.create', ''], [
-          'm.room.power_levels',
-          '',
-        ]]
-      ) {
-        const id = await tx.state.groupKey(group, type, key);
-        if (id !== null) auth.push(id);
-      }
-      if (membership === 'leave') {
-        const own = await tx.state.groupKey(group, 'm.room.member', userId);
-        if (own !== null) auth.push(own);
-      }
-    }
+    const auth = getRulebook(version).selectAuthEvents(
+      {
+        type: 'm.room.member',
+        sender: userId,
+        state_key: userId,
+        content: { membership },
+      } as unknown as Pdu,
+      group === null ? new Map() : await tx.state.groupMap(group),
+    );
     return {
       room_version: version,
       event: {

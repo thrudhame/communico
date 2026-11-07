@@ -451,7 +451,7 @@ Deno.test('createRoom: a knock initial_state join_rule in a v6 room is legal sta
       origin_server_ts: 1000,
     }, signer);
     assertEquals(knock.standing, 'rejected');
-    assertEquals(knock.reason, 'state');
+    assertEquals(knock.reason, 'auth');
     assert(
       knock.rule !== null && knock.rule.includes('4.6'),
       knock.rule ?? '<no rule>',
