@@ -16,6 +16,7 @@
 // over; other 4xx abort (the old classification). Network never runs
 // under the lock (R13).
 import { canonicalJson } from '#engine/canonical.ts';
+import { withAuthProofs } from '#engine/auth-proofs.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import {
@@ -24,13 +25,14 @@ import {
   type Rulebook,
   supportedRoomVersions,
 } from '#engine/rulebook/index.ts';
-import { finalizeBuilt } from '#engine/room/build.ts';
+import { checkDeclaredAuth, finalizeBuilt } from '#engine/room/build.ts';
 import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
 import { projectAfterWrite, registerCreatedRoom } from '#engine/room/hooks.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import type { Signer } from '#engine/room/signer.ts';
+import { orderEvents } from '#engine/room/order.ts';
 import { mapEntries, type StateMap } from '#engine/room/state.ts';
 import { identify, oversizedOf, verify } from '#engine/room/verify.ts';
 import type { Store } from '#engine/store/index.ts';
@@ -215,18 +217,20 @@ async function joinVia(
     if (v === null) continue;
     if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
   }
-  // Per-event auth checks in (depth, id) order, regardless of the source
+  // Per-event auth checks in dependency order, regardless of the source
   // array: rejected evidence is stored but never imported as state.
-  const rejected = new Map<string, string>();
-  const packStore: EventStore = {
+  const rejected = new Map([...pack.keys()].map((id) => [id, 'unchecked']));
+  const packStore: EventStore = await withAuthProofs({
     get: (id) => pack.get(id),
     isRejected: (id) => rejected.has(id),
-  };
-  const ordered = [...pack.entries()].sort(([a, pa], [b, pb]) =>
-    pa.depth !== pb.depth ? pa.depth - pb.depth : a < b ? -1 : 1
-  );
+  }, pack.values());
+  const ordered = orderEvents(
+    [...pack].map(([eventId, pdu]) => ({ eventId, pdu })),
+    ['auth_events'],
+  ).map(({ eventId, pdu }) => [eventId, pdu] as const);
   for (const [id, eventPdu] of ordered) {
-    const chain = rulebook.checkAuthChain(eventPdu, packStore);
+    rejected.delete(id);
+    const chain = checkDeclaredAuth(eventPdu, rulebook, packStore);
     if (!chain.ok) {
       rejected.set(id, chain.rule);
     }
@@ -304,11 +308,11 @@ async function joinVia(
     throw badResponse('the returned join is not vouched by the resident');
   }
   // the join against the snapshot: its auth events and the state before
-  const joinStore: EventStore = {
+  const joinStore: EventStore = await withAuthProofs({
     get: (id) => id === eventId ? join : pack.get(id),
     isRejected: (id) => rejected.has(id),
-  };
-  const joinChain = rulebook.checkAuthChain(join, joinStore);
+  }, [...pack.values(), join]);
+  const joinChain = checkDeclaredAuth(join, rulebook, joinStore);
   if (!joinChain.ok) {
     throw badResponse(
       `the join is not authorized by its auth events (${joinChain.rule})`,

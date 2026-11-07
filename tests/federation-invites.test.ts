@@ -37,6 +37,7 @@ import {
 } from '#engine/signing-primitives.js';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { genesis } from './fixtures/genesis.ts';
+import { authAt } from './fixtures/auth.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -181,7 +182,12 @@ Deno.test('inviter: the /v2/invite shape, merged signatures, outbox to joined se
         state_key: `@rudy:${dest}`,
         content: { membership: 'join' },
         prev_events: [g.tipId],
-        auth_events: [g.createId],
+        auth_events: await authAt(g.room, {
+          type: 'm.room.member',
+          sender: `@rudy:${dest}`,
+          state_key: `@rudy:${dest}`,
+          content: { membership: 'join' },
+        }, g.tipId),
         origin_server_ts: 100,
       });
       const joined = await ingestRemote(g.room, [join], dest, {

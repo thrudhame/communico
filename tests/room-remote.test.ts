@@ -12,6 +12,7 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { genesis } from './fixtures/genesis.ts';
+import { authAt } from './fixtures/auth.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -84,7 +85,12 @@ async function remoteSetup(
     state_key: user,
     content: { membership: 'join' },
     prev_events: [g.tipId],
-    auth_events: [g.createId],
+    auth_events: await authAt(g.room, {
+      type: 'm.room.member',
+      sender: user,
+      state_key: user,
+      content: { membership: 'join' },
+    }, g.tipId),
     origin_server_ts: 100,
   });
   const outcomes = await ingestRemote(g.room, [join], server.name, deps);
@@ -116,7 +122,11 @@ async function remoteMsg(
     sender: opts.sender ?? s.user,
     content: { msgtype: 'm.text', body },
     prev_events: prevIds,
-    auth_events: opts.auth ?? [s.createId],
+    auth_events: opts.auth ?? await authAt(s.room, {
+      type: 'm.room.message',
+      sender: opts.sender ?? s.user,
+      content: { body },
+    }, s.joinId),
     depth: opts.depth,
     origin_server_ts: opts.ts,
   });
@@ -233,7 +243,7 @@ Deno.test('remote: a bad signature or wrong sender domain is refused before stor
   });
 });
 
-Deno.test('remote: claimed auth events that do not authorize are rejected; a non-member write is state-rejected', async () => {
+Deno.test('remote: claimed auth events and a non-member write are auth-rejected', async () => {
   await withStore(async (store) => {
     const s = await remoteSetup(store, { roomId: '!rem4:test' });
     // a held topic — a valid event, but (m.room.topic, '') is outside the
@@ -250,7 +260,7 @@ Deno.test('remote: claimed auth events that do not authorize are rejected; a non
       ts: 200,
       auth: [s.createId, topic.eventId],
     });
-    // a stranger (never joined) writes — rule 5 rejects against the state
+    // A stranger (never joined) fails rule 5 at the declared-auth check first.
     const stranger = await remoteMsg(s, 'not a member', [s.joinId], {
       ts: 201,
       sender: '@stranger:remote.test',
@@ -264,7 +274,7 @@ Deno.test('remote: claimed auth events that do not authorize are rejected; a non
     assertEquals(outcomes[0].outcome, 'rejected');
     assertEquals(outcomes[0].reason, 'auth');
     assertEquals(outcomes[1].outcome, 'rejected');
-    assertEquals(outcomes[1].reason, 'state');
+    assertEquals(outcomes[1].reason, 'auth');
     await s.room.tx(async (tx) => {
       // both stored (rejection is not a drop), never extremities
       const a = await tx.events.getStatus(String(oddAuth.event_id));
@@ -309,7 +319,7 @@ Deno.test('remote: passing the DAG state but not the current state soft-fails (s
   });
 });
 
-Deno.test('remote: relaxed depth and a consumed-prev fork are accepted; the declared auth set is rules 1–2 only', async () => {
+Deno.test('remote: relaxed depth and a consumed-prev fork are accepted with valid declared auth', async () => {
   await withStore(async (store) => {
     const s = await remoteSetup(store, { roomId: '!rem6:test' });
     // an event citing a CONSUMED prev (the join is no longer a frontier
@@ -513,7 +523,12 @@ Deno.test('remote: the fetch phase is revalidated under the lock (G8) — a mean
       state_key: user,
       content: { membership: 'join' },
       prev_events: [g.tipId],
-      auth_events: [g.createId],
+      auth_events: await authAt(g.room, {
+        type: 'm.room.member',
+        sender: user,
+        state_key: user,
+        content: { membership: 'join' },
+      }, g.tipId),
       origin_server_ts: 100,
     });
     // the missing event the pushed PDU waits for
@@ -522,7 +537,14 @@ Deno.test('remote: the fetch phase is revalidated under the lock (G8) — a mean
       sender: user,
       content: { msgtype: 'm.text', body: 'missing link' },
       prev_events: [String(join.event_id)],
-      auth_events: [g.createId],
+      auth_events: [
+        ...await authAt(g.room, {
+          type: 'm.room.message',
+          sender: user,
+          content: {},
+        }, g.tipId),
+        String(join.event_id),
+      ],
       depth: 51,
       origin_server_ts: 150,
     });
@@ -557,7 +579,11 @@ Deno.test('remote: the fetch phase is revalidated under the lock (G8) — a mean
       sender: user,
       content: { msgtype: 'm.text', body: 'pushed' },
       prev_events: [String(join.event_id), String(missing.event_id)],
-      auth_events: [g.createId],
+      auth_events: await authAt(g.room, {
+        type: 'm.room.message',
+        sender: user,
+        content: {},
+      }, String(join.event_id)),
       depth: 52,
       origin_server_ts: 170,
     });
@@ -589,7 +615,12 @@ Deno.test('remote: a throw mid-batch rolls the room file back (G11)', async () =
       state_key: user,
       content: { membership: 'join' },
       prev_events: [g.tipId],
-      auth_events: [g.createId],
+      auth_events: await authAt(g.room, {
+        type: 'm.room.member',
+        sender: user,
+        state_key: user,
+        content: { membership: 'join' },
+      }, g.tipId),
       origin_server_ts: 100,
     });
     const missing = await remoteEvent(g.roomId, server, '11', {
@@ -597,7 +628,14 @@ Deno.test('remote: a throw mid-batch rolls the room file back (G11)', async () =
       sender: user,
       content: { msgtype: 'm.text', body: 'fetched' },
       prev_events: [String(join.event_id)],
-      auth_events: [g.createId],
+      auth_events: [
+        ...await authAt(g.room, {
+          type: 'm.room.message',
+          sender: user,
+          content: {},
+        }, g.tipId),
+        String(join.event_id),
+      ],
       depth: 51,
       origin_server_ts: 150,
     });
@@ -630,7 +668,11 @@ Deno.test('remote: a throw mid-batch rolls the room file back (G11)', async () =
       sender: user,
       content: { msgtype: 'm.text', body: 'pushed' },
       prev_events: [String(join.event_id), String(missing.event_id)],
-      auth_events: [g.createId],
+      auth_events: await authAt(g.room, {
+        type: 'm.room.message',
+        sender: user,
+        content: {},
+      }, String(join.event_id)),
       depth: 52,
       origin_server_ts: 170,
     });

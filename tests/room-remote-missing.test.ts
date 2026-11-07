@@ -11,6 +11,8 @@ import { type Room, roomSchema } from '#engine/room/index.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { genesis } from './fixtures/genesis.ts';
+import { authAt } from './fixtures/auth.ts';
+import { testRemoteServer } from './fixtures/signer.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -72,7 +74,12 @@ async function setup(
     state_key: user,
     content: { membership: 'join' },
     prev_events: [g.tipId],
-    auth_events: [g.createId],
+    auth_events: await authAt(g.room, {
+      type: 'm.room.member',
+      sender: user,
+      state_key: user,
+      content: { membership: 'join' },
+    }, g.tipId),
     origin_server_ts: 100,
   });
   const joined = await ingestRemote(g.room, [join], server.name, deps);
@@ -91,7 +98,11 @@ async function msg(
     sender: s.user,
     content: { msgtype: 'm.text', body },
     prev_events: prevIds,
-    auth_events: [s.g.createId],
+    auth_events: await authAt(s.g.room, {
+      type: 'm.room.message',
+      sender: s.user,
+      content: {},
+    }, s.joinId),
     depth,
     origin_server_ts: 1000 + depth,
   });
@@ -119,7 +130,16 @@ Deno.test('missing: complete pushed batches need no recovery, including rejected
           ...(kind === 'rejected' ? { state_key: '' } : {}),
           content: kind === 'redaction' ? { redacts: '$unknown' } : {},
           prev_events: [s.joinId],
-          auth_events: [s.g.createId],
+          auth_events: await authAt(s.g.room, {
+            type: kind === 'rejected'
+              ? 'm.room.power_levels'
+              : kind === 'redaction'
+              ? 'm.room.redaction'
+              : 'm.room.message',
+            sender: s.user,
+            content: {},
+            ...(kind === 'rejected' ? { state_key: '' } : {}),
+          }, s.joinId),
           depth: 100,
           origin_server_ts: 200,
         });
@@ -331,19 +351,31 @@ Deno.test('missing: /state_ids + /event packs the gap tip with its fetched state
       state_key: '@zoe:remote.test',
       content: { membership: 'join' },
       prev_events: ['$zoe-parent-we-never-held'],
-      auth_events: [s.g.createId],
+      auth_events: await authAt(s.g.room, {
+        type: 'm.room.member',
+        sender: '@zoe:remote.test',
+        state_key: '@zoe:remote.test',
+        content: { membership: 'join' },
+      }, s.joinId),
       depth: 50,
       origin_server_ts: 150,
     });
     // the state at zoe: the room's full current state (held) plus a
     // topic we do NOT hold
-    const topic = await remoteEvent(s.g.roomId, s.server, '11', {
+    const localServer = await testRemoteServer();
+    s.deps.keys = fakeKeyResolver(s.server, localServer);
+    const topic = await remoteEvent(s.g.roomId, localServer, '11', {
       type: 'm.room.topic',
-      sender: '@zoe:remote.test',
+      sender: s.g.creator,
       state_key: '',
       content: { topic: 'on the wire' },
       prev_events: [s.joinId],
-      auth_events: [s.g.createId],
+      auth_events: await authAt(s.g.room, {
+        type: 'm.room.topic',
+        sender: s.g.creator,
+        state_key: '',
+        content: { topic: 'on the wire' },
+      }, s.joinId),
       depth: 49,
       origin_server_ts: 140,
     });
@@ -581,7 +613,11 @@ Deno.test('missing: a wait for an unknown redaction target is applied when the t
       sender: s.user,
       content: { redacts: String(target.event_id) },
       prev_events: [s.joinId],
-      auth_events: [s.g.createId],
+      auth_events: await authAt(s.g.room, {
+        type: 'm.room.redaction',
+        sender: s.user,
+        content: {},
+      }, s.joinId),
       depth: 51,
       origin_server_ts: 160,
     });

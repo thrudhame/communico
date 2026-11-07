@@ -31,6 +31,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { type Genesis, genesis } from './fixtures/genesis.ts';
+import { authAt } from './fixtures/auth.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -169,7 +170,12 @@ async function withSetup<T>(
     state_key: `@bob:${dest}`,
     content: { membership: 'join' },
     prev_events: [g.tipId],
-    auth_events: [g.createId],
+    auth_events: await authAt(g.room, {
+      type: 'm.room.member',
+      sender: `@bob:${dest}`,
+      state_key: `@bob:${dest}`,
+      content: { membership: 'join' },
+    }, g.tipId),
     origin_server_ts: 100,
   });
   const joined = await ingestRemote(g.room, [join], dest, {

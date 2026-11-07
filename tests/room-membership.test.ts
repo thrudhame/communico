@@ -106,7 +106,7 @@ Deno.test('A1b: PL {} self-demotion allowed; PL {users:{}} then rejected (rule 9
     assertEquals(demote.standing, 'accepted');
     const rejected = await pl(room, signer, creator, { users: {} });
     assertEquals(rejected.standing, 'rejected');
-    assertEquals(rejected.reason, 'state');
+    assertEquals(rejected.reason, 'auth');
   });
 });
 

@@ -14,6 +14,7 @@ import { installServerHooks } from '#engine/server/startup.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { assertAuthored } from './fixtures/authored.ts';
 import { genesis } from './fixtures/genesis.ts';
+import { authAt } from './fixtures/auth.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -130,7 +131,12 @@ Deno.test('origin: a received event without origin is stored and served unchange
       state_key: '@rudy:remote.test',
       content: { membership: 'join' },
       prev_events: [g.tipId],
-      auth_events: [g.createId],
+      auth_events: await authAt(g.room, {
+        type: 'm.room.member',
+        sender: '@rudy:remote.test',
+        state_key: '@rudy:remote.test',
+        content: { membership: 'join' },
+      }, g.tipId),
     });
     const expected = canonicalJson(received);
     assertEquals('origin' in received, false);

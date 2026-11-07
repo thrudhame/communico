@@ -12,6 +12,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { backfill } from '#engine/room/history.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { sendLocal } from '#engine/room/ingest.ts';
 import { joinRemote } from '#engine/room/join.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import type { Signer } from '#engine/room/signer.ts';
@@ -32,7 +33,8 @@ import {
   type RemoteServer,
   wireOf,
 } from './fixtures/remote.ts';
-import { type Genesis, genesis } from './fixtures/genesis.ts';
+import { type Genesis, genesis, PL_DEFAULTS } from './fixtures/genesis.ts';
+import { authAt } from './fixtures/auth.ts';
 import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import { makeDoc } from './federation/doc-helper.ts';
 import { fakeMessage, makeFakeRoom } from './fixtures/remote-room.ts';
@@ -235,7 +237,12 @@ async function boot(store: Store, opts: { roomId: string }): Promise<Boot> {
     state_key: rudy,
     content: { membership: 'join' },
     prev_events: [g.tipId],
-    auth_events: [g.createId],
+    auth_events: await authAt(g.room, {
+      type: 'm.room.member',
+      sender: rudy,
+      state_key: rudy,
+      content: { membership: 'join' },
+    }, g.tipId),
     origin_server_ts: 100,
   });
   const joined = await ingestRemote(g.room, [join], remote.name, deps);
@@ -263,7 +270,11 @@ async function msg(
     sender: b.rudy,
     content: { msgtype: 'm.text', body },
     prev_events: prevIds,
-    auth_events: [b.g.createId],
+    auth_events: await authAt(b.g.room, {
+      type: 'm.room.message',
+      sender: b.rudy,
+      content: {},
+    }, b.joinId),
     depth,
     origin_server_ts: 1000 + depth,
   });
@@ -356,6 +367,16 @@ Deno.test('fetcher: /state_ids + /event packs the gap tip over TLS (imported bou
     await withStore(async (store) => {
       const b = await boot(store, { roomId: '!ff3:test' });
       try {
+        const power = await sendLocal(b.g.room, {
+          type: 'm.room.power_levels',
+          sender: b.g.creator,
+          state_key: '',
+          content: {
+            ...PL_DEFAULTS(b.g.creator),
+            users: { [b.g.creator]: 100, [b.rudy]: 100 },
+          },
+        }, b.g.signer);
+        assertEquals(power.standing, 'accepted');
         // the gap tip: a member join for zoe, citing a genuinely absent
         // prev — its before-state can only be the remote's answer (G1)
         const zoeUser = '@zoe:' + b.remote.name;
@@ -365,20 +386,35 @@ Deno.test('fetcher: /state_ids + /event packs the gap tip over TLS (imported bou
           state_key: zoeUser,
           content: { membership: 'join' },
           prev_events: ['$zoe-parent-we-never-held'],
-          auth_events: [b.g.createId],
+          auth_events: await authAt(b.g.room, {
+            type: 'm.room.member',
+            sender: zoeUser,
+            state_key: zoeUser,
+            content: { membership: 'join' },
+          }, power.eventId),
           depth: 50,
           origin_server_ts: 150,
         });
-        const topic = await remoteEvent(b.g.roomId, b.remote, '11', {
-          type: 'm.room.topic',
-          sender: zoeUser,
-          state_key: '',
-          content: { topic: 'on the wire' },
-          prev_events: [b.joinId],
-          auth_events: [b.g.createId],
-          depth: 49,
-          origin_server_ts: 140,
-        });
+        const topic = await remoteEvent(
+          b.g.roomId,
+          b.remote,
+          '11',
+          {
+            type: 'm.room.topic',
+            sender: b.rudy,
+            state_key: '',
+            content: { topic: 'on the wire' },
+            prev_events: [power.eventId],
+            auth_events: await authAt(b.g.room, {
+              type: 'm.room.topic',
+              sender: b.rudy,
+              state_key: '',
+              content: {},
+            }, power.eventId),
+            depth: 49,
+            origin_server_ts: 140,
+          },
+        );
         const stateIds = await b.g.room.tx(async (tx) => {
           const stay = await tx.segments.openStay();
           const group = await tx.state.current(stay!.id);
