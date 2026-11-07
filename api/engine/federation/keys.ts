@@ -301,6 +301,7 @@ export function keyStore(
     name: string,
     minimumValidUntilTs: number,
     ctx?: { roomId?: string },
+    wantKeyId?: string,
   ): Promise<KeyDoc> {
     // rung 4: a key-is-name server IS its ed25519 key — nothing to fetch
     if (isKeyName(name)) {
@@ -316,6 +317,17 @@ export function keyStore(
     const until = failureMemory.get(name);
     if (until !== undefined && Date.now() < until) {
       throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
+    }
+    // Check each caller's demand before coalescing. Only actual refreshes
+    // enter inFlight: a generic cached answer cannot satisfy a rotated-key
+    // caller merely because both requests concern the same server.
+    const row = await readDocRow(name);
+    if (row !== null) {
+      const cached = JSON.parse(row.key_json) as KeyDoc;
+      const hasKey = wantKeyId === undefined ||
+        Object.hasOwn(cached.verify_keys, wantKeyId) ||
+        Object.hasOwn(cached.old_verify_keys, wantKeyId);
+      if (hasKey && cached.valid_until_ts >= minimumValidUntilTs) return cached;
     }
     const existing = inFlight.get(name);
     if (existing !== undefined) return await existing;
@@ -334,13 +346,6 @@ export function keyStore(
     ctx?: { roomId?: string },
   ): Promise<KeyDoc> {
     try {
-      // cache: a stored document that still serves the caller's horizon
-      const row = await readDocRow(name);
-      if (row !== null) {
-        const cached = JSON.parse(row.key_json) as KeyDoc;
-        if (cached.valid_until_ts >= minimumValidUntilTs) return cached;
-      }
-
       let candidate: { doc: KeyDoc; via: string } | null = null;
 
       // witnesses first — a single usable answer is single-source trust
@@ -527,7 +532,7 @@ export function keyStore(
       purpose,
     );
     if (hit !== null) return hit;
-    await acquireKeyDoc(name, minimumValidUntilTs, ctx);
+    await acquireKeyDoc(name, minimumValidUntilTs, ctx, keyId);
     const again = await cachedVerifyKey(
       name,
       keyId,
@@ -535,6 +540,13 @@ export function keyStore(
       purpose,
     );
     if (again !== null) return again;
+    // A valid answer without the demanded key is still a failed lookup.
+    // Remember it per server so varying random key ids cannot force dials.
+    // Known cached keys above remain usable during this negative window.
+    failureMemory.set(
+      name,
+      Date.now() + config().federation.keyfailminutes * 60_000,
+    );
     throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
   }
 
