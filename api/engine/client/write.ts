@@ -81,7 +81,11 @@ export async function sendEvent(
       origin_server_ts: Date.now(),
     },
     app.tenant.signer(),
-    transactionSubmission(app.tenant, deviceId, roomId, txnId),
+    transactionSubmission(app.tenant, deviceId, {
+      kind: 'send',
+      roomId,
+      eventType: type,
+    }, txnId),
   );
   if (res.standing === 'rejected') {
     throw new MatrixError(
@@ -166,7 +170,11 @@ export async function redactEvent(
     target,
     app.tenant.signer(),
     reason,
-    transactionSubmission(app.tenant, deviceId, roomId, txnId),
+    transactionSubmission(app.tenant, deviceId, {
+      kind: 'redact',
+      roomId,
+      eventId: target,
+    }, txnId),
   );
   return res;
 }

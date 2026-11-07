@@ -1,4 +1,4 @@
-// api/engine/tenant/schema.ts - tenant schema v2 (design row 1, D3.2): the
+// api/engine/tenant/schema.ts - tenant schema v3 (design row 1, D3.2): the
 // tenant file's tables, re-expressed for SQLite/Turso from
 // doltgres:db/tenant/schema.sql — identity and signing keys, users and
 // credentials, devices, access/refresh tokens (stored hashed, not plain),
@@ -144,17 +144,19 @@ CREATE TABLE filters(
 
 CREATE TABLE transactions(
   device_id TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
   room_id TEXT NOT NULL,
   txn_id TEXT NOT NULL,
   event_id TEXT NOT NULL,
   pending_pdu TEXT,
   completed INTEGER NOT NULL DEFAULT 1,
-  PRIMARY KEY(device_id, room_id, txn_id)
+  PRIMARY KEY(device_id, endpoint, txn_id)
 );
+CREATE INDEX transactions_event ON transactions(device_id, room_id, event_id);
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 2,
+  version: 3,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
   },

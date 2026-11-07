@@ -365,3 +365,78 @@ test('txn: repeat/content/token/device/room scope; redaction receipt and read-ti
     first.body,
   );
 });
+
+test('txn: endpoint identity includes send type, operation and redaction target', async () => {
+  const user = await registerTestUser('txn-path', 'pw');
+  const token = user.access_token;
+  const id = await create(token);
+  const base = roomPath(id);
+  const message = await call(base + '/send/m.room.message/shared', token, {
+    msgtype: 'm.text',
+    body: 'target one',
+  });
+  assertEquals(message.status, 200);
+  const other = await call(base + '/send/com.example.custom/shared', token, {
+    body: 'target two',
+  });
+  assertEquals(other.status, 200);
+  assertNotEquals(other.body.event_id, message.body.event_id);
+  const targets = [message.body.event_id, other.body.event_id];
+  const redactions: string[] = [];
+  for (const target of targets) {
+    const path = base + '/redact/' + encodeURIComponent(String(target)) +
+      '/shared';
+    const result = await call(path, token, {});
+    assertEquals(result.status, 200);
+    assert(!targets.includes(result.body.event_id));
+    assertEquals(
+      (await call(path, token, { reason: 'retry' })).body,
+      result.body,
+    );
+    redactions.push(String(result.body.event_id));
+    const event = await call(
+      base + '/event/' + encodeURIComponent(String(target)),
+      token,
+    );
+    assertEquals(event.body.content, {});
+    assertEquals(
+      ((event.body.unsigned as Json).redacted_because as Json).event_id,
+      result.body.event_id,
+    );
+  }
+  assertNotEquals(redactions[0], redactions[1]);
+  assertEquals(
+    (await call(base + '/send/com.example.custom/shared', token, {
+      body: 'retry',
+    })).body,
+    other.body,
+  );
+});
+
+test('txn: concurrent retransmissions publish exactly one event', async () => {
+  const user = await registerTestUser('txn-concurrent', 'pw');
+  const id = await create(user.access_token);
+  const base = roomPath(id);
+  const results = await Promise.all(
+    Array.from(
+      { length: 8 },
+      () =>
+        call(base + '/send/m.room.message/concurrent', user.access_token, {
+          msgtype: 'm.text',
+          body: 'one transaction',
+        }),
+    ),
+  );
+  assert(results.every((r) => r.status === 200));
+  assertEquals(new Set(results.map((r) => r.body.event_id)).size, 1);
+  const messages = await call(
+    base + '/messages?dir=b&limit=100',
+    user.access_token,
+  );
+  assertEquals(
+    (messages.body.chunk as Json[]).filter((e) =>
+      (e.content as Json).body === 'one transaction'
+    ).length,
+    1,
+  );
+});

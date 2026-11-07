@@ -289,28 +289,45 @@ function bind(conn: Conn, changed: () => void = () => {}) {
         media.markMediaUploaded(conn, mediaId, meta),
     },
     txns: {
-      submission: (deviceId: string, roomId: string, txnId: string) =>
-        txns.submissionById(conn, deviceId, roomId, txnId),
-      prepare: (deviceId: string, roomId: string, txnId: string, pdu: Pdu) =>
-        txns.prepareSubmission(conn, deviceId, roomId, txnId, pdu),
+      submission: (
+        deviceId: string,
+        endpoint: txns.TransactionEndpoint,
+        txnId: string,
+      ) => txns.submissionById(conn, deviceId, endpoint, txnId),
+      prepare: (
+        deviceId: string,
+        endpoint: txns.TransactionEndpoint,
+        txnId: string,
+        pdu: Pdu,
+      ) => txns.prepareSubmission(conn, deviceId, endpoint, txnId, pdu),
       finish: (
         deviceId: string,
-        roomId: string,
+        endpoint: txns.TransactionEndpoint,
         txnId: string,
         eventId: string,
         accepted: boolean,
       ) =>
-        txns.finishSubmission(conn, deviceId, roomId, txnId, eventId, accepted),
+        txns.finishSubmission(
+          conn,
+          deviceId,
+          endpoint,
+          txnId,
+          eventId,
+          accepted,
+        ),
       forEvent: (deviceId: string, roomId: string, eventId: string) =>
         txns.transactionIdForEvent(conn, deviceId, roomId, eventId),
-      lookup: (deviceId: string, roomId: string, txnId: string) =>
-        txns.transactionById(conn, deviceId, roomId, txnId),
+      lookup: (
+        deviceId: string,
+        endpoint: txns.TransactionEndpoint,
+        txnId: string,
+      ) => txns.transactionById(conn, deviceId, endpoint, txnId),
       record: (
         deviceId: string,
-        roomId: string,
+        endpoint: txns.TransactionEndpoint,
         txnId: string,
         eventId: string,
-      ) => txns.insertTransaction(conn, deviceId, roomId, txnId, eventId),
+      ) => txns.insertTransaction(conn, deviceId, endpoint, txnId, eventId),
     },
   };
 }
