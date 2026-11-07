@@ -1,16 +1,28 @@
 # communico
 
-A Matrix homeserver rebuilding its core on Turso.
+A Matrix homeserver with a Turso event-store core, Matrix client-server and
+server-server APIs, and a private local admin API.
+
+See [HOW-IT-WORKS.md](HOW-IT-WORKS.md) for the current architecture.
 
 The running server owns its Turso store. Start it with `deno task start` after
 building the native library in the project test environment.
 
-The former Doltgres implementation and its integration tests remain on
-`doltgres` at `2d3944abaed7571fd8fe24a532860bd134a46d15`.
+The former Doltgres implementation is preserved on `doltgres` at
+`2d3944abaed7571fd8fe24a532860bd134a46d15`. Current integration tests live on
+this branch under `tests/`.
+
+Browser homeserver/native sync, home/VPS sync, store-image adoption, announce
+digests and WebRTC/WebTransport are parked; Model B is a future expansion.
+Parking does not change the browser's first-class homeserver expectation or
+choose its storage engine. E2EE is core product scope: its server APIs and
+room-encryption controls are being designed, not implemented in this snapshot.
+The old browser demo's E2EE exclusion was scoped to that demo.
 
 ## Checks
 
-Run inside the authorized project test VM:
+Run inside the named, authorized project test VM or dedicated project LXC on
+agora specified by the execution plan:
 
 - `deno task check`
 - `deno task test`
@@ -20,9 +32,12 @@ Configuration uses `defaults/communico.toml`, an optional
 `config/communico.toml` overlay and `COMMUNICO_*` environment overrides.
 `deno task config` prints the merged settings; it does not initialize storage.
 
-The Complement runner, blacklist and historical baseline are retained for
-restoration. Its runtime image and continuity query helpers must be rebuilt
-before the harness can run on this branch.
+The Turso Complement runtime image, runner and HTTP-only continuity helper are
+restored. [complement/BASELINE.md](complement/BASELINE.md) records the
+2026-11-06 PST run: 59 failing tests (including parent/subtest entries), with
+`TestUnrejectRejectedEvents` passing in its configured settings run. This is
+recorded evidence, not an all-green conformance claim. Exclusion rationales
+remain in [complement/blacklist.md](complement/blacklist.md).
 
 ## Operator tools
 
