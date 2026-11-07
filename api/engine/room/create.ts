@@ -2,17 +2,19 @@
 // sequence in the spec's order (create_room.yaml at v1.16): create,
 // creator join, power levels, canonical alias, preset join rules /
 // history_visibility (guest_access is never preset-emitted), initial_state,
-// name, topic, invites — each through the local ingest, one room
-// transaction per event. The content rules are ported from the old
+// name, topic, invites - one initialization transaction in an unpublished
+// file. The content rules are ported from the old
 // createRoom; its storage side effects are not (alias/visibility rows
 // belong to the server file — stage 4; remote invitee transport is the
 // caller's work, 3c).
 import { MatrixError } from '#engine/matrix-error.ts';
+import { assertCanonicalNumbers } from '#engine/canonical.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { validAdditionalCreators } from '#engine/rulebook/auth-rules.ts';
-import { buildCreate } from '#engine/room/build.ts';
-import { openRoom } from '#engine/room/index.ts';
-import { ingestInTx, sendLocal } from '#engine/room/ingest.ts';
+import { parsePowerLevels } from '#engine/rulebook/power-levels.ts';
+import { buildCreate, buildInTx } from '#engine/room/build.ts';
+import { initializeRoom, openRoom } from '#engine/room/index.ts';
+import { ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Store } from '#engine/store/index.ts';
@@ -73,6 +75,34 @@ export async function createRoom(
   signer: Signer,
 ): Promise<CreateRoomResult> {
   const creator = opts.creator;
+  const object = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (typeof creator !== 'string' || !USER_ID_RE.test(creator)) {
+    throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid creator');
+  }
+  for (
+    const value of [opts.creation_content, opts.power_level_content_override]
+  ) {
+    if (value !== undefined && !object(value)) {
+      throw new MatrixError(
+        400,
+        'M_BAD_JSON',
+        'creation content and power levels must be objects',
+      );
+    }
+  }
+  for (const value of [opts.name, opts.topic, opts.alias]) {
+    if (value !== undefined && typeof value !== 'string') {
+      throw new MatrixError(
+        400,
+        'M_BAD_JSON',
+        'name, topic and alias must be strings',
+      );
+    }
+  }
+  if (opts.is_direct !== undefined && typeof opts.is_direct !== 'boolean') {
+    throw new MatrixError(400, 'M_BAD_JSON', 'is_direct must be a boolean');
+  }
   const version = opts.version ?? '11';
   if (typeof version !== 'string') {
     throw new MatrixError(400, 'M_BAD_JSON', 'room_version must be a string');
@@ -96,12 +126,18 @@ export async function createRoom(
     throw new MatrixError(400, 'M_INVALID_PARAM', 'unknown preset: ' + preset);
   }
   const invite = opts.invite ?? [];
+  if (!Array.isArray(invite)) {
+    throw new MatrixError(400, 'M_BAD_JSON', 'invite must be an array');
+  }
   for (const u of invite) {
-    if (!USER_ID_RE.test(u)) {
+    if (typeof u !== 'string' || !USER_ID_RE.test(u)) {
       throw new MatrixError(400, 'M_INVALID_PARAM', 'not a user id: ' + u);
     }
   }
   const initialState = opts.initial_state ?? [];
+  if (!Array.isArray(initialState)) {
+    throw new MatrixError(400, 'M_BAD_JSON', 'initial_state must be an array');
+  }
   for (const e of initialState) {
     if (
       typeof e?.type !== 'string' ||
@@ -170,6 +206,35 @@ export async function createRoom(
     }
   }
 
+  let pl: Record<string, unknown> = {
+    ban: 50,
+    events: spec.creatorsHaveInfinitePower ? { 'm.room.tombstone': 150 } : {},
+    events_default: 0,
+    invite: 0,
+    kick: 50,
+    redact: 50,
+    state_default: 50,
+    users: spec.creatorsHaveInfinitePower ? {} : { [creator]: 100 },
+    users_default: 0,
+    notifications: { room: 50 },
+  };
+  if (opts.power_level_content_override !== undefined) {
+    pl = deepMerge(pl, opts.power_level_content_override);
+  }
+  if (preset === 'trusted_private_chat' && !spec.creatorsHaveInfinitePower) {
+    const users = { ...(pl.users as Record<string, unknown>) };
+    for (const u of invite) users[u] = 100;
+    pl.users = users;
+  }
+  if (spec.strictCanonicalJson) {
+    assertCanonicalNumbers(pl);
+    assertCanonicalNumbers(opts.creation_content);
+    for (const e of initialState) assertCanonicalNumbers(e.content);
+  }
+  if (!parsePowerLevels(pl, spec).ok) {
+    throw new MatrixError(400, 'M_BAD_JSON', 'invalid power levels');
+  }
+
   const createContent: Record<string, unknown> = {
     ...(opts.creation_content ?? {}),
   };
@@ -226,126 +291,112 @@ export async function createRoom(
     );
   }
 
-  const room = await openRoom(store, finalRoomId, { create: true });
-  const send = async (
-    type: string,
-    stateKey: string,
-    content: Record<string, unknown>,
-  ): Promise<string> => {
-    const res = await sendLocal(room, {
-      type,
-      sender: creator,
-      state_key: stateKey,
-      content,
-      origin_server_ts: Date.now(),
-    }, signer);
-    if (res.standing === 'rejected') {
-      throw new Error(
-        `E_CREATE_ROOM_REJECT: ${res.reason}${
-          res.rule === null ? '' : ' (rule ' + res.rule + ')'
-        }`,
-      );
-    }
-    return res.eventId;
-  };
-
-  // 1. m.room.create — with the stay, in its one room transaction.
-  const createEventId = await withRoomLock(
+  return await withRoomLock(
     finalRoomId,
     () =>
-      room.tx(async (tx) => {
+      initializeRoom(store, finalRoomId, async (tx) => {
+        const send = async (
+          type: string,
+          stateKey: string,
+          content: Record<string, unknown>,
+        ): Promise<string> => {
+          const pdu = await buildInTx(tx, finalRoomId, {
+            type,
+            sender: creator,
+            state_key: stateKey,
+            content,
+            origin_server_ts: Date.now(),
+          }, signer);
+          const res = await ingestInTx(tx, finalRoomId, pdu);
+          if (res.standing !== 'accepted') {
+            throw new Error(
+              `E_CREATE_ROOM_REJECT: ${res.reason}${
+                res.rule === null ? '' : ' (rule ' + res.rule + ')'
+              }`,
+            );
+          }
+          return res.eventId;
+        };
+
+        // 1. m.room.create - with the stay and every later initial event.
         const empty = await tx.materialize.newGroup(null, []);
         await tx.segments.create({ kind: 'stay', opening_group: empty });
         const res = await ingestInTx(tx, finalRoomId, createPdu);
         if (res.standing !== 'accepted') {
           throw new Error('E_CREATE_ROOM_REJECT: create ' + res.reason);
         }
-        return res.eventId;
+        const createEventId = res.eventId;
+
+        // 2. the creator's join
+        const memberEventId = await send('m.room.member', creator, {
+          membership: 'join',
+        });
+
+        // 3. m.room.power_levels — spec defaults (every key explicit), the
+        //    override deep-merged on top; trusted_private_chat PL-100s the
+        //    invitees (≤11 — for v12 they are additional_creators, rule 10.4)
+        await send('m.room.power_levels', '', pl);
+
+        // 4. the canonical alias (create_room.yaml's order — before the presets)
+        if (alias !== undefined) {
+          await send('m.room.canonical_alias', '', { alias });
+        }
+
+        // 5. the preset events (guest_access is never preset-emitted — the
+        //    table's column is the default)
+        const presetEvents: [string, Record<string, unknown>][] =
+          preset === 'public_chat'
+            ? [
+              ['m.room.join_rules', { join_rule: 'public' }],
+              ['m.room.history_visibility', { history_visibility: 'shared' }],
+            ]
+            : [
+              ['m.room.join_rules', { join_rule: 'invite' }],
+              ['m.room.history_visibility', { history_visibility: 'shared' }],
+            ];
+        for (const [type, content] of presetEvents) {
+          await send(type, '', content);
+        }
+
+        // 6. initial_state, in order (content verbatim; state_key default '')
+        for (const e of initialState) {
+          await send(
+            e.type,
+            e.state_key ?? '',
+            e.content as Record<string, unknown>,
+          );
+        }
+
+        // 7. name / topic — AFTER initial_state, so they override it. The topic
+        //    is the rich v1.15+ form (m.room.topic.yaml: m.topic.m.text[0].body)
+        if (opts.name !== undefined) {
+          await send('m.room.name', '', { name: opts.name });
+        }
+        if (opts.topic !== undefined) {
+          await send('m.room.topic', '', {
+            topic: opts.topic,
+            'm.topic': { 'm.text': [{ body: opts.topic }] },
+          });
+        }
+
+        // 8. invites (sender: the creator); is_direct rides along when set.
+        //    LOCAL invitees only — remote invitee transport is the caller's work.
+        for (const u of invite) {
+          if (u.indexOf(':', 1) >= 0 && !u.endsWith(':' + signer.serverName)) {
+            continue;
+          }
+          await send('m.room.member', u, {
+            membership: 'invite',
+            ...(opts.is_direct === true ? { is_direct: true } : {}),
+          });
+        }
+
+        return {
+          roomId: finalRoomId,
+          createEventId,
+          memberEventId,
+          roomAlias: alias,
+        };
       }),
   );
-
-  // 2. the creator's join
-  const memberEventId = await send('m.room.member', creator, {
-    membership: 'join',
-  });
-
-  // 3. m.room.power_levels — spec defaults (every key explicit), the
-  //    override deep-merged on top; trusted_private_chat PL-100s the
-  //    invitees (≤11 — for v12 they are additional_creators, rule 10.4)
-  let pl: Record<string, unknown> = {
-    ban: 50,
-    events: spec.creatorsHaveInfinitePower ? { 'm.room.tombstone': 150 } : {},
-    events_default: 0,
-    invite: 0,
-    kick: 50,
-    redact: 50,
-    state_default: 50,
-    users: spec.creatorsHaveInfinitePower ? {} : { [creator]: 100 },
-    users_default: 0,
-    notifications: { room: 50 },
-  };
-  if (opts.power_level_content_override !== undefined) {
-    pl = deepMerge(pl, opts.power_level_content_override);
-  }
-  if (preset === 'trusted_private_chat' && !spec.creatorsHaveInfinitePower) {
-    const users = { ...(pl.users as Record<string, unknown>) };
-    for (const u of invite) users[u] = 100;
-    pl.users = users;
-  }
-  await send('m.room.power_levels', '', pl);
-
-  // 4. the canonical alias (create_room.yaml's order — before the presets)
-  if (alias !== undefined) {
-    await send('m.room.canonical_alias', '', { alias });
-  }
-
-  // 5. the preset events (guest_access is never preset-emitted — the
-  //    table's column is the default)
-  const presetEvents: [string, Record<string, unknown>][] =
-    preset === 'public_chat'
-      ? [
-        ['m.room.join_rules', { join_rule: 'public' }],
-        ['m.room.history_visibility', { history_visibility: 'shared' }],
-      ]
-      : [
-        ['m.room.join_rules', { join_rule: 'invite' }],
-        ['m.room.history_visibility', { history_visibility: 'shared' }],
-      ];
-  for (const [type, content] of presetEvents) await send(type, '', content);
-
-  // 6. initial_state, in order (content verbatim; state_key default '')
-  for (const e of initialState) {
-    await send(e.type, e.state_key ?? '', e.content as Record<string, unknown>);
-  }
-
-  // 7. name / topic — AFTER initial_state, so they override it. The topic
-  //    is the rich v1.15+ form (m.room.topic.yaml: m.topic.m.text[0].body)
-  if (opts.name !== undefined) {
-    await send('m.room.name', '', { name: opts.name });
-  }
-  if (opts.topic !== undefined) {
-    await send('m.room.topic', '', {
-      topic: opts.topic,
-      'm.topic': { 'm.text': [{ body: opts.topic }] },
-    });
-  }
-
-  // 8. invites (sender: the creator); is_direct rides along when set.
-  //    LOCAL invitees only — remote invitee transport is the caller's work.
-  for (const u of invite) {
-    if (u.indexOf(':', 1) >= 0 && !u.endsWith(':' + signer.serverName)) {
-      continue;
-    }
-    await send('m.room.member', u, {
-      membership: 'invite',
-      ...(opts.is_direct === true ? { is_direct: true } : {}),
-    });
-  }
-
-  return {
-    roomId: finalRoomId,
-    createEventId,
-    memberEventId,
-    roomAlias: alias,
-  };
 }
