@@ -1,7 +1,11 @@
 // Local-only composition root. Public Matrix listeners never mount this handler.
 import { dirname, resolve } from '@std/path';
 import type { App } from '#engine/app.ts';
-import { adminSocket, serverName } from '#engine/config.ts';
+import {
+  adminSocket,
+  serverName,
+  validateAdminSocketPath,
+} from '#engine/config.ts';
 import metadata from '#root/deno.json' with { type: 'json' };
 import { AdminError, type Operation } from '#root/api/admin/protocol.ts';
 import { federationOperations } from '#root/api/admin/federation.ts';
@@ -70,6 +74,7 @@ export async function startAdmin(
   path = adminSocket(),
   lifetime?: ServerLifetime,
 ) {
+  path = validateAdminSocketPath(path);
   const parent = await Deno.lstat(dirname(path));
   const uid = Deno.uid();
   if (!parent.isDirectory || parent.uid !== uid) {
