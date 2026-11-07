@@ -16,7 +16,7 @@ import { getRulebook } from '#engine/rulebook/index.ts';
 import { ruleId } from '#engine/rulebook/rule-ids.ts';
 import { membershipOf } from '#engine/server/read.ts';
 import { lookupAlias, registerAlias } from '#engine/server/aliases.ts';
-import { lookupTransaction, recordTransaction } from '#engine/tenant/txns.ts';
+import { transactionSubmission } from '#engine/tenant/txns.ts';
 import { requireRoom, stateAtSeq, versionOf } from './room.ts';
 
 export type { CreateRoomOptions };
@@ -72,16 +72,17 @@ export async function sendEvent(
 ) {
   const app = theApp();
   const room = await requireRoom(roomId);
-  if (deviceId !== null) {
-    const seen = await lookupTransaction(app.tenant, deviceId, roomId, txnId);
-    if (seen !== null) return { event_id: seen };
-  }
-  const res = await sendLocal(room, {
-    type,
-    sender: userId,
-    content,
-    origin_server_ts: Date.now(),
-  }, app.tenant.signer());
+  const res = await sendLocal(
+    room,
+    {
+      type,
+      sender: userId,
+      content,
+      origin_server_ts: Date.now(),
+    },
+    app.tenant.signer(),
+    transactionSubmission(app.tenant, deviceId, roomId, txnId),
+  );
   if (res.standing === 'rejected') {
     throw new MatrixError(
       403,
@@ -90,9 +91,6 @@ export async function sendEvent(
         res.reason === 'auth' ? 'AUTHCHAIN' : 'STATE'
       }_REJECT (rule ${res.rule})`,
     );
-  }
-  if (deviceId !== null) {
-    await recordTransaction(app.tenant, deviceId, roomId, txnId, res.eventId);
   }
   return { event_id: res.eventId };
 }
@@ -162,13 +160,13 @@ export async function redactEvent(
 ) {
   const app = theApp();
   const room = await requireRoom(roomId);
-  if (deviceId !== null) {
-    const seen = await lookupTransaction(app.tenant, deviceId, roomId, txnId);
-    if (seen !== null) return { eventId: seen };
-  }
-  const res = await redact(room, userId, target, app.tenant.signer(), reason);
-  if (deviceId !== null) {
-    await recordTransaction(app.tenant, deviceId, roomId, txnId, res.eventId);
-  }
+  const res = await redact(
+    room,
+    userId,
+    target,
+    app.tenant.signer(),
+    reason,
+    transactionSubmission(app.tenant, deviceId, roomId, txnId),
+  );
   return res;
 }

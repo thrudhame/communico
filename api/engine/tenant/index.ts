@@ -7,6 +7,7 @@
 import type { Store } from '#engine/store/index.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Signer } from '#engine/room/signer.ts';
+import type { Pdu } from '#engine/pdu.ts';
 import { tenantSchema } from '#engine/tenant/schema.ts';
 import * as accountdata from '#engine/tenant/accountdata.ts';
 import * as auth from '#engine/tenant/auth.ts';
@@ -282,6 +283,18 @@ function bind(conn: Conn, changed: () => void = () => {}) {
         media.markMediaUploaded(conn, mediaId, meta),
     },
     txns: {
+      submission: (deviceId: string, roomId: string, txnId: string) =>
+        txns.submissionById(conn, deviceId, roomId, txnId),
+      prepare: (deviceId: string, roomId: string, txnId: string, pdu: Pdu) =>
+        txns.prepareSubmission(conn, deviceId, roomId, txnId, pdu),
+      finish: (
+        deviceId: string,
+        roomId: string,
+        txnId: string,
+        eventId: string,
+        accepted: boolean,
+      ) =>
+        txns.finishSubmission(conn, deviceId, roomId, txnId, eventId, accepted),
       forEvent: (deviceId: string, roomId: string, eventId: string) =>
         txns.transactionIdForEvent(conn, deviceId, roomId, eventId),
       lookup: (deviceId: string, roomId: string, txnId: string) =>

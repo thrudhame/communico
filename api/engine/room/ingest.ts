@@ -113,12 +113,80 @@ export async function sendLocal(
   room: Room,
   partial: BuildPartial,
   signer: Signer,
+  submission?: LocalSubmission,
 ): Promise<IngestLocalResult> {
-  const result = await withRoomLock(room.id, () =>
-    room.tx(async (tx) => {
-      const pdu = await buildInTx(tx, room.id, partial, signer);
-      return await ingestInTx(tx, room.id, pdu, { self: signer.serverName });
-    }));
+  return await submitLocal(
+    room,
+    signer,
+    (tx) => buildInTx(tx, room.id, partial, signer),
+    submission,
+  );
+}
+
+export type PreparedSubmission = { eventId: string; pdu: Pdu | null };
+export type LocalSubmission = {
+  lookup(): Promise<PreparedSubmission | null>;
+  prepare(pdu: Pdu): Promise<PreparedSubmission>;
+  finish(eventId: string, accepted: boolean): Promise<void>;
+};
+
+async function submissionReceipt(
+  tx: RoomTx,
+  eventId: string,
+): Promise<IngestLocalResult | null> {
+  const event = await tx.events.get(eventId);
+  if (event === null) return null;
+  const status = await tx.events.getStatus(eventId);
+  if (status === null || status.grounding !== 'grounded') {
+    throw new Error('E_SUBMISSION_STATUS: ' + eventId);
+  }
+  return {
+    eventId,
+    event,
+    standing: status.standing,
+    grounding: status.grounding,
+    reason: null,
+    rule: null,
+    stored: true,
+    receipt: true,
+  };
+}
+
+// Persist exact signed bytes before the room commit. A retry reconciles by
+// event id before lifecycle/permission checks, without authoring on a new tip.
+// Cross-file writes stay outside retryable room transactions.
+async function submitLocal(
+  room: Room,
+  signer: Signer,
+  build: (tx: RoomTx) => Promise<Pdu>,
+  submission?: LocalSubmission,
+): Promise<IngestLocalResult> {
+  const result = await withRoomLock(room.id, async () => {
+    if (submission === undefined) {
+      return await room.tx(async (tx) =>
+        ingestInTx(tx, room.id, await build(tx), { self: signer.serverName })
+      );
+    }
+    let prepared = await submission.lookup();
+    if (prepared === null) {
+      prepared = await submission.prepare(await room.tx(build));
+    }
+    const result = await room.tx(async (tx) => {
+      const receipt = await submissionReceipt(tx, prepared.eventId);
+      if (receipt !== null) return receipt;
+      if (prepared.pdu === null) {
+        throw new Error('E_SUBMISSION_EVENT_MISSING: ' + prepared.eventId);
+      }
+      if (prepared.pdu.event_id !== prepared.eventId) {
+        throw new Error('E_SUBMISSION_ID_MISMATCH');
+      }
+      return await ingestInTx(tx, room.id, prepared.pdu, {
+        self: signer.serverName,
+      });
+    });
+    await submission.finish(result.eventId, result.standing !== 'rejected');
+    return result;
+  });
   // A wait naming this event (a redaction target, a missing prev) is
   // re-run now that it has arrived (R10 — the 3c recheck driver).
   await maybeResume(room, result.eventId, signer.serverName);
@@ -897,8 +965,9 @@ export async function redactEvent(
   targetEventId: string,
   signer: Signer,
   reason?: string,
+  submission?: LocalSubmission,
 ): Promise<{ eventId: string }> {
-  const gate = await room.tx(async (tx) => {
+  const res = await submitLocal(room, signer, async (tx) => {
     const stay = await tx.segments.openStay();
     if (stay === null) {
       throw new Error('E_ROOM_ARCHIVED: no open stay for ' + room.id);
@@ -923,29 +992,28 @@ export async function redactEvent(
     const required = targetPdu !== null && targetPdu.sender === sender
       ? eventLevel
       : Math.max(eventLevel, namedLevel('redact', pl));
-    return { required, senderLevel, version };
-  });
-  if (gate.senderLevel < gate.required) {
-    throw new MatrixError(
-      403,
-      'M_FORBIDDEN',
-      `redact requires level ${gate.required}, sender has ${gate.senderLevel}`,
-    );
-  }
-  const content: Record<string, unknown> = {};
-  const partial: BuildPartial = {
-    type: 'm.room.redaction',
-    sender,
-    content,
-    origin_server_ts: Date.now(),
-  };
-  if (getRulebook(gate.version).spec.redactsInContent) {
-    content.redacts = targetEventId;
-  } else {
-    partial.redacts = targetEventId;
-  }
-  if (reason !== undefined) content.reason = reason;
-  const res = await sendLocal(room, partial, signer);
+    if (senderLevel < required) {
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        `redact requires level ${required}, sender has ${senderLevel}`,
+      );
+    }
+    const content: Record<string, unknown> = {};
+    const partial: BuildPartial = {
+      type: 'm.room.redaction',
+      sender,
+      content,
+      origin_server_ts: Date.now(),
+    };
+    if (spec.redactsInContent) {
+      content.redacts = targetEventId;
+    } else {
+      partial.redacts = targetEventId;
+    }
+    if (reason !== undefined) content.reason = reason;
+    return await buildInTx(tx, room.id, partial, signer);
+  }, submission);
   if (res.standing === 'rejected') {
     throw new MatrixError(
       403,
