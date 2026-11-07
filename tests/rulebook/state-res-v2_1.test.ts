@@ -25,6 +25,24 @@ function ev(
   return mkPdu({ event_id: '$v21-' + seq, ...over }, stateKey);
 }
 
+// v12 obtains the create from the room id, never from auth_events.
+function v12Store(events: Pdu[]): MemStore {
+  const create = events.find((event) => event.type === 'm.room.create')!;
+  return MemStore.from(events.map((event) => {
+    const copy = {
+      ...event,
+      room_id: event === create ? undefined : '!' + create.event_id!.slice(1),
+      auth_events: event.auth_events.filter((id) => id !== create.event_id),
+    };
+    if (copy.type === 'm.room.power_levels') {
+      const users = { ...(copy.content.users as Record<string, unknown>) };
+      delete users[create.sender];
+      copy.content = { ...copy.content, users };
+    }
+    return copy;
+  }));
+}
+
 // --- Scenario 1: "starts from empty set" --------------------------------------
 // Conflicted: join_rules public (stale) vs invite (current). Unconflicted:
 // alice = leave. The invite event's auth chain has alice JOINED — v2
@@ -87,7 +105,7 @@ function emptySetScenario() {
 
 Deno.test('v2.1 starts from the empty set: invite join rule survives; alice stays leave', () => {
   const { events, s1, s2, jrInvite, leaveA } = emptySetScenario();
-  const store = MemStore.from(events);
+  const store = v12Store(events);
   const resolved = resolve([s1, s2], store, V12);
   assertEquals(
     resolved.get(stateKeyOf('m.room.join_rules', '')),
@@ -190,7 +208,7 @@ function subgraphScenario() {
 
 Deno.test('v2.1 includes the conflicted subgraph: PL3 wins over stale PL1', () => {
   const { events, correct, stale, pl3 } = subgraphScenario();
-  const store = MemStore.from(events);
+  const store = v12Store(events);
   const resolved = resolve([correct, stale], store, V12);
   assertEquals(
     resolved.get(stateKeyOf('m.room.power_levels', '')),
@@ -246,7 +264,7 @@ Deno.test('reverse topological order: a creator (Infinity) beats 2^53-1', () => 
     content: { join_rule: 'knock' },
     auth_events: [create.event_id!, pl.event_id!, joinB.event_id!],
   }, '');
-  const store = MemStore.from([create, joinC, joinB, pl, byCreator, byBob]);
+  const store = v12Store([create, joinC, joinB, pl, byCreator, byBob]);
   const order = reverseTopologicalPowerOrder(
     [byBob.event_id!, byCreator.event_id!],
     store,
