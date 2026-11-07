@@ -71,6 +71,11 @@ export class Pool {
     });
   }
 
+  async isRetired(kind: FileKind, id: string): Promise<boolean> {
+    const key = kind + ':' + await keyFor(id);
+    return await this.locked(() => this.retiring.has(key));
+  }
+
   // Opening, leasing and eviction share one metadata critical section.
   // File operations run OUTSIDE it, protected by their lease count.
   private locked<T>(fn: () => T | Promise<T>): Promise<T> {

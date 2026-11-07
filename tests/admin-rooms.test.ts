@@ -9,6 +9,11 @@ import { adminCall } from '#tests/admin-client.ts';
 import { genesis } from '#tests/fixtures/genesis.ts';
 import { registerRoom } from '#engine/server/registry.ts';
 import { type Conn, operations } from '#engine/store/db.ts';
+import {
+  inviteIntentProvider,
+  rejectInviteRemote,
+} from '#engine/federation/invites.ts';
+import { fakeKeyResolver } from '#tests/fixtures/remote.ts';
 
 Deno.test('admin rooms offered list, age filter, drop cleanup and lease retirement', async () => {
   const dir = await Deno.makeTempDir();
@@ -186,6 +191,18 @@ for (const boundary of ['unlink', 'server cleanup'] as const) {
     let admin = await startAdmin(app, `${dir}/a.sock`);
     try {
       const g = await genesis(app.store, { roomId: '!recover-drop:test' });
+      if (boundary === 'server cleanup') {
+        await app.server.execute(
+          `INSERT INTO federation_invites(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
+           VALUES(?,'@waiting:test','$waiting','11','{}','[]','waiting.test',1,'pending',1)`,
+          [g.roomId],
+        );
+        await app.server.execute(
+          `INSERT INTO federation_invites(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
+           VALUES(?,'@rejecting:test','$rejecting','11','{}','[]','waiting.test',1,'rejecting',1)`,
+          [g.roomId],
+        );
+      }
       await app.server.execute(
         "INSERT INTO outbox(room,pos,destination,event,state,added_ms) VALUES(?,900,'remote.test',?,'pending',1)",
         [g.roomId, g.tipId],
@@ -246,6 +263,25 @@ for (const boundary of ['unlink', 'server cleanup'] as const) {
         () => app.store.room(g.roomId, { create: true }),
         Deno.errors.NotFound,
       );
+      if (boundary === 'server cleanup') {
+        const deps = {
+          store: app.store,
+          server: app.server,
+          signer: app.tenant.signer(),
+          keys: fakeKeyResolver(),
+          self: app.tenant.serverName,
+          wake: () => {},
+        };
+        assertEquals(
+          await inviteIntentProvider(deps)(app.server, 'waiting.test'),
+          null,
+        );
+        await assertRejects(
+          () => rejectInviteRemote(g.roomId, '@waiting:test', deps),
+          Error,
+          'room removal is pending',
+        );
+      }
       await admin.shutdown();
       await closeApp();
       app = await openApp(cfg);
@@ -265,6 +301,121 @@ for (const boundary of ['unlink', 'server cleanup'] as const) {
         [],
       );
     } finally {
+      await admin.shutdown();
+      await closeApp();
+      await Deno.remove(dir, { recursive: true });
+    }
+  });
+}
+
+for (const race of ['new rejection', 'candidate failover'] as const) {
+  Deno.test(`admin room removal owns the invite cut against ${race} and startup reopens`, async () => {
+    const dir = await Deno.makeTempDir();
+    const cfg = {
+      dir: `${dir}/store`,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    };
+    let app = await openApp(cfg);
+    let admin = await startAdmin(app, `${dir}/a.sock`);
+    const originalRetire = app.store.retireRoom.bind(app.store);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => release = resolve);
+    let retiring!: () => void;
+    const cut = new Promise<void>((resolve) => retiring = resolve);
+    try {
+      const g = await genesis(app.store, { roomId: '!invite-drop:test' });
+      const user = '@invitee:' + app.tenant.serverName;
+      await app.server.execute(
+        `INSERT INTO federation_invites(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
+         VALUES(?,?,?,'11',?,?,?,1,?,1)`,
+        [
+          g.roomId,
+          user,
+          '$invite',
+          JSON.stringify({ sender: '@inviter:origin.test' }),
+          JSON.stringify([{ sender: '@other:alternate.test' }]),
+          'origin.test',
+          race === 'new rejection' ? 'pending' : 'rejecting',
+        ],
+      );
+      const wakes: string[] = [];
+      const deps = {
+        store: app.store,
+        server: app.server,
+        signer: app.tenant.signer(),
+        keys: fakeKeyResolver(),
+        self: app.tenant.serverName,
+        wake: (destination: string) => wakes.push(destination),
+      };
+      const provider = inviteIntentProvider(deps);
+      if (race === 'candidate failover') {
+        await (await provider(app.server, 'origin.test'))!.failed(
+          new Error('first failure'),
+        );
+        assertEquals(
+          (await provider.review())[0].destination,
+          'alternate.test',
+        );
+      }
+      app.sender = {
+        wake: deps.wake,
+        contactHook: () => () => {},
+        setIntentProvider: () => {},
+        stop: () => Promise.resolve(),
+        snapshot: () => [],
+        reviewIntents: () => provider.review(),
+        pruneIntents: (d) => provider.prune(d),
+      };
+      app.store.retireRoom = async (id) => {
+        retiring();
+        await held;
+        return await originalRetire(id);
+      };
+      const owner = race === 'new rejection' ? null : 'alternate.test';
+      const job = owner === null ? null : await provider(app.server, owner);
+      const dropping = adminCall(admin.path, 'rooms/drop', {
+        roomId: g.roomId,
+      });
+      await cut;
+      const racing = race === 'new rejection'
+        ? rejectInviteRemote(g.roomId, user, deps)
+        : job!.failed(new Error('failure after removal snapshot'));
+      // Keep the removal cut open while the competing real operation runs.
+      // A corrected owner queues that transition until cleanup finishes.
+      const raced = racing.then(() => null, (error) => error);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      release();
+      const result = await dropping;
+      await raced;
+      assertEquals(result.status, 200, JSON.stringify(result.body));
+      assertEquals(result.body.result.settled, owner === null ? 0 : 1);
+      assertEquals(await provider.review(), []);
+      assertEquals(wakes, owner === null ? [] : ['alternate.test']);
+      const refused = await app.server.query(
+        "SELECT name, count FROM federation_pending WHERE kind='refused'",
+      );
+      assertEquals(
+        refused.map((row) => [row.name, Number(row.count)]),
+        owner === null ? [] : [[owner, 1]],
+      );
+      app.store.retireRoom = originalRetire;
+      await admin.shutdown();
+      await closeApp();
+      app = await openApp(cfg);
+      admin = await startAdmin(app, `${dir}/a.sock`);
+      assertEquals((await adminCall(admin.path, 'rooms/list')).body.result, []);
+      assertEquals(
+        await app.server.query(
+          'SELECT * FROM federation_invites WHERE room_id=?',
+          [g.roomId],
+        ),
+        [],
+      );
+    } finally {
+      release();
       await admin.shutdown();
       await closeApp();
       await Deno.remove(dir, { recursive: true });
