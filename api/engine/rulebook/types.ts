@@ -42,6 +42,9 @@ export function stateKeyOf(
 export interface EventStore {
   get(eventId: string): Pdu | undefined;
   isRejected(eventId: string): boolean;
+  // Engine-verified facts, bound to BOTH immutable events. The pure rulebook
+  // never imports crypto or accepts an unverified signature-shaped string.
+  thirdPartyInviteVerified?(memberEventId: string, keyEventId: string): boolean;
 }
 
 // Per-version feature flags (plan §3b). Every rule that branches on a

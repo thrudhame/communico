@@ -4,7 +4,7 @@ use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use turso::{Connection, Database, Value};
 
 #[derive(Debug)]
@@ -51,9 +51,47 @@ impl From<turso::Error> for Failure {
 }
 
 struct File {
-    database: Database,
+    database: Arc<Database>,
     references: usize,
+    connecting: usize,
     path: PathBuf,
+}
+
+#[derive(Default)]
+struct Opening {
+    done: Mutex<bool>,
+    finished: Condvar,
+}
+
+// A reservation survives failure and unwind, so waiters always retry against
+// the registry after the sole initializer has either published or failed.
+struct OpenReservation {
+    path: PathBuf,
+    opening: Arc<Opening>,
+}
+
+impl Drop for OpenReservation {
+    fn drop(&mut self) {
+        if let Ok(mut handles) = handles() {
+            handles.opening.remove(&self.path);
+        }
+        if let Ok(mut done) = self.opening.done.lock() {
+            *done = true;
+            self.opening.finished.notify_all();
+        }
+    }
+}
+
+struct Connecting(u32);
+
+impl Drop for Connecting {
+    fn drop(&mut self) {
+        if let Ok(mut handles) = handles() {
+            if let Some(file) = handles.files.get_mut(&self.0) {
+                file.connecting -= 1;
+            }
+        }
+    }
 }
 
 type SharedConnection = Arc<tokio::sync::Mutex<Connection>>;
@@ -63,6 +101,7 @@ struct Handles {
     next: u32,
     files: HashMap<u32, File>,
     paths: HashMap<PathBuf, u32>,
+    opening: HashMap<PathBuf, Arc<Opening>>,
     connections: HashMap<u32, (u32, SharedConnection)>,
 }
 
@@ -223,8 +262,21 @@ fn canonical_file(path: &str) -> Result<PathBuf> {
 
 #[no_mangle]
 pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
-    reply(|| {
-        let path = canonical_file(&text(path)?)?;
+    reply(|| open_file(canonical_file(&text(path)?)?, initialize_database).map(|id| json!(id)))
+}
+
+fn initialize_database(name: String) -> Result<Database> {
+    run(async move {
+        let database = turso::Builder::new_local(&name).build().await?;
+        let connection = database.connect()?;
+        query(&connection, "PRAGMA journal_mode=mvcc", vec![]).await?;
+        query(&connection, "PRAGMA synchronous=FULL", vec![]).await?;
+        Ok(database)
+    })
+}
+
+fn open_file(path: PathBuf, initialize: impl FnOnce(String) -> Result<Database>) -> Result<u32> {
+    let reservation = loop {
         let mut handles = handles()?;
         if let Some(handle) = handles.paths.get(&path).copied() {
             let file = handles
@@ -232,19 +284,36 @@ pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
                 .get_mut(&handle)
                 .ok_or_else(|| Failure::binding("missing file handle"))?;
             file.references += 1;
-            return Ok(json!(handle));
+            return Ok(handle);
         }
-        let name = path
-            .to_str()
-            .ok_or_else(|| Failure::binding("non-UTF8 path"))?
-            .to_owned();
-        let database = run(async move {
-            let database = turso::Builder::new_local(&name).build().await?;
-            let connection = database.connect()?;
-            query(&connection, "PRAGMA journal_mode=mvcc", vec![]).await?;
-            query(&connection, "PRAGMA synchronous=FULL", vec![]).await?;
-            Ok(database)
-        })?;
+        if let Some(opening) = handles.opening.get(&path).cloned() {
+            drop(handles);
+            let done = opening
+                .done
+                .lock()
+                .map_err(|_| Failure::binding("opening reservation poisoned"))?;
+            drop(
+                opening
+                    .finished
+                    .wait_while(done, |done| !*done)
+                    .map_err(|_| Failure::binding("opening reservation poisoned"))?,
+            );
+            continue;
+        }
+        let opening = Arc::new(Opening::default());
+        handles.opening.insert(path.clone(), opening.clone());
+        break OpenReservation {
+            path: path.clone(),
+            opening,
+        };
+    };
+    let name = path
+        .to_str()
+        .ok_or_else(|| Failure::binding("non-UTF8 path"))?
+        .to_owned();
+    let database = Arc::new(initialize(name)?);
+    let handle = {
+        let mut handles = handles()?;
         let handle = handles.id()?;
         handles.paths.insert(path.clone(), handle);
         handles.files.insert(
@@ -252,33 +321,156 @@ pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
             File {
                 database,
                 references: 1,
+                connecting: 0,
                 path,
             },
         );
-        Ok(json!(handle))
-    })
+        handle
+    };
+    drop(reservation);
+    Ok(handle)
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn slow_open_does_not_block_unrelated_registry_work() {
+        let (entered, ready) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let slow = std::thread::spawn(move || {
+            open_file(PathBuf::from("slow-registry-test"), |_| {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+                Err(Failure::binding("injected initialization failure"))
+            })
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (completed, result) = mpsc::channel();
+        let fast = std::thread::spawn(move || {
+            let outcome = open_file(PathBuf::from("other-registry-test"), |_| {
+                Err(Failure::binding("independent initialization"))
+            });
+            completed.send(outcome.is_err()).unwrap();
+        });
+        let independent = result.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        assert!(slow.join().unwrap().is_err());
+        fast.join().unwrap();
+        assert_eq!(
+            independent.ok(),
+            Some(true),
+            "registry held during initialization"
+        );
+    }
+
+    #[test]
+    fn same_path_has_one_initializer_and_failure_releases_waiters() {
+        let (entered, ready) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            open_file(PathBuf::from("same-registry-test"), |_| {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+                Err(Failure::binding("first initialization fails"))
+            })
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (entered_second, second_ready) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            open_file(PathBuf::from("same-registry-test"), |_| {
+                entered_second.send(()).unwrap();
+                Err(Failure::binding("retry initialization fails"))
+            })
+        });
+        let premature = second_ready.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        assert!(second.join().unwrap().is_err());
+        assert!(premature.is_err(), "same path initialized concurrently");
+        second_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!handles()
+            .unwrap()
+            .opening
+            .contains_key(&PathBuf::from("same-registry-test")));
+    }
+
+    #[test]
+    fn connecting_releases_registry_but_reserves_file_lifetime() {
+        let dir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap())
+            .join(format!("registry-connect-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let handle = open_file(dir.join("data.db"), initialize_database).unwrap();
+        let (entered, ready) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let connecting = std::thread::spawn(move || {
+            connect_file(handle, |connection| {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+                Ok(connection)
+            })
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (completed, result) = mpsc::channel();
+        let closing = std::thread::spawn(move || {
+            let pointer = ffi_close(handle, 0);
+            let result = unsafe { text(pointer) }.unwrap();
+            unsafe { ffi_free(pointer) };
+            completed
+                .send(serde_json::from_str::<Json>(&result).unwrap())
+                .unwrap();
+        });
+        let close_result = result.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        let connection = connecting.join().unwrap().unwrap();
+        closing.join().unwrap();
+        unsafe { ffi_free(ffi_close(connection, 1)) };
+        unsafe { ffi_free(ffi_close(handle, 0)) };
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(close_result.unwrap()["code"], 21);
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn ffi_connect(handle: u32) -> *mut c_char {
     reply(|| {
+        connect_file(handle, |connection| {
+            run(async move {
+                query(&connection, "PRAGMA synchronous=FULL", vec![]).await?;
+                Ok(connection)
+            })
+        })
+        .map(|id| json!(id))
+    })
+}
+
+fn connect_file(
+    handle: u32,
+    initialize: impl FnOnce(Connection) -> Result<Connection>,
+) -> Result<u32> {
+    let (database, connecting) = {
         let mut handles = handles()?;
-        let connection = handles
+        let file = handles
             .files
-            .get(&handle)
-            .ok_or_else(|| Failure::binding("invalid database"))?
-            .database
-            .connect()?;
-        let connection = run(async move {
-            query(&connection, "PRAGMA synchronous=FULL", vec![]).await?;
-            Ok(connection)
-        })?;
+            .get_mut(&handle)
+            .ok_or_else(|| Failure::binding("invalid database"))?;
+        file.connecting += 1;
+        (file.database.clone(), Connecting(handle))
+    };
+    let connection = initialize(database.connect()?)?;
+    let id = {
+        let mut handles = handles()?;
         let id = handles.id()?;
         handles
             .connections
             .insert(id, (handle, Arc::new(tokio::sync::Mutex::new(connection))));
-        Ok(json!(id))
-    })
+        id
+    };
+    drop(connecting);
+    Ok(id)
 }
 
 #[no_mangle]
@@ -399,7 +591,9 @@ pub extern "C" fn ffi_close(handle: u32, kind: u32) -> *mut c_char {
                     .files
                     .get(&handle)
                     .ok_or_else(|| Failure::binding("invalid database"))?;
-                if file.references == 1 && handles.connections.values().any(|(id, _)| *id == handle)
+                if file.references == 1
+                    && (file.connecting > 0
+                        || handles.connections.values().any(|(id, _)| *id == handle))
                 {
                     return Err(Failure::binding("database has live connections"));
                 }

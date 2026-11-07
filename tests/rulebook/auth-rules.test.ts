@@ -560,6 +560,7 @@ function invitePdu(content: Record<string, unknown>): Pdu {
   return mkPdu({
     type: 'm.room.member',
     sender: '@dev:localhost',
+    event_id: '$member_invite',
     content,
     auth_events: [CREATE_ID, PL_ID, JOIN_DEV_ID],
   }, '@target:example.org');
@@ -684,7 +685,7 @@ Deno.test('auth rule 4.4.1.6: a different sender than the third_party_invite is 
   if (!v.ok) assertEquals(v.rule, '4.4.1.6');
 });
 
-Deno.test('auth rule 4.4.1.7: a signature matching a public key allows the invite', () => {
+Deno.test('auth rule 4.4.1.7: an engine-verified proof for both events allows the invite', () => {
   const { state, store } = tpiState('tok', '@dev:localhost', 'pubkey1');
   const v = checkAuthAgainstState(
     invitePdu({
@@ -698,7 +699,12 @@ Deno.test('auth rule 4.4.1.7: a signature matching a public key allows the invit
       },
     }),
     state,
-    store,
+    {
+      get: (id) => store.get(id),
+      isRejected: (id) => store.isRejected(id),
+      thirdPartyInviteVerified: (member, key) =>
+        member === '$member_invite' && key === '$tpi_tok',
+    },
     V11,
   );
   assertEquals(v.ok, true);
