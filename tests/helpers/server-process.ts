@@ -30,7 +30,12 @@ export async function bounded<T>(promise: Promise<T>, ms = 20000): Promise<T> {
 }
 
 export async function serverProcess(
-  options: { grace?: number; dir?: string; exitBarrier?: string } = {},
+  options: {
+    grace?: number;
+    dir?: string;
+    exitBarrier?: string;
+    fatal?: 'close' | 'hang' | 'second';
+  } = {},
 ) {
   const dir = options.dir ?? await Deno.makeTempDir({ prefix: 'life-' });
   const probe = Deno.listen({ hostname: '127.0.0.1', port: 0 });
@@ -45,7 +50,7 @@ export async function serverProcess(
     }\n[store]\ndir="${dir}/store"\n[media]\nroot="${dir}/media"\n[admin]\nsocket="${socket}"\n[federation]\nenabled=false\n`,
   );
   const child = new Deno.Command(Deno.execPath(), {
-    args: options.exitBarrier
+    args: options.exitBarrier || options.fatal
       ? [
         ...metadata.tasks.start.split(' ').slice(1, -1),
         'tests/fixtures/lifecycle-child.ts',
@@ -56,6 +61,12 @@ export async function serverProcess(
       DENO_NO_PROMPT: '1',
       ...(options.exitBarrier
         ? { DENO_COMMUNICO_TEST_EXIT_BARRIER: options.exitBarrier }
+        : {}),
+      ...(options.fatal
+        ? {
+          DENO_COMMUNICO_TEST_FATAL_TRIGGER: `${dir}/fatal-trigger`,
+          DENO_COMMUNICO_TEST_FATAL_MODE: options.fatal,
+        }
         : {}),
     },
     stdout: 'piped',

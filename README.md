@@ -60,3 +60,35 @@ Room listings show `stay <id>` or `archived`. Outbox listings use composite
 ids shown only while the running sender owns the request. PDU expiry is derived
 from its queued timestamp and configured lifespan; reject-invite jobs have no
 expiry in the current core. CLI punctuation uses ASCII.
+
+## Server lifecycle
+
+SIGTERM and SIGINT stop admission on all listeners. Admitted handlers and
+response bodies have `[server] shutdowngraceseconds` (default 10) to finish.
+New requests receive 503 or a refused connection. At the deadline remaining
+transports are aborted and their per-listener counts are logged. The store
+closes after the listeners. A clean drain exits 0; forced aborts exit non-zero.
+Admin socket paths are limited to 107 UTF-8 bytes after absolute resolution.
+
+Unhandled promise rejections are fatal. The server logs
+`fatal: unhandled rejection` and the reason/stack, immediately stops serving,
+and allows at most two seconds for store cleanup before exiting non-zero.
+A second unhandled rejection exits immediately. Run the server under a
+supervisor that restarts failed processes, for example:
+
+```ini
+[Unit]
+Description=Communico Matrix homeserver
+After=network.target
+
+[Service]
+User=communico
+WorkingDirectory=/srv/communico
+ExecStart=/usr/bin/deno task start
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+```

@@ -51,6 +51,11 @@ export class ServerLifetime {
     return [...this.#active.values()].reduce((a, b) => a + b, 0);
   }
 
+  abort(): void {
+    this.#draining = true;
+    this.controller.abort();
+  }
+
   async drain(seconds: number): Promise<Record<string, number>> {
     this.#draining = true;
     if (this.count !== 0) {
@@ -70,7 +75,7 @@ export class ServerLifetime {
     const remaining = Object.fromEntries(
       [...this.#active].filter(([, count]) => count !== 0),
     );
-    if (this.count !== 0) this.controller.abort();
+    if (this.count !== 0) this.abort();
     return remaining;
   }
 }

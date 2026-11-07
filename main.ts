@@ -10,6 +10,38 @@ import { mediaRoot } from '#engine/media.ts';
 import { startAdmin } from '#root/api/admin/index.ts';
 import { ServerLifetime } from '#root/api/server-lifetime.ts';
 
+const lifetime = new ServerLifetime();
+let fatal = false;
+let closing: Promise<void> | undefined;
+function closeStore(): Promise<void> {
+  return closing ??= closeApp();
+}
+
+globalThis.addEventListener('unhandledrejection', (event) => {
+  if (fatal) Deno.exit(1);
+  fatal = true;
+  // Defer Deno's immediate fatal default only for bounded cleanup. Continuing
+  // to serve, recovering from the rejection or exiting successfully is forbidden.
+  event.preventDefault();
+  lifetime.abort();
+  console.error('fatal: unhandled rejection');
+  console.error(
+    event.reason instanceof Error
+      ? event.reason.stack
+      : new Error(String(event.reason)).stack,
+  );
+  const timer = setTimeout(() => Deno.exit(1), 2000);
+  void closeStore().then(() => {
+    console.error('fatal: store closed');
+    clearTimeout(timer);
+    Deno.exit(1);
+  }, (error) => {
+    console.error('fatal: store close failed', error);
+    clearTimeout(timer);
+    Deno.exit(1);
+  });
+});
+
 try {
   const loaded = loadedConfig();
   const absDefaults = Deno.realPathSync(loaded.defaultsPath);
@@ -56,12 +88,11 @@ try {
 
 await Deno.mkdir(mediaRoot(), { recursive: true });
 const app = await openApp();
-const lifetime = new ServerLifetime();
 let admin: Awaited<ReturnType<typeof startAdmin>>;
 try {
   admin = await startAdmin(app, undefined, lifetime);
 } catch (error) {
-  await closeApp();
+  await closeStore();
   throw error;
 }
 
@@ -121,7 +152,9 @@ async function shutdown(): Promise<void> {
     ...servers.map((server) => server.shutdown()),
     admin.shutdown(),
   ]);
-  await closeApp();
+  if (fatal) return;
+  await closeStore();
+  if (fatal) return;
   console.log('shutdown: store closed');
   Deno.exit(forced ? 1 : 0);
 }
