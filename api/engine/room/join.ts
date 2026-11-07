@@ -25,7 +25,11 @@ import {
   type Rulebook,
   supportedRoomVersions,
 } from '#engine/rulebook/index.ts';
-import { checkDeclaredAuth, finalizeBuilt } from '#engine/room/build.ts';
+import {
+  checkDeclaredAuth,
+  finalizeBuilt,
+  roomCreateId,
+} from '#engine/room/build.ts';
 import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
 import { projectAfterWrite, registerCreatedRoom } from '#engine/room/hooks.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
@@ -58,35 +62,14 @@ async function verifySnapshotEvent(
   candidate: string,
   roomId: string,
   keys: KeyResolver,
+  self: string,
 ): Promise<{ eventId: string; pdu: Pdu } | null> {
   try {
-    return await verify(raw, roomVersion, keys, { roomId });
+    return await verify(raw, roomVersion, keys, {
+      roomId,
+      localSnapshotFallback: { self, resident: candidate },
+    });
   } catch {
-    // A resident signature cannot rescue a malformed event.
-    const identified = await identify(raw, roomVersion, { roomId }).catch(() =>
-      null
-    );
-    if (identified === null) return null;
-    const residentSigs = (raw.signatures as
-      | Record<string, Record<string, string>>
-      | undefined)?.[candidate] ?? {};
-    for (const keyId of Object.keys(residentSigs)) {
-      try {
-        if (
-          await keys.verifyEventSignature({
-            server: candidate,
-            keyId,
-            pdu: raw,
-            roomVersion,
-            minValidUntilMs: 0,
-          })
-        ) {
-          return { eventId: identified.eventId, pdu: raw };
-        }
-      } catch {
-        // key unobtainable under this id — try the next
-      }
-    }
     return null;
   }
 }
@@ -201,6 +184,7 @@ async function joinVia(
       candidate,
       args.roomId,
       deps.keys,
+      deps.self,
     );
     if (v === null) continue;
     if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
@@ -213,6 +197,7 @@ async function joinVia(
       candidate,
       args.roomId,
       deps.keys,
+      deps.self,
     );
     if (v === null) continue;
     if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
@@ -224,13 +209,26 @@ async function joinVia(
     get: (id) => pack.get(id),
     isRejected: (id) => rejected.has(id),
   }, pack.values());
+  const stateIdSet = new Set(stateEventIds);
+  const snapshotCreates = [...stateIdSet].filter((id) =>
+    pack.get(id)?.type === 'm.room.create' &&
+    checkDeclaredAuth(pack.get(id)!, rulebook, packStore, null).ok
+  );
+  if (snapshotCreates.length !== 1) {
+    throw badResponse('snapshot has no single create');
+  }
   const ordered = orderEvents(
     [...pack].map(([eventId, pdu]) => ({ eventId, pdu })),
     ['auth_events'],
   ).map(({ eventId, pdu }) => [eventId, pdu] as const);
   for (const [id, eventPdu] of ordered) {
     rejected.delete(id);
-    const chain = checkDeclaredAuth(eventPdu, rulebook, packStore);
+    const chain = checkDeclaredAuth(
+      eventPdu,
+      rulebook,
+      packStore,
+      snapshotCreates[0],
+    );
     if (!chain.ok) {
       rejected.set(id, chain.rule);
     }
@@ -260,8 +258,8 @@ async function joinVia(
     if (eventPdu.state_key === undefined) continue;
     snapshot.set(String(eventPdu.type) + '\0' + String(eventPdu.state_key), id);
   }
-  // The returned join must match ours. A verifying resident signature
-  // selects that copy; otherwise keep our signed join. The countersigned
+  // The returned join must match ours. Merge only its verified resident
+  // signature into our authored event. The countersigned
   // copy is required only for restricted authorisation (joins-v2.yaml).
   // Decide from OUR content, even when the response omits the event.
   let join = signed;
@@ -282,6 +280,7 @@ async function joinVia(
     const residentSigs = (returned.signatures as
       | Record<string, Record<string, string>>
       | undefined)?.[candidate] ?? {};
+    const verifiedSigs: Record<string, string> = {};
     for (const keyId of Object.keys(residentSigs)) {
       try {
         if (
@@ -293,14 +292,26 @@ async function joinVia(
             minValidUntilMs: 0,
           })
         ) {
-          vouched = true;
+          verifiedSigs[keyId] = residentSigs[keyId];
           break;
         }
       } catch {
         // key unobtainable under this id — try the next
       }
     }
-    if (vouched) join = returned;
+    vouched = Object.keys(verifiedSigs).length > 0;
+    if (vouched) {
+      join = {
+        ...signed,
+        signatures: {
+          ...signed.signatures,
+          [candidate]: {
+            ...signed.signatures?.[candidate],
+            ...verifiedSigs,
+          },
+        },
+      };
+    }
   }
   if (
     signed.content?.join_authorised_via_users_server !== undefined && !vouched
@@ -312,7 +323,12 @@ async function joinVia(
     get: (id) => id === eventId ? join : pack.get(id),
     isRejected: (id) => rejected.has(id),
   }, [...pack.values(), join]);
-  const joinChain = checkDeclaredAuth(join, rulebook, joinStore);
+  const joinChain = checkDeclaredAuth(
+    join,
+    rulebook,
+    joinStore,
+    String(creates[0].event_id),
+  );
   if (!joinChain.ok) {
     throw badResponse(
       `the join is not authorized by its auth events (${joinChain.rule})`,
@@ -344,6 +360,12 @@ async function joinVia(
       const prevStay = (await tx.segments.list())
         .filter((segment) => segment.kind === 'stay')
         .pop() ?? null;
+      if (
+        prevStay !== null &&
+        await roomCreateId(tx, prevStay.id) !== String(creates[0].event_id)
+      ) {
+        throw badResponse('snapshot replaces the room create');
+      }
 
       // the auth chain and state events as EVIDENCE (R2 — first writer
       // wins; bytes, never state-at, never positioned)

@@ -26,11 +26,16 @@ import {
   checkDeclaredAuth,
   loadRulebookStore,
   resolvePrevs,
+  roomCreateId,
   roomVersionOf,
   stateBefore,
   ungroundedPrevs,
 } from '#engine/room/build.ts';
-import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
+import {
+  type Fetcher,
+  fetchOrNull,
+  type KeyResolver,
+} from '#engine/room/deps.ts';
 import { projectAfterWrite } from '#engine/room/hooks.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -70,7 +75,7 @@ async function fetchBoundary(
   version: string,
   deps: BackfillDeps,
 ): Promise<{ boundary: StateMap; pack: Map<string, Pdu> } | null> {
-  const ids = await deps.fetcher.stateIds(room.id, at, via);
+  const ids = await fetchOrNull(() => deps.fetcher.stateIds(room.id, at, via));
   if (ids === null) return null;
   const wanted = [...new Set([...ids.pduIds, ...ids.authChainIds])].sort();
   const unknown = await room.tx(async (tx) => {
@@ -82,7 +87,7 @@ async function fetchBoundary(
   });
   const pack = new Map<string, Pdu>();
   for (const id of unknown) {
-    const raw = await deps.fetcher.event(id, via);
+    const raw = await fetchOrNull(() => deps.fetcher.event(id, via));
     if (raw === null) return null;
     try {
       const v = await verify(raw, version, deps.keys, {
@@ -265,6 +270,7 @@ export async function backfill(
         throw new Error('E_ROOM_ARCHIVED: no stay for ' + room.id);
       }
       const rulebook = getRulebook(await roomVersionOf(tx, stay.id));
+      const createId = await roomCreateId(tx, stay.id);
       let history = await tx.segments.historyOf(stay.id);
       if (history === null) {
         const id = await tx.segments.create({ kind: 'history', prev: stay.id });
@@ -326,7 +332,7 @@ export async function backfill(
         if (!positionedCandidates.has(item.eventId)) {
           const { eventId: id, pdu } = item;
           if ((await tx.events.get(id)) !== null) continue;
-          const chain = checkDeclaredAuth(pdu, rulebook, store);
+          const chain = checkDeclaredAuth(pdu, rulebook, store, createId);
           if (!chain.ok) localRejected.add(id);
           await tx.events.insert(
             id,
@@ -369,7 +375,7 @@ export async function backfill(
         const absent = await ungroundedPrevs(tx, item.pdu.prev_events ?? []);
         const classification = classified.get(item.eventId)!;
         const invalidBoundary = classification.kind === 'imported' &&
-          !authorizedBoundary(classification.boundary, store);
+          !authorizedBoundary(classification.boundary, store, createId);
         if (
           absent.length > 0 &&
           (classification.kind !== 'imported' || invalidBoundary)
@@ -378,7 +384,7 @@ export async function backfill(
           // evidence — held, auth-checked, never positioned
           const chain = invalidBoundary
             ? { ok: false as const, rule: 'unverifiable' }
-            : checkDeclaredAuth(item.pdu, rulebook, store);
+            : checkDeclaredAuth(item.pdu, rulebook, store, createId);
           if (!chain.ok) localRejected.add(item.eventId);
           if (existing === null) {
             await tx.events.insert(
@@ -424,7 +430,7 @@ export async function backfill(
         let standing: 'accepted' | 'rejected' = 'accepted';
         let reason: 'auth' | 'state' | null = null;
         let rule: string | null = null;
-        const chain = checkDeclaredAuth(item.pdu, rulebook, store);
+        const chain = checkDeclaredAuth(item.pdu, rulebook, store, createId);
         if (!chain.ok) {
           standing = 'rejected';
           reason = 'auth';

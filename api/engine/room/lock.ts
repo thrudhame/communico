@@ -15,12 +15,13 @@ export async function withRoomLock<T>(
   const prev = locks.get(roomId) ?? Promise.resolve();
   let release!: () => void;
   const mine = new Promise<void>((resolve) => (release = resolve));
-  locks.set(roomId, prev.then(() => mine));
+  const tail = prev.then(() => mine);
+  locks.set(roomId, tail);
   await prev;
   try {
     return await fn();
   } finally {
     release();
-    if (locks.get(roomId) === mine) locks.delete(roomId);
+    if (locks.get(roomId) === tail) locks.delete(roomId);
   }
 }

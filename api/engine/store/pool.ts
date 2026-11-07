@@ -188,6 +188,47 @@ export class Pool {
     return ids;
   }
 
+  // Initialize before safe-create publishes the file. The callback cannot
+  // expose the staged handle; on rejection the store removes its own stage.
+  async initialize<T>(
+    kind: FileKind,
+    id: string,
+    fn: (db: Database) => Promise<T>,
+  ): Promise<T> {
+    return await this.locked(() => this.initializeLocked(kind, id, fn));
+  }
+
+  private async initializeLocked<T>(
+    kind: FileKind,
+    id: string,
+    fn: (db: Database) => Promise<T>,
+  ): Promise<T> {
+    if (this.closed) throw new Error('open-file pool is closed');
+    const parent = join(this.root, kind);
+    const key = await keyFor(id);
+    const identity = kind + ':' + key;
+    if (this.removing.has(identity) || this.retiring.has(identity)) {
+      throw new Deno.errors.NotFound(`removed ${kind} database: ${id}`);
+    }
+    const provider = this.providers[kind];
+    await Deno.mkdir(parent, { recursive: true });
+    let result!: T;
+    await createDatabase(this.ffi, parent, key, {
+      checkpointlogbytes: this.options.checkpointlogbytes,
+      discardOnFailure: true,
+      schema: async (db) => {
+        await recordId(db, id);
+        await applySchema(db, provider);
+        result = await fn(db);
+      },
+      verify: async (db) => {
+        await checkId(db, id);
+        await checkSchema(db, provider);
+      },
+    });
+    return result;
+  }
+
   async acquire(
     kind: FileKind,
     id: string,

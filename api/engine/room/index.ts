@@ -145,6 +145,46 @@ export type Room = {
   tx<T>(fn: (room: RoomTx) => Promise<T>): Promise<T>;
 };
 
+// Initialization runs in one transaction in the store's unpublished file.
+// Only the receipt escapes; ordinary room handles open after publication.
+export function initializeRoom<T>(
+  store: Store,
+  roomId: string,
+  fn: (tx: RoomTx) => Promise<T>,
+): Promise<T> {
+  return roomTransaction(
+    store,
+    roomId,
+    fn,
+    (body) => store.initializeRoom(roomId, (db) => db.tx(body)),
+  );
+}
+
+// One attempt owner for normal files and unpublished initialization. The
+// runner resolves only after its transaction/publication boundary succeeds.
+async function roomTransaction<T>(
+  store: Store,
+  roomId: string,
+  fn: (tx: RoomTx) => Promise<T>,
+  run: <R>(body: (conn: Conn) => Promise<R>) => Promise<R>,
+): Promise<T> {
+  const cutoff = roomEdges.cutoff();
+  const { result, resolutions, edges } = await run(async (conn) => {
+    const edges = roomEdges.attempt(store, roomId, cutoff);
+    const tx = bind(conn, edges);
+    try {
+      const result = await fn(tx);
+      return { result, resolutions: tx.diagnostics.resolutions, edges };
+    } finally {
+      // Cache hits must not let an escaped RoomTx outlive its Conn.
+      edges.release();
+    }
+  });
+  edges.commit();
+  resolutionProbe.resolutions += resolutions;
+  return result;
+}
+
 export async function openRoom(
   store: Store,
   roomId: string,
@@ -154,22 +194,6 @@ export async function openRoom(
   return {
     id: roomId,
     store,
-    tx: async (fn) => {
-      const cutoff = roomEdges.cutoff();
-      const { result, resolutions, edges } = await db.tx(async (conn) => {
-        const edges = roomEdges.attempt(store, roomId, cutoff);
-        const tx = bind(conn, edges);
-        try {
-          const result = await fn(tx);
-          return { result, resolutions: tx.diagnostics.resolutions, edges };
-        } finally {
-          // Cache hits must not let an escaped RoomTx outlive its Conn.
-          edges.release();
-        }
-      });
-      edges.commit();
-      resolutionProbe.resolutions += resolutions;
-      return result;
-    },
+    tx: (fn) => roomTransaction(store, roomId, fn, (body) => db.tx(body)),
   };
 }

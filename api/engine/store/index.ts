@@ -121,6 +121,10 @@ export class Store implements StartupStore {
     return this.pool.remove('rooms', id);
   }
 
+  initializeRoom<T>(id: string, fn: (db: Database) => Promise<T>): Promise<T> {
+    return this.pool.initialize('rooms', id, fn);
+  }
+
   stats(): StoreStats {
     return {
       openFiles: this.pool.size,

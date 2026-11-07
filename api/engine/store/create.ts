@@ -12,6 +12,7 @@ export type CreateOptions = {
   schema: (db: Database) => Promise<void>;
   verify: (db: Database) => Promise<void>;
   beforeRename?: (temporary: string, final: string) => Promise<void>;
+  discardOnFailure?: boolean;
 };
 
 // A schema provider owns one database kind's domain tables. Safe create
@@ -123,25 +124,44 @@ export async function createDatabase(
     if (!(error instanceof Deno.errors.NotFound)) throw error;
   }
   await Deno.mkdir(temporary, { mode: 0o700 });
-  const path = databaseFiles(temporary).database;
-  let db = await Db.open(ffi, path, options.checkpointlogbytes);
+  // Only this invocation's successfully reserved staging directory is ours
+  // to discard. Never remove an existing final or another creator's stage.
   try {
-    await options.schema(db);
-  } finally {
-    await db.close();
+    const path = databaseFiles(temporary).database;
+    let db = await Db.open(ffi, path, options.checkpointlogbytes);
+    try {
+      await options.schema(db);
+    } finally {
+      await db.close();
+    }
+    db = await Db.open(ffi, path, options.checkpointlogbytes);
+    try {
+      await integrityCheck(db);
+      await options.verify(db);
+    } finally {
+      await db.close();
+    }
+    await syncTree(temporary);
+    await options.beforeRename?.(temporary, final);
+    await Deno.rename(temporary, final);
+    await sync(parent);
+    return final;
+  } catch (error) {
+    if (options.discardOnFailure) {
+      try {
+        await Deno.remove(temporary, { recursive: true });
+        await sync(parent);
+      } catch (cleanup) {
+        if (!(cleanup instanceof Deno.errors.NotFound)) {
+          throw new AggregateError(
+            [error, cleanup],
+            'database creation cleanup failed',
+          );
+        }
+      }
+    }
+    throw error;
   }
-  db = await Db.open(ffi, path, options.checkpointlogbytes);
-  try {
-    await integrityCheck(db);
-    await options.verify(db);
-  } finally {
-    await db.close();
-  }
-  await syncTree(temporary);
-  await options.beforeRename?.(temporary, final);
-  await Deno.rename(temporary, final);
-  await sync(parent);
-  return final;
 }
 
 export async function sweep(parent: string): Promise<string[]> {
