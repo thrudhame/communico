@@ -22,6 +22,8 @@ import {
   type StateMap,
 } from '#engine/rulebook/index.ts';
 import {
+  authorizedBoundary,
+  checkDeclaredAuth,
   loadRulebookStore,
   resolvePrevs,
   roomVersionOf,
@@ -32,6 +34,7 @@ import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
 import { projectAfterWrite } from '#engine/room/hooks.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
+import { orderEvents } from '#engine/room/order.ts';
 import { mapEntries } from '#engine/room/state.ts';
 import { verify } from '#engine/room/verify.ts';
 
@@ -54,56 +57,6 @@ type Classification =
   | { kind: 'dag' }
   | { kind: 'imported'; boundary: StateMap }
   | { kind: 'evidence' };
-
-// A deterministic topological order over the page DAG (Kahn; the ready
-// set ordered by (depth, event id)): parents always precede children —
-// a hostile depth never inverts the order (G4). A cycle's remainder
-// lands last in (depth, id) order; its in-cycle prevs are absent for
-// the remainder (boundary or evidence, as for any absent prev).
-function topoOrder(page: PageItem[]): PageItem[] {
-  const byId = new Map(page.map((item) => [item.eventId, item]));
-  const indegree = new Map<string, number>();
-  const children = new Map<string, string[]>();
-  for (const item of page) {
-    const parents = (item.pdu.prev_events ?? []).filter((p) => byId.has(p));
-    indegree.set(item.eventId, parents.length);
-    for (const parent of parents) {
-      children.set(parent, [...(children.get(parent) ?? []), item.eventId]);
-    }
-  }
-  const compare = (a: string, b: string): number => {
-    const da = byId.get(a)!.pdu.depth;
-    const db = byId.get(b)!.pdu.depth;
-    if (da !== db) return da - db;
-    return a < b ? -1 : 1;
-  };
-  const ready = page
-    .filter((item) => indegree.get(item.eventId) === 0)
-    .map((item) => item.eventId)
-    .sort(compare);
-  const out: PageItem[] = [];
-  const done = new Set<string>();
-  while (ready.length > 0) {
-    const id = ready.shift()!;
-    if (done.has(id)) continue;
-    done.add(id);
-    out.push(byId.get(id)!);
-    for (const child of children.get(id) ?? []) {
-      const left = indegree.get(child)! - 1;
-      indegree.set(child, left);
-      if (left === 0) {
-        ready.push(child);
-        ready.sort(compare);
-      }
-    }
-  }
-  const rest = page
-    .filter((item) => !done.has(item.eventId))
-    .map((item) => item.eventId)
-    .sort(compare);
-  for (const id of rest) out.push(byId.get(id)!);
-  return out;
-}
 
 // /state_ids + /event for one page-edge event: the answer's state ids
 // are the event's imported before-state (G1); the unknown state/auth
@@ -210,7 +163,7 @@ export async function backfill(
     }
   }
   if (page.length === 0) return empty;
-  const orderedAll = topoOrder(page);
+  const orderedAll = orderEvents(page, ['prev_events', 'auth_events']);
   const pageIds = new Set(page.map((item) => item.eventId));
 
   // Held-grounding snapshot (grounding only grows, so the locked pass
@@ -328,46 +281,29 @@ export async function backfill(
         seeds.add(id);
         for (const auth of pdu.auth_events ?? []) seeds.add(auth);
       }
-      const held = await loadRulebookStore(tx, [...seeds]);
-      const localRejected = new Set<string>();
-      const pagePack = new Map(page.map((item) => [item.eventId, item.pdu]));
-      const store: EventStore = {
-        get: (id) => pagePack.get(id) ?? evidencePack.get(id) ?? held.get(id),
-        isRejected: (id) => localRejected.has(id) || held.isRejected(id),
-      };
-
-      // The fetched state/auth evidence: stored after its own auth
-      // check, grounding 'evidence' — bytes, never state-at (G2).
-      for (const [id, pdu] of evidencePack) {
-        if (pageIds.has(id)) continue; // the page's own copy wins
-        if ((await tx.events.get(id)) !== null) continue; // first writer
-        const chain = rulebook.checkAuthChain(pdu, store);
-        if (!chain.ok) localRejected.add(id);
-        await tx.events.insert(
-          id,
-          canonicalJson(pdu as unknown as Record<string, unknown>),
-        );
-        await tx.events.setStatus(id, {
-          standing: chain.ok ? 'accepted' : 'rejected',
-          grounding: 'evidence',
-          origin: args.via,
-          received_ts: Date.now(),
-        });
-        await tx.changes.append('event', id, {
-          standing: chain.ok ? 'accepted' : 'rejected',
-          reason: chain.ok ? null : 'auth',
-          rule: chain.ok ? null : chain.rule,
-          type: String(pdu.type),
-          state_key: pdu.state_key ?? null,
-          sender: String(pdu.sender),
-          depth: pdu.depth,
-          origin_server_ts: pdu.origin_server_ts,
-          stay: null,
-          offset: null,
-          grounding: 'evidence',
-          origin: args.via,
-        });
+      for (const classification of classified.values()) {
+        if (classification.kind === 'imported') {
+          for (const id of classification.boundary.values()) seeds.add(id);
+        }
       }
+      const candidates = new Map<string, PageItem>();
+      for (const [eventId, pdu] of evidencePack) {
+        candidates.set(eventId, { eventId, pdu });
+      }
+      for (const item of ordered) {
+        candidates.set(item.eventId, item);
+      }
+      const allOrdered = orderEvents([...candidates.values()], [
+        'prev_events',
+        'auth_events',
+      ], (item) => {
+        const c = classified.get(item.eventId);
+        return c?.kind === 'imported' ? [...c.boundary.values()] : [];
+      });
+      const localRejected = new Set<string>(candidates.keys());
+      const store: EventStore = await loadRulebookStore(tx, [...seeds], [
+        ...candidates.values().map((item) => item.pdu),
+      ], localRejected);
 
       // The page, in topology order: each event's own auth-chain and
       // state-before checks, explicit before/after refs, first-owner
@@ -384,7 +320,40 @@ export async function backfill(
       };
       const stored: Stored[] = [];
       const overlapped: string[] = [];
-      for (const item of ordered) {
+      const positionedCandidates = new Set(ordered.map((item) => item.eventId));
+      for (const item of allOrdered) {
+        localRejected.delete(item.eventId);
+        if (!positionedCandidates.has(item.eventId)) {
+          const { eventId: id, pdu } = item;
+          if ((await tx.events.get(id)) !== null) continue;
+          const chain = checkDeclaredAuth(pdu, rulebook, store);
+          if (!chain.ok) localRejected.add(id);
+          await tx.events.insert(
+            id,
+            canonicalJson(pdu as unknown as Record<string, unknown>),
+          );
+          await tx.events.setStatus(id, {
+            standing: chain.ok ? 'accepted' : 'rejected',
+            grounding: 'evidence',
+            origin: args.via,
+            received_ts: Date.now(),
+          });
+          await tx.changes.append('event', id, {
+            standing: chain.ok ? 'accepted' : 'rejected',
+            reason: chain.ok ? null : 'auth',
+            rule: chain.ok ? null : chain.rule,
+            type: pdu.type,
+            state_key: pdu.state_key ?? null,
+            sender: pdu.sender,
+            depth: pdu.depth,
+            origin_server_ts: pdu.origin_server_ts,
+            stay: null,
+            offset: null,
+            grounding: 'evidence',
+            origin: args.via,
+          });
+          continue;
+        }
         const existing = await tx.events.get(item.eventId);
         const refs = existing === null
           ? null
@@ -399,10 +368,17 @@ export async function backfill(
         }
         const absent = await ungroundedPrevs(tx, item.pdu.prev_events ?? []);
         const classification = classified.get(item.eventId)!;
-        if (absent.length > 0 && classification.kind !== 'imported') {
+        const invalidBoundary = classification.kind === 'imported' &&
+          !authorizedBoundary(classification.boundary, store);
+        if (
+          absent.length > 0 &&
+          (classification.kind !== 'imported' || invalidBoundary)
+        ) {
           // the boundary fetch failed for it (or for a page parent):
           // evidence — held, auth-checked, never positioned
-          const chain = rulebook.checkAuthChain(item.pdu, store);
+          const chain = invalidBoundary
+            ? { ok: false as const, rule: 'unverifiable' }
+            : checkDeclaredAuth(item.pdu, rulebook, store);
           if (!chain.ok) localRejected.add(item.eventId);
           if (existing === null) {
             await tx.events.insert(
@@ -448,7 +424,7 @@ export async function backfill(
         let standing: 'accepted' | 'rejected' = 'accepted';
         let reason: 'auth' | 'state' | null = null;
         let rule: string | null = null;
-        const chain = rulebook.checkAuthChain(item.pdu, store);
+        const chain = checkDeclaredAuth(item.pdu, rulebook, store);
         if (!chain.ok) {
           standing = 'rejected';
           reason = 'auth';
