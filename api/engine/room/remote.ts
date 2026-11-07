@@ -23,6 +23,7 @@ import {
   authorizedBoundary,
   checkDeclaredAuth,
   loadRulebookStore,
+  roomCreateId,
   roomVersionOf,
   ungroundedPrevs,
 } from '#engine/room/build.ts';
@@ -436,6 +437,7 @@ export async function ingestRemote(
         throw new Error('E_ROOM_ARCHIVED: no open stay for ' + room.id);
       }
       const lockedVersion = await roomVersionOf(tx, stay.id);
+      const createId = await roomCreateId(tx, stay.id);
       const rulebook = getRulebook(lockedVersion);
 
       // The ingest set: pushed PDUs and fetched live events, deduplicated
@@ -480,13 +482,13 @@ export async function ingestRemote(
         const needsBoundary = boundary !== undefined &&
           (await ungroundedPrevs(tx, pdu.prev_events ?? [])).length > 0;
         const invalidBoundary = needsBoundary &&
-          !authorizedBoundary(boundary, store);
+          !authorizedBoundary(boundary, store, createId);
         if (!merged.has(id) || invalidBoundary) {
           if ((await tx.events.get(id)) !== null) continue; // first-writer
           const corrupted = acc.corrupted.has(id) || invalidBoundary;
           const chain = corrupted
             ? null
-            : checkDeclaredAuth(pdu, rulebook, store);
+            : checkDeclaredAuth(pdu, rulebook, store, createId);
           const rejected = corrupted || chain === null || !chain.ok;
           if (rejected) localRejected.add(id);
           await tx.events.insert(

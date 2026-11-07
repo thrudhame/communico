@@ -45,6 +45,14 @@ export type Verified = Identified & {
   pdu: Pdu;
 };
 
+type VerifyOptions = {
+  roomId?: string;
+  exemptPrevAuthLimits?: boolean;
+  // Re-join snapshots may carry our own historical events with a resident
+  // signature. Only our sender domain is eligible, after all normal checks.
+  localSnapshotFallback?: { self: string; resident: string };
+};
+
 function domainOf(userId: string): string {
   const at = userId.indexOf(':');
   return at === -1 ? userId : userId.slice(at + 1);
@@ -181,7 +189,7 @@ export async function verify(
   pdu: Pdu,
   roomVersion: string,
   keys: KeyResolver,
-  opts: { roomId?: string; exemptPrevAuthLimits?: boolean } = {},
+  opts: VerifyOptions = {},
 ): Promise<Verified> {
   const spec = getRulebook(roomVersion).spec;
   const { eventId, oversized } = await identify(pdu, roomVersion, opts);
@@ -223,30 +231,37 @@ export async function verify(
   const minValidUntilMs = spec.enforceKeyValidity
     ? Number(pdu.origin_server_ts)
     : 0;
-  let sigOk = false;
-  for (
-    const keyId of Object.keys(
-      (pdu.signatures as Record<string, Record<string, string>> | undefined)?.[
-        senderDomain
-      ] ?? {},
-    )
-  ) {
-    try {
-      if (
-        await keys.verifyEventSignature({
-          server: senderDomain,
-          keyId,
-          pdu,
-          roomVersion,
-          minValidUntilMs,
-        })
-      ) {
-        sigOk = true;
-        break;
+  const verifiedBy = async (server: string): Promise<boolean> => {
+    for (
+      const keyId of Object.keys(
+        (pdu.signatures as Record<string, Record<string, string>> | undefined)
+          ?.[
+            server
+          ] ?? {},
+      )
+    ) {
+      try {
+        if (
+          await keys.verifyEventSignature({
+            server,
+            keyId,
+            pdu,
+            roomVersion,
+            minValidUntilMs,
+          })
+        ) {
+          return true;
+        }
+      } catch {
+        // key unobtainable under this id - try the next
       }
-    } catch {
-      // key unobtainable under this id — try the next
     }
+    return false;
+  };
+  let sigOk = await verifiedBy(senderDomain);
+  const fallback = opts.localSnapshotFallback;
+  if (!sigOk && fallback !== undefined && senderDomain === fallback.self) {
+    sigOk = await verifiedBy(fallback.resident);
   }
   if (!sigOk) {
     throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
