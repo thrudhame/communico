@@ -1,9 +1,8 @@
 // api/engine/tenant/auth.ts — access and refresh tokens. The old code
 // stored tokens plain (doltgres:api/engine/tenant.ts); this module stores
 // only the hex sha-256 of each token (plan §3) — the plain token leaves
-// the server only at issue time. Refresh rotation (D8/3h): consuming a
-// refresh token revokes the pair's access token, deletes the old refresh
-// row and issues a NEW access+refresh pair for the SAME device. Unknown
+// the server only at issue time. Rotation revokes the old access token,
+// but retains its refresh token until the replacement pair is used. Unknown
 // refresh token → 401 M_UNKNOWN_TOKEN (refresh.yaml:89-101).
 import type { Conn } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -131,6 +130,7 @@ export type RefreshTokenRow = {
   localpart: string;
   device_id: string | null;
   access_token: string;
+  next_token: string | null;
 };
 
 export async function refreshTokenByHash(
@@ -138,7 +138,7 @@ export async function refreshTokenByHash(
   hash: string,
 ): Promise<RefreshTokenRow | null> {
   const rows = await conn.query(
-    'SELECT localpart, device_id, access_token FROM refresh_tokens WHERE token = ?',
+    'SELECT localpart, device_id, access_token, next_token FROM refresh_tokens WHERE token = ?',
     [hash],
   );
   if (rows.length === 0) return null;
@@ -146,6 +146,7 @@ export async function refreshTokenByHash(
     localpart: String(rows[0].localpart),
     device_id: rows[0].device_id == null ? null : String(rows[0].device_id),
     access_token: String(rows[0].access_token),
+    next_token: rows[0].next_token == null ? null : String(rows[0].next_token),
   };
 }
 
@@ -174,6 +175,38 @@ export async function deleteRefreshTokensOfUser(
   ]);
 }
 
+/** First use closes the predecessor's retry window in the same transaction. */
+export async function confirmRefreshToken(
+  conn: Conn,
+  hash: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM refresh_tokens WHERE next_token = ?', [hash]);
+}
+
+export async function confirmAccessToken(
+  conn: Conn,
+  hash: string,
+): Promise<void> {
+  await conn.execute(
+    'DELETE FROM refresh_tokens WHERE access_token = ? AND next_token IS NOT NULL',
+    [hash],
+  );
+}
+
+/** A pending predecessor references the candidate access token, so every
+ * device/user/token revocation also removes its retry window. */
+export async function replaceRefreshToken(
+  conn: Conn,
+  hash: string,
+  nextHash: string,
+  accessHash: string,
+): Promise<void> {
+  await conn.execute(
+    'UPDATE refresh_tokens SET next_token = ?, access_token = ? WHERE token = ?',
+    [nextHash, accessHash, hash],
+  );
+}
+
 // --- tenant-level behaviour --------------------------------------------------
 
 /** Mint an access token; only its hash is stored. */
@@ -200,6 +233,7 @@ export async function lookupToken(
   return await tenant.tx(async (tx) => {
     const row = await tx.tokens.byHash(hash);
     if (row === null) return null;
+    await tx.refresh.confirmAccess(hash);
     return {
       localpart: row.localpart,
       user_id: `@${row.localpart}:${tenant.serverName}`,
@@ -225,11 +259,9 @@ export async function issueRefreshToken(
   return token;
 }
 
-// plan 3h: the old access token is revoked and the old refresh token
-// deleted immediately (spec note: refresh.yaml:34-35 allows the old
-// refresh token a grace period until the new one is used — the plan's
-// simpler rotation is what Complement exercises). Child row first:
-// refresh_tokens references access_tokens.
+// MSC2918: retries can replace an unused candidate, never an accepted one.
+// All rotation/use decisions are serialized by the tenant transaction, and
+// survive restarts without storing plaintext tokens or an in-memory grace timer.
 export async function consumeRefreshToken(
   tenant: Tenant,
   refreshToken: string,
@@ -242,22 +274,27 @@ export async function consumeRefreshToken(
     if (row === null) {
       throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'unknown refresh token');
     }
-    await tx.refresh.delete(hash);
-    await tx.tokens.delete(row.access_token);
+    await tx.refresh.confirm(hash);
+    if (row.next_token !== null) await tx.refresh.delete(row.next_token);
     const accessToken = crypto.randomUUID();
+    const accessHash = await hashToken(accessToken);
     await tx.tokens.insert(
-      await hashToken(accessToken),
+      accessHash,
       row.localpart,
       row.device_id,
       Date.now() + REFRESH_LIFETIME_MS,
     );
     const newRefresh = crypto.randomUUID();
+    const refreshHash = await hashToken(newRefresh);
     await tx.refresh.insert(
-      await hashToken(newRefresh),
+      refreshHash,
       row.localpart,
       row.device_id,
-      await hashToken(accessToken),
+      accessHash,
     );
+    await tx.refresh.replace(hash, refreshHash, accessHash);
+    await tx.pushers.moveToken(row.access_token, accessHash);
+    await tx.tokens.delete(row.access_token);
     return {
       accessToken,
       refreshToken: newRefresh,

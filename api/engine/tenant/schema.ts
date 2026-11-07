@@ -1,4 +1,4 @@
-// api/engine/tenant/schema.ts — tenant schema v1 (design row 1, D3.2): the
+// api/engine/tenant/schema.ts - tenant schema v2 (design row 1, D3.2): the
 // tenant file's tables, re-expressed for SQLite/Turso from
 // doltgres:db/tenant/schema.sql — identity and signing keys, users and
 // credentials, devices, access/refresh tokens (stored hashed, not plain),
@@ -56,8 +56,11 @@ CREATE TABLE refresh_tokens(
   token TEXT PRIMARY KEY NOT NULL,
   localpart TEXT NOT NULL,
   device_id TEXT,
-  access_token TEXT NOT NULL REFERENCES access_tokens(token)
+  access_token TEXT NOT NULL REFERENCES access_tokens(token),
+  next_token TEXT
 );
+CREATE INDEX refresh_tokens_access ON refresh_tokens(access_token);
+CREATE INDEX refresh_tokens_next ON refresh_tokens(next_token);
 
 CREATE TABLE uia_sessions(
   session TEXT PRIMARY KEY NOT NULL,
@@ -151,7 +154,7 @@ CREATE TABLE transactions(
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 1,
+  version: 2,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
   },

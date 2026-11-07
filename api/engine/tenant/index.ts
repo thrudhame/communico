@@ -151,6 +151,10 @@ function bind(conn: Conn, changed: () => void = () => {}) {
         auth.deleteRefreshForAccessToken(conn, accessHash),
       deleteForUser: (localpart: string) =>
         auth.deleteRefreshTokensOfUser(conn, localpart),
+      confirm: (hash: string) => auth.confirmRefreshToken(conn, hash),
+      confirmAccess: (hash: string) => auth.confirmAccessToken(conn, hash),
+      replace: (hash: string, nextHash: string, accessHash: string) =>
+        auth.replaceRefreshToken(conn, hash, nextHash, accessHash),
     },
     uia: {
       insert: (session: string, flows: { stages: string[] }[]) =>
@@ -161,6 +165,8 @@ function bind(conn: Conn, changed: () => void = () => {}) {
       drop: (session: string) => uia.deleteUiaSession(conn, session),
     },
     pushers: {
+      moveToken: (oldHash: string, newHash: string) =>
+        pushers.movePusherToken(conn, oldHash, newHash),
       deleteForToken: (accessHash: string) =>
         pushers.deletePushersForToken(conn, accessHash),
       deleteForUser: (localpart: string) =>
