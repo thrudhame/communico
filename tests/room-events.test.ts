@@ -137,6 +137,21 @@ Deno.test('room events: insert/get/list and edges from the PDU', async () => {
       );
       // A duplicate id is a constraint error; events never change.
       await assertRejects(() => insertEvent(conn, '$c', create));
+      const repeated = pdu({
+        prev_events: ['$c', '$c', '$m1'],
+        auth_events: ['$m1', '$m1', '$c'],
+      });
+      await insertEvent(conn, '$repeated', repeated);
+      assertEquals((await getEvent(conn, '$repeated'))?.pdu, repeated);
+      assertEquals(await prevsOf(conn, '$repeated'), ['$c', '$m1']);
+      assertEquals(await authsOf(conn, '$repeated'), ['$m1', '$c']);
+      assertEquals(
+        await conn.query(
+          'SELECT ord FROM prev_edges WHERE event = ? ORDER BY ord',
+          ['$repeated'],
+        ),
+        [{ ord: 0 }, { ord: 2 }],
+      );
       // Malformed facets are rejected before any row.
       await assertRejects(
         () => insertEvent(conn, '$bad', pdu({ depth: 1.5 })),

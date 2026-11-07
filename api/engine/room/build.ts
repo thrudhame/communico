@@ -49,6 +49,16 @@ export type BuildPartial = {
 // The room's version is read from the accepted m.room.create in the
 // stay's current state (a second create is always rejected, so it is
 // unique). The create event itself supplies its own content.room_version.
+export async function roomCreateId(
+  tx: RoomTx,
+  stayId: number,
+): Promise<string | null> {
+  const group = await tx.state.current(stayId);
+  return group === null
+    ? null
+    : await tx.state.groupKey(group, 'm.room.create', '');
+}
+
 export async function roomVersionOf(
   tx: RoomTx,
   stayId: number,
@@ -165,12 +175,34 @@ export function checkDeclaredAuth(
   pdu: Pdu,
   rulebook: Rulebook,
   store: EventStore,
+  createId: string | null,
 ) {
+  // A create establishes identity once. The same constraint applies to
+  // live events and unpositioned evidence, before either can seed state.
+  if (
+    pdu.type === 'm.room.create' && createId !== null &&
+    pdu.event_id !== createId
+  ) {
+    return {
+      ok: false as const,
+      rule: 'room_create',
+      reason: 'room already has a different create',
+    };
+  }
   const chain = rulebook.checkAuthChain(pdu, store);
   if (!chain.ok) return chain;
   const state: StateMap = new Map();
   for (const id of pdu.auth_events ?? []) {
     const auth = store.get(id);
+    if (
+      auth?.type === 'm.room.create' && createId !== null && id !== createId
+    ) {
+      return {
+        ok: false as const,
+        rule: 'room_create',
+        reason: 'auth names a different room create',
+      };
+    }
     if (auth?.state_key !== undefined) {
       state.set(auth.type + '\0' + auth.state_key, id);
     }
@@ -190,7 +222,11 @@ export function checkDeclaredAuth(
 export function authorizedBoundary(
   state: StateMap,
   store: EventStore,
+  createId: string | null,
 ): boolean {
+  if (createId !== null && state.get('m.room.create\0') !== createId) {
+    return false;
+  }
   for (const [key, id] of state) {
     const pdu = store.get(id);
     if (

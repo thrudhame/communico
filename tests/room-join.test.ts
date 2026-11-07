@@ -443,6 +443,7 @@ Deno.test('join remote: unusable snapshot events do not block an authorized join
       'unobtainable key',
       'malformed',
       'unverifiable auth',
+      'rejected create',
     ]
   ) {
     await t.step(failure, async () => {
@@ -475,11 +476,25 @@ Deno.test('join remote: unusable snapshot events do not block an authorized join
           assert(descendant.auth_events?.includes(String(dependent.event_id)));
         }
         const badId = String(bad.event_id);
+        const invalidCreate = failure === 'rejected create'
+          ? await remoteEvent(fr.roomId, fr.server, fr.version, {
+            type: 'm.room.create',
+            sender: fr.creator,
+            state_key: '',
+            content: { room_version: fr.version },
+            prev_events: [fr.tipId],
+            auth_events: [],
+          })
+          : undefined;
         const keys = fakeKeyResolver(fr.server, await testRemoteServer());
         const { fetcher } = fakeFetcher({
           makeJoin: (user) => fr.makeJoinAnswer(user),
           sendJoin: (event) =>
             fr.acceptSendJoin(event, (resp) => {
+              if (invalidCreate) {
+                resp.state.push(invalidCreate);
+                return;
+              }
               for (const pdu of [...resp.state, ...resp.authChain]) {
                 if (pdu.event_id !== badId) continue;
                 if (failure === 'malformed') {
@@ -520,13 +535,21 @@ Deno.test('join remote: unusable snapshot events do not block an authorized join
         });
         const room = await openRoom(store, fr.roomId);
         await room.tx(async (tx) => {
-          assertEquals(await tx.events.get(badId), null);
+          if (invalidCreate) {
+            assertEquals(
+              (await tx.events.getStatus(String(invalidCreate.event_id)))
+                ?.standing,
+              'rejected',
+            );
+          } else {
+            assertEquals(await tx.events.get(badId), null);
+          }
           const before = (await tx.state.eventStateBefore(result.eventId))!;
           const after = (await tx.state.eventStateAfter(result.eventId))!;
           for (const group of [before.group, after.group]) {
             assertEquals(
               await tx.state.groupKey(group, 'm.room.name', ''),
-              null,
+              invalidCreate ? badId : null,
             );
             assertEquals(
               await tx.state.groupKey(group, 'm.room.topic', ''),

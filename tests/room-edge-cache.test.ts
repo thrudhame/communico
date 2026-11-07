@@ -9,7 +9,13 @@ import {
 import { EdgeCache } from '#engine/room/edges.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { ancestors, authClosure, insertEvent } from '#engine/room/events.ts';
-import { openRoom, roomSchema, type RoomTx } from '#engine/room/index.ts';
+import {
+  initializeRoom,
+  openRoom,
+  resolutionProbe,
+  roomSchema,
+  type RoomTx,
+} from '#engine/room/index.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { Conn } from '#engine/store/db.ts';
@@ -467,5 +473,56 @@ Deno.test('edge cache: cached and uncached walks agree on order, stops, truncati
     await room.tx(async (tx) =>
       assert((await tx.events.authClosure(['$a'], 100)).ids.includes('$later'))
     );
+  });
+});
+
+Deno.test('edge cache: initialization shares attempt rollback, release and committed diagnostics', async () => {
+  await withStore(async (store) => {
+    const roomId = '!initialize-cache:test';
+    let attempts = 0;
+    let escaped!: RoomTx;
+    const before = resolutionProbe.resolutions;
+    await initializeRoom(store, roomId, async (tx) => {
+      escaped = tx;
+      if (++attempts === 1) {
+        await tx.events.insert('$new', raw(['$aborted']));
+        tx.diagnostics.resolutions = 9;
+        throw new StoreError(517, 'snapshot conflict', 'BusySnapshot');
+      }
+      assertEquals(await tx.events.get('$new'), null);
+      await tx.events.insert('$new', raw(['$real']));
+      tx.diagnostics.resolutions = 2;
+    });
+    assertEquals(attempts, 2);
+    assertEquals(resolutionProbe.resolutions - before, 2);
+    await assertRejects(
+      () => escaped.events.authsOf('$new'),
+      Error,
+      'released',
+    );
+    const room = await openRoom(store, roomId);
+    assertEquals(
+      await countEdges(async () => {
+        await room.tx(async (tx) => {
+          assertEquals(await tx.events.authsOf('$new'), ['$real']);
+        });
+      }),
+      0,
+    );
+    await assertRejects(
+      () =>
+        initializeRoom(store, '!failed-cache:test', async (tx) => {
+          await tx.events.insert('$failed', raw(['$ghost']));
+          tx.diagnostics.resolutions = 7;
+          throw new Error('initialization rejected');
+        }),
+      Error,
+      'initialization rejected',
+    );
+    assertEquals(resolutionProbe.resolutions - before, 2);
+    await initializeRoom(store, '!failed-cache:test', async (tx) => {
+      assertEquals(await tx.events.get('$failed'), null);
+      assertEquals(await tx.events.authsOf('$failed'), []);
+    });
   });
 });
