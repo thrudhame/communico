@@ -31,7 +31,11 @@ import {
   stateBefore,
   ungroundedPrevs,
 } from '#engine/room/build.ts';
-import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
+import {
+  type Fetcher,
+  fetchOrNull,
+  type KeyResolver,
+} from '#engine/room/deps.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { orderEvents } from '#engine/room/order.ts';
@@ -70,7 +74,7 @@ async function fetchBoundary(
   version: string,
   deps: BackfillDeps,
 ): Promise<{ boundary: StateMap; pack: Map<string, Pdu> } | null> {
-  const ids = await deps.fetcher.stateIds(room.id, at, via);
+  const ids = await fetchOrNull(() => deps.fetcher.stateIds(room.id, at, via));
   if (ids === null) return null;
   const wanted = [...new Set([...ids.pduIds, ...ids.authChainIds])].sort();
   const unknown = await room.tx(async (tx) => {
@@ -82,7 +86,7 @@ async function fetchBoundary(
   });
   const pack = new Map<string, Pdu>();
   for (const id of unknown) {
-    const raw = await deps.fetcher.event(id, via);
+    const raw = await fetchOrNull(() => deps.fetcher.event(id, via));
     if (raw === null) return null;
     try {
       const v = await verify(raw, version, deps.keys, {
