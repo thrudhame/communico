@@ -15,11 +15,12 @@ export function newMediaId(): string {
   return b64encode(crypto.getRandomValues(new Uint8Array(18)));
 }
 
-// Validate both components before touching metadata or the filesystem.
-const MXC_COMPONENT = /^[A-Za-z0-9_-]+$/;
+// Only the media id becomes a filesystem component. The server name must
+// match configuration exactly, including any dots, port or IPv6 literal.
+const MXC_MEDIA_ID = /^[A-Za-z0-9_-]+$/;
 export function assertLocalMxc(mxcServerName: string, mediaId: string): void {
   if (
-    !MXC_COMPONENT.test(mxcServerName) || !MXC_COMPONENT.test(mediaId) ||
+    !MXC_MEDIA_ID.test(mediaId) ||
     mxcServerName !== serverName()
   ) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media');
@@ -138,6 +139,7 @@ export async function serveMedia(
     'Content-Security-Policy':
       "sandbox; default-src 'none'; script-src 'none'; plugin-types application/pdf; style-src 'unsafe-inline'; object-src 'self';",
     'Cross-Origin-Resource-Policy': 'cross-origin',
+    'X-Content-Type-Options': 'nosniff',
   });
   if (row.size_bytes !== null) {
     headers.set('Content-Length', String(row.size_bytes));
