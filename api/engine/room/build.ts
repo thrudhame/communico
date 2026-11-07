@@ -9,6 +9,7 @@
 // computation (single-prev ingest never resolves — it aliases the
 // parent's after-group).
 import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
+import { withAuthProofs } from '#engine/auth-proofs.ts';
 import { eventIdFor, redact } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -117,14 +118,22 @@ export async function ungroundedPrevs(
 export async function loadRulebookStore(
   tx: RoomTx,
   seeds: readonly string[],
+  incoming: readonly Pdu[] = [],
+  localRejected: ReadonlySet<string> = new Set(),
 ): Promise<EventStore> {
-  const walk = await tx.events.authClosure(seeds, AUTH_CLOSURE_LIMIT);
+  const roots = [
+    ...new Set([
+      ...seeds,
+      ...incoming.flatMap((pdu) => pdu.auth_events ?? []),
+    ]),
+  ];
+  const walk = await tx.events.authClosure(roots, AUTH_CLOSURE_LIMIT);
   if (walk.truncated) {
     throw new Error(
       `E_AUTH_CLOSURE: auth closure exceeds ${AUTH_CLOSURE_LIMIT} events`,
     );
   }
-  const ids = [...new Set([...seeds, ...walk.ids])];
+  const ids = [...new Set([...roots, ...walk.ids])];
   const rows = await tx.events.list(ids);
   const standings = await tx.events.statuses(ids);
   const pdus = new Map<string, Pdu>();
@@ -135,10 +144,54 @@ export async function loadRulebookStore(
   for (const [id, status] of standings) {
     if (status.standing === 'rejected') rejected.add(id);
   }
-  return {
+  for (const pdu of incoming) pdus.set(String(pdu.event_id), pdu);
+  return await withAuthProofs({
     get: (id) => pdus.get(id),
-    isRejected: (id) => rejected.has(id),
-  };
+    isRejected: (id) => localRejected.has(id) || rejected.has(id),
+  }, pdus.values());
+}
+
+// Evidence has no DAG state, but its declared auth events must authorize it.
+// The structural rules (1-2) alone do not check membership or TPI proofs.
+// Reuse the pure state rules over that exact auth set, never room-current state.
+export function checkDeclaredAuth(
+  pdu: Pdu,
+  rulebook: Rulebook,
+  store: EventStore,
+) {
+  const chain = rulebook.checkAuthChain(pdu, store);
+  if (!chain.ok) return chain;
+  const state: StateMap = new Map();
+  for (const id of pdu.auth_events ?? []) {
+    const auth = store.get(id);
+    if (auth?.state_key !== undefined) {
+      state.set(auth.type + '\0' + auth.state_key, id);
+    }
+  }
+  if (rulebook.spec.roomIdFromCreateEvent && typeof pdu.room_id === 'string') {
+    const id = '$' + pdu.room_id.slice(1);
+    if (store.get(id)?.type === 'm.room.create') {
+      state.set('m.room.create\0', id);
+    }
+  }
+  return rulebook.checkAuthAgainstState(pdu, state, store);
+}
+
+// Imported state is usable only after every named event was authorized.
+// A rejected/missing event must never become state merely because a peer
+// listed its id in a snapshot or /state_ids response.
+export function authorizedBoundary(
+  state: StateMap,
+  store: EventStore,
+): boolean {
+  for (const [key, id] of state) {
+    const pdu = store.get(id);
+    if (
+      pdu === undefined || store.isRejected(id) ||
+      pdu.state_key === undefined || key !== pdu.type + '\0' + pdu.state_key
+    ) return false;
+  }
+  return true;
 }
 
 // The state before an event citing the given prevs: the single prev's

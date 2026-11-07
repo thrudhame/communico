@@ -21,6 +21,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { type Genesis, genesis } from './fixtures/genesis.ts';
+import { authAt } from './fixtures/auth.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -76,7 +77,12 @@ async function remoteSetup(store: Store): Promise<Setup> {
     state_key: user,
     content: { membership: 'join' },
     prev_events: [g.tipId],
-    auth_events: [g.createId],
+    auth_events: await authAt(g.room, {
+      type: 'm.room.member',
+      sender: user,
+      state_key: user,
+      content: { membership: 'join' },
+    }, g.tipId),
     origin_server_ts: 100,
   });
   const { fetcher } = fakeFetcher({});
@@ -126,7 +132,11 @@ async function msg(
     sender: opts.sender !== undefined ? opts.sender : s.user,
     content: { msgtype: 'm.text', body },
     prev_events: prev,
-    auth_events: [s.g.createId],
+    auth_events: await authAt(s.g.room, {
+      type: 'm.room.message',
+      sender: opts.sender ?? s.user,
+      content: {},
+    }, s.tip),
   });
 }
 

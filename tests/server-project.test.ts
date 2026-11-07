@@ -18,6 +18,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { get } from '#engine/store/watermark.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { bobJoins, genesis, PL_DEFAULTS } from './fixtures/genesis.ts';
+import { authAt } from './fixtures/auth.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -419,7 +420,7 @@ Deno.test('project: a rejected event is indexed without a feed row', async () =>
     );
     assertEquals(rows_.length, 1);
     assertEquals(rows_[0].standing, 'rejected');
-    assertEquals(rows_[0].reason, 'state');
+    assertEquals(rows_[0].reason, 'auth');
     assertEquals(rows_[0].seq, null);
     assertEquals(
       (await rows(store, `SELECT * FROM feed WHERE event = ?`, [bad.eventId]))
@@ -484,7 +485,12 @@ Deno.test('project: a pending remote event grounds as a transition (feed row, se
       state_key: user,
       content: { membership: 'join' },
       prev_events: [g.tipId],
-      auth_events: [g.createId],
+      auth_events: await authAt(g.room, {
+        type: 'm.room.member',
+        sender: user,
+        state_key: user,
+        content: { membership: 'join' },
+      }, g.tipId),
       origin_server_ts: 100,
     });
     assertEquals(
@@ -498,7 +504,11 @@ Deno.test('project: a pending remote event grounds as a transition (feed row, se
       sender: user,
       content: { msgtype: 'm.text', body: 'the missing one' },
       prev_events: [String(join.event_id)],
-      auth_events: [g.createId],
+      auth_events: await authAt(g.room, {
+        type: 'm.room.message',
+        sender: user,
+        content: {},
+      }, String(join.event_id)),
       depth: 50,
       origin_server_ts: 1000,
     });
@@ -507,7 +517,11 @@ Deno.test('project: a pending remote event grounds as a transition (feed row, se
       sender: user,
       content: { msgtype: 'm.text', body: 'held behind' },
       prev_events: [String(missing.event_id)],
-      auth_events: [g.createId],
+      auth_events: await authAt(g.room, {
+        type: 'm.room.message',
+        sender: user,
+        content: {},
+      }, String(join.event_id)),
       depth: 51,
       origin_server_ts: 1001,
     });
