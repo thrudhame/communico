@@ -66,3 +66,20 @@ async function assertRejectsStat(path: string): Promise<void> {
   }
   assert(missing, `${path} must have been swept`);
 }
+
+Deno.test('store open: interrupted server publication is swept before retry', async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    await Deno.mkdir(`${dir}/server.new`);
+    await Deno.writeTextFile(`${dir}/server.new/partial`, 'interrupted');
+    const store = await openStore(config(dir));
+    try {
+      await assertRejectsStat(`${dir}/server.new`);
+      await integrityCheck(await store.server());
+    } finally {
+      await store.close();
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
