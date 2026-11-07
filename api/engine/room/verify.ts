@@ -68,6 +68,16 @@ function checkFormat(
   spec: RoomVersionSpec,
   exemptPrevAuthLimits: boolean,
 ): boolean {
+  for (const list of [pdu.prev_events, pdu.auth_events]) {
+    if (
+      list !== undefined &&
+      (!Array.isArray(list) || list.some((id) => typeof id !== 'string'))
+    ) {
+      throw new Error(
+        'M_BAD_EVENT: prev_events/auth_events must be string arrays',
+      );
+    }
+  }
   const prevIds = pdu.prev_events ?? [];
   const declaredAuth = pdu.auth_events ?? [];
   if (!exemptPrevAuthLimits) {
