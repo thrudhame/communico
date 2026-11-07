@@ -78,6 +78,19 @@ Deno.test('verify: format guards refuse malformed events before storage', async 
   });
   (badKey as unknown as Record<string, unknown>).state_key = 42;
   await assertRejects(() => verify(badKey, '11', keys), Error, 'state_key');
+  for (const field of ['prev_events', 'auth_events']) {
+    for (
+      const value of [null, 'not an array', [null], [{}], [['$legacy', {}]]]
+    ) {
+      const malformed = await base();
+      (malformed as unknown as Record<string, unknown>)[field] = value;
+      await assertRejects(
+        () => verify(malformed, '11', keys),
+        Error,
+        'must be string arrays',
+      );
+    }
+  }
 });
 
 Deno.test('verify: the event id is recomputed, never trusted; uncanonicalizable content drops', async () => {

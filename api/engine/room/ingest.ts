@@ -43,6 +43,7 @@ import {
   checkDeclaredAuth,
   loadRulebookStore,
   resolvePrevs,
+  roomCreateId,
   roomVersionOf,
   stateBefore,
   ungroundedPrevs,
@@ -175,7 +176,8 @@ export async function ingestInTx(
   if (stay === null) {
     throw new Error('E_ROOM_ARCHIVED: no open stay for ' + roomId);
   }
-  const version = isCreate
+  const createId = await roomCreateId(tx, stay.id);
+  const version = isCreate && createId === null
     ? String(pdu.content?.room_version)
     : await roomVersionOf(tx, stay.id);
   const rulebook = getRulebook(version); // unknown: never a default
@@ -358,7 +360,7 @@ export async function ingestInTx(
     standing = 'rejected';
     reason = 'auth';
   } else {
-    const chain = checkDeclaredAuth(pdu, rulebook, store);
+    const chain = checkDeclaredAuth(pdu, rulebook, store, createId);
     const selected = remote !== null || isCreate
       ? null
       : rulebook.selectAuthEvents(pdu, before);

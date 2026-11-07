@@ -23,10 +23,11 @@ import {
   authorizedBoundary,
   checkDeclaredAuth,
   loadRulebookStore,
+  roomCreateId,
   roomVersionOf,
   ungroundedPrevs,
 } from '#engine/room/build.ts';
-import type { RemoteDeps } from '#engine/room/deps.ts';
+import { fetchOrNull, type RemoteDeps } from '#engine/room/deps.ts';
 import { projectAfterWrite } from '#engine/room/hooks.ts';
 import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
 import type { Room } from '#engine/room/index.ts';
@@ -115,12 +116,27 @@ async function fetchMissing(
   acc: FetchAcc,
 ): Promise<void> {
   const missingNow = async (): Promise<string[]> =>
-    await room.tx(async (tx) =>
-      await ungroundedPrevs(tx, item.pdu.prev_events ?? [])
-    );
+    await room.tx(async (tx) => {
+      const missing: string[] = [];
+      const seen = new Set<string>();
+      const visit = async (ids: readonly string[]): Promise<void> => {
+        for (const id of ids) {
+          if (seen.has(id)) continue;
+          seen.add(id);
+          if (
+            acc.boundaries.has(id) ||
+            await tx.state.eventStateAfter(id) !== null
+          ) continue;
+          const supplied = acc.live.get(id);
+          if (supplied === undefined) missing.push(id);
+          else await visit(supplied.pdu.prev_events ?? []);
+        }
+      };
+      await visit(item.pdu.prev_events ?? []);
+      return missing;
+    });
   const budgetLeft = () => budget.until - Date.now();
   let missing = await missingNow();
-  if (missing.length === 0) return;
 
   // 1. WAIT missingwaitms, waking early when the prevs arrive (the
   //    sender usually pushes them next) — the lock is NOT held meanwhile
@@ -132,13 +148,12 @@ async function fetchMissing(
       missing = await missingNow();
     }
   }
-  if (missing.length === 0) return;
 
   // 2. ONE get_missing_events (backfill.yaml:71-141): earliest = our
   //    current forward extremities, latest = the pushed PDU, limit =
   //    missinglimit. Verified answers land live; a verify failure is a
   //    drop and terminal for its cited id in this chain (…BadJSON).
-  if (budgetLeft() > 0) {
+  if (missing.length > 0 && budgetLeft() > 0) {
     const earliest = await room.tx(async (tx) => {
       const stay = await tx.segments.openStay();
       return stay === null ? [] : await tx.extremities.frontier(stay.id);
@@ -159,12 +174,14 @@ async function fetchMissing(
     for (const raw of answered) {
       try {
         const v = await verify(raw, version, deps.keys, { roomId: room.id });
-        acc.live.set(v.eventId, {
-          index: -1,
-          pdu: v.pdu,
-          eventId: v.eventId,
-          oversized: v.oversized,
-        });
+        if (!acc.live.has(v.eventId)) {
+          acc.live.set(v.eventId, {
+            index: -1,
+            pdu: v.pdu,
+            eventId: v.eventId,
+            oversized: v.oversized,
+          });
+        }
       } catch {
         dropped++;
       }
@@ -173,7 +190,9 @@ async function fetchMissing(
     // CITED id (authored under different redaction rules, our computed id
     // differs from the citation): tombstone the cited prev in this chain
     // or the chase asks /state_ids for it forever (…BadJSONForRoomVersion6)
-    if (dropped > 0 && missing.length === 1) acc.terminal.add(missing[0]);
+    if (dropped > 0 && missing.length === 1 && !acc.live.has(missing[0])) {
+      acc.terminal.add(missing[0]);
+    }
   }
 
   // 3. /state_ids + /event for the GAP TIPS (at most missinglimit state
@@ -184,7 +203,7 @@ async function fetchMissing(
   const chase = async (ids: readonly string[]): Promise<void> => {
     for (const id of ids) {
       if (
-        chased.has(id) || acc.terminal.has(id) ||
+        chased.has(id) || acc.terminal.has(id) || acc.boundaries.has(id) ||
         gapTips.length >= deps.limits.limit
       ) {
         continue;
@@ -228,10 +247,12 @@ async function fetchMissing(
       }
       if (missingAuth.length === 0) continue;
       if (budgetLeft() <= 0) return;
-      const chain = await deps.fetcher.eventAuth(
-        room.id,
-        target.eventId,
-        origin,
+      const chain = await fetchOrNull(() =>
+        deps.fetcher.eventAuth(
+          room.id,
+          target.eventId,
+          origin,
+        )
       );
       if (chain === null) continue;
       // wire form has no id yet — depth order, stable ties
@@ -263,7 +284,9 @@ async function fetchGapTip(
   budget: { until: number },
   acc: FetchAcc,
 ): Promise<void> {
-  const ids = await deps.fetcher.stateIds(room.id, tip, origin);
+  const ids = await fetchOrNull(() =>
+    deps.fetcher.stateIds(room.id, tip, origin)
+  );
   if (ids === null) return;
   const authSet = new Set(ids.authChainIds);
   const wanted = [...new Set([...ids.pduIds, ...ids.authChainIds])].sort();
@@ -278,7 +301,7 @@ async function fetchGapTip(
   let corruptedAuth = false;
   for (const id of unknown.slice(0, deps.limits.limit)) {
     if (budget.until - Date.now() <= 0) return;
-    const raw = await deps.fetcher.event(id, origin);
+    const raw = await fetchOrNull(() => deps.fetcher.event(id, origin));
     if (raw === null) {
       if (authSet.has(id)) corruptedAuth = true;
       continue;
@@ -296,7 +319,7 @@ async function fetchGapTip(
   }
   // the tip itself via /event
   let tipPdu: Pdu | null = null;
-  const rawTip = await deps.fetcher.event(tip, origin);
+  const rawTip = await fetchOrNull(() => deps.fetcher.event(tip, origin));
   if (rawTip !== null) {
     try {
       const v = await verify(rawTip, version, deps.keys, {
@@ -409,7 +432,7 @@ export async function ingestRemote(
   // The unlocked fetch phase: gather what is missing before the lock,
   // inside the whole-batch budget (R13 — network never under the lock)
   const acc: FetchAcc = {
-    live: new Map(),
+    live: new Map(items.map((item) => [item.eventId, item])),
     evidence: new Map(),
     corrupted: new Map(),
     boundaries: new Map(),
@@ -437,6 +460,7 @@ export async function ingestRemote(
         throw new Error('E_ROOM_ARCHIVED: no open stay for ' + room.id);
       }
       const lockedVersion = await roomVersionOf(tx, stay.id);
+      const createId = await roomCreateId(tx, stay.id);
       const rulebook = getRulebook(lockedVersion);
 
       // The ingest set: pushed PDUs and fetched live events, deduplicated
@@ -481,13 +505,13 @@ export async function ingestRemote(
         const needsBoundary = boundary !== undefined &&
           (await ungroundedPrevs(tx, pdu.prev_events ?? [])).length > 0;
         const invalidBoundary = needsBoundary &&
-          !authorizedBoundary(boundary, store);
+          !authorizedBoundary(boundary, store, createId);
         if (!merged.has(id) || invalidBoundary) {
           if ((await tx.events.get(id)) !== null) continue; // first-writer
           const corrupted = acc.corrupted.has(id) || invalidBoundary;
           const chain = corrupted
             ? null
-            : checkDeclaredAuth(pdu, rulebook, store);
+            : checkDeclaredAuth(pdu, rulebook, store, createId);
           const rejected = corrupted || chain === null || !chain.ok;
           if (rejected) localRejected.add(id);
           await tx.events.insert(
