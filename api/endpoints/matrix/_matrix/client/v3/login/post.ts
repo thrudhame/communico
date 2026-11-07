@@ -1,8 +1,6 @@
 import { parseJson } from '@pathfinder/pathfinder/body';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { isDeactivated, verifyUserPassword } from '#engine/tenant/users.ts';
-import { issueRefreshToken, issueToken } from '#engine/tenant/auth.ts';
-import { upsertDevice } from '#engine/tenant/devices.ts';
+import { loginUser } from '#engine/tenant/users.ts';
 import { theApp } from '#engine/app.ts';
 import { serverName } from '#engine/config.ts';
 import { splitId } from '#engine/ids.ts';
@@ -51,54 +49,32 @@ export default async function (
   } else {
     localpart = rawUser.toLowerCase();
   }
-  // M2: deactivated accounts cannot log in (spec: M_USER_DEACTIVATED,
-  // "Typically for endpoints that prove authentication, such as /login").
-  if (await isDeactivated(theApp().tenant, localpart)) {
-    throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account deactivated');
-  }
-  if (!await verifyUserPassword(theApp().tenant, localpart, body.password)) {
-    throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
-  }
   const deviceId: string =
     typeof body.device_id === 'string' && body.device_id.length > 0
       ? body.device_id
       : crypto.randomUUID().replaceAll('-', '').slice(0, 10);
-  // Login (re)creates the device row — the devices list reflects every
-  // device that holds (or held) a token.
-  await upsertDevice(
-    theApp().tenant,
+  const session = await loginUser(theApp().tenant, {
     localpart,
     deviceId,
-    typeof body.initial_device_display_name === 'string'
+    password: body.password,
+    displayName: typeof body.initial_device_display_name === 'string'
       ? body.initial_device_display_name
       : undefined,
-  );
+    refresh: body.refresh_token === true,
+  });
   // Band C (D8): refresh_token: true asks for the refresh flow
   // (login.yaml:158-161) — the access token then carries an
   // (informational, never enforced) expiry and a refresh token is issued.
-  const wantsRefresh = body.refresh_token === true;
-  const expiresInMs = 3_600_000;
-  const accessToken = await issueToken(
-    theApp().tenant,
-    localpart,
-    deviceId,
-    wantsRefresh ? Date.now() + expiresInMs : undefined,
-  );
   await ensurePresenceRow(theApp().server, `@${localpart}:${serverName()}`);
   const result: Record<string, unknown> = {
     user_id: `@${localpart}:${serverName()}`,
-    access_token: accessToken,
+    access_token: session.accessToken,
     device_id: deviceId,
     home_server: serverName(),
   };
-  if (wantsRefresh) {
-    result.expires_in_ms = expiresInMs;
-    result.refresh_token = await issueRefreshToken(
-      theApp().tenant,
-      localpart,
-      deviceId,
-      accessToken,
-    );
+  if (session.refreshToken !== undefined) {
+    result.expires_in_ms = session.expiresInMs;
+    result.refresh_token = session.refreshToken;
   }
   return result;
 }

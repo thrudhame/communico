@@ -264,7 +264,7 @@ test('state routes: both depths, trailing slash, content/event shape, idempotenc
 
 test('txn: repeat/content/token/device/room scope; redaction receipt and read-time projection', async () => {
   const a = await registerTestUser('txn-a', 'pw');
-  const A = a.access_token;
+  let A = a.access_token;
   const id = await create(A);
   const id2 = await create(A);
   const send = (room: string, token: string, text: string) =>
@@ -287,8 +287,10 @@ test('txn: repeat/content/token/device/room scope; redaction receipt and read-ti
     device_id: a.device_id,
   }, 'POST');
   assertEquals(login.status, 200);
+  assertEquals((await send(id, A, 'revoked token')).status, 401);
+  A = login.body.access_token as string;
   assertEquals(
-    (await send(id, login.body.access_token as string, 'other token')).body,
+    (await send(id, A, 'other token')).body,
     first.body,
   );
   const room = await requireRoom(id);

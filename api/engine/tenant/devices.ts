@@ -2,6 +2,8 @@
 // devices removes their tokens (and those tokens' pushers and refresh
 // rows) with them.
 import type { Conn } from '#engine/store/db.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { revokeDeviceTokens } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 
 export type DeviceRow = {
@@ -26,10 +28,17 @@ export async function upsertDeviceRow(
   localpart: string,
   displayName: string | null,
 ): Promise<void> {
-  await conn.execute(
-    'INSERT INTO devices (device_id, localpart, display_name) VALUES (?, ?, ?) ON CONFLICT (device_id) DO UPDATE SET localpart = excluded.localpart, display_name = COALESCE(excluded.display_name, devices.display_name)',
+  const changed = await conn.execute(
+    'INSERT INTO devices (device_id, localpart, display_name) VALUES (?, ?, ?) ON CONFLICT (device_id) DO UPDATE SET display_name = COALESCE(excluded.display_name, devices.display_name) WHERE devices.localpart = excluded.localpart',
     [deviceId, localpart, displayName],
   );
+  if (changed === 0) {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'device ID belongs to another user',
+    );
+  }
 }
 
 export async function deviceById(
@@ -143,12 +152,7 @@ export async function deleteDevices(
 ): Promise<void> {
   await tenant.tx(async (tx) => {
     for (const deviceId of deviceIds) {
-      for (const t of await tx.tokens.ofDevice(deviceId)) {
-        if (t.localpart !== localpart) continue;
-        await tx.pushers.deleteForToken(t.token);
-        await tx.refresh.deleteForAccessToken(t.token);
-        await tx.tokens.delete(t.token);
-      }
+      await revokeDeviceTokens(tx, deviceId, localpart);
       await tx.devices.deleteOwned(deviceId, localpart);
     }
   });
