@@ -8,6 +8,7 @@ import {
 import { pathfinder } from '@pathfinder/pathfinder';
 import { mediaRoot } from '#engine/media.ts';
 import { startAdmin } from '#root/api/admin/index.ts';
+import { ServerLifetime } from '#root/api/server-lifetime.ts';
 
 try {
   const loaded = loadedConfig();
@@ -55,9 +56,10 @@ try {
 
 await Deno.mkdir(mediaRoot(), { recursive: true });
 const app = await openApp();
+const lifetime = new ServerLifetime();
 let admin: Awaited<ReturnType<typeof startAdmin>>;
 try {
-  admin = await startAdmin(app);
+  admin = await startAdmin(app, undefined, lifetime);
 } catch (error) {
   await closeApp();
   throw error;
@@ -83,7 +85,10 @@ if (config().federation.enabled) {
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 
 const servers = [
-  Deno.serve({ port: appPort() }, matrix),
+  Deno.serve(
+    { port: appPort(), signal: lifetime.controller.signal },
+    lifetime.wrap('cs', matrix),
+  ),
 ];
 
 if (config().federation.enabled) {
@@ -95,22 +100,30 @@ if (config().federation.enabled) {
       port,
       cert: await Deno.readTextFile(cert),
       key: await Deno.readTextFile(key),
-    }, matrix),
+      signal: lifetime.controller.signal,
+    }, lifetime.wrap('federation', matrix)),
   );
 }
 
-// Clean shutdown closes the store: stop the listeners, then the app
-// (sender stopped, files closed) and exit 0 — a SIGTERM must never
-// leave a half-written database directory behind.
+// Stop admission first; keep transports readable until admitted work drains.
+// The store lock is released only after every listener (including admin) ends.
 let stopping = false;
 async function shutdown(): Promise<void> {
   if (stopping) return;
   stopping = true;
-  await Promise.allSettled(servers.map((server) => server.shutdown()));
-  await admin.shutdown();
+  console.log('shutdown: draining');
+  const remaining = await lifetime.drain(config().server.shutdowngraceseconds);
+  const forced = Object.keys(remaining).length !== 0;
+  if (forced) {
+    console.error('shutdown: forced aborts', JSON.stringify(remaining));
+  }
+  await Promise.all([
+    ...servers.map((server) => server.shutdown()),
+    admin.shutdown(),
+  ]);
   await closeApp();
   console.log('shutdown: store closed');
-  Deno.exit(0);
+  Deno.exit(forced ? 1 : 0);
 }
 Deno.addSignalListener('SIGINT', () => void shutdown());
 Deno.addSignalListener('SIGTERM', () => void shutdown());

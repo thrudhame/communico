@@ -19,6 +19,7 @@ const PROBE = `console.log('VALUE=' + Deno.env.get('TEST_KEY'));\n`;
 const FULL = `[server]
 name = "localhost"
 port = 8008
+shutdowngraceseconds = 10
 
 [admin]
 socket = ""

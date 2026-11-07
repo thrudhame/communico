@@ -7,6 +7,7 @@ import { AdminError, type Operation } from '#root/api/admin/protocol.ts';
 import { federationOperations } from '#root/api/admin/federation.ts';
 import { roomOperations } from '#root/api/admin/rooms.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import type { ServerLifetime } from '#root/api/server-lifetime.ts';
 
 export function adminHandler(
   app: App,
@@ -64,7 +65,11 @@ export function adminHandler(
 }
 
 /** Bind synchronously under a restrictive umask, verify before serving work. */
-export async function startAdmin(app: App, path = adminSocket()) {
+export async function startAdmin(
+  app: App,
+  path = adminSocket(),
+  lifetime?: ServerLifetime,
+) {
   const parent = await Deno.lstat(dirname(path));
   const uid = Deno.uid();
   if (!parent.isDirectory || parent.uid !== uid) {
@@ -102,8 +107,13 @@ export async function startAdmin(app: App, path = adminSocket()) {
   let server: Deno.HttpServer<Deno.UnixAddr>;
   try {
     server = Deno.serve(
-      { transport: 'unix', path, onListen() {} },
-      adminHandler(app),
+      {
+        transport: 'unix',
+        path,
+        signal: lifetime?.controller.signal,
+        onListen() {},
+      },
+      lifetime ? lifetime.wrap('admin', adminHandler(app)) : adminHandler(app),
     );
   } finally {
     Deno.umask(mask);

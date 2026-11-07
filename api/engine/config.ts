@@ -300,6 +300,14 @@ export function loadConfig(opts: {
     );
   }
 
+  const grace = (built.server as Record<string, unknown> | undefined)
+    ?.shutdowngraceseconds;
+  if (typeof grace === 'number' && grace < 0) {
+    problems.push(
+      `config: server.shutdowngraceseconds (COMMUNICO_SERVER_SHUTDOWNGRACESECONDS): expected >= 0, got ${grace}`,
+    );
+  }
+
   const preview = built.preview;
   if (
     preview !== null && typeof preview === 'object' && !Array.isArray(preview)
@@ -517,7 +525,7 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
-  server?: { name?: string; port?: number };
+  server?: { name?: string; port?: number; shutdowngraceseconds?: number };
   admin?: { socket?: string };
   media?: { root?: string; maxbytes?: number };
   preview?: {

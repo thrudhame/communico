@@ -8,6 +8,9 @@
 name = "localhost"
 # The one listener's port. COMMUNICO_SERVER_PORT (formerly APP_PORT)
 port = 8008
+# Admission stops immediately on SIGTERM/SIGINT; admitted work gets this long.
+# COMMUNICO_SERVER_SHUTDOWNGRACESECONDS
+shutdowngraceseconds = 10
 
 [admin]
 # Local operator API. Empty means admin.sock beside the resolved store root.
