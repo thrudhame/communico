@@ -25,7 +25,7 @@ import { onTenantStream } from '#engine/tenant/streams.ts';
 import {
   getPresence,
   onEphemeral,
-  publicReceiptRoomsSince,
+  receiptRoomsSince,
   receiptsSince,
   setPresenceValue,
   sharedUsers,
@@ -177,6 +177,7 @@ async function roomTimeline(
     const receipts = await receiptsSince(
       app.server,
       room.id,
+      i.userId,
       i.since?.rSeq ?? 0,
     );
     if (receipts !== null) {
@@ -244,7 +245,7 @@ async function relevantChanged(i: SyncInputs): Promise<boolean> {
     )
   ) return true;
   if (
-    (await publicReceiptRoomsSince(app.server, i.userId, i.since.rSeq)).size > 0
+    (await receiptRoomsSince(app.server, i.userId, i.since.rSeq)).size > 0
   ) return true;
   for (const u of await sharedUsers(app.server, i.userId)) {
     if ((await getPresence(app.server, u)).seq > i.since.pSeq) return true;
@@ -318,7 +319,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const memberships = await roomsFor(app.server, i.userId);
   const receiptRooms = i.since === null
     ? new Set<string>()
-    : await publicReceiptRoomsSince(app.server, i.userId, i.since.rSeq);
+    : await receiptRoomsSince(app.server, i.userId, i.since.rSeq);
   const join: Record<string, unknown> = {},
     invite: Record<string, unknown> = {},
     leave: Record<string, unknown> = {};
