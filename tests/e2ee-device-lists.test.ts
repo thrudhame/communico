@@ -97,6 +97,8 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
           'e2ee_room_members',
           'device_tracking',
           'device_notices',
+          'edu_outbox',
+          'federation_batches',
         ]
       ) await db.exec('DROP TABLE ' + name);
     },
@@ -162,7 +164,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
     assertEquals(
       (await migrated.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '5',
+      '6',
     );
   } finally {
     await store.close();

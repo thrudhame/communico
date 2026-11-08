@@ -1,21 +1,7 @@
-// api/engine/federation/sender.ts — the outbound delivery loop (old D2,
-// on the 4b outbox). One loop per destination, started lazily when a row
-// for it appears (projection insert → the onProjected rescan → wake) or
-// at startSender for every destination with pending rows (a restart
-// picks up exactly what was pending). The batch is DERIVED: the oldest
-// ≤ 50 pending rows in feed order, and the transaction — id and
-// origin_server_ts — derives deterministically from it, so a retry
-// (process restart or not) resends exactly that transaction; a changed
-// body (rows delivered or expired meanwhile) derives a different id,
-// the old "a changed body may never reuse an id". The frozen batch's
-// EDUs ride in memory while the process lives (never persisted — after
-// a restart the resend carries PDUs only). Every non-2xx is retried on
-// the millihour ladder (peer_status is the timing source; the rows
-// mirror it); rows leave pending by exactly three doors — sent, the
-// operator's prune, or the refusedmillihours expiry with its admin
-// alert (ruling E). Inbound contact resets the ladder (contactHook —
-// auth.ts's onContact wires it into every authenticated endpoint).
-// Delivery truth stays in the server file; never derived again.
+// One destination loop owns room delivery, reliable EDUs and the peer ladder.
+// Persist the exact mixed envelope before transport; retry its bytes and id
+// across restart. Only PDU work uses refusedmillihours expiry. A changed PDU
+// selection retires its envelope without expiring accepted reliable messages.
 import { config } from '#engine/config.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom } from '#engine/room/index.ts';
@@ -24,7 +10,13 @@ import { onProjected } from '#engine/server/project.ts';
 import { outboxDue, type OutboxDueRow } from '#engine/server/read.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
-import { b64encode, sha256ofString } from '#engine/signing-primitives.js';
+import {
+  completeBatch,
+  deliveryTurn,
+  freezeBatch,
+  frozenBatch,
+  pendingEdus,
+} from '#engine/server/delivery.ts';
 import { federationRequest } from './client.ts';
 import { isBlocked, recordPending } from './peers.ts';
 
@@ -76,7 +68,7 @@ export async function listOutbox(
 // Destinations with undelivered rows (the startSender / projection rescan).
 async function destinationsWithPending(server: Db): Promise<string[]> {
   const rows = await server.query(
-    "SELECT DISTINCT destination FROM outbox WHERE state = 'pending'",
+    "SELECT destination FROM outbox WHERE state='pending' UNION SELECT destination FROM edu_outbox WHERE state='pending' UNION SELECT destination FROM federation_batches",
     [],
   );
   return rows.map((row) => String(row.destination));
@@ -328,30 +320,11 @@ function backoffMs(failures: number): number {
   return mh * 3_600; // millihours → ms
 }
 
-// The derived transaction identity: stable while the batch is (same
-// rows → same id and ts, restart or not), different the moment the body
-// changes. ts = the newest row's added_ms (the old inflight ts's
-// deterministic equivalent).
-async function deriveTxn(
-  destination: string,
-  rows: OutboxDueRow[],
-): Promise<{ txnId: string; ts: number }> {
-  const ts = rows.reduce((m, r) => Math.max(m, r.addedMs), 0);
-  const keys = rows.map((r) => `${r.room}:${r.pos}`).join('\n');
-  const hash = b64encode(
-    await sha256ofString(`${destination}\n${ts}\n${keys}`),
-  );
-  return { txnId: `${ts}-${hash.slice(0, 22)}`, ts };
-}
-
 export function startSender(deps: SenderDeps): Sender {
   const serverP = deps.store.server();
   const running = new Set<string>();
   const wakers = new Map<string, () => void>();
-  // the derived transaction's EDUs, in-memory while the process lives
-  const frozenEdus = new Map<string, Edu[]>();
   const inFlight = new Map<string, { txnId: string; rows: string[] }>();
-  let eduTxnCounter = 0;
   let intentProvider: IntentProvider | null = null;
   let stopped = false;
   const loops = new Set<Promise<void>>();
@@ -480,40 +453,80 @@ export function startSender(deps: SenderDeps): Sender {
       // a block added later stops the loop; rows left in place for the
       // operator's prune
       if (await isBlocked(server, destination)) return;
-      // 2. the derived batch — the oldest ≤ 50 pending rows in feed order
-      const batch = await outboxDue(server, destination, Date.now(), 50);
-      // the transaction: derived while PDUs ride (stable across retries
-      // and restarts); an EDU-only send is ephemeral — a fresh id every
-      // time (the old counter mint), never frozen, never retried
-      let txnId: string;
-      let ts: number;
-      if (batch.length > 0) {
-        const derived = await deriveTxn(destination, batch);
-        txnId = derived.txnId;
-        ts = derived.ts;
-      } else {
-        txnId = `${Date.now()}-${++eduTxnCounter}`;
-        ts = Date.now();
+      // Resume exact persisted bytes first. New work cannot change an in-flight
+      // transaction, even when it arrives between a failure and a restart.
+      let frozen = await frozenBatch(server, destination);
+      if (frozen === null) {
+        const candidates = await outboxDue(server, destination, Date.now(), 50);
+        const pending = await pendingEdus(server, destination, 100);
+        const rows: OutboxDueRow[] = [];
+        const reliable: typeof pending = [];
+        const edus: Edu[] = [];
+        const pdus: Record<string, unknown>[] = [];
+        if (stopped) return;
+        // Reliable and room work get independent slots in every envelope. The
+        // byte budget leaves room for both before draining ephemeral extras.
+        const maxBytes = config().federation.bulkmaxbytes;
+        const ts = Date.now();
+        const encode = () =>
+          JSON.stringify({
+            origin: deps.signer.serverName,
+            origin_server_ts: ts,
+            pdus,
+            edus,
+          });
+        // Alternate the first family durably, then interleave candidates. A
+        // large PDU and an EDU that cannot fit together each get their turn.
+        const eduFirst = (await deliveryTurn(server, destination)) % 2 === 1;
+        for (let i = 0; i < Math.max(candidates.length, pending.length); i++) {
+          for (const family of eduFirst ? ['edu', 'pdu'] : ['pdu', 'edu']) {
+            if (family === 'pdu' && i < candidates.length) {
+              const row = candidates[i];
+              const pdu = await pduOf(row.room, row.event);
+              if (pdu !== null) pdus.push(pdu);
+              if (new TextEncoder().encode(encode()).length <= maxBytes) {
+                rows.push(row);
+              } else if (pdu !== null) pdus.pop();
+            } else if (family === 'edu' && i < pending.length) {
+              const row = pending[i];
+              edus.push({ edu_type: row.edu_type, content: row.content });
+              if (new TextEncoder().encode(encode()).length <= maxBytes) {
+                reliable.push(row);
+              } else edus.pop();
+            }
+          }
+        }
+        if (
+          rows.length === 0 && reliable.length === 0 &&
+          (candidates.length || pending.length)
+        ) {
+          throw new Error('individual federation work exceeds envelope budget');
+        }
+        const extras = deps.drainEdus === undefined
+          ? []
+          : deps.drainEdus(destination, 100 - edus.length);
+        for (const edu of extras) {
+          edus.push(edu);
+          if (new TextEncoder().encode(encode()).length > maxBytes) {
+            edus.pop();
+          }
+        }
+        if (rows.length === 0 && edus.length === 0) return;
+        const body = encode();
+        if (new TextEncoder().encode(body).length > maxBytes) {
+          throw new Error('federation envelope exceeds byte budget');
+        }
+        frozen = {
+          txnId: crypto.randomUUID(),
+          body,
+          rows,
+          sources: reliable.map((r) => r.source),
+        };
+        if (!await freezeBatch(server, destination, frozen)) continue;
       }
-      let edus: Edu[];
       if (stopped) return;
-      if (batch.length > 0 && frozenEdus.has(txnId)) {
-        // a retry in this process: the frozen batch's EDUs ride again
-        edus = frozenEdus.get(txnId) as Edu[];
-      } else {
-        edus = deps.drainEdus !== undefined
-          ? deps.drainEdus(destination, 100)
-          : [];
-        if (batch.length > 0 && edus.length > 0) frozenEdus.set(txnId, edus);
-      }
-      if (batch.length === 0 && edus.length === 0) return;
-      // 3. wire form PDUs from the room files
-      const pdus: Record<string, unknown>[] = [];
-      for (const row of batch) {
-        const pdu = await pduOf(row.room, row.event);
-        if (pdu !== null) pdus.push(pdu);
-      }
-      if (stopped) return;
+      const delivered = frozen;
+      const { txnId, rows: batch } = delivered;
       let res;
       try {
         inFlight.set(destination, {
@@ -524,14 +537,7 @@ export function startSender(deps: SenderDeps): Sender {
           destination,
           method: 'PUT',
           path: `/_matrix/federation/v1/send/${encodeURIComponent(txnId)}`,
-          body: new TextEncoder().encode(
-            JSON.stringify({
-              origin: deps.signer.serverName,
-              origin_server_ts: ts,
-              pdus,
-              edus: edus.map((e) => ({ ...e })),
-            }),
-          ),
+          body: new TextEncoder().encode(delivered.body),
           maxBytes: config().federation.bulkmaxbytes,
         });
       } catch (e) {
@@ -585,15 +591,9 @@ export function startSender(deps: SenderDeps): Sender {
       // Persistence errors are not transport failures. Roll back the delivery
       // outcome as a unit, leaving the derived batch available after restart.
       await server.tx(async (tx) => {
-        for (const row of batch) {
-          await tx.execute(
-            "UPDATE outbox SET state = 'sent' WHERE room = ? AND pos = ? AND destination = ?",
-            [row.room, row.pos, destination],
-          );
-        }
+        await completeBatch(tx, destination, delivered);
         await recordSuccess(tx, destination);
       });
-      frozenEdus.delete(txnId);
       const body = res.json as
         | { pdus?: Record<string, { error?: string }> }
         | null;

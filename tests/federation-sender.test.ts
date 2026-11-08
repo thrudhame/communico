@@ -28,6 +28,7 @@ import type { Room } from '#engine/room/index.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { enqueueEdu } from '#engine/server/delivery.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { type Genesis, genesis } from './fixtures/genesis.ts';
@@ -41,7 +42,6 @@ import { testRemoteServer } from './fixtures/signer.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
-  sha256ofString,
 } from '#engine/signing-primitives.js';
 import { type FakeServer, startFakeServer } from './federation/fake-server.ts';
 
@@ -258,67 +258,45 @@ Deno.test('sender: rows visible after the room write; delivery; wire form; sent 
   });
 });
 
-for (const character of ['/', '+']) {
-  Deno.test(`sender: generated transaction with standard Base64 ${character} stays one URL segment`, async () => {
-    await withStore(async (store) => {
-      await withSetup(store, async ({ g, dest, fake, sends, sender }) => {
-        await sender.stop();
-        const eventId = await devSays(g.room, g.signer, 'URL-safe transaction');
-        const server = await store.server();
-        const [row] = await listOutbox(server, dest);
-        // Fixed future timestamps avoid expiry. Search the fixture, not the
-        // generator, so the ephemeral TLS port cannot make the test lucky.
-        let ts = 4_000_000_000_000;
-        let standard = '';
-        for (let i = 0; i < 4096; i++, ts++) {
-          standard = b64encodeStd(
-            await sha256ofString(`${dest}\n${ts}\n${row.room}:${row.pos}`),
-          ).slice(0, 22);
-          if (standard.includes(character)) break;
-        }
+Deno.test('sender: persisted transaction id stays one signed URL segment', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, dest, fake, sends, sender }) => {
+      await sender.stop();
+      const eventId = await devSays(g.room, g.signer, 'URL-safe transaction');
+      const server = await store.server();
+      const [row] = await listOutbox(server, dest);
+      assertEquals(row.state, 'pending');
+      const restarted = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(() => sends.length === 1, 3000);
+        const expected = sends[0].txnId;
+        assert(/^[A-Za-z0-9_-]+$/.test(sends[0].txnId));
+        const request = fake.requests.find((r) => r.method === 'PUT')!;
         assert(
-          standard.includes(character),
-          'fixture forces the unsafe alphabet',
+          request.verified,
+          'the consumer verifies the actual signed URI',
         );
-        await server.execute(
-          'UPDATE outbox SET added_ms = ? WHERE destination = ?',
-          [ts, dest],
+        assertEquals(request.path, `/_matrix/federation/v1/send/${expected}`);
+        assertEquals(decodeURIComponent(request.path).split('/'), [
+          '',
+          '_matrix',
+          'federation',
+          'v1',
+          'send',
+          expected,
+        ]);
+        await waitFor(async () =>
+          (await listOutbox(server, dest))[0].state === 'sent'
         );
-        const restarted = startSender({ store, signer: g.signer });
-        try {
-          await waitFor(() => sends.length === 1, 3000);
-          const expected = `${ts}-${
-            standard.replaceAll('+', '-').replaceAll('/', '_')
-          }`;
-          assertEquals(sends[0].txnId, expected);
-          assert(/^[A-Za-z0-9_-]+$/.test(sends[0].txnId));
-          const request = fake.requests.find((r) => r.method === 'PUT')!;
-          assert(
-            request.verified,
-            'the consumer verifies the actual signed URI',
-          );
-          assertEquals(request.path, `/_matrix/federation/v1/send/${expected}`);
-          assertEquals(decodeURIComponent(request.path).split('/'), [
-            '',
-            '_matrix',
-            'federation',
-            'v1',
-            'send',
-            expected,
-          ]);
-          await waitFor(async () =>
-            (await listOutbox(server, dest))[0].state === 'sent'
-          );
-          assertEquals((await listOutbox(server, dest))[0].event, eventId);
-        } finally {
-          await restarted.stop();
-        }
-      });
+        assertEquals((await listOutbox(server, dest))[0].event, eventId);
+      } finally {
+        await restarted.stop();
+      }
     });
   });
-}
+});
 
-Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only after a restart', async () => {
+Deno.test('sender: frozen retry preserves the same transaction, timestamp, PDUs and EDUs after restart', async () => {
   await withStore(async (store) => {
     // a draining stub: the real queues land in edus.ts (c3); the
     // drain-once shape is what the sender's frozen cache relies on
@@ -349,7 +327,7 @@ Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only af
       assertEquals(second.pdus, first.pdus);
       assertEquals(second.edus, first.edus);
       assertEquals(second.edus.length, 1, 'the frozen EDU rides again');
-      // a restart: the derived batch's EDUs were never persisted — PDUs only
+      // A restart must preserve the entire transaction body, including EDUs.
       await sender.stop();
       const restarted = startSender({
         store,
@@ -364,7 +342,7 @@ Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only af
         const third = sends.filter((s) => s.txnId === first.txnId)[2];
         assertEquals(third.pdus, first.pdus);
         assertEquals(third.origin_server_ts, first.origin_server_ts);
-        assertEquals(third.edus, []);
+        assertEquals(third.edus, first.edus);
         // success now: rows sent
         steer.status = 200;
         await waitFor(
@@ -384,6 +362,64 @@ Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only af
         await restarted.stop();
       }
     }, { drainEdus: drain });
+  });
+});
+
+Deno.test('sender: reliable EDU-only retry survives restart byte-for-byte and new work waits for another envelope', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, fake, dest, sends, steer, sender }) => {
+      const server = await store.server();
+      await sender.stop();
+      const content = {
+        sender: '@dev:test',
+        type: 'm.test',
+        message_id: 'logical-one',
+        messages: { [`@bob:${dest}`]: { '*': { opaque: 1 } } },
+      };
+      await server.tx((tx) =>
+        enqueueEdu(tx, 'one', dest, 'm.direct_to_device', content)
+      );
+      steer.status = 500;
+      let resumed = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(async () =>
+          (await peerStatus(server, dest)).failures > 0
+        );
+        await resumed.stop();
+        assertEquals(sends[0].edus, [{
+          edu_type: 'm.direct_to_device',
+          content,
+        }]);
+        await server.tx((tx) =>
+          enqueueEdu(tx, 'two', dest, 'm.direct_to_device', {
+            ...content,
+            message_id: 'logical-two',
+          })
+        );
+        steer.status = 200;
+        resumed = startSender({ store, signer: g.signer });
+        await waitFor(async () =>
+          (await server.query("SELECT 1 FROM edu_outbox WHERE state='pending'"))
+            .length === 0
+        );
+        const puts = fake.requests.filter((r) => r.method === 'PUT');
+        assert(puts.length >= 3);
+        assertEquals(puts[1].path, puts[0].path);
+        assertEquals(puts[1].body, puts[0].body);
+        assert(puts[2].path !== puts[0].path);
+        assertEquals(sends[1].edus.length, 1);
+        assertEquals(sends[2].edus[0].content, {
+          ...content,
+          message_id: 'logical-two',
+        });
+        assertEquals(
+          await server.query('SELECT * FROM federation_batches'),
+          [],
+        );
+      } finally {
+        await resumed.stop();
+      }
+    });
   });
 });
 
