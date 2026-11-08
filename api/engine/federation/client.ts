@@ -46,6 +46,14 @@ export class FederationHttpError extends MatrixError {
   }
 }
 
+// v2 -> v1 fallback requires a completed endpoint-unknown response, not a
+// client-facing mapped status or a local error with a coincidentally equal code.
+export function isEndpointUnknown(error: unknown): boolean {
+  if (!(error instanceof FederationHttpError)) return false;
+  if (error.remoteStatus !== 404 && error.remoteStatus !== 405) return false;
+  return !error.matrixBody || error.errcode === 'M_UNRECOGNIZED';
+}
+
 export async function federationRequest(
   server: Db,
   signer: Signer,

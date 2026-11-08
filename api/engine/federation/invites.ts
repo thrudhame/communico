@@ -37,7 +37,7 @@ import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { withProjectionLock } from '#engine/server/project.ts';
-import { federationRequest } from './client.ts';
+import { federationRequest, isEndpointUnknown } from './client.ts';
 import { admit } from './gate.ts';
 import { domainOf, toWire } from './pdu.ts';
 import type {
@@ -590,10 +590,7 @@ export async function sendRemoteLeave(
       ),
     });
   } catch (e) {
-    const err = e as { status?: number; errcode?: string };
-    const endpointUnknown = (err.status === 404 || err.status === 405) &&
-      (err.errcode === undefined || err.errcode === 'M_UNRECOGNIZED');
-    if (!endpointUnknown) throw e;
+    if (!isEndpointUnknown(e)) throw e;
     await federationRequest(deps.server, deps.signer, {
       destination,
       method: 'PUT',

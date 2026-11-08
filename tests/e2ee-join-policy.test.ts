@@ -18,6 +18,8 @@ import {
 import {
   type InviteDeps,
   inviteIntentProvider,
+  prepareRemoteLeave,
+  sendRemoteLeave,
 } from '#engine/federation/invites.ts';
 import {
   joinCleanupProvider,
@@ -36,6 +38,90 @@ import { createRoom } from '#engine/room/create.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { ingestLocal, sendLocal } from '#engine/room/ingest.ts';
 import { productionFetcher } from '#engine/federation/fetcher.ts';
+
+Deno.test('E6 remote leave fallback uses completed upstream endpoint status and preserves real refusals', async () => {
+  const old = config();
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  const dir = await Deno.makeTempDir();
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { server: serverSchema } });
+  const signer = await testSigner();
+  const user = '@anna:test';
+  const fr = await makeFakeRoom({ roomId: '!leave-fallback:remote.test' });
+  let status = 404;
+  let errcode: string | undefined;
+  let membership = 'join';
+  let v1Calls = 0;
+  const fake = await startFakeServer({
+    ourKeyDoc: async () => ({
+      server_name: signer.serverName,
+      verify_keys: {
+        [signer.keyId]: {
+          key: b64encodeStd(await exportPublicKeyRaw(remote.kp.publicKey)),
+        },
+      },
+    }),
+    handlers: (req) => {
+      if (req.path.includes('/make_leave/')) {
+        return Response.json({ event: fr.makeJoinAnswer(user).event });
+      }
+      if (req.path.includes('/send_leave/')) {
+        assert(req.verified);
+        if (req.path.includes('/v2/')) {
+          return errcode === undefined
+            ? new Response('upstream endpoint error', { status })
+            : Response.json({ errcode }, { status });
+        }
+        assertEquals((req.json() as Pdu).content.membership, 'leave');
+        membership = 'leave';
+        v1Calls++;
+        return Response.json([200, {}]);
+      }
+      return null;
+    },
+  });
+  try {
+    const deps = { server: await store.server(), signer };
+    const signed = await prepareRemoteLeave(fake.name, {
+      roomId: fr.roomId,
+      userId: user,
+      roomVersion: '11',
+    }, deps);
+    for (const matrix of [false, true]) {
+      for (status of [404, 405]) {
+        errcode = matrix ? 'M_UNRECOGNIZED' : undefined;
+        membership = 'join';
+        const before = v1Calls;
+        await sendRemoteLeave(fake.name, signed, '11', deps);
+        assertEquals(membership, 'leave');
+        assertEquals(v1Calls, before + 1);
+      }
+    }
+    for (
+      const refusal of [[403, 'M_FORBIDDEN'], [404, 'M_NOT_FOUND'], [
+        503,
+        undefined,
+      ]] as const
+    ) {
+      [status, errcode] = refusal;
+      const before = v1Calls;
+      membership = 'join';
+      await assertRejects(() => sendRemoteLeave(fake.name, signed, '11', deps));
+      assertEquals(v1Calls, before, 'real refusal must not replay to v1');
+      assertEquals(membership, 'join');
+    }
+  } finally {
+    await fake.close();
+    await store.close();
+    setConfigForTests(old);
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup despite leave 403 across reopen', async () => {
   const old = config();

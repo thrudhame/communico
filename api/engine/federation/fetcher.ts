@@ -15,7 +15,11 @@ import type { Pdu } from '#engine/pdu.ts';
 import { type Fetcher, SendJoinRefused } from '#engine/room/deps.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Database as Db } from '#engine/store/db.ts';
-import { FederationHttpError, federationRequest } from './client.ts';
+import {
+  FederationHttpError,
+  federationRequest,
+  isEndpointUnknown,
+} from './client.ts';
 
 function jsonObject(res: { json: unknown }): Record<string, unknown> {
   return res.json !== null && typeof res.json === 'object' &&
@@ -27,15 +31,6 @@ function jsonObject(res: { json: unknown }): Record<string, unknown> {
 function pdusOf(obj: Record<string, unknown>, key: string): Pdu[] {
   const list = obj[key];
   return Array.isArray(list) ? list as Pdu[] : [];
-}
-
-// v2 → v1 fallback ONLY on endpoint-unknown answers (joins-v2.yaml:26-32):
-// 404/405 with M_UNRECOGNIZED or a non-Matrix body; a genuine remote
-// 400/403 with a Matrix body is the answer and is surfaced, not replayed
-function isEndpointUnknown(e: unknown): boolean {
-  if (!(e instanceof FederationHttpError)) return false;
-  if (e.remoteStatus !== 404 && e.remoteStatus !== 405) return false;
-  return !e.matrixBody || e.errcode === 'M_UNRECOGNIZED';
 }
 
 function sendJoinFailure(error: unknown): never {
