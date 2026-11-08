@@ -43,7 +43,7 @@ backfillbatch=2
   tlsReservation.close();
   const child = new Deno.Command(Deno.execPath(), {
     args: ['run', '--allow-all', 'main.ts'],
-    env: { COMMUNICO_CONFIG: overlay, TMPDIR: Deno.env.get('TMPDIR')! },
+    env: { COMMUNICO_CONFIG: overlay },
     stdout: 'piped',
     stderr: 'piped',
   }).spawn();

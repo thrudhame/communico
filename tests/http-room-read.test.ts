@@ -395,3 +395,73 @@ test('G6 HTTP: grounded history visibility and context use the event state, neve
   );
   assertEquals(after.status, 200);
 });
+
+test('shared HTTP history remains readable after departure, including imported unpositioned joins', async () => {
+  const a = await registerTestUser('shared-history-reader', 'pw');
+  const b = await registerTestUser('shared-snapshot-reader', 'pw');
+  const fr = await makeFakeRoom({ roomId: '!shared-history:remote.test' });
+  const old = await fr.addEvent({
+    type: 'm.room.message',
+    content: { msgtype: 'm.text', body: 'shared-before-join' },
+  });
+  const imported = await fr.addEvent({
+    type: 'm.room.member',
+    state_key: b.user_id,
+    sender: b.user_id,
+    content: { membership: 'join' },
+  });
+  const fetcher = fakeFetcher({
+    makeJoin: (user) => fr.makeJoinAnswer(user),
+    sendJoin: (pdu) => fr.acceptSendJoin(pdu),
+    backfill: (from, limit) => fr.backfillPdus(from, limit),
+  }).fetcher;
+  const keys = fakeKeyResolver(fr.server);
+  const joined = await joinRemote(theApp().store, {
+    roomId: fr.roomId,
+    user: a.user_id,
+    via: [fr.server.name],
+    signer: theApp().tenant.signer(),
+    deps: { keys, fetcher, self: a.home_server },
+  });
+  const room = await openRoom(theApp().store, fr.roomId);
+  assertEquals(
+    await room.tx((tx) => tx.segments.positionOf(String(imported.event_id))),
+    null,
+  );
+  const joinPdu = await room.tx(async (tx) =>
+    JSON.parse((await tx.events.get(joined.eventId))!.pdu)
+  );
+  assertEquals(
+    (await backfill(room, {
+      from: joinPdu.prev_events,
+      limit: 100,
+      via: fr.server.name,
+    }, { keys, fetcher })).outcome,
+    'complete',
+  );
+  const index = await theApp().server.query(
+    'SELECT seq FROM event_index WHERE event = ?',
+    [String(old.event_id)],
+  );
+  assertEquals(index[0].seq, null);
+  for (const token of [a.access_token, b.access_token]) {
+    for (const route of ['event/', 'context/']) {
+      assertEquals(
+        (await call(
+          path(fr.roomId) + '/' + route +
+            encodeURIComponent(String(old.event_id)),
+          token,
+        )).status,
+        200,
+      );
+    }
+  }
+  await call(path(fr.roomId) + '/leave', a.access_token, {}, 'POST');
+  assertEquals(
+    (await call(
+      path(fr.roomId) + '/event/' + encodeURIComponent(String(old.event_id)),
+      a.access_token,
+    )).status,
+    200,
+  );
+});

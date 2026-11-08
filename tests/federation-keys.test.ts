@@ -173,6 +173,91 @@ Deno.test('purpose: a retired key never authenticates a request; events within e
   });
 });
 
+Deno.test('rotation: missing keys refresh a valid document and share the actual fetch', async () => {
+  await withStore(async (store) => {
+    const server = await store.server();
+    const old = await makeServer('rotation.test');
+    await seedServer(server, old);
+    const next = await makeServer(old.name, 'ed25519:next');
+    const extra = await makeServer(old.name, 'ed25519:extra');
+    const doc = await makeDoc(next, {
+      extraVerifyKeys: {
+        [extra.keyId]: b64encodeStd(
+          await exportPublicKeyRaw(extra.kp.publicKey),
+        ),
+      },
+      oldVerifyKeys: {
+        [old.keyId]: {
+          key: b64encodeStd(await exportPublicKeyRaw(old.kp.publicKey)),
+          expired_ts: Date.now() + 3600_000,
+        },
+      },
+    });
+    let calls = 0;
+    const ks = keyStore(server, {
+      deps: stubDeps({
+        directGet: async () => {
+          calls++;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return doc;
+        },
+      }),
+    });
+    const [cached, a, b] = await Promise.all([
+      ks.acquireKeyDoc(old.name, 0),
+      ks.getVerifyKey(next.name, next.keyId, Date.now(), 'request'),
+      ks.getVerifyKey(extra.name, extra.keyId, Date.now(), 'event'),
+    ]);
+    assertEquals(cached.server_name, old.name);
+    assertEquals(calls, 1);
+    assertEquals(
+      await exportPublicKeyRaw(a),
+      await exportPublicKeyRaw(next.kp.publicKey),
+    );
+    assertEquals(
+      await exportPublicKeyRaw(b),
+      await exportPublicKeyRaw(extra.kp.publicKey),
+    );
+    await assertRejects(() =>
+      ks.getVerifyKey(old.name, old.keyId, Date.now(), 'request')
+    );
+    assert(
+      await ks.getVerifyKey(old.name, old.keyId, Date.now(), 'event') instanceof
+        CryptoKey,
+    );
+    assertEquals(
+      calls,
+      1,
+      'a known retired key does not trigger another fetch',
+    );
+  });
+});
+
+Deno.test('rotation: missing-key failures are remembered per server without blocking cached keys', async () => {
+  await withStore(async (store) => {
+    const server = await store.server();
+    const s = await makeServer('missing-key.test');
+    const doc = await seedServer(server, s);
+    const counter = { calls: 0 };
+    const ks = keyStore(server, { deps: directOnly(doc, counter) });
+    await assertRejects(() =>
+      ks.getVerifyKey(s.name, 'ed25519:absent', 0, 'request')
+    );
+    assertEquals(counter.calls, 1, 'a missing key must actually be requested');
+    await assertRejects(() =>
+      ks.getVerifyKey(s.name, 'ed25519:another', 0, 'event')
+    );
+    assertEquals(
+      counter.calls,
+      1,
+      'random key ids cannot bypass failure memory',
+    );
+    assert(
+      await ks.getVerifyKey(s.name, s.keyId, 0, 'request') instanceof CryptoKey,
+    );
+  });
+});
+
 Deno.test('key-is-name short-circuit: no fetch, the name IS the key', async () => {
   const kp = (await generateSigningKeypair()) as unknown as CryptoKeyPair;
   const raw = await exportPublicKeyRaw(kp.publicKey);

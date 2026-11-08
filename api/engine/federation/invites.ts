@@ -33,9 +33,10 @@ import { ingestLocal } from '#engine/room/ingest.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { getRulebook, supportedRoomVersions } from '#engine/rulebook/index.ts';
-import type { Database as Db } from '#engine/store/db.ts';
+import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
+import { withProjectionLock } from '#engine/server/project.ts';
 import { federationRequest } from './client.ts';
 import { admit } from './gate.ts';
 import { domainOf, toWire } from './pdu.ts';
@@ -57,6 +58,13 @@ export type InviteDeps = {
   // the sender's public wake (the reject intent queues on the loop)
   wake: (destination: string) => void;
 };
+
+// OOB invite transitions share projection's lifecycle lane. A removal captures
+// candidate ownership and cleans up under that same lane, so neither new
+// rejections nor sender failover can invalidate its durable cut.
+function inviteTransition<T>(server: Db, fn: (tx: Conn) => Promise<T>) {
+  return withProjectionLock(() => eventStreamTx(server, fn));
+}
 
 // The spec's stripped-state list (CS:2810-2827) + the inviter's member
 // event; each stripped to type, state_key, content, sender (CS:2795-2796)
@@ -432,7 +440,11 @@ export async function receiveInvite(
   // store: a room we HOLD does nothing else (the event arrives by /send
   // too, invites-v2.yaml:40-42); otherwise the out-of-band row so the
   // invitee sees it
-  if (!(await participating(deps.store, roomId))) {
+  await withProjectionLock(async () => {
+    if (await deps.store.roomRetired(roomId)) {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
+    }
+    if (await participating(deps.store, roomId)) return;
     await eventStreamTx(deps.server, async (tx) => {
       const seq = await nextEventSeq(tx);
       await tx.execute(
@@ -455,7 +467,7 @@ export async function receiveInvite(
         ],
       );
     });
-  }
+  });
   return { event: toWire(pdu, roomVersion) };
 }
 
@@ -487,17 +499,24 @@ export async function rejectInviteRemote(
   userId: string,
   deps: InviteDeps,
 ): Promise<void> {
-  const invite = await inviteFor(roomId, userId, deps);
-  if (invite === null || invite.status === 'joined') {
-    throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
-  }
-  const candidates = candidatesOf(invite, deps.self);
-  await eventStreamTx(deps.server, async (tx) => {
+  const candidates = await inviteTransition(deps.server, async (tx) => {
+    if (await deps.store.roomRetired(roomId)) {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
+    }
+    const rows = await tx.query(
+      'SELECT * FROM federation_invites WHERE room_id=? AND user_id=?',
+      [roomId, userId],
+    );
+    const invite = rows.length === 0 ? null : inviteOf(rows[0]);
+    if (invite === null || invite.status === 'joined') {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
+    }
     const seq = await nextEventSeq(tx);
     await tx.execute(
       "UPDATE federation_invites SET status = 'rejecting', seq = ? WHERE room_id = ? AND user_id = ?",
       [seq, roomId, userId],
     );
+    return candidatesOf(invite, deps.self);
   });
   // nothing ingested an event — wake the first candidate's loop directly
   deps.wake(candidates[0]);
@@ -580,7 +599,12 @@ async function performRejectInvite(
   // delivered: the row becomes 'rejected', and the SIGNED LEAVE becomes
   // the rendered event — the out-of-band leave section of /sync carries
   // it in state.events (stage 5; SyncLeftFrom wants a leave event there)
-  await eventStreamTx(deps.server, async (tx) => {
+  await inviteTransition(deps.server, async (tx) => {
+    const pending = await tx.query(
+      "SELECT 1 FROM federation_invites WHERE room_id=? AND user_id=? AND event_id=? AND status='rejecting'",
+      [roomId, userId, invite.eventId],
+    );
+    if (pending.length === 0) return;
     const seq = await nextEventSeq(tx);
     await tx.execute(
       "UPDATE federation_invites SET status = 'rejected', event_json = ?, seq = ? WHERE room_id = ? AND user_id = ?",
@@ -600,7 +624,7 @@ async function performRejectInvite(
 export function inviteIntentProvider(
   deps: InviteDeps,
 ): ReviewableIntentProvider {
-  const progress = new Map<string, number>();
+  const progress: InviteProgress = new Map();
   const provider = async (server: Db, destination: string) => {
     const rows = await server.query(
       "SELECT * FROM federation_invites WHERE status = 'rejecting' ORDER BY received_ms",
@@ -608,31 +632,55 @@ export function inviteIntentProvider(
     );
     for (const raw of rows) {
       const invite = inviteOf(raw);
+      if (await deps.store.roomRetired(invite.roomId)) continue;
       const key = JSON.stringify([invite.roomId, invite.userId]);
       const candidates = candidatesOf(invite, deps.self);
-      const at = progress.get(key) == null ? 0 : (progress.get(key) as number);
+      const at = candidateIndex(invite, progress);
       if (candidates[at] !== destination) continue;
       return {
         id: 'reject-invite:' + key,
         run: async () => {
+          const active = await withProjectionLock(async () => {
+            if (await deps.store.roomRetired(invite.roomId)) return false;
+            const current = await inviteFor(invite.roomId, invite.userId, deps);
+            return current?.eventId === invite.eventId &&
+              current.status === 'rejecting' &&
+              candidateIndex(current, progress) === at;
+          });
+          if (!active) return;
           await admit(server, destination, {
             kind: 'outbound',
             user: invite.userId,
             what: 'intent:reject-invite',
           });
           await performRejectInvite(destination, invite, deps);
-          progress.delete(key);
+          await withProjectionLock(async () => {
+            const current = await inviteFor(invite.roomId, invite.userId, deps);
+            if (current === null || current.eventId === invite.eventId) {
+              progress.delete(key);
+            }
+          });
         },
-        failed: () => {
-          const next = candidates.length === 0
-            ? null
-            : candidates[(at + 1) % candidates.length];
-          if (next !== null) {
-            progress.set(key, (at + 1) % candidates.length);
-            if (next !== destination) deps.wake(next);
-          }
-          return Promise.resolve();
-        },
+        failed: () =>
+          withProjectionLock(async () => {
+            if (await deps.store.roomRetired(invite.roomId)) return;
+            const current = await inviteFor(invite.roomId, invite.userId, deps);
+            if (
+              current?.eventId !== invite.eventId ||
+              current.status !== 'rejecting' ||
+              candidateIndex(current, progress) !== at
+            ) return;
+            const next = candidates.length === 0
+              ? null
+              : candidates[(at + 1) % candidates.length];
+            if (next !== null) {
+              progress.set(key, {
+                eventId: invite.eventId,
+                at: (at + 1) % candidates.length,
+              });
+              if (next !== destination) deps.wake(next);
+            }
+          }),
       } satisfies IntentJob;
     }
     return null;
@@ -644,11 +692,21 @@ export function inviteIntentProvider(
   });
 }
 
+type InviteProgress = Map<string, { eventId: string; at: number }>;
+
+function candidateIndex(
+  invite: StoredInvite,
+  progress: InviteProgress,
+): number {
+  const entry = progress.get(JSON.stringify([invite.roomId, invite.userId]));
+  return entry?.eventId === invite.eventId ? entry.at : 0;
+}
+
 /** Operator review shares candidate ownership with the performing provider. */
 export async function listRejectIntents(
-  server: Db,
+  server: Pick<Db, 'query'>,
   self: string,
-  progress = new Map<string, number>(),
+  progress: InviteProgress = new Map(),
 ): Promise<ReviewIntent[]> {
   const rows = await server.query(
     "SELECT * FROM federation_invites WHERE status = 'rejecting' ORDER BY received_ms, room_id, user_id",
@@ -657,7 +715,7 @@ export async function listRejectIntents(
     const invite = inviteOf(raw);
     const key = JSON.stringify([invite.roomId, invite.userId]);
     const candidates = candidatesOf(invite, self);
-    const at = progress.get(key) === undefined ? 0 : progress.get(key)!;
+    const at = candidateIndex(invite, progress);
     return {
       id: 'reject-invite:' + key,
       destination: candidates[at],
@@ -675,12 +733,12 @@ export async function pruneRejectIntents(
   server: Db,
   self: string,
   destination: string,
-  progress = new Map<string, number>(),
+  progress: InviteProgress = new Map(),
 ): Promise<number> {
-  const rows = (await listRejectIntents(server, self, progress)).filter((r) =>
-    r.destination === destination
-  );
-  return await eventStreamTx(server, async (tx) => {
+  return await inviteTransition(server, async (tx) => {
+    const rows = (await listRejectIntents(tx, self, progress)).filter((r) =>
+      r.destination === destination
+    );
     let count = 0;
     for (const row of rows) {
       const key = row.id.slice('reject-invite:'.length);
@@ -712,13 +770,17 @@ export async function acceptRescind(
   }).membership;
   if (membership !== 'leave' && membership !== 'ban') return false;
   const target = String(pdu.state_key == null ? '' : pdu.state_key);
-  const invite = await inviteFor(roomId, target, deps);
-  if (invite === null || invite.status === 'joined') return false;
   const sender = String(pdu.sender == null ? '' : pdu.sender);
-  const stored = JSON.parse(invite.eventJson) as Record<string, unknown>;
-  const inviter = typeof stored.sender === 'string' ? stored.sender : null;
-  if (inviter === null || sender !== inviter) return false;
-  await eventStreamTx(deps.server, async (tx) => {
+  return await inviteTransition(deps.server, async (tx) => {
+    const rows = await tx.query(
+      'SELECT * FROM federation_invites WHERE room_id=? AND user_id=?',
+      [roomId, target],
+    );
+    const invite = rows.length === 0 ? null : inviteOf(rows[0]);
+    if (invite === null || invite.status === 'joined') return false;
+    const stored = JSON.parse(invite.eventJson) as Record<string, unknown>;
+    const inviter = typeof stored.sender === 'string' ? stored.sender : null;
+    if (inviter === null || sender !== inviter) return false;
     const seq = await nextEventSeq(tx);
     await tx.execute(
       "UPDATE federation_invites SET status = 'rejected', event_json = ?, seq = ? WHERE room_id = ? AND user_id = ?",
@@ -729,8 +791,8 @@ export async function acceptRescind(
         target,
       ],
     );
+    return true;
   });
-  return true;
 }
 
 // --- join ↔ invite wiring ----------------------------------------------------
@@ -755,7 +817,7 @@ export async function markInviteJoined(
   userId: string,
   deps: InviteDeps,
 ): Promise<void> {
-  await eventStreamTx(deps.server, async (tx) => {
+  await inviteTransition(deps.server, async (tx) => {
     const rows = await tx.query(
       "SELECT 1 FROM federation_invites WHERE room_id = ? AND user_id = ? AND status = 'pending'",
       [roomId, userId],

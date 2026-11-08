@@ -16,7 +16,6 @@
 // SS:1085-1088, presence SS:1094-1099, receipts SS:1105-1110) or the EDU
 // is ignored. Typing is in memory; receipts and presence use the same
 // durable server-file streams as client producers and sync readers.
-import { membershipOf } from '#engine/server/read.ts';
 import {
   getPresence,
   receiptRows,
@@ -243,9 +242,13 @@ export function eduState(server: Db, self: string): EduState {
     const userId = typeof content.user_id === 'string' ? content.user_id : null;
     if (roomId === null || userId === null) return;
     if (domainOf(userId) !== origin) return; // users belong to origin
-    const m = await membershipOf(server, roomId, userId);
-    if (m === null || m.membership !== 'join') return; // joined users only
-    setTyping(roomId, userId, content.typing === true, REMOTE_TYPING_TTL_MS);
+    await setTyping(
+      server,
+      roomId,
+      userId,
+      content.typing === true,
+      REMOTE_TYPING_TTL_MS,
+    );
   });
 
   handlers.set('m.receipt', async (origin, content) => {

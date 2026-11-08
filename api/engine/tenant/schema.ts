@@ -144,6 +144,8 @@ CREATE TABLE transactions(
   room_id TEXT NOT NULL,
   txn_id TEXT NOT NULL,
   event_id TEXT NOT NULL,
+  pending_pdu TEXT,
+  completed INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY(device_id, room_id, txn_id)
 );
 `;

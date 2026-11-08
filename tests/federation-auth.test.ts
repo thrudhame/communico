@@ -220,6 +220,38 @@ Deno.test('auth: bad signature → 401', async () => {
   });
 });
 
+Deno.test('auth: malformed signature candidates cannot mask a later valid candidate', async () => {
+  await withStore(async (store) => {
+    const origin = await makeServer('origin.test');
+    const good = await headerFor(origin, 'PUT', TARGET);
+    const bad =
+      `X-Matrix origin="${origin.name}",key="${origin.keyId}",sig="%"`;
+    assertEquals(await attempt(store, origin, bad), '401');
+    assertEquals(
+      await attempt(store, origin, bad + ',' + good),
+      'ok:origin.test',
+    );
+  });
+});
+
+Deno.test('auth: invalid signed JSON and canonical numbers fail as authentication input', async () => {
+  await withStore(async (store) => {
+    const origin = await makeServer('origin.test');
+    const auth = await headerFor(origin, 'PUT', TARGET);
+    for (
+      const bodyText of ['{', '{"n":1.5}', '{"n":9007199254740992}', '{"n":-0}']
+    ) {
+      const contacts: string[] = [];
+      assertEquals(
+        await attempt(store, origin, auth, { bodyText, contacts }),
+        '401',
+      );
+      assertEquals(contacts, []);
+      assertEquals(await listPending(await store.server()), []);
+    }
+  });
+});
+
 Deno.test('auth: a destination that is not us → 401', async () => {
   await withStore(async (store) => {
     const origin = await makeServer('origin.test');

@@ -3,7 +3,7 @@ import { assert, assertEquals } from '@std/assert';
 import { theApp } from '#engine/app.ts';
 import { httpSuite } from '#tests/http-app.ts';
 import { eduQueues } from '#engine/federation/edus.ts';
-import { fedCaller } from '#tests/http-federation.ts';
+import { fedCaller, remoteServer } from '#tests/http-federation.ts';
 import { seedServer } from '#tests/federation/doc-helper.ts';
 import { wireEphemeral } from '#engine/federation/ephemeral.ts';
 import { startSender } from '#engine/federation/sender.ts';
@@ -202,6 +202,196 @@ suite.test('receipts and read markers round-trip; private receipts stay stored a
   );
 });
 
+for (const mode of ['selection', 'long poll']) {
+  suite.test(
+    'private receipts are excluded from peer sync ' + mode,
+    async () => {
+      const a = await suite.registerTestUser(
+        'ep-private-a-' + mode.replace(' ', '-'),
+        'pw',
+      );
+      const b = await suite.registerTestUser(
+        'ep-private-b-' + mode.replace(' ', '-'),
+        'pw',
+      );
+      const { roomId, base } = await roomFor(a, b);
+      const sent = await call(
+        base + '/send/m.room.message/private-target',
+        a.access_token!,
+        'PUT',
+        { body: 'target' },
+      );
+      assertEquals(sent.status, 200);
+      const target = encodeURIComponent(String(sent.body.event_id));
+      const before = await sync(b.access_token!);
+      const receipt = async (type: string) => {
+        assertEquals(
+          (await call(
+            base + '/receipt/' + type + '/' + target,
+            a.access_token!,
+            'POST',
+            {},
+          )).status,
+          200,
+        );
+      };
+      if (mode === 'selection') {
+        await receipt('m.read.private');
+        const after = await sync(
+          b.access_token!,
+          '&since=' + before.next_batch,
+        );
+        assertEquals(entry(after, roomId), {});
+        return;
+      }
+      let done = false;
+      const pending = call(
+        '/_matrix/client/v3/sync?timeout=2000&since=' + before.next_batch,
+        b.access_token!,
+      ).then((response) => {
+        done = true;
+        return response;
+      });
+      let stayedPending = false;
+      let result: Awaited<ReturnType<typeof call>>;
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        await receipt('m.read.private');
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        stayedPending = !done;
+      } finally {
+        await receipt('m.read');
+        result = await pending;
+      }
+      assertEquals(
+        stayedPending,
+        true,
+        'private activity must not satisfy peer long-poll relevance',
+      );
+      assertEquals(result.status, 200);
+      assert(eventOf(result.body, roomId, 'm.receipt'));
+    },
+  );
+}
+
+suite.test('room ephemeral admission rejects absent, invited and departed users across client producers', async () => {
+  const a = await suite.registerTestUser('ep-admit-a', 'pw');
+  const b = await suite.registerTestUser('ep-admit-b', 'pw');
+  const { roomId, base } = await roomFor(a, b);
+  const outsider = await suite.registerTestUser('ep-admit-out', 'pw');
+  const before = await sync(a.access_token!);
+  const denied = async (user: typeof outsider) => {
+    const results = await Promise.all([
+      call(
+        base + '/receipt/m.read/%24forbidden',
+        user.access_token!,
+        'POST',
+        {},
+      ),
+      call(
+        base + '/receipt/m.read.private/%24forbidden',
+        user.access_token!,
+        'POST',
+        {},
+      ),
+      call(base + '/read_markers', user.access_token!, 'POST', {
+        'm.read': '$forbidden',
+      }),
+      call(
+        base + '/typing/' + encodeURIComponent(user.user_id),
+        user.access_token!,
+        'PUT',
+        { typing: true },
+      ),
+    ]);
+    assertEquals(
+      results.map((r) => [r.status, r.body.errcode]),
+      Array(4).fill([403, 'M_FORBIDDEN']),
+    );
+  };
+  await denied(outsider);
+  assertEquals(
+    (await call(base + '/invite', a.access_token!, 'POST', {
+      user_id: outsider.user_id,
+    })).status,
+    200,
+  );
+  await denied(outsider);
+  assertEquals(
+    (await call(base + '/leave', b.access_token!, 'POST', {})).status,
+    200,
+  );
+  await denied(b);
+  assertEquals(
+    (await call(base + '/ban', a.access_token!, 'POST', {
+      user_id: outsider.user_id,
+    })).status,
+    200,
+  );
+  await denied(outsider);
+  assertEquals(
+    await theApp().server.query(
+      'SELECT user_id FROM receipts WHERE room_id=?',
+      [roomId],
+    ),
+    [],
+  );
+  const after = await sync(a.access_token!, '&since=' + before.next_batch);
+  assertEquals(eventOf(after, roomId, 'm.receipt'), undefined);
+  assertEquals(eventOf(after, roomId, 'm.typing'), undefined);
+});
+
+suite.test('inbound receipt admission cannot retain arbitrary room-user pairs or advance the stream', async () => {
+  const app = theApp();
+  const a = await suite.registerTestUser('ep-fed-deny', 'pw');
+  const created = await call(
+    '/_matrix/client/v3/createRoom',
+    a.access_token!,
+    'POST',
+    {},
+  );
+  const roomId = String(created.body.room_id);
+  const remote = await remoteServer('ep-unjoined.test');
+  const fed = fedCaller(suite.matrix, remote);
+  const before = await sync(a.access_token!);
+  const content: Json = {};
+  for (let i = 0; i < 12; i++) {
+    const room = i === 0 ? roomId : '!arbitrary-' + i + ':' + remote.name;
+    content[room] = {
+      'm.read': {
+        ['@unjoined-' + i + ':' + remote.name]: {
+          event_ids: ['$forbidden'],
+          data: { ts: i },
+        },
+      },
+    };
+  }
+  const response = await fed(
+    'PUT',
+    '/_matrix/federation/v1/send/deny-arbitrary-receipts',
+    {
+      origin: remote.name,
+      origin_server_ts: Date.now(),
+      pdus: [],
+      edus: [{ edu_type: 'm.receipt', content }],
+    },
+  );
+  assertEquals(response, { status: 200, body: { pdus: {} } });
+  assertEquals(
+    await app.server.query(
+      'SELECT user_id FROM receipts WHERE user_id LIKE ?',
+      ['%:' + remote.name],
+    ),
+    [],
+  );
+  const after = await sync(a.access_token!, '&since=' + before.next_batch);
+  assertEquals(
+    String(after.next_batch).match(/_r\d+/)?.[0],
+    String(before.next_batch).match(/_r\d+/)?.[0],
+  );
+  assertEquals(eventOf(after, roomId, 'm.receipt'), undefined);
+});
+
 suite.test('presence joins fan out both ways; status/set_presence validation and relevant wake', async () => {
   const a = await suite.registerTestUser('ep-pr-a', 'pw');
   const b = await suite.registerTestUser('ep-pr-b', 'pw');
@@ -262,7 +452,7 @@ suite.test('presence joins fan out both ways; status/set_presence validation and
   await sync(b.access_token!, '&set_presence=unavailable');
   const got = await call(status(b.user_id), a.access_token!);
   assertEquals(got.body.presence, 'unavailable');
-  assertEquals(got.body.status_msg, undefined);
+  assertEquals(got.body.status_msg, 'ready');
   const before = await sync(a.access_token!);
   let done = false;
   const waiting = call(
@@ -281,6 +471,64 @@ suite.test('presence joins fan out both ways; status/set_presence validation and
   const result = await waiting;
   assert(performance.now() - start < 450);
   assert(presence(result.body).some((e) => e.sender === b.user_id));
+});
+
+suite.test('sync presence changes preserve status and identical concurrent syncs do not rewrite or wake peers', async () => {
+  const a = await suite.registerTestUser('ep-presence-stable-a', 'pw');
+  const b = await suite.registerTestUser('ep-presence-stable-b', 'pw');
+  await roomFor(a, b);
+  const path = '/_matrix/client/v3/presence/' + encodeURIComponent(a.user_id) +
+    '/status';
+  await call(path, a.access_token!, 'PUT', {
+    presence: 'online',
+    status_msg: 'ready',
+  });
+  await sync(b.access_token!, '&set_presence=online');
+  const original = await theApp().server.query(
+    'SELECT * FROM presence WHERE user_id=?',
+    [a.user_id],
+  );
+  await Promise.all(
+    Array.from(
+      { length: 4 },
+      () => sync(a.access_token!, '&set_presence=online'),
+    ),
+  );
+  assertEquals(
+    await theApp().server.query('SELECT * FROM presence WHERE user_id=?', [
+      a.user_id,
+    ]),
+    original,
+  );
+  const before = await sync(b.access_token!);
+  let finished = false;
+  const waiting = call(
+    '/_matrix/client/v3/sync?timeout=1000&set_presence=online&since=' +
+      before.next_batch,
+    b.access_token!,
+  ).then((r) => {
+    finished = true;
+    return r;
+  });
+  let stayedPending = false;
+  try {
+    await sync(a.access_token!, '&set_presence=online');
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    stayedPending = !finished;
+    await sync(a.access_token!, '&set_presence=unavailable');
+  } finally {
+    const changed = await waiting;
+    assertEquals(
+      stayedPending,
+      true,
+      'identical set_presence cannot wake a co-member',
+    );
+    const observed = ((changed.body.presence as Json).events as Json[]).find((
+      e,
+    ) => e.sender === a.user_id);
+    assertEquals((observed?.content as Json)?.presence, 'unavailable');
+    assertEquals((observed?.content as Json)?.status_msg, 'ready');
+  }
 });
 
 suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, never private or remote echoes', async () => {

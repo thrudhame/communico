@@ -116,6 +116,10 @@ export class Store implements StartupStore {
     return this.pool.retire('rooms', id);
   }
 
+  roomRetired(id: string): Promise<boolean> {
+    return this.pool.isRetired('rooms', id);
+  }
+
   removeRoom(id: string): Promise<void> {
     if (this.stopped) throw new Error('store is closed');
     return this.pool.remove('rooms', id);

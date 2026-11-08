@@ -1,4 +1,5 @@
 import { MatrixError } from '#engine/matrix-error.ts';
+import { theApp } from '#engine/app.ts';
 import { setTyping } from '#engine/typing.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
 
@@ -17,11 +18,19 @@ export default async function (
   }
   const body = (await parseJson(request)) as Record<string, unknown>;
   const timeout = typeof body.timeout === 'number' ? body.timeout : undefined;
-  setTyping(
+  const accepted = await setTyping(
+    theApp().server,
     request.params.roomId as string,
     userId,
     body.typing === true,
     timeout,
   );
+  if (!accepted) {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'not joined to ' + request.params.roomId,
+    );
+  }
   return {};
 }

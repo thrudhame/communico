@@ -1,8 +1,8 @@
 // G6/F14: one client visibility policy on the event's own stored state.
-// A state transition is visible when either side permits it (CS history
-// visibility). Publications belong to state blocks, never this decision.
+// Own membership events are visible even without a qualifying join. Other
+// state transitions use either side's policy. Published state can prove a later join;
+// it never substitutes for the event's own visibility or membership.
 import type { Room } from '#engine/room/index.ts';
-import { membershipOf } from '#engine/server/read.ts';
 export async function canSeeEvent(
   userId: string,
   room: Room,
@@ -15,6 +15,9 @@ export async function canSeeEvent(
       event === null || status?.standing !== 'accepted' ||
       status.grounding !== 'grounded'
     ) return null;
+    if (event.type === 'm.room.member' && event.state_key === userId) {
+      return true;
+    }
     const refs = await tx.state.eventReadState(eventId);
     if (refs === null) return null;
     const content = async (group: number, type: string, key: string) => {
@@ -30,26 +33,31 @@ export async function canSeeEvent(
       membership: (await content(group, 'm.room.member', userId)).membership,
     });
     const states = [await atGroup(refs.after.group)];
-    if (
-      event.type === 'm.room.history_visibility' ||
-      (event.type === 'm.room.member' && event.state_key === userId)
-    ) {
+    if (event.type === 'm.room.history_visibility') {
       states.push(await atGroup(refs.before.group));
     }
-    return states;
+    let shared = false;
+    for (const state of states) {
+      if (state.hv === 'world_readable' || state.membership === 'join') {
+        return true;
+      }
+      if (state.hv === 'invited' && state.membership === 'invite') return true;
+      // Shared (including unknown values) needs a qualifying join at the
+      // event or later. A current invite/leave/ban row proves neither.
+      if (!['joined', 'invited', 'world_readable'].includes(String(state.hv))) {
+        shared = true;
+      }
+    }
+    if (shared) {
+      for (const group of await tx.state.publishedGroupsAfter(eventId)) {
+        if (
+          (await content(group, 'm.room.member', userId)).membership === 'join'
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
   });
-  if (at === null) return false;
-  for (const state of at) {
-    if (state.hv === 'world_readable' || state.membership === 'join') {
-      return true;
-    }
-    if (state.hv === 'invited' && state.membership === 'invite') return true;
-    // Unrecognized visibility has the spec's shared default, too.
-    if (!['joined', 'invited', 'world_readable'].includes(String(state.hv))) {
-      if (
-        await membershipOf(await room.store.server(), room.id, userId) !== null
-      ) return true;
-    }
-  }
-  return false;
+  return at === true;
 }

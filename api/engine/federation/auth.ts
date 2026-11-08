@@ -79,8 +79,22 @@ export async function authenticateRequest(
       origin: candidate.origin,
       destination,
     };
-    if (req.body.length > 0) {
-      obj.content = JSON.parse(new TextDecoder().decode(req.body));
+    let canonical: string;
+    try {
+      if (req.body.length > 0) {
+        obj.content = JSON.parse(
+          new TextDecoder('utf-8', { fatal: true }).decode(req.body),
+        );
+      }
+      canonical = canonicalJson(obj);
+    } catch {
+      unauthorized();
+    }
+    let sig: ReturnType<typeof b64decode>;
+    try {
+      sig = b64decode(candidate.signature);
+    } catch {
+      continue;
     }
     // 6. the origin's key from what we remember, witnesses, or — open
     //    mode — a direct fetch; then the signature must verify
@@ -95,12 +109,11 @@ export async function authenticateRequest(
     } catch {
       continue; // key unobtainable → try the next candidate
     }
-    const sig = b64decode(candidate.signature);
     const ok = await crypto.subtle.verify(
       { name: 'Ed25519' },
       pub,
       sig,
-      new TextEncoder().encode(canonicalJson(obj)),
+      new TextEncoder().encode(canonical),
     );
     if (!ok) continue;
     // 7. authenticated — and only NOW the first contact is recorded (open

@@ -168,7 +168,7 @@ suite.test('sync timeline uses event refs; its state and unsigned membership rem
   );
 });
 
-suite.test('event endpoint includes before-visible transitions but not an own invite with neither side visible', async () => {
+suite.test('event endpoint includes before-visible transitions and own invites', async () => {
   assertEquals(
     (await call(base(roomId) + '/event/' + encodeURIComponent(hidden))).status,
     404,
@@ -182,7 +182,7 @@ suite.test('event endpoint includes before-visible transitions but not an own in
   assertEquals(
     (await call(base(transitionRoom) + '/event/' + encodeURIComponent(invite)))
       .status,
-    404,
+    200,
   );
 });
 
@@ -263,11 +263,11 @@ suite.test('thread bundles and thread lists expose only visible children and the
   assertEquals(ids(next.chunk), [root]);
 });
 
-suite.test('own membership is tested before-or-after, never allowed solely because the state key is ours', async () => {
+suite.test('own membership remains visible even when neither side grants other-event visibility', async () => {
   assertEquals(
     (await call(base(transitionRoom) + '/event/' + encodeURIComponent(invite)))
       .status,
-    404,
+    200,
   );
 });
 
@@ -356,5 +356,66 @@ suite.test('membership join-to-leave and visibility loosening remain visible thr
         encodeURIComponent(String(loosened.event_id)),
     )).status,
     200,
+  );
+});
+
+suite.test('shared history requires a join, and departure denies later events until a qualifying rejoin', async () => {
+  const observed: { case: string; actual: number; expected: number }[] = [];
+  const expectStatus = async (
+    id: string,
+    event: string,
+    expected: number,
+    label: string,
+  ) => {
+    for (const endpoint of ['event', 'context']) {
+      observed.push({
+        case: label + '/' + endpoint,
+        actual: (await call(base(id) + '/' + endpoint + '/' + event)).status,
+        expected,
+      });
+    }
+  };
+  for (const hv of ['shared', 'future-unknown']) {
+    const id = String(
+      (await ok('createRoom', alice.access_token, 'POST', {
+        preset: 'public_chat',
+        initial_state: [{
+          type: 'm.room.history_visibility',
+          content: { history_visibility: hv },
+        }],
+      })).room_id,
+    );
+    const say = async (name: string) =>
+      String(
+        (await ok(
+          base(id) + '/send/m.room.message/' + name,
+          alice.access_token,
+          'PUT',
+          { body: name, msgtype: 'm.text' },
+        )).event_id,
+      );
+    const before = await say('before-join');
+    const member = base(id) + '/state/m.room.member/' +
+      encodeURIComponent(bob.user_id);
+    await ok(member, alice.access_token, 'PUT', { membership: 'invite' });
+    await expectStatus(id, before, 404, hv + '/invited-only');
+    await ok(base(id) + '/leave', bob.access_token, 'POST', {});
+    await expectStatus(id, before, 404, hv + '/rejected-invite');
+    await ok(base(id) + '/join', bob.access_token, 'POST', {});
+    await ok(base(id) + '/leave', bob.access_token, 'POST', {});
+    const afterLeave = await say('after-leave');
+    await expectStatus(id, before, 200, hv + '/prejoin-after-leave');
+    await expectStatus(id, afterLeave, 404, hv + '/post-leave');
+    await ok(base(id) + '/join', bob.access_token, 'POST', {});
+    await expectStatus(id, afterLeave, 200, hv + '/qualifying-rejoin');
+    await ok(member, alice.access_token, 'PUT', { membership: 'ban' });
+    const afterBan = await say('after-ban');
+    await expectStatus(id, before, 200, hv + '/prejoin-after-ban');
+    await expectStatus(id, afterLeave, 200, hv + '/rejoin-history-after-ban');
+    await expectStatus(id, afterBan, 404, hv + '/post-ban');
+  }
+  assertEquals(
+    observed.map((row) => [row.case, row.actual]),
+    observed.map((row) => [row.case, row.expected]),
   );
 });

@@ -3,6 +3,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
+import { isJoined } from '#engine/server/read.ts';
 
 export type PresenceRow = {
   presence: string;
@@ -69,19 +70,50 @@ export async function setPresence(
   statusMsg?: string,
   opts: { lastActiveAgo?: number; currentlyActive?: boolean } = {},
 ): Promise<void> {
+  await writePresence(server, userId, presence, statusMsg ?? null, opts, false);
+}
+
+// A presence-only intent preserves the separately owned status message and
+// does nothing when the value already matches, including concurrent callers.
+export async function setPresenceValue(
+  server: Db,
+  userId: string,
+  presence: string,
+): Promise<void> {
+  await writePresence(server, userId, presence, undefined, {}, true);
+}
+
+async function writePresence(
+  server: Db,
+  userId: string,
+  presence: string,
+  statusMsg: string | null | undefined,
+  opts: { lastActiveAgo?: number; currentlyActive?: boolean },
+  skipUnchanged: boolean,
+): Promise<void> {
   if (!['online', 'offline', 'unavailable'].includes(presence)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'bad presence: ' + presence);
   }
   const lastActiveMs = Date.now() - (opts.lastActiveAgo ?? 0);
   const row = await eventStreamTx(server, async (tx) => {
+    let status = statusMsg;
+    if (skipUnchanged) {
+      const current = (await tx.query(
+        'SELECT presence,status_msg FROM presence WHERE user_id=?',
+        [userId],
+      ))[0];
+      if (current?.presence === presence) return null;
+      status = current?.status_msg == null ? null : String(current.status_msg);
+    }
     const seq = await next(tx, 'presence');
     await tx.execute(
       `INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq) VALUES(?,?,?,?,?)
       ON CONFLICT(user_id) DO UPDATE SET presence=excluded.presence,status_msg=excluded.status_msg,last_active_ms=excluded.last_active_ms,seq=excluded.seq`,
-      [userId, presence, statusMsg ?? null, lastActiveMs, seq],
+      [userId, presence, status ?? null, lastActiveMs, seq],
     );
-    return { presence, statusMsg: statusMsg ?? null, lastActiveMs, seq };
+    return { presence, statusMsg: status ?? null, lastActiveMs, seq };
   });
+  if (row === null) return;
   notify(server, { kind: 'presence', userId, row });
 }
 export async function ensurePresenceRow(
@@ -135,9 +167,10 @@ export async function setReceipt(
   receiptType: 'm.read' | 'm.read.private',
   eventId: string,
   opts: { ts?: number; threadId?: string | null } = {},
-): Promise<void> {
+): Promise<boolean> {
   const ts = opts.ts ?? Date.now();
   const row = await eventStreamTx(server, async (tx) => {
+    if (!await isJoined(tx, roomId, userId)) return null;
     const seq = await next(tx, 'receipts');
     await tx.execute(
       `INSERT INTO receipts(room_id,user_id,receipt_type,event_id,ts_ms,seq) VALUES(?,?,?,?,?,?)
@@ -146,9 +179,26 @@ export async function setReceipt(
     );
     return { userId, eventId, ts, seq };
   });
+  if (row === null) return false;
   // doltgres stored no per-thread receipt; private rows never federate.
   notify(server, { kind: 'receipt', roomId, receiptType, row });
+  return true;
 }
+// Relevance is a publication read too: use the same public-only contract for
+// long-poll wakeups and incremental room selection as for receipt content.
+export async function publicReceiptRoomsSince(
+  server: Db,
+  userId: string,
+  since: number,
+): Promise<Set<string>> {
+  const rows = await server.query(
+    `SELECT DISTINCT r.room_id FROM receipts r JOIN memberships m ON m.room=r.room_id
+     WHERE m.user=? AND m.membership='join' AND r.receipt_type='m.read' AND r.seq>?`,
+    [userId, since],
+  );
+  return new Set(rows.map((r) => String(r.room_id)));
+}
+
 export async function receiptRows(
   server: Db,
   roomId: string,

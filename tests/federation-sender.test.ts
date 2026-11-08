@@ -616,6 +616,38 @@ Deno.test('sender: an EDU-only change delivers within 1 s of its wake, no PDUs, 
   });
 });
 
+Deno.test('review sender: a persistent failed intent cannot bypass the peer backoff', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ dest, sender }) => {
+      const server = await store.server();
+      let calls = 0;
+      sender.setIntentProvider(() =>
+        Promise.resolve({
+          id: 'persistent',
+          run: () => {
+            calls++;
+            return Promise.reject(new Error('unreachable'));
+          },
+          failed: () => Promise.resolve(),
+        })
+      );
+      sender.wake(dest);
+      await waitFor(
+        async () => (await peerStatus(server, dest)).failures > 0,
+        3000,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await sender.stop();
+      assertEquals(
+        calls,
+        1,
+        'the retained intent must wait for its ladder rung',
+      );
+      assert((await peerStatus(server, dest)).nextAttemptMs > Date.now());
+    });
+  });
+});
+
 Deno.test('sender: batches cap at 50 PDUs per transaction', async () => {
   await withStore(async (store) => {
     await withSetup(store, async ({ g, dest, sends }) => {

@@ -71,6 +71,11 @@ export class Pool {
     });
   }
 
+  async isRetired(kind: FileKind, id: string): Promise<boolean> {
+    const key = kind + ':' + await keyFor(id);
+    return await this.locked(() => this.retiring.has(key));
+  }
+
   // Opening, leasing and eviction share one metadata critical section.
   // File operations run OUTSIDE it, protected by their lease count.
   private locked<T>(fn: () => T | Promise<T>): Promise<T> {
@@ -153,6 +158,11 @@ export class Pool {
   // discovery): every directory's file is opened, its id row read, then
   // released. Files already pooled stay pooled (the open dedups by path).
   async list(kind: FileKind): Promise<string[]> {
+    return await this.locked(() => this.listLocked(kind));
+  }
+
+  private async listLocked(kind: FileKind): Promise<string[]> {
+    if (this.closed) throw new Error('open-file pool is closed');
     const parent = join(this.root, kind);
     const entries: Deno.DirEntry[] = [];
     try {
@@ -165,6 +175,14 @@ export class Pool {
     for (const entry of entries) {
       if (!entry.isDirectory || entry.name.endsWith('.new')) continue;
       const files = databaseFiles(directory(this.root, kind, entry.name));
+      try {
+        if (!(await Deno.stat(files.database)).isFile) {
+          throw new Error(`not a database file: ${files.database}`);
+        }
+      } catch (error) {
+        if (error instanceof Deno.errors.NotFound) continue;
+        throw error;
+      }
       let db: Db;
       try {
         db = await Db.open(

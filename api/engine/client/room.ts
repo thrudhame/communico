@@ -53,6 +53,7 @@ export type StateRow = {
 export async function stateAtSeq(
   roomId: string,
   seq: number | null,
+  keys?: readonly (readonly [type: string, stateKey: string])[],
 ): Promise<StateRow[]> {
   const room = await requireRoom(roomId);
   const feed = seq === null ? [] : await theApp().server.query(
@@ -68,7 +69,17 @@ export async function stateAtSeq(
       : await tx.state.publishedAt(Number(feed[0].stay), Number(feed[0].pos));
     if (group === null) return [];
     const rows: StateRow[] = [];
-    for (const entry of await tx.state.groupEntries(group)) {
+    const entries = keys === undefined
+      ? await tx.state.groupEntries(group)
+      : [];
+    for (const [type, state_key] of keys ?? []) {
+      entries.push({
+        type,
+        state_key,
+        event: await tx.state.groupKey(group, type, state_key),
+      });
+    }
+    for (const entry of entries) {
       if (entry.event === null) continue;
       const row = await tx.events.get(entry.event);
       if (row === null) continue;

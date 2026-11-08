@@ -6,6 +6,10 @@ for (const fatal of ['close', 'hang', 'second'] as const) {
     const server = await serverProcess({ fatal });
     try {
       const started = performance.now();
+      const exited = server.output.then((output) => ({
+        output,
+        at: performance.now(),
+      }));
       await Deno.writeTextFile(`${server.dir}/fatal-trigger`, 'reject');
       await server.waitLog('fatal: unhandled rejection');
       for (let i = 0; i < 5; i++) {
@@ -33,8 +37,10 @@ for (const fatal of ['close', 'hang', 'second'] as const) {
         env: { COMMUNICO_CONFIG: server.config },
       }).output();
       assertEquals(tool.code, 1, 'admin still serves after the fatal marker');
-      const output = await bounded(server.output, 5000);
-      const elapsed = performance.now() - started;
+      // A slow observer must not extend the measured server exit deadline.
+      await new Promise((resolve) => setTimeout(resolve, 3600));
+      const { output, at } = await bounded(exited, 5000);
+      const elapsed = at - started;
       assertEquals(output.code, 1, output.stderr);
       assert(output.stderr.includes('fatal: unhandled rejection'));
       assert(output.stderr.includes('Error: fatal-test-rejection'));

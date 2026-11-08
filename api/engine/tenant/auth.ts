@@ -7,7 +7,7 @@
 // refresh token → 401 M_UNKNOWN_TOKEN (refresh.yaml:89-101).
 import type { Conn } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import type { Tenant } from '#engine/tenant/index.ts';
+import type { Tenant, TenantTx } from '#engine/tenant/index.ts';
 
 // The informational access-token lifetime advertised at refresh (band C
 // D8: expires_in_ms is advertised, never enforced — spec: optional).
@@ -287,6 +287,20 @@ export async function revokeToken(tenant: Tenant, token: string) {
       await tx.devices.delete(deviceId);
     }
   });
+}
+
+/** Revoke a device's sessions without deleting its owned device row. */
+export async function revokeDeviceTokens(
+  tx: TenantTx,
+  deviceId: string,
+  localpart: string,
+): Promise<void> {
+  for (const token of await tx.tokens.ofDevice(deviceId)) {
+    if (token.localpart !== localpart) continue;
+    await tx.pushers.deleteForToken(token.token);
+    await tx.refresh.deleteForAccessToken(token.token);
+    await tx.tokens.delete(token.token);
+  }
 }
 
 /** Every token, pusher and device of the user goes (child rows first). */

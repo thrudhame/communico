@@ -276,7 +276,7 @@ Deno.test('F4: imported remote membership passes inbound EDU checks and server d
         setConfigForTests({ server: { name: previousName } });
       }
     } finally {
-      setTyping(s.room.id, s.fr.creator, false);
+      await setTyping(s.server, s.room.id, s.fr.creator, false);
     }
   });
 });

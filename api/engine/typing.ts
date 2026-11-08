@@ -8,6 +8,9 @@
 // user was not typing — §3c), and the expiry sweep (when it drops
 // entries). Per-room lastChangeT lets /sync emit m.typing only for rooms
 // whose typing moved since the token (§3d).
+import type { Database } from '#engine/store/db.ts';
+import { isJoined } from '#engine/server/read.ts';
+
 const typing = new Map<string, Map<string, number>>();
 const lastChangeT = new Map<string, number>();
 let t = 0;
@@ -43,12 +46,14 @@ export function lastTypingChange(roomId: string): number {
 // the user typing for `timeout` ms (default 30000; 0 = immediate expiry
 // — still a registered start, TestTyping's no-room_id case sends it);
 // typing=false is an explicit stop and always bumps t.
-export function setTyping(
+export async function setTyping(
+  server: Database,
   roomId: string,
   userId: string,
   isTyping: boolean,
   timeoutMs?: number,
-): void {
+): Promise<boolean> {
+  if (!await isJoined(server, roomId, userId)) return false;
   if (isTyping) {
     const timeout = timeoutMs ?? 30000;
     let room = typing.get(roomId);
@@ -68,6 +73,7 @@ export function setTyping(
       console.error('typing listener error:', e);
     }
   }
+  return true;
 }
 
 // Sweep every room's expired entries. syncfeed calls this up front, so

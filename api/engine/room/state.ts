@@ -186,3 +186,30 @@ export async function current(
   if (rows[0].current_group !== null) return Number(rows[0].current_group);
   return rows[0].opening_group === null ? null : Number(rows[0].opening_group);
 }
+
+// Published snapshots at/after a positioned event in the stable book. History
+// precedes its owning stay, regardless of its later insertion/change position.
+// Opening snapshots cover imported members with no positioned membership event.
+export async function publishedGroupsAfter(
+  conn: Conn,
+  event: string,
+): Promise<number[]> {
+  const rows = await conn.query(
+    `WITH anchor AS (
+       SELECT CASE WHEN s.kind = 'history' THEN s.prev ELSE s.id END AS stay,
+              s.kind, p.offset
+       FROM positions p JOIN segments s ON s.id = p.segment WHERE p.event = ?
+     )
+     SELECT pub.grp FROM publications pub
+       JOIN changes c ON c.pos = pub.change_pos
+       JOIN positions p ON p.event = c.event CROSS JOIN anchor a
+     WHERE pub.stay > a.stay OR (pub.stay = a.stay AND
+       (a.kind = 'history' OR p.offset >= a.offset))
+     UNION
+     SELECT s.opening_group AS grp FROM segments s CROSS JOIN anchor a
+     WHERE s.kind = 'stay' AND s.opening_group IS NOT NULL AND
+       (s.id > a.stay OR (s.id = a.stay AND a.kind = 'history'))`,
+    [event],
+  );
+  return rows.map((row) => Number(row.grp));
+}

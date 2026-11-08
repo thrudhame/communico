@@ -9,7 +9,11 @@ import {
 } from '@stdext/crypto/hash/argon2';
 import type { Conn } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { hashToken } from '#engine/tenant/auth.ts';
+import {
+  hashToken,
+  REFRESH_LIFETIME_MS,
+  revokeDeviceTokens,
+} from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 
 // Spec appendices: user_id_localpart = 1*user_id_char;
@@ -169,6 +173,7 @@ export type RegisterParams = {
   password: string;
   deviceId?: string;
   displayName?: string;
+  deviceDisplayName?: string;
   // Fixed token override (dev seeds). null = inhibit_login (no token).
   // undefined = mint a random token.
   accessToken?: string | null;
@@ -216,7 +221,11 @@ export async function registerUser(
     }
     await tx.users.insert(localpart, displayName);
     await tx.credentials.set(localpart, hashPassword(params.password));
-    await tx.devices.upsert(deviceId, localpart, displayName);
+    await tx.devices.upsert(
+      deviceId,
+      localpart,
+      params.deviceDisplayName ?? displayName,
+    );
     if (accessHash !== null) {
       await tx.tokens.insert(accessHash, localpart, deviceId, null);
     }
@@ -237,6 +246,62 @@ export async function verifyUserPassword(
   const hash = await tenant.tx((tx) => tx.credentials.hash(localpart));
   if (hash === null) return false;
   return verifyPassword(hash, password);
+}
+
+/** Authentication, device ownership and session replacement are one tenant
+ * operation. A failure cannot expose a partial device or revoke an old pair. */
+export async function loginUser(
+  tenant: Tenant,
+  params: {
+    localpart: string;
+    password: string;
+    deviceId: string;
+    displayName?: string;
+    refresh: boolean;
+  },
+): Promise<
+  { accessToken: string; refreshToken?: string; expiresInMs?: number }
+> {
+  const accessToken = crypto.randomUUID();
+  const accessHash = await hashToken(accessToken);
+  const refreshToken = params.refresh ? crypto.randomUUID() : undefined;
+  const refreshHash = refreshToken === undefined
+    ? null
+    : await hashToken(refreshToken);
+  return await tenant.tx(async (tx) => {
+    const phc = await tx.credentials.hash(params.localpart);
+    if (phc === null || !verifyPassword(phc, params.password)) {
+      throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
+    }
+    if ((await tx.users.byLocalpart(params.localpart))?.deactivated) {
+      throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account deactivated');
+    }
+    await tx.devices.upsert(
+      params.deviceId,
+      params.localpart,
+      params.displayName ?? null,
+    );
+    await revokeDeviceTokens(tx, params.deviceId, params.localpart);
+    await tx.tokens.insert(
+      accessHash,
+      params.localpart,
+      params.deviceId,
+      params.refresh ? Date.now() + REFRESH_LIFETIME_MS : null,
+    );
+    if (refreshHash !== null) {
+      await tx.refresh.insert(
+        refreshHash,
+        params.localpart,
+        params.deviceId,
+        accessHash,
+      );
+    }
+    return {
+      accessToken,
+      refreshToken,
+      expiresInMs: params.refresh ? REFRESH_LIFETIME_MS : undefined,
+    };
+  });
 }
 
 /** The user's profile fields; null = no such user. Keys omitted when unset. */

@@ -59,7 +59,7 @@ export default async function (
     localpart,
     password: body.password,
     deviceId: typeof body.device_id === 'string' ? body.device_id : undefined,
-    displayName: typeof body.initial_device_display_name === 'string'
+    deviceDisplayName: typeof body.initial_device_display_name === 'string'
       ? body.initial_device_display_name
       : undefined,
     accessToken: inhibit ? null : undefined,
