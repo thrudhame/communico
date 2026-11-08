@@ -7,7 +7,10 @@ import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Config } from '#engine/config-schema.ts';
-import { keyView } from '#engine/e2ee-key-view.ts';
+import {
+  forgetKeySignatures,
+  signatureView,
+} from '#engine/tenant/signature-view.ts';
 
 export type Json = Record<string, unknown>;
 export type KeyLimits = Config['e2ee'];
@@ -156,6 +159,17 @@ export async function uploadKeys(
       args,
     );
     if (!old.length || old[0].key_json !== input.device) {
+      if (
+        old.length &&
+        material(String(old[0].key_json)) !== material(input.device)
+      ) {
+        const rows = await conn.query('SELECT server_name FROM tenant');
+        await forgetKeySignatures(
+          conn,
+          '@' + device.localpart + ':' + rows[0].server_name,
+          device.deviceId,
+        );
+      }
       await conn.execute(
         'INSERT INTO device_keys VALUES(?,?,?,?) ON CONFLICT(localpart,device_id,generation) DO UPDATE SET key_json=excluded.key_json',
         [...args, input.device],
@@ -264,7 +278,13 @@ export async function queryKeys(
     if (deviceIds.length && !deviceIds.includes(String(row.device_id))) {
       continue;
     }
-    const key = keyView(JSON.parse(String(row.key_json)), owner, requester);
+    const key = await signatureView(
+      conn,
+      JSON.parse(String(row.key_json)),
+      owner,
+      String(row.device_id),
+      requester,
+    );
     const unsigned: Json = key.unsigned && typeof key.unsigned === 'object' &&
         !Array.isArray(key.unsigned)
       ? key.unsigned as Json

@@ -6,6 +6,7 @@ import { nextCounter } from '#engine/tenant/accountdata.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { appendDeviceChange } from '#engine/tenant/changes.ts';
 import { signingCollision } from '#engine/tenant/cross-signing.ts';
+import { forgetKeySignatures } from '#engine/tenant/signature-view.ts';
 
 export type DeviceRow = {
   device_id: string;
@@ -104,6 +105,12 @@ export async function deleteDevice(
 ): Promise<void> {
   // Sole device lifecycle deletion: all consumers revoke through this owner.
   const device = await deviceById(conn, deviceId, localpart);
+  const tenant = await conn.query('SELECT server_name FROM tenant');
+  await forgetKeySignatures(
+    conn,
+    '@' + localpart + ':' + tenant[0].server_name,
+    deviceId,
+  );
   const tokens = await conn.query(
     'SELECT token FROM access_tokens WHERE localpart = ? AND device_id = ?',
     [localpart, deviceId],

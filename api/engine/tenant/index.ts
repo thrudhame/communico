@@ -14,6 +14,7 @@ import * as auth from '#engine/tenant/auth.ts';
 import * as devices from '#engine/tenant/devices.ts';
 import * as e2ee from '#engine/tenant/e2ee.ts';
 import * as crossSigning from '#engine/tenant/cross-signing.ts';
+import * as keySignatures from '#engine/tenant/key-signatures.ts';
 import type { SigningUpload } from '#engine/e2ee-signing.ts';
 import { config } from '#engine/config.ts';
 import * as todevice from '#engine/tenant/todevice.ts';
@@ -105,7 +106,33 @@ function bind(
     return value;
   };
   return {
+    keySignatures: {
+      upload: (
+        localpart: string,
+        user: string,
+        targets: keySignatures.SignatureTarget[],
+      ) =>
+        mutation(
+          keySignatures.uploadSignatures(
+            conn,
+            localpart,
+            user,
+            targets,
+            config().e2ee,
+            config().federation.bulkmaxbytes,
+          ),
+        ),
+    },
     crossSigning: {
+      clear: (localpart: string, user: string) =>
+        mutation(
+          crossSigning.clearSigningKeys(
+            conn,
+            localpart,
+            user,
+            config().federation.bulkmaxbytes,
+          ),
+        ),
       state: (localpart: string) => crossSigning.signingState(conn, localpart),
       views: (localpart: string, user: string, requester: string) =>
         crossSigning.signingViews(conn, localpart, user, requester),

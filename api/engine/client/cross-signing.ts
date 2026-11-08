@@ -6,6 +6,14 @@ import { signingUpload } from '#engine/e2ee-signing.ts';
 import { needsSigningAuth } from '#engine/tenant/cross-signing.ts';
 import { PASSWORD_FLOWS, requireUia } from '#engine/tenant/uia.ts';
 import { object } from '#engine/tenant/e2ee.ts';
+import { signatureTargets } from '#engine/tenant/key-signatures.ts';
+
+export async function uploadSignatures(user: string, body: unknown) {
+  const targets = signatureTargets(body, config().e2ee);
+  return await theApp().tenant.tx((tx) =>
+    tx.keySignatures.upload(localpartOf(user), user, targets)
+  );
+}
 
 export async function uploadSigningKeys(
   user: string,

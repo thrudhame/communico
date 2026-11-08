@@ -86,7 +86,7 @@ Deno.test('cross-signing: v9 upgrade, restart and owner-only change replay prese
     version: 9,
     apply: async (db: Parameters<typeof tenantSchema.apply>[0]) => {
       await tenantSchema.apply(db);
-      await db.exec('DROP TABLE cross_signing_keys');
+      await db.exec('DROP TABLE key_signatures; DROP TABLE cross_signing_keys');
     },
   };
   let store = await openStore(options(dir), {
@@ -189,7 +189,7 @@ Deno.test('cross-signing: v9 upgrade, restart and owner-only change replay prese
       (await (await store.tenant('a.test')).query(
         "SELECT v FROM meta WHERE k='schema_version'",
       ))[0].v,
-      '10',
+      '11',
     );
   } finally {
     await store.close();

@@ -392,6 +392,10 @@ export async function deactivateUser(
     await tx.refresh.deleteForUser(localpart);
     await tx.tokens.deleteForUser(localpart);
     await tx.devices.deleteForUser(localpart);
+    await tx.crossSigning.clear(
+      localpart,
+      '@' + localpart + ':' + tenant.serverName,
+    );
     await tx.users.markDeactivated(localpart);
   });
 }

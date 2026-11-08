@@ -34,7 +34,7 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
             } else {for (const scope of ['sync', 'keys']) {
                 await conn.execute(
                   'INSERT INTO device_notices VALUES(?,?,?,?,?)',
-                  [seq, subject, subject, scope, 'change'],
+                  [seq, subject, payload.subject ?? subject, scope, 'private'],
                 );
               }}
             continue;

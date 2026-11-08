@@ -3,7 +3,6 @@ import type { Conn } from '#engine/store/db.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
-import { keyView } from '#engine/e2ee-key-view.ts';
 import {
   type SigningUpload,
   signingUsages,
@@ -13,6 +12,10 @@ import type { Json } from '#engine/tenant/e2ee.ts';
 import { bounded } from '#engine/tenant/e2ee.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { domainOf } from '#engine/ids.ts';
+import {
+  forgetKeySignatures,
+  signatureView,
+} from '#engine/tenant/signature-view.ts';
 
 export async function signingState(
   conn: Conn,
@@ -73,9 +76,11 @@ export async function signingViews(
   for (const usage of signingUsages) {
     if (usage === 'user_signing' && requester !== user) continue;
     if (state[usage]) {
-      result[usage + '_keys'] = keyView(
+      result[usage + '_keys'] = await signatureView(
+        conn,
         JSON.parse(state[usage]!.json),
         user,
+        state[usage]!.public,
         requester,
       );
     }
@@ -136,6 +141,15 @@ export async function uploadSigningKeys(
     }
   }
   if (canonicalJson(next) === canonicalJson(old)) return;
+  const revisions = await conn.query(
+    'SELECT usage,revision FROM cross_signing_keys WHERE localpart=?',
+    [localpart],
+  );
+  for (const usage of signingUsages) {
+    if (old[usage] && old[usage]!.json !== next[usage]?.json) {
+      await forgetKeySignatures(conn, user, old[usage]!.public);
+    }
+  }
   const revision = await nextCounter(conn, 'cross_signing');
   await conn.execute('DELETE FROM cross_signing_keys WHERE localpart=?', [
     localpart,
@@ -148,20 +162,46 @@ export async function uploadSigningKeys(
         usage,
         key.id,
         key.json,
-        revision,
+        old[usage]?.json === key.json
+          ? Number(revisions.find((row) => row.usage === usage)!.revision)
+          : revision,
       ]);
     }
   }
   const publicChanged = ['master', 'self_signing'].some((u) =>
     old[u as keyof SigningUpload]?.json !== next[u as keyof SigningUpload]?.json
   );
+  await appendSigningChange(
+    conn,
+    localpart,
+    user,
+    publicChanged,
+    maxEnvelopeBytes,
+  );
+}
+
+export async function appendSigningChange(
+  conn: Conn,
+  localpart: string,
+  user: string,
+  publicChanged: boolean,
+  maxEnvelopeBytes: number,
+  subject = user,
+): Promise<void> {
+  const next = await signingState(conn, localpart);
   const payload: Json = {
     kind: publicChanged ? 'public_signing' : 'private_signing',
+    ...(publicChanged ? {} : { subject }),
   };
   if (publicChanged) {
     for (const usage of ['master', 'self_signing'] as const) {
       if (next[usage]) {
-        payload[usage + '_key'] = keyView(JSON.parse(next[usage]!.json), user);
+        payload[usage + '_key'] = await signatureView(
+          conn,
+          JSON.parse(next[usage]!.json),
+          user,
+          next[usage]!.public,
+        );
       }
     }
     const { kind: _kind, ...publicKeys } = payload;
@@ -182,4 +222,20 @@ export async function uploadSigningKeys(
     0,
     canonicalJson(payload),
   ]);
+}
+
+export async function clearSigningKeys(
+  conn: Conn,
+  localpart: string,
+  user: string,
+  maxEnvelopeBytes: number,
+): Promise<void> {
+  await conn.execute('DELETE FROM cross_signing_keys WHERE localpart=?', [
+    localpart,
+  ]);
+  await conn.execute(
+    'DELETE FROM key_signatures WHERE signer_localpart=? OR target_user=?',
+    [localpart, user],
+  );
+  await appendSigningChange(conn, localpart, user, true, maxEnvelopeBytes);
 }
