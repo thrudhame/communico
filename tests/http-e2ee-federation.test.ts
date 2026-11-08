@@ -271,6 +271,9 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
   resetCaCertsForTests();
   const peers: Awaited<ReturnType<typeof startFakeServer>>[] = [];
   let active = 0, peak = 0;
+  const ready = Promise.withResolvers<void>();
+  let arrivals = 0;
+  let barrierTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     for (let n = 0; n < 6; n++) {
       const fake = await startFakeServer({
@@ -288,6 +291,22 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
             active++;
             peak = Math.max(peak, active);
             try {
+              if (++arrivals === 1) {
+                barrierTimer = setTimeout(
+                  () =>
+                    ready.reject(
+                      new Error(
+                        'four origin workers did not reach the consumer',
+                      ),
+                    ),
+                  1500,
+                );
+              }
+              if (arrivals === 4) {
+                clearTimeout(barrierTimer);
+                ready.resolve();
+              }
+              if (arrivals <= 4) await ready.promise;
               await new Promise((resolve) => setTimeout(resolve, 40));
               const user = Object.keys(
                 (req.json() as { device_keys: Json }).device_keys,
@@ -345,6 +364,7 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
     );
     assertEquals(Object.keys(count.failures).length, 3);
   } finally {
+    clearTimeout(barrierTimer);
     await Promise.all(peers.map((p) => p.close()));
     setConfigForTests(previous);
     resetCaCertsForTests();

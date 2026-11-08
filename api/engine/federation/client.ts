@@ -1,6 +1,6 @@
 // api/engine/federation/client.ts — the signed outbound federation client.
-// Resolve → connect (http1 for trust 'ca'; the node:tls dialer for
-// 'pinned'/'keyname') → sign with the tenant Signer → send. The admission
+// Resolve -> sign with the tenant Signer -> connect through the shared
+// node:tls dialer for every trust kind -> send. The admission
 // gate is the CALLER's job. The server file's Db is explicit (roster
 // lookup inside resolve); the Signer is the tenant's event-signing
 // identity. Ported from doltgres; maxBytes defaults to
@@ -11,10 +11,10 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Database as Db } from '#engine/store/db.ts';
-import { http1Request, type Http1Response } from '#engine/net/http1.ts';
 import { dialNodeTls } from './dial-node-tls.ts';
 import { caCertsPem, resolve } from './resolve.ts';
 import { buildXMatrixHeader } from './xmatrix.ts';
+import { abortable } from '#engine/net/abort.ts';
 
 export { caCertsPem, resetCaCertsForTests } from './resolve.ts';
 
@@ -25,6 +25,7 @@ export type FederationRequest = {
   body: Uint8Array | null;
   // response cap; defaults to federation.maxbytes
   maxBytes?: number;
+  signal?: AbortSignal;
 };
 
 export type FederationResponse = {
@@ -41,7 +42,8 @@ export async function federationRequest(
   if (!config().federation.enabled) {
     throw new MatrixError(502, 'M_UNKNOWN', 'federation disabled');
   }
-  const endpoint = await resolve(server, req.destination);
+  req.signal?.throwIfAborted();
+  const endpoint = await resolve(server, req.destination, req.signal);
   const origin = signer.serverName;
   const obj: Record<string, unknown> = {
     method: req.method,
@@ -55,7 +57,10 @@ export async function federationRequest(
   }
   // the X-Matrix signature covers the canonical request object (spec §
   // Request Authentication) — the Signer signs canonical bytes verbatim
-  const signature = await signer.sign(canonicalJson(obj));
+  const signature = await abortable(
+    req.signal,
+    () => signer.sign(canonicalJson(obj)),
+  );
   const auth = buildXMatrixHeader({
     origin,
     destination: req.destination,
@@ -67,41 +72,24 @@ export async function federationRequest(
   const maxBytes = req.maxBytes !== undefined
     ? req.maxBytes
     : config().federation.maxbytes;
-  let res: Http1Response;
-  if (endpoint.trust.kind === 'ca') {
-    const tls = endpoint.sni === null
-      ? { sni: null, caCerts: caCertsPem() }
-      : { sni: endpoint.sni, caCerts: caCertsPem() };
-    res = await http1Request({
-      connectIp: endpoint.connectIp,
-      port: endpoint.port,
-      tls,
-      hostHeader: endpoint.hostHeader,
-      method: req.method,
-      path: req.path,
-      headers,
-      body,
-      connectMs: config().federation.connectms,
-      timeoutMs: config().federation.timeoutms,
-      maxBytes,
-    });
-  } else {
-    // pinned / key-is-name → the node:tls dialer (roster trust kind)
-    res = await dialNodeTls({
-      connectIp: endpoint.connectIp,
-      port: endpoint.port,
-      sni: endpoint.sni,
-      hostHeader: endpoint.hostHeader,
-      trust: endpoint.trust,
-      method: req.method,
-      path: req.path,
-      headers,
-      body,
-      connectMs: config().federation.connectms,
-      timeoutMs: config().federation.timeoutms,
-      maxBytes,
-    });
-  }
+  req.signal?.throwIfAborted();
+  const res = await dialNodeTls({
+    connectIp: endpoint.connectIp,
+    port: endpoint.port,
+    sni: endpoint.sni,
+    hostHeader: endpoint.hostHeader,
+    trust: endpoint.trust.kind === 'ca'
+      ? { kind: 'ca', caCerts: caCertsPem() }
+      : endpoint.trust,
+    method: req.method,
+    path: req.path,
+    headers,
+    body,
+    connectMs: config().federation.connectms,
+    timeoutMs: config().federation.timeoutms,
+    maxBytes,
+    signal: req.signal,
+  });
   if (res.status >= 200 && res.status < 300) {
     let json: unknown = null;
     if (res.body.length > 0) {

@@ -238,6 +238,59 @@ Deno.test('resolve: well-known cache resets for tests', () => {
   resetWellKnownCache(); // smoke: exists and callable
 });
 
+Deno.test('resolve: cancellation stops DNS and well-known ladders without continuing late discovery', async () => {
+  for (const stage of ['dns', 'well-known']) {
+    const ac = new AbortController();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const calls: string[] = [];
+    const d = deps({
+      dnsA: async () => {
+        calls.push('dns');
+        if (stage === 'dns') {
+          entered();
+          await held;
+        }
+        return ['127.0.0.1'];
+      },
+      dnsSrv: () => {
+        calls.push('srv');
+        return Promise.resolve([]);
+      },
+      wellKnownGet: async () => {
+        calls.push('well-known');
+        if (stage === 'well-known') {
+          entered();
+          await held;
+        }
+        return { mServer: 'later.test:8448', maxAgeMs: null };
+      },
+    });
+    const pending = resolveWith(
+      stage === 'dns' ? 'slow.test:8448' : 'slow.test',
+      d,
+      ac.signal,
+    );
+    await started;
+    ac.abort();
+    try {
+      await assertRejects(() => pending, DOMException);
+    } finally {
+      release();
+    }
+    // A late answer cannot fall through to another DNS leg or produce an endpoint.
+    await held;
+    await Promise.resolve();
+    assertEquals(calls, stage === 'dns' ? ['dns'] : ['well-known']);
+  }
+});
+
 // --- the production wiring: the roster lives in the server file ---------
 
 Deno.test('resolve: the production ladder reads the roster from the server file', async () => {
