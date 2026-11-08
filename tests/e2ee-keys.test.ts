@@ -22,6 +22,8 @@ const limits: KeyLimits = {
   maxonetimekeys: 10000,
   maxinboxmessages: 10000,
   maxdestinationmessages: 1000,
+  maxbackupsessions: 100000,
+  maxbackupversions: 100,
 };
 const config = (dir: string) => ({
   dir,

@@ -15,6 +15,7 @@ import * as devices from '#engine/tenant/devices.ts';
 import * as e2ee from '#engine/tenant/e2ee.ts';
 import * as crossSigning from '#engine/tenant/cross-signing.ts';
 import * as keySignatures from '#engine/tenant/key-signatures.ts';
+import * as keyBackup from '#engine/tenant/key-backup.ts';
 import {
   remoteTargetMaterial,
   signatureSigner,
@@ -111,6 +112,41 @@ function bind(
     return value;
   };
   return {
+    keyBackup: {
+      clear: (localpart: string) => keyBackup.clearBackup(conn, localpart),
+      version: (
+        localpart: string,
+        action: keyBackup.Action,
+        version?: string,
+        input?: unknown,
+      ) =>
+        keyBackup.backupVersion(
+          conn,
+          localpart,
+          action,
+          version,
+          input,
+          config().e2ee,
+        ),
+      keys: (
+        localpart: string,
+        action: keyBackup.Action,
+        version: string | null,
+        room?: string,
+        session?: string,
+        input?: unknown,
+      ) =>
+        keyBackup.backupKeys(
+          conn,
+          localpart,
+          action,
+          version,
+          room,
+          session,
+          input,
+          config().e2ee,
+        ),
+    },
     keySignatures: {
       basis: async (localpart: string) => {
         const state = await crossSigning.signingState(conn, localpart);

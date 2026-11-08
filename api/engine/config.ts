@@ -560,6 +560,8 @@ export type ConfigPatch = {
     maxonetimekeys?: number;
     maxinboxmessages?: number;
     maxdestinationmessages?: number;
+    maxbackupsessions?: number;
+    maxbackupversions?: number;
   };
   preview?: {
     enabled?: boolean;
