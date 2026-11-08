@@ -56,13 +56,13 @@ Deno.test('E2: publication reconciliation queries only relationship pairs affect
       await reconcile([...members, '@new:test'], true, 3),
       members.length * 4,
     );
-    assertEquals(await reconcile([...members, '@new:test'], false, 4), 13 * 12);
+    assertEquals(await reconcile([...members, '@new:test'], false, 4), 0);
     const after = await deviceStreamMax(server);
     assertEquals(
       await deviceListsBetween(server, members[0], before, after, 'sync'),
       {
-        changed: [],
-        left: [...members.slice(1), '@new:test'].sort(),
+        changed: ['@new:test'],
+        left: [],
       },
     );
     assertEquals(
@@ -97,8 +97,15 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
           'e2ee_room_members',
           'device_tracking',
           'device_notices',
+          'edu_outbox',
+          'federation_batches',
+          'remote_device_keys',
+          'remote_device_users',
+          'device_subscriptions',
+          'device_recovery_requests',
         ]
       ) await db.exec('DROP TABLE ' + name);
+      await db.exec("DELETE FROM counters WHERE name='reliable-edus'");
     },
   };
   let store = await openStore(config, {
@@ -162,7 +169,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
     assertEquals(
       (await migrated.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '5',
+      '10',
     );
   } finally {
     await store.close();
@@ -170,7 +177,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
   }
 });
 
-Deno.test('E2: encryption redaction closes encrypted tracking but keeps all-room keys tracking', async () => {
+Deno.test('E3: encryption redaction leaves all-room device tracking intact', async () => {
   const dir = await Deno.makeTempDir();
   const store = await openStore({
     dir,
@@ -197,7 +204,7 @@ Deno.test('E2: encryption redaction closes encrypted tracking but keeps all-room
     const after = await deviceStreamMax(server);
     assertEquals(
       await deviceListsBetween(server, g.creator, before, after, 'sync'),
-      { changed: [], left: [bob] },
+      { changed: [], left: [] },
     );
     assertEquals(
       await deviceListsBetween(server, g.creator, before, after, 'keys'),

@@ -111,6 +111,7 @@ function bind(
         source: string,
         messages: todevice.Message[],
         limits: e2ee.KeyLimits,
+        delivery: todevice.DeliveryPolicy,
       ) =>
         mutation(
           todevice.sendMessages(
@@ -120,6 +121,28 @@ function bind(
             type,
             txn,
             source,
+            messages,
+            limits,
+            delivery,
+          ),
+        ),
+      receive: (
+        origin: string,
+        id: string,
+        sender: string,
+        type: string,
+        server: string,
+        messages: todevice.Message[],
+        limits: e2ee.KeyLimits,
+      ) =>
+        mutation(
+          todevice.receiveMessages(
+            conn,
+            origin,
+            id,
+            sender,
+            type,
+            server,
             messages,
             limits,
           ),
@@ -147,6 +170,8 @@ function bind(
       claim: (localpart: string, id: string, algorithm: string) =>
         mutation(e2ee.claimKey(conn, localpart, id, algorithm)),
       status: (device: devices.DeviceIdentity) => e2ee.keyStatus(conn, device),
+      snapshot: (localpart: string, owner: string, limits: e2ee.KeyLimits) =>
+        e2ee.deviceSnapshot(conn, localpart, owner, limits),
     },
     users: {
       exists: (localpart: string) => users.userExists(conn, localpart),

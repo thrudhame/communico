@@ -11,8 +11,8 @@
 //
 // INBOUND: dispatch on edu_type through the registered handlers; unknown
 // types are ignored silently (Synapse federation_server.py:1612-1637)
-// and errors in one EDU never fail the transaction (the caller logs and
-// continues). EVERY EDU's users must belong to `origin` (typing
+// Permanent refusals are visible and don't fail the transaction; reliable
+// persistence failures remain retryable. EVERY EDU's users belong to `origin` (typing
 // SS:1085-1088, presence SS:1094-1099, receipts SS:1105-1110) or the EDU
 // is ignored. Typing is in memory; receipts and presence use the same
 // durable server-file streams as client producers and sync readers.
@@ -25,6 +25,7 @@ import {
 import type { Database as Db } from '#engine/store/db.ts';
 import { setTyping, typingIn } from '#engine/typing.ts';
 import { domainOf } from './pdu.ts';
+import { recordPending } from './peers.ts';
 
 export type Edu = { edu_type: string; content: Record<string, unknown> };
 
@@ -226,7 +227,7 @@ export type EduHandler = (
 
 export type EduState = {
   dispatch(origin: string, raw: unknown): Promise<void>;
-  register(type: string, handler: EduHandler): void;
+  register(type: string, handler: EduHandler, reliable?: boolean): void;
   // Reads share the durable stream owner; typing remains ephemeral.
   typingOf(roomId: string): { userIds: string[] };
   presenceOf(userId: string): Promise<PresencePush | null>;
@@ -237,12 +238,26 @@ export type EduState = {
   >;
 };
 
+export class ReliableEduError extends Error {
+  constructor(cause: unknown) {
+    super('reliable EDU acceptance failed', { cause });
+  }
+}
+
+/** An explicit pre-acceptance policy decision, never inferred from a DB error. */
+export class PermanentEduRefusal extends Error {
+  constructor(readonly errcode: string, reason: string) {
+    super(reason);
+  }
+}
+
 // The inbound state of one instance: the handlers (typing/receipts/
 // presence built in; device list and anything else ignored — the old
 // stubs). Receipts/presence are server-file reads. `self` is our server
 // name (the shares-room check's local side).
 export function eduState(server: Db, self: string): EduState {
   const handlers = new Map<string, EduHandler>();
+  const reliable = new Set<string>();
 
   handlers.set('m.typing', async (origin, content) => {
     const roomId = typeof content.room_id === 'string' ? content.room_id : null;
@@ -340,10 +355,46 @@ export function eduState(server: Db, self: string): EduState {
       >;
       const handler = handlers.get(type);
       if (handler === undefined) return; // unknown types ignored silently
-      await handler(origin, content);
+      try {
+        await handler(origin, content);
+      } catch (error) {
+        if (error instanceof PermanentEduRefusal) {
+          const detail = {
+            direction: 'inbound',
+            edu_type: type,
+            errcode: error.errcode,
+            error: error.message,
+          };
+          try {
+            await server.tx(async (tx) => {
+              await recordPending(
+                tx,
+                origin,
+                'refused',
+                true,
+                JSON.stringify(detail),
+              );
+              await tx.execute(
+                'INSERT INTO counters VALUES(?,1) ON CONFLICT(name) DO UPDATE SET value=value+1',
+                ['federation-edu-refused:' + type],
+              );
+            });
+          } catch (failure) {
+            throw new ReliableEduError(failure);
+          }
+          console.error(
+            `federation[${origin}]: EDU refused: ${JSON.stringify(detail)}`,
+          );
+          return;
+        }
+        if (reliable.has(type)) throw new ReliableEduError(error);
+        throw error;
+      }
     },
-    register: (type, handler) => {
+    register: (type, handler, durable = false) => {
       handlers.set(type, handler);
+      if (durable) reliable.add(type);
+      else reliable.delete(type);
     },
     typingOf: (roomId) => ({ userIds: typingIn(roomId).userIds }),
     presenceOf: async (userId) => {

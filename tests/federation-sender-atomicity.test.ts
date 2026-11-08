@@ -72,7 +72,7 @@ function failWrite(
 }
 
 async function waitFor(what: () => Promise<boolean> | boolean) {
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + 25000;
   while (!await what()) {
     assert(Date.now() < deadline, 'sender outcome timed out');
     await new Promise((resolve) => setTimeout(resolve, 10));

@@ -43,7 +43,7 @@ const sync = (token: string, since?: string, timeout = 0) =>
 const send = (token: string, txn: string, messages: unknown, status = 200) =>
   call(token, 'sendToDevice/m.test/' + txn, { messages }, 'PUT', status);
 
-suite.test('remote sends are refused atomically until reliable federation delivery is available', async () => {
+suite.test('remote admission follows reliable federation availability and mixed sends remain atomic', async () => {
   const a = await suite.registerTestUser('unsupported-a', 'pw');
   const b = await suite.registerTestUser('unsupported-b', 'pw');
   const enabled = config().federation.enabled;
@@ -54,9 +54,41 @@ suite.test('remote sends are refused atomically until reliable federation delive
       await send(a.access_token!, txn, {
         [b.user_id]: { '*': { local: true } },
         '@remote:other.test': { '*': { remote: true } },
-      }, 403);
-      assertEquals((await sync(b.access_token!)).to_device.events, []);
+      }, federation ? 200 : 403);
       const db = await theApp().store.tenant(theApp().tenant.serverName);
+      if (federation) {
+        const delivered = await sync(b.access_token!);
+        assertEquals(delivered.to_device.events.map((e) => e.content), [{
+          local: true,
+        }]);
+        const intent = await db.query(
+          'SELECT source_id,payload FROM to_device_intents',
+        );
+        assertEquals(intent.length, 1);
+        assertEquals(JSON.parse(String(intent[0].payload)).messages, {
+          '@remote:other.test': { '*': { remote: true } },
+        });
+        assertEquals(
+          (await theApp().server.query(
+            'SELECT * FROM edu_outbox WHERE source=?',
+            [
+              'tenant:' + theApp().tenant.serverName + ':to-device:' +
+              intent[0].source_id,
+            ],
+          )).length,
+          1,
+        );
+        assertEquals(
+          (await db.query(
+            'SELECT * FROM to_device_transactions WHERE txn_id=?',
+            [txn],
+          )).length,
+          1,
+        );
+        await sync(b.access_token!, delivered.next_batch);
+        continue;
+      }
+      assertEquals((await sync(b.access_token!)).to_device.events, []);
       assertEquals(await db.query('SELECT * FROM to_device_intents'), []);
       assertEquals(
         await db.query('SELECT * FROM to_device_transactions WHERE txn_id=?', [

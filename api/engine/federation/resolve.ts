@@ -14,12 +14,13 @@
 // Ported from doltgres; one repair: the well-known fetch reads the
 // configured cacerts FILES (the old code passed the paths as PEM).
 import { config } from '#engine/config.ts';
-import { http1Request } from '#engine/net/http1.ts';
+import { dialNodeTls } from './dial-node-tls.ts';
 import { parseIp } from '#engine/preview/cidr.ts';
 import { b32decode, isKeyName } from '#engine/signing-primitives.js';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { lookupPeer, type PeerRow } from './peers.ts';
 import type { Database as Db } from '#engine/store/db.ts';
+import { abortable } from '#engine/net/abort.ts';
 
 export type Trust =
   | { kind: 'ca' }
@@ -48,24 +49,36 @@ export type ResolveDeps = {
   lookupPeer: (name: string) => Promise<PeerRow | null>;
 };
 
-async function defaultDns(host: string, type: 'A' | 'AAAA'): Promise<string[]> {
+async function defaultDns(
+  host: string,
+  type: 'A' | 'AAAA',
+  signal?: AbortSignal,
+): Promise<string[]> {
   try {
-    const r = await Deno.resolveDns(host, type);
+    const r = await abortable(
+      signal,
+      () => Deno.resolveDns(host, type, { signal }),
+    );
     return r.map((x: unknown) =>
       typeof x === 'string' ? x : String((x as Record<string, unknown>).addr)
     );
   } catch {
+    signal?.throwIfAborted();
     return [];
   }
 }
 
 async function defaultSrv(
   host: string,
+  signal?: AbortSignal,
 ): Promise<
   { target: string; port: number; priority: number; weight: number }[]
 > {
   try {
-    const r = await Deno.resolveDns(host, 'SRV');
+    const r = await abortable(
+      signal,
+      () => Deno.resolveDns(host, 'SRV', { signal }),
+    );
     return r.map((x: unknown) => {
       const o = x as {
         target: string;
@@ -81,6 +94,7 @@ async function defaultSrv(
       };
     });
   } catch {
+    signal?.throwIfAborted();
     return [];
   }
 }
@@ -118,6 +132,7 @@ export function resetWellKnownCache(): void {
 
 async function defaultWellKnownGet(
   host: string,
+  signal?: AbortSignal,
 ): Promise<{ mServer: string | null; maxAgeMs: number | null }> {
   const now = Date.now();
   const hit = wellKnownCache.get(host);
@@ -130,8 +145,8 @@ async function defaultWellKnownGet(
   let answer: { mServer: string | null; maxAgeMs: number | null } | 'error';
   try {
     const ips = [
-      ...(await defaultDns(host, 'A')),
-      ...(await defaultDns(host, 'AAAA')),
+      ...(await defaultDns(host, 'A', signal)),
+      ...(await defaultDns(host, 'AAAA', signal)),
     ];
     if (ips.length === 0) throw new MatrixError(502, 'M_UNKNOWN', 'no address');
     let url = 'https://' + host + '/.well-known/matrix/server';
@@ -139,17 +154,18 @@ async function defaultWellKnownGet(
     while (true) {
       const parsed = new URL(url);
       const hopIps = [
-        ...(await defaultDns(parsed.hostname, 'A')),
-        ...(await defaultDns(parsed.hostname, 'AAAA')),
+        ...(await defaultDns(parsed.hostname, 'A', signal)),
+        ...(await defaultDns(parsed.hostname, 'AAAA', signal)),
       ];
       if (hopIps.length === 0) {
         throw new MatrixError(502, 'M_UNKNOWN', 'no address');
       }
       const port = parsed.port === '' ? 443 : Number(parsed.port);
-      const res = await http1Request({
+      const res = await dialNodeTls({
         connectIp: hopIps[0],
         port,
-        tls: { sni: parsed.hostname, caCerts: caCertsPem() },
+        sni: parseIp(parsed.hostname) === null ? parsed.hostname : null,
+        trust: { kind: 'ca', caCerts: caCertsPem() },
         hostHeader: port === 443
           ? parsed.hostname
           : parsed.hostname + ':' + port,
@@ -160,6 +176,7 @@ async function defaultWellKnownGet(
         connectMs: fed.connectms,
         timeoutMs: fed.timeoutms,
         maxBytes: fed.maxbytes,
+        signal,
       });
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get('location');
@@ -194,6 +211,7 @@ async function defaultWellKnownGet(
       break;
     }
   } catch {
+    signal?.throwIfAborted(); // A caller's cancellation is not a discovery failure to cache.
     answer = 'error';
   }
   const fed2 = config().federation;
@@ -250,7 +268,16 @@ export function splitServerName(
 export async function resolveWith(
   name: string,
   deps: ResolveDeps,
+  signal?: AbortSignal,
 ): Promise<Endpoint> {
+  const source = deps;
+  deps = {
+    dnsA: (h) => abortable(signal, () => source.dnsA(h)),
+    dnsAAAA: (h) => abortable(signal, () => source.dnsAAAA(h)),
+    dnsSrv: (h) => abortable(signal, () => source.dnsSrv(h)),
+    wellKnownGet: (h) => abortable(signal, () => source.wellKnownGet(h)),
+    lookupPeer: (n) => abortable(signal, () => source.lookupPeer(n)),
+  };
   // (0) roster row: trust comes from the row whatever the address source
   const row = await deps.lookupPeer(name);
   const trust = row !== null ? trustOf(row) : { kind: 'ca' } as Trust;
@@ -402,13 +429,17 @@ async function resolveSrv(
 
 // The production ladder: DNS + the cached .well-known fetch + the roster
 // in the server file.
-export async function resolve(server: Db, name: string): Promise<Endpoint> {
+export async function resolve(
+  server: Db,
+  name: string,
+  signal?: AbortSignal,
+): Promise<Endpoint> {
   const deps: ResolveDeps = {
-    dnsA: (h) => defaultDns(h, 'A'),
-    dnsAAAA: (h) => defaultDns(h, 'AAAA'),
-    dnsSrv: defaultSrv,
-    wellKnownGet: defaultWellKnownGet,
+    dnsA: (h) => defaultDns(h, 'A', signal),
+    dnsAAAA: (h) => defaultDns(h, 'AAAA', signal),
+    dnsSrv: (h) => defaultSrv(h, signal),
+    wellKnownGet: (h) => defaultWellKnownGet(h, signal),
     lookupPeer: (n) => lookupPeer(server, n),
   };
-  return await resolveWith(name, deps);
+  return await resolveWith(name, deps, signal);
 }

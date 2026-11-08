@@ -172,10 +172,11 @@ Deno.test('loop: A offline → B retries with backoff, a B restart resumes the p
     // B keeps talking: two messages queue in B's outbox
     const m1 = await say(b, roomId, '@bob:' + b.name, 'A is down 1');
     const m2 = await say(b, roomId, '@bob:' + b.name, 'A is down 2');
-    // B's sender fails against the dead listener — the ladder grows
+    // B exhausts its 4/16-second transaction retry group before publishing
+    // a durable failure. Observe that phase, not a pre-retry 10-second bound.
     await waitFor(
       async () => (await peerStatus(b.server, a.name)).failures >= 1,
-      10000,
+      30000,
     );
     const st = await peerStatus(b.server, a.name);
     assert(st.unreachableSinceMs !== null);
@@ -186,7 +187,7 @@ Deno.test('loop: A offline → B retries with backoff, a B restart resumes the p
     await b.restartSender();
     await waitFor(
       async () => (await peerStatus(b.server, a.name)).attemptsTotal >= 2,
-      10000,
+      30000,
     );
     // A returns — the ladder fires (a tiny rung) and the batch delivers
     await a.startNet();

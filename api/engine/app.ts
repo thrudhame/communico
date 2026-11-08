@@ -17,6 +17,12 @@ import {
   eduState,
 } from '#engine/federation/edus.ts';
 import { wireEphemeral } from '#engine/federation/ephemeral.ts';
+import { registerToDevice } from '#engine/federation/todevice.ts';
+import {
+  type DeviceListService,
+  deviceListService,
+} from '#engine/federation/device-lists.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
 import {
   type InviteDeps,
   inviteIntentProvider,
@@ -42,6 +48,7 @@ export type App = {
   readonly tenant: Tenant;
   readonly federationKeys: KeyStore;
   readonly federationEdus: EduState;
+  readonly deviceLists: DeviceListService;
   // The delivery worker — null until startFederationServices (federation
   // disabled, or an endpoint-test app).
   sender: Sender | null;
@@ -74,20 +81,25 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
     const tenant = await openTenant(store, serverName(), { create: true });
     const server = await store.server();
     const stopRuleMigration = await installRuleMigration(store, tenant);
+    const federationEdus = eduState(server, tenant.serverName);
+    const deviceLists = deviceListService(server, tenant, federationEdus);
     const app: App = {
       store,
       server,
       tenant,
       federationKeys: keyStore(server, { signer: tenant.signer() }),
-      federationEdus: eduState(server, tenant.serverName),
+      federationEdus,
+      deviceLists,
       sender: null,
       close: async () => {
         stopRuleMigration();
+        await deviceLists.stop();
         await app.sender?.stop();
         app.sender = null;
         await store.close();
       },
     };
+    registerToDevice(app.federationEdus, tenant);
     current = app;
     return app;
   } catch (error) {
@@ -101,6 +113,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
  * queues and the reject-invite intent provider. Endpoints (5b) are not
  * part of this — no federation routes exist yet. */
 export function startFederationServices(app: App): void {
+  app.deviceLists.start();
   const name = serverName();
   const signer = app.tenant.signer();
   let senderRef: Sender | null = null;
@@ -112,6 +125,7 @@ export function startFederationServices(app: App): void {
     store: app.store,
     signer,
     drainEdus: queues.drain,
+    onDelivered: () => projectTenant(app.store, app.tenant.serverName),
   });
   senderRef = sender;
   const inviteDeps: InviteDeps = {

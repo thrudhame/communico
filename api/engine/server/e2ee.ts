@@ -1,43 +1,17 @@
 import type { Conn, Database } from '#engine/store/db.ts';
+import { domainOf } from '#engine/ids.ts';
+import { nextDeviceSeq } from '#engine/server/device-notices.ts';
+import { invalidateDeviceCache } from '#engine/server/remote-devices.ts';
+import { reconcileDeviceSubscriptions } from '#engine/server/device-federation.ts';
+export {
+  nextDeviceSeq,
+  publishDeviceChange,
+} from '#engine/server/device-notices.ts';
 
 export type TrackingScope = 'sync' | 'keys';
 export type DeviceLists = { changed: string[]; left: string[] };
 
-export async function nextDeviceSeq(tx: Conn): Promise<number> {
-  await tx.execute(
-    "INSERT INTO counters VALUES('devices',0) ON CONFLICT(name) DO NOTHING",
-  );
-  await tx.execute("UPDATE counters SET value=value+1 WHERE name='devices'");
-  return Number(
-    (await tx.query("SELECT value FROM counters WHERE name='devices'"))[0]
-      .value,
-  );
-}
-
-/** Capture the audience at publication time; later membership never rewrites history. */
-export async function publishDeviceChange(
-  tx: Conn,
-  seq: number,
-  subject: string,
-): Promise<void> {
-  for (const scope of ['sync', 'keys']) {
-    const audience = new Set(
-      (await tx.query(
-        'SELECT observer FROM device_tracking WHERE subject=? AND scope=? AND end_seq IS NULL',
-        [subject, 'keys'],
-      )).map((r) => String(r.observer)),
-    );
-    audience.add(subject);
-    for (const observer of audience) {
-      await tx.execute(
-        'INSERT INTO device_notices VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
-        [seq, observer, subject, scope, 'change'],
-      );
-    }
-  }
-}
-
-/** Reconcile one immutable publication, keeping both predicates and last-room loss together. */
+/** Both client surfaces deliberately track the all-room superset at published cuts. */
 export async function reconcileDeviceRoom(
   tx: Conn,
   room: string,
@@ -45,6 +19,7 @@ export async function reconcileDeviceRoom(
   encrypted: boolean,
   encryptionEvent: string | null,
   position: number,
+  localServers: string[] = [],
 ): Promise<void> {
   const priorRoom = (await tx.query(
     'SELECT encrypted,publication_pos FROM e2ee_rooms WHERE room=?',
@@ -60,8 +35,6 @@ export async function reconcileDeviceRoom(
   const moved = affected.filter((user) =>
     oldSet.has(user) !== newSet.has(user)
   );
-  const encryptionChanged =
-    (Number(priorRoom?.encrypted ?? 0) === 1) !== encrypted;
   await tx.execute(
     'INSERT INTO e2ee_rooms VALUES(?,?,?,?) ON CONFLICT(room) DO UPDATE SET encrypted=excluded.encrypted,encryption_event=excluded.encryption_event,publication_pos=excluded.publication_pos',
     [room, encrypted ? 1 : 0, encryptionEvent, position],
@@ -79,17 +52,34 @@ export async function reconcileDeviceRoom(
       );
     }
   }
+  // A newly joined local user also starts tracking their own devices. This is
+  // an invalidation, not a fabricated key mutation, and never sends self left.
+  if (members.length > 1) {
+    for (const user of moved) {
+      if (!newSet.has(user) || !localServers.includes(domainOf(user)!)) {
+        continue;
+      }
+      const seq = await nextDeviceSeq(tx);
+      for (const scope of ['sync', 'keys']) {
+        await tx.execute('INSERT INTO device_notices VALUES(?,?,?,?,?)', [
+          seq,
+          user,
+          user,
+          scope,
+          'join',
+        ]);
+      }
+    }
+  }
   for (const scope of ['sync', 'keys']) {
-    // Only changed memberships affect all-room sharing; encryption changes
-    // affect every pair in the encrypted scope. Avoid even enumerating the
-    // unchanged cross product on ordinary room publications.
-    const pivots = scope === 'sync' && encryptionChanged ? affected : moved;
+    // Encryption changes do not change the all-room relationship. Avoid even
+    // enumerating unchanged pairs on ordinary publications or encryption edits.
     const pairs = new Map<string, Set<string>>();
     const add = (observer: string, subject: string) => {
       if (!pairs.has(observer)) pairs.set(observer, new Set());
       pairs.get(observer)!.add(subject);
     };
-    for (const user of pivots) {
+    for (const user of moved) {
       for (const peer of affected) {
         if (user === peer) continue;
         add(user, peer);
@@ -103,12 +93,11 @@ export async function reconcileDeviceRoom(
           [observer, subject, scope],
         );
         const shared = await tx.query(
-          `SELECT 1 FROM e2ee_room_members a JOIN e2ee_room_members b ON a.room=b.room JOIN e2ee_rooms r ON r.room=a.room WHERE a.user=? AND b.user=? ${
-            scope === 'sync' ? 'AND r.encrypted=1' : ''
-          } LIMIT 1`,
+          'SELECT 1 FROM e2ee_room_members a JOIN e2ee_room_members b ON a.room=b.room WHERE a.user=? AND b.user=? LIMIT 1',
           [observer, subject],
         );
         if (Boolean(prior.length) === Boolean(shared.length)) continue;
+        if (scope === 'keys') await invalidateDeviceCache(tx, subject);
         const seq = await nextDeviceSeq(tx);
         if (shared.length) {
           await tx.execute('INSERT INTO device_tracking VALUES(?,?,?,?,NULL)', [
@@ -132,6 +121,9 @@ export async function reconcileDeviceRoom(
         ]);
       }
     }
+  }
+  if (moved.length) {
+    await reconcileDeviceSubscriptions(tx, affected, localServers);
   }
 }
 
@@ -163,8 +155,7 @@ export async function deviceListsBetween(
             [observer, subject, predicate, to, to],
           )).length > 0;
       const active = await activeAt(scope);
-      // Actual mutations have an all-room audience; tracking transitions use
-      // the selected predicate. A plaintext peer must never invent a sync left.
+      // Both tracking transitions and mutations use the all-room audience.
       if (
         (reasons.has('join') && active) ||
         (reasons.has('change') && await activeAt('keys'))

@@ -12,7 +12,7 @@ import { createHash, X509Certificate } from 'node:crypto';
 import { setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { addPeer, removePeer } from '#engine/federation/peers.ts';
-import { resolve } from '#engine/federation/resolve.ts';
+import { resetWellKnownCache, resolve } from '#engine/federation/resolve.ts';
 import {
   federationRequest,
   resetCaCertsForTests,
@@ -381,6 +381,353 @@ Deno.test('dial: key-is-name peer → raw key equality round trips', async () =>
       assert((err as MatrixError).message.includes('key'));
       await removePeer(server, name);
       await removePeer(server, otherName);
+    });
+  });
+});
+
+Deno.test('client: caller cancellation closes both CA and pinned sockets during handshake and response reads', async () => {
+  const identity = await makeIdentity('cancel-client.test');
+  const cert = await Deno.readTextFile('tests/fixtures/tls/localhost.crt');
+  const key = await Deno.readTextFile('tests/fixtures/tls/localhost.key');
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  try {
+    await withStore(async (store) => {
+      const server = await store.server();
+      for (const trust of ['ca', 'pinned'] as const) {
+        for (
+          const mode of [
+            'response-abort',
+            'handshake-abort',
+            'handshake-deadline',
+          ]
+        ) {
+          const handshake = mode !== 'response-abort';
+          setConfigForTests({
+            federation: {
+              cacerts: ['tests/fixtures/tls/ca.crt'],
+              timeoutms: mode === 'handshake-deadline' ? 150 : 30_000,
+            },
+          });
+          const listener = handshake
+            ? Deno.listen({ hostname: '127.0.0.1', port: 0 })
+            : Deno.listenTls({ hostname: '127.0.0.1', port: 0, cert, key });
+          const port = (listener.addr as Deno.NetAddr).port;
+          await addPeer(server, {
+            name: 'localhost',
+            host: '127.0.0.1',
+            port,
+            trust,
+            pin: trust === 'pinned' ? pinOf(cert) : null,
+            addedBy: 'operator',
+          });
+          const ac = new AbortController();
+          const pending = federationRequest(server, identity.signer, {
+            destination: 'localhost',
+            method: 'POST',
+            path: '/claim',
+            body: new TextEncoder().encode('{}'),
+            signal: ac.signal,
+          }).then(() => 'unexpected success', (error: unknown) => error);
+          let peer: Deno.Conn | undefined;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            peer = await Promise.race([
+              listener.accept(),
+              pending.then((result) => {
+                throw new Error(
+                  'request ended before connection: ' + String(result),
+                );
+              }),
+            ]);
+            const buffer = new Uint8Array(4096);
+            // A real handshake or signed request has reached the consumer.
+            assert((await peer.read(buffer))! > 0);
+            if (mode !== 'handshake-deadline') ac.abort();
+            const result = await Promise.race([
+              pending,
+              new Promise<string>((resolve) => {
+                timer = setTimeout(() => resolve('stalled'), 500);
+              }),
+            ]);
+            assert(
+              mode === 'handshake-deadline'
+                ? result instanceof MatrixError &&
+                  result.message.includes('timeout')
+                : result instanceof DOMException,
+              `${trust}/${mode}: ${result}`,
+            );
+            // Drain any already-written bytes; cancellation must close the peer.
+            const closed = (async () => {
+              try {
+                while (await peer!.read(buffer) !== null) { /* drain */ }
+              } catch { /* TLS reset is also closure */ }
+              return 'closed';
+            })();
+            assertEquals(
+              await Promise.race([
+                closed,
+                new Promise<string>((resolve) => {
+                  clearTimeout(timer);
+                  timer = setTimeout(() => resolve('still open'), 500);
+                }),
+              ]),
+              'closed',
+              `${trust}/${mode}: cancellation left the transport open`,
+            );
+          } finally {
+            clearTimeout(timer);
+            ac.abort();
+            try {
+              peer?.close();
+            } catch { /* already closed */ }
+            listener.close();
+            await pending;
+          }
+        }
+      }
+    });
+  } finally {
+    setConfigForTests({ federation: { cacerts: [], timeoutms: 30_000 } });
+    resetCaCertsForTests();
+  }
+});
+
+Deno.test('client: CA transport verifies configured roots, IP SAN and server identity, refusing unknown CA and expired leaves', async () => {
+  const identity = await makeIdentity('ca-client.test');
+  const key = await Deno.readTextFile('tests/fixtures/tls/localhost.key');
+  const valid = await Deno.readTextFile('tests/fixtures/tls/localhost.crt');
+  const dir = await Deno.makeTempDir();
+  const openssl = async (...args: string[]) => {
+    const output = await new Deno.Command('openssl', {
+      args,
+      stdout: 'piped',
+      stderr: 'piped',
+    }).output();
+    assert(output.success, new TextDecoder().decode(output.stderr));
+  };
+  try {
+    await Deno.writeTextFile(dir + '/index', '');
+    await Deno.writeTextFile(dir + '/serial', '01\n');
+    await Deno.writeTextFile(
+      dir + '/ca.cnf',
+      `[ca]\ndefault_ca=local\n[local]\ndatabase=${dir}/index\nserial=${dir}/serial\nnew_certs_dir=${dir}\ndefault_md=sha256\npolicy=policy\nx509_extensions=extensions\n[policy]\ncommonName=supplied\n[extensions]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n`,
+    );
+    await openssl(
+      'req',
+      '-new',
+      '-key',
+      'tests/fixtures/tls/localhost.key',
+      '-subj',
+      '/CN=localhost',
+      '-out',
+      dir + '/leaf.csr',
+    );
+    await openssl(
+      'ca',
+      '-batch',
+      '-notext',
+      '-config',
+      dir + '/ca.cnf',
+      '-keyfile',
+      'tests/fixtures/tls/ca.key',
+      '-cert',
+      'tests/fixtures/tls/ca.crt',
+      '-in',
+      dir + '/leaf.csr',
+      '-out',
+      dir + '/expired.crt',
+      '-startdate',
+      '20200101000000Z',
+      '-enddate',
+      '20210101000000Z',
+    );
+    const expired = await Deno.readTextFile(dir + '/expired.crt');
+    await withStore(async (store) => {
+      const server = await store.server();
+      for (
+        const kind of [
+          'valid-name',
+          'valid-ip',
+          'wrong-name',
+          'unknown-ca',
+          'expired',
+        ]
+      ) {
+        let requests = 0;
+        const peer = Deno.serve({
+          hostname: '127.0.0.1',
+          port: 0,
+          cert: kind === 'expired' ? expired : valid,
+          key,
+        }, () => {
+          requests++;
+          return Response.json({ accepted: true });
+        });
+        const name = kind === 'valid-ip'
+          ? '127.0.0.1'
+          : kind === 'wrong-name'
+          ? 'wrong.test'
+          : 'localhost';
+        setConfigForTests({
+          federation: {
+            cacerts: kind === 'unknown-ca' ? [] : ['tests/fixtures/tls/ca.crt'],
+          },
+        });
+        resetCaCertsForTests();
+        try {
+          await addPeer(server, {
+            name,
+            host: '127.0.0.1',
+            port: (peer.addr as Deno.NetAddr).port,
+            trust: 'ca',
+            addedBy: 'operator',
+          });
+          const result = await federationRequest(server, identity.signer, {
+            destination: name,
+            method: 'POST',
+            path: '/keys/claim',
+            body: new TextEncoder().encode('{}'),
+          }).then((x) => x.status, (e: unknown) => e);
+          if (kind.startsWith('valid')) {
+            assertEquals(result, 200);
+            assertEquals(requests, 1);
+          } else {
+            assert(result instanceof MatrixError, kind + ': ' + String(result));
+            assertEquals(
+              requests,
+              0,
+              'wrote consuming request before trust verification',
+            );
+          }
+        } finally {
+          await peer.shutdown();
+          await removePeer(server, name);
+        }
+      }
+    });
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+    setConfigForTests({ federation: { cacerts: [] } });
+    resetCaCertsForTests();
+  }
+});
+
+Deno.test('resolve: real well-known handshake cancellation closes its socket without poisoning the next discovery', async () => {
+  const identity = await makeIdentity('discovery-cancel.test');
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  resetWellKnownCache();
+  try {
+    await withStore(async (store) => {
+      const server = await store.server();
+      const listener = Deno.listen({ hostname: '127.0.0.1', port: 443 });
+      const ac = new AbortController();
+      const pending = resolve(server, 'localhost', ac.signal).then(
+        () => 'unexpected success',
+        (e: unknown) => e,
+      );
+      let peer: Deno.Conn | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        peer = await listener.accept();
+        const buffer = new Uint8Array(4096);
+        assert((await peer.read(buffer))! > 0);
+        ac.abort();
+        assert((await pending) instanceof DOMException);
+        const closed = (async () => {
+          try {
+            while (await peer!.read(buffer) !== null) { /* drain */ }
+          } catch { /* reset */ }
+          return 'closed';
+        })();
+        assertEquals(
+          await Promise.race([
+            closed,
+            new Promise<string>((resolve) => {
+              timer = setTimeout(() => resolve('still open'), 500);
+            }),
+          ]),
+          'closed',
+        );
+      } finally {
+        clearTimeout(timer);
+        ac.abort();
+        try {
+          peer?.close();
+        } catch { /* already closed */ }
+        listener.close();
+        await pending;
+      }
+      const fake = await startFakeServer({
+        ourKeyDoc: () => Promise.resolve(identity.doc),
+      });
+      const wk = Deno.serve({
+        hostname: '127.0.0.1',
+        port: 443,
+        cert: await Deno.readTextFile('tests/fixtures/tls/localhost.crt'),
+        key: await Deno.readTextFile('tests/fixtures/tls/localhost.key'),
+      }, () => Response.json({ 'm.server': fake.name }));
+      try {
+        const endpoint = await resolve(server, 'localhost');
+        assertEquals(endpoint.port, fake.port);
+        const response = await federationRequest(server, identity.signer, {
+          destination: 'localhost',
+          method: 'GET',
+          path: '/_matrix/key/v2/server',
+          body: null,
+        });
+        assertEquals(response.status, 200);
+      } finally {
+        await wk.shutdown();
+        await fake.close();
+      }
+    });
+  } finally {
+    resetWellKnownCache();
+    setConfigForTests({ federation: { cacerts: [] } });
+    resetCaCertsForTests();
+  }
+});
+
+Deno.test('client: cancellation during signing prevents a late consuming dial', async () => {
+  const identity = await makeIdentity('cancel-sign.test');
+  await withStore(async (store) => {
+    await withFake(identity, async (fake) => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered!: () => void;
+      const signing = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const signer: Signer = {
+        ...identity.signer,
+        sign: async (data) => {
+          entered();
+          await held;
+          return await identity.signer.sign(data);
+        },
+      };
+      const ac = new AbortController();
+      const pending = federationRequest(await store.server(), signer, {
+        destination: fake.name,
+        method: 'POST',
+        path: '/claim',
+        body: new TextEncoder().encode('{}'),
+        signal: ac.signal,
+      }).then(() => 'unexpected success', (error: unknown) => error);
+      await signing;
+      ac.abort();
+      try {
+        assert((await pending) instanceof DOMException);
+      } finally {
+        release();
+      }
+      await held;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assertEquals(fake.requests.length, 0);
     });
   });
 });

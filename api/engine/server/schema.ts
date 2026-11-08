@@ -25,6 +25,30 @@ CREATE TABLE device_notices(seq INTEGER NOT NULL, observer TEXT NOT NULL, subjec
 CREATE INDEX device_notices_observer ON device_notices(observer,scope,seq);
 `;
 
+const RELIABLE_DELIVERY_SQL = `
+CREATE TABLE edu_outbox(source TEXT NOT NULL, destination TEXT NOT NULL, edu_type TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(source,destination));
+CREATE INDEX edu_outbox_pending ON edu_outbox(destination,state);
+CREATE TABLE federation_batches(destination TEXT PRIMARY KEY NOT NULL, txn_id TEXT NOT NULL, body TEXT NOT NULL, pdu_rows TEXT NOT NULL, edu_sources TEXT NOT NULL);
+`;
+
+const DELIVERY_FIFO_SQL = `
+ALTER TABLE edu_outbox ADD COLUMN enqueue_pos INTEGER NOT NULL DEFAULT 0;
+UPDATE edu_outbox SET enqueue_pos=rowid;
+INSERT INTO counters(name,value) SELECT 'reliable-edus',COALESCE(MAX(enqueue_pos),0) FROM edu_outbox;
+CREATE INDEX edu_outbox_fifo ON edu_outbox(destination,state,enqueue_pos);
+CREATE INDEX edu_outbox_completed ON edu_outbox(state,source);
+`;
+
+const REMOTE_DEVICES_SQL = `
+CREATE TABLE remote_device_users(user_id TEXT PRIMARY KEY NOT NULL, anchor TEXT, stale INTEGER NOT NULL, revision INTEGER NOT NULL, retry_at INTEGER NOT NULL, failures INTEGER NOT NULL, pending TEXT NOT NULL, seen TEXT NOT NULL);
+CREATE INDEX remote_device_users_due ON remote_device_users(stale,retry_at);
+CREATE TABLE remote_device_keys(user_id TEXT NOT NULL, device_id TEXT NOT NULL, key_json TEXT NOT NULL, PRIMARY KEY(user_id,device_id));
+`;
+
+const DEVICE_SUBSCRIPTIONS_SQL = `
+CREATE TABLE device_subscriptions(subject TEXT NOT NULL, destination TEXT NOT NULL, active INTEGER NOT NULL, epoch INTEGER NOT NULL, queued_stream INTEGER NOT NULL, sent_stream INTEGER, PRIMARY KEY(subject,destination));
+`;
+
 export const SERVER_SCHEMA_SQL = `
 -- Derived (S11/S12): rebuilt only by roll-forward replaying the rooms'
 -- change logs, keyed by (room, pos) so a replay changes nothing.
@@ -260,15 +284,30 @@ CREATE TABLE server_key_changes(
 );
 `;
 
+const DEVICE_RECOVERY_SQL = `
+CREATE TABLE device_recovery_requests(user_id TEXT PRIMARY KEY NOT NULL);
+INSERT INTO device_recovery_requests SELECT user_id FROM remote_device_users WHERE pending!='[]' OR failures>0 OR anchor IS NOT NULL;
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 5,
+  version: 10,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
     await db.exec(DEVICE_TRACKING_SQL);
+    await db.exec(RELIABLE_DELIVERY_SQL);
+    await db.exec(DELIVERY_FIFO_SQL);
+    await db.exec(REMOTE_DEVICES_SQL);
+    await db.exec(DEVICE_SUBSCRIPTIONS_SQL);
+    await db.exec(DEVICE_RECOVERY_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
     4: (conn) => conn.exec(DEVICE_TRACKING_SQL),
+    5: (conn) => conn.exec(RELIABLE_DELIVERY_SQL),
+    6: (conn) => conn.exec(DELIVERY_FIFO_SQL),
+    7: (conn) => conn.exec(REMOTE_DEVICES_SQL),
+    8: (conn) => conn.exec(DEVICE_SUBSCRIPTIONS_SQL),
+    9: (conn) => conn.exec(DEVICE_RECOVERY_SQL),
   },
 };

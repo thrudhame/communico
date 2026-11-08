@@ -32,6 +32,10 @@ export async function sendToDevice(
       source,
       messages,
       limits,
+      {
+        enabled: config().federation.enabled,
+        maxBytes: config().federation.bulkmaxbytes,
+      },
     )
   );
   return {};

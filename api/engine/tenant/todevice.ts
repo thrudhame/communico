@@ -15,9 +15,17 @@ import { domainOf, localpartOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { hashToken } from '#engine/tenant/auth.ts';
 import { encodeStreamToken, type StreamToken } from '#engine/client/tokens.ts';
+import { encodeEnvelope } from '#engine/federation-envelope.ts';
 
 const args = (d: DeviceIdentity) => [d.localpart, d.deviceId, d.generation];
 export type Message = { user: string; id: string; content: Json };
+/** Queue pressure is temporary, unlike a permanently oversized wire object. */
+export class InboxFullError extends MatrixError {
+  constructor() {
+    super(413, 'M_TOO_LARGE', 'device inbox is full');
+  }
+}
+export type DeliveryPolicy = { enabled: boolean; maxBytes: number };
 export function validateMessages(body: unknown, limits: KeyLimits): Message[] {
   bounded(body, limits.maxrequestbytes);
   const messages = object(object(body, 'body').messages, 'messages');
@@ -64,7 +72,7 @@ export async function insertMessage(
     'SELECT COUNT(*) AS n FROM to_device_inbox WHERE localpart=? AND device_id=? AND generation=?',
     owner,
   );
-  limitEntries(Number(count[0].n) + 1, limits.maxinboxmessages);
+  if (Number(count[0].n) >= limits.maxinboxmessages) throw new InboxFullError();
   const pos = await nextCounter(conn, 'to_device');
   await conn.execute('INSERT INTO to_device_inbox VALUES(?,?,?,?,?,?)', [
     ...owner,
@@ -83,6 +91,7 @@ export async function sendMessages(
   source: string,
   messages: Message[],
   limits: KeyLimits,
+  delivery: DeliveryPolicy,
 ): Promise<void> {
   await current(conn, d);
   const receipt = [...args(d), type, txn];
@@ -93,16 +102,18 @@ export async function sendMessages(
     )).length
   ) return;
   let fanout = 0;
+  const remote = new Map<string, Record<string, Record<string, Json>>>();
   for (const m of messages) {
     const destination = domainOf(m.user);
     if (destination !== server) {
-      // Remote admission requires a durable delivery worker. Until it exists,
-      // refuse in the shared owner so mixed sends roll back without a receipt.
-      throw new MatrixError(
-        403,
-        'M_FORBIDDEN',
-        'remote device delivery is unavailable',
-      );
+      let users = remote.get(destination);
+      if (!users) {
+        users = Object.create(null);
+        remote.set(destination, users!);
+      }
+      if (!Object.hasOwn(users!, m.user)) users![m.user] = Object.create(null);
+      users![m.user][m.id] = m.content;
+      continue;
     }
     const lp = localpartOf(m.user);
     const targets = m.id === '*'
@@ -124,10 +135,102 @@ export async function sendMessages(
       );
     }
   }
+  for (const [destination, users] of remote) {
+    if (!delivery.enabled) {
+      throw new MatrixError(403, 'M_FORBIDDEN', 'federation is disabled');
+    }
+    const sender = '@' + d.localpart + ':' + server;
+    const content = { sender, type, message_id: source, messages: users };
+    // Use the widest interoperable timestamp so every accepted EDU fits alone.
+    bounded(
+      JSON.parse(
+        encodeEnvelope(server, Number.MAX_SAFE_INTEGER, [], [{
+          edu_type: 'm.direct_to_device',
+          content,
+        }]),
+      ),
+      delivery.maxBytes,
+    );
+    bounded(content, limits.maxrequestbytes);
+    const pending = await conn.query(
+      'SELECT COUNT(*) AS n FROM to_device_intents',
+    );
+    limitEntries(Number(pending[0].n) + 1, limits.maxinboxmessages);
+    const own = await conn.query(
+      'SELECT COUNT(*) AS n FROM to_device_intents WHERE sender=?',
+      [sender],
+    );
+    limitEntries(Number(own[0].n) + 1, limits.maxkeys);
+    const peer = await conn.query(
+      'SELECT COUNT(*) AS n FROM to_device_intents WHERE destination=?',
+      [destination],
+    );
+    // One failed peer must not occupy the entire tenant allowance, even if
+    // its configured cap exceeds the total. Existing accepted rows stay put.
+    limitEntries(
+      Number(peer[0].n) + 1,
+      Math.min(
+        limits.maxdestinationmessages,
+        Math.max(0, limits.maxinboxmessages - 1),
+      ),
+    );
+    await conn.execute(
+      'INSERT INTO to_device_intents(source_id,destination,payload,sender) VALUES(?,?,?,?)',
+      [
+        source + ':' + destination,
+        destination,
+        JSON.stringify(content),
+        sender,
+      ],
+    );
+  }
   await conn.execute(
     'INSERT INTO to_device_transactions VALUES(?,?,?,?,?)',
     receipt,
   );
+}
+
+/** The receiving tenant owns logical dedup and captured device expansion together. */
+export async function receiveMessages(
+  conn: Conn,
+  origin: string,
+  id: string,
+  sender: string,
+  type: string,
+  server: string,
+  messages: Message[],
+  limits: KeyLimits,
+): Promise<void> {
+  if (
+    (await conn.query(
+      'SELECT 1 FROM inbound_to_device WHERE origin=? AND message_id=?',
+      [origin, id],
+    )).length
+  ) return;
+  for (const m of messages) {
+    if (domainOf(m.user) !== server) continue;
+    const lp = localpartOf(m.user);
+    const targets = m.id === '*'
+      ? await devicesOfUser(conn, lp)
+      : [await deviceById(conn, m.id, lp)];
+    for (const target of targets) {
+      if (target === null) continue;
+      // Wire entries are sender-bounded before this transaction. Wildcard
+      // expansion belongs to the local device owner, not that wire budget.
+      await insertMessage(
+        conn,
+        {
+          localpart: lp,
+          deviceId: target.device_id,
+          generation: target.generation,
+        },
+        JSON.stringify(['federation', origin, id]),
+        { sender, type, content: m.content },
+        limits,
+      );
+    }
+  }
+  await conn.execute('INSERT INTO inbound_to_device VALUES(?,?)', [origin, id]);
 }
 
 /** Only an issued full token for this incarnation can advance the durable ack. */

@@ -11,7 +11,7 @@
 // tests/federation-outbox.test.ts, restored at the engine functions —
 // endpoints are stage 5.)
 import { assert, assertEquals } from '@std/assert';
-import { setConfigForTests } from '#engine/config.ts';
+import { config as runtimeConfig, setConfigForTests } from '#engine/config.ts';
 import {
   listOutbox,
   peerStatus,
@@ -28,6 +28,8 @@ import type { Room } from '#engine/room/index.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { enqueueEdu } from '#engine/server/delivery.ts';
+import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { type Genesis, genesis } from './fixtures/genesis.ts';
@@ -41,7 +43,6 @@ import { testRemoteServer } from './fixtures/signer.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
-  sha256ofString,
 } from '#engine/signing-primitives.js';
 import { type FakeServer, startFakeServer } from './federation/fake-server.ts';
 
@@ -258,67 +259,45 @@ Deno.test('sender: rows visible after the room write; delivery; wire form; sent 
   });
 });
 
-for (const character of ['/', '+']) {
-  Deno.test(`sender: generated transaction with standard Base64 ${character} stays one URL segment`, async () => {
-    await withStore(async (store) => {
-      await withSetup(store, async ({ g, dest, fake, sends, sender }) => {
-        await sender.stop();
-        const eventId = await devSays(g.room, g.signer, 'URL-safe transaction');
-        const server = await store.server();
-        const [row] = await listOutbox(server, dest);
-        // Fixed future timestamps avoid expiry. Search the fixture, not the
-        // generator, so the ephemeral TLS port cannot make the test lucky.
-        let ts = 4_000_000_000_000;
-        let standard = '';
-        for (let i = 0; i < 4096; i++, ts++) {
-          standard = b64encodeStd(
-            await sha256ofString(`${dest}\n${ts}\n${row.room}:${row.pos}`),
-          ).slice(0, 22);
-          if (standard.includes(character)) break;
-        }
+Deno.test('sender: persisted transaction id stays one signed URL segment', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, dest, fake, sends, sender }) => {
+      await sender.stop();
+      const eventId = await devSays(g.room, g.signer, 'URL-safe transaction');
+      const server = await store.server();
+      const [row] = await listOutbox(server, dest);
+      assertEquals(row.state, 'pending');
+      const restarted = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(() => sends.length === 1, 3000);
+        const expected = sends[0].txnId;
+        assert(/^[A-Za-z0-9_-]+$/.test(sends[0].txnId));
+        const request = fake.requests.find((r) => r.method === 'PUT')!;
         assert(
-          standard.includes(character),
-          'fixture forces the unsafe alphabet',
+          request.verified,
+          'the consumer verifies the actual signed URI',
         );
-        await server.execute(
-          'UPDATE outbox SET added_ms = ? WHERE destination = ?',
-          [ts, dest],
+        assertEquals(request.path, `/_matrix/federation/v1/send/${expected}`);
+        assertEquals(decodeURIComponent(request.path).split('/'), [
+          '',
+          '_matrix',
+          'federation',
+          'v1',
+          'send',
+          expected,
+        ]);
+        await waitFor(async () =>
+          (await listOutbox(server, dest))[0].state === 'sent'
         );
-        const restarted = startSender({ store, signer: g.signer });
-        try {
-          await waitFor(() => sends.length === 1, 3000);
-          const expected = `${ts}-${
-            standard.replaceAll('+', '-').replaceAll('/', '_')
-          }`;
-          assertEquals(sends[0].txnId, expected);
-          assert(/^[A-Za-z0-9_-]+$/.test(sends[0].txnId));
-          const request = fake.requests.find((r) => r.method === 'PUT')!;
-          assert(
-            request.verified,
-            'the consumer verifies the actual signed URI',
-          );
-          assertEquals(request.path, `/_matrix/federation/v1/send/${expected}`);
-          assertEquals(decodeURIComponent(request.path).split('/'), [
-            '',
-            '_matrix',
-            'federation',
-            'v1',
-            'send',
-            expected,
-          ]);
-          await waitFor(async () =>
-            (await listOutbox(server, dest))[0].state === 'sent'
-          );
-          assertEquals((await listOutbox(server, dest))[0].event, eventId);
-        } finally {
-          await restarted.stop();
-        }
-      });
+        assertEquals((await listOutbox(server, dest))[0].event, eventId);
+      } finally {
+        await restarted.stop();
+      }
     });
   });
-}
+});
 
-Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only after a restart', async () => {
+Deno.test('sender: frozen retry preserves the same transaction, timestamp, PDUs and EDUs after restart', async () => {
   await withStore(async (store) => {
     // a draining stub: the real queues land in edus.ts (c3); the
     // drain-once shape is what the sender's frozen cache relies on
@@ -349,7 +328,8 @@ Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only af
       assertEquals(second.pdus, first.pdus);
       assertEquals(second.edus, first.edus);
       assertEquals(second.edus.length, 1, 'the frozen EDU rides again');
-      // a restart: the derived batch's EDUs were never persisted — PDUs only
+      await waitFor(() => sender.snapshot().length === 0);
+      // A restart must preserve the entire transaction body, including EDUs.
       await sender.stop();
       const restarted = startSender({
         store,
@@ -364,7 +344,7 @@ Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only af
         const third = sends.filter((s) => s.txnId === first.txnId)[2];
         assertEquals(third.pdus, first.pdus);
         assertEquals(third.origin_server_ts, first.origin_server_ts);
-        assertEquals(third.edus, []);
+        assertEquals(third.edus, first.edus);
         // success now: rows sent
         steer.status = 200;
         await waitFor(
@@ -378,8 +358,10 @@ Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only af
         );
         const st = await peerStatus(server, dest);
         assertEquals(st.failures, 0);
-        assert(st.failuresTotal >= 2, JSON.stringify(st));
-        assert(st.attemptsTotal >= 3);
+        // Both transient phases were interrupted before exhaustion; only the
+        // successful outcome is published to the durable peer ladder.
+        assertEquals(st.failuresTotal, 0);
+        assertEquals(st.attemptsTotal, 1);
       } finally {
         await restarted.stop();
       }
@@ -387,7 +369,200 @@ Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only af
   });
 });
 
-Deno.test('sender: a 4xx refusal is retried like a 5xx and writes the refused entry', async () => {
+Deno.test('sender: reliable EDU-only retry survives restart byte-for-byte and new work waits for another envelope', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, fake, dest, sends, steer, sender }) => {
+      const server = await store.server();
+      await sender.stop();
+      const content = {
+        sender: '@dev:test',
+        type: 'm.test',
+        message_id: 'logical-one',
+        messages: { [`@bob:${dest}`]: { '*': { opaque: 1 } } },
+      };
+      await server.tx((tx) =>
+        enqueueEdu(tx, 'one', dest, 'm.direct_to_device', content)
+      );
+      steer.status = 500;
+      let resumed = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(
+          async () => (await peerStatus(server, dest)).failures > 0,
+          25000,
+        );
+        await resumed.stop();
+        assertEquals(sends[0].edus, [{
+          edu_type: 'm.direct_to_device',
+          content,
+        }]);
+        await server.tx((tx) =>
+          enqueueEdu(tx, 'two', dest, 'm.direct_to_device', {
+            ...content,
+            message_id: 'logical-two',
+          })
+        );
+        steer.status = 200;
+        resumed = startSender({ store, signer: g.signer });
+        await waitFor(async () =>
+          (await server.query("SELECT 1 FROM edu_outbox WHERE state='pending'"))
+            .length === 0
+        );
+        const puts = fake.requests.filter((r) => r.method === 'PUT');
+        const original = puts.filter((r) => r.path === puts[0].path);
+        assertEquals(
+          original.length,
+          4,
+          'three transient attempts then durable restart retry',
+        );
+        for (const retry of original) assertEquals(retry.body, puts[0].body);
+        const following = puts.filter((r) => r.path !== puts[0].path);
+        assertEquals(following.length, 1);
+        for (const send of sends) assertEquals(send.edus.length, 1);
+        assertEquals(sends.at(-1)!.edus[0].content, {
+          ...content,
+          message_id: 'logical-two',
+        });
+        assertEquals(
+          await server.query('SELECT * FROM federation_batches'),
+          [],
+        );
+      } finally {
+        await resumed.stop();
+      }
+    });
+  });
+});
+
+Deno.test('sender: transient transaction failures retry before the production peer ladder', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, fake, dest, sends, steer, sender }) => {
+      setConfigForTests({
+        federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+      });
+      const server = await store.server();
+      steer.status = 503;
+      await devSays(g.room, g.signer, 'short outage');
+      await waitFor(() => sends.length === 1);
+      await waitFor(() => sender.snapshot().length === 0);
+      const first = fake.requests.find((r) => r.method === 'PUT')!;
+      for (let i = 0; i < 10; i++) sender.wake(dest);
+      await new Promise((r) => setTimeout(r, 150));
+      assertEquals(
+        sends.length,
+        1,
+        'producer wakes cannot bypass transient retry wait',
+      );
+      steer.status = 200;
+      await waitFor(
+        async () =>
+          (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
+        6000,
+      );
+      const puts = fake.requests.filter((r) => r.method === 'PUT');
+      assertEquals(puts.length, 2);
+      assertEquals(puts[1].path, first.path);
+      assertEquals(puts[1].body, first.body);
+      assertEquals((await peerStatus(server, dest)).failuresTotal, 0);
+
+      // Exhaust only the bounded short phase, then retain the real 450s ladder.
+      steer.status = 500;
+      sends.splice(0);
+      const started = Date.now();
+      await devSays(g.room, g.signer, 'long outage');
+      await waitFor(
+        async () => (await peerStatus(server, dest)).failures === 1,
+        25000,
+      );
+      const status = await peerStatus(server, dest);
+      assertEquals(sends.length, 3);
+      assert(Date.now() - started >= 20000);
+      assert(status.nextAttemptMs > Date.now() + 440_000);
+      const before = sends.length;
+      for (let i = 0; i < 10; i++) sender.wake(dest);
+      await new Promise((r) => setTimeout(r, 150));
+      assertEquals(
+        sends.length,
+        before,
+        'new traffic never bypasses durable backoff',
+      );
+    });
+  });
+});
+
+Deno.test('sender: restart during transient retries resumes the frozen envelope without a long failure ladder', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, fake, dest, sends, steer, sender }) => {
+      setConfigForTests({
+        federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+      });
+      const server = await store.server();
+      steer.status = 503;
+      await devSays(g.room, g.signer, 'restart short retry');
+      await waitFor(() => sends.length === 1);
+      // Wait until the failed request enters its retry wait, then interrupt it.
+      await waitFor(() => sender.snapshot().length === 0);
+      assertEquals((await peerStatus(server, dest)).failures, 0);
+      const first = fake.requests.find((r) => r.method === 'PUT')!;
+      await sender.stop();
+      steer.status = 200;
+      const resumed = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(
+          async () =>
+            (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
+          3000,
+        );
+        const puts = fake.requests.filter((r) => r.method === 'PUT');
+        assertEquals(puts.length, 2);
+        assertEquals(puts[1].path, first.path);
+        assertEquals(puts[1].body, first.body);
+      } finally {
+        await resumed.stop();
+      }
+    });
+  });
+});
+
+Deno.test('sender: restarted sender retains a transaction retry window while the receiver starts', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, fake, dest, sends, steer, sender }) => {
+      setConfigForTests({
+        federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+      });
+      const server = await store.server();
+      steer.status = 503;
+      await devSays(g.room, g.signer, 'receiver still starting');
+      await waitFor(() => sends.length === 1);
+      await waitFor(() => sender.snapshot().length === 0);
+      await sender.stop();
+      const first = fake.requests.find((r) => r.method === 'PUT')!;
+      const sendsBeforeRestart = sends.length;
+      const resumed = startSender({ store, signer: g.signer });
+      try {
+        // A receiver reboot is not instantaneous. The sender is ready first;
+        // retain its transient window across the receiver's startup interval.
+        await waitFor(() => sends.length >= sendsBeforeRestart + 1);
+        await new Promise((r) => setTimeout(r, 7000));
+        await waitFor(() => sends.length >= sendsBeforeRestart + 2);
+        steer.status = 200;
+        await waitFor(
+          async () =>
+            (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
+          30000,
+        );
+        for (const put of fake.requests.filter((r) => r.method === 'PUT')) {
+          assertEquals(put.path, first.path);
+          assertEquals(put.body, first.body);
+        }
+        assertEquals((await peerStatus(server, dest)).failuresTotal, 0);
+      } finally {
+        await resumed.stop();
+      }
+    });
+  });
+});
+
+Deno.test('sender: a 4xx refusal follows the peer ladder and writes the refused entry', async () => {
   await withStore(async (store) => {
     await withSetup(store, async ({ g, dest, sends, steer }) => {
       const server = await store.server();
@@ -471,7 +646,7 @@ Deno.test('sender: the contact hook resets the ladder and wakes the queue', asyn
       // the failure lands a tick after the request — wait on IT
       await waitFor(
         async () => (await peerStatus(server, dest)).failures >= 1,
-        5000,
+        25000,
       );
       const st1 = await peerStatus(server, dest);
       assert(st1.unreachableSinceMs !== null);
@@ -661,6 +836,165 @@ Deno.test('sender: batches cap at 50 PDUs per transaction', async () => {
       }, 30000);
       for (const s of sends) {
         assert(s.pdus.length <= 50, `batch of ${s.pdus.length}`);
+      }
+    });
+  });
+});
+
+Deno.test('sender: a producer wake during the final empty drain starts another loop', async () => {
+  await withStore(async (store) => {
+    let wake: () => void;
+    let drains = 0;
+    await withSetup(store, async ({ dest, sender, sends }) => {
+      wake = () => sender.wake(dest);
+      sender.wake(dest);
+      await waitFor(() => sends.length === 1);
+      assertEquals(sends[0].edus, [{
+        edu_type: 'm.test',
+        content: { raced: true },
+      }]);
+    }, {
+      drainEdus: () => {
+        if (++drains === 1) {
+          wake();
+          return [];
+        }
+        return drains === 2
+          ? [{ edu_type: 'm.test', content: { raced: true } }]
+          : [];
+      },
+    });
+  });
+});
+
+Deno.test('sender: reliable and room backlogs both get slots and alternate first turn under the byte budget', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, dest, sender: initial, sends }) => {
+      await initial.stop();
+      const server = await store.server();
+      for (let i = 0; i < 51; i++) {
+        await devSays(g.room, g.signer, 'count-' + i);
+      }
+      await server.tx(async (conn) => {
+        for (let i = 0; i < 101; i++) {
+          await enqueueEdu(
+            conn,
+            'count-' + i.toString().padStart(3, '0'),
+            dest,
+            'm.test',
+            { i },
+          );
+        }
+      });
+      let worker = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(async () =>
+          (await server.query("SELECT 1 FROM edu_outbox WHERE state='pending'"))
+              .length === 0 &&
+          (await listOutbox(server, dest)).every((r) => r.state !== 'pending')
+        );
+        assertEquals(sends[0].pdus.length, 50);
+        assertEquals(sends[0].edus.length, 100);
+        assertEquals(sends[1].pdus.length, 1);
+        assertEquals(sends[1].edus.length, 1);
+        await worker.stop();
+        const before = sends.length;
+        const ids: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          ids.push(
+            await devSays(g.room, g.signer, 'byte-' + i + 'x'.repeat(700)),
+          );
+        }
+        const pdu = JSON.parse(
+          (await g.room.tx((tx) => tx.events.get(ids[0])))!.pdu,
+        );
+        delete pdu.event_id;
+        delete pdu.unsigned;
+        const edu = {
+          edu_type: 'm.test',
+          content: { opaque: 'y'.repeat(1100) },
+        };
+        const size = (pdus: Record<string, unknown>[], edus: typeof edu[]) =>
+          new TextEncoder().encode(
+            encodeEnvelope(
+              g.signer.serverName,
+              Number.MAX_SAFE_INTEGER,
+              pdus,
+              edus,
+            ),
+          ).length;
+        const maxBytes = Math.max(size([pdu], []), size([], [edu])) + 20;
+        assert(size([pdu], [edu]) > maxBytes);
+        const oldBytes = runtimeConfig().federation.bulkmaxbytes;
+        try {
+          setConfigForTests({ federation: { bulkmaxbytes: maxBytes } });
+          await server.tx(async (conn) => {
+            for (let i = 0; i < 3; i++) {
+              await enqueueEdu(
+                conn,
+                'bytes-' + i,
+                dest,
+                edu.edu_type,
+                edu.content,
+              );
+            }
+          });
+          worker = startSender({ store, signer: g.signer });
+          await waitFor(async () =>
+            (await server.query(
+                "SELECT 1 FROM edu_outbox WHERE state='pending'",
+              )).length === 0 &&
+            (await listOutbox(server, dest)).every((r) => r.state !== 'pending')
+          );
+          const batches = sends.slice(before);
+          assertEquals(batches.reduce((n, b) => n + b.pdus.length, 0), 3);
+          assertEquals(batches.reduce((n, b) => n + b.edus.length, 0), 3);
+          assert(
+            batches[0].pdus.length !== batches[1].pdus.length,
+            'opposite family wins next byte-limited turn',
+          );
+          for (const batch of batches) {
+            assert(size(batch.pdus, batch.edus as typeof edu[]) <= maxBytes);
+          }
+        } finally {
+          await worker.stop();
+          setConfigForTests({ federation: { bulkmaxbytes: oldBytes } });
+        }
+      } finally {
+        await worker.stop();
+      }
+    });
+  });
+});
+
+Deno.test('sender: reliable FIFO never lets newer lexical sources overtake retained work', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, dest, sends, sender: initial }) => {
+      await initial.stop();
+      const server = await store.server();
+      await server.tx(async (tx) => {
+        await enqueueEdu(tx, 'z-old', dest, 'm.test', { order: 'old' });
+        for (let i = 0; i < 101; i++) {
+          await enqueueEdu(tx, 'a-new-' + i, dest, 'm.test', { order: i });
+        }
+        // Idempotent roll-forward must not change the old row's queue position.
+        await enqueueEdu(tx, 'z-old', dest, 'm.test', { order: 'old' });
+      });
+      const worker = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(async () =>
+          (await server.query("SELECT 1 FROM edu_outbox WHERE state='pending'"))
+            .length === 0
+        );
+        assertEquals(
+          sends.flatMap((s) => s.edus.map((e) => e.content)),
+          [
+            { order: 'old' },
+            ...Array.from({ length: 101 }, (_, order) => ({ order })),
+          ],
+        );
+      } finally {
+        await worker.stop();
       }
     });
   });

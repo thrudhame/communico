@@ -18,6 +18,7 @@ import type { Fetcher, KeyResolver, RemoteDeps } from '#engine/room/deps.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import type { Store } from '#engine/store/index.ts';
+import { ReliableEduError } from '#engine/federation/edus.ts';
 
 export type TransactionDeps = {
   store: Store;
@@ -219,11 +220,12 @@ export async function receiveTransaction(
     await receiveRoom(roomId, roomPdus, origin, deps, remoteDeps, results);
   }
 
-  // EDUs after PDUs: unknown types ignored, errors in one never fail
+  // Reliable acceptance must finish before the transport success is cached.
   for (const raw of edus) {
     try {
       await deps.edus.dispatch(origin, raw);
     } catch (e) {
+      if (e instanceof ReliableEduError) throw e;
       console.error(`transactions[${origin}]: EDU dropped:`, e);
     }
   }

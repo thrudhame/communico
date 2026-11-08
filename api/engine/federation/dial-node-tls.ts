@@ -1,7 +1,7 @@
-// api/engine/federation/dial-node-tls.ts — pinned and key-is-name dialing
-// over node:tls (the M5a §3.8 spike passed on the VM's Deno 2.9.6). This
-// module is the ONLY place in the tree with `rejectUnauthorized: false` —
-// grep-enforced; the process-wide flag is never used. The peer
+// One outbound TLS transport for federation requests and discovery. CA trust
+// verifies the certificate chain and resolved server identity against system,
+// bundled and configured roots. Pin/keyname trust checks the peer key instead;
+// only this module may disable certificate-chain verification. The peer
 // certificate's SPKI SHA-256 is computed via node:crypto X509Certificate
 // (Deno's getPeerCertificate().pubkey is undefined for Ed25519 — only
 // RSA/EC); pinned peers match SPKI equality, key-is-name peers match the
@@ -27,6 +27,7 @@ export type DialOpts = {
   sni: string | null;
   hostHeader: string;
   trust:
+    | { kind: 'ca'; caCerts: string[] }
     | { kind: 'pinned'; spkiSha256: string }
     | { kind: 'keyname'; pubkey: Uint8Array };
   method: string;
@@ -36,6 +37,7 @@ export type DialOpts = {
   connectMs: number;
   timeoutMs: number;
   maxBytes: number;
+  signal?: AbortSignal;
 };
 
 // node:tls TLSSocket → the WireConn shape
@@ -53,6 +55,10 @@ class NodeTlsConn {
       this.#poke();
     });
     sock.on('end', () => {
+      this.#ended = true;
+      this.#poke();
+    });
+    sock.on('close', () => {
       this.#ended = true;
       this.#poke();
     });
@@ -104,26 +110,51 @@ function connectWithDeadline(opts: {
   port: number;
   sni: string | null;
   connectMs: number;
+  signal: AbortSignal;
+  trust: DialOpts['trust'];
 }): Promise<tls.TLSSocket> {
+  opts.signal.throwIfAborted();
   return new Promise((resolve, reject) => {
-    // rejectUnauthorized: false — identity is checked below against the
-    // roster's pin/key; nowhere else in the tree does this
+    // Explicit CA roots extend normal bundled/system trust; they never replace it.
+    const trust = opts.trust.kind === 'ca'
+      ? {
+        rejectUnauthorized: true,
+        ca: [
+          ...new Set([
+            ...tls.getCACertificates('default'),
+            ...tls.getCACertificates('system'),
+            ...opts.trust.caCerts,
+          ]),
+        ],
+      }
+      : { rejectUnauthorized: false }; // Identity is checked below against the roster pin/key.
     const sock = tls.connect({
       host: opts.connectIp,
       port: opts.port,
       servername: opts.sni !== null ? opts.sni : undefined,
-      rejectUnauthorized: false,
+      ...trust,
     });
+    const cleanup = () => {
+      clearTimeout(timer);
+      opts.signal.removeEventListener('abort', cancel);
+    };
+    const cancel = () => {
+      cleanup();
+      sock.destroy();
+      reject(opts.signal.reason);
+    };
+    opts.signal.addEventListener('abort', cancel, { once: true });
     const timer = setTimeout(() => {
+      cleanup();
       sock.destroy();
       reject(new Error(`connect timeout after ${opts.connectMs}ms`));
     }, opts.connectMs);
     sock.once('secureConnect', () => {
-      clearTimeout(timer);
+      cleanup();
       resolve(sock);
     });
     sock.once('error', (e: Error) => {
-      clearTimeout(timer);
+      cleanup();
       reject(e);
     });
   });
@@ -136,14 +167,19 @@ function spkiSha256(raw: Uint8Array): string {
 }
 
 export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
+  opts.signal?.throwIfAborted();
   const deadline = Date.now() + opts.timeoutMs;
   let conn: NodeTlsConn | null = null;
+  const ac = new AbortController();
+  const cancel = () => {
+    ac.abort();
+    try {
+      if (conn !== null) conn.close();
+    } catch { /* already closed */ }
+  };
+  opts.signal?.addEventListener('abort', cancel, { once: true });
   const totalTimer = setTimeout(
-    () => {
-      try {
-        if (conn !== null) conn.close();
-      } catch { /* already closed */ }
-    },
+    cancel,
     opts.timeoutMs,
   );
   try {
@@ -152,8 +188,12 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
       port: opts.port,
       sni: opts.sni,
       connectMs: opts.connectMs,
+      signal: ac.signal,
+      trust: opts.trust,
     });
     conn = new NodeTlsConn(sock);
+    opts.signal?.throwIfAborted();
+    ac.signal.throwIfAborted();
     // identity check BEFORE any request bytes are written
     const cert = sock.getPeerCertificate(true);
     const raw = cert !== null && typeof cert === 'object'
@@ -177,7 +217,7 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
           'peer certificate does not match the roster pin',
         );
       }
-    } else {
+    } else if (opts.trust.kind === 'keyname') {
       const x = new X509Certificate(raw);
       const spki = x.publicKey.export({ type: 'spki', format: 'der' });
       const rawKey = new Uint8Array(spki.subarray(12));
@@ -202,12 +242,14 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
       maxBytes: opts.maxBytes,
     });
   } catch (e) {
+    opts.signal?.throwIfAborted();
     if (e instanceof MatrixError) throw e;
     if (Date.now() >= deadline) {
       throw new MatrixError(502, 'M_UNKNOWN', 'upstream timeout');
     }
     throw new MatrixError(502, 'M_UNKNOWN', 'upstream connection failed');
   } finally {
+    opts.signal?.removeEventListener('abort', cancel);
     clearTimeout(totalTimer);
     if (conn !== null) {
       try {
