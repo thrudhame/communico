@@ -1,0 +1,173 @@
+# defaults/communico.toml — shipped, complete, never edited by an operator.
+# Overlay: config/communico.toml (partial) or COMMUNICO_* env; later wins.
+# Node names are [a-z0-9]+ (compounds are one token). Env: COMMUNICO_ + path
+# joined by _, upper-cased. Env overrides leaves only.
+
+[server]
+# Homeserver DNS name. COMMUNICO_SERVER_NAME (formerly SERVER_NAME)
+name = "localhost"
+# The one listener's port. COMMUNICO_SERVER_PORT (formerly APP_PORT)
+port = 8008
+
+[media]
+# Byte-store root for the later content repository. COMMUNICO_MEDIA_ROOT
+root = "./.media"
+# Upload limit in bytes (50 MiB — Complement's upload tests).
+# COMMUNICO_MEDIA_MAXBYTES (formerly MEDIA_MAX_BYTES)
+maxbytes = 52428800
+
+[preview]
+# URL previews (GET /_matrix/client/v1/media/preview_url). Off until the
+# operator opts in. COMMUNICO_PREVIEW_ENABLED
+enabled = false
+# Fetch size cap in bytes (10 MiB — Synapse's default, written explicitly).
+# COMMUNICO_PREVIEW_MAXBYTES
+maxbytes = 10485760
+# Addresses the HS must not fetch. Synapse's DEFAULT_IP_RANGE_BLOCKLIST
+# (config/server.py) plus 0.0.0.0/8 and ::/128, which Synapse always adds
+# — here they are just list entries, nothing baked into code. An empty
+# list with enabled = true starts (and logs once); it does not refuse.
+# COMMUNICO_PREVIEW_BLOCKLIST
+blocklist = [
+  "127.0.0.0/8",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "100.64.0.0/10",
+  "192.0.0.0/24",
+  "169.254.0.0/16",
+  "192.88.99.0/24",
+  "198.18.0.0/15",
+  "192.0.2.0/24",
+  "198.51.100.0/24",
+  "203.0.113.0/24",
+  "224.0.0.0/4",
+  "0.0.0.0/8",
+  "::1/128",
+  "fe80::/10",
+  "fc00::/7",
+  "2001:db8::/32",
+  "ff00::/8",
+  "fec0::/10",
+  "::/128",
+]
+# Wins over blocklist per CIDR match. COMMUNICO_PREVIEW_ALLOWLIST
+allowlist = []
+
+[federation]
+# Server-to-server API on/off. Off = no :8448 listener; /_matrix/federation,
+# /_matrix/key and /.well-known/matrix/server answer 404; no outbound
+# federation requests. COMMUNICO_FEDERATION_ENABLED
+enabled = true
+# TLS listener port (spec default). COMMUNICO_FEDERATION_PORT
+port = 8448
+# PEM certificate + key for the federation listener when it is restored.
+# COMMUNICO_FEDERATION_CERT / COMMUNICO_FEDERATION_KEY
+cert = "config/federation.crt"
+key = "config/federation.key"
+# Extra CA bundles (PEM paths) trusted for outbound TLS IN ADDITION to
+# Deno's bundled root store (not the OS store — `trust anchor` on the host
+# does not reach us). Complement: /complement/ca/ca.crt.
+# COMMUNICO_FEDERATION_CACERTS
+cacerts = []
+# Own key document validity; spec cap 7 days
+# (data/api/server-server/definitions/keys.yaml:96-99).
+# COMMUNICO_FEDERATION_KEYVALIDITYHOURS
+keyvalidityhours = 168
+# When a server we know presents signing-key MATERIAL we have not seen and
+# its document does not carry the remembered key: "accept" (store and go
+# on — what every other server does), "warn" (go on, record the change,
+# surface it in `federation-peer pending`), "block" (pause that server —
+# its requests and events wait — until `federation-key accept` or removal).
+# COMMUNICO_FEDERATION_KEYCHANGE
+keychange = "warn"
+# Who we federate with. "open": anyone not in federation_blocks; strangers'
+# keys are learned from servers we know first, then directly. "closed":
+# only servers in federation_peers; strangers get 403 and a pending row.
+# COMMUNICO_FEDERATION_MODE
+mode = "open"
+# Value served at /.well-known/matrix/server as m.server; empty = not
+# served (404). COMMUNICO_FEDERATION_WELLKNOWN
+wellknown = ""
+# Cache-Control max-age (seconds) on our own /.well-known answer.
+# COMMUNICO_FEDERATION_WELLKNOWNMAXAGE
+wellknownmaxage = 86400
+# Outbound: TCP connect budget and whole-request budget, ms. Discovery
+# hops (.well-known, SRV, key fetch) must fail fast — Complement's
+# two-server tests resolve `hs1` with no .well-known and no SRV.
+# COMMUNICO_FEDERATION_CONNECTMS / COMMUNICO_FEDERATION_TIMEOUTMS
+connectms = 5000
+timeoutms = 30000
+# Response size cap for federation fetches (key documents, .well-known,
+# query answers). COMMUNICO_FEDERATION_MAXBYTES
+maxbytes = 1048576
+# Remote .well-known cache: default when no Cache-Control, hard max, and
+# how long a failed lookup is remembered (SS:129-133 recommends caching
+# errors with backoff). COMMUNICO_FEDERATION_WELLKNOWNHOURS /
+# WELLKNOWNMAXHOURS / WELLKNOWNERRORHOURS
+wellknownhours = 24
+wellknownmaxhours = 48
+wellknownerrorhours = 1
+# How long a FAILED key fetch for a name is remembered before we dial it
+# again (bounds what a flood of forged origins can make us do).
+# COMMUNICO_FEDERATION_KEYFAILMINUTES
+keyfailminutes = 5
+# How many vouched-for roster peers are asked (in parallel, by seniority)
+# about a stranger's key before we consider dialing it ourselves.
+# COMMUNICO_FEDERATION_WITNESSES
+witnesses = 3
+# The door log (federation_pending) for unverified claims in closed mode:
+# hard row cap (oldest evicted) and expiry in days.
+# COMMUNICO_FEDERATION_PENDINGMAX / PENDINGDAYS
+pendingmax = 10000
+pendingdays = 30
+# Anonymous lookups of remote users/aliases (the spec's public
+# /profile/{userId} and /directory/room/{alias}): "known" answers only
+# from what we already hold (users and rooms we share); "none" does not
+# answer them. We never ask a remote server on an anonymous caller's
+# behalf — that would make us an open proxy. COMMUNICO_FEDERATION_LOOKUPS
+lookups = "known"
+# Missing prev_events on a pushed PDU: how long to wait for them to arrive
+# on their own before asking (the sender usually pushes them next), how many
+# events one get_missing_events may return to us, and the whole-transaction
+# budget for such fetching — when it is spent, the remaining PDUs with
+# unknown prevs are stored ungrounded and the answer goes out (a sender
+# waits ~10 s for /send). COMMUNICO_FEDERATION_MISSINGWAITMS / MISSINGLIMIT
+# / MISSINGBUDGETMS
+missingwaitms = 750
+missinglimit = 10
+missingbudgetms = 8000
+# Serving get_missing_events: hard cap on a requester's `limit`.
+# COMMUNICO_FEDERATION_MISSINGMAX
+missingmax = 20
+# Backfill: how many events we ask for per scroll-back step, and the cap on
+# a requester's `limit` when we serve /backfill.
+# COMMUNICO_FEDERATION_BACKFILLBATCH / BACKFILLMAX
+backfillbatch = 50
+backfillmax = 100
+# Room transfers (send_join state, /state, /backfill answers) are far larger
+# than key documents; separate response cap for them, bytes.
+# COMMUNICO_FEDERATION_BULKMAXBYTES
+bulkmaxbytes = 67108864
+# Outbound delivery. The pause after a failed transaction starts here and
+# doubles on every failure (125 → 250 → 500 → 1000 → 2000 … millihours, i.e.
+# 7.5 min → 15 → 30 → 1 h → 2 h …) up to the ceiling; any request the
+# destination makes to us resets it. The ceiling must be start × 2^k (256 h
+# is; 168 h is not — startup names the neighbouring rungs). Whole numbers in
+# MILLIHOURS: one unit for everything about delivery and expiry.
+# COMMUNICO_FEDERATION_BACKOFFSTARTMILLIHOURS / BACKOFFMAXMILLIHOURS
+backoffstartmillihours = 125
+backoffmaxmillihours = 256000
+# Undelivered rows (destination unreachable or refusing) are retried on the
+# ladder and kept this long; when it lapses they are removed and the admin
+# is told (federation-peer pending). COMMUNICO_FEDERATION_REFUSEDMILLIHOURS
+refusedmillihours = 256000
+# An event whose parents we could not obtain is kept this long as a
+# "couldn't check yet" placeholder and re-checked when its parent arrives or
+# it is re-sent; 0 = do not store such events at all (drop, as Synapse does).
+# COMMUNICO_FEDERATION_UNGROUNDEDMILLIHOURS
+ungroundedmillihours = 256000
+# Inbound transactions: how long a (origin, txnId) → response pair is kept so
+# a retried transaction gets the same answer, hours (a cache, not an
+# obligation). COMMUNICO_FEDERATION_TXNHOURS
+txnhours = 24

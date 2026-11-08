@@ -1,11 +1,4 @@
 {
   "private": true,
-  "name": "@communico/api",
-  "exports": {
-    ".": "./api.ts",
-    "./interfaces": "./interfaces.ts"
-  },
-  "imports": {
-    "@oak/oak": "jsr:@oak/oak@^17.2.0"
-  }
+  "name": "@communico/api"
 }

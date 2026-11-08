@@ -1,0 +1,6 @@
+.git
+node_modules
+.env
+complement/baseline.jsonl
+complement/BASELINE.md
+complement/work-*

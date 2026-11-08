@@ -1,3 +1,15 @@
-/auth.db
 .DS_Store
 /debug
+/.env
+/.envrc
+/.media/
+# Operator overlay — the folder is tracked (config/.gitkeep); the TOML is not
+config/*.toml
+# Local development TLS material (not shipped)
+config/federation.crt
+config/federation.key
+# Complement run artifacts (regenerable; BASELINE.md is the record)
+complement/baseline.jsonl
+complement/BASELINE.prev.md
+complement/work-*
+complement/.test-status
