@@ -3,6 +3,8 @@
 // across restart. Only PDU work uses refusedmillihours expiry. A changed PDU
 // selection retires its envelope without expiring accepted reliable messages.
 import { config } from '#engine/config.ts';
+import { encodeEnvelope } from '#engine/federation-envelope.ts';
+import { onTenantStream } from '#engine/tenant/streams.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom } from '#engine/room/index.ts';
 import type { Signer } from '#engine/room/signer.ts';
@@ -297,6 +299,7 @@ export type SenderDeps = {
   // the EDU drain (edus.ts's queues; injected — the sender predates the
   // module and the frozen-batch cache lives here regardless)
   drainEdus?: (destination: string, limit: number) => Edu[];
+  onDelivered?: () => Promise<void>;
 };
 
 export type Sender = {
@@ -323,6 +326,7 @@ function backoffMs(failures: number): number {
 export function startSender(deps: SenderDeps): Sender {
   const serverP = deps.store.server();
   const running = new Set<string>();
+  const rerun = new Set<string>();
   const wakers = new Map<string, () => void>();
   const inFlight = new Map<string, { txnId: string; rows: string[] }>();
   let intentProvider: IntentProvider | null = null;
@@ -346,13 +350,18 @@ export function startSender(deps: SenderDeps): Sender {
 
   function wake(destination: string): void {
     wakers.get(destination)?.();
+    if (running.has(destination)) rerun.add(destination);
     if (!running.has(destination) && !stopped) {
+      rerun.delete(destination);
       running.add(destination);
       const loop = loopDestination(destination)
         .catch((e) => console.error(`sender[${destination}] error:`, e))
         .finally(() => {
           running.delete(destination);
           loops.delete(loop);
+          // A producer can wake after the final empty read but before this
+          // finally runs. Latch that wake rather than stranding durable work.
+          if (rerun.delete(destination) && !stopped) wake(destination);
         });
       loops.add(loop);
     }
@@ -469,12 +478,7 @@ export function startSender(deps: SenderDeps): Sender {
         const maxBytes = config().federation.bulkmaxbytes;
         const ts = Date.now();
         const encode = () =>
-          JSON.stringify({
-            origin: deps.signer.serverName,
-            origin_server_ts: ts,
-            pdus,
-            edus,
-          });
+          encodeEnvelope(deps.signer.serverName, ts, pdus, edus);
         // Alternate the first family durably, then interleave candidates. A
         // large PDU and an EDU that cannot fit together each get their turn.
         const eduFirst = (await deliveryTurn(server, destination)) % 2 === 1;
@@ -594,6 +598,7 @@ export function startSender(deps: SenderDeps): Sender {
         await completeBatch(tx, destination, delivered);
         await recordSuccess(tx, destination);
       });
+      await deps.onDelivered?.();
       const body = res.json as
         | { pdus?: Record<string, { error?: string }> }
         | null;
@@ -610,14 +615,16 @@ export function startSender(deps: SenderDeps): Sender {
 
   // the projection wake: new outbox rows for any destination wake its
   // loop (this sender's store only — instances share the process)
-  onProjected((store) => {
+  function rescan(store: Store): void {
     if (store !== deps.store || stopped) return;
     void serverP.then((server) =>
       destinationsWithPending(server).then((ds) => {
         for (const d of ds) wake(d);
       })
     ).catch(() => {});
-  });
+  }
+  const unproject = onProjected(rescan);
+  const untenant = onTenantStream(rescan);
 
   // a restart picks up pending rows
   void serverP.then((server) =>
@@ -653,6 +660,8 @@ export function startSender(deps: SenderDeps): Sender {
     },
     stop: async () => {
       stopped = true;
+      unproject();
+      untenant();
       for (const resolve of wakers.values()) resolve();
       await Promise.all([...loops]);
     },

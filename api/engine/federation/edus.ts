@@ -226,7 +226,7 @@ export type EduHandler = (
 
 export type EduState = {
   dispatch(origin: string, raw: unknown): Promise<void>;
-  register(type: string, handler: EduHandler): void;
+  register(type: string, handler: EduHandler, reliable?: boolean): void;
   // Reads share the durable stream owner; typing remains ephemeral.
   typingOf(roomId: string): { userIds: string[] };
   presenceOf(userId: string): Promise<PresencePush | null>;
@@ -237,12 +237,19 @@ export type EduState = {
   >;
 };
 
+export class ReliableEduError extends Error {
+  constructor(cause: unknown) {
+    super('reliable EDU acceptance failed', { cause });
+  }
+}
+
 // The inbound state of one instance: the handlers (typing/receipts/
 // presence built in; device list and anything else ignored — the old
 // stubs). Receipts/presence are server-file reads. `self` is our server
 // name (the shares-room check's local side).
 export function eduState(server: Db, self: string): EduState {
   const handlers = new Map<string, EduHandler>();
+  const reliable = new Set<string>();
 
   handlers.set('m.typing', async (origin, content) => {
     const roomId = typeof content.room_id === 'string' ? content.room_id : null;
@@ -340,10 +347,17 @@ export function eduState(server: Db, self: string): EduState {
       >;
       const handler = handlers.get(type);
       if (handler === undefined) return; // unknown types ignored silently
-      await handler(origin, content);
+      try {
+        await handler(origin, content);
+      } catch (error) {
+        if (reliable.has(type)) throw new ReliableEduError(error);
+        throw error;
+      }
     },
-    register: (type, handler) => {
+    register: (type, handler, durable = false) => {
       handlers.set(type, handler);
+      if (durable) reliable.add(type);
+      else reliable.delete(type);
     },
     typingOf: (roomId) => ({ userIds: typingIn(roomId).userIds }),
     presenceOf: async (userId) => {

@@ -111,6 +111,7 @@ function bind(
         source: string,
         messages: todevice.Message[],
         limits: e2ee.KeyLimits,
+        delivery: todevice.DeliveryPolicy,
       ) =>
         mutation(
           todevice.sendMessages(
@@ -120,6 +121,28 @@ function bind(
             type,
             txn,
             source,
+            messages,
+            limits,
+            delivery,
+          ),
+        ),
+      receive: (
+        origin: string,
+        id: string,
+        sender: string,
+        type: string,
+        server: string,
+        messages: todevice.Message[],
+        limits: e2ee.KeyLimits,
+      ) =>
+        mutation(
+          todevice.receiveMessages(
+            conn,
+            origin,
+            id,
+            sender,
+            type,
+            server,
             messages,
             limits,
           ),

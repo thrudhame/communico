@@ -11,7 +11,7 @@
 // tests/federation-outbox.test.ts, restored at the engine functions —
 // endpoints are stage 5.)
 import { assert, assertEquals } from '@std/assert';
-import { setConfigForTests } from '#engine/config.ts';
+import { config as runtimeConfig, setConfigForTests } from '#engine/config.ts';
 import {
   listOutbox,
   peerStatus,
@@ -29,6 +29,7 @@ import { roomSchema } from '#engine/room/index.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { enqueueEdu } from '#engine/server/delivery.ts';
+import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { type Genesis, genesis } from './fixtures/genesis.ts';
@@ -697,6 +698,132 @@ Deno.test('sender: batches cap at 50 PDUs per transaction', async () => {
       }, 30000);
       for (const s of sends) {
         assert(s.pdus.length <= 50, `batch of ${s.pdus.length}`);
+      }
+    });
+  });
+});
+
+Deno.test('sender: a producer wake during the final empty drain starts another loop', async () => {
+  await withStore(async (store) => {
+    let wake: () => void;
+    let drains = 0;
+    await withSetup(store, async ({ dest, sender, sends }) => {
+      wake = () => sender.wake(dest);
+      sender.wake(dest);
+      await waitFor(() => sends.length === 1);
+      assertEquals(sends[0].edus, [{
+        edu_type: 'm.test',
+        content: { raced: true },
+      }]);
+    }, {
+      drainEdus: () => {
+        if (++drains === 1) {
+          wake();
+          return [];
+        }
+        return drains === 2
+          ? [{ edu_type: 'm.test', content: { raced: true } }]
+          : [];
+      },
+    });
+  });
+});
+
+Deno.test('sender: reliable and room backlogs both get slots and alternate first turn under the byte budget', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, dest, sender: initial, sends }) => {
+      await initial.stop();
+      const server = await store.server();
+      for (let i = 0; i < 51; i++) {
+        await devSays(g.room, g.signer, 'count-' + i);
+      }
+      await server.tx(async (conn) => {
+        for (let i = 0; i < 101; i++) {
+          await enqueueEdu(
+            conn,
+            'count-' + i.toString().padStart(3, '0'),
+            dest,
+            'm.test',
+            { i },
+          );
+        }
+      });
+      let worker = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(async () =>
+          (await server.query("SELECT 1 FROM edu_outbox WHERE state='pending'"))
+              .length === 0 &&
+          (await listOutbox(server, dest)).every((r) => r.state !== 'pending')
+        );
+        assertEquals(sends[0].pdus.length, 50);
+        assertEquals(sends[0].edus.length, 100);
+        assertEquals(sends[1].pdus.length, 1);
+        assertEquals(sends[1].edus.length, 1);
+        await worker.stop();
+        const before = sends.length;
+        const ids: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          ids.push(
+            await devSays(g.room, g.signer, 'byte-' + i + 'x'.repeat(700)),
+          );
+        }
+        const pdu = JSON.parse(
+          (await g.room.tx((tx) => tx.events.get(ids[0])))!.pdu,
+        );
+        delete pdu.event_id;
+        delete pdu.unsigned;
+        const edu = {
+          edu_type: 'm.test',
+          content: { opaque: 'y'.repeat(1100) },
+        };
+        const size = (pdus: Record<string, unknown>[], edus: typeof edu[]) =>
+          new TextEncoder().encode(
+            encodeEnvelope(
+              g.signer.serverName,
+              Number.MAX_SAFE_INTEGER,
+              pdus,
+              edus,
+            ),
+          ).length;
+        const maxBytes = Math.max(size([pdu], []), size([], [edu])) + 20;
+        assert(size([pdu], [edu]) > maxBytes);
+        const oldBytes = runtimeConfig().federation.bulkmaxbytes;
+        try {
+          setConfigForTests({ federation: { bulkmaxbytes: maxBytes } });
+          await server.tx(async (conn) => {
+            for (let i = 0; i < 3; i++) {
+              await enqueueEdu(
+                conn,
+                'bytes-' + i,
+                dest,
+                edu.edu_type,
+                edu.content,
+              );
+            }
+          });
+          worker = startSender({ store, signer: g.signer });
+          await waitFor(async () =>
+            (await server.query(
+                "SELECT 1 FROM edu_outbox WHERE state='pending'",
+              )).length === 0 &&
+            (await listOutbox(server, dest)).every((r) => r.state !== 'pending')
+          );
+          const batches = sends.slice(before);
+          assertEquals(batches.reduce((n, b) => n + b.pdus.length, 0), 3);
+          assertEquals(batches.reduce((n, b) => n + b.edus.length, 0), 3);
+          assert(
+            batches[0].pdus.length !== batches[1].pdus.length,
+            'opposite family wins next byte-limited turn',
+          );
+          for (const batch of batches) {
+            assert(size(batch.pdus, batch.edus as typeof edu[]) <= maxBytes);
+          }
+        } finally {
+          await worker.stop();
+          setConfigForTests({ federation: { bulkmaxbytes: oldBytes } });
+        }
+      } finally {
+        await worker.stop();
       }
     });
   });

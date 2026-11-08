@@ -17,6 +17,8 @@ import {
   eduState,
 } from '#engine/federation/edus.ts';
 import { wireEphemeral } from '#engine/federation/ephemeral.ts';
+import { registerToDevice } from '#engine/federation/todevice.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
 import {
   type InviteDeps,
   inviteIntentProvider,
@@ -88,6 +90,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
         await store.close();
       },
     };
+    registerToDevice(app.federationEdus, tenant);
     current = app;
     return app;
   } catch (error) {
@@ -112,6 +115,7 @@ export function startFederationServices(app: App): void {
     store: app.store,
     signer,
     drainEdus: queues.drain,
+    onDelivered: () => projectTenant(app.store, app.tenant.serverName),
   });
   senderRef = sender;
   const inviteDeps: InviteDeps = {
