@@ -7,6 +7,7 @@
 import type { Conn } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Tenant, TenantTx } from '#engine/tenant/index.ts';
+import { deviceById } from '#engine/tenant/devices.ts';
 
 // The informational access-token lifetime advertised at refresh (band C
 // D8: expires_in_ms is advertised, never enforced — spec: optional).
@@ -29,6 +30,7 @@ export type TokenInfo = {
   localpart: string;
   user_id: string;
   device_id: string | null;
+  generation: number | null;
   // band C (D8): informational expiry (nullable; never enforced)
   expires_ms: number | null;
 };
@@ -42,9 +44,15 @@ export async function insertAccessToken(
   deviceId: string | null,
   expiresMs: number | null,
 ): Promise<void> {
+  const device = deviceId === null
+    ? null
+    : await deviceById(conn, deviceId, localpart);
+  if (deviceId !== null && device === null) {
+    throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'device no longer exists');
+  }
   await conn.execute(
-    'INSERT INTO access_tokens (token, localpart, device_id, expires_ms) VALUES (?, ?, ?, ?) ON CONFLICT (token) DO NOTHING',
-    [hash, localpart, deviceId, expiresMs],
+    'INSERT INTO access_tokens (token, localpart, device_id, generation, expires_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT (token) DO NOTHING',
+    [hash, localpart, deviceId, device?.generation ?? null, expiresMs],
   );
 }
 
@@ -52,6 +60,7 @@ export type AccessTokenRow = {
   token: string;
   localpart: string;
   device_id: string | null;
+  generation: number | null;
   expires_ms: number | null;
 };
 
@@ -60,6 +69,7 @@ function accessRow(row: Record<string, unknown>): AccessTokenRow {
     token: String(row.token),
     localpart: String(row.localpart),
     device_id: row.device_id == null ? null : String(row.device_id),
+    generation: row.generation == null ? null : Number(row.generation),
     expires_ms: row.expires_ms == null ? null : Number(row.expires_ms),
   };
 }
@@ -69,7 +79,7 @@ export async function accessTokenByHash(
   hash: string,
 ): Promise<AccessTokenRow | null> {
   const rows = await conn.query(
-    'SELECT token, localpart, device_id, expires_ms FROM access_tokens WHERE token = ?',
+    'SELECT token, localpart, device_id, generation, expires_ms FROM access_tokens WHERE token = ?',
     [hash],
   );
   return rows.length === 0 ? null : accessRow(rows[0]);
@@ -80,7 +90,7 @@ export async function accessTokensOfUser(
   localpart: string,
 ): Promise<AccessTokenRow[]> {
   const rows = await conn.query(
-    'SELECT token, localpart, device_id, expires_ms FROM access_tokens WHERE localpart = ?',
+    'SELECT token, localpart, device_id, generation, expires_ms FROM access_tokens WHERE localpart = ?',
     [localpart],
   );
   return rows.map(accessRow);
@@ -89,10 +99,11 @@ export async function accessTokensOfUser(
 export async function accessTokensOfDevice(
   conn: Conn,
   deviceId: string,
+  localpart: string,
 ): Promise<AccessTokenRow[]> {
   const rows = await conn.query(
-    'SELECT token, localpart, device_id, expires_ms FROM access_tokens WHERE device_id = ?',
-    [deviceId],
+    'SELECT token, localpart, device_id, generation, expires_ms FROM access_tokens WHERE device_id = ? AND localpart = ?',
+    [deviceId, localpart],
   );
   return rows.map(accessRow);
 }
@@ -120,15 +131,21 @@ export async function insertRefreshToken(
   deviceId: string | null,
   accessHash: string,
 ): Promise<void> {
+  const access = await accessTokenByHash(conn, accessHash);
+  if (
+    access === null || access.localpart !== localpart ||
+    access.device_id !== deviceId
+  ) throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'invalid refresh device');
   await conn.execute(
-    'INSERT INTO refresh_tokens (token, localpart, device_id, access_token) VALUES (?, ?, ?, ?)',
-    [hash, localpart, deviceId, accessHash],
+    'INSERT INTO refresh_tokens (token, localpart, device_id, generation, access_token) VALUES (?, ?, ?, ?, ?)',
+    [hash, localpart, deviceId, access.generation, accessHash],
   );
 }
 
 export type RefreshTokenRow = {
   localpart: string;
   device_id: string | null;
+  generation: number | null;
   access_token: string;
   next_token: string | null;
 };
@@ -138,13 +155,14 @@ export async function refreshTokenByHash(
   hash: string,
 ): Promise<RefreshTokenRow | null> {
   const rows = await conn.query(
-    'SELECT localpart, device_id, access_token, next_token FROM refresh_tokens WHERE token = ?',
+    'SELECT localpart, device_id, generation, access_token, next_token FROM refresh_tokens WHERE token = ?',
     [hash],
   );
   if (rows.length === 0) return null;
   return {
     localpart: String(rows[0].localpart),
     device_id: rows[0].device_id == null ? null : String(rows[0].device_id),
+    generation: rows[0].generation == null ? null : Number(rows[0].generation),
     access_token: String(rows[0].access_token),
     next_token: rows[0].next_token == null ? null : String(rows[0].next_token),
   };
@@ -218,9 +236,10 @@ export async function issueToken(
 ): Promise<string> {
   const token = crypto.randomUUID();
   const hash = await hashToken(token);
-  await tenant.tx((tx) =>
-    tx.tokens.insert(hash, localpart, deviceId, expiresMs ?? null)
-  );
+  await tenant.tx(async (tx) => {
+    await tx.devices.upsert(deviceId, localpart, null);
+    await tx.tokens.insert(hash, localpart, deviceId, expiresMs ?? null);
+  });
   return token;
 }
 
@@ -233,11 +252,16 @@ export async function lookupToken(
   return await tenant.tx(async (tx) => {
     const row = await tx.tokens.byHash(hash);
     if (row === null) return null;
+    if (row.device_id !== null) {
+      const device = await tx.devices.byId(row.device_id, row.localpart);
+      if (device === null || device.generation !== row.generation) return null;
+    }
     await tx.refresh.confirmAccess(hash);
     return {
       localpart: row.localpart,
       user_id: `@${row.localpart}:${tenant.serverName}`,
       device_id: row.device_id,
+      generation: row.generation,
       expires_ms: row.expires_ms,
     };
   });
@@ -273,6 +297,16 @@ export async function consumeRefreshToken(
     const row = await tx.refresh.byHash(hash);
     if (row === null) {
       throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'unknown refresh token');
+    }
+    if (row.device_id !== null) {
+      const device = await tx.devices.byId(row.device_id, row.localpart);
+      if (device === null || device.generation !== row.generation) {
+        throw new MatrixError(
+          401,
+          'M_UNKNOWN_TOKEN',
+          'device no longer exists',
+        );
+      }
     }
     await tx.refresh.confirm(hash);
     if (row.next_token !== null) await tx.refresh.delete(row.next_token);
@@ -315,13 +349,8 @@ export async function revokeToken(tenant: Tenant, token: string) {
     await tx.pushers.deleteForToken(hash);
     await tx.refresh.deleteForAccessToken(hash);
     await tx.tokens.delete(hash);
-    if (deviceId !== null) {
-      for (const t of await tx.tokens.ofDevice(deviceId)) {
-        await tx.pushers.deleteForToken(t.token);
-        await tx.refresh.deleteForAccessToken(t.token);
-        await tx.tokens.delete(t.token);
-      }
-      await tx.devices.delete(deviceId);
+    if (deviceId !== null && row !== null) {
+      await tx.devices.delete(deviceId, row.localpart);
     }
   });
 }
@@ -332,8 +361,7 @@ export async function revokeDeviceTokens(
   deviceId: string,
   localpart: string,
 ): Promise<void> {
-  for (const token of await tx.tokens.ofDevice(deviceId)) {
-    if (token.localpart !== localpart) continue;
+  for (const token of await tx.tokens.ofDevice(deviceId, localpart)) {
     await tx.pushers.deleteForToken(token.token);
     await tx.refresh.deleteForAccessToken(token.token);
     await tx.tokens.delete(token.token);

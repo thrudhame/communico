@@ -16,7 +16,8 @@ import { getRulebook } from '#engine/rulebook/index.ts';
 import { ruleId } from '#engine/rulebook/rule-ids.ts';
 import { membershipOf } from '#engine/server/read.ts';
 import { lookupAlias, registerAlias } from '#engine/server/aliases.ts';
-import { transactionSubmission } from '#engine/tenant/txns.ts';
+import { deviceIdentity, transactionSubmission } from '#engine/tenant/txns.ts';
+import { localpartOf } from '#engine/ids.ts';
 import { requireRoom, stateAtSeq, versionOf } from './room.ts';
 
 export type { CreateRoomOptions };
@@ -69,6 +70,7 @@ export async function sendEvent(
   content: Record<string, unknown>,
   deviceId: string | null,
   txnId: string,
+  deviceGeneration?: number,
 ) {
   const app = theApp();
   const room = await requireRoom(roomId);
@@ -81,11 +83,21 @@ export async function sendEvent(
       origin_server_ts: Date.now(),
     },
     app.tenant.signer(),
-    transactionSubmission(app.tenant, deviceId, {
-      kind: 'send',
-      roomId,
-      eventType: type,
-    }, txnId),
+    transactionSubmission(
+      app.tenant,
+      deviceId === null ? null : await deviceIdentity(
+        app.tenant,
+        localpartOf(userId),
+        deviceId,
+        deviceGeneration,
+      ),
+      {
+        kind: 'send',
+        roomId,
+        eventType: type,
+      },
+      txnId,
+    ),
   );
   if (res.standing === 'rejected') {
     throw new MatrixError(
@@ -161,6 +173,7 @@ export async function redactEvent(
   reason: string | undefined,
   deviceId: string | null,
   txnId: string,
+  deviceGeneration?: number,
 ) {
   const app = theApp();
   const room = await requireRoom(roomId);
@@ -170,11 +183,21 @@ export async function redactEvent(
     target,
     app.tenant.signer(),
     reason,
-    transactionSubmission(app.tenant, deviceId, {
-      kind: 'redact',
-      roomId,
-      eventId: target,
-    }, txnId),
+    transactionSubmission(
+      app.tenant,
+      deviceId === null ? null : await deviceIdentity(
+        app.tenant,
+        localpartOf(userId),
+        deviceId,
+        deviceGeneration,
+      ),
+      {
+        kind: 'redact',
+        roomId,
+        eventId: target,
+      },
+      txnId,
+    ),
   );
   return res;
 }

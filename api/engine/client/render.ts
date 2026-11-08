@@ -5,6 +5,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import type { Room } from '#engine/room/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { transactionForEvent } from '#engine/tenant/txns.ts';
+import { localpartOf } from '#engine/ids.ts';
 import { redactionOf, relationsOf } from '#engine/server/read.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { canSeeEvent } from './visibility.ts';
@@ -81,9 +82,16 @@ export async function renderStateEvent(
     viewer?.tenant !== undefined && viewer.deviceId !== null &&
     viewer.userId === pdu.sender
   ) {
-    const txn = await transactionForEvent(
+    const device = await viewer.tenant.tx((tx) =>
+      tx.devices.byId(viewer.deviceId!, localpartOf(viewer.userId))
+    );
+    const txn = device === null ? null : await transactionForEvent(
       viewer.tenant,
-      viewer.deviceId,
+      {
+        localpart: localpartOf(viewer.userId),
+        deviceId: viewer.deviceId,
+        generation: device.generation,
+      },
       room.id,
       eventId,
     );

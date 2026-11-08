@@ -7,7 +7,7 @@ import { openRoom } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { join, leave } from '#engine/room/membership.ts';
 import { putAccountData } from '#engine/tenant/accountdata.ts';
-import { recordTransaction } from '#engine/tenant/txns.ts';
+import { deviceIdentity, recordTransaction } from '#engine/tenant/txns.ts';
 import { revokeToken } from '#engine/tenant/auth.ts';
 import { httpSuite } from '#tests/http-app.ts';
 import {
@@ -91,7 +91,7 @@ suite.test('initial, incremental and full_state; global tokens; account data; re
   }, signer);
   await recordTransaction(
     app.tenant,
-    alice.device_id!,
+    await deviceIdentity(app.tenant, 'sy-a', alice.device_id!),
     { kind: 'send', roomId, eventType: 'm.room.message' },
     'local-echo',
     sent.eventId,

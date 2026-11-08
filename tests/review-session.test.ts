@@ -24,7 +24,7 @@ function login(http: Http, user: string, device: string, extra: Json = {}) {
   });
 }
 
-Deno.test('review session: another user cannot claim a device through login', async () => {
+Deno.test('review session: same device string is independent across users at login', async () => {
   const http = await startHttp();
   try {
     await http.registerTestUser('owner', 'pw');
@@ -35,8 +35,16 @@ Deno.test('review session: another user cannot claim a device through login', as
     const attempt = await login(http, 'other', 'owned', {
       initial_device_display_name: 'stolen',
     });
-    assertEquals(attempt.status, 400);
-    assertEquals(attempt.body.errcode, 'M_INVALID_PARAM');
+    assertEquals(attempt.status, 200);
+    assertEquals(
+      (await call(
+        http,
+        'account/whoami',
+        undefined,
+        attempt.body.access_token as string,
+      )).body.user_id,
+      '@other:' + http.app.tenant.serverName,
+    );
     const token = first.body.access_token as string;
     assertEquals(
       (await call(http, 'account/whoami', undefined, token)).status,
@@ -69,7 +77,7 @@ Deno.test('review session: only valid credentials disclose deactivation', async 
   }
 });
 
-Deno.test('review session: registration conflict rolls back the new account and preserves device owner', async () => {
+Deno.test('review session: registration with the same device string preserves both owners', async () => {
   const http = await startHttp();
   try {
     await http.registerTestUser('owner', 'pw');
@@ -80,11 +88,10 @@ Deno.test('review session: registration conflict rolls back the new account and 
       ...input,
       auth: { type: 'm.login.dummy', session: challenge.body.session },
     });
-    assertEquals(result.status, 400);
-    assertEquals(result.body.errcode, 'M_INVALID_PARAM');
+    assertEquals(result.status, 200);
     assertEquals(
       (await call(http, 'register/available?username=conflict')).status,
-      200,
+      400,
     );
     assertEquals(
       (await call(

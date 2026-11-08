@@ -12,5 +12,6 @@ export default async function (
     await parseJson(request) as Record<string, unknown>,
     (context.state.device as string | undefined) ?? null,
     request.params.txnId as string,
+    context.state.deviceGeneration as number | undefined,
   );
 }

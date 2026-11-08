@@ -118,9 +118,8 @@ function bind(conn: Conn, changed: () => void = () => {}) {
       ofUser: (localpart: string) => devices.devicesOfUser(conn, localpart),
       rename: (deviceId: string, localpart: string, displayName: string) =>
         devices.renameDevice(conn, deviceId, localpart, displayName),
-      delete: (deviceId: string) => devices.deleteDevice(conn, deviceId),
-      deleteOwned: (deviceId: string, localpart: string) =>
-        devices.deleteDeviceOwned(conn, deviceId, localpart),
+      delete: (deviceId: string, localpart: string) =>
+        devices.deleteDevice(conn, deviceId, localpart),
       deleteForUser: (localpart: string) =>
         devices.deleteDevicesOfUser(conn, localpart),
     },
@@ -133,7 +132,8 @@ function bind(conn: Conn, changed: () => void = () => {}) {
       ) => auth.insertAccessToken(conn, hash, localpart, deviceId, expiresMs),
       byHash: (hash: string) => auth.accessTokenByHash(conn, hash),
       ofUser: (localpart: string) => auth.accessTokensOfUser(conn, localpart),
-      ofDevice: (deviceId: string) => auth.accessTokensOfDevice(conn, deviceId),
+      ofDevice: (deviceId: string, localpart: string) =>
+        auth.accessTokensOfDevice(conn, deviceId, localpart),
       delete: (hash: string) => auth.deleteAccessToken(conn, hash),
       deleteForUser: (localpart: string) =>
         auth.deleteAccessTokensOfUser(conn, localpart),
@@ -290,18 +290,18 @@ function bind(conn: Conn, changed: () => void = () => {}) {
     },
     txns: {
       submission: (
-        deviceId: string,
+        deviceId: devices.DeviceIdentity,
         endpoint: txns.TransactionEndpoint,
         txnId: string,
       ) => txns.submissionById(conn, deviceId, endpoint, txnId),
       prepare: (
-        deviceId: string,
+        deviceId: devices.DeviceIdentity,
         endpoint: txns.TransactionEndpoint,
         txnId: string,
         pdu: Pdu,
       ) => txns.prepareSubmission(conn, deviceId, endpoint, txnId, pdu),
       finish: (
-        deviceId: string,
+        deviceId: devices.DeviceIdentity,
         endpoint: txns.TransactionEndpoint,
         txnId: string,
         eventId: string,
@@ -315,15 +315,18 @@ function bind(conn: Conn, changed: () => void = () => {}) {
           eventId,
           accepted,
         ),
-      forEvent: (deviceId: string, roomId: string, eventId: string) =>
-        txns.transactionIdForEvent(conn, deviceId, roomId, eventId),
+      forEvent: (
+        deviceId: devices.DeviceIdentity,
+        roomId: string,
+        eventId: string,
+      ) => txns.transactionIdForEvent(conn, deviceId, roomId, eventId),
       lookup: (
-        deviceId: string,
+        deviceId: devices.DeviceIdentity,
         endpoint: txns.TransactionEndpoint,
         txnId: string,
       ) => txns.transactionById(conn, deviceId, endpoint, txnId),
       record: (
-        deviceId: string,
+        deviceId: devices.DeviceIdentity,
         endpoint: txns.TransactionEndpoint,
         txnId: string,
         eventId: string,

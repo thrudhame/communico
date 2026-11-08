@@ -376,7 +376,7 @@ export async function changePassword(
     }
     for (const device of await tx.devices.ofUser(localpart)) {
       if (keepDevice !== null && device.device_id === keepDevice) continue;
-      await tx.devices.delete(device.device_id);
+      await tx.devices.delete(device.device_id, localpart);
     }
   });
 }
