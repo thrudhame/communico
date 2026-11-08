@@ -17,7 +17,8 @@ export default async function (
     return json(thrown.body, { status: 405 });
   }
   const allowed = context.miss?.kind === 'method-miss'
-    ? context.miss.allowed
+    // Discovery order is filesystem-dependent; do not mutate match data.
+    ? [...context.miss.allowed].sort()
     : [];
   return json(
     { errcode: 'M_UNRECOGNIZED', error: 'Unrecognized request' },

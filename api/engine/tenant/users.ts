@@ -155,6 +155,15 @@ export async function credentialHash(
 
 // --- tenant-level behaviour --------------------------------------------------
 
+/** Registration's pre-UIA availability check (the old endpoints queried
+ * users directly). Keep tenant storage access behind the engine. */
+export function isRegistered(
+  tenant: Tenant,
+  localpart: string,
+): Promise<boolean> {
+  return tenant.tx((tx) => tx.users.exists(localpart));
+}
+
 export type RegisterParams = {
   localpart: string;
   password: string;

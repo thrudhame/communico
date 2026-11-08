@@ -1,0 +1,73 @@
+import { parseJson } from '@pathfinder/pathfinder/body';
+import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  checkLocalpart,
+  isRegistered,
+  registerUser,
+} from '#engine/tenant/users.ts';
+import { DUMMY_FLOWS, requireUia } from '#engine/tenant/uia.ts';
+import { theApp } from '#engine/app.ts';
+
+// POST /_matrix/client/v3/register — UIA (F1 step 17; M2: via the shared
+// requireUia helper). Complement's contract (read off
+// apidoc_register_test.go, not assumed):
+// - bodies are validated BEFORE UIA: bad-grammar username → 400
+//   M_INVALID_USERNAME and taken username → 400 M_USER_IN_USE, even with
+//   no session at all;
+// - otherwise the UIA 401 dance (flows/params/session; params rides the
+//   401 body per spec v1.11) with the dummy flow, then finalize.
+// honoring: inhibit_login, device_id, initial_device_display_name.
+export default async function (
+  request: import('@pathfinder/pathfinder').PathfinderRequest,
+) {
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await parseJson(request)) as Record<string, unknown>;
+  } catch (e) {
+    if (e instanceof Error && e.name === 'ParseError') body = {};
+    else throw e;
+  }
+  // 1. body validation first (Complement: "validate request bodies
+  // before handling UIA").
+  let localpart: string | null = null;
+  if (body.username !== undefined) {
+    localpart = checkLocalpart(body.username);
+    const taken = await isRegistered(theApp().tenant, localpart);
+    if (taken) {
+      throw new MatrixError(400, 'M_USER_IN_USE', 'user in use: ' + localpart);
+    }
+  }
+
+  // 2. UIA: dummy flow via the shared helper (sessions + completion).
+  await requireUia(theApp().tenant, {
+    body,
+    flows: DUMMY_FLOWS,
+  });
+
+  // Finalize: username was grammar-checked pre-UIA (localpart is set);
+  // missing username/password here is a 400 (the UIA dance always
+  // carries them in Complement's flows).
+  if (localpart === null) {
+    throw new MatrixError(400, 'M_INVALID_USERNAME', 'username required');
+  }
+  if (typeof body.password !== 'string' || body.password.length === 0) {
+    throw new MatrixError(400, 'M_BAD_REQUEST', 'password required');
+  }
+  const inhibit = body.inhibit_login === true;
+  const result = await registerUser(theApp().tenant, {
+    localpart,
+    password: body.password,
+    deviceId: typeof body.device_id === 'string' ? body.device_id : undefined,
+    displayName: typeof body.initial_device_display_name === 'string'
+      ? body.initial_device_display_name
+      : undefined,
+    accessToken: inhibit ? null : undefined,
+  });
+  const out: Record<string, unknown> = {
+    user_id: result.user_id,
+    device_id: result.device_id,
+    home_server: result.home_server,
+  };
+  if (result.access_token !== undefined) out.access_token = result.access_token;
+  return out;
+}
