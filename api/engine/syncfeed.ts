@@ -10,7 +10,7 @@ import {
   type StreamToken,
 } from '#engine/client/tokens.ts';
 import { config } from '#engine/config.ts';
-import { deviceStreamMax } from '#engine/server/e2ee.ts';
+import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
@@ -220,7 +220,7 @@ async function roomTimeline(
       ),
     };
   }
-  const joiners: string[] = [], leavers: string[] = [];
+  const joiners: string[] = [];
   for (const row of raw) {
     const pdu = await room.tx(async (tx) => {
       const e = await tx.events.get(row.event);
@@ -228,11 +228,8 @@ async function roomTimeline(
     });
     if (pdu?.type !== 'm.room.member') continue;
     if (pdu.content.membership === 'join') joiners.push(String(pdu.state_key));
-    if (['leave', 'ban'].includes(String(pdu.content.membership))) {
-      leavers.push(String(pdu.state_key));
-    }
   }
-  return { entry, joiners, leavers };
+  return { entry, joiners };
 }
 
 async function relevantChanged(
@@ -242,6 +239,14 @@ async function relevantChanged(
   if (i.since === null) return true;
   sweepTyping();
   const app = theApp();
+  const lists = await deviceListsBetween(
+    app.server,
+    i.userId,
+    i.since.dSeq,
+    await deviceStreamMax(app.server),
+    'sync',
+  );
+  if (lists.changed.length || lists.left.length) return true;
   if (
     device !== null &&
     await app.tenant.tx(async (tx) =>
@@ -401,7 +406,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       };
     }
   }
-  const allJoiners = new Set<string>(), allLeavers = new Set<string>();
+  const allJoiners = new Set<string>();
   for (const m of memberships) {
     if (oobRooms.has(m.roomId)) continue;
     const room = await heldRoom(m.roomId);
@@ -456,7 +461,6 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     );
     (left ? leave : join)[m.roomId] = result.entry;
     for (const u of result.joiners) allJoiners.add(u);
-    for (const u of result.leavers) allLeavers.add(u);
   }
   const presenceEvents = new Map<string, Record<string, unknown>>();
   const shared = await sharedUsers(app.server, i.userId);
@@ -481,17 +485,15 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       await includePresence(u);
     }
   }
-  const deviceChanged: string[] = [], deviceLeft: string[] = [];
-  if (i.since !== null) {
-    deviceChanged.push(...allJoiners);
-    for (const u of allLeavers) {
-      const shared = await app.server.query(
-        "SELECT 1 FROM memberships a JOIN memberships b ON a.room = b.room WHERE a.user = ? AND b.user = ? AND a.membership = 'join' AND b.membership = 'join' LIMIT 1",
-        [i.userId, u],
-      );
-      if (!shared.length) deviceLeft.push(u);
-    }
-  }
+  const deviceLists = i.since === null
+    ? { changed: [], left: [] }
+    : await deviceListsBetween(
+      app.server,
+      i.userId,
+      i.since.dSeq,
+      now.dSeq,
+      'sync',
+    );
   const accountData: { type: string; content: unknown }[] = i.since === null
     ? await listGlobalAccountData(app.tenant, lp)
     : await listGlobalAccountDataSince(app.tenant, lp, i.since.aSeq);
@@ -507,7 +509,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     presence: { events: [...presenceEvents.values()] },
     account_data: { events: accountData },
     to_device: { events: delivery.events },
-    device_lists: { changed: deviceChanged, left: deviceLeft },
+    device_lists: deviceLists,
     device_one_time_keys_count: delivery.pools.counts,
     device_unused_fallback_key_types: delivery.pools.unused,
   };

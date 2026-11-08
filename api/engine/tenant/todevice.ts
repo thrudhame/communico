@@ -243,11 +243,18 @@ export async function deliverMessages(
       'INSERT INTO sync_deliveries VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
       [...owner, hash, cut],
     );
-    const proofs = await conn.query(
-      'SELECT COUNT(*) AS n FROM sync_deliveries WHERE localpart=? AND device_id=? AND generation=?',
-      owner,
+    // The just-issued token survives even when several proofs have the same cut.
+    // Evicted tokens replay from the durable ack, never acknowledge unseen data.
+    const obsolete = await conn.query(
+      'SELECT token_hash FROM sync_deliveries WHERE localpart=? AND device_id=? AND generation=? AND token_hash!=? ORDER BY to_msg_pos DESC,token_hash LIMIT -1 OFFSET ?',
+      [...owner, hash, Math.max(0, limits.maxkeys - 1)],
     );
-    limitEntries(Number(proofs[0].n), limits.maxkeys);
+    for (const proof of obsolete) {
+      await conn.execute(
+        'DELETE FROM sync_deliveries WHERE localpart=? AND device_id=? AND generation=? AND token_hash=?',
+        [...owner, String(proof.token_hash)],
+      );
+    }
   }
   return { events, token: next };
 }

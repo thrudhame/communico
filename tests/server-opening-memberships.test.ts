@@ -22,6 +22,8 @@ import { fakeFetcher, fakeKeyResolver } from '#tests/fixtures/remote.ts';
 import { makeFakeRoom } from '#tests/fixtures/remote-room.ts';
 import { testRemoteServer, testSigner } from '#tests/fixtures/signer.ts';
 import { setTyping } from '#engine/typing.ts';
+import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
+import { finishRoomRemoval } from '#engine/server/removal.ts';
 
 const ANNA = '@anna:test';
 const BOB = '@bob:remote.test';
@@ -45,7 +47,7 @@ async function withStore(fn: (store: Store) => Promise<void>) {
   }
 }
 
-async function setup(store: Store, suffix: string) {
+async function setup(store: Store, suffix: string, encrypted = false) {
   const fr = await makeFakeRoom({
     roomId: '!f4-' + suffix + ':remote.test',
     joinRule: 'public',
@@ -56,6 +58,14 @@ async function setup(store: Store, suffix: string) {
       sender: user,
       state_key: user,
       content: { membership: 'join' },
+    });
+  }
+  if (encrypted) {
+    await fr.addEvent({
+      type: 'm.room.encryption',
+      sender: fr.creator,
+      state_key: '',
+      content: { algorithm: 'm.megolm.v1.aes-sha2' },
     });
   }
   const signer = await testSigner();
@@ -147,6 +157,74 @@ Deno.test('F4: fresh remote join projects all imported members at its live cut, 
     assertEquals(await s.members(), before);
     assertEquals(await eventStreamMax(s.server), high);
     assertEquals(await watermark(s.server, sourceOf(s.room.id)), mark);
+  });
+});
+
+Deno.test('E2: imported encrypted opening, rejoin and removal retain bounded device audiences', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store, 'device-tracking', true);
+    await project(store, s.room.id);
+    const first = await deviceStreamMax(s.server);
+    const peers = [BOB, EVE, GONE, s.fr.creator].sort();
+    assertEquals(await deviceListsBetween(s.server, ANNA, 0, first, 'sync'), {
+      changed: peers,
+      left: [],
+    });
+    await leave(s.room, ANNA, s.signer);
+    await project(store, s.room.id);
+    const left = await deviceStreamMax(s.server);
+    assertEquals(
+      await deviceListsBetween(s.server, ANNA, first, left, 'sync'),
+      { changed: [], left: peers },
+    );
+    s.omitted.add(GONE);
+    // An unknown remote tip forces an imported opening. A known predecessor
+    // correctly retains its stored state instead of trusting an omitted key.
+    await s.fr.addEvent({
+      type: 'm.room.member',
+      sender: s.fr.creator,
+      state_key: s.fr.creator,
+      content: { membership: 'join', displayname: 'after gap' },
+    });
+    await s.enter();
+    await project(store, s.room.id);
+    const again = await deviceStreamMax(s.server);
+    const remaining = peers.filter((user) => user !== GONE);
+    assertEquals(
+      await deviceListsBetween(s.server, ANNA, left, again, 'sync'),
+      { changed: remaining, left: [] },
+    );
+    const before = await s.server.query(
+      'SELECT * FROM device_notices ORDER BY seq,observer,scope',
+    );
+    await s.server.execute('DELETE FROM watermarks WHERE source=?', [
+      sourceOf(s.room.id),
+    ]);
+    await project(store, s.room.id);
+    assertEquals(
+      await s.server.query(
+        'SELECT * FROM device_notices ORDER BY seq,observer,scope',
+      ),
+      before,
+    );
+    await finishRoomRemoval(store, s.room.id, {
+      why: 'test removal',
+      intents: [],
+    }, null);
+    assertEquals(
+      await deviceListsBetween(
+        s.server,
+        ANNA,
+        again,
+        await deviceStreamMax(s.server),
+        'sync',
+      ),
+      { changed: [], left: remaining },
+    );
+    assertEquals(await deviceListsBetween(s.server, ANNA, 0, first, 'sync'), {
+      changed: peers,
+      left: [],
+    });
   });
 });
 

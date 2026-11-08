@@ -62,9 +62,7 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in BASELINE.md.
 
 - tests/csapi/e2e_key_backup_test.go
-- tests/csapi/keychanges_test.go
 - tests/csapi/device_lists_test.go
-- tests/csapi/to_device_test.go
 - tests/csapi/push_test.go
 - tests/csapi/thread_notifications_test.go
 - tests/federation_acl_test.go
