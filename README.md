@@ -19,6 +19,75 @@ choose its storage engine. E2EE is core product scope: its server APIs and
 room-encryption controls are being designed, not implemented in this snapshot.
 The old browser demo's E2EE exclusion was scoped to that demo.
 
+## What end-to-end encryption does not hide
+
+Matrix E2EE protects payloads that clients encrypt, not the whole protocol.
+These limits apply even in an encrypted room. Communico's E2EE server APIs
+are still being designed. HTTPS protects transport, but the receiving
+server can still read fields outside the encrypted payload.
+
+"Our server" means your account's homeserver. "Room servers" means homeservers
+participating in that room. Room data is also visible to users allowed to
+receive it by [membership and history visibility][e2ee-history], including
+new joiners or people peeking where permitted. Unencrypted does not mean
+universally public.
+
+| #  | Not hidden by room E2EE                                                                                                                                       | Visible to whom                                                                                                                                                                                         | Matrix spec                                                                           |
+| -- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| 1  | All room state: name, topic, avatar, members and membership changes, join rules, power levels, history visibility, aliases, and the encryption setting itself | Our server and room servers; permitted readers. Invites/knocks can expose selected state before joining.                                                                                                | [State][e2ee-state], [stripped state][e2ee-stripped]                                  |
+| 2  | Space metadata and room hierarchy (`m.space.child`, `m.space.parent`)                                                                                         | Our server and room servers; users allowed to discover the hierarchy. Spaces hold state, which Matrix does not encrypt.                                                                                 | [Spaces][e2ee-spaces], [no encrypted state][e2ee-no-state]                            |
+| 3  | Event sender, room ID, timestamps, event IDs, ciphertext size, encryption algorithm and session ID; device/sender-key fields when present                     | Our server, room servers and permitted readers. Size means encrypted event size, not exact plaintext length.                                                                                            | [Event format][e2ee-events], [Megolm][e2ee-megolm]                                    |
+| 4  | `m.relates_to`: reply, thread, edit and reaction targets, relationship types, and reaction keys (such as emoji)                                               | Our server, room servers and permitted readers                                                                                                                                                          | [Relationships][e2ee-relations], [reactions][e2ee-reactions]                          |
+| 5  | Redaction targets (`redacts`) and any redaction reason                                                                                                        | Our server, room servers and permitted readers                                                                                                                                                          | [Redactions][e2ee-redactions]                                                         |
+| 6  | Typing notifications and public read receipts, including event/thread IDs and receipt timestamps                                                              | Our server, room servers and room members. Private read receipts stay with our server and the sending user; they are not E2EE.                                                                          | [Typing][e2ee-typing], [receipts][e2ee-receipts]                                      |
+| 7  | Presence, last-active information and status messages, when sent                                                                                              | Our server; interested remote servers and users sharing rooms                                                                                                                                           | [Presence][e2ee-presence]                                                             |
+| 8  | User profiles: display names, avatars and other published profile fields                                                                                      | Our server; remote servers and users permitted to query them. Room membership also carries display names and avatars.                                                                                   | [Profiles][e2ee-profiles]                                                             |
+| 9  | Account data (except values clients separately encrypt, such as secret storage); push rules                                                                   | Our server and your own clients, not other room members merely because they share a room                                                                                                                | [Account data][e2ee-account], [push rules][e2ee-push], [secret storage][e2ee-secrets] |
+| 10 | Device lists, device names, public device/cross-signing keys and published one-time/fallback keys                                                             | Our server; querying clients and remote servers receiving key/device information. Private keys are not published.                                                                                       | [Key distribution][e2ee-keys], [device federation][e2ee-devices]                      |
+| 11 | To-device message contents unless the client Olm-encrypts them; sender, destination users/devices and routing type remain visible either way                  | Sending and receiving homeservers; the destination devices                                                                                                                                              | [To-device][e2ee-to-device], [Olm][e2ee-olm]                                          |
+| 12 | URLs requested through server-side URL previews                                                                                                               | Our server learns the URL, even if it came from an encrypted message                                                                                                                                    | [URL preview privacy][e2ee-previews]                                                  |
+| 13 | Media and thumbnails uploaded without client-side attachment encryption, including avatars and unencrypted image-pack media                                   | Uploading/serving servers and users able to retrieve the media. Encrypting the message alone does not encrypt its files; thumbnails need separate encryption too.                                       | [Attachments][e2ee-attachments], [media][e2ee-media], [image packs][e2ee-no-state]    |
+| 14 | Published room-directory entries: room IDs, names, topics, aliases, avatars and member counts                                                                 | The publishing server and anyone allowed to query its directory, without joining the listed room                                                                                                        | [Room directory][e2ee-directory]                                                      |
+| 15 | Push-notification routing and metadata sent to a push gateway                                                                                                 | Our server and the configured gateway; the provider sees what the gateway forwards. The notification format determines which fields are sent.                                                           | [Push notifications][e2ee-push]                                                       |
+| 16 | Connection IPs, request timing and traffic sizes                                                                                                              | The servers you connect to and network observers (their view depends on transport/proxies). Room E2EE provides no traffic anonymity; it does not automatically give remote room servers your client IP. | [HTTP transport][e2ee-transport], [connection records][e2ee-connections]              |
+
+[Server-side search][e2ee-search] excludes encrypted rooms; clients must search
+decrypted content locally. Access to encrypted events does not itself give a
+reader the decryption keys, and recipients who receive keys can read the content.
+
+Communico intends to explore its own protocol for some of these gaps later.
+That is future work, with no promised coverage or dates; the current E2EE design
+leaves spaces unencrypted because their contents are state.
+
+[e2ee-history]: https://spec.matrix.org/unstable/client-server-api/#room-history-visibility
+[e2ee-state]: https://spec.matrix.org/unstable/client-server-api/#types-of-room-events
+[e2ee-stripped]: https://spec.matrix.org/unstable/client-server-api/#stripped-state
+[e2ee-spaces]: https://spec.matrix.org/unstable/client-server-api/#spaces
+[e2ee-no-state]: https://spec.matrix.org/unstable/client-server-api/#encrypted-image-packs
+[e2ee-events]: https://spec.matrix.org/unstable/client-server-api/#room-event-format
+[e2ee-megolm]: https://spec.matrix.org/unstable/client-server-api/#mmegolmv1aes-sha2
+[e2ee-relations]: https://spec.matrix.org/unstable/client-server-api/#forming-relationships-between-events
+[e2ee-reactions]: https://spec.matrix.org/unstable/client-server-api/#event-annotations-and-reactions
+[e2ee-redactions]: https://spec.matrix.org/unstable/client-server-api/#mroomredaction
+[e2ee-typing]: https://spec.matrix.org/unstable/client-server-api/#typing-notifications
+[e2ee-receipts]: https://spec.matrix.org/unstable/client-server-api/#receipts
+[e2ee-presence]: https://spec.matrix.org/unstable/client-server-api/#presence
+[e2ee-profiles]: https://spec.matrix.org/unstable/client-server-api/#profiles
+[e2ee-account]: https://spec.matrix.org/unstable/client-server-api/#client-config
+[e2ee-push]: https://spec.matrix.org/unstable/client-server-api/#push-notifications
+[e2ee-secrets]: https://spec.matrix.org/unstable/client-server-api/#storage
+[e2ee-keys]: https://spec.matrix.org/unstable/client-server-api/#key-distribution
+[e2ee-devices]: https://spec.matrix.org/unstable/server-server-api/#device-management
+[e2ee-to-device]: https://spec.matrix.org/unstable/client-server-api/#send-to-device-messaging
+[e2ee-olm]: https://spec.matrix.org/unstable/client-server-api/#molmv1curve25519-aes-sha2
+[e2ee-previews]: https://spec.matrix.org/unstable/client-server-api/#get_matrixclientv1mediapreview_url
+[e2ee-attachments]: https://spec.matrix.org/unstable/client-server-api/#sending-encrypted-attachments
+[e2ee-media]: https://spec.matrix.org/unstable/client-server-api/#content-repository
+[e2ee-directory]: https://spec.matrix.org/unstable/client-server-api/#published-room-directory
+[e2ee-transport]: https://spec.matrix.org/unstable/client-server-api/#api-standards
+[e2ee-connections]: https://spec.matrix.org/unstable/client-server-api/#get_matrixclientv3adminwhoisuserid
+[e2ee-search]: https://spec.matrix.org/unstable/client-server-api/#server-side-search
+
 ## Checks
 
 Run inside the named, authorized project test VM or dedicated project LXC on
