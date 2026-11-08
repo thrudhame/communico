@@ -4,6 +4,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { isJoined } from '#engine/server/read.ts';
+import { advanceNotificationRead } from '#engine/server/notifications.ts';
 
 export type PresenceRow = {
   presence: string;
@@ -187,6 +188,14 @@ export async function setReceipt(
       ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_id=excluded.event_id,ts_ms=excluded.ts_ms,seq=excluded.seq`,
       [roomId, userId, receiptType, threadId ?? '', eventId, ts, seq],
     );
+    await advanceNotificationRead(
+      tx,
+      userId,
+      roomId,
+      threadId ?? '',
+      eventId,
+      Date.now(),
+    );
     return { userId, receiptType, threadId, eventId, ts, seq };
   });
   if (row === null) return false;
@@ -211,7 +220,7 @@ export async function receiptRoomsSince(
 }
 
 export async function receiptRows(
-  server: Db,
+  server: Pick<Db, 'query'>,
   roomId: string,
   since = 0,
   viewer: string | null = null,
@@ -230,7 +239,7 @@ export async function receiptRows(
   }));
 }
 export async function receiptsSince(
-  server: Db,
+  server: Pick<Db, 'query'>,
   roomId: string,
   viewer: string,
   since: number,

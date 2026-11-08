@@ -390,6 +390,8 @@ function bind(
       },
     },
     accountData: {
+      snapshot: (localpart: string, roomId: string, type: string) =>
+        accountdata.accountDataSnapshot(conn, localpart, roomId, type),
       put: (
         localpart: string,
         roomId: string,

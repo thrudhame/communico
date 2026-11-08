@@ -300,8 +300,19 @@ CREATE TABLE federation_join_attempts(room_id TEXT NOT NULL, user_id TEXT NOT NU
 CREATE INDEX federation_join_attempts_destination ON federation_join_attempts(destination,added_ms);
 `;
 
+const NOTIFICATIONS_SQL = `
+CREATE TABLE push_evaluations(tenant TEXT NOT NULL, user TEXT NOT NULL, event TEXT NOT NULL, room TEXT NOT NULL, event_seq INTEGER NOT NULL, source TEXT NOT NULL, source_pos INTEGER NOT NULL, rule_revision INTEGER NOT NULL, ignore_revision INTEGER NOT NULL, version INTEGER NOT NULL, rule_id TEXT, rule_kind TEXT, PRIMARY KEY(tenant,user,event));
+CREATE TABLE notifications(seq INTEGER PRIMARY KEY NOT NULL, tenant TEXT NOT NULL, user TEXT NOT NULL, event TEXT NOT NULL, room TEXT NOT NULL, event_seq INTEGER NOT NULL, thread TEXT NOT NULL, actions TEXT NOT NULL, highlight INTEGER NOT NULL, created_ms INTEGER NOT NULL, read_ms INTEGER, withdrawn INTEGER NOT NULL DEFAULT 0, UNIQUE(tenant,user,event));
+CREATE INDEX notifications_user_room ON notifications(user,room,thread,event_seq);
+CREATE TABLE notification_counts(user TEXT NOT NULL, room TEXT NOT NULL, thread TEXT NOT NULL, unread INTEGER NOT NULL CHECK(unread>=0), highlight INTEGER NOT NULL CHECK(highlight>=0 AND highlight<=unread), PRIMARY KEY(user,room,thread));
+CREATE TABLE notification_horizons(user TEXT NOT NULL, room TEXT NOT NULL, scope TEXT NOT NULL, event_seq INTEGER NOT NULL, PRIMARY KEY(user,room,scope));
+CREATE TABLE notification_receipt_refs(user TEXT NOT NULL, room TEXT NOT NULL, scope TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(user,room,scope,event));
+CREATE TABLE notification_changes(seq INTEGER PRIMARY KEY NOT NULL, user TEXT NOT NULL, room TEXT NOT NULL, thread TEXT NOT NULL);
+CREATE INDEX notification_changes_user ON notification_changes(user,seq);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 13,
+  version: 14,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -314,6 +325,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(PUBLIC_SIGNING_SQL);
     await db.exec(REMOTE_SIGNING_SQL);
     await db.exec(JOIN_ATTEMPTS_SQL);
+    await db.exec(NOTIFICATIONS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -326,5 +338,6 @@ export const serverSchema: SchemaProvider = {
     10: (conn) => conn.exec(PUBLIC_SIGNING_SQL),
     11: (conn) => conn.exec(REMOTE_SIGNING_SQL),
     12: (conn) => conn.exec(JOIN_ATTEMPTS_SQL),
+    13: (conn) => conn.exec(NOTIFICATIONS_SQL),
   },
 };

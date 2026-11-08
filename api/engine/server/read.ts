@@ -94,7 +94,7 @@ const MEMBERSHIP_SELECT =
 // roomsFor; the forgotten flag rides along, stage 5 decides its read
 // semantics — the projection never touches it).
 export async function roomsFor(
-  db: Db,
+  db: Pick<Db, 'query'>,
   userId: string,
 ): Promise<MembershipRow[]> {
   const rows = await db.query(`${MEMBERSHIP_SELECT} WHERE m.user = ?`, [
@@ -229,7 +229,7 @@ export async function threadRootsOf(db: Db, roomId: string) {
 /** Receipt membership follows at most three relation hops. Roots themselves
  * and non-thread relations to roots are on main; participation is separate. */
 export async function threadOfEvent(
-  db: Db,
+  db: Pick<Db, 'query'>,
   roomId: string,
   eventId: string,
 ): Promise<string> {
