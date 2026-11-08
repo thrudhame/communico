@@ -25,6 +25,7 @@ import { onTenantStream } from '#engine/tenant/streams.ts';
 import {
   getPresence,
   onEphemeral,
+  publicReceiptRoomsSince,
   receiptsSince,
   setPresenceValue,
   sharedUsers,
@@ -242,11 +243,9 @@ async function relevantChanged(i: SyncInputs): Promise<boolean> {
       m.membership === 'join' && lastTypingChange(m.roomId) > i.since!.tSeq
     )
   ) return true;
-  const receipts = await app.server.query(
-    "SELECT MAX(r.seq) AS m FROM receipts r JOIN memberships m ON m.room=r.room_id WHERE m.user=? AND m.membership='join'",
-    [i.userId],
-  );
-  if (Number(receipts[0].m ?? 0) > i.since.rSeq) return true;
+  if (
+    (await publicReceiptRoomsSince(app.server, i.userId, i.since.rSeq)).size > 0
+  ) return true;
   for (const u of await sharedUsers(app.server, i.userId)) {
     if ((await getPresence(app.server, u)).seq > i.since.pSeq) return true;
   }
@@ -317,6 +316,9 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     now.aSeq,
   );
   const memberships = await roomsFor(app.server, i.userId);
+  const receiptRooms = i.since === null
+    ? new Set<string>()
+    : await publicReceiptRoomsSince(app.server, i.userId, i.since.rSeq);
   const join: Record<string, unknown> = {},
     invite: Record<string, unknown> = {},
     leave: Record<string, unknown> = {};
@@ -396,12 +398,8 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
         1,
         now.eSeq,
       );
-      const receipts = await app.server.query(
-        'SELECT 1 FROM receipts WHERE room_id=? AND seq>? LIMIT 1',
-        [m.roomId, i.since.rSeq],
-      );
       if (
-        !changed.length && !receipts.length &&
+        !changed.length && !receiptRooms.has(m.roomId) &&
         lastTypingChange(m.roomId) <= i.since.tSeq
       ) continue;
     }

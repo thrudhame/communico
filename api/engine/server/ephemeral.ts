@@ -184,6 +184,21 @@ export async function setReceipt(
   notify(server, { kind: 'receipt', roomId, receiptType, row });
   return true;
 }
+// Relevance is a publication read too: use the same public-only contract for
+// long-poll wakeups and incremental room selection as for receipt content.
+export async function publicReceiptRoomsSince(
+  server: Db,
+  userId: string,
+  since: number,
+): Promise<Set<string>> {
+  const rows = await server.query(
+    `SELECT DISTINCT r.room_id FROM receipts r JOIN memberships m ON m.room=r.room_id
+     WHERE m.user=? AND m.membership='join' AND r.receipt_type='m.read' AND r.seq>?`,
+    [userId, since],
+  );
+  return new Set(rows.map((r) => String(r.room_id)));
+}
+
 export async function receiptRows(
   server: Db,
   roomId: string,

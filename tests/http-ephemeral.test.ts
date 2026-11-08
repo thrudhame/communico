@@ -202,6 +202,78 @@ suite.test('receipts and read markers round-trip; private receipts stay stored a
   );
 });
 
+for (const mode of ['selection', 'long poll']) {
+  suite.test(
+    'private receipts are excluded from peer sync ' + mode,
+    async () => {
+      const a = await suite.registerTestUser(
+        'ep-private-a-' + mode.replace(' ', '-'),
+        'pw',
+      );
+      const b = await suite.registerTestUser(
+        'ep-private-b-' + mode.replace(' ', '-'),
+        'pw',
+      );
+      const { roomId, base } = await roomFor(a, b);
+      const sent = await call(
+        base + '/send/m.room.message/private-target',
+        a.access_token!,
+        'PUT',
+        { body: 'target' },
+      );
+      assertEquals(sent.status, 200);
+      const target = encodeURIComponent(String(sent.body.event_id));
+      const before = await sync(b.access_token!);
+      const receipt = async (type: string) => {
+        assertEquals(
+          (await call(
+            base + '/receipt/' + type + '/' + target,
+            a.access_token!,
+            'POST',
+            {},
+          )).status,
+          200,
+        );
+      };
+      if (mode === 'selection') {
+        await receipt('m.read.private');
+        const after = await sync(
+          b.access_token!,
+          '&since=' + before.next_batch,
+        );
+        assertEquals(entry(after, roomId), {});
+        return;
+      }
+      let done = false;
+      const pending = call(
+        '/_matrix/client/v3/sync?timeout=2000&since=' + before.next_batch,
+        b.access_token!,
+      ).then((response) => {
+        done = true;
+        return response;
+      });
+      let stayedPending = false;
+      let result: Awaited<ReturnType<typeof call>>;
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        await receipt('m.read.private');
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        stayedPending = !done;
+      } finally {
+        await receipt('m.read');
+        result = await pending;
+      }
+      assertEquals(
+        stayedPending,
+        true,
+        'private activity must not satisfy peer long-poll relevance',
+      );
+      assertEquals(result.status, 200);
+      assert(eventOf(result.body, roomId, 'm.receipt'));
+    },
+  );
+}
+
 suite.test('room ephemeral admission rejects absent, invited and departed users across client producers', async () => {
   const a = await suite.registerTestUser('ep-admit-a', 'pw');
   const b = await suite.registerTestUser('ep-admit-b', 'pw');
