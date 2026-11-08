@@ -146,7 +146,35 @@ Deno.test('E3 tenant intents survive unprojected restart, retain admission until
         )
       );
     await send(alice, 'two');
-    await assertRejects(() => send(alice, 'three'));
+    await assertRejects(() =>
+      tenant.tx((tx) =>
+        tx.toDevice.send(
+          alice,
+          'local.test',
+          'm.test',
+          'three',
+          'three',
+          [
+            { user: '@alice:local.test', id: '*', content: { local: true } },
+            ...messages,
+          ],
+          limits,
+          policy,
+        )
+      )
+    );
+    assertEquals(
+      (await tenant.tx((tx) =>
+        tx.toDevice.deliver(alice, parseStreamToken('s0')!, limits)
+      )).events,
+      [],
+    );
+    assertEquals(
+      await (await store.tenant('local.test')).query(
+        "SELECT 1 FROM to_device_transactions WHERE txn_id='three'",
+      ),
+      [],
+    );
     await send(carol, 'independent');
     const db = await store.tenant('local.test');
     assertEquals(
