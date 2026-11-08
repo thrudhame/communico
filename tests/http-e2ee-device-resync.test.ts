@@ -1,5 +1,5 @@
 import { assert, assertEquals } from '@std/assert';
-import { httpSuite } from '#tests/http-app.ts';
+import { httpSuite, startHttp } from '#tests/http-app.ts';
 import { fedCaller, remoteServer } from '#tests/http-federation.ts';
 import { theApp } from '#engine/app.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
@@ -51,6 +51,178 @@ suite.test('device-list EDU invalidates the shared peer at sync, ignores origin 
   await send(a.user_id, 'spoof');
   const spoof = await sync(after.next_batch);
   assertEquals(spoof.device_lists.changed, []);
+});
+
+Deno.test('lazy device recovery: membership is dormant; query demand and an EDU gap each fetch once', async () => {
+  const previous = config().federation;
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  const http = await startHttp();
+  let user = '', snapshots = 0, claims = 0;
+  let paused = false, release: (() => void) | undefined;
+  const key = {
+    user_id: '',
+    device_id: 'D',
+    algorithms: [],
+    keys: { 'ed25519:D': 'origin-key' },
+    signatures: {},
+  };
+  const fake = await startFakeServer({
+    ourKeyDoc: () =>
+      Promise.resolve({
+        server_name: http.app.tenant.serverName,
+        verify_keys: {
+          [http.app.tenant.keyId]: { key: http.app.tenant.publicB64 },
+        },
+      }),
+    handlers: (req) => {
+      if (req.path.includes('/user/devices/')) {
+        return (async () => {
+          snapshots++;
+          if (paused) {
+            await new Promise<void>((r) => {
+              release = r;
+            });
+          }
+          await new Promise((r) => setTimeout(r, 80));
+          return Response.json({
+            user_id: user,
+            stream_id: 10,
+            devices: [{ device_id: 'D', keys: key }],
+          });
+        })();
+      }
+      if (req.path.endsWith('/user/keys/claim')) {
+        claims++;
+        return Response.json({
+          one_time_keys: {
+            [user]: { D: { 'signed_curve25519:one': { key: 'once' } } },
+          },
+        });
+      }
+      return null;
+    },
+  });
+  user = '@remote:' + fake.name;
+  key.user_id = user;
+  try {
+    const a = await http.registerTestUser('lazy-cache', 'pw');
+    http.app.deviceLists.start();
+    const relationship = (members: string[], pos: number) =>
+      http.app.server.tx((tx) =>
+        reconcileDeviceRoom(tx, '!lazy:local', members, false, null, pos, [
+          http.app.tenant.serverName,
+        ])
+      );
+    await relationship([a.user_id, user], 1);
+    await new Promise((r) => setTimeout(r, 1200));
+    assertEquals(snapshots, 0, 'membership alone must not dial a remote user');
+    assertEquals(
+      (await http.app.server.query(
+        'SELECT stale FROM remote_device_users WHERE user_id=?',
+        [user],
+      ))[0].stale,
+      1,
+    );
+    const query = async () => {
+      const r = await http.matrix(
+        new Request('http://x/_matrix/client/v3/keys/query', {
+          method: 'POST',
+          headers: { authorization: 'Bearer ' + a.access_token },
+          body: JSON.stringify({ device_keys: { [user]: [] } }),
+        }),
+      );
+      assertEquals(r.status, 200);
+      assertEquals((await r.json()).device_keys[user].D.keys, key.keys);
+    };
+    await Promise.all([query(), query(), query()]);
+    assertEquals(
+      snapshots,
+      1,
+      'concurrent explicit key demand is single-flight',
+    );
+    const call = fedCaller(http.matrix, await remoteServer(fake.name));
+    const response = await call('PUT', '/_matrix/federation/v1/send/lazy-gap', {
+      origin: fake.name,
+      origin_server_ts: Date.now(),
+      pdus: [],
+      edus: [{
+        edu_type: 'm.device_list_update',
+        content: {
+          user_id: user,
+          device_id: 'D',
+          stream_id: 20,
+          prev_id: [999],
+          keys: key,
+        },
+      }],
+    });
+    assertEquals(response.status, 200);
+    const until = Date.now() + 5000;
+    while (
+      await cachedDeviceKeys(http.app.server, user, [], a.user_id) === null
+    ) {
+      assert(Date.now() < until, 'EDU gap did not trigger recovery');
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assertEquals(snapshots, 2);
+    await query();
+    assertEquals(snapshots, 2);
+    await relationship([a.user_id], 2);
+    await relationship([a.user_id, user], 3);
+    await new Promise((r) => setTimeout(r, 1100));
+    assertEquals(snapshots, 2, 'rejoin remains dormant until fresh demand');
+    paused = true;
+    const started = Date.now();
+    const timed = await http.matrix(
+      new Request('http://x/_matrix/client/v3/keys/query', {
+        method: 'POST',
+        headers: { authorization: 'Bearer ' + a.access_token },
+        body: JSON.stringify({
+          timeout: 200,
+          device_keys: { [user]: [], [a.user_id]: [] },
+        }),
+      }),
+    );
+    assertEquals(timed.status, 200);
+    const timedBody = await timed.json();
+    assert(
+      Date.now() - started < 1500,
+      'snapshot phase exceeded the client deadline',
+    );
+    assert(timedBody.failures[fake.name]);
+    assertEquals(timedBody.device_keys[a.user_id], {});
+    assertEquals(snapshots, 3);
+    paused = false;
+    release!();
+    await new Promise((r) => setTimeout(r, 150));
+    assertEquals(
+      await cachedDeviceKeys(http.app.server, user, [], a.user_id),
+      null,
+      'late snapshot cannot publish after cancellation',
+    );
+    const claim = await http.matrix(
+      new Request('http://x/_matrix/client/v3/keys/claim', {
+        method: 'POST',
+        headers: { authorization: 'Bearer ' + a.access_token },
+        body: JSON.stringify({
+          one_time_keys: { [user]: { D: 'signed_curve25519' } },
+        }),
+      }),
+    );
+    assertEquals(claim.status, 200);
+    assertEquals((await claim.json()).one_time_keys[user].D, {
+      'signed_curve25519:one': { key: 'once' },
+    });
+    assertEquals(snapshots, 4);
+    assertEquals(claims, 1, 'consuming claim remains one-shot');
+  } finally {
+    release?.();
+    await http.close();
+    await fake.close();
+    setConfigForTests({ federation: previous });
+    resetCaCertsForTests();
+  }
 });
 
 suite.test('single-flight signed snapshot reaches C-S query; malformed and oversized recovery stays stale with durable retry', async () => {

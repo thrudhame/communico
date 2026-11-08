@@ -27,6 +27,9 @@ export async function invalidateDeviceCache(
   tx: Conn,
   user: string,
 ): Promise<void> {
+  await tx.execute('DELETE FROM device_recovery_requests WHERE user_id=?', [
+    user,
+  ]);
   await tx.execute(
     "UPDATE remote_device_users SET stale=1,revision=revision+1,pending='[]',seen='[]',retry_at=0 WHERE user_id=?",
     [user],
@@ -124,6 +127,10 @@ export async function acceptDeviceDelta(
       }
     } else s.stale = true;
     if (s.stale) {
+      await tx.execute(
+        'INSERT INTO device_recovery_requests VALUES(?) ON CONFLICT DO NOTHING',
+        [d.user],
+      );
       s.pending.push({ revision: s.revision, delta: d });
       try {
         limitEntries(s.pending.length, limits.maxkeys);
@@ -140,6 +147,18 @@ export async function acceptDeviceDelta(
 }
 
 export type RecoveryCut = { user: string; revision: number };
+/** Membership creates dormant stale state; only explicit demand or a hint activates retry. */
+export async function requestDeviceRecovery(
+  db: Database,
+  user: string,
+): Promise<void> {
+  await db.tx(async (tx) => {
+    await tx.execute(
+      'INSERT INTO device_recovery_requests SELECT user_id FROM remote_device_users WHERE user_id=? AND stale=1 ON CONFLICT DO NOTHING',
+      [user],
+    );
+  });
+}
 export async function recoveryCut(
   db: Database,
   user: string,
@@ -214,6 +233,9 @@ export async function installDeviceSnapshot(
     s.pending = [];
     s.seen = seen.slice(-limits.maxkeys);
     await writeState(tx, cut.user, s);
+    await tx.execute('DELETE FROM device_recovery_requests WHERE user_id=?', [
+      cut.user,
+    ]);
     await tx.execute(
       'UPDATE remote_device_users SET retry_at=0,failures=0 WHERE user_id=?',
       [cut.user],

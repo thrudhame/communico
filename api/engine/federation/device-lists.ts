@@ -10,13 +10,14 @@ import {
   acceptDeviceDelta,
   installDeviceSnapshot,
   recoveryCut,
+  requestDeviceRecovery,
 } from '#engine/server/remote-devices.ts';
 import { federationRequest } from './client.ts';
 import { type EduState, PermanentEduRefusal } from './edus.ts';
 import { admit } from './gate.ts';
 
 export type DeviceListService = {
-  recover(user: string): Promise<void>;
+  recover(user: string, signal?: AbortSignal): Promise<void>;
   start(): void;
   stop(): Promise<void>;
 };
@@ -33,9 +34,15 @@ export function deviceListService(
   let rescan = false;
   let unlisten: (() => void) | undefined;
 
-  async function recover(user: string): Promise<void> {
+  async function recover(
+    user: string,
+    callerSignal?: AbortSignal,
+  ): Promise<void> {
+    callerSignal?.throwIfAborted();
     const current = inFlight.get(user);
-    if (current !== undefined) return await current;
+    if (current !== undefined) {
+      return await abortable(callerSignal, () => current);
+    }
     const run = (async () => {
       const cut = await recoveryCut(db, user);
       if (cut === null || shutdown.signal.aborted) return;
@@ -47,8 +54,10 @@ export function deviceListService(
         domainOf(id) === tenant.serverName
       );
       if (observer === undefined) return;
+      await requestDeviceRecovery(db, user);
       const signal = AbortSignal.any([
         shutdown.signal,
+        ...(callerSignal ? [callerSignal] : []),
         AbortSignal.timeout(config().federation.timeoutms),
       ]);
       try {
@@ -123,7 +132,7 @@ export function deviceListService(
     rescan = false;
     scan = (async () => {
       const due = await db.query(
-        "SELECT u.user_id FROM remote_device_users u WHERE u.stale=1 AND u.retry_at<=? AND EXISTS (SELECT 1 FROM device_tracking t WHERE t.subject=u.user_id AND t.scope='keys' AND t.end_seq IS NULL AND substr(t.observer,instr(t.observer,':')+1)=?) ORDER BY u.retry_at,u.user_id LIMIT 4",
+        "SELECT u.user_id FROM remote_device_users u JOIN device_recovery_requests r ON r.user_id=u.user_id WHERE u.stale=1 AND u.retry_at<=? AND EXISTS (SELECT 1 FROM device_tracking t WHERE t.subject=u.user_id AND t.scope='keys' AND t.end_seq IS NULL AND substr(t.observer,instr(t.observer,':')+1)=?) ORDER BY u.retry_at,u.user_id LIMIT 4",
         [Date.now(), tenant.serverName],
       );
       await Promise.all(due.map((r) => recover(String(r.user_id))));

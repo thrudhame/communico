@@ -41,7 +41,7 @@ async function waitFor(predicate: () => Promise<boolean> | boolean) {
   }
 }
 
-Deno.test('all-room subscriptions seed empty lists, freeze per-peer chains and recover initial remote keys without an EDU', async () => {
+Deno.test('all-room subscriptions seed empty lists, freeze per-peer chains and recover initial remote keys on demand without an EDU', async () => {
   const dir = await Deno.makeTempDir();
   const previous = config().federation;
   setConfigForTests({
@@ -114,9 +114,8 @@ Deno.test('all-room subscriptions seed empty lists, freeze per-peer chains and r
     recovery.start();
     sender = startSender({ store, signer: tenant.signer() });
     await waitFor(() => attempts.length > 0);
-    await waitFor(async () =>
-      await cachedDeviceKeys(db, bob, [], alice) !== null
-    );
+    assertEquals(snapshots, 0);
+    await recovery.recover(bob);
     assertEquals(snapshots, 1);
     assertEquals((await cachedDeviceKeys(db, bob, [], alice))!.REMOTE, {
       user_id: bob,
@@ -286,7 +285,9 @@ Deno.test('v8 upgrade seeds existing published subscriptions once and preserves 
         version: 8,
         apply: async (db) => {
           await serverSchema.apply(db);
-          await db.exec('DROP TABLE device_subscriptions');
+          await db.exec(
+            'DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions',
+          );
         },
       },
     },
@@ -295,13 +296,10 @@ Deno.test('v8 upgrade seeds existing published subscriptions once and preserves 
     await openTenant(store, 'local.test', { create: true });
     let db = await store.server();
     await db.tx(async (tx) => {
-      await reconcileDeviceRoom(
-        tx,
-        '!old:local',
-        ['@empty:local.test', '@bob:remote.test'],
-        false,
-        null,
-        10,
+      // Seed genuine pre-subscription rows, without executing a newer projector
+      // against an old schema that cannot contain its recovery-intent table.
+      await tx.exec(
+        "INSERT INTO e2ee_rooms VALUES('!old:local',0,NULL,10); INSERT INTO e2ee_room_members VALUES('!old:local','@empty:local.test'),('!old:local','@bob:remote.test'); INSERT INTO device_tracking VALUES('@bob:remote.test','@empty:local.test','keys',1,NULL),('@empty:local.test','@bob:remote.test','keys',1,NULL)",
       );
       await enqueueEdu(tx, 'kept', 'remote.test', 'm.direct_to_device', {
         message_id: 'kept',

@@ -104,12 +104,20 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
       reconcileDeviceRoom(tx, '!shared:local', [observer, user], false, null, 1)
     );
     await acceptDeviceDelta(db, delta(10, []), limits());
+    assertEquals(
+      await db.query('SELECT user_id FROM device_recovery_requests'),
+      [{ user_id: user }],
+    );
     assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
     await store.close();
     store = await openStore(options(dir), {
       schemas: { server: serverSchema, tenant: tenantSchema },
     });
     db = await store.server();
+    assertEquals(
+      await db.query('SELECT user_id FROM device_recovery_requests'),
+      [{ user_id: user }],
+    );
     const cut = await recoveryCut(db, user);
     assert(cut);
     assert(
@@ -166,6 +174,52 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
       false,
     );
     assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('v9 lazy-recovery upgrade retains hinted retries and leaves membership-only state dormant', async () => {
+  const dir = await Deno.makeTempDir();
+  const previous = {
+    version: 9,
+    apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
+      await serverSchema.apply(db);
+      await db.exec('DROP TABLE device_recovery_requests');
+    },
+  };
+  let store = await openStore(options(dir), { schemas: { server: previous } });
+  try {
+    let db = await store.server();
+    await db.exec(
+      "INSERT INTO remote_device_users VALUES('@dormant:r',NULL,1,0,0,0,'[]','[]'),('@hint:r',NULL,1,1,123,1,'[]','[]');",
+    );
+    await store.close();
+    store = await openStore(options(dir), {
+      schemas: { server: serverSchema },
+    });
+    db = await store.server();
+    assertEquals(
+      await db.query('SELECT user_id FROM device_recovery_requests'),
+      [{ user_id: '@hint:r' }],
+    );
+    assertEquals(
+      (await db.query(
+        "SELECT retry_at,failures FROM remote_device_users WHERE user_id='@hint:r'",
+      ))[0],
+      { retry_at: 123, failures: 1 },
+    );
+    await store.close();
+    store = await openStore(options(dir), {
+      schemas: { server: serverSchema },
+    });
+    assertEquals(
+      await (await store.server()).query(
+        'SELECT user_id FROM device_recovery_requests',
+      ),
+      [{ user_id: '@hint:r' }],
+    );
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
@@ -235,7 +289,7 @@ Deno.test('pending and cache overflow stay bounded and stale; supported v7 upgra
         apply: async (db) => {
           await serverSchema.apply(db);
           await db.exec(
-            'DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
+            'DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
           );
         },
       },
@@ -252,7 +306,7 @@ Deno.test('pending and cache overflow stay bounded and stale; supported v7 upgra
     const db = await store.server();
     assertEquals(
       (await db.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-      '9',
+      '10',
     );
     assertEquals(
       (await db.query('SELECT source FROM edu_outbox'))[0].source,
