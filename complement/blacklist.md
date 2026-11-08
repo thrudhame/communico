@@ -47,7 +47,8 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - E2EE: device keys, device lists and to-device delivery run locally and over
   federation. Cross-signing and encrypted key backup are implemented; backup
   replacement consumers run in the corpus.
-- Push (later).
+- Push rules and aggregate counts run; thread notification counts remain
+  scheduled for push stage P2.
 - Federation — rooms landed in M5b (the room-federation files run: joins,
   sends, missing events, invites, event auth, redaction, sync, unreject,
   bans, presence, typing). What stays listed: **M5c territory**
@@ -63,7 +64,6 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
   red under the M5 line, not here.
 - Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in BASELINE.md.
 
-- tests/csapi/push_test.go
 - tests/csapi/thread_notifications_test.go
 - tests/federation_acl_test.go
 - tests/federation_media_content_test.go
