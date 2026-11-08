@@ -370,3 +370,199 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
     resetCaCertsForTests();
   }
 });
+
+suite.test('query and claim deadlines retain local successes, cancel remote work and never start queued origins', async () => {
+  const a = await suite.registerTestUser('key-deadline-client', 'pw');
+  const previous = { federation: { ...config().federation } };
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  const peers: Awaited<ReturnType<typeof startFakeServer>>[] = [];
+  try {
+    for (let n = 0; n < 6; n++) {
+      peers.push(
+        await startFakeServer({
+          ourKeyDoc: () =>
+            Promise.resolve({
+              server_name: theApp().tenant.serverName,
+              verify_keys: {
+                [theApp().tenant.keyId]: { key: theApp().tenant.publicB64 },
+              },
+            }),
+          handlers: (req) => {
+            if (!req.path.includes('/user/keys/')) return null;
+            return (async () => {
+              await new Promise((resolve) => setTimeout(resolve, 500));
+              const claim = req.path.endsWith('/claim');
+              const field = claim ? 'one_time_keys' : 'device_keys';
+              const user = Object.keys((req.json() as Json)[field] as Json)[0];
+              return Response.json({
+                [field]: {
+                  [user]: {
+                    D: claim ? { 'curve25519:late': 'consumed' } : {
+                      user_id: user,
+                      device_id: 'D',
+                      algorithms: [],
+                      keys: {},
+                      signatures: {},
+                    },
+                  },
+                },
+              });
+            })();
+          },
+        }),
+      );
+    }
+    for (const claim of [false, true]) {
+      const field = claim ? 'one_time_keys' : 'device_keys';
+      await post(a.access_token!, 'upload', {
+        device_keys: {
+          user_id: a.user_id,
+          device_id: a.device_id,
+          algorithms: [],
+          keys: {},
+          signatures: {},
+        },
+        one_time_keys: { ['curve25519:' + field]: 'local' },
+      });
+      const before = peers.map((p) => p.requests.length);
+      const started = performance.now();
+      const result = await post(a.access_token!, claim ? 'claim' : 'query', {
+        timeout: 100,
+        [field]: Object.fromEntries([
+          [a.user_id, claim ? { [a.device_id]: 'curve25519' } : []],
+          ...peers.map((
+            p,
+          ) => ['@remote:' + p.name, claim ? { D: 'curve25519' } : []]),
+        ]),
+      });
+      assert(
+        performance.now() - started < 350,
+        'remote work exceeded the client deadline',
+      );
+      assert(
+        (result[field] as KeyResponse['device_keys'])[a.user_id][a.device_id],
+      );
+      assertEquals(
+        Object.keys(result.failures).sort(),
+        peers.map((p) => p.name).sort(),
+      );
+      assertEquals(Object.keys(result[field]), [a.user_id]);
+      const snapshot = JSON.stringify(result);
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assertEquals(
+        JSON.stringify(result),
+        snapshot,
+        'late answer mutated the response',
+      );
+      assertEquals(
+        peers.slice(4).map((p, i) => p.requests.length - before[i + 4]),
+        [0, 0],
+      );
+      for (let n = 0; n < 4; n++) {
+        assert(
+          peers[n].requests.length - before[n] <= 1,
+          'consuming work was retried',
+        );
+      }
+    }
+  } finally {
+    await Promise.all(peers.map((p) => p.close()));
+    setConfigForTests(previous);
+    resetCaCertsForTests();
+  }
+});
+
+suite.test('the same deadline bounds admission and discovery before any consuming dial', async () => {
+  const a = await suite.registerTestUser('key-discovery-deadline', 'pw');
+  const previous = { federation: { ...config().federation } };
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  const fake = await startFakeServer({
+    ourKeyDoc: () =>
+      Promise.resolve({
+        server_name: theApp().tenant.serverName,
+        verify_keys: {
+          [theApp().tenant.keyId]: { key: theApp().tenant.publicB64 },
+        },
+      }),
+  });
+  const server = theApp().server;
+  const query = server.query;
+  try {
+    for (const stage of ['admission', 'discovery']) {
+      let delayed = false;
+      let peerReads = 0;
+      server.query = async function (sql, values) {
+        const target = stage === 'admission'
+          ? sql === 'SELECT pattern FROM federation_blocks'
+          : sql.includes('FROM federation_peers WHERE name = ?') &&
+            ++peerReads === 2;
+        if (target) {
+          delayed = true;
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        return await query.call(this, sql, values);
+      };
+      const started = performance.now();
+      const result = await post(a.access_token!, 'claim', {
+        timeout: 100,
+        one_time_keys: { ['@remote:' + fake.name]: { D: 'curve25519' } },
+      });
+      assert(delayed, 'did not exercise ' + stage);
+      assert(
+        performance.now() - started < 350,
+        stage + ' ignored the deadline',
+      );
+      assert(result.failures[fake.name]);
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assertEquals(
+        fake.requests.length,
+        0,
+        'late discovery started a consuming dial',
+      );
+      server.query = query;
+    }
+  } finally {
+    server.query = query;
+    await fake.close();
+    setConfigForTests(previous);
+    resetCaCertsForTests();
+  }
+});
+
+suite.test('invalid timeout is rejected before local consumption and zero timeout preserves local results', async () => {
+  const a = await suite.registerTestUser('key-timeout-input', 'pw');
+  await post(a.access_token!, 'upload', {
+    one_time_keys: { 'curve25519:safe': 'safe' },
+  });
+  const one_time_keys = {
+    [a.user_id]: { [a.device_id]: 'curve25519' },
+    '@remote:127.0.0.1:1': { D: 'curve25519' },
+  };
+  for (const path of ['query', 'claim']) {
+    for (const timeout of [-1, 0.5, '100', null, Number.MAX_SAFE_INTEGER + 1]) {
+      const response = await suite.matrix(
+        new Request('http://x/_matrix/client/v3/keys/' + path, {
+          method: 'POST',
+          headers: { authorization: 'Bearer ' + a.access_token },
+          body: JSON.stringify({
+            timeout,
+            device_keys: { [a.user_id]: [] },
+            one_time_keys,
+          }),
+        }),
+      );
+      assertEquals(response.status, 400);
+      await response.body?.cancel();
+    }
+  }
+  const claimed = await post(a.access_token!, 'claim', {
+    timeout: 0,
+    one_time_keys,
+  });
+  assertEquals(claimed.one_time_keys[a.user_id][a.device_id], {
+    'curve25519:safe': 'safe',
+  });
+  assert(claimed.failures['127.0.0.1:1']);
+});

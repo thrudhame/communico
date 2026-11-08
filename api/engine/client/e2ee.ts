@@ -19,6 +19,7 @@ import {
 import { federationRequest } from '#engine/federation/client.ts';
 import { keyView } from '#engine/e2ee-key-view.ts';
 import { admit } from '#engine/federation/gate.ts';
+import { abortable } from '#engine/net/abort.ts';
 
 export async function uploadKeys(
   userId: string,
@@ -121,6 +122,17 @@ async function composed(
   const parsed = claim
     ? claimRequest(body, limits)
     : queryRequest(body, limits);
+  const requestedTimeout = object(body, 'body').timeout;
+  const timeout = requestedTimeout === undefined ? 10_000 : requestedTimeout;
+  if (
+    typeof timeout !== 'number' || !Number.isSafeInteger(timeout) || timeout < 0
+  ) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'timeout must be nonnegative integer milliseconds',
+    );
+  }
   const local = parsed.filter(([user]) =>
     domainOf(user) === app.tenant.serverName
   );
@@ -155,45 +167,64 @@ async function composed(
     0,
   );
   const iterator = groups.entries();
-  // Four bounded answers in flight, never one unbounded Promise per user.
-  await Promise.all(
-    Array.from({ length: Math.min(4, groups.size) }, async () => {
-      for (const [origin, requests] of iterator) {
-        try {
-          await admit(app.server, origin, {
-            kind: 'outbound',
-            user: requester,
-            what: claim ? 'claim device keys' : 'query device keys',
-          });
-          const res = await federationRequest(app.server, app.tenant.signer(), {
-            destination: origin,
-            method: 'POST',
-            path: '/_matrix/federation/v1/user/keys/' +
-              (claim ? 'claim' : 'query'),
-            body: new TextEncoder().encode(
-              JSON.stringify({ [field]: Object.fromEntries(requests) }),
-            ),
-            maxBytes: limits.maxrequestbytes,
-          });
-          const answer = remoteKeys(res.json, requests, claim, requester);
-          limitEntries(count + answer.count, limits.maxkeys);
-          const merged = { ...(response[field] as Json), ...answer.keys };
-          const remaining = { ...failures };
-          delete remaining[origin];
-          bounded(
-            { ...response, [field]: merged, failures: remaining },
-            limits.maxrequestbytes,
-          );
-          // No await between budget validation and publication.
-          response[field] = merged;
-          delete failures[origin];
-          count += answer.count;
-        } catch {
-          /* Destination failed; keep its bounded reservation. Claims are never retried. */
-        }
-      }
-    }),
+  const deadline = new AbortController();
+  // Client timeout is a maximum; the configured transport ceiling still applies.
+  const timer = setTimeout(
+    () => deadline.abort(),
+    Math.min(timeout, config().federation.timeoutms, 2_147_483_647),
   );
+  if (timeout === 0) deadline.abort();
+  try {
+    // Four bounded answers in flight, never one unbounded Promise per user.
+    await Promise.all(
+      Array.from({ length: Math.min(4, groups.size) }, async () => {
+        for (const [origin, requests] of iterator) {
+          if (deadline.signal.aborted) break;
+          try {
+            await abortable(deadline.signal, () =>
+              admit(app.server, origin, {
+                kind: 'outbound',
+                user: requester,
+                what: claim ? 'claim device keys' : 'query device keys',
+              }));
+            const res = await federationRequest(
+              app.server,
+              app.tenant.signer(),
+              {
+                destination: origin,
+                method: 'POST',
+                path: '/_matrix/federation/v1/user/keys/' +
+                  (claim ? 'claim' : 'query'),
+                body: new TextEncoder().encode(
+                  JSON.stringify({ [field]: Object.fromEntries(requests) }),
+                ),
+                maxBytes: limits.maxrequestbytes,
+                signal: deadline.signal,
+              },
+            );
+            deadline.signal.throwIfAborted();
+            const answer = remoteKeys(res.json, requests, claim, requester);
+            limitEntries(count + answer.count, limits.maxkeys);
+            const merged = { ...(response[field] as Json), ...answer.keys };
+            const remaining = { ...failures };
+            delete remaining[origin];
+            bounded(
+              { ...response, [field]: merged, failures: remaining },
+              limits.maxrequestbytes,
+            );
+            // No await between budget validation and publication.
+            response[field] = merged;
+            delete failures[origin];
+            count += answer.count;
+          } catch {
+            /* Destination failed; keep its bounded reservation. Claims are never retried. */
+          }
+        }
+      }),
+    );
+  } finally {
+    clearTimeout(timer);
+  }
   return response;
 }
 export async function queryKeys(
