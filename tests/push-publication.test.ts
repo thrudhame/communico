@@ -60,6 +60,10 @@ Deno.test('push publication: v13 migration preserves old feed and receipts witho
         [old.eventId, g.roomId, oldPos],
       );
       await tx.execute("INSERT INTO counters VALUES('events',41)");
+      await tx.execute(
+        'INSERT INTO relations(event,relates_to,rel_type,room,seq) VALUES(?,?,?,?,41)',
+        [old.eventId, g.createId, 'm.reference', g.roomId],
+      );
       await tx.execute('INSERT INTO watermarks VALUES(?,?)', [
         sourceOf(g.roomId),
         mark,
@@ -74,6 +78,10 @@ Deno.test('push publication: v13 migration preserves old feed and receipts witho
       schemas: { room: roomSchema, tenant: tenantSchema, server: serverSchema },
     });
     db = await store.server();
+    assertEquals((await db.query('SELECT event,seq FROM relations'))[0], {
+      event: old.eventId,
+      seq: 41,
+    });
     await project(store, g.roomId);
     assertEquals(
       (await db.query('SELECT COUNT(*) AS n FROM notifications'))[0].n,

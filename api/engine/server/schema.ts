@@ -311,8 +311,20 @@ CREATE TABLE notification_changes(seq INTEGER PRIMARY KEY NOT NULL, user TEXT NO
 CREATE INDEX notification_changes_user ON notification_changes(user,seq);
 `;
 
+// Relation identity includes accepted history; a null seq never enters live
+// relation listings. Keeping one edge owner lets receipt and count classifiers
+// traverse late historical parents without inventing live publication.
+const HISTORY_RELATIONS_SQL = `
+ALTER TABLE relations RENAME TO relations_live;
+CREATE TABLE relations(event TEXT PRIMARY KEY NOT NULL, relates_to TEXT NOT NULL, rel_type TEXT, room TEXT NOT NULL, seq INTEGER);
+INSERT INTO relations SELECT * FROM relations_live;
+DROP TABLE relations_live;
+CREATE INDEX relations_parent ON relations(room,relates_to,seq);
+CREATE TABLE notification_own_events(room TEXT NOT NULL,event TEXT NOT NULL,user TEXT NOT NULL,event_seq INTEGER NOT NULL,PRIMARY KEY(room,event));
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 14,
+  version: 15,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -326,6 +338,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(REMOTE_SIGNING_SQL);
     await db.exec(JOIN_ATTEMPTS_SQL);
     await db.exec(NOTIFICATIONS_SQL);
+    await db.exec(HISTORY_RELATIONS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -339,5 +352,6 @@ export const serverSchema: SchemaProvider = {
     11: (conn) => conn.exec(REMOTE_SIGNING_SQL),
     12: (conn) => conn.exec(JOIN_ATTEMPTS_SQL),
     13: (conn) => conn.exec(NOTIFICATIONS_SQL),
+    14: (conn) => conn.exec(HISTORY_RELATIONS_SQL),
   },
 };

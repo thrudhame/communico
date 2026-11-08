@@ -229,3 +229,43 @@ suite.test('a related main event acknowledges only the requested thread horizon'
   );
   assertEquals((await sync()).unread_notifications, count(0));
 });
+
+suite.test('redaction withdraws unread contributions and wakes a count-only zero', async () => {
+  const a = await suite.registerTestUser('push-redact-a', 'pw');
+  const b = await suite.registerTestUser('push-redact-b', 'pw');
+  const room = String(
+    (await call('createRoom', a.access_token!, { invite: [b.user_id] }))
+      .room_id,
+  );
+  const base = 'rooms/' + encodeURIComponent(room);
+  await call(base + '/join', b.access_token!, {});
+  const event = String(
+    (await call(base + '/send/m.room.message/redact', a.access_token!, {
+      body: 'activity',
+      'm.mentions': { user_ids: [b.user_id] },
+    }, 'PUT')).event_id,
+  );
+  const filter = encodeURIComponent(
+    JSON.stringify({ room: { timeline: { types: ['never'] } } }),
+  );
+  const first = await call('sync?filter=' + filter, b.access_token!);
+  assertEquals(entry(first, room).unread_notifications, count(1, 1));
+  const pending = call(
+    'sync?timeout=3000&filter=' + filter + '&since=' + first.next_batch,
+    b.access_token!,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  await call(
+    base + '/redact/' + encodeURIComponent(event) + '/withdraw',
+    a.access_token!,
+    {},
+    'PUT',
+  );
+  const result = await pending;
+  assertEquals(entry(result, room).unread_notifications, count(0));
+  assertEquals((entry(result, room).timeline as Json).events, []);
+  assert(
+    Number(String(result.next_batch).match(/_n(\d+)/)?.[1]) >
+      Number(String(first.next_batch).match(/_n(\d+)/)?.[1]),
+  );
+});

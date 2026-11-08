@@ -10,9 +10,8 @@
 //
 // History is never news: history/evidence/pending events are indexed
 // without a seq. Only live accepted events (positioned on a stay) enter
-// the feed, relations and search — the old ingest's "seq IS NOT NULL"
-// rule (requirements §4.3 I12), now structurally: the room positions
-// exactly those events.
+// the feed, live relation listings and search. Accepted historical relation
+// edges remain available to the shared classifier without publishing news.
 import type { Change } from '#engine/room/changes.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -26,7 +25,10 @@ import {
   preparePush,
   type PushPublication,
 } from '#engine/server/push-project.ts';
-import { applyPushPublication } from '#engine/server/notifications.ts';
+import {
+  applyPushPublication,
+  reconcileNotificationEvent,
+} from '#engine/server/notifications.ts';
 
 // The watermark source naming a room's change log (storage plan's
 // sources() enumerates these; tests already use this shape).
@@ -87,6 +89,7 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
   const room = await openRoom(store, roomId);
   const source = sourceOf(roomId);
   const localServers = await store.tenants();
+  await seedHistoricalRelations(store, room);
   for (;;) {
     const mark = await get(server, source);
     // A supported schema upgrade seeds at the already projected publication,
@@ -141,11 +144,70 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
         await apply(tx, roomId, item, addedMs, localServers);
       }
       await advance(tx, source, batch[batch.length - 1].pos);
+      await advance(tx, 'push-context:' + roomId, batch[batch.length - 1].pos);
     });
   }
 }
 
 // --- the change payloads ---------------------------------------------------
+
+// Older schemas lacked history edges and implicit-read event identity. Recover
+// those facts from immutable PDUs, then reconcile saved decisions. This never
+// re-evaluates rules or replays live publication/delivery intent.
+async function seedHistoricalRelations(
+  store: Store,
+  room: Room,
+): Promise<void> {
+  const server = await store.server();
+  const source = 'push-context:' + room.id;
+  const mark = await get(server, sourceOf(room.id));
+  if (mark === 0 || await get(server, source) >= mark) return;
+  let cursor = await get(server, source);
+  for (;;) {
+    const page = await server.query(
+      `SELECT event,pos,seq FROM event_index WHERE room=? AND pos>? AND pos<=?
+      AND standing='accepted' AND grounding='grounded' ORDER BY pos LIMIT ?`,
+      [room.id, cursor, mark, BATCH],
+    );
+    const edges = await room.tx(async (tx) => {
+      const out = [];
+      for (const row of page) {
+        const event = String(row.event);
+        const pdu = await tx.events.get(event);
+        if (pdu === null) throw new Error('projected event missing: ' + event);
+        const data = JSON.parse(pdu.pdu) as Record<string, unknown>;
+        out.push({
+          event,
+          relation: relationOf(data),
+          sender: String(data.sender),
+          seq: row.seq === null ? null : Number(row.seq),
+        });
+      }
+      return out;
+    });
+    cursor = page.length < BATCH ? mark : Number(page.at(-1)!.pos);
+    const now = Date.now();
+    await server.tx(async (tx) => {
+      for (const { event, relation, sender, seq } of edges) {
+        if (relation !== null) {
+          await tx.execute(
+            'INSERT INTO relations(event,relates_to,rel_type,room,seq) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
+            [event, relation.relatesTo, relation.relType, room.id, seq],
+          );
+        }
+        if (seq !== null) {
+          await tx.execute(
+            'INSERT INTO notification_own_events(room,event,user,event_seq) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
+            [room.id, event, sender, seq],
+          );
+        }
+        await reconcileNotificationEvent(tx, room.id, event, now);
+      }
+      await advance(tx, source, cursor);
+    });
+    if (cursor === mark) return;
+  }
+}
 
 // The 'event'/'transition'/'history' payloads share one shape (the room's
 // change log writes it verbatim; a 'transition' adds `from`, a 'history'
@@ -321,7 +383,9 @@ async function prepare(
         let relation: { relatesTo: string; relType: string | null } | null =
           null;
         let search: { key: string; text: string } | null = null;
-        if (change.kind !== 'history' && isLive(payload)) {
+        if (
+          payload.standing === 'accepted' && payload.grounding === 'grounded'
+        ) {
           const pdu = await room.tx(async (tx) => {
             const row = await tx.events.get(change.event!);
             return row === null
@@ -330,7 +394,9 @@ async function prepare(
           });
           if (pdu !== null) {
             relation = relationOf(pdu);
-            search = searchTextOf(payload, pdu);
+            if (change.kind !== 'history' && isLive(payload)) {
+              search = searchTextOf(payload, pdu);
+            }
           }
         }
         const ids = change.kind !== 'history' && isLive(payload)
@@ -571,6 +637,7 @@ async function apply(
         ],
       );
       if (isLive(item.payload)) await applyLive(tx, roomId, item, addedMs);
+      else await reconcileNotificationEvent(tx, roomId, change.event!, addedMs);
       await applyPublication(
         tx,
         roomId,
@@ -602,6 +669,7 @@ async function apply(
         ],
       );
       if (isLive(item.payload)) await applyLive(tx, roomId, item, addedMs);
+      else await reconcileNotificationEvent(tx, roomId, change.event!, addedMs);
       await applyPublication(
         tx,
         roomId,
@@ -633,6 +701,8 @@ async function apply(
           item.payload.origin,
         ],
       );
+      await applyRelation(tx, roomId, item);
+      await reconcileNotificationEvent(tx, roomId, change.event!, addedMs);
       return;
     }
     case 'membership': {
@@ -664,6 +734,7 @@ async function apply(
            event = excluded.event, pos = excluded.pos`,
         [item.target, roomId, change.event, change.pos],
       );
+      await reconcileNotificationEvent(tx, roomId, item.target, addedMs);
       if (
         (await tx.query(
           'SELECT 1 FROM e2ee_rooms WHERE room=? AND encryption_event=? AND encrypted=1',
@@ -824,21 +895,8 @@ async function applyLive(
      ) WHERE event = ?`,
     [roomId, item.change.pos, item.change.event],
   );
-  if (item.relation !== null) {
-    await tx.execute(
-      `INSERT INTO relations(event, relates_to, rel_type, room, seq)
-       VALUES(?,?,?,?,(SELECT seq FROM feed WHERE room = ? AND event = ?))
-       ON CONFLICT(event) DO NOTHING`,
-      [
-        item.change.event,
-        item.relation.relatesTo,
-        item.relation.relType,
-        roomId,
-        roomId,
-        item.change.event,
-      ],
-    );
-  }
+  await applyRelation(tx, roomId, item);
+  await reconcileNotificationEvent(tx, roomId, item.change.event!, addedMs);
   if (item.search !== null) {
     await tx.execute(
       `INSERT INTO search(event, room, seq, key, sender, origin_ts, body_lower)
@@ -865,6 +923,28 @@ async function applyLive(
       item.change.pos,
       item.push,
       addedMs,
+    );
+  }
+}
+
+async function applyRelation(
+  tx: Conn,
+  roomId: string,
+  item: Prepared & { kind: 'event' | 'transition' | 'history' },
+): Promise<void> {
+  if (item.relation !== null) {
+    await tx.execute(
+      `INSERT INTO relations(event, relates_to, rel_type, room, seq)
+       VALUES(?,?,?,?,(SELECT seq FROM feed WHERE room = ? AND event = ?))
+        ON CONFLICT(event) DO UPDATE SET seq=COALESCE(relations.seq,excluded.seq)`,
+      [
+        item.change.event,
+        item.relation.relatesTo,
+        item.relation.relType,
+        roomId,
+        roomId,
+        item.change.event,
+      ],
     );
   }
 }
