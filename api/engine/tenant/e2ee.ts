@@ -133,7 +133,10 @@ function material(json: string): string {
   const { signatures: _s, unsigned: _u, ...body } = key;
   return canonicalJson(body);
 }
-async function current(conn: Conn, device: DeviceIdentity): Promise<void> {
+export async function current(
+  conn: Conn,
+  device: DeviceIdentity,
+): Promise<void> {
   const row = await deviceById(conn, device.deviceId, device.localpart);
   if (row === null || row.generation !== device.generation) {
     throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'device no longer exists');

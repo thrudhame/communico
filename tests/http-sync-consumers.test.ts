@@ -64,7 +64,7 @@ suite.test('sync tokens bound messages in both directions and preserve room curs
   await send(1);
   await send(2);
   const first = (await sync(token)).next_batch;
-  assert(/^s\d+_p\d+_t\d+_r\d+_a\d+$/.test(String(first)));
+  assert(/^s\d+_p\d+_t\d+_r\d+_a\d+_d\d+_m\d+_k\d+$/.test(String(first)));
   await send(3);
   await send(4);
   const second = (await sync(token)).next_batch;

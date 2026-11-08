@@ -36,6 +36,7 @@ maxkeys = 1000
 # Unclaimed OTKs per device; reject overflow, never prune accepted keys.
 # COMMUNICO_E2EE_MAXONETIMEKEYS
 maxonetimekeys = 10000
+maxinboxmessages = 10000
 
 [store]
 # Turso files root: server/, rooms/<key>/, tenants/<key>/ beneath it.

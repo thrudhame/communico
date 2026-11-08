@@ -558,6 +558,7 @@ export type ConfigPatch = {
     maxkeybytes?: number;
     maxkeys?: number;
     maxonetimekeys?: number;
+    maxinboxmessages?: number;
   };
   preview?: {
     enabled?: boolean;

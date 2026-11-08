@@ -19,6 +19,14 @@ CREATE TABLE user_device_stream(localpart TEXT PRIMARY KEY NOT NULL, value INTEG
 CREATE TABLE e2ee_changes(pos INTEGER PRIMARY KEY NOT NULL, localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, stream_id INTEGER NOT NULL, payload TEXT NOT NULL);
 `;
 
+const INBOX_SQL = `
+CREATE TABLE to_device_inbox(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, msg_pos INTEGER NOT NULL, source_id TEXT NOT NULL, event_json TEXT NOT NULL, PRIMARY KEY(localpart,device_id,generation,msg_pos), UNIQUE(localpart,device_id,generation,source_id));
+CREATE TABLE to_device_transactions(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, event_type TEXT NOT NULL, txn_id TEXT NOT NULL, PRIMARY KEY(localpart,device_id,generation,event_type,txn_id));
+CREATE TABLE sync_deliveries(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, token_hash TEXT NOT NULL, to_msg_pos INTEGER NOT NULL, PRIMARY KEY(localpart,device_id,generation,token_hash));
+CREATE TABLE device_ack(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, msg_pos INTEGER NOT NULL, PRIMARY KEY(localpart,device_id,generation));
+CREATE TABLE to_device_intents(source_id TEXT PRIMARY KEY NOT NULL, destination TEXT NOT NULL, payload TEXT NOT NULL);
+`;
+
 export const TENANT_SCHEMA_SQL = `
 CREATE TABLE tenant(
   server_name TEXT PRIMARY KEY NOT NULL,
@@ -172,12 +180,14 @@ CREATE INDEX transactions_event ON transactions(localpart, device_id, generation
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 5,
+  version: 6,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
+    await db.exec(INBOX_SQL);
   },
   migrations: {
+    5: (conn) => conn.exec(INBOX_SQL),
     4: (conn) => conn.exec(E2EE_SQL),
     3: async (conn) => {
       await conn.exec(`

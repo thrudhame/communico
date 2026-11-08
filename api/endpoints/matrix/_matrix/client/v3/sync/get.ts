@@ -31,6 +31,7 @@ export default async function (
   return await syncFor({
     userId,
     deviceId,
+    deviceGeneration: context.state.deviceGeneration,
     since,
     timeoutMs,
     filter,

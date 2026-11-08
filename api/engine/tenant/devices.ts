@@ -132,6 +132,10 @@ export async function deleteDevice(
       'one_time_keys',
       'fallback_keys',
       'key_pool_updates',
+      'to_device_inbox',
+      'to_device_transactions',
+      'sync_deliveries',
+      'device_ack',
     ]
   ) {
     await conn.execute(
