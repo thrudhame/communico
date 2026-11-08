@@ -46,28 +46,58 @@ export async function reconcileDeviceRoom(
   encryptionEvent: string | null,
   position: number,
 ): Promise<void> {
-  if (
-    (await tx.query(
-      'SELECT 1 FROM e2ee_rooms WHERE room=? AND publication_pos>=?',
-      [room, position],
-    )).length
-  ) return;
+  const priorRoom = (await tx.query(
+    'SELECT encrypted,publication_pos FROM e2ee_rooms WHERE room=?',
+    [room],
+  ))[0];
+  if (priorRoom && Number(priorRoom.publication_pos) >= position) return;
   const old =
     (await tx.query('SELECT user FROM e2ee_room_members WHERE room=?', [room]))
       .map((r) => String(r.user));
   const affected = [...new Set([...old, ...members])].sort();
+  const oldSet = new Set(old);
+  const newSet = new Set(members);
+  const moved = affected.filter((user) =>
+    oldSet.has(user) !== newSet.has(user)
+  );
+  const encryptionChanged =
+    (Number(priorRoom?.encrypted ?? 0) === 1) !== encrypted;
   await tx.execute(
     'INSERT INTO e2ee_rooms VALUES(?,?,?,?) ON CONFLICT(room) DO UPDATE SET encrypted=excluded.encrypted,encryption_event=excluded.encryption_event,publication_pos=excluded.publication_pos',
     [room, encrypted ? 1 : 0, encryptionEvent, position],
   );
-  await tx.execute('DELETE FROM e2ee_room_members WHERE room=?', [room]);
-  for (const user of members) {
-    await tx.execute('INSERT INTO e2ee_room_members VALUES(?,?)', [room, user]);
+  for (const user of moved) {
+    if (newSet.has(user)) {
+      await tx.execute('INSERT INTO e2ee_room_members VALUES(?,?)', [
+        room,
+        user,
+      ]);
+    } else {
+      await tx.execute(
+        'DELETE FROM e2ee_room_members WHERE room=? AND user=?',
+        [room, user],
+      );
+    }
   }
-  for (const observer of affected) {
-    for (const subject of affected) {
-      if (observer === subject) continue;
-      for (const scope of ['sync', 'keys']) {
+  for (const scope of ['sync', 'keys']) {
+    // Only changed memberships affect all-room sharing; encryption changes
+    // affect every pair in the encrypted scope. Avoid even enumerating the
+    // unchanged cross product on ordinary room publications.
+    const pivots = scope === 'sync' && encryptionChanged ? affected : moved;
+    const pairs = new Map<string, Set<string>>();
+    const add = (observer: string, subject: string) => {
+      if (!pairs.has(observer)) pairs.set(observer, new Set());
+      pairs.get(observer)!.add(subject);
+    };
+    for (const user of pivots) {
+      for (const peer of affected) {
+        if (user === peer) continue;
+        add(user, peer);
+        add(peer, user);
+      }
+    }
+    for (const [observer, subjects] of pairs) {
+      for (const subject of subjects) {
         const prior = await tx.query(
           'SELECT start_seq FROM device_tracking WHERE observer=? AND subject=? AND scope=? AND end_seq IS NULL',
           [observer, subject, scope],

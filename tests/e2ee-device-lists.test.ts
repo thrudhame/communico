@@ -3,9 +3,80 @@ import { openStore } from '#engine/store/index.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { project, sourceOf } from '#engine/server/project.ts';
-import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
+import {
+  deviceListsBetween,
+  deviceStreamMax,
+  reconcileDeviceRoom,
+} from '#engine/server/e2ee.ts';
+import type { Conn } from '#engine/store/db.ts';
 import { bobJoins, genesis } from '#tests/fixtures/genesis.ts';
 import { redactEvent, sendLocal } from '#engine/room/ingest.ts';
+
+Deno.test('E2: publication reconciliation queries only relationship pairs affected by the change', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { server: serverSchema } });
+  try {
+    const server = await store.server();
+    const members = Array.from({ length: 12 }, (_, i) => `@u${i}:test`);
+    await server.tx((tx) =>
+      reconcileDeviceRoom(tx, '!pairs:test', members, true, '$enc', 1)
+    );
+    const reconcile = (users: string[], encrypted: boolean, pos: number) =>
+      server.tx(async (tx) => {
+        let pairQueries = 0;
+        const measured = {
+          query: (sql: string, values?: Parameters<Conn['query']>[1]) => {
+            if (sql.startsWith('SELECT start_seq FROM device_tracking')) {
+              pairQueries++;
+            }
+            return tx.query(sql, values);
+          },
+          execute: tx.execute.bind(tx),
+        } as Conn;
+        await reconcileDeviceRoom(
+          measured,
+          '!pairs:test',
+          users,
+          encrypted,
+          encrypted ? '$enc' : null,
+          pos,
+        );
+        return pairQueries;
+      });
+    const before = await deviceStreamMax(server);
+    assertEquals(await reconcile(members, true, 2), 0);
+    assertEquals(await deviceStreamMax(server), before);
+    assertEquals(
+      await reconcile([...members, '@new:test'], true, 3),
+      members.length * 4,
+    );
+    assertEquals(await reconcile([...members, '@new:test'], false, 4), 13 * 12);
+    const after = await deviceStreamMax(server);
+    assertEquals(
+      await deviceListsBetween(server, members[0], before, after, 'sync'),
+      {
+        changed: [],
+        left: [...members.slice(1), '@new:test'].sort(),
+      },
+    );
+    assertEquals(
+      await deviceListsBetween(server, members[0], before, after, 'keys'),
+      {
+        changed: ['@new:test'],
+        left: [],
+      },
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth and rolls forward once', async () => {
   const dir = await Deno.makeTempDir();
