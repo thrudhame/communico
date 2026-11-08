@@ -23,6 +23,12 @@ socket = ""
 root = "./.media"
 maxbytes = 52428800
 
+[e2ee]
+maxrequestbytes = 1048576
+maxkeybytes = 65536
+maxkeys = 1000
+maxonetimekeys = 10000
+
 [preview]
 enabled = false
 maxbytes = 10485760
@@ -617,7 +623,7 @@ Deno.test('--shell printer quoting', async () => {
   );
 });
 
-Deno.test('48 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('52 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -635,14 +641,15 @@ Deno.test('48 leaves total across the sections (the surface tripwire)', async ()
     ['server', 3],
     ['admin', 1],
     ['media', 2],
+    ['e2ee', 4],
     ['store', 5],
     ['preview', 4],
     ['federation', 33],
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    48,
-    'the whole config surface is 48 leaves - a new leaf belongs in the plan, not just the schema',
+    52,
+    'the whole config surface is 52 leaves, including the E2EE budgets',
   );
 });
 

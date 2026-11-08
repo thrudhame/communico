@@ -10,6 +10,11 @@
 // the meta table and the watermarks; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
 
+const DEVICE_CHANGES_SQL = `
+CREATE TABLE device_changes(seq INTEGER PRIMARY KEY NOT NULL, source TEXT NOT NULL, source_pos INTEGER NOT NULL, subject TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, stream_id INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(source,source_pos));
+CREATE INDEX device_changes_subject ON device_changes(subject,seq);
+`;
+
 export const SERVER_SCHEMA_SQL = `
 -- Derived (S11/S12): rebuilt only by roll-forward replaying the rooms'
 -- change logs, keyed by (room, pos) so a replay changes nothing.
@@ -246,8 +251,10 @@ CREATE TABLE server_key_changes(
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 3,
+  version: 4,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
+    await db.exec(DEVICE_CHANGES_SQL);
   },
+  migrations: { 3: (conn) => conn.exec(DEVICE_CHANGES_SQL) },
 };

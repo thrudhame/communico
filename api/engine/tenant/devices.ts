@@ -4,6 +4,7 @@
 import type { Conn } from '#engine/store/db.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import { appendDeviceChange } from '#engine/tenant/changes.ts';
 
 export type DeviceRow = {
   device_id: string;
@@ -47,6 +48,7 @@ export async function upsertDeviceRow(
     'INSERT INTO devices(device_id, localpart, generation, display_name) VALUES(?,?,?,?)',
     [deviceId, localpart, generation, displayName],
   );
+  await appendDeviceChange(conn, { localpart, deviceId, generation });
 }
 
 export async function deviceById(
@@ -78,10 +80,19 @@ export async function renameDevice(
   localpart: string,
   displayName: string,
 ): Promise<boolean> {
-  return (await conn.execute(
+  const device = await deviceById(conn, deviceId, localpart);
+  if (device === null) return false;
+  if (device.display_name === displayName) return true;
+  await conn.execute(
     'UPDATE devices SET display_name = ? WHERE device_id = ? AND localpart = ?',
     [displayName, deviceId, localpart],
-  )) > 0;
+  );
+  await appendDeviceChange(conn, {
+    localpart,
+    deviceId,
+    generation: device.generation,
+  });
+  return true;
 }
 
 export async function deleteDevice(
@@ -90,6 +101,7 @@ export async function deleteDevice(
   localpart: string,
 ): Promise<void> {
   // Sole device lifecycle deletion: all consumers revoke through this owner.
+  const device = await deviceById(conn, deviceId, localpart);
   const tokens = await conn.query(
     'SELECT token FROM access_tokens WHERE localpart = ? AND device_id = ?',
     [localpart, deviceId],
@@ -114,6 +126,26 @@ export async function deleteDevice(
     'DELETE FROM transactions WHERE localpart = ? AND device_id = ?',
     [localpart, deviceId],
   );
+  for (
+    const table of [
+      'device_keys',
+      'one_time_keys',
+      'fallback_keys',
+      'key_pool_updates',
+    ]
+  ) {
+    await conn.execute(
+      `DELETE FROM ${table} WHERE localpart=? AND device_id=?`,
+      [localpart, deviceId],
+    );
+  }
+  if (device !== null) {
+    await appendDeviceChange(conn, {
+      localpart,
+      deviceId,
+      generation: device.generation,
+    }, true);
+  }
   await conn.execute(
     'DELETE FROM devices WHERE device_id = ? AND localpart = ?',
     [deviceId, localpart],

@@ -21,6 +21,12 @@ export const SCHEMA = {
     root: 'string',
     maxbytes: 'int',
   },
+  e2ee: {
+    maxrequestbytes: 'int',
+    maxkeybytes: 'int',
+    maxkeys: 'int',
+    maxonetimekeys: 'int',
+  },
   store: {
     dir: 'string',
     library: 'string',

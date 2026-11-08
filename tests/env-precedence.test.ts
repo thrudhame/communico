@@ -28,6 +28,12 @@ socket = ""
 root = "./.media"
 maxbytes = 52428800
 
+[e2ee]
+maxrequestbytes = 1048576
+maxkeybytes = 65536
+maxkeys = 1000
+maxonetimekeys = 10000
+
 [preview]
 enabled = false
 maxbytes = 10485760
