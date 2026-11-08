@@ -178,7 +178,7 @@ Deno.test('backup: per-user stored-session/version budgets, no-op etag and bound
       tx.keyBackup.version('b', 'post', undefined, metadata)
     );
     await tenant.tx((tx) => tx.keyBackup.keys('b', 'put', '1', 'r', 's', key));
-    setConfigForTests({ e2ee: { maxrequestbytes: 10 } });
+    setConfigForTests({ e2ee: { maxbackupbytes: 10 } });
     await assertRejects(() =>
       tenant.tx((tx) => tx.keyBackup.keys('a', 'get', '1', 'r', 's'))
     );

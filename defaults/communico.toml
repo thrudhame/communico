@@ -45,6 +45,9 @@ maxdestinationmessages = 1000
 # accepted encrypted keys remain until the user deletes them.
 maxbackupsessions = 100000
 maxbackupversions = 100
+# Serialized whole-backup restore bytes per version, also enforced on writes.
+# Upload requests still use maxrequestbytes/maxkeys. COMMUNICO_E2EE_MAXBACKUPBYTES
+maxbackupbytes = 67108864
 
 [store]
 # Turso files root: server/, rooms/<key>/, tenants/<key>/ beneath it.

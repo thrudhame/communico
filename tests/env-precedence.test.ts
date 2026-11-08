@@ -37,6 +37,7 @@ maxinboxmessages = 10000
 maxdestinationmessages = 1000
 maxbackupsessions = 100000
 maxbackupversions = 100
+maxbackupbytes = 67108864
 
 [preview]
 enabled = false

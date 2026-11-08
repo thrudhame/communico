@@ -19,6 +19,7 @@ const limits: KeyLimits = {
   maxdestinationmessages: 1000,
   maxbackupsessions: 100000,
   maxbackupversions: 100,
+  maxbackupbytes: 67108864,
 };
 const token: StreamToken = {
   eSeq: 0,

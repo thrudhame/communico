@@ -65,6 +65,46 @@ async function stats(conn: Conn, user: string, row: VersionRow) {
   return { count: Number(result[0].n), etag: String(row.etag) };
 }
 
+const encoder = new TextEncoder();
+const bytes = (text: string) => encoder.encode(text).byteLength;
+function backupOverflow(): never {
+  throw new MatrixError(
+    413,
+    'M_TOO_LARGE',
+    'Backup restore byte limit exceeded',
+  );
+}
+
+// Measure the exact whole-backup JSON without loading or parsing ciphertext.
+// This runs in the writing transaction, so every accepted set can be restored
+// without depending on the much smaller individual upload request budget.
+async function assertRestoreCapacity(
+  conn: Conn,
+  user: string,
+  version: number,
+  limits: Limits,
+): Promise<void> {
+  const rows = await conn.query(
+    'SELECT room_id,session_id,length(CAST(payload AS BLOB)) AS payload_bytes FROM backup_sessions WHERE localpart=? AND version_no=? ORDER BY room_id,session_id LIMIT ?',
+    [user, version, limits.maxbackupsessions + 1],
+  );
+  limitEntries(rows.length, limits.maxbackupsessions);
+  let size = bytes('{"rooms":{}}');
+  let previousRoom: string | undefined;
+  for (const row of rows) {
+    const room = String(row.room_id);
+    if (room !== previousRoom) {
+      size += bytes(JSON.stringify(room)) + bytes(':{"sessions":{}}') +
+        (previousRoom === undefined ? 0 : 1);
+    } else size++;
+    size += bytes(JSON.stringify(String(row.session_id))) + 1 +
+      Number(row.payload_bytes);
+    if (size > limits.maxbackupbytes) backupOverflow();
+    previousRoom = room;
+  }
+  if (size > limits.maxbackupbytes) backupOverflow();
+}
+
 export async function backupVersion(
   conn: Conn,
   user: string,
@@ -125,7 +165,7 @@ export async function backupVersion(
     auth_data: JSON.parse(row.auth_data),
     ...await stats(conn, user, row),
   };
-  bounded(result, limits.maxrequestbytes);
+  bounded(result, limits.maxbackupbytes);
   return result;
 }
 function metadata(
@@ -139,6 +179,13 @@ function metadata(
   }
   const auth = object(body.auth_data, 'auth_data');
   bounded(body, limits.maxkeybytes);
+  bounded({
+    version: String(Number.MAX_SAFE_INTEGER),
+    algorithm: body.algorithm,
+    auth_data: auth,
+    count: Number.MAX_SAFE_INTEGER,
+    etag: String(Number.MAX_SAFE_INTEGER),
+  }, limits.maxbackupbytes);
   return { ...body, algorithm: body.algorithm, auth_data: auth };
 }
 function sessionData(input: unknown, limits: Limits): Session {
@@ -265,6 +312,7 @@ export async function backupKeys(
       [user],
     );
     limitEntries(Number(total[0].n), limits.maxbackupsessions);
+    await assertRestoreCapacity(conn, user, row.version_no, limits);
   } else if (action === 'delete') {
     const exists = await conn.query(
       'SELECT 1 FROM backup_sessions WHERE ' + where + ' LIMIT 1',
@@ -278,13 +326,13 @@ export async function backupKeys(
     const rows = await conn.query(
       'SELECT room_id,session_id,payload FROM backup_sessions WHERE ' + where +
         ' ORDER BY room_id,session_id LIMIT ?',
-      [...args, limits.maxkeys + 1],
+      [...args, limits.maxbackupsessions + 1],
     );
-    limitEntries(rows.length, limits.maxkeys);
+    limitEntries(rows.length, limits.maxbackupsessions);
     if (session !== undefined) {
       if (!rows.length) throw missing();
       const result = JSON.parse(String(rows[0].payload));
-      bounded(result, limits.maxrequestbytes);
+      bounded(result, limits.maxbackupbytes);
       return result;
     }
     const rooms: Record<string, { sessions: Json }> = Object.create(null);
@@ -298,7 +346,7 @@ export async function backupKeys(
     const result = room === undefined
       ? { rooms }
       : rooms[room] ?? { sessions: {} };
-    bounded(result, limits.maxrequestbytes);
+    bounded(result, limits.maxbackupbytes);
     return result;
   }
   if (changed) {

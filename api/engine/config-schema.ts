@@ -30,6 +30,7 @@ export const SCHEMA = {
     maxdestinationmessages: 'int',
     maxbackupsessions: 'int',
     maxbackupversions: 'int',
+    maxbackupbytes: 'int',
   },
   store: {
     dir: 'string',

@@ -562,6 +562,7 @@ export type ConfigPatch = {
     maxdestinationmessages?: number;
     maxbackupsessions?: number;
     maxbackupversions?: number;
+    maxbackupbytes?: number;
   };
   preview?: {
     enabled?: boolean;

@@ -235,3 +235,108 @@ suite.test('validation and configured budgets reject atomically without changing
   );
   assertEquals(writes.at(-1)!.count, 1);
 });
+
+suite.test('batched accepted backups restore beyond individual upload count and byte limits', async () => {
+  const a = await suite.registerTestUser('backup-restore', 'pw');
+  const token = a.access_token!;
+  const before = { ...config().e2ee };
+  try {
+    setConfigForTests({ e2ee: { maxkeys: 1, maxrequestbytes: 512 } });
+    await request(token, 'POST', 'version', { algorithm, auth_data: {} });
+    const expected: Json = {};
+    for (let i = 0; i < 4; i++) {
+      const value = key(String(i) + 'x'.repeat(100));
+      expected['s' + i] = value;
+      await request(token, 'PUT', `keys/room/s${i}?version=1`, value);
+    }
+    assertEquals(await request(token, 'GET', 'keys/room?version=1'), {
+      sessions: expected,
+    });
+    assertEquals(await request(token, 'GET', 'keys?version=1'), {
+      rooms: { room: { sessions: expected } },
+    });
+    assertEquals((await request(token, 'GET', 'version/1')).count, 4);
+    setConfigForTests({ e2ee: before });
+    const large = await suite.registerTestUser('backup-default-restore', 'pw');
+    await request(large.access_token!, 'POST', 'version', {
+      algorithm,
+      auth_data: {},
+    });
+    const sessions: Json = {};
+    for (let batch = 0; batch < 2; batch++) {
+      const upload: Json = {};
+      for (let i = 0; i < 550; i++) {
+        const id = 's' + (batch * 550 + i);
+        upload[id] = sessions[id] = key(id + 'x'.repeat(1000));
+      }
+      await request(large.access_token!, 'PUT', 'keys/room?version=1', {
+        sessions: upload,
+      });
+    }
+    assertEquals(await request(large.access_token!, 'GET', 'keys?version=1'), {
+      rooms: { room: { sessions } },
+    });
+  } finally {
+    setConfigForTests({ e2ee: before });
+  }
+});
+
+suite.test('restore byte admission is exact, atomic across granularities and released by deletion', async () => {
+  const a = await suite.registerTestUser('backup-restore-bytes', 'pw');
+  const token = a.access_token!;
+  const before = { ...config().e2ee };
+  const room = 'r"\\\nÄ';
+  const otherRoom = 'other"\\\n';
+  const first = key('x'.repeat(200));
+  const second = key('y'.repeat(200));
+  const expected = {
+    rooms: {
+      [room]: { sessions: { 's"\\\n': first, second } },
+      [otherRoom]: { sessions: { s: second } },
+    },
+  };
+  const limit = new TextEncoder().encode(JSON.stringify(expected)).byteLength;
+  try {
+    setConfigForTests({ e2ee: { maxbackupbytes: limit } });
+    await request(token, 'POST', 'version', { algorithm, auth_data: {} });
+    await request(token, 'PUT', 'keys?version=1', expected);
+    assertEquals(await request(token, 'GET', 'keys?version=1'), expected);
+    const original = await request(token, 'GET', 'version/1');
+    await request(token, 'PUT', 'keys/third?version=1', {
+      sessions: { s: first },
+    }, 413);
+    await request(
+      token,
+      'PUT',
+      `keys/${encodeURIComponent(room)}/${
+        encodeURIComponent('s"\\\n')
+      }?version=1`,
+      key('z'.repeat(202), true),
+      413,
+    );
+    await request(token, 'PUT', 'keys?version=1', {
+      rooms: { third: { sessions: { a: first, b: second } } },
+    }, 413);
+    assertEquals(await request(token, 'GET', 'version/1'), original);
+    assertEquals(await request(token, 'GET', 'keys?version=1'), expected);
+    await request(token, 'PUT', 'version/1', {
+      algorithm,
+      auth_data: { oversized: 'x'.repeat(limit) },
+    }, 413);
+    assertEquals(await request(token, 'GET', 'version/1'), original);
+    await request(
+      token,
+      'DELETE',
+      `keys/${encodeURIComponent(room)}?version=1`,
+    );
+    await request(token, 'PUT', 'keys/third/s?version=1', first);
+    assertEquals(await request(token, 'GET', 'keys?version=1'), {
+      rooms: {
+        [otherRoom]: expected.rooms[otherRoom],
+        third: { sessions: { s: first } },
+      },
+    });
+  } finally {
+    setConfigForTests({ e2ee: before });
+  }
+});
