@@ -59,6 +59,13 @@ backoffmaxmillihours = 256000
 refusedmillihours = 256000
 ungroundedmillihours = 256000
 txnhours = 24
+
+[store]
+dir = "./.store"
+library = "./.native/libturso_ffi.so"
+checkpointlogbytes = 4120000
+maxopenfiles = 256
+idleseconds = 300
 `;
 
 async function writeTree(
@@ -606,7 +613,7 @@ Deno.test('--shell printer quoting', async () => {
   );
 });
 
-Deno.test('41 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('46 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -623,12 +630,13 @@ Deno.test('41 leaves total across the sections (the surface tripwire)', async ()
   assertEquals(counts, [
     ['server', 2],
     ['media', 2],
+    ['store', 5],
     ['preview', 4],
     ['federation', 33],
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    41,
-    'the whole config surface is 41 leaves — a new leaf belongs in the plan, not just the schema',
+    46,
+    'the whole config surface is 46 leaves — a new leaf belongs in the plan, not just the schema',
   );
 });

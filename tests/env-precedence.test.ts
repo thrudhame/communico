@@ -64,6 +64,13 @@ backoffmaxmillihours = 256000
 refusedmillihours = 256000
 ungroundedmillihours = 256000
 txnhours = 24
+
+[store]
+dir = "./.store"
+library = "./.native/libturso_ffi.so"
+checkpointlogbytes = 4120000
+maxopenfiles = 256
+idleseconds = 300
 `;
 
 const CONFIG_PROBE =

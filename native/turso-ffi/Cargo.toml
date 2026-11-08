@@ -1,0 +1,21 @@
+[package]
+name = "turso-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The embedding process owns allocation. Turso's default global mimalloc has
+# invalid TLS after dlopen/worker turnover; retain FTS without that allocator.
+# tools/native-build.sh patches this exact version to the qualified checkout.
+turso = { version = "=0.8.3", default-features = false, features = ["fts"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+serde_json = "1"
+
+[profile.release]
+debug = false
+incremental = false
+panic = "unwind"

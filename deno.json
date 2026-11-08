@@ -4,9 +4,10 @@
   "description": "Matrix Homeserver for the rest of us",
   "version": "0.1.0-dev",
   "tasks": {
+    "native": "sh tools/native-build.sh",
     "check": "deno fmt --check && deno lint && deno check api/ tests/ tools/config.ts",
     "fmt": "deno fmt",
-    "test": "deno test --allow-net --allow-env --allow-read --allow-write --allow-run tests/*.test.ts tests/rulebook/*.test.ts",
+    "test": "deno test --allow-net --allow-env --allow-read --allow-write --allow-run --allow-ffi tests/*.test.ts tests/rulebook/*.test.ts",
     "config": "deno run --allow-env --allow-read tools/config.ts",
     "debug-proxy": "deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
   },

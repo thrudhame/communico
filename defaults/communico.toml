@@ -16,6 +16,22 @@ root = "./.media"
 # COMMUNICO_MEDIA_MAXBYTES (formerly MEDIA_MAX_BYTES)
 maxbytes = 52428800
 
+[store]
+# Turso files root: server/, rooms/<key>/, tenants/<key>/ beneath it.
+# COMMUNICO_STORE_DIR
+dir = "./.store"
+# The native library built by `deno task native`. COMMUNICO_STORE_LIBRARY
+library = "./.native/libturso_ffi.so"
+# Logical-log size in bytes that closes a file's write gate for a
+# checkpoint barrier. COMMUNICO_STORE_CHECKPOINTLOGBYTES
+checkpointlogbytes = 4120000
+# Room/tenant files the open-file pool keeps hot at most.
+# COMMUNICO_STORE_MAXOPENFILES
+maxopenfiles = 256
+# Seconds an unused open file stays hot before the pool closes it.
+# COMMUNICO_STORE_IDLESECONDS
+idleseconds = 300
+
 [preview]
 # URL previews (GET /_matrix/client/v1/media/preview_url). Off until the
 # operator opts in. COMMUNICO_PREVIEW_ENABLED

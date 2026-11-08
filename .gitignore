@@ -13,3 +13,7 @@ complement/baseline.jsonl
 complement/BASELINE.prev.md
 complement/work-*
 complement/.test-status
+# Native engine output/cache and operator database files
+/.native/
+/.native-cache/
+/.store/
