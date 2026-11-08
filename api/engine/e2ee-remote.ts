@@ -50,9 +50,11 @@ export type DeviceDelta = {
   key: Json | null;
   deleted: boolean;
 };
-function entry(raw: unknown, user: string, limits: KeyLimits) {
+function entry(raw: unknown, user: string, limits: KeyLimits, reset = false) {
   const value = object(raw, 'device');
-  if (typeof value.device_id !== 'string' || !value.device_id.length) {
+  if (
+    typeof value.device_id !== 'string' || (!value.device_id.length && !reset)
+  ) {
     throw new Error('invalid device ID');
   }
   if (
@@ -89,7 +91,12 @@ export function deviceDelta(raw: unknown, limits: KeyLimits): DeviceDelta {
   limitEntries(prev.length, limits.maxkeys);
   return {
     user: value.user_id,
-    ...entry(value, value.user_id, limits),
+    ...entry(
+      value,
+      value.user_id,
+      limits,
+      value.deleted === true && prev.length === 0 && value.keys === undefined,
+    ),
     stream: deviceStreamId(value.stream_id),
     prev: [...new Set(prev.map(deviceStreamId))],
     deleted: value.deleted === true,

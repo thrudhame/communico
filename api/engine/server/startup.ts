@@ -9,6 +9,7 @@ import { discover, listRooms, registerRoom } from '#engine/server/registry.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { setTenantProjector } from '#engine/tenant/hooks.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
+import { reconcileDeviceSubscriptions } from '#engine/server/device-federation.ts';
 import type { Store } from '#engine/store/index.ts';
 import { onStartup, type StartupStore } from '#engine/store/watermark.ts';
 
@@ -42,4 +43,13 @@ async function rollForward(store: StartupStore): Promise<void> {
   for (const tenant of await concrete.tenants()) {
     await projectTenant(concrete, tenant);
   }
+  // Supported upgrades can have published relationships before the federation
+  // subscription tables exist. Seed at the projected cut, once and idempotently.
+  const localServers = await concrete.tenants();
+  await server.tx(async (tx) => {
+    const subjects = (await tx.query(
+      "SELECT DISTINCT subject FROM device_tracking WHERE scope='keys' AND end_seq IS NULL",
+    )).map((r) => String(r.subject));
+    await reconcileDeviceSubscriptions(tx, subjects, localServers);
+  });
 }

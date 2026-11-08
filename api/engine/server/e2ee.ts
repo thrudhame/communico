@@ -1,6 +1,7 @@
 import type { Conn, Database } from '#engine/store/db.ts';
 import { nextDeviceSeq } from '#engine/server/device-notices.ts';
 import { invalidateDeviceCache } from '#engine/server/remote-devices.ts';
+import { reconcileDeviceSubscriptions } from '#engine/server/device-federation.ts';
 export {
   nextDeviceSeq,
   publishDeviceChange,
@@ -17,6 +18,7 @@ export async function reconcileDeviceRoom(
   encrypted: boolean,
   encryptionEvent: string | null,
   position: number,
+  localServers: string[] = [],
 ): Promise<void> {
   const priorRoom = (await tx.query(
     'SELECT encrypted,publication_pos FROM e2ee_rooms WHERE room=?',
@@ -105,6 +107,9 @@ export async function reconcileDeviceRoom(
         ]);
       }
     }
+  }
+  if (moved.length) {
+    await reconcileDeviceSubscriptions(tx, affected, localServers);
   }
 }
 

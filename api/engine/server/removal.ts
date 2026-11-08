@@ -19,6 +19,7 @@ export async function finishRoomRemoval(
 ): Promise<number> {
   await store.retireRoom(roomId);
   const db = await store.server();
+  const localServers = await store.tenants();
   const settled = await db.tx(async (tx) => {
     await reconcileDeviceRoom(
       tx,
@@ -27,6 +28,7 @@ export async function finishRoomRemoval(
       false,
       null,
       Number.MAX_SAFE_INTEGER,
+      localServers,
     );
     await tx.execute('DELETE FROM e2ee_rooms WHERE room=?', [roomId]);
     const rows = await tx.query(

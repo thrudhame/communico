@@ -154,6 +154,10 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
     );
     assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
     const leaveCut = (await recoveryCut(db, user))!;
+    const leaveHead = await deviceStreamMax(db);
+    await acceptDeviceDelta(db, delta(2000, []), limits(), 'local.test');
+    assertEquals(await recoveryCut(db, user), leaveCut);
+    assertEquals(await deviceStreamMax(db), leaveHead);
     await db.tx((tx) =>
       reconcileDeviceRoom(tx, '!shared:local', [observer, user], false, null, 3)
     );
@@ -203,6 +207,19 @@ Deno.test('snapshot race replays only provably subsequent deltas and never overw
       Object.keys((await cachedDeviceKeys(db, user, [], observer))!),
       ['NEW'],
     );
+    await acceptDeviceDelta(db, delta(50, []), limits());
+    const overlap = (await recoveryCut(db, user))!;
+    await acceptDeviceDelta(db, delta(60, [50], 'BEFORE'), limits());
+    await acceptDeviceDelta(db, delta(70, [60], 'AT'), limits());
+    await acceptDeviceDelta(db, delta(80, [70], 'AFTER'), limits());
+    assert(
+      await installDeviceSnapshot(db, overlap, snapshot(70, ['AT']), limits()),
+    );
+    const covered = (await cachedDeviceKeys(db, user, [], observer))!;
+    assertEquals(Object.keys(covered).sort(), ['AFTER', 'AT']);
+    assertEquals((covered.AT as { keys: unknown }).keys, {
+      'ed25519:AT': '70',
+    });
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
@@ -218,7 +235,7 @@ Deno.test('pending and cache overflow stay bounded and stale; supported v7 upgra
         apply: async (db) => {
           await serverSchema.apply(db);
           await db.exec(
-            'DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
+            'DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
           );
         },
       },
@@ -235,7 +252,7 @@ Deno.test('pending and cache overflow stay bounded and stale; supported v7 upgra
     const db = await store.server();
     assertEquals(
       (await db.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-      '8',
+      '9',
     );
     assertEquals(
       (await db.query('SELECT source FROM edu_outbox'))[0].source,

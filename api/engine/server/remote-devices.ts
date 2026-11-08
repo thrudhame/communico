@@ -85,8 +85,15 @@ export async function acceptDeviceDelta(
   db: Database,
   d: DeviceDelta,
   limits: KeyLimits,
+  localServer?: string,
 ): Promise<void> {
   await eventStreamTx(db, async (tx) => {
+    if (
+      localServer !== undefined && !(await tx.query(
+        "SELECT 1 FROM device_tracking WHERE subject=? AND scope='keys' AND end_seq IS NULL AND substr(observer,instr(observer,':')+1)=? LIMIT 1",
+        [d.user, localServer],
+      )).length
+    ) return;
     await tx.execute(
       "INSERT INTO remote_device_users VALUES(?,NULL,1,0,0,0,'[]','[]') ON CONFLICT DO NOTHING",
       [d.user],
@@ -159,7 +166,22 @@ export async function installDeviceSnapshot(
       newer.some((p, i) => p.revision !== cut.revision + i + 1)
     ) return false;
     const seen = [snapshot.stream];
-    const remaining = [...newer];
+    // The fetch can include mutations accepted after its local recovery cut.
+    // Walk the snapshot's known causal ancestry, not numeric stream ordering:
+    // all of those hints are already represented by the authoritative cut.
+    const covered = new Set([snapshot.stream]);
+    const byStream = new Map(newer.map((p) => [p.delta.stream, p.delta]));
+    const visit = [snapshot.stream];
+    while (visit.length) {
+      const d = byStream.get(visit.pop()!);
+      if (!d) continue;
+      for (const predecessor of d.prev) {
+        if (covered.has(predecessor)) continue;
+        covered.add(predecessor);
+        visit.push(predecessor);
+      }
+    }
+    const remaining = newer.filter((p) => !covered.has(p.delta.stream));
     const ordered: DeviceDelta[] = [];
     while (remaining.length) {
       const i = remaining.findIndex((p) => compatible(p.delta, seen));

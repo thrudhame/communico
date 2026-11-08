@@ -5,6 +5,7 @@ import { domainOf } from '#engine/ids.ts';
 import { abortable } from '#engine/net/abort.ts';
 import type { Database } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import { onEventStream } from '#engine/server/stream.ts';
 import {
   acceptDeviceDelta,
   installDeviceSnapshot,
@@ -29,6 +30,8 @@ export function deviceListService(
   const shutdown = new AbortController();
   let timer: ReturnType<typeof setInterval> | undefined;
   let scan: Promise<void> | undefined;
+  let rescan = false;
+  let unlisten: (() => void) | undefined;
 
   async function recover(user: string): Promise<void> {
     const current = inFlight.get(user);
@@ -110,9 +113,14 @@ export function deviceListService(
     }
   }
   function wake(): void {
-    if (timer === undefined || scan !== undefined || shutdown.signal.aborted) {
+    if (timer === undefined || shutdown.signal.aborted) {
       return;
     }
+    if (scan !== undefined) {
+      rescan = true;
+      return;
+    }
+    rescan = false;
     scan = (async () => {
       const due = await db.query(
         "SELECT u.user_id FROM remote_device_users u WHERE u.stale=1 AND u.retry_at<=? AND EXISTS (SELECT 1 FROM device_tracking t WHERE t.subject=u.user_id AND t.scope='keys' AND t.end_seq IS NULL AND substr(t.observer,instr(t.observer,':')+1)=?) ORDER BY u.retry_at,u.user_id LIMIT 4",
@@ -122,6 +130,7 @@ export function deviceListService(
     })().catch((e) => console.error(`device-list recovery: ${String(e)}`))
       .finally(() => {
         scan = undefined;
+        if (rescan) wake();
       });
   }
   edus.register('m.device_list_update', async (origin, raw) => {
@@ -142,7 +151,7 @@ export function deviceListService(
     } catch (e) {
       throw new PermanentEduRefusal('M_BAD_JSON', String(e));
     }
-    await acceptDeviceDelta(db, delta, config().e2ee);
+    await acceptDeviceDelta(db, delta, config().e2ee, tenant.serverName);
     wake();
   }, true);
   return {
@@ -150,12 +159,17 @@ export function deviceListService(
     start: () => {
       if (timer === undefined && !shutdown.signal.aborted) {
         timer = setInterval(wake, 1000);
+        unlisten = onEventStream((path) => {
+          if (path === db.path) wake();
+        });
         wake();
       }
     },
     stop: async () => {
       clearInterval(timer);
       timer = undefined;
+      unlisten?.();
+      unlisten = undefined;
       shutdown.abort();
       await scan;
       await Promise.allSettled(inFlight.values());

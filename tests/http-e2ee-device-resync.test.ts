@@ -99,10 +99,10 @@ suite.test('single-flight signed snapshot reaches C-S query; malformed and overs
         }
         const response = {
           user_id: user,
-          stream_id: 10,
+          stream_id: mode === 'covered' ? 50 : 10,
           devices: [{ device_id: 'D', keys: key('D') }],
         };
-        if (mode === 'race') {
+        if (mode === 'race' || mode === 'covered') {
           return (async () => {
             await new Promise<void>((r) => {
               release = r;
@@ -222,8 +222,26 @@ suite.test('single-flight signed snapshot reaches C-S query; malformed and overs
       1,
       'complete cache must serve the C-S consumer without a query dial',
     );
-    // A missing predecessor durably invalidates and periodic recovery resumes it.
     await send(30, [999]);
+    mode = 'covered';
+    const coveredReady = new Promise<void>((r) => {
+      entered = r;
+    });
+    const coveredRecovery = theApp().deviceLists.recover(user);
+    await coveredReady;
+    await send(40, [30], 'OLD');
+    await send(50, [40], 'D');
+    await send(60, [50], 'NEW');
+    release!();
+    await coveredRecovery;
+    assertEquals(Object.keys(await query()).sort(), ['D', 'NEW']);
+    assertEquals(
+      queries,
+      1,
+      'covered updates must not force an origin-query fallback',
+    );
+    // A missing predecessor durably invalidates and periodic recovery resumes it.
+    await send(70, [999]);
     mode = 'good';
     await theApp().server.execute(
       'UPDATE remote_device_users SET retry_at=0 WHERE user_id=?',

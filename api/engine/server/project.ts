@@ -81,6 +81,7 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
   const server = await store.server();
   const room = await openRoom(store, roomId);
   const source = sourceOf(roomId);
+  const localServers = await store.tenants();
   for (;;) {
     const mark = await get(server, source);
     // A supported schema upgrade seeds at the already projected publication,
@@ -109,6 +110,7 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
               roomId,
               { ...ids, members },
               Number(cut[0].pos),
+              localServers,
             )
           );
         }
@@ -130,7 +132,9 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
     const prepared = await prepare(room, store, roomId, batch);
     const addedMs = Date.now();
     await eventStreamTx(server, async (tx) => {
-      for (const item of prepared) await apply(tx, roomId, item, addedMs);
+      for (const item of prepared) {
+        await apply(tx, roomId, item, addedMs, localServers);
+      }
       await advance(tx, source, batch[batch.length - 1].pos);
     });
   }
@@ -529,6 +533,7 @@ async function apply(
   roomId: string,
   item: Prepared,
   addedMs: number,
+  localServers: string[],
 ): Promise<void> {
   const { change } = item;
   switch (item.kind) {
@@ -554,6 +559,7 @@ async function apply(
         item.payload.stay,
         change.pos,
         item.publication,
+        localServers,
       );
       return;
     }
@@ -584,6 +590,7 @@ async function apply(
         item.payload.stay,
         change.pos,
         item.publication,
+        localServers,
       );
       return;
     }
@@ -656,6 +663,7 @@ async function apply(
           false,
           item.target,
           change.pos,
+          localServers,
         );
       }
       return;
@@ -683,6 +691,7 @@ async function applyPublication(
   stay: number | null,
   pos: number,
   publication: Publication | null,
+  localServers: string[],
 ): Promise<void> {
   if (publication === null || stay === null) return;
   const members = publication.members;
@@ -715,7 +724,7 @@ async function applyPublication(
     const seq = first ? cut : (await seqOf(tx, roomId, member.toId)) ?? cut;
     await applyMember(tx, roomId, member.user, member.to, member.toId, seq);
   }
-  await applyDevicePublication(tx, roomId, publication, pos);
+  await applyDevicePublication(tx, roomId, publication, pos, localServers);
 }
 
 async function applyDevicePublication(
@@ -723,6 +732,7 @@ async function applyDevicePublication(
   roomId: string,
   publication: Publication,
   pos: number,
+  localServers: string[],
 ): Promise<void> {
   const redacted = publication.encryption !== null &&
     (await tx.query('SELECT 1 FROM redactions WHERE target=?', [
@@ -735,6 +745,7 @@ async function applyDevicePublication(
     publication.encrypted && !redacted,
     publication.encryption,
     pos,
+    localServers,
   );
 }
 
