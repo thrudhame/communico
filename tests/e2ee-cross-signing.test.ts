@@ -3,6 +3,7 @@ import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
+import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { type SigningUpload, signingUpload } from '#engine/e2ee-signing.ts';
 import { config } from '#engine/config.ts';
@@ -121,11 +122,19 @@ Deno.test('cross-signing: v9 upgrade, restart and owner-only change replay prese
     await projectTenant(store, 'a.test');
     const server = await store.server();
     // A real historical peer relation permits public notices, never private ones.
-    await server.execute(
-      "INSERT INTO device_tracking VALUES(?,?,'keys',0,NULL)",
-      ['@peer:remote.test', '@a:a.test'],
+    await server.tx((tx) =>
+      reconcileDeviceRoom(
+        tx,
+        '!private:a.test',
+        ['@peer:remote.test', '@a:a.test'],
+        false,
+        null,
+        1,
+        ['a.test'],
+      )
     );
     const before = await server.query('SELECT * FROM device_notices');
+    const beforeDelivery = await server.query('SELECT * FROM edu_outbox');
     const secretPair = await generateSigningKeypair() as CryptoKeyPair;
     const secret = b64encodeStd(await exportPublicKeyRaw(secretPair.publicKey));
     const secretJson = {
@@ -166,6 +175,14 @@ Deno.test('cross-signing: v9 upgrade, restart and owner-only change replay prese
         .includes(secret),
     );
     assertEquals(await tenant.tx((tx) => tx.crossSigning.state('a')), expected);
+    assertEquals(
+      await reopened.query('SELECT * FROM edu_outbox'),
+      beforeDelivery,
+    );
+    assert(
+      !JSON.stringify(await reopened.query('SELECT * FROM public_signing_keys'))
+        .includes(secret),
+    );
     await projectTenant(store, 'a.test');
     assertEquals(await reopened.query('SELECT * FROM device_notices'), notices);
     assertEquals(

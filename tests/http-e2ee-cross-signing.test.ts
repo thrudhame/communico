@@ -1,5 +1,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { fedCaller, remoteServer } from '#tests/http-federation.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -174,4 +176,62 @@ suite.test('structure, crypto and collisions reject atomically in both direction
     password: 'pw',
     device_id: second.pub,
   }, 403);
+});
+
+suite.test('federation snapshots expose the same coherent public signing set as key query', async () => {
+  const a = await suite.registerTestUser('sign-snapshot', 'pw');
+  const master = await key(a.user_id, 'master');
+  const self = await key(a.user_id, 'self_signing');
+  const secret = await key(a.user_id, 'user_signing');
+  await signJson(self.json, a.user_id, master.id, master.pair.privateKey);
+  await signJson(secret.json, a.user_id, master.id, master.pair.privateKey);
+  master.json.signatures = { '@hidden:elsewhere': { x: 'private' } };
+  await call(a.access_token!, 'keys/device_signing/upload', {
+    master_key: master.json,
+    self_signing_key: self.json,
+    user_signing_key: secret.json,
+  });
+  const fed = fedCaller(suite.matrix, await remoteServer());
+  const snapshot = await fed(
+    'GET',
+    '/_matrix/federation/v1/user/devices/' + encodeURIComponent(a.user_id),
+  );
+  assertEquals(snapshot.status, 200);
+  const query = await fed('POST', '/_matrix/federation/v1/user/keys/query', {
+    device_keys: { [a.user_id]: [] },
+  });
+  assertEquals(query.status, 200);
+  assertEquals(
+    snapshot.body.master_key,
+    (query.body.master_keys as Json)[a.user_id],
+  );
+  assertEquals(
+    snapshot.body.self_signing_key,
+    (query.body.self_signing_keys as Json)[a.user_id],
+  );
+  assertEquals((snapshot.body.master_key as Json).signatures, {});
+  assert(!JSON.stringify(snapshot.body).includes(secret.pub));
+  assert(!JSON.stringify(query.body).includes(secret.pub));
+});
+
+suite.test('a public signing set that cannot fit one reliable envelope is refused atomically', async () => {
+  const a = await suite.registerTestUser('sign-envelope', 'pw');
+  const master = await key(a.user_id, 'master');
+  const previous = config().federation;
+  try {
+    setConfigForTests({ federation: { bulkmaxbytes: 100 } });
+    await call(a.access_token!, 'keys/device_signing/upload', {
+      master_key: master.json,
+    }, 413);
+    assertEquals((await keys(a.access_token!, a.user_id)).master_keys, {});
+  } finally {
+    setConfigForTests({ federation: previous });
+  }
+  await call(a.access_token!, 'keys/device_signing/upload', {
+    master_key: master.json,
+  });
+  assertEquals(
+    ((await keys(a.access_token!, a.user_id)).master_keys as Json)[a.user_id],
+    { ...master.json, signatures: {} },
+  );
 });

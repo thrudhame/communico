@@ -149,15 +149,17 @@ export async function completeBatch(
   }
   for (const source of batch.sources) {
     const edu = (await tx.query(
-      "SELECT payload FROM edu_outbox WHERE source=? AND destination=? AND edu_type='m.device_list_update'",
+      "SELECT payload,edu_type FROM edu_outbox WHERE source=? AND destination=? AND edu_type IN ('m.device_list_update','m.signing_key_update')",
       [source, destination],
     ))[0];
     if (edu) {
-      const content = JSON.parse(String(edu.payload));
-      await tx.execute(
-        'UPDATE device_subscriptions SET sent_stream=? WHERE subject=? AND destination=? AND (sent_stream IS NULL OR sent_stream<?)',
-        [content.stream_id, content.user_id, destination, content.stream_id],
-      );
+      if (edu.edu_type === 'm.device_list_update') {
+        const content = JSON.parse(String(edu.payload));
+        await tx.execute(
+          'UPDATE device_subscriptions SET sent_stream=? WHERE subject=? AND destination=? AND (sent_stream IS NULL OR sent_stream<?)',
+          [content.stream_id, content.user_id, destination, content.stream_id],
+        );
+      }
       // Publication epochs/tenant watermarks already own replay prevention.
       // This server-owned work needs no cross-file completion marker.
       await tx.execute(

@@ -15,6 +15,7 @@ import * as devices from '#engine/tenant/devices.ts';
 import * as e2ee from '#engine/tenant/e2ee.ts';
 import * as crossSigning from '#engine/tenant/cross-signing.ts';
 import type { SigningUpload } from '#engine/e2ee-signing.ts';
+import { config } from '#engine/config.ts';
 import * as todevice from '#engine/tenant/todevice.ts';
 import type { StreamToken } from '#engine/client/tokens.ts';
 import { tenantE2eeCommitted } from '#engine/tenant/hooks.ts';
@@ -123,6 +124,7 @@ function bind(
             input,
             basis,
             authenticated,
+            config().federation.bulkmaxbytes,
           ),
         ),
     },

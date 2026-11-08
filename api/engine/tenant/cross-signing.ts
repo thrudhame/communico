@@ -10,6 +10,9 @@ import {
   verifySigningKey,
 } from '#engine/e2ee-signing.ts';
 import type { Json } from '#engine/tenant/e2ee.ts';
+import { bounded } from '#engine/tenant/e2ee.ts';
+import { encodeEnvelope } from '#engine/federation-envelope.ts';
+import { domainOf } from '#engine/ids.ts';
 
 export async function signingState(
   conn: Conn,
@@ -86,6 +89,7 @@ export async function uploadSigningKeys(
   input: SigningUpload,
   basis: string,
   authenticated: boolean,
+  maxEnvelopeBytes: number,
 ): Promise<void> {
   const old = await signingState(conn, localpart);
   if (
@@ -160,6 +164,14 @@ export async function uploadSigningKeys(
         payload[usage + '_key'] = keyView(JSON.parse(next[usage]!.json), user);
       }
     }
+    const { kind: _kind, ...publicKeys } = payload;
+    bounded(
+      JSON.parse(encodeEnvelope(domainOf(user)!, Number.MAX_SAFE_INTEGER, [], [{
+        edu_type: 'm.signing_key_update',
+        content: { ...publicKeys, user_id: user },
+      }])),
+      maxEnvelopeBytes,
+    );
   }
   const pos = await nextCounter(conn, 'e2ee_changes');
   await conn.execute('INSERT INTO e2ee_changes VALUES(?,?,?,?,?,?)', [

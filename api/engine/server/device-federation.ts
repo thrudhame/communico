@@ -74,6 +74,19 @@ export async function reconcileDeviceSubscriptions(
           prev_id: [],
         },
       );
+      const signing = (await tx.query(
+        'SELECT payload FROM public_signing_keys WHERE subject=?',
+        [subject],
+      ))[0];
+      if (signing) {
+        await enqueueEdu(
+          tx,
+          'signing-reset:' + JSON.stringify([subject, destination, epoch]),
+          destination,
+          'm.signing_key_update',
+          { ...JSON.parse(String(signing.payload)), user_id: subject },
+        );
+      }
       await tx.execute(
         'INSERT INTO device_subscriptions VALUES(?,?,1,?,?,NULL) ON CONFLICT(subject,destination) DO UPDATE SET active=1,epoch=excluded.epoch,queued_stream=excluded.queued_stream',
         [subject, destination, epoch, stream],
@@ -110,6 +123,34 @@ export async function fanoutDeviceChange(
     await tx.execute(
       'UPDATE device_subscriptions SET queued_stream=? WHERE subject=? AND destination=?',
       [stream, subject, row.destination],
+    );
+  }
+}
+
+/** Keep current public material and immutable fanout in the same projection cut. */
+export async function fanoutSigningChange(
+  tx: Conn,
+  subject: string,
+  pos: number,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  const { kind: _kind, ...publicKeys } = payload;
+  await tx.execute(
+    'INSERT INTO public_signing_keys VALUES(?,?,?) ON CONFLICT(subject) DO UPDATE SET source_pos=excluded.source_pos,payload=excluded.payload',
+    [subject, pos, JSON.stringify(publicKeys)],
+  );
+  for (
+    const row of await tx.query(
+      'SELECT destination FROM device_subscriptions WHERE subject=? AND active=1',
+      [subject],
+    )
+  ) {
+    await enqueueEdu(
+      tx,
+      'signing-change:' + JSON.stringify([subject, pos]),
+      String(row.destination),
+      'm.signing_key_update',
+      { ...publicKeys, user_id: subject },
     );
   }
 }

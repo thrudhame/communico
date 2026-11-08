@@ -286,7 +286,7 @@ Deno.test('v8 upgrade seeds existing published subscriptions once and preserves 
         apply: async (db) => {
           await serverSchema.apply(db);
           await db.exec(
-            'DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions',
+            'DROP TABLE public_signing_keys; DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions',
           );
         },
       },
