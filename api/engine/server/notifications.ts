@@ -318,3 +318,23 @@ export function roomNotificationCounts(
   }
   return total;
 }
+
+/** Split sync is another view of the same exact buckets, including zero clears. */
+export function syncNotificationCounts(
+  buckets: Map<string, Counts> | undefined,
+  threaded: boolean,
+): {
+  unread_notifications: Counts;
+  unread_thread_notifications?: Record<string, Counts>;
+} {
+  if (!threaded) {
+    return { unread_notifications: roomNotificationCounts(buckets) };
+  }
+  return {
+    unread_notifications: buckets?.get('main') ??
+      { notification_count: 0, highlight_count: 0 },
+    unread_thread_notifications: Object.fromEntries(
+      [...buckets ?? []].filter(([thread]) => thread !== 'main'),
+    ),
+  };
+}
