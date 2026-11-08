@@ -45,7 +45,8 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 ## Scheduled (will implement at the named milestone)
 
 - E2EE: device keys, device lists and to-device delivery run locally and over
-  federation. Encrypted key backup remains scheduled for E5.
+  federation. Cross-signing and encrypted key backup are implemented; backup
+  replacement consumers run in the corpus.
 - Push (later).
 - Federation — rooms landed in M5b (the room-federation files run: joins,
   sends, missing events, invites, event auth, redaction, sync, unreject,
@@ -62,7 +63,6 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
   red under the M5 line, not here.
 - Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in BASELINE.md.
 
-- tests/csapi/e2e_key_backup_test.go
 - tests/csapi/push_test.go
 - tests/csapi/thread_notifications_test.go
 - tests/federation_acl_test.go

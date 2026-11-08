@@ -52,6 +52,12 @@ CREATE TABLE key_signatures(signer_localpart TEXT NOT NULL, signer_user TEXT NOT
 CREATE INDEX key_signatures_target ON key_signatures(target_user,target_key);
 `;
 
+const KEY_BACKUP_SQL = `
+CREATE TABLE backup_versions(localpart TEXT NOT NULL, version_no INTEGER NOT NULL, algorithm TEXT NOT NULL, auth_data TEXT NOT NULL, etag INTEGER NOT NULL, deleted INTEGER NOT NULL, PRIMARY KEY(localpart,version_no));
+CREATE INDEX backup_versions_current ON backup_versions(localpart,deleted,version_no);
+CREATE TABLE backup_sessions(localpart TEXT NOT NULL, version_no INTEGER NOT NULL, room_id TEXT NOT NULL, session_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(localpart,version_no,room_id,session_id));
+`;
+
 export const TENANT_SCHEMA_SQL = `
 CREATE TABLE tenant(
   server_name TEXT PRIMARY KEY NOT NULL,
@@ -205,7 +211,7 @@ CREATE INDEX transactions_event ON transactions(localpart, device_id, generation
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 11,
+  version: 12,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -215,8 +221,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(INTENT_DESTINATION_SQL);
     await db.exec(CROSS_SIGNING_SQL);
     await db.exec(KEY_SIGNATURES_SQL);
+    await db.exec(KEY_BACKUP_SQL);
   },
   migrations: {
+    11: (conn) => conn.exec(KEY_BACKUP_SQL),
     10: (conn) => conn.exec(KEY_SIGNATURES_SQL),
     9: (conn) => conn.exec(CROSS_SIGNING_SQL),
     8: (conn) => conn.exec(INTENT_DESTINATION_SQL),

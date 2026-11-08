@@ -276,7 +276,7 @@ Deno.test('E3 v6 tenant upgrade preserves pending payloads, sender admission and
     apply: async (conn: Parameters<typeof tenantSchema.apply>[0]) => {
       await tenantSchema.apply(conn);
       await conn.exec(
-        'DROP TABLE key_signatures; DROP TABLE cross_signing_keys; DROP TABLE inbound_to_device; DROP INDEX to_device_intents_sender; ALTER TABLE to_device_intents DROP COLUMN sender; DROP INDEX to_device_intents_projection; ALTER TABLE to_device_intents DROP COLUMN projected; DROP INDEX to_device_intents_destination;',
+        'DROP TABLE backup_sessions; DROP TABLE backup_versions; DROP TABLE key_signatures; DROP TABLE cross_signing_keys; DROP TABLE inbound_to_device; DROP INDEX to_device_intents_sender; ALTER TABLE to_device_intents DROP COLUMN sender; DROP INDEX to_device_intents_projection; ALTER TABLE to_device_intents DROP COLUMN projected; DROP INDEX to_device_intents_destination;',
       );
     },
   };
@@ -536,7 +536,7 @@ Deno.test('E3 v8 destination admission upgrade retains over-cap accepted intents
     apply: async (conn: Parameters<typeof tenantSchema.apply>[0]) => {
       await tenantSchema.apply(conn);
       await conn.exec(
-        'DROP TABLE key_signatures; DROP TABLE cross_signing_keys; DROP INDEX to_device_intents_destination',
+        'DROP TABLE backup_sessions; DROP TABLE backup_versions; DROP TABLE key_signatures; DROP TABLE cross_signing_keys; DROP INDEX to_device_intents_destination',
       );
     },
   };
@@ -579,7 +579,7 @@ Deno.test('E3 v8 destination admission upgrade retains over-cap accepted intents
     assertEquals(
       (await upgraded.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '11',
+      '12',
     );
     assertEquals(
       (await upgraded.query(

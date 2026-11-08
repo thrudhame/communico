@@ -396,6 +396,7 @@ export async function deactivateUser(
       localpart,
       '@' + localpart + ':' + tenant.serverName,
     );
+    await tx.keyBackup.clear(localpart);
     await tx.users.markDeactivated(localpart);
   });
 }

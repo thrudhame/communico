@@ -30,6 +30,9 @@ maxkeys = 1000
 maxonetimekeys = 10000
 maxinboxmessages = 10000
 maxdestinationmessages = 1000
+maxbackupsessions = 100000
+maxbackupversions = 100
+maxbackupbytes = 67108864
 
 [preview]
 enabled = false
@@ -625,7 +628,7 @@ Deno.test('--shell printer quoting', async () => {
   );
 });
 
-Deno.test('54 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('57 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -643,15 +646,15 @@ Deno.test('54 leaves total across the sections (the surface tripwire)', async ()
     ['server', 3],
     ['admin', 1],
     ['media', 2],
-    ['e2ee', 6],
+    ['e2ee', 9],
     ['store', 5],
     ['preview', 4],
     ['federation', 33],
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    54,
-    'the whole config surface is 54 leaves, including the E2EE budgets',
+    57,
+    'the whole config surface is 57 leaves, including the E2EE budgets',
   );
 });
 

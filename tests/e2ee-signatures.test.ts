@@ -28,7 +28,9 @@ Deno.test('signature overlays: real v10 upgrade and reopen retain verified publi
         version: 10,
         apply: async (db) => {
           await tenantSchema.apply(db);
-          await db.exec('DROP TABLE key_signatures');
+          await db.exec(
+            'DROP TABLE backup_sessions; DROP TABLE backup_versions; DROP TABLE key_signatures',
+          );
         },
       },
     },

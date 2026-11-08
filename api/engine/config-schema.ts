@@ -28,6 +28,9 @@ export const SCHEMA = {
     maxonetimekeys: 'int',
     maxinboxmessages: 'int',
     maxdestinationmessages: 'int',
+    maxbackupsessions: 'int',
+    maxbackupversions: 'int',
+    maxbackupbytes: 'int',
   },
   store: {
     dir: 'string',
