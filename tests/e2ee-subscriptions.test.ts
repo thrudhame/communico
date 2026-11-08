@@ -1,4 +1,5 @@
 import { assert, assertEquals } from '@std/assert';
+import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -284,7 +285,7 @@ Deno.test('v8 upgrade seeds existing published subscriptions once and preserves 
       server: {
         version: 8,
         apply: async (db) => {
-          await serverSchema.apply(db);
+          await db.exec(SERVER_V13);
           await db.exec(
             'DROP TABLE federation_join_attempts; DROP TABLE remote_signing_keys; DROP TABLE public_signing_keys; DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions',
           );

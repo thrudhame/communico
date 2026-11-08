@@ -173,3 +173,63 @@ suite.test('rules and ignored users affect future publication, not saved decisio
     highlight_count: 0,
   });
 });
+
+suite.test('room profiles, live joined count and event-context notification power drive decisions', async () => {
+  const a = await suite.registerTestUser('push-context-a', 'pw');
+  const b = await suite.registerTestUser('push-context-b', 'pw');
+  const c = await suite.registerTestUser('push-context-c', 'pw');
+  await call(
+    'profile/' + encodeURIComponent(b.user_id) + '/displayname',
+    b.access_token!,
+    { displayname: 'GlobalOnly' },
+    'PUT',
+  );
+  const room = String(
+    (await call('createRoom', a.access_token!, {
+      invite: [b.user_id, c.user_id],
+    })).room_id,
+  );
+  const base = 'rooms/' + encodeURIComponent(room);
+  await call(base + '/join', b.access_token!, {});
+  await call(
+    base + '/state/m.room.member/' + encodeURIComponent(b.user_id),
+    b.access_token!,
+    { membership: 'join', displayname: 'RoomOnly' },
+    'PUT',
+  );
+  const send = (token: string, txn: string, body: string) =>
+    call(base + '/send/m.room.message/' + txn, token, {
+      msgtype: 'm.text',
+      body,
+    }, 'PUT');
+  await send(a.access_token!, 'room-profile', 'hello RoomOnly');
+  await send(a.access_token!, 'global-profile', 'hello GlobalOnly');
+  assertEquals(counts(await sync(b.access_token!), room), {
+    notification_count: 2,
+    highlight_count: 1,
+  });
+  await send(a.access_token!, 'owner-power', '@room');
+  assertEquals(counts(await sync(b.access_token!), room), {
+    notification_count: 3,
+    highlight_count: 2,
+  });
+  await call(base + '/join', c.access_token!, {});
+  await send(c.access_token!, 'ordinary-power', '@room');
+  assertEquals(counts(await sync(b.access_token!), room), {
+    notification_count: 4,
+    highlight_count: 2,
+  });
+  await call('pushrules/global/override/three-members', b.access_token!, {
+    conditions: [{ kind: 'room_member_count', is: '3' }],
+    actions: [],
+  }, 'PUT');
+  await send(
+    a.access_token!,
+    'three-members',
+    'silent at the actual live joined count',
+  );
+  assertEquals(counts(await sync(b.access_token!), room), {
+    notification_count: 4,
+    highlight_count: 2,
+  });
+});

@@ -15,6 +15,11 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import { verify } from '#engine/room/verify.ts';
 import { project, sourceOf } from '#engine/server/project.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
+import {
+  notificationSnapshot,
+  roomNotificationCounts,
+} from '#engine/server/notifications.ts';
 import { get } from '#engine/store/watermark.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { bobJoins, genesis, PL_DEFAULTS } from './fixtures/genesis.ts';
@@ -26,6 +31,7 @@ import {
   remoteEvent,
 } from './fixtures/remote.ts';
 import { fakeMessage, makeFakeRoom } from './fixtures/remote-room.ts';
+import { testRemoteServer } from './fixtures/signer.ts';
 
 const config = (dir: string) => ({
   dir,
@@ -40,9 +46,14 @@ async function withStore(
 ): Promise<void> {
   const dir = await Deno.makeTempDir();
   const store = await openStore(config(dir), {
-    schemas: { room: roomSchema, server: serverSchema },
+    schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
   });
   try {
+    const tenant = await openTenant(store, 'test', { create: true });
+    await tenant.tx(async (tx) => {
+      await tx.users.insert('dev', 'Dev');
+      await tx.users.insert('bob', 'Bob');
+    });
     await fn(store);
   } finally {
     await store.close();
@@ -427,6 +438,14 @@ Deno.test('project: a rejected event is indexed without a feed row', async () =>
         .length,
       0,
     );
+    assertEquals(
+      (await rows(
+        store,
+        'SELECT COUNT(*) AS n FROM push_evaluations WHERE event=?',
+        [bad.eventId],
+      ))[0].n,
+      0,
+    );
   });
 });
 
@@ -536,6 +555,14 @@ Deno.test('project: a pending remote event grounds as a transition (feed row, se
     assertEquals(before[0].standing, 'rejected');
     assertEquals(before[0].grounding, 'pending');
     assertEquals(before[0].seq, null);
+    assertEquals(
+      (await rows(
+        store,
+        'SELECT COUNT(*) AS n FROM push_evaluations WHERE event=?',
+        [String(orphan.event_id)],
+      ))[0].n,
+      0,
+    );
     // deliver the missing prev: the orphan grounds via resumeWaits
     const fetch2 = fakeFetcher({ missingEvents: [] });
     deps.fetcher = fetch2.fetcher;
@@ -562,6 +589,21 @@ Deno.test('project: a pending remote event grounds as a transition (feed row, se
     );
     assertEquals(feedRow.length, 1);
     assertEquals(after[0].seq, feedRow[0].seq);
+    const snapshot = await (await store.server()).tx((tx) =>
+      notificationSnapshot(tx, '@dev:test', 0)
+    );
+    assertEquals(roomNotificationCounts(snapshot.rooms.get(g.roomId)), {
+      notification_count: 2,
+      highlight_count: 0,
+    });
+    assertEquals(
+      (await rows(
+        store,
+        'SELECT COUNT(*) AS n FROM notifications WHERE event=? AND user=?',
+        [String(orphan.event_id), '@dev:test'],
+      ))[0].n,
+      1,
+    );
     // the remote events get no delivery intent (we do not forward)
     assertEquals(
       (await rows(store, `SELECT COUNT(*) AS n FROM outbox`))[0].n,
@@ -573,8 +615,22 @@ Deno.test('project: a pending remote event grounds as a transition (feed row, se
 Deno.test('project: history is indexed without a seq and never feeds news', async () => {
   await withStore(async (store) => {
     // the fake remote room: genesis lives here, the page backfills
-    const fr = await makeFakeRoom({ roomId: '!p7:remote.test' });
-    const genesisIds = [...fr.events.values()].slice(0, 5);
+    const fr = await makeFakeRoom({
+      roomId: '!p7:test',
+      server: await testRemoteServer(),
+    });
+    await fr.addEvent({
+      type: 'm.room.member',
+      state_key: '@bob:test',
+      content: { membership: 'invite' },
+    });
+    await fr.addEvent({
+      type: 'm.room.member',
+      sender: '@bob:test',
+      state_key: '@bob:test',
+      content: { membership: 'join' },
+    });
+    const genesisIds = [...fr.events.values()].slice(0, 7);
     await fakeMessage(fr, 'old 1');
     await fakeMessage(fr, 'old 2');
     const tip = await fakeMessage(fr, 'at the gap');
@@ -665,7 +721,8 @@ Deno.test('project: history is indexed without a seq and never feeds news', asyn
       `SELECT COUNT(*) AS n FROM feed WHERE room = ?`,
       [room.id],
     );
-    const liveCount = 5 /* genesis live */ + 2 /* gap tip + the pushed tip */;
+    const liveCount = 7 /* genesis + invite/join */ +
+      2 /* gap tip + pushed tip */;
     assertEquals(Number(feedCount[0].n), liveCount);
     assertEquals(
       (await rows(store, `SELECT COUNT(*) AS n FROM outbox`))[0].n,
@@ -679,12 +736,63 @@ Deno.test('project: history is indexed without a seq and never feeds news', asyn
       search.some((row) => row.event === history[0].event),
       false,
     );
+    const snapshot = await (await store.server()).tx((tx) =>
+      notificationSnapshot(tx, '@bob:test', 0)
+    );
+    assertEquals(roomNotificationCounts(snapshot.rooms.get(room.id)), {
+      notification_count: 2,
+      highlight_count: 0,
+    });
+    assertEquals(
+      (await rows(store, 'SELECT event FROM push_evaluations WHERE event=?', [
+        String(history[0].event),
+      ])).length,
+      0,
+    );
+  });
+});
+
+Deno.test('push projection: a soft-failed event with a valid earlier DAG context never notifies', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!push-soft:test' });
+    const oldTip = await bobJoins(g);
+    await sendLocal(g.room, {
+      type: 'm.room.member',
+      state_key: '@bob:test',
+      sender: g.creator,
+      content: { membership: 'ban' },
+    }, g.signer);
+    const soft = await sendLocal(g.room, {
+      type: 'm.room.message',
+      sender: '@bob:test',
+      prev_events: [oldTip],
+      content: { msgtype: 'm.text', body: 'not live' },
+    }, g.signer);
+    assertEquals(soft.standing, 'soft_failed');
+    await project(store, g.roomId);
+    assertEquals(
+      (await rows(
+        store,
+        'SELECT COUNT(*) AS n FROM push_evaluations WHERE event=?',
+        [soft.eventId],
+      ))[0].n,
+      0,
+    );
+    assertEquals(
+      (await rows(
+        store,
+        'SELECT COUNT(*) AS n FROM notifications WHERE event=?',
+        [soft.eventId],
+      ))[0].n,
+      0,
+    );
   });
 });
 
 Deno.test('project: more than 500 changes project in batches, in order', async () => {
   await withStore(async (store) => {
     const g = await genesis(store, { roomId: '!p8:test' });
+    await bobJoins(g);
     for (let i = 0; i < 300; i++) {
       await sendLocal(g.room, {
         type: 'm.room.message',
@@ -703,8 +811,15 @@ Deno.test('project: more than 500 changes project in batches, in order', async (
       `SELECT seq, pos FROM feed WHERE room = ? ORDER BY seq`,
       [g.roomId],
     );
-    // 5 genesis events + 300 messages, seq and pos strictly increasing
-    assertEquals(feed.length, 305);
+    // 5 genesis events + invite/join + 300 messages, strictly increasing.
+    assertEquals(feed.length, 307);
+    const snapshot = await server.tx((tx) =>
+      notificationSnapshot(tx, '@bob:test', 0)
+    );
+    assertEquals(roomNotificationCounts(snapshot.rooms.get(g.roomId)), {
+      notification_count: 300,
+      highlight_count: 0,
+    });
     for (let i = 1; i < feed.length; i++) {
       assert(Number(feed[i].seq) > Number(feed[i - 1].seq));
       assert(Number(feed[i].pos) > Number(feed[i - 1].pos));
@@ -713,5 +828,69 @@ Deno.test('project: more than 500 changes project in batches, in order', async (
     await project(store, g.roomId);
     const max = await rows(store, `SELECT MAX(seq) AS m FROM feed`);
     assertEquals(Number(max[0].m), Number(feed[feed.length - 1].seq));
+    const replay = await server.tx((tx) =>
+      notificationSnapshot(tx, '@bob:test', 0)
+    );
+    assertEquals(roomNotificationCounts(replay.rooms.get(g.roomId)), {
+      notification_count: 300,
+      highlight_count: 0,
+    });
+  });
+});
+
+Deno.test('push projection: a later rejoin does not grant eligibility at an earlier live cut', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!push-visibility:test' });
+    await bobJoins(g);
+    await sendLocal(g.room, {
+      type: 'm.room.history_visibility',
+      state_key: '',
+      sender: g.creator,
+      content: { history_visibility: 'joined' },
+    }, g.signer);
+    await sendLocal(g.room, {
+      type: 'm.room.member',
+      state_key: '@bob:test',
+      sender: '@bob:test',
+      content: { membership: 'leave' },
+    }, g.signer);
+    const hidden = await sendLocal(g.room, {
+      type: 'm.room.message',
+      sender: g.creator,
+      content: {
+        msgtype: 'm.text',
+        body: 'not a notification for the later rejoiner',
+      },
+    }, g.signer);
+    await bobJoins(g, '@bob:test', 2000);
+    const visible = await sendLocal(g.room, {
+      type: 'm.room.message',
+      sender: g.creator,
+      content: { msgtype: 'm.text', body: 'after the rejoin' },
+    }, g.signer);
+    await project(store, g.roomId);
+    const snapshot = await (await store.server()).tx((tx) =>
+      notificationSnapshot(tx, '@bob:test', 0)
+    );
+    assertEquals(roomNotificationCounts(snapshot.rooms.get(g.roomId)), {
+      notification_count: 1,
+      highlight_count: 0,
+    });
+    assertEquals(
+      (await rows(
+        store,
+        'SELECT event FROM notifications WHERE user=? AND read_ms IS NULL',
+        ['@bob:test'],
+      )).map((r) => r.event),
+      [visible.eventId],
+    );
+    assertEquals(
+      (await rows(
+        store,
+        'SELECT event FROM push_evaluations WHERE user=? AND event=?',
+        ['@bob:test', hidden.eventId],
+      )).length,
+      0,
+    );
   });
 });
