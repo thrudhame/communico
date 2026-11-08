@@ -62,7 +62,7 @@ Deno.test('review identity: a second create cannot replace state; original redel
         g.signer,
         version,
       );
-      const result = await ingestLocal(g.room, replacement);
+      const result = await ingestLocal(g.room, replacement, signer.serverName);
       assertEquals(result.standing, 'rejected');
       assertEquals(result.receipt, false);
       await g.room.tx(async (tx) => {
@@ -73,7 +73,7 @@ Deno.test('review identity: a second create cannot replace state; original redel
         assertEquals(await tx.events.get(g.createId), before.original);
       });
       const original = JSON.parse(before.original!.pdu) as Pdu;
-      const receipt = await ingestLocal(g.room, original);
+      const receipt = await ingestLocal(g.room, original, signer.serverName);
       assertEquals(receipt.receipt, true);
       assertEquals(receipt.standing, 'accepted');
       // Only the rejected replacement adds an event change, never a publication.
@@ -94,7 +94,7 @@ Deno.test('review identity: a second create cannot replace state; original redel
         version,
       );
       assertEquals(
-        (await ingestLocal(g.room, foreignVersion)).standing,
+        (await ingestLocal(g.room, foreignVersion, signer.serverName)).standing,
         'rejected',
       );
     }

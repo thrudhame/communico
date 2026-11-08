@@ -28,6 +28,7 @@ import {
   ungroundedPrevs,
 } from '#engine/room/build.ts';
 import { fetchOrNull, type RemoteDeps } from '#engine/room/deps.ts';
+import { projectAfterWrite } from '#engine/room/hooks.ts';
 import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -585,6 +586,7 @@ export async function ingestRemote(
     return false;
   });
   if (hasWaiters) await resumeWaits(room, { self: deps.self });
+  await projectAfterWrite(room.store, room.id);
 
   return outcomes.map((outcome) =>
     outcome ?? outcomeOf(null, 'refused', 'E_OUTCOME_MISSING')

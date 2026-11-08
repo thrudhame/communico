@@ -102,6 +102,45 @@ export class Pool {
     }
   }
 
+  // The ids recorded on disk for one kind (the server stage's startup
+  // discovery): every directory's file is opened, its id row read, then
+  // released. Files already pooled stay pooled (the open dedups by path).
+  async list(kind: FileKind): Promise<string[]> {
+    const parent = join(this.root, kind);
+    const entries: Deno.DirEntry[] = [];
+    try {
+      for await (const entry of Deno.readDir(parent)) entries.push(entry);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) return [];
+      throw error;
+    }
+    const ids: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory || entry.name.endsWith('.new')) continue;
+      const files = databaseFiles(directory(this.root, kind, entry.name));
+      let db: Db;
+      try {
+        db = await Db.open(
+          this.ffi,
+          files.database,
+          this.options.checkpointlogbytes,
+        );
+      } catch (error) {
+        if (error instanceof Deno.errors.NotFound) continue;
+        throw error;
+      }
+      try {
+        const rows = await db.query('SELECT value FROM id');
+        if (rows.length === 1 && typeof rows[0].value === 'string') {
+          ids.push(rows[0].value);
+        }
+      } finally {
+        await db.close();
+      }
+    }
+    return ids;
+  }
+
   // Initialize before safe-create publishes the file. The callback cannot
   // expose the staged handle; on rejection the store removes its own stage.
   async initialize<T>(

@@ -13,6 +13,7 @@ import { getRulebook } from '#engine/rulebook/index.ts';
 import { validAdditionalCreators } from '#engine/rulebook/auth-rules.ts';
 import { parsePowerLevels } from '#engine/rulebook/power-levels.ts';
 import { buildCreate, buildInTx } from '#engine/room/build.ts';
+import { projectAfterWrite, registerCreatedRoom } from '#engine/room/hooks.ts';
 import { initializeRoom, openRoom } from '#engine/room/index.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -291,7 +292,7 @@ export async function createRoom(
     );
   }
 
-  return await withRoomLock(
+  const created = await withRoomLock(
     finalRoomId,
     () =>
       initializeRoom(store, finalRoomId, async (tx) => {
@@ -307,7 +308,9 @@ export async function createRoom(
             content,
             origin_server_ts: Date.now(),
           }, signer);
-          const res = await ingestInTx(tx, finalRoomId, pdu);
+          const res = await ingestInTx(tx, finalRoomId, pdu, {
+            self: signer.serverName,
+          });
           if (res.standing !== 'accepted') {
             throw new Error(
               `E_CREATE_ROOM_REJECT: ${res.reason}${
@@ -321,7 +324,9 @@ export async function createRoom(
         // 1. m.room.create - with the stay and every later initial event.
         const empty = await tx.materialize.newGroup(null, []);
         await tx.segments.create({ kind: 'stay', opening_group: empty });
-        const res = await ingestInTx(tx, finalRoomId, createPdu);
+        const res = await ingestInTx(tx, finalRoomId, createPdu, {
+          self: signer.serverName,
+        });
         if (res.standing !== 'accepted') {
           throw new Error('E_CREATE_ROOM_REJECT: create ' + res.reason);
         }
@@ -399,4 +404,9 @@ export async function createRoom(
         };
       }),
   );
+  // Only the complete committed file is discoverable. Registry and feed
+  // projection follow it; startup can recover an interrupted projection.
+  await registerCreatedRoom(store, finalRoomId);
+  await projectAfterWrite(store, finalRoomId);
+  return created;
 }

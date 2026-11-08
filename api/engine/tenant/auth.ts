@@ -1,0 +1,306 @@
+// api/engine/tenant/auth.ts — access and refresh tokens. The old code
+// stored tokens plain (doltgres:api/engine/tenant.ts); this module stores
+// only the hex sha-256 of each token (plan §3) — the plain token leaves
+// the server only at issue time. Refresh rotation (D8/3h): consuming a
+// refresh token revokes the pair's access token, deletes the old refresh
+// row and issues a NEW access+refresh pair for the SAME device. Unknown
+// refresh token → 401 M_UNKNOWN_TOKEN (refresh.yaml:89-101).
+import type { Conn } from '#engine/store/db.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import type { Tenant } from '#engine/tenant/index.ts';
+
+// The informational access-token lifetime advertised at refresh (band C
+// D8: expires_in_ms is advertised, never enforced — spec: optional).
+export const REFRESH_LIFETIME_MS = 3_600_000;
+
+/** The localpart of a full MXID (@localpart:server). */
+export function localpartOf(userId: string): string {
+  return userId.slice(1, userId.lastIndexOf(':'));
+}
+
+/** The stored form of a token: lowercase hex sha-256. */
+export async function hashToken(token: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(token),
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+export type TokenInfo = {
+  localpart: string;
+  user_id: string;
+  device_id: string | null;
+  // band C (D8): informational expiry (nullable; never enforced)
+  expires_ms: number | null;
+};
+
+// --- conn-level rows (bound on TenantTx) -----------------------------------
+
+export async function insertAccessToken(
+  conn: Conn,
+  hash: string,
+  localpart: string,
+  deviceId: string | null,
+  expiresMs: number | null,
+): Promise<void> {
+  await conn.execute(
+    'INSERT INTO access_tokens (token, localpart, device_id, expires_ms) VALUES (?, ?, ?, ?) ON CONFLICT (token) DO NOTHING',
+    [hash, localpart, deviceId, expiresMs],
+  );
+}
+
+export type AccessTokenRow = {
+  token: string;
+  localpart: string;
+  device_id: string | null;
+  expires_ms: number | null;
+};
+
+function accessRow(row: Record<string, unknown>): AccessTokenRow {
+  return {
+    token: String(row.token),
+    localpart: String(row.localpart),
+    device_id: row.device_id == null ? null : String(row.device_id),
+    expires_ms: row.expires_ms == null ? null : Number(row.expires_ms),
+  };
+}
+
+export async function accessTokenByHash(
+  conn: Conn,
+  hash: string,
+): Promise<AccessTokenRow | null> {
+  const rows = await conn.query(
+    'SELECT token, localpart, device_id, expires_ms FROM access_tokens WHERE token = ?',
+    [hash],
+  );
+  return rows.length === 0 ? null : accessRow(rows[0]);
+}
+
+export async function accessTokensOfUser(
+  conn: Conn,
+  localpart: string,
+): Promise<AccessTokenRow[]> {
+  const rows = await conn.query(
+    'SELECT token, localpart, device_id, expires_ms FROM access_tokens WHERE localpart = ?',
+    [localpart],
+  );
+  return rows.map(accessRow);
+}
+
+export async function accessTokensOfDevice(
+  conn: Conn,
+  deviceId: string,
+): Promise<AccessTokenRow[]> {
+  const rows = await conn.query(
+    'SELECT token, localpart, device_id, expires_ms FROM access_tokens WHERE device_id = ?',
+    [deviceId],
+  );
+  return rows.map(accessRow);
+}
+
+export async function deleteAccessToken(
+  conn: Conn,
+  hash: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM access_tokens WHERE token = ?', [hash]);
+}
+
+export async function deleteAccessTokensOfUser(
+  conn: Conn,
+  localpart: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM access_tokens WHERE localpart = ?', [
+    localpart,
+  ]);
+}
+
+export async function insertRefreshToken(
+  conn: Conn,
+  hash: string,
+  localpart: string,
+  deviceId: string | null,
+  accessHash: string,
+): Promise<void> {
+  await conn.execute(
+    'INSERT INTO refresh_tokens (token, localpart, device_id, access_token) VALUES (?, ?, ?, ?)',
+    [hash, localpart, deviceId, accessHash],
+  );
+}
+
+export type RefreshTokenRow = {
+  localpart: string;
+  device_id: string | null;
+  access_token: string;
+};
+
+export async function refreshTokenByHash(
+  conn: Conn,
+  hash: string,
+): Promise<RefreshTokenRow | null> {
+  const rows = await conn.query(
+    'SELECT localpart, device_id, access_token FROM refresh_tokens WHERE token = ?',
+    [hash],
+  );
+  if (rows.length === 0) return null;
+  return {
+    localpart: String(rows[0].localpart),
+    device_id: rows[0].device_id == null ? null : String(rows[0].device_id),
+    access_token: String(rows[0].access_token),
+  };
+}
+
+export async function deleteRefreshToken(
+  conn: Conn,
+  hash: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM refresh_tokens WHERE token = ?', [hash]);
+}
+
+export async function deleteRefreshForAccessToken(
+  conn: Conn,
+  accessHash: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM refresh_tokens WHERE access_token = ?', [
+    accessHash,
+  ]);
+}
+
+export async function deleteRefreshTokensOfUser(
+  conn: Conn,
+  localpart: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM refresh_tokens WHERE localpart = ?', [
+    localpart,
+  ]);
+}
+
+// --- tenant-level behaviour --------------------------------------------------
+
+/** Mint an access token; only its hash is stored. */
+export async function issueToken(
+  tenant: Tenant,
+  localpart: string,
+  deviceId: string,
+  expiresMs?: number,
+): Promise<string> {
+  const token = crypto.randomUUID();
+  const hash = await hashToken(token);
+  await tenant.tx((tx) =>
+    tx.tokens.insert(hash, localpart, deviceId, expiresMs ?? null)
+  );
+  return token;
+}
+
+/** The token's owner, or null when unknown. */
+export async function lookupToken(
+  tenant: Tenant,
+  token: string,
+): Promise<TokenInfo | null> {
+  const hash = await hashToken(token);
+  return await tenant.tx(async (tx) => {
+    const row = await tx.tokens.byHash(hash);
+    if (row === null) return null;
+    return {
+      localpart: row.localpart,
+      user_id: `@${row.localpart}:${tenant.serverName}`,
+      device_id: row.device_id,
+      expires_ms: row.expires_ms,
+    };
+  });
+}
+
+/** Mint a refresh token paired with an existing access token. */
+export async function issueRefreshToken(
+  tenant: Tenant,
+  localpart: string,
+  deviceId: string,
+  accessToken: string,
+): Promise<string> {
+  const token = crypto.randomUUID();
+  const hash = await hashToken(token);
+  const accessHash = await hashToken(accessToken);
+  await tenant.tx((tx) =>
+    tx.refresh.insert(hash, localpart, deviceId, accessHash)
+  );
+  return token;
+}
+
+// plan 3h: the old access token is revoked and the old refresh token
+// deleted immediately (spec note: refresh.yaml:34-35 allows the old
+// refresh token a grace period until the new one is used — the plan's
+// simpler rotation is what Complement exercises). Child row first:
+// refresh_tokens references access_tokens.
+export async function consumeRefreshToken(
+  tenant: Tenant,
+  refreshToken: string,
+): Promise<
+  { accessToken: string; refreshToken: string; expiresInMs: number }
+> {
+  const hash = await hashToken(refreshToken);
+  return await tenant.tx(async (tx) => {
+    const row = await tx.refresh.byHash(hash);
+    if (row === null) {
+      throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'unknown refresh token');
+    }
+    await tx.refresh.delete(hash);
+    await tx.tokens.delete(row.access_token);
+    const accessToken = crypto.randomUUID();
+    await tx.tokens.insert(
+      await hashToken(accessToken),
+      row.localpart,
+      row.device_id,
+      Date.now() + REFRESH_LIFETIME_MS,
+    );
+    const newRefresh = crypto.randomUUID();
+    await tx.refresh.insert(
+      await hashToken(newRefresh),
+      row.localpart,
+      row.device_id,
+      await hashToken(accessToken),
+    );
+    return {
+      accessToken,
+      refreshToken: newRefresh,
+      expiresInMs: REFRESH_LIFETIME_MS,
+    };
+  });
+}
+
+/** Log one token out: its pushers die with it, and logging out removes
+ * the device too (Synapse semantics — the logout gate asserts the device
+ * list shrinks). Refresh tokens riding the revoked access tokens go as
+ * well (child rows first; the old code left them behind). */
+export async function revokeToken(tenant: Tenant, token: string) {
+  const hash = await hashToken(token);
+  await tenant.tx(async (tx) => {
+    const row = await tx.tokens.byHash(hash);
+    const deviceId = row === null ? null : row.device_id;
+    await tx.pushers.deleteForToken(hash);
+    await tx.refresh.deleteForAccessToken(hash);
+    await tx.tokens.delete(hash);
+    if (deviceId !== null) {
+      for (const t of await tx.tokens.ofDevice(deviceId)) {
+        await tx.pushers.deleteForToken(t.token);
+        await tx.refresh.deleteForAccessToken(t.token);
+        await tx.tokens.delete(t.token);
+      }
+      await tx.devices.delete(deviceId);
+    }
+  });
+}
+
+/** Every token, pusher and device of the user goes (child rows first). */
+export async function revokeAllTokens(
+  tenant: Tenant,
+  localpart: string,
+): Promise<void> {
+  await tenant.tx(async (tx) => {
+    await tx.pushers.deleteForUser(localpart);
+    await tx.refresh.deleteForUser(localpart);
+    await tx.tokens.deleteForUser(localpart);
+    await tx.devices.deleteForUser(localpart);
+  });
+}

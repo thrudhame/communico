@@ -12,8 +12,10 @@ import { ingestInTx, ingestLocal, sendLocal } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { contentHashOf } from '#engine/signing-primitives.js';
+import { b64encodeStd } from '#engine/signing-primitives.js';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { bobJoins, genesis, PL_DEFAULTS } from './fixtures/genesis.ts';
+import { makeRemoteServer } from './fixtures/remote.ts';
 
 const config = (dir: string) => ({
   dir,
@@ -142,7 +144,9 @@ Deno.test('ingest: >20 prev_events is a clean refusal — nothing stored, fronti
       signatures: { test: { 'ed25519:test': 'x' } },
       event_id: '$whatever',
     } as Pdu;
-    const err = await assertRejects(() => ingestLocal(g.room, pdu));
+    const err = await assertRejects(() =>
+      ingestLocal(g.room, pdu, g.signer.serverName)
+    );
     assert(
       String(err).startsWith('Error: M_TOO_MANY_PREV_EVENTS'),
       String(err),
@@ -484,8 +488,8 @@ Deno.test('ingest: a throw mid-transaction rolls the whole ingest back (G11)', a
             origin_server_ts: 1002,
           }, g.signer);
           good2Id = good2.event_id!;
-          await ingestInTx(tx, g.roomId, good2);
-          await ingestInTx(tx, g.roomId, bad);
+          await ingestInTx(tx, g.roomId, good2, { self: g.signer.serverName });
+          await ingestInTx(tx, g.roomId, bad, { self: g.signer.serverName });
         }))
     );
     const after = await g.room.tx(async (tx) => {
@@ -520,7 +524,11 @@ Deno.test('ingest: redelivery returns the original receipt — no second write',
     const countBefore = await g.room.tx(async (tx) =>
       (await tx.changes.after(0, 100)).length
     );
-    const again = await ingestLocal(g.room, JSON.parse(r.event.pdu) as Pdu);
+    const again = await ingestLocal(
+      g.room,
+      JSON.parse(r.event.pdu) as Pdu,
+      g.signer.serverName,
+    );
     assertEquals(again.eventId, r.eventId);
     assertEquals(again.standing, 'accepted');
     await g.room.tx(async (tx) => {
@@ -740,10 +748,128 @@ Deno.test('ingest: a depth mismatch is a stored auth-reject', async () => {
     bad.content = { body: 'wrong depth', msgtype: 'm.text' };
     delete (bad as unknown as Record<string, unknown>).state_key;
     await resign(bad, g.signer);
-    const r = await ingestLocal(g.room, bad);
+    const r = await ingestLocal(g.room, bad, g.signer.serverName);
     assertEquals(r.standing, 'rejected');
     assertEquals(r.reason, 'auth');
     // stored but never published, never an extremity
     assertEquals(await frontierOf(g.room), [good.eventId]);
+  });
+});
+
+Deno.test('ingest (R16): a single-signed local event as before — self explicit, destination exclusion by it', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, {
+      roomId: '!ing17:test',
+      joinRule: 'public',
+    });
+    const join = await sendLocal(g.room, {
+      type: 'm.room.member',
+      sender: '@bob:remote.test',
+      state_key: '@bob:remote.test',
+      content: { membership: 'join' },
+      origin_server_ts: 1000,
+    }, g.signer);
+    assertEquals(join.standing, 'accepted');
+    const stored = await g.room.tx(async (tx) => {
+      const row = await tx.events.get(join.eventId);
+      assert(row !== null);
+      return (JSON.parse(row.pdu) as Pdu).signatures;
+    });
+    assertEquals(Object.keys(stored), ['test'], 'one in-process signature');
+    // the delivery intent excluded the explicit self, nobody else
+    const deliveries = await g.room.tx(async (tx) =>
+      (await tx.changes.after(0, 100)).filter((c) => c.kind === 'delivery')
+    );
+    const forJoin = deliveries.find((c) => c.event === join.eventId);
+    assertEquals(JSON.parse(forJoin!.data).destinations, ['remote.test']);
+  });
+});
+
+Deno.test('ingest (R16): a countersigned local invite is accepted — both signatures stored, self still ours', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!ing18:test' });
+    // our authored invite, then the invitee server's countersignature
+    // (verified by the caller — invites.ts's dance in miniature)
+    const invitee = await makeRemoteServer('remote.test');
+    const pdu = await g.room.tx((tx) =>
+      buildInTx(tx, g.roomId, {
+        type: 'm.room.member',
+        state_key: '@zoe:remote.test',
+        sender: g.creator,
+        content: { membership: 'invite' },
+        origin_server_ts: 1000,
+      }, g.signer)
+    );
+    const redacted = redact(pdu as unknown as Record<string, unknown>, '11');
+    delete redacted.event_id;
+    const existing = (redacted.signatures ?? {}) as Record<
+      string,
+      Record<string, string>
+    >;
+    delete redacted.signatures;
+    const signature = await crypto.subtle.sign(
+      { name: 'Ed25519' },
+      invitee.kp.privateKey,
+      new TextEncoder().encode(canonicalJson(redacted)),
+    );
+    existing[invitee.name] = {
+      [invitee.keyId]: b64encodeStd(new Uint8Array(signature)),
+    };
+    pdu.signatures = existing;
+    // accepted, the event id unchanged, BOTH signatures stored
+    const r = await ingestLocal(g.room, pdu, g.signer.serverName);
+    assertEquals(r.standing, 'accepted');
+    const stored = await g.room.tx(async (tx) => {
+      const row = await tx.events.get(r.eventId);
+      assert(row !== null);
+      return (JSON.parse(row.pdu) as Pdu).signatures;
+    });
+    assert(stored['test'] !== undefined, 'our signature');
+    assert(stored['remote.test'] !== undefined, 'the countersignature');
+    // the delivery intent excluded the explicit self and reached the
+    // invitee's server (the membership target)
+    const deliveries = await g.room.tx(async (tx) =>
+      (await tx.changes.after(0, 100)).filter((c) => c.kind === 'delivery')
+    );
+    const forInvite = deliveries.find((c) => c.event === r.eventId);
+    assertEquals(JSON.parse(forInvite!.data).destinations, ['remote.test']);
+  });
+});
+
+Deno.test('ingest (R16): a local event lacking a signature by self is refused', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!ing19:test' });
+    const good = await sendLocal(g.room, {
+      type: 'm.room.message',
+      sender: g.creator,
+      content: { body: 'signed by another', msgtype: 'm.text' },
+      origin_server_ts: 1000,
+    }, g.signer);
+    const bad = JSON.parse(good.event.pdu) as Pdu;
+    // re-signed by a DIFFERENT server only — no signature by self
+    const stranger = await makeRemoteServer('stranger.test');
+    await resign(bad, {
+      serverName: stranger.name,
+      keyId: stranger.keyId,
+      sign: async (canonical: string) => {
+        const sig = await crypto.subtle.sign(
+          { name: 'Ed25519' },
+          stranger.kp.privateKey,
+          new TextEncoder().encode(canonical),
+        );
+        return b64encodeStd(new Uint8Array(sig));
+      },
+    });
+    const err = await assertRejects(() =>
+      ingestLocal(g.room, bad, g.signer.serverName)
+    );
+    assert(String(err).startsWith('Error: M_UNAUTHORIZED'), String(err));
+    // nothing stored
+    assertEquals(
+      await g.room.tx(async (tx) =>
+        await tx.events.get(String(bad.event_id)) !== null
+      ),
+      false,
+    );
   });
 });
