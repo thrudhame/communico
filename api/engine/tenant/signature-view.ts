@@ -9,6 +9,9 @@ export function keyMaterial(key: Json): string {
   const { signatures: _signatures, unsigned: _unsigned, ...body } = key;
   return canonicalJson(body);
 }
+export function remoteTargetMaterial(key: Json, revision: number): string {
+  return canonicalJson([keyMaterial(key), revision]);
+}
 export type SignatureSigner = { key: string; public: string; basis: string };
 export async function signatureSigner(
   conn: Conn,
@@ -46,13 +49,14 @@ export async function signatureView(
   owner: string,
   target: string,
   requester?: string,
+  material = keyMaterial(key),
 ): Promise<Json> {
   const result = keyView(key, owner, requester);
   const signatures = result.signatures as Json;
   for (
     const row of await conn.query(
       'SELECT signer_localpart,signer_user,signer_key,signer_basis,signature FROM key_signatures WHERE target_user=? AND target_key=? AND target_material=? AND (signer_user=? OR signer_user=?)',
-      [owner, target, keyMaterial(key), owner, requester ?? ''],
+      [owner, target, material, owner, requester ?? ''],
     )
   ) {
     const signer = await signatureSigner(

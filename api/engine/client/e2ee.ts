@@ -20,7 +20,10 @@ import { federationRequest } from '#engine/federation/client.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { abortable } from '#engine/net/abort.ts';
 import { publicDeviceKey } from '#engine/e2ee-remote.ts';
-import { cachedKeyQuery } from '#engine/server/remote-devices.ts';
+import {
+  cachedKeyQuery,
+  withRemoteSigningState,
+} from '#engine/server/remote-devices.ts';
 import {
   publicSigning,
   signingViews,
@@ -222,10 +225,20 @@ async function composed(
               }));
             const cached: Json = Object.create(null), cachedSigning: Json = {};
             const missing: Requests = [];
+            const revisions = new Map<string, number>();
             for (const entry of requests) {
               await abortable(
                 deadline.signal,
                 () => app.deviceLists.recover(entry[0], deadline.signal),
+              );
+              revisions.set(
+                entry[0],
+                await abortable(deadline.signal, () =>
+                  withRemoteSigningState(
+                    app.server,
+                    entry[0],
+                    (state) => Promise.resolve(state.revision),
+                  )),
               );
               const keys = claim
                 ? null
@@ -270,6 +283,35 @@ async function composed(
               0,
             );
             mergeViews(answer.signing, cachedSigning);
+            if (!claim) {
+              const masters = answer.signing.master_keys as Json | undefined;
+              for (const [user, raw] of Object.entries(masters ?? {})) {
+                masters![user] = await abortable(
+                  deadline.signal,
+                  () =>
+                    withRemoteSigningState(
+                      app.server,
+                      user,
+                      async (state) => {
+                        if (
+                          state.revision !== revisions.get(user)
+                        ) throw new Error('remote signing keys changed');
+                        const key = raw as Json;
+                        const id = Object.keys(key.keys as Json)[0].slice(8);
+                        return await app.tenant.tx((tx) =>
+                          tx.keySignatures.remoteView(
+                            key,
+                            user,
+                            id,
+                            requester,
+                            state.revision,
+                          )
+                        );
+                      },
+                    ),
+                );
+              }
+            }
             answer.count += Object.values(cachedSigning).reduce(
               (n: number, users) => n + Object.keys(users as Json).length,
               0,

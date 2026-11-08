@@ -5,6 +5,7 @@ import { config } from '#engine/config.ts';
 import { signingUpload } from '#engine/e2ee-signing.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
+import type { Json } from '#engine/tenant/e2ee.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -109,6 +110,114 @@ Deno.test('signature overlays: real v10 upgrade and reopen retain verified publi
       await tenant.tx((tx) => tx.crossSigning.state('alice')),
       signingUpload({ master_key: master }, user, config().e2ee),
     );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('remote private overlays survive reopen and remain bound to the learned target revision', async () => {
+  const dir = await Deno.makeTempDir();
+  const options = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(options, { schemas: { tenant: tenantSchema } });
+  const user = '@alice:a.test', remote = '@bob:b.test';
+  const make = async (owner: string, usage: string) => {
+    const pair = await generateSigningKeypair() as CryptoKeyPair;
+    const pub = b64encodeStd(await exportPublicKeyRaw(pair.publicKey));
+    return {
+      pair,
+      pub,
+      json: {
+        user_id: owner,
+        usage: [usage],
+        keys: { ['ed25519:' + pub]: pub },
+      } as Json,
+    };
+  };
+  try {
+    let tenant = await openTenant(store, 'a.test', { create: true });
+    await tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+    const master = await make(user, 'master'),
+      secret = await make(user, 'user_signing');
+    await signJson(
+      secret.json,
+      user,
+      'ed25519:' + master.pub,
+      master.pair.privateKey,
+    );
+    await tenant.tx((tx) =>
+      tx.crossSigning.upload(
+        'alice',
+        user,
+        signingUpload(
+          { master_key: master.json, user_signing_key: secret.json },
+          user,
+          config().e2ee,
+        ),
+        '{}',
+        false,
+      )
+    );
+    const target = await make(remote, 'master');
+    const signed = structuredClone(target.json);
+    await signJson(
+      signed,
+      user,
+      'ed25519:' + secret.pub,
+      secret.pair.privateKey,
+    );
+    const signers = await tenant.tx((tx) => tx.keySignatures.basis('alice'));
+    const upload = [{
+      user: remote,
+      id: target.pub,
+      json: signed,
+      remote: { json: target.json, revision: 7, signers },
+    }];
+    assertEquals(
+      await tenant.tx((tx) => tx.keySignatures.upload('alice', user, upload)),
+      { failures: {} },
+    );
+    const db = await store.tenant('a.test');
+    const log = await db.query('SELECT * FROM e2ee_changes');
+    assertEquals(
+      await tenant.tx((tx) => tx.keySignatures.upload('alice', user, upload)),
+      { failures: {} },
+    );
+    assertEquals(await db.query('SELECT * FROM e2ee_changes'), log);
+    await store.close();
+    store = await openStore(options, { schemas: { tenant: tenantSchema } });
+    tenant = await openTenant(store, 'a.test');
+    assertEquals(
+      await tenant.tx((tx) =>
+        tx.keySignatures.remoteView(target.json, remote, target.pub, user, 7)
+      ),
+      signed,
+    );
+    for (
+      const [requester, revision] of [[user, 8], ['@charlie:a.test', 7], [
+        '',
+        7,
+      ]] as [string, number][]
+    ) {
+      assertEquals(
+        (await tenant.tx((tx) =>
+          tx.keySignatures.remoteView(
+            target.json,
+            remote,
+            target.pub,
+            requester,
+            revision,
+          )
+        )).signatures,
+        {},
+      );
+    }
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });

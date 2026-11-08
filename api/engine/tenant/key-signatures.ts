@@ -17,6 +17,7 @@ import {
 } from '#engine/tenant/e2ee.ts';
 import {
   keyMaterial,
+  remoteTargetMaterial,
   type SignatureSigner,
   signatureSigner,
   signatureView,
@@ -27,7 +28,12 @@ import { signingViews } from '#engine/tenant/cross-signing.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 
-export type SignatureTarget = { user: string; id: string; json: Json };
+export type SignatureTarget = {
+  user: string;
+  id: string;
+  json: Json;
+  remote?: { json: Json; revision: number; signers: Record<string, string> };
+};
 const invalid = () => ({
   errcode: 'M_INVALID_SIGNATURE',
   error: 'signature, signer or target is invalid or changed',
@@ -49,15 +55,18 @@ export async function uploadSignatures(
       (failures[target.user] as Json)[target.id] = invalid();
     };
     // Local state is read and rechecked in the same transaction as the write.
-    if (domainOf(target.user) !== domainOf(user)) {
+    const remote = domainOf(target.user) !== domainOf(user);
+    if (remote && !target.remote) {
       fail();
       continue;
     }
     const targetLocalpart = localpartOf(target.user);
-    const masterRows = await conn.query(
-      "SELECT key_json FROM cross_signing_keys WHERE localpart=? AND usage='master' AND key_id=?",
-      [targetLocalpart, 'ed25519:' + target.id],
-    );
+    const masterRows = remote
+      ? [{ key_json: JSON.stringify(target.remote!.json) }]
+      : await conn.query(
+        "SELECT key_json FROM cross_signing_keys WHERE localpart=? AND usage='master' AND key_id=?",
+        [targetLocalpart, 'ed25519:' + target.id],
+      );
     const deviceRows = masterRows.length || target.user !== user
       ? []
       : await conn.query(
@@ -65,6 +74,9 @@ export async function uploadSignatures(
         [targetLocalpart, target.id],
       );
     const row = masterRows[0] ?? deviceRows[0];
+    const material = remote
+      ? remoteTargetMaterial(target.json, target.remote!.revision)
+      : keyMaterial(target.json);
     if (
       !row ||
       keyMaterial(target.json) !== keyMaterial(JSON.parse(String(row.key_json)))
@@ -113,6 +125,7 @@ export async function uploadSignatures(
       }
       const signer = await signatureSigner(conn, localpart, key);
       if (!signer) continue;
+      if (remote && target.remote!.signers[key] !== signer.basis) continue;
       let valid = false;
       try {
         valid = await verifyJson(
@@ -137,6 +150,7 @@ export async function uploadSignatures(
       target.user,
       target.id,
       user,
+      material,
     );
     const signatures = augmented.signatures as Json;
     signatures[user] = {
@@ -196,7 +210,6 @@ export async function uploadSignatures(
         'SELECT signer_basis,target_material,signature FROM key_signatures WHERE signer_localpart=? AND signer_key=? AND target_user=? AND target_key=?',
         [localpart, signer.key, target.user, target.id],
       );
-      const material = keyMaterial(target.json);
       if (
         old.length && old[0].signer_basis === signer.basis &&
         old[0].target_material === material && old[0].signature === signature
@@ -245,6 +258,9 @@ export function signatureTargets(
   bounded(body, limits.maxrequestbytes);
   const targets: SignatureTarget[] = [];
   for (const [user, keys] of Object.entries(object(body, 'body'))) {
+    if (!/^@[^:]+:.+$/.test(user)) {
+      throw new MatrixError(400, 'M_BAD_JSON', 'invalid user ID');
+    }
     for (const [id, value] of Object.entries(object(keys, 'target keys'))) {
       const json = object(value, 'signed target');
       bounded(json, limits.maxkeybytes);
@@ -263,5 +279,13 @@ export function signatureTargets(
     }
   }
   limitEntries(targets.length, limits.maxkeys);
+  // Reserve the complete per-target error response before composition commits
+  // any independent successes or starts remote resolution.
+  const failures: Json = Object.create(null);
+  for (const target of targets) {
+    failures[target.user] ??= Object.create(null);
+    (failures[target.user] as Json)[target.id] = invalid();
+  }
+  bounded({ failures }, limits.maxrequestbytes);
   return targets;
 }

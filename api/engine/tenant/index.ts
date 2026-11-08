@@ -15,6 +15,11 @@ import * as devices from '#engine/tenant/devices.ts';
 import * as e2ee from '#engine/tenant/e2ee.ts';
 import * as crossSigning from '#engine/tenant/cross-signing.ts';
 import * as keySignatures from '#engine/tenant/key-signatures.ts';
+import {
+  remoteTargetMaterial,
+  signatureSigner,
+  signatureView,
+} from '#engine/tenant/signature-view.ts';
 import type { SigningUpload } from '#engine/e2ee-signing.ts';
 import { config } from '#engine/config.ts';
 import * as todevice from '#engine/tenant/todevice.ts';
@@ -107,6 +112,27 @@ function bind(
   };
   return {
     keySignatures: {
+      basis: async (localpart: string) => {
+        const state = await crossSigning.signingState(conn, localpart);
+        const signer = state.user_signing &&
+          await signatureSigner(conn, localpart, state.user_signing.id);
+        return signer ? { [signer.key]: signer.basis } : {};
+      },
+      remoteView: (
+        key: e2ee.Json,
+        user: string,
+        id: string,
+        requester: string,
+        revision: number,
+      ) =>
+        signatureView(
+          conn,
+          key,
+          user,
+          id,
+          requester,
+          remoteTargetMaterial(key, revision),
+        ),
       upload: (
         localpart: string,
         user: string,
