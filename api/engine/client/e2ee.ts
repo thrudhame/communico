@@ -17,9 +17,10 @@ import {
   queryRequest,
 } from '#engine/e2ee.ts';
 import { federationRequest } from '#engine/federation/client.ts';
-import { keyView } from '#engine/e2ee-key-view.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { abortable } from '#engine/net/abort.ts';
+import { publicDeviceKey } from '#engine/e2ee-remote.ts';
+import { cachedDeviceKeys } from '#engine/server/remote-devices.ts';
 
 export async function uploadKeys(
   userId: string,
@@ -93,19 +94,7 @@ function remoteKeys(
         ) throw new Error('invalid claimed material');
         result[id] = raw;
       } else {
-        const key = object(raw, 'device key');
-        const input = validateUpload(
-          {
-            device_keys: {
-              ...key,
-              signatures: key.signatures === undefined ? {} : key.signatures,
-            },
-          },
-          user,
-          id,
-          limits,
-        );
-        result[id] = keyView(JSON.parse(input.device!), user, requester);
+        result[id] = publicDeviceKey(raw, user, id, limits, requester);
       }
     }
     keys[user] = result;
@@ -187,23 +176,47 @@ async function composed(
                 user: requester,
                 what: claim ? 'claim device keys' : 'query device keys',
               }));
-            const res = await federationRequest(
-              app.server,
-              app.tenant.signer(),
-              {
-                destination: origin,
-                method: 'POST',
-                path: '/_matrix/federation/v1/user/keys/' +
-                  (claim ? 'claim' : 'query'),
-                body: new TextEncoder().encode(
-                  JSON.stringify({ [field]: Object.fromEntries(requests) }),
-                ),
-                maxBytes: limits.maxrequestbytes,
-                signal: deadline.signal,
-              },
-            );
+            const cached: Json = Object.create(null);
+            const missing: Requests = [];
+            for (const entry of requests) {
+              const keys = claim
+                ? null
+                : await abortable(deadline.signal, () =>
+                  cachedDeviceKeys(
+                    app.server,
+                    entry[0],
+                    entry[1] as string[],
+                    requester,
+                  ));
+              if (keys === null) missing.push(entry);
+              else cached[entry[0]] = keys;
+            }
+            const res = missing.length
+              ? await federationRequest(
+                app.server,
+                app.tenant.signer(),
+                {
+                  destination: origin,
+                  method: 'POST',
+                  path: '/_matrix/federation/v1/user/keys/' +
+                    (claim ? 'claim' : 'query'),
+                  body: new TextEncoder().encode(
+                    JSON.stringify({ [field]: Object.fromEntries(missing) }),
+                  ),
+                  maxBytes: limits.maxrequestbytes,
+                  signal: deadline.signal,
+                },
+              )
+              : null;
             deadline.signal.throwIfAborted();
-            const answer = remoteKeys(res.json, requests, claim, requester);
+            const answer = res === null
+              ? { keys: {}, count: 0 }
+              : remoteKeys(res.json, missing, claim, requester);
+            answer.keys = { ...cached, ...answer.keys };
+            answer.count += Object.values(cached).reduce<number>(
+              (n, keys) => n + Object.keys(keys as Json).length,
+              0,
+            );
             limitEntries(count + answer.count, limits.maxkeys);
             const merged = { ...(response[field] as Json), ...answer.keys };
             const remaining = { ...failures };

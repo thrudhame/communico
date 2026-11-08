@@ -39,6 +39,12 @@ CREATE INDEX edu_outbox_fifo ON edu_outbox(destination,state,enqueue_pos);
 CREATE INDEX edu_outbox_completed ON edu_outbox(state,source);
 `;
 
+const REMOTE_DEVICES_SQL = `
+CREATE TABLE remote_device_users(user_id TEXT PRIMARY KEY NOT NULL, anchor TEXT, stale INTEGER NOT NULL, revision INTEGER NOT NULL, retry_at INTEGER NOT NULL, failures INTEGER NOT NULL, pending TEXT NOT NULL, seen TEXT NOT NULL);
+CREATE INDEX remote_device_users_due ON remote_device_users(stale,retry_at);
+CREATE TABLE remote_device_keys(user_id TEXT NOT NULL, device_id TEXT NOT NULL, key_json TEXT NOT NULL, PRIMARY KEY(user_id,device_id));
+`;
+
 export const SERVER_SCHEMA_SQL = `
 -- Derived (S11/S12): rebuilt only by roll-forward replaying the rooms'
 -- change logs, keyed by (room, pos) so a replay changes nothing.
@@ -275,18 +281,20 @@ CREATE TABLE server_key_changes(
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 7,
+  version: 8,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
     await db.exec(DEVICE_TRACKING_SQL);
     await db.exec(RELIABLE_DELIVERY_SQL);
     await db.exec(DELIVERY_FIFO_SQL);
+    await db.exec(REMOTE_DEVICES_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
     4: (conn) => conn.exec(DEVICE_TRACKING_SQL),
     5: (conn) => conn.exec(RELIABLE_DELIVERY_SQL),
     6: (conn) => conn.exec(DELIVERY_FIFO_SQL),
+    7: (conn) => conn.exec(REMOTE_DEVICES_SQL),
   },
 };

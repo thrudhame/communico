@@ -1,41 +1,13 @@
 import type { Conn, Database } from '#engine/store/db.ts';
+import { nextDeviceSeq } from '#engine/server/device-notices.ts';
+import { invalidateDeviceCache } from '#engine/server/remote-devices.ts';
+export {
+  nextDeviceSeq,
+  publishDeviceChange,
+} from '#engine/server/device-notices.ts';
 
 export type TrackingScope = 'sync' | 'keys';
 export type DeviceLists = { changed: string[]; left: string[] };
-
-export async function nextDeviceSeq(tx: Conn): Promise<number> {
-  await tx.execute(
-    "INSERT INTO counters VALUES('devices',0) ON CONFLICT(name) DO NOTHING",
-  );
-  await tx.execute("UPDATE counters SET value=value+1 WHERE name='devices'");
-  return Number(
-    (await tx.query("SELECT value FROM counters WHERE name='devices'"))[0]
-      .value,
-  );
-}
-
-/** Capture the audience at publication time; later membership never rewrites history. */
-export async function publishDeviceChange(
-  tx: Conn,
-  seq: number,
-  subject: string,
-): Promise<void> {
-  for (const scope of ['sync', 'keys']) {
-    const audience = new Set(
-      (await tx.query(
-        'SELECT observer FROM device_tracking WHERE subject=? AND scope=? AND end_seq IS NULL',
-        [subject, 'keys'],
-      )).map((r) => String(r.observer)),
-    );
-    audience.add(subject);
-    for (const observer of audience) {
-      await tx.execute(
-        'INSERT INTO device_notices VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
-        [seq, observer, subject, scope, 'change'],
-      );
-    }
-  }
-}
 
 /** Reconcile one immutable publication, keeping both predicates and last-room loss together. */
 export async function reconcileDeviceRoom(
@@ -109,6 +81,7 @@ export async function reconcileDeviceRoom(
           [observer, subject],
         );
         if (Boolean(prior.length) === Boolean(shared.length)) continue;
+        if (scope === 'keys') await invalidateDeviceCache(tx, subject);
         const seq = await nextDeviceSeq(tx);
         if (shared.length) {
           await tx.execute('INSERT INTO device_tracking VALUES(?,?,?,?,NULL)', [
