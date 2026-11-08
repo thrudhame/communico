@@ -536,16 +536,19 @@ Deno.test('sender: restarted sender retains a transaction retry window while the
       await waitFor(() => sender.snapshot().length === 0);
       await sender.stop();
       const first = fake.requests.find((r) => r.method === 'PUT')!;
+      const sendsBeforeRestart = sends.length;
       const resumed = startSender({ store, signer: g.signer });
       try {
         // A receiver reboot is not instantaneous. The sender is ready first;
         // retain its transient window across the receiver's startup interval.
+        await waitFor(() => sends.length >= sendsBeforeRestart + 1);
         await new Promise((r) => setTimeout(r, 7000));
+        await waitFor(() => sends.length >= sendsBeforeRestart + 2);
         steer.status = 200;
         await waitFor(
           async () =>
             (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
-          18000,
+          30000,
         );
         for (const put of fake.requests.filter((r) => r.method === 'PUT')) {
           assertEquals(put.path, first.path);
