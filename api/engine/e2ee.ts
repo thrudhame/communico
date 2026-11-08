@@ -90,6 +90,11 @@ export async function localQuery(
   ownUsers(tenant, entries);
   return await tenant.tx(async (tx) => {
     const device_keys: Json = Object.create(null);
+    const signing: Record<string, Json> = {
+      master_keys: {},
+      self_signing_keys: {},
+      user_signing_keys: {},
+    };
     let count = 0;
     for (const [user, ids] of entries) {
       const keys = await tx.e2ee.query(
@@ -102,9 +107,18 @@ export async function localQuery(
       count += Object.keys(keys).length;
       limitEntries(count, limits.maxkeys);
       device_keys[user] = keys;
+      const view = await tx.crossSigning.views(
+        localpartOf(user),
+        user,
+        requester,
+      );
+      for (const [field, value] of Object.entries(view)) {
+        signing[field][user] = value;
+      }
     }
     const response = {
       device_keys,
+      ...signing,
       ...(failures === undefined ? {} : { failures }),
     };
     bounded(response, limits.maxrequestbytes);

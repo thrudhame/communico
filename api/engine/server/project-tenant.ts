@@ -19,13 +19,29 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
       if (!rows.length) break;
       await server.tx(async (conn) => {
         for (const row of rows) {
+          const payload = JSON.parse(String(row.payload));
+          const subject = '@' + row.localpart + ':' + tenant;
+          if (
+            payload.kind === 'public_signing' ||
+            payload.kind === 'private_signing'
+          ) {
+            const seq = await nextDeviceSeq(conn);
+            if (payload.kind === 'public_signing') {
+              await publishDeviceChange(conn, seq, subject);
+            } else {for (const scope of ['sync', 'keys']) {
+                await conn.execute(
+                  'INSERT INTO device_notices VALUES(?,?,?,?,?)',
+                  [seq, subject, subject, scope, 'change'],
+                );
+              }}
+            continue;
+          }
           const old = await conn.query(
             'SELECT seq FROM device_changes WHERE source=? AND source_pos=?',
             [source, row.pos],
           );
           if (old.length) continue;
           const seq = await nextDeviceSeq(conn);
-          const subject = '@' + row.localpart + ':' + tenant;
           await conn.execute(
             'INSERT INTO device_changes VALUES(?,?,?,?,?,?,?,?)',
             [

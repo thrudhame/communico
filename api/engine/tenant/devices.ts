@@ -5,6 +5,7 @@ import type { Conn } from '#engine/store/db.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { appendDeviceChange } from '#engine/tenant/changes.ts';
+import { signingCollision } from '#engine/tenant/cross-signing.ts';
 
 export type DeviceRow = {
   device_id: string;
@@ -36,6 +37,7 @@ export async function upsertDeviceRow(
   localpart: string,
   displayName: string | null,
 ): Promise<void> {
+  await signingCollision(conn, localpart, deviceId);
   const existing = await deviceById(conn, deviceId, localpart);
   if (existing !== null) {
     if (displayName !== null) {

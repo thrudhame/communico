@@ -50,6 +50,7 @@ Deno.test('E2 v5 upgrade preserves accepted keys and credentials while adding in
           'device_ack',
           'to_device_intents',
           'inbound_to_device',
+          'cross_signing_keys',
         ]
       ) await db.exec('DROP TABLE ' + table);
     },
@@ -79,7 +80,7 @@ Deno.test('E2 v5 upgrade preserves accepted keys and credentials while adding in
     assertEquals(
       (await upgraded.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '9',
+      '10',
     );
   } finally {
     await store.close();
@@ -194,7 +195,7 @@ Deno.test('E2 inbox survives reopen and concurrent/out-of-order issued cuts cann
     const raw = await store.tenant('a.test');
     assertEquals(
       (await raw.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-      '9',
+      '10',
     );
     assert(await tenant.tx((tx) => tx.toDevice.head()) >= 3);
   } finally {

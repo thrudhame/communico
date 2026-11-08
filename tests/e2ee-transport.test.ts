@@ -276,7 +276,7 @@ Deno.test('E3 v6 tenant upgrade preserves pending payloads, sender admission and
     apply: async (conn: Parameters<typeof tenantSchema.apply>[0]) => {
       await tenantSchema.apply(conn);
       await conn.exec(
-        'DROP TABLE inbound_to_device; DROP INDEX to_device_intents_sender; ALTER TABLE to_device_intents DROP COLUMN sender; DROP INDEX to_device_intents_projection; ALTER TABLE to_device_intents DROP COLUMN projected; DROP INDEX to_device_intents_destination;',
+        'DROP TABLE cross_signing_keys; DROP TABLE inbound_to_device; DROP INDEX to_device_intents_sender; ALTER TABLE to_device_intents DROP COLUMN sender; DROP INDEX to_device_intents_projection; ALTER TABLE to_device_intents DROP COLUMN projected; DROP INDEX to_device_intents_destination;',
       );
     },
   };
@@ -535,7 +535,9 @@ Deno.test('E3 v8 destination admission upgrade retains over-cap accepted intents
     version: 8,
     apply: async (conn: Parameters<typeof tenantSchema.apply>[0]) => {
       await tenantSchema.apply(conn);
-      await conn.exec('DROP INDEX to_device_intents_destination');
+      await conn.exec(
+        'DROP TABLE cross_signing_keys; DROP INDEX to_device_intents_destination',
+      );
     },
   };
   let store = await openStore(options(dir), {
@@ -543,11 +545,10 @@ Deno.test('E3 v8 destination admission upgrade retains over-cap accepted intents
   });
   try {
     let tenant = await openTenant(store, 'upgrade.test', { create: true });
-    await tenant.tx(async (tx) => {
-      await tx.users.insert('alice', 'Alice');
-      await tx.devices.upsert('PHONE', 'alice', null);
-    });
     const db = await store.tenant('upgrade.test');
+    await db.exec(
+      "INSERT INTO users(localpart,display_name) VALUES('alice','Alice'); INSERT INTO devices VALUES('PHONE','alice',1,NULL);",
+    );
     for (let i = 0; i < 3; i++) {
       await db.execute(
         'INSERT INTO to_device_intents(source_id,destination,payload,sender,projected) VALUES(?,?,?,?,1)',
@@ -578,7 +579,7 @@ Deno.test('E3 v8 destination admission upgrade retains over-cap accepted intents
     assertEquals(
       (await upgraded.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '9',
+      '10',
     );
     assertEquals(
       (await upgraded.query(
