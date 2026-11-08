@@ -56,13 +56,13 @@ Deno.test('E2: publication reconciliation queries only relationship pairs affect
       await reconcile([...members, '@new:test'], true, 3),
       members.length * 4,
     );
-    assertEquals(await reconcile([...members, '@new:test'], false, 4), 13 * 12);
+    assertEquals(await reconcile([...members, '@new:test'], false, 4), 0);
     const after = await deviceStreamMax(server);
     assertEquals(
       await deviceListsBetween(server, members[0], before, after, 'sync'),
       {
-        changed: [],
-        left: [...members.slice(1), '@new:test'].sort(),
+        changed: ['@new:test'],
+        left: [],
       },
     );
     assertEquals(
@@ -176,7 +176,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
   }
 });
 
-Deno.test('E2: encryption redaction closes encrypted tracking but keeps all-room keys tracking', async () => {
+Deno.test('E3: encryption redaction leaves all-room device tracking intact', async () => {
   const dir = await Deno.makeTempDir();
   const store = await openStore({
     dir,
@@ -203,7 +203,7 @@ Deno.test('E2: encryption redaction closes encrypted tracking but keeps all-room
     const after = await deviceStreamMax(server);
     assertEquals(
       await deviceListsBetween(server, g.creator, before, after, 'sync'),
-      { changed: [], left: [bob] },
+      { changed: [], left: [] },
     );
     assertEquals(
       await deviceListsBetween(server, g.creator, before, after, 'keys'),

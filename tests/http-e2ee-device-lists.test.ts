@@ -87,7 +87,7 @@ suite.test('self changes wake an empty account and keys/changes validates cuts',
   );
 });
 
-suite.test('all-room keys predicate differs from encrypted sync; bounded old audiences survive leave and rejoin', async () => {
+suite.test('all-room sync and keys changes retain bounded old audiences through leave and rejoin', async () => {
   const a = await suite.registerTestUser('list-a', 'pw');
   const b = await suite.registerTestUser('list-b', 'pw');
   const initial = await sync(a.access_token!);
@@ -96,7 +96,7 @@ suite.test('all-room keys predicate differs from encrypted sync; bounded old aud
       .room_id;
   await call(b.access_token!, 'join/' + encodeURIComponent(r), {});
   const plain = await sync(a.access_token!, initial.next_batch);
-  assertEquals(plain.device_lists, { changed: [], left: [] });
+  assertEquals(plain.device_lists, { changed: [b.user_id], left: [] });
   assertEquals(
     (await changes(a.access_token!, initial.next_batch, plain.next_batch))
       .changed,
@@ -104,7 +104,7 @@ suite.test('all-room keys predicate differs from encrypted sync; bounded old aud
   );
   await encrypt(a.access_token!, r);
   const encrypted = await sync(a.access_token!, plain.next_batch);
-  assertEquals(encrypted.device_lists, { changed: [b.user_id], left: [] });
+  assertEquals(encrypted.device_lists, { changed: [], left: [] });
   await call(
     b.access_token!,
     'devices/' + b.device_id,
@@ -147,7 +147,7 @@ suite.test('all-room keys predicate differs from encrypted sync; bounded old aud
   );
 });
 
-suite.test('plaintext peer mutations notify changed without plaintext join or leave invalidations', async () => {
+suite.test('plaintext sharing notifies join, mutation and last-room loss as a deliberate all-room superset', async () => {
   const a = await suite.registerTestUser('plain-list-a', 'pw');
   const b = await suite.registerTestUser('plain-list-b', 'pw');
   const initial = await sync(a.access_token!);
@@ -156,7 +156,7 @@ suite.test('plaintext peer mutations notify changed without plaintext join or le
       .room_id;
   await call(b.access_token!, 'join/' + encodeURIComponent(room), {});
   const joined = await sync(a.access_token!, initial.next_batch);
-  assertEquals(joined.device_lists, { changed: [], left: [] });
+  assertEquals(joined.device_lists, { changed: [b.user_id], left: [] });
   await call(b.access_token!, 'devices/' + b.device_id, {
     display_name: 'plain mutation',
   }, 'PUT');
@@ -168,12 +168,29 @@ suite.test('plaintext peer mutations notify changed without plaintext join or le
     {},
   );
   const left = await sync(a.access_token!, changed.next_batch);
-  assertEquals(left.device_lists, { changed: [], left: [] });
-  // No fabricated encrypted leave, even if the interval also includes the mutation.
+  assertEquals(left.device_lists, { changed: [], left: [b.user_id] });
+  // The final relationship cut wins even when the interval includes a mutation.
   assertEquals(
     (await sync(a.access_token!, joined.next_batch)).device_lists.left,
-    [],
+    [b.user_id],
   );
+});
+
+suite.test('joining an existing room invalidates the joiner own device list without another upload', async () => {
+  const a = await suite.registerTestUser('list-join-self-a', 'pw');
+  const b = await suite.registerTestUser('list-join-self-b', 'pw');
+  const room =
+    (await call(a.access_token!, 'createRoom', { visibility: 'public' }))
+      .room_id;
+  const before = await sync(b.access_token!);
+  await call(b.access_token!, 'join/' + encodeURIComponent(room), {});
+  const joined = await sync(b.access_token!, before.next_batch);
+  assertEquals(joined.device_lists, {
+    changed: [a.user_id, b.user_id].sort(),
+    left: [],
+  });
+  const after = await sync(b.access_token!, joined.next_batch);
+  assertEquals(after.device_lists, { changed: [], left: [] });
 });
 
 suite.test('peer upload and logout notify sync before query observes the new key view', async () => {
