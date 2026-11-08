@@ -2,18 +2,25 @@
 // devices removes their tokens (and those tokens' pushers and refresh
 // rows) with them.
 import type { Conn } from '#engine/store/db.ts';
-import { MatrixError } from '#engine/matrix-error.ts';
-import { revokeDeviceTokens } from '#engine/tenant/auth.ts';
+import { nextCounter } from '#engine/tenant/accountdata.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 
 export type DeviceRow = {
   device_id: string;
+  generation: number;
   display_name: string | null;
+};
+
+export type DeviceIdentity = {
+  localpart: string;
+  deviceId: string;
+  generation: number;
 };
 
 function deviceRow(row: Record<string, unknown>): DeviceRow {
   return {
     device_id: String(row.device_id),
+    generation: Number(row.generation),
     display_name: row.display_name == null ? null : String(row.display_name),
   };
 }
@@ -28,17 +35,18 @@ export async function upsertDeviceRow(
   localpart: string,
   displayName: string | null,
 ): Promise<void> {
-  const changed = await conn.execute(
-    'INSERT INTO devices (device_id, localpart, display_name) VALUES (?, ?, ?) ON CONFLICT (device_id) DO UPDATE SET display_name = COALESCE(excluded.display_name, devices.display_name) WHERE devices.localpart = excluded.localpart',
-    [deviceId, localpart, displayName],
-  );
-  if (changed === 0) {
-    throw new MatrixError(
-      400,
-      'M_INVALID_PARAM',
-      'device ID belongs to another user',
-    );
+  const existing = await deviceById(conn, deviceId, localpart);
+  if (existing !== null) {
+    if (displayName !== null) {
+      await renameDevice(conn, deviceId, localpart, displayName);
+    }
+    return;
   }
+  const generation = await nextCounter(conn, 'device_generation');
+  await conn.execute(
+    'INSERT INTO devices(device_id, localpart, generation, display_name) VALUES(?,?,?,?)',
+    [deviceId, localpart, generation, displayName],
+  );
 }
 
 export async function deviceById(
@@ -47,7 +55,7 @@ export async function deviceById(
   localpart: string,
 ): Promise<DeviceRow | null> {
   const rows = await conn.query(
-    'SELECT device_id, display_name FROM devices WHERE device_id = ? AND localpart = ?',
+    'SELECT device_id, generation, display_name FROM devices WHERE device_id = ? AND localpart = ?',
     [deviceId, localpart],
   );
   return rows.length === 0 ? null : deviceRow(rows[0]);
@@ -58,7 +66,7 @@ export async function devicesOfUser(
   localpart: string,
 ): Promise<DeviceRow[]> {
   const rows = await conn.query(
-    'SELECT device_id, display_name FROM devices WHERE localpart = ? ORDER BY device_id',
+    'SELECT device_id, generation, display_name FROM devices WHERE localpart = ? ORDER BY device_id',
     [localpart],
   );
   return rows.map(deviceRow);
@@ -79,15 +87,33 @@ export async function renameDevice(
 export async function deleteDevice(
   conn: Conn,
   deviceId: string,
-): Promise<void> {
-  await conn.execute('DELETE FROM devices WHERE device_id = ?', [deviceId]);
-}
-
-export async function deleteDeviceOwned(
-  conn: Conn,
-  deviceId: string,
   localpart: string,
 ): Promise<void> {
+  // Sole device lifecycle deletion: all consumers revoke through this owner.
+  const tokens = await conn.query(
+    'SELECT token FROM access_tokens WHERE localpart = ? AND device_id = ?',
+    [localpart, deviceId],
+  );
+  for (const row of tokens) {
+    await conn.execute('DELETE FROM pushers WHERE access_token = ?', [
+      row.token,
+    ]);
+    await conn.execute('DELETE FROM refresh_tokens WHERE access_token = ?', [
+      row.token,
+    ]);
+  }
+  await conn.execute(
+    'DELETE FROM refresh_tokens WHERE localpart = ? AND device_id = ?',
+    [localpart, deviceId],
+  );
+  await conn.execute(
+    'DELETE FROM access_tokens WHERE localpart = ? AND device_id = ?',
+    [localpart, deviceId],
+  );
+  await conn.execute(
+    'DELETE FROM transactions WHERE localpart = ? AND device_id = ?',
+    [localpart, deviceId],
+  );
   await conn.execute(
     'DELETE FROM devices WHERE device_id = ? AND localpart = ?',
     [deviceId, localpart],
@@ -98,7 +124,9 @@ export async function deleteDevicesOfUser(
   conn: Conn,
   localpart: string,
 ): Promise<void> {
-  await conn.execute('DELETE FROM devices WHERE localpart = ?', [localpart]);
+  for (const row of await devicesOfUser(conn, localpart)) {
+    await deleteDevice(conn, row.device_id, localpart);
+  }
 }
 
 // --- tenant-level behaviour --------------------------------------------------
@@ -120,15 +148,21 @@ export async function getDevice(
   tenant: Tenant,
   localpart: string,
   deviceId: string,
-): Promise<DeviceRow | null> {
-  return await tenant.tx((tx) => tx.devices.byId(deviceId, localpart));
+): Promise<Omit<DeviceRow, 'generation'> | null> {
+  const row = await tenant.tx((tx) => tx.devices.byId(deviceId, localpart));
+  return row === null
+    ? null
+    : { device_id: row.device_id, display_name: row.display_name };
 }
 
 export async function listDevices(
   tenant: Tenant,
   localpart: string,
-): Promise<DeviceRow[]> {
-  return await tenant.tx((tx) => tx.devices.ofUser(localpart));
+): Promise<Omit<DeviceRow, 'generation'>[]> {
+  return (await tenant.tx((tx) => tx.devices.ofUser(localpart))).map((row) => ({
+    device_id: row.device_id,
+    display_name: row.display_name,
+  }));
 }
 
 /** Rename a device the localpart owns; false = not owned/not found. */
@@ -152,8 +186,7 @@ export async function deleteDevices(
 ): Promise<void> {
   await tenant.tx(async (tx) => {
     for (const deviceId of deviceIds) {
-      await revokeDeviceTokens(tx, deviceId, localpart);
-      await tx.devices.deleteOwned(deviceId, localpart);
+      await tx.devices.delete(deviceId, localpart);
     }
   });
 }

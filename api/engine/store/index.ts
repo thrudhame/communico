@@ -10,6 +10,7 @@ import {
   checkSchema,
   createDatabase,
   EMPTY_SCHEMA,
+  ensureSchema,
   type SchemaProvider,
   sweep,
 } from '#engine/store/create.ts';
@@ -162,6 +163,7 @@ export async function openStore(
     await sweep(join(config.dir, 'tenants'));
     const serverProvider: SchemaProvider = {
       version: (options.schemas?.server ?? EMPTY_SCHEMA).version,
+      migrations: options.schemas?.server?.migrations,
       apply: async (db) => {
         await ensureWatermarks(db);
         await (options.schemas?.server ?? EMPTY_SCHEMA).apply(db);
@@ -183,7 +185,7 @@ export async function openStore(
       });
     }
     serverDb = await Db.open(ffi, serverPath, config.checkpointlogbytes);
-    await checkSchema(serverDb, serverProvider);
+    await ensureSchema(serverDb, serverProvider);
     pool = new Pool(ffi, config.dir, {
       checkpointlogbytes: config.checkpointlogbytes,
       maxopenfiles: config.maxopenfiles,

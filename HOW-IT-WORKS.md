@@ -239,7 +239,7 @@ refresh credentials are stored only as SHA-256 digests.
 
 Refresh rotation revokes the old access token but keeps the old refresh token
 retryable until the replacement access or refresh token is used. Client send
-and redaction retries are scoped to `(device, endpoint, transaction id)`,
+and redaction retries are scoped to `(user, device, generation, endpoint, transaction id)`,
 independent of token refresh; endpoint identity includes the send event type
 or redaction target as well as the room.
 (`api/engine/tenant/auth.ts:227-303`, `api/engine/tenant/txns.ts:1-52`)
@@ -254,8 +254,12 @@ completed file. Generated media ids use the shared URL-safe encoder.
 The storage layer owns native-library loading, file transactions and
 maintenance. Startup checks the qualified Turso revision and patch set. Safe
 creation applies the schema in a `.new` directory, closes/reopens, verifies,
-syncs files, renames, then syncs the parent. Opens refuse schema mismatches;
-this snapshot has no schema migration path.
+syncs files, renames, then syncs the parent. Opens apply only explicitly
+supported version steps in one store-owned transaction with the version
+marker; unknown versions are refused. Tenant v3 upgrades to v4 preserve
+identity and credentials while scoping devices to each user. A new device
+incarnation gets a new generation, bound into tokens and transaction receipts.
+Legacy v3 receipts remain archived when their ownership cannot be proved.
 (`api/engine/store/index.ts:151-197`, `api/engine/store/build.ts:12-38`,
 `api/engine/store/create.ts:18-21`, `api/engine/store/create.ts:104-165`)
 

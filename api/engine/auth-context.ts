@@ -34,5 +34,6 @@ export default async function (request: PathfinderRequest, context: Context) {
   context.state.tenant = info.tenant;
   context.state.user = info.user_id;
   context.state.device = info.device_id ?? undefined;
+  context.state.deviceGeneration = info.generation ?? undefined;
   context.state.token = info.token;
 }

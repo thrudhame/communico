@@ -16,6 +16,7 @@ export default async function (
     reason,
     (context.state.device as string | undefined) ?? null,
     request.params.txnId as string,
+    context.state.deviceGeneration as number | undefined,
   );
   return { event_id: res.eventId };
 }

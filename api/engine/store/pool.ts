@@ -8,6 +8,7 @@ import {
   checkSchema,
   createDatabase,
   EMPTY_SCHEMA,
+  ensureSchema,
   type SchemaProvider,
 } from '#engine/store/create.ts';
 import { type Database, Db, operations } from '#engine/store/db.ts';
@@ -392,7 +393,7 @@ export class Pool {
     );
     try {
       await checkId(db, id);
-      await checkSchema(db, this.providers[kind]);
+      await ensureSchema(db, this.providers[kind]);
     } catch (error) {
       await db.close();
       throw error;

@@ -1,4 +1,4 @@
-// api/engine/tenant/schema.ts - tenant schema v3 (design row 1, D3.2): the
+// api/engine/tenant/schema.ts - tenant schema v4 (design row 1, D3.2): the
 // tenant file's tables, re-expressed for SQLite/Turso from
 // doltgres:db/tenant/schema.sql — identity and signing keys, users and
 // credentials, devices, access/refresh tokens (stored hashed, not plain),
@@ -35,9 +35,11 @@ CREATE TABLE credentials(
 );
 
 CREATE TABLE devices(
-  device_id TEXT PRIMARY KEY NOT NULL,
+  device_id TEXT NOT NULL,
   localpart TEXT NOT NULL REFERENCES users(localpart),
-  display_name TEXT
+  generation INTEGER NOT NULL,
+  display_name TEXT,
+  PRIMARY KEY(localpart, device_id)
 );
 CREATE INDEX devices_localpart ON devices(localpart);
 
@@ -47,15 +49,17 @@ CREATE TABLE access_tokens(
   token TEXT PRIMARY KEY NOT NULL,
   localpart TEXT NOT NULL REFERENCES users(localpart),
   device_id TEXT,
+  generation INTEGER,
   expires_ms INTEGER
 );
 CREATE INDEX access_tokens_localpart ON access_tokens(localpart);
-CREATE INDEX access_tokens_device ON access_tokens(device_id);
+CREATE INDEX access_tokens_device ON access_tokens(localpart, device_id, generation);
 
 CREATE TABLE refresh_tokens(
   token TEXT PRIMARY KEY NOT NULL,
   localpart TEXT NOT NULL,
   device_id TEXT,
+  generation INTEGER,
   access_token TEXT NOT NULL REFERENCES access_tokens(token),
   next_token TEXT
 );
@@ -143,21 +147,66 @@ CREATE TABLE filters(
 );
 
 CREATE TABLE transactions(
+  localpart TEXT NOT NULL,
   device_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
   endpoint TEXT NOT NULL,
   room_id TEXT NOT NULL,
   txn_id TEXT NOT NULL,
   event_id TEXT NOT NULL,
   pending_pdu TEXT,
   completed INTEGER NOT NULL DEFAULT 1,
-  PRIMARY KEY(device_id, endpoint, txn_id)
+  PRIMARY KEY(localpart, device_id, generation, endpoint, txn_id)
 );
-CREATE INDEX transactions_event ON transactions(device_id, room_id, event_id);
+CREATE INDEX transactions_event ON transactions(localpart, device_id, generation, room_id, event_id);
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 3,
+  version: 4,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
+  },
+  migrations: {
+    3: async (conn) => {
+      await conn.exec(`
+        ALTER TABLE devices RENAME TO devices_v3;
+        DROP INDEX devices_localpart;
+        CREATE TABLE devices(
+          device_id TEXT NOT NULL,
+          localpart TEXT NOT NULL REFERENCES users(localpart),
+          generation INTEGER NOT NULL,
+          display_name TEXT,
+          PRIMARY KEY(localpart, device_id)
+        );
+        INSERT INTO devices SELECT device_id, localpart, 1, display_name FROM devices_v3;
+        DROP TABLE devices_v3;
+        CREATE INDEX devices_localpart ON devices(localpart);
+        INSERT INTO counters(name, value) VALUES('device_generation', 1);
+        ALTER TABLE access_tokens ADD COLUMN generation INTEGER;
+        ALTER TABLE refresh_tokens ADD COLUMN generation INTEGER;
+        UPDATE access_tokens SET generation = 1 WHERE EXISTS(
+          SELECT 1 FROM devices WHERE devices.localpart = access_tokens.localpart AND devices.device_id = access_tokens.device_id
+        );
+        UPDATE refresh_tokens SET generation = 1 WHERE EXISTS(
+          SELECT 1 FROM devices WHERE devices.localpart = refresh_tokens.localpart AND devices.device_id = refresh_tokens.device_id
+        );
+        DROP INDEX access_tokens_device;
+        CREATE INDEX access_tokens_device ON access_tokens(localpart, device_id, generation);
+        ALTER TABLE transactions RENAME TO transactions_v3;
+        DROP INDEX transactions_event;
+        CREATE TABLE transactions(
+          localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL,
+          endpoint TEXT NOT NULL, room_id TEXT NOT NULL, txn_id TEXT NOT NULL, event_id TEXT NOT NULL,
+          pending_pdu TEXT, completed INTEGER NOT NULL DEFAULT 1,
+          PRIMARY KEY(localpart, device_id, generation, endpoint, txn_id)
+        );
+        INSERT INTO transactions SELECT d.localpart, t.device_id, d.generation,
+          t.endpoint, t.room_id, t.txn_id, t.event_id, t.pending_pdu, t.completed
+          FROM transactions_v3 t JOIN devices d ON d.device_id = t.device_id;
+        CREATE INDEX transactions_event ON transactions(localpart, device_id, generation, room_id, event_id);
+      `);
+      // Keep v3 receipts as a read-only archive: deleted devices have no
+      // provable owner. Never attribute those receipts to a new incarnation.
+    },
   },
 };

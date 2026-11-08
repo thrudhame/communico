@@ -38,7 +38,11 @@ import {
   validateFilterDocument,
 } from '#engine/tenant/filters.ts';
 import { createMedia, getMedia, markUploaded } from '#engine/tenant/media.ts';
-import { lookupTransaction, recordTransaction } from '#engine/tenant/txns.ts';
+import {
+  deviceIdentity,
+  lookupTransaction,
+  recordTransaction,
+} from '#engine/tenant/txns.ts';
 import {
   consumeRefreshToken,
   issueRefreshToken,
@@ -587,7 +591,7 @@ Deno.test('txns: (device, room, txn) → same event id, other room differs, cont
       password: 'pw',
       deviceId: 'txn-one',
     });
-    const device = reg.device_id;
+    const device = await deviceIdentity(tenant, 'txn', reg.device_id);
     const endpoint = {
       kind: 'send' as const,
       roomId: '!room1:a.test',
@@ -620,7 +624,12 @@ Deno.test('txns: (device, room, txn) → same event id, other room differs, cont
     );
     // other device → nothing recorded
     assertEquals(
-      await lookupTransaction(tenant, 'txn-two', endpoint, 'm-txn'),
+      await lookupTransaction(
+        tenant,
+        { ...device, deviceId: 'txn-two' },
+        endpoint,
+        'm-txn',
+      ),
       null,
     );
 
@@ -629,13 +638,13 @@ Deno.test('txns: (device, room, txn) → same event id, other room differs, cont
     const refresh = await issueRefreshToken(
       tenant,
       'txn',
-      device,
+      reg.device_id,
       reg.access_token!,
     );
     const rotated = await consumeRefreshToken(tenant, refresh);
     assertEquals(
       (await lookupToken(tenant, rotated.accessToken))?.device_id,
-      device,
+      reg.device_id,
     );
     assertEquals(
       await lookupTransaction(tenant, device, endpoint, 'm-txn'),

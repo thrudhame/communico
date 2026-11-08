@@ -1,9 +1,9 @@
 // api/engine/store/create.ts — publish only a closed, reopened, verified and
 // fsynced database. Failed creation is deliberately left for startup sweep.
 // Schema providers own each database kind's domain tables; the store owns
-// the meta table and refuses a missing row or a version mismatch (R14).
+// the meta table and upgrades only explicitly supported versions (R14).
 import { basename, join } from '@std/path';
-import { type Database, Db } from '#engine/store/db.ts';
+import { type Conn, type Database, Db } from '#engine/store/db.ts';
 import { type Row, Turso } from '#engine/store/ffi.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 
@@ -17,11 +17,13 @@ export type CreateOptions = {
 
 // A schema provider owns one database kind's domain tables. Safe create
 // applies it in the `.new` stage and every open checks the recorded
-// `meta.schema_version` against it — a mismatch or a missing row refuses
-// the open (R14; no migrations yet). Version 0 is the empty placeholder.
+// `meta.schema_version` against it. Known upgrade steps are atomic; unknown
+// versions and missing metadata refuse the open. Version 0 is empty.
 export type SchemaProvider = {
   readonly version: number;
   apply(db: Database): Promise<void>;
+  // Explicit supported v -> v+1 steps. The store owns their transaction.
+  readonly migrations?: Readonly<Record<number, (conn: Conn) => Promise<void>>>;
 };
 
 export const EMPTY_SCHEMA: SchemaProvider = {
@@ -70,6 +72,52 @@ export async function checkSchema(
         `provider wants ${JSON.stringify(String(provider.version))}`,
     );
   }
+}
+
+/** Upgrade only a fully known chain, atomically with its version marker.
+ * Opens run this before exposing a handle. Unknown/forward versions still fail.
+ * Bodies obey the same retry contract as every other storage transaction. */
+export async function ensureSchema(
+  db: Database,
+  provider: SchemaProvider,
+): Promise<void> {
+  if (!Number.isSafeInteger(provider.version) || provider.version < 0) {
+    throw new TypeError('schema version must be a non-negative safe integer');
+  }
+  await db.tx(async (conn) => {
+    const rows = await conn.query('SELECT v FROM meta WHERE k = ?', [
+      'schema_version',
+    ]);
+    const value = rows.length === 1 ? rows[0].v : undefined;
+    if (value === String(provider.version)) return;
+    const version = Number(value);
+    if (
+      typeof value !== 'string' || String(version) !== value ||
+      !Number.isSafeInteger(version) || version < 0 ||
+      version > provider.version
+    ) {
+      throw new Error(
+        `schema version mismatch: database has ${
+          JSON.stringify(value)
+        }, provider wants ${provider.version}`,
+      );
+    }
+    // Preflight prevents a partial upgrade when an intermediate step is absent.
+    for (let v = version; v < provider.version; v++) {
+      if (!provider.migrations?.[v]) {
+        throw new Error(
+          `schema version mismatch: no supported migration from ${v}`,
+        );
+      }
+    }
+    for (let v = version; v < provider.version; v++) {
+      await provider.migrations![v](conn);
+      await conn.execute('UPDATE meta SET v = ? WHERE k = ?', [
+        String(v + 1),
+        'schema_version',
+      ]);
+    }
+  }, { mode: 'deferred' });
 }
 
 async function sync(path: string): Promise<void> {
