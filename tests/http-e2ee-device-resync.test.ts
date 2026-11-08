@@ -39,7 +39,7 @@ suite.test('device-list EDU invalidates the shared peer at sync, ignores origin 
           user_id: subject,
           device_id: 'D',
           stream_id: 10,
-          prev_id: [],
+          prev_id: [9],
         },
       }],
     });

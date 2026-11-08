@@ -226,6 +226,97 @@ Deno.test('v9 lazy-recovery upgrade retains hinted retries and leaves membership
   }
 });
 
+Deno.test('reset hints and empty snapshots do not repeat a join notification; authoritative key changes do', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(options(dir), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    const db = await store.server();
+    await db.tx((tx) =>
+      reconcileDeviceRoom(tx, '!reset:local', [observer, user], false, null, 1)
+    );
+    const joined = await deviceStreamMax(db);
+    const reset = (stream: number) =>
+      deviceDelta({
+        user_id: user,
+        device_id: 'NO_KEYS',
+        stream_id: stream,
+        prev_id: [],
+      }, limits());
+    await acceptDeviceDelta(db, reset(10), limits());
+    assertEquals(
+      await deviceStreamMax(db),
+      joined,
+      'a reset is a recovery hint, not an additional key mutation',
+    );
+    assert(
+      await installDeviceSnapshot(
+        db,
+        (await recoveryCut(db, user))!,
+        snapshot(10, []),
+        limits(),
+      ),
+    );
+    assertEquals(
+      await deviceStreamMax(db),
+      joined,
+      'learning an empty authoritative list must not fabricate a mutation',
+    );
+    await acceptDeviceDelta(db, reset(20), limits());
+    assert(
+      await installDeviceSnapshot(
+        db,
+        (await recoveryCut(db, user))!,
+        snapshot(20),
+        limits(),
+      ),
+    );
+    const changed = await deviceStreamMax(db);
+    assert(changed > joined);
+    assertEquals(
+      (await deviceListsBetween(db, observer, joined, changed, 'sync')).changed,
+      [user],
+    );
+    assertEquals(
+      Object.keys((await cachedDeviceKeys(db, user, [], observer))!),
+      ['D'],
+    );
+    await acceptDeviceDelta(db, reset(30), limits());
+    const same = { ...snapshot(20), stream: '30' };
+    assert(
+      await installDeviceSnapshot(
+        db,
+        (await recoveryCut(db, user))!,
+        same,
+        limits(),
+      ),
+    );
+    assertEquals(
+      await deviceStreamMax(db),
+      changed,
+      'a new causal anchor with identical public material is not a key change',
+    );
+    await acceptDeviceDelta(db, reset(40), limits());
+    assert(
+      await installDeviceSnapshot(
+        db,
+        (await recoveryCut(db, user))!,
+        snapshot(40, []),
+        limits(),
+      ),
+    );
+    assert(
+      (await deviceStreamMax(db)) > changed,
+      'removing the last key must notify',
+    );
+    assertEquals(await cachedDeviceKeys(db, user, [], observer), {});
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('snapshot race replays only provably subsequent deltas and never overwrites a newer invalidation', async () => {
   const dir = await Deno.makeTempDir();
   const store = await openStore(options(dir), {

@@ -13,6 +13,7 @@ import {
 } from '#engine/server/device-notices.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { keyView } from '#engine/e2ee-key-view.ts';
+import { canonicalJson } from '#engine/canonical.ts';
 
 type Pending = { revision: number; delta: DeviceDelta };
 type State = {
@@ -142,7 +143,10 @@ export async function acceptDeviceDelta(
       }
     }
     await writeState(tx, d.user, s);
-    await notify(tx, d.user);
+    // An empty predecessor set asks for an authoritative reset. Its contents
+    // may merely repeat the subscription cut already announced by room sharing.
+    // Publish that reset only when the snapshot establishes changed material.
+    if (d.prev.length > 0) await notify(tx, d.user);
   });
 }
 
@@ -218,6 +222,12 @@ export async function installDeviceSnapshot(
     }
     limitEntries(keys.size, limits.maxkeys);
     bounded(Object.fromEntries(keys), limits.maxrequestbytes);
+    const previous = Object.fromEntries((await tx.query(
+      'SELECT device_id,key_json FROM remote_device_keys WHERE user_id=?',
+      [cut.user],
+    )).map((r) => [String(r.device_id), JSON.parse(String(r.key_json))]));
+    const changed =
+      canonicalJson(previous) !== canonicalJson(Object.fromEntries(keys));
     await tx.execute('DELETE FROM remote_device_keys WHERE user_id=?', [
       cut.user,
     ]);
@@ -240,7 +250,7 @@ export async function installDeviceSnapshot(
       'UPDATE remote_device_users SET retry_at=0,failures=0 WHERE user_id=?',
       [cut.user],
     );
-    await notify(tx, cut.user);
+    if (changed) await notify(tx, cut.user);
     return true;
   });
 }
