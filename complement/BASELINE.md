@@ -1,10 +1,15 @@
-# Complement baseline - 2026-11-07T07:16:36.445Z
+# Complement baseline - 2026-11-06 23:16:36 PST
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
 - image: communico-complement:local (commit 5535f3bc81cec266f83f3d00edf691276bc656c4)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
 - failing tests: 59
+
+The recorded image commit predates publication's timestamp rewrite. Its reachable
+equivalent is `d618b92bc8f34b8951515b855f213d39e87ca0e9`; both commits have
+tree `5a8738d3fda39eb6537e9e19faa887ec3bac09ce` (verified with
+`git rev-parse <commit>^{tree}`). Only commit metadata changed.
 
 ## Per-setting runs
 
