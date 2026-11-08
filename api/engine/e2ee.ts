@@ -114,6 +114,7 @@ export async function localQuery(
       );
       for (const [field, value] of Object.entries(view)) {
         signing[field][user] = value;
+        limitEntries(++count, limits.maxkeys);
       }
     }
     const response = {

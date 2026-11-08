@@ -1,6 +1,10 @@
 // Pure validation shared by origin queries and the stream-anchored cache.
 import { keyView } from '#engine/e2ee-key-view.ts';
 import {
+  type PublicSigning,
+  publicSigning,
+} from '#engine/e2ee-public-signing.ts';
+import {
   bounded,
   type Json,
   type KeyLimits,
@@ -106,6 +110,7 @@ export type DeviceSnapshot = {
   user: string;
   stream: string;
   devices: { id: string; key: Json | null }[];
+  signing: PublicSigning;
 };
 export function remoteDeviceSnapshot(
   raw: unknown,
@@ -122,5 +127,12 @@ export function remoteDeviceSnapshot(
   if (new Set(devices.map((d) => d.id)).size !== devices.length) {
     throw new Error('duplicate snapshot device');
   }
-  return { user, stream: deviceStreamId(value.stream_id), devices };
+  const signing = publicSigning(value, user, limits);
+  limitEntries(devices.length + Object.keys(signing).length, limits.maxkeys);
+  return {
+    user,
+    stream: deviceStreamId(value.stream_id),
+    devices,
+    signing,
+  };
 }

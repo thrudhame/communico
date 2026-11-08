@@ -292,9 +292,12 @@ INSERT INTO device_recovery_requests SELECT user_id FROM remote_device_users WHE
 const PUBLIC_SIGNING_SQL = `
 CREATE TABLE public_signing_keys(subject TEXT PRIMARY KEY NOT NULL, source_pos INTEGER NOT NULL, payload TEXT NOT NULL);
 `;
+const REMOTE_SIGNING_SQL = `
+CREATE TABLE remote_signing_keys(user_id TEXT PRIMARY KEY NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL);
+`;
 
 export const serverSchema: SchemaProvider = {
-  version: 11,
+  version: 12,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -305,6 +308,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(DEVICE_SUBSCRIPTIONS_SQL);
     await db.exec(DEVICE_RECOVERY_SQL);
     await db.exec(PUBLIC_SIGNING_SQL);
+    await db.exec(REMOTE_SIGNING_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -315,5 +319,6 @@ export const serverSchema: SchemaProvider = {
     8: (conn) => conn.exec(DEVICE_SUBSCRIPTIONS_SQL),
     9: (conn) => conn.exec(DEVICE_RECOVERY_SQL),
     10: (conn) => conn.exec(PUBLIC_SIGNING_SQL),
+    11: (conn) => conn.exec(REMOTE_SIGNING_SQL),
   },
 };

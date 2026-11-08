@@ -48,6 +48,9 @@ const TABLES = [
   'remote_device_users',
   'remote_device_keys',
   'device_subscriptions',
+  'device_recovery_requests',
+  'public_signing_keys',
+  'remote_signing_keys',
 ];
 
 const INDEXES = [
@@ -86,7 +89,7 @@ Deno.test('server schema: tables and indexes land on create, version recorded', 
     const version = await server.query(
       `SELECT v FROM meta WHERE k = 'schema_version'`,
     );
-    assertEquals(version, [{ v: '10' }]);
+    assertEquals(version, [{ v: '12' }]);
     await store.close();
     // A second open with the same provider checks out.
     const again = await openStore(config(dir), {
