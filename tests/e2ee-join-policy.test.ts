@@ -35,6 +35,150 @@ import { join, leave, reopen } from '#engine/room/membership.ts';
 import { createRoom } from '#engine/room/create.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { ingestLocal, sendLocal } from '#engine/room/ingest.ts';
+import { productionFetcher } from '#engine/federation/fetcher.ts';
+
+Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup despite leave 403 across reopen', async () => {
+  const old = config();
+  setConfigForTests({
+    encryption: { allowunencryptedjoining: false },
+    federation: { cacerts: ['tests/fixtures/tls/ca.crt'], timeoutms: 200 },
+  });
+  const dir = await Deno.makeTempDir();
+  const settings = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(settings, {
+    schemas: { room: roomSchema, server: serverSchema },
+  });
+  const signer = await testSigner();
+  const user = '@anna:test';
+  let mode = '503';
+  let allowLeave = false;
+  let fr: Awaited<ReturnType<typeof makeFakeRoom>>;
+  const memberships = new Map<string, string>();
+  const fake = await startFakeServer({
+    ourKeyDoc: async () => ({
+      server_name: signer.serverName,
+      verify_keys: {
+        [signer.keyId]: {
+          key: b64encodeStd(await exportPublicKeyRaw(remote.kp.publicKey)),
+        },
+      },
+    }),
+    handlers: (req) => {
+      if (req.path.includes('/make_join/')) {
+        return Response.json({
+          room_version: fr.version,
+          event: fr.makeJoinAnswer(user).event,
+        });
+      }
+      if (req.path.includes('/send_join/')) {
+        assert(req.verified);
+        memberships.set(fr.roomId, 'join');
+        if (mode === 'timeout') {
+          return new Promise<Response>((resolve) =>
+            setTimeout(() => resolve(Response.json({})), 400)
+          );
+        }
+        return mode === 'malformed'
+          ? Response.json({})
+          : Response.json({ errcode: 'M_UNKNOWN' }, { status: Number(mode) });
+      }
+      if (req.path.includes('/make_leave/')) {
+        if (!allowLeave) {
+          return Response.json({ errcode: 'M_FORBIDDEN' }, { status: 403 });
+        }
+        return Response.json({
+          room_version: '11',
+          event: fr.makeJoinAnswer(user).event,
+        });
+      }
+      if (req.path.includes('/send_leave/')) {
+        assert(req.verified);
+        const roomId = decodeURIComponent(req.url.pathname.split('/').at(-2)!);
+        memberships.set(roomId, 'leave');
+        return Response.json({});
+      }
+      return null;
+    },
+  });
+  try {
+    for (mode of ['503', '408', '429', 'timeout', 'malformed', 'local-error']) {
+      fr = await makeFakeRoom({
+        roomId: '!' + mode + ':' + fake.name,
+        server: fake,
+      });
+      const server = await store.server();
+      const fetcher = productionFetcher(server, signer);
+      if (mode === 'local-error') {
+        // Same status/errcode as a remote refusal, but no response provenance.
+        fetcher.sendJoin = () =>
+          Promise.reject(new MatrixError(403, 'M_FORBIDDEN', 'local failure'));
+      }
+      const args = {
+        roomId: fr.roomId,
+        user,
+        via: [fake.name],
+        signer,
+        deps: {
+          self: 'test',
+          fetcher,
+          keys: fakeKeyResolver(fake),
+          leave: (attempt: JoinAttempt) =>
+            performJoinCleanup({ server, signer }, attempt),
+        },
+      };
+      await assertRejects(() => joinRemote(store, args));
+      assertEquals(
+        (await pendingJoinAttempts(server)).filter((a) =>
+          a.roomId === fr.roomId
+        ).length,
+        1,
+        mode,
+      );
+      await assertRejects(
+        () => joinRemote(store, args),
+        MatrixError,
+        'cleanup is pending',
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    const before = await pendingJoinAttempts(await store.server());
+    assertEquals(before.length, 6);
+    await store.close();
+    store = await openStore(settings, {
+      schemas: { room: roomSchema, server: serverSchema },
+    });
+    assertEquals(await pendingJoinAttempts(await store.server()), before);
+    allowLeave = true;
+    const deps: InviteDeps = {
+      store,
+      server: await store.server(),
+      signer,
+      keys: fakeKeyResolver(fake),
+      self: 'test',
+      wake: () => {},
+    };
+    const provider = joinCleanupProvider(deps, inviteIntentProvider(deps));
+    for (const attempt of before) {
+      fr = await makeFakeRoom({ roomId: attempt.roomId, server: fake });
+      const job = await provider(deps.server, fake.name);
+      assert(job);
+      await job.run();
+    }
+    assertEquals(await pendingJoinAttempts(deps.server), []);
+    assertEquals([...memberships.values()], Array(6).fill('leave'));
+  } finally {
+    await store.close();
+    await fake.close();
+    setConfigForTests(old);
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('E6 pending remote cleanup blocks every local join authoring boundary until leave acknowledgment', async () => {
   const old = config();

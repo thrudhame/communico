@@ -31,7 +31,11 @@ import {
   finalizeBuilt,
   roomCreateId,
 } from '#engine/room/build.ts';
-import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
+import {
+  type Fetcher,
+  type KeyResolver,
+  SendJoinRefused,
+} from '#engine/room/deps.ts';
 import { projectAfterWrite, registerCreatedRoom } from '#engine/room/hooks.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
@@ -194,9 +198,14 @@ async function joinVia(
       addedMs: Date.now(),
     };
   if (attempt !== null) await beginJoinAttempt(store, attempt);
+  let refused = false;
   try {
     // 3. send_join — the answer is untrusted input
-    const resp = await deps.fetcher.sendJoin(args.roomId, signed, candidate);
+    const resp = await deps.fetcher.sendJoin(args.roomId, signed, candidate)
+      .catch((error: unknown) => {
+        refused = error instanceof SendJoinRefused;
+        throw error;
+      });
 
     // 4. validate BEFORE anything is written: individual receipt failures
     //    drop events, auth failures reject them. Only accepted state enters
@@ -468,7 +477,7 @@ async function joinVia(
   } finally {
     if (attempt !== null) {
       try {
-        if (await joinAttemptCommitted(store, attempt)) {
+        if (refused || await joinAttemptCommitted(store, attempt)) {
           await clearJoinAttempt(await store.server(), attempt);
         } else if (deps.leave !== undefined) {
           await deps.leave(attempt);

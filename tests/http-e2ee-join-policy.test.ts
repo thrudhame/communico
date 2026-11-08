@@ -25,6 +25,137 @@ const strict = () =>
     federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
   });
 
+Deno.test('HTTP E6 confirmed send_join refusals allow retry and failover without compensating a nonexistent join', async () => {
+  const old = config();
+  strict();
+  const http = await startHttp();
+  let room: FakeRoom;
+  let refusal = 403;
+  let legacy = 'none';
+  const ourKeyDoc = () =>
+    Promise.resolve({
+      server_name: 'test',
+      verify_keys: {
+        [http.app.tenant.keyId]: { key: http.app.tenant.publicB64 },
+      },
+    });
+  const fake = await startFakeServer({
+    ourKeyDoc,
+    handlers: (req) => {
+      if (req.path.includes('/make_join/')) {
+        const user = decodeURIComponent(req.url.pathname.split('/').at(-1)!);
+        return Response.json({
+          room_version: room.version,
+          event: room.makeJoinAnswer(user).event,
+        });
+      }
+      if (req.path.includes('/send_join/')) {
+        assert(req.verified);
+        if (legacy !== 'none' && req.path.includes('/v2/')) {
+          return legacy === 'matrix'
+            ? Response.json({ errcode: 'M_UNRECOGNIZED' }, { status: 404 })
+            : new Response('not found', { status: 404 });
+        }
+        return Response.json({
+          errcode: refusal === 404 ? 'M_NOT_FOUND' : 'M_FORBIDDEN',
+        }, { status: refusal });
+      }
+      if (req.path.includes('/make_leave/')) {
+        return Response.json({ errcode: 'M_FORBIDDEN' }, { status: 403 });
+      }
+      return null;
+    },
+  });
+  const resident = await startFakeServer({
+    ourKeyDoc,
+    handlers: (req) => {
+      if (req.path.includes('/make_join/')) {
+        const user = decodeURIComponent(req.url.pathname.split('/').at(-1)!);
+        return Response.json({
+          room_version: room.version,
+          event: room.makeJoinAnswer(user).event,
+        });
+      }
+      if (req.path.includes('/send_join/')) {
+        return (async () => {
+          assert(req.verified);
+          const response = await room.acceptSendJoin({
+            ...(req.json() as Pdu),
+            event_id: decodeURIComponent(req.url.pathname.split('/').at(-1)!),
+          });
+          return Response.json({
+            state: response.state,
+            auth_chain: response.authChain,
+            event: response.event,
+          });
+        })();
+      }
+      return null;
+    },
+  });
+  try {
+    const user = await http.registerTestUser('join-refusal', 'pw');
+    const join = (via: string[]) =>
+      http.matrix(
+        new Request(
+          'http://x/_matrix/client/v3/join/' + encodeURIComponent(room.roomId) +
+            '?' +
+            new URLSearchParams(via.map((name) => ['server_name', name])),
+          {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + user.access_token },
+            body: '{}',
+          },
+        ),
+      );
+    for (const v1 of ['none', 'matrix', 'html']) {
+      legacy = v1;
+      refusal = 403;
+      room = await makeFakeRoom({
+        roomId: '!refused-' + v1 + ':' + resident.name,
+        server: resident,
+      });
+      await room.addEvent({
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      });
+      let response = await join([fake.name]);
+      assertEquals(response.status, 403, await response.text());
+      assertEquals(
+        await pendingJoinAttempts(http.app.server),
+        [],
+        'a confirmed refusal must not strand join admission',
+      );
+      response = await join([resident.name]);
+      assertEquals(response.status, 200, await response.text());
+      assertEquals(await pendingJoinAttempts(http.app.server), []);
+      refusal = 404;
+      room = await makeFakeRoom({
+        roomId: '!failover-' + v1 + ':' + resident.name,
+        server: resident,
+      });
+      await room.addEvent({
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      });
+      response = await join([fake.name, resident.name]);
+      assertEquals(response.status, 200, await response.text());
+      assertEquals(await pendingJoinAttempts(http.app.server), []);
+    }
+    assertEquals(
+      fake.requests.filter((req) => req.path.includes('/make_leave/')).length,
+      0,
+    );
+  } finally {
+    await http.close();
+    await fake.close();
+    await resident.close();
+    setConfigForTests(old);
+  }
+});
+
 Deno.test('HTTP E6 unknown joins, aliases, invite acceptance and authoritative encryption races compensate through production transport', async () => {
   const old = config();
   strict();

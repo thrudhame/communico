@@ -4,6 +4,11 @@
 // The real federation client and key store arrive in stage 4; tests use
 // the fakes in tests/fixtures/.
 import type { Pdu } from '#engine/pdu.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+
+// A Fetcher may prove that send_join was refused before membership changed.
+// All other throws, including locally constructed MatrixErrors, are uncertain.
+export class SendJoinRefused extends MatrixError {}
 
 // KeyResolver: verify one signature entry of an event at a time. The
 // resolver owns key discovery (direct fetch, witnesses, caching — stage
@@ -75,7 +80,8 @@ export interface Fetcher {
   // chain and the resident-signed join (joins-v2.yaml; the v1 dance is
   // the client's concern — stage 4). `event` is our signed join WITH
   // its computed event_id (the transport strips it for the wire and
-  // carries it on the path).
+  // carries it on the path). Confirmed refusal throws SendJoinRefused;
+  // unsuccessful transport or invalid successful answers must never do so.
   sendJoin(
     roomId: string,
     event: Pdu,
