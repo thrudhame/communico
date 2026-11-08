@@ -31,9 +31,8 @@ test('pushrules: CRUD + ordering + enabled/actions + server-controlled 405s', as
   const empty = await call('/_matrix/client/v3/pushrules/', { token: tok });
   assertEquals(empty.status, 200);
   const emptyGlobal = empty.body.global as Json;
-  for (const kind of ['override', 'content', 'room', 'sender', 'underride']) {
-    assertEquals((emptyGlobal[kind] as unknown[]).length, 0, kind);
-  }
+  assertEquals(Object.values(emptyGlobal).flat().length, 18);
+  assertEquals((emptyGlobal.override as Json[])[0].rule_id, '.m.rule.master');
   const roomId = '!someroom:localhost';
   assertEquals(
     (await call(rule('room', roomId), {
@@ -80,11 +79,16 @@ test('pushrules: CRUD + ordering + enabled/actions + server-controlled 405s', as
   assertEquals((await mk('ruleC', '?before=ruleA')).status, 200);
   const ordered = (await call('/_matrix/client/v3/pushrules/', { token: tok }))
     .body.global as Json;
-  assertEquals((ordered.override as Json[]).map((r) => r.rule_id), [
-    'ruleC',
-    'ruleA',
-    'ruleB',
-  ]);
+  assertEquals(
+    (ordered.override as Json[]).filter((r) => !r.default).map((r) =>
+      r.rule_id
+    ),
+    [
+      'ruleC',
+      'ruleA',
+      'ruleB',
+    ],
+  );
   const noAnchor = await mk('ruleD', '?after=nope');
   assertEquals(noAnchor.status, 400);
   assertEquals(noAnchor.body.errcode, 'M_UNKNOWN');
@@ -145,4 +149,79 @@ test('pushrules: CRUD + ordering + enabled/actions + server-controlled 405s', as
     { method: 'PUT', token: tok, body: { event_id: '$e' } },
   );
   assertEquals(r405.status, 405);
+});
+
+test('default overrides share the catalog, preserve enabled/actions independently and cannot replace definitions', async () => {
+  const alice = await registerTestUser('pr-default', 'pw');
+  const token = alice.access_token!;
+  const master = '/_matrix/client/v3/pushrules/global/override/.m.rule.master';
+  const initial = await call(master, { token });
+  assertEquals(initial.body.enabled, false);
+  assertEquals(initial.body.default, true);
+  assertEquals(
+    (await call(master + '/actions', {
+      method: 'PUT',
+      token,
+      body: { actions: ['notify'] },
+    })).status,
+    200,
+  );
+  assertEquals((await call(master, { token })).body.enabled, false);
+  assertEquals(
+    (await call(master + '/enabled', {
+      method: 'PUT',
+      token,
+      body: { enabled: true },
+    })).status,
+    200,
+  );
+  const changed = await call(master, { token });
+  assertEquals(changed.body.actions, ['notify']);
+  assertEquals(changed.body.enabled, true);
+  assertEquals(changed.body.conditions, []);
+  assertEquals((await call(master, { method: 'DELETE', token })).status, 400);
+  assertEquals(
+    (await call(master, { method: 'PUT', token, body: { actions: [] } }))
+      .status,
+    400,
+  );
+  assertEquals(
+    (await call(master + '/enabled', {
+      method: 'PUT',
+      token,
+      body: { enabled: false },
+    })).status,
+    200,
+  );
+  assertEquals((await call(master, { token })).body.actions, ['notify']);
+  const custom = '/_matrix/client/v3/pushrules/global/override/custom';
+  assertEquals(
+    (await call(custom + '?before=.m.rule.master', {
+      method: 'PUT',
+      token,
+      body: { actions: [] },
+    })).status,
+    400,
+  );
+  assertEquals(
+    (await call(custom + '?after=.m.rule.master', {
+      method: 'PUT',
+      token,
+      body: { actions: [] },
+    })).status,
+    200,
+  );
+  const all = (await call('/_matrix/client/v3/pushrules/', { token })).body
+    .global as Json;
+  assertEquals((all.override as Json[]).slice(0, 2).map((r) => r.rule_id), [
+    '.m.rule.master',
+    'custom',
+  ]);
+  assertEquals(
+    (await call(
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.unknown/enabled',
+      { method: 'PUT', token, body: { enabled: true } },
+    )).status,
+    404,
+  );
 });

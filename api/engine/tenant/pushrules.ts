@@ -2,22 +2,26 @@
 // table behind /pushrules; m.push_rules is SYNTHESISED from it on read,
 // never stored as account_data. Priorities are internal ordering only
 // (lower = more important, 100-step with midpoint inserts and a re-pack
-// when the gap closes). Spec default rules (.m.rule.*) are not seeded —
-// the push milestone. The push_rules_stream marker is the stream: EVERY
+// when the gap closes). Default definitions come from the shared catalog;
+// only user overrides are stored. The push_rules_stream marker is the stream: EVERY
 // mutation stamps it inside the same tenant transaction (so a delete
 // that empties the table still moves the token's _a<n>).
 import type { Conn } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import type { Tenant } from '#engine/tenant/index.ts';
-
-export const PUSH_KINDS = [
-  'override',
-  'content',
-  'room',
-  'sender',
-  'underride',
-] as const;
-export type PushKind = (typeof PUSH_KINDS)[number];
+import type { Tenant, TenantTx } from '#engine/tenant/index.ts';
+import {
+  defaultRules,
+  effectiveRules,
+  PUSH_KINDS,
+  type PushKind,
+  type PushRule,
+  type Ruleset,
+} from '#engine/push/defaults.ts';
+export {
+  PUSH_KINDS,
+  type PushKind,
+  type PushRule,
+} from '#engine/push/defaults.ts';
 
 // The /pushrules path validation shared by the endpoint files (the
 // endpoints tree carries route files only): scope must be `global`
@@ -34,15 +38,6 @@ export function assertScopeKind(scope: string, kind: string): void {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'unknown rule kind: ' + kind);
   }
 }
-
-export type PushRule = {
-  rule_id: string;
-  actions: unknown[];
-  default: boolean;
-  enabled: boolean;
-  conditions?: unknown[];
-  pattern?: string;
-};
 
 export type RuleRow = {
   localpart?: string;
@@ -167,6 +162,27 @@ export async function setRuleEnabledRow(
   );
 }
 
+export async function putDefaultOverride(
+  conn: Conn,
+  localpart: string,
+  kind: string,
+  rule: PushRule,
+): Promise<void> {
+  await conn.execute(
+    `INSERT INTO push_rules(localpart,scope,kind,rule_id,priority,actions,conditions,pattern,enabled,is_default,seq)
+     VALUES(?,'global',?,?,0,?,?,?,?,1,NULL) ON CONFLICT DO NOTHING`,
+    [
+      localpart,
+      kind,
+      rule.rule_id,
+      JSON.stringify(rule.actions),
+      JSON.stringify(rule.conditions ?? []),
+      rule.pattern ?? null,
+      rule.enabled ? 1 : 0,
+    ],
+  );
+}
+
 export async function setRuleActionsRow(
   conn: Conn,
   localpart: string,
@@ -285,14 +301,47 @@ export async function rulesetFor(
   tenant: Tenant,
   localpart: string,
 ): Promise<Record<PushKind, PushRule[]>> {
-  const out = {} as Record<PushKind, PushRule[]>;
+  return await tenant.tx((tx) => rulesetAt(tx, localpart, tenant.serverName));
+}
+
+export async function rulesetAt(
+  tx: TenantTx,
+  localpart: string,
+  serverName: string,
+): Promise<Ruleset> {
+  const stored = {} as Ruleset;
   for (const kind of PUSH_KINDS) {
-    out[kind] = (await tenant.tx((tx) =>
-      tx.pushRules.kindRows(localpart, kind)
-    ))
-      .map(rowToRule);
+    stored[kind] = (await tx.pushRules.kindRows(localpart, kind)).map(
+      rowToRule,
+    );
   }
-  return out;
+  return effectiveRules(`@${localpart}:${serverName}`, stored);
+}
+
+function builtin(
+  localpart: string,
+  serverName: string,
+  kind: string,
+  ruleId: string,
+): PushRule | undefined {
+  return defaultRules(`@${localpart}:${serverName}`)[kind as PushKind]?.find((
+    r,
+  ) => r.rule_id === ruleId);
+}
+
+async function requireStored(
+  tx: TenantTx,
+  localpart: string,
+  serverName: string,
+  kind: string,
+  ruleId: string,
+): Promise<void> {
+  if (await tx.pushRules.byId(localpart, kind, ruleId)) return;
+  const rule = builtin(localpart, serverName, kind, ruleId);
+  if (!rule) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'The push rule was not found.');
+  }
+  await tx.pushRules.putDefault(localpart, kind, rule);
 }
 
 export async function getRule(
@@ -301,13 +350,12 @@ export async function getRule(
   kind: string,
   ruleId: string,
 ): Promise<PushRule> {
-  const row = await tenant.tx((tx) =>
-    tx.pushRules.byId(localpart, kind, ruleId)
-  );
-  if (row === null) {
+  const rules = await rulesetFor(tenant, localpart);
+  const rule = rules[kind as PushKind]?.find((r) => r.rule_id === ruleId);
+  if (rule === undefined) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'The push rule was not found.');
   }
-  return rowToRule(row);
+  return rule;
 }
 
 // Re-pack a kind's priorities to 100-steps (called when an insert has no
@@ -318,7 +366,9 @@ async function repack(
   localpart: string,
   kind: string,
 ): Promise<void> {
-  const rows = await tx.pushRules.kindRows(localpart, kind);
+  const rows = (await tx.pushRules.kindRows(localpart, kind)).filter((r) =>
+    !r.is_default
+  );
   for (let i = 0; i < rows.length; i++) {
     await tx.pushRules.setPriority(
       localpart,
@@ -361,10 +411,39 @@ export async function putRule(
     );
   }
   await tenant.tx(async (tx) => {
+    // User rules stay ahead of defaults, with master unconditionally first.
+    // Placement relative to a default can only name that boundary.
+    let boundary: 'top' | 'bottom' | null = null;
+    for (const direction of ['before', 'after'] as const) {
+      const id = placement[direction];
+      if (
+        id === undefined || !builtin(localpart, tenant.serverName, kind, id)
+      ) continue;
+      const master = id === '.m.rule.master';
+      if (
+        (direction === 'before' && master) || (direction === 'after' && !master)
+      ) {
+        throw new MatrixError(
+          400,
+          'M_INVALID_PARAM',
+          'user rules must follow master and precede other defaults',
+        );
+      }
+      boundary = master ? 'top' : 'bottom';
+    }
     const existing = await tx.pushRules.byId(localpart, kind, ruleId);
     let priority: number;
     if (existing !== null) {
       priority = existing.priority; // an update keeps its place
+    } else if (boundary !== null) {
+      const rows = (await tx.pushRules.kindRows(localpart, kind)).filter((r) =>
+        !r.is_default
+      );
+      priority = rows.length === 0
+        ? 100
+        : boundary === 'top'
+        ? Math.min(...rows.map((r) => r.priority)) - 100
+        : Math.max(...rows.map((r) => r.priority)) + 100;
     } else if (placement.before !== undefined) {
       let anchor = await tx.pushRules.byId(localpart, kind, placement.before);
       if (anchor === null) {
@@ -375,19 +454,19 @@ export async function putRule(
         );
       }
       const above = (await tx.pushRules.kindRows(localpart, kind)).filter((r) =>
-        r.priority < anchor!.priority
+        !r.is_default && r.priority < anchor!.priority
       );
       const floor = above.length > 0
         ? Math.max(...above.map((r) => r.priority))
-        : 0;
+        : Math.min(0, anchor.priority - 100);
       if (anchor.priority - floor <= 1) await repack(tx, localpart, kind);
       anchor = (await tx.pushRules.byId(localpart, kind, placement.before))!;
       const above2 = (await tx.pushRules.kindRows(localpart, kind)).filter((
         r,
-      ) => r.priority < anchor!.priority);
+      ) => !r.is_default && r.priority < anchor!.priority);
       const floor2 = above2.length > 0
         ? Math.max(...above2.map((r) => r.priority))
-        : 0;
+        : Math.min(0, anchor.priority - 100);
       priority = floor2 + Math.floor((anchor.priority - floor2) / 2);
       if (priority <= floor2) priority = floor2 + 1;
     } else if (placement.after !== undefined) {
@@ -400,7 +479,7 @@ export async function putRule(
         );
       }
       const below = (await tx.pushRules.kindRows(localpart, kind)).filter((r) =>
-        r.priority > anchor!.priority
+        !r.is_default && r.priority > anchor!.priority
       );
       const ceil = below.length > 0
         ? Math.min(...below.map((r) => r.priority))
@@ -409,7 +488,7 @@ export async function putRule(
       anchor = (await tx.pushRules.byId(localpart, kind, placement.after))!;
       const below2 = (await tx.pushRules.kindRows(localpart, kind)).filter((
         r,
-      ) => r.priority > anchor!.priority);
+      ) => !r.is_default && r.priority > anchor!.priority);
       const ceil2 = below2.length > 0
         ? Math.min(...below2.map((r) => r.priority))
         : anchor.priority + 200;
@@ -418,7 +497,9 @@ export async function putRule(
     } else {
       // the most important user-defined rule of the kind (pushrules.yaml
       // :199-201) — priority 100 when the kind is empty
-      const rows = await tx.pushRules.kindRows(localpart, kind);
+      const rows = (await tx.pushRules.kindRows(localpart, kind)).filter((r) =>
+        !r.is_default
+      );
       priority = rows.length > 0
         ? Math.min(...rows.map((r) => r.priority)) - 100
         : 100;
@@ -446,6 +527,13 @@ export async function deleteRule(
   kind: string,
   ruleId: string,
 ): Promise<void> {
+  if (builtin(localpart, tenant.serverName, kind, ruleId)) {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'default rules cannot be deleted',
+    );
+  }
   await tenant.tx(async (tx) => {
     if ((await tx.pushRules.byId(localpart, kind, ruleId)) === null) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'The push rule was not found.');
@@ -464,9 +552,7 @@ export async function setRuleEnabled(
   enabled: boolean,
 ): Promise<void> {
   await tenant.tx(async (tx) => {
-    if ((await tx.pushRules.byId(localpart, kind, ruleId)) === null) {
-      throw new MatrixError(404, 'M_NOT_FOUND', 'The push rule was not found.');
-    }
+    await requireStored(tx, localpart, tenant.serverName, kind, ruleId);
     await tx.pushRules.setEnabled(localpart, kind, ruleId, enabled);
     await tx.pushRules.stampStream(localpart, await tx.counters.nextStream());
   });
@@ -480,9 +566,7 @@ export async function setRuleActions(
   actions: unknown[],
 ): Promise<void> {
   await tenant.tx(async (tx) => {
-    if ((await tx.pushRules.byId(localpart, kind, ruleId)) === null) {
-      throw new MatrixError(404, 'M_NOT_FOUND', 'The push rule was not found.');
-    }
+    await requireStored(tx, localpart, tenant.serverName, kind, ruleId);
     await tx.pushRules.setActions(
       localpart,
       kind,

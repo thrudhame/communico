@@ -145,10 +145,10 @@ Deno.test('push rules: scope/kind validation, invalid ids, CRUD, placement, stre
     }
     assert(caught instanceof MatrixError);
 
-    // the ruleset starts with every kind present and empty
+    // Every user gets the built-in catalog without persisting seed rows.
     const empty = await rulesetFor(tenant, 'pr-a');
     assertEquals(Object.keys(empty).sort(), [...PUSH_KINDS].sort());
-    for (const kind of PUSH_KINDS) assertEquals(empty[kind].length, 0);
+    assertEquals(Object.values(empty).flat().length, 18);
 
     // .-prefixed (and slashed) rule ids are reserved → 400 M_INVALID_PARAM
     for (const id of ['.m.rule.master', 'a/b', 'a\\b']) {
@@ -203,7 +203,7 @@ Deno.test('push rules: scope/kind validation, invalid ids, CRUD, placement, stre
     );
     const ordered = await rulesetFor(tenant, 'pr-a');
     assertEquals(
-      ordered.override.map((r) => r.rule_id),
+      ordered.override.filter((r) => !r.default).map((r) => r.rule_id),
       ['ruleC', 'ruleA', 'ruleB'],
     );
     // before/after with an unknown anchor → 400 M_UNKNOWN
@@ -299,7 +299,7 @@ Deno.test('push rules: tight gap triggers a re-pack to 100-steps', async () => {
     }
     const rules = (await rulesetFor(tenant, 'pr-rp')).override;
     assertEquals(
-      rules.map((r) => r.rule_id),
+      rules.filter((r) => !r.default).map((r) => r.rule_id),
       ['b0', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'base'],
     );
     // The re-packed 100-steps with the last midpoint at 750, exactly as
@@ -309,6 +309,54 @@ Deno.test('push rules: tight gap triggers a re-pack to 100-steps', async () => {
     );
     assertEquals(priorities, [100, 200, 300, 400, 500, 600, 700, 750, 800]);
   });
+});
+
+Deno.test('push rules: overrides survive reopen, preserve defaults and custom ordering around negative priorities', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: { tenant: tenantSchema },
+  });
+  try {
+    const tenant = await openTenant(store, 'a.test', { create: true });
+    await registerUser(tenant, { localpart: 'overrides', password: 'pw' });
+    await setRuleEnabled(
+      tenant,
+      'overrides',
+      'override',
+      '.m.rule.master',
+      true,
+    );
+    await setRuleActions(tenant, 'overrides', 'override', '.m.rule.master', [
+      'dont_notify',
+    ]);
+    for (const id of ['a', 'b', 'c']) {
+      await putRule(tenant, 'overrides', 'override', id, { actions: [] }, {});
+    }
+    await putRule(tenant, 'overrides', 'override', 'd', { actions: [] }, {
+      before: 'c',
+    });
+    const expected = await rulesetFor(tenant, 'overrides');
+    assertEquals(expected.override.slice(0, 5).map((r) => r.rule_id), [
+      '.m.rule.master',
+      'd',
+      'c',
+      'b',
+      'a',
+    ]);
+    const revision = await pushStreamSeq(tenant, 'overrides');
+    await store.close();
+    store = await openStore(config(dir), { schemas: { tenant: tenantSchema } });
+    const reopened = await openTenant(store, 'a.test');
+    assertEquals(await rulesetFor(reopened, 'overrides'), expected);
+    assertEquals(await pushStreamSeq(reopened, 'overrides'), revision);
+    assertEquals(
+      (await rulesetFor(reopened, 'another')).override[0].enabled,
+      false,
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
 });
 
 Deno.test('push rules migration: copy for all local users, own rule wins, stream stamped', async () => {
