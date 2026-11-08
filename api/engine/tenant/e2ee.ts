@@ -7,6 +7,7 @@ import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Config } from '#engine/config-schema.ts';
+import { keyView } from '#engine/e2ee-key-view.ts';
 
 export type Json = Record<string, unknown>;
 export type KeyLimits = Config['e2ee'];
@@ -254,20 +255,16 @@ export async function queryKeys(
     if (deviceIds.length && !deviceIds.includes(String(row.device_id))) {
       continue;
     }
-    const key = JSON.parse(String(row.key_json));
-    const signed: Json = Object.create(null);
-    for (const [user, sigs] of Object.entries(key.signatures)) {
-      if (user === owner || user === requester) signed[user] = sigs;
-    }
-    key.signatures = signed;
-    key.unsigned = key.unsigned && typeof key.unsigned === 'object' &&
+    const key = keyView(JSON.parse(String(row.key_json)), owner, requester);
+    const unsigned: Json = key.unsigned && typeof key.unsigned === 'object' &&
         !Array.isArray(key.unsigned)
-      ? key.unsigned
+      ? key.unsigned as Json
       : {};
-    delete key.unsigned.device_display_name;
+    delete unsigned.device_display_name;
     if (row.display_name !== null) {
-      key.unsigned.device_display_name = String(row.display_name);
+      unsigned.device_display_name = String(row.display_name);
     }
+    key.unsigned = unsigned;
     result[String(row.device_id)] = key;
   }
   return result;

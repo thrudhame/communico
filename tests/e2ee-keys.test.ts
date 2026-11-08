@@ -142,7 +142,10 @@ Deno.test('E1: tenant commit survives projection interruption; replay cannot res
       device_id: 'PHONE',
       algorithms: [],
       keys: {},
-      signatures: {},
+      signatures: {
+        [user.user_id]: { 'ed25519:PHONE': 'owner' },
+        '@private:b.test': { 'ed25519:master': 'private' },
+      },
       extension: 'kept',
     };
     await tenant.tx((tx) =>
@@ -179,7 +182,10 @@ Deno.test('E1: tenant commit survives projection interruption; replay cannot res
       'SELECT * FROM device_changes ORDER BY seq',
     );
     assertEquals(changes.length, 2);
-    assertEquals(JSON.parse(String(changes[1].payload)).keys, key);
+    assertEquals(JSON.parse(String(changes[1].payload)).keys, {
+      ...key,
+      signatures: { [user.user_id]: key.signatures[user.user_id] },
+    });
     await projectTenant(store, 'a.test');
     assertEquals(
       await (await store.server()).query(

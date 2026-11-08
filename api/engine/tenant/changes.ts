@@ -2,6 +2,7 @@ import type { Conn } from '#engine/store/db.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import { canonicalJson } from '#engine/canonical.ts';
+import { keyView } from '#engine/e2ee-key-view.ts';
 
 /** Immutable public snapshot/tombstone, committed with its owning mutation. */
 export async function appendDeviceChange(
@@ -33,7 +34,12 @@ export async function appendDeviceChange(
       payload.device_display_name = rows[0].display_name;
     }
     if (rows[0].key_json !== null) {
-      payload.keys = JSON.parse(String(rows[0].key_json));
+      const tenant = await conn.query('SELECT server_name FROM tenant');
+      if (tenant.length !== 1) throw new Error('tenant identity missing');
+      payload.keys = keyView(
+        JSON.parse(String(rows[0].key_json)),
+        '@' + device.localpart + ':' + tenant[0].server_name,
+      );
     }
   }
   await conn.execute('INSERT INTO e2ee_changes VALUES(?,?,?,?,?,?)', [
