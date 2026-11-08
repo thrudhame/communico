@@ -16,6 +16,7 @@ const limits: KeyLimits = {
   maxkeys: 1000,
   maxonetimekeys: 10000,
   maxinboxmessages: 10000,
+  maxdestinationmessages: 1000,
 };
 const token: StreamToken = {
   eSeq: 0,
@@ -78,7 +79,7 @@ Deno.test('E2 v5 upgrade preserves accepted keys and credentials while adding in
     assertEquals(
       (await upgraded.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '8',
+      '9',
     );
   } finally {
     await store.close();
@@ -193,7 +194,7 @@ Deno.test('E2 inbox survives reopen and concurrent/out-of-order issued cuts cann
     const raw = await store.tenant('a.test');
     assertEquals(
       (await raw.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-      '8',
+      '9',
     );
     assert(await tenant.tx((tx) => tx.toDevice.head()) >= 3);
   } finally {

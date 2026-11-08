@@ -38,6 +38,10 @@ ALTER TABLE to_device_intents ADD COLUMN projected INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX to_device_intents_projection ON to_device_intents(projected);
 `;
 
+const INTENT_DESTINATION_SQL = `
+CREATE INDEX to_device_intents_destination ON to_device_intents(destination);
+`;
+
 export const TENANT_SCHEMA_SQL = `
 CREATE TABLE tenant(
   server_name TEXT PRIMARY KEY NOT NULL,
@@ -191,15 +195,17 @@ CREATE INDEX transactions_event ON transactions(localpart, device_id, generation
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 8,
+  version: 9,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
     await db.exec(INBOX_SQL);
     await db.exec(TRANSPORT_SQL);
     await db.exec(INTENT_PROJECTION_SQL);
+    await db.exec(INTENT_DESTINATION_SQL);
   },
   migrations: {
+    8: (conn) => conn.exec(INTENT_DESTINATION_SQL),
     7: (conn) => conn.exec(INTENT_PROJECTION_SQL),
     6: async (conn) => {
       await conn.exec(TRANSPORT_SQL);

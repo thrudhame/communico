@@ -15,7 +15,7 @@ import { receiveTransaction } from '#engine/federation/transactions.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { startFakeServer } from './federation/fake-server.ts';
 import { fakeFetcher } from './fixtures/remote.ts';
-import { sendMessages } from '#engine/tenant/todevice.ts';
+import { type Message, sendMessages } from '#engine/tenant/todevice.ts';
 import { parseStreamToken } from '#engine/client/tokens.ts';
 
 installServerHooks();
@@ -276,7 +276,7 @@ Deno.test('E3 v6 tenant upgrade preserves pending payloads, sender admission and
     apply: async (conn: Parameters<typeof tenantSchema.apply>[0]) => {
       await tenantSchema.apply(conn);
       await conn.exec(
-        'DROP TABLE inbound_to_device; DROP INDEX to_device_intents_sender; ALTER TABLE to_device_intents DROP COLUMN sender; DROP INDEX to_device_intents_projection; ALTER TABLE to_device_intents DROP COLUMN projected;',
+        'DROP TABLE inbound_to_device; DROP INDEX to_device_intents_sender; ALTER TABLE to_device_intents DROP COLUMN sender; DROP INDEX to_device_intents_projection; ALTER TABLE to_device_intents DROP COLUMN projected; DROP INDEX to_device_intents_destination;',
       );
     },
   };
@@ -319,6 +319,305 @@ Deno.test('E3 v6 tenant upgrade preserves pending payloads, sender admission and
       42,
     );
     assertEquals(await upgraded.query('SELECT * FROM inbound_to_device'), []);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('E3 destination pressure preserves healthy delivery and atomic mixed-send admission across restart', async () => {
+  const dir = await Deno.makeTempDir();
+  const previous = config().federation;
+  setConfigForTests({
+    federation: {
+      cacerts: ['tests/fixtures/tls/ca.crt'],
+      backoffstartmillihours: 1,
+    },
+  });
+  resetCaCertsForTests();
+  let store = await openStore(options(dir + '/source'), { schemas });
+  const remote = await openStore(options(dir + '/recipient'), { schemas });
+  let tenant = await openTenant(store, 'local.test', { create: true });
+  let sender: Sender | undefined;
+  let blockedSucceeds = false, blockedRequests = 0;
+  const ourKeyDoc = () =>
+    Promise.resolve({
+      server_name: tenant.serverName,
+      verify_keys: { [tenant.keyId]: { key: tenant.publicB64 } },
+    });
+  const blocked = await startFakeServer({
+    ourKeyDoc,
+    handlers: (req) => {
+      if (
+        !req.url.pathname.startsWith('/_matrix/federation/v1/send/')
+      ) return null;
+      assert(req.verified);
+      blockedRequests++;
+      return Response.json({ pdus: {} }, {
+        status: blockedSucceeds ? 200 : 503,
+      });
+    },
+  });
+  let accept: (id: string, body: unknown) => Promise<void>;
+  const healthy = await startFakeServer({
+    ourKeyDoc,
+    handlers: (req) => {
+      if (
+        !req.url.pathname.startsWith('/_matrix/federation/v1/send/')
+      ) return null;
+      assert(req.verified);
+      return accept(req.url.pathname.split('/').pop()!, req.json()).then(() =>
+        Response.json({ pdus: {} })
+      );
+    },
+  });
+  try {
+    const recipient = await openTenant(remote, healthy.name, { create: true });
+    await recipient.tx(async (tx) => {
+      await tx.users.insert('bob', 'Bob');
+      await tx.devices.upsert('PHONE', 'bob', null);
+    });
+    const bob = await deviceIdentity(recipient, 'bob', 'PHONE');
+    const edus = eduState(await remote.server(), healthy.name);
+    registerToDevice(edus, recipient);
+    accept = async (id, body) => {
+      await receiveTransaction('local.test', id, body, {
+        store: remote,
+        self: healthy.name,
+        edus,
+        keys: { verifyEventSignature: () => Promise.resolve(false) },
+        fetcher: fakeFetcher({}).fetcher,
+      });
+    };
+    await tenant.tx(async (tx) => {
+      for (const lp of ['alice', 'carol', 'dave']) {
+        await tx.users.insert(lp, lp);
+        await tx.devices.upsert('PHONE', lp, null);
+      }
+    });
+    const devices = await Promise.all(
+      ['alice', 'carol', 'dave'].map((lp) =>
+        deviceIdentity(tenant, lp, 'PHONE')
+      ),
+    );
+    const limits = {
+      ...config().e2ee,
+      maxkeys: 4,
+      maxinboxmessages: 4,
+      maxdestinationmessages: 2,
+    };
+    const policy = { enabled: true, maxBytes: 1048576 };
+    const message = (destination: string): Message => ({
+      user: '@bob:' + destination,
+      id: '*',
+      content: { ciphertext: 'kept' },
+    });
+    const send = (
+      index: number,
+      id: string,
+      messages = [message(blocked.name)],
+      bounds = limits,
+    ) =>
+      tenant.tx((tx) =>
+        tx.toDevice.send(
+          devices[index],
+          'local.test',
+          'm.test',
+          id,
+          id,
+          messages,
+          bounds,
+          policy,
+        )
+      );
+    await send(0, 'blocked-one');
+    await send(1, 'blocked-two');
+    // A third sender cannot consume the reserved capacity; the whole send rolls back.
+    await assertRejects(() =>
+      send(2, 'mixed', [
+        { user: '@dave:local.test', id: '*', content: { local: true } },
+        message(healthy.name),
+        message(blocked.name),
+      ])
+    );
+    const db = await store.tenant('local.test');
+    assertEquals(
+      await db.query(
+        "SELECT 1 FROM to_device_transactions WHERE txn_id='mixed'",
+      ),
+      [],
+    );
+    assertEquals(
+      (await tenant.tx((tx) =>
+        tx.toDevice.deliver(devices[2], parseStreamToken('s0')!, limits)
+      )).events,
+      [],
+    );
+    const retained = await db.query(
+      'SELECT * FROM to_device_intents ORDER BY source_id',
+    );
+    assertEquals(retained.length, 2);
+    await store.close();
+    store = await openStore(options(dir + '/source'), { schemas });
+    tenant = await openTenant(store, 'local.test');
+    await assertRejects(() => send(2, 'blocked-three'));
+    // Even a destination setting above the tenant budget must retain one slot for another peer.
+    await assertRejects(() =>
+      send(2, 'no-reserve', [message(blocked.name)], {
+        ...limits,
+        maxinboxmessages: 3,
+        maxdestinationmessages: 100,
+      })
+    );
+    await send(2, 'mixed', [message(healthy.name)]);
+    sender = startSender({
+      store,
+      signer: tenant.signer(),
+      onDelivered: () => projectTenant(store, 'local.test'),
+    });
+    await waitFor(async () =>
+      blockedRequests > 0 &&
+      (await recipient.tx((tx) =>
+          tx.toDevice.deliver(bob, parseStreamToken('s0')!, limits)
+        )).events.length === 1
+    );
+    assertEquals(
+      (await recipient.tx((tx) =>
+        tx.toDevice.deliver(bob, parseStreamToken('s0')!, limits)
+      )).events[0].content,
+      { ciphertext: 'kept' },
+    );
+    await waitFor(async () =>
+      (await (await store.tenant('local.test')).query(
+        'SELECT * FROM to_device_intents',
+      )).length === 2
+    );
+    assertEquals(
+      await (await store.tenant('local.test')).query(
+        'SELECT * FROM to_device_intents ORDER BY source_id',
+      ),
+      retained,
+    );
+    await sender.stop();
+    sender = undefined;
+    blockedSucceeds = true;
+    sender = startSender({
+      store,
+      signer: tenant.signer(),
+      onDelivered: () => projectTenant(store, 'local.test'),
+    });
+    await waitFor(async () =>
+      (await (await store.tenant('local.test')).query(
+        'SELECT * FROM to_device_intents',
+      )).length === 0
+    );
+    await send(2, 'blocked-three');
+    await waitFor(async () =>
+      (await (await store.tenant('local.test')).query(
+        'SELECT * FROM to_device_intents',
+      )).length === 0
+    );
+  } finally {
+    await sender?.stop();
+    await blocked.close();
+    await healthy.close();
+    await store.close();
+    await remote.close();
+    setConfigForTests({ federation: previous });
+    resetCaCertsForTests();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('E3 v8 destination admission upgrade retains over-cap accepted intents', async () => {
+  const dir = await Deno.makeTempDir();
+  const oldSchema = {
+    version: 8,
+    apply: async (conn: Parameters<typeof tenantSchema.apply>[0]) => {
+      await tenantSchema.apply(conn);
+      await conn.exec('DROP INDEX to_device_intents_destination');
+    },
+  };
+  let store = await openStore(options(dir), {
+    schemas: { ...schemas, tenant: oldSchema },
+  });
+  try {
+    let tenant = await openTenant(store, 'upgrade.test', { create: true });
+    await tenant.tx(async (tx) => {
+      await tx.users.insert('alice', 'Alice');
+      await tx.devices.upsert('PHONE', 'alice', null);
+    });
+    const db = await store.tenant('upgrade.test');
+    for (let i = 0; i < 3; i++) {
+      await db.execute(
+        'INSERT INTO to_device_intents(source_id,destination,payload,sender,projected) VALUES(?,?,?,?,1)',
+        [
+          'kept-' + i,
+          'blocked.test',
+          JSON.stringify({
+            sender: '@alice:upgrade.test',
+            message_id: String(i),
+          }),
+          '@alice:upgrade.test',
+        ],
+      );
+    }
+    const kept = await db.query(
+      'SELECT * FROM to_device_intents ORDER BY source_id',
+    );
+    await store.close();
+    store = await openStore(options(dir), { schemas });
+    tenant = await openTenant(store, 'upgrade.test');
+    const upgraded = await store.tenant('upgrade.test');
+    assertEquals(
+      await upgraded.query(
+        'SELECT * FROM to_device_intents ORDER BY source_id',
+      ),
+      kept,
+    );
+    assertEquals(
+      (await upgraded.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
+        .v,
+      '9',
+    );
+    assertEquals(
+      (await upgraded.query(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='to_device_intents_destination'",
+      )).length,
+      1,
+    );
+    const alice = await deviceIdentity(tenant, 'alice', 'PHONE');
+    const limits = {
+      ...config().e2ee,
+      maxkeys: 10,
+      maxinboxmessages: 5,
+      maxdestinationmessages: 2,
+    };
+    const send = (destination: string) =>
+      tenant.tx((tx) =>
+        tx.toDevice.send(
+          alice,
+          'upgrade.test',
+          'm.test',
+          'retry',
+          'retry',
+          [{
+            user: '@bob:' + destination,
+            id: '*',
+            content: { ciphertext: 'kept' },
+          }],
+          limits,
+          { enabled: true, maxBytes: 1048576 },
+        )
+      );
+    await assertRejects(() => send('blocked.test'));
+    await send('healthy.test');
+    assertEquals(
+      await upgraded.query(
+        "SELECT * FROM to_device_intents WHERE destination='blocked.test' ORDER BY source_id",
+      ),
+      kept,
+    );
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });

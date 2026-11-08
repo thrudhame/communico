@@ -161,6 +161,19 @@ export async function sendMessages(
       [sender],
     );
     limitEntries(Number(own[0].n) + 1, limits.maxkeys);
+    const peer = await conn.query(
+      'SELECT COUNT(*) AS n FROM to_device_intents WHERE destination=?',
+      [destination],
+    );
+    // One failed peer must not occupy the entire tenant allowance, even if
+    // its configured cap exceeds the total. Existing accepted rows stay put.
+    limitEntries(
+      Number(peer[0].n) + 1,
+      Math.min(
+        limits.maxdestinationmessages,
+        Math.max(0, limits.maxinboxmessages - 1),
+      ),
+    );
     await conn.execute(
       'INSERT INTO to_device_intents(source_id,destination,payload,sender) VALUES(?,?,?,?)',
       [

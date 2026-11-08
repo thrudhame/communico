@@ -37,6 +37,10 @@ maxkeys = 1000
 # COMMUNICO_E2EE_MAXONETIMEKEYS
 maxonetimekeys = 10000
 maxinboxmessages = 10000
+# Pending remote to-device intents per destination, across all senders.
+# Also limited to maxinboxmessages - 1, reserving capacity for another peer.
+# Accepted intents retain admission until delivery. COMMUNICO_E2EE_MAXDESTINATIONMESSAGES
+maxdestinationmessages = 1000
 
 [store]
 # Turso files root: server/, rooms/<key>/, tenants/<key>/ beneath it.
