@@ -170,6 +170,8 @@ function bind(
       claim: (localpart: string, id: string, algorithm: string) =>
         mutation(e2ee.claimKey(conn, localpart, id, algorithm)),
       status: (device: devices.DeviceIdentity) => e2ee.keyStatus(conn, device),
+      snapshot: (localpart: string, owner: string, limits: e2ee.KeyLimits) =>
+        e2ee.deviceSnapshot(conn, localpart, owner, limits),
     },
     users: {
       exists: (localpart: string) => users.userExists(conn, localpart),

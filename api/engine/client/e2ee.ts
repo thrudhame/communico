@@ -1,4 +1,4 @@
-// C-S key composition. The tenant owns consuming transactions and public keys.
+// C-S composition: tenant-local transactions and bounded signed origin requests.
 import { theApp } from '#engine/app.ts';
 import { config } from '#engine/config.ts';
 import { domainOf, localpartOf } from '#engine/ids.ts';
@@ -10,6 +10,15 @@ import {
   object,
   validateUpload,
 } from '#engine/tenant/e2ee.ts';
+import {
+  claimRequest,
+  localClaim,
+  localQuery,
+  queryRequest,
+} from '#engine/e2ee.ts';
+import { federationRequest } from '#engine/federation/client.ts';
+import { keyView } from '#engine/e2ee-key-view.ts';
+import { admit } from '#engine/federation/gate.ts';
 
 export async function uploadKeys(
   userId: string,
@@ -35,105 +44,167 @@ export async function uploadKeys(
   return { one_time_key_counts: counts };
 }
 
-function requests(value: unknown, field: string): [string, unknown][] {
-  bounded(value, config().e2ee.maxrequestbytes);
-  const entries = Object.entries(object(object(value, 'body')[field], field));
-  limitEntries(entries.length, config().e2ee.maxkeys);
-  for (const [user] of entries) {
-    if (!/^@[^:]+:.+$/.test(user)) {
-      throw new MatrixError(400, 'M_BAD_JSON', 'invalid user ID');
+type Requests = [string, string[] | Record<string, string>][];
+const unavailable = () => ({
+  errcode: 'M_UNAVAILABLE',
+  error: 'remote keys unavailable',
+});
+
+/** Validate the complete origin answer before publishing any part of it. */
+function remoteKeys(
+  value: unknown,
+  requests: Requests,
+  claim: boolean,
+  requester: string,
+): { keys: Json; count: number } {
+  const limits = config().e2ee;
+  bounded(value, limits.maxrequestbytes);
+  const source = object(
+    object(value, 'response')[claim ? 'one_time_keys' : 'device_keys'],
+    'keys',
+  );
+  const wanted = new Map(requests);
+  const keys: Json = Object.create(null);
+  let count = 0;
+  for (const [user, devices] of Object.entries(source)) {
+    const ids = wanted.get(user);
+    if (ids === undefined) throw new Error('origin returned unrequested user');
+    const result: Json = Object.create(null);
+    for (const [id, raw] of Object.entries(object(devices, 'devices'))) {
+      if (
+        Array.isArray(ids)
+          ? ids.length > 0 && !ids.includes(id)
+          : !Object.hasOwn(ids, id)
+      ) throw new Error('origin returned unrequested device');
+      limitEntries(++count, limits.maxkeys);
+      bounded(raw, limits.maxkeybytes);
+      if (claim) {
+        const entries = Object.entries(object(raw, 'claimed key'));
+        if (entries.length !== 1) throw new Error('invalid claimed key count');
+        const [keyId, key] = entries[0];
+        if (
+          !keyId.startsWith((ids as Record<string, string>)[id] + ':') ||
+          keyId.endsWith(':')
+        ) throw new Error('invalid claimed algorithm');
+        if (
+          typeof key !== 'string' &&
+          typeof object(key, 'claimed key').key !== 'string'
+        ) throw new Error('invalid claimed material');
+        result[id] = raw;
+      } else {
+        const key = object(raw, 'device key');
+        const input = validateUpload(
+          {
+            device_keys: {
+              ...key,
+              signatures: key.signatures === undefined ? {} : key.signatures,
+            },
+          },
+          user,
+          id,
+          limits,
+        );
+        result[id] = keyView(JSON.parse(input.device!), user, requester);
+      }
     }
+    keys[user] = result;
   }
-  return entries;
+  return { keys, count };
+}
+
+async function composed(
+  requester: string,
+  body: unknown,
+  claim: boolean,
+): Promise<Json> {
+  const app = theApp(), limits = config().e2ee;
+  const parsed = claim
+    ? claimRequest(body, limits)
+    : queryRequest(body, limits);
+  const local = parsed.filter(([user]) =>
+    domainOf(user) === app.tenant.serverName
+  );
+  const groups = new Map<string, Requests>();
+  for (const entry of parsed) {
+    const origin = domainOf(entry[0])!;
+    if (origin === app.tenant.serverName) continue;
+    if (!groups.has(origin)) groups.set(origin, []);
+    groups.get(origin)!.push(entry);
+  }
+  // Reserve every possible failure before consuming local keys. Later merges
+  // can only replace this reservation when the complete response still fits.
+  const failures: Json = Object.create(null);
+  for (const origin of groups.keys()) failures[origin] = unavailable();
+  const field = claim ? 'one_time_keys' : 'device_keys';
+  const response = claim
+    ? await localClaim(
+      app.tenant,
+      local as Parameters<typeof localClaim>[1],
+      limits,
+      failures,
+    )
+    : await localQuery(
+      app.tenant,
+      local as Parameters<typeof localQuery>[1],
+      requester,
+      limits,
+      failures,
+    );
+  let count = Object.values(response[field] as Json).reduce<number>(
+    (n, keys) => n + Object.keys(keys as Json).length,
+    0,
+  );
+  const iterator = groups.entries();
+  // Four bounded answers in flight, never one unbounded Promise per user.
+  await Promise.all(
+    Array.from({ length: Math.min(4, groups.size) }, async () => {
+      for (const [origin, requests] of iterator) {
+        try {
+          await admit(app.server, origin, {
+            kind: 'outbound',
+            user: requester,
+            what: claim ? 'claim device keys' : 'query device keys',
+          });
+          const res = await federationRequest(app.server, app.tenant.signer(), {
+            destination: origin,
+            method: 'POST',
+            path: '/_matrix/federation/v1/user/keys/' +
+              (claim ? 'claim' : 'query'),
+            body: new TextEncoder().encode(
+              JSON.stringify({ [field]: Object.fromEntries(requests) }),
+            ),
+            maxBytes: limits.maxrequestbytes,
+          });
+          const answer = remoteKeys(res.json, requests, claim, requester);
+          limitEntries(count + answer.count, limits.maxkeys);
+          const merged = { ...(response[field] as Json), ...answer.keys };
+          const remaining = { ...failures };
+          delete remaining[origin];
+          bounded(
+            { ...response, [field]: merged, failures: remaining },
+            limits.maxrequestbytes,
+          );
+          // No await between budget validation and publication.
+          response[field] = merged;
+          delete failures[origin];
+          count += answer.count;
+        } catch {
+          /* Destination failed; keep its bounded reservation. Claims are never retried. */
+        }
+      }
+    }),
+  );
+  return response;
 }
 export async function queryKeys(
   requester: string,
   body: unknown,
 ): Promise<Json> {
-  const limits = config().e2ee;
-  const entries = requests(body, 'device_keys');
-  const parsed = entries.map(([user, value]) => {
-    if (!Array.isArray(value) || value.some((id) => typeof id !== 'string')) {
-      throw new MatrixError(
-        400,
-        'M_BAD_JSON',
-        'device IDs must be an array of strings',
-      );
-    }
-    return [user, value as string[]] as const;
-  });
-  limitEntries(
-    parsed.reduce((n, [, ids]) => n + Math.max(1, ids.length), 0),
-    config().e2ee.maxkeys,
-  );
-  const tenant = theApp().tenant;
-  return await tenant.tx(async (tx) => {
-    const result: Json = Object.create(null),
-      failures: Json = Object.create(null);
-    let count = 0;
-    for (const [user, ids] of parsed) {
-      const origin = domainOf(user);
-      if (origin === tenant.serverName) {
-        result[user] = await tx.e2ee.query(
-          localpartOf(user),
-          ids,
-          requester,
-          user,
-          limits.maxkeys,
-        );
-        count += Object.keys(result[user] as Json).length;
-        limitEntries(count, limits.maxkeys);
-      } else {
-        failures[origin] = {
-          errcode: 'M_UNAVAILABLE',
-          error: 'remote keys unavailable',
-        };
-      }
-    }
-    const response = { device_keys: result, failures };
-    bounded(response, limits.maxrequestbytes);
-    return response;
-  });
+  return await composed(requester, body, false);
 }
-
-export async function claimKeys(body: unknown): Promise<Json> {
-  const entries = requests(body, 'one_time_keys');
-  const parsed: [string, string, string][] = [];
-  for (const [user, value] of entries) {
-    for (
-      const [id, algorithm] of Object.entries(
-        object(value, 'device algorithms'),
-      )
-    ) {
-      if (
-        !id.length || typeof algorithm !== 'string' || !algorithm.length
-      ) throw new MatrixError(400, 'M_BAD_JSON', 'invalid device algorithm');
-      parsed.push([user, id, algorithm]);
-    }
-  }
-  const limits = config().e2ee;
-  limitEntries(parsed.length, limits.maxkeys);
-  const tenant = theApp().tenant;
-  return await tenant.tx(async (tx) => {
-    const result: Record<string, Json> = Object.create(null),
-      failures: Json = Object.create(null);
-    for (const [user, id, algorithm] of parsed) {
-      const origin = domainOf(user);
-      if (origin !== tenant.serverName) {
-        failures[origin] = {
-          errcode: 'M_UNAVAILABLE',
-          error: 'remote keys unavailable',
-        };
-        continue;
-      }
-      const key = await tx.e2ee.claim(localpartOf(user), id, algorithm);
-      if (key !== null) {
-        if (!Object.hasOwn(result, user)) result[user] = Object.create(null);
-        result[user][id] = key;
-      }
-    }
-    const response = { one_time_keys: result, failures };
-    bounded(response, limits.maxrequestbytes); // Throw rolls back every consuming claim.
-    return response;
-  });
+export async function claimKeys(
+  requester: string,
+  body: unknown,
+): Promise<Json> {
+  return await composed(requester, body, true);
 }

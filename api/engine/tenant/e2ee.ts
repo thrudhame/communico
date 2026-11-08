@@ -279,6 +279,38 @@ export async function queryKeys(
   return result;
 }
 
+/** The list and causal anchor are captured on the same tenant connection. */
+export async function deviceSnapshot(
+  conn: Conn,
+  localpart: string,
+  owner: string,
+  limits: KeyLimits,
+): Promise<Json> {
+  const keys = await queryKeys(conn, localpart, [], '', owner, limits.maxkeys);
+  const rows = await conn.query(
+    'SELECT value FROM user_device_stream WHERE localpart=?',
+    [localpart],
+  );
+  const devices = Object.entries(keys).map(([device_id, value]) => {
+    const key = value as Json;
+    const unsigned = key.unsigned as Json;
+    return {
+      device_id,
+      keys: key,
+      ...(unsigned.device_display_name === undefined
+        ? {}
+        : { device_display_name: unsigned.device_display_name }),
+    };
+  });
+  const response = {
+    user_id: owner,
+    stream_id: rows.length ? Number(rows[0].value) : 0,
+    devices,
+  };
+  bounded(response, limits.maxrequestbytes);
+  return response;
+}
+
 /** Shared consuming primitive for C-S and federation; empty means exhaustion. */
 export async function claimKey(
   conn: Conn,
