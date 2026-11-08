@@ -12,6 +12,7 @@ import { projectTenant } from '#engine/server/project-tenant.ts';
 import { reconcileDeviceSubscriptions } from '#engine/server/device-federation.ts';
 import type { Store } from '#engine/store/index.ts';
 import { onStartup, type StartupStore } from '#engine/store/watermark.ts';
+import { installJoinAdmission } from '#engine/server/join-attempts.ts';
 
 export function installServerHooks(): void {
   setRoomHooks({ project, register: registerRoom });
@@ -32,6 +33,7 @@ async function rollForward(store: StartupStore): Promise<void> {
   ) {
     return;
   }
+  installJoinAdmission(concrete);
   await discover(concrete);
   // A completed unlink can precede deletion of its now-orphaned watermark.
   await server.execute(

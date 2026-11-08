@@ -25,6 +25,12 @@ root = "./.media"
 # COMMUNICO_MEDIA_MAXBYTES (formerly MEDIA_MAX_BYTES)
 maxbytes = 52428800
 
+[encryption]
+# Local client policy; remote events still follow the Matrix room rules.
+allowunencryptedcreation = false
+allowunencryptedjoining = true
+allowunencryptedmessages = false
+
 [e2ee]
 # Maximum serialized key request or response bytes. COMMUNICO_E2EE_MAXREQUESTBYTES
 maxrequestbytes = 1048576

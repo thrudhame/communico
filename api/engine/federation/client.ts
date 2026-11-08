@@ -33,6 +33,27 @@ export type FederationResponse = {
   json: unknown;
 };
 
+// Only a completed HTTP response carries this provenance. Local validation,
+// discovery, signing and uncertain transport failures remain ordinary errors.
+export class FederationHttpError extends MatrixError {
+  constructor(
+    readonly remoteStatus: number,
+    readonly matrixBody: boolean,
+    errcode: string,
+    message: string,
+  ) {
+    super(matrixBody ? remoteStatus : 502, errcode, message);
+  }
+}
+
+// v2 -> v1 fallback requires a completed endpoint-unknown response, not a
+// client-facing mapped status or a local error with a coincidentally equal code.
+export function isEndpointUnknown(error: unknown): boolean {
+  if (!(error instanceof FederationHttpError)) return false;
+  if (error.remoteStatus !== 404 && error.remoteStatus !== 405) return false;
+  return !error.matrixBody || error.errcode === 'M_UNRECOGNIZED';
+}
+
 export async function federationRequest(
   server: Db,
   signer: Signer,
@@ -104,8 +125,9 @@ export async function federationRequest(
     const j = JSON.parse(new TextDecoder().decode(res.body));
     const o = j as Record<string, unknown>;
     if (o !== null && typeof o === 'object' && typeof o.errcode === 'string') {
-      throw new MatrixError(
+      throw new FederationHttpError(
         res.status,
+        true,
         o.errcode,
         typeof o.error === 'string' ? o.error : o.errcode,
       );
@@ -113,5 +135,10 @@ export async function federationRequest(
   } catch (e) {
     if (e instanceof MatrixError) throw e;
   }
-  throw new MatrixError(502, 'M_UNKNOWN', `upstream returned ${res.status}`);
+  throw new FederationHttpError(
+    res.status,
+    false,
+    'M_UNKNOWN',
+    `upstream returned ${res.status}`,
+  );
 }

@@ -3,6 +3,7 @@
 // cover the remaining public/protected splits and storage round-trips.
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { config } from '#engine/config.ts';
 const { matrix, registerTestUser, test } = httpSuite('HTTP client data');
 type Json = Record<string, unknown>;
 
@@ -214,7 +215,17 @@ test('pushers: upsert, omission of optional profile_tag, no token disclosure, ki
 test('versions stays public, capabilities stays protected, discovery absent per Addendum B', async () => {
   assertEquals(await call('/_matrix/client/versions'), {
     status: 200,
-    body: { versions: ['v1.1'], unstable_features: {} },
+    body: {
+      versions: ['v1.1'],
+      unstable_features: {
+        'io.element.e2ee_forced.public': !config().encryption
+          .allowunencryptedcreation,
+        'io.element.e2ee_forced.private': !config().encryption
+          .allowunencryptedcreation,
+        'io.element.e2ee_forced.trusted_private': !config().encryption
+          .allowunencryptedcreation,
+      },
+    },
   });
   const url = '/_matrix/client/v3/capabilities';
   assertEquals((await call(url)).status, 401);

@@ -13,6 +13,26 @@ export type RoomHooks = {
 };
 
 let hooks: RoomHooks | null = null;
+const joinAdmissions = new WeakMap<
+  Store,
+  (roomId: string, userId: string) => Promise<void>
+>();
+
+export function setJoinAdmission(
+  store: Store,
+  admission: (roomId: string, userId: string) => Promise<void>,
+): void {
+  joinAdmissions.set(store, admission);
+}
+
+// Called with the room authoring lock held, before opening its transaction.
+export async function admitLocalJoin(
+  store: Store,
+  roomId: string,
+  userId: string,
+): Promise<void> {
+  await joinAdmissions.get(store)?.(roomId, userId);
+}
 
 export function setRoomHooks(next: RoomHooks): void {
   hooks = next;

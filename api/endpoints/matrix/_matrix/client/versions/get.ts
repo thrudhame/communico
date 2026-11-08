@@ -5,11 +5,19 @@
 // Complement set is green. M2: v1.1 only (every later label implies
 // room/sync features M3/M4 don't have yet). The inherited r0.6.1/v1.6
 // placeholder is gone. Do not add v1.16 until the user rules it.
-// unstable_features stays empty — no unstable features.
+// The three Element creation-policy flags describe the configured presets.
+import { config } from '#engine/config.ts';
 // deno-lint-ignore require-await
 export default async function () {
   return {
     versions: ['v1.1'],
-    unstable_features: {},
+    unstable_features: {
+      'io.element.e2ee_forced.public': !config().encryption
+        .allowunencryptedcreation,
+      'io.element.e2ee_forced.private': !config().encryption
+        .allowunencryptedcreation,
+      'io.element.e2ee_forced.trusted_private': !config().encryption
+        .allowunencryptedcreation,
+    },
   };
 }

@@ -16,6 +16,7 @@
 // over; other 4xx abort (the old classification). Network never runs
 // under the lock (R13).
 import { canonicalJson } from '#engine/canonical.ts';
+import { config } from '#engine/config.ts';
 import { withAuthProofs } from '#engine/auth-proofs.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -30,8 +31,16 @@ import {
   finalizeBuilt,
   roomCreateId,
 } from '#engine/room/build.ts';
-import type { Fetcher, KeyResolver } from '#engine/room/deps.ts';
-import { projectAfterWrite, registerCreatedRoom } from '#engine/room/hooks.ts';
+import {
+  type Fetcher,
+  type KeyResolver,
+  SendJoinRefused,
+} from '#engine/room/deps.ts';
+import {
+  admitLocalJoin,
+  projectAfterWrite,
+  registerCreatedRoom,
+} from '#engine/room/hooks.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -40,11 +49,24 @@ import { orderEvents } from '#engine/room/order.ts';
 import { mapEntries, type StateMap } from '#engine/room/state.ts';
 import { identify, oversizedOf, verify } from '#engine/room/verify.ts';
 import type { Store } from '#engine/store/index.ts';
+import {
+  assertJoinEncryption,
+  assertKnownJoinEncryption,
+} from '#engine/room/encryption-policy.ts';
+import {
+  beginJoinAttempt,
+  clearJoinAttempt,
+  type JoinAttempt,
+  joinAttemptCommitted,
+  releaseJoinAttempt,
+} from '#engine/server/join-attempts.ts';
 
 export type JoinDeps = {
   keys: KeyResolver;
   fetcher: Fetcher;
   self: string;
+  leave?: (attempt: JoinAttempt) => Promise<void>;
+  wake?: (destination: string) => void;
 };
 
 export type JoinResult = { roomId: string; eventId: string };
@@ -103,6 +125,7 @@ export async function joinRemote(
     content?: Record<string, unknown>;
   },
 ): Promise<JoinResult> {
+  await assertKnownJoinEncryption(store, args.roomId);
   let lastError: unknown = null;
   for (const candidate of args.via) {
     try {
@@ -169,266 +192,315 @@ async function joinVia(
   const signed = await finalizeBuilt(pdu, rulebook, args.signer);
   const eventId = String(signed.event_id);
 
-  // 3. send_join — the answer is untrusted input
-  const resp = await deps.fetcher.sendJoin(args.roomId, signed, candidate);
-
-  // 4. validate BEFORE anything is written: individual receipt failures
-  //    drop events, auth failures reject them. Only accepted state enters
-  //    the boundary; the join must still be authorized by that snapshot.
-  const pack = new Map<string, Pdu>();
-  const stateEventIds: string[] = [];
-  for (const raw of resp.state ?? []) {
-    const v = await verifySnapshotEvent(
-      raw,
-      mk.roomVersion,
-      candidate,
-      args.roomId,
-      deps.keys,
-      deps.self,
-    );
-    if (v === null) continue;
-    if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
-    stateEventIds.push(v.eventId);
-  }
-  for (const raw of resp.authChain ?? []) {
-    const v = await verifySnapshotEvent(
-      raw,
-      mk.roomVersion,
-      candidate,
-      args.roomId,
-      deps.keys,
-      deps.self,
-    );
-    if (v === null) continue;
-    if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
-  }
-  // Per-event auth checks in dependency order, regardless of the source
-  // array: rejected evidence is stored but never imported as state.
-  const rejected = new Map([...pack.keys()].map((id) => [id, 'unchecked']));
-  const packStore: EventStore = await withAuthProofs({
-    get: (id) => pack.get(id),
-    isRejected: (id) => rejected.has(id),
-  }, pack.values());
-  const stateIdSet = new Set(stateEventIds);
-  const snapshotCreates = [...stateIdSet].filter((id) =>
-    pack.get(id)?.type === 'm.room.create' &&
-    checkDeclaredAuth(pack.get(id)!, rulebook, packStore, null).ok
+  // Outstanding compensation fences every new membership side effect, even
+  // after policy changes. Durable recording below remains strict-policy only.
+  await withRoomLock(
+    args.roomId,
+    () => admitLocalJoin(store, args.roomId, args.user),
   );
-  if (snapshotCreates.length !== 1) {
-    throw badResponse('snapshot has no single create');
-  }
-  const ordered = orderEvents(
-    [...pack].map(([eventId, pdu]) => ({ eventId, pdu })),
-    ['auth_events'],
-  ).map(({ eventId, pdu }) => [eventId, pdu] as const);
-  for (const [id, eventPdu] of ordered) {
-    rejected.delete(id);
-    const chain = checkDeclaredAuth(
-      eventPdu,
-      rulebook,
-      packStore,
-      snapshotCreates[0],
-    );
-    if (!chain.ok) {
-      rejected.set(id, chain.rule);
-    }
-  }
-  // exactly one create among the accepted state events, for the
-  // template's version
-  const creates = stateEventIds
-    .filter((id) => !rejected.has(id))
-    .map((id) => pack.get(id)!)
-    .filter((eventPdu) => eventPdu.type === 'm.room.create');
-  if (creates.length !== 1) {
-    throw badResponse('snapshot has no single create');
-  }
-  if (String(creates[0].content?.room_version ?? '') !== mk.roomVersion) {
-    throw badResponse(
-      `snapshot create says room_version ${
-        String(creates[0].content?.room_version)
-      }, expected ${mk.roomVersion}`,
-    );
-  }
-  // the snapshot: the accepted state events (the imported boundary —
-  // the state PRIOR to the join, joins-v2.yaml)
-  const snapshot: StateMap = new Map();
-  for (const id of stateEventIds) {
-    if (rejected.has(id)) continue;
-    const eventPdu = pack.get(id)!;
-    if (eventPdu.state_key === undefined) continue;
-    snapshot.set(String(eventPdu.type) + '\0' + String(eventPdu.state_key), id);
-  }
-  // The returned join must match ours. Merge only its verified resident
-  // signature into our authored event. The countersigned
-  // copy is required only for restricted authorisation (joins-v2.yaml).
-  // Decide from OUR content, even when the response omits the event.
-  let join = signed;
-  let vouched = false;
-  if (resp.event !== undefined) {
-    const returned = resp.event;
-    let identifiedId: string;
-    try {
-      identifiedId = (await identify(returned, mk.roomVersion, {
-        roomId: args.roomId,
-      })).eventId;
-    } catch (e) {
-      throw badResponse('the returned join is malformed: ' + String(e));
-    }
-    if (identifiedId !== eventId) {
-      throw badResponse('the returned join does not match ours');
-    }
-    const residentSigs = (returned.signatures as
-      | Record<string, Record<string, string>>
-      | undefined)?.[candidate] ?? {};
-    const verifiedSigs: Record<string, string> = {};
-    for (const keyId of Object.keys(residentSigs)) {
-      try {
-        if (
-          await deps.keys.verifyEventSignature({
-            server: candidate,
-            keyId,
-            pdu: returned,
-            roomVersion: mk.roomVersion,
-            minValidUntilMs: 0,
-          })
-        ) {
-          verifiedSigs[keyId] = residentSigs[keyId];
-          break;
-        }
-      } catch {
-        // key unobtainable under this id — try the next
-      }
-    }
-    vouched = Object.keys(verifiedSigs).length > 0;
-    if (vouched) {
-      join = {
-        ...signed,
-        signatures: {
-          ...signed.signatures,
-          [candidate]: {
-            ...signed.signatures?.[candidate],
-            ...verifiedSigs,
-          },
-        },
-      };
-    }
-  }
-  if (
-    signed.content?.join_authorised_via_users_server !== undefined && !vouched
-  ) {
-    throw badResponse('the returned join is not vouched by the resident');
-  }
-  // the join against the snapshot: its auth events and the state before
-  const joinStore: EventStore = await withAuthProofs({
-    get: (id) => id === eventId ? join : pack.get(id),
-    isRejected: (id) => rejected.has(id),
-  }, [...pack.values(), join]);
-  const joinChain = checkDeclaredAuth(
-    join,
-    rulebook,
-    joinStore,
-    String(creates[0].event_id),
-  );
-  if (!joinChain.ok) {
-    throw badResponse(
-      `the join is not authorized by its auth events (${joinChain.rule})`,
-    );
-  }
-  const joinState = rulebook.checkAuthAgainstState(join, snapshot, joinStore);
-  if (!joinState.ok) {
-    throw badResponse(
-      `the join is not authorized against the snapshot state (${joinState.rule})`,
-    );
-  }
+  const attempt: JoinAttempt | null =
+    config().encryption.allowunencryptedjoining ? null : {
+      roomId: args.roomId,
+      userId: args.user,
+      eventId,
+      roomVersion: mk.roomVersion,
+      destination: candidate,
+      addedMs: Date.now(),
+    };
+  if (attempt !== null) await beginJoinAttempt(store, attempt);
+  let refused = false;
+  try {
+    // 3. send_join — the answer is untrusted input
+    const resp = await deps.fetcher.sendJoin(args.roomId, signed, candidate)
+      .catch((error: unknown) => {
+        refused = error instanceof SendJoinRefused;
+        throw error;
+      });
 
-  // 5. the room file (safe create when absent — validation has passed),
-  //    then ONE transaction (G11). room-first: the registry follows the
-  //    file's existence (a crash between the two is the startup
-  //    discovery's window).
-  const room = await openRoom(store, args.roomId, { create: true });
-  await registerCreatedRoom(store, args.roomId);
-  await withRoomLock(args.roomId, () =>
-    room.tx(async (tx) => {
-      // revalidation (G8): a live stay means the room is already joined
-      if ((await tx.segments.openStay()) !== null) {
-        throw new MatrixError(
-          400,
-          'M_BAD_STATE',
-          'already joined to ' + args.roomId,
-        );
-      }
-      const prevStay = (await tx.segments.list())
-        .filter((segment) => segment.kind === 'stay')
-        .pop() ?? null;
-      if (
-        prevStay !== null &&
-        await roomCreateId(tx, prevStay.id) !== String(creates[0].event_id)
-      ) {
-        throw badResponse('snapshot replaces the room create');
-      }
-
-      // the auth chain and state events as EVIDENCE (R2 — first writer
-      // wins; bytes, never state-at, never positioned)
-      for (const [id, eventPdu] of ordered) {
-        if ((await tx.events.get(id)) !== null) continue;
-        const rule = rejected.get(id) ?? null;
-        await tx.events.insert(
-          id,
-          canonicalJson(eventPdu as unknown as Record<string, unknown>),
-        );
-        await tx.events.setStatus(id, {
-          standing: rule === null ? 'accepted' : 'rejected',
-          grounding: 'evidence',
-          origin: candidate,
-          received_ts: Date.now(),
-        });
-        await tx.changes.append('event', id, {
-          standing: rule === null ? 'accepted' : 'rejected',
-          reason: rule === null ? null : 'auth',
-          rule,
-          type: String(eventPdu.type),
-          state_key: eventPdu.state_key ?? null,
-          sender: String(eventPdu.sender),
-          depth: eventPdu.depth,
-          origin_server_ts: eventPdu.origin_server_ts,
-          stay: null,
-          offset: null,
-          grounding: 'evidence',
-          origin: candidate,
-        });
-      }
-
-      // the imported snapshot group (R5/G1) opens the new stay; the
-      // join is ingested with before = the snapshot — the pipeline
-      // positions it, sets the frontier, publishes and logs the
-      // membership change
-      const snapshotGroup = await tx.materialize.newGroup(
-        null,
-        mapEntries(snapshot),
+    // 4. validate BEFORE anything is written: individual receipt failures
+    //    drop events, auth failures reject them. Only accepted state enters
+    //    the boundary; the join must still be authorized by that snapshot.
+    const pack = new Map<string, Pdu>();
+    const stateEventIds: string[] = [];
+    for (const raw of resp.state ?? []) {
+      const v = await verifySnapshotEvent(
+        raw,
+        mk.roomVersion,
+        candidate,
+        args.roomId,
+        deps.keys,
+        deps.self,
       );
-      const stayId = await tx.segments.create({
-        kind: 'stay',
-        prev: prevStay?.id ?? null,
-        opening_group: snapshotGroup,
-      });
-      const result = await ingestInTx(tx, args.roomId, join, {
-        remote: {
-          origin: candidate,
-          self: deps.self,
-          oversized: oversizedOf(join, mk.roomVersion),
-          ungroundedMs: 0,
-          boundary: snapshot,
-        },
-      });
-      if (result.standing !== 'accepted') {
-        throw new Error(
-          `E_JOIN_NOT_ACCEPTED: ${result.standing} (${result.reason ?? ''}${
-            result.rule === null ? '' : ', rule ' + result.rule
-          })`,
-        );
+      if (v === null) continue;
+      if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
+      stateEventIds.push(v.eventId);
+    }
+    for (const raw of resp.authChain ?? []) {
+      const v = await verifySnapshotEvent(
+        raw,
+        mk.roomVersion,
+        candidate,
+        args.roomId,
+        deps.keys,
+        deps.self,
+      );
+      if (v === null) continue;
+      if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
+    }
+    // Per-event auth checks in dependency order, regardless of the source
+    // array: rejected evidence is stored but never imported as state.
+    const rejected = new Map([...pack.keys()].map((id) => [id, 'unchecked']));
+    const packStore: EventStore = await withAuthProofs({
+      get: (id) => pack.get(id),
+      isRejected: (id) => rejected.has(id),
+    }, pack.values());
+    const stateIdSet = new Set(stateEventIds);
+    const snapshotCreates = [...stateIdSet].filter((id) =>
+      pack.get(id)?.type === 'm.room.create' &&
+      checkDeclaredAuth(pack.get(id)!, rulebook, packStore, null).ok
+    );
+    if (snapshotCreates.length !== 1) {
+      throw badResponse('snapshot has no single create');
+    }
+    const ordered = orderEvents(
+      [...pack].map(([eventId, pdu]) => ({ eventId, pdu })),
+      ['auth_events'],
+    ).map(({ eventId, pdu }) => [eventId, pdu] as const);
+    for (const [id, eventPdu] of ordered) {
+      rejected.delete(id);
+      const chain = checkDeclaredAuth(
+        eventPdu,
+        rulebook,
+        packStore,
+        snapshotCreates[0],
+      );
+      if (!chain.ok) {
+        rejected.set(id, chain.rule);
       }
-      await tx.segments.setOpenedBy(stayId, eventId);
-    }));
-  await projectAfterWrite(store, args.roomId);
-  return { roomId: args.roomId, eventId };
+    }
+    // exactly one create among the accepted state events, for the
+    // template's version
+    const creates = stateEventIds
+      .filter((id) => !rejected.has(id))
+      .map((id) => pack.get(id)!)
+      .filter((eventPdu) => eventPdu.type === 'm.room.create');
+    if (creates.length !== 1) {
+      throw badResponse('snapshot has no single create');
+    }
+    if (String(creates[0].content?.room_version ?? '') !== mk.roomVersion) {
+      throw badResponse(
+        `snapshot create says room_version ${
+          String(creates[0].content?.room_version)
+        }, expected ${mk.roomVersion}`,
+      );
+    }
+    // the snapshot: the accepted state events (the imported boundary —
+    // the state PRIOR to the join, joins-v2.yaml)
+    const snapshot: StateMap = new Map();
+    for (const id of stateEventIds) {
+      if (rejected.has(id)) continue;
+      const eventPdu = pack.get(id)!;
+      if (eventPdu.state_key === undefined) continue;
+      snapshot.set(
+        String(eventPdu.type) + '\0' + String(eventPdu.state_key),
+        id,
+      );
+    }
+    // The returned join must match ours. Merge only its verified resident
+    // signature into our authored event. The countersigned
+    // copy is required only for restricted authorisation (joins-v2.yaml).
+    // Decide from OUR content, even when the response omits the event.
+    let join = signed;
+    let vouched = false;
+    if (resp.event !== undefined) {
+      const returned = resp.event;
+      let identifiedId: string;
+      try {
+        identifiedId = (await identify(returned, mk.roomVersion, {
+          roomId: args.roomId,
+        })).eventId;
+      } catch (e) {
+        throw badResponse('the returned join is malformed: ' + String(e));
+      }
+      if (identifiedId !== eventId) {
+        throw badResponse('the returned join does not match ours');
+      }
+      const residentSigs = (returned.signatures as
+        | Record<string, Record<string, string>>
+        | undefined)?.[candidate] ?? {};
+      const verifiedSigs: Record<string, string> = {};
+      for (const keyId of Object.keys(residentSigs)) {
+        try {
+          if (
+            await deps.keys.verifyEventSignature({
+              server: candidate,
+              keyId,
+              pdu: returned,
+              roomVersion: mk.roomVersion,
+              minValidUntilMs: 0,
+            })
+          ) {
+            verifiedSigs[keyId] = residentSigs[keyId];
+            break;
+          }
+        } catch {
+          // key unobtainable under this id — try the next
+        }
+      }
+      vouched = Object.keys(verifiedSigs).length > 0;
+      if (vouched) {
+        join = {
+          ...signed,
+          signatures: {
+            ...signed.signatures,
+            [candidate]: {
+              ...signed.signatures?.[candidate],
+              ...verifiedSigs,
+            },
+          },
+        };
+      }
+    }
+    if (
+      signed.content?.join_authorised_via_users_server !== undefined && !vouched
+    ) {
+      throw badResponse('the returned join is not vouched by the resident');
+    }
+    // the join against the snapshot: its auth events and the state before
+    const joinStore: EventStore = await withAuthProofs({
+      get: (id) => id === eventId ? join : pack.get(id),
+      isRejected: (id) => rejected.has(id),
+    }, [...pack.values(), join]);
+    const joinChain = checkDeclaredAuth(
+      join,
+      rulebook,
+      joinStore,
+      String(creates[0].event_id),
+    );
+    if (!joinChain.ok) {
+      throw badResponse(
+        `the join is not authorized by its auth events (${joinChain.rule})`,
+      );
+    }
+    const joinState = rulebook.checkAuthAgainstState(join, snapshot, joinStore);
+    if (!joinState.ok) {
+      throw badResponse(
+        `the join is not authorized against the snapshot state (${joinState.rule})`,
+      );
+    }
+
+    const encryptionId = snapshot.get('m.room.encryption\0');
+    assertJoinEncryption(
+      encryptionId === undefined ? undefined : pack.get(encryptionId)?.content,
+    );
+
+    // 5. the room file (safe create when absent — validation has passed),
+    //    then ONE transaction (G11). room-first: the registry follows the
+    //    file's existence (a crash between the two is the startup
+    //    discovery's window).
+    const room = await openRoom(store, args.roomId, { create: true });
+    await registerCreatedRoom(store, args.roomId);
+    await withRoomLock(args.roomId, () =>
+      room.tx(async (tx) => {
+        // revalidation (G8): a live stay means the room is already joined
+        if ((await tx.segments.openStay()) !== null) {
+          throw new MatrixError(
+            400,
+            'M_BAD_STATE',
+            'already joined to ' + args.roomId,
+          );
+        }
+        const prevStay = (await tx.segments.list())
+          .filter((segment) => segment.kind === 'stay')
+          .pop() ?? null;
+        if (
+          prevStay !== null &&
+          await roomCreateId(tx, prevStay.id) !== String(creates[0].event_id)
+        ) {
+          throw badResponse('snapshot replaces the room create');
+        }
+
+        // the auth chain and state events as EVIDENCE (R2 — first writer
+        // wins; bytes, never state-at, never positioned)
+        for (const [id, eventPdu] of ordered) {
+          if ((await tx.events.get(id)) !== null) continue;
+          const rule = rejected.get(id) ?? null;
+          await tx.events.insert(
+            id,
+            canonicalJson(eventPdu as unknown as Record<string, unknown>),
+          );
+          await tx.events.setStatus(id, {
+            standing: rule === null ? 'accepted' : 'rejected',
+            grounding: 'evidence',
+            origin: candidate,
+            received_ts: Date.now(),
+          });
+          await tx.changes.append('event', id, {
+            standing: rule === null ? 'accepted' : 'rejected',
+            reason: rule === null ? null : 'auth',
+            rule,
+            type: String(eventPdu.type),
+            state_key: eventPdu.state_key ?? null,
+            sender: String(eventPdu.sender),
+            depth: eventPdu.depth,
+            origin_server_ts: eventPdu.origin_server_ts,
+            stay: null,
+            offset: null,
+            grounding: 'evidence',
+            origin: candidate,
+          });
+        }
+
+        // the imported snapshot group (R5/G1) opens the new stay; the
+        // join is ingested with before = the snapshot — the pipeline
+        // positions it, sets the frontier, publishes and logs the
+        // membership change
+        const snapshotGroup = await tx.materialize.newGroup(
+          null,
+          mapEntries(snapshot),
+        );
+        const stayId = await tx.segments.create({
+          kind: 'stay',
+          prev: prevStay?.id ?? null,
+          opening_group: snapshotGroup,
+        });
+        const result = await ingestInTx(tx, args.roomId, join, {
+          remote: {
+            origin: candidate,
+            self: deps.self,
+            oversized: oversizedOf(join, mk.roomVersion),
+            ungroundedMs: 0,
+            boundary: snapshot,
+          },
+        });
+        if (result.standing !== 'accepted') {
+          throw new Error(
+            `E_JOIN_NOT_ACCEPTED: ${result.standing} (${result.reason ?? ''}${
+              result.rule === null ? '' : ', rule ' + result.rule
+            })`,
+          );
+        }
+        await tx.segments.setOpenedBy(stayId, eventId);
+      }));
+    await projectAfterWrite(store, args.roomId);
+    return { roomId: args.roomId, eventId };
+  } finally {
+    if (attempt !== null) {
+      try {
+        if (refused || await joinAttemptCommitted(store, attempt)) {
+          await clearJoinAttempt(await store.server(), attempt);
+        } else if (deps.leave !== undefined) {
+          await deps.leave(attempt);
+          await clearJoinAttempt(await store.server(), attempt);
+        }
+      } catch (error) {
+        // The durable intent survives failed cleanup or acknowledgment. Never
+        // replace the original join refusal with a misleading cleanup success.
+        console.warn('join cleanup remains pending:', String(error));
+      } finally {
+        releaseJoinAttempt(store, attempt);
+        deps.wake?.(candidate);
+      }
+    }
+  }
 }

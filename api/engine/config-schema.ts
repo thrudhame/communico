@@ -21,6 +21,11 @@ export const SCHEMA = {
     root: 'string',
     maxbytes: 'int',
   },
+  encryption: {
+    allowunencryptedcreation: 'bool',
+    allowunencryptedjoining: 'bool',
+    allowunencryptedmessages: 'bool',
+  },
   e2ee: {
     maxrequestbytes: 'int',
     maxkeybytes: 'int',

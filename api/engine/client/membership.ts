@@ -12,6 +12,7 @@ import {
   rejectInviteRemote,
 } from '#engine/federation/invites.ts';
 import { joinRemote } from '#engine/room/join.ts';
+import { performJoinCleanup } from '#engine/federation/join-cleanup.ts';
 import * as local from '#engine/room/membership.ts';
 import { lookupAlias } from '#engine/server/aliases.ts';
 import { membershipOf, roomsFor } from '#engine/server/read.ts';
@@ -78,6 +79,10 @@ export async function join(
           keys: deps.keys,
           fetcher: productionFetcher(app.server, signer),
           self: serverName(),
+          leave: async (attempt) => {
+            await performJoinCleanup(deps, attempt);
+          },
+          wake: deps.wake,
         },
       });
       result = { ...remote, created: true };

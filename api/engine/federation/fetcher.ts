@@ -11,12 +11,15 @@
 // missingEvents/backfill/makeJoin/sendJoin throw (the caller catches
 // into its ladder/failover).
 import { config } from '#engine/config.ts';
-import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import type { Fetcher } from '#engine/room/deps.ts';
+import { type Fetcher, SendJoinRefused } from '#engine/room/deps.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Database as Db } from '#engine/store/db.ts';
-import { federationRequest } from './client.ts';
+import {
+  FederationHttpError,
+  federationRequest,
+  isEndpointUnknown,
+} from './client.ts';
 
 function jsonObject(res: { json: unknown }): Record<string, unknown> {
   return res.json !== null && typeof res.json === 'object' &&
@@ -30,13 +33,19 @@ function pdusOf(obj: Record<string, unknown>, key: string): Pdu[] {
   return Array.isArray(list) ? list as Pdu[] : [];
 }
 
-// v2 → v1 fallback ONLY on endpoint-unknown answers (joins-v2.yaml:26-32):
-// 404/405 with M_UNRECOGNIZED or a non-Matrix body; a genuine remote
-// 400/403 with a Matrix body is the answer and is surfaced, not replayed
-function isEndpointUnknown(e: unknown): boolean {
-  const err = e as { status?: number; errcode?: string };
-  if (err.status !== 404 && err.status !== 405) return false;
-  return err.errcode === undefined || err.errcode === 'M_UNRECOGNIZED';
+function sendJoinFailure(error: unknown): never {
+  if (
+    error instanceof FederationHttpError && error.matrixBody &&
+    error.remoteStatus >= 400 && error.remoteStatus < 500 &&
+    error.remoteStatus !== 408 && error.remoteStatus !== 429
+  ) {
+    throw new SendJoinRefused(
+      error.status,
+      error.errcode,
+      String(error.responseBody().error),
+    );
+  }
+  throw error;
 }
 
 export function productionFetcher(server: Db, signer: Signer): Fetcher {
@@ -186,17 +195,21 @@ export function productionFetcher(server: Db, signer: Signer): Fetcher {
         });
         return unwrap(jsonObject(res));
       } catch (e) {
-        if (e instanceof MatrixError && !isEndpointUnknown(e)) throw e;
-        if (!(e instanceof MatrixError)) throw e;
-        const res = await federationRequest(server, signer, {
-          destination: via,
-          method: 'PUT',
-          path: `/_matrix/federation/v1/send_join/${
-            encodeURIComponent(roomId)
-          }/${encodeURIComponent(eventId)}`,
-          body,
-          maxBytes: bulk(),
-        });
+        if (!isEndpointUnknown(e)) sendJoinFailure(e);
+        let res;
+        try {
+          res = await federationRequest(server, signer, {
+            destination: via,
+            method: 'PUT',
+            path: `/_matrix/federation/v1/send_join/${
+              encodeURIComponent(roomId)
+            }/${encodeURIComponent(eventId)}`,
+            body,
+            maxBytes: bulk(),
+          });
+        } catch (error) {
+          sendJoinFailure(error);
+        }
         // the v1 wrapper: [statusCode, body]
         const arr = Array.isArray(res.json) ? res.json : [];
         const inner = arr.length > 1 && arr[1] !== null &&

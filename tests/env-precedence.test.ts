@@ -39,6 +39,11 @@ maxbackupsessions = 100000
 maxbackupversions = 100
 maxbackupbytes = 67108864
 
+[encryption]
+allowunencryptedcreation = false
+allowunencryptedjoining = true
+allowunencryptedmessages = false
+
 [preview]
 enabled = false
 maxbytes = 10485760

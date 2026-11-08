@@ -34,6 +34,11 @@ maxbackupsessions = 100000
 maxbackupversions = 100
 maxbackupbytes = 67108864
 
+[encryption]
+allowunencryptedcreation = false
+allowunencryptedjoining = true
+allowunencryptedmessages = false
+
 [preview]
 enabled = false
 maxbytes = 10485760
@@ -628,7 +633,7 @@ Deno.test('--shell printer quoting', async () => {
   );
 });
 
-Deno.test('57 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('60 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -646,6 +651,7 @@ Deno.test('57 leaves total across the sections (the surface tripwire)', async ()
     ['server', 3],
     ['admin', 1],
     ['media', 2],
+    ['encryption', 3],
     ['e2ee', 9],
     ['store', 5],
     ['preview', 4],
@@ -653,9 +659,47 @@ Deno.test('57 leaves total across the sections (the surface tripwire)', async ()
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    57,
-    'the whole config surface is 57 leaves, including the E2EE budgets',
+    60,
+    'the whole config surface is 60 leaves, including encryption policy',
   );
+});
+
+Deno.test('encryption controls have independent strict booleans and real shipped defaults', () => {
+  const defaultsPath = 'defaults/communico.toml';
+  assertEquals(
+    loadConfig({ defaultsPath, configPath: null, env: {} }).config.encryption,
+    {
+      allowunencryptedcreation: false,
+      allowunencryptedjoining: true,
+      allowunencryptedmessages: false,
+    },
+  );
+  for (
+    const leaf of [
+      'allowunencryptedcreation',
+      'allowunencryptedjoining',
+      'allowunencryptedmessages',
+    ]
+  ) {
+    const name = 'COMMUNICO_ENCRYPTION_' + leaf.toUpperCase();
+    for (const value of ['true', 'false']) {
+      const result = loadConfig({
+        defaultsPath,
+        configPath: null,
+        env: { [name]: value },
+      });
+      assertEquals(
+        result.config.encryption[leaf as keyof typeof result.config.encryption],
+        value === 'true',
+      );
+      assertEquals(result.sources['encryption.' + leaf], 'env');
+    }
+    assert(
+      loadFail({ defaultsPath, configPath: null, env: { [name]: '1' } }).some((
+        problem,
+      ) => problem.includes(name) && problem.includes('expected bool')),
+    );
+  }
 });
 
 Deno.test('shutdown grace defaults to ten seconds and rejects negative values', () => {

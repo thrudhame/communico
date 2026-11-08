@@ -28,6 +28,7 @@ import {
   inviteIntentProvider,
 } from '#engine/federation/invites.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
+import { joinCleanupProvider } from '#engine/federation/join-cleanup.ts';
 import { type KeyStore, keyStore } from '#engine/federation/keys.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
 import { roomSchema } from '#engine/room/index.ts';
@@ -136,7 +137,14 @@ export function startFederationServices(app: App): void {
     self: name,
     wake: (destination) => sender.wake(destination),
   };
-  sender.setIntentProvider(inviteIntentProvider(inviteDeps));
+  const intents = joinCleanupProvider(
+    inviteDeps,
+    inviteIntentProvider(inviteDeps),
+  );
+  sender.setIntentProvider(intents);
+  void intents.review().then((rows) => {
+    for (const row of rows) sender.wake(row.destination);
+  }).catch((error) => console.error('intent startup scan:', error));
   const unwire = wireEphemeral(app.server, name, queues);
   app.sender = {
     ...sender,
