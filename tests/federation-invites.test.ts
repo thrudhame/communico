@@ -46,6 +46,7 @@ import {
   wireOf,
 } from './fixtures/remote.ts';
 import { testRemoteServer, testSigner } from './fixtures/signer.ts';
+import { assertAuthored } from './fixtures/authored.ts';
 
 async function ourKeyDoc(name: string): Promise<Record<string, unknown>> {
   const us = await testRemoteServer(name);
@@ -218,6 +219,7 @@ Deno.test('inviter: the /v2/invite shape, merged signatures, outbox to joined se
       assertEquals(h.inviteRequests.length, 1);
       const req = h.inviteRequests[0];
       assertEquals(req.room_version, '11');
+      await assertAuthored(req.event);
       assertEquals(req.event.type, 'm.room.member');
       assertEquals(
         (req.event.content as Record<string, unknown>).membership,
@@ -378,6 +380,8 @@ Deno.test('invitee: the validation matrix, the countersigned answer, the stored 
       deps,
     );
     const answered = good.event as Record<string, unknown>;
+    assertEquals('origin' in answered, false);
+    assertEquals(answered.hashes, invite.hashes);
     assert(
       (answered.signatures as Record<string, unknown>)['test'] !== undefined,
       'our signature on the answer',
@@ -388,6 +392,9 @@ Deno.test('invitee: the validation matrix, the countersigned answer, the stored 
     assertEquals(row.status, 'pending');
     assertEquals(row.origin, 'remote.test');
     const storedEvent = JSON.parse(row.eventJson) as Pdu;
+    const { signatures: _signatures, ...unchanged } = storedEvent;
+    const { signatures: _originalSignatures, ...original } = invite;
+    assertEquals(unchanged, original);
     assert(storedEvent.signatures['test'] !== undefined);
     assert(storedEvent.signatures['remote.test'] !== undefined);
     // accepting marks it joined
@@ -502,6 +509,7 @@ Deno.test('reject: local effect at once + the intent performs make/send_leave ag
             10000,
           );
           assert(h.makeLeaveCalls.includes('@dev:test'));
+          await assertAuthored(h.sendLeaveCalls[0]);
           assertEquals(
             (await inviteFor(h.room.roomId, '@dev:test', deps))?.status,
             'rejected',
@@ -511,6 +519,7 @@ Deno.test('reject: local effect at once + the intent performs make/send_leave ag
             (await inviteFor(h.room.roomId, '@dev:test', deps))!.eventJson,
           ) as Record<string, unknown>;
           assertEquals(rendered.type, 'm.room.member');
+          await assertAuthored(rendered);
           assertEquals(
             (rendered.content as Record<string, unknown>).membership,
             'leave',

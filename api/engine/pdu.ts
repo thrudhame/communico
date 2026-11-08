@@ -12,6 +12,8 @@ export interface Pdu {
   prev_events: string[];
   auth_events: string[];
   depth: number;
+  // Our authored PDUs carry this; received PDUs may omit it.
+  origin?: string;
   origin_server_ts: number;
   hashes: { sha256: string };
   signatures: Record<string, Record<string, string>>;

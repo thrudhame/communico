@@ -1,4 +1,4 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assertEquals } from '@std/assert';
 import { createRoom } from '#engine/room/create.ts';
 import { loadRulebookStore } from '#engine/room/build.ts';
 import { backfill } from '#engine/room/history.ts';
@@ -189,10 +189,22 @@ for (const mode of ['valid', 'forged', 'wrong-key'] as const) {
           deps: { self: 'test', keys, fetcher },
         });
       if (mode !== 'valid') {
-        await assertRejects(join, Error, 'snapshot state event not authorized');
-        await assertRejects(
-          () => openRoom(store, fr.roomId),
-          Deno.errors.NotFound,
+        // This layer filters rejected snapshot state rather than refusing
+        // the whole response. The rejected invitation must not be imported.
+        const result = await join();
+        const room = await openRoom(store, fr.roomId);
+        assertEquals(
+          (await current(room)).has('m.room.member\0@bob:remote.test'),
+          false,
+        );
+        assertEquals(
+          (await current(room)).get('m.room.member\0@anna:test'),
+          result.eventId,
+        );
+        assertEquals(
+          (await room.tx((tx) => tx.events.getStatus(member.event_id!)))
+            ?.standing,
+          'rejected',
         );
         return;
       }

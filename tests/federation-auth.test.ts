@@ -158,6 +158,47 @@ Deno.test('auth: a valid signature passes and returns the origin; the contact ho
   });
 });
 
+Deno.test('auth: parallel authenticated requests all commit one origin door-log count', async () => {
+  await withStore(async (store) => {
+    const origin = await makeServer('parallel.test');
+    const server = await store.server();
+    const keys = keyStore(server, { deps: directOnly(await makeDoc(origin)) });
+    // Prime the key cache, so the concurrent writes below are the door log.
+    await keys.getVerifyKey(origin.name, origin.keyId, Date.now(), 'request');
+    const authorization = await headerFor(origin, 'PUT', TARGET);
+    const count = 32;
+    const contacts: string[] = [];
+    const results = await Promise.allSettled(
+      Array.from({ length: count }, () =>
+        authenticateRequest(
+          {
+            server,
+            keys,
+            onContact: (o) => contacts.push(o),
+          },
+          OURS,
+          {
+            method: 'PUT',
+            uri: TARGET,
+            authorization,
+            body: new Uint8Array(),
+          },
+        )),
+    );
+    assertEquals(results.map((r) => r.status), Array(count).fill('fulfilled'));
+    assertEquals(
+      results.map((r) => r.status === 'fulfilled' ? r.value : null),
+      Array(count).fill(origin.name),
+    );
+    const rows = await listPending(server);
+    assertEquals(rows.length, 1);
+    assertEquals(rows[0].name, origin.name);
+    assertEquals(rows[0].verified, true);
+    assertEquals(rows[0].count, count);
+    assertEquals(contacts, Array(count).fill(origin.name));
+  });
+});
+
 Deno.test('auth: missing header → 401; garbage scheme → 401', async () => {
   await withStore(async (store) => {
     const origin = await makeServer('origin.test');

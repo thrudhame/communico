@@ -3,6 +3,7 @@ import { theApp } from '#engine/app.ts';
 import { config, serverName } from '#engine/config.ts';
 import { getMedia } from '#engine/tenant/media.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { b64encode } from '#engine/signing-primitives.js';
 
 export function mediaRoot(): string {
   return config().media.root;
@@ -11,13 +12,7 @@ export function mediaMaxBytes(): number {
   return config().media.maxbytes;
 }
 export function newMediaId(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(18));
-  let binary = '';
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(
-    /=+$/,
-    '',
-  );
+  return b64encode(crypto.getRandomValues(new Uint8Array(18)));
 }
 
 // Validate both components before touching metadata or the filesystem.

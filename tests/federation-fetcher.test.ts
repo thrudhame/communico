@@ -12,6 +12,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { backfill } from '#engine/room/history.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { sendLocal } from '#engine/room/ingest.ts';
 import { joinRemote } from '#engine/room/join.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import type { Signer } from '#engine/room/signer.ts';
@@ -32,7 +33,7 @@ import {
   type RemoteServer,
   wireOf,
 } from './fixtures/remote.ts';
-import { type Genesis, genesis } from './fixtures/genesis.ts';
+import { type Genesis, genesis, PL_DEFAULTS } from './fixtures/genesis.ts';
 import { authAt } from './fixtures/auth.ts';
 import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import { makeDoc } from './federation/doc-helper.ts';
@@ -366,6 +367,16 @@ Deno.test('fetcher: /state_ids + /event packs the gap tip over TLS (imported bou
     await withStore(async (store) => {
       const b = await boot(store, { roomId: '!ff3:test' });
       try {
+        const power = await sendLocal(b.g.room, {
+          type: 'm.room.power_levels',
+          sender: b.g.creator,
+          state_key: '',
+          content: {
+            ...PL_DEFAULTS(b.g.creator),
+            users: { [b.g.creator]: 100, [b.rudy]: 100 },
+          },
+        }, b.g.signer);
+        assertEquals(power.standing, 'accepted');
         // the gap tip: a member join for zoe, citing a genuinely absent
         // prev — its before-state can only be the remote's answer (G1)
         const zoeUser = '@zoe:' + b.remote.name;
@@ -380,26 +391,26 @@ Deno.test('fetcher: /state_ids + /event packs the gap tip over TLS (imported bou
             sender: zoeUser,
             state_key: zoeUser,
             content: { membership: 'join' },
-          }, b.joinId),
+          }, power.eventId),
           depth: 50,
           origin_server_ts: 150,
         });
         const topic = await remoteEvent(
           b.g.roomId,
-          await testRemoteServer(b.g.signer.serverName),
+          b.remote,
           '11',
           {
             type: 'm.room.topic',
-            sender: b.g.creator,
+            sender: b.rudy,
             state_key: '',
             content: { topic: 'on the wire' },
-            prev_events: [b.joinId],
+            prev_events: [power.eventId],
             auth_events: await authAt(b.g.room, {
               type: 'm.room.topic',
-              sender: b.g.creator,
+              sender: b.rudy,
               state_key: '',
               content: {},
-            }, b.joinId),
+            }, power.eventId),
             depth: 49,
             origin_server_ts: 140,
           },

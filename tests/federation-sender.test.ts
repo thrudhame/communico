@@ -41,6 +41,7 @@ import { testRemoteServer } from './fixtures/signer.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
+  sha256ofString,
 } from '#engine/signing-primitives.js';
 import { type FakeServer, startFakeServer } from './federation/fake-server.ts';
 
@@ -256,6 +257,66 @@ Deno.test('sender: rows visible after the room write; delivery; wire form; sent 
     });
   });
 });
+
+for (const character of ['/', '+']) {
+  Deno.test(`sender: generated transaction with standard Base64 ${character} stays one URL segment`, async () => {
+    await withStore(async (store) => {
+      await withSetup(store, async ({ g, dest, fake, sends, sender }) => {
+        await sender.stop();
+        const eventId = await devSays(g.room, g.signer, 'URL-safe transaction');
+        const server = await store.server();
+        const [row] = await listOutbox(server, dest);
+        // Fixed future timestamps avoid expiry. Search the fixture, not the
+        // generator, so the ephemeral TLS port cannot make the test lucky.
+        let ts = 4_000_000_000_000;
+        let standard = '';
+        for (let i = 0; i < 4096; i++, ts++) {
+          standard = b64encodeStd(
+            await sha256ofString(`${dest}\n${ts}\n${row.room}:${row.pos}`),
+          ).slice(0, 22);
+          if (standard.includes(character)) break;
+        }
+        assert(
+          standard.includes(character),
+          'fixture forces the unsafe alphabet',
+        );
+        await server.execute(
+          'UPDATE outbox SET added_ms = ? WHERE destination = ?',
+          [ts, dest],
+        );
+        const restarted = startSender({ store, signer: g.signer });
+        try {
+          await waitFor(() => sends.length === 1, 3000);
+          const expected = `${ts}-${
+            standard.replaceAll('+', '-').replaceAll('/', '_')
+          }`;
+          assertEquals(sends[0].txnId, expected);
+          assert(/^[A-Za-z0-9_-]+$/.test(sends[0].txnId));
+          const request = fake.requests.find((r) => r.method === 'PUT')!;
+          assert(
+            request.verified,
+            'the consumer verifies the actual signed URI',
+          );
+          assertEquals(request.path, `/_matrix/federation/v1/send/${expected}`);
+          assertEquals(decodeURIComponent(request.path).split('/'), [
+            '',
+            '_matrix',
+            'federation',
+            'v1',
+            'send',
+            expected,
+          ]);
+          await waitFor(async () =>
+            (await listOutbox(server, dest))[0].state === 'sent'
+          );
+          assertEquals((await listOutbox(server, dest))[0].event, eventId);
+        } finally {
+          await restarted.stop();
+        }
+      });
+    });
+  });
+}
 
 Deno.test('sender: frozen retry — same txn id, ts, PDUs and EDUs; PDUs only after a restart', async () => {
   await withStore(async (store) => {

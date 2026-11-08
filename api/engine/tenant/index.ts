@@ -28,6 +28,7 @@ import {
   generateSigningKeypair,
   importPrivateKeyFromPkcs8,
   importPublicKeyFromRaw,
+  sha256bytes,
 } from '#engine/signing-primitives.js';
 
 export { tenantSchema };
@@ -43,6 +44,19 @@ export type { UiaSession } from '#engine/tenant/uia.ts';
 // DNS label (52 chars for ed25519) — as in doltgres:api/engine/tenant.ts.
 export function nativeNameFor(pubRaw: Uint8Array): string {
   return b32encode(pubRaw).replace(/=+$/, '').toLowerCase();
+}
+
+export async function signingKeyVersionFor(
+  pubRaw: Uint8Array,
+): Promise<string> {
+  // Matrix key versions allow only [a-zA-Z0-9_]. Twelve hex digits retain
+  // 48 bits of the key fingerprint without the '-' in base64url.
+  const hash = await sha256bytes(pubRaw);
+  return Array.from(
+    hash.slice(0, 6),
+    (byte) => byte.toString(16).padStart(2, '0'),
+  )
+    .join('');
 }
 
 export type Tenant = {
@@ -307,7 +321,8 @@ export async function openTenant(
       native_name: nativeNameFor(pubRaw),
       pubkey_b64: b64encodeStd(pubRaw),
       privkey_enc: b64encodeStd(privDer),
-      key_id: '1',
+      // Counterparts cache (server, key id): a new key needs a new id.
+      key_id: await signingKeyVersionFor(pubRaw),
     };
     await conn.execute(
       'INSERT INTO tenant (server_name, native_name, pubkey_b64, privkey_enc, key_id, created_ms) VALUES (?, ?, ?, ?, ?, ?)',
@@ -343,12 +358,13 @@ export async function openTenant(
       },
     }),
     tx: async (fn) => {
-      let changed = false;
-      const result = await db.tx((conn) =>
-        fn(bind(conn, () => {
+      const { result, changed } = await db.tx(async (conn) => {
+        let changed = false;
+        const result = await fn(bind(conn, () => {
           changed = true;
-        }))
-      );
+        }));
+        return { result, changed };
+      });
       if (changed) tenantStreamCommitted(store, serverName);
       return result;
     },

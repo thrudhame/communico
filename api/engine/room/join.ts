@@ -1,8 +1,9 @@
 // api/engine/room/join.ts — joining a room hosted elsewhere (3c-2):
 // make_join → build the join from the resident's template → sign →
 // send_join → the returned snapshot is validated BEFORE anything is
-// written (every state/auth-chain event through the ONE verification
-// path and checked against its auth events; the returned join must
+// written (state/auth-chain events through the ONE verification path:
+// unverifiable events dropped, auth failures rejected and excluded from
+// the snapshot; the returned join must
 // match ours; the room file is only created after validation passes —
 // plan §3). Then one room transaction under the per-room lock: the
 // auth chain and state events stored as `evidence` (R2 — bytes, never
@@ -53,7 +54,8 @@ export type JoinResult = { roomId: string; eventId: string };
 // carries our first join): their sender-domain key is not resolvable
 // through the injected resolver, so — as in the old snapshot semantics
 // — the RESIDENT's signature also proves the event (it vouches for the
-// snapshot it serves). Both failing refuses the response.
+// snapshot it serves). Both failing drops only this event; the usable
+// snapshot and join authorization decide whether the response suffices.
 async function verifySnapshotEvent(
   raw: Pdu,
   roomVersion: string,
@@ -61,11 +63,15 @@ async function verifySnapshotEvent(
   roomId: string,
   keys: KeyResolver,
   self: string,
-): Promise<{ eventId: string; pdu: Pdu }> {
-  return await verify(raw, roomVersion, keys, {
-    roomId,
-    localSnapshotFallback: { self, resident: candidate },
-  });
+): Promise<{ eventId: string; pdu: Pdu } | null> {
+  try {
+    return await verify(raw, roomVersion, keys, {
+      roomId,
+      localSnapshotFallback: { self, resident: candidate },
+    });
+  } catch {
+    return null;
+  }
 }
 
 // Fail over to the next candidate on network failure, 5xx,
@@ -166,10 +172,9 @@ async function joinVia(
   // 3. send_join — the answer is untrusted input
   const resp = await deps.fetcher.sendJoin(args.roomId, signed, candidate);
 
-  // 4. validate BEFORE anything is written: every returned event
-  //    through the ONE verification path (G9) and checked against its
-  //    auth events; the returned join must match ours; the join must
-  //    be authorized by the snapshot
+  // 4. validate BEFORE anything is written: individual receipt failures
+  //    drop events, auth failures reject them. Only accepted state enters
+  //    the boundary; the join must still be authorized by that snapshot.
   const pack = new Map<string, Pdu>();
   const stateEventIds: string[] = [];
   for (const raw of resp.state ?? []) {
@@ -181,6 +186,7 @@ async function joinVia(
       deps.keys,
       deps.self,
     );
+    if (v === null) continue;
     if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
     stateEventIds.push(v.eventId);
   }
@@ -193,10 +199,11 @@ async function joinVia(
       deps.keys,
       deps.self,
     );
+    if (v === null) continue;
     if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
   }
-  // Per-event auth checks in dependency order: a rejected STATE event
-  // refuses the response; a rejected auth-chain-only event is excluded
+  // Per-event auth checks in dependency order, regardless of the source
+  // array: rejected evidence is stored but never imported as state.
   const rejected = new Map([...pack.keys()].map((id) => [id, 'unchecked']));
   const packStore: EventStore = await withAuthProofs({
     get: (id) => pack.get(id),
@@ -204,7 +211,8 @@ async function joinVia(
   }, pack.values());
   const stateIdSet = new Set(stateEventIds);
   const snapshotCreates = [...stateIdSet].filter((id) =>
-    pack.get(id)?.type === 'm.room.create'
+    pack.get(id)?.type === 'm.room.create' &&
+    checkDeclaredAuth(pack.get(id)!, rulebook, packStore, null).ok
   );
   if (snapshotCreates.length !== 1) {
     throw badResponse('snapshot has no single create');
@@ -222,11 +230,6 @@ async function joinVia(
       snapshotCreates[0],
     );
     if (!chain.ok) {
-      if (stateIdSet.has(id)) {
-        throw badResponse(
-          `snapshot state event not authorized (${chain.rule}): ${id}`,
-        );
-      }
       rejected.set(id, chain.rule);
     }
   }
@@ -255,12 +258,12 @@ async function joinVia(
     if (eventPdu.state_key === undefined) continue;
     snapshot.set(String(eventPdu.type) + '\0' + String(eventPdu.state_key), id);
   }
-  // the returned join: recomputed id must match ours and the resident's
-  // signature must verify (it vouches for the event it accepted); else
-  // the response is refused. The sender-domain signature is OURS — the
-  // joiner's, already proven at build time — so the resident's entry is
-  // the one checked here.
+  // The returned join must match ours. Merge only its verified resident
+  // signature into our authored event. The countersigned
+  // copy is required only for restricted authorisation (joins-v2.yaml).
+  // Decide from OUR content, even when the response omits the event.
   let join = signed;
+  let vouched = false;
   if (resp.event !== undefined) {
     const returned = resp.event;
     let identifiedId: string;
@@ -296,19 +299,24 @@ async function joinVia(
         // key unobtainable under this id — try the next
       }
     }
-    if (Object.keys(verifiedSigs).length === 0) {
-      throw badResponse('the returned join is not vouched by the resident');
-    }
-    join = {
-      ...signed,
-      signatures: {
-        ...signed.signatures,
-        [candidate]: {
-          ...signed.signatures?.[candidate],
-          ...verifiedSigs,
+    vouched = Object.keys(verifiedSigs).length > 0;
+    if (vouched) {
+      join = {
+        ...signed,
+        signatures: {
+          ...signed.signatures,
+          [candidate]: {
+            ...signed.signatures?.[candidate],
+            ...verifiedSigs,
+          },
         },
-      },
-    };
+      };
+    }
+  }
+  if (
+    signed.content?.join_authorised_via_users_server !== undefined && !vouched
+  ) {
+    throw badResponse('the returned join is not vouched by the resident');
   }
   // the join against the snapshot: its auth events and the state before
   const joinStore: EventStore = await withAuthProofs({

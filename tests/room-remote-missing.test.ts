@@ -115,6 +115,105 @@ async function frontierOf(room: Room): Promise<string[]> {
   });
 }
 
+Deno.test('missing: complete pushed batches need no recovery, including rejected and redaction parents', async (t) => {
+  for (const kind of ['message', 'rejected', 'redaction']) {
+    await t.step(kind, async () => {
+      await withStore(async (store) => {
+        const s = await setup(store);
+        const parent = await remoteEvent(s.g.roomId, s.server, '11', {
+          type: kind === 'rejected'
+            ? 'm.room.power_levels'
+            : kind === 'redaction'
+            ? 'm.room.redaction'
+            : 'm.room.message',
+          sender: s.user,
+          ...(kind === 'rejected' ? { state_key: '' } : {}),
+          content: kind === 'redaction' ? { redacts: '$unknown' } : {},
+          prev_events: [s.joinId],
+          auth_events: await authAt(s.g.room, {
+            type: kind === 'rejected'
+              ? 'm.room.power_levels'
+              : kind === 'redaction'
+              ? 'm.room.redaction'
+              : 'm.room.message',
+            sender: s.user,
+            content: {},
+            ...(kind === 'rejected' ? { state_key: '' } : {}),
+          }, s.joinId),
+          depth: 100,
+          origin_server_ts: 200,
+        });
+        const left = await msg(s, 'left', [String(parent.event_id)], 101);
+        const right = await msg(s, 'right', [String(parent.event_id)], 102);
+        const tip = await msg(s, 'merge', [
+          String(left.event_id),
+          String(right.event_id),
+        ], 103);
+        // Wire order is not dependency order; receipts retain input order.
+        const batch = [tip, right, parent, left];
+        const out = await ingestRemote(s.g.room, batch, s.server.name, s.deps);
+        assertEquals(
+          out.map((o) => o.eventId),
+          batch.map((p) => String(p.event_id)),
+        );
+        assertEquals(out.map((o) => o.outcome), [
+          'accepted',
+          'accepted',
+          kind === 'rejected' ? 'rejected' : 'accepted',
+          'accepted',
+        ]);
+        assertEquals(s.calls.missingEvents, []);
+        assertEquals(s.calls.stateIds, []);
+        assertEquals(s.calls.event, []);
+        assertEquals(s.calls.eventAuth, []);
+        assertEquals(await frontierOf(s.g.room), [String(tip.event_id)]);
+        await s.g.room.tx(async (tx) => {
+          for (const pdu of batch) {
+            assertEquals(
+              (await tx.events.getStatus(String(pdu.event_id)))?.grounding,
+              'grounded',
+            );
+          }
+          if (kind === 'redaction') {
+            assertEquals(
+              (await tx.waits.of(String(parent.event_id))).map((w) => w.kind),
+              ['redaction'],
+            );
+          }
+        });
+      });
+    });
+  }
+});
+
+Deno.test('missing: recovery follows the real hole behind pushed parents only once', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const far = await msg(s, 'far', [s.joinId], 100);
+    const parent = await msg(s, 'parent', [String(far.event_id)], 101);
+    const tip = await msg(s, 'tip', [String(parent.event_id)], 102);
+    const recording = fakeFetcher({
+      stateIds: new Map([[String(far.event_id), {
+        pduIds: [s.g.createId, s.joinId],
+        authChainIds: [],
+      }]]),
+      event: new Map([[String(far.event_id), far]]),
+    });
+    s.deps.fetcher = recording.fetcher;
+    const out = await ingestRemote(
+      s.g.room,
+      [tip, parent],
+      s.server.name,
+      s.deps,
+    );
+    assertEquals(out.map((o) => o.outcome), ['accepted', 'accepted']);
+    assertEquals(recording.calls.missingEvents.length, 1);
+    assertEquals(recording.calls.stateIds, [String(far.event_id)]);
+    assertEquals(recording.calls.event, [String(far.event_id)]);
+    assertEquals(await frontierOf(s.g.room), [String(tip.event_id)]);
+  });
+});
+
 Deno.test('missing: request shape (earliest = our extremities); answers land live in depth order', async () => {
   await withStore(async (store) => {
     const s = await setup(store, { roomId: '!m1:test' });

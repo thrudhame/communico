@@ -20,6 +20,15 @@ export class StoreError extends Error {
   get busy(): boolean {
     return (this.code & 255) === 5;
   }
+
+  get conflict(): boolean {
+    // At the qualified pin the Rust SDK exposes WriteWriteConflict through
+    // its generic Error variant. Match that exact reply, never arbitrary SQL
+    // errors containing words such as "busy" or "conflict".
+    return this.busy || (this.code === 1 &&
+      this.message === 'Write-write conflict' &&
+      this.lastError === 'Error("Write-write conflict")');
+  }
 }
 
 const definitions = {

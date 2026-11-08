@@ -4,11 +4,37 @@ import { basename, dirname, join, resolve } from '@std/path';
 import {
   type BeginMode,
   type Row,
+  StoreError,
   Turso,
   type Value,
 } from '#engine/store/ffi.ts';
 import { Gate } from '#engine/store/gate.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
+
+export class StoreConflictError extends StoreError {
+  constructor(
+    readonly path: string,
+    readonly attempts: number,
+    cause: StoreError,
+  ) {
+    super(
+      cause.code,
+      `write conflict after ${attempts} attempts: ${path}`,
+      cause.lastError,
+    );
+    this.name = 'StoreConflictError';
+    this.cause = cause;
+  }
+}
+
+export type ConflictStats = {
+  conflicts: number;
+  retries: number;
+  exhausted: number;
+  backoffMs: number;
+};
+
+const TRANSACTION_ATTEMPTS = 20;
 
 export class Conn {
   private active = true;
@@ -75,6 +101,12 @@ export class Db {
   private closed = false;
   private closingTask?: Promise<void>;
   private waiters: (() => void)[] = [];
+  private readonly conflictCounters: ConflictStats = {
+    conflicts: 0,
+    retries: 0,
+    exhausted: 0,
+    backoffMs: 0,
+  };
 
   private constructor(
     readonly ffi: Turso,
@@ -163,6 +195,14 @@ export class Db {
     }
   }
 
+  conflictStats(): ConflictStats {
+    return { ...this.conflictCounters };
+  }
+
+  // A body may run more than once. Use only its Conn and attempt-local
+  // values; never perform network I/O, notify listeners, or mutate captured
+  // state. Return effects as values and publish them only after tx resolves.
+  // Only native write-write/busy conflicts retry, after a successful rollback.
   async tx<T>(
     fn: (connection: Conn) => Promise<T>,
     options: { mode?: BeginMode } = {},
@@ -171,6 +211,36 @@ export class Db {
       throw new Error('database is closing or closed');
     }
     this.users++;
+    try {
+      for (let attempt = 1;; attempt++) {
+        const result = await this.attempt(fn, options.mode ?? 'concurrent');
+        if (result.committed) return result.value;
+        this.conflictCounters.conflicts++;
+        if (attempt === TRANSACTION_ATTEMPTS) {
+          this.conflictCounters.exhausted++;
+          throw new StoreConflictError(this.path, attempt, result.error);
+        }
+        this.conflictCounters.retries++;
+        // Equal jitter avoids synchronized writers and caps every wait at 50ms.
+        const cap = Math.min(50, 2 ** (attempt - 1));
+        const started = performance.now();
+        await new Promise((wake) =>
+          setTimeout(wake, cap / 2 + Math.random() * cap / 2)
+        );
+        this.conflictCounters.backoffMs += performance.now() - started;
+      }
+    } finally {
+      this.users--;
+      this.notify();
+    }
+  }
+
+  private async attempt<T>(
+    fn: (connection: Conn) => Promise<T>,
+    mode: BeginMode,
+  ): Promise<
+    { committed: true; value: T } | { committed: false; error: StoreError }
+  > {
     await this.gate.enter();
     let handle: number | undefined;
     let connection: Conn | undefined;
@@ -179,12 +249,12 @@ export class Db {
     try {
       handle = await this.acquire();
       connection = new Conn(this.ffi, handle);
-      await this.ffi.begin(handle, options.mode ?? 'concurrent');
       try {
+        await this.ffi.begin(handle, mode);
         const result = await fn(connection);
         await this.ffi.commit(handle);
         committed = true;
-        return result;
+        return { committed: true, value: result };
       } catch (error) {
         try {
           await this.ffi.rollback(handle);
@@ -194,6 +264,9 @@ export class Db {
             [error, rollback],
             'transaction and rollback failed',
           );
+        }
+        if (error instanceof StoreError && error.conflict) {
+          return { committed: false, error };
         }
         throw error;
       }
@@ -211,12 +284,9 @@ export class Db {
           }
         }
       } finally {
-        try {
-          await this.gate.leave(committed);
-        } finally {
-          this.users--;
-          this.notify();
-        }
+        this.notify();
+        // Maintenance errors after COMMIT must never replay a committed body.
+        await this.gate.leave(committed);
       }
     }
   }

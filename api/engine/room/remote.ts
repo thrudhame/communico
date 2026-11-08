@@ -115,6 +115,10 @@ async function fetchMissing(
   budget: { until: number },
   acc: FetchAcc,
 ): Promise<void> {
+  // Recovery sees the same verified union as the locked ingest. Supplied
+  // parents are not missing: walk through them to the actual unresolved
+  // edge. Bytes alone are not grounding; only a persisted after-state or
+  // a fetched boundary can end that walk.
   const missingNow = async (): Promise<string[]> =>
     await room.tx(async (tx) => {
       const missing: string[] = [];
@@ -125,7 +129,7 @@ async function fetchMissing(
           seen.add(id);
           if (
             acc.boundaries.has(id) ||
-            await tx.state.eventStateAfter(id) !== null
+            (await tx.state.eventStateAfter(id)) !== null
           ) continue;
           const supplied = acc.live.get(id);
           if (supplied === undefined) missing.push(id);
@@ -255,18 +259,24 @@ async function fetchMissing(
         )
       );
       if (chain === null) continue;
-      // wire form has no id yet — depth order, stable ties
+      // missinglimit bounds get_missing_events, not this required auth
+      // pack. A prefix is not an auth chain. Verify the whole answer
+      // within the batch budget before exposing any of it to ingest.
       const sorted = [...chain].sort((a, b) => a.depth - b.depth);
-      for (const raw of sorted.slice(0, deps.limits.limit)) {
+      const verified = new Map<string, Pdu>();
+      for (const raw of sorted) {
+        if (budgetLeft() <= 0) return;
         try {
           const v = await verify(raw, version, deps.keys, {
             roomId: room.id,
           });
-          if (!acc.live.has(v.eventId)) acc.evidence.set(v.eventId, v.pdu);
+          if (!acc.live.has(v.eventId)) verified.set(v.eventId, v.pdu);
         } catch {
           // an unverifiable auth-chain event is simply not evidence
         }
       }
+      if (budgetLeft() <= 0) return;
+      for (const [id, pdu] of verified) acc.evidence.set(id, pdu);
     }
   }
 }
@@ -299,24 +309,34 @@ async function fetchGapTip(
   });
   const pack = new Map<string, Pdu>();
   let corruptedAuth = false;
-  for (const id of unknown.slice(0, deps.limits.limit)) {
+  // A state/auth boundary must not lose dependencies to the unrelated
+  // get_missing_events batch size. The whole-batch time budget still
+  // bounds fetching; an unfinished pack supplies no imported state.
+  // Independent reads overlap in bounded waves, then enter the pack in
+  // stable id order. Serial round trips can exhaust the budget even for
+  // an ordinary member auth chain; no network runs under the room lock.
+  const concurrency = 8;
+  for (let start = 0; start < unknown.length; start += concurrency) {
     if (budget.until - Date.now() <= 0) return;
-    const raw = await fetchOrNull(() => deps.fetcher.event(id, origin));
-    if (raw === null) {
-      if (authSet.has(id)) corruptedAuth = true;
-      continue;
-    }
-    try {
-      const v = await verify(raw, version, deps.keys, { roomId: room.id });
-      if (v.eventId !== id) {
-        if (authSet.has(id)) corruptedAuth = true;
-        continue;
+    const wave = unknown.slice(start, start + concurrency);
+    const fetched = await Promise.all(wave.map(async (id) => {
+      const raw = await fetchOrNull(() => deps.fetcher.event(id, origin));
+      if (raw === null) return null;
+      try {
+        const v = await verify(raw, version, deps.keys, { roomId: room.id });
+        return v.eventId === id ? v.pdu : null;
+      } catch {
+        return null;
       }
-      pack.set(id, v.pdu);
-    } catch {
-      if (authSet.has(id)) corruptedAuth = true;
+    }));
+    if (budget.until - Date.now() <= 0) return;
+    for (const [index, pdu] of fetched.entries()) {
+      const id = wave[index];
+      if (pdu !== null) pack.set(id, pdu);
+      else if (authSet.has(id)) corruptedAuth = true;
     }
   }
+  if (budget.until - Date.now() <= 0) return;
   // the tip itself via /event
   let tipPdu: Pdu | null = null;
   const rawTip = await fetchOrNull(() => deps.fetcher.event(tip, origin));
@@ -338,7 +358,7 @@ async function fetchGapTip(
       // stays missing — the caller's terminal decides
     }
   }
-  if (tipPdu === null) return;
+  if (tipPdu === null || budget.until - Date.now() <= 0) return;
   if (corruptedAuth) {
     acc.live.delete(tip);
     acc.corrupted.set(tip, tipPdu);
@@ -353,7 +373,7 @@ async function fetchGapTip(
         const row = await tx.events.get(id);
         return row === null ? null : (JSON.parse(row.pdu) as Pdu);
       });
-    if (pdu === null || pdu.state_key === undefined) continue;
+    if (pdu === null || pdu.state_key === undefined) return;
     boundary.set(String(pdu.type) + '\0' + String(pdu.state_key), id);
   }
   for (const [id, pdu] of pack) {
@@ -444,15 +464,16 @@ export async function ingestRemote(
   }
 
   // One room transaction for the accepted batch, under the per-room lock
-  const grounded: string[] = [];
   const outcomeIndex = new Map<string, number[]>();
   for (const item of items) {
     const indexes = outcomeIndex.get(item.eventId) ?? [];
     indexes.push(item.index);
     outcomeIndex.set(item.eventId, indexes);
   }
-  await withRoomLock(room.id, () =>
+  const committed = await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
+      const grounded: string[] = [];
+      const results = new Map<number, RemoteOutcome>();
       // Revalidation (G8): the fetch phase ran unlocked — the stay, the
       // version and the extremities are re-read inside the lock
       const stay = await tx.segments.openStay();
@@ -572,15 +593,17 @@ export async function ingestRemote(
             error: null,
           };
         for (const index of outcomeIndex.get(item.eventId) ?? []) {
-          outcomes[index] = result;
+          results.set(index, result);
         }
       }
+      return { grounded, results };
     }));
+  for (const [index, result] of committed.results) outcomes[index] = result;
 
   // A later arrival re-runs what waited for it (R10 — each recheck is a
   // locked ingest of its own, after this lock released)
   const hasWaiters = await room.tx(async (tx) => {
-    for (const id of grounded) {
+    for (const id of committed.grounded) {
       if ((await tx.waits.for(id)).length > 0) return true;
     }
     return false;

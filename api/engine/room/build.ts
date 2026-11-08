@@ -20,12 +20,13 @@ import {
   type StateMap,
 } from '#engine/rulebook/index.ts';
 import type { RoomTx } from '#engine/room/index.ts';
+import { edgeIds } from '#engine/room/events.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { contentHashOf } from '#engine/signing-primitives.js';
 
 // Counts rulebook resolveState calls (the plan's instrumented guardrail:
 // a single-prev linear ingest performs no resolution).
-export const resolutionProbe = { resolutions: 0 };
+export { resolutionProbe } from '#engine/room/index.ts';
 
 // The auth closure feeding the rulebook is a bounded indexed walk (R3);
 // a truncated walk is a loud failure, never a silent partial store.
@@ -124,20 +125,26 @@ export async function ungroundedPrevs(
 }
 
 // The rulebook's synchronous EventStore over the bounded recursive auth
-// closure of the seeds, with rejected flags (S4 155-194).
+// closure of the seeds, with rejected flags (S4 155-194). The room create
+// is an invariant dependency: v12 refers to it through room_id instead of
+// auth_events, including when an evidence/history check has no state seeds.
 export async function loadRulebookStore(
   tx: RoomTx,
   seeds: readonly string[],
   incoming: readonly Pdu[] = [],
   localRejected: ReadonlySet<string> = new Set(),
 ): Promise<EventStore> {
-  const roots = [
-    ...new Set([
-      ...seeds,
-      ...incoming.flatMap((pdu) => pdu.auth_events ?? []),
-    ]),
-  ];
-  const walk = await tx.events.authClosure(roots, AUTH_CLOSURE_LIMIT);
+  const roots = new Set([
+    ...seeds,
+    ...incoming.flatMap((pdu) => pdu.auth_events ?? []),
+  ]);
+  const stay = await tx.segments.latestStay();
+  const current = stay === null ? null : await tx.state.current(stay.id);
+  const create = current === null
+    ? null
+    : await tx.state.groupKey(current, 'm.room.create', '');
+  if (create !== null) roots.add(create);
+  const walk = await tx.events.authClosure([...roots], AUTH_CLOSURE_LIMIT);
   if (walk.truncated) {
     throw new Error(
       `E_AUTH_CLOSURE: auth closure exceeds ${AUTH_CLOSURE_LIMIT} events`,
@@ -230,6 +237,37 @@ export function authorizedBoundary(
   return true;
 }
 
+// Publication reuses authorization's already-loaded graph, extended by the
+// newly accepted event. Its seeds can differ, so preserve the closure guard
+// (including unknown ids) with an in-memory walk, never another DB load.
+export function withRulebookEvent(
+  store: EventStore,
+  eventId: string,
+  pdu: Pdu,
+  seeds: readonly string[],
+  limit = AUTH_CLOSURE_LIMIT,
+): EventStore {
+  const extended: EventStore = {
+    ...store,
+    get: (id) => id === eventId ? pdu : store.get(id),
+    isRejected: (id) => id === eventId ? false : store.isRejected(id),
+  };
+  const visited = new Set<string>();
+  const queue = [...seeds];
+  for (let i = 0; i < queue.length; i++) {
+    const id = queue[i];
+    if (visited.has(id)) continue;
+    if (visited.size >= limit) {
+      throw new Error(`E_AUTH_CLOSURE: auth closure exceeds ${limit} events`);
+    }
+    visited.add(id);
+    for (const auth of edgeIds(extended.get(id)?.auth_events)) {
+      if (!visited.has(auth)) queue.push(auth);
+    }
+  }
+  return extended;
+}
+
 // The state before an event citing the given prevs: the single prev's
 // after-group aliased (no resolution — the plan's performance guardrail),
 // or the rulebook resolution over every prev's after-state.
@@ -251,7 +289,7 @@ export async function stateBefore(
       maps.flatMap((map) => [...map.values()]),
     )
     : store;
-  resolutionProbe.resolutions++;
+  tx.diagnostics.resolutions++;
   return rulebook.resolveState(maps, resolver);
 }
 
@@ -267,6 +305,9 @@ export async function finalizeBuilt(
   if (rulebook.spec.strictCanonicalJson) {
     assertCanonicalNumbers(pdu.content);
   }
+  // Authored events name us before hashing/signing, including template builds.
+  // Received events use verification/countersigning, never this finalizer.
+  pdu.origin = signer.serverName;
   // The v11+ wire form has no event_id field: it is derived, never hashed
   // or signed. It is absent at build time.
   pdu.hashes = { sha256: await contentHashOf(pdu) };
