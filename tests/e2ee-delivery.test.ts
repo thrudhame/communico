@@ -1,6 +1,7 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import {
   completeBatch,
   enqueueEdu,
@@ -21,7 +22,7 @@ Deno.test('E3: server v5 upgrade preserves pending work, frozen envelopes surviv
   const previous = {
     version: 5,
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
-      await serverSchema.apply(db);
+      await db.exec(SERVER_V13);
       await db.exec(
         'DROP TABLE federation_join_attempts; DROP TABLE remote_signing_keys; DROP TABLE public_signing_keys; DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
       );
@@ -110,7 +111,7 @@ Deno.test('E3 v6 FIFO upgrade retains insertion order and exact frozen ownership
   const previous = {
     version: 6,
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
-      await serverSchema.apply(db);
+      await db.exec(SERVER_V13);
       await db.exec(
         'DROP TABLE federation_join_attempts; DROP TABLE remote_signing_keys; DROP TABLE public_signing_keys; DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
       );

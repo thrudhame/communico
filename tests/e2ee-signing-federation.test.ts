@@ -1,4 +1,5 @@
 import { assert, assertEquals } from '@std/assert';
+import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { keyView } from '#engine/e2ee-key-view.ts';
@@ -55,7 +56,7 @@ Deno.test('public signing projection replays old intents, seeds subscriptions an
   const previousServer = {
     version: 10,
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
-      await serverSchema.apply(db);
+      await db.exec(SERVER_V13);
       await db.exec('DROP TABLE public_signing_keys');
       await db.exec('DROP TABLE remote_signing_keys');
       await db.exec('DROP TABLE federation_join_attempts');

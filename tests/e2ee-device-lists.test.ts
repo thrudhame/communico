@@ -1,4 +1,5 @@
 import { assertEquals } from '@std/assert';
+import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { openStore } from '#engine/store/index.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -90,7 +91,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
   const previous = {
     version: 4,
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
-      await serverSchema.apply(db);
+      await db.exec(SERVER_V13);
       for (
         const name of [
           'e2ee_rooms',
@@ -172,7 +173,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
     assertEquals(
       (await migrated.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '13',
+      String(serverSchema.version),
     );
   } finally {
     await store.close();

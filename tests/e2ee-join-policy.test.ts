@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { joinRemote } from '#engine/room/join.ts';
@@ -415,7 +416,7 @@ Deno.test('E6 real server v12 upgrade adds empty cleanup state and preserves acc
       server: {
         version: 12,
         apply: async (db) => {
-          await serverSchema.apply(db);
+          await db.exec(SERVER_V13);
           await db.exec('DROP TABLE federation_join_attempts');
         },
       },
@@ -435,7 +436,7 @@ Deno.test('E6 real server v12 upgrade adds empty cleanup state and preserves acc
     );
     assertEquals(
       (await server.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-      '13',
+      String(serverSchema.version),
     );
   } finally {
     await store.close();

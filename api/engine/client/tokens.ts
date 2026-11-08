@@ -8,12 +8,13 @@ export type StreamToken = {
   dSeq: number;
   mSeq: number;
   kSeq: number;
+  nSeq?: number;
 };
 
 export function parseStreamToken(raw: string | null): StreamToken | null {
   if (raw === null) return null;
   const m =
-    /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?(?:_a(\d+))?(?:_d(\d+))?(?:_m(\d+))?(?:_k(\d+))?$/
+    /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?(?:_a(\d+))?(?:_d(\d+))?(?:_m(\d+))?(?:_k(\d+))?(?:_n(\d+))?$/
       .exec(
         raw,
       );
@@ -30,6 +31,7 @@ export function parseStreamToken(raw: string | null): StreamToken | null {
     dSeq: m[6] ? Number(m[6]) : 0,
     mSeq: m[7] ? Number(m[7]) : 0,
     kSeq: m[8] ? Number(m[8]) : 0,
+    ...(m[9] === undefined ? {} : { nSeq: Number(m[9]) }),
   };
 }
 
@@ -42,8 +44,10 @@ export function formatStreamToken(
   dSeq = 0,
   mSeq = 0,
   kSeq = 0,
+  nSeq?: number,
 ): string {
-  return `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}_a${aSeq}_d${dSeq}_m${mSeq}_k${kSeq}`;
+  return `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}_a${aSeq}_d${dSeq}_m${mSeq}_k${kSeq}` +
+    (nSeq === undefined ? '' : `_n${nSeq}`);
 }
 
 export function encodeStreamToken(t: StreamToken): string {
@@ -56,5 +60,6 @@ export function encodeStreamToken(t: StreamToken): string {
     t.dSeq,
     t.mSeq,
     t.kSeq,
+    t.nSeq,
   );
 }

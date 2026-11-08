@@ -390,6 +390,8 @@ function bind(
       },
     },
     accountData: {
+      snapshot: (localpart: string, roomId: string, type: string) =>
+        accountdata.accountDataSnapshot(conn, localpart, roomId, type),
       put: (
         localpart: string,
         roomId: string,
@@ -415,6 +417,8 @@ function bind(
         accountdata.accountDataMaxSeq(conn, localpart),
     },
     pushRules: {
+      putDefault: (localpart: string, kind: string, rule: pushrules.PushRule) =>
+        pushrules.putDefaultOverride(conn, localpart, kind, rule),
       kindRows: (localpart: string, kind: string) =>
         pushrules.kindRows(conn, localpart, kind),
       byId: (localpart: string, kind: string, ruleId: string) =>

@@ -22,6 +22,11 @@ import { advance, get } from '#engine/store/watermark.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
+import {
+  preparePush,
+  type PushPublication,
+} from '#engine/server/push-project.ts';
+import { applyPushPublication } from '#engine/server/notifications.ts';
 
 // The watermark source naming a room's change log (storage plan's
 // sources() enumerates these; tests already use this shape).
@@ -129,7 +134,7 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
       return;
     }
     if (drop > 0) batch = batch.slice(0, drop);
-    const prepared = await prepare(room, store, roomId, batch);
+    const prepared = await prepare(room, store, roomId, batch, localServers);
     const addedMs = Date.now();
     await eventStreamTx(server, async (tx) => {
       for (const item of prepared) {
@@ -173,6 +178,7 @@ type Prepared =
       // the server rows inside apply's transaction, including earlier
       // changes in the same batch. Evidence/history carry no publication.
       publication: Publication | null;
+      push: PushPublication | null;
     }
     | {
       kind: 'membership';
@@ -282,6 +288,7 @@ async function prepare(
   store: Store,
   roomId: string,
   batch: Change[],
+  localServers: string[],
 ): Promise<Prepared[]> {
   // The triggers of membership changes whose own event change sits in an
   // earlier batch: their feed rows are already committed in the server
@@ -363,6 +370,17 @@ async function prepare(
           relation,
           search,
           publication,
+          push: localServers.length > 0 && change.kind !== 'history' &&
+              isLive(payload)
+            ? await preparePush(
+              room,
+              store,
+              change.event,
+              payload.stay!,
+              change.pos,
+              localServers,
+            )
+            : null,
         });
         break;
       }
@@ -552,7 +570,7 @@ async function apply(
           item.payload.origin,
         ],
       );
-      if (isLive(item.payload)) await applyLive(tx, roomId, item);
+      if (isLive(item.payload)) await applyLive(tx, roomId, item, addedMs);
       await applyPublication(
         tx,
         roomId,
@@ -583,7 +601,7 @@ async function apply(
           item.payload.origin,
         ],
       );
-      if (isLive(item.payload)) await applyLive(tx, roomId, item);
+      if (isLive(item.payload)) await applyLive(tx, roomId, item, addedMs);
       await applyPublication(
         tx,
         roomId,
@@ -790,6 +808,7 @@ async function applyLive(
   tx: Conn,
   roomId: string,
   item: Prepared & { kind: 'event' | 'transition' | 'history' },
+  addedMs: number,
 ): Promise<void> {
   const existing = await feedSeqAtPos(tx, roomId, item.change.pos);
   if (existing === null) {
@@ -835,6 +854,17 @@ async function applyLive(
         item.payload.origin_server_ts,
         item.search.text,
       ],
+    );
+  }
+  if (existing === null && item.push !== null) {
+    await applyPushPublication(
+      tx,
+      roomId,
+      item.change.event!,
+      (await feedSeqAtPos(tx, roomId, item.change.pos))!,
+      item.change.pos,
+      item.push,
+      addedMs,
     );
   }
 }

@@ -70,6 +70,22 @@ export type AccountDataRow = {
   content: unknown;
 };
 
+/** A value and its revision from the same owning transaction. */
+export async function accountDataSnapshot(
+  conn: Conn,
+  localpart: string,
+  roomId: string,
+  type: string,
+): Promise<{ content: unknown; seq: number } | null> {
+  const rows = await conn.query(
+    'SELECT content,seq FROM account_data WHERE localpart=? AND room_id=? AND type=?',
+    [localpart, roomId, type],
+  );
+  return rows.length
+    ? { content: JSON.parse(String(rows[0].content)), seq: Number(rows[0].seq) }
+    : null;
+}
+
 function toAccountDataRows(
   rows: Record<string, unknown>[],
 ): AccountDataRow[] {

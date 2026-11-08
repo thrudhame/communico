@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { config } from '#engine/config.ts';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -41,7 +42,7 @@ Deno.test('remote signing revision rejects a late device snapshot over rotation;
   const old = {
     version: 11,
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
-      await serverSchema.apply(db);
+      await db.exec(SERVER_V13);
       await db.exec('DROP TABLE remote_signing_keys');
       await db.exec('DROP TABLE federation_join_attempts');
     },

@@ -75,7 +75,9 @@ suite.test('typing starts/stops/expires, has no room_id, does not leak, and is p
   );
   let before = await sync(b.access_token!, '&since=s0');
   assert(
-    /^s\d+_p\d+_t\d+_r\d+_a\d+_d\d+_m\d+_k\d+$/.test(String(before.next_batch)),
+    /^s\d+_p\d+_t\d+_r\d+_a\d+_d\d+_m\d+_k\d+_n\d+$/.test(
+      String(before.next_batch),
+    ),
   );
   for (
     const body of [{ typing: true, timeout: 10000 }, { typing: false }, {

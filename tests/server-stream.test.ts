@@ -52,7 +52,7 @@ Deno.test('event stream: room publications and every OOB transition share durabl
     };
     const roomId = '!invite:remote.test';
     const user = '@dev:test';
-    const invite = await remoteEvent(roomId, remote, '11', {
+    let invite = await remoteEvent(roomId, remote, '11', {
       type: 'm.room.member',
       sender: '@zoe:remote.test',
       state_key: user,
@@ -101,6 +101,21 @@ Deno.test('event stream: room publications and every OOB transition share durabl
     });
     assert(await acceptRescind(roomId, leave, deps));
     assertEquals((await inviteFor(roomId, user, deps))?.seq, 9);
+    await receive();
+    assertEquals(
+      await eventStreamMax(server),
+      9,
+      'withdrawn invite replay is inert',
+    );
+    assertEquals((await inviteFor(roomId, user, deps))?.status, 'rejected');
+    invite = await remoteEvent(roomId, remote, '11', {
+      type: 'm.room.member',
+      sender: '@zoe:remote.test',
+      state_key: user,
+      content: { membership: 'invite', is_direct: true },
+      prev_events: [leave.event_id!],
+      auth_events: [],
+    });
     await receive();
     await markInviteJoined(roomId, user, deps);
     const accepted = await inviteFor(roomId, user, deps);

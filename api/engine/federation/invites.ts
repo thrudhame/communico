@@ -37,6 +37,11 @@ import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { withProjectionLock } from '#engine/server/project.ts';
+import { prepareInvitePush } from '#engine/server/push-project.ts';
+import {
+  applyInvitePush,
+  withdrawInvitePush,
+} from '#engine/server/notifications.ts';
 import { federationRequest, isEndpointUnknown } from './client.ts';
 import { admit } from './gate.ts';
 import { domainOf, toWire } from './pdu.ts';
@@ -445,7 +450,28 @@ export async function receiveInvite(
       throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
     }
     if (await participating(deps.store, roomId)) return;
+    const publication = await prepareInvitePush(deps.store, deps.self, pdu);
+    const now = Date.now();
     await eventStreamTx(deps.server, async (tx) => {
+      const evaluated = await tx.query(
+        'SELECT 1 FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
+        [deps.self, target, eventId],
+      );
+      if (evaluated.length) return;
+      const previous = await tx.query(
+        'SELECT event_id FROM federation_invites WHERE room_id=? AND user_id=?',
+        [roomId, target],
+      );
+      // Redelivery is not a new invitation, including after local rejection.
+      if (previous[0]?.event_id === eventId) return;
+      if (previous.length) {
+        await withdrawInvitePush(
+          tx,
+          target,
+          roomId,
+          String(previous[0].event_id),
+        );
+      }
       const seq = await nextEventSeq(tx);
       await tx.execute(
         `INSERT INTO federation_invites(room_id, user_id, event_id, room_version, event_json, invite_room_state, origin, received_ms, status, seq)
@@ -462,10 +488,11 @@ export async function receiveInvite(
           JSON.stringify(pdu),
           JSON.stringify(stripped),
           origin,
-          Date.now(),
+          now,
           seq,
         ],
       );
+      await applyInvitePush(tx, roomId, eventId, seq, publication, now);
     });
   });
   return { event: toWire(pdu, roomVersion) };
@@ -511,6 +538,7 @@ export async function rejectInviteRemote(
     if (invite === null || invite.status === 'joined') {
       throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
     }
+    await withdrawInvitePush(tx, userId, roomId, invite.eventId);
     const seq = await nextEventSeq(tx);
     await tx.execute(
       "UPDATE federation_invites SET status = 'rejecting', seq = ? WHERE room_id = ? AND user_id = ?",
@@ -797,6 +825,7 @@ export async function acceptRescind(
     const stored = JSON.parse(invite.eventJson) as Record<string, unknown>;
     const inviter = typeof stored.sender === 'string' ? stored.sender : null;
     if (inviter === null || sender !== inviter) return false;
+    await withdrawInvitePush(tx, target, roomId, invite.eventId);
     const seq = await nextEventSeq(tx);
     await tx.execute(
       "UPDATE federation_invites SET status = 'rejected', event_json = ?, seq = ? WHERE room_id = ? AND user_id = ?",
@@ -835,10 +864,11 @@ export async function markInviteJoined(
 ): Promise<void> {
   await inviteTransition(deps.server, async (tx) => {
     const rows = await tx.query(
-      "SELECT 1 FROM federation_invites WHERE room_id = ? AND user_id = ? AND status = 'pending'",
+      "SELECT event_id FROM federation_invites WHERE room_id = ? AND user_id = ? AND status = 'pending'",
       [roomId, userId],
     );
     if (rows.length === 0) return;
+    await withdrawInvitePush(tx, userId, roomId, String(rows[0].event_id));
     const seq = await nextEventSeq(tx);
     await tx.execute(
       "UPDATE federation_invites SET status = 'joined', seq = ? WHERE room_id = ? AND user_id = ? AND status = 'pending'",

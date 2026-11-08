@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertThrows } from '@std/assert';
+import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { config } from '#engine/config.ts';
 import {
   deviceDelta,
@@ -185,7 +186,7 @@ Deno.test('v9 lazy-recovery upgrade retains hinted retries and leaves membership
   const previous = {
     version: 9,
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
-      await serverSchema.apply(db);
+      await db.exec(SERVER_V13);
       await db.exec(
         'DROP TABLE federation_join_attempts; DROP TABLE remote_signing_keys; DROP TABLE public_signing_keys; DROP TABLE device_recovery_requests',
       );
@@ -380,7 +381,7 @@ Deno.test('pending and cache overflow stay bounded and stale; supported v7 upgra
       server: {
         version: 7,
         apply: async (db) => {
-          await serverSchema.apply(db);
+          await db.exec(SERVER_V13);
           await db.exec(
             'DROP TABLE federation_join_attempts; DROP TABLE remote_signing_keys; DROP TABLE public_signing_keys; DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
           );
@@ -399,7 +400,7 @@ Deno.test('pending and cache overflow stay bounded and stale; supported v7 upgra
     const db = await store.server();
     assertEquals(
       (await db.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-      '13',
+      String(serverSchema.version),
     );
     assertEquals(
       (await db.query('SELECT source FROM edu_outbox'))[0].source,

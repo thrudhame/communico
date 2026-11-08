@@ -16,7 +16,11 @@ import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { feedAfter, roomsFor } from '#engine/server/read.ts';
-import { eventStreamMax } from '#engine/server/stream.ts';
+import {
+  notificationSnapshot,
+  roomNotificationCounts,
+} from '#engine/server/notifications.ts';
+import type { Row } from '#engine/store/ffi.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import {
   accountDataMax,
@@ -37,7 +41,6 @@ import {
   receiptsSince,
   setPresenceValue,
   sharedUsers,
-  streamMax,
 } from '#engine/server/ephemeral.ts';
 import {
   lastTypingChange,
@@ -81,6 +84,11 @@ async function roomTimeline(
   now: StreamToken,
   end: number,
   summary: boolean,
+  snapshot: {
+    receipts: Record<string, unknown>[];
+    members: Row[];
+    unread: ReturnType<typeof roomNotificationCounts>;
+  },
 ) {
   const app = theApp();
   const raw = await feedAfter(
@@ -167,11 +175,12 @@ async function roomTimeline(
         now.dSeq,
         now.mSeq,
         now.kSeq,
+        now.nSeq,
       ),
     },
     ephemeral: { events: [] },
     account_data: { events: [] },
-    unread_notifications: {},
+    unread_notifications: snapshot.unread,
   };
   if (summary) {
     const ephemeral: Record<string, unknown>[] = [];
@@ -186,20 +195,12 @@ async function roomTimeline(
         content: { user_ids: typing.userIds },
       });
     }
-    const receipts = await receiptsSince(
-      app.server,
-      room.id,
-      i.userId,
-      i.since?.rSeq ?? 0,
-    );
+    const receipts = snapshot.receipts;
     for (const content of receipts) {
       ephemeral.push({ type: 'm.receipt', content });
     }
     entry.ephemeral = { events: ephemeral };
-    const members = await app.server.query(
-      "SELECT user, membership FROM memberships WHERE room = ? AND membership IN ('join','invite') ORDER BY CASE membership WHEN 'join' THEN 0 ELSE 1 END, user",
-      [room.id],
-    );
+    const members = snapshot.members;
     const heroes = members.filter((r) => r.user !== i.userId).slice(0, 5).map((
       r,
     ) => String(r.user));
@@ -239,6 +240,10 @@ async function relevantChanged(
   if (i.since === null) return true;
   sweepTyping();
   const app = theApp();
+  if (
+    (await notificationSnapshot(app.server, i.userId, i.since.nSeq ?? 0))
+      .changed.size
+  ) return true;
   const lists = await deviceListsBetween(
     app.server,
     i.userId,
@@ -343,15 +348,54 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   sweepTyping();
   await waitForRelevant(i, device);
   sweepTyping();
+  // One server transaction selects events, receipts, memberships and counts.
+  // Rendering afterward may be slow, but cannot mix a later count/receipt cut.
+  const snapshot = await app.server.tx(async (tx) => {
+    const counters = new Map(
+      (await tx.query('SELECT name,value FROM counters')).map((
+        r,
+      ) => [String(r.name), Number(r.value)]),
+    );
+    const memberships = await roomsFor(tx, i.userId);
+    const notifications = await notificationSnapshot(
+      tx,
+      i.userId,
+      i.since?.nSeq ?? 0,
+    );
+    const rooms = new Map<
+      string,
+      { receipts: Record<string, unknown>[]; members: Row[] }
+    >();
+    for (const membership of memberships) {
+      rooms.set(membership.roomId, {
+        receipts: await receiptsSince(
+          tx,
+          membership.roomId,
+          i.userId,
+          i.since?.rSeq ?? 0,
+        ),
+        members: await tx.query(
+          "SELECT user,membership FROM memberships WHERE room=? AND membership IN ('join','invite') ORDER BY CASE membership WHEN 'join' THEN 0 ELSE 1 END,user",
+          [membership.roomId],
+        ),
+      });
+    }
+    const oob = await tx.query(
+      'SELECT * FROM federation_invites WHERE user_id=? ORDER BY seq',
+      [i.userId],
+    );
+    return { counters, memberships, notifications, rooms, oob };
+  });
   const now: StreamToken = {
-    eSeq: await eventStreamMax(app.server),
-    pSeq: await streamMax(app.server, 'presence'),
+    eSeq: snapshot.counters.get('events') ?? 0,
+    pSeq: snapshot.counters.get('presence') ?? 0,
     tSeq: typingSeq(),
-    rSeq: await streamMax(app.server, 'receipts'),
+    rSeq: snapshot.counters.get('receipts') ?? 0,
     aSeq: await accountDataMax(app.tenant, lp),
-    dSeq: await deviceStreamMax(app.server),
+    dSeq: snapshot.counters.get('devices') ?? 0,
     mSeq: 0,
     kSeq: 0,
+    nSeq: snapshot.counters.get('notifications') ?? 0,
   };
   const delivery = device === null
     ? { events: [], token: now, pools: { counts: {}, unused: [] } }
@@ -364,10 +408,10 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       return { ...delivered, pools };
     });
   const nextBatch = encodeStreamToken(delivery.token);
-  const memberships = await roomsFor(app.server, i.userId);
-  const receiptRooms = i.since === null
-    ? new Set<string>()
-    : await receiptRoomsSince(app.server, i.userId, i.since.rSeq);
+  const memberships = snapshot.memberships;
+  const receiptRooms = new Set(
+    [...snapshot.rooms].filter(([, r]) => r.receipts.length).map(([id]) => id),
+  );
   const join: Record<string, unknown> = {},
     invite: Record<string, unknown> = {},
     leave: Record<string, unknown> = {};
@@ -379,10 +423,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   ) as { ignored_users?: Record<string, unknown> } | null;
   const ignoredUsers = new Set(Object.keys(ignored?.ignored_users ?? {}));
   // OOB rows have their own authoritative owner, never synthetic room files.
-  const oob = await app.server.query(
-    'SELECT * FROM federation_invites WHERE user_id = ? AND seq <= ? ORDER BY seq',
-    [i.userId, now.eSeq],
-  );
+  const oob = snapshot.oob;
   const oobRooms = new Set<string>();
   for (const row of oob) {
     if (row.status === 'joined') continue;
@@ -449,6 +490,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       );
       if (
         !changed.length && !receiptRooms.has(m.roomId) &&
+        !snapshot.notifications.changed.has(m.roomId) &&
         lastTypingChange(m.roomId) <= i.since.tSeq
       ) continue;
     }
@@ -458,6 +500,12 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       delivery.token,
       left ? m.seq : now.eSeq,
       !left,
+      {
+        ...snapshot.rooms.get(m.roomId)!,
+        unread: roomNotificationCounts(
+          snapshot.notifications.rooms.get(m.roomId),
+        ),
+      },
     );
     (left ? leave : join)[m.roomId] = result.entry;
     for (const u of result.joiners) allJoiners.add(u);
