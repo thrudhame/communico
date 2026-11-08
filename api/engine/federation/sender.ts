@@ -437,6 +437,8 @@ export function startSender(deps: SenderDeps): Sender {
   }
 
   async function loopDestination(destination: string): Promise<void> {
+    let retryTxn: string | undefined;
+    let quickAttempts = 0;
     for (;;) {
       if (stopped) return;
       // 0. expiry FIRST (r4, muse): lapsed rows surface even deep in
@@ -531,6 +533,10 @@ export function startSender(deps: SenderDeps): Sender {
       if (stopped) return;
       const delivered = frozen;
       const { txnId, rows: batch } = delivered;
+      if (retryTxn !== txnId) {
+        retryTxn = txnId;
+        quickAttempts = 0;
+      }
       let res;
       try {
         inFlight.set(destination, {
@@ -550,6 +556,24 @@ export function startSender(deps: SenderDeps): Sender {
           errcode?: string;
           message?: string;
         };
+        // A short outage should not immediately enter the many-minute peer
+        // ladder. Only this idempotent frozen transaction retries here: claims
+        // and other consuming federation requests remain strictly one-shot.
+        // Bound the transient phase to three waits (0.5/1/2s), then publish the
+        // configured durable ladder as before. Restart retains the exact batch.
+        const transient = err.status === undefined || err.status === 429 ||
+          err.status >= 500;
+        if (!stopped && transient && quickAttempts < 3) {
+          const until = Date.now() + 500 * 2 ** quickAttempts++;
+          inFlight.delete(destination);
+          // Producer wakes cannot accelerate retries. Stop can interrupt this
+          // wait; expiry and blocks are rechecked at the normal loop boundary.
+          while (!stopped && Date.now() < until) {
+            await sleep(until - Date.now(), destination);
+          }
+          continue;
+        }
+        quickAttempts = 0;
         const now = Date.now();
         await server.tx(async (tx) => {
           const fresh = await peerStatus(tx, destination);

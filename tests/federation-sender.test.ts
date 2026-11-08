@@ -328,6 +328,7 @@ Deno.test('sender: frozen retry preserves the same transaction, timestamp, PDUs 
       assertEquals(second.pdus, first.pdus);
       assertEquals(second.edus, first.edus);
       assertEquals(second.edus.length, 1, 'the frozen EDU rides again');
+      await waitFor(() => sender.snapshot().length === 0);
       // A restart must preserve the entire transaction body, including EDUs.
       await sender.stop();
       const restarted = startSender({
@@ -357,8 +358,10 @@ Deno.test('sender: frozen retry preserves the same transaction, timestamp, PDUs 
         );
         const st = await peerStatus(server, dest);
         assertEquals(st.failures, 0);
-        assert(st.failuresTotal >= 2, JSON.stringify(st));
-        assert(st.attemptsTotal >= 3);
+        // Both transient phases were interrupted before exhaustion; only the
+        // successful outcome is published to the durable peer ladder.
+        assertEquals(st.failuresTotal, 0);
+        assertEquals(st.attemptsTotal, 1);
       } finally {
         await restarted.stop();
       }
@@ -404,12 +407,17 @@ Deno.test('sender: reliable EDU-only retry survives restart byte-for-byte and ne
             .length === 0
         );
         const puts = fake.requests.filter((r) => r.method === 'PUT');
-        assert(puts.length >= 3);
-        assertEquals(puts[1].path, puts[0].path);
-        assertEquals(puts[1].body, puts[0].body);
-        assert(puts[2].path !== puts[0].path);
-        assertEquals(sends[1].edus.length, 1);
-        assertEquals(sends[2].edus[0].content, {
+        const original = puts.filter((r) => r.path === puts[0].path);
+        assertEquals(
+          original.length,
+          5,
+          'four transient attempts then durable restart retry',
+        );
+        for (const retry of original) assertEquals(retry.body, puts[0].body);
+        const following = puts.filter((r) => r.path !== puts[0].path);
+        assertEquals(following.length, 1);
+        for (const send of sends) assertEquals(send.edus.length, 1);
+        assertEquals(sends.at(-1)!.edus[0].content, {
           ...content,
           message_id: 'logical-two',
         });
@@ -424,7 +432,97 @@ Deno.test('sender: reliable EDU-only retry survives restart byte-for-byte and ne
   });
 });
 
-Deno.test('sender: a 4xx refusal is retried like a 5xx and writes the refused entry', async () => {
+Deno.test('sender: transient transaction failures retry before the production peer ladder', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, fake, dest, sends, steer, sender }) => {
+      setConfigForTests({
+        federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+      });
+      const server = await store.server();
+      steer.status = 503;
+      await devSays(g.room, g.signer, 'short outage');
+      await waitFor(() => sends.length === 1);
+      await waitFor(() => sender.snapshot().length === 0);
+      const first = fake.requests.find((r) => r.method === 'PUT')!;
+      for (let i = 0; i < 10; i++) sender.wake(dest);
+      await new Promise((r) => setTimeout(r, 150));
+      assertEquals(
+        sends.length,
+        1,
+        'producer wakes cannot bypass transient retry wait',
+      );
+      steer.status = 200;
+      await waitFor(
+        async () =>
+          (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
+        3000,
+      );
+      const puts = fake.requests.filter((r) => r.method === 'PUT');
+      assertEquals(puts.length, 2);
+      assertEquals(puts[1].path, first.path);
+      assertEquals(puts[1].body, first.body);
+      assertEquals((await peerStatus(server, dest)).failuresTotal, 0);
+
+      // Exhaust only the bounded short phase, then retain the real 450s ladder.
+      steer.status = 500;
+      sends.splice(0);
+      const started = Date.now();
+      await devSays(g.room, g.signer, 'long outage');
+      await waitFor(
+        async () => (await peerStatus(server, dest)).failures === 1,
+        6000,
+      );
+      const status = await peerStatus(server, dest);
+      assertEquals(sends.length, 4);
+      assert(Date.now() - started >= 3500);
+      assert(status.nextAttemptMs > Date.now() + 440_000);
+      const before = sends.length;
+      for (let i = 0; i < 10; i++) sender.wake(dest);
+      await new Promise((r) => setTimeout(r, 150));
+      assertEquals(
+        sends.length,
+        before,
+        'new traffic never bypasses durable backoff',
+      );
+    });
+  });
+});
+
+Deno.test('sender: restart during transient retries resumes the frozen envelope without a long failure ladder', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, fake, dest, sends, steer, sender }) => {
+      setConfigForTests({
+        federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+      });
+      const server = await store.server();
+      steer.status = 503;
+      await devSays(g.room, g.signer, 'restart short retry');
+      await waitFor(() => sends.length === 1);
+      // Wait until the failed request enters its retry wait, then interrupt it.
+      await waitFor(() => sender.snapshot().length === 0);
+      assertEquals((await peerStatus(server, dest)).failures, 0);
+      const first = fake.requests.find((r) => r.method === 'PUT')!;
+      await sender.stop();
+      steer.status = 200;
+      const resumed = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(
+          async () =>
+            (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
+          3000,
+        );
+        const puts = fake.requests.filter((r) => r.method === 'PUT');
+        assertEquals(puts.length, 2);
+        assertEquals(puts[1].path, first.path);
+        assertEquals(puts[1].body, first.body);
+      } finally {
+        await resumed.stop();
+      }
+    });
+  });
+});
+
+Deno.test('sender: a 4xx refusal follows the peer ladder and writes the refused entry', async () => {
   await withStore(async (store) => {
     await withSetup(store, async ({ g, dest, sends, steer }) => {
       const server = await store.server();
