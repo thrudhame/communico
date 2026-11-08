@@ -115,13 +115,10 @@ type Prepared =
       payload: EventPayload;
       relation: { relatesTo: string; relType: string | null } | null;
       search: { key: string; text: string } | null;
-      // The publication this change carries (when it moves the stay's
-      // published state): the m.room.member diff against the previous
-      // published group — memberships follow the published state, not
-      // only membership events (a fork resolution can flip a member
-      // without a new membership event; the old fold caught it by
-      // walking every published member row on every publish).
-      publication: { user: string; to: string | null; toId: string | null }[];
+      // A live cut's complete published membership. Reconciliation uses
+      // the server rows inside apply's transaction, including earlier
+      // changes in the same batch. Evidence/history carry no publication.
+      publication: PublishedMember[] | null;
     }
     | {
       kind: 'membership';
@@ -149,51 +146,55 @@ function isLive(payload: EventPayload): boolean {
   return payload.standing === 'accepted' && payload.stay !== null;
 }
 
-// The publication diff at a change position: when the stay's published
-// state moved at this change (a publication hangs off the event's change
-// pos), the m.room.member keys that changed between the previous
-// published group and the new one — added, removed, value- or
-// event-flipped. An unchanged key is never re-stamped: the old fold's
-// keep-its-seq rule falls out of the diff (it re-stamped every row whose
-// event id moved and kept the rest). `to`/`toId` null means the key left
-// the published state — the same 'leave' the reads default to without a
-// row (MSC4115), mirrored by the membership path's delete.
-async function memberDiff(
+type PublishedMember = { user: string; to: string; toId: string };
+
+// A plain message with unchanged publication does no membership work.
+// Offset zero is the stay's first live position, whose opening boundary
+// still needs projection even if the room read fallback has the same group.
+async function memberIdsAt(
   room: Room,
   stay: number | null,
   pos: number,
-): Promise<{ user: string; to: string | null; toId: string | null }[]> {
-  if (stay === null) return [];
+  first: boolean,
+): Promise<Map<string, string> | null> {
+  if (stay === null) return null;
   return await room.tx(async (tx) => {
-    const groupNow = await tx.state.publishedAt(stay, pos);
-    const groupPrev = await tx.state.publishedAt(stay, pos - 1);
-    if (groupNow === null || groupNow === groupPrev) return [];
-    const nowMap = await tx.state.groupMap(groupNow);
-    const prevMap = groupPrev === null
-      ? new Map<string, string>()
-      : await tx.state.groupMap(groupPrev);
+    const group = await tx.state.publishedAt(stay, pos);
+    if (group === null) return null;
+    if (!first && group === await tx.state.publishedAt(stay, pos - 1)) {
+      return null;
+    }
+    const map = await tx.state.groupMap(group);
     const prefix = 'm.room.member\0';
-    const users = new Set<string>();
-    for (const key of nowMap.keys()) {
-      if (key.startsWith(prefix)) users.add(key.slice(prefix.length));
-    }
-    for (const key of prevMap.keys()) {
-      if (key.startsWith(prefix)) users.add(key.slice(prefix.length));
-    }
-    const out: { user: string; to: string | null; toId: string | null }[] = [];
-    for (const user of users) {
-      const fromId = prevMap.get(prefix + user) ?? null;
-      const toId = nowMap.get(prefix + user) ?? null;
-      if (fromId === toId) continue;
-      let to: string | null = null;
-      if (toId !== null) {
-        const row = await tx.events.get(toId);
-        if (row === null) {
-          throw new Error(`published member event missing: ${toId}`);
-        }
-        const membership = (JSON.parse(row.pdu) as Pdu).content?.membership;
-        to = typeof membership === 'string' ? membership : 'leave';
+    return new Map(
+      [...map].filter(([key]) => key.startsWith(prefix)).map(
+        ([key, event]) => [key.slice(prefix.length), event],
+      ),
+    );
+  });
+}
+
+// The baseline is the actual projected rows plus prior publications in
+// this batch. Immutable member events only need reading when their id moved.
+async function membersAt(
+  room: Room,
+  ids: Map<string, string>,
+  projected: Map<string, PublishedMember>,
+): Promise<PublishedMember[]> {
+  return await room.tx(async (tx) => {
+    const out: PublishedMember[] = [];
+    for (const [user, toId] of ids) {
+      const prior = projected.get(user);
+      if (prior?.toId === toId) {
+        out.push(prior);
+        continue;
       }
+      const row = await tx.events.get(toId);
+      if (row === null) {
+        throw new Error(`published member event missing: ${toId}`);
+      }
+      const membership = (JSON.parse(row.pdu) as Pdu).content?.membership;
+      const to = typeof membership === 'string' ? membership : 'leave';
       out.push({ user, to, toId });
     }
     return out;
@@ -224,6 +225,9 @@ async function prepare(
     }
   }
   const out: Prepared[] = [];
+  // Loaded only when a cut needs reconciliation. Advancing this baseline
+  // keeps selective event reads correct across multiple cuts in one batch.
+  let projected: Map<string, PublishedMember> | null = null;
   for (const change of batch) {
     switch (change.kind) {
       case 'event':
@@ -248,9 +252,33 @@ async function prepare(
             search = searchTextOf(payload, pdu);
           }
         }
-        const publication = change.kind === 'history'
-          ? []
-          : await memberDiff(room, payload.stay, change.pos);
+        const ids = change.kind !== 'history' && isLive(payload)
+          ? await memberIdsAt(
+            room,
+            payload.stay,
+            change.pos,
+            payload.offset === 0,
+          )
+          : null;
+        let publication: PublishedMember[] | null = null;
+        if (ids !== null) {
+          if (projected === null) {
+            const server = await store.server();
+            const rows = await server.query(
+              'SELECT user, membership, event FROM memberships WHERE room = ?',
+              [roomId],
+            );
+            projected = new Map(rows.map((row) => [String(row.user), {
+              user: String(row.user),
+              to: String(row.membership),
+              toId: String(row.event),
+            }]));
+          }
+          publication = await membersAt(room, ids, projected);
+          projected = new Map(
+            publication.map((member) => [member.user, member]),
+          );
+        }
         out.push({
           change,
           kind: change.kind,
@@ -447,7 +475,13 @@ async function apply(
         ],
       );
       if (isLive(item.payload)) await applyLive(tx, roomId, item);
-      await applyPublication(tx, roomId, change.pos, item.publication);
+      await applyPublication(
+        tx,
+        roomId,
+        item.payload.stay,
+        change.pos,
+        item.publication,
+      );
       return;
     }
     case 'transition': {
@@ -471,7 +505,13 @@ async function apply(
         ],
       );
       if (isLive(item.payload)) await applyLive(tx, roomId, item);
-      await applyPublication(tx, roomId, change.pos, item.publication);
+      await applyPublication(
+        tx,
+        roomId,
+        item.payload.stay,
+        change.pos,
+        item.publication,
+      );
       return;
     }
     case 'history': {
@@ -514,14 +554,7 @@ async function apply(
       const eventId = item.toId ?? change.event!;
       const seq = (await seqOf(tx, roomId, eventId)) ??
         (await feedSeqOf(tx, roomId, change.event!));
-      await tx.execute(
-        `INSERT INTO memberships(user, room, membership, event, seq)
-         VALUES(?,?,?,?,?)
-         ON CONFLICT(user, room) DO UPDATE SET
-           membership = excluded.membership,
-           event = excluded.event, seq = excluded.seq`,
-        [item.user, roomId, item.to, eventId, seq],
-      );
+      await applyMember(tx, roomId, item.user, item.to, eventId, seq);
       return;
     }
     case 'redaction': {
@@ -548,43 +581,67 @@ async function apply(
   }
 }
 
-// The membership writes of a publication diff, in the same projection tx
-// as the feed row the publication hangs off (applied after it). Removed
-// keys delete the row; the others upsert with the member event's own seq
-// — or the triggering change's feed position when the member event has
-// no seq of its own (history/evidence) — exactly the old fold's
-// ownSeq ?? triggeringSeq. Deterministic on replay: the diff, the seq
-// lookups and the upsert all recompute from unchanged inputs.
+// Reconcile against what the server has actually projected, in the same
+// transaction as the live feed cut. This also sees earlier batch writes.
+// Imported opening changes take the new stay's first live seq; ordinary
+// publication changes retain the existing own-event/trigger seq contract.
 async function applyPublication(
   tx: Conn,
   roomId: string,
+  stay: number | null,
   pos: number,
-  diff: { user: string; to: string | null; toId: string | null }[],
+  members: PublishedMember[] | null,
 ): Promise<void> {
-  for (const d of diff) {
-    if (d.to === null) {
+  if (members === null || stay === null) return;
+  const current = new Map((await tx.query(
+    'SELECT user, membership, event FROM memberships WHERE room = ?',
+    [roomId],
+  )).map((row) => [String(row.user), row]));
+  const target = new Set(members.map((m) => m.user));
+  for (const user of current.keys()) {
+    if (!target.has(user)) {
       await tx.execute(
         'DELETE FROM memberships WHERE user = ? AND room = ?',
-        [d.user, roomId],
+        [user, roomId],
       );
+    }
+  }
+  const cut = await feedSeqAtPos(tx, roomId, pos);
+  if (cut === null) {
+    throw new Error(`publication at pos ${pos} without a feed row`);
+  }
+  const first = (await tx.query(
+    'SELECT 1 FROM feed WHERE room = ? AND stay = ? AND pos < ? LIMIT 1',
+    [roomId, stay, pos],
+  )).length === 0;
+  for (const member of members) {
+    const prior = current.get(member.user);
+    if (prior?.event === member.toId && prior.membership === member.to) {
       continue;
     }
-    const seq = (await seqOf(tx, roomId, d.toId!)) ??
-      (await feedSeqAtPos(tx, roomId, pos));
-    if (seq === null) {
-      // a publication hangs off an accepted (positioned, feed-rowed)
-      // change — never null
-      throw new Error(`publication at pos ${pos} without a feed row`);
-    }
-    await tx.execute(
-      `INSERT INTO memberships(user, room, membership, event, seq)
-       VALUES(?,?,?,?,?)
-       ON CONFLICT(user, room) DO UPDATE SET
-         membership = excluded.membership,
-         event = excluded.event, seq = excluded.seq`,
-      [d.user, roomId, d.to, d.toId, seq],
-    );
+    const seq = first ? cut : (await seqOf(tx, roomId, member.toId)) ?? cut;
+    await applyMember(tx, roomId, member.user, member.to, member.toId, seq);
   }
+}
+
+// Both the full-publication and explicit membership-change paths preserve
+// an unchanged row's seq, including the redundant change after a join cut.
+async function applyMember(
+  tx: Conn,
+  roomId: string,
+  user: string,
+  membership: string,
+  eventId: string,
+  seq: number | null,
+): Promise<void> {
+  await tx.execute(
+    `INSERT INTO memberships(user, room, membership, event, seq)
+     VALUES(?,?,?,?,?)
+     ON CONFLICT(user, room) DO UPDATE SET
+       membership = excluded.membership, event = excluded.event, seq = excluded.seq
+     WHERE memberships.event != excluded.event OR memberships.membership != excluded.membership`,
+    [user, roomId, membership, eventId, seq],
+  );
 }
 
 async function feedSeqAtPos(

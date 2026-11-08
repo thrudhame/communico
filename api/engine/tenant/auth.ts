@@ -13,10 +13,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 // D8: expires_in_ms is advertised, never enforced — spec: optional).
 export const REFRESH_LIFETIME_MS = 3_600_000;
 
-/** The localpart of a full MXID (@localpart:server). */
-export function localpartOf(userId: string): string {
-  return userId.slice(1, userId.lastIndexOf(':'));
-}
+export { localpartOf } from '#engine/ids.ts';
 
 /** The stored form of a token: lowercase hex sha-256. */
 export async function hashToken(token: string): Promise<string> {

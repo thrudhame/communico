@@ -5,6 +5,8 @@ import { issueRefreshToken, issueToken } from '#engine/tenant/auth.ts';
 import { upsertDevice } from '#engine/tenant/devices.ts';
 import { theApp } from '#engine/app.ts';
 import { serverName } from '#engine/config.ts';
+import { splitId } from '#engine/ids.ts';
+import { ensurePresenceRow } from '#engine/server/ephemeral.ts';
 
 // m.login.password (F1 step 18): argon2id verify against the tenant
 // credentials; `identifier.type m.id.user` plus the legacy `user` shape
@@ -38,13 +40,12 @@ export default async function (
   // downcased (registration downcases too).
   let localpart: string;
   if (rawUser.startsWith('@')) {
-    const rest = rawUser.slice(1);
-    const colon = rest.lastIndexOf(':');
-    if (colon < 0) {
+    const parts = splitId(rawUser);
+    if (parts.server === null) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
     }
-    localpart = rest.slice(0, colon).toLowerCase();
-    if (rest.slice(colon + 1) !== serverName()) {
+    localpart = parts.localpart.toLowerCase();
+    if (parts.server !== serverName()) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
     }
   } else {
@@ -83,7 +84,7 @@ export default async function (
     deviceId,
     wantsRefresh ? Date.now() + expiresInMs : undefined,
   );
-  // Presence producers return with /sync and presence (5a-3).
+  await ensurePresenceRow(theApp().server, `@${localpart}:${serverName()}`);
   const result: Record<string, unknown> = {
     user_id: `@${localpart}:${serverName()}`,
     access_token: accessToken,

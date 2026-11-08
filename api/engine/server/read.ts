@@ -49,11 +49,12 @@ export async function feedAfter(
   roomId: string,
   sinceSeq: number,
   limit: number,
+  endSeq = Number.MAX_SAFE_INTEGER,
 ): Promise<FeedRow[]> {
   const rows = await db.query(
     `SELECT seq, room, pos, event, stay FROM feed
-     WHERE room = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
-    [roomId, sinceSeq, limit],
+     WHERE room = ? AND seq > ? AND seq <= ? ORDER BY seq ASC LIMIT ?`,
+    [roomId, sinceSeq, endSeq, limit],
   );
   return rows.map(feedRowOf);
 }

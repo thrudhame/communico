@@ -8,7 +8,8 @@
 // behind (booleans are INTEGER 0/1; the tuple-IN workaround becomes one
 // rowid pass).
 import { config } from '#engine/config.ts';
-import type { Database as Db } from '#engine/store/db.ts';
+import { splitId } from '#engine/ids.ts';
+import type { Conn, Database as Db } from '#engine/store/db.ts';
 
 export type PeerRow = {
   name: string;
@@ -143,9 +144,9 @@ export async function listWitnesses(
   );
   for (const row of rows) {
     const uid = String(row.user);
-    const at = uid.indexOf(':');
-    if (at < 0) continue;
-    const domain = uid.slice(at + 1);
+    const parts = splitId(uid);
+    if (parts.server === null) continue;
+    const domain = parts.server;
     if (!seniority.has(domain)) seniority.set(domain, Number(row.seq));
   }
   if (!seniority.has(ours)) return roster; // we are not in the room
@@ -211,47 +212,52 @@ export async function listBlocks(server: Db): Promise<BlockRow[]> {
 // oldest last_ms is evicted on insert — and pruned after
 // federation.pendingdays.
 export async function recordPending(
-  server: Db,
+  server: Db | Conn,
   name: string,
   kind: 'inbound' | 'outbound' | 'disagreement' | 'refused',
   verified: boolean,
   detail: string | null,
 ): Promise<void> {
+  // Standalone callers own a transaction; delivery transitions pass theirs so
+  // the door log cannot commit independently of the outcome it describes.
+  if ('tx' in server) {
+    return await server.tx((tx) =>
+      recordPending(tx, name, kind, verified, detail)
+    );
+  }
   const fed = config().federation;
   const now = Date.now();
   const coalesceMs = fed.keyfailminutes * 60_000;
-  await server.tx(async (tx) => {
-    const existing = await tx.query(
-      'SELECT first_ms, last_ms, count FROM federation_pending WHERE name = ? AND kind = ?',
-      [name, kind],
+  const existing = await server.query(
+    'SELECT first_ms, last_ms, count FROM federation_pending WHERE name = ? AND kind = ?',
+    [name, kind],
+  );
+  if (
+    existing.length > 0 && now - Number(existing[0].last_ms) < coalesceMs
+  ) {
+    await server.execute(
+      'UPDATE federation_pending SET last_ms = ?, count = count + 1, detail = ?, verified = verified OR ? WHERE name = ? AND kind = ?',
+      [now, detail, verified ? 1 : 0, name, kind],
     );
-    if (
-      existing.length > 0 && now - Number(existing[0].last_ms) < coalesceMs
-    ) {
-      await tx.execute(
-        'UPDATE federation_pending SET last_ms = ?, count = count + 1, detail = ?, verified = verified OR ? WHERE name = ? AND kind = ?',
-        [now, detail, verified ? 1 : 0, name, kind],
-      );
-    } else {
-      await tx.execute(
-        'INSERT INTO federation_pending(name, kind, verified, first_ms, last_ms, count, detail) VALUES(?,?,?,?,?,1,?) ON CONFLICT(name, kind) DO UPDATE SET first_ms = excluded.first_ms, last_ms = excluded.last_ms, count = 1, detail = excluded.detail, verified = excluded.verified',
-        [name, kind, verified ? 1 : 0, now, now, detail],
-      );
-    }
-    if (!verified) {
-      // hard cap on unverified rows: rows beyond pendingmax (oldest
-      // last_ms) are deleted, one rowid pass
-      await tx.execute(
-        'DELETE FROM federation_pending WHERE verified = 0 AND rowid NOT IN (SELECT rowid FROM federation_pending WHERE verified = 0 ORDER BY last_ms DESC LIMIT ?)',
-        [fed.pendingmax],
-      );
-      // expiry
-      await tx.execute(
-        'DELETE FROM federation_pending WHERE verified = 0 AND last_ms < ?',
-        [now - fed.pendingdays * 86_400_000],
-      );
-    }
-  });
+  } else {
+    await server.execute(
+      'INSERT INTO federation_pending(name, kind, verified, first_ms, last_ms, count, detail) VALUES(?,?,?,?,?,1,?) ON CONFLICT(name, kind) DO UPDATE SET first_ms = excluded.first_ms, last_ms = excluded.last_ms, count = 1, detail = excluded.detail, verified = excluded.verified',
+      [name, kind, verified ? 1 : 0, now, now, detail],
+    );
+  }
+  if (!verified) {
+    // hard cap on unverified rows: rows beyond pendingmax (oldest
+    // last_ms) are deleted, one rowid pass
+    await server.execute(
+      'DELETE FROM federation_pending WHERE verified = 0 AND rowid NOT IN (SELECT rowid FROM federation_pending WHERE verified = 0 ORDER BY last_ms DESC LIMIT ?)',
+      [fed.pendingmax],
+    );
+    // expiry
+    await server.execute(
+      'DELETE FROM federation_pending WHERE verified = 0 AND last_ms < ?',
+      [now - fed.pendingdays * 86_400_000],
+    );
+  }
 }
 
 export async function listPending(server: Db): Promise<PendingRow[]> {

@@ -4,6 +4,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { setDisplayName } from '#engine/tenant/users.ts';
 import { propagateProfile } from '#engine/client/membership.ts';
 import { authorize } from '#engine/auth-context.ts';
+import { localpartOf } from '#engine/ids.ts';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 // PUT /_matrix/client/v3/profile/{userId}/displayname — "This API sets the
@@ -32,10 +33,9 @@ export default async function (request: PathfinderRequest) {
       'displayname must be a string or null',
     );
   }
-  const colon = userId.lastIndexOf(':');
   await setDisplayName(
     theApp().tenant,
-    userId.slice(1, colon),
+    localpartOf(userId),
     body.displayname,
   );
   await propagateProfile(userId, 'displayname');

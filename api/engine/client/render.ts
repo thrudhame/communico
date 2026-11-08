@@ -5,8 +5,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import type { Room } from '#engine/room/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { transactionForEvent } from '#engine/tenant/txns.ts';
-import { redactionOf } from '#engine/server/read.ts';
-import { relationsOf } from '#engine/server/read.ts';
+import { redactionOf, relationsOf } from '#engine/server/read.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 
 export type Viewer = {

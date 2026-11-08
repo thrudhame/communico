@@ -10,12 +10,19 @@
 // it.
 import { config, serverName } from '#engine/config.ts';
 import { installRuleMigration } from '#engine/client/rule-migration.ts';
-import { type EduQueues, eduQueues } from '#engine/federation/edus.ts';
+import {
+  type EduQueues,
+  eduQueues,
+  type EduState,
+  eduState,
+} from '#engine/federation/edus.ts';
+import { wireEphemeral } from '#engine/federation/ephemeral.ts';
 import {
   type InviteDeps,
   inviteIntentProvider,
 } from '#engine/federation/invites.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
+import { type KeyStore, keyStore } from '#engine/federation/keys.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -33,6 +40,8 @@ export type App = {
   readonly server: Db;
   // The tenant of the configured server name (one server, one tenant).
   readonly tenant: Tenant;
+  readonly federationKeys: KeyStore;
+  readonly federationEdus: EduState;
   // The delivery worker — null until startFederationServices (federation
   // disabled, or an endpoint-test app).
   sender: Sender | null;
@@ -69,6 +78,8 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       store,
       server,
       tenant,
+      federationKeys: keyStore(server, { signer: tenant.signer() }),
+      federationEdus: eduState(server, tenant.serverName),
       sender: null,
       close: async () => {
         stopRuleMigration();
@@ -112,7 +123,14 @@ export function startFederationServices(app: App): void {
     wake: (destination) => sender.wake(destination),
   };
   sender.setIntentProvider(inviteIntentProvider(inviteDeps));
-  app.sender = sender;
+  const unwire = wireEphemeral(app.server, name, queues);
+  app.sender = {
+    ...sender,
+    stop: async () => {
+      await unwire();
+      await sender.stop();
+    },
+  };
 }
 
 /** Close the running app (sender stopped, store closed) and forget it. */

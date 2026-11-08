@@ -8,6 +8,7 @@
 // belong to the server file — stage 4; remote invitee transport is the
 // caller's work, 3c).
 import { MatrixError } from '#engine/matrix-error.ts';
+import { splitId } from '#engine/ids.ts';
 import { assertCanonicalNumbers } from '#engine/canonical.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { validAdditionalCreators } from '#engine/rulebook/auth-rules.ts';
@@ -387,7 +388,9 @@ export async function createRoom(
         // 8. invites (sender: the creator); is_direct rides along when set.
         //    LOCAL invitees only — remote invitee transport is the caller's work.
         for (const u of invite) {
-          if (u.indexOf(':', 1) >= 0 && !u.endsWith(':' + signer.serverName)) {
+          if (
+            splitId(u).server !== null && !u.endsWith(':' + signer.serverName)
+          ) {
             continue;
           }
           await send('m.room.member', u, {

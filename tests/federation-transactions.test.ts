@@ -324,13 +324,13 @@ Deno.test('send: EDUs — typing, receipt, presence for the origin’s users; wr
     assert(typing.userIds.includes(s.user), JSON.stringify(typing));
     assert(!typing.userIds.some((u) => u.endsWith(':other.test')));
     // the receipt is held
-    const receipts = s.edus.receiptsIn(s.g.roomId);
+    const receipts = await s.edus.receiptsIn(s.g.roomId);
     assertEquals(receipts.length, 1);
     assertEquals(receipts[0].userId, s.user);
     assertEquals(receipts[0].eventId, String(event.event_id));
     assertEquals(receipts[0].ts, 1234567890);
     // presence
-    const presence = s.edus.presenceOf(s.user);
+    const presence = await s.edus.presenceOf(s.user);
     assert(presence !== null);
     assertEquals(presence.presence, 'online');
     assertEquals(presence.status_msg, 'on the wire');

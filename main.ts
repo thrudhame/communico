@@ -6,6 +6,7 @@ import {
   listPending,
 } from '#engine/federation/peers.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
+import { mediaRoot } from '#engine/media.ts';
 
 try {
   const loaded = loadedConfig();
@@ -51,6 +52,7 @@ try {
   throw e;
 }
 
+await Deno.mkdir(mediaRoot(), { recursive: true });
 const app = await openApp();
 
 if (config().federation.enabled) {

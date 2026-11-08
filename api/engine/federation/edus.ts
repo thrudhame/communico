@@ -14,10 +14,15 @@
 // and errors in one EDU never fail the transaction (the caller logs and
 // continues). EVERY EDU's users must belong to `origin` (typing
 // SS:1085-1088, presence SS:1094-1099, receipts SS:1105-1110) or the EDU
-// is ignored. The handlers are in-memory (plan §2 row 5): typing rides
-// the kept in-process typing module, receipts/presence are per-instance
-// maps; the durable tables are stage 5's.
+// is ignored. Typing is in memory; receipts and presence use the same
+// durable server-file streams as client producers and sync readers.
 import { membershipOf } from '#engine/server/read.ts';
+import {
+  getPresence,
+  receiptRows,
+  setPresence,
+  setReceipt,
+} from '#engine/server/ephemeral.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import { setTyping, typingIn } from '#engine/typing.ts';
 import { domainOf } from './pdu.ts';
@@ -216,24 +221,21 @@ export type EduHandler = (
 export type EduState = {
   dispatch(origin: string, raw: unknown): Promise<void>;
   register(type: string, handler: EduHandler): void;
-  // the in-memory reads (tests and — stage 5 — the /sync assembly)
+  // Reads share the durable stream owner; typing remains ephemeral.
   typingOf(roomId: string): { userIds: string[] };
-  presenceOf(userId: string): PresencePush | null;
+  presenceOf(userId: string): Promise<PresencePush | null>;
   receiptsIn(
     roomId: string,
-  ): { userId: string; eventId: string; ts: number; threadId: string | null }[];
+  ): Promise<
+    { userId: string; eventId: string; ts: number; threadId: string | null }[]
+  >;
 };
 
 // The inbound state of one instance: the handlers (typing/receipts/
 // presence built in; device list and anything else ignored — the old
-// stubs) and the in-memory receipt/presence maps. `self` is our server
+// stubs). Receipts/presence are server-file reads. `self` is our server
 // name (the shares-room check's local side).
 export function eduState(server: Db, self: string): EduState {
-  const receipts = new Map<
-    string,
-    Map<string, { eventId: string; ts: number; threadId: string | null }>
-  >();
-  const presence = new Map<string, PresencePush>();
   const handlers = new Map<string, EduHandler>();
 
   handlers.set('m.typing', async (origin, content) => {
@@ -246,7 +248,7 @@ export function eduState(server: Db, self: string): EduState {
     setTyping(roomId, userId, content.typing === true, REMOTE_TYPING_TTL_MS);
   });
 
-  handlers.set('m.receipt', (origin, content) => {
+  handlers.set('m.receipt', async (origin, content) => {
     // content: { <roomId>: { 'm.read': { <userId>: { event_ids, data } } } }
     for (const [roomId, perRoom] of Object.entries(content)) {
       const reads = (perRoom as Record<string, unknown>)['m.read'] as
@@ -261,19 +263,21 @@ export function eduState(server: Db, self: string): EduState {
           ts?: unknown;
           thread_id?: unknown;
         };
-        let room = receipts.get(roomId);
-        if (room === undefined) {
-          room = new Map();
-          receipts.set(roomId, room);
-        }
-        room.set(userId, {
-          eventId: String(eventIds[0]),
-          ts: typeof data.ts === 'number' ? data.ts : Date.now(),
-          threadId: typeof data.thread_id === 'string' ? data.thread_id : null,
-        });
+        await setReceipt(
+          server,
+          roomId,
+          userId,
+          'm.read',
+          String(eventIds[0]),
+          {
+            ts: typeof data.ts === 'number' ? data.ts : Date.now(),
+            threadId: typeof data.thread_id === 'string'
+              ? data.thread_id
+              : null,
+          },
+        );
       }
     }
-    return Promise.resolve();
   });
 
   handlers.set('m.presence', async (origin, content) => {
@@ -300,15 +304,18 @@ export function eduState(server: Db, self: string): EduState {
         [p.user_id, self],
       );
       if (shares.length === 0) continue;
-      presence.set(p.user_id, {
-        user_id: p.user_id,
-        presence: p.presence,
-        status_msg: typeof p.status_msg === 'string' ? p.status_msg : null,
-        last_active_ago: typeof p.last_active_ago === 'number'
-          ? p.last_active_ago
-          : 0,
-        currently_active: p.currently_active === true,
-      });
+      await setPresence(
+        server,
+        p.user_id,
+        p.presence,
+        typeof p.status_msg === 'string' ? p.status_msg : undefined,
+        {
+          lastActiveAgo: typeof p.last_active_ago === 'number'
+            ? p.last_active_ago
+            : 0,
+          currentlyActive: p.currently_active === true,
+        },
+      );
     }
   });
 
@@ -328,18 +335,22 @@ export function eduState(server: Db, self: string): EduState {
       handlers.set(type, handler);
     },
     typingOf: (roomId) => ({ userIds: typingIn(roomId).userIds }),
-    presenceOf: (userId) => {
-      const p = presence.get(userId);
-      return p === undefined ? null : p;
+    presenceOf: async (userId) => {
+      const p = await getPresence(server, userId);
+      return p.seq === 0 ? null : {
+        user_id: userId,
+        presence: p.presence,
+        status_msg: p.statusMsg,
+        last_active_ago: Math.max(0, Date.now() - p.lastActiveMs),
+        currently_active: Date.now() - p.lastActiveMs < 60_000,
+      };
     },
-    receiptsIn: (roomId) => {
-      const room = receipts.get(roomId);
-      if (room === undefined) return [];
-      return [...room.entries()].map(([userId, mark]) => ({
-        userId,
-        eventId: mark.eventId,
-        ts: mark.ts,
-        threadId: mark.threadId,
+    receiptsIn: async (roomId) => {
+      return (await receiptRows(server, roomId)).map((row) => ({
+        userId: row.userId,
+        eventId: row.eventId,
+        ts: row.ts,
+        threadId: null,
       }));
     },
   };

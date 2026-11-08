@@ -14,6 +14,7 @@
 // An unknown target is not an error: the redaction is stored and a waits
 // entry (R10) records the delayed effect for the 3c recheck driver.
 import type { Pdu } from '#engine/pdu.ts';
+import { domainOf } from '#engine/ids.ts';
 import {
   namedLevel,
   parsePowerLevels,
@@ -28,11 +29,6 @@ export function redactionTarget(pdu: Pdu): string | null {
   const inContent = pdu.content?.redacts;
   if (typeof inContent === 'string') return inContent;
   return typeof pdu.redacts === 'string' ? pdu.redacts : null;
-}
-
-function domainOf(userId: string): string {
-  const at = userId.indexOf(':');
-  return at === -1 ? userId : userId.slice(at + 1);
 }
 
 async function statePdu(
