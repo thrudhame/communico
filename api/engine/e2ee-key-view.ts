@@ -8,7 +8,7 @@ export function keyView(
   const signatures: Record<string, unknown> = Object.create(null);
   for (
     const [signer, value] of Object.entries(
-      key.signatures as Record<string, unknown>,
+      (key.signatures ?? {}) as Record<string, unknown>,
     )
   ) {
     if (signer === owner || signer === requester) signatures[signer] = value;

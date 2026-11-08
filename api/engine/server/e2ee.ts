@@ -157,6 +157,7 @@ export async function deviceListsBetween(
       const active = await activeAt(scope);
       // Both tracking transitions and mutations use the all-room audience.
       if (
+        reasons.has('private') ||
         (reasons.has('join') && active) ||
         (reasons.has('change') && await activeAt('keys'))
       ) result.changed.push(subject);

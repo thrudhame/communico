@@ -14,6 +14,100 @@ import {
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { keyView } from '#engine/e2ee-key-view.ts';
 import { canonicalJson } from '#engine/canonical.ts';
+import {
+  type PublicSigning,
+  signingViews,
+  verifiedPublicSigning,
+} from '#engine/e2ee-public-signing.ts';
+
+async function signingState(
+  tx: Conn,
+  user: string,
+): Promise<{ revision: number; keys: PublicSigning }> {
+  const row = (await tx.query(
+    'SELECT revision,payload FROM remote_signing_keys WHERE user_id=?',
+    [user],
+  ))[0];
+  return row
+    ? { revision: Number(row.revision), keys: JSON.parse(String(row.payload)) }
+    : { revision: 0, keys: {} };
+}
+// Same above-store, non-reentrant mutex discipline as room/lock.ts. Only local
+// commit/recheck work runs here, never origin discovery or network requests.
+const signingLocks = new Map<string, Promise<void>>();
+async function serializeSigning<T>(
+  db: Database,
+  user: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = JSON.stringify([db.path, user]);
+  const previous = signingLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => mine);
+  signingLocks.set(key, tail);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (signingLocks.get(key) === tail) signingLocks.delete(key);
+  }
+}
+/** Recheck a learned target revision without holding a server transaction over tenant work. */
+export function withRemoteSigningState<T>(
+  db: Database,
+  user: string,
+  fn: (state: { revision: number; keys: PublicSigning }) => Promise<T>,
+): Promise<T> {
+  return serializeSigning(
+    db,
+    user,
+    async () => fn(await db.tx((tx) => signingState(tx, user))),
+  );
+}
+async function writeSigning(
+  tx: Conn,
+  user: string,
+  keys: PublicSigning,
+): Promise<boolean> {
+  const prior = await signingState(tx, user);
+  if (canonicalJson(prior.keys) === canonicalJson(keys)) return false;
+  await tx.execute(
+    'INSERT INTO remote_signing_keys VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET revision=excluded.revision,payload=excluded.payload',
+    [user, prior.revision + 1, canonicalJson(keys)],
+  );
+  return true;
+}
+
+/** EDU and authoritative snapshot writes share this transaction-owned revision. */
+export async function acceptSigningUpdate(
+  db: Database,
+  user: string,
+  supplied: PublicSigning,
+  limits: KeyLimits,
+  localServer: string,
+): Promise<void> {
+  await serializeSigning(db, user, () =>
+    eventStreamTx(db, async (tx) => {
+      if (
+        !(await tx.query(
+          "SELECT 1 FROM device_tracking WHERE subject=? AND scope='keys' AND end_seq IS NULL AND substr(observer,instr(observer,':')+1)=? LIMIT 1",
+          [user, localServer],
+        )).length
+      ) return;
+      const prior = await signingState(tx, user);
+      const keys = await verifiedPublicSigning(
+        supplied,
+        user,
+        limits,
+        prior.keys,
+      );
+      if (await writeSigning(tx, user, keys)) await notify(tx, user);
+    }));
+}
 
 type Pending = { revision: number; delta: DeviceDelta };
 type State = {
@@ -116,9 +210,10 @@ export async function acceptDeviceDelta(
       );
       // Cache overflow is invalidation, never a truncated authoritative list.
       try {
-        limitEntries(keys.length, limits.maxkeys);
+        const signing = (await signingState(tx, d.user)).keys;
+        limitEntries(keys.length + Object.keys(signing).length, limits.maxkeys);
         bounded(
-          keys.map((r) => JSON.parse(String(r.key_json))),
+          { devices: keys.map((r) => JSON.parse(String(r.key_json))), signing },
           limits.maxrequestbytes,
         );
         s.anchor = d.stream;
@@ -150,7 +245,11 @@ export async function acceptDeviceDelta(
   });
 }
 
-export type RecoveryCut = { user: string; revision: number };
+export type RecoveryCut = {
+  user: string;
+  revision: number;
+  signingRevision: number;
+};
 /** Membership creates dormant stale state; only explicit demand or a hint activates retry. */
 export async function requestDeviceRecovery(
   db: Database,
@@ -169,7 +268,13 @@ export async function recoveryCut(
 ): Promise<RecoveryCut | null> {
   return await db.tx(async (tx) => {
     const s = await state(tx, user);
-    return s?.stale ? { user, revision: s.revision } : null;
+    return s?.stale
+      ? {
+        user,
+        revision: s.revision,
+        signingRevision: (await signingState(tx, user)).revision,
+      }
+      : null;
   });
 }
 
@@ -180,79 +285,145 @@ export async function installDeviceSnapshot(
   snapshot: DeviceSnapshot,
   limits: KeyLimits,
 ): Promise<boolean> {
-  return await eventStreamTx(db, async (tx) => {
-    const s = await state(tx, cut.user);
-    if (!s?.stale || snapshot.user !== cut.user) return false;
-    const newer = s.pending.filter((p) => p.revision > cut.revision);
-    if (
-      s.revision - cut.revision !== newer.length ||
-      newer.some((p, i) => p.revision !== cut.revision + i + 1)
-    ) return false;
-    const seen = [snapshot.stream];
-    // The fetch can include mutations accepted after its local recovery cut.
-    // Walk the snapshot's known causal ancestry, not numeric stream ordering:
-    // all of those hints are already represented by the authoritative cut.
-    const covered = new Set([snapshot.stream]);
-    const byStream = new Map(newer.map((p) => [p.delta.stream, p.delta]));
-    const visit = [snapshot.stream];
-    while (visit.length) {
-      const d = byStream.get(visit.pop()!);
-      if (!d) continue;
-      for (const predecessor of d.prev) {
-        if (covered.has(predecessor)) continue;
-        covered.add(predecessor);
-        visit.push(predecessor);
-      }
-    }
-    const remaining = newer.filter((p) => !covered.has(p.delta.stream));
-    const ordered: DeviceDelta[] = [];
-    while (remaining.length) {
-      const i = remaining.findIndex((p) => compatible(p.delta, seen));
-      if (i < 0) return false;
-      const d = remaining.splice(i, 1)[0].delta;
-      ordered.push(d);
-      seen.push(d.stream);
-    }
-    const keys = new Map(
-      snapshot.devices.filter((d) => d.key !== null).map((d) => [d.id, d.key!]),
-    );
-    for (const d of ordered) {
-      if (d.deleted || d.key === null) keys.delete(d.id);
-      else keys.set(d.id, d.key);
-    }
-    limitEntries(keys.size, limits.maxkeys);
-    bounded(Object.fromEntries(keys), limits.maxrequestbytes);
-    const previous = Object.fromEntries((await tx.query(
-      'SELECT device_id,key_json FROM remote_device_keys WHERE user_id=?',
-      [cut.user],
-    )).map((r) => [String(r.device_id), JSON.parse(String(r.key_json))]));
-    const changed =
-      canonicalJson(previous) !== canonicalJson(Object.fromEntries(keys));
-    await tx.execute('DELETE FROM remote_device_keys WHERE user_id=?', [
-      cut.user,
-    ]);
-    for (const [id, key] of keys) {
-      await tx.execute('INSERT INTO remote_device_keys VALUES(?,?,?)', [
-        cut.user,
-        id,
-        JSON.stringify(key),
-      ]);
-    }
-    s.anchor = seen.at(-1)!;
-    s.stale = false;
-    s.pending = [];
-    s.seen = seen.slice(-limits.maxkeys);
-    await writeState(tx, cut.user, s);
-    await tx.execute('DELETE FROM device_recovery_requests WHERE user_id=?', [
-      cut.user,
-    ]);
-    await tx.execute(
-      'UPDATE remote_device_users SET retry_at=0,failures=0 WHERE user_id=?',
-      [cut.user],
-    );
-    if (changed) await notify(tx, cut.user);
-    return true;
+  const signing = await verifiedPublicSigning(
+    snapshot.signing,
+    snapshot.user,
+    limits,
+  );
+  return await serializeSigning(
+    db,
+    cut.user,
+    () =>
+      eventStreamTx(db, async (tx) => {
+        const s = await state(tx, cut.user);
+        if (!s?.stale || snapshot.user !== cut.user) return false;
+        // Signing EDUs have no causal stream IDs. Reject the old whole snapshot
+        // rather than let it overwrite an independently committed key rotation.
+        if (
+          (await signingState(tx, cut.user)).revision !== cut.signingRevision
+        ) {
+          return false;
+        }
+        const newer = s.pending.filter((p) => p.revision > cut.revision);
+        if (
+          s.revision - cut.revision !== newer.length ||
+          newer.some((p, i) => p.revision !== cut.revision + i + 1)
+        ) return false;
+        const seen = [snapshot.stream];
+        // The fetch can include mutations accepted after its local recovery cut.
+        // Walk the snapshot's known causal ancestry, not numeric stream ordering:
+        // all of those hints are already represented by the authoritative cut.
+        const covered = new Set([snapshot.stream]);
+        const byStream = new Map(newer.map((p) => [p.delta.stream, p.delta]));
+        const visit = [snapshot.stream];
+        while (visit.length) {
+          const d = byStream.get(visit.pop()!);
+          if (!d) continue;
+          for (const predecessor of d.prev) {
+            if (covered.has(predecessor)) continue;
+            covered.add(predecessor);
+            visit.push(predecessor);
+          }
+        }
+        const remaining = newer.filter((p) => !covered.has(p.delta.stream));
+        const ordered: DeviceDelta[] = [];
+        while (remaining.length) {
+          const i = remaining.findIndex((p) => compatible(p.delta, seen));
+          if (i < 0) return false;
+          const d = remaining.splice(i, 1)[0].delta;
+          ordered.push(d);
+          seen.push(d.stream);
+        }
+        const keys = new Map(
+          snapshot.devices.filter((d) => d.key !== null).map((
+            d,
+          ) => [d.id, d.key!]),
+        );
+        for (const d of ordered) {
+          if (d.deleted || d.key === null) keys.delete(d.id);
+          else keys.set(d.id, d.key);
+        }
+        limitEntries(keys.size + Object.keys(signing).length, limits.maxkeys);
+        bounded(
+          { devices: Object.fromEntries(keys), signing },
+          limits.maxrequestbytes,
+        );
+        const previous = Object.fromEntries((await tx.query(
+          'SELECT device_id,key_json FROM remote_device_keys WHERE user_id=?',
+          [cut.user],
+        )).map((r) => [String(r.device_id), JSON.parse(String(r.key_json))]));
+        const signingChanged = await writeSigning(tx, cut.user, signing);
+        const changed = signingChanged ||
+          canonicalJson(previous) !== canonicalJson(Object.fromEntries(keys));
+        await tx.execute('DELETE FROM remote_device_keys WHERE user_id=?', [
+          cut.user,
+        ]);
+        for (const [id, key] of keys) {
+          await tx.execute('INSERT INTO remote_device_keys VALUES(?,?,?)', [
+            cut.user,
+            id,
+            JSON.stringify(key),
+          ]);
+        }
+        s.anchor = seen.at(-1)!;
+        s.stale = false;
+        s.pending = [];
+        s.seen = seen.slice(-limits.maxkeys);
+        await writeState(tx, cut.user, s);
+        await tx.execute(
+          'DELETE FROM device_recovery_requests WHERE user_id=?',
+          [
+            cut.user,
+          ],
+        );
+        await tx.execute(
+          'UPDATE remote_device_users SET retry_at=0,failures=0 WHERE user_id=?',
+          [cut.user],
+        );
+        if (changed) await notify(tx, cut.user);
+        return true;
+      }),
+  );
+}
+
+/** Device completeness is required before any snapshot signing view is served. */
+export async function cachedKeyQuery(
+  db: Database,
+  user: string,
+  ids: string[],
+  requester: string,
+): Promise<Json | null> {
+  return await db.tx(async (tx) => {
+    const s = await state(tx, user);
+    if (s === null || s.stale) return null;
+    const keys = await deviceKeys(tx, user, ids, requester);
+    const signing = await signingState(tx, user);
+    return {
+      device_keys: { [user]: keys },
+      ...signingViews(signing.keys, user, requester),
+    };
   });
+}
+
+async function deviceKeys(
+  tx: Conn,
+  user: string,
+  ids: string[],
+  requester: string,
+): Promise<Json> {
+  const keys: Json = Object.create(null);
+  for (
+    const row of await tx.query(
+      'SELECT device_id,key_json FROM remote_device_keys WHERE user_id=? ORDER BY device_id',
+      [user],
+    )
+  ) {
+    const id = String(row.device_id);
+    if (!ids.length || ids.includes(id)) {
+      keys[id] = keyView(JSON.parse(String(row.key_json)), user, requester);
+    }
+  }
+  return keys;
 }
 
 /** Only complete stream-anchored state can answer a client query. */
@@ -265,18 +436,6 @@ export async function cachedDeviceKeys(
   return await db.tx(async (tx) => {
     const s = await state(tx, user);
     if (s === null || s.stale) return null;
-    const keys: Json = Object.create(null);
-    for (
-      const row of await tx.query(
-        'SELECT device_id,key_json FROM remote_device_keys WHERE user_id=? ORDER BY device_id',
-        [user],
-      )
-    ) {
-      const id = String(row.device_id);
-      if (!ids.length || ids.includes(id)) {
-        keys[id] = keyView(JSON.parse(String(row.key_json)), user, requester);
-      }
-    }
-    return keys;
+    return await deviceKeys(tx, user, ids, requester);
   });
 }

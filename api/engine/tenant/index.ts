@@ -13,6 +13,15 @@ import * as accountdata from '#engine/tenant/accountdata.ts';
 import * as auth from '#engine/tenant/auth.ts';
 import * as devices from '#engine/tenant/devices.ts';
 import * as e2ee from '#engine/tenant/e2ee.ts';
+import * as crossSigning from '#engine/tenant/cross-signing.ts';
+import * as keySignatures from '#engine/tenant/key-signatures.ts';
+import {
+  remoteTargetMaterial,
+  signatureSigner,
+  signatureView,
+} from '#engine/tenant/signature-view.ts';
+import type { SigningUpload } from '#engine/e2ee-signing.ts';
+import { config } from '#engine/config.ts';
 import * as todevice from '#engine/tenant/todevice.ts';
 import type { StreamToken } from '#engine/client/tokens.ts';
 import { tenantE2eeCommitted } from '#engine/tenant/hooks.ts';
@@ -102,6 +111,76 @@ function bind(
     return value;
   };
   return {
+    keySignatures: {
+      basis: async (localpart: string) => {
+        const state = await crossSigning.signingState(conn, localpart);
+        const signer = state.user_signing &&
+          await signatureSigner(conn, localpart, state.user_signing.id);
+        return signer ? { [signer.key]: signer.basis } : {};
+      },
+      remoteView: (
+        key: e2ee.Json,
+        user: string,
+        id: string,
+        requester: string,
+        revision: number,
+      ) =>
+        signatureView(
+          conn,
+          key,
+          user,
+          id,
+          requester,
+          remoteTargetMaterial(key, revision),
+        ),
+      upload: (
+        localpart: string,
+        user: string,
+        targets: keySignatures.SignatureTarget[],
+      ) =>
+        mutation(
+          keySignatures.uploadSignatures(
+            conn,
+            localpart,
+            user,
+            targets,
+            config().e2ee,
+            config().federation.bulkmaxbytes,
+          ),
+        ),
+    },
+    crossSigning: {
+      clear: (localpart: string, user: string) =>
+        mutation(
+          crossSigning.clearSigningKeys(
+            conn,
+            localpart,
+            user,
+            config().federation.bulkmaxbytes,
+          ),
+        ),
+      state: (localpart: string) => crossSigning.signingState(conn, localpart),
+      views: (localpart: string, user: string, requester: string) =>
+        crossSigning.signingViews(conn, localpart, user, requester),
+      upload: (
+        localpart: string,
+        user: string,
+        input: SigningUpload,
+        basis: string,
+        authenticated: boolean,
+      ) =>
+        mutation(
+          crossSigning.uploadSigningKeys(
+            conn,
+            localpart,
+            user,
+            input,
+            basis,
+            authenticated,
+            config().federation.bulkmaxbytes,
+          ),
+        ),
+    },
     toDevice: {
       send: (
         d: devices.DeviceIdentity,

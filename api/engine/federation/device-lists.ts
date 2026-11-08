@@ -1,6 +1,10 @@
 // Inbound device-list acceptance and bounded single-flight snapshot recovery.
 import { config } from '#engine/config.ts';
 import { deviceDelta, remoteDeviceSnapshot } from '#engine/e2ee-remote.ts';
+import {
+  InvalidPublicSigning,
+  publicSigning,
+} from '#engine/e2ee-public-signing.ts';
 import { domainOf } from '#engine/ids.ts';
 import { abortable } from '#engine/net/abort.ts';
 import type { Database } from '#engine/store/db.ts';
@@ -8,6 +12,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { onEventStream } from '#engine/server/stream.ts';
 import {
   acceptDeviceDelta,
+  acceptSigningUpdate,
   installDeviceSnapshot,
   recoveryCut,
   requestDeviceRecovery,
@@ -162,6 +167,32 @@ export function deviceListService(
     }
     await acceptDeviceDelta(db, delta, config().e2ee, tenant.serverName);
     wake();
+  }, true);
+  edus.register('m.signing_key_update', async (origin, raw) => {
+    if (
+      typeof raw.user_id !== 'string' || domainOf(raw.user_id) !== origin ||
+      origin === tenant.serverName
+    ) return;
+    let keys;
+    try {
+      keys = publicSigning(raw, raw.user_id, config().e2ee);
+    } catch (e) {
+      throw new PermanentEduRefusal('M_BAD_JSON', String(e));
+    }
+    try {
+      await acceptSigningUpdate(
+        db,
+        raw.user_id,
+        keys,
+        config().e2ee,
+        tenant.serverName,
+      );
+    } catch (e) {
+      if (e instanceof InvalidPublicSigning) {
+        throw new PermanentEduRefusal('M_BAD_JSON', e.message);
+      }
+      throw e;
+    }
   }, true);
   return {
     recover,

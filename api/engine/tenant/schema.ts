@@ -42,6 +42,16 @@ const INTENT_DESTINATION_SQL = `
 CREATE INDEX to_device_intents_destination ON to_device_intents(destination);
 `;
 
+const CROSS_SIGNING_SQL = `
+CREATE TABLE cross_signing_keys(localpart TEXT NOT NULL, usage TEXT NOT NULL, key_id TEXT NOT NULL, key_json TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(localpart,usage));
+CREATE INDEX cross_signing_ids ON cross_signing_keys(localpart,key_id);
+`;
+
+const KEY_SIGNATURES_SQL = `
+CREATE TABLE key_signatures(signer_localpart TEXT NOT NULL, signer_user TEXT NOT NULL, signer_key TEXT NOT NULL, signer_basis TEXT NOT NULL, target_user TEXT NOT NULL, target_key TEXT NOT NULL, target_material TEXT NOT NULL, signature TEXT NOT NULL, PRIMARY KEY(signer_localpart,signer_key,target_user,target_key));
+CREATE INDEX key_signatures_target ON key_signatures(target_user,target_key);
+`;
+
 export const TENANT_SCHEMA_SQL = `
 CREATE TABLE tenant(
   server_name TEXT PRIMARY KEY NOT NULL,
@@ -195,7 +205,7 @@ CREATE INDEX transactions_event ON transactions(localpart, device_id, generation
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 9,
+  version: 11,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -203,8 +213,12 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(TRANSPORT_SQL);
     await db.exec(INTENT_PROJECTION_SQL);
     await db.exec(INTENT_DESTINATION_SQL);
+    await db.exec(CROSS_SIGNING_SQL);
+    await db.exec(KEY_SIGNATURES_SQL);
   },
   migrations: {
+    10: (conn) => conn.exec(KEY_SIGNATURES_SQL),
+    9: (conn) => conn.exec(CROSS_SIGNING_SQL),
     8: (conn) => conn.exec(INTENT_DESTINATION_SQL),
     7: (conn) => conn.exec(INTENT_PROJECTION_SQL),
     6: async (conn) => {

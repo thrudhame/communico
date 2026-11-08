@@ -11,6 +11,7 @@ import {
 import { localpartOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { assertFederationEnabled } from './keydoc.ts';
+import { bounded } from '#engine/tenant/e2ee.ts';
 
 export async function queryUserKeys(body: unknown) {
   assertFederationEnabled();
@@ -41,6 +42,14 @@ export async function userDevices(user: string) {
     if (!await tx.users.exists(lp)) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'no such user');
     }
-    return await tx.e2ee.snapshot(lp, user, config().e2ee);
+    const response = await tx.e2ee.snapshot(lp, user, config().e2ee);
+    const signing = await tx.crossSigning.views(lp, user, '');
+    for (const usage of ['master', 'self_signing']) {
+      if (signing[usage + '_keys'] !== undefined) {
+        response[usage + '_key'] = signing[usage + '_keys'];
+      }
+    }
+    bounded(response, config().e2ee.maxrequestbytes);
+    return response;
   });
 }

@@ -4,7 +4,10 @@ import { withProjectionLock } from '#engine/server/project.ts';
 import { advance, get } from '#engine/store/watermark.ts';
 import { nextDeviceSeq, publishDeviceChange } from '#engine/server/e2ee.ts';
 import { enqueueEdu } from '#engine/server/delivery.ts';
-import { fanoutDeviceChange } from '#engine/server/device-federation.ts';
+import {
+  fanoutDeviceChange,
+  fanoutSigningChange,
+} from '#engine/server/device-federation.ts';
 
 export function projectTenant(store: Store, tenant: string): Promise<void> {
   return withProjectionLock(async () => {
@@ -19,13 +22,29 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
       if (!rows.length) break;
       await server.tx(async (conn) => {
         for (const row of rows) {
+          const payload = JSON.parse(String(row.payload));
+          const subject = '@' + row.localpart + ':' + tenant;
+          if (
+            payload.kind === 'public_signing' ||
+            payload.kind === 'private_signing'
+          ) {
+            const seq = await nextDeviceSeq(conn);
+            if (payload.kind === 'public_signing') {
+              await publishDeviceChange(conn, seq, subject);
+            } else {for (const scope of ['sync', 'keys']) {
+                await conn.execute(
+                  'INSERT INTO device_notices VALUES(?,?,?,?,?)',
+                  [seq, subject, payload.subject ?? subject, scope, 'private'],
+                );
+              }}
+            continue;
+          }
           const old = await conn.query(
             'SELECT seq FROM device_changes WHERE source=? AND source_pos=?',
             [source, row.pos],
           );
           if (old.length) continue;
           const seq = await nextDeviceSeq(conn);
-          const subject = '@' + row.localpart + ':' + tenant;
           await conn.execute(
             'INSERT INTO device_changes VALUES(?,?,?,?,?,?,?,?)',
             [
@@ -48,6 +67,30 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
           );
         }
         await advance(conn, source, Number(rows[rows.length - 1].pos));
+      });
+    }
+    // E4 public-signing intents predate federation support. A distinct durable
+    // cursor replays them even if the notification watermark already advanced.
+    const signingSource = 'tenant:' + tenant + ':public-signing';
+    for (;;) {
+      const mark = await get(server, signingSource);
+      const rows = await db.query(
+        'SELECT pos,localpart,payload FROM e2ee_changes WHERE pos>? ORDER BY pos LIMIT 500',
+        [mark],
+      );
+      if (!rows.length) break;
+      await server.tx(async (conn) => {
+        for (const row of rows) {
+          const payload = JSON.parse(String(row.payload));
+          if (payload.kind !== 'public_signing') continue;
+          await fanoutSigningChange(
+            conn,
+            '@' + row.localpart + ':' + tenant,
+            Number(row.pos),
+            payload,
+          );
+        }
+        await advance(conn, signingSource, Number(rows[rows.length - 1].pos));
       });
     }
     // Intents are not a lossy change-log instruction. Keep tenant admission

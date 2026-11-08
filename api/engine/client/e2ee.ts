@@ -20,7 +20,15 @@ import { federationRequest } from '#engine/federation/client.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { abortable } from '#engine/net/abort.ts';
 import { publicDeviceKey } from '#engine/e2ee-remote.ts';
-import { cachedDeviceKeys } from '#engine/server/remote-devices.ts';
+import {
+  cachedKeyQuery,
+  withRemoteSigningState,
+} from '#engine/server/remote-devices.ts';
+import {
+  publicSigning,
+  signingViews,
+  verifiedPublicSigning,
+} from '#engine/e2ee-public-signing.ts';
 
 export async function uploadKeys(
   userId: string,
@@ -53,12 +61,12 @@ const unavailable = () => ({
 });
 
 /** Validate the complete origin answer before publishing any part of it. */
-function remoteKeys(
+async function remoteKeys(
   value: unknown,
   requests: Requests,
   claim: boolean,
   requester: string,
-): { keys: Json; count: number } {
+): Promise<{ keys: Json; signing: Json; count: number }> {
   const limits = config().e2ee;
   bounded(value, limits.maxrequestbytes);
   const source = object(
@@ -67,6 +75,7 @@ function remoteKeys(
   );
   const wanted = new Map(requests);
   const keys: Json = Object.create(null);
+  const signing: Json = {};
   let count = 0;
   for (const [user, devices] of Object.entries(source)) {
     const ids = wanted.get(user);
@@ -99,7 +108,39 @@ function remoteKeys(
     }
     keys[user] = result;
   }
-  return { keys, count };
+  if (!claim) {
+    const answer = object(value, 'response');
+    for (const field of ['master_keys', 'self_signing_keys']) {
+      if (answer[field] === undefined) continue;
+      for (const user of Object.keys(object(answer[field], field))) {
+        if (!wanted.has(user)) {
+          throw new Error('origin returned unrequested signing user');
+        }
+      }
+    }
+    for (const [user] of requests) {
+      const supplied = publicSigning(
+        {
+          master_key: (answer.master_keys as Json | undefined)?.[user],
+          self_signing_key: (answer.self_signing_keys as Json | undefined)
+            ?.[user],
+        },
+        user,
+        limits,
+      );
+      const publicKeys = await verifiedPublicSigning(supplied, user, limits);
+      count += Object.keys(publicKeys).length;
+      limitEntries(count, limits.maxkeys);
+      mergeViews(signing, signingViews(publicKeys, user, requester));
+    }
+  }
+  return { keys, signing, count };
+}
+
+function mergeViews(target: Json, source: Json): void {
+  for (const [field, users] of Object.entries(source)) {
+    target[field] = { ...(target[field] as Json), ...(users as Json) };
+  }
 }
 
 async function composed(
@@ -155,6 +196,12 @@ async function composed(
     (n, keys) => n + Object.keys(keys as Json).length,
     0,
   );
+  if (!claim) {
+    count += ['master_keys', 'self_signing_keys', 'user_signing_keys'].reduce(
+      (n, f) => n + Object.keys(response[f] as Json).length,
+      0,
+    );
+  }
   const iterator = groups.entries();
   const deadline = new AbortController();
   // Client timeout is a maximum; the configured transport ceiling still applies.
@@ -176,24 +223,38 @@ async function composed(
                 user: requester,
                 what: claim ? 'claim device keys' : 'query device keys',
               }));
-            const cached: Json = Object.create(null);
+            const cached: Json = Object.create(null), cachedSigning: Json = {};
             const missing: Requests = [];
+            const revisions = new Map<string, number>();
             for (const entry of requests) {
               await abortable(
                 deadline.signal,
                 () => app.deviceLists.recover(entry[0], deadline.signal),
               );
+              revisions.set(
+                entry[0],
+                await abortable(deadline.signal, () =>
+                  withRemoteSigningState(
+                    app.server,
+                    entry[0],
+                    (state) => Promise.resolve(state.revision),
+                  )),
+              );
               const keys = claim
                 ? null
                 : await abortable(deadline.signal, () =>
-                  cachedDeviceKeys(
+                  cachedKeyQuery(
                     app.server,
                     entry[0],
                     entry[1] as string[],
                     requester,
                   ));
               if (keys === null) missing.push(entry);
-              else cached[entry[0]] = keys;
+              else {
+                cached[entry[0]] = (keys.device_keys as Json)[entry[0]];
+                const { device_keys: _devices, ...views } = keys;
+                mergeViews(cachedSigning, views);
+              }
             }
             const res = missing.length
               ? await federationRequest(
@@ -214,23 +275,65 @@ async function composed(
               : null;
             deadline.signal.throwIfAborted();
             const answer = res === null
-              ? { keys: {}, count: 0 }
-              : remoteKeys(res.json, missing, claim, requester);
+              ? { keys: {}, signing: {}, count: 0 }
+              : await remoteKeys(res.json, missing, claim, requester);
             answer.keys = { ...cached, ...answer.keys };
             answer.count += Object.values(cached).reduce<number>(
               (n, keys) => n + Object.keys(keys as Json).length,
               0,
             );
+            mergeViews(answer.signing, cachedSigning);
+            if (!claim) {
+              const masters = answer.signing.master_keys as Json | undefined;
+              for (const [user, raw] of Object.entries(masters ?? {})) {
+                masters![user] = await abortable(
+                  deadline.signal,
+                  () =>
+                    withRemoteSigningState(
+                      app.server,
+                      user,
+                      async (state) => {
+                        if (
+                          state.revision !== revisions.get(user)
+                        ) throw new Error('remote signing keys changed');
+                        const key = raw as Json;
+                        const id = Object.keys(key.keys as Json)[0].slice(8);
+                        return await app.tenant.tx((tx) =>
+                          tx.keySignatures.remoteView(
+                            key,
+                            user,
+                            id,
+                            requester,
+                            state.revision,
+                          )
+                        );
+                      },
+                    ),
+                );
+              }
+            }
+            answer.count += Object.values(cachedSigning).reduce(
+              (n: number, users) => n + Object.keys(users as Json).length,
+              0,
+            );
+            deadline.signal.throwIfAborted();
             limitEntries(count + answer.count, limits.maxkeys);
             const merged = { ...(response[field] as Json), ...answer.keys };
             const remaining = { ...failures };
             delete remaining[origin];
+            const next: Json = {
+              ...response,
+              [field]: merged,
+              failures: remaining,
+            };
+            mergeViews(next, answer.signing);
             bounded(
-              { ...response, [field]: merged, failures: remaining },
+              next,
               limits.maxrequestbytes,
             );
             // No await between budget validation and publication.
             response[field] = merged;
+            for (const f of Object.keys(answer.signing)) response[f] = next[f];
             delete failures[origin];
             count += answer.count;
           } catch {

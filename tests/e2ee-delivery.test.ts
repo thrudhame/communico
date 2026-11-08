@@ -23,7 +23,7 @@ Deno.test('E3: server v5 upgrade preserves pending work, frozen envelopes surviv
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
       await serverSchema.apply(db);
       await db.exec(
-        'DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
+        'DROP TABLE remote_signing_keys; DROP TABLE public_signing_keys; DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
       );
       await db.exec(
         "DROP TABLE edu_outbox; DROP TABLE federation_batches; DELETE FROM counters WHERE name='reliable-edus'",
@@ -112,7 +112,7 @@ Deno.test('E3 v6 FIFO upgrade retains insertion order and exact frozen ownership
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
       await serverSchema.apply(db);
       await db.exec(
-        'DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
+        'DROP TABLE remote_signing_keys; DROP TABLE public_signing_keys; DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
       );
       await db.exec(
         "DROP INDEX edu_outbox_fifo; DROP INDEX edu_outbox_completed; ALTER TABLE edu_outbox DROP COLUMN enqueue_pos; DELETE FROM counters WHERE name='reliable-edus'",
