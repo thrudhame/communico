@@ -316,3 +316,60 @@ Deno.test('E1: pool overflow rejects the entire mutation and leaves accepted key
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test('E1: retained fallbacks and pool status stay bounded across uploads and concurrent writers', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(config(dir), {
+    schemas: { tenant: tenantSchema },
+  });
+  try {
+    const tenant = await openTenant(store, 'a.test', { create: true });
+    const user = await registerUser(tenant, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'PHONE',
+    });
+    const device = await deviceIdentity(tenant, 'alice', 'PHONE');
+    const constrained = { ...limits, maxkeys: 2 };
+    const upload = (body: unknown, cap = constrained) =>
+      tenant.tx((tx) =>
+        tx.e2ee.upload(device, validateUpload(body, user.user_id, 'PHONE', cap))
+      );
+    await upload({ fallback_keys: { 'a:first': 'first' } });
+    await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'a'));
+    const result = await Promise.allSettled(
+      ['b', 'c'].map((algorithm) =>
+        upload({ fallback_keys: { [algorithm + ':key']: algorithm } })
+      ),
+    );
+    assertEquals(result.filter((r) => r.status === 'fulfilled').length, 1);
+    assertEquals(result.filter((r) => r.status === 'rejected').length, 1);
+    assertEquals(
+      (await tenant.tx((tx) => tx.e2ee.status(device))).unused.length,
+      1,
+    );
+    // Used fallbacks remain stored and count toward the same aggregate limit.
+    assertEquals(
+      await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'a')),
+      { 'a:first': 'first' },
+    );
+    await upload({ fallback_keys: { 'a:replacement': 'replacement' } });
+    const before = await tenant.tx((tx) => tx.e2ee.status(device));
+    const algorithm = 'x'.repeat(100);
+    const body = { one_time_keys: { [algorithm + ':1']: 'one' } };
+    await assertRejects(() =>
+      upload(body, {
+        ...constrained,
+        maxrequestbytes: JSON.stringify(body).length,
+      })
+    );
+    assertEquals(await tenant.tx((tx) => tx.e2ee.status(device)), before);
+    assertEquals(
+      await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', algorithm)),
+      null,
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});

@@ -201,11 +201,17 @@ export async function uploadKeys(
     );
     changed = true;
   }
+  const fallbackCount = await conn.query(
+    'SELECT COUNT(*) AS n FROM fallback_keys WHERE localpart=? AND device_id=? AND generation=?',
+    args,
+  );
+  limitEntries(Number(fallbackCount[0].n), input.limits.maxkeys);
   const status = await keyStatus(conn, device);
   limitEntries(
     Object.values(status.counts).reduce((a, b) => a + b, 0),
     input.limits.maxonetimekeys,
   );
+  bounded(status, input.limits.maxrequestbytes);
   if (changed) await poolChanged(conn, device);
   return status.counts;
 }
