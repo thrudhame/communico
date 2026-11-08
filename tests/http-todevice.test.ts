@@ -43,6 +43,42 @@ const sync = (token: string, since?: string, timeout = 0) =>
 const send = (token: string, txn: string, messages: unknown, status = 200) =>
   call(token, 'sendToDevice/m.test/' + txn, { messages }, 'PUT', status);
 
+suite.test('remote sends are refused atomically until reliable federation delivery is available', async () => {
+  const a = await suite.registerTestUser('unsupported-a', 'pw');
+  const b = await suite.registerTestUser('unsupported-b', 'pw');
+  const enabled = config().federation.enabled;
+  try {
+    for (const federation of [false, true]) {
+      setConfigForTests({ federation: { enabled: federation } });
+      const txn = 'unsupported-' + federation;
+      await send(a.access_token!, txn, {
+        [b.user_id]: { '*': { local: true } },
+        '@remote:other.test': { '*': { remote: true } },
+      }, 403);
+      assertEquals((await sync(b.access_token!)).to_device.events, []);
+      const db = await theApp().store.tenant(theApp().tenant.serverName);
+      assertEquals(await db.query('SELECT * FROM to_device_intents'), []);
+      assertEquals(
+        await db.query('SELECT * FROM to_device_transactions WHERE txn_id=?', [
+          txn,
+        ]),
+        [],
+      );
+      // A rejected transaction has no receipt: a local-only retry still delivers.
+      await send(a.access_token!, txn, {
+        [b.user_id]: { '*': { local: true } },
+      });
+      const delivered = await sync(b.access_token!);
+      assertEquals(delivered.to_device.events.map((e) => e.content), [{
+        local: true,
+      }]);
+      await sync(b.access_token!, delivered.next_batch);
+    }
+  } finally {
+    setConfigForTests({ federation: { enabled } });
+  }
+});
+
 suite.test('durable send, wildcard snapshot, scoped retries and issued-cut acknowledgments', async () => {
   const a = await suite.registerTestUser('inbox-a', 'pw');
   const b = await suite.registerTestUser('inbox-b', 'pw');

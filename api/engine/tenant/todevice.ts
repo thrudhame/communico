@@ -93,18 +93,16 @@ export async function sendMessages(
     )).length
   ) return;
   let fanout = 0;
-  const remote = new Map<string, Record<string, Record<string, Json>>>();
   for (const m of messages) {
     const destination = domainOf(m.user);
     if (destination !== server) {
-      let users = remote.get(destination);
-      if (!users) {
-        users = Object.create(null);
-        remote.set(destination, users!);
-      }
-      if (!Object.hasOwn(users!, m.user)) users![m.user] = Object.create(null);
-      users![m.user][m.id] = m.content;
-      continue;
+      // Remote admission requires a durable delivery worker. Until it exists,
+      // refuse in the shared owner so mixed sends roll back without a receipt.
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        'remote device delivery is unavailable',
+      );
     }
     const lp = localpartOf(m.user);
     const targets = m.id === '*'
@@ -125,22 +123,6 @@ export async function sendMessages(
         limits,
       );
     }
-  }
-  for (const [destination, users] of remote) {
-    const pending = await conn.query(
-      'SELECT COUNT(*) AS n FROM to_device_intents',
-    );
-    limitEntries(Number(pending[0].n) + 1, limits.maxinboxmessages);
-    await conn.execute('INSERT INTO to_device_intents VALUES(?,?,?)', [
-      source + ':' + destination,
-      destination,
-      JSON.stringify({
-        sender: '@' + d.localpart + ':' + server,
-        type,
-        message_id: source,
-        messages: users,
-      }),
-    ]);
   }
   await conn.execute(
     'INSERT INTO to_device_transactions VALUES(?,?,?,?,?)',
