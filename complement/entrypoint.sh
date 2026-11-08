@@ -5,6 +5,11 @@ set -euo pipefail
 
 APP_DIR="/app"
 export COMMUNICO_SERVER_NAME="$SERVER_NAME"
+# Conformance corpus intentionally authors plaintext. Product defaults remain
+# enforced in real installs and the dedicated native policy consumers.
+export COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDCREATION=true
+export COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDJOINING=true
+export COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDMESSAGES=true
 echo ">> entrypoint: SERVER_NAME=$SERVER_NAME"
 cd "$APP_DIR"
 

@@ -553,6 +553,11 @@ export type ConfigPatch = {
   server?: { name?: string; port?: number; shutdowngraceseconds?: number };
   admin?: { socket?: string };
   media?: { root?: string; maxbytes?: number };
+  encryption?: {
+    allowunencryptedcreation?: boolean;
+    allowunencryptedjoining?: boolean;
+    allowunencryptedmessages?: boolean;
+  };
   e2ee?: {
     maxrequestbytes?: number;
     maxkeybytes?: number;

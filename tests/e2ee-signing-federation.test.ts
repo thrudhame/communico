@@ -58,6 +58,7 @@ Deno.test('public signing projection replays old intents, seeds subscriptions an
       await serverSchema.apply(db);
       await db.exec('DROP TABLE public_signing_keys');
       await db.exec('DROP TABLE remote_signing_keys');
+      await db.exec('DROP TABLE federation_join_attempts');
     },
   };
   let store = await openStore(options(dir), {

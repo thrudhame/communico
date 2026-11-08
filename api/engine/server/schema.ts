@@ -295,9 +295,13 @@ CREATE TABLE public_signing_keys(subject TEXT PRIMARY KEY NOT NULL, source_pos I
 const REMOTE_SIGNING_SQL = `
 CREATE TABLE remote_signing_keys(user_id TEXT PRIMARY KEY NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL);
 `;
+const JOIN_ATTEMPTS_SQL = `
+CREATE TABLE federation_join_attempts(room_id TEXT NOT NULL, user_id TEXT NOT NULL, event_id TEXT NOT NULL, room_version TEXT NOT NULL, destination TEXT NOT NULL, added_ms INTEGER NOT NULL, leave_json TEXT, PRIMARY KEY(room_id,user_id));
+CREATE INDEX federation_join_attempts_destination ON federation_join_attempts(destination,added_ms);
+`;
 
 export const serverSchema: SchemaProvider = {
-  version: 12,
+  version: 13,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -309,6 +313,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(DEVICE_RECOVERY_SQL);
     await db.exec(PUBLIC_SIGNING_SQL);
     await db.exec(REMOTE_SIGNING_SQL);
+    await db.exec(JOIN_ATTEMPTS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -320,5 +325,6 @@ export const serverSchema: SchemaProvider = {
     9: (conn) => conn.exec(DEVICE_RECOVERY_SQL),
     10: (conn) => conn.exec(PUBLIC_SIGNING_SQL),
     11: (conn) => conn.exec(REMOTE_SIGNING_SQL),
+    12: (conn) => conn.exec(JOIN_ATTEMPTS_SQL),
   },
 };

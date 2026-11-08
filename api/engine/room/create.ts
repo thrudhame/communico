@@ -12,12 +12,19 @@ import { splitId } from '#engine/ids.ts';
 import { assertCanonicalNumbers } from '#engine/canonical.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { validAdditionalCreators } from '#engine/rulebook/auth-rules.ts';
-import { parsePowerLevels } from '#engine/rulebook/power-levels.ts';
+import {
+  parsePowerLevels,
+  requiredLevel,
+} from '#engine/rulebook/power-levels.ts';
 import { buildCreate, buildInTx } from '#engine/room/build.ts';
 import { projectAfterWrite, registerCreatedRoom } from '#engine/room/hooks.ts';
 import { initializeRoom, openRoom } from '#engine/room/index.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
+import {
+  encryptedInitialState,
+  encryptionError,
+} from '#engine/room/encryption-policy.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Store } from '#engine/store/index.ts';
 
@@ -136,11 +143,11 @@ export async function createRoom(
       throw new MatrixError(400, 'M_INVALID_PARAM', 'not a user id: ' + u);
     }
   }
-  const initialState = opts.initial_state ?? [];
-  if (!Array.isArray(initialState)) {
+  const requestedState = opts.initial_state ?? [];
+  if (!Array.isArray(requestedState)) {
     throw new MatrixError(400, 'M_BAD_JSON', 'initial_state must be an array');
   }
-  for (const e of initialState) {
+  for (const e of requestedState) {
     if (
       typeof e?.type !== 'string' ||
       (e.state_key !== undefined && typeof e.state_key !== 'string') ||
@@ -154,6 +161,10 @@ export async function createRoom(
       );
     }
   }
+  const initialState = encryptedInitialState(
+    requestedState,
+    opts.creation_content?.type,
+  );
   let alias: string | undefined;
   if (opts.alias !== undefined) {
     if (!ALIAS_LOCALPART_RE.test(opts.alias)) {
@@ -237,6 +248,28 @@ export async function createRoom(
     throw new MatrixError(400, 'M_BAD_JSON', 'invalid power levels');
   }
 
+  // Check the creator's effective power at every planned encryption event
+  // before initializeRoom creates even an unpublished file.
+  let effectivePower = pl;
+  for (const event of initialState) {
+    if (
+      event.type === 'm.room.power_levels' && (event.state_key ?? '') === ''
+    ) {
+      effectivePower = event.content as Record<string, unknown>;
+    }
+    if (event.type !== 'm.room.encryption') continue;
+    const parsed = parsePowerLevels(effectivePower, spec);
+    if (!parsed.ok) {
+      throw encryptionError('Invalid power levels before encryption');
+    }
+    const level = spec.creatorsHaveInfinitePower
+      ? Infinity
+      : (parsed.pl.users[creator] ?? parsed.pl.users_default);
+    if (level < requiredLevel('m.room.encryption', '', parsed.pl)) {
+      throw encryptionError('Creator cannot authorize required encryption');
+    }
+  }
+
   const createContent: Record<string, unknown> = {
     ...(opts.creation_content ?? {}),
   };
@@ -311,6 +344,7 @@ export async function createRoom(
           }, signer);
           const res = await ingestInTx(tx, finalRoomId, pdu, {
             self: signer.serverName,
+            initializing: true,
           });
           if (res.standing !== 'accepted') {
             throw new Error(

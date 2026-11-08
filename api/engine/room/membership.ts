@@ -13,6 +13,7 @@ import { buildInTx } from '#engine/room/build.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { projectAfterWrite } from '#engine/room/hooks.ts';
+import { admitLocalJoin } from '#engine/room/hooks.ts';
 
 export type MembershipOpResult = {
   roomId: string;
@@ -214,8 +215,9 @@ export async function reopen(
   signer: Signer,
   content: Record<string, unknown>,
 ): Promise<MembershipOpResult> {
-  const result = await withRoomLock(room.id, () =>
-    room.tx(async (tx) => {
+  const result = await withRoomLock(room.id, async () => {
+    await admitLocalJoin(room.store, room.id, userId);
+    return await room.tx(async (tx) => {
       if (await tx.segments.openStay() !== null) {
         throw new MatrixError(
           400,
@@ -258,7 +260,8 @@ export async function reopen(
       }
       await tx.segments.setOpenedBy(stay, res.eventId);
       return { roomId: room.id, eventId: res.eventId, created: true };
-    }));
+    });
+  });
   await projectAfterWrite(room.store, room.id);
   return result;
 }

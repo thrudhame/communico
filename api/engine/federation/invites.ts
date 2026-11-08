@@ -525,11 +525,11 @@ export async function rejectInviteRemote(
 // The reject-invite performer (ruling F): make_leave → fill → sign →
 // send_leave v2 (→ v1 on endpoint-unknown) against the CURRENT
 // destination; the loop advances candidates on failure.
-async function performRejectInvite(
+export async function prepareRemoteLeave(
   destination: string,
-  invite: StoredInvite,
-  deps: InviteDeps,
-): Promise<void> {
+  invite: Pick<StoredInvite, 'userId' | 'roomId' | 'roomVersion'>,
+  deps: Pick<InviteDeps, 'server' | 'signer'>,
+): Promise<Pdu> {
   const userId = invite.userId;
   const roomId = invite.roomId;
   const mk = await federationRequest(deps.server, deps.signer, {
@@ -563,11 +563,20 @@ async function performRejectInvite(
     signatures: {},
   };
   // hash, id and our signature (the old signPdu dance)
-  const signed = await finalizeBuilt(
+  return await finalizeBuilt(
     pdu,
     getRulebook(roomVersion),
     deps.signer,
   );
+}
+
+export async function sendRemoteLeave(
+  destination: string,
+  signed: Pdu,
+  roomVersion: string,
+  deps: Pick<InviteDeps, 'server' | 'signer'>,
+): Promise<void> {
+  const roomId = String(signed.room_id);
   const eventId = String(signed.event_id);
   try {
     await federationRequest(deps.server, deps.signer, {
@@ -596,6 +605,16 @@ async function performRejectInvite(
       ),
     });
   }
+}
+
+async function performRejectInvite(
+  destination: string,
+  invite: StoredInvite,
+  deps: InviteDeps,
+): Promise<void> {
+  const signed = await prepareRemoteLeave(destination, invite, deps);
+  await sendRemoteLeave(destination, signed, invite.roomVersion, deps);
+  const { roomId, userId } = invite;
   // delivered: the row becomes 'rejected', and the SIGNED LEAVE becomes
   // the rendered event — the out-of-band leave section of /sync carries
   // it in state.events (stage 5; SyncLeftFrom wants a leave event there)

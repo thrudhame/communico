@@ -15,9 +15,9 @@ this branch under `tests/`.
 Browser homeserver/native sync, home/VPS sync, store-image adoption, announce
 digests and WebRTC/WebTransport are parked; Model B is a future expansion.
 Parking does not change the browser's first-class homeserver expectation or
-choose its storage engine. E2EE is core product scope: its server APIs and
-room-encryption controls are being designed, not implemented in this snapshot.
-The old browser demo's E2EE exclusion was scoped to that demo.
+choose its storage engine. E2EE server APIs cover device and one-time/fallback
+keys, durable to-device delivery, device lists, federation, cross-signing and
+encrypted key backup. Clients own encryption, private keys and decryption.
 
 ## What end-to-end encryption does not hide
 
@@ -26,6 +26,30 @@ specific to communico. Encrypting protocol-required cleartext would break
 compatibility with other Matrix servers and clients.**
 
 Communico's goal is end-to-end encryption as tight as Matrix allows.
+
+Rooms created by local users use Megolm encryption by default. Spaces are
+exempt because their content is state; server-notice creation has no public
+exemption. Clients cannot bypass enforcement by claiming a server-notice type.
+Local users cannot send plaintext non-state events into encrypted rooms,
+except redactions and the standard in-room key-verification exchange. State
+remains plaintext. Local encryption downgrade/redaction is blocked while
+unencrypted creation is disabled; remote events retain normal Matrix validity.
+
+Administrators control three independent settings in `[encryption]`:
+
+| # | Config name                           | Default | Effect when false                                                                                                         |
+| - | ------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------- |
+| 1 | `encryption.allowunencryptedcreation` | `false` | Insert Megolm at room creation and protect local encryption state from downgrade/removal                                  |
+| 2 | `encryption.allowunencryptedjoining`  | `true`  | Refuse local joins to known plaintext rooms; leave unknown remote plaintext rooms after the handshake and return an error |
+| 3 | `encryption.allowunencryptedmessages` | `false` | Refuse local plaintext non-state events in encrypted rooms, with the exceptions above                                     |
+
+Environment overrides are `COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDCREATION`,
+`COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDJOINING` and
+`COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDMESSAGES`. Strict remote join refusal
+may briefly join before discovering the room's authoritative encryption state.
+Interrupted cleanup remains durable and visible in federation-outbox review;
+it retries through the federation sender. Existing members are not evicted.
+The three `io.element.e2ee_forced.*` `/versions` flags reflect creation policy.
 
 Matrix E2EE protects payloads that clients encrypt, not the whole protocol.
 These limits apply even in an encrypted room. HTTPS protects transport, but
@@ -104,6 +128,10 @@ agora specified by the execution plan:
 - `deno task check`
 - `deno task test`
 - `sh hooks/pre-commit`
+
+`deno task test` and the Complement image explicitly permit plaintext for
+their conformance corpus. Dedicated encryption-policy consumers exercise the
+shipped defaults and all eight control combinations.
 
 Configuration uses `defaults/communico.toml`, an optional
 `config/communico.toml` overlay and `COMMUNICO_*` environment overrides.

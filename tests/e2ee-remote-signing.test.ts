@@ -43,6 +43,7 @@ Deno.test('remote signing revision rejects a late device snapshot over rotation;
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
       await serverSchema.apply(db);
       await db.exec('DROP TABLE remote_signing_keys');
+      await db.exec('DROP TABLE federation_join_attempts');
     },
   };
   let store = await openStore(options, { schemas: { server: old } });

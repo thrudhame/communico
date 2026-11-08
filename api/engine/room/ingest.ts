@@ -29,6 +29,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { domainOf } from '#engine/ids.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { admitLocalJoin } from '#engine/room/hooks.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { getRulebook, type StateMap } from '#engine/rulebook/index.ts';
 import {
@@ -62,6 +63,7 @@ import {
 import type { Signer } from '#engine/room/signer.ts';
 import { mapEntries } from '#engine/room/state.ts';
 import { oversizedOf } from '#engine/room/verify.ts';
+import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
 
 export type Standing = 'accepted' | 'rejected' | 'soft_failed';
 
@@ -120,7 +122,15 @@ export async function sendLocal(
     signer,
     (tx) => buildInTx(tx, room.id, partial, signer),
     submission,
+    localJoiningUser(partial),
   );
+}
+
+function localJoiningUser(event: BuildPartial): string | undefined {
+  return event.type === 'm.room.member' && event.state_key === event.sender &&
+      event.content.membership === 'join'
+    ? event.sender
+    : undefined;
 }
 
 export type PreparedSubmission = { eventId: string; pdu: Pdu | null };
@@ -160,8 +170,12 @@ async function submitLocal(
   signer: Signer,
   build: (tx: RoomTx) => Promise<Pdu>,
   submission?: LocalSubmission,
+  joiningUser?: string,
 ): Promise<IngestLocalResult> {
   const result = await withRoomLock(room.id, async () => {
+    if (joiningUser !== undefined) {
+      await admitLocalJoin(room.store, room.id, joiningUser);
+    }
     if (submission === undefined) {
       return await room.tx(async (tx) =>
         ingestInTx(tx, room.id, await build(tx), { self: signer.serverName })
@@ -169,7 +183,19 @@ async function submitLocal(
     }
     let prepared = await submission.lookup();
     if (prepared === null) {
-      prepared = await submission.prepare(await room.tx(build));
+      const built = await room.tx(async (tx) => {
+        const pdu = await build(tx);
+        const stay = await tx.segments.openStay();
+        const group = stay === null ? null : await tx.state.current(stay.id);
+        await assertLocalEncryption(
+          tx,
+          group,
+          pdu as BuildPartial,
+          signer.serverName,
+        );
+        return pdu;
+      });
+      prepared = await submission.prepare(built);
     }
     const result = await room.tx(async (tx) => {
       const receipt = await submissionReceipt(tx, prepared.eventId);
@@ -206,7 +232,11 @@ export async function ingestLocal(
 ): Promise<IngestLocalResult> {
   const result = await withRoomLock(
     room.id,
-    () => room.tx((tx) => ingestInTx(tx, room.id, pdu, { self })),
+    async () => {
+      const user = localJoiningUser(pdu as BuildPartial);
+      if (user !== undefined) await admitLocalJoin(room.store, room.id, user);
+      return await room.tx((tx) => ingestInTx(tx, room.id, pdu, { self }));
+    },
   );
   await maybeResume(room, result.eventId, self);
   await projectAfterWrite(room.store, room.id);
@@ -236,7 +266,7 @@ export async function ingestInTx(
   tx: RoomTx,
   roomId: string,
   pdu: Pdu,
-  opts: { remote?: RemoteIngest; self?: string } = {},
+  opts: { remote?: RemoteIngest; self?: string; initializing?: boolean } = {},
 ): Promise<IngestLocalResult> {
   const remote = opts.remote ?? null;
   const isCreate = pdu.type === 'm.room.create' &&
@@ -417,6 +447,15 @@ export async function ingestInTx(
     ? boundary
     : await stateBefore(tx, prevs.afterGroups, rulebook, store);
   const priorGroup = await tx.state.current(stay.id);
+  if (remote === null) {
+    await assertLocalEncryption(
+      tx,
+      priorGroup,
+      pdu as BuildPartial,
+      self,
+      opts.initializing,
+    );
+  }
 
   // The S8 sequence: auth chain -> state -> soft-fail against the
   // current resolved state. For remote events the declared-set
