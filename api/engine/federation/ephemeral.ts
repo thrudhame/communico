@@ -50,7 +50,7 @@ export function wireEphemeral(
             userId: change.row.userId,
             eventId: change.row.eventId,
             ts: change.row.ts,
-            threadId: null,
+            threadId: change.row.threadId,
           }, change.row.seq);
         }
       });

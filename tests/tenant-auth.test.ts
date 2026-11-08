@@ -78,8 +78,10 @@ Deno.test('refresh rotation: old access revoked, old refresh consumed, same devi
     assertNotEquals(rotated.accessToken, reg.access_token);
     assertNotEquals(rotated.refreshToken, refresh1);
     assertEquals(rotated.expiresInMs, REFRESH_LIFETIME_MS);
-    // the OLD access token is revoked; the OLD refresh token is consumed
+    // The old access is revoked immediately. First replacement use consumes
+    // the old refresh token (the HTTP suite covers retries before that use).
     assertEquals(await lookupToken(tenant, reg.access_token!), null);
+    const info = await lookupToken(tenant, rotated.accessToken);
     const reuse = await consumeRefreshToken(tenant, refresh1).then(
       () => null,
       (e) => e,
@@ -88,7 +90,6 @@ Deno.test('refresh rotation: old access revoked, old refresh consumed, same devi
     assertEquals(reuse.status, 401);
     assertEquals(reuse.errcode, 'M_UNKNOWN_TOKEN');
     // the new pair works, on the SAME device
-    const info = await lookupToken(tenant, rotated.accessToken);
     assertEquals(info?.user_id, '@rt:a.test');
     assertEquals(info?.device_id, reg.device_id);
     assert(info !== null && info.expires_ms !== null);
@@ -121,6 +122,45 @@ Deno.test('uia sessions: create/complete/drop', async () => {
     assertEquals(await getUiaSession(tenant, s.session), null);
     assertEquals(await getUiaSession(tenant, 'no-such-session'), null);
   });
+});
+
+Deno.test('refresh retry window persists across a store reopen', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: { tenant: tenantSchema },
+  });
+  try {
+    let tenant = await openTenant(store, 'a.test', { create: true });
+    const user = await registerUser(tenant, {
+      localpart: 'restart',
+      password: 'pw',
+    });
+    const original = await issueRefreshToken(
+      tenant,
+      'restart',
+      user.device_id,
+      user.access_token!,
+    );
+    const lost = await consumeRefreshToken(tenant, original);
+    await store.close();
+    store = await openStore(config(dir), { schemas: { tenant: tenantSchema } });
+    tenant = await openTenant(store, 'a.test');
+    const retry = await consumeRefreshToken(tenant, original);
+    assertEquals(await lookupToken(tenant, lost.accessToken), null);
+    assertEquals(
+      (await lookupToken(tenant, retry.accessToken))?.device_id,
+      user.device_id,
+    );
+    await store.close();
+    store = await openStore(config(dir), { schemas: { tenant: tenantSchema } });
+    tenant = await openTenant(store, 'a.test');
+    const error = await consumeRefreshToken(tenant, original).catch((e) => e);
+    assert(error instanceof MatrixError);
+    assertEquals(error.errcode, 'M_UNKNOWN_TOKEN');
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
 });
 
 /** Await a requireUia that must throw; hand back the MatrixError. */

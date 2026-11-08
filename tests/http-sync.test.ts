@@ -92,7 +92,7 @@ suite.test('initial, incremental and full_state; global tokens; account data; re
   await recordTransaction(
     app.tenant,
     alice.device_id!,
-    roomId,
+    { kind: 'send', roomId, eventType: 'm.room.message' },
     'local-echo',
     sent.eventId,
   );

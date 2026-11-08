@@ -6,6 +6,18 @@ import type { Conn } from '#engine/store/db.ts';
 import { hashToken } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 
+/** Refresh retains pushers while replacing the token that owns them. */
+export async function movePusherToken(
+  conn: Conn,
+  oldHash: string,
+  newHash: string,
+): Promise<void> {
+  await conn.execute(
+    'UPDATE pushers SET access_token = ? WHERE access_token = ?',
+    [newHash, oldHash],
+  );
+}
+
 export async function deletePushersForToken(
   conn: Conn,
   accessHash: string,

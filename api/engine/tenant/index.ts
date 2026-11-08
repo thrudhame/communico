@@ -151,6 +151,10 @@ function bind(conn: Conn, changed: () => void = () => {}) {
         auth.deleteRefreshForAccessToken(conn, accessHash),
       deleteForUser: (localpart: string) =>
         auth.deleteRefreshTokensOfUser(conn, localpart),
+      confirm: (hash: string) => auth.confirmRefreshToken(conn, hash),
+      confirmAccess: (hash: string) => auth.confirmAccessToken(conn, hash),
+      replace: (hash: string, nextHash: string, accessHash: string) =>
+        auth.replaceRefreshToken(conn, hash, nextHash, accessHash),
     },
     uia: {
       insert: (session: string, flows: { stages: string[] }[]) =>
@@ -161,6 +165,8 @@ function bind(conn: Conn, changed: () => void = () => {}) {
       drop: (session: string) => uia.deleteUiaSession(conn, session),
     },
     pushers: {
+      moveToken: (oldHash: string, newHash: string) =>
+        pushers.movePusherToken(conn, oldHash, newHash),
       deleteForToken: (accessHash: string) =>
         pushers.deletePushersForToken(conn, accessHash),
       deleteForUser: (localpart: string) =>
@@ -283,28 +289,45 @@ function bind(conn: Conn, changed: () => void = () => {}) {
         media.markMediaUploaded(conn, mediaId, meta),
     },
     txns: {
-      submission: (deviceId: string, roomId: string, txnId: string) =>
-        txns.submissionById(conn, deviceId, roomId, txnId),
-      prepare: (deviceId: string, roomId: string, txnId: string, pdu: Pdu) =>
-        txns.prepareSubmission(conn, deviceId, roomId, txnId, pdu),
+      submission: (
+        deviceId: string,
+        endpoint: txns.TransactionEndpoint,
+        txnId: string,
+      ) => txns.submissionById(conn, deviceId, endpoint, txnId),
+      prepare: (
+        deviceId: string,
+        endpoint: txns.TransactionEndpoint,
+        txnId: string,
+        pdu: Pdu,
+      ) => txns.prepareSubmission(conn, deviceId, endpoint, txnId, pdu),
       finish: (
         deviceId: string,
-        roomId: string,
+        endpoint: txns.TransactionEndpoint,
         txnId: string,
         eventId: string,
         accepted: boolean,
       ) =>
-        txns.finishSubmission(conn, deviceId, roomId, txnId, eventId, accepted),
+        txns.finishSubmission(
+          conn,
+          deviceId,
+          endpoint,
+          txnId,
+          eventId,
+          accepted,
+        ),
       forEvent: (deviceId: string, roomId: string, eventId: string) =>
         txns.transactionIdForEvent(conn, deviceId, roomId, eventId),
-      lookup: (deviceId: string, roomId: string, txnId: string) =>
-        txns.transactionById(conn, deviceId, roomId, txnId),
+      lookup: (
+        deviceId: string,
+        endpoint: txns.TransactionEndpoint,
+        txnId: string,
+      ) => txns.transactionById(conn, deviceId, endpoint, txnId),
       record: (
         deviceId: string,
-        roomId: string,
+        endpoint: txns.TransactionEndpoint,
         txnId: string,
         eventId: string,
-      ) => txns.insertTransaction(conn, deviceId, roomId, txnId, eventId),
+      ) => txns.insertTransaction(conn, deviceId, endpoint, txnId, eventId),
     },
   };
 }

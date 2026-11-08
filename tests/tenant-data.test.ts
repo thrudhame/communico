@@ -588,31 +588,39 @@ Deno.test('txns: (device, room, txn) → same event id, other room differs, cont
       deviceId: 'txn-one',
     });
     const device = reg.device_id;
-    await recordTransaction(tenant, device, '!room1:a.test', 'm-txn', '$first');
+    const endpoint = {
+      kind: 'send' as const,
+      roomId: '!room1:a.test',
+      eventType: 'm.room.message',
+    };
+    await recordTransaction(tenant, device, endpoint, 'm-txn', '$first');
     assertEquals(
-      await lookupTransaction(tenant, device, '!room1:a.test', 'm-txn'),
+      await lookupTransaction(tenant, device, endpoint, 'm-txn'),
       '$first',
     );
     // a repeat record (whatever the content was) is a no-op
     await recordTransaction(
       tenant,
       device,
-      '!room1:a.test',
+      endpoint,
       'm-txn',
       '$second',
     );
     assertEquals(
-      await lookupTransaction(tenant, device, '!room1:a.test', 'm-txn'),
+      await lookupTransaction(tenant, device, endpoint, 'm-txn'),
       '$first',
     );
     // other room → nothing recorded
     assertEquals(
-      await lookupTransaction(tenant, device, '!room2:a.test', 'm-txn'),
+      await lookupTransaction(tenant, device, {
+        ...endpoint,
+        roomId: '!room2:a.test',
+      }, 'm-txn'),
       null,
     );
     // other device → nothing recorded
     assertEquals(
-      await lookupTransaction(tenant, 'txn-two', '!room1:a.test', 'm-txn'),
+      await lookupTransaction(tenant, 'txn-two', endpoint, 'm-txn'),
       null,
     );
 
@@ -630,7 +638,7 @@ Deno.test('txns: (device, room, txn) → same event id, other room differs, cont
       device,
     );
     assertEquals(
-      await lookupTransaction(tenant, device, '!room1:a.test', 'm-txn'),
+      await lookupTransaction(tenant, device, endpoint, 'm-txn'),
       '$first',
     );
   });

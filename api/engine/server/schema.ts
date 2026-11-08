@@ -116,10 +116,11 @@ CREATE TABLE receipts(
   room_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
   receipt_type TEXT NOT NULL,
+  thread_id TEXT NOT NULL DEFAULT '',
   event_id TEXT NOT NULL,
   ts_ms INTEGER NOT NULL,
   seq INTEGER NOT NULL,
-  PRIMARY KEY(room_id, user_id, receipt_type)
+  PRIMARY KEY(room_id, user_id, receipt_type, thread_id)
 );
 
 CREATE TABLE presence(
@@ -245,7 +246,7 @@ CREATE TABLE server_key_changes(
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 2,
+  version: 3,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
   },
