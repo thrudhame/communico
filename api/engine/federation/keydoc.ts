@@ -6,7 +6,7 @@
 // doltgres; the server file's Db and the tenant Signer are explicit.
 import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { type KeyDoc, signWithSigner } from './keys.ts';

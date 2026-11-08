@@ -3,7 +3,7 @@
 // its module's short name. The store must have been opened with the room
 // schema provider (R14).
 import type { Store } from '#engine/store/index.ts';
-import { type Conn, Db } from '#engine/store/db.ts';
+import type { Conn, Database } from '#engine/store/db.ts';
 import * as changes from '#engine/room/changes.ts';
 import * as events from '#engine/room/events.ts';
 import * as extremities from '#engine/room/extremities.ts';
@@ -154,7 +154,7 @@ export async function openRoom(
   roomId: string,
   options: { create?: boolean } = {},
 ): Promise<Room> {
-  const db: Db = await store.room(roomId, options);
+  const db: Database = await store.room(roomId, options);
   return {
     id: roomId,
     store,

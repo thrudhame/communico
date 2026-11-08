@@ -211,6 +211,7 @@ CREATE TABLE federation_invites(
   origin TEXT NOT NULL,
   received_ms INTEGER NOT NULL,
   status TEXT NOT NULL,
+  seq INTEGER NOT NULL,
   PRIMARY KEY(room_id, user_id)
 );
 
@@ -244,7 +245,7 @@ CREATE TABLE server_key_changes(
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 1,
+  version: 2,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
   },

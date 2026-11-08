@@ -19,7 +19,7 @@ import { parseIp } from '#engine/preview/cidr.ts';
 import { b32decode, isKeyName } from '#engine/signing-primitives.js';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { lookupPeer, type PeerRow } from './peers.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 
 export type Trust =
   | { kind: 'ca' }

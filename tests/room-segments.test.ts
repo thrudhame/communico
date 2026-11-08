@@ -3,7 +3,7 @@
 // without renumbering, extremities per stay, the waits lifecycle, the
 // change log's order and paging, and atomic rollback of a room tx.
 import { assert, assertEquals, assertRejects } from '@std/assert';
-import type { Conn, Db } from '#engine/store/db.ts';
+import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Value } from '#engine/store/ffi.ts';
 import { openRoom, type Room, roomSchema } from '#engine/room/index.ts';
 import { openStore, type Store } from '#engine/store/index.ts';

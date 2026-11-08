@@ -315,7 +315,7 @@ export async function buildInTx(
 ): Promise<Pdu> {
   const isCreate = partial.type === 'm.room.create' &&
     (partial.prev_events ?? []).length === 0;
-  const stay = await tx.segments.openStay();
+  const stay = await stayForEvent(tx, partial);
   if (stay === null && !isCreate) {
     throw new Error('E_ROOM_ARCHIVED: no open stay for ' + roomId);
   }
@@ -358,6 +358,31 @@ export async function buildInTx(
   if (partial.state_key !== undefined) pdu.state_key = partial.state_key;
   if (partial.redacts !== undefined) pdu.redacts = partial.redacts;
   return await finalizeBuilt(pdu, rulebook, signer);
+}
+
+// The archived-room carve-out is a property of the event, not a caller
+// flag: only an invited user's self-leave may land on the closed stay.
+// Used by both authoring and ingest (local and federation consumers).
+export async function stayForEvent(
+  tx: RoomTx,
+  event: Pick<BuildPartial, 'type' | 'sender' | 'state_key' | 'content'>,
+) {
+  const live = await tx.segments.openStay();
+  if (live !== null) return live;
+  if (
+    event.type !== 'm.room.member' || event.sender !== event.state_key ||
+    event.content?.membership !== 'leave'
+  ) return null;
+  const last = await tx.segments.latestStay();
+  const group = last === null ? null : await tx.state.current(last.id);
+  const id = group === null
+    ? null
+    : await tx.state.groupKey(group, 'm.room.member', event.sender);
+  const row = id === null ? null : await tx.events.get(id);
+  return row !== null &&
+      (JSON.parse(row.pdu) as Pdu).content?.membership === 'invite'
+    ? last
+    : null;
 }
 
 // Build an m.room.create outside any room transaction: the v12 room id is

@@ -13,7 +13,7 @@ import {
 } from '#engine/signing-primitives.js';
 import { keyStore } from '#engine/federation/keys.ts';
 import { serverSchema } from '#engine/server/schema.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import {
   directOnly,

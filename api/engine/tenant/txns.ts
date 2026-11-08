@@ -56,3 +56,26 @@ export async function recordTransaction(
 ): Promise<void> {
   await tenant.tx((tx) => tx.txns.record(deviceId, roomId, txnId, eventId));
 }
+
+/** The sending device's local echo metadata, resolved from durable receipts. */
+export async function transactionForEvent(
+  tenant: Tenant,
+  deviceId: string,
+  roomId: string,
+  eventId: string,
+): Promise<string | null> {
+  return await tenant.tx((tx) => tx.txns.forEvent(deviceId, roomId, eventId));
+}
+
+export async function transactionIdForEvent(
+  conn: Conn,
+  deviceId: string,
+  roomId: string,
+  eventId: string,
+): Promise<string | null> {
+  const rows = await conn.query(
+    'SELECT txn_id FROM transactions WHERE device_id = ? AND room_id = ? AND event_id = ? ORDER BY txn_id LIMIT 1',
+    [deviceId, roomId, eventId],
+  );
+  return rows.length === 0 ? null : String(rows[0].txn_id);
+}

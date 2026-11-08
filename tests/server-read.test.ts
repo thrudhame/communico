@@ -20,7 +20,7 @@ import {
 } from '#engine/server/read.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { bobJoins, genesis } from './fixtures/genesis.ts';
 

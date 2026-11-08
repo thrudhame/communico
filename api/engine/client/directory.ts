@@ -1,0 +1,270 @@
+import { theApp } from '#engine/app.ts';
+import { serverName } from '#engine/config.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  aliasRecord,
+  lookupAlias,
+  registerAlias,
+  removeAlias,
+  roomAliases as aliases,
+} from '#engine/server/aliases.ts';
+import * as directory from '#engine/server/directory.ts';
+import { membershipOf } from '#engine/server/read.ts';
+import { getProfile } from '#engine/tenant/users.ts';
+import { getRulebook } from '#engine/rulebook/index.ts';
+import {
+  parsePowerLevels,
+  requiredLevel,
+  userPowerLevel,
+} from '#engine/rulebook/power-levels.ts';
+import { requireRoom, stateAtSeq, versionOf } from './room.ts';
+import { joinedRooms, serversInRoom } from './membership.ts';
+import { writeStateKey } from './write.ts';
+
+export function aliasIsLocal(alias: string) {
+  const colon = alias.lastIndexOf(':');
+  return colon > 1 && alias.slice(colon + 1) === serverName() &&
+    alias.startsWith('#');
+}
+export async function createAlias(
+  alias: string,
+  roomId: string,
+  creator: string,
+) {
+  if (
+    !/^#[^:]+:[^:]+$/.test(alias) ||
+    alias.slice(alias.indexOf(':') + 1) !== serverName()
+  ) throw new MatrixError(400, 'M_INVALID_PARAM', 'Room alias invalid');
+  await requireRoom(roomId);
+  if (await lookupAlias(theApp().server, alias) !== null) {
+    throw new MatrixError(409, 'M_ROOM_IN_USE', 'alias taken: ' + alias);
+  }
+  await registerAlias(theApp().server, alias, roomId, creator);
+}
+export async function resolveAlias(alias: string) {
+  const roomId = await lookupAlias(theApp().server, alias);
+  if (roomId === null || await directory.purgeable(theApp().server, roomId)) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
+  }
+  const servers = await serversInRoom(roomId);
+  if (servers.length === 0) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
+  }
+  return { room_id: roomId, servers };
+}
+export async function powerFor(roomId: string, user: string, type: string) {
+  const room = await requireRoom(roomId),
+    spec = getRulebook(await versionOf(room)).spec;
+  const rows = await stateAtSeq(roomId, null);
+  const pdu = async (type: string) => {
+    const id = rows.find((r) => r.type === type && r.stateKey === '')?.eventId;
+    const row = id === undefined
+      ? null
+      : await room.tx((tx) => tx.events.get(id));
+    return row === null ? null : JSON.parse(row.pdu);
+  };
+  const pl = await pdu('m.room.power_levels'),
+    create = await pdu('m.room.create');
+  const parsed = pl === null ? null : parsePowerLevels(pl.content, spec);
+  return {
+    level: userPowerLevel(user, pl, create, spec),
+    need: requiredLevel(type, '', parsed?.ok ? parsed.pl : null),
+  };
+}
+export async function deleteAlias(alias: string, user: string) {
+  const db = theApp().server, row = await aliasRecord(db, alias);
+  if (row === null) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
+  }
+  const power = await powerFor(row.roomId, user, 'm.room.canonical_alias');
+  if (row.creator !== user && power.level < power.need) {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'not the alias creator and insufficient power level',
+    );
+  }
+  const canon = (await stateAtSeq(row.roomId, null)).find((r) =>
+    r.type === 'm.room.canonical_alias' && r.stateKey === ''
+  );
+  await removeAlias(db, alias);
+  if (canon !== undefined) {
+    const content = { ...canon.content };
+    let changed = false;
+    if (content.alias === alias) {
+      delete content.alias;
+      changed = true;
+    }
+    if (Array.isArray(content.alt_aliases)) {
+      const kept = content.alt_aliases.filter((a) => a !== alias);
+      if (kept.length !== content.alt_aliases.length) {
+        content.alt_aliases = kept;
+        changed = true;
+      }
+    }
+    if (changed) {
+      try {
+        await writeStateKey(
+          row.roomId,
+          user,
+          'm.room.canonical_alias',
+          '',
+          content,
+        );
+      } catch (e) {
+        console.error(
+          'alias delete: canonical_alias update rejected (kept):',
+          String(e),
+        );
+      }
+    }
+  }
+}
+export async function roomAliases(roomId: string, user: string) {
+  await requireRoom(roomId);
+  const m = await membershipOf(theApp().server, roomId, user),
+    state = await stateAtSeq(roomId, null);
+  if (
+    m?.membership !== 'join' &&
+    !state.some((r) =>
+      r.type === 'm.room.history_visibility' &&
+      r.content.history_visibility === 'world_readable'
+    )
+  ) {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'You are not a member of the room.',
+    );
+  }
+  return await aliases(theApp().server, roomId);
+}
+export async function getVisibility(roomId: string) {
+  await requireRoom(roomId);
+  return { visibility: await directory.visibility(theApp().server, roomId) };
+}
+export async function setVisibility(
+  roomId: string,
+  user: string,
+  value: string,
+) {
+  await requireRoom(roomId);
+  if (value !== 'public' && value !== 'private') {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'unknown visibility: ' + value,
+    );
+  }
+  if (
+    (await membershipOf(theApp().server, roomId, user))?.membership !== 'join'
+  ) {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'You are not a member of the room.',
+    );
+  }
+  await directory.setVisibility(theApp().server, roomId, value);
+}
+export async function publicRooms(
+  opts: { search?: string; limit?: number; since?: string },
+) {
+  const limit = opts.limit !== undefined && opts.limit > 0 ? opts.limit : 100,
+    offset = opts.since === undefined
+      ? 0
+      : Math.max(0, parseInt(opts.since, 10) || 0);
+  const all: Record<string, unknown>[] = [];
+  for (const id of await directory.listedRooms(theApp().server)) {
+    const state = await stateAtSeq(id, null);
+    const value = (type: string, key: string) => {
+      const v = state.find((r) => r.type === type && r.stateKey === '')
+        ?.content[key];
+      return typeof v === 'string' ? v : undefined;
+    };
+    const name = value('m.room.name', 'name'),
+      topic = value('m.room.topic', 'topic'),
+      canonical = value('m.room.canonical_alias', 'alias');
+    if (
+      opts.search !== undefined &&
+      ![name, topic, canonical].some((v) =>
+        v?.toLowerCase().includes(opts.search!.toLowerCase())
+      )
+    ) continue;
+    const chunk: Record<string, unknown> = {
+      room_id: id,
+      num_joined_members:
+        (await directory.joinedUsers(theApp().server, id)).length,
+      world_readable:
+        value('m.room.history_visibility', 'history_visibility') ===
+          'world_readable',
+      guest_can_join:
+        value('m.room.guest_access', 'guest_access') === 'can_join',
+    };
+    for (
+      const [key, v] of [
+        ['name', name],
+        ['topic', topic],
+        ['canonical_alias', canonical],
+        ['join_rule', value('m.room.join_rules', 'join_rule')],
+        ['avatar_url', value('m.room.avatar', 'url')],
+      ]
+    ) if (v !== undefined) chunk[key!] = v;
+    all.push(chunk);
+  }
+  all.sort((a, b) =>
+    Number(b.num_joined_members) - Number(a.num_joined_members) ||
+    String(a.room_id).localeCompare(String(b.room_id))
+  );
+  const out: {
+    chunk: Record<string, unknown>[];
+    total_room_count_estimate: number;
+    next_batch?: string;
+    prev_batch?: string;
+  } = {
+    chunk: all.slice(offset, offset + limit),
+    total_room_count_estimate: all.length,
+  };
+  if (offset + limit < all.length) out.next_batch = String(offset + limit);
+  if (offset > 0) out.prev_batch = String(Math.max(0, offset - limit));
+  return out;
+}
+export async function searchUsers(searcher: string, term: string, limit = 10) {
+  const candidates = new Set<string>(),
+    publicIds = new Set(await directory.listedRooms(theApp().server));
+  for (const id of await directory.allMemberRooms(theApp().server)) {
+    if (
+      (await stateAtSeq(id, null)).some((r) =>
+        r.type === 'm.room.join_rules' && r.content.join_rule === 'public'
+      )
+    ) publicIds.add(id);
+  }
+  for (const id of new Set([...publicIds, ...await joinedRooms(searcher)])) {
+    for (const user of await directory.joinedUsers(theApp().server, id)) {
+      candidates.add(user);
+    }
+  }
+  candidates.delete(searcher);
+  const needle = term.toLowerCase(), results: Record<string, unknown>[] = [];
+  for (const user of candidates) {
+    if (!user.endsWith(':' + serverName())) continue;
+    const profile = await getProfile(
+      theApp().tenant,
+      user.slice(1, user.indexOf(':')),
+    );
+    if (
+      !user.toLowerCase().includes(needle) &&
+      !profile?.displayname?.toLowerCase().includes(needle)
+    ) continue;
+    const result: Record<string, unknown> = { user_id: user };
+    if (profile?.displayname !== undefined) {
+      result.display_name = profile.displayname;
+    }
+    if (profile?.avatar_url !== undefined) {
+      result.avatar_url = profile.avatar_url;
+    }
+    results.push(result);
+  }
+  results.sort((a, b) => String(a.user_id).localeCompare(String(b.user_id)));
+  return { results: results.slice(0, limit), limited: results.length > limit };
+}

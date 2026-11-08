@@ -3,14 +3,14 @@
 // Schema providers own each database kind's domain tables; the store owns
 // the meta table and refuses a missing row or a version mismatch (R14).
 import { basename, join } from '@std/path';
-import { Db } from '#engine/store/db.ts';
+import { type Database, Db } from '#engine/store/db.ts';
 import { type Row, Turso } from '#engine/store/ffi.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 
 export type CreateOptions = {
   checkpointlogbytes: number;
-  schema: (db: Db) => Promise<void>;
-  verify: (db: Db) => Promise<void>;
+  schema: (db: Database) => Promise<void>;
+  verify: (db: Database) => Promise<void>;
   beforeRename?: (temporary: string, final: string) => Promise<void>;
   discardOnFailure?: boolean;
 };
@@ -21,7 +21,7 @@ export type CreateOptions = {
 // the open (R14; no migrations yet). Version 0 is the empty placeholder.
 export type SchemaProvider = {
   readonly version: number;
-  apply(db: Db): Promise<void>;
+  apply(db: Database): Promise<void>;
 };
 
 export const EMPTY_SCHEMA: SchemaProvider = {
@@ -33,7 +33,7 @@ export const META_SCHEMA =
   'CREATE TABLE meta(k TEXT PRIMARY KEY NOT NULL, v TEXT NOT NULL)';
 
 export async function applySchema(
-  db: Db,
+  db: Database,
   provider: SchemaProvider,
 ): Promise<void> {
   if (!Number.isSafeInteger(provider.version) || provider.version < 0) {
@@ -48,7 +48,7 @@ export async function applySchema(
 }
 
 export async function checkSchema(
-  db: Db,
+  db: Database,
   provider: SchemaProvider,
 ): Promise<void> {
   let rows: Row[];
@@ -91,7 +91,7 @@ async function syncTree(directory: string): Promise<void> {
   await sync(directory);
 }
 
-export async function integrityCheck(db: Db): Promise<void> {
+export async function integrityCheck(db: Database): Promise<void> {
   const rows = await db.query('PRAGMA integrity_check');
   if (
     rows.length !== 1 || Object.values(rows[0]).length !== 1 ||

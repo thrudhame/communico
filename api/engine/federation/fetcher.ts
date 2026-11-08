@@ -15,7 +15,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Fetcher } from '#engine/room/deps.ts';
 import type { Signer } from '#engine/room/signer.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { federationRequest } from './client.ts';
 
 function jsonObject(res: { json: unknown }): Record<string, unknown> {

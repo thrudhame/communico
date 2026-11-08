@@ -10,7 +10,7 @@ import { config } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Signer } from '#engine/room/signer.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { http1Request, type Http1Response } from '#engine/net/http1.ts';
 import { dialNodeTls } from './dial-node-tls.ts';
 import { caCertsPem, resolve } from './resolve.ts';

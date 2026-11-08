@@ -2,6 +2,7 @@ import { parseJson } from '@pathfinder/pathfinder/body';
 import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setAvatarUrl } from '#engine/tenant/users.ts';
+import { propagateProfile } from '#engine/client/membership.ts';
 import { authorize } from '#engine/auth-context.ts';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
@@ -34,6 +35,6 @@ export default async function (request: PathfinderRequest) {
   }
   const colon = userId.lastIndexOf(':');
   await setAvatarUrl(theApp().tenant, userId.slice(1, colon), body.avatar_url);
-  // D5 member-event fan-out returns with room/membership serving (5a-2).
+  await propagateProfile(userId, 'avatar_url');
   return {};
 }

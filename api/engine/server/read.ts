@@ -5,8 +5,20 @@
 // evidence: syncfeed.ts's window query and roomsFor/membershipOf
 // (room.ts), relations.ts's relationRows, search.ts's candidates +
 // matchTokens/rankOf, federation/outbox.ts's eventBatchFor.
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
+
+export async function redactionOf(
+  db: Db,
+  roomId: string,
+  eventId: string,
+): Promise<string | null> {
+  const rows = await db.query(
+    'SELECT event FROM redactions WHERE room = ? AND target = ?',
+    [roomId, eventId],
+  );
+  return rows.length === 0 ? null : String(rows[0].event);
+}
 
 // --- the feed --------------------------------------------------------------
 
@@ -186,6 +198,17 @@ export async function relationsOf(
     eventId: String(row.event),
     relType: row.rel_type === null ? null : String(row.rel_type),
     seq: Number(row.seq),
+  }));
+}
+
+export async function threadRootsOf(db: Db, roomId: string) {
+  const rows = await db.query(
+    "SELECT relates_to,MAX(seq) AS latest FROM relations WHERE room=? AND rel_type='m.thread' GROUP BY relates_to ORDER BY latest DESC",
+    [roomId],
+  );
+  return rows.map((r) => ({
+    eventId: String(r.relates_to),
+    latestSeq: Number(r.latest),
   }));
 }
 

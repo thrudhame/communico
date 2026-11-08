@@ -1,7 +1,7 @@
 // api/engine/store/watermark.ts — the server file's roll-forward positions.
 // advance() runs inside the caller's own server-file transaction and never
 // moves a source's position backward, so replays after a crash are safe.
-import type { Conn, Db } from '#engine/store/db.ts';
+import type { Conn, Database as Db } from '#engine/store/db.ts';
 
 export const WATERMARK_SCHEMA =
   'CREATE TABLE IF NOT EXISTS watermarks(source TEXT PRIMARY KEY NOT NULL, position INTEGER NOT NULL)';

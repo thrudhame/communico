@@ -11,7 +11,7 @@
 // The cache tables are shared across tenants of the same server file
 // (a fetched key serves every tenant). Ported from doltgres.
 import { config } from '#engine/config.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Signer } from '#engine/room/signer.ts';

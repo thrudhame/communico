@@ -46,6 +46,7 @@ import {
   roomCreateId,
   roomVersionOf,
   stateBefore,
+  stayForEvent,
   ungroundedPrevs,
 } from '#engine/room/build.ts';
 import type { Grounding } from '#engine/room/events.ts';
@@ -172,7 +173,7 @@ export async function ingestInTx(
   const remote = opts.remote ?? null;
   const isCreate = pdu.type === 'm.room.create' &&
     (pdu.prev_events ?? []).length === 0;
-  const stay = await tx.segments.openStay();
+  const stay = await stayForEvent(tx, pdu as BuildPartial);
   if (stay === null) {
     throw new Error('E_ROOM_ARCHIVED: no open stay for ' + roomId);
   }

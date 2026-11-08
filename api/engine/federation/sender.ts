@@ -22,7 +22,7 @@ import { openRoom } from '#engine/room/index.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { outboxDue, type OutboxDueRow } from '#engine/server/read.ts';
-import type { Db } from '#engine/store/db.ts';
+import type { Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { b64encodeStd, sha256ofString } from '#engine/signing-primitives.js';
 import { federationRequest } from './client.ts';
