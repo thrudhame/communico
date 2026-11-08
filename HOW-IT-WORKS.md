@@ -1,0 +1,308 @@
+# How communico works
+
+This guide describes the current server tree. Source pointers are relative to
+this repository and refer to the commit containing this guide. For commands,
+configuration paths and operator procedures, start with [README.md](README.md).
+
+## Files and ownership
+
+The application opens one store with room, tenant and server schemas, then
+selects the tenant for the configured server name. It serves one tenant per
+process; separate tenant files do not imply multi-tenant serving.
+(`api/engine/app.ts:61-82`)
+
+| # | File under the store root | Responsibility                                           | Source                                                                    |
+| - | ------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------- |
+| 1 | `rooms/<key>/data.db`     | Room events, graph, state cache, segments and change log | `api/engine/room/schema.ts:10-120`                                        |
+| 2 | `tenants/<key>/data.db`   | Tenant signing identity and hosted account data          | `api/engine/tenant/index.ts:337-379`, `api/engine/tenant/schema.ts:1-123` |
+| 3 | `server/data.db`          | Cross-room projections and durable server-owned data     | `api/engine/server/schema.ts:1-164`, `api/engine/server/project.ts:1-15`  |
+
+For rooms and tenants, `<key>` is the first 32 hex characters of SHA-256 of
+the full identifier. Files have `data.db-log` and `data.db-wal` sidecars;
+the stored full identifier is checked when opening its file.
+(`api/engine/store/layout.ts:7-36`, `api/engine/store/layout.ts:39-65`,
+`api/engine/store/pool.ts:376-409`)
+
+## Room truth and rulebooks
+
+An event is a validated PDU stored once with its indexed type, state key,
+sender, depth and timestamp. Mutable knowledge is separate: `event_status`
+records standing (`accepted`, `rejected`, `soft_failed`) independently of
+grounding (`grounded`, `evidence`, `pending`). Forward and reverse graph
+indexes retain the event's `prev_events` and `auth_events` edges.
+(`api/engine/room/schema.ts:10-46`, `api/engine/room/events.ts:30-106`)
+
+"Stored PDU" does not mean raw received bytes. Receipt removes `unsigned`,
+recomputes and annotates the event id, redacts on content-hash mismatch,
+and normally requires a verifying sender-server signature. Rejoin snapshots
+allow a resident-signature fallback only for our own historical sender domain.
+The event id is the room-version Matrix reference hash, not a second identity
+to translate.
+(`api/engine/room/verify.ts:151-275`, `api/engine/room/join.ts:59-78`,
+`api/engine/eventid.ts:171-192`)
+
+The accepted create event fixes the room version. The registry dispatches
+versions 3-12 and refuses unknown versions. The rulebook supplies auth
+selection, auth-chain and state checks, state resolution and redaction;
+it takes event/state data rather than doing storage or network I/O.
+(`api/engine/room/build.ts:49-80`, `api/engine/rulebook/index.ts:26-45`,
+`api/engine/rulebook/types.ts:129-144`, `hooks/pre-commit:31-35`)
+
+Authoring finalizes `origin` from the injected signer before content hashing,
+version-specific redaction, signing and reference-id calculation. Local ingest
+takes that signer's server explicitly, requires its signature entry, and
+permits additional caller-verified signatures such as an invite countersignature.
+(`api/engine/room/build.ts:296-326`, `api/engine/room/ingest.ts:320-358`)
+
+Ingest checks the declared auth chain, authorization against state at the
+event's own parents, then authorization against current published state for
+soft failure. Rejected and soft-failed events remain stored but get no live
+position or frontier membership. A soft-failed state event still has its own
+after-state. Accepted children walk flagged ancestry when updating the frontier.
+(`api/engine/room/ingest.ts:421-516`, `api/engine/room/ingest.ts:527-557`)
+
+Room mutations are serialized by a room-id lock above the storage file gate.
+Remote fetches run outside it; lifecycle is revalidated inside the locked
+transaction. Remote batches use the shared ingest pipeline after verification
+and bounded missing-event recovery.
+(`api/engine/room/lock.ts:1-27`, `api/engine/room/remote.ts:1-17`)
+
+## Two different state questions
+
+State groups cache resolver output as snapshots or parent-relative deltas.
+`materialize.ts` alone writes groups, entries, event-state refs, publications
+and the current pointer. It writes a fresh snapshot when another delta would
+exceed depth 32. A fingerprint deduplicates local groups; it is not a wire
+agreement certificate.
+(`api/engine/room/materialize.ts:1-12`, `api/engine/room/materialize.ts:71-127`,
+`api/engine/room/materialize.ts:135-200`)
+
+**State at an event** means its stored before/after refs. A single parent's
+after-group supplies the child's before-state; multiple parents invoke the
+rulebook resolver. An imported join or gap boundary is explicitly marked
+`imported`; unknown state has null refs and provenance `none`, never a current
+state fallback. Soft failure changes publication eligibility, not this question.
+(`api/engine/room/build.ts:271-294`, `api/engine/room/ingest.ts:471-516`,
+`api/engine/room/state.ts:107-153`, `api/engine/room/schema.ts:63-70`)
+
+**State at a live cut** means the latest publication at or before a room
+change position within a stay, or its opening group. The current pointer
+represents the resolved live frontier. A server feed sequence is first
+translated to `(stay, room change position)` before reading that publication.
+These cuts need not equal an arriving event's own after-state.
+(`api/engine/room/state.ts:155-188`, `api/engine/room/ingest.ts:579-621`,
+`api/engine/client/read.ts:16-50`)
+
+## Stays, history and recovery
+
+A stay is an interval of local room participation. Stays and history are
+explicit segment kinds, not numeric parity. Closing the last local member's
+stay retains its frontier; a rejoin opens another stay. A remote join stores
+its auth/state evidence without timeline positions, opens an imported state
+boundary and ingests the join as live.
+(`api/engine/room/segments.ts:18-26`, `api/engine/room/segments.ts:143-175`,
+`api/engine/room/ingest.ts:717-741`, `api/engine/room/join.ts:370-431`)
+
+Positions are `(segment, offset)` with one first owner per event. History
+prepends below the existing minimum offset, preserving existing cursors.
+Backfill verifies and authorizes parents before children, writes history
+changes and event-state refs, and never publishes live state, queues delivery
+or enters the live feed: history is never news.
+(`api/engine/room/schema.ts:83-89`, `api/engine/room/segments.ts:1-12`,
+`api/engine/room/history.ts:1-16`, `api/engine/server/project.ts:535-556`)
+
+Remote recovery waits briefly, asks for missing events, then requests state
+and events for gap tips within a batch budget. Remaining ungrounded events
+become pending with waits; later arrivals re-run the shared pipeline. A zero
+ungrounded lifetime drops them instead. Delayed redaction targets use waits
+too, without rewriting the stored target PDU.
+(`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,
+`api/engine/room/ingest.ts:654-681`)
+
+## Room-first writes and server projection
+
+The room transaction records its mutations and delivery destinations in
+`changes`. After that transaction commits, an injected hook projects them
+into the server file. Projection failure leaves the room write committed;
+the next projection or startup rolls forward from its watermark.
+(`api/engine/room/schema.ts:109-120`, `api/engine/room/ingest.ts:685-714`,
+`api/engine/room/hooks.ts:21-48`, `api/engine/server/startup.ts:13-38`)
+
+Projection writes a batch and advances its watermark in one server
+transaction. Rows are idempotent on `(room, pos)`; outbox rows also include
+destination. The server assigns global live-feed sequence numbers here.
+It is durable truth for those numbers, delivery progress and user intent,
+not a disposable file to rebuild from room events.
+(`api/engine/server/project.ts:1-15`, `api/engine/server/project.ts:79-103`,
+`api/engine/server/project.ts:589-597`, `api/engine/server/project.ts:678-700`)
+
+Membership reconciliation compares published members with the server's
+actual projected rows, including the imported opening of a new stay.
+Changed opening memberships get that first live cut; unchanged rows keep
+their sequence. Relations, search and redaction effects also belong to
+server projection. Search normalizes NUL to space and lowercases indexed
+body/name/topic text without altering the PDU.
+(`api/engine/server/project.ts:602-662`, `api/engine/server/project.ts:701-730`,
+`api/engine/server/project.ts:578-587`, `api/engine/server/project.ts:419-467`)
+
+## Client reads and sync
+
+All client timeline rendering crosses one viewer-aware `renderEvent` boundary.
+Its shared visibility policy requires accepted, grounded events; the viewer's
+own membership events are visible without a qualifying join. Other events need
+genuine event-state refs: after-state, plus before-state for history-visibility
+transitions. Shared visibility, including unknown values, requires a qualifying
+join at the event or later; publications can prove the later join without
+replacing the event's own policy. Thread bundles filter children before
+computing count, latest reply and participation.
+(`api/engine/client/render.ts:19-30`, `api/engine/client/visibility.ts:6-62`,
+`api/engine/client/render.ts:115-145`)
+
+`/sync` timeline visibility follows that same event-state policy. Its state
+blocks and unsigned membership retain their separate publication-cut
+contracts; `renderStateEvent` formats admitted state snapshots, including
+imported evidence, rather than imposing timeline eligibility on them.
+(`api/engine/syncfeed.ts:99-144`, `api/engine/client/render.ts:29-54`)
+
+The token grammar is `s<e>_p<p>_t<t>_r<r>_a<a>`: events, presence, typing,
+receipts and account data. Omitted suffix components parse as zero. Room
+feed entries and out-of-band invite transitions share one durable event
+allocator. Typing is ephemeral; presence and receipts are server data, while
+account-data stream markers belong to the tenant.
+(`api/engine/client/tokens.ts:1-33`, `api/engine/server/stream.ts:1-52`,
+`api/engine/typing.ts:1-48`, `api/engine/server/schema.ts:115-132`,
+`api/engine/tenant/schema.ts:72-108`)
+
+Receipts are keyed by room, user, public/private type and thread. Sync exposes
+public receipts plus the viewer's private receipts; federation consumes only
+public receipts. Thread identity survives both sync and federation, with
+unthreaded receipts kept distinct from `main` and named threads.
+(`api/engine/server/ephemeral.ts:165-264`, `api/engine/federation/ephemeral.ts:40-56`,
+`api/engine/federation/edus.ts:157-188`)
+
+Some client details are easy to overstate. `/messages` may omit `end` on a
+nonempty, completed unfiltered walk. Alias listing also permits world-readable
+nonmembers. User directory search covers visible local accounts, not remote
+users. The v12 upgrade transformation sets tombstone power to 150 only if the
+inherited value is below `state_default + 1`; 150 is not an unconditional floor.
+(`api/engine/client/timeline.ts:228-240`, `api/engine/client/directory.ts:127-144`,
+`api/engine/client/directory.ts:244-282`, `api/engine/client/upgrade.ts:65-77`)
+
+## Federation and delivery
+
+Federation has its own request-signature/admission boundary and per-version
+event-signature verification. Keys are looked up by server and key id with
+the required validity floor; failure to obtain or verify a key refuses the
+event. Authenticated contact resets outbound backoff and wakes the queue.
+(`api/engine/federation/auth.ts:32-135`,
+`api/engine/federation/keyresolver.ts:17-46`)
+
+Resident `/state` and `/state_ids` read the event's own before-state, including
+imported boundaries; unknown state returns 404. Federation event/history
+serving has a separate server-principal policy: return full or version-redacted
+PDUs according to that server's visibility at the event. This is not the
+client user's boolean timeline-visibility question.
+(`api/engine/federation/serve.ts:32-54`, `api/engine/federation/serve.ts:70-94`,
+`api/engine/federation/serve.ts:174-177`)
+
+Joining verifies the returned snapshot and our join. A returned join must
+recompute to our id; only its verified resident signature is merged into our
+authored copy, retaining our signed content. Restricted authorization requires
+that resident signature; ordinary joins can keep our signed copy alone.
+(`api/engine/room/join.ts:252-340`)
+
+Delivery begins with durable room intent, then idempotent projected outbox
+rows. One worker per destination resumes pending work on startup. Batches
+and URL-safe transaction ids are derived from pending rows; changed batches
+get different ids. Frozen EDUs exist only in process memory and do not survive
+restart; EDU-only sends are ephemeral, not durable retry jobs.
+(`api/engine/room/ingest.ts:685-714`, `api/engine/server/project.ts:589-597`,
+`api/engine/federation/sender.ts:1-18`, `api/engine/federation/sender.ts:331-344`,
+`api/engine/federation/sender.ts:483-507`)
+
+PDU expiry marks lapsed rows failed and records refusal in one server
+transaction. Reject-invite jobs currently have no expiry. The sender's stop
+latch prevents a new backoff sleep after stopping begins.
+(`api/engine/federation/sender.ts:388-411`, `api/engine/federation/invites.ts:706-728`,
+`api/engine/federation/sender.ts:359-371`)
+
+## Tenant data, storage and process lifetime
+
+Hosted accounts are localparts under the configured homeserver's signing
+identity. The tenant generates its key once and reloads it on reopen, keeping
+its stored native name and key id. A newly generated key has a public-key-derived
+id; existing ids are retained. Passwords use Argon2id PHC strings; access and
+refresh credentials are stored only as SHA-256 digests.
+(`api/engine/tenant/index.ts:337-401`, `api/engine/tenant/index.ts:51-62`,
+`api/engine/tenant/users.ts:1-3`, `api/engine/tenant/users.ts:39-55`,
+`api/engine/tenant/auth.ts:1-6`, `api/engine/tenant/auth.ts:17-48`)
+
+Refresh rotation revokes the old access token but keeps the old refresh token
+retryable until the replacement access or refresh token is used. Client send
+and redaction retries are scoped to `(device, endpoint, transaction id)`,
+independent of token refresh; endpoint identity includes the send event type
+or redaction target as well as the room.
+(`api/engine/tenant/auth.ts:227-303`, `api/engine/tenant/txns.ts:1-52`)
+
+The shared Matrix-id parser splits at the first colon, preserving a server
+name's port. Media metadata is tenant data; bytes live under `media.root`.
+Uploads enforce the size bound while streaming to `.part`, then rename the
+completed file. Generated media ids use the shared URL-safe encoder.
+(`api/engine/ids.ts:1-24`, `api/engine/media.ts:1-16`,
+`api/engine/media.ts:84-117`, `api/engine/tenant/media.ts:1-35`)
+
+The storage layer owns native-library loading, file transactions and
+maintenance. Startup checks the qualified Turso revision and patch set. Safe
+creation applies the schema in a `.new` directory, closes/reopens, verifies,
+syncs files, renames, then syncs the parent. Opens refuse schema mismatches;
+this snapshot has no schema migration path.
+(`api/engine/store/index.ts:151-197`, `api/engine/store/build.ts:12-38`,
+`api/engine/store/create.ts:18-21`, `api/engine/store/create.ts:104-165`)
+
+Room/tenant handles acquire a pool lease per operation and release it in
+`finally`; idle eviction cannot close leased files. At the configured log
+threshold (default 4,120,000 bytes), the file gate pauses admission, drains
+active transactions and checkpoints before reopening admission.
+(`api/engine/store/index.ts:88-105`, `api/engine/store/pool.ts:118-154`,
+`api/engine/store/pool.ts:250-300`, `api/engine/store/gate.ts:59-83`,
+`api/engine/store/gate.ts:102-142`, `defaults/communico.toml:28-42`)
+
+Write conflicts retry the entire transaction after rollback, with bounded
+jittered backoff; other errors propagate. Transaction bodies must use only
+their connection and attempt-local values, publishing effects after commit.
+The bounded immutable-edge cache follows that contract: attempt overlays
+merge only after a successful room transaction, and contain no database handles.
+(`api/engine/store/db.ts:202-271`, `api/engine/room/edges.ts:1-23`,
+`api/engine/room/index.ts:165-188`)
+
+The process owns public Matrix HTTP, optional federation TLS and a private
+admin Unix socket. Admin operations are versioned JSON POSTs calling engine
+functions; socket ownership/mode checks and inode-checked cleanup protect the
+local boundary. Tools use the running server, not direct file access. Whole-room
+operator drop/purge records durable removal intent, distinct from event redaction.
+(`main.ts:90-135`, `api/admin/index.ts:16-66`, `api/admin/index.ts:72-148`,
+`tools/admin.sh:1-12`, `api/engine/room/operator.ts:55-134`)
+
+Configuration layers shipped TOML, an optional overlay and environment leaves;
+unknown nodes and wrong types are errors. Signals stop admission, drain all
+listeners within the configured grace and close storage last. Unhandled
+rejections log a fatal marker and allow at most two seconds for cleanup before
+non-zero exit. See README for socket paths, certificate bootstrap and a
+supervisor example.
+(`api/engine/config.ts:1-5`, `api/engine/config.ts:135-165`,
+`api/engine/config.ts:253-301`, `main.ts:20-42`, `main.ts:139-162`)
+
+## Scope and recorded evidence
+
+The checked-in Complement baseline records a red conformance baseline, not
+universal protocol correctness. Native checks and HTTP integration tests are
+available through the current tasks. This document was verified by source
+inspection and pointer checks, not a new runtime or conformance run.
+(`complement/BASELINE.md:1-22`, `deno.json:7-18`)
+
+Browser homeserver/native sync, home/VPS sync, store-image adoption,
+announce digests, WebRTC/WebTransport and Model B remain parked/future work.
+That does not demote the browser homeserver promise or choose its storage
+engine. E2EE remains core product scope; current implementation status and
+the distinction from these parked tracks are summarized in README.
+(`README.md:15-20`)
