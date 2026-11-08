@@ -46,50 +46,62 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
     // Intents are not a lossy change-log instruction. Keep tenant admission
     // occupied until the server's durable completion, even after projection.
     const prefix = 'tenant:' + tenant + ':to-device:';
-    const intents = await db.query(
-      'SELECT source_id,destination,payload FROM to_device_intents',
-    );
-    for (const intent of intents) {
-      const source = prefix + intent.source_id;
-      const sent = await server.tx(async (conn) => {
-        await enqueueEdu(
-          conn,
-          source,
-          String(intent.destination),
-          'm.direct_to_device',
-          JSON.parse(String(intent.payload)),
-        );
-        const row = (await conn.query(
-          'SELECT state FROM edu_outbox WHERE source=? AND destination=?',
-          [source, intent.destination],
-        ))[0];
-        return row.state === 'sent';
+    for (;;) {
+      const intents = await db.query(
+        'SELECT source_id,destination,payload FROM to_device_intents WHERE projected=0 ORDER BY rowid LIMIT 500',
+      );
+      if (!intents.length) break;
+      await server.tx(async (conn) => {
+        for (const intent of intents) {
+          await enqueueEdu(
+            conn,
+            prefix + intent.source_id,
+            String(intent.destination),
+            'm.direct_to_device',
+            JSON.parse(String(intent.payload)),
+          );
+        }
       });
-      if (sent) {
-        await db.execute('DELETE FROM to_device_intents WHERE source_id=?', [
-          intent.source_id,
-        ]);
-      }
+      // This mark follows the durable server commit. Interruption replays the
+      // same sources idempotently, without releasing tenant admission early.
+      await db.tx(async (conn) => {
+        for (const intent of intents) {
+          await conn.execute(
+            'UPDATE to_device_intents SET projected=1 WHERE source_id=?',
+            [intent.source_id],
+          );
+        }
+      });
     }
-    // Tenant deletion precedes server pruning. A crash between them leaves a
-    // harmless sent marker, never a chance to resurrect an accepted send.
-    const remaining = new Set(
-      (await db.query('SELECT source_id FROM to_device_intents')).map((r) =>
-        prefix + r.source_id
-      ),
-    );
-    for (
-      const row of await server.query(
-        "SELECT source,destination FROM edu_outbox WHERE state='sent' AND edu_type='m.direct_to_device'",
-      )
-    ) {
-      const source = String(row.source);
-      if (source.startsWith(prefix) && !remaining.has(source)) {
-        await server.execute(
-          "DELETE FROM edu_outbox WHERE source=? AND destination=? AND state='sent'",
-          [source, row.destination],
-        );
-      }
+    // The prefix ends in ':', whose immediate successor is ';'. This indexed
+    // range visits only this tenant's completed work, not its retained backlog.
+    const end = prefix.slice(0, -1) + ';';
+    for (;;) {
+      const completed = await server.query(
+        "SELECT source,destination FROM edu_outbox WHERE state='sent' AND source>=? AND source<? AND edu_type='m.direct_to_device' LIMIT 500",
+        [prefix, end],
+      );
+      if (!completed.length) break;
+      // Tenant deletion precedes server pruning. A crash between them leaves
+      // harmless sent markers, never a chance to resurrect an accepted send.
+      await db.tx(async (conn) => {
+        for (const row of completed) {
+          await conn.execute(
+            'DELETE FROM to_device_intents WHERE source_id=?',
+            [
+              String(row.source).slice(prefix.length),
+            ],
+          );
+        }
+      });
+      await server.tx(async (conn) => {
+        for (const row of completed) {
+          await conn.execute(
+            "DELETE FROM edu_outbox WHERE source=? AND destination=? AND state='sent'",
+            [row.source, row.destination],
+          );
+        }
+      });
     }
   });
 }

@@ -6,6 +6,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { roomSchema } from '#engine/room/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
+import { enqueueEdu } from '#engine/server/delivery.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { registerToDevice } from '#engine/federation/todevice.ts';
@@ -275,7 +276,7 @@ Deno.test('E3 v6 tenant upgrade preserves pending payloads, sender admission and
     apply: async (conn: Parameters<typeof tenantSchema.apply>[0]) => {
       await tenantSchema.apply(conn);
       await conn.exec(
-        'DROP TABLE inbound_to_device; DROP INDEX to_device_intents_sender; ALTER TABLE to_device_intents DROP COLUMN sender;',
+        'DROP TABLE inbound_to_device; DROP INDEX to_device_intents_sender; ALTER TABLE to_device_intents DROP COLUMN sender; DROP INDEX to_device_intents_projection; ALTER TABLE to_device_intents DROP COLUMN projected;',
       );
     },
   };
@@ -311,12 +312,173 @@ Deno.test('E3 v6 tenant upgrade preserves pending payloads, sender admission and
       destination: 'remote.test',
       payload,
       sender: '@alice:old.test',
+      projected: 0,
     }]);
     assertEquals(
       (await upgraded.query('SELECT msg_pos FROM to_device_inbox'))[0].msg_pos,
       42,
     );
     assertEquals(await upgraded.query('SELECT * FROM inbound_to_device'), []);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('E3 intent projection batches new work and never rescans retained admission payloads', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(options(dir), { schemas });
+  try {
+    const db = await store.tenant('projection.test', { create: true });
+    await db.tx(async (tx) => {
+      for (let i = 0; i < 575; i++) {
+        await tx.execute(
+          'INSERT INTO to_device_intents(source_id,destination,payload,sender) VALUES(?,?,?,?)',
+          [
+            'intent-' + i,
+            'remote.test',
+            JSON.stringify({ message_id: String(i) }),
+            '@a:projection.test',
+          ],
+        );
+      }
+    });
+    const server = await store.server();
+    const actualTenant = store.tenant.bind(store);
+    let transactions = 0, payloadReads = 0;
+    store.server = () =>
+      Promise.resolve({
+        ...server,
+        tx: (fn, opts) => {
+          transactions++;
+          return server.tx(fn, opts);
+        },
+      });
+    store.tenant = async (...args) => {
+      const tenant = await actualTenant(...args);
+      return {
+        ...tenant,
+        query: async (sql, values) => {
+          const rows = await tenant.query(sql, values);
+          if (sql.includes('to_device_intents')) {
+            payloadReads += rows.filter((r) =>
+              Object.hasOwn(r, 'payload')
+            ).length;
+          }
+          return rows;
+        },
+      };
+    };
+    await projectTenant(store, 'projection.test');
+    assertEquals((await server.query('SELECT * FROM edu_outbox')).length, 575);
+    assert(
+      transactions <= 2,
+      'one server transaction per bounded batch, not per row: ' + transactions,
+    );
+    transactions = 0;
+    payloadReads = 0;
+    await projectTenant(store, 'projection.test');
+    assertEquals(payloadReads, 0, 'retained admission is not unprojected work');
+    assertEquals(transactions, 0);
+    // Completion clears only this tenant's rows, not other owners' sent work.
+    await server.tx(async (tx) => {
+      await enqueueEdu(
+        tx,
+        'tenant:other.test:to-device:kept',
+        'remote.test',
+        'm.direct_to_device',
+        {},
+      );
+      await enqueueEdu(
+        tx,
+        'tenant:projection.test:to-device:other-kind',
+        'remote.test',
+        'm.device_list_update',
+        {},
+      );
+    });
+    await server.execute("UPDATE edu_outbox SET state='sent'");
+    await projectTenant(store, 'projection.test');
+    assertEquals(await db.query('SELECT * FROM to_device_intents'), []);
+    assertEquals(
+      (await server.query('SELECT source FROM edu_outbox ORDER BY source')).map(
+        (r) => r.source,
+      ),
+      [
+        'tenant:other.test:to-device:kept',
+        'tenant:projection.test:to-device:other-kind',
+      ],
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('E3 intent projection resumes both cross-file commit boundaries without replaying a completed send', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(options(dir), { schemas });
+  try {
+    const db = await store.tenant('crash.test', { create: true });
+    await db.execute(
+      'INSERT INTO to_device_intents(source_id,destination,payload,sender) VALUES(?,?,?,?)',
+      ['kept', 'remote.test', '{"message_id":"kept"}', '@a:crash.test'],
+    );
+    const originalTenant = store.tenant.bind(store);
+    store.tenant = async (...args) => {
+      const tenant = await originalTenant(...args);
+      return {
+        ...tenant,
+        tx: () => Promise.reject(new Error('interrupted after server enqueue')),
+      };
+    };
+    await assertRejects(
+      () => projectTenant(store, 'crash.test'),
+      Error,
+      'interrupted after server enqueue',
+    );
+    const before = await (await store.server()).query(
+      'SELECT * FROM edu_outbox',
+    );
+    assertEquals(before.length, 1);
+    await store.close();
+    store = await openStore(options(dir), { schemas });
+    await projectTenant(store, 'crash.test');
+    const server = await store.server();
+    assertEquals(
+      await server.query('SELECT * FROM edu_outbox'),
+      before,
+      'roll-forward retains position and immutable payload',
+    );
+    await server.execute("UPDATE edu_outbox SET state='sent'");
+    store.server = () =>
+      Promise.resolve({
+        ...server,
+        tx: () =>
+          Promise.reject(new Error('interrupted after tenant completion')),
+      });
+    await assertRejects(
+      () => projectTenant(store, 'crash.test'),
+      Error,
+      'interrupted after tenant completion',
+    );
+    assertEquals(
+      await (await store.tenant('crash.test')).query(
+        'SELECT * FROM to_device_intents',
+      ),
+      [],
+    );
+    assertEquals(
+      (await server.query('SELECT state FROM edu_outbox'))[0].state,
+      'sent',
+    );
+    await store.close();
+    store = await openStore(options(dir), { schemas });
+    await projectTenant(store, 'crash.test');
+    assertEquals(
+      await (await store.server()).query('SELECT * FROM edu_outbox'),
+      [],
+    );
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });

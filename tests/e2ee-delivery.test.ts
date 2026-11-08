@@ -6,6 +6,7 @@ import {
   enqueueEdu,
   freezeBatch,
   frozenBatch,
+  pendingEdus,
 } from '#engine/server/delivery.ts';
 
 Deno.test('E3: server v5 upgrade preserves pending work, frozen envelopes survive reopen, and retired PDUs never expire reliable EDUs', async () => {
@@ -21,7 +22,9 @@ Deno.test('E3: server v5 upgrade preserves pending work, frozen envelopes surviv
     version: 5,
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
       await serverSchema.apply(db);
-      await db.exec('DROP TABLE edu_outbox; DROP TABLE federation_batches');
+      await db.exec(
+        "DROP TABLE edu_outbox; DROP TABLE federation_batches; DELETE FROM counters WHERE name='reliable-edus'",
+      );
     },
   };
   let store = await openStore(config, { schemas: { server: previous } });
@@ -85,6 +88,79 @@ Deno.test('E3: server v5 upgrade preserves pending work, frozen envelopes surviv
     assertEquals(
       (await server.query('SELECT state FROM outbox'))[0].state,
       'failed',
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('E3 v6 FIFO upgrade retains insertion order and exact frozen ownership across reopen', async () => {
+  const dir = await Deno.makeTempDir();
+  const config = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  const previous = {
+    version: 6,
+    apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
+      await serverSchema.apply(db);
+      await db.exec(
+        "DROP INDEX edu_outbox_fifo; DROP INDEX edu_outbox_completed; ALTER TABLE edu_outbox DROP COLUMN enqueue_pos; DELETE FROM counters WHERE name='reliable-edus'",
+      );
+    },
+  };
+  let store = await openStore(config, { schemas: { server: previous } });
+  const frozen = {
+    txnId: 'old-frozen',
+    body: 'exact bytes',
+    rows: [],
+    sources: ['z-old'],
+  };
+  try {
+    let server = await store.server();
+    for (const source of ['z-old', 'a-new']) {
+      await server.execute(
+        "INSERT INTO edu_outbox VALUES(?,'remote.test','m.test',?,'pending')",
+        [source, JSON.stringify({ source })],
+      );
+    }
+    await freezeBatch(server, 'remote.test', frozen);
+    await store.close();
+    store = await openStore(config, { schemas: { server: serverSchema } });
+    server = await store.server();
+    assertEquals(await frozenBatch(server, 'remote.test'), frozen);
+    await server.tx(async (tx) => {
+      await enqueueEdu(tx, '0-newest', 'remote.test', 'm.test', {
+        source: '0-newest',
+      });
+      await enqueueEdu(tx, 'z-old', 'remote.test', 'm.test', {
+        replaced: true,
+      });
+    });
+    assertEquals(
+      (await pendingEdus(server, 'remote.test', 100)).map((e) => e.content),
+      [
+        { source: 'z-old' },
+        { source: 'a-new' },
+        { source: '0-newest' },
+      ],
+    );
+    await server.tx((tx) => completeBatch(tx, 'remote.test', frozen));
+    assertEquals(
+      (await pendingEdus(server, 'remote.test', 100)).map((e) => e.source),
+      ['a-new', '0-newest'],
+    );
+    await store.close();
+    store = await openStore(config, { schemas: { server: serverSchema } });
+    assertEquals(
+      (await pendingEdus(await store.server(), 'remote.test', 100)).map((e) =>
+        e.source
+      ),
+      ['a-new', '0-newest'],
     );
   } finally {
     await store.close();

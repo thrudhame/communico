@@ -828,3 +828,36 @@ Deno.test('sender: reliable and room backlogs both get slots and alternate first
     });
   });
 });
+
+Deno.test('sender: reliable FIFO never lets newer lexical sources overtake retained work', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, dest, sends, sender: initial }) => {
+      await initial.stop();
+      const server = await store.server();
+      await server.tx(async (tx) => {
+        await enqueueEdu(tx, 'z-old', dest, 'm.test', { order: 'old' });
+        for (let i = 0; i < 101; i++) {
+          await enqueueEdu(tx, 'a-new-' + i, dest, 'm.test', { order: i });
+        }
+        // Idempotent roll-forward must not change the old row's queue position.
+        await enqueueEdu(tx, 'z-old', dest, 'm.test', { order: 'old' });
+      });
+      const worker = startSender({ store, signer: g.signer });
+      try {
+        await waitFor(async () =>
+          (await server.query("SELECT 1 FROM edu_outbox WHERE state='pending'"))
+            .length === 0
+        );
+        assertEquals(
+          sends.flatMap((s) => s.edus.map((e) => e.content)),
+          [
+            { order: 'old' },
+            ...Array.from({ length: 101 }, (_, order) => ({ order })),
+          ],
+        );
+      } finally {
+        await worker.stop();
+      }
+    });
+  });
+});

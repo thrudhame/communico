@@ -101,6 +101,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
           'federation_batches',
         ]
       ) await db.exec('DROP TABLE ' + name);
+      await db.exec("DELETE FROM counters WHERE name='reliable-edus'");
     },
   };
   let store = await openStore(config, {
@@ -164,7 +165,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
     assertEquals(
       (await migrated.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '6',
+      '7',
     );
   } finally {
     await store.close();

@@ -31,6 +31,14 @@ CREATE INDEX edu_outbox_pending ON edu_outbox(destination,state);
 CREATE TABLE federation_batches(destination TEXT PRIMARY KEY NOT NULL, txn_id TEXT NOT NULL, body TEXT NOT NULL, pdu_rows TEXT NOT NULL, edu_sources TEXT NOT NULL);
 `;
 
+const DELIVERY_FIFO_SQL = `
+ALTER TABLE edu_outbox ADD COLUMN enqueue_pos INTEGER NOT NULL DEFAULT 0;
+UPDATE edu_outbox SET enqueue_pos=rowid;
+INSERT INTO counters(name,value) SELECT 'reliable-edus',COALESCE(MAX(enqueue_pos),0) FROM edu_outbox;
+CREATE INDEX edu_outbox_fifo ON edu_outbox(destination,state,enqueue_pos);
+CREATE INDEX edu_outbox_completed ON edu_outbox(state,source);
+`;
+
 export const SERVER_SCHEMA_SQL = `
 -- Derived (S11/S12): rebuilt only by roll-forward replaying the rooms'
 -- change logs, keyed by (room, pos) so a replay changes nothing.
@@ -267,16 +275,18 @@ CREATE TABLE server_key_changes(
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 6,
+  version: 7,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
     await db.exec(DEVICE_TRACKING_SQL);
     await db.exec(RELIABLE_DELIVERY_SQL);
+    await db.exec(DELIVERY_FIFO_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
     4: (conn) => conn.exec(DEVICE_TRACKING_SQL),
     5: (conn) => conn.exec(RELIABLE_DELIVERY_SQL),
+    6: (conn) => conn.exec(DELIVERY_FIFO_SQL),
   },
 };

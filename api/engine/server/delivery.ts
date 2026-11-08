@@ -21,9 +21,21 @@ export async function enqueueEdu(
   type: string,
   content: Record<string, unknown>,
 ): Promise<void> {
+  if (
+    (await tx.query(
+      'SELECT 1 FROM edu_outbox WHERE source=? AND destination=?',
+      [source, destination],
+    )).length
+  ) return;
   await tx.execute(
-    "INSERT INTO edu_outbox VALUES(?,?,?,?,'pending') ON CONFLICT DO NOTHING",
-    [source, destination, type, JSON.stringify(content)],
+    "UPDATE counters SET value=value+1 WHERE name='reliable-edus'",
+  );
+  const position = (await tx.query(
+    "SELECT value FROM counters WHERE name='reliable-edus'",
+  ))[0].value;
+  await tx.execute(
+    "INSERT INTO edu_outbox(source,destination,edu_type,payload,state,enqueue_pos) VALUES(?,?,?,?,'pending',?)",
+    [source, destination, type, JSON.stringify(content), position],
   );
 }
 
@@ -33,7 +45,7 @@ export async function pendingEdus(
   limit: number,
 ): Promise<ReliableEdu[]> {
   return (await server.query(
-    "SELECT source,edu_type,payload FROM edu_outbox WHERE destination=? AND state='pending' ORDER BY source LIMIT ?",
+    "SELECT source,edu_type,payload FROM edu_outbox WHERE destination=? AND state='pending' ORDER BY enqueue_pos LIMIT ?",
     [destination, limit],
   )).map((row) => ({
     source: String(row.source),
