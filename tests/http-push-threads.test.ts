@@ -173,3 +173,59 @@ suite.test('private count-only zero wakes owner with a filtered timeline', async
   assertEquals(entry(result, room).unread_notifications, count(0));
   assertEquals((entry(result, room).timeline as Json).events, []);
 });
+
+suite.test('a related main event acknowledges only the requested thread horizon', async () => {
+  const a = await suite.registerTestUser('push-related-a', 'pw');
+  const b = await suite.registerTestUser('push-related-b', 'pw');
+  const room = String(
+    (await call('createRoom', a.access_token!, { invite: [b.user_id] }))
+      .room_id,
+  );
+  const base = 'rooms/' + encodeURIComponent(room);
+  await call(base + '/join', b.access_token!, {});
+  let txn = 0;
+  const send = async (parent?: string, rel_type?: string) =>
+    String(
+      (await call(base + '/send/m.room.message/' + (++txn), a.access_token!, {
+        body: 'activity',
+        'm.mentions': {},
+        ...(parent ? { 'm.relates_to': { event_id: parent, rel_type } } : {}),
+      }, 'PUT')).event_id,
+    );
+  const root = await send();
+  await send(root, 'm.thread');
+  const f = await send(root, 'm.reference');
+  const g = await send(f, 'm.annotation');
+  const sync = async () =>
+    entry(
+      await call(
+        'sync?filter=' +
+          encodeURIComponent(
+            JSON.stringify({
+              room: { timeline: { unread_thread_notifications: true } },
+            }),
+          ),
+        b.access_token!,
+      ),
+      room,
+    );
+  assertEquals((await sync()).unread_notifications, count(3));
+  assertEquals((await sync()).unread_thread_notifications, {
+    [root]: count(1),
+  });
+  await call(
+    base + '/receipt/m.read.private/' + encodeURIComponent(g),
+    b.access_token!,
+    { thread_id: root },
+  );
+  assertEquals((await sync()).unread_notifications, count(3));
+  assertEquals((await sync()).unread_thread_notifications, {
+    [root]: count(0),
+  });
+  await call(
+    base + '/receipt/m.read/' + encodeURIComponent(g),
+    b.access_token!,
+    { thread_id: 'main' },
+  );
+  assertEquals((await sync()).unread_notifications, count(0));
+});

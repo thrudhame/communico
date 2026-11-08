@@ -226,7 +226,22 @@ export async function threadRootsOf(db: Db, roomId: string) {
   }));
 }
 
-/** Receipt membership follows at most three relation hops. Roots themselves
+async function parentRelation(
+  db: Pick<Db, 'query'>,
+  room: string,
+  event: string,
+) {
+  const rows = await db.query(
+    `SELECT r.relates_to, r.rel_type FROM relations r
+     JOIN event_index p ON p.event=r.relates_to AND p.room=r.room
+     WHERE r.room=? AND r.event=?
+     AND NOT EXISTS (SELECT 1 FROM redactions WHERE target=r.event)`,
+    [room, event],
+  );
+  return rows[0];
+}
+
+/** Notification membership follows at most three relation hops. Roots themselves
  * and non-thread relations to roots are on main; participation is separate. */
 export async function threadOfEvent(
   db: Pick<Db, 'query'>,
@@ -237,18 +252,41 @@ export async function threadOfEvent(
   let current = eventId;
   for (let hops = 0; hops < 3 && !visited.has(current); hops++) {
     visited.add(current);
-    const rows = await db.query(
-      `SELECT r.relates_to, r.rel_type FROM relations r
-       JOIN event_index p ON p.event=r.relates_to AND p.room=r.room
-       WHERE r.room=? AND r.event=?
-       AND NOT EXISTS (SELECT 1 FROM redactions WHERE target=r.event)`,
-      [roomId, current],
-    );
-    if (rows.length === 0) return 'main';
-    if (rows[0].rel_type === 'm.thread') return String(rows[0].relates_to);
-    current = String(rows[0].relates_to);
+    const parent = await parentRelation(db, roomId, current);
+    if (parent === undefined) return 'main';
+    if (parent.rel_type === 'm.thread') return String(parent.relates_to);
+    current = String(parent.relates_to);
   }
   return 'main';
+}
+
+/** A read-up-to target can be related to a thread while counted on main.
+ * Scope admission is distinct from notification bucket classification. */
+export async function receiptTargetInThread(
+  db: Pick<Db, 'query'>,
+  roomId: string,
+  eventId: string,
+  threadId: string,
+): Promise<boolean> {
+  if (threadId === 'main') {
+    return await threadOfEvent(db, roomId, eventId) === 'main';
+  }
+  const visited = new Set<string>();
+  let current = eventId;
+  for (let hops = 0; hops <= 3 && !visited.has(current); hops++) {
+    if (current === threadId) {
+      return (await db.query(
+        'SELECT 1 FROM event_index WHERE room=? AND event=?',
+        [roomId, current],
+      )).length > 0;
+    }
+    if (hops === 3) break;
+    visited.add(current);
+    const parent = await parentRelation(db, roomId, current);
+    if (parent === undefined) return false;
+    current = String(parent.relates_to);
+  }
+  return false;
 }
 
 // --- search ----------------------------------------------------------------
