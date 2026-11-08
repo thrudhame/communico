@@ -386,8 +386,9 @@ Deno.test('sender: reliable EDU-only retry survives restart byte-for-byte and ne
       steer.status = 500;
       let resumed = startSender({ store, signer: g.signer });
       try {
-        await waitFor(async () =>
-          (await peerStatus(server, dest)).failures > 0
+        await waitFor(
+          async () => (await peerStatus(server, dest)).failures > 0,
+          25000,
         );
         await resumed.stop();
         assertEquals(sends[0].edus, [{
@@ -410,8 +411,8 @@ Deno.test('sender: reliable EDU-only retry survives restart byte-for-byte and ne
         const original = puts.filter((r) => r.path === puts[0].path);
         assertEquals(
           original.length,
-          5,
-          'four transient attempts then durable restart retry',
+          4,
+          'three transient attempts then durable restart retry',
         );
         for (const retry of original) assertEquals(retry.body, puts[0].body);
         const following = puts.filter((r) => r.path !== puts[0].path);
@@ -455,7 +456,7 @@ Deno.test('sender: transient transaction failures retry before the production pe
       await waitFor(
         async () =>
           (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
-        3000,
+        6000,
       );
       const puts = fake.requests.filter((r) => r.method === 'PUT');
       assertEquals(puts.length, 2);
@@ -470,11 +471,11 @@ Deno.test('sender: transient transaction failures retry before the production pe
       await devSays(g.room, g.signer, 'long outage');
       await waitFor(
         async () => (await peerStatus(server, dest)).failures === 1,
-        6000,
+        25000,
       );
       const status = await peerStatus(server, dest);
-      assertEquals(sends.length, 4);
-      assert(Date.now() - started >= 3500);
+      assertEquals(sends.length, 3);
+      assert(Date.now() - started >= 20000);
       assert(status.nextAttemptMs > Date.now() + 440_000);
       const before = sends.length;
       for (let i = 0; i < 10; i++) sender.wake(dest);
@@ -515,6 +516,42 @@ Deno.test('sender: restart during transient retries resumes the frozen envelope 
         assertEquals(puts.length, 2);
         assertEquals(puts[1].path, first.path);
         assertEquals(puts[1].body, first.body);
+      } finally {
+        await resumed.stop();
+      }
+    });
+  });
+});
+
+Deno.test('sender: restarted sender retains a transaction retry window while the receiver starts', async () => {
+  await withStore(async (store) => {
+    await withSetup(store, async ({ g, fake, dest, sends, steer, sender }) => {
+      setConfigForTests({
+        federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+      });
+      const server = await store.server();
+      steer.status = 503;
+      await devSays(g.room, g.signer, 'receiver still starting');
+      await waitFor(() => sends.length === 1);
+      await waitFor(() => sender.snapshot().length === 0);
+      await sender.stop();
+      const first = fake.requests.find((r) => r.method === 'PUT')!;
+      const resumed = startSender({ store, signer: g.signer });
+      try {
+        // A receiver reboot is not instantaneous. The sender is ready first;
+        // retain its transient window across the receiver's startup interval.
+        await new Promise((r) => setTimeout(r, 7000));
+        steer.status = 200;
+        await waitFor(
+          async () =>
+            (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
+          18000,
+        );
+        for (const put of fake.requests.filter((r) => r.method === 'PUT')) {
+          assertEquals(put.path, first.path);
+          assertEquals(put.body, first.body);
+        }
+        assertEquals((await peerStatus(server, dest)).failuresTotal, 0);
       } finally {
         await resumed.stop();
       }
@@ -606,7 +643,7 @@ Deno.test('sender: the contact hook resets the ladder and wakes the queue', asyn
       // the failure lands a tick after the request — wait on IT
       await waitFor(
         async () => (await peerStatus(server, dest)).failures >= 1,
-        5000,
+        25000,
       );
       const st1 = await peerStatus(server, dest);
       assert(st1.unreachableSinceMs !== null);

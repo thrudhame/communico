@@ -559,12 +559,13 @@ export function startSender(deps: SenderDeps): Sender {
         // A short outage should not immediately enter the many-minute peer
         // ladder. Only this idempotent frozen transaction retries here: claims
         // and other consuming federation requests remain strictly one-shot.
-        // Bound the transient phase to three waits (0.5/1/2s), then publish the
-        // configured durable ladder as before. Restart retains the exact batch.
+        // Transactions need a reboot-sized window, unlike interactive key
+        // requests. Use the initial transaction retry intervals (4/16s), then
+        // publish the configured durable ladder. Restart retains the exact batch.
         const transient = err.status === undefined || err.status === 429 ||
           err.status >= 500;
-        if (!stopped && transient && quickAttempts < 3) {
-          const until = Date.now() + 500 * 2 ** quickAttempts++;
+        if (!stopped && transient && quickAttempts < 2) {
+          const until = Date.now() + 4000 * 4 ** quickAttempts++;
           inFlight.delete(destination);
           // Producer wakes cannot accelerate retries. Stop can interrupt this
           // wait; expiry and blocks are rechecked at the normal loop boundary.
