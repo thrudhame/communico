@@ -36,7 +36,11 @@ import {
   type KeyResolver,
   SendJoinRefused,
 } from '#engine/room/deps.ts';
-import { projectAfterWrite, registerCreatedRoom } from '#engine/room/hooks.ts';
+import {
+  admitLocalJoin,
+  projectAfterWrite,
+  registerCreatedRoom,
+} from '#engine/room/hooks.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -188,6 +192,12 @@ async function joinVia(
   const signed = await finalizeBuilt(pdu, rulebook, args.signer);
   const eventId = String(signed.event_id);
 
+  // Outstanding compensation fences every new membership side effect, even
+  // after policy changes. Durable recording below remains strict-policy only.
+  await withRoomLock(
+    args.roomId,
+    () => admitLocalJoin(store, args.roomId, args.user),
+  );
   const attempt: JoinAttempt | null =
     config().encryption.allowunencryptedjoining ? null : {
       roomId: args.roomId,

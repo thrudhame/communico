@@ -11,6 +11,7 @@ import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import {
   beginJoinAttempt,
   clearJoinAttempt,
+  installJoinAdmission,
   type JoinAttempt,
   pendingJoinAttempts,
   releaseJoinAttempt,
@@ -697,6 +698,24 @@ Deno.test('E6 interrupted send_join retains visible cleanup across reopen; sende
       schemas: { room: roomSchema, server: serverSchema },
     });
     const server = await store.server();
+    installJoinAdmission(store);
+    for (const allowunencryptedjoining of [true, false]) {
+      setConfigForTests({
+        encryption: { allowunencryptedjoining },
+        federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+      });
+      await assertRejects(
+        () => joinRemote(store, args),
+        MatrixError,
+        'cleanup is pending',
+      );
+      assertEquals(
+        calls.sendJoin.length,
+        1,
+        'pending leave must fence remote joins',
+      );
+      assertEquals((await pendingJoinAttempts(server)).length, 1);
+    }
     sender = startSender({ store, signer });
     const deps: InviteDeps = {
       store,
@@ -729,6 +748,29 @@ Deno.test('E6 interrupted send_join retains visible cleanup across reopen; sende
     assertEquals(sent[0].body, sent[1].body);
     assertEquals(await pendingJoinAttempts(server), []);
     await assertRejects(() => openRoom(store, fr.roomId), Deno.errors.NotFound);
+    setConfigForTests({
+      encryption: { allowunencryptedjoining: true },
+      federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+    });
+    const retry = fakeFetcher({
+      makeJoin: (u) => fr.makeJoinAnswer(u),
+      sendJoin: async (pdu) => {
+        membership = 'join';
+        return await fr.acceptSendJoin(pdu);
+      },
+    });
+    const joined = await joinRemote(store, {
+      ...args,
+      deps: { ...args.deps, fetcher: retry.fetcher },
+    });
+    assertEquals(membership, 'join');
+    assertEquals(retry.calls.sendJoin.length, 1);
+    const room = await openRoom(store, fr.roomId);
+    assertEquals(
+      (await room.tx((tx) => tx.events.getStatus(joined.eventId)))?.standing,
+      'accepted',
+    );
+    assertEquals(await provider(server, fake.name), null);
   } finally {
     await sender?.stop();
     await fake.close();
