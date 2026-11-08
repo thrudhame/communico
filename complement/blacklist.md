@@ -44,14 +44,15 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 
 ## Scheduled (will implement at the named milestone)
 
-- E2EE (later; Complement-Crypto out of scope).
+- E2EE: device keys, device lists and to-device delivery run locally and over
+  federation. Encrypted key backup remains scheduled for E5.
 - Push (later).
 - Federation — rooms landed in M5b (the room-federation files run: joins,
   sends, missing events, invites, event auth, redaction, sync, unreject,
   bans, presence, typing). What stays listed: **M5c territory**
   (`federation_acl`, `knocking`, `knock_restricted`), media
-  (`federation_media_content`), devices/E2EE (`federation_device_list_update`,
-  `federation_to_device`, `federation_upload_keys`). The knocking files share
+  (`federation_media_content`). Device/E2EE federation files run after E3.
+  The knocking files share
   the `testValidationForSendMembershipEndpoint` helper defined in
   `federation_room_join_test.go` — compilable again now that the join file
   runs, so they are listed for their own category (M5c), not as ride-alongs.
@@ -62,14 +63,10 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in BASELINE.md.
 
 - tests/csapi/e2e_key_backup_test.go
-- tests/csapi/device_lists_test.go
 - tests/csapi/push_test.go
 - tests/csapi/thread_notifications_test.go
 - tests/federation_acl_test.go
-- tests/federation_device_list_update_test.go
 - tests/federation_media_content_test.go
-- tests/federation_to_device_test.go
-- tests/federation_upload_keys_test.go
 - tests/knocking_test.go
 - tests/knock_restricted_test.go
 
