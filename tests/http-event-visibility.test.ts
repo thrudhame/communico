@@ -168,7 +168,7 @@ suite.test('sync timeline uses event refs; its state and unsigned membership rem
   );
 });
 
-suite.test('event endpoint includes before-visible transitions but not an own invite with neither side visible', async () => {
+suite.test('event endpoint includes before-visible transitions and own invites', async () => {
   assertEquals(
     (await call(base(roomId) + '/event/' + encodeURIComponent(hidden))).status,
     404,
@@ -182,7 +182,7 @@ suite.test('event endpoint includes before-visible transitions but not an own in
   assertEquals(
     (await call(base(transitionRoom) + '/event/' + encodeURIComponent(invite)))
       .status,
-    404,
+    200,
   );
 });
 
@@ -263,11 +263,11 @@ suite.test('thread bundles and thread lists expose only visible children and the
   assertEquals(ids(next.chunk), [root]);
 });
 
-suite.test('own membership is tested before-or-after, never allowed solely because the state key is ours', async () => {
+suite.test('own membership remains visible even when neither side grants other-event visibility', async () => {
   assertEquals(
     (await call(base(transitionRoom) + '/event/' + encodeURIComponent(invite)))
       .status,
-    404,
+    200,
   );
 });
 

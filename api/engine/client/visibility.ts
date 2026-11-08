@@ -1,6 +1,6 @@
 // G6/F14: one client visibility policy on the event's own stored state.
-// A state transition is visible when either side permits it (CS history
-// visibility). Published state can prove a later join for shared history;
+// Own membership events are visible even without a qualifying join. Other
+// state transitions use either side's policy. Published state can prove a later join;
 // it never substitutes for the event's own visibility or membership.
 import type { Room } from '#engine/room/index.ts';
 export async function canSeeEvent(
@@ -15,6 +15,9 @@ export async function canSeeEvent(
       event === null || status?.standing !== 'accepted' ||
       status.grounding !== 'grounded'
     ) return null;
+    if (event.type === 'm.room.member' && event.state_key === userId) {
+      return true;
+    }
     const refs = await tx.state.eventReadState(eventId);
     if (refs === null) return null;
     const content = async (group: number, type: string, key: string) => {
@@ -30,10 +33,7 @@ export async function canSeeEvent(
       membership: (await content(group, 'm.room.member', userId)).membership,
     });
     const states = [await atGroup(refs.after.group)];
-    if (
-      event.type === 'm.room.history_visibility' ||
-      (event.type === 'm.room.member' && event.state_key === userId)
-    ) {
+    if (event.type === 'm.room.history_visibility') {
       states.push(await atGroup(refs.before.group));
     }
     let shared = false;
