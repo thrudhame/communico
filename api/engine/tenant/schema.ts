@@ -9,6 +9,16 @@
 // id row and the meta table; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
 
+const E2EE_SQL = `
+CREATE TABLE device_keys(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, key_json TEXT NOT NULL, PRIMARY KEY(localpart,device_id,generation));
+CREATE TABLE one_time_keys(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, algorithm TEXT NOT NULL, key_id TEXT NOT NULL, upload_pos INTEGER NOT NULL, key_json TEXT NOT NULL, PRIMARY KEY(localpart,device_id,generation,algorithm,key_id));
+CREATE INDEX one_time_keys_fifo ON one_time_keys(localpart,device_id,generation,algorithm,upload_pos,key_id);
+CREATE TABLE fallback_keys(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, algorithm TEXT NOT NULL, key_id TEXT NOT NULL, key_json TEXT NOT NULL, used INTEGER NOT NULL, PRIMARY KEY(localpart,device_id,generation,algorithm));
+CREATE TABLE key_pool_updates(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(localpart,device_id,generation));
+CREATE TABLE user_device_stream(localpart TEXT PRIMARY KEY NOT NULL, value INTEGER NOT NULL);
+CREATE TABLE e2ee_changes(pos INTEGER PRIMARY KEY NOT NULL, localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, stream_id INTEGER NOT NULL, payload TEXT NOT NULL);
+`;
+
 export const TENANT_SCHEMA_SQL = `
 CREATE TABLE tenant(
   server_name TEXT PRIMARY KEY NOT NULL,
@@ -162,11 +172,13 @@ CREATE INDEX transactions_event ON transactions(localpart, device_id, generation
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 4,
+  version: 5,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
+    await db.exec(E2EE_SQL);
   },
   migrations: {
+    4: (conn) => conn.exec(E2EE_SQL),
     3: async (conn) => {
       await conn.exec(`
         ALTER TABLE devices RENAME TO devices_v3;

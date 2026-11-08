@@ -7,11 +7,14 @@ import { setRoomHooks } from '#engine/room/hooks.ts';
 import { project } from '#engine/server/project.ts';
 import { discover, listRooms, registerRoom } from '#engine/server/registry.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { setTenantProjector } from '#engine/tenant/hooks.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
 import type { Store } from '#engine/store/index.ts';
 import { onStartup, type StartupStore } from '#engine/store/watermark.ts';
 
 export function installServerHooks(): void {
   setRoomHooks({ project, register: registerRoom });
+  setTenantProjector(projectTenant);
   onStartup(rollForward);
 }
 
@@ -35,5 +38,8 @@ async function rollForward(store: StartupStore): Promise<void> {
   );
   for (const roomId of await listRooms(concrete)) {
     await project(concrete, roomId);
+  }
+  for (const tenant of await concrete.tenants()) {
+    await projectTenant(concrete, tenant);
   }
 }

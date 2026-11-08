@@ -25,6 +25,18 @@ root = "./.media"
 # COMMUNICO_MEDIA_MAXBYTES (formerly MEDIA_MAX_BYTES)
 maxbytes = 52428800
 
+[e2ee]
+# Maximum serialized key request or response bytes. COMMUNICO_E2EE_MAXREQUESTBYTES
+maxrequestbytes = 1048576
+# Individual signed key bytes, using the 64 KiB Synapse content budget.
+# COMMUNICO_E2EE_MAXKEYBYTES
+maxkeybytes = 65536
+# Key entries or requested devices per operation. COMMUNICO_E2EE_MAXKEYS
+maxkeys = 1000
+# Unclaimed OTKs per device; reject overflow, never prune accepted keys.
+# COMMUNICO_E2EE_MAXONETIMEKEYS
+maxonetimekeys = 10000
+
 [store]
 # Turso files root: server/, rooms/<key>/, tenants/<key>/ beneath it.
 # COMMUNICO_STORE_DIR

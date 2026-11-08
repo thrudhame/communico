@@ -309,6 +309,19 @@ export function loadConfig(opts: {
   }
 
   const preview = built.preview;
+  for (
+    const [leaf, value] of Object.entries(
+      (built.e2ee ?? {}) as Record<string, unknown>,
+    )
+  ) {
+    if (typeof value === 'number' && value < 0) {
+      problems.push(
+        `config: e2ee.${leaf} (${
+          envNameOf(['e2ee', leaf])
+        }): expected >= 0, got ${value}`,
+      );
+    }
+  }
   if (
     preview !== null && typeof preview === 'object' && !Array.isArray(preview)
   ) {
@@ -540,6 +553,12 @@ export type ConfigPatch = {
   server?: { name?: string; port?: number; shutdowngraceseconds?: number };
   admin?: { socket?: string };
   media?: { root?: string; maxbytes?: number };
+  e2ee?: {
+    maxrequestbytes?: number;
+    maxkeybytes?: number;
+    maxkeys?: number;
+    maxonetimekeys?: number;
+  };
   preview?: {
     enabled?: boolean;
     maxbytes?: number;

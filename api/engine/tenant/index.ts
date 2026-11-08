@@ -12,6 +12,8 @@ import { tenantSchema } from '#engine/tenant/schema.ts';
 import * as accountdata from '#engine/tenant/accountdata.ts';
 import * as auth from '#engine/tenant/auth.ts';
 import * as devices from '#engine/tenant/devices.ts';
+import * as e2ee from '#engine/tenant/e2ee.ts';
+import { tenantE2eeCommitted } from '#engine/tenant/hooks.ts';
 import * as filters from '#engine/tenant/filters.ts';
 import * as media from '#engine/tenant/media.ts';
 import * as pushers from '#engine/tenant/pushers.ts';
@@ -87,8 +89,31 @@ type IdentityRow = {
   key_id: string;
 };
 
-function bind(conn: Conn, changed: () => void = () => {}) {
+function bind(
+  conn: Conn,
+  changed: () => void = () => {},
+  e2eeChanged: () => void = () => {},
+) {
+  const mutation = async <T>(operation: Promise<T>): Promise<T> => {
+    const value = await operation;
+    e2eeChanged();
+    return value;
+  };
   return {
+    e2ee: {
+      upload: (device: devices.DeviceIdentity, input: e2ee.Upload) =>
+        mutation(e2ee.uploadKeys(conn, device, input)),
+      query: (
+        localpart: string,
+        ids: string[],
+        requester: string,
+        owner: string,
+        maxKeys: number,
+      ) => e2ee.queryKeys(conn, localpart, ids, requester, owner, maxKeys),
+      claim: (localpart: string, id: string, algorithm: string) =>
+        mutation(e2ee.claimKey(conn, localpart, id, algorithm)),
+      status: (device: devices.DeviceIdentity) => e2ee.keyStatus(conn, device),
+    },
     users: {
       exists: (localpart: string) => users.userExists(conn, localpart),
       insert: (localpart: string, displayName: string) =>
@@ -112,16 +137,19 @@ function bind(conn: Conn, changed: () => void = () => {}) {
         deviceId: string,
         localpart: string,
         displayName: string | null,
-      ) => devices.upsertDeviceRow(conn, deviceId, localpart, displayName),
+      ) =>
+        mutation(
+          devices.upsertDeviceRow(conn, deviceId, localpart, displayName),
+        ),
       byId: (deviceId: string, localpart: string) =>
         devices.deviceById(conn, deviceId, localpart),
       ofUser: (localpart: string) => devices.devicesOfUser(conn, localpart),
       rename: (deviceId: string, localpart: string, displayName: string) =>
-        devices.renameDevice(conn, deviceId, localpart, displayName),
+        mutation(devices.renameDevice(conn, deviceId, localpart, displayName)),
       delete: (deviceId: string, localpart: string) =>
-        devices.deleteDevice(conn, deviceId, localpart),
+        mutation(devices.deleteDevice(conn, deviceId, localpart)),
       deleteForUser: (localpart: string) =>
-        devices.deleteDevicesOfUser(conn, localpart),
+        mutation(devices.deleteDevicesOfUser(conn, localpart)),
     },
     tokens: {
       insert: (
@@ -404,14 +432,18 @@ export async function openTenant(
       },
     }),
     tx: async (fn) => {
-      const { result, changed } = await db.tx(async (conn) => {
+      const { result, changed, e2eeChanged } = await db.tx(async (conn) => {
         let changed = false;
+        let e2eeChanged = false;
         const result = await fn(bind(conn, () => {
           changed = true;
+        }, () => {
+          e2eeChanged = true;
         }));
-        return { result, changed };
+        return { result, changed, e2eeChanged };
       });
-      if (changed) tenantStreamCommitted(store, serverName);
+      if (e2eeChanged) await tenantE2eeCommitted(store, serverName);
+      if (changed || e2eeChanged) tenantStreamCommitted(store, serverName);
       return result;
     },
   };

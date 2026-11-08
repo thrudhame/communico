@@ -1,8 +1,11 @@
-// POST /_matrix/client/v3/keys/upload — stub (phase-2 step 2.4; the
-// capture lists this endpoint: matrix-commander constructs nio with
-// encryption_enabled=True + a store, so nio uploads device keys on its
-// first sync). E2EE is out of scope; --plain everywhere.
-// deno-lint-ignore require-await
-export default async function () {
-  return { one_time_key_counts: {} };
+import { parseJson } from '@pathfinder/pathfinder/body';
+import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
+import { uploadKeys } from '#engine/client/e2ee.ts';
+export default async function (request: PathfinderRequest, context: Context) {
+  return await uploadKeys(
+    context.state.user!,
+    context.state.device,
+    context.state.deviceGeneration,
+    await parseJson(request),
+  );
 }

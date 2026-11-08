@@ -111,6 +111,10 @@ export class Store implements StartupStore {
     return this.pool.list('rooms');
   }
 
+  tenants(): Promise<string[]> {
+    return this.pool.list('tenants');
+  }
+
   /** The engine owns deletion intent/projection; storage owns file retirement. */
   retireRoom(id: string): Promise<void> {
     if (this.stopped) throw new Error('store is closed');

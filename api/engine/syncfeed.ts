@@ -458,6 +458,18 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       content: { global: await rulesetFor(app.tenant, lp) },
     });
   }
+  const device = i.deviceId === null
+    ? null
+    : await app.tenant.tx((tx) => tx.devices.byId(i.deviceId!, lp));
+  const pools = device === null
+    ? { counts: {}, unused: [] }
+    : await app.tenant.tx((tx) =>
+      tx.e2ee.status({
+        localpart: lp,
+        deviceId: device.device_id,
+        generation: device.generation,
+      })
+    );
   return {
     next_batch: nextBatch,
     rooms: { join, invite, leave },
@@ -465,6 +477,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     account_data: { events: accountData },
     to_device: { events: [] },
     device_lists: { changed: deviceChanged, left: deviceLeft },
-    device_one_time_keys_count: {},
+    device_one_time_keys_count: pools.counts,
+    device_unused_fallback_key_types: pools.unused,
   };
 }
