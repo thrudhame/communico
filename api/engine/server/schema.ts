@@ -284,8 +284,13 @@ CREATE TABLE server_key_changes(
 );
 `;
 
+const DEVICE_RECOVERY_SQL = `
+CREATE TABLE device_recovery_requests(user_id TEXT PRIMARY KEY NOT NULL);
+INSERT INTO device_recovery_requests SELECT user_id FROM remote_device_users WHERE pending!='[]' OR failures>0 OR anchor IS NOT NULL;
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 9,
+  version: 10,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -294,6 +299,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(DELIVERY_FIFO_SQL);
     await db.exec(REMOTE_DEVICES_SQL);
     await db.exec(DEVICE_SUBSCRIPTIONS_SQL);
+    await db.exec(DEVICE_RECOVERY_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -302,5 +308,6 @@ export const serverSchema: SchemaProvider = {
     6: (conn) => conn.exec(DELIVERY_FIFO_SQL),
     7: (conn) => conn.exec(REMOTE_DEVICES_SQL),
     8: (conn) => conn.exec(DEVICE_SUBSCRIPTIONS_SQL),
+    9: (conn) => conn.exec(DEVICE_RECOVERY_SQL),
   },
 };

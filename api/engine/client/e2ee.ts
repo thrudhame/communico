@@ -179,6 +179,10 @@ async function composed(
             const cached: Json = Object.create(null);
             const missing: Requests = [];
             for (const entry of requests) {
+              await abortable(
+                deadline.signal,
+                () => app.deviceLists.recover(entry[0], deadline.signal),
+              );
               const keys = claim
                 ? null
                 : await abortable(deadline.signal, () =>

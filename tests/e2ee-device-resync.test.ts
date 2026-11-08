@@ -104,12 +104,20 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
       reconcileDeviceRoom(tx, '!shared:local', [observer, user], false, null, 1)
     );
     await acceptDeviceDelta(db, delta(10, []), limits());
+    assertEquals(
+      await db.query('SELECT user_id FROM device_recovery_requests'),
+      [{ user_id: user }],
+    );
     assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
     await store.close();
     store = await openStore(options(dir), {
       schemas: { server: serverSchema, tenant: tenantSchema },
     });
     db = await store.server();
+    assertEquals(
+      await db.query('SELECT user_id FROM device_recovery_requests'),
+      [{ user_id: user }],
+    );
     const cut = await recoveryCut(db, user);
     assert(cut);
     assert(
@@ -166,6 +174,143 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
       false,
     );
     assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('v9 lazy-recovery upgrade retains hinted retries and leaves membership-only state dormant', async () => {
+  const dir = await Deno.makeTempDir();
+  const previous = {
+    version: 9,
+    apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
+      await serverSchema.apply(db);
+      await db.exec('DROP TABLE device_recovery_requests');
+    },
+  };
+  let store = await openStore(options(dir), { schemas: { server: previous } });
+  try {
+    let db = await store.server();
+    await db.exec(
+      "INSERT INTO remote_device_users VALUES('@dormant:r',NULL,1,0,0,0,'[]','[]'),('@hint:r',NULL,1,1,123,1,'[]','[]');",
+    );
+    await store.close();
+    store = await openStore(options(dir), {
+      schemas: { server: serverSchema },
+    });
+    db = await store.server();
+    assertEquals(
+      await db.query('SELECT user_id FROM device_recovery_requests'),
+      [{ user_id: '@hint:r' }],
+    );
+    assertEquals(
+      (await db.query(
+        "SELECT retry_at,failures FROM remote_device_users WHERE user_id='@hint:r'",
+      ))[0],
+      { retry_at: 123, failures: 1 },
+    );
+    await store.close();
+    store = await openStore(options(dir), {
+      schemas: { server: serverSchema },
+    });
+    assertEquals(
+      await (await store.server()).query(
+        'SELECT user_id FROM device_recovery_requests',
+      ),
+      [{ user_id: '@hint:r' }],
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('reset hints and empty snapshots do not repeat a join notification; authoritative key changes do', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(options(dir), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    const db = await store.server();
+    await db.tx((tx) =>
+      reconcileDeviceRoom(tx, '!reset:local', [observer, user], false, null, 1)
+    );
+    const joined = await deviceStreamMax(db);
+    const reset = (stream: number) =>
+      deviceDelta({
+        user_id: user,
+        device_id: 'NO_KEYS',
+        stream_id: stream,
+        prev_id: [],
+      }, limits());
+    await acceptDeviceDelta(db, reset(10), limits());
+    assertEquals(
+      await deviceStreamMax(db),
+      joined,
+      'a reset is a recovery hint, not an additional key mutation',
+    );
+    assert(
+      await installDeviceSnapshot(
+        db,
+        (await recoveryCut(db, user))!,
+        snapshot(10, []),
+        limits(),
+      ),
+    );
+    assertEquals(
+      await deviceStreamMax(db),
+      joined,
+      'learning an empty authoritative list must not fabricate a mutation',
+    );
+    await acceptDeviceDelta(db, reset(20), limits());
+    assert(
+      await installDeviceSnapshot(
+        db,
+        (await recoveryCut(db, user))!,
+        snapshot(20),
+        limits(),
+      ),
+    );
+    const changed = await deviceStreamMax(db);
+    assert(changed > joined);
+    assertEquals(
+      (await deviceListsBetween(db, observer, joined, changed, 'sync')).changed,
+      [user],
+    );
+    assertEquals(
+      Object.keys((await cachedDeviceKeys(db, user, [], observer))!),
+      ['D'],
+    );
+    await acceptDeviceDelta(db, reset(30), limits());
+    const same = { ...snapshot(20), stream: '30' };
+    assert(
+      await installDeviceSnapshot(
+        db,
+        (await recoveryCut(db, user))!,
+        same,
+        limits(),
+      ),
+    );
+    assertEquals(
+      await deviceStreamMax(db),
+      changed,
+      'a new causal anchor with identical public material is not a key change',
+    );
+    await acceptDeviceDelta(db, reset(40), limits());
+    assert(
+      await installDeviceSnapshot(
+        db,
+        (await recoveryCut(db, user))!,
+        snapshot(40, []),
+        limits(),
+      ),
+    );
+    assert(
+      (await deviceStreamMax(db)) > changed,
+      'removing the last key must notify',
+    );
+    assertEquals(await cachedDeviceKeys(db, user, [], observer), {});
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
@@ -235,7 +380,7 @@ Deno.test('pending and cache overflow stay bounded and stale; supported v7 upgra
         apply: async (db) => {
           await serverSchema.apply(db);
           await db.exec(
-            'DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
+            'DROP TABLE device_recovery_requests; DROP TABLE device_subscriptions; DROP TABLE remote_device_keys; DROP TABLE remote_device_users;',
           );
         },
       },
@@ -252,7 +397,7 @@ Deno.test('pending and cache overflow stay bounded and stale; supported v7 upgra
     const db = await store.server();
     assertEquals(
       (await db.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-      '9',
+      '10',
     );
     assertEquals(
       (await db.query('SELECT source FROM edu_outbox'))[0].source,

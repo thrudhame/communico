@@ -86,7 +86,7 @@ Deno.test('server schema: tables and indexes land on create, version recorded', 
     const version = await server.query(
       `SELECT v FROM meta WHERE k = 'schema_version'`,
     );
-    assertEquals(version, [{ v: '9' }]);
+    assertEquals(version, [{ v: '10' }]);
     await store.close();
     // A second open with the same provider checks out.
     const again = await openStore(config(dir), {

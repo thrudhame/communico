@@ -102,6 +102,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
           'remote_device_keys',
           'remote_device_users',
           'device_subscriptions',
+          'device_recovery_requests',
         ]
       ) await db.exec('DROP TABLE ' + name);
       await db.exec("DELETE FROM counters WHERE name='reliable-edus'");
@@ -168,7 +169,7 @@ Deno.test('E2: v4 server upgrade seeds its projected cut, preserves feed truth a
     assertEquals(
       (await migrated.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '9',
+      '10',
     );
   } finally {
     await store.close();
