@@ -11,7 +11,7 @@ export type PushContext = {
   event: Record<string, unknown>;
   userId: string;
   displayName: string | null;
-  joinedCount: number;
+  joinedCount: number | null;
   senderPower: number | null;
   notificationPower: Readonly<Record<string, number>>;
 };
@@ -151,7 +151,9 @@ export function matchesCondition(
         );
     }
     case 'room_member_count': {
-      if (typeof condition.is !== 'string') return false;
+      if (typeof condition.is !== 'string' || ctx.joinedCount === null) {
+        return false;
+      }
       const parsed = /^(==|<=|>=|<|>)?([0-9]+)$/.exec(condition.is);
       if (!parsed) return false;
       const count = Number(parsed[2]);

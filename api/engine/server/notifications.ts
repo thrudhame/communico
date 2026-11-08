@@ -134,16 +134,63 @@ export async function applyPushPublication(
     event,
     now,
   );
+  await applyDecisions(
+    tx,
+    room,
+    event,
+    eventSeq,
+    pos,
+    publication,
+    now,
+    thread,
+    'room',
+  );
+}
+
+/** OOB events share recipient/event uniqueness with later held-room truth. */
+export async function applyInvitePush(
+  tx: Conn,
+  room: string,
+  event: string,
+  eventSeq: number,
+  publication: PushPublication,
+  now: number,
+): Promise<void> {
+  await applyDecisions(
+    tx,
+    room,
+    event,
+    eventSeq,
+    eventSeq,
+    publication,
+    now,
+    'main',
+    'invite',
+  );
+}
+
+async function applyDecisions(
+  tx: Conn,
+  room: string,
+  event: string,
+  eventSeq: number,
+  pos: number,
+  publication: PushPublication,
+  now: number,
+  thread: string,
+  source: string,
+): Promise<void> {
   for (const input of publication.decisions) {
     const inserted = await tx.execute(
       `INSERT INTO push_evaluations(tenant,user,event,room,event_seq,source,source_pos,rule_revision,ignore_revision,version,rule_id,rule_kind)
-      VALUES(?,?,?,?,?,'room',?,?,?,1,?,?) ON CONFLICT DO NOTHING`,
+      VALUES(?,?,?,?,?,?,?,?,?,1,?,?) ON CONFLICT DO NOTHING`,
       [
         input.tenant,
         input.user,
         event,
         room,
         eventSeq,
+        source,
         pos,
         input.ruleRevision,
         input.ignoreRevision,
@@ -198,6 +245,38 @@ export async function applyPushPublication(
         thread,
         1,
         input.decision.highlight ? 1 : 0,
+      );
+    }
+  }
+}
+
+/** Withdraw an invite's contribution without deleting its evaluation identity. */
+export async function withdrawInvitePush(
+  tx: Conn,
+  user: string,
+  room: string,
+  event: string,
+): Promise<void> {
+  const rows = await tx.query(
+    `SELECT n.thread,n.highlight,n.read_ms FROM notifications n JOIN push_evaluations e
+    ON e.tenant=n.tenant AND e.user=n.user AND e.event=n.event
+    WHERE n.user=? AND n.room=? AND n.event=? AND n.withdrawn=0 AND e.source='invite'`,
+    [user, room, event],
+  );
+  if (!rows.length) return;
+  await tx.execute(
+    'UPDATE notifications SET withdrawn=1 WHERE user=? AND room=? AND event=?',
+    [user, room, event],
+  );
+  for (const row of rows) {
+    if (row.read_ms === null) {
+      await delta(
+        tx,
+        user,
+        room,
+        String(row.thread),
+        -1,
+        -Number(row.highlight),
       );
     }
   }
