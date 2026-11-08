@@ -2,6 +2,7 @@
 import type { Store } from '#engine/store/index.ts';
 import { withProjectionLock } from '#engine/server/project.ts';
 import { advance, get } from '#engine/store/watermark.ts';
+import { nextDeviceSeq, publishDeviceChange } from '#engine/server/e2ee.ts';
 
 export function projectTenant(store: Store, tenant: string): Promise<void> {
   return withProjectionLock(async () => {
@@ -21,28 +22,22 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
             [source, row.pos],
           );
           if (old.length) continue;
-          await conn.execute(
-            "INSERT INTO counters VALUES('devices',0) ON CONFLICT(name) DO NOTHING",
-          );
-          await conn.execute(
-            "UPDATE counters SET value=value+1 WHERE name='devices'",
-          );
-          const seq = await conn.query(
-            "SELECT value FROM counters WHERE name='devices'",
-          );
+          const seq = await nextDeviceSeq(conn);
+          const subject = '@' + row.localpart + ':' + tenant;
           await conn.execute(
             'INSERT INTO device_changes VALUES(?,?,?,?,?,?,?,?)',
             [
-              Number(seq[0].value),
+              seq,
               source,
               row.pos,
-              '@' + row.localpart + ':' + tenant,
+              subject,
               row.device_id,
               row.generation,
               row.stream_id,
               row.payload,
             ],
           );
+          await publishDeviceChange(conn, seq, subject);
         }
         await advance(conn, source, Number(rows[rows.length - 1].pos));
       });

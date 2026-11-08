@@ -13,6 +13,8 @@ import * as accountdata from '#engine/tenant/accountdata.ts';
 import * as auth from '#engine/tenant/auth.ts';
 import * as devices from '#engine/tenant/devices.ts';
 import * as e2ee from '#engine/tenant/e2ee.ts';
+import * as todevice from '#engine/tenant/todevice.ts';
+import type { StreamToken } from '#engine/client/tokens.ts';
 import { tenantE2eeCommitted } from '#engine/tenant/hooks.ts';
 import * as filters from '#engine/tenant/filters.ts';
 import * as media from '#engine/tenant/media.ts';
@@ -100,6 +102,38 @@ function bind(
     return value;
   };
   return {
+    toDevice: {
+      send: (
+        d: devices.DeviceIdentity,
+        server: string,
+        type: string,
+        txn: string,
+        source: string,
+        messages: todevice.Message[],
+        limits: e2ee.KeyLimits,
+      ) =>
+        mutation(
+          todevice.sendMessages(
+            conn,
+            d,
+            server,
+            type,
+            txn,
+            source,
+            messages,
+            limits,
+          ),
+        ),
+      acknowledge: (d: devices.DeviceIdentity, since: StreamToken | null) =>
+        todevice.acknowledge(conn, d, since),
+      deliver: (
+        d: devices.DeviceIdentity,
+        token: StreamToken,
+        limits: e2ee.KeyLimits,
+      ) => todevice.deliverMessages(conn, d, token, limits),
+      pending: (d: devices.DeviceIdentity) => todevice.pendingMessages(conn, d),
+      head: () => todevice.inboxHead(conn),
+    },
     e2ee: {
       upload: (device: devices.DeviceIdentity, input: e2ee.Upload) =>
         mutation(e2ee.uploadKeys(conn, device, input)),

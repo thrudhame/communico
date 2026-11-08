@@ -4,7 +4,9 @@ import { assert, assertEquals } from '@std/assert';
 import { serverName } from '#engine/config.ts';
 import { httpSuite } from '#tests/http-app.ts';
 
-const { matrix, test } = httpSuite('HTTP registration and session lifecycle');
+const { matrix, test, registerTestUser } = httpSuite(
+  'HTTP registration and session lifecycle',
+);
 type Json = Record<string, unknown>;
 async function call(path: string, method = 'GET', body?: Json, token?: string) {
   const res = await matrix(
@@ -16,6 +18,32 @@ async function call(path: string, method = 'GET', body?: Json, token?: string) {
   );
   return { status: res.status, body: await res.json() as Json };
 }
+
+test('r0 and v3 login adapters issue usable device-bound tokens through the same session owner', async () => {
+  const user = await registerTestUser('login-alias', 'pw');
+  for (const version of ['r0', 'v3']) {
+    const session = await call(version + '/login', 'POST', {
+      type: 'm.login.password',
+      identifier: { type: 'm.id.user', user: user.user_id },
+      password: 'pw',
+      device_id: 'alias-' + version,
+    });
+    assertEquals(session.status, 200);
+    const token = session.body.access_token as string;
+    assertEquals(
+      (await call('v3/account/whoami', 'GET', undefined, token)).body,
+      {
+        user_id: user.user_id,
+        device_id: 'alias-' + version,
+      },
+    );
+    assertEquals((await call('v3/logout', 'POST', {}, token)).status, 200);
+    assertEquals(
+      (await call('v3/account/whoami', 'GET', undefined, token)).status,
+      401,
+    );
+  }
+});
 
 test('registration availability, validation before UIA, inhibit_login; login/logout and logout/all', async () => {
   for (const version of ['v3', 'r0']) {

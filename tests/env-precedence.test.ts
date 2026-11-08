@@ -33,6 +33,7 @@ maxrequestbytes = 1048576
 maxkeybytes = 65536
 maxkeys = 1000
 maxonetimekeys = 10000
+maxinboxmessages = 10000
 
 [preview]
 enabled = false

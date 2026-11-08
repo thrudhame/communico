@@ -39,6 +39,10 @@ const TABLES = [
   'server_key_docs',
   'server_key_changes',
   'device_changes',
+  'e2ee_rooms',
+  'e2ee_room_members',
+  'device_tracking',
+  'device_notices',
 ];
 
 const INDEXES = [
@@ -77,7 +81,7 @@ Deno.test('server schema: tables and indexes land on create, version recorded', 
     const version = await server.query(
       `SELECT v FROM meta WHERE k = 'schema_version'`,
     );
-    assertEquals(version, [{ v: '4' }]);
+    assertEquals(version, [{ v: '5' }]);
     await store.close();
     // A second open with the same provider checks out.
     const again = await openStore(config(dir), {

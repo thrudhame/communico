@@ -4,7 +4,15 @@
 import { theApp } from '#engine/app.ts';
 import { heldRoom, stateAtSeq, type StateRow } from '#engine/client/read.ts';
 import { renderEvent, renderStateEvent } from '#engine/client/render.ts';
-import { formatStreamToken, type StreamToken } from '#engine/client/tokens.ts';
+import {
+  encodeStreamToken,
+  formatStreamToken,
+  type StreamToken,
+} from '#engine/client/tokens.ts';
+import { config } from '#engine/config.ts';
+import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { feedAfter, roomsFor } from '#engine/server/read.ts';
@@ -42,6 +50,7 @@ import {
 export interface SyncInputs {
   userId: string;
   deviceId: string | null;
+  deviceGeneration?: number;
   since: StreamToken | null;
   timeoutMs: number;
   filter: RoomFilter;
@@ -155,6 +164,9 @@ async function roomTimeline(
         now.tSeq,
         now.rSeq,
         now.aSeq,
+        now.dSeq,
+        now.mSeq,
+        now.kSeq,
       ),
     },
     ephemeral: { events: [] },
@@ -208,7 +220,7 @@ async function roomTimeline(
       ),
     };
   }
-  const joiners: string[] = [], leavers: string[] = [];
+  const joiners: string[] = [];
   for (const row of raw) {
     const pdu = await room.tx(async (tx) => {
       const e = await tx.events.get(row.event);
@@ -216,17 +228,32 @@ async function roomTimeline(
     });
     if (pdu?.type !== 'm.room.member') continue;
     if (pdu.content.membership === 'join') joiners.push(String(pdu.state_key));
-    if (['leave', 'ban'].includes(String(pdu.content.membership))) {
-      leavers.push(String(pdu.state_key));
-    }
   }
-  return { entry, joiners, leavers };
+  return { entry, joiners };
 }
 
-async function relevantChanged(i: SyncInputs): Promise<boolean> {
+async function relevantChanged(
+  i: SyncInputs,
+  device: DeviceIdentity | null,
+): Promise<boolean> {
   if (i.since === null) return true;
   sweepTyping();
   const app = theApp();
+  const lists = await deviceListsBetween(
+    app.server,
+    i.userId,
+    i.since.dSeq,
+    await deviceStreamMax(app.server),
+    'sync',
+  );
+  if (lists.changed.length || lists.left.length) return true;
+  if (
+    device !== null &&
+    await app.tenant.tx(async (tx) =>
+      await tx.toDevice.pending(device) ||
+      (await tx.e2ee.status(device)).seq > i.since!.kSeq
+    )
+  ) return true;
   const rows = await app.server.query(
     `SELECT MAX(seq) AS m FROM (
        SELECT f.seq FROM feed f JOIN memberships m ON m.room = f.room WHERE m.user = ?
@@ -253,7 +280,10 @@ async function relevantChanged(i: SyncInputs): Promise<boolean> {
   return false;
 }
 
-async function waitForRelevant(i: SyncInputs): Promise<void> {
+async function waitForRelevant(
+  i: SyncInputs,
+  device: DeviceIdentity | null,
+): Promise<void> {
   if (i.since === null || i.timeoutMs <= 0) return;
   const app = theApp();
   const deadline = Date.now() + Math.min(i.timeoutMs, 30000);
@@ -284,7 +314,7 @@ async function waitForRelevant(i: SyncInputs): Promise<void> {
       Math.min(500, Math.max(0, deadline - Date.now())),
     );
     try {
-      if (await relevantChanged(i)) return;
+      if (await relevantChanged(i, device)) return;
       await changed;
     } finally {
       clearTimeout(timer);
@@ -296,11 +326,22 @@ async function waitForRelevant(i: SyncInputs): Promise<void> {
 export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const app = theApp();
   const lp = localpartOf(i.userId);
+  const device: DeviceIdentity | null =
+    i.deviceId === null || i.deviceGeneration === undefined
+      ? null
+      : { localpart: lp, deviceId: i.deviceId, generation: i.deviceGeneration };
+  if (device !== null) {
+    await app.tenant.tx((tx) => tx.toDevice.acknowledge(device, i.since));
+  }
+  const deviceHead = await deviceStreamMax(app.server);
+  if (i.since !== null && i.since.dSeq > deviceHead) {
+    throw new MatrixError(400, 'M_INVALID_PARAM', 'future device token');
+  }
   if (i.setPresence !== undefined) {
     await setPresenceValue(app.server, i.userId, i.setPresence);
   }
   sweepTyping();
-  await waitForRelevant(i);
+  await waitForRelevant(i, device);
   sweepTyping();
   const now: StreamToken = {
     eSeq: await eventStreamMax(app.server),
@@ -308,14 +349,21 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     tSeq: typingSeq(),
     rSeq: await streamMax(app.server, 'receipts'),
     aSeq: await accountDataMax(app.tenant, lp),
+    dSeq: await deviceStreamMax(app.server),
+    mSeq: 0,
+    kSeq: 0,
   };
-  const nextBatch = formatStreamToken(
-    now.eSeq,
-    now.pSeq,
-    now.tSeq,
-    now.rSeq,
-    now.aSeq,
-  );
+  const delivery = device === null
+    ? { events: [], token: now, pools: { counts: {}, unused: [] } }
+    : await app.tenant.tx(async (tx) => {
+      const pools = await tx.e2ee.status(device);
+      const delivered = await tx.toDevice.deliver(device, {
+        ...now,
+        kSeq: pools.seq,
+      }, config().e2ee);
+      return { ...delivered, pools };
+    });
+  const nextBatch = encodeStreamToken(delivery.token);
   const memberships = await roomsFor(app.server, i.userId);
   const receiptRooms = i.since === null
     ? new Set<string>()
@@ -358,7 +406,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       };
     }
   }
-  const allJoiners = new Set<string>(), allLeavers = new Set<string>();
+  const allJoiners = new Set<string>();
   for (const m of memberships) {
     if (oobRooms.has(m.roomId)) continue;
     const room = await heldRoom(m.roomId);
@@ -407,13 +455,12 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     const result = await roomTimeline(
       room,
       i,
-      now,
+      delivery.token,
       left ? m.seq : now.eSeq,
       !left,
     );
     (left ? leave : join)[m.roomId] = result.entry;
     for (const u of result.joiners) allJoiners.add(u);
-    for (const u of result.leavers) allLeavers.add(u);
   }
   const presenceEvents = new Map<string, Record<string, unknown>>();
   const shared = await sharedUsers(app.server, i.userId);
@@ -438,17 +485,15 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       await includePresence(u);
     }
   }
-  const deviceChanged: string[] = [], deviceLeft: string[] = [];
-  if (i.since !== null) {
-    deviceChanged.push(...allJoiners);
-    for (const u of allLeavers) {
-      const shared = await app.server.query(
-        "SELECT 1 FROM memberships a JOIN memberships b ON a.room = b.room WHERE a.user = ? AND b.user = ? AND a.membership = 'join' AND b.membership = 'join' LIMIT 1",
-        [i.userId, u],
-      );
-      if (!shared.length) deviceLeft.push(u);
-    }
-  }
+  const deviceLists = i.since === null
+    ? { changed: [], left: [] }
+    : await deviceListsBetween(
+      app.server,
+      i.userId,
+      i.since.dSeq,
+      now.dSeq,
+      'sync',
+    );
   const accountData: { type: string; content: unknown }[] = i.since === null
     ? await listGlobalAccountData(app.tenant, lp)
     : await listGlobalAccountDataSince(app.tenant, lp, i.since.aSeq);
@@ -458,26 +503,14 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       content: { global: await rulesetFor(app.tenant, lp) },
     });
   }
-  const device = i.deviceId === null
-    ? null
-    : await app.tenant.tx((tx) => tx.devices.byId(i.deviceId!, lp));
-  const pools = device === null
-    ? { counts: {}, unused: [] }
-    : await app.tenant.tx((tx) =>
-      tx.e2ee.status({
-        localpart: lp,
-        deviceId: device.device_id,
-        generation: device.generation,
-      })
-    );
   return {
     next_batch: nextBatch,
     rooms: { join, invite, leave },
     presence: { events: [...presenceEvents.values()] },
     account_data: { events: accountData },
-    to_device: { events: [] },
-    device_lists: { changed: deviceChanged, left: deviceLeft },
-    device_one_time_keys_count: pools.counts,
-    device_unused_fallback_key_types: pools.unused,
+    to_device: { events: delivery.events },
+    device_lists: deviceLists,
+    device_one_time_keys_count: delivery.pools.counts,
+    device_unused_fallback_key_types: delivery.pools.unused,
   };
 }

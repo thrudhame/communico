@@ -26,6 +26,7 @@ export const SCHEMA = {
     maxkeybytes: 'int',
     maxkeys: 'int',
     maxonetimekeys: 'int',
+    maxinboxmessages: 'int',
   },
   store: {
     dir: 'string',

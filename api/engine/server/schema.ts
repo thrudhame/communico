@@ -15,6 +15,16 @@ CREATE TABLE device_changes(seq INTEGER PRIMARY KEY NOT NULL, source TEXT NOT NU
 CREATE INDEX device_changes_subject ON device_changes(subject,seq);
 `;
 
+const DEVICE_TRACKING_SQL = `
+CREATE TABLE e2ee_rooms(room TEXT PRIMARY KEY NOT NULL, encrypted INTEGER NOT NULL, encryption_event TEXT, publication_pos INTEGER NOT NULL);
+CREATE TABLE e2ee_room_members(room TEXT NOT NULL, user TEXT NOT NULL, PRIMARY KEY(room,user));
+CREATE INDEX e2ee_room_members_user ON e2ee_room_members(user,room);
+CREATE TABLE device_tracking(observer TEXT NOT NULL, subject TEXT NOT NULL, scope TEXT NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER, PRIMARY KEY(observer,subject,scope,start_seq));
+CREATE INDEX device_tracking_subject ON device_tracking(subject,scope,end_seq);
+CREATE TABLE device_notices(seq INTEGER NOT NULL, observer TEXT NOT NULL, subject TEXT NOT NULL, scope TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY(seq,observer,subject,scope));
+CREATE INDEX device_notices_observer ON device_notices(observer,scope,seq);
+`;
+
 export const SERVER_SCHEMA_SQL = `
 -- Derived (S11/S12): rebuilt only by roll-forward replaying the rooms'
 -- change logs, keyed by (room, pos) so a replay changes nothing.
@@ -251,10 +261,14 @@ CREATE TABLE server_key_changes(
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 4,
+  version: 5,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
+    await db.exec(DEVICE_TRACKING_SQL);
   },
-  migrations: { 3: (conn) => conn.exec(DEVICE_CHANGES_SQL) },
+  migrations: {
+    3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
+    4: (conn) => conn.exec(DEVICE_TRACKING_SQL),
+  },
 };

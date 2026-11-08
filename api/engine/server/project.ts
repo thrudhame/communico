@@ -21,6 +21,7 @@ import type { Store } from '#engine/store/index.ts';
 import { advance, get } from '#engine/store/watermark.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
+import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 
 // The watermark source naming a room's change log (storage plan's
 // sources() enumerates these; tests already use this shape).
@@ -82,6 +83,37 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
   const source = sourceOf(roomId);
   for (;;) {
     const mark = await get(server, source);
+    // A supported schema upgrade seeds at the already projected publication,
+    // not at a newer room head and not by replaying history as news.
+    if (
+      mark > 0 &&
+      !(await server.query('SELECT 1 FROM e2ee_rooms WHERE room=?', [roomId]))
+        .length
+    ) {
+      const cut = await server.query(
+        'SELECT stay,pos FROM feed WHERE room=? AND pos<=? ORDER BY pos DESC LIMIT 1',
+        [roomId, mark],
+      );
+      if (cut.length) {
+        const ids = await memberIdsAt(
+          room,
+          Number(cut[0].stay),
+          Number(cut[0].pos),
+          true,
+        );
+        if (ids !== null) {
+          const members = await membersAt(room, ids.members, new Map());
+          await server.tx((tx) =>
+            applyDevicePublication(
+              tx,
+              roomId,
+              { ...ids, members },
+              Number(cut[0].pos),
+            )
+          );
+        }
+      }
+    }
     let batch = await room.tx((tx) => tx.changes.after(mark, BATCH));
     if (batch.length === 0) return;
     const drop = batch.findIndex((change) => change.kind === 'drop');
@@ -136,7 +168,7 @@ type Prepared =
       // A live cut's complete published membership. Reconciliation uses
       // the server rows inside apply's transaction, including earlier
       // changes in the same batch. Evidence/history carry no publication.
-      publication: PublishedMember[] | null;
+      publication: Publication | null;
     }
     | {
       kind: 'membership';
@@ -165,6 +197,11 @@ function isLive(payload: EventPayload): boolean {
 }
 
 type PublishedMember = { user: string; to: string; toId: string };
+type Publication = {
+  members: PublishedMember[];
+  encryption: string | null;
+  encrypted: boolean;
+};
 
 // A plain message with unchanged publication does no membership work.
 // Offset zero is the stay's first live position, whose opening boundary
@@ -174,7 +211,13 @@ async function memberIdsAt(
   stay: number | null,
   pos: number,
   first: boolean,
-): Promise<Map<string, string> | null> {
+): Promise<
+  {
+    members: Map<string, string>;
+    encryption: string | null;
+    encrypted: boolean;
+  } | null
+> {
   if (stay === null) return null;
   return await room.tx(async (tx) => {
     const group = await tx.state.publishedAt(stay, pos);
@@ -184,11 +227,20 @@ async function memberIdsAt(
     }
     const map = await tx.state.groupMap(group);
     const prefix = 'm.room.member\0';
-    return new Map(
-      [...map].filter(([key]) => key.startsWith(prefix)).map(
-        ([key, event]) => [key.slice(prefix.length), event],
+    const encryption = map.get('m.room.encryption\0') ?? null;
+    const key = encryption === null ? null : await tx.events.get(encryption);
+    const algorithm = key === null
+      ? null
+      : (JSON.parse(key.pdu) as Pdu).content?.algorithm;
+    return {
+      encryption,
+      encrypted: typeof algorithm === 'string' && algorithm.length > 0,
+      members: new Map(
+        [...map].filter(([key]) => key.startsWith(prefix)).map(
+          ([key, event]) => [key.slice(prefix.length), event],
+        ),
       ),
-    );
+    };
   });
 }
 
@@ -278,7 +330,7 @@ async function prepare(
             payload.offset === 0,
           )
           : null;
-        let publication: PublishedMember[] | null = null;
+        let publication: Publication | null = null;
         if (ids !== null) {
           if (projected === null) {
             const server = await store.server();
@@ -292,9 +344,12 @@ async function prepare(
               toId: String(row.event),
             }]));
           }
-          publication = await membersAt(room, ids, projected);
+          publication = {
+            ...ids,
+            members: await membersAt(room, ids.members, projected),
+          };
           projected = new Map(
-            publication.map((member) => [member.user, member]),
+            publication.members.map((member) => [member.user, member]),
           );
         }
         out.push({
@@ -584,6 +639,25 @@ async function apply(
            event = excluded.event, pos = excluded.pos`,
         [item.target, roomId, change.event, change.pos],
       );
+      if (
+        (await tx.query(
+          'SELECT 1 FROM e2ee_rooms WHERE room=? AND encryption_event=? AND encrypted=1',
+          [roomId, item.target],
+        )).length
+      ) {
+        const members =
+          (await tx.query('SELECT user FROM e2ee_room_members WHERE room=?', [
+            roomId,
+          ])).map((r) => String(r.user));
+        await reconcileDeviceRoom(
+          tx,
+          roomId,
+          members,
+          false,
+          item.target,
+          change.pos,
+        );
+      }
       return;
     }
     case 'delivery': {
@@ -608,9 +682,10 @@ async function applyPublication(
   roomId: string,
   stay: number | null,
   pos: number,
-  members: PublishedMember[] | null,
+  publication: Publication | null,
 ): Promise<void> {
-  if (members === null || stay === null) return;
+  if (publication === null || stay === null) return;
+  const members = publication.members;
   const current = new Map((await tx.query(
     'SELECT user, membership, event FROM memberships WHERE room = ?',
     [roomId],
@@ -640,6 +715,27 @@ async function applyPublication(
     const seq = first ? cut : (await seqOf(tx, roomId, member.toId)) ?? cut;
     await applyMember(tx, roomId, member.user, member.to, member.toId, seq);
   }
+  await applyDevicePublication(tx, roomId, publication, pos);
+}
+
+async function applyDevicePublication(
+  tx: Conn,
+  roomId: string,
+  publication: Publication,
+  pos: number,
+): Promise<void> {
+  const redacted = publication.encryption !== null &&
+    (await tx.query('SELECT 1 FROM redactions WHERE target=?', [
+        publication.encryption,
+      ])).length > 0;
+  await reconcileDeviceRoom(
+    tx,
+    roomId,
+    publication.members.filter((m) => m.to === 'join').map((m) => m.user),
+    publication.encrypted && !redacted,
+    publication.encryption,
+    pos,
+  );
 }
 
 // Both the full-publication and explicit membership-change paths preserve

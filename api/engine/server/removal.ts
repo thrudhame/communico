@@ -7,6 +7,7 @@ import { listRejectIntents } from '#engine/federation/invites.ts';
 import type { ReviewIntent } from '#engine/federation/sender.ts';
 import { roomEdges } from '#engine/room/edges.ts';
 import { advance } from '#engine/store/watermark.ts';
+import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 
 export type Removal = { why: string; intents: ReviewIntent[] };
 
@@ -19,6 +20,15 @@ export async function finishRoomRemoval(
   await store.retireRoom(roomId);
   const db = await store.server();
   const settled = await db.tx(async (tx) => {
+    await reconcileDeviceRoom(
+      tx,
+      roomId,
+      [],
+      false,
+      null,
+      Number.MAX_SAFE_INTEGER,
+    );
+    await tx.execute('DELETE FROM e2ee_rooms WHERE room=?', [roomId]);
     const rows = await tx.query(
       "SELECT destination, count(*) AS n FROM outbox WHERE room = ? AND state = 'pending' GROUP BY destination",
       [roomId],
