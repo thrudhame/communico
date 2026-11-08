@@ -19,6 +19,12 @@ import { encodeEnvelope } from '#engine/federation-envelope.ts';
 
 const args = (d: DeviceIdentity) => [d.localpart, d.deviceId, d.generation];
 export type Message = { user: string; id: string; content: Json };
+/** Queue pressure is temporary, unlike a permanently oversized wire object. */
+export class InboxFullError extends MatrixError {
+  constructor() {
+    super(413, 'M_TOO_LARGE', 'device inbox is full');
+  }
+}
 export type DeliveryPolicy = { enabled: boolean; maxBytes: number };
 export function validateMessages(body: unknown, limits: KeyLimits): Message[] {
   bounded(body, limits.maxrequestbytes);
@@ -66,7 +72,7 @@ export async function insertMessage(
     'SELECT COUNT(*) AS n FROM to_device_inbox WHERE localpart=? AND device_id=? AND generation=?',
     owner,
   );
-  limitEntries(Number(count[0].n) + 1, limits.maxinboxmessages);
+  if (Number(count[0].n) >= limits.maxinboxmessages) throw new InboxFullError();
   const pos = await nextCounter(conn, 'to_device');
   await conn.execute('INSERT INTO to_device_inbox VALUES(?,?,?,?,?,?)', [
     ...owner,
@@ -188,7 +194,6 @@ export async function receiveMessages(
       [origin, id],
     )).length
   ) return;
-  let fanout = 0;
   for (const m of messages) {
     if (domainOf(m.user) !== server) continue;
     const lp = localpartOf(m.user);
@@ -197,7 +202,8 @@ export async function receiveMessages(
       : [await deviceById(conn, m.id, lp)];
     for (const target of targets) {
       if (target === null) continue;
-      limitEntries(++fanout, limits.maxkeys);
+      // Wire entries are sender-bounded before this transaction. Wildcard
+      // expansion belongs to the local device owner, not that wire budget.
       await insertMessage(
         conn,
         {
