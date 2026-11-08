@@ -63,6 +63,10 @@ export class Store implements StartupStore {
     return this.pool.acquire('tenants', id, options);
   }
 
+  initializeRoom<T>(id: string, fn: (db: Db) => Promise<T>): Promise<T> {
+    return this.pool.initialize('rooms', id, fn);
+  }
+
   stats(): StoreStats {
     return {
       openFiles: this.pool.size,
