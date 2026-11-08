@@ -14,6 +14,10 @@ import {
 const FULL = `[server]
 name = "localhost"
 port = 8008
+shutdowngraceseconds = 10
+
+[admin]
+socket = ""
 
 [media]
 root = "./.media"
@@ -613,7 +617,7 @@ Deno.test('--shell printer quoting', async () => {
   );
 });
 
-Deno.test('46 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('48 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -628,7 +632,8 @@ Deno.test('46 leaves total across the sections (the surface tripwire)', async ()
     [name, leaves],
   ): [string, number] => [name, Object.keys(leaves).length]);
   assertEquals(counts, [
-    ['server', 2],
+    ['server', 3],
+    ['admin', 1],
     ['media', 2],
     ['store', 5],
     ['preview', 4],
@@ -636,7 +641,35 @@ Deno.test('46 leaves total across the sections (the surface tripwire)', async ()
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    46,
-    'the whole config surface is 46 leaves — a new leaf belongs in the plan, not just the schema',
+    48,
+    'the whole config surface is 48 leaves - a new leaf belongs in the plan, not just the schema',
+  );
+});
+
+Deno.test('shutdown grace defaults to ten seconds and rejects negative values', () => {
+  const defaultsPath = 'defaults/communico.toml';
+  assertEquals(
+    loadConfig({ defaultsPath, configPath: null, env: {} }).config.server
+      .shutdowngraceseconds,
+    10,
+  );
+  for (const value of ['0', '3']) {
+    assertEquals(
+      loadConfig({
+        defaultsPath,
+        configPath: null,
+        env: { COMMUNICO_SERVER_SHUTDOWNGRACESECONDS: value },
+      }).config.server.shutdowngraceseconds,
+      Number(value),
+    );
+  }
+  assert(
+    loadFail({
+      defaultsPath,
+      configPath: null,
+      env: { COMMUNICO_SERVER_SHUTDOWNGRACESECONDS: '-1' },
+    }).some((p) =>
+      p.includes('server.shutdowngraceseconds') && p.includes('>= 0')
+    ),
   );
 });

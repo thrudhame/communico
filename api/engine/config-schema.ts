@@ -12,6 +12,10 @@ export const SCHEMA = {
   server: {
     name: 'string',
     port: 'int',
+    shutdowngraceseconds: 'int',
+  },
+  admin: {
+    socket: 'string',
   },
   media: {
     root: 'string',

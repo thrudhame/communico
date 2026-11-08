@@ -2,7 +2,7 @@
 // 5a-3 in notes; these assertions observe producer persistence and EDU state.
 import { assert, assertEquals } from '@std/assert';
 import { startFederationServices, theApp } from '#engine/app.ts';
-import { setConfigForTests } from '#engine/config.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
 import { toWire } from '#engine/federation/pdu.ts';
 import { peerStatus } from '#engine/federation/sender.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -348,3 +348,90 @@ test('send: missing prevs persist pending waits without news; zero retention dro
     setConfigForTests({});
   }
 });
+
+for (const retention of ['default', 'zero'] as const) {
+  test(`send: ${retention} ungrounded lifespan controls arrival and redelivery in /sync`, async () => {
+    const s = await setup();
+    // tx-http.test has no federation listener: recovery cannot fetch A.
+    // Keep the configured fetch budget and default lifespan in the first case.
+    setConfigForTests({
+      federation: {
+        missingwaitms: 0,
+        ...(retention === 'zero' ? { ungroundedmillihours: 0 } : {}),
+      },
+    });
+    try {
+      if (retention === 'default') {
+        assert(config().federation.ungroundedmillihours > 0);
+      }
+      const sync = async (since?: string) => {
+        const response = await matrix(
+          new Request(
+            'http://x/_matrix/client/v3/sync?timeout=0' +
+              (since === undefined ? '' : '&since=' + enc(since)),
+            { headers: { authorization: 'Bearer ' + token } },
+          ),
+        );
+        assertEquals(response.status, 200);
+        const body = await response.json() as Json;
+        const joined = ((body.rooms as Json).join as Json)[s.id] as
+          | Json
+          | undefined;
+        const events = joined === undefined
+          ? []
+          : (joined.timeline as Json).events as Json[];
+        return {
+          next: String(body.next_batch),
+          ids: events.map((event) => event.event_id),
+        };
+      };
+      const a = await message(s, 'unreject A');
+      const b = await message(s, 'unreject B', {
+        prev_events: [String(a.event_id)],
+        depth: a.depth! + 1,
+      });
+      const aId = String(a.event_id);
+      const bId = String(b.event_id);
+      const before = await sync();
+      const first = await send(`unreject-${retention}-B`, [b]);
+      assertEquals(first.status, 200);
+      const receipt = (first.body.pdus as Json)[bId] as Json;
+      if (retention === 'default') assertEquals(receipt, {});
+      else assert(typeof receipt.error === 'string');
+      const waiting = await sync(before.next);
+      assertEquals(waiting.ids, []);
+      assertEquals(await send(`unreject-${retention}-A`, [a]), {
+        status: 200,
+        body: { pdus: { [aId]: {} } },
+      });
+      const arrived = await sync(waiting.next);
+      assertEquals(arrived.ids, retention === 'default' ? [aId, bId] : [aId]);
+      const resent = await send(`unreject-${retention}-B-again`, [b]);
+      assertEquals(resent, {
+        status: 200,
+        body: { pdus: { [bId]: {} } },
+      });
+      if (retention === 'default') assertEquals(resent, first);
+      const after = await sync(arrived.next);
+      assertEquals(after.ids, retention === 'default' ? [] : [bId]);
+      assertEquals((await sync(after.next)).ids, []);
+      const response = await matrix(
+        new Request(
+          'http://x/_matrix/client/v3/rooms/' + enc(s.id) +
+            '/messages?dir=f&limit=100',
+          { headers: { authorization: 'Bearer ' + token } },
+        ),
+      );
+      assertEquals(response.status, 200);
+      const page = await response.json() as Json;
+      assertEquals(
+        (page.chunk as Json[]).map((event) => event.event_id).filter((id) =>
+          id === aId || id === bId
+        ),
+        [aId, bId],
+      );
+    } finally {
+      setConfigForTests({});
+    }
+  });
+}

@@ -5,11 +5,17 @@
   "version": "0.1.0-dev",
   "tasks": {
     "native": "sh tools/native-build.sh",
-    "check": "deno fmt --check && deno lint && deno check main.ts api/ tests/ tools/config.ts",
-    "start": "deno --env --allow-net --allow-env --allow-read --allow-write --allow-ffi main.ts",
+    "check": "deno fmt --check && deno lint && deno check main.ts api/ tests/ tools/",
+    "start": "deno --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys=uid,umask --allow-run=openssl main.ts",
     "fmt": "deno fmt",
-    "test": "deno test --allow-net --allow-env --allow-read --allow-write --allow-run --allow-ffi tests/*.test.ts tests/rulebook/*.test.ts",
+    "test": "deno test --allow-net --allow-env --allow-read --allow-write --allow-run --allow-ffi --allow-sys=uid,umask tests/*.test.ts tests/rulebook/*.test.ts",
     "config": "deno run --allow-env --allow-read tools/config.ts",
+    "federation-block": "sh tools/admin.sh federation-block",
+    "federation-peer": "sh tools/admin.sh federation-peer",
+    "federation-key": "sh tools/admin.sh federation-key",
+    "federation-outbox": "sh tools/admin.sh federation-outbox",
+    "federation-cert": "sh tools/admin.sh federation-cert",
+    "rooms": "sh tools/admin.sh rooms",
     "debug-proxy": "deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
   },
   "imports": {

@@ -19,6 +19,7 @@ import * as txns from '#engine/tenant/txns.ts';
 import * as uia from '#engine/tenant/uia.ts';
 import * as users from '#engine/tenant/users.ts';
 import { tenantStreamCommitted } from '#engine/tenant/streams.ts';
+import { writeCertificate } from '#engine/tenant/certificate.ts';
 import {
   b32encode,
   b64decode,
@@ -70,6 +71,10 @@ export type Tenant = {
   readonly publicB64: string;
   // The real event signer (stage 3b) from the tenant key.
   signer(): Signer;
+  writeFederationCert(
+    certPath: string,
+    keyPath: string,
+  ): ReturnType<typeof writeCertificate>;
   tx<T>(fn: (tenant: TenantTx) => Promise<T>): Promise<T>;
 };
 
@@ -345,6 +350,8 @@ export async function openTenant(
     nativeName: String(row.native_name),
     keyId: 'ed25519:' + String(row.key_id),
     publicB64: String(row.pubkey_b64),
+    writeFederationCert: (certPath, keyPath) =>
+      writeCertificate(privateKey, String(row.native_name), certPath, keyPath),
     signer: () => ({
       serverName,
       keyId: 'ed25519:' + String(row.key_id),

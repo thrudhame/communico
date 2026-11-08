@@ -7,6 +7,40 @@ import {
 } from '#engine/federation/peers.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { mediaRoot } from '#engine/media.ts';
+import { startAdmin } from '#root/api/admin/index.ts';
+import { ServerLifetime } from '#root/api/server-lifetime.ts';
+
+const lifetime = new ServerLifetime();
+let fatal = false;
+let closing: Promise<void> | undefined;
+function closeStore(): Promise<void> {
+  return closing ??= closeApp();
+}
+
+globalThis.addEventListener('unhandledrejection', (event) => {
+  if (fatal) Deno.exit(1);
+  fatal = true;
+  // Defer Deno's immediate fatal default only for bounded cleanup. Continuing
+  // to serve, recovering from the rejection or exiting successfully is forbidden.
+  event.preventDefault();
+  lifetime.abort();
+  console.error('fatal: unhandled rejection');
+  console.error(
+    event.reason instanceof Error
+      ? event.reason.stack
+      : new Error(String(event.reason)).stack,
+  );
+  const timer = setTimeout(() => Deno.exit(1), 2000);
+  void closeStore().then(() => {
+    console.error('fatal: store closed');
+    clearTimeout(timer);
+    Deno.exit(1);
+  }, (error) => {
+    console.error('fatal: store close failed', error);
+    clearTimeout(timer);
+    Deno.exit(1);
+  });
+});
 
 try {
   const loaded = loadedConfig();
@@ -54,6 +88,13 @@ try {
 
 await Deno.mkdir(mediaRoot(), { recursive: true });
 const app = await openApp();
+let admin: Awaited<ReturnType<typeof startAdmin>>;
+try {
+  admin = await startAdmin(app, undefined, lifetime);
+} catch (error) {
+  await closeStore();
+  throw error;
+}
 
 if (config().federation.enabled) {
   const fed = config().federation;
@@ -75,7 +116,10 @@ if (config().federation.enabled) {
 const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 
 const servers = [
-  Deno.serve({ port: appPort() }, matrix),
+  Deno.serve(
+    { port: appPort(), signal: lifetime.controller.signal },
+    lifetime.wrap('cs', matrix),
+  ),
 ];
 
 if (config().federation.enabled) {
@@ -87,21 +131,32 @@ if (config().federation.enabled) {
       port,
       cert: await Deno.readTextFile(cert),
       key: await Deno.readTextFile(key),
-    }, matrix),
+      signal: lifetime.controller.signal,
+    }, lifetime.wrap('federation', matrix)),
   );
 }
 
-// Clean shutdown closes the store: stop the listeners, then the app
-// (sender stopped, files closed) and exit 0 — a SIGTERM must never
-// leave a half-written database directory behind.
+// Stop admission first; keep transports readable until admitted work drains.
+// The store lock is released only after every listener (including admin) ends.
 let stopping = false;
 async function shutdown(): Promise<void> {
   if (stopping) return;
   stopping = true;
-  await Promise.allSettled(servers.map((server) => server.shutdown()));
-  await closeApp();
+  console.log('shutdown: draining');
+  const remaining = await lifetime.drain(config().server.shutdowngraceseconds);
+  const forced = Object.keys(remaining).length !== 0;
+  if (forced) {
+    console.error('shutdown: forced aborts', JSON.stringify(remaining));
+  }
+  await Promise.all([
+    ...servers.map((server) => server.shutdown()),
+    admin.shutdown(),
+  ]);
+  if (fatal) return;
+  await closeStore();
+  if (fatal) return;
   console.log('shutdown: store closed');
-  Deno.exit(0);
+  Deno.exit(forced ? 1 : 0);
 }
 Deno.addSignalListener('SIGINT', () => void shutdown());
 Deno.addSignalListener('SIGTERM', () => void shutdown());

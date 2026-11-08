@@ -1,0 +1,2 @@
+# Top-level test followed by whitespace-separated environment overrides.
+TestUnrejectRejectedEvents	PASS_COMMUNICO_FEDERATION_UNGROUNDEDMILLIHOURS=0

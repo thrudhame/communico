@@ -36,6 +36,7 @@ type Entry = {
 export type Lease = {
   readonly db: Database;
   readonly events: EventTarget;
+  readonly incarnation: symbol;
   release(): Promise<void>;
 };
 
@@ -48,10 +49,31 @@ export class Pool {
   private queue: Promise<unknown> = Promise.resolve();
   private readonly released: (() => void)[] = [];
   private closing?: Promise<void>;
+  private readonly removing = new Set<string>();
+  // Unlink failure does not undo logical retirement. Only successful removal
+  // clears this fence; a restart replays the durable room drop before serving.
+  private readonly retiring = new Set<string>();
+  private readonly incarnations = new Map<string, symbol>();
+
+  private retireKey(key: string): void {
+    if (this.retiring.has(key)) return;
+    this.retiring.add(key);
+    this.incarnations.set(key, Symbol());
+  }
+
+  /** Fence new leases as soon as the engine has committed deletion intent,
+   * before fallible server cleanup or physical removal begins. */
+  async retire(kind: FileKind, id: string): Promise<void> {
+    const key = kind + ':' + await keyFor(id);
+    await this.locked(() => {
+      if (this.closed) throw new Error('open-file pool is closed');
+      this.retireKey(key);
+    });
+  }
 
   // Opening, leasing and eviction share one metadata critical section.
   // File operations run OUTSIDE it, protected by their lease count.
-  private locked<T>(fn: () => Promise<T>): Promise<T> {
+  private locked<T>(fn: () => T | Promise<T>): Promise<T> {
     const result = this.queue.then(fn);
     this.queue = result.catch(() => undefined);
     return result;
@@ -184,6 +206,10 @@ export class Pool {
     if (this.closed) throw new Error('open-file pool is closed');
     const parent = join(this.root, kind);
     const key = await keyFor(id);
+    const identity = kind + ':' + key;
+    if (this.removing.has(identity) || this.retiring.has(identity)) {
+      throw new Deno.errors.NotFound(`removed ${kind} database: ${id}`);
+    }
     const provider = this.providers[kind];
     await Deno.mkdir(parent, { recursive: true });
     let result!: T;
@@ -206,12 +232,21 @@ export class Pool {
   async acquire(
     kind: FileKind,
     id: string,
-    options: { create?: boolean } = {},
+    options: { create?: boolean; incarnation?: symbol } = {},
   ): Promise<Lease> {
     return await this.locked(async () => {
       if (this.closed) throw new Error('open-file pool is closed');
       const fileKey = await keyFor(id);
       const key = kind + ':' + fileKey;
+      if (!this.incarnations.has(key)) this.incarnations.set(key, Symbol());
+      const incarnation = this.incarnations.get(key)!;
+      if (
+        this.removing.has(key) || this.retiring.has(key) ||
+        (options.incarnation !== undefined &&
+          options.incarnation !== incarnation)
+      ) {
+        throw new Deno.errors.NotFound(`removed ${kind} database: ${id}`);
+      }
       let entry = this.entries.get(key);
       if (entry === undefined) {
         entry = {
@@ -228,6 +263,7 @@ export class Pool {
       let released = false;
       const leased = entry;
       return {
+        incarnation,
         events: leased.db.gate,
         db: operations((fn, txOptions) => {
           if (released) throw new Error('database lease has been released');
@@ -245,6 +281,55 @@ export class Pool {
         },
       };
     });
+  }
+
+  /** Retire this file incarnation, drain leases, close, then unlink its directory.
+   * Metadata waits never hold the queue needed by lease.release(). */
+  async remove(kind: FileKind, id: string): Promise<void> {
+    const fileKey = await keyFor(id);
+    const key = kind + ':' + fileKey;
+    await this.locked(() => {
+      if (this.closed) throw new Error('open-file pool is closed');
+      if (this.removing.has(key)) {
+        throw new Error(`removal already in progress: ${id}`);
+      }
+      this.removing.add(key);
+      this.retireKey(key);
+    });
+    try {
+      for (;;) {
+        const waiting = await this.locked(async () => {
+          const entry = this.entries.get(key);
+          if (entry !== undefined && entry.leases > 0) {
+            return {
+              wait: new Promise<void>((resolve) => this.released.push(resolve)),
+            };
+          }
+          if (entry !== undefined) {
+            await entry.db.close();
+            this.entries.delete(key);
+          }
+          const dir = directory(this.root, kind, fileKey);
+          try {
+            const info = await Deno.lstat(dir);
+            if (!info.isDirectory) {
+              throw new Error(`not a database directory: ${dir}`);
+            }
+            await Deno.remove(dir, { recursive: true });
+          } catch (error) {
+            if (!(error instanceof Deno.errors.NotFound)) throw error;
+          }
+          this.retiring.delete(key);
+          return null;
+        });
+        if (waiting === null) return;
+        await waiting.wait;
+      }
+    } finally {
+      await this.locked(() => {
+        this.removing.delete(key);
+      });
+    }
   }
 
   private async open(

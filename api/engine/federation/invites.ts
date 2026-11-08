@@ -39,7 +39,11 @@ import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { federationRequest } from './client.ts';
 import { admit } from './gate.ts';
 import { domainOf, toWire } from './pdu.ts';
-import type { IntentJob, IntentProvider } from './sender.ts';
+import type {
+  IntentJob,
+  ReviewableIntentProvider,
+  ReviewIntent,
+} from './sender.ts';
 
 export type InviteDeps = {
   store: Store;
@@ -593,16 +597,18 @@ async function performRejectInvite(
 // The sender's intent provider: 'rejecting' invites are the durable
 // intents; the current candidate index is in-memory (a restart resumes
 // from the inviter). One job per destination per wake.
-export function inviteIntentProvider(deps: InviteDeps): IntentProvider {
+export function inviteIntentProvider(
+  deps: InviteDeps,
+): ReviewableIntentProvider {
   const progress = new Map<string, number>();
-  return async (server, destination) => {
+  const provider = async (server: Db, destination: string) => {
     const rows = await server.query(
       "SELECT * FROM federation_invites WHERE status = 'rejecting' ORDER BY received_ms",
       [],
     );
     for (const raw of rows) {
       const invite = inviteOf(raw);
-      const key = invite.roomId + '|' + invite.userId;
+      const key = JSON.stringify([invite.roomId, invite.userId]);
       const candidates = candidatesOf(invite, deps.self);
       const at = progress.get(key) == null ? 0 : (progress.get(key) as number);
       if (candidates[at] !== destination) continue;
@@ -631,6 +637,62 @@ export function inviteIntentProvider(deps: InviteDeps): IntentProvider {
     }
     return null;
   };
+  return Object.assign(provider, {
+    review: () => listRejectIntents(deps.server, deps.self, progress),
+    prune: (destination: string) =>
+      pruneRejectIntents(deps.server, deps.self, destination, progress),
+  });
+}
+
+/** Operator review shares candidate ownership with the performing provider. */
+export async function listRejectIntents(
+  server: Db,
+  self: string,
+  progress = new Map<string, number>(),
+): Promise<ReviewIntent[]> {
+  const rows = await server.query(
+    "SELECT * FROM federation_invites WHERE status = 'rejecting' ORDER BY received_ms, room_id, user_id",
+  );
+  return rows.map((raw) => {
+    const invite = inviteOf(raw);
+    const key = JSON.stringify([invite.roomId, invite.userId]);
+    const candidates = candidatesOf(invite, self);
+    const at = progress.get(key) === undefined ? 0 : progress.get(key)!;
+    return {
+      id: 'reject-invite:' + key,
+      destination: candidates[at],
+      kind: 'intent',
+      eventId: null,
+      intent: { what: 'reject-invite', user_id: invite.userId, candidates },
+      addedMs: invite.receivedMs,
+      expiresMs: null,
+      inflightTxn: null,
+    };
+  });
+}
+
+export async function pruneRejectIntents(
+  server: Db,
+  self: string,
+  destination: string,
+  progress = new Map<string, number>(),
+): Promise<number> {
+  const rows = (await listRejectIntents(server, self, progress)).filter((r) =>
+    r.destination === destination
+  );
+  return await eventStreamTx(server, async (tx) => {
+    let count = 0;
+    for (const row of rows) {
+      const key = row.id.slice('reject-invite:'.length);
+      const [roomId, userId] = JSON.parse(key) as [string, string];
+      count += await tx.execute(
+        "UPDATE federation_invites SET status = 'rejected', seq = ? WHERE room_id = ? AND user_id = ? AND status = 'rejecting'",
+        [await nextEventSeq(tx), roomId, userId],
+      );
+      progress.delete(key);
+    }
+    return count;
+  });
 }
 
 // --- RESCIND (§3.8 step 7) --------------------------------------------------

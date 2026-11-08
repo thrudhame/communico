@@ -1,10 +1,20 @@
-# Complement baseline — 2026-11-06T09:32:49.668Z
+# Complement baseline - 2026-11-07T07:16:36.445Z
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit e2d5256f9e95c6e17477b02e07b8b06416b84356)
+- image: communico-complement:local (commit 5535f3bc81cec266f83f3d00edf691276bc656c4)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 60
+- failing tests: 59
+
+## Per-setting runs
+
+The same image and checkout are used for every pass; the user filter applies to all passes.
+Package totals above count each package once, failing if any pass fails.
+
+| # | Pass | Test | Environment override | Go test exit |
+|---|---|---|---|---|
+| 1 | default | All except configured tests | Defaults | 1 |
+| 2 | settings-1 | TestUnrejectRejectedEvents | PASS_COMMUNICO_FEDERATION_UNGROUNDEDMILLIHOURS=0 | 0 |
 
 ## Failing packages
 
@@ -21,12 +31,11 @@
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
 - github.com/matrix-org/complement/tests TestJoinFederatedRoomFromApplicationServiceBridgeUser
-- github.com/matrix-org/complement/tests TestUnrejectRejectedEvents
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
+- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII

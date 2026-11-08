@@ -128,3 +128,59 @@ Deno.test('review pool: close drains an initializer before releasing native life
     await Deno.remove(root, { recursive: true });
   }
 });
+
+Deno.test('review pool: retirement fences unpublished initialization until removal completes', async () => {
+  const root = await Deno.makeTempDir();
+  const { ffi, pool } = fixture(root);
+  try {
+    await pool.retire('rooms', 'retired');
+    await assertRejects(
+      () => pool.initialize('rooms', 'retired', () => Promise.resolve()),
+      Deno.errors.NotFound,
+      'removed rooms database',
+    );
+    assertEquals(await pool.list('rooms'), []);
+    await pool.remove('rooms', 'retired');
+    await pool.initialize('rooms', 'retired', async (db) => {
+      await db.exec('CREATE TABLE fresh(value TEXT)');
+    });
+    const lease = await pool.acquire('rooms', 'retired');
+    try {
+      assertEquals(await lease.db.query('SELECT * FROM fresh'), []);
+    } finally {
+      await lease.release();
+    }
+  } finally {
+    await pool.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('review pool: removal drains staged initialization and leaves no discoverable file', async () => {
+  const root = await Deno.makeTempDir();
+  const { ffi, pool } = fixture(root);
+  const entered = barrier();
+  const finish = barrier();
+  const initializing = pool.initialize('rooms', 'removing', async (db) => {
+    entered.release();
+    await finish.wait;
+    await db.query('SELECT value FROM id');
+  });
+  await entered.wait;
+  const removing = pool.remove('rooms', 'removing');
+  finish.release();
+  try {
+    await initializing;
+    await removing;
+    assertEquals(await pool.list('rooms'), []);
+    await assertRejects(
+      () => pool.acquire('rooms', 'removing'),
+      Deno.errors.NotFound,
+    );
+  } finally {
+    await pool.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});

@@ -4,11 +4,13 @@ import { relationsOf, threadRootsOf } from '#engine/server/read.ts';
 import { requireRoom } from './room.ts';
 import { parseStreamToken } from './timeline.ts';
 import { renderEvent } from './render.ts';
+import { canSeeEvent } from './visibility.ts';
 export async function relationsPage(
   roomId: string,
   eventId: string,
   filters: { relType?: string; eventType?: string },
   query: { dir: string | null; limit: string | null; from: string | null },
+  viewer: string,
 ) {
   const dir = query.dir ?? 'b';
   if (dir !== 'b' && dir !== 'f') {
@@ -19,7 +21,7 @@ export async function relationsPage(
       : Math.max(0, Number(query.limit) || 0),
     from = parseStreamToken(query.from)?.eSeq ?? null;
   const room = await requireRoom(roomId);
-  if (await room.tx((tx) => tx.events.get(eventId)) === null) {
+  if (!await canSeeEvent(viewer, room, eventId)) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'event not found: ' + eventId);
   }
   const rendered: { seq: number; ev: Record<string, unknown> }[] = [];
@@ -31,7 +33,10 @@ export async function relationsPage(
       filters.relType,
     )
   ) {
-    const ev = await renderEvent(room, row.eventId);
+    const ev = await renderEvent(room, row.eventId, {
+      userId: viewer,
+      deviceId: null,
+    });
     if (
       ev !== null &&
       (filters.eventType === undefined || ev.type === filters.eventType)
@@ -58,15 +63,8 @@ export async function threads(
 ) {
   const room = await requireRoom(roomId);
   const roots = await threadRootsOf(theApp().server, roomId);
-  const window = roots.filter((r) =>
-      page.fromSeq === null || r.latestSeq < page.fromSeq
-    ),
-    slice = window.slice(
-      0,
-      page.limit === 0 ? window.length : Math.max(0, page.limit),
-    );
-  const chunk: Record<string, unknown>[] = [];
-  for (const root of slice) {
+  const rendered: { latestSeq: number; ev: Record<string, unknown> }[] = [];
+  for (const root of roots) {
     const ev = await renderEvent(room, root.eventId, {
       userId: viewer,
       deviceId: null,
@@ -80,10 +78,32 @@ export async function threads(
       include === 'participated' &&
       unsigned['m.relations']?.['m.thread']?.current_user_participated !== true
     ) continue;
-    chunk.push(ev);
+    const latest = unsigned['m.relations']?.['m.thread']?.latest_event as
+      | Record<string, unknown>
+      | undefined;
+    if (latest === undefined) continue;
+    const children = await relationsOf(
+      theApp().server,
+      roomId,
+      root.eventId,
+      'm.thread',
+    );
+    const child = children.find((r) => r.eventId === latest.event_id);
+    if (child !== undefined) rendered.push({ latestSeq: child.seq, ev });
   }
+  rendered.sort((a, b) =>
+    b.latestSeq - a.latestSeq ||
+    String(a.ev.event_id).localeCompare(String(b.ev.event_id))
+  );
+  const window = rendered.filter((r) =>
+    page.fromSeq === null || r.latestSeq < page.fromSeq
+  );
+  const slice = window.slice(
+    0,
+    page.limit === 0 ? window.length : Math.max(0, page.limit),
+  );
   const out: { chunk: Record<string, unknown>[]; next_batch?: string } = {
-    chunk,
+    chunk: slice.map((r) => r.ev),
   };
   if (page.limit > 0 && window.length > page.limit && slice.length > 0) {
     out.next_batch = 's' + slice[slice.length - 1].latestSeq;

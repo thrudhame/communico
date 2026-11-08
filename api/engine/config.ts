@@ -4,7 +4,7 @@
 // is pure given its paths; config() loads lazily from conventional paths
 // + Deno.env on first use.
 import { parse } from '@std/toml';
-import { join } from '@std/path';
+import { dirname, join, resolve } from '@std/path';
 import {
   type Config,
   envNameOf,
@@ -300,6 +300,14 @@ export function loadConfig(opts: {
     );
   }
 
+  const grace = (built.server as Record<string, unknown> | undefined)
+    ?.shutdowngraceseconds;
+  if (typeof grace === 'number' && grace < 0) {
+    problems.push(
+      `config: server.shutdowngraceseconds (COMMUNICO_SERVER_SHUTDOWNGRACESECONDS): expected >= 0, got ${grace}`,
+    );
+  }
+
   const preview = built.preview;
   if (
     preview !== null && typeof preview === 'object' && !Array.isArray(preview)
@@ -467,6 +475,18 @@ export function loadConfig(opts: {
     }
   }
 
+  if (
+    typeof (built.admin as Record<string, unknown> | undefined)?.socket ===
+      'string' &&
+    typeof (built.store as Record<string, unknown> | undefined)?.dir ===
+      'string'
+  ) {
+    try {
+      adminSocket(built as Config);
+    } catch (error) {
+      problems.push((error as Error).message);
+    }
+  }
   if (problems.length > 0) throw new ConfigError(problems);
   return { config: built as Config, sources };
 }
@@ -517,7 +537,8 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
-  server?: { name?: string; port?: number };
+  server?: { name?: string; port?: number; shutdowngraceseconds?: number };
+  admin?: { socket?: string };
   media?: { root?: string; maxbytes?: number };
   preview?: {
     enabled?: boolean;
@@ -581,4 +602,25 @@ export function serverName(): string {
 /** The one listener's port. */
 export function appPort(): number {
   return config().server.port;
+}
+
+/** Shared by the listener and operator clients; never opens the store. */
+export function adminSocket(c: Config = config()): string {
+  return validateAdminSocketPath(
+    c.admin.socket === ''
+      ? join(dirname(resolve(c.store.dir)), 'admin.sock')
+      : c.admin.socket,
+  );
+}
+
+/** Linux sun_path reserves one of its 108 bytes for the terminating NUL. */
+export function validateAdminSocketPath(value: string): string {
+  const path = resolve(value);
+  const length = new TextEncoder().encode(path).length;
+  if (length > 107) {
+    throw new Error(
+      `admin socket path exceeds 107 bytes: ${path} (${length} bytes)`,
+    );
+  }
+  return path;
 }

@@ -29,6 +29,10 @@ async function rollForward(store: StartupStore): Promise<void> {
     return;
   }
   await discover(concrete);
+  // A completed unlink can precede deletion of its now-orphaned watermark.
+  await server.execute(
+    "DELETE FROM watermarks WHERE source LIKE 'room:%' AND NOT EXISTS (SELECT 1 FROM rooms WHERE room_id = substr(watermarks.source,6))",
+  );
   for (const roomId of await listRooms(concrete)) {
     await project(concrete, roomId);
   }
