@@ -183,7 +183,15 @@ export async function startPushSender(deps: Deps): Promise<PushSender> {
 
   async function scan(): Promise<void> {
     if (abort.signal.aborted || active.size >= 8) return;
-    if (tenantProjectionPending(store, tenant.serverName)) {
+    // Rejections are server-owned durable work, independent of tenant commits.
+    // This indexed server lookup does not reopen an otherwise idle tenant.
+    if (
+      tenantProjectionPending(store, tenant.serverName) ||
+      (await server.query(
+          'SELECT 1 FROM push_rejections WHERE tenant=? LIMIT 1',
+          [tenant.serverName],
+        )).length > 0
+    ) {
       await projectTenant(store, tenant.serverName);
     }
     if (abort.signal.aborted) return;

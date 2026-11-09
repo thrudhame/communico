@@ -442,6 +442,53 @@ Deno.test('push sender: response acknowledges only the badge revision sent; shut
   }
 });
 
+Deno.test('push sender: persisted gateway rejection retries failed tenant cleanup without a pending tenant revision', async () => {
+  const f = await fixture();
+  let calls = 0;
+  const sender = await startPushSender({
+    store: f.store,
+    tenant: f.tenant,
+    automatic: false,
+    send: () => {
+      calls++;
+      return Promise.resolve(['key']);
+    },
+  });
+  const original = f.store.tenant.bind(f.store);
+  try {
+    await f.send('reject and recover');
+    f.store.tenant = () => Promise.reject(new Error('tenant unavailable'));
+    await assertRejects(() => sender.tick(), Error, 'tenant unavailable');
+    f.store.tenant = original;
+    const db = await f.store.server();
+    const tenantDb = await f.store.tenant('test');
+    assertEquals(
+      await tenantDb.query(
+        "SELECT value FROM counters WHERE name='projection_pending'",
+      ),
+      [],
+    );
+    assertEquals((await db.query('SELECT * FROM push_rejections')).length, 1);
+    assertEquals(
+      (await f.tenant.tx((tx) => tx.pushers.ofUser('bob'))).length,
+      1,
+    );
+    await sender.tick();
+    assertEquals(await f.tenant.tx((tx) => tx.pushers.ofUser('bob')), []);
+    assertEquals(await db.query('SELECT * FROM push_rejections'), []);
+    assertEquals(await db.query('SELECT * FROM push_targets'), []);
+    assertEquals(
+      calls,
+      1,
+      'rejection recovery never resends the rejected target',
+    );
+  } finally {
+    f.store.tenant = original;
+    await sender.stop();
+    await f.close();
+  }
+});
+
 Deno.test('push sender: refresh retains delivery, a matching rejected verdict deletes the registration, stale device generation cannot send', async () => {
   const f = await fixture();
   let calls = 0;
