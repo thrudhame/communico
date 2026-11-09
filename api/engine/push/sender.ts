@@ -2,6 +2,7 @@
 // are active; each pass scans at most32 targets and one job per identity.
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import { tenantProjectionPending } from '#engine/tenant/hooks.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { config } from '#engine/config.ts';
 import { openRoom } from '#engine/room/index.ts';
@@ -182,7 +183,9 @@ export async function startPushSender(deps: Deps): Promise<PushSender> {
 
   async function scan(): Promise<void> {
     if (abort.signal.aborted || active.size >= 8) return;
-    await projectTenant(store, tenant.serverName);
+    if (tenantProjectionPending(store, tenant.serverName)) {
+      await projectTenant(store, tenant.serverName);
+    }
     if (abort.signal.aborted) return;
     const at = now();
     const rows = await server.query(

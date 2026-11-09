@@ -137,6 +137,7 @@ Deno.test('push targets: validation rejects unsupported email, unsafe URLs, form
         ...[
           'http://gateway.test/_matrix/push/v1/notify',
           'https://u:p@gateway.test/_matrix/push/v1/notify',
+          'https://gateway.test',
           'https://gateway.test/wrong',
           'https://gateway.test/_matrix/push/v1/notify#frag',
         ].map((url) => ({ ...input(), data: { url } })),

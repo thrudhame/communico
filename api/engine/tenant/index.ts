@@ -25,7 +25,12 @@ import type { SigningUpload } from '#engine/e2ee-signing.ts';
 import { config } from '#engine/config.ts';
 import * as todevice from '#engine/tenant/todevice.ts';
 import type { StreamToken } from '#engine/client/tokens.ts';
-import { tenantCommitted } from '#engine/tenant/hooks.ts';
+import {
+  pendingTenantProjection,
+  recordTenantProjection,
+  rememberTenantProjection,
+  tenantCommitted,
+} from '#engine/tenant/hooks.ts';
 import * as filters from '#engine/tenant/filters.ts';
 import * as media from '#engine/tenant/media.ts';
 import * as pushers from '#engine/tenant/pushers.ts';
@@ -604,6 +609,11 @@ export async function openTenant(
   // The public key is verified loadable once at open; the signer closes
   // over both halves.
   await importPublicKeyFromRaw(b64decode(String(row.pubkey_b64)));
+  rememberTenantProjection(
+    store,
+    serverName,
+    await pendingTenantProjection(db),
+  );
   return {
     serverName,
     nativeName: String(row.native_name),
@@ -624,7 +634,7 @@ export async function openTenant(
       },
     }),
     tx: async (fn) => {
-      const { result, changed, projectionChanged } = await db.tx(
+      const { result, changed, projectionRevision } = await db.tx(
         async (conn) => {
           let changed = false;
           let projectionChanged = false;
@@ -633,11 +643,17 @@ export async function openTenant(
           }, () => {
             projectionChanged = true;
           }));
-          return { result, changed, projectionChanged };
+          const projectionRevision = projectionChanged
+            ? await recordTenantProjection(conn)
+            : 0;
+          return { result, changed, projectionRevision };
         },
       );
-      if (projectionChanged) await tenantCommitted(store, serverName);
-      if (changed || projectionChanged) {
+      if (projectionRevision) {
+        rememberTenantProjection(store, serverName, projectionRevision);
+        await tenantCommitted(store, serverName);
+      }
+      if (changed || projectionRevision) {
         tenantStreamCommitted(store, serverName);
       }
       return result;

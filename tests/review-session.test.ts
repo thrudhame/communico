@@ -125,7 +125,7 @@ Deno.test('review session: device relogin atomically replaces tokens, refresh an
         app_display_name: 'app',
         device_display_name: 'device',
         lang: 'en',
-        data: { url: 'https://push.invalid' },
+        data: { url: 'https://push.invalid/_matrix/push/v1/notify' },
       }, token)).status,
       200,
     );
