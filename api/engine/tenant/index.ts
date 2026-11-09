@@ -370,16 +370,21 @@ function bind(
       moveToken: (oldHash: string, newHash: string) =>
         pushers.movePusherToken(conn, oldHash, newHash),
       deleteForToken: (accessHash: string) =>
-        pushers.deletePushersForToken(conn, accessHash),
+        mutation(pushers.deletePushersForToken(conn, accessHash)),
       deleteForUser: (localpart: string) =>
-        pushers.deletePushersOfUser(conn, localpart),
+        mutation(pushers.deletePushersOfUser(conn, localpart)),
       delete: (localpart: string, appId: string, pushkey: string) =>
-        pushers.deletePusherRow(conn, localpart, appId, pushkey),
+        mutation(pushers.deletePusherRow(conn, localpart, appId, pushkey)),
+      deleteOtherUsers: (localpart: string, appId: string, pushkey: string) =>
+        mutation(
+          pushers.deleteOtherPusherUsers(conn, localpart, appId, pushkey),
+        ),
       upsert: (
         localpart: string,
         pusher: pushers.PusherInput & { kind: string },
         accessHash: string,
-      ) => pushers.upsertPusherRow(conn, localpart, pusher, accessHash),
+      ) =>
+        mutation(pushers.upsertPusherRow(conn, localpart, pusher, accessHash)),
       ofUser: (localpart: string) => pushers.pushersOfUser(conn, localpart),
     },
     counters: {

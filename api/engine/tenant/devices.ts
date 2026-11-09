@@ -7,6 +7,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { appendDeviceChange } from '#engine/tenant/changes.ts';
 import { signingCollision } from '#engine/tenant/cross-signing.ts';
 import { forgetKeySignatures } from '#engine/tenant/signature-view.ts';
+import { deletePushersForToken } from '#engine/tenant/pushers.ts';
 
 export type DeviceRow = {
   device_id: string;
@@ -116,9 +117,7 @@ export async function deleteDevice(
     [localpart, deviceId],
   );
   for (const row of tokens) {
-    await conn.execute('DELETE FROM pushers WHERE access_token = ?', [
-      row.token,
-    ]);
+    await deletePushersForToken(conn, String(row.token));
     await conn.execute('DELETE FROM refresh_tokens WHERE access_token = ?', [
       row.token,
     ]);

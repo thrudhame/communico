@@ -9,8 +9,7 @@ import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 // associated with app_id and pushkey for the authenticated user."
 // (spec v1.11, Push Notifications.) Required: app_id, pushkey; when kind
 // is not null also app_display_name, device_display_name, lang, data.
-// kind null deletes the pusher. Storage only — data.url is NEVER fetched
-// (no gateway traffic in M2). Response: {}.
+// kind null deletes the pusher. Registration never probes data.url.
 export default async function (request: PathfinderRequest, context: Context) {
   const body = await parseJson(request) as Record<string, unknown>;
   const str = (v: unknown): string | null => typeof v === 'string' ? v : null;
@@ -63,6 +62,7 @@ export default async function (request: PathfinderRequest, context: Context) {
       profile_tag: str(body.profile_tag),
       lang,
       data,
+      append: body.append as boolean | undefined,
     };
   }
   const caller = context.state.user as string;

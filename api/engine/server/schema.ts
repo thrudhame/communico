@@ -337,8 +337,16 @@ CREATE INDEX notification_history_retention ON notification_history(read_ms,seq)
 INSERT INTO notification_history SELECT seq,user,room,highlight,read_ms FROM notifications WHERE withdrawn=0;
 `;
 
+const PUSH_TARGETS_SQL = `
+CREATE TABLE push_targets(tenant TEXT NOT NULL,user TEXT NOT NULL,app_id TEXT NOT NULL,pushkey TEXT NOT NULL,incarnation TEXT NOT NULL,payload TEXT NOT NULL,registered_seq INTEGER NOT NULL,state TEXT NOT NULL,PRIMARY KEY(tenant,user,app_id,pushkey));
+CREATE UNIQUE INDEX push_targets_incarnation ON push_targets(incarnation);
+CREATE INDEX push_targets_user ON push_targets(user);
+CREATE TABLE push_rejections(tenant TEXT NOT NULL,user TEXT NOT NULL,app_id TEXT NOT NULL,pushkey TEXT NOT NULL,incarnation TEXT PRIMARY KEY NOT NULL);
+CREATE INDEX push_rejections_tenant ON push_rejections(tenant);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 17,
+  version: 18,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -355,6 +363,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(HISTORY_RELATIONS_SQL);
     await db.exec(NOTIFICATION_LOOKUPS_SQL);
     await db.exec(NOTIFICATION_HISTORY_SQL);
+    await db.exec(PUSH_TARGETS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -371,5 +380,6 @@ export const serverSchema: SchemaProvider = {
     14: (conn) => conn.exec(HISTORY_RELATIONS_SQL),
     15: (conn) => conn.exec(NOTIFICATION_LOOKUPS_SQL),
     16: (conn) => conn.exec(NOTIFICATION_HISTORY_SQL),
+    17: (conn) => conn.exec(PUSH_TARGETS_SQL),
   },
 };
