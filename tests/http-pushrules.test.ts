@@ -67,7 +67,7 @@ test('pushrules: CRUD + ordering + enabled/actions + server-controlled 405s', as
     )).status,
     400,
   );
-  assertEquals((await call(rule('bogus', 'x'), { token: tok })).status, 400);
+  assertEquals((await call(rule('bogus', 'x'), { token: tok })).status, 404);
   const mk = (id: string, qs = '') =>
     call(rule('override', id) + qs, {
       method: 'PUT',
@@ -224,4 +224,45 @@ test('default overrides share the catalog, preserve enabled/actions independentl
     )).status,
     404,
   );
+});
+
+test('absent rule resources return not found across kinds while unsupported mutations stay invalid', async () => {
+  const alice = await registerTestUser('pr-absent', 'pw');
+  const token = alice.access_token!;
+  for (
+    const kind of [
+      'override',
+      'content',
+      'room',
+      'sender',
+      'underride',
+      'postcontent',
+      'bogus',
+    ]
+  ) {
+    const rule = `/_matrix/client/v3/pushrules/global/${kind}/missing`;
+    for (const suffix of ['', '/enabled', '/actions']) {
+      const result = await call(rule + suffix, { token });
+      assertEquals(result.status, 404, kind + suffix);
+      assertEquals(result.body.errcode, 'M_NOT_FOUND');
+    }
+    if (kind === 'postcontent' || kind === 'bogus') {
+      for (
+        const [suffix, body] of [
+          ['', { actions: ['notify'] }],
+          ['/enabled', { enabled: true }],
+          ['/actions', { actions: ['notify'] }],
+        ] as const
+      ) {
+        const result = await call(rule + suffix, {
+          method: 'PUT',
+          token,
+          body,
+        });
+        assertEquals(result.status, 400);
+        assertEquals(result.body.errcode, 'M_INVALID_PARAM');
+      }
+      assertEquals((await call(rule, { method: 'DELETE', token })).status, 400);
+    }
+  }
 });
