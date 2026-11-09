@@ -23,6 +23,9 @@ shutdowngraceseconds = 10
 
 [push]
 readretentiondays = 30
+blocklist = []
+allowlist = []
+cacerts = []
 
 [admin]
 socket = ""

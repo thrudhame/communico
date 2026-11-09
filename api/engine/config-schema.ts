@@ -39,6 +39,9 @@ export const SCHEMA = {
   },
   push: {
     readretentiondays: 'int',
+    blocklist: 'list',
+    allowlist: 'list',
+    cacerts: 'list',
   },
   store: {
     dir: 'string',

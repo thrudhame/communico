@@ -308,7 +308,6 @@ export function loadConfig(opts: {
     );
   }
 
-  const preview = built.preview;
   const retention = (built.push as Record<string, unknown> | undefined)
     ?.readretentiondays;
   if (typeof retention === 'number' && retention < 0) {
@@ -329,10 +328,9 @@ export function loadConfig(opts: {
       );
     }
   }
-  if (
-    preview !== null && typeof preview === 'object' && !Array.isArray(preview)
-  ) {
-    const p = preview as Record<string, unknown>;
+  for (const section of ['preview', 'push']) {
+    const p = built[section] as Record<string, unknown> | undefined;
+    if (!p) continue;
     for (const leaf of ['blocklist', 'allowlist']) {
       const list = p[leaf];
       if (!Array.isArray(list)) continue;
@@ -340,11 +338,26 @@ export function loadConfig(opts: {
         if (typeof item !== 'string') continue;
         if (parseCidr(item) === null) {
           problems.push(
-            `config: preview.${leaf} (${
-              envNameOf(['preview', leaf])
+            `config: ${section}.${leaf} (${
+              envNameOf([section, leaf])
             }): malformed CIDR ${display(item)}`,
           );
         }
+      }
+    }
+  }
+  const pushCa = (built.push as Record<string, unknown> | undefined)?.cacerts;
+  if (Array.isArray(pushCa)) {
+    for (const path of pushCa) {
+      if (typeof path !== 'string') continue;
+      try {
+        Deno.readTextFileSync(path);
+      } catch {
+        problems.push(
+          `config: push.cacerts (COMMUNICO_PUSH_CACERTS): file not readable: ${
+            display(path)
+          }`,
+        );
       }
     }
   }
@@ -557,7 +570,12 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
-  push?: { readretentiondays?: number };
+  push?: {
+    readretentiondays?: number;
+    blocklist?: string[];
+    allowlist?: string[];
+    cacerts?: string[];
+  };
   server?: { name?: string; port?: number; shutdowngraceseconds?: number };
   admin?: { socket?: string };
   media?: { root?: string; maxbytes?: number };
