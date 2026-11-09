@@ -226,6 +226,24 @@ latch prevents a new backoff sleep after stopping begins.
 (`api/engine/federation/sender.ts:388-411`, `api/engine/federation/invites.ts:706-728`,
 `api/engine/federation/sender.ts:359-371`)
 
+### Room ACL admission
+
+Room ACL admission reads current published room truth, not the received PDU's
+parents or the server projection. The network-free room evaluator implements
+case-insensitive whole-host globs, deny precedence, default-deny for a present
+ACL, port-independent matching and IP-literal policy. Applied redaction effects
+are read from the room change log. Storage errors never mean "no ACL".
+(`api/engine/room/acl.ts`, `api/engine/room/changes.ts`)
+
+Federation serving and membership use that owner; inbound transactions recheck
+each PDU in the locked batch, so an accepted ACL change immediately affects
+later traffic. Typing and each receipt room use the same room lock. Outgoing
+requests carry explicit room scope, including `/event` recovery, and are checked
+before discovery and again before dialing. Delivery to resident peers retains
+the spec's recommendation even when a peer is denied; mixed frozen transaction
+bodies and durable delivery obligations are not rewritten or discarded.
+(`api/engine/federation/{acl,client,edus,joins,serve}.ts`, `api/engine/room/remote.ts`)
+
 ## Tenant data, storage and process lifetime
 
 Hosted accounts are localparts under the configured homeserver's signing

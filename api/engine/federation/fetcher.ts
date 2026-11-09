@@ -15,6 +15,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { type Fetcher, SendJoinRefused } from '#engine/room/deps.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Database as Db } from '#engine/store/db.ts';
+import type { Store } from '#engine/store/index.ts';
 import {
   FederationHttpError,
   federationRequest,
@@ -48,14 +49,19 @@ function sendJoinFailure(error: unknown): never {
   throw error;
 }
 
-export function productionFetcher(server: Db, signer: Signer): Fetcher {
+export function productionFetcher(
+  server: Db,
+  signer: Signer,
+  store: Store,
+): Fetcher {
   const bulk = () => config().federation.bulkmaxbytes;
   return {
     // GET /_matrix/federation/v1/event/{eventId} — the PDU, or null on
     // 404/unreachable.
-    event: async (id, via) => {
+    event: async (id, via, roomId) => {
       try {
         const res = await federationRequest(server, signer, {
+          room: { store, id: roomId },
           destination: via,
           method: 'GET',
           path: `/_matrix/federation/v1/event/${encodeURIComponent(id)}`,
@@ -71,6 +77,7 @@ export function productionFetcher(server: Db, signer: Signer): Fetcher {
     // POST /_matrix/federation/v1/get_missing_events/{roomId}.
     missingEvents: async (roomId, earliest, latest, limit, via) => {
       const res = await federationRequest(server, signer, {
+        room: { store, id: roomId },
         destination: via,
         method: 'POST',
         path: `/_matrix/federation/v1/get_missing_events/${
@@ -93,6 +100,7 @@ export function productionFetcher(server: Db, signer: Signer): Fetcher {
     stateIds: async (roomId, at, via) => {
       try {
         const res = await federationRequest(server, signer, {
+          room: { store, id: roomId },
           destination: via,
           method: 'GET',
           path: `/_matrix/federation/v1/state_ids/${
@@ -114,6 +122,7 @@ export function productionFetcher(server: Db, signer: Signer): Fetcher {
     eventAuth: async (roomId, id, via) => {
       try {
         const res = await federationRequest(server, signer, {
+          room: { store, id: roomId },
           destination: via,
           method: 'GET',
           path: `/_matrix/federation/v1/event_auth/${
@@ -133,6 +142,7 @@ export function productionFetcher(server: Db, signer: Signer): Fetcher {
     // GET /_matrix/federation/v1/backfill/{roomId}?v=…&limit=.
     backfill: async (roomId, from, limit, via) => {
       const res = await federationRequest(server, signer, {
+        room: { store, id: roomId },
         destination: via,
         method: 'GET',
         path: `/_matrix/federation/v1/backfill/${encodeURIComponent(roomId)}?${
@@ -147,6 +157,7 @@ export function productionFetcher(server: Db, signer: Signer): Fetcher {
     // GET /_matrix/federation/v1/make_join/{roomId}/{userId}?ver=…
     makeJoin: async (roomId, userId, versions, via) => {
       const res = await federationRequest(server, signer, {
+        room: { store, id: roomId, participation: true },
         destination: via,
         method: 'GET',
         path: `/_matrix/federation/v1/make_join/${encodeURIComponent(roomId)}/${
@@ -185,6 +196,7 @@ export function productionFetcher(server: Db, signer: Signer): Fetcher {
       });
       try {
         const res = await federationRequest(server, signer, {
+          room: { store, id: roomId, participation: true },
           destination: via,
           method: 'PUT',
           path: `/_matrix/federation/v2/send_join/${
@@ -199,6 +211,7 @@ export function productionFetcher(server: Db, signer: Signer): Fetcher {
         let res;
         try {
           res = await federationRequest(server, signer, {
+            room: { store, id: roomId, participation: true },
             destination: via,
             method: 'PUT',
             path: `/_matrix/federation/v1/send_join/${

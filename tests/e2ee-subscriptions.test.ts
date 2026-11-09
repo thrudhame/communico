@@ -111,7 +111,7 @@ Deno.test('all-room subscriptions seed empty lists, freeze per-peer chains and r
         'local.test',
       ])
     );
-    recovery = deviceListService(db, tenant, eduState(db, 'local.test'));
+    recovery = deviceListService(db, tenant, eduState(db, 'local.test', store));
     recovery.start();
     sender = startSender({ store, signer: tenant.signer() });
     await waitFor(() => attempts.length > 0);

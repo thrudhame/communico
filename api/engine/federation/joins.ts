@@ -7,6 +7,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { projectAfterWrite } from '#engine/room/hooks.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
+import { assertAcl } from '#engine/room/acl.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import type { InviteDeps } from './invites.ts';
 import { countersign } from './invites.ts';
@@ -33,6 +34,7 @@ async function template(
   }
   const room = await heldRoom(deps.store, roomId);
   return await room.tx(async (tx) => {
+    await assertAcl(tx, origin);
     const snapshot = await currentSnapshot(tx);
     const { version, state, stay } = snapshot;
     if (versions.length > 0 && !versions.includes(version)) {
@@ -130,9 +132,10 @@ async function sendMembership(
   deps: InviteDeps,
 ) {
   const room = await heldRoom(deps.store, roomId);
-  const version = await room.tx(async (tx) =>
-    (await currentSnapshot(tx)).version
-  );
+  const version = await room.tx(async (tx) => {
+    await assertAcl(tx, origin);
+    return (await currentSnapshot(tx)).version;
+  });
   const pdu = raw as Pdu;
   if (pdu.room_id !== roomId) {
     throw new MatrixError(400, 'M_BAD_JSON', 'room_id does not match the path');
@@ -183,6 +186,7 @@ async function sendMembership(
   await countersign(verified.pdu, version, deps.signer);
   const answer = await withRoomLock(roomId, () =>
     room.tx(async (tx) => {
+      await assertAcl(tx, origin);
       const snapshot = await currentSnapshot(tx);
       if (!(await serverInState(tx, snapshot.state, deps.self))) {
         if (membership === 'join' || snapshot.stay.status !== 'closed') {

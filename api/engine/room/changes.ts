@@ -58,3 +58,22 @@ export async function changePosOf(
   );
   return rows.length === 0 ? null : Number(rows[0].pos);
 }
+
+// Applied redaction effects are room truth even before projection catches up.
+// Read the durable effect log, not raw PDUs or the server projection watermark.
+export async function redactionOf(
+  conn: Conn,
+  target: string,
+): Promise<string | null> {
+  const rows = await conn.query(
+    "SELECT event, data FROM changes WHERE kind = 'redaction' ORDER BY pos",
+  );
+  for (const row of rows) {
+    if (
+      (JSON.parse(String(row.data)) as { target?: unknown }).target === target
+    ) {
+      return String(row.event);
+    }
+  }
+  return null;
+}

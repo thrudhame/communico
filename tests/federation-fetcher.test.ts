@@ -186,10 +186,10 @@ async function ourPubB64(signer: Signer): Promise<string> {
   return b64encodeStd(await exportPublicKeyRaw(pub));
 }
 
-function productionDeps(server: Db, signer: Signer): RemoteDeps {
+function productionDeps(server: Db, signer: Signer, store: Store): RemoteDeps {
   return {
     keys: productionKeyResolver(server, signer),
-    fetcher: productionFetcher(server, signer),
+    fetcher: productionFetcher(server, signer, store),
     self: signer.serverName,
     limits: { waitMs: 25, limit: 10, budgetMs: 8000 },
     ungroundedMs: 3_600_000,
@@ -229,7 +229,7 @@ async function boot(store: Store, opts: { roomId: string }): Promise<Boot> {
     keyId: fake.keyId,
     kp: fake.kp,
   };
-  const deps = productionDeps(server, g.signer);
+  const deps = productionDeps(server, g.signer, store);
   const rudy = '@rudy:' + remote.name;
   const join = await remoteEvent(g.roomId, remote, '11', {
     type: 'm.room.member',
@@ -491,7 +491,7 @@ Deno.test('fetcher: make_join/send_join over TLS, then backfill into the joined 
         await fakeMessage(scripted.fr, 'history three', {
           origin_server_ts: 30,
         });
-        const deps = productionDeps(server, signer);
+        const deps = productionDeps(server, signer, store);
         // the join dance over TLS: make_join → send_join
         const result = await joinRemote(store, {
           roomId: scripted.fr.roomId,

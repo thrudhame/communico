@@ -30,7 +30,7 @@ export function transactionDeps(): TransactionDeps {
   return {
     store: app.store,
     keys: deps.keys,
-    fetcher: productionFetcher(app.server, deps.signer),
+    fetcher: productionFetcher(app.server, deps.signer, app.store),
     self: deps.self,
     edus: app.federationEdus,
     rescind: (roomId, pdu) => acceptRescind(roomId, pdu, deps),

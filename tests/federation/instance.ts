@@ -91,11 +91,16 @@ export type Instance = {
   close(): Promise<void>;
 };
 
-function remoteDepsOf(server: Db, signer: Signer, self: string): RemoteDeps {
+function remoteDepsOf(
+  server: Db,
+  signer: Signer,
+  self: string,
+  store: Store,
+): RemoteDeps {
   const fed = config().federation;
   return {
     keys: productionKeyResolver(server, signer),
-    fetcher: productionFetcher(server, signer),
+    fetcher: productionFetcher(server, signer, store),
     self,
     limits: {
       waitMs: fed.missingwaitms,
@@ -199,7 +204,7 @@ export async function startInstance(): Promise<Instance> {
   box.tenant = tenant;
   const signer = tenant.signer();
   const keys = keyStore(server, { signer });
-  const edus = eduState(server, name);
+  const edus = eduState(server, name, store);
   const box2 = { sender: null as Sender | null };
   const queues = eduQueues(
     (userId) => userId.endsWith(':' + name),
@@ -231,7 +236,7 @@ export async function startInstance(): Promise<Instance> {
     queues,
     sender,
     inviteDeps,
-    remoteDeps: () => remoteDepsOf(server, signer, name),
+    remoteDeps: () => remoteDepsOf(server, signer, name, store),
     receivedTxns,
     restartSender: async () => {
       await instance.sender.stop();
@@ -335,7 +340,7 @@ export async function startInstance(): Promise<Instance> {
       room,
       [join],
       origin,
-      remoteDepsOf(server, signer, name),
+      remoteDepsOf(server, signer, name, store),
     );
     const outcome = outcomes[0];
     if (outcome.outcome !== 'accepted' && outcome.outcome !== 'known') {
@@ -390,7 +395,7 @@ export async function startInstance(): Promise<Instance> {
         const res = await receiveTransaction(origin, txnId, bodyJson, {
           store,
           keys: productionKeyResolver(server, signer),
-          fetcher: productionFetcher(server, signer),
+          fetcher: productionFetcher(server, signer, store),
           self: name,
           edus,
           rescind: (roomId, pdu) => acceptRescind(roomId, pdu, inviteDeps),
@@ -462,7 +467,7 @@ export async function startInstance(): Promise<Instance> {
           room,
           [leave],
           origin,
-          remoteDepsOf(server, signer, name),
+          remoteDepsOf(server, signer, name, store),
         );
         if (outcomes[0].outcome !== 'accepted') {
           throw new MatrixError(

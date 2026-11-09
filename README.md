@@ -144,6 +144,16 @@ restored. [complement/BASELINE.md](complement/BASELINE.md) records the
 recorded evidence, not an all-green conformance claim. Exclusion rationales
 remain in [complement/blacklist.md](complement/blacklist.md).
 
+## Room server ACLs
+
+Current published `m.room.server_acl` state gates inbound room events, typing,
+receipts and room-scoped federation reads/membership requests. A denied room
+does not block other rooms or non-room device/to-device traffic in a mixed
+transaction. Requests and history fetches never contact a denied room peer;
+known ACLs also prevent initiating participation when our server is denied.
+Events and room EDUs still go to denied peers that remain resident, following
+Matrix's delivery recommendation. Room ACLs do not govern media requests.
+
 ## Notification history
 
 Push rules evaluate live events, including encrypted envelopes, independently of

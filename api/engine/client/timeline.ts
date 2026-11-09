@@ -180,7 +180,7 @@ export async function messages(
           stay,
         }, {
           keys: productionKeyResolver(theApp().server, signer),
-          fetcher: productionFetcher(theApp().server, signer),
+          fetcher: productionFetcher(theApp().server, signer, theApp().store),
         });
         outcome = res.outcome;
         if (outcome !== 'open') break;

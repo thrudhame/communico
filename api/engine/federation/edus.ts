@@ -26,6 +26,9 @@ import type { Database as Db } from '#engine/store/db.ts';
 import { setTyping, typingIn } from '#engine/typing.ts';
 import { domainOf } from './pdu.ts';
 import { recordPending } from './peers.ts';
+import type { Store } from '#engine/store/index.ts';
+import { roomAllows } from './acl.ts';
+import { withRoomLock } from '#engine/room/lock.ts';
 
 export type Edu = { edu_type: string; content: Record<string, unknown> };
 
@@ -255,54 +258,67 @@ export class PermanentEduRefusal extends Error {
 // presence built in; device list and anything else ignored — the old
 // stubs). Receipts/presence are server-file reads. `self` is our server
 // name (the shares-room check's local side).
-export function eduState(server: Db, self: string): EduState {
+export function eduState(server: Db, self: string, store: Store): EduState {
   const handlers = new Map<string, EduHandler>();
   const reliable = new Set<string>();
+  const admitted = (
+    roomId: string,
+    origin: string,
+    fn: () => Promise<unknown>,
+  ) =>
+    withRoomLock(roomId, async () => {
+      if (await roomAllows(store, roomId, origin)) await fn();
+    });
 
   handlers.set('m.typing', async (origin, content) => {
     const roomId = typeof content.room_id === 'string' ? content.room_id : null;
     const userId = typeof content.user_id === 'string' ? content.user_id : null;
     if (roomId === null || userId === null) return;
     if (domainOf(userId) !== origin) return; // users belong to origin
-    await setTyping(
-      server,
-      roomId,
-      userId,
-      content.typing === true,
-      REMOTE_TYPING_TTL_MS,
-    );
+    await admitted(roomId, origin, () =>
+      setTyping(
+        server,
+        roomId,
+        userId,
+        content.typing === true,
+        REMOTE_TYPING_TTL_MS,
+      ));
   });
 
   handlers.set('m.receipt', async (origin, content) => {
     // content: { <roomId>: { 'm.read': { <userId>: { event_ids, data } } } }
     for (const [roomId, perRoom] of Object.entries(content)) {
-      const reads = (perRoom as Record<string, unknown>)['m.read'] as
-        | Record<string, { event_ids?: unknown; data?: unknown }>
-        | undefined;
-      if (reads === undefined || typeof reads !== 'object') continue;
-      for (const [userId, mark] of Object.entries(reads)) {
-        if (domainOf(userId) !== origin) continue;
-        const eventIds = Array.isArray(mark.event_ids) ? mark.event_ids : [];
-        if (eventIds.length === 0 || typeof eventIds[0] !== 'string') continue;
-        const data = (mark.data == null ? {} : mark.data) as {
-          ts?: unknown;
-          thread_id?: unknown;
-        };
-        if (data.thread_id === '') continue;
-        await setReceipt(
-          server,
-          roomId,
-          userId,
-          'm.read',
-          String(eventIds[0]),
-          {
-            ts: typeof data.ts === 'number' ? data.ts : Date.now(),
-            threadId: typeof data.thread_id === 'string'
-              ? data.thread_id
-              : null,
-          },
-        );
-      }
+      await admitted(roomId, origin, async () => {
+        const reads = (perRoom as Record<string, unknown>)['m.read'] as
+          | Record<string, { event_ids?: unknown; data?: unknown }>
+          | undefined;
+        if (reads === undefined || typeof reads !== 'object') return;
+        for (const [userId, mark] of Object.entries(reads)) {
+          if (domainOf(userId) !== origin) continue;
+          const eventIds = Array.isArray(mark.event_ids) ? mark.event_ids : [];
+          if (eventIds.length === 0 || typeof eventIds[0] !== 'string') {
+            continue;
+          }
+          const data = (mark.data == null ? {} : mark.data) as {
+            ts?: unknown;
+            thread_id?: unknown;
+          };
+          if (data.thread_id === '') continue;
+          await setReceipt(
+            server,
+            roomId,
+            userId,
+            'm.read',
+            String(eventIds[0]),
+            {
+              ts: typeof data.ts === 'number' ? data.ts : Date.now(),
+              threadId: typeof data.thread_id === 'string'
+                ? data.thread_id
+                : null,
+            },
+          );
+        }
+      });
     }
   });
 

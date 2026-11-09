@@ -102,7 +102,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
     services.push(stopRuleMigration);
     const stopNotificationHistory = await startNotificationHistory(server);
     services.push(stopNotificationHistory);
-    const federationEdus = eduState(server, tenant.serverName);
+    const federationEdus = eduState(server, tenant.serverName, store);
     const deviceLists = deviceListService(server, tenant, federationEdus);
     services.push(() => deviceLists.stop());
     const pushSender = await startPushSender({ store, tenant });

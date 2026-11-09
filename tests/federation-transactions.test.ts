@@ -101,7 +101,7 @@ async function remoteSetup(store: Store): Promise<Setup> {
     user,
     tip: String(join.event_id),
     deps: { keys: deps.keys, fetcher, self: deps.self },
-    edus: eduState(await store.server(), g.signer.serverName),
+    edus: eduState(await store.server(), g.signer.serverName, store),
   };
 }
 

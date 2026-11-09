@@ -77,7 +77,7 @@ export async function join(
         content,
         deps: {
           keys: deps.keys,
-          fetcher: productionFetcher(app.server, signer),
+          fetcher: productionFetcher(app.server, signer, app.store),
           self: serverName(),
           leave: async (attempt) => {
             await performJoinCleanup(deps, attempt);

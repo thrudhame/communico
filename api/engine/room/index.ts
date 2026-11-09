@@ -133,6 +133,7 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       after: (pos: number, limit: number) =>
         changes.changesAfter(conn, pos, limit),
       posOf: (event: string) => changes.changePosOf(conn, event),
+      redactionOf: (event: string) => changes.redactionOf(conn, event),
     },
   };
 }
