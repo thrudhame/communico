@@ -6,7 +6,11 @@ import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
-import { project, sourceOf } from '#engine/server/project.ts';
+import {
+  project,
+  sourceOf,
+  withProjectionLock,
+} from '#engine/server/project.ts';
 import { get } from '#engine/store/watermark.ts';
 import {
   advanceNotificationRead,
@@ -172,6 +176,198 @@ Deno.test('push publication: v13 migration preserves old feed and receipts witho
     const feed = await db.query('SELECT seq,event FROM feed ORDER BY seq');
     assertEquals(feed.map((r) => r.seq), [41, 42]);
     assert(feed.some((r) => r.event === fresh.eventId));
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('push upgrade: durable chunks release projection lock, interleaved live counts stay exact and restart resumes', async () => {
+  const dir = await Deno.makeTempDir();
+  const settings = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  const schemas = {
+    room: roomSchema,
+    tenant: tenantSchema,
+    server: serverSchema,
+  };
+  let store = await openStore(settings, { schemas });
+  try {
+    const tenant = await openTenant(store, 'test', { create: true });
+    await tenant.tx((tx) => tx.users.insert('bob', 'Bob'));
+    const old = await genesis(store, { roomId: '!chunk-upgrade:test' });
+    await bobJoins(old);
+    for (let i = 0; i < 501; i++) {
+      await sendLocal(old.room, {
+        type: 'm.room.message',
+        sender: old.creator,
+        content: { body: 'old ' + i, msgtype: 'm.text' },
+      }, old.signer);
+    }
+    await project(store, old.roomId);
+    const other = await genesis(store, { roomId: '!chunk-live:test' });
+    await bobJoins(other);
+    await project(store, other.roomId);
+    const fresh = await sendLocal(other.room, {
+      type: 'm.room.message',
+      sender: other.creator,
+      content: { body: 'interleaved', msgtype: 'm.text' },
+    }, other.signer);
+    let db = await store.server();
+    const cut = await get(db, sourceOf(old.roomId));
+    const page = await db.query(
+      `SELECT pos FROM event_index WHERE room=? AND standing='accepted'
+      AND grounding='grounded' ORDER BY pos LIMIT 500`,
+      [old.roomId],
+    );
+    const firstCut = Number(page.at(-1)!.pos);
+    assert(firstCut < cut);
+    const feed = await db.query(
+      'SELECT * FROM feed WHERE room=? ORDER BY seq',
+      [old.roomId],
+    );
+    await db.tx(async (tx) => {
+      await tx.execute('DELETE FROM watermarks WHERE source=?', [
+        'push-context:' + old.roomId,
+      ]);
+      await tx.execute('DELETE FROM notification_own_events WHERE room=?', [
+        old.roomId,
+      ]);
+    });
+    const originalQuery = db.query.bind(db);
+    const originalServer = store.server.bind(store);
+    store.server = () => Promise.resolve(db);
+    let visited = 0;
+    db.query = (...args: Parameters<typeof db.query>) => {
+      if (args[0].includes('SELECT event,pos,seq FROM event_index')) {
+        visited++;
+        if (visited === 2) throw new Error('interrupt next upgrade chunk');
+      }
+      return originalQuery(...args);
+    };
+    try {
+      const recovery = assertRejects(
+        () => project(store, old.roomId),
+        Error,
+        'interrupt next upgrade chunk',
+      );
+      const live = project(store, other.roomId);
+      const between = withProjectionLock(async () => {
+        assertEquals(
+          visited,
+          1,
+          'another projection gets the lock before the second upgrade page',
+        );
+        assertEquals(
+          await get(db, 'push-context:' + old.roomId),
+          firstCut,
+          'queued live projection runs after exactly one durable upgrade chunk',
+        );
+        assertEquals(
+          (await db.query('SELECT event FROM feed WHERE event=?', [
+            fresh.eventId,
+          ]))[0].event,
+          fresh.eventId,
+        );
+        const snapshot = await db.tx((tx) =>
+          notificationSnapshot(tx, '@bob:test', 0)
+        );
+        assertEquals(roomNotificationCounts(snapshot.rooms.get(other.roomId)), {
+          notification_count: 1,
+          highlight_count: 0,
+        });
+        assertEquals(roomNotificationCounts(snapshot.rooms.get(old.roomId)), {
+          notification_count: 501,
+          highlight_count: 0,
+        });
+      });
+      const results = await Promise.allSettled([recovery, live, between]);
+      for (const result of results) {
+        if (result.status === 'rejected') throw result.reason;
+      }
+    } finally {
+      db.query = originalQuery;
+      store.server = originalServer;
+    }
+    assertEquals(await get(db, 'push-context:' + old.roomId), firstCut);
+    await store.close();
+    store = await openStore(settings, { schemas });
+    db = await store.server();
+    await project(store, old.roomId);
+    assertEquals(await get(db, 'push-context:' + old.roomId), cut);
+    assertEquals(
+      await db.query('SELECT * FROM feed WHERE room=? ORDER BY seq', [
+        old.roomId,
+      ]),
+      feed,
+    );
+    assertEquals(
+      (await db.query(
+        'SELECT COUNT(*) AS n FROM notification_own_events WHERE room=?',
+        [old.roomId],
+      ))[0].n,
+      508,
+    );
+    assertEquals(
+      (await db.query(
+        'SELECT COUNT(*) AS n FROM notifications WHERE room=? AND read_ms IS NULL AND withdrawn=0',
+        [old.roomId],
+      ))[0].n,
+      501,
+    );
+    // Two callers for this same room cooperate on its seed. Neither can move
+    // the normal watermark past missing context before publishing a new event.
+    await db.execute('DELETE FROM watermarks WHERE source=?', [
+      'push-context:' + old.roomId,
+    ]);
+    const room = await openRoom(store, old.roomId);
+    const ownRoomLive = await sendLocal(room, {
+      type: 'm.room.message',
+      sender: old.creator,
+      content: { body: 'same-room live', msgtype: 'm.text' },
+    }, old.signer);
+    const seeding = project(store, old.roomId);
+    const sameRoomBoundary = withProjectionLock(async () => {
+      assertEquals(await get(db, 'push-context:' + old.roomId), firstCut);
+      assertEquals(
+        (await db.query('SELECT COUNT(*) AS n FROM feed WHERE event=?', [
+          ownRoomLive.eventId,
+        ]))[0].n,
+        0,
+        'same-room live publication waits for its complete context',
+      );
+    });
+    const sameRoomLive = project(store, old.roomId);
+    await Promise.all([seeding, sameRoomBoundary, sameRoomLive]);
+    assertEquals(
+      await get(db, 'push-context:' + old.roomId),
+      await get(db, sourceOf(old.roomId)),
+    );
+    assertEquals(
+      (await db.query(
+        'SELECT COUNT(*) AS n FROM notification_own_events WHERE room=?',
+        [old.roomId],
+      ))[0].n,
+      509,
+    );
+    assertEquals(
+      (await db.query(
+        'SELECT COUNT(*) AS n FROM notifications WHERE room=? AND read_ms IS NULL AND withdrawn=0',
+        [old.roomId],
+      ))[0].n,
+      502,
+    );
+    assertEquals(
+      (await db.query('SELECT COUNT(*) AS n FROM notifications WHERE event=?', [
+        ownRoomLive.eventId,
+      ]))[0].n,
+      1,
+    );
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
