@@ -226,3 +226,8 @@ ungroundedmillihours = 256000
 # a retried transaction gets the same answer, hours (a cache, not an
 # obligation). COMMUNICO_FEDERATION_TXNHOURS
 txnhours = 24
+[push]
+# Read notification listing history in days. 0 removes entries when read.
+# Unread notifications and reconciliation facts are retained independently.
+# COMMUNICO_PUSH_READRETENTIONDAYS
+readretentiondays = 30

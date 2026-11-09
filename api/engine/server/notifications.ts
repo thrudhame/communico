@@ -3,6 +3,10 @@
 import type { Conn, Database } from '#engine/store/db.ts';
 import type { PushPublication } from '#engine/server/push-project.ts';
 import {
+  pruneNotificationHistory,
+  syncNotificationHistory,
+} from './notification-history.ts';
+import {
   receiptRelationPending,
   receiptTargetInThread,
   threadOfEvent,
@@ -28,6 +32,7 @@ export async function removeNotificationFacts(
       'notification_receipt_refs',
       'notification_changes',
       'notification_own_events',
+      'notification_history',
     ]
   ) {
     await tx.execute(`DELETE FROM ${table} WHERE ${column}=?`, [value]);
@@ -140,6 +145,13 @@ export async function advanceNotificationRead(
       -Number(row.n),
       -Number(row.h),
     );
+  }
+  if (affected.length) {
+    await tx.execute(
+      'UPDATE notification_history SET read_ms=(SELECT read_ms FROM notifications WHERE seq=notification_history.seq) WHERE user=? AND room=?',
+      [user, room],
+    );
+    await pruneNotificationHistory(tx, now);
   }
 }
 
@@ -269,6 +281,7 @@ export async function reconcileNotificationEvent(
           Number(row.seq),
         ],
       );
+      await syncNotificationHistory(tx, Number(row.seq), now);
       await delta(
         tx,
         user,
@@ -396,6 +409,7 @@ async function applyDecisions(
         input.decision.highlight ? 1 : 0,
       );
     }
+    await syncNotificationHistory(tx, notificationSeq, now);
   }
 }
 
@@ -415,6 +429,10 @@ export async function withdrawInvitePush(
   if (!rows.length) return;
   await tx.execute(
     'UPDATE notifications SET withdrawn=1 WHERE user=? AND room=? AND event=?',
+    [user, room, event],
+  );
+  await tx.execute(
+    'DELETE FROM notification_history WHERE seq IN (SELECT seq FROM notifications WHERE user=? AND room=? AND event=?)',
     [user, room, event],
   );
   for (const row of rows) {

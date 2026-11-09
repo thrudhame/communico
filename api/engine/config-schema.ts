@@ -37,6 +37,9 @@ export const SCHEMA = {
     maxbackupversions: 'int',
     maxbackupbytes: 'int',
   },
+  push: {
+    readretentiondays: 'int',
+  },
   store: {
     dir: 'string',
     library: 'string',

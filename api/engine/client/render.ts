@@ -17,6 +17,33 @@ export type Viewer = {
   tenant?: Tenant;
 };
 
+function clientShape(pdu: Pdu, eventId: string): Record<string, unknown> {
+  const event: Record<string, unknown> = {
+    event_id: eventId,
+    type: pdu.type,
+    sender: pdu.sender,
+    content: pdu.content ?? {},
+    origin_server_ts: pdu.origin_server_ts,
+  };
+  if (pdu.state_key != null) event.state_key = pdu.state_key;
+  if (pdu.redacts != null) event.redacts = pdu.redacts;
+  return event;
+}
+
+/** Only the authoritative pending OOB invite owner may call this boundary.
+ * It exposes the viewer's own invite, never arbitrary stripped-state PDUs. */
+export function renderInviteNotification(
+  pdu: Pdu,
+  eventId: string,
+  viewer: Viewer,
+): Record<string, unknown> | null {
+  if (
+    pdu.type !== 'm.room.member' || pdu.state_key !== viewer.userId ||
+    pdu.content?.membership !== 'invite'
+  ) return null;
+  return clientShape(pdu, eventId);
+}
+
 export async function renderEvent(
   room: Room,
   eventId: string,
@@ -65,13 +92,7 @@ export async function renderStateEvent(
     pdu as unknown as Record<string, unknown>,
     version,
   ) as unknown as Pdu;
-  const event: Record<string, unknown> = {
-    event_id: eventId,
-    type: shown.type,
-    sender: shown.sender,
-    content: shown.content ?? {},
-    origin_server_ts: shown.origin_server_ts,
-  };
+  const event = clientShape(shown, eventId);
   if (opts?.omitRoomId !== true) event.room_id = room.id;
   if (shown.state_key != null) event.state_key = shown.state_key;
   if (shown.redacts != null) event.redacts = shown.redacts;

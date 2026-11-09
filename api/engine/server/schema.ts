@@ -328,8 +328,17 @@ CREATE INDEX notifications_event ON notifications(event,room);
 CREATE INDEX notification_receipt_refs_event ON notification_receipt_refs(event,room);
 `;
 
+const NOTIFICATION_HISTORY_SQL = `
+CREATE TABLE notification_history(seq INTEGER PRIMARY KEY NOT NULL,user TEXT NOT NULL,room TEXT NOT NULL,highlight INTEGER NOT NULL,read_ms INTEGER);
+CREATE INDEX notification_history_user ON notification_history(user,seq);
+CREATE INDEX notification_history_highlight ON notification_history(user,highlight,seq);
+CREATE INDEX notification_history_room ON notification_history(room,seq);
+CREATE INDEX notification_history_retention ON notification_history(read_ms,seq);
+INSERT INTO notification_history SELECT seq,user,room,highlight,read_ms FROM notifications WHERE withdrawn=0;
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 16,
+  version: 17,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -345,6 +354,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(NOTIFICATIONS_SQL);
     await db.exec(HISTORY_RELATIONS_SQL);
     await db.exec(NOTIFICATION_LOOKUPS_SQL);
+    await db.exec(NOTIFICATION_HISTORY_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -360,5 +370,6 @@ export const serverSchema: SchemaProvider = {
     13: (conn) => conn.exec(NOTIFICATIONS_SQL),
     14: (conn) => conn.exec(HISTORY_RELATIONS_SQL),
     15: (conn) => conn.exec(NOTIFICATION_LOOKUPS_SQL),
+    16: (conn) => conn.exec(NOTIFICATION_HISTORY_SQL),
   },
 };

@@ -20,6 +20,7 @@ const tables = [
   'notification_receipt_refs',
   'notification_changes',
   'notification_own_events',
+  'notification_history',
 ];
 
 async function setup(store: Store) {

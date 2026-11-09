@@ -1,4 +1,5 @@
 import { assertEquals } from '@std/assert';
+import { setConfigForTests } from '#engine/config.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
@@ -20,6 +21,7 @@ import { fakeMessage, makeFakeRoom } from '#tests/fixtures/remote-room.ts';
 import { testRemoteServer, testSigner } from '#tests/fixtures/signer.ts';
 
 Deno.test('push reconciliation: a history parent moves only existing live decisions; redaction reapplies horizons and survives reopen', async () => {
+  setConfigForTests({ push: { readretentiondays: 0 } });
   const dir = await Deno.makeTempDir();
   const config = {
     dir,
@@ -142,6 +144,13 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
     assertEquals(await counts(), {
       unread_notifications: c(0),
     });
+    assertEquals(
+      await db.query(
+        'SELECT 1 FROM notification_history WHERE seq IN (SELECT seq FROM notifications WHERE user=? AND event=?)',
+        ['@bob:test', child.event_id!],
+      ),
+      [],
+    );
     deps.fetcher = fakeFetcher({
       backfill: (from, limit) => fr.backfillPdus(from, limit),
     }).fetcher;
@@ -159,6 +168,13 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
       unread_notifications: c(0),
       unread_thread_notifications: { [root.event_id!]: c(1, 1) },
     });
+    assertEquals(
+      (await db.query(
+        'SELECT 1 FROM notification_history WHERE seq IN (SELECT seq FROM notifications WHERE user=? AND event=?)',
+        ['@bob:test', child.event_id!],
+      )).length,
+      1,
+    );
     assertEquals(
       (await relationsOf(db, fr.roomId, root.event_id!)).length,
       0,
@@ -186,6 +202,13 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
       unread_notifications: c(0),
     });
     assertEquals(await threadOfEvent(db, fr.roomId, child.event_id!), 'main');
+    assertEquals(
+      await db.query(
+        'SELECT 1 FROM notification_history WHERE seq IN (SELECT seq FROM notifications WHERE user=? AND event=?)',
+        ['@bob:test', child.event_id!],
+      ),
+      [],
+    );
     await store.close();
     store = await openStore(config, { schemas });
     db = await store.server();
@@ -201,6 +224,7 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
       1,
     );
   } finally {
+    setConfigForTests({});
     await store.close();
     await Deno.remove(dir, { recursive: true });
   }

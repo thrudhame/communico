@@ -16,6 +16,9 @@ name = "localhost"
 port = 8008
 shutdowngraceseconds = 10
 
+[push]
+readretentiondays = 30
+
 [admin]
 socket = ""
 
@@ -633,7 +636,32 @@ Deno.test('--shell printer quoting', async () => {
   );
 });
 
-Deno.test('60 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('push retention is layered, accepts zero and rejects negative days', async () => {
+  const dir = await writeTree({
+    'defaults/communico.toml': FULL,
+    'config/communico.toml': '[push]\nreadretentiondays = 7\n',
+  });
+  const opts = {
+    defaultsPath: `${dir}/defaults/communico.toml`,
+    configPath: `${dir}/config/communico.toml`,
+    env: {},
+  };
+  assertEquals(loadConfig(opts).config.push.readretentiondays, 7);
+  assertEquals(
+    loadConfig({ ...opts, env: { COMMUNICO_PUSH_READRETENTIONDAYS: '0' } })
+      .config.push.readretentiondays,
+    0,
+  );
+  assert(
+    loadFail({ ...opts, env: { COMMUNICO_PUSH_READRETENTIONDAYS: '-1' } }).some(
+      (problem) =>
+        problem.includes('push.readretentiondays') &&
+        problem.includes('expected >= 0'),
+    ),
+  );
+});
+
+Deno.test('61 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -653,14 +681,15 @@ Deno.test('60 leaves total across the sections (the surface tripwire)', async ()
     ['media', 2],
     ['encryption', 3],
     ['e2ee', 9],
+    ['push', 1],
     ['store', 5],
     ['preview', 4],
     ['federation', 33],
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    60,
-    'the whole config surface is 60 leaves, including encryption policy',
+    61,
+    'the whole config surface is 61 leaves, including push retention',
   );
 });
 

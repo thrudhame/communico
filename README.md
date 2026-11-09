@@ -144,6 +144,26 @@ restored. [complement/BASELINE.md](complement/BASELINE.md) records the
 recorded evidence, not an all-green conformance claim. Exclusion rationales
 remain in [complement/blacklist.md](complement/blacklist.md).
 
+## Notification history
+
+Push rules evaluate live events, including encrypted envelopes, independently of
+pusher registration or gateway delivery. `/sync` reports exact room/thread
+notification counts. Public/private receipts clear only their applicable scope;
+`m.fully_read` alone does not clear notifications. Encrypted mentions hidden in
+ciphertext cannot contribute server-side highlights.
+
+`GET /_matrix/client/v3/notifications` lists the authenticated account's saved
+decisions, newest first, with `from`, `limit` (default 50, maximum 100) and
+`only=highlight`. Events use ordinary viewer-aware client rendering; ciphertext
+is not decrypted. Redacted or withdrawn entries are not listed.
+
+`[push] readretentiondays` defaults to 30; 0 deletes listing entries as soon as
+they are read. Unread entries do not expire. Minimal projection facts remain so
+late thread relations can reconcile exact counts and restore newly unread
+entries without re-evaluating rules or issuing historical alerts. Retention
+runs on startup, periodically and when listing; zero-day receipt effects commit
+immediately. This is separate from event storage and gateway delivery.
+
 ## Operator tools
 
 The tools require the server to be running with the same configuration. They
