@@ -39,6 +39,9 @@ async function rollForward(store: StartupStore): Promise<void> {
   await server.execute(
     "DELETE FROM watermarks WHERE source LIKE 'room:%' AND NOT EXISTS (SELECT 1 FROM rooms WHERE room_id = substr(watermarks.source,6))",
   );
+  await server.execute(
+    "DELETE FROM watermarks WHERE source LIKE 'push-context:%' AND NOT EXISTS (SELECT 1 FROM rooms WHERE room_id = substr(watermarks.source,14))",
+  );
   for (const roomId of await listRooms(concrete)) {
     await project(concrete, roomId);
   }

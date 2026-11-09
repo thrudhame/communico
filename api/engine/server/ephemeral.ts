@@ -3,7 +3,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
-import { isJoined } from '#engine/server/read.ts';
+import { isJoined, receiptTargetInThread } from '#engine/server/read.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
 
 export type PresenceRow = {
@@ -169,7 +169,8 @@ export async function setReceipt(
   userId: string,
   receiptType: 'm.read' | 'm.read.private',
   eventId: string,
-  opts: { ts?: number; threadId?: string | null } = {},
+  opts: { ts?: number; threadId?: string | null; requireRelated?: boolean } =
+    {},
 ): Promise<boolean> {
   const ts = opts.ts ?? Date.now();
   const threadId = opts.threadId ?? null;
@@ -182,6 +183,18 @@ export async function setReceipt(
   }
   const row = await eventStreamTx(server, async (tx) => {
     if (!await isJoined(tx, roomId, userId)) return null;
+    // Local API admission and read effects share the same relation snapshot.
+    // Inbound EDUs may reference targets not held yet and retain their identity.
+    if (
+      opts.requireRelated && threadId !== null &&
+      !await receiptTargetInThread(tx, roomId, eventId, threadId)
+    ) {
+      throw new MatrixError(
+        400,
+        'M_INVALID_PARAM',
+        'event_id is not related to the given thread',
+      );
+    }
     const seq = await next(tx, 'receipts');
     await tx.execute(
       `INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_id,ts_ms,seq) VALUES(?,?,?,?,?,?,?)

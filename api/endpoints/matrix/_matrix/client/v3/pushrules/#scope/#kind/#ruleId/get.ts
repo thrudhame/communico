@@ -11,6 +11,7 @@ export default async function (
   assertScopeKind(
     request.params.scope as string,
     request.params.kind as string,
+    'read',
   );
   return await getRule(
     theApp().tenant,

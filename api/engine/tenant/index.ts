@@ -25,7 +25,7 @@ import type { SigningUpload } from '#engine/e2ee-signing.ts';
 import { config } from '#engine/config.ts';
 import * as todevice from '#engine/tenant/todevice.ts';
 import type { StreamToken } from '#engine/client/tokens.ts';
-import { tenantE2eeCommitted } from '#engine/tenant/hooks.ts';
+import { tenantCommitted } from '#engine/tenant/hooks.ts';
 import * as filters from '#engine/tenant/filters.ts';
 import * as media from '#engine/tenant/media.ts';
 import * as pushers from '#engine/tenant/pushers.ts';
@@ -104,11 +104,11 @@ type IdentityRow = {
 function bind(
   conn: Conn,
   changed: () => void = () => {},
-  e2eeChanged: () => void = () => {},
+  projectionChanged: () => void = () => {},
 ) {
   const mutation = async <T>(operation: Promise<T>): Promise<T> => {
     const value = await operation;
-    e2eeChanged();
+    projectionChanged();
     return value;
   };
   return {
@@ -299,7 +299,7 @@ function bind(
       setAvatarUrl: (localpart: string, url: string | null) =>
         users.setUserAvatarUrl(conn, localpart, url),
       markDeactivated: (localpart: string) =>
-        users.markDeactivated(conn, localpart),
+        mutation(users.markDeactivated(conn, localpart)),
     },
     credentials: {
       set: (localpart: string, phc: string) =>
@@ -610,18 +610,22 @@ export async function openTenant(
       },
     }),
     tx: async (fn) => {
-      const { result, changed, e2eeChanged } = await db.tx(async (conn) => {
-        let changed = false;
-        let e2eeChanged = false;
-        const result = await fn(bind(conn, () => {
-          changed = true;
-        }, () => {
-          e2eeChanged = true;
-        }));
-        return { result, changed, e2eeChanged };
-      });
-      if (e2eeChanged) await tenantE2eeCommitted(store, serverName);
-      if (changed || e2eeChanged) tenantStreamCommitted(store, serverName);
+      const { result, changed, projectionChanged } = await db.tx(
+        async (conn) => {
+          let changed = false;
+          let projectionChanged = false;
+          const result = await fn(bind(conn, () => {
+            changed = true;
+          }, () => {
+            projectionChanged = true;
+          }));
+          return { result, changed, projectionChanged };
+        },
+      );
+      if (projectionChanged) await tenantCommitted(store, serverName);
+      if (changed || projectionChanged) {
+        tenantStreamCommitted(store, serverName);
+      }
       return result;
     },
   };

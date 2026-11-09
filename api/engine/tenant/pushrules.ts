@@ -25,8 +25,13 @@ export {
 
 // The /pushrules path validation shared by the endpoint files (the
 // endpoints tree carries route files only): scope must be `global`
-// (pushrules.yaml defines no other), kind one of the five.
-export function assertScopeKind(scope: string, kind: string): void {
+// (pushrules.yaml defines no other). Reads of unsupported kinds name absent
+// resources; writes may only use the supported catalog kinds.
+export function assertScopeKind(
+  scope: string,
+  kind: string,
+  operation: 'read' | 'write' = 'write',
+): void {
   if (scope !== 'global') {
     throw new MatrixError(
       400,
@@ -35,6 +40,9 @@ export function assertScopeKind(scope: string, kind: string): void {
     );
   }
   if (!(PUSH_KINDS as readonly string[]).includes(kind)) {
+    if (operation === 'read') {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'The push rule was not found.');
+    }
     throw new MatrixError(400, 'M_INVALID_PARAM', 'unknown rule kind: ' + kind);
   }
 }

@@ -2,6 +2,8 @@
 import { assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
 import { eduQueues } from '#engine/federation/edus.ts';
+import { theApp } from '#engine/app.ts';
+import { threadOfEvent } from '#engine/server/read.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP threaded receipts');
@@ -154,6 +156,11 @@ suite.test('thread roots and their non-thread relations stay on main; reply rela
   await noBody.arrayBuffer();
   const onReply = await f.send('reaction-to-reply', f.reply, 'm.annotation');
   const onRoot = await f.send('reaction-to-root', f.root, 'm.annotation');
+  const indirectRoot = await f.send(
+    'reaction-to-root-relation',
+    onRoot,
+    'm.annotation',
+  );
   for (
     const [event, thread] of [[f.root, 'main'], [onRoot, 'main'], [
       f.reply,
@@ -161,12 +168,21 @@ suite.test('thread roots and their non-thread relations stay on main; reply rela
     ], [onReply, f.root]]
   ) {
     await ok(f.receipt(event), f.a.access_token!, { thread_id: thread });
+    assertEquals(await threadOfEvent(theApp().server, f.room, event), thread);
+  }
+  for (const event of [f.root, onRoot, indirectRoot]) {
+    assertEquals(await threadOfEvent(theApp().server, f.room, event), 'main');
+    for (const type of ['m.read', 'm.read.private']) {
+      await ok(f.receipt(event, type), f.a.access_token!, {
+        thread_id: f.root,
+      });
+    }
   }
   for (
-    const [event, thread] of [[f.root, f.root], [f.reply, 'main'], [
-      onRoot,
-      f.root,
-    ], [f.reply, f.otherRoot]]
+    const [event, thread] of [[f.reply, 'main'], [f.otherRoot, f.root], [
+      f.reply,
+      f.otherRoot,
+    ]]
   ) {
     const result = await call(f.receipt(event), f.a.access_token!, {
       thread_id: thread,

@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
+import { TENANT_V12 } from '#tests/fixtures/tenant-v12.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
@@ -85,7 +86,7 @@ Deno.test('cross-signing: v9 upgrade, restart and owner-only change replay prese
   const previous = {
     version: 9,
     apply: async (db: Parameters<typeof tenantSchema.apply>[0]) => {
-      await tenantSchema.apply(db);
+      await db.exec(TENANT_V12);
       await db.exec(
         'DROP TABLE backup_sessions; DROP TABLE backup_versions; DROP TABLE key_signatures; DROP TABLE cross_signing_keys',
       );
@@ -191,7 +192,7 @@ Deno.test('cross-signing: v9 upgrade, restart and owner-only change replay prese
       (await (await store.tenant('a.test')).query(
         "SELECT v FROM meta WHERE k='schema_version'",
       ))[0].v,
-      '12',
+      String(tenantSchema.version),
     );
   } finally {
     await store.close();

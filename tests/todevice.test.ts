@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
+import { TENANT_V12 } from '#tests/fixtures/tenant-v12.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
@@ -44,7 +45,7 @@ Deno.test('E2 v5 upgrade preserves accepted keys and credentials while adding in
   const previous = {
     version: 5,
     apply: async (db: Parameters<typeof tenantSchema.apply>[0]) => {
-      await tenantSchema.apply(db);
+      await db.exec(TENANT_V12);
       for (
         const table of [
           'to_device_inbox',
@@ -86,7 +87,7 @@ Deno.test('E2 v5 upgrade preserves accepted keys and credentials while adding in
     assertEquals(
       (await upgraded.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '12',
+      String(tenantSchema.version),
     );
   } finally {
     await store.close();
@@ -201,7 +202,7 @@ Deno.test('E2 inbox survives reopen and concurrent/out-of-order issued cuts cann
     const raw = await store.tenant('a.test');
     assertEquals(
       (await raw.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-      '12',
+      String(tenantSchema.version),
     );
     assert(await tenant.tx((tx) => tx.toDevice.head()) >= 3);
   } finally {

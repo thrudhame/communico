@@ -18,7 +18,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { feedAfter, roomsFor } from '#engine/server/read.ts';
 import {
   notificationSnapshot,
-  roomNotificationCounts,
+  syncNotificationCounts,
 } from '#engine/server/notifications.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
@@ -87,7 +87,7 @@ async function roomTimeline(
   snapshot: {
     receipts: Record<string, unknown>[];
     members: Row[];
-    unread: ReturnType<typeof roomNotificationCounts>;
+    notifications: ReturnType<typeof syncNotificationCounts>;
   },
 ) {
   const app = theApp();
@@ -180,7 +180,7 @@ async function roomTimeline(
     },
     ephemeral: { events: [] },
     account_data: { events: [] },
-    unread_notifications: snapshot.unread,
+    ...snapshot.notifications,
   };
   if (summary) {
     const ephemeral: Record<string, unknown>[] = [];
@@ -502,8 +502,9 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       !left,
       {
         ...snapshot.rooms.get(m.roomId)!,
-        unread: roomNotificationCounts(
+        notifications: syncNotificationCounts(
           snapshot.notifications.rooms.get(m.roomId),
+          i.filter.timeline.unread_thread_notifications === true,
         ),
       },
     );

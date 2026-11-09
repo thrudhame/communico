@@ -1,5 +1,6 @@
 import { assertEquals } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
+import { TENANT_V12 } from '#tests/fixtures/tenant-v12.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { config } from '#engine/config.ts';
 import { signingUpload } from '#engine/e2ee-signing.ts';
@@ -27,7 +28,7 @@ Deno.test('signature overlays: real v10 upgrade and reopen retain verified publi
       tenant: {
         version: 10,
         apply: async (db) => {
-          await tenantSchema.apply(db);
+          await db.exec(TENANT_V12);
           await db.exec(
             'DROP TABLE backup_sessions; DROP TABLE backup_versions; DROP TABLE key_signatures',
           );

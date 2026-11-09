@@ -15,6 +15,7 @@ export interface EventFilter {
   types?: string[];
   not_types?: string[];
   lazy_load_members?: boolean;
+  unread_thread_notifications?: boolean;
 }
 
 export interface RoomFilter {
@@ -104,6 +105,13 @@ export function validateFilterDocument(raw: unknown): void {
   for (const section of ['timeline', 'state', 'ephemeral', 'account_data']) {
     checkSection(room[section], 'room.' + section);
   }
+  const timeline = room.timeline as Record<string, unknown> | undefined;
+  if (
+    timeline?.unread_thread_notifications !== undefined &&
+    typeof timeline.unread_thread_notifications !== 'boolean'
+  ) {
+    throw bad('room.timeline.unread_thread_notifications is not a boolean');
+  }
 }
 
 function eventFilterOf(raw: unknown): EventFilter {
@@ -126,6 +134,9 @@ function eventFilterOf(raw: unknown): EventFilter {
   }
   if (typeof r.lazy_load_members === 'boolean') {
     out.lazy_load_members = r.lazy_load_members;
+  }
+  if (typeof r.unread_thread_notifications === 'boolean') {
+    out.unread_thread_notifications = r.unread_thread_notifications;
   }
   return out;
 }

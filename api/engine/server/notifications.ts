@@ -2,10 +2,37 @@
 // connection, committing with live publication or the receipt that caused them.
 import type { Conn, Database } from '#engine/store/db.ts';
 import type { PushPublication } from '#engine/server/push-project.ts';
-import { threadOfEvent } from '#engine/server/read.ts';
+import {
+  receiptRelationPending,
+  receiptTargetInThread,
+  threadOfEvent,
+} from '#engine/server/read.ts';
 
 type Reader = Pick<Database, 'query'>;
 export type Counts = { notification_count: number; highlight_count: number };
+
+/** The lifecycle owners retire the complete projection, not just its summaries.
+ * Runs in their server transaction so replay cannot retain orphaned read facts. */
+export async function removeNotificationFacts(
+  tx: Conn,
+  scope: { room: string } | { user: string },
+): Promise<void> {
+  const column = 'room' in scope ? 'room' : 'user';
+  const value = 'room' in scope ? scope.room : scope.user;
+  for (
+    const table of [
+      'push_evaluations',
+      'notifications',
+      'notification_counts',
+      'notification_horizons',
+      'notification_receipt_refs',
+      'notification_changes',
+      'notification_own_events',
+    ]
+  ) {
+    await tx.execute(`DELETE FROM ${table} WHERE ${column}=?`, [value]);
+  }
+}
 
 async function next(tx: Conn): Promise<number> {
   await tx.execute(
@@ -53,17 +80,37 @@ export async function advanceNotificationRead(
   now: number,
 ): Promise<void> {
   const rows = await tx.query(
-    'SELECT seq FROM event_index WHERE room=? AND event=? AND seq IS NOT NULL',
-    [room, event],
+    'SELECT room,seq,standing,grounding FROM event_index WHERE event=?',
+    [event],
   );
-  if (!rows.length) {
+  const target = rows[0];
+  const pending = target === undefined ||
+    (target.room === room && target.standing === 'accepted' &&
+      target.grounding !== 'grounded');
+  const invalidScope = target !== undefined && target.room === room &&
+    target.seq !== null && scope !== '' &&
+    !await receiptTargetInThread(tx, room, event, scope);
+  if (
+    pending || (invalidScope && await receiptRelationPending(tx, room, event))
+  ) {
     await tx.execute(
       'INSERT INTO notification_receipt_refs(user,room,scope,event) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
       [user, room, scope, event],
     );
     return;
   }
-  const seq = Number(rows[0].seq);
+  await tx.execute(
+    'DELETE FROM notification_receipt_refs WHERE user=? AND room=? AND scope=? AND event=?',
+    [user, room, scope, event],
+  );
+  // Known history has no live-order position. A wrong-room, rejected or
+  // unrelated target cannot borrow another event's cut or leave a pending ref.
+  if (
+    target.room !== room || target.seq === null ||
+    target.standing !== 'accepted' || target.grounding !== 'grounded' ||
+    invalidScope
+  ) return;
+  const seq = Number(target.seq);
   await tx.execute(
     `INSERT INTO notification_horizons(user,room,scope,event_seq) VALUES(?,?,?,?)
     ON CONFLICT(user,room,scope) DO UPDATE SET event_seq=MAX(event_seq,excluded.event_seq)`,
@@ -106,24 +153,9 @@ export async function applyPushPublication(
   now: number,
 ): Promise<void> {
   const thread = await threadOfEvent(tx, room, event);
-  // Resolve receipts that arrived before this target was projected.
-  const pending = await tx.query(
-    'SELECT user,scope FROM notification_receipt_refs WHERE room=? AND event=?',
-    [room, event],
-  );
-  for (const row of pending) {
-    await advanceNotificationRead(
-      tx,
-      String(row.user),
-      room,
-      String(row.scope),
-      event,
-      now,
-    );
-  }
   await tx.execute(
-    'DELETE FROM notification_receipt_refs WHERE room=? AND event=?',
-    [room, event],
+    'INSERT INTO notification_own_events(room,event,user,event_seq) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
+    [room, event, publication.sender, eventSeq],
   );
   // Own events never notify; they implicitly read only their classified bucket.
   await advanceNotificationRead(
@@ -145,6 +177,118 @@ export async function applyPushPublication(
     thread,
     'room',
   );
+}
+
+/** An edge's arrival or redaction can affect only itself and descendants within
+ * the shared classifier's three-hop bound. Reconcile saved decisions, never
+ * evaluate history or publish a second alert. All effects share projection's tx. */
+export async function reconcileNotificationEvent(
+  tx: Conn,
+  room: string,
+  event: string,
+  now: number,
+): Promise<void> {
+  const affected = new Set([event]);
+  let frontier = [event];
+  for (let hop = 0; hop < 3 && frontier.length; hop++) {
+    const next: string[] = [];
+    for (const parent of frontier) {
+      const children = await tx.query(
+        'SELECT event FROM relations WHERE room=? AND relates_to=?',
+        [room, parent],
+      );
+      for (const row of children) {
+        const child = String(row.event);
+        if (!affected.has(child)) {
+          affected.add(child);
+          next.push(child);
+        }
+      }
+    }
+    frontier = next;
+  }
+  for (const target of affected) {
+    const pending = await tx.query(
+      'SELECT user,scope FROM notification_receipt_refs WHERE room=? AND event=?',
+      [room, target],
+    );
+    for (const row of pending) {
+      await advanceNotificationRead(
+        tx,
+        String(row.user),
+        room,
+        String(row.scope),
+        target,
+        now,
+      );
+    }
+    // An event ID resolves only in its actual room, even if an earlier receipt
+    // claimed another room before the event was held.
+    await tx.execute(
+      'DELETE FROM notification_receipt_refs WHERE event=? AND room<>? AND EXISTS (SELECT 1 FROM event_index WHERE event=?)',
+      [target, room, target],
+    );
+    const thread = await threadOfEvent(tx, room, target);
+    const own = await tx.query(
+      'SELECT user FROM notification_own_events WHERE room=? AND event=?',
+      [room, target],
+    );
+    for (const row of own) {
+      await advanceNotificationRead(
+        tx,
+        String(row.user),
+        room,
+        thread,
+        target,
+        now,
+      );
+    }
+    const redacted = (await tx.query(
+      'SELECT 1 FROM redactions WHERE room=? AND target=?',
+      [room, target],
+    )).length > 0;
+    const rows = await tx.query(
+      'SELECT seq,user,thread,event_seq,highlight,read_ms FROM notifications WHERE room=? AND event=? AND withdrawn=0',
+      [room, target],
+    );
+    for (const row of rows) {
+      if (!redacted && row.thread === thread) continue;
+      const user = String(row.user);
+      const priorUnread = row.read_ms === null;
+      const horizon = (await tx.query(
+        "SELECT MAX(event_seq) AS m FROM notification_horizons WHERE user=? AND room=? AND scope IN ('',?)",
+        [user, room, thread],
+      ))[0].m;
+      const read = Number(horizon ?? 0) >= Number(row.event_seq);
+      await tx.execute(
+        'UPDATE notifications SET thread=?,withdrawn=?,read_ms=? WHERE seq=?',
+        [
+          thread,
+          redacted ? 1 : 0,
+          read ? Number(row.read_ms ?? now) : null,
+          Number(row.seq),
+        ],
+      );
+      await delta(
+        tx,
+        user,
+        room,
+        String(row.thread),
+        priorUnread ? -1 : 0,
+        priorUnread ? -Number(row.highlight) : 0,
+      );
+      if (!redacted) {
+        await delta(
+          tx,
+          user,
+          room,
+          thread,
+          read ? 0 : 1,
+          read ? 0 : Number(row.highlight),
+        );
+      }
+    }
+  }
 }
 
 /** OOB events share recipient/event uniqueness with later held-room truth. */
@@ -220,9 +364,13 @@ async function applyDecisions(
       [input.user, room, thread],
     );
     const read = Number(horizons[0].m ?? 0) >= eventSeq;
+    const withdrawn = (await tx.query(
+      'SELECT 1 FROM redactions WHERE room=? AND target=?',
+      [room, event],
+    )).length > 0;
     const notificationSeq = await next(tx);
     await tx.execute(
-      `INSERT INTO notifications(seq,tenant,user,event,room,event_seq,thread,actions,highlight,created_ms,read_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO notifications(seq,tenant,user,event,room,event_seq,thread,actions,highlight,created_ms,read_ms,withdrawn) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         notificationSeq,
         input.tenant,
@@ -235,9 +383,10 @@ async function applyDecisions(
         input.decision.highlight ? 1 : 0,
         now,
         read ? now : null,
+        withdrawn ? 1 : 0,
       ],
     );
-    if (!read) {
+    if (!read && !withdrawn) {
       await delta(
         tx,
         input.user,
@@ -317,4 +466,26 @@ export function roomNotificationCounts(
     total.highlight_count += count.highlight_count;
   }
   return total;
+}
+
+/** Split sync is another view of the same exact buckets. Empty thread maps are
+ * omitted per sync.yaml; the room and its numeric main zero still clear counts. */
+export function syncNotificationCounts(
+  buckets: Map<string, Counts> | undefined,
+  threaded: boolean,
+): {
+  unread_notifications: Counts;
+  unread_thread_notifications?: Record<string, Counts>;
+} {
+  if (!threaded) {
+    return { unread_notifications: roomNotificationCounts(buckets) };
+  }
+  const threads = [...buckets ?? []].filter(([thread]) => thread !== 'main');
+  return {
+    unread_notifications: buckets?.get('main') ??
+      { notification_count: 0, highlight_count: 0 },
+    ...(threads.some(([, counts]) => counts.notification_count > 0)
+      ? { unread_thread_notifications: Object.fromEntries(threads) }
+      : {}),
+  };
 }

@@ -4,7 +4,7 @@ let project: ((store: Store, tenant: string) => Promise<void>) | undefined;
 export function setTenantProjector(fn: typeof project): void {
   project = fn;
 }
-export async function tenantE2eeCommitted(
+export async function tenantCommitted(
   store: Store,
   tenant: string,
 ): Promise<void> {

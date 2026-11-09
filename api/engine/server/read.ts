@@ -200,12 +200,12 @@ export async function relationsOf(
   const rows = relType === undefined
     ? await db.query(
       `SELECT event, rel_type, seq FROM relations
-       WHERE room = ? AND relates_to = ? ORDER BY seq ASC`,
+       WHERE room = ? AND relates_to = ? AND seq IS NOT NULL ORDER BY seq ASC`,
       [roomId, eventId],
     )
     : await db.query(
       `SELECT event, rel_type, seq FROM relations
-       WHERE room = ? AND relates_to = ? AND rel_type = ? ORDER BY seq ASC`,
+       WHERE room = ? AND relates_to = ? AND rel_type = ? AND seq IS NOT NULL ORDER BY seq ASC`,
       [roomId, eventId, relType],
     );
   return rows.map((row) => ({
@@ -217,7 +217,7 @@ export async function relationsOf(
 
 export async function threadRootsOf(db: Db, roomId: string) {
   const rows = await db.query(
-    "SELECT relates_to,MAX(seq) AS latest FROM relations WHERE room=? AND rel_type='m.thread' GROUP BY relates_to ORDER BY latest DESC",
+    "SELECT relates_to,MAX(seq) AS latest FROM relations WHERE room=? AND rel_type='m.thread' AND seq IS NOT NULL GROUP BY relates_to ORDER BY latest DESC",
     [roomId],
   );
   return rows.map((r) => ({
@@ -226,7 +226,25 @@ export async function threadRootsOf(db: Db, roomId: string) {
   }));
 }
 
-/** Receipt membership follows at most three relation hops. Roots themselves
+async function parentRelation(
+  db: Pick<Db, 'query'>,
+  room: string,
+  event: string,
+) {
+  const rows = await db.query(
+    `SELECT r.relates_to, r.rel_type FROM relations r
+     JOIN event_index p ON p.event=r.relates_to AND p.room=r.room
+     JOIN event_index e ON e.event=r.event AND e.room=r.room
+     WHERE r.room=? AND r.event=?
+     AND e.standing='accepted' AND e.grounding='grounded'
+     AND p.standing='accepted' AND p.grounding='grounded'
+     AND NOT EXISTS (SELECT 1 FROM redactions WHERE room=r.room AND target=r.event)`,
+    [room, event],
+  );
+  return rows[0];
+}
+
+/** Notification membership follows at most three relation hops. Roots themselves
  * and non-thread relations to roots are on main; participation is separate. */
 export async function threadOfEvent(
   db: Pick<Db, 'query'>,
@@ -237,18 +255,70 @@ export async function threadOfEvent(
   let current = eventId;
   for (let hops = 0; hops < 3 && !visited.has(current); hops++) {
     visited.add(current);
-    const rows = await db.query(
-      `SELECT r.relates_to, r.rel_type FROM relations r
-       JOIN event_index p ON p.event=r.relates_to AND p.room=r.room
-       WHERE r.room=? AND r.event=?
-       AND NOT EXISTS (SELECT 1 FROM redactions WHERE target=r.event)`,
-      [roomId, current],
-    );
-    if (rows.length === 0) return 'main';
-    if (rows[0].rel_type === 'm.thread') return String(rows[0].relates_to);
-    current = String(rows[0].relates_to);
+    const parent = await parentRelation(db, roomId, current);
+    if (parent === undefined) return 'main';
+    if (parent.rel_type === 'm.thread') return String(parent.relates_to);
+    current = String(parent.relates_to);
   }
   return 'main';
+}
+
+/** A read-up-to target can be related to a thread while counted on main.
+ * Scope admission is distinct from notification bucket classification. */
+export async function receiptTargetInThread(
+  db: Pick<Db, 'query'>,
+  roomId: string,
+  eventId: string,
+  threadId: string,
+): Promise<boolean> {
+  if (threadId === 'main') {
+    return await threadOfEvent(db, roomId, eventId) === 'main';
+  }
+  const visited = new Set<string>();
+  let current = eventId;
+  for (let hops = 0; hops <= 3 && !visited.has(current); hops++) {
+    if (current === threadId) {
+      return (await db.query(
+        'SELECT 1 FROM event_index WHERE room=? AND event=?',
+        [roomId, current],
+      )).length > 0;
+    }
+    if (hops === 3) break;
+    visited.add(current);
+    const parent = await parentRelation(db, roomId, current);
+    if (parent === undefined) return false;
+    current = String(parent.relates_to);
+  }
+  return false;
+}
+
+/** A missing intermediate edge target can become related later. This reports
+ * incomplete knowledge only; the shared receipt admission owns relatedness. */
+export async function receiptRelationPending(
+  db: Pick<Db, 'query'>,
+  room: string,
+  event: string,
+): Promise<boolean> {
+  const visited = new Set<string>();
+  let current = event;
+  for (let hops = 0; hops <= 3 && !visited.has(current); hops++) {
+    visited.add(current);
+    const rows = await db.query(
+      'SELECT room,standing,grounding FROM event_index WHERE event=?',
+      [current],
+    );
+    if (!rows.length) return true;
+    if (rows[0].room !== room || rows[0].standing !== 'accepted') return false;
+    if (rows[0].grounding !== 'grounded') return true;
+    if (hops === 3) break;
+    const edges = await db.query(
+      'SELECT relates_to FROM relations WHERE room=? AND event=? AND NOT EXISTS (SELECT 1 FROM redactions WHERE room=? AND target=?)',
+      [room, current, room, current],
+    );
+    if (!edges.length) return false;
+    current = String(edges[0].relates_to);
+  }
+  return false;
 }
 
 // --- search ----------------------------------------------------------------

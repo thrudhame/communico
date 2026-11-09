@@ -1,7 +1,7 @@
 // doltgres receipt entry point; client and federation share one durable writer.
 import { theApp } from '#engine/app.ts';
 import * as rows from '#engine/server/ephemeral.ts';
-import { isJoined, threadOfEvent } from '#engine/server/read.ts';
+import { isJoined } from '#engine/server/read.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 
 export async function setReceipt(
@@ -25,17 +25,11 @@ export async function setReceipt(
       );
     }
     threadId = opts.threadId;
-    if (threadId !== await threadOfEvent(server, roomId, eventId)) {
-      throw new MatrixError(
-        400,
-        'M_INVALID_PARAM',
-        'event_id is not in the given thread',
-      );
-    }
   }
   if (
     !await rows.setReceipt(server, roomId, userId, receiptType, eventId, {
       threadId,
+      requireRelated: true,
     })
   ) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);
