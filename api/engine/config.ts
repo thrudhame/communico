@@ -309,6 +309,13 @@ export function loadConfig(opts: {
   }
 
   const preview = built.preview;
+  const retention = (built.push as Record<string, unknown> | undefined)
+    ?.readretentiondays;
+  if (typeof retention === 'number' && retention < 0) {
+    problems.push(
+      `config: push.readretentiondays (COMMUNICO_PUSH_READRETENTIONDAYS): expected >= 0, got ${retention}`,
+    );
+  }
   for (
     const [leaf, value] of Object.entries(
       (built.e2ee ?? {}) as Record<string, unknown>,
@@ -550,6 +557,7 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
+  push?: { readretentiondays?: number };
   server?: { name?: string; port?: number; shutdowngraceseconds?: number };
   admin?: { socket?: string };
   media?: { root?: string; maxbytes?: number };

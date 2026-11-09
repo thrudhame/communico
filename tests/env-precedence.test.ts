@@ -21,6 +21,9 @@ name = "localhost"
 port = 8008
 shutdowngraceseconds = 10
 
+[push]
+readretentiondays = 30
+
 [admin]
 socket = ""
 

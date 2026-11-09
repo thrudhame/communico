@@ -23,6 +23,7 @@ import {
   deviceListService,
 } from '#engine/federation/device-lists.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
+import { startNotificationHistory } from '#engine/server/notification-history.ts';
 import {
   type InviteDeps,
   inviteIntentProvider,
@@ -82,6 +83,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
     const tenant = await openTenant(store, serverName(), { create: true });
     const server = await store.server();
     const stopRuleMigration = await installRuleMigration(store, tenant);
+    const stopNotificationHistory = await startNotificationHistory(server);
     const federationEdus = eduState(server, tenant.serverName);
     const deviceLists = deviceListService(server, tenant, federationEdus);
     const app: App = {
@@ -94,6 +96,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       sender: null,
       close: async () => {
         stopRuleMigration();
+        await stopNotificationHistory();
         await deviceLists.stop();
         await app.sender?.stop();
         app.sender = null;

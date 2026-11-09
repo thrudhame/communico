@@ -69,6 +69,30 @@ Deno.test('push invites: accepted OOB invites count once, replace and withdraw a
       });
     const first = await make('one');
     await receive(first);
+    const history = async () => {
+      const response = await http.matrix(
+        new Request('http://x/_matrix/client/v3/notifications', {
+          headers: { Authorization: 'Bearer ' + user.access_token },
+        }),
+      );
+      assertEquals(response.status, 200);
+      return (await response.json()).notifications as Record<string, unknown>[];
+    };
+    const listed = await history();
+    assertEquals(listed.length, 1);
+    assertEquals(
+      (listed[0].event as Record<string, unknown>).event_id,
+      first.event_id,
+    );
+    assertEquals(
+      (listed[0].event as Record<string, unknown>).room_id,
+      undefined,
+    );
+    assertEquals(
+      (listed[0].event as Record<string, unknown>).signatures,
+      undefined,
+    );
+    assertEquals(listed[0].room_id, room);
     assertEquals(await count(), { notification_count: 1, highlight_count: 0 });
     const sync = await http.matrix(
       new Request('http://x/_matrix/client/v3/sync', {
@@ -92,6 +116,12 @@ Deno.test('push invites: accepted OOB invites count once, replace and withdraw a
     );
     const second = await make('two');
     await receive(second);
+    assertEquals(
+      (await history()).map((n) =>
+        (n.event as Record<string, unknown>).event_id
+      ),
+      [second.event_id],
+    );
     assertEquals(await count(), { notification_count: 1, highlight_count: 0 });
     await receive(first);
     assertEquals(
@@ -110,6 +140,7 @@ Deno.test('push invites: accepted OOB invites count once, replace and withdraw a
       1,
     );
     await rejectInviteRemote(room, user.user_id, deps);
+    assertEquals(await history(), []);
     assertEquals(await count(), { notification_count: 0, highlight_count: 0 });
     // Duplicate federation traffic after a local rejection cannot resurrect it.
     await receive(second);
