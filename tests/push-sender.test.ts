@@ -16,6 +16,11 @@ import { bobJoins, genesis } from '#tests/fixtures/genesis.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
+import {
+  preparePushWork,
+  type PushTarget,
+  retryPushWork,
+} from '#engine/server/push-work.ts';
 import { startPushSender } from '#engine/push/sender.ts';
 import { setConfigForTests } from '#engine/config.ts';
 
@@ -539,6 +544,39 @@ Deno.test('push sender: bounded parallelism scans through more identities than t
   } finally {
     release();
     await sender.stop();
+    await f.close();
+  }
+});
+
+Deno.test('push sender: jitter stays within one second and one hour for both event and badge retries', async () => {
+  const f = await fixture();
+  try {
+    await f.send('retry bounds');
+    const db = await f.store.server();
+    const target =
+      (await db.query('SELECT * FROM push_targets'))[0] as PushTarget;
+    const now = Date.now();
+    const work = await db.tx((tx) =>
+      preparePushWork(tx, target, now, 86400000)
+    );
+    assert(work.event && work.badge);
+    await db.tx((tx) => retryPushWork(tx, target, work, now, 0));
+    for (const table of ['push_delivery', 'push_badges']) {
+      assertEquals(
+        (await db.query(`SELECT next_ms FROM ${table}`))[0].next_ms,
+        now + 1000,
+      );
+    }
+    work.event.attempts = 20;
+    work.badge.attempts = 20;
+    await db.tx((tx) => retryPushWork(tx, target, work, now, 1));
+    for (const table of ['push_delivery', 'push_badges']) {
+      assertEquals(
+        (await db.query(`SELECT next_ms FROM ${table}`))[0].next_ms,
+        now + 3600000,
+      );
+    }
+  } finally {
     await f.close();
   }
 });

@@ -137,9 +137,12 @@ export async function retryPushWork(
   const next = (attempts: number) =>
     now +
     Math.round(
-      Math.min(
-        3600000,
-        1000 * 2 ** Math.min(attempts, 12) * (0.8 + jitter * 0.4),
+      Math.max(
+        1000,
+        Math.min(
+          3600000,
+          1000 * 2 ** Math.min(attempts, 12) * (0.8 + jitter * 0.4),
+        ),
       ),
     );
   if (work.event) {
