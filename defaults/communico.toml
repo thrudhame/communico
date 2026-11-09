@@ -231,3 +231,20 @@ txnhours = 24
 # Unread notifications and reconciliation facts are retained independently.
 # COMMUNICO_PUSH_READRETENTIONDAYS
 readretentiondays = 30
+# Gateway retry lifetime in hours. 0 expires immediately, without clearing counts.
+# COMMUNICO_PUSH_DELIVERYGIVEUPHOURS
+deliverygiveuphours = 24
+# Gateway SSRF policy, checked against every resolved address before connecting.
+# Explicit self-hosted gateways can override a blocked CIDR in the allowlist.
+# COMMUNICO_PUSH_BLOCKLIST / COMMUNICO_PUSH_ALLOWLIST
+blocklist = [
+  "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+  "100.64.0.0/10", "192.0.0.0/24", "169.254.0.0/16", "192.88.99.0/24",
+  "198.18.0.0/15", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",
+  "224.0.0.0/4", "0.0.0.0/8", "::1/128", "fe80::/10", "fc00::/7",
+  "2001:db8::/32", "ff00::/8", "fec0::/10", "::/128", "::ffff:0:0/96",
+]
+allowlist = []
+# Extra PEM root files, extending system/bundled CA trust. No pins or TLS bypass.
+# COMMUNICO_PUSH_CACERTS
+cacerts = []

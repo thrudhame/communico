@@ -8,6 +8,7 @@
 // transaction as the write it stamps (no sequences). The store owns the
 // id row and the meta table; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
+import { recordPusherChange } from '#engine/tenant/pushers.ts';
 
 const E2EE_SQL = `
 CREATE TABLE device_keys(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, key_json TEXT NOT NULL, PRIMARY KEY(localpart,device_id,generation));
@@ -218,8 +219,15 @@ INSERT INTO account_changes SELECT rowid,localpart,'deactivated' FROM users WHER
 INSERT INTO counters(name,value) SELECT 'account_changes',COALESCE(MAX(pos),0) FROM account_changes;
 `;
 
+const PUSHER_CHANGES_SQL = `
+ALTER TABLE pushers ADD COLUMN incarnation TEXT NOT NULL DEFAULT '';
+ALTER TABLE pushers ADD COLUMN added_ms INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE pusher_changes(pos INTEGER PRIMARY KEY NOT NULL,localpart TEXT NOT NULL,app_id TEXT NOT NULL,pushkey TEXT NOT NULL,incarnation TEXT NOT NULL,payload TEXT);
+CREATE INDEX pushers_identity ON pushers(app_id,pushkey);
+`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 13,
+  version: 14,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -231,8 +239,25 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(KEY_SIGNATURES_SQL);
     await db.exec(KEY_BACKUP_SQL);
     await db.exec(ACCOUNT_CHANGES_SQL);
+    await db.exec(PUSHER_CHANGES_SQL);
   },
   migrations: {
+    13: async (conn) => {
+      await conn.exec(PUSHER_CHANGES_SQL);
+      for (const row of await conn.query('SELECT * FROM pushers')) {
+        const incarnation = crypto.randomUUID();
+        const added = Date.now();
+        await conn.execute(
+          'UPDATE pushers SET incarnation=?,added_ms=? WHERE localpart=? AND app_id=? AND pushkey=?',
+          [incarnation, added, row.localpart, row.app_id, row.pushkey],
+        );
+        await recordPusherChange(
+          conn,
+          { ...row, incarnation, added_ms: added },
+          false,
+        );
+      }
+    },
     12: (conn) => conn.exec(ACCOUNT_CHANGES_SQL),
     11: (conn) => conn.exec(KEY_BACKUP_SQL),
     10: (conn) => conn.exec(KEY_SIGNATURES_SQL),

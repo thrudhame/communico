@@ -180,7 +180,7 @@ test('pushers: upsert, omission of optional profile_tag, no token disclosure, ki
     app_display_name: 'app',
     device_display_name: 'device',
     lang: 'en',
-    data: { url: 'https://never-fetched.invalid' },
+    data: { url: 'https://never-fetched.invalid/_matrix/push/v1/notify' },
   };
   const set = (body: unknown) =>
     call('/_matrix/client/v3/pushers/set', 'POST', body, a.access_token);

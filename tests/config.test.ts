@@ -18,6 +18,10 @@ shutdowngraceseconds = 10
 
 [push]
 readretentiondays = 30
+deliverygiveuphours = 24
+blocklist = []
+allowlist = []
+cacerts = []
 
 [admin]
 socket = ""
@@ -636,10 +640,11 @@ Deno.test('--shell printer quoting', async () => {
   );
 });
 
-Deno.test('push retention is layered, accepts zero and rejects negative days', async () => {
+Deno.test('push retention and delivery lifetime are layered, accept zero and reject negative values', async () => {
   const dir = await writeTree({
     'defaults/communico.toml': FULL,
-    'config/communico.toml': '[push]\nreadretentiondays = 7\n',
+    'config/communico.toml':
+      '[push]\nreadretentiondays = 7\ndeliverygiveuphours = 3\n',
   });
   const opts = {
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -647,6 +652,19 @@ Deno.test('push retention is layered, accepts zero and rejects negative days', a
     env: {},
   };
   assertEquals(loadConfig(opts).config.push.readretentiondays, 7);
+  assertEquals(loadConfig(opts).config.push.deliverygiveuphours, 3);
+  assertEquals(
+    loadConfig({ ...opts, env: { COMMUNICO_PUSH_DELIVERYGIVEUPHOURS: '0' } })
+      .config.push.deliverygiveuphours,
+    0,
+  );
+  assert(
+    loadFail({ ...opts, env: { COMMUNICO_PUSH_DELIVERYGIVEUPHOURS: '-1' } })
+      .some((problem) =>
+        problem.includes('push.deliverygiveuphours') &&
+        problem.includes('expected >= 0')
+      ),
+  );
   assertEquals(
     loadConfig({ ...opts, env: { COMMUNICO_PUSH_READRETENTIONDAYS: '0' } })
       .config.push.readretentiondays,
@@ -661,7 +679,42 @@ Deno.test('push retention is layered, accepts zero and rejects negative days', a
   );
 });
 
-Deno.test('61 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('push gateway CIDRs and root files are validated in every layer', () => {
+  const opts = {
+    defaultsPath: 'defaults/communico.toml',
+    configPath: null,
+    env: {},
+  };
+  for (const leaf of ['BLOCKLIST', 'ALLOWLIST']) {
+    const error = (() => {
+      try {
+        loadConfig({ ...opts, env: { ['COMMUNICO_PUSH_' + leaf]: 'invalid' } });
+      } catch (error) {
+        return error;
+      }
+    })();
+    assert(error instanceof ConfigError);
+    assert(
+      error.problems.some((problem) =>
+        problem.includes('push.' + leaf.toLowerCase())
+      ),
+    );
+  }
+  const error = (() => {
+    try {
+      loadConfig({
+        ...opts,
+        env: { COMMUNICO_PUSH_CACERTS: 'missing-push-root.pem' },
+      });
+    } catch (error) {
+      return error;
+    }
+  })();
+  assert(error instanceof ConfigError);
+  assert(error.problems.some((problem) => problem.includes('push.cacerts')));
+});
+
+Deno.test('64 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -681,15 +734,15 @@ Deno.test('61 leaves total across the sections (the surface tripwire)', async ()
     ['media', 2],
     ['encryption', 3],
     ['e2ee', 9],
-    ['push', 1],
+    ['push', 5],
     ['store', 5],
     ['preview', 4],
     ['federation', 33],
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    61,
-    'the whole config surface is 61 leaves, including push retention',
+    65,
+    'the whole config surface is 65 leaves, including push retention, retry lifetime and transport',
   );
 });
 

@@ -5,6 +5,11 @@ import { advance, get } from '#engine/store/watermark.ts';
 import { nextDeviceSeq, publishDeviceChange } from '#engine/server/e2ee.ts';
 import { enqueueEdu } from '#engine/server/delivery.ts';
 import { removeNotificationFacts } from '#engine/server/notifications.ts';
+import { projectPushTargets } from '#engine/server/push-targets.ts';
+import {
+  completeTenantProjection,
+  pendingTenantProjection,
+} from '#engine/tenant/hooks.ts';
 import {
   fanoutDeviceChange,
   fanoutSigningChange,
@@ -13,6 +18,8 @@ import {
 export function projectTenant(store: Store, tenant: string): Promise<void> {
   return withProjectionLock(async () => {
     const server = await store.server(), db = await store.tenant(tenant);
+    const pending = await pendingTenantProjection(db);
+    await projectPushTargets(store, tenant);
     const accountSource = 'tenant:' + tenant + ':accounts';
     for (;;) {
       const mark = await get(server, accountSource);
@@ -173,5 +180,6 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
         }
       });
     }
+    await completeTenantProjection(store, tenant, db, pending);
   });
 }

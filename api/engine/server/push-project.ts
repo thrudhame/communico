@@ -24,6 +24,7 @@ export type PublicationDecision = {
   ruleRevision: number;
   ignoreRevision: number;
   decision: Decision | null;
+  pusherIncarnations?: string[];
 };
 export type PushPublication = {
   sender: string;
@@ -62,6 +63,7 @@ async function prepareDecisions(
             user: recipient.user,
             ruleRevision: await tx.pushRules.streamSeq(lp),
             ignoreRevision: ignored?.seq ?? 0,
+            pusherIncarnations: await tx.pushers.incarnations(lp),
             decision: Object.hasOwn(
                 value?.ignored_users ?? {},
                 String(context.event.sender),

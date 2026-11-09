@@ -164,6 +164,40 @@ entries without re-evaluating rules or issuing historical alerts. Retention
 runs on startup, periodically and when listing; zero-day receipt effects commit
 immediately. This is separate from event storage and gateway delivery.
 
+## What a push notification reveals
+
+Full-format HTTP pushers receive visible event content, sender and available
+room/profile names. Encrypted content remains ciphertext; communico never
+decrypts it. A pusher requesting `event_id_only` receives IDs, priority, account
+unread count and device routing/custom data, without content, names or tweaks.
+Counts-only updates contain no event. See the [E2EE disclosure table](#what-end-to-end-encryption-does-not-hide).
+The configured gateway sees this payload; its provider sees what it forwards.
+HTTPS does not hide the payload from the gateway.
+
+## HTTP push gateways
+
+Only HTTP pushers are supported; email registrations return a clear unsupported
+error. Registration validates but never probes the gateway. Notify URLs require
+HTTPS and `/_matrix/push/v1/notify`. `[push] blocklist` and `allowlist` check every
+resolved address; private gateways need an explicit allowed CIDR. `cacerts`
+adds PEM roots without disabling certificate/name verification. Redirects are
+not followed. Requests are limited to 256 KiB, responses to 64 KiB, with a
+10-second total request deadline.
+
+Delivery resumes durable saved decisions after restart, independently of
+federation enablement. At most eight stable pusher identities run concurrently,
+with one request per identity even across registration replacement. Retry delays
+use jittered exponential backoff bounded from 1 second to 1 hour.
+`[push] deliverygiveuphours` defaults to 24 (0 expires immediately). Expiry stops
+delivery attempts, not unread counts or notification history. Delivery is
+at-least-once; a crash after acceptance may resend the same event ID.
+
+Read/withdrawn events suppress pending alerts. Badge updates coalesce exact
+joined-room/thread notification totals plus pending invites, including explicit
+zero to clear badges. Logout, device/token revocation, account deactivation and
+matching gateway `rejected` verdicts cancel the corresponding registration's
+work. Invalid responses and HTTP/TLS errors retry; they never delete a pusher.
+
 ## Operator tools
 
 The tools require the server to be running with the same configuration. They
