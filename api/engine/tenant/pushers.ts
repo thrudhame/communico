@@ -190,6 +190,26 @@ export async function pusherIncarnations(
   )).map((row) => String(row.incarnation));
 }
 
+/** Send admission reads account, registration and its current token/device
+ * generation in one tenant snapshot. Refresh moves ownership without changing
+ * the incarnation; deletion/recreation cannot revive an old registration. */
+export async function pusherIsCurrent(
+  conn: Conn,
+  localpart: string,
+  appId: string,
+  pushkey: string,
+  incarnation: string,
+): Promise<boolean> {
+  return (await conn.query(
+    `SELECT 1 FROM pushers p JOIN users u ON u.localpart=p.localpart
+    JOIN access_tokens a ON a.token=p.access_token AND a.localpart=p.localpart
+    WHERE p.localpart=? AND p.app_id=? AND p.pushkey=? AND p.incarnation=?
+    AND p.kind='http' AND u.deactivated=0 AND (a.device_id IS NULL OR EXISTS (
+      SELECT 1 FROM devices d WHERE d.localpart=a.localpart AND d.device_id=a.device_id AND d.generation=a.generation))`,
+    [localpart, appId, pushkey, incarnation],
+  )).length !== 0;
+}
+
 // --- tenant-level behaviour --------------------------------------------------
 
 /** kind null → delete that (app_id, pushkey); else upsert bound to the

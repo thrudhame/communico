@@ -367,6 +367,13 @@ function bind(
       drop: (session: string) => uia.deleteUiaSession(conn, session),
     },
     pushers: {
+      isCurrent: (
+        localpart: string,
+        appId: string,
+        pushkey: string,
+        incarnation: string,
+      ) =>
+        pushers.pusherIsCurrent(conn, localpart, appId, pushkey, incarnation),
       moveToken: (oldHash: string, newHash: string) =>
         pushers.movePusherToken(conn, oldHash, newHash),
       deleteForToken: (accessHash: string) =>

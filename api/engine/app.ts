@@ -24,6 +24,7 @@ import {
 } from '#engine/federation/device-lists.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
 import { startNotificationHistory } from '#engine/server/notification-history.ts';
+import { type PushSender, startPushSender } from '#engine/push/sender.ts';
 import {
   type InviteDeps,
   inviteIntentProvider,
@@ -54,6 +55,7 @@ export type App = {
   // The delivery worker — null until startFederationServices (federation
   // disabled, or an endpoint-test app).
   sender: Sender | null;
+  readonly pushSender: PushSender;
   close(): Promise<void>;
 };
 
@@ -79,13 +81,32 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   const store = await openStore(storeConfig ?? config().store, {
     schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
   });
+  const services: (() => void | Promise<void>)[] = [];
+  const stopServices = async () => {
+    const errors: unknown[] = [];
+    for (const stop of services.splice(0).reverse()) {
+      try {
+        await stop();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length) {
+      throw new AggregateError(errors, 'app service shutdown failed');
+    }
+  };
   try {
     const tenant = await openTenant(store, serverName(), { create: true });
     const server = await store.server();
     const stopRuleMigration = await installRuleMigration(store, tenant);
+    services.push(stopRuleMigration);
     const stopNotificationHistory = await startNotificationHistory(server);
+    services.push(stopNotificationHistory);
     const federationEdus = eduState(server, tenant.serverName);
     const deviceLists = deviceListService(server, tenant, federationEdus);
+    services.push(() => deviceLists.stop());
+    const pushSender = await startPushSender({ store, tenant });
+    services.push(() => pushSender.stop());
     const app: App = {
       store,
       server,
@@ -94,20 +115,29 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       federationEdus,
       deviceLists,
       sender: null,
+      pushSender,
       close: async () => {
-        stopRuleMigration();
-        await stopNotificationHistory();
-        await deviceLists.stop();
-        await app.sender?.stop();
-        app.sender = null;
-        await store.close();
+        try {
+          try {
+            await app.sender?.stop();
+          } finally {
+            app.sender = null;
+            await stopServices();
+          }
+        } finally {
+          await store.close();
+        }
       },
     };
     registerToDevice(app.federationEdus, tenant);
     current = app;
     return app;
   } catch (error) {
-    await store.close();
+    try {
+      await stopServices();
+    } finally {
+      await store.close();
+    }
     throw error;
   }
 }

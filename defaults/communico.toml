@@ -231,6 +231,7 @@ txnhours = 24
 # Unread notifications and reconciliation facts are retained independently.
 # COMMUNICO_PUSH_READRETENTIONDAYS
 readretentiondays = 30
+deliverygiveuphours = 24
 # Gateway SSRF policy, checked against every resolved address before connecting.
 # Explicit self-hosted gateways can override a blocked CIDR in the allowlist.
 # COMMUNICO_PUSH_BLOCKLIST / COMMUNICO_PUSH_ALLOWLIST

@@ -315,6 +315,13 @@ export function loadConfig(opts: {
       `config: push.readretentiondays (COMMUNICO_PUSH_READRETENTIONDAYS): expected >= 0, got ${retention}`,
     );
   }
+  const deliveryHours = (built.push as Record<string, unknown> | undefined)
+    ?.deliverygiveuphours;
+  if (typeof deliveryHours === 'number' && deliveryHours < 0) {
+    problems.push(
+      `config: push.deliverygiveuphours (COMMUNICO_PUSH_DELIVERYGIVEUPHOURS): expected >= 0, got ${deliveryHours}`,
+    );
+  }
   for (
     const [leaf, value] of Object.entries(
       (built.e2ee ?? {}) as Record<string, unknown>,
@@ -572,6 +579,7 @@ export function loadedConfig(): LoadedConfig {
 export type ConfigPatch = {
   push?: {
     readretentiondays?: number;
+    deliverygiveuphours?: number;
     blocklist?: string[];
     allowlist?: string[];
     cacerts?: string[];
