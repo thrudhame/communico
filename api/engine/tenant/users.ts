@@ -8,6 +8,7 @@ import {
   verify as argonVerify,
 } from '@stdext/crypto/hash/argon2';
 import type { Conn } from '#engine/store/db.ts';
+import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   hashToken,
@@ -129,9 +130,15 @@ export async function markDeactivated(
   conn: Conn,
   localpart: string,
 ): Promise<void> {
+  const old = await userByLocalpart(conn, localpart);
+  if (old === null || old.deactivated) return;
   await conn.execute(
     'UPDATE users SET deactivated = 1, display_name = NULL, avatar_url = NULL WHERE localpart = ?',
     [localpart],
+  );
+  await conn.execute(
+    "INSERT INTO account_changes(pos,localpart,kind) VALUES(?,?,'deactivated')",
+    [await nextCounter(conn, 'account_changes'), localpart],
   );
 }
 

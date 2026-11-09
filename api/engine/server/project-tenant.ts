@@ -4,6 +4,7 @@ import { withProjectionLock } from '#engine/server/project.ts';
 import { advance, get } from '#engine/store/watermark.ts';
 import { nextDeviceSeq, publishDeviceChange } from '#engine/server/e2ee.ts';
 import { enqueueEdu } from '#engine/server/delivery.ts';
+import { removeNotificationFacts } from '#engine/server/notifications.ts';
 import {
   fanoutDeviceChange,
   fanoutSigningChange,
@@ -12,6 +13,25 @@ import {
 export function projectTenant(store: Store, tenant: string): Promise<void> {
   return withProjectionLock(async () => {
     const server = await store.server(), db = await store.tenant(tenant);
+    const accountSource = 'tenant:' + tenant + ':accounts';
+    for (;;) {
+      const mark = await get(server, accountSource);
+      const rows = await db.query(
+        'SELECT pos,localpart,kind FROM account_changes WHERE pos>? ORDER BY pos LIMIT 500',
+        [mark],
+      );
+      if (!rows.length) break;
+      await server.tx(async (conn) => {
+        for (const row of rows) {
+          if (row.kind === 'deactivated') {
+            await removeNotificationFacts(conn, {
+              user: '@' + row.localpart + ':' + tenant,
+            });
+          }
+        }
+        await advance(conn, accountSource, Number(rows.at(-1)!.pos));
+      });
+    }
     const source = 'tenant:' + tenant + ':e2ee';
     for (;;) {
       const mark = await get(server, source);

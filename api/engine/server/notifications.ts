@@ -11,6 +11,29 @@ import {
 type Reader = Pick<Database, 'query'>;
 export type Counts = { notification_count: number; highlight_count: number };
 
+/** The lifecycle owners retire the complete projection, not just its summaries.
+ * Runs in their server transaction so replay cannot retain orphaned read facts. */
+export async function removeNotificationFacts(
+  tx: Conn,
+  scope: { room: string } | { user: string },
+): Promise<void> {
+  const column = 'room' in scope ? 'room' : 'user';
+  const value = 'room' in scope ? scope.room : scope.user;
+  for (
+    const table of [
+      'push_evaluations',
+      'notifications',
+      'notification_counts',
+      'notification_horizons',
+      'notification_receipt_refs',
+      'notification_changes',
+      'notification_own_events',
+    ]
+  ) {
+    await tx.execute(`DELETE FROM ${table} WHERE ${column}=?`, [value]);
+  }
+}
+
 async function next(tx: Conn): Promise<number> {
   await tx.execute(
     "INSERT INTO counters(name,value) VALUES('notifications',0) ON CONFLICT DO NOTHING",

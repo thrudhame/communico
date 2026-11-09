@@ -8,6 +8,7 @@ import type { ReviewIntent } from '#engine/federation/sender.ts';
 import { roomEdges } from '#engine/room/edges.ts';
 import { advance } from '#engine/store/watermark.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
+import { removeNotificationFacts } from '#engine/server/notifications.ts';
 
 export type Removal = { why: string; intents: ReviewIntent[] };
 
@@ -31,6 +32,10 @@ export async function finishRoomRemoval(
       localServers,
     );
     await tx.execute('DELETE FROM e2ee_rooms WHERE room=?', [roomId]);
+    await removeNotificationFacts(tx, { room: roomId });
+    await tx.execute('DELETE FROM watermarks WHERE source=?', [
+      'push-context:' + roomId,
+    ]);
     const rows = await tx.query(
       "SELECT destination, count(*) AS n FROM outbox WHERE room = ? AND state = 'pending' GROUP BY destination",
       [roomId],

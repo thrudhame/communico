@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { openStore } from '#engine/store/index.ts';
+import { TENANT_V12 } from '#tests/fixtures/tenant-v12.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { roomSchema } from '#engine/room/schema.ts';
@@ -274,7 +275,7 @@ Deno.test('E3 v6 tenant upgrade preserves pending payloads, sender admission and
   const previous = {
     version: 6,
     apply: async (conn: Parameters<typeof tenantSchema.apply>[0]) => {
-      await tenantSchema.apply(conn);
+      await conn.exec(TENANT_V12);
       await conn.exec(
         'DROP TABLE backup_sessions; DROP TABLE backup_versions; DROP TABLE key_signatures; DROP TABLE cross_signing_keys; DROP TABLE inbound_to_device; DROP INDEX to_device_intents_sender; ALTER TABLE to_device_intents DROP COLUMN sender; DROP INDEX to_device_intents_projection; ALTER TABLE to_device_intents DROP COLUMN projected; DROP INDEX to_device_intents_destination;',
       );
@@ -534,7 +535,7 @@ Deno.test('E3 v8 destination admission upgrade retains over-cap accepted intents
   const oldSchema = {
     version: 8,
     apply: async (conn: Parameters<typeof tenantSchema.apply>[0]) => {
-      await tenantSchema.apply(conn);
+      await conn.exec(TENANT_V12);
       await conn.exec(
         'DROP TABLE backup_sessions; DROP TABLE backup_versions; DROP TABLE key_signatures; DROP TABLE cross_signing_keys; DROP INDEX to_device_intents_destination',
       );
@@ -579,7 +580,7 @@ Deno.test('E3 v8 destination admission upgrade retains over-cap accepted intents
     assertEquals(
       (await upgraded.query("SELECT v FROM meta WHERE k='schema_version'"))[0]
         .v,
-      '12',
+      String(tenantSchema.version),
     );
     assertEquals(
       (await upgraded.query(

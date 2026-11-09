@@ -323,8 +323,13 @@ CREATE INDEX relations_parent ON relations(room,relates_to,seq);
 CREATE TABLE notification_own_events(room TEXT NOT NULL,event TEXT NOT NULL,user TEXT NOT NULL,event_seq INTEGER NOT NULL,PRIMARY KEY(room,event));
 `;
 
+const NOTIFICATION_LOOKUPS_SQL = `
+CREATE INDEX notifications_event ON notifications(event,room);
+CREATE INDEX notification_receipt_refs_event ON notification_receipt_refs(event,room);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 15,
+  version: 16,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -339,6 +344,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(JOIN_ATTEMPTS_SQL);
     await db.exec(NOTIFICATIONS_SQL);
     await db.exec(HISTORY_RELATIONS_SQL);
+    await db.exec(NOTIFICATION_LOOKUPS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -353,5 +359,6 @@ export const serverSchema: SchemaProvider = {
     12: (conn) => conn.exec(JOIN_ATTEMPTS_SQL),
     13: (conn) => conn.exec(NOTIFICATIONS_SQL),
     14: (conn) => conn.exec(HISTORY_RELATIONS_SQL),
+    15: (conn) => conn.exec(NOTIFICATION_LOOKUPS_SQL),
   },
 };

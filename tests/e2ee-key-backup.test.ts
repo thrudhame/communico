@@ -1,5 +1,6 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
+import { TENANT_V12 } from '#tests/fixtures/tenant-v12.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { deactivateUser } from '#engine/tenant/users.ts';
@@ -29,7 +30,7 @@ Deno.test('backup: genuine v11 upgrade, restart, concurrent version cuts and ato
       tenant: {
         version: 11,
         apply: async (conn) => {
-          await tenantSchema.apply(conn);
+          await conn.exec(TENANT_V12);
           await conn.exec(
             'DROP TABLE backup_sessions; DROP TABLE backup_versions',
           );

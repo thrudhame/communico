@@ -210,8 +210,16 @@ CREATE TABLE transactions(
 CREATE INDEX transactions_event ON transactions(localpart, device_id, generation, room_id, event_id);
 `;
 
+// Durable account lifecycle source, including accounts already deactivated when
+// upgrading. Projection acknowledges this stream only with its server effects.
+const ACCOUNT_CHANGES_SQL = `
+CREATE TABLE account_changes(pos INTEGER PRIMARY KEY NOT NULL, localpart TEXT NOT NULL, kind TEXT NOT NULL);
+INSERT INTO account_changes SELECT rowid,localpart,'deactivated' FROM users WHERE deactivated=1;
+INSERT INTO counters(name,value) SELECT 'account_changes',COALESCE(MAX(pos),0) FROM account_changes;
+`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 12,
+  version: 13,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -222,8 +230,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(CROSS_SIGNING_SQL);
     await db.exec(KEY_SIGNATURES_SQL);
     await db.exec(KEY_BACKUP_SQL);
+    await db.exec(ACCOUNT_CHANGES_SQL);
   },
   migrations: {
+    12: (conn) => conn.exec(ACCOUNT_CHANGES_SQL),
     11: (conn) => conn.exec(KEY_BACKUP_SQL),
     10: (conn) => conn.exec(KEY_SIGNATURES_SQL),
     9: (conn) => conn.exec(CROSS_SIGNING_SQL),

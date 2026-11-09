@@ -78,6 +78,15 @@ Deno.test('push publication: v13 migration preserves old feed and receipts witho
       schemas: { room: roomSchema, tenant: tenantSchema, server: serverSchema },
     });
     db = await store.server();
+    for (const table of ['notifications', 'notification_receipt_refs']) {
+      const plan = JSON.stringify(
+        await db.query(
+          `EXPLAIN QUERY PLAN SELECT * FROM ${table} WHERE event=? AND room=?`,
+          ['$e', '!r:test'],
+        ),
+      );
+      assert(plan.includes(table + '_event'), plan);
+    }
     assertEquals((await db.query('SELECT event,seq FROM relations'))[0], {
       event: old.eventId,
       seq: 41,
