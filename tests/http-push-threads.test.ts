@@ -82,10 +82,15 @@ suite.test('split counts, exact partial scopes, fully_read and own-send share on
     const result = await sync(true);
     const got = entry(result, room);
     assertEquals(got.unread_notifications, count(mainCount));
-    assertEquals(got.unread_thread_notifications, {
-      [rootA]: count(aCount, highlights),
-      [rootB]: count(bCount),
-    });
+    assertEquals(
+      got.unread_thread_notifications,
+      aCount || bCount
+        ? {
+          [rootA]: count(aCount, highlights),
+          [rootB]: count(bCount),
+        }
+        : undefined,
+    );
     return result;
   };
   await check(3, 2, 1);
@@ -125,10 +130,7 @@ suite.test('split counts, exact partial scopes, fully_read and own-send share on
   await read(main, 'm.read.private');
   const zero = entry(await sync(true, before.next_batch), room);
   assertEquals(zero.unread_notifications, count(0));
-  assertEquals(zero.unread_thread_notifications, {
-    [rootA]: count(0),
-    [rootB]: count(0),
-  });
+  assertEquals(zero.unread_thread_notifications, undefined);
   await read(firstA, 'm.read', rootA);
   await check(0, 0, 0, 0);
 });
@@ -219,9 +221,7 @@ suite.test('a related main event acknowledges only the requested thread horizon'
     { thread_id: root },
   );
   assertEquals((await sync()).unread_notifications, count(3));
-  assertEquals((await sync()).unread_thread_notifications, {
-    [root]: count(0),
-  });
+  assertEquals((await sync()).unread_thread_notifications, undefined);
   await call(
     base + '/receipt/m.read/' + encodeURIComponent(g),
     b.access_token!,

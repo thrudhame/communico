@@ -121,7 +121,6 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
     });
     assertEquals(await counts(), {
       unread_notifications: c(3, 1),
-      unread_thread_notifications: {},
     });
     const live = await db.query('SELECT event,seq FROM feed ORDER BY seq');
     const decisions = await db.query(
@@ -142,7 +141,6 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
     });
     assertEquals(await counts(), {
       unread_notifications: c(0),
-      unread_thread_notifications: {},
     });
     deps.fetcher = fakeFetcher({
       backfill: (from, limit) => fr.backfillPdus(from, limit),
@@ -186,7 +184,6 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
     await project(store, fr.roomId);
     assertEquals(await counts(), {
       unread_notifications: c(0),
-      unread_thread_notifications: { [root.event_id!]: c(0) },
     });
     assertEquals(await threadOfEvent(db, fr.roomId, child.event_id!), 'main');
     await store.close();
@@ -195,7 +192,6 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
     await project(store, fr.roomId);
     assertEquals(await counts(), {
       unread_notifications: c(0),
-      unread_thread_notifications: { [root.event_id!]: c(0) },
     });
     assertEquals(
       (await db.query(

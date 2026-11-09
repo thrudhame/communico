@@ -468,7 +468,8 @@ export function roomNotificationCounts(
   return total;
 }
 
-/** Split sync is another view of the same exact buckets, including zero clears. */
+/** Split sync is another view of the same exact buckets. Empty thread maps are
+ * omitted per sync.yaml; the room and its numeric main zero still clear counts. */
 export function syncNotificationCounts(
   buckets: Map<string, Counts> | undefined,
   threaded: boolean,
@@ -479,11 +480,12 @@ export function syncNotificationCounts(
   if (!threaded) {
     return { unread_notifications: roomNotificationCounts(buckets) };
   }
+  const threads = [...buckets ?? []].filter(([thread]) => thread !== 'main');
   return {
     unread_notifications: buckets?.get('main') ??
       { notification_count: 0, highlight_count: 0 },
-    unread_thread_notifications: Object.fromEntries(
-      [...buckets ?? []].filter(([thread]) => thread !== 'main'),
-    ),
+    ...(threads.some(([, counts]) => counts.notification_count > 0)
+      ? { unread_thread_notifications: Object.fromEntries(threads) }
+      : {}),
   };
 }
