@@ -2,6 +2,7 @@
 // connection, committing with live publication or the receipt that caused them.
 import type { Conn, Database } from '#engine/store/db.ts';
 import type { PushPublication } from '#engine/server/push-project.ts';
+import { enqueuePush, queueBadge, removePushWork } from './push-queue.ts';
 import {
   pruneNotificationHistory,
   syncNotificationHistory,
@@ -23,6 +24,7 @@ export async function removeNotificationFacts(
 ): Promise<void> {
   const column = 'room' in scope ? 'room' : 'user';
   const value = 'room' in scope ? scope.room : scope.user;
+  await removePushWork(tx, scope);
   for (
     const table of [
       'push_evaluations',
@@ -72,6 +74,7 @@ async function delta(
     'INSERT INTO notification_changes(seq,user,room,thread) VALUES(?,?,?,?)',
     [await next(tx), user, room, thread],
   );
+  await queueBadge(tx, user);
 }
 
 /** Effective read positions never move backwards, regardless of wire echo.
@@ -324,6 +327,7 @@ export async function applyInvitePush(
     'main',
     'invite',
   );
+  for (const input of publication.decisions) await queueBadge(tx, input.user);
 }
 
 async function applyDecisions(
@@ -410,6 +414,19 @@ async function applyDecisions(
       );
     }
     await syncNotificationHistory(tx, notificationSeq, now);
+    if (!read && !withdrawn) {
+      for (const incarnation of input.pusherIncarnations ?? []) {
+        await enqueuePush(
+          tx,
+          incarnation,
+          notificationSeq,
+          input.user,
+          room,
+          event,
+          now,
+        );
+      }
+    }
   }
 }
 
@@ -420,6 +437,7 @@ export async function withdrawInvitePush(
   room: string,
   event: string,
 ): Promise<void> {
+  await queueBadge(tx, user);
   const rows = await tx.query(
     `SELECT n.thread,n.highlight,n.read_ms FROM notifications n JOIN push_evaluations e
     ON e.tenant=n.tenant AND e.user=n.user AND e.event=n.event

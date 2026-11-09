@@ -345,8 +345,17 @@ CREATE TABLE push_rejections(tenant TEXT NOT NULL,user TEXT NOT NULL,app_id TEXT
 CREATE INDEX push_rejections_tenant ON push_rejections(tenant);
 `;
 
+const PUSH_DELIVERY_SQL = `
+CREATE TABLE push_delivery(incarnation TEXT NOT NULL,notification_seq INTEGER NOT NULL,user TEXT NOT NULL,room TEXT NOT NULL,event TEXT NOT NULL,created_ms INTEGER NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL,error TEXT,PRIMARY KEY(incarnation,notification_seq));
+CREATE INDEX push_delivery_pending ON push_delivery(incarnation,state,notification_seq);
+CREATE INDEX push_delivery_room ON push_delivery(room,state);
+CREATE INDEX push_delivery_user ON push_delivery(user,state);
+CREATE TABLE push_badges(incarnation TEXT PRIMARY KEY NOT NULL,user TEXT NOT NULL,revision INTEGER NOT NULL,sent_revision INTEGER NOT NULL,expired_revision INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL,created_ms INTEGER NOT NULL,error TEXT);
+CREATE INDEX push_badges_user ON push_badges(user);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 18,
+  version: 19,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -364,6 +373,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(NOTIFICATION_LOOKUPS_SQL);
     await db.exec(NOTIFICATION_HISTORY_SQL);
     await db.exec(PUSH_TARGETS_SQL);
+    await db.exec(PUSH_DELIVERY_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -381,5 +391,6 @@ export const serverSchema: SchemaProvider = {
     15: (conn) => conn.exec(NOTIFICATION_LOOKUPS_SQL),
     16: (conn) => conn.exec(NOTIFICATION_HISTORY_SQL),
     17: (conn) => conn.exec(PUSH_TARGETS_SQL),
+    18: (conn) => conn.exec(PUSH_DELIVERY_SQL),
   },
 };

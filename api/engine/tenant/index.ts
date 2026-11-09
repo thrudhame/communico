@@ -386,6 +386,8 @@ function bind(
       ) =>
         mutation(pushers.upsertPusherRow(conn, localpart, pusher, accessHash)),
       ofUser: (localpart: string) => pushers.pushersOfUser(conn, localpart),
+      incarnations: (localpart: string) =>
+        pushers.pusherIncarnations(conn, localpart),
     },
     counters: {
       next: (name: string) => accountdata.nextCounter(conn, name),

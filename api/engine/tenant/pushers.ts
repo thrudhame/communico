@@ -180,6 +180,16 @@ export async function pushersOfUser(
   }));
 }
 
+export async function pusherIncarnations(
+  conn: Conn,
+  localpart: string,
+): Promise<string[]> {
+  return (await conn.query(
+    "SELECT incarnation FROM pushers WHERE localpart=? AND kind='http'",
+    [localpart],
+  )).map((row) => String(row.incarnation));
+}
+
 // --- tenant-level behaviour --------------------------------------------------
 
 /** kind null → delete that (app_id, pushkey); else upsert bound to the

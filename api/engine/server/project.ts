@@ -17,6 +17,7 @@ import { openRoom, type Room } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
+import { queueBadge } from '#engine/server/push-queue.ts';
 import { advance, get } from '#engine/store/watermark.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
@@ -720,6 +721,7 @@ async function apply(
           'DELETE FROM memberships WHERE user = ? AND room = ?',
           [item.user, roomId],
         );
+        await queueBadge(tx, item.user);
         return;
       }
       // The old fold's own-event seq, else the triggering seq: the member
@@ -802,6 +804,7 @@ async function applyPublication(
         'DELETE FROM memberships WHERE user = ? AND room = ?',
         [user, roomId],
       );
+      await queueBadge(tx, user);
     }
   }
   const cut = await feedSeqAtPos(tx, roomId, pos);
@@ -855,7 +858,7 @@ async function applyMember(
   eventId: string,
   seq: number | null,
 ): Promise<void> {
-  await tx.execute(
+  const changed = await tx.execute(
     `INSERT INTO memberships(user, room, membership, event, seq)
      VALUES(?,?,?,?,?)
      ON CONFLICT(user, room) DO UPDATE SET
@@ -863,6 +866,7 @@ async function applyMember(
      WHERE memberships.event != excluded.event OR memberships.membership != excluded.membership`,
     [user, roomId, membership, eventId, seq],
   );
+  if (changed) await queueBadge(tx, user);
 }
 
 async function feedSeqAtPos(

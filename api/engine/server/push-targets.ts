@@ -5,6 +5,7 @@ import { advance, get } from '#engine/store/watermark.ts';
 import { deleteRejectedPusher } from '#engine/tenant/pushers.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { gatewayUrl } from '#engine/push/registration.ts';
+import { cancelPushTarget } from './push-queue.ts';
 
 /** Called under the existing projection lock; never nests file transactions. */
 export async function projectPushTargets(
@@ -31,6 +32,7 @@ export async function projectPushTargets(
     });
     await server.tx(async (tx) => {
       for (const row of rejected) {
+        await cancelPushTarget(tx, String(row.incarnation));
         await tx.execute('DELETE FROM push_targets WHERE incarnation=?', [
           row.incarnation,
         ]);
@@ -52,6 +54,7 @@ export async function projectPushTargets(
       for (const row of rows) {
         const user = '@' + row.localpart + ':' + tenant;
         if (row.payload === null) {
+          await cancelPushTarget(tx, String(row.incarnation));
           await tx.execute('DELETE FROM push_targets WHERE incarnation=?', [
             row.incarnation,
           ]);
@@ -74,6 +77,15 @@ export async function projectPushTargets(
             'SELECT COALESCE(MAX(seq),0) AS m FROM notifications',
           ))[0].m,
         );
+        const old = await tx.query(
+          'SELECT incarnation FROM push_targets WHERE tenant=? AND user=? AND app_id=? AND pushkey=?',
+          [tenant, user, row.app_id, row.pushkey],
+        );
+        for (const prior of old) {
+          if (prior.incarnation !== row.incarnation) {
+            await cancelPushTarget(tx, String(prior.incarnation));
+          }
+        }
         await tx.execute(
           'INSERT INTO push_targets(tenant,user,app_id,pushkey,incarnation,payload,registered_seq,state) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(tenant,user,app_id,pushkey) DO UPDATE SET incarnation=excluded.incarnation,payload=excluded.payload,registered_seq=excluded.registered_seq,state=excluded.state',
           [
