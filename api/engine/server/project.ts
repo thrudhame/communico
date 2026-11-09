@@ -61,17 +61,24 @@ export function onProjected(
   };
 }
 
-export function project(store: Store, roomId: string): Promise<void> {
-  return withProjectionLock(async () => {
-    await projectNow(store, roomId);
-    for (const fn of projectedListeners) {
-      try {
-        await fn(store, roomId);
-      } catch (error) {
-        console.error(`projection listener failed for ${roomId}:`, error);
+export async function project(store: Store, roomId: string): Promise<void> {
+  // Recovery remains synchronous for the caller (including startup), but each
+  // durable upgrade page rejoins the queue so another room can publish between
+  // pages. A same-room caller helps recovery before publishing any new changes.
+  for (;;) {
+    const complete = await withProjectionLock(async () => {
+      if (!await projectNow(store, roomId)) return false;
+      for (const fn of projectedListeners) {
+        try {
+          await fn(store, roomId);
+        } catch (error) {
+          console.error(`projection listener failed for ${roomId}:`, error);
+        }
       }
-    }
-  });
+      return true;
+    });
+    if (complete) return;
+  }
 }
 
 /** Room lifecycle operations use the same serialization as projection. */
@@ -84,12 +91,14 @@ export function withProjectionLock<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-async function projectNow(store: Store, roomId: string): Promise<void> {
+async function projectNow(store: Store, roomId: string): Promise<boolean> {
   const server = await store.server();
   const room = await openRoom(store, roomId);
   const source = sourceOf(roomId);
   const localServers = await store.tenants();
-  await seedHistoricalRelations(store, room);
+  // Never advance the normal room/context watermark past an incomplete seed:
+  // live decisions must see the complete already-published relation context.
+  if (!await seedHistoricalRelations(store, room)) return false;
   for (;;) {
     const mark = await get(server, source);
     // A supported schema upgrade seeds at the already projected publication,
@@ -125,7 +134,7 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
       }
     }
     let batch = await room.tx((tx) => tx.changes.after(mark, BATCH));
-    if (batch.length === 0) return;
+    if (batch.length === 0) return true;
     const drop = batch.findIndex((change) => change.kind === 'drop');
     if (drop === 0) {
       await finishRoomRemoval(
@@ -134,7 +143,7 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
         JSON.parse(batch[0].data) as Removal,
         batch[0].pos,
       );
-      return;
+      return true;
     }
     if (drop > 0) batch = batch.slice(0, drop);
     const prepared = await prepare(room, store, roomId, batch, localServers);
@@ -157,56 +166,54 @@ async function projectNow(store: Store, roomId: string): Promise<void> {
 async function seedHistoricalRelations(
   store: Store,
   room: Room,
-): Promise<void> {
+): Promise<boolean> {
   const server = await store.server();
   const source = 'push-context:' + room.id;
   const mark = await get(server, sourceOf(room.id));
-  if (mark === 0 || await get(server, source) >= mark) return;
+  if (mark === 0 || await get(server, source) >= mark) return true;
   let cursor = await get(server, source);
-  for (;;) {
-    const page = await server.query(
-      `SELECT event,pos,seq FROM event_index WHERE room=? AND pos>? AND pos<=?
+  const page = await server.query(
+    `SELECT event,pos,seq FROM event_index WHERE room=? AND pos>? AND pos<=?
       AND standing='accepted' AND grounding='grounded' ORDER BY pos LIMIT ?`,
-      [room.id, cursor, mark, BATCH],
-    );
-    const edges = await room.tx(async (tx) => {
-      const out = [];
-      for (const row of page) {
-        const event = String(row.event);
-        const pdu = await tx.events.get(event);
-        if (pdu === null) throw new Error('projected event missing: ' + event);
-        const data = JSON.parse(pdu.pdu) as Record<string, unknown>;
-        out.push({
-          event,
-          relation: relationOf(data),
-          sender: String(data.sender),
-          seq: row.seq === null ? null : Number(row.seq),
-        });
+    [room.id, cursor, mark, BATCH],
+  );
+  const edges = await room.tx(async (tx) => {
+    const out = [];
+    for (const row of page) {
+      const event = String(row.event);
+      const pdu = await tx.events.get(event);
+      if (pdu === null) throw new Error('projected event missing: ' + event);
+      const data = JSON.parse(pdu.pdu) as Record<string, unknown>;
+      out.push({
+        event,
+        relation: relationOf(data),
+        sender: String(data.sender),
+        seq: row.seq === null ? null : Number(row.seq),
+      });
+    }
+    return out;
+  });
+  cursor = page.length < BATCH ? mark : Number(page.at(-1)!.pos);
+  const now = Date.now();
+  await server.tx(async (tx) => {
+    for (const { event, relation, sender, seq } of edges) {
+      if (relation !== null) {
+        await tx.execute(
+          'INSERT INTO relations(event,relates_to,rel_type,room,seq) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
+          [event, relation.relatesTo, relation.relType, room.id, seq],
+        );
       }
-      return out;
-    });
-    cursor = page.length < BATCH ? mark : Number(page.at(-1)!.pos);
-    const now = Date.now();
-    await server.tx(async (tx) => {
-      for (const { event, relation, sender, seq } of edges) {
-        if (relation !== null) {
-          await tx.execute(
-            'INSERT INTO relations(event,relates_to,rel_type,room,seq) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
-            [event, relation.relatesTo, relation.relType, room.id, seq],
-          );
-        }
-        if (seq !== null) {
-          await tx.execute(
-            'INSERT INTO notification_own_events(room,event,user,event_seq) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
-            [room.id, event, sender, seq],
-          );
-        }
-        await reconcileNotificationEvent(tx, room.id, event, now);
+      if (seq !== null) {
+        await tx.execute(
+          'INSERT INTO notification_own_events(room,event,user,event_seq) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
+          [room.id, event, sender, seq],
+        );
       }
-      await advance(tx, source, cursor);
-    });
-    if (cursor === mark) return;
-  }
+      await reconcileNotificationEvent(tx, room.id, event, now);
+    }
+    await advance(tx, source, cursor);
+  });
+  return cursor === mark;
 }
 
 // The 'event'/'transition'/'history' payloads share one shape (the room's
