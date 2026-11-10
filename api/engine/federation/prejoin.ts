@@ -9,6 +9,8 @@ import { verify } from '#engine/room/verify.ts';
 import { toWire } from './pdu.ts';
 import { erasedView } from '#engine/erasure.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import { redactionOf } from '#engine/server/read.ts';
+import { redact } from '#engine/eventid.ts';
 
 export const prejoinTypes = new Set([
   'm.room.create',
@@ -78,10 +80,15 @@ export async function prejoinDisplay(
   });
   if (loaded === null) return [];
   const out: Record<string, unknown>[] = [];
+  const server = await room.store.server();
   for (const { id, pdu } of loaded.events) {
-    const shown = await erasedView(room, id, pdu, loaded.version, {
-      userId: viewer.userId,
-    }, viewer.tenant);
+    // Display snapshots retain immutable original PDUs. Apply current redaction
+    // effects here for every sync/unsigned hint, never on the signed wire path.
+    const shown = await redactionOf(server, room.id, id) === null
+      ? await erasedView(room, id, pdu, loaded.version, {
+        userId: viewer.userId,
+      }, viewer.tenant)
+      : redact(pdu as unknown as Record<string, unknown>, loaded.version);
     out.push(stripPrejoin(shown as unknown as Record<string, unknown>));
   }
   return out;
