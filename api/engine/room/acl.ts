@@ -4,6 +4,21 @@ import { isIP } from 'node:net';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { RoomTx } from './index.ts';
 
+// Local policy provenance is distinct from a peer's ordinary M_FORBIDDEN.
+// A denied destination may be skipped; a denied local participant may not.
+export class AclDenied extends MatrixError {
+  constructor(readonly server: string) {
+    super(403, 'M_FORBIDDEN', 'server denied by room ACL');
+  }
+}
+
+export function assertServerAllowed(
+  server: string,
+  content: unknown | null,
+): void {
+  if (!serverAllowed(server, content)) throw new AclDenied(server);
+}
+
 function hostname(server: string): string | null {
   if (server.length > 261) return null;
   const match = /^(\[[0-9a-fA-F:.]+\]|[a-zA-Z0-9.-]+)(?::([0-9]+))?$/.exec(
@@ -84,6 +99,6 @@ export async function aclAllows(tx: RoomTx, server: string): Promise<boolean> {
 
 export async function assertAcl(tx: RoomTx, server: string): Promise<void> {
   if (!await aclAllows(tx, server)) {
-    throw new MatrixError(403, 'M_FORBIDDEN', 'server denied by room ACL');
+    throw new AclDenied(server);
   }
 }

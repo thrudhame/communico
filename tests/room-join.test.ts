@@ -7,8 +7,10 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import type { Pdu } from '#engine/pdu.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { assertRoomAcl } from '#engine/federation/acl.ts';
 import { joinRemote } from '#engine/room/join.ts';
 import { openRoom, type Room, roomSchema } from '#engine/room/index.ts';
+import { mapEntries } from '#engine/room/state.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import {
   fakeFetcher,
@@ -47,6 +49,82 @@ async function withStore(
 }
 
 const ANNA = '@anna:test';
+
+Deno.test('join remote: candidate ACL refusal fails over, own-server refusal aborts', async (t) => {
+  for (
+    const mode of [
+      'snapshot candidate',
+      'known candidate',
+      'snapshot self',
+      'known self',
+    ]
+  ) {
+    await t.step(mode, () =>
+      withStore(async (store) => {
+        const fr = await makeFakeRoom({ roomId: '!acl-failover:remote.test' });
+        await fr.addEvent({
+          type: 'm.room.server_acl',
+          state_key: '',
+          content: {
+            allow: ['*'],
+            deny: [mode.endsWith('self') ? 'test' : 'blocked.test'],
+          },
+        });
+        const { fetcher, calls } = fakeFetcher({
+          makeJoin: async (user, via) => {
+            if (mode.startsWith('known')) {
+              // Exercise the same pre-dial owner used by the production client.
+              await assertRoomAcl(store, fr.roomId, 'test');
+              await assertRoomAcl(store, fr.roomId, via);
+            }
+            return fr.makeJoinAnswer(user);
+          },
+          sendJoin: (event) => fr.acceptSendJoin(event),
+        });
+        const signer = await testSigner();
+        const deps = {
+          fetcher,
+          keys: fakeKeyResolver(fr.server, await testRemoteServer()),
+          self: 'test',
+        };
+        if (mode.startsWith('known')) {
+          const room = await openRoom(store, fr.roomId, { create: true });
+          await room.tx(async (tx) => {
+            for (const pdu of fr.events.values()) {
+              await tx.events.insert(String(pdu.event_id), JSON.stringify(pdu));
+            }
+            const group = await tx.materialize.newGroup(
+              null,
+              mapEntries(fr.afterOf.get(fr.tipId)!),
+            );
+            const stay = await tx.segments.create({
+              kind: 'stay',
+              prev: null,
+              opening_group: group,
+            });
+            await tx.materialize.setCurrent(stay, group);
+            await tx.segments.close(stay);
+          });
+        }
+        const join = () =>
+          joinRemote(store, {
+            roomId: fr.roomId,
+            user: ANNA,
+            via: ['blocked.test', fr.server.name],
+            signer,
+            deps,
+          });
+        if (mode.endsWith('self')) {
+          assertEquals((await assertRejects(join, MatrixError)).status, 403);
+          assertEquals(calls.makeJoin.length, 1);
+        } else {
+          assertEquals((await join()).roomId, fr.roomId);
+          assertEquals(calls.makeJoin.length, 2);
+          assertEquals(calls.sendJoin.length, mode.startsWith('known') ? 1 : 2);
+        }
+      }));
+  }
+});
 
 async function joinDepsFor(fr: FakeRoom) {
   const { fetcher, calls } = fakeFetcher({

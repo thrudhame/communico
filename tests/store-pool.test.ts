@@ -7,6 +7,74 @@ import { Pool } from '#engine/store/pool.ts';
 const delay = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+Deno.test('store pool: failed admissions publish no incarnation and preserve existing fences', async () => {
+  const root = await Deno.makeTempDir();
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const pool = new Pool(ffi, root, {
+    checkpointlogbytes: 65536,
+    maxopenfiles: 1,
+    idleseconds: 300,
+  });
+  // Inspect the retained metadata directly: open-file count alone cannot
+  // detect tokens leaked by rejected, attacker-selected room identifiers.
+  const tokens = (pool as unknown as { incarnations: Map<string, symbol> })
+    .incarnations;
+  try {
+    for (const kind of ['rooms', 'tenants'] as const) {
+      for (let i = 0; i < 20; i++) {
+        await assertRejects(
+          () => pool.acquire(kind, `!absent${i}:test`),
+          Deno.errors.NotFound,
+        );
+        await assertRejects(() =>
+          pool.acquire(kind, `!stale${i}:test`, {
+            create: true,
+            incarnation: Symbol(),
+          }), Deno.errors.NotFound);
+      }
+    }
+    assertEquals(tokens.size, 0, 'failed first admission must retain no token');
+    const first = await pool.acquire('rooms', '!kept:test', { create: true });
+    const token = first.incarnation;
+    await first.release();
+    const other = await pool.acquire('rooms', '!other:test', { create: true });
+    await other.release();
+    assertEquals(pool.size, 1);
+    await assertRejects(() =>
+      pool.acquire('rooms', '!kept:test', {
+        incarnation: Symbol(),
+      }), Deno.errors.NotFound);
+    const reopened = await pool.acquire('rooms', '!kept:test', {
+      incarnation: token,
+    });
+    assertEquals(
+      reopened.incarnation,
+      token,
+      'eviction and failed admission preserve handles',
+    );
+    await reopened.release();
+    await pool.retire('rooms', '!kept:test');
+    await assertRejects(
+      () => pool.acquire('rooms', '!kept:test', { incarnation: token }),
+      Deno.errors.NotFound,
+    );
+    await pool.remove('rooms', '!kept:test');
+    const replacement = await pool.acquire('rooms', '!kept:test', {
+      create: true,
+    });
+    assert(replacement.incarnation !== token);
+    await replacement.release();
+    await assertRejects(
+      () => pool.acquire('rooms', '!kept:test', { incarnation: token }),
+      Deno.errors.NotFound,
+    );
+  } finally {
+    await pool.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 Deno.test('store pool: LRU eviction over 20 room files, reopen preserves rows', async () => {
   const root = await Deno.makeTempDir();
   const ffi = new Turso('./.native/libturso_ffi.so');

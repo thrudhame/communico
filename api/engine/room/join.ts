@@ -44,7 +44,7 @@ import {
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
-import { serverAllowed } from '#engine/room/acl.ts';
+import { AclDenied, assertServerAllowed } from '#engine/room/acl.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { orderEvents } from '#engine/room/order.ts';
 import { mapEntries, type StateMap } from '#engine/room/state.ts';
@@ -132,7 +132,9 @@ export async function joinRemote(
     try {
       return await joinVia(store, args, candidate);
     } catch (e) {
-      if (isFailover(e)) {
+      if (
+        (e instanceof AclDenied && e.server !== args.deps.self) || isFailover(e)
+      ) {
         lastError = e;
         continue;
       }
@@ -392,13 +394,8 @@ async function joinVia(
 
     const aclId = snapshot.get('m.room.server_acl\0');
     const acl = aclId === undefined ? null : pack.get(aclId)?.content ?? {};
-    if (!serverAllowed(deps.self, acl) || !serverAllowed(candidate, acl)) {
-      throw new MatrixError(
-        403,
-        'M_FORBIDDEN',
-        'server denied by verified room ACL',
-      );
-    }
+    assertServerAllowed(deps.self, acl);
+    assertServerAllowed(candidate, acl);
     const encryptionId = snapshot.get('m.room.encryption\0');
     assertJoinEncryption(
       encryptionId === undefined ? undefined : pack.get(encryptionId)?.content,

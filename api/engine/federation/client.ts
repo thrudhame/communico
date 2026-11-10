@@ -69,10 +69,10 @@ export async function federationRequest(
   }
   req.signal?.throwIfAborted();
   if (req.room !== undefined) {
-    await assertRoomAcl(req.room.store, req.room.id, req.destination);
     if (req.room.participation) {
       await assertRoomAcl(req.room.store, req.room.id, signer.serverName);
     }
+    await assertRoomAcl(req.room.store, req.room.id, req.destination);
   }
   const endpoint = await resolve(server, req.destination, req.signal);
   const origin = signer.serverName;
@@ -107,10 +107,10 @@ export async function federationRequest(
   // Discovery/signing can yield while the ACL changes. Check again at the
   // final network boundary; room state is never locked across network I/O.
   if (req.room !== undefined) {
-    await assertRoomAcl(req.room.store, req.room.id, req.destination);
     if (req.room.participation) {
       await assertRoomAcl(req.room.store, req.room.id, signer.serverName);
     }
+    await assertRoomAcl(req.room.store, req.room.id, req.destination);
   }
   const res = await dialNodeTls({
     connectIp: endpoint.connectIp,
