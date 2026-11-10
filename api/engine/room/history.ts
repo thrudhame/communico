@@ -15,7 +15,7 @@
 // cursors never renumber). The gap is COMPLETE when the page's boundary
 // events' prevs are all grounded (the create is such an event).
 import { canonicalJson } from '#engine/canonical.ts';
-import { assertAcl } from '#engine/room/acl.ts';
+import { aclAllows } from '#engine/room/acl.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import {
   type EventStore,
@@ -151,9 +151,14 @@ export async function backfill(
       ? (await tx.segments.openStay()) ?? await tx.segments.latestStay()
       : await tx.segments.get(args.stay);
     if (stay === null || stay.kind !== 'stay') return null;
-    return { stay, version: await roomVersionOf(tx, stay.id) };
+    return {
+      stay,
+      version: await roomVersionOf(tx, stay.id),
+      allowed: await aclAllows(tx, args.via),
+    };
   });
   if (stayRow === null) throw new Error('M_ROOM_NOT_FOUND: ' + room.id);
+  if (!stayRow.allowed) return empty;
   const version = stayRow.version;
 
   // The fetch phase (never under the lock): the page, each event
@@ -284,7 +289,10 @@ export async function backfill(
     room.tx(async (tx) => {
       // Revalidation (G8): the fetch phase ran unlocked.
       deps.signal?.throwIfAborted();
-      await assertAcl(tx, args.via);
+      // A policy refusal is the same unresolved page as a refused fetch, not a
+      // caller exception. Every pagination/search caller can keep its local
+      // result and try the next peer; storage faults still propagate.
+      if (!await aclAllows(tx, args.via)) return empty;
       const stay = args.stay === undefined
         ? (await tx.segments.openStay()) ?? await tx.segments.latestStay()
         : await tx.segments.get(args.stay);

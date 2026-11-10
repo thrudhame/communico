@@ -370,3 +370,82 @@ Deno.test('timestamp: untrusted claims, wrong side, signatures and unavailable s
     );
   });
 });
+
+for (const mode of ['anchor', 'page'] as const) {
+  Deno.test(
+    'history admission: ACL change during ' + mode +
+      ' fetch preserves the open-gap result',
+    async () => {
+      await fixture(async ({ fr, room, deps }) => {
+        const root = fr.tipId;
+        await fr.addEvent(message(80, 'missing parent'));
+        const anchor = await fr.addEvent(message(100, 'remote anchor'));
+        const acl = await fr.addEvent({
+          type: 'm.room.server_acl',
+          state_key: '',
+          prev_events: [root],
+          content: { allow: ['*'], deny: [fr.server.name] },
+        });
+        const remote = fakeFetcher({
+          event: fr.events,
+          stateIds: new Map([[
+            anchor.event_id!,
+            fr.stateIdsAt(anchor.event_id!)!,
+          ]]),
+          backfill: [anchor],
+          onStateIds: async () => {
+            const admitted = await ingestRemote(
+              room,
+              [acl],
+              fr.server.name,
+              deps,
+            );
+            assertEquals(admitted[0].outcome, 'accepted');
+          },
+        });
+        const result = await backfill(room, {
+          from: [anchor.event_id!],
+          limit: 1,
+          via: fr.server.name,
+          ...(mode === 'anchor' ? { anchor } : {}),
+        }, { ...deps, fetcher: remote.fetcher });
+        assertEquals(result, {
+          outcome: 'open',
+          segment: null,
+          positioned: [],
+        });
+        assertEquals(
+          await room.tx((tx) => tx.segments.positionOf(anchor.event_id!)),
+          null,
+        );
+        assertEquals(
+          (await room.tx((tx) => tx.segments.list())).filter((s) =>
+            s.kind !== 'stay'
+          ),
+          [],
+        );
+      });
+    },
+  );
+}
+
+Deno.test('history admission: an already denied peer is never fetched', async () => {
+  await fixture(async ({ fr, room, deps }) => {
+    const acl = await fr.addEvent({
+      type: 'm.room.server_acl',
+      state_key: '',
+      content: { allow: ['*'], deny: [fr.server.name] },
+    });
+    await ingestRemote(room, [acl], fr.server.name, deps);
+    const remote = fakeFetcher({ backfill: [] });
+    assertEquals(
+      await backfill(room, {
+        from: ['$missing'],
+        limit: 1,
+        via: fr.server.name,
+      }, { ...deps, fetcher: remote.fetcher }),
+      { outcome: 'open', segment: null, positioned: [] },
+    );
+    assertEquals(remote.calls.backfill, []);
+  });
+});
