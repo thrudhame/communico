@@ -58,7 +58,7 @@ export function productionFetcher(
   return {
     // GET /_matrix/federation/v1/event/{eventId} — the PDU, or null on
     // 404/unreachable.
-    event: async (id, via, roomId) => {
+    event: async (id, via, roomId, signal) => {
       try {
         const res = await federationRequest(server, signer, {
           room: { store, id: roomId },
@@ -66,11 +66,37 @@ export function productionFetcher(
           method: 'GET',
           path: `/_matrix/federation/v1/event/${encodeURIComponent(id)}`,
           body: null,
+          signal,
         });
         const pdus = pdusOf(jsonObject(res), 'pdus');
         return pdus.length === 0 ? null : pdus[0];
       } catch {
         return null; // a 404 on the id — the caller decides what it means
+      }
+    },
+
+    timestampToEvent: async (roomId, ts, dir, via, signal) => {
+      try {
+        const res = await federationRequest(server, signer, {
+          room: { store, id: roomId },
+          destination: via,
+          method: 'GET',
+          path: `/_matrix/federation/v1/timestamp_to_event/${
+            encodeURIComponent(roomId)
+          }?ts=${ts}&dir=${dir}`,
+          body: null,
+          signal,
+        });
+        const j = jsonObject(res);
+        return typeof j.event_id === 'string' &&
+            Number.isSafeInteger(j.origin_server_ts)
+          ? {
+            event_id: j.event_id,
+            origin_server_ts: j.origin_server_ts as number,
+          }
+          : null;
+      } catch {
+        return null;
       }
     },
 
@@ -97,7 +123,7 @@ export function productionFetcher(
     },
 
     // GET /_matrix/federation/v1/state_ids/{roomId}?event_id=at.
-    stateIds: async (roomId, at, via) => {
+    stateIds: async (roomId, at, via, signal) => {
       try {
         const res = await federationRequest(server, signer, {
           room: { store, id: roomId },
@@ -107,6 +133,7 @@ export function productionFetcher(
             encodeURIComponent(roomId)
           }?event_id=${encodeURIComponent(at)}`,
           body: null,
+          signal,
         });
         const j = jsonObject(res);
         return {

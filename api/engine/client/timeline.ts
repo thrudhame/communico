@@ -155,6 +155,10 @@ export async function messages(
       ended = true;
       break;
     }
+    if (step.kind === 'gap') {
+      frontier = step.cursor;
+      break;
+    }
     if (step.kind === 'frontier') {
       if (filled) {
         frontier = step.cursor;
@@ -167,7 +171,7 @@ export async function messages(
       const segment = await room.tx((tx) =>
         tx.segments.get(step.cursor.segment)
       );
-      const stay = segment?.kind === 'history'
+      const stay = segment !== null && segment.kind !== 'stay'
         ? segment.prev!
         : step.cursor.segment;
       const signer = theApp().tenant.signer();
@@ -178,6 +182,7 @@ export async function messages(
           limit: config().federation.backfillbatch,
           via,
           stay,
+          segment: segment?.kind === 'anchor' ? segment.id : undefined,
         }, {
           keys: productionKeyResolver(theApp().server, signer),
           fetcher: productionFetcher(theApp().server, signer, theApp().store),

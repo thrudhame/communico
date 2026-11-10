@@ -17,7 +17,7 @@ import { eventStateAfter } from '#engine/room/state.ts';
 
 export type Segment = {
   id: number;
-  kind: 'stay' | 'history';
+  kind: 'stay' | 'history' | 'anchor';
   prev: number | null;
   opened_by: string | null;
   opening_group: number | null;
@@ -28,7 +28,7 @@ export type Segment = {
 function segmentOf(row: Row): Segment {
   return {
     id: Number(row.id),
-    kind: String(row.kind) as 'stay' | 'history',
+    kind: String(row.kind) as Segment['kind'],
     prev: row.prev === null ? null : Number(row.prev),
     opened_by: row.opened_by === null ? null : String(row.opened_by),
     opening_group: row.opening_group === null
@@ -57,7 +57,7 @@ async function allocate(conn: Conn): Promise<number> {
 export async function createSegment(
   conn: Conn,
   options: {
-    kind: 'stay' | 'history';
+    kind: 'stay' | 'history' | 'anchor';
     prev?: number | null;
     opened_by?: string | null;
     opening_group?: number | null;
@@ -272,6 +272,9 @@ export type WalkStep =
   | { kind: 'event'; event: string; cursor: WalkCursor }
   // the gap-facing ungrounded prevs: what the next backfill asks for
   | { kind: 'frontier'; cursor: WalkCursor; prevs: string[] }
+  // An isolated anchor has no proven forward adjacency. Keep a resumable
+  // cursor instead of claiming the gap complete or jumping to its owning stay.
+  | { kind: 'gap'; cursor: WalkCursor }
   | { kind: 'end' };
 
 async function offsetBound(
@@ -395,6 +398,20 @@ export async function stepPosition(
           };
         }
       }
+      if (seg.kind === 'anchor') {
+        const facing = oldest === null
+          ? null
+          : await eventAtOffset(conn, seg.id, oldest);
+        for (const prev of facing === null ? [] : await prevsOf(conn, facing)) {
+          const position = await positionOf(conn, prev);
+          if (position !== null && position.segment !== seg.id) {
+            at = { ...position, offset: position.offset + 1 };
+            break;
+          }
+        }
+        if (at.segment !== seg.id) continue;
+        return { kind: 'end' };
+      }
       // the stay before the one this history belongs to
       const owner = seg.prev === null ? null : await getSegment(conn, seg.prev);
       const prevStay = owner === null ? null : owner.prev;
@@ -419,6 +436,9 @@ export async function stepPosition(
     }
     const seg = await getSegment(conn, at.segment);
     if (seg === null) return { kind: 'end' };
+    if (seg.kind === 'anchor') {
+      return { kind: 'gap', cursor: at };
+    }
     if (seg.kind === 'history') {
       // the owning stay's first event comes right after the newest
       // history event

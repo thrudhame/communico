@@ -7,6 +7,7 @@
 // (G7); a read of an event always uses that event's own state refs,
 // never the current state (G6).
 import { assert, assertEquals } from '@std/assert';
+import { findTimestamp } from '#engine/room/timestamp.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { backfill } from '#engine/room/history.ts';
 import {
@@ -81,6 +82,10 @@ async function walkAll(
     if (step.kind === 'frontier') {
       return { events, end: { prevs: step.prevs } };
     }
+    assert(
+      step.kind === 'event',
+      'stay walks do not enter isolated anchor gaps',
+    );
     events.push(step.event);
     at = step.cursor;
   }
@@ -197,6 +202,18 @@ Deno.test('stays: join → leave closes → rejoin opens a new stay; the old sta
     );
     assertEquals(filled.outcome, 'complete'); // the first join is held
     assertEquals(filled.positioned.length, 2); // gap1, gap2 — the cut
+    for (const dir of ['b', 'f'] as const) {
+      assertEquals(
+        (await room.tx((tx) =>
+          findTimestamp(
+            tx,
+            { ts: 100, dir },
+            (id) => Promise.resolve(id === msg.eventId),
+          )
+        ))?.event_id,
+        msg.eventId,
+      );
+    }
 
     // the backward walk so far: the new stay → its history → the old
     // stay — and the FRONTIER of the older gap (the first join's prevs)

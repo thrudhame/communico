@@ -121,6 +121,37 @@ export async function getEvent(
   return event;
 }
 
+// Seek the next complete timestamp bucket, never LIMIT away a causal tie or a
+// visible result behind hidden events. The caller fails explicitly at the bound.
+export async function timestampBucket(
+  conn: Conn,
+  ts: number,
+  dir: 'f' | 'b',
+  inclusive: boolean,
+): Promise<{ id: string; ts: number; segment: number; offset: number }[]> {
+  const op = dir === 'f' ? (inclusive ? '>=' : '>') : (inclusive ? '<=' : '<');
+  const order = dir === 'f' ? 'ASC' : 'DESC';
+  const eligible = `FROM events e JOIN event_status s ON s.event = e.id
+    JOIN positions p ON p.event = e.id JOIN event_state r ON r.event = e.id
+    WHERE s.standing = 'accepted' AND s.grounding = 'grounded'
+      AND r.provenance != 'none' AND r.after_group IS NOT NULL`;
+  const next = await conn.query(
+    `SELECT e.origin_ts ${eligible} AND e.origin_ts ${op} ? ORDER BY e.origin_ts ${order} LIMIT 1`,
+    [ts],
+  );
+  if (next.length === 0) return [];
+  const rows = await conn.query(
+    `SELECT e.id, e.origin_ts, p.segment, p.offset ${eligible} AND e.origin_ts = ? ORDER BY p.segment, p.offset, e.id LIMIT 10001`,
+    [Number(next[0].origin_ts)],
+  );
+  return rows.map((r) => ({
+    id: String(r.id),
+    ts: Number(r.origin_ts),
+    segment: Number(r.segment),
+    offset: Number(r.offset),
+  }));
+}
+
 function* chunks(ids: readonly string[]): Generator<string[]> {
   for (let index = 0; index < ids.length; index += 500) {
     yield ids.slice(index, index + 500);

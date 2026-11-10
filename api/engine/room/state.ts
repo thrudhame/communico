@@ -196,7 +196,7 @@ export async function publishedGroupsAfter(
 ): Promise<number[]> {
   const rows = await conn.query(
     `WITH anchor AS (
-       SELECT CASE WHEN s.kind = 'history' THEN s.prev ELSE s.id END AS stay,
+       SELECT CASE WHEN s.kind IN ('history', 'anchor') THEN s.prev ELSE s.id END AS stay,
               s.kind, p.offset
        FROM positions p JOIN segments s ON s.id = p.segment WHERE p.event = ?
      )
@@ -204,11 +204,11 @@ export async function publishedGroupsAfter(
        JOIN changes c ON c.pos = pub.change_pos
        JOIN positions p ON p.event = c.event CROSS JOIN anchor a
      WHERE pub.stay > a.stay OR (pub.stay = a.stay AND
-       (a.kind = 'history' OR p.offset >= a.offset))
+        (a.kind IN ('history', 'anchor') OR p.offset >= a.offset))
      UNION
      SELECT s.opening_group AS grp FROM segments s CROSS JOIN anchor a
      WHERE s.kind = 'stay' AND s.opening_group IS NOT NULL AND
-       (s.id > a.stay OR (s.id = a.stay AND a.kind = 'history'))`,
+        (s.id > a.stay OR (s.id = a.stay AND a.kind IN ('history', 'anchor')))`,
     [event],
   );
   return rows.map((row) => Number(row.grp));

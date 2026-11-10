@@ -209,6 +209,7 @@ export function fakeFetcher(script: {
   return {
     calls,
     fetcher: {
+      timestampToEvent: () => Promise.resolve(null),
       event: async (id) => {
         calls.event.push(id);
         if (script.onEvent !== undefined) await script.onEvent(id);

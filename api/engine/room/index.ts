@@ -49,6 +49,8 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       setStatus: (event: string, status: events.Status) =>
         events.setStatus(conn, event, status),
       statuses: (ids: readonly string[]) => events.statuses(conn, ids),
+      timestampBucket: (ts: number, dir: 'f' | 'b', inclusive: boolean) =>
+        events.timestampBucket(conn, ts, dir, inclusive),
     },
     state: {
       groupEntries: (group: number) => state.groupEntries(conn, group),
@@ -80,7 +82,7 @@ function bind(conn: Conn, edges: EdgeOverlay) {
     },
     segments: {
       create: (options: {
-        kind: 'stay' | 'history';
+        kind: 'stay' | 'history' | 'anchor';
         prev?: number | null;
         opened_by?: string | null;
         opening_group?: number | null;

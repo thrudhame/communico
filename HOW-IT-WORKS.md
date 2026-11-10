@@ -119,6 +119,35 @@ too, without rewriting the stored target PDU.
 (`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,
 `api/engine/room/ingest.ts:654-681`)
 
+## Timestamp lookup and isolated history anchors
+
+Client and federation `timestamp_to_event` routes share a room-owned indexed
+search over accepted, grounded, positioned events with genuine state refs.
+Directions are inclusive; each candidate passes the caller's existing user or
+server visibility policy. Complete equal-timestamp buckets are dependency-ordered
+through the stored prev DAG, with first-owner positions breaking branch ties;
+remote depths never determine the answer. Reads fail explicitly with 503 above
+10,000 equal-time candidates or 100,000 scanned/ancestry events, rather than
+returning a truncated or hidden result.
+(`api/engine/room/{events,timestamp}.ts`, `api/engine/federation/serve.ts`)
+
+On a local miss or unresolved history boundary, client lookup tries up to three
+current ACL-eligible residents, oldest held membership first, with an eight-second
+fetch deadline. Timestamp distance is not evidence of a complete history. Serving
+federation lookup is local-only. A remote claim must match its fetched, verified
+PDU's room, id, timestamp and direction, then pass the shared history importer's
+auth and state checks. Key acquisition retains its transport's own request bound.
+Failure retains an eligible local result; storage errors are not peer misses.
+(`api/engine/room/timestamp-search.ts`, `api/engine/federation/fetcher.ts`)
+
+A disconnected hit gets an `anchor` segment in the existing segment owner, not
+an arbitrary prepend to a stay's connected history. Backward pagination fills
+that anchor's own gap; forward pagination retains an explicit unresolved gap
+cursor instead of inventing adjacency. Positions and event-state refs survive
+reopen. Import changes are history, never live news: sync/feed, notifications,
+published state, extremities and delivery stay unchanged.
+(`api/engine/room/{history,segments,state}.ts`, `api/engine/client/timeline.ts`)
+
 ## Room-first writes and server projection
 
 The room transaction records its mutations and delivery destinations in
