@@ -8,7 +8,7 @@
 // belong to the server file — stage 4; remote invitee transport is the
 // caller's work, 3c).
 import { MatrixError } from '#engine/matrix-error.ts';
-import { splitId } from '#engine/ids.ts';
+import { splitId, validEventUserId } from '#engine/ids.ts';
 import { assertCanonicalNumbers } from '#engine/canonical.ts';
 import { creationCreators, creationVersion } from './creation-input.ts';
 import {
@@ -73,7 +73,6 @@ function deepMerge(
 }
 
 const ALIAS_LOCALPART_RE = /^[a-z0-9._=\-/+]+$/;
-const USER_ID_RE = /^@[^:\s]+:[^\s]+$/;
 
 // Everything validates BEFORE the first write — a bad option is a 400,
 // never a half-created room. A rulebook reject inside the sequence is a
@@ -86,7 +85,7 @@ export async function createRoom(
   const creator = opts.creator;
   const object = (value: unknown): value is Record<string, unknown> =>
     value !== null && typeof value === 'object' && !Array.isArray(value);
-  if (typeof creator !== 'string' || !USER_ID_RE.test(creator)) {
+  if (!validEventUserId(creator)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid creator');
   }
   for (
@@ -137,7 +136,7 @@ export async function createRoom(
     throw new MatrixError(400, 'M_BAD_JSON', 'invite must be an array');
   }
   for (const u of invite) {
-    if (typeof u !== 'string' || !USER_ID_RE.test(u)) {
+    if (!validEventUserId(u)) {
       throw new MatrixError(400, 'M_INVALID_PARAM', 'not a user id: ' + u);
     }
   }

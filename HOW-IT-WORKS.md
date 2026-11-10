@@ -482,7 +482,12 @@ or redaction target as well as the room.
 (`api/engine/tenant/auth.ts:227-303`, `api/engine/tenant/txns.ts:1-52`)
 
 The shared Matrix-id parser splits at the first colon, preserving a server
-name's port. Local upload metadata remains tenant-owned; bytes live under
+name's port. Event-context user references share historical-ID validation:
+legal non-surrogate Unicode, controls other than NUL, and empty localparts are
+accepted without normalization, with the 255-byte identifier bound. Power
+levels, additional creators and restricted authorizers use this contract;
+new local account naming and non-event device-list policy remain separate.
+Local upload metadata remains tenant-owned; bytes live under
 `media.root`. Uploads enforce the size bound while streaming to `.part`, then
 rename the completed file. Generated media ids use the shared URL-safe encoder.
 (`api/engine/ids.ts`, `api/engine/media.ts`, `api/engine/tenant/media.ts`)

@@ -1,6 +1,6 @@
 import { theApp } from '#engine/app.ts';
 import { serverName } from '#engine/config.ts';
-import { localpartOf } from '#engine/ids.ts';
+import { localpartOf, validEventUserId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { domainOf } from '#engine/federation/pdu.ts';
 import { federationRequest } from '#engine/federation/client.ts';
@@ -229,7 +229,7 @@ export async function memberOperation(
   const app = theApp();
   let result;
   if (op === 'invite' && domainOf(target) !== serverName()) {
-    if (!/^@[^:\s]+:[^\s]+$/.test(target)) {
+    if (!validEventUserId(target)) {
       throw new MatrixError(400, 'M_INVALID_PARAM', 'not a user id: ' + target);
     }
     if (
