@@ -7,7 +7,10 @@ export default async function (
   context: import('@pathfinder/pathfinder').Context,
 ) {
   const receiptType = request.params.receiptType as string;
-  if (receiptType !== 'm.read' && receiptType !== 'm.read.private') {
+  if (
+    receiptType !== 'm.read' && receiptType !== 'm.read.private' &&
+    receiptType !== 'm.fully_read'
+  ) {
     throw new MatrixError(
       400,
       'M_INVALID_PARAM',

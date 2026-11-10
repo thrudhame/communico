@@ -187,7 +187,7 @@ async function seedHistoricalRelations(
       const data = JSON.parse(pdu.pdu) as Record<string, unknown>;
       out.push({
         event,
-        relation: relationOf(data),
+        relation: relationOf(data, event),
         sender: String(data.sender),
         seq: row.seq === null ? null : Number(row.seq),
       });
@@ -401,7 +401,7 @@ async function prepare(
               : (JSON.parse(row.pdu) as Record<string, unknown>);
           });
           if (pdu !== null) {
-            relation = relationOf(pdu);
+            relation = relationOf(pdu, change.event);
             if (change.kind !== 'history' && isLive(payload)) {
               search = searchTextOf(payload, pdu);
             }
@@ -544,6 +544,7 @@ async function prepare(
 // NOT relations rows (the old condition, ported verbatim).
 function relationOf(
   pdu: Record<string, unknown>,
+  eventId: string,
 ): { relatesTo: string; relType: string | null } | null {
   const content = pdu.content;
   if (
@@ -559,11 +560,14 @@ function relationOf(
     return null;
   }
   const target = (relatesTo as Record<string, unknown>).event_id;
-  if (typeof target !== 'string') return null;
+  if (typeof target !== 'string' || target.length === 0 || target === eventId) {
+    return null;
+  }
   const relType = (relatesTo as Record<string, unknown>).rel_type;
+  if (typeof relType !== 'string' || relType.length === 0) return null;
   return {
     relatesTo: target,
-    relType: typeof relType === 'string' ? relType : null,
+    relType,
   };
 }
 

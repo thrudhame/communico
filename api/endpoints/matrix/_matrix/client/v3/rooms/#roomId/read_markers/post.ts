@@ -1,8 +1,5 @@
-import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { localpartOf } from '#engine/tenant/auth.ts';
-import { setReceipt } from '#engine/receipts.ts';
-import { putAccountData } from '#engine/tenant/accountdata.ts';
+import { setFullyRead, setReceipt } from '#engine/receipts.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
 
 export default async function (
@@ -23,13 +20,7 @@ export default async function (
     }
   }
   if (typeof body['m.fully_read'] === 'string') {
-    await putAccountData(
-      theApp().tenant,
-      localpartOf(userId),
-      roomId,
-      'm.fully_read',
-      { event_id: body['m.fully_read'] },
-    );
+    await setFullyRead(roomId, userId, body['m.fully_read']);
   }
   if (typeof body['m.read'] === 'string') {
     await setReceipt(roomId, userId, 'm.read', body['m.read']);

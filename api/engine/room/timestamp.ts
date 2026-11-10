@@ -1,6 +1,6 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { RoomTx } from './index.ts';
-import { precedes } from './causal.ts';
+import { causalOrder } from './order.ts';
 
 export type TimestampQuery = { ts: number; dir: 'f' | 'b' };
 export type TimestampHit = { event_id: string; origin_server_ts: number };
@@ -26,59 +26,6 @@ function exhausted(): never {
     'M_UNKNOWN',
     'timestamp search exceeds bounded history read',
   );
-}
-
-// Order equal-time candidates through their actual prev DAG, including paths
-// through other timestamps. Untrusted depths never participate. First-owner
-// positions and then ids break concurrent-branch ties; old positions never move.
-async function causalOrder(tx: RoomTx, ids: string[]): Promise<string[]> {
-  if (ids.length < 2) return ids;
-  const graph = new Map<string, string[]>();
-  const children = new Map<string, string[]>();
-  const rank = new Map<string, [number, number, string]>();
-  const budget = { remaining: 100_000 };
-  for (const id of ids) {
-    graph.set(id, []);
-    const pos = await tx.segments.positionOf(id);
-    rank.set(id, [
-      pos?.segment ?? Number.MAX_SAFE_INTEGER,
-      pos?.offset ?? 0,
-      id,
-    ]);
-  }
-  for (const parent of ids) {
-    for (const child of ids) {
-      if (parent === child) continue;
-      const related = await precedes(tx.events, parent, child, budget);
-      if (related === null) exhausted();
-      if (!related) continue;
-      graph.get(child)!.push(parent);
-      const next = children.get(parent) ?? [];
-      next.push(child);
-      children.set(parent, next);
-    }
-  }
-  const compare = (a: string, b: string) => {
-    const x = rank.get(a)!, y = rank.get(b)!;
-    return x[0] - y[0] || x[1] - y[1] ||
-      (x[2] < y[2] ? -1 : x[2] === y[2] ? 0 : 1);
-  };
-  const ready = ids.filter((id) => graph.get(id)!.length === 0);
-  const result: string[] = [];
-  let visited = 0;
-  while (ready.length > 0) {
-    ready.sort(compare);
-    const id = ready.shift()!;
-    visited++;
-    result.push(id);
-    for (const child of children.get(id) ?? []) {
-      const parents = graph.get(child)!;
-      parents.splice(parents.indexOf(id), 1);
-      if (parents.length === 0) ready.push(child);
-    }
-  }
-  if (visited !== ids.length) exhausted();
-  return result;
 }
 
 export async function findTimestamp(

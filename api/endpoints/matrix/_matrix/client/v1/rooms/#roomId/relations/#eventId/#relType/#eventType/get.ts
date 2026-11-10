@@ -14,6 +14,8 @@ export default async function (
       dir: request.query.get('dir'),
       limit: request.query.get('limit'),
       from: request.query.get('from'),
+      to: request.query.get('to'),
+      recurse: request.query.get('recurse'),
     },
     context.state.user as string,
   );

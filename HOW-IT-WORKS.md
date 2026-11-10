@@ -193,6 +193,34 @@ computing count, latest reply and participation.
 (`api/engine/client/render.ts:19-30`, `api/engine/client/visibility.ts:6-62`,
 `api/engine/client/render.ts:115-145`)
 
+Relations share structural admission across live and historical projections:
+accepted, grounded, same-room parents and children, valid string relationship
+fields, no self-links or redacted children. A late parent is re-evaluated at read
+time; redacting a parent does not detach its children. The viewer relation view
+then excludes ignored senders and invisible children before count, latest,
+participation and pagination. Thread lists order by the latest eligible reply.
+The three relations routes decode messages/sync cursors directionally, support
+`from`/`to`, and issue opaque room-bound continuation tokens. Explicit `recurse`
+walks three levels before result filtering and reports `recursion_depth`; omitted
+`recurse` omits the depth. Reads beyond the explicit traversal budget fail, rather
+than claiming an incomplete walk is complete. Nested latest events inherit the
+parent's serialization options, without recursively bundling threads.
+(`api/engine/client/{relations,relation-view}.ts`, `api/engine/room/order.ts`,
+`api/engine/server/{project,read}.ts`)
+
+Paginated relation/thread order uses the stored ancestry-closed DAG and a priority
+queue, avoiding quadratic candidate-pair searches and subset-dependent order when
+a boundary anchor is added. The shared room ordering module also retains the
+nearby, bidirectional tie algorithm for non-paginated timestamp queries, whose
+cost contract does not permit reading an old room prefix for a small tie.
+
+Ignored non-state messages share a presentation filter across client timeline,
+context and search readers. State still reaches clients and original PDUs remain
+unchanged. Both read-marker routes persist `m.fully_read` through the account-data
+owner; it never enters the public/private read-receipt stream, changes unread
+counts, or accepts a thread id.
+(`api/engine/client/{ignored,render,search}.ts`, `api/engine/receipts.ts`)
+
 `/sync` timeline visibility follows that same event-state policy. Its state
 blocks and unsigned membership retain their separate publication-cut
 contracts; `renderStateEvent` formats admitted state snapshots, including
