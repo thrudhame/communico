@@ -245,6 +245,12 @@ the same viewer-aware state rendering as other state consumers.
 Its state blocks and unsigned membership retain their separate publication-cut
 contracts; `renderStateEvent` formats admitted state snapshots, including
 imported evidence, rather than imposing timeline eligibility on them.
+With `use_state_after=true`, joined/left rooms send `state_after` instead of
+`state`, even when empty. It is the resolved publication at the response end
+or departure cut, including updates already in the timeline. Initial/full-state
+responses carry the full cut; incremental responses carry its delta from since.
+Filtering and lazy member loading apply after cut selection. Later publications
+cannot leak across the captured response token.
 (`api/engine/syncfeed.ts:99-144`, `api/engine/client/render.ts:29-54`)
 
 The token grammar is `s<e>_p<p>_t<t>_r<r>_a<a>`: events, presence, typing,
@@ -253,8 +259,20 @@ feed entries and out-of-band invite transitions share one durable event
 allocator. Invites and knocks use one typed, revisioned `prejoin_memberships`
 row per room/user. They never provision a room file or open a stay. A later
 room membership publication supersedes OOB display/count truth at the shared
-sequence cut. Federation prejoin state keeps the signed full create PDU;
-validated client display strips it. Legacy malformed create hints are filtered,
+sequence cut. One prejoin owner emits signed, version-correct full PDUs for
+federation invite/knock state, including create, and stripped events for client
+display. Held sync uses its membership publication cut; unsigned membership
+hints use that event's after-state, never later current state. Those client
+forms apply ordinary redactions and viewer-aware erasure before stripping.
+OOB hints come only from their revisioned, validated prejoin record. Full hints
+retain privately computed source IDs, never remote-asserted IDs. Once a room is
+held, sync, notifications and push share the saved-hint display owner: accepted
+sources use the current redaction/erasure projection; unidentified legacy hints
+are pruned by the room-version rules instead of exposing uncheckable content.
+The shared display decision applies the room-version redaction algorithm to the
+saved event itself. Its source shape ceiling is recursive, preserves saved
+values, never restores omitted fields, and drops incompatible nested shapes.
+Private provenance is never included in client hints. Legacy malformed create hints are filtered,
 while v12 requires a valid create tied to the room identity. Typing is ephemeral;
 presence and receipts are server data, while
 account-data stream markers belong to the tenant.
@@ -274,6 +292,10 @@ nonempty, completed unfiltered walk. Alias listing also permits world-readable
 nonmembers. User directory search covers visible local accounts, not remote
 users. The v12 upgrade transformation sets tombstone power to 150 only if the
 inherited value is below `state_default + 1`; 150 is not an unconditional floor.
+Create and upgrade share version-aware creator-list validation. Malformed
+upgrade bodies, versions and v12 creator lists fail before replacement-room,
+alias, push-rule or tombstone effects; supported older versions ignore the
+v12-only creator field. Valid duplicates and the upgrader's own ID are retained.
 (`api/engine/client/timeline.ts:228-240`, `api/engine/client/directory.ts:127-144`,
 `api/engine/client/directory.ts:244-282`, `api/engine/client/upgrade.ts:65-77`)
 
@@ -468,7 +490,12 @@ or redaction target as well as the room.
 (`api/engine/tenant/auth.ts:227-303`, `api/engine/tenant/txns.ts:1-52`)
 
 The shared Matrix-id parser splits at the first colon, preserving a server
-name's port. Local upload metadata remains tenant-owned; bytes live under
+name's port. Event-context user references share historical-ID validation:
+legal non-surrogate Unicode, controls other than NUL, and empty localparts are
+accepted without normalization, with the 255-byte identifier bound. Power
+levels, additional creators and restricted authorizers use this contract;
+new local account naming and non-event device-list policy remain separate.
+Local upload metadata remains tenant-owned; bytes live under
 `media.root`. Uploads enforce the size bound while streaming to `.part`, then
 rename the completed file. Generated media ids use the shared URL-safe encoder.
 (`api/engine/ids.ts`, `api/engine/media.ts`, `api/engine/tenant/media.ts`)

@@ -22,3 +22,14 @@ export function domainOf(id: string): string {
   const { server } = splitId(id);
   return server === null ? id : server;
 }
+
+// Event-context identifiers include historical accounts, not just names a
+// server may create today (appendices: Historical User IDs). Do not use this
+// to validate new local account names or non-event device-list forwarding.
+const HISTORICAL_USER =
+  /^@[^:\uD800-\uDFFF]*:(\[[0-9A-Fa-f:.]+\]|[0-9A-Za-z.-]+)(:[0-9]{1,5})?$/u;
+export function validEventUserId(value: unknown): value is string {
+  return typeof value === 'string' && !value.includes('\0') &&
+    HISTORICAL_USER.exec(value)?.[0] === value &&
+    new TextEncoder().encode(value).length <= 255;
+}

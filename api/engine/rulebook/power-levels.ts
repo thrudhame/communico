@@ -16,6 +16,7 @@
 // - user-id grammar: content/appendices.md:561-567
 import type { Pdu, RoomVersionSpec } from './types.ts';
 import { ruleId } from './rule-ids.ts';
+import { validEventUserId } from '#engine/ids.ts';
 
 // A parsed, structurally-valid m.room.power_levels content. Optional
 // numeric fields stay optional so readers apply the spec defaults.
@@ -43,7 +44,6 @@ export type PlParse =
 //   user_id = "@" user_id_localpart ":" server_name
 //   user_id_localpart = 1*user_id_char
 //   user_id_char = DIGIT / %x61-7A / "-" / "." / "=" / "_" / "/" / "+"
-const USER_ID_RE = /^@[0-9a-z.\=_/+-]+:.+$/;
 
 function isInt(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v);
@@ -117,7 +117,7 @@ export function parsePowerLevels(
       return { ok: false, rule: ruleId(spec, 'pl.users_object') };
     }
     for (const [key, val] of Object.entries(u)) {
-      if (!USER_ID_RE.test(key)) {
+      if (!validEventUserId(key)) {
         return { ok: false, rule: ruleId(spec, 'pl.users_object') };
       }
       const n = parseLevel(val, spec);

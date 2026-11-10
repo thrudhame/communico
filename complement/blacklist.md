@@ -25,6 +25,10 @@ admin alternatives. `TestOutboundFederationProfile` and
 `TestRemoteAliasRequestsUnderstandUnicode` are required to pass, not intentional
 red cases.
 
+The MSC4222 package exercises the stable v1.16 `use_state_after` contract
+(its client sends both stable and legacy request keys). It now runs with G5;
+its historical package name is not an unstable-feature exclusion.
+
 - tests/csapi/admin_test.go
 - tests/msc2836/msc2836_test.go
 - tests/msc3391/msc3391_test.go
@@ -36,7 +40,6 @@ red cases.
 - tests/msc3967/msc3967_test.go
 - tests/msc4140/delayed_event_test.go
 - tests/msc4155/invite_filter_test.go
-- tests/msc4222/msc4222_test.go
 - tests/msc4306/thread_subscriptions_test.go
 - tests/msc4306/thread_subscriptions_sliding_sync_test.go
 - tests/msc4429/msc4429_test.go

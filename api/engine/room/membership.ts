@@ -5,6 +5,7 @@
 // M_FORBIDDEN, never a 500. Profile fan-out, forget/purgeable and the
 // federation dances are 3c/4.
 import { MatrixError } from '#engine/matrix-error.ts';
+import { validEventUserId } from '#engine/ids.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Room } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
@@ -158,8 +159,6 @@ export async function leave(
   return await authorMember(room, userId, userId, content, signer);
 }
 
-const USER_ID_RE = /^@[^:\s]+:[^\s]+$/;
-
 // invite: sender invites the target. Malformed target -> 400; self-invite
 // -> 403; target already joined -> 403. The event is authored into the
 // room; remote invitee transport is the caller's work (3c).
@@ -170,7 +169,7 @@ export async function invite(
   signer: Signer,
   reason?: string,
 ): Promise<MembershipOpResult> {
-  if (!USER_ID_RE.test(target)) {
+  if (!validEventUserId(target)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'not a user id: ' + target);
   }
   if (target === sender) {

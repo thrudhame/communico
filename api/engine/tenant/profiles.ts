@@ -62,6 +62,14 @@ export async function setProfileRow(
 ): Promise<void> {
   checkProfileKey(key);
   const legacy = key === 'displayname' || key === 'avatar_url';
+  // Synapse-compatible defaults: the field type is enforced, but avatar and
+  // timezone strings stay opaque. Semantic validation is optional in the spec.
+  if (
+    (key === 'avatar_url' || key === 'm.tz') && value !== undefined &&
+    typeof value !== 'string'
+  ) {
+    throw new MatrixError(400, 'M_INVALID_PARAM', key + ' must be a string');
+  }
   if (
     legacy && value !== undefined && value !== null && typeof value !== 'string'
   ) {
@@ -70,30 +78,6 @@ export async function setProfileRow(
       'M_BAD_JSON',
       'legacy profile value must be a string or null',
     );
-  }
-  if (
-    key === 'avatar_url' && typeof value === 'string' &&
-    !/^mxc:\/\/[^/\s]+\/[^/\s]+$/.test(value)
-  ) {
-    throw new MatrixError(
-      400,
-      'M_INVALID_PARAM',
-      'avatar_url must be an MXC URI',
-    );
-  }
-  if (key === 'm.tz' && value !== undefined) {
-    if (typeof value !== 'string') {
-      throw new MatrixError(
-        400,
-        'M_INVALID_PARAM',
-        'm.tz must be a time zone string',
-      );
-    }
-    try {
-      new Intl.DateTimeFormat('en', { timeZone: value });
-    } catch {
-      throw new MatrixError(400, 'M_INVALID_PARAM', 'unknown time zone');
-    }
   }
   const profile = await profileRow(conn, localpart);
   if (profile === null) {

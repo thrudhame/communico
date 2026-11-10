@@ -141,3 +141,49 @@ suite.test('one public profile supports arbitrary JSON, explicit delete and lega
   const after = await call(profile);
   assert(Object.hasOwn(after.body, validKey));
 });
+
+suite.test('avatar and timezone strings remain opaque while non-strings are rejected', async () => {
+  const alice = await suite.registerTestUser('pf-opaque', 'pw');
+  const token = alice.access_token!;
+  const profile = '/_matrix/client/v3/profile/' +
+    encodeURIComponent(alice.user_id);
+  const made = await call('/_matrix/client/v3/createRoom', token, 'POST', {});
+  assertEquals(made.status, 200);
+  const membership = '/_matrix/client/v3/rooms/' +
+    encodeURIComponent(String(made.body.room_id)) + '/state/m.room.member/' +
+    encodeURIComponent(alice.user_id);
+  for (
+    const avatar of [
+      'LemurLover',
+      '',
+      'https://example.test/avatar',
+      'mxc://remote/avatar',
+    ]
+  ) {
+    assertEquals(
+      (await call(profile + '/avatar_url', token, 'PUT', {
+        avatar_url: avatar,
+      })).status,
+      200,
+    );
+    assertEquals((await call(profile + '/avatar_url')).body.avatar_url, avatar);
+    assertEquals((await call(membership, token)).body.avatar_url, avatar);
+  }
+  for (const zone of ['Unknown/NotAnIANAZone', '', 'America/Los_Angeles']) {
+    assertEquals(
+      (await call(profile + '/m.tz', token, 'PUT', { 'm.tz': zone })).status,
+      200,
+    );
+    assertEquals((await call(profile + '/m.tz')).body['m.tz'], zone);
+    assertEquals((await call(membership, token)).body['m.tz'], undefined);
+  }
+  for (const key of ['avatar_url', 'm.tz']) {
+    for (const value of [null, 42, false, [], {}]) {
+      const rejected = await call(profile + '/' + key, token, 'PUT', {
+        [key]: value,
+      });
+      assertEquals(rejected.status, 400);
+      assertEquals(rejected.body.errcode, 'M_INVALID_PARAM');
+    }
+  }
+});

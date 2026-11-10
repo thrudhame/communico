@@ -36,7 +36,7 @@ test('known-only profile policy returns 404 M_NOT_FOUND for an unknown foreign u
   }
 });
 
-test('local profile: public combined reads, self-only writes, null clears and absent keys', async () => {
+test('local profile: public combined reads, self-only writes, deletion and absent keys', async () => {
   const a = await registerTestUser('data-profile', 'pw');
   const b = await registerTestUser('data-other', 'pw');
   const base = '/_matrix/client/v3/profile/' + encodeURIComponent(a.user_id);
@@ -64,10 +64,21 @@ test('local profile: public combined reads, self-only writes, null clears and ab
       200,
     );
     assertEquals((await call(url)).body, { [field]: value });
-    assertEquals(
-      (await call(url, 'PUT', { [field]: null }, a.access_token)).status,
-      200,
-    );
+    if (field === 'avatar_url') {
+      const invalid = await call(url, 'PUT', { [field]: null }, a.access_token);
+      assertEquals(invalid.status, 400);
+      assertEquals(invalid.body.errcode, 'M_INVALID_PARAM');
+      assertEquals((await call(url)).body, { [field]: value });
+      assertEquals(
+        (await call(url, 'DELETE', undefined, a.access_token)).status,
+        200,
+      );
+    } else {
+      assertEquals(
+        (await call(url, 'PUT', { [field]: null }, a.access_token)).status,
+        200,
+      );
+    }
     assertEquals((await call(url)).body, {});
   }
   assertEquals((await call(base)).body, {});

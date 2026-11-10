@@ -2,7 +2,7 @@
 // has no feed position and cannot enter a new timeline. R6 cuts use the
 // published state, never the last event's own DAG state.
 import { theApp } from '#engine/app.ts';
-import { heldRoom, stateAtSeq, type StateRow } from '#engine/client/read.ts';
+import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
 import { renderEvent, renderStateEvent } from '#engine/client/render.ts';
 import {
   encodeStreamToken,
@@ -10,7 +10,10 @@ import {
   type StreamToken,
 } from '#engine/client/tokens.ts';
 import { config } from '#engine/config.ts';
-import { prejoinTypes } from '#engine/federation/prejoin.ts';
+import {
+  prejoinDisplay,
+  savedPrejoinDisplay,
+} from '#engine/federation/prejoin.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
 import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -68,17 +71,9 @@ export interface SyncInputs {
   timeoutMs: number;
   filter: RoomFilter;
   fullState: boolean;
+  useStateAfter?: boolean;
   setPresence?: string;
 }
-
-const strippedTypes = prejoinTypes;
-const stripped = (row: StateRow) => ({
-  type: row.type,
-  state_key: row.stateKey,
-  content: row.content,
-  sender: row.sender,
-  ...(row.type === 'm.room.create' ? { origin_server_ts: row.originTs } : {}),
-});
 
 async function roomTimeline(
   room: Room,
@@ -153,21 +148,29 @@ async function roomTimeline(
   const returned = selected.map((item) => item.row);
   const events = selected.map((item) => item.event);
   const start = returned[0];
-  const atStart = await stateAtSeq(room, start?.seq ?? end, start?.stay);
+  const atStart = await stateAtSeq(
+    room,
+    i.useStateAfter ? end : start?.seq ?? end,
+    i.useStateAfter ? undefined : start?.stay,
+  );
   let stateRows = atStart;
   if (i.since !== null && !i.fullState) {
     const previous = new Map(
-      (await stateAtSeq(room, i.since.eSeq, start?.stay)).map((
+      (await stateAtSeq(
+        room,
+        i.since.eSeq,
+        i.useStateAfter ? undefined : start?.stay,
+      )).map((
         r,
       ) => [r.type + '\0' + r.stateKey, r.eventId]),
     );
-    // A delta supplies state not already delivered by the timeline. Keep
-    // the inclusive publication (fork resolution may change other keys),
-    // but subtract only events actually rendered, after filtering/visibility.
+    // Legacy deltas omit state already in the timeline. state_after is the
+    // complete end-cut delta: clients must ignore timeline state in this mode.
+    // Both read resolved publications, not the trigger event's DAG state.
     const inTimeline = new Set(events.map((event) => event.event_id));
     stateRows = atStart.filter((r) =>
       previous.get(r.type + '\0' + r.stateKey) !== r.eventId &&
-      !inTimeline.has(r.eventId)
+      (i.useStateAfter || !inTimeline.has(r.eventId))
     );
   }
   const stateEvents: Record<string, unknown>[] = [];
@@ -188,7 +191,7 @@ async function roomTimeline(
   }
   const prevE = trimmed && returned.length ? returned[0].seq - 1 : end;
   const entry: Record<string, unknown> = {
-    state: { events: stateEvents },
+    [i.useStateAfter ? 'state_after' : 'state']: { events: stateEvents },
     timeline: {
       events,
       limited: more || scanned > returned.length,
@@ -258,7 +261,8 @@ async function roomTimeline(
   const joiners = i.since === null
     ? []
     : snapshot.members.filter((row) =>
-      row.membership === 'join' && Number(row.seq) > i.since!.eSeq
+      row.membership === 'join' && Number(row.seq) > i.since!.eSeq &&
+      Number(row.seq) <= end
     ).map((row) => String(row.user));
   return { entry, joiners };
 }
@@ -483,7 +487,10 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       unknown
     >[];
     const events = [
-      ...saved.filter((e) =>
+      ...(await savedPrejoinDisplay(await heldRoom(roomId), saved, i.userId, {
+        userId: i.userId,
+        tenant: app.tenant,
+      })).filter((e) =>
         !(e.type === 'm.room.member' && e.state_key === i.userId)
       ),
       {
@@ -504,7 +511,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     ) {
       leave[roomId] = {
         timeline: { events: [], limited: false, prev_batch: '' },
-        state: { events },
+        [i.useStateAfter ? 'state_after' : 'state']: { events },
       };
     }
   }
@@ -523,10 +530,15 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       const section = m.membership === 'knock' ? knock : invite;
       section[m.roomId] = {
         [m.membership === 'knock' ? 'knock_state' : 'invite_state']: {
-          events: at.filter((r) =>
-            strippedTypes.has(r.type) ||
-            r.type === 'm.room.member' && r.stateKey === i.userId
-          ).map(stripped),
+          events: await prejoinDisplay(
+            room,
+            at.map((r) => r.eventId),
+            i.userId,
+            {
+              userId: i.userId,
+              tenant: app.tenant,
+            },
+          ),
         },
       };
       continue;

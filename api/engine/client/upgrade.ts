@@ -1,6 +1,9 @@
 import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { getRulebook } from '#engine/rulebook/index.ts';
+import {
+  creationCreators,
+  creationVersion,
+} from '#engine/room/creation-input.ts';
 import { moveAliases, roomAliases } from '#engine/server/aliases.ts';
 import { migrateRoomRules } from '#engine/tenant/pushrules.ts';
 import { requireRoom, stateAtSeq } from './room.ts';
@@ -20,23 +23,15 @@ const TRANSFER = [
 export async function upgradeRoom(
   oldRoomId: string,
   userId: string,
-  newVersion: string,
-  additionalCreators: string[] = [],
+  requestedVersion: unknown,
+  requestedCreators?: unknown,
 ) {
+  const { version: newVersion, spec } = creationVersion(
+    requestedVersion,
+    'new_version',
+  );
+  const additionalCreators = creationCreators(spec, requestedCreators);
   const room = await requireRoom(oldRoomId);
-  let spec;
-  try {
-    spec = getRulebook(newVersion).spec;
-  } catch (e) {
-    if (String(e).includes('M_UNSUPPORTED_ROOM_VERSION')) {
-      throw new MatrixError(
-        400,
-        'M_UNSUPPORTED_ROOM_VERSION',
-        'This server does not support that room version',
-      );
-    }
-    throw e;
-  }
   const power = await powerFor(oldRoomId, userId, 'm.room.tombstone');
   if (power.level < power.need) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'You cannot upgrade this room');

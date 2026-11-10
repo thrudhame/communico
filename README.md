@@ -21,6 +21,10 @@ encrypted key backup. Clients own encryption, private keys and decryption.
 
 ## Client data and sync
 
+`/sync?use_state_after=true` returns state at the response's timeline end in
+`state_after` (also when empty), not `state`. The default retains the legacy
+state-before-timeline contract. Filters and lazy member loading apply to both.
+
 Room tags use the standard tags API and the same private `m.tag` room account
 data clients can read and write directly. Tag changes wake incremental sync.
 Stored and inline sync filters support room and sender inclusion/exclusion,
@@ -324,6 +328,8 @@ Public profiles support namespaced custom JSON fields and `m.tz`, with per-field
 GET/PUT/DELETE and `m.profile_fields` capability discovery. Keys are at most 255
 UTF-8 bytes; the whole profile must remain below 64 KiB. Custom null values are
 retained until DELETE. Only display names and avatars enter room membership.
+Avatar and timezone values must be strings but are otherwise accepted verbatim,
+matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
 ## Operator tools
 

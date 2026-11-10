@@ -54,16 +54,18 @@ export async function notificationsFor(
       : await renderEvent(room, eventId, viewer, { omitRoomId: true });
     if (event === null) {
       const invite = (await app.server.query(
-        `SELECT event_json FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND status='pending' AND kind='invite' AND ${
+        `SELECT event_json,invite_room_state FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND status='pending' AND kind='invite' AND ${
           visiblePrejoin('p')
         }`,
         [roomId, userId, eventId],
       ))[0];
       if (invite) {
-        event = renderInviteNotification(
+        event = await renderInviteNotification(
           JSON.parse(String(invite.event_json)) as Pdu,
           eventId,
           viewer,
+          JSON.parse(String(invite.invite_room_state)),
+          room,
         );
       }
     }

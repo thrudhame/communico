@@ -138,18 +138,18 @@ Deno.test('power-levels: non-integer inside users/events/notifications rejected 
   if (!usersBadVal.ok) assertEquals(usersBadVal.rule, '9.3');
 });
 
-Deno.test('power-levels: users keys must be valid user IDs (appendices 561-567)', () => {
+Deno.test('power-levels: users keys accept historical event user IDs', () => {
   assertEquals(
     parsePowerLevels({ users: { '@ok:localhost': 0 } }, V11).ok,
     true,
   );
   assertEquals(
     parsePowerLevels({ users: { '@UPPER:localhost': 0 } }, V11).ok,
-    false,
+    true,
   );
   assertEquals(
     parsePowerLevels({ users: { '@:localhost': 0 } }, V11).ok,
-    false,
+    true,
   );
   assertEquals(
     parsePowerLevels({ users: { 'no-sigil:localhost': 0 } }, V11).ok,
@@ -157,6 +157,10 @@ Deno.test('power-levels: users keys must be valid user IDs (appendices 561-567)'
   );
   assertEquals(
     parsePowerLevels({ users: { '@bad*char:localhost': 0 } }, V11).ok,
+    true,
+  );
+  assertEquals(
+    parsePowerLevels({ users: { '@bad\0char:localhost': 0 } }, V11).ok,
     false,
   );
 });

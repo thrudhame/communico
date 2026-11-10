@@ -1,12 +1,34 @@
-# Complement baseline - 2026-11-10 02:13:39 PST
+# Complement baseline - 2026-11-10 05:28:46 PST
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit f2061ac71564b26ff98c01eb4df20342f31facee)
+- image: communico-complement:local (commit cadcc30b6215fbc798de8973ccd4e5ca19de691f)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
 - failing tests: 18
 
 ## Change from the previous baseline
+
+G5's exact production tip has the same 18 failing tests/subtests as the G3
+baseline: no new failures and no removed entries. The full default pass and the
+unchanged settings pass both completed; the no-new-failure comparator exited 0.
+The documentation-only baseline commit does not change the tested runtime inputs.
+
+| # | Explicitly observed passing in this full run |
+|---|---|
+| 1 | Stable `msc4222` package `TestSync`, including public/private lazy-member state_after cases |
+| 2 | Ordinary client `TestSync`, `TestRoomsInvite` and `TestPushRuleRoomUpgrade` |
+| 3 | `TestFederationRoomsInvite`, `TestFederationRejectInvite`, `TestKnocking` and `TestKnockingInMSC3787Room` |
+| 4 | `TestMSC4289PrivilegedRoomCreators_Upgrades` and `TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms` |
+| 5 | `TestAvatarUrlUpdate`, with the unchanged Complement fixture and Synapse-compatible optional semantic validation |
+| 6 | `TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph` |
+
+These are observed passes, not tests inferred passing from absence. The earlier
+load-sensitive v12 deadline failures remain a mandatory G5b latency investigation
+and correction (T-G5-3); they are not added to the baseline or waived as flakes.
+Known timeline-gap and OOB departed-state shape shortcomings remain documented;
+this run is not a claim of cumulative Matrix conformance.
+
+### Historical G3 improvement
 
 No new failures. The previous 59 failing tests/subtests decreased to 18;
 all 41 removed entries were observed passing, not merely absent or skipped.

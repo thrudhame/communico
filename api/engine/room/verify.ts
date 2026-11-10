@@ -26,7 +26,7 @@
 // WITHOUT re-verification; a pending redelivery falls through) is the
 // caller's composition: identify() supplies the recomputed id for it.
 import { canonicalJson } from '#engine/canonical.ts';
-import { domainOf } from '#engine/ids.ts';
+import { domainOf, validEventUserId } from '#engine/ids.ts';
 import { eventIdFor, redact } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { getRulebook, type RoomVersionSpec } from '#engine/rulebook/index.ts';
@@ -234,7 +234,7 @@ export function authorizerServer(pdu: Pdu, roomVersion: string): string | null {
   ) return null;
   const via = pdu.content?.join_authorised_via_users_server;
   if (via === undefined) return null;
-  if (typeof via !== 'string' || !/^@[^:\s]+:[^\s]+$/.test(via)) {
+  if (!validEventUserId(via)) {
     throw new Error('M_BAD_EVENT: malformed authorising user id');
   }
   return domainOf(via);

@@ -11,8 +11,8 @@ import type { PathfinderRequest } from '@pathfinder/pathfinder';
 // given user's avatar URL. You must have permission to set this user's
 // avatar URL, e.g. you need to have their `access_token`." (spec v1.11,
 // Profiles.) Self-only: any other user is 403 M_FORBIDDEN. Body:
-// {avatar_url: string|null}; the mxc value is accepted verbatim (foreign
-// servers included — no validation beyond string). Response: {}.
+// {avatar_url: string}; values are accepted verbatim, as in Synapse. DELETE
+// removes the field; no optional MXC validation is imposed. Response: {}.
 export default async function (request: PathfinderRequest) {
   const caller = await authorize(request);
   const userId = request.params.userId as string;
@@ -23,18 +23,22 @@ export default async function (request: PathfinderRequest) {
       'cannot set another user\u2019s avatar_url',
     );
   }
-  const body = await parseJson(request) as { avatar_url?: unknown };
+  const body = await parseJson(request);
   if (
-    !('avatar_url' in body) ||
-    !(typeof body.avatar_url === 'string' || body.avatar_url === null)
+    body === null || typeof body !== 'object' || Array.isArray(body) ||
+    typeof (body as Record<string, unknown>).avatar_url !== 'string'
   ) {
     throw new MatrixError(
       400,
-      'M_BAD_JSON',
-      'avatar_url must be a string or null',
+      'M_INVALID_PARAM',
+      'avatar_url must be a string',
     );
   }
-  await setAvatarUrl(theApp().tenant, localpartOf(userId), body.avatar_url);
+  await setAvatarUrl(
+    theApp().tenant,
+    localpartOf(userId),
+    (body as { avatar_url: string }).avatar_url,
+  );
   await propagateProfile(userId, 'avatar_url');
   return {};
 }

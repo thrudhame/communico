@@ -24,6 +24,7 @@ import { openRoom } from '#engine/room/index.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { verify } from '#engine/room/verify.ts';
+import { stripPrejoin } from '#engine/federation/prejoin.ts';
 
 Deno.test('push invites: accepted OOB invites count once, replace and withdraw atomically without room files', async () => {
   const http = await startHttp();
@@ -264,6 +265,140 @@ Deno.test('push invites: later held-room publication deduplicates the same OOB e
       ]))[0].n,
       1,
     );
+  } finally {
+    await http.close();
+  }
+});
+
+Deno.test('saved OOB hints cannot bypass known held-room redactions in notification and sync display', async () => {
+  const http = await startHttp();
+  try {
+    const { app } = http;
+    const user = await http.registerTestUser('push-hint-redaction', 'pw');
+    const get = async (path: string) => {
+      const response = await http.matrix(
+        new Request('http://x/_matrix/client/v3/' + path, {
+          headers: { Authorization: 'Bearer ' + user.access_token },
+        }),
+      );
+      assertEquals(response.status, 200);
+      return await response.json();
+    };
+    for (const format of ['full', 'partial', 'legacy']) {
+      const fake = await makeFakeRoom({
+        roomId: '!hint-' + format + ':remote.test',
+      });
+      const name = await fake.addEvent({
+        type: 'm.room.name',
+        state_key: '',
+        content: { name: 'private name' },
+      });
+      const topic = await fake.addEvent({
+        type: 'm.room.topic',
+        state_key: '',
+        content: { topic: 'retained topic' },
+      });
+      const beforeInvite = [...fake.events.values()];
+      const invite = await fake.addEvent({
+        type: 'm.room.member',
+        state_key: user.user_id,
+        content: { membership: 'invite' },
+      });
+      const keys = fakeKeyResolver(fake.server);
+      const hints = [fake.events.get(fake.createId)!, name, topic].map(wireOf);
+      if (format === 'partial') hints[2] = { ...hints[2], content: {} };
+      await receiveInvite(
+        fake.roomId,
+        invite.event_id!,
+        {
+          room_version: '11',
+          event: wireOf(invite),
+          invite_room_state: format !== 'legacy'
+            ? hints
+            : hints.map((e) =>
+              stripPrejoin(e as unknown as Record<string, unknown>)
+            ),
+        },
+        fake.server.name,
+        {
+          store: app.store,
+          server: app.server,
+          signer: app.tenant.signer(),
+          self: app.tenant.serverName,
+          keys,
+          wake: () => {},
+        },
+      );
+      const first = (await get('notifications')).notifications.find((
+        n: { room_id: string },
+      ) => n.room_id === fake.roomId);
+      assertEquals(
+        first.event.unsigned.invite_room_state.find((e: { type: string }) =>
+          e.type === 'm.room.name'
+        ).content.name,
+        'private name',
+      );
+      const room = await openRoom(app.store, fake.roomId, { create: true });
+      const create = await verify(beforeInvite[0], fake.version, keys, {
+        roomId: fake.roomId,
+      });
+      await room.tx(async (tx) => {
+        const group = await tx.materialize.newGroup(null, []);
+        await tx.segments.create({ kind: 'stay', opening_group: group });
+        await ingestInTx(tx, fake.roomId, create.pdu, {
+          remote: {
+            origin: fake.server.name,
+            self: app.tenant.serverName,
+            oversized: create.oversized,
+            ungroundedMs: 3_600_000,
+          },
+        });
+      });
+      const redaction = await fake.addEvent({
+        type: 'm.room.redaction',
+        prev_events: [topic.event_id!],
+        content: { redacts: name.event_id },
+      });
+      const result = await ingestRemote(
+        room,
+        [...beforeInvite.slice(1), redaction],
+        fake.server.name,
+        {
+          keys,
+          self: app.tenant.serverName,
+          fetcher: fakeFetcher({}).fetcher,
+          limits: { waitMs: 0, limit: 20, budgetMs: 8000 },
+          ungroundedMs: 3_600_000,
+        },
+      );
+      assert(result.every((r) => r.outcome === 'accepted'));
+      const notification = (await get('notifications')).notifications.find((
+        n: { room_id: string },
+      ) => n.room_id === fake.roomId);
+      const sync = await get('sync');
+      for (
+        const shown of [
+          notification.event.unsigned.invite_room_state,
+          sync.rooms.invite[fake.roomId].invite_state.events,
+        ]
+      ) {
+        assertEquals(
+          shown.find((e: { type: string }) => e.type === 'm.room.name').content,
+          {},
+        );
+        assertEquals(
+          shown.find((e: { type: string }) => e.type === 'm.room.topic')
+            .content,
+          format === 'full' ? { topic: 'retained topic' } : {},
+        );
+        assert(
+          shown.every((e: Record<string, unknown>) =>
+            !('source_event_id' in e) && !('event_id' in e) &&
+            !('signatures' in e)
+          ),
+        );
+      }
+    }
   } finally {
     await http.close();
   }

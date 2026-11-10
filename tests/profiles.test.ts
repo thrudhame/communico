@@ -36,6 +36,14 @@ Deno.test('profiles persist, enforce atomic whole-profile UTF8 bounds and clear 
       undefined,
     );
     await setProfileField(tenant, 'alice', key, null);
+    await tenant.tx((tx) => tx.users.setAvatarUrl('alice', 'internal avatar'));
+    await tenant.tx((tx) => tx.users.setAvatarUrl('alice', null));
+    assertEquals(
+      (await getPublicProfile(tenant, 'alice'))?.avatar_url,
+      undefined,
+    );
+    await setProfileField(tenant, 'alice', 'avatar_url', 'LemurLover');
+    await setProfileField(tenant, 'alice', 'm.tz', 'Unknown/NotAnIANAZone');
     await setProfileField(
       tenant,
       'alice',
@@ -49,6 +57,14 @@ Deno.test('profiles persist, enforce atomic whole-profile UTF8 bounds and clear 
     store = await openStore(settings, { schemas: { tenant: tenantSchema } });
     tenant = await openTenant(store, 'profiles.test');
     assertEquals((await getPublicProfile(tenant, 'alice'))?.[key], null);
+    assertEquals(
+      (await getPublicProfile(tenant, 'alice'))?.avatar_url,
+      'LemurLover',
+    );
+    assertEquals(
+      (await getPublicProfile(tenant, 'alice'))?.['m.tz'],
+      'Unknown/NotAnIANAZone',
+    );
     await deactivateUser(tenant, 'alice');
     assertEquals(await getPublicProfile(tenant, 'alice'), {});
   } finally {

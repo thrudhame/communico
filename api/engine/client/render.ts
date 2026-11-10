@@ -12,6 +12,10 @@ import { isIgnoredEvent } from './ignored.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { canSeeEvent } from './visibility.ts';
 import { erasedView } from '#engine/erasure.ts';
+import {
+  prejoinDisplay,
+  savedPrejoinDisplay,
+} from '#engine/federation/prejoin.ts';
 
 export type Viewer = {
   userId: string;
@@ -35,16 +39,28 @@ function clientShape(pdu: Pdu, eventId: string): Record<string, unknown> {
 
 /** Only the authoritative pending OOB invite owner may call this boundary.
  * It exposes the viewer's own invite, never arbitrary stripped-state PDUs. */
-export function renderInviteNotification(
+export async function renderInviteNotification(
   pdu: Pdu,
   eventId: string,
   viewer: Viewer,
-): Record<string, unknown> | null {
+  saved: Record<string, unknown>[],
+  room: Room | null,
+): Promise<Record<string, unknown> | null> {
   if (
     pdu.type !== 'm.room.member' || pdu.state_key !== viewer.userId ||
     pdu.content?.membership !== 'invite'
   ) return null;
-  return clientShape(pdu, eventId);
+  return {
+    ...clientShape(pdu, eventId),
+    unsigned: {
+      invite_room_state: await savedPrejoinDisplay(
+        room,
+        saved,
+        viewer.userId,
+        viewer,
+      ),
+    },
+  };
 }
 
 export async function renderEvent(
@@ -95,7 +111,17 @@ export async function renderStateEvent(
         prevId = old.id;
       }
     }
-    return { pdu: JSON.parse(row.pdu) as Pdu, prev, prevId, version };
+    const pdu = JSON.parse(row.pdu) as Pdu;
+    const membership = pdu.type === 'm.room.member'
+      ? pdu.content?.membership
+      : null;
+    const prejoinGroup = membership === 'invite' || membership === 'knock'
+      ? await tx.state.eventStateAfter(eventId)
+      : null;
+    const prejoinIds = prejoinGroup === null
+      ? null
+      : [...(await tx.state.groupMap(prejoinGroup.group)).values()];
+    return { pdu, prev, prevId, version, membership, prejoinIds };
   });
   if (loaded === null) return null;
   const { pdu, prev, prevId, version } = loaded;
@@ -145,6 +171,16 @@ export async function renderStateEvent(
     if (txn !== null) unsigned.transaction_id = txn;
   }
   if (viewer?.membership !== undefined) unsigned.membership = viewer.membership;
+  if (viewer !== undefined && loaded.prejoinIds !== null) {
+    unsigned[
+      loaded.membership === 'knock' ? 'knock_room_state' : 'invite_room_state'
+    ] = await prejoinDisplay(
+      room,
+      loaded.prejoinIds,
+      String(pdu.state_key),
+      viewer,
+    );
+  }
   if (prev !== null) {
     const shownPrev = await erasedView(
       room,

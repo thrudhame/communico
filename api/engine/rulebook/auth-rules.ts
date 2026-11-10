@@ -7,7 +7,7 @@
 // Rules 1-2 are state-independent (they read the event's own auth_events
 // via the EventStore — S8 check 4, server-server-api.md:473-474). Rules
 // 3-10 are state-dependent (S8 check 5, server-server-api.md:475-476).
-import { domainOf } from '#engine/ids.ts';
+import { domainOf, validEventUserId } from '#engine/ids.ts';
 import {
   creatorsOf,
   namedLevel,
@@ -135,18 +135,11 @@ function rule1(
   return allow(ruleId(spec, 'create.allow'));
 }
 
-// The user-id grammar applied to sender and additional_creators (D4):
-// @localpart:domain — localpart 1+ of [a-z0-9.=_/-+] (appendices.md
-// :552-555), domain a server name: dns-name / IPv4 / [IPv6], optional
-// :port (appendices.md:451-467).
-const SENDER_RE =
-  /^@[0-9a-z.=_/+-]+:(\[[0-9A-Fa-f:.]+\]|[0-9A-Za-z.-]+)(:[0-9]{1,5})?$/;
-
 // D4's validator, shared with createRoom (engine side) — the same
 // grammar rule 1.4 applies at ingest.
 export function validAdditionalCreators(value: unknown): boolean {
   if (!Array.isArray(value)) return false;
-  return value.every((v) => typeof v === 'string' && SENDER_RE.test(v));
+  return value.every(validEventUserId);
 }
 
 // The (type, state_key) pairs the auth-events selection algorithm permits
@@ -468,7 +461,7 @@ function rule4(
   if (
     spec.restrictedJoinRule && viaUser !== undefined
   ) {
-    if (typeof viaUser !== 'string' || !/^@[^:\s]+:[^\s]+$/.test(viaUser)) {
+    if (!validEventUserId(viaUser)) {
       return reject(
         ruleId(spec, 'member.via_sig'),
         'malformed authorising user id',
