@@ -245,3 +245,95 @@ Deno.test('verify: identify alone answers the id and the size verdict', async ()
   assertEquals(pre.eventId, String(event.event_id));
   assertEquals(pre.oversized, false);
 });
+
+Deno.test('verify: required authorizer signatures are cryptographic, versioned and independent of snapshot fallback', async () => {
+  const sender = await makeRemoteServer('sender.test');
+  const authorizer = await makeRemoteServer('authorizer.test');
+  const keys = fakeKeyResolver(sender, authorizer);
+  const { countersign } = await import('#engine/federation/invites.ts');
+  const { b64encodeStd } = await import('#engine/signing-primitives.js');
+  const { redact } = await import('#engine/eventid.ts');
+  const signer = {
+    serverName: authorizer.name,
+    keyId: authorizer.keyId,
+    sign: async (value: string) =>
+      b64encodeStd(
+        new Uint8Array(
+          await crypto.subtle.sign(
+            'Ed25519',
+            authorizer.kp.privateKey,
+            new TextEncoder().encode(value),
+          ),
+        ),
+      ),
+  };
+  for (const version of ['8', '9', '10', '11', '12']) {
+    const event = await remoteEvent(ROOM, sender, version, {
+      type: 'm.room.member',
+      sender: '@joiner:sender.test',
+      state_key: '@joiner:sender.test',
+      content: {
+        membership: 'join',
+        join_authorised_via_users_server: '@admin:authorizer.test',
+      },
+      prev_events: ['$prev'],
+    });
+    event.signatures[authorizer.name] = { [authorizer.keyId]: 'forged' };
+    await assertRejects(
+      () => verify(structuredClone(event), version, keys),
+      Error,
+      'authorising',
+    );
+    await assertRejects(
+      () =>
+        verify(structuredClone(event), version, keys, {
+          localSnapshotFallback: { self: sender.name, resident: sender.name },
+        }),
+      Error,
+      'authorising',
+    );
+    const redacted = redact(
+      event as unknown as Record<string, unknown>,
+      version,
+    ) as unknown as Pdu;
+    if (version === '8') {
+      assertEquals(
+        (await verify(redacted, version, keys)).pdu.content
+          .join_authorised_via_users_server,
+        undefined,
+      );
+    } else {
+      await assertRejects(
+        () => verify(redacted, version, keys),
+        Error,
+        'authorising',
+      );
+    }
+    await countersign(event, version, signer);
+    event.signatures['unrelated.test'] = { 'ed25519:bad': 'invalid' };
+    assertEquals(
+      (await verify(structuredClone(event), version, keys)).eventId,
+      event.event_id,
+    );
+    const expired = fakeKeyResolver(sender, { ...authorizer, validUntilMs: 0 });
+    await assertRejects(
+      () => verify(structuredClone(event), version, expired),
+      Error,
+      'authorising',
+    );
+  }
+  for (const via of [null, 42, '', 'not-a-user', '@missing:']) {
+    const malformed = await remoteEvent(ROOM, sender, '11', {
+      type: 'm.room.member',
+      sender: '@joiner:sender.test',
+      state_key: '@joiner:sender.test',
+      content: { membership: 'join', join_authorised_via_users_server: via },
+      prev_events: ['$prev'],
+    });
+    await assertRejects(
+      () => verify(malformed, '11', keys),
+      Error,
+      'malformed authorising',
+    );
+  }
+});

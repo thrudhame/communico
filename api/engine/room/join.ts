@@ -49,6 +49,8 @@ import type { Signer } from '#engine/room/signer.ts';
 import { orderEvents } from '#engine/room/order.ts';
 import { mapEntries, type StateMap } from '#engine/room/state.ts';
 import { identify, oversizedOf, verify } from '#engine/room/verify.ts';
+import { authorizerServer } from '#engine/room/verify.ts';
+import { ingestRemote } from '#engine/room/remote.ts';
 import type { Store } from '#engine/store/index.ts';
 import {
   assertJoinEncryption,
@@ -128,7 +130,9 @@ export async function joinRemote(
 ): Promise<JoinResult> {
   await assertKnownJoinEncryption(store, args.roomId);
   let lastError: unknown = null;
-  for (const candidate of args.via) {
+  const until = Date.now() + 60_000;
+  for (const candidate of [...new Set(args.via)].slice(0, 8)) {
+    if (Date.now() > until) break;
     try {
       return await joinVia(store, args, candidate);
     } catch (e) {
@@ -179,12 +183,40 @@ async function joinVia(
   // 2. build the join from the template (the resident's prevs, auth
   //    events and depth; our content) and sign it
   const template = mk.event;
+  if (
+    template.type !== 'm.room.member' || template.room_id !== args.roomId ||
+    template.sender !== args.user || template.state_key !== args.user ||
+    template.content?.membership !== 'join' ||
+    !Array.isArray(template.prev_events) ||
+    !Array.isArray(template.auth_events) ||
+    !Number.isSafeInteger(template.depth)
+  ) {
+    throw badResponse('invalid make_join template identity or shape');
+  }
+  let authorizer: string | null;
+  try {
+    authorizer = authorizerServer(template, mk.roomVersion);
+  } catch {
+    throw badResponse('invalid make_join authorizer');
+  }
+  if (authorizer !== null && authorizer !== candidate) {
+    throw badResponse('make_join authorizer is not on the resident');
+  }
+  const content = { ...args.content, membership: 'join' } as Record<
+    string,
+    unknown
+  >;
+  delete content.join_authorised_via_users_server;
+  if (authorizer !== null) {
+    content.join_authorised_via_users_server =
+      template.content.join_authorised_via_users_server;
+  }
   const pdu: Pdu = {
     type: 'm.room.member',
     state_key: args.user,
     sender: args.user,
     room_id: args.roomId,
-    content: { ...(args.content ?? {}), membership: 'join' },
+    content,
     prev_events: template.prev_events ?? [],
     auth_events: template.auth_events ?? [],
     depth: template.depth ?? 1,
@@ -340,7 +372,9 @@ async function joinVia(
               keyId,
               pdu: returned,
               roomVersion: mk.roomVersion,
-              minValidUntilMs: 0,
+              minValidUntilMs: rulebook.spec.enforceKeyValidity
+                ? signed.origin_server_ts
+                : 0,
             })
           ) {
             verifiedSigs[keyId] = residentSigs[keyId];
@@ -401,6 +435,43 @@ async function joinVia(
       encryptionId === undefined ? undefined : pack.get(encryptionId)?.content,
     );
 
+    let held = null;
+    try {
+      held = await openRoom(store, args.roomId);
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
+    if (
+      held !== null && await held.tx((tx) => tx.segments.openStay()) !== null
+    ) {
+      // Already resident does not mean able to vouch. Land the remote vouch
+      // through normal verified recovery into this stay, never install its
+      // send_join snapshot over our published state or open a second stay.
+      const outcomes = await ingestRemote(held, [join], candidate, {
+        keys: deps.keys,
+        fetcher: deps.fetcher,
+        self: deps.self,
+        limits: {
+          waitMs: config().federation.missingwaitms,
+          limit: config().federation.missinglimit,
+          budgetMs: config().federation.missingbudgetms,
+        },
+        ungroundedMs: 0,
+        localJoin: { eventId, userId: args.user },
+      });
+      const landed = await held.tx(async (tx) => {
+        const status = await tx.events.getStatus(eventId);
+        return status?.standing === 'accepted' &&
+          status.grounding === 'grounded';
+      });
+      if (!landed) {
+        throw badResponse(
+          'resident remote join did not land: ' + JSON.stringify(outcomes),
+        );
+      }
+      return { roomId: args.roomId, eventId };
+    }
+
     // 5. the room file (safe create when absent — validation has passed),
     //    then ONE transaction (G11). room-first: the registry follows the
     //    file's existence (a crash between the two is the startup
@@ -411,10 +482,17 @@ async function joinVia(
       room.tx(async (tx) => {
         // revalidation (G8): a live stay means the room is already joined
         if ((await tx.segments.openStay()) !== null) {
+          // /send may publish the same join while the dance is in flight.
+          // Reconcile its original receipt, not the returned snapshot.
+          const existing = await tx.events.getStatus(eventId);
+          if (
+            existing?.standing === 'accepted' &&
+            existing.grounding === 'grounded'
+          ) return;
           throw new MatrixError(
             400,
             'M_BAD_STATE',
-            'already joined to ' + args.roomId,
+            'room became resident during join',
           );
         }
         const prevStay = (await tx.segments.list())

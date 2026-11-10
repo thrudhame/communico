@@ -8,7 +8,7 @@
 import { assert, assertEquals, assertMatch, assertRejects } from '@std/assert';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { createRoom } from '#engine/room/create.ts';
+import { createRoom, type CreateRoomOptions } from '#engine/room/create.ts';
 import { openRoom, type Room, roomSchema } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
@@ -164,7 +164,7 @@ Deno.test('createRoom: spec-default power levels, every key explicit; override d
       ban: 50,
       events: {},
       events_default: 0,
-      invite: 0,
+      invite: 50,
       kick: 50,
       redact: 50,
       state_default: 50,
@@ -182,6 +182,72 @@ Deno.test('createRoom: spec-default power levels, every key explicit; override d
     const room3 = await open(store, res3.roomId);
     const pl3 = (await stateContent(room3, 'm.room.power_levels'))!;
     assertEquals((pl3.users as Record<string, unknown>)[bob], 100);
+  });
+});
+
+Deno.test('createRoom: per-preset invite defaults follow Synapse; explicit preset and power levels win', async () => {
+  await withStore(async (store) => {
+    const signer = await testSigner();
+    const cases: {
+      options: Partial<CreateRoomOptions>;
+      invite: number;
+      rule: string;
+    }[] = [
+      {
+        options: { preset: 'public_chat', visibility: 'private' },
+        invite: 50,
+        rule: 'public',
+      },
+      {
+        options: { preset: 'private_chat', visibility: 'public' },
+        invite: 0,
+        rule: 'invite',
+      },
+      {
+        options: { preset: 'trusted_private_chat', visibility: 'public' },
+        invite: 0,
+        rule: 'invite',
+      },
+      { options: { visibility: 'public' }, invite: 50, rule: 'public' },
+      { options: {}, invite: 0, rule: 'invite' },
+    ];
+    for (const { options, invite, rule } of cases) {
+      for (const override of [undefined, 0, 75]) {
+        const made = await createRoom(store, {
+          creator: '@dev:test',
+          ...options,
+          ...(override === undefined
+            ? {}
+            : { power_level_content_override: { invite: override } }),
+        }, signer);
+        const room = await open(store, made.roomId);
+        assertEquals(
+          (await stateContent(room, 'm.room.power_levels'))?.invite,
+          override ?? invite,
+        );
+        assertEquals(
+          (await stateContent(room, 'm.room.join_rules'))?.join_rule,
+          rule,
+        );
+      }
+      const made = await createRoom(store, {
+        creator: '@dev:test',
+        ...options,
+        power_level_content_override: { invite: 75 },
+        initial_state: [{
+          type: 'm.room.power_levels',
+          state_key: '',
+          content: { users: { '@dev:test': 100 }, invite: 23 },
+        }],
+      }, signer);
+      assertEquals(
+        (await stateContent(
+          await open(store, made.roomId),
+          'm.room.power_levels',
+        ))?.invite,
+        23,
+      );
+    }
   });
 });
 

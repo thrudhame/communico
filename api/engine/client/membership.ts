@@ -12,6 +12,7 @@ import {
   rejectInviteRemote,
 } from '#engine/federation/invites.ts';
 import { joinRemote } from '#engine/room/join.ts';
+import { restrictedResidents } from '#engine/room/restricted.ts';
 import { performJoinCleanup } from '#engine/federation/join-cleanup.ts';
 import { knockRemote } from '#engine/federation/knocks.ts';
 import { assertKnownJoinEncryption } from '#engine/room/encryption-policy.ts';
@@ -31,6 +32,21 @@ export async function serversInRoom(roomId: string): Promise<string[]> {
     r.type === 'm.room.member' && r.content.membership === 'join'
   );
   return [...new Set(members.map((r) => domainOf(r.stateKey)))].sort();
+}
+
+// Keep candidate provenance at the client composition boundary. Explicit
+// remote choices and automatic resident discovery are distinct inputs.
+export function remoteJoinCandidates(
+  self: string,
+  explicit: readonly string[],
+  invited: readonly string[],
+  qualified: readonly string[],
+  held: readonly string[],
+): string[] {
+  const requested = [...new Set(explicit)].filter((server) => server !== self);
+  if (requested.length > 0) return requested;
+  return [...new Set([...invited, ...qualified, ...held])]
+    .filter((server) => server !== self);
 }
 
 export async function join(
@@ -53,18 +69,32 @@ export async function join(
   const room = await lookupRoom(roomId);
   let result;
   if (room !== null && await room.tx((tx) => tx.segments.openStay()) !== null) {
-    result = await local.join(room, userId, signer, content);
-  } else {
+    try {
+      result = await local.join(room, userId, signer, content);
+    } catch (error) {
+      const code = (error as { errcode?: string }).errcode;
+      if (
+        code !== 'M_UNABLE_TO_AUTHORISE_JOIN' &&
+        code !== 'M_UNABLE_TO_GRANT_JOIN'
+      ) throw error;
+    }
+  }
+  if (result === undefined) {
     const deps = inviteDeps();
     const invitation = await inviteFor(roomId, userId, deps);
     const held = room === null ? [] : await serversInRoom(roomId);
-    const via = [
-      ...new Set([
-        ...(opts.via ?? []),
-        ...(invitation?.status === 'pending' ? [invitation.origin] : []),
-        ...held,
-      ]),
-    ].filter((s) => s !== serverName());
+    const qualified = room === null || await room.tx((tx) =>
+          tx.segments.openStay()
+        ) === null
+      ? []
+      : await restrictedResidents(room, userId);
+    const via = remoteJoinCandidates(
+      serverName(),
+      opts.via ?? [],
+      invitation?.status === 'pending' ? [invitation.origin] : [],
+      qualified,
+      held,
+    );
     if (via.length === 0) {
       if (room === null) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'no servers to join through');
@@ -132,7 +162,9 @@ export async function joinByIdOrAlias(
     }
   }
   candidates.push(...via);
-  if (roomId.includes(':')) candidates.push(domainOf(roomId));
+  if (candidates.length === 0 && roomId.includes(':')) {
+    candidates.push(domainOf(roomId));
+  }
   return await operation(roomId, userId, content, {
     via: [...new Set(candidates)].filter((s) => s !== serverName()),
   });

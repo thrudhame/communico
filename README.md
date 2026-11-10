@@ -68,6 +68,20 @@ for explicit retry. Existing invite rejection jobs remain nonexpiring. Remote
 kick/ban notification is not guaranteed by Matrix; unproven terminal events do
 not become membership truth on the knocker's server.
 
+Restricted rooms support local and federated joins based on current membership
+in an allowed room. An invite bypasses that condition; leaving the allowed room
+after authorization does not evict an existing member. The authorizing resident
+must have a joined user with invite power and countersigns the join. A local
+user can obtain that authorization from another resident even when our server
+already participates. Authorizer signatures are verified on every remote
+receipt path, not trusted because a signature entry exists.
+
+New rooms use Synapse-compatible invite defaults: `public_chat` requires power
+50, while `private_chat` and `trusted_private_chat` use 0. An explicit preset
+wins; otherwise public visibility selects `public_chat`, and private/default
+visibility selects `private_chat`. Explicit power-level overrides and initial
+state still win. Existing rooms keep their stored power levels.
+
 Matrix E2EE protects payloads that clients encrypt, not the whole protocol.
 These limits apply even in an encrypted room. HTTPS protects transport, but
 the receiving server can still read fields outside the encrypted payload.

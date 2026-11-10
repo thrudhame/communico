@@ -19,7 +19,8 @@ import {
   pduAt,
   serverInState,
 } from './room.ts';
-import { verify } from '#engine/room/verify.ts';
+import { verify, verifyJoinForCountersign } from '#engine/room/verify.ts';
+import { withRestrictedAdmission } from '#engine/room/restricted.ts';
 import { loadRulebookStore } from '#engine/room/build.ts';
 import { prejoinStateInTx } from './prejoin.ts';
 
@@ -35,7 +36,10 @@ async function template(
     throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is not on ${origin}`);
   }
   const room = await heldRoom(deps.store, roomId);
-  return await room.tx(async (tx) => {
+  const build = async (
+    tx: Parameters<Parameters<typeof room.tx>[0]>[0],
+    authorizer: string | null = null,
+  ) => {
     await assertAcl(tx, origin);
     const snapshot = await currentSnapshot(tx);
     const { version, state, stay } = snapshot;
@@ -54,13 +58,6 @@ async function template(
       return pdu === null || pdu.content == null ? {} : pdu.content;
     };
     const joinRule = (await contentAt('m.room.join_rules')).join_rule;
-    if (membership === 'join' && joinRule === 'restricted') {
-      throw new MatrixError(
-        400,
-        'M_UNABLE_TO_AUTHORISE_JOIN',
-        'restricted rooms are M5c',
-      );
-    }
     const current = (await contentAt('m.room.member', userId)).membership;
     if (current === 'ban') {
       throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is banned`);
@@ -84,7 +81,12 @@ async function template(
       type: 'm.room.member',
       state_key: userId,
       sender: userId,
-      content: { membership },
+      content: {
+        membership,
+        ...(authorizer === null
+          ? {}
+          : { join_authorised_via_users_server: authorizer }),
+      },
     };
     if (membership === 'knock') {
       const rulebook = getRulebook(version);
@@ -140,7 +142,10 @@ async function template(
         origin_server_ts: Date.now(),
       },
     };
-  });
+  };
+  return membership === 'join'
+    ? await withRestrictedAdmission(room, userId, deps.self, build)
+    : await room.tx((tx) => build(tx));
 }
 
 export function makeJoin(
@@ -233,73 +238,112 @@ async function sendMembership(
     ) sigOk = true;
   }
   if (!sigOk) throw new MatrixError(403, 'M_FORBIDDEN', 'bad signature');
-  const verified = await verify(pdu, version, deps.keys, { roomId });
-  await countersign(verified.pdu, version, deps.signer);
-  const answer = await withRoomLock(roomId, () =>
-    room.tx(async (tx) => {
-      await assertAcl(tx, origin);
-      const snapshot = await currentSnapshot(tx);
-      if (
-        membership === 'knock' &&
-        (!getRulebook(version).spec.knockJoinRule ||
-          snapshot.stay.status !== 'open')
-      ) {
-        throw new MatrixError(
-          403,
-          'M_FORBIDDEN',
-          'room does not support knocking',
-        );
-      }
-      if (!(await serverInState(tx, snapshot.state, deps.self))) {
-        if (membership !== 'leave' || snapshot.stay.status !== 'closed') {
-          throw new MatrixError(404, 'M_NOT_FOUND', roomId);
-        }
-      }
-      const ids = [...snapshot.state.values()];
-      const declaredAuth = pdu.auth_events == null ? [] : pdu.auth_events;
-      const closure = await authClosure(tx, [
-        ...ids,
-        ...declaredAuth,
-      ]);
-      const state = ids.map((id) => closure.pdus.get(id)).filter((
-        p,
-      ): p is Pdu => p !== undefined);
-      const chain = new Set([...closure.ids, ...declaredAuth]);
-      const auth = [...chain].map((id) => closure.pdus.get(id)).filter((
-        p,
-      ): p is Pdu => p !== undefined);
-      const result = await ingestInTx(tx, roomId, verified.pdu, {
-        remote: {
-          origin,
-          self: deps.self,
-          oversized: verified.oversized,
-          ungroundedMs: config().federation.ungroundedmillihours * 3600,
-          residentMembership: true,
-        },
+  const prepared =
+    await (membership === 'join'
+      ? verifyJoinForCountersign(pdu, version, deps.keys, deps.self, roomId)
+      : verify(pdu, version, deps.keys, { roomId })).catch((error) => {
+        throw new MatrixError(403, 'M_FORBIDDEN', String(error));
       });
-      if (result.standing !== 'accepted' || result.grounding !== 'grounded') {
-        throw new MatrixError(
-          403,
-          'M_FORBIDDEN',
-          `membership rejected (${result.reason})`,
-        );
+  const nominated = prepared.pdu.content?.join_authorised_via_users_server;
+  if (membership === 'join') {
+    await withRestrictedAdmission(
+      room,
+      pdu.sender,
+      deps.self,
+      (_tx, authorizer) => {
+        if (authorizer !== null && nominated === undefined) {
+          throw new MatrixError(
+            403,
+            'M_FORBIDDEN',
+            'restricted join has no authorizer',
+          );
+        }
+      },
+      typeof nominated === 'string' ? nominated : undefined,
+    );
+  }
+  await countersign(prepared.pdu, version, deps.signer);
+  // Keys/network stay outside the publication lock. Our freshly added
+  // signature is verified locally; every other required signer uses resolver.
+  const verified = await verify(prepared.pdu, version, {
+    verifyEventSignature: (args) =>
+      args.server === deps.self && args.keyId === deps.signer.keyId
+        ? Promise.resolve(true)
+        : deps.keys.verifyEventSignature(args),
+  }, { roomId });
+  const publish = async (tx: Parameters<Parameters<typeof room.tx>[0]>[0]) => {
+    await assertAcl(tx, origin);
+    const snapshot = await currentSnapshot(tx);
+    if (
+      membership === 'knock' &&
+      (!getRulebook(version).spec.knockJoinRule ||
+        snapshot.stay.status !== 'open')
+    ) {
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        'room does not support knocking',
+      );
+    }
+    if (!(await serverInState(tx, snapshot.state, deps.self))) {
+      if (membership !== 'leave' || snapshot.stay.status !== 'closed') {
+        throw new MatrixError(404, 'M_NOT_FOUND', roomId);
       }
-      if (membership === 'leave') return apiVersion === 'v2' ? {} : [200, {}];
-      if (membership === 'knock') {
-        return { knock_room_state: await prejoinStateInTx(tx, pdu.sender) };
-      }
-      const event = toWire(verified.pdu, version);
-      const response = {
-        state: state.map((p) => toWire(p, version)),
-        auth_chain: auth.map((p) => toWire(p, version)),
-        event,
-      };
-      return apiVersion === 'v1' ? [200, response] : {
-        ...response,
-        members_omitted: false,
-        servers_in_room: [deps.self],
-      };
-    }));
+    }
+    const ids = [...snapshot.state.values()];
+    const declaredAuth = pdu.auth_events == null ? [] : pdu.auth_events;
+    const closure = await authClosure(tx, [
+      ...ids,
+      ...declaredAuth,
+    ]);
+    const state = ids.map((id) => closure.pdus.get(id)).filter((
+      p,
+    ): p is Pdu => p !== undefined);
+    const chain = new Set([...closure.ids, ...declaredAuth]);
+    const auth = [...chain].map((id) => closure.pdus.get(id)).filter((
+      p,
+    ): p is Pdu => p !== undefined);
+    const result = await ingestInTx(tx, roomId, verified.pdu, {
+      remote: {
+        origin,
+        self: deps.self,
+        oversized: verified.oversized,
+        ungroundedMs: config().federation.ungroundedmillihours * 3600,
+        residentMembership: true,
+      },
+    });
+    if (result.standing !== 'accepted' || result.grounding !== 'grounded') {
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        `membership rejected (${result.reason})`,
+      );
+    }
+    if (membership === 'leave') return apiVersion === 'v2' ? {} : [200, {}];
+    if (membership === 'knock') {
+      return { knock_room_state: await prejoinStateInTx(tx, pdu.sender) };
+    }
+    const event = toWire(verified.pdu, version);
+    const response = {
+      state: state.map((p) => toWire(p, version)),
+      auth_chain: auth.map((p) => toWire(p, version)),
+      event,
+    };
+    return apiVersion === 'v1' ? [200, response] : {
+      ...response,
+      members_omitted: false,
+      servers_in_room: [deps.self],
+    };
+  };
+  const answer = membership === 'join'
+    ? await withRestrictedAdmission(
+      room,
+      pdu.sender,
+      deps.self,
+      publish,
+      typeof nominated === 'string' ? nominated : undefined,
+    )
+    : await withRoomLock(roomId, () => room.tx(publish));
   await projectAfterWrite(deps.store, roomId);
   return answer;
 }

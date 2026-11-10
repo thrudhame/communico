@@ -176,6 +176,8 @@ for (const restricted of [false, true]) {
             makeJoin: (user) => {
               const template = fr.makeJoinAnswer(user);
               if (restricted) {
+                template.event.content.join_authorised_via_users_server =
+                  fr.creator;
                 const authoriser = fr.afterOf.get(fr.tipId)!.get(
                   'm.room.member\0' + fr.creator,
                 )!;

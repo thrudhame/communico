@@ -223,7 +223,7 @@ export async function createRoom(
     ban: 50,
     events: spec.creatorsHaveInfinitePower ? { 'm.room.tombstone': 150 } : {},
     events_default: 0,
-    invite: 0,
+    invite: 50,
     kick: 50,
     redact: 50,
     state_default: 50,
@@ -231,6 +231,10 @@ export async function createRoom(
     users_default: 0,
     notifications: { room: 50 },
   };
+  // Synapse's creation presets: public_chat keeps the base invite power;
+  // private/trusted-private chat permit ordinary members to invite. Apply
+  // these before explicit overrides, independently of the final join rule.
+  if (preset !== 'public_chat') pl.invite = 0;
   if (opts.power_level_content_override !== undefined) {
     pl = deepMerge(pl, opts.power_level_content_override);
   }

@@ -213,9 +213,33 @@ client user's boolean timeline-visibility question.
 
 Joining verifies the returned snapshot and our join. A returned join must
 recompute to our id; only its verified resident signature is merged into our
-authored copy, retaining our signed content. Restricted authorization requires
-that resident signature; ordinary joins can keep our signed copy alone.
+authored copy, retaining our signed content. Restricted authorization preserves
+only the template's validated authorizer field over our own profile/reason,
+and requires its resident signature; ordinary joins can keep our signed copy
+alone. Required authorizer signatures cross the shared verification boundary
+for live, recovered, history, snapshot and prejoin events. Snapshot sender
+fallback never replaces the additional authorizer requirement. The pure
+rulebook consumes verified input; it does not resolve keys under a room lock.
 (`api/engine/room/join.ts:252-340`)
+
+`room/restricted.ts` owns the decision to vouch, separate from DAG auth. It
+reads current allowed-room membership outside the target write, then rechecks
+its immutable stay/group revision before the locked target transaction. That
+fresh eligibility read is the authorization point; later departure does not
+retroactively revoke a join. Target state changes retry at most three times.
+Only open allowed-room stays vouch for remote users, never archived snapshots.
+The rulebook supplies versioned invite power, including v12 noncreator users.
+No local authorizer or unknown eligibility can route a local user to another
+resident. Candidate attempts are deterministic, capped at eight, with a
+60-second scheduling budget and the transport's per-request deadline. A
+resident remote-vouch response enters normal verified recovery in the existing
+stay, never installs the returned snapshot over published state.
+
+Explicit remote join candidates constrain the attempted servers. Automatic
+invite/qualified-resident discovery is used only when no remote candidate was
+supplied (including a request naming only our own server); a room-ID domain is
+only a no-candidate fallback. This keeps an explicit failover refusal from
+silently becoming a join through an unrequested peer.
 
 Delivery begins with durable room intent, then idempotent projected outbox
 rows. One worker per destination resumes pending work on startup. Batches
