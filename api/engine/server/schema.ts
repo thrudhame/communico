@@ -365,8 +365,13 @@ CREATE INDEX prejoin_user ON prejoin_memberships(user_id,seq);
 CREATE INDEX prejoin_pending ON prejoin_memberships(status,origin);
 `;
 
+const MEDIA_CACHE_SQL = `
+CREATE TABLE media_cache(cache_key TEXT PRIMARY KEY NOT NULL,origin TEXT NOT NULL,media_id TEXT NOT NULL,variant TEXT NOT NULL,scope TEXT NOT NULL,blob TEXT UNIQUE NOT NULL,size INTEGER NOT NULL,content_type TEXT NOT NULL,filename TEXT,created_ms INTEGER NOT NULL,accessed_ms INTEGER NOT NULL,UNIQUE(origin,media_id,variant));
+CREATE INDEX media_cache_lru ON media_cache(scope,accessed_ms);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 20,
+  version: 21,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -386,6 +391,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(PUSH_TARGETS_SQL);
     await db.exec(PUSH_DELIVERY_SQL);
     await db.exec(PREJOIN_SQL);
+    await db.exec(MEDIA_CACHE_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -405,5 +411,6 @@ export const serverSchema: SchemaProvider = {
     17: (conn) => conn.exec(PUSH_TARGETS_SQL),
     18: (conn) => conn.exec(PUSH_DELIVERY_SQL),
     19: (conn) => conn.exec(PREJOIN_SQL),
+    20: (conn) => conn.exec(MEDIA_CACHE_SQL),
   },
 };

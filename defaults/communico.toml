@@ -25,6 +25,56 @@ root = "./.media"
 # COMMUNICO_MEDIA_MAXBYTES (formerly MEDIA_MAX_BYTES)
 maxbytes = 52428800
 
+# Authenticated remote media: one end-to-end deadline, bounded active downloads.
+# COMMUNICO_MEDIA_TIMEOUTMS / MAXFETCHES / MAXREDIRECTS
+timeoutms = 30000
+maxfetches = 4
+maxredirects = 5
+# PNG/JPEG decoder and output bounds; killable workers, not in-process promises.
+# COMMUNICO_MEDIA_MAXPIXELS / MAXDIMENSION / THUMBNAILMS / THUMBNAILWORKERS
+maxpixels = 32000000
+maxdimension = 10000
+thumbnailms = 5000
+thumbnailworkers = 2
+# Per media ID, including in-progress renders; independent of byte retention.
+# Existing variants remain usable at the cap. COMMUNICO_MEDIA_MAXVARIANTS
+maxvariants = 32
+# Cache maintenance interval, seconds. No retention/quota policy is on by default.
+cleanupseconds = 3600
+# CA-only HTTPS CDN Location policy. All resolved addresses are checked at each
+# redirect; explicit private deployments can allow their trusted CIDRs.
+# COMMUNICO_MEDIA_BLOCKLIST / ALLOWLIST
+blocklist = [
+  "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+  "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+  "192.168.0.0/16", "192.88.99.0/24", "198.18.0.0/15", "198.51.100.0/24",
+  "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128",
+  "::ffff:0:0/96", "64:ff9b::/96", "100::/64", "2001::/32", "2001:db8::/32",
+  "2002::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+]
+allowlist = []
+
+[media.cache]
+# Optional total byte cap across remote originals and all generated thumbnails.
+# 0 = unlimited. An undismissed admin-UI warning for unlimited storage is TODO;
+# no log warning is emitted. COMMUNICO_MEDIA_CACHE_MAXBYTES
+maxbytes = 0
+
+[media.cache.remote]
+# Remote original bytes only; never local uploads or room/event data.
+# 0 disables each condition. Conditions combine with OR; byte cap evicts LRU.
+# COMMUNICO_MEDIA_CACHE_REMOTE_MAXAGEDAYS / UNOPENEDDAY / MAXBYTES
+maxagedays = 0
+unopenedday = 0
+maxbytes = 0
+
+[media.cache.thumbnail]
+# Derived thumbnails (local and remote), independent from remote originals.
+# COMMUNICO_MEDIA_CACHE_THUMBNAIL_MAXAGEDAYS / UNOPENEDDAY / MAXBYTES
+maxagedays = 0
+unopenedday = 0
+maxbytes = 0
+
 [encryption]
 # Local client policy; remote events still follow the Matrix room rules.
 allowunencryptedcreation = false

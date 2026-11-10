@@ -63,7 +63,9 @@ Deno.test('media: dotted, port-bearing and IPv6 local names round-trip through r
             ]
           ) {
             const denied = await http.matrix(
-              new Request('http://x' + route + bad, { headers }),
+              new Request('http://x' + route + bad + '?allow_remote=false', {
+                headers,
+              }),
             );
             await denied.arrayBuffer();
             assertEquals(denied.status, 404);

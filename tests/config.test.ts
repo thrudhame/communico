@@ -29,6 +29,27 @@ socket = ""
 [media]
 root = "./.media"
 maxbytes = 52428800
+timeoutms = 30000
+maxfetches = 4
+maxredirects = 5
+maxpixels = 32000000
+maxdimension = 10000
+thumbnailms = 5000
+thumbnailworkers = 2
+maxvariants = 32
+cleanupseconds = 3600
+blocklist = []
+allowlist = []
+[media.cache]
+maxbytes = 0
+[media.cache.remote]
+maxagedays = 0
+unopenedday = 0
+maxbytes = 0
+[media.cache.thumbnail]
+maxagedays = 0
+unopenedday = 0
+maxbytes = 0
 
 [e2ee]
 maxrequestbytes = 1048576
@@ -714,7 +735,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('64 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('83 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -725,13 +746,17 @@ Deno.test('64 leaves total across the sections (the surface tripwire)', async ()
     string,
     Record<string, unknown>
   >;
+  const countLeaves = (value: unknown): number =>
+    value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? Object.values(value).reduce<number>((n, v) => n + countLeaves(v), 0)
+      : 1;
   const counts = Object.entries(sections).map((
     [name, leaves],
-  ): [string, number] => [name, Object.keys(leaves).length]);
+  ): [string, number] => [name, countLeaves(leaves)]);
   assertEquals(counts, [
     ['server', 3],
     ['admin', 1],
-    ['media', 2],
+    ['media', 20],
     ['encryption', 3],
     ['e2ee', 9],
     ['push', 5],
@@ -741,9 +766,54 @@ Deno.test('64 leaves total across the sections (the surface tripwire)', async ()
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    65,
-    'the whole config surface is 65 leaves, including push retention, retry lifetime and transport',
+    83,
+    'the whole config surface includes remote media resource and cache policy leaves',
   );
+});
+
+Deno.test('media resource limits layer independently, cache retention is off/unlimited and private CIDRs require explicit allowance', async () => {
+  const loaded = loadConfig({
+    defaultsPath: 'defaults/communico.toml',
+    configPath: null,
+    env: {
+      COMMUNICO_MEDIA_CACHE_REMOTE_MAXAGEDAYS: '30',
+      COMMUNICO_MEDIA_ALLOWLIST: '10.1.0.0/16',
+    },
+  });
+  assertEquals(loaded.config.media.cache.remote, {
+    maxagedays: 30,
+    unopenedday: 0,
+    maxbytes: 0,
+  });
+  assertEquals(loaded.config.media.cache.thumbnail, {
+    maxagedays: 0,
+    unopenedday: 0,
+    maxbytes: 0,
+  });
+  assertEquals(loaded.config.media.cache.maxbytes, 0);
+  assertEquals(loaded.config.media.allowlist, ['10.1.0.0/16']);
+  const dir = await writeTree({ 'defaults/communico.toml': FULL });
+  try {
+    for (
+      const [key, value] of Object.entries({
+        COMMUNICO_MEDIA_MAXFETCHES: '0',
+        COMMUNICO_MEDIA_TIMEOUTMS: '-1',
+        COMMUNICO_MEDIA_MAXREDIRECTS: '-1',
+        COMMUNICO_MEDIA_CACHE_THUMBNAIL_UNOPENEDDAY: '-1',
+        COMMUNICO_MEDIA_ALLOWLIST: 'not-a-cidr',
+      })
+    ) {
+      assert(
+        loadFail({
+          defaultsPath: dir + '/defaults/communico.toml',
+          configPath: null,
+          env: { [key]: value },
+        }).some((message) => message.includes(key)),
+      );
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });
 
 Deno.test('encryption controls have independent strict booleans and real shipped defaults', () => {

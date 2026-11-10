@@ -17,6 +17,7 @@ import { buildXMatrixHeader } from './xmatrix.ts';
 import { abortable } from '#engine/net/abort.ts';
 import { assertRoomAcl } from './acl.ts';
 import type { Store } from '#engine/store/index.ts';
+import type { Http1Response, Http1WireOpts } from '#engine/net/http1.ts';
 
 export { caCertsPem, resetCaCertsForTests } from './resolve.ts';
 
@@ -63,6 +64,24 @@ export async function federationRequest(
   signer: Signer,
   req: FederationRequest,
 ): Promise<FederationResponse> {
+  const res = await federationRequestRaw(server, signer, req);
+  let json: unknown = null;
+  if (res.body.length > 0) {
+    try {
+      json = JSON.parse(new TextDecoder().decode(res.body));
+    } catch { /* existing JSON callers tolerate empty/non-JSON success */ }
+  }
+  return { status: res.status, json };
+}
+
+// Raw bytes and streaming sinks share signing, ACL admission, discovery, TLS
+// trust and cancellation with JSON federation. Non-success bodies stay bounded
+// and buffered so completed HTTP error provenance is preserved for all callers.
+export async function federationRequestRaw(
+  server: Db,
+  signer: Signer,
+  req: FederationRequest & { sink?: Http1WireOpts['sink'] },
+): Promise<Http1Response> {
   // disabled ⇒ refuse to dial at all
   if (!config().federation.enabled) {
     throw new MatrixError(502, 'M_UNKNOWN', 'federation disabled');
@@ -128,15 +147,13 @@ export async function federationRequest(
     timeoutMs: config().federation.timeoutms,
     maxBytes,
     signal: req.signal,
+    sink: (status, headers) =>
+      status >= 200 && status < 300 && req.sink !== undefined
+        ? req.sink(status, headers)
+        : null,
   });
   if (res.status >= 200 && res.status < 300) {
-    let json: unknown = null;
-    if (res.body.length > 0) {
-      try {
-        json = JSON.parse(new TextDecoder().decode(res.body));
-      } catch { /* a 2xx empty-ish body — tolerate */ }
-    }
-    return { status: res.status, json };
+    return res;
   }
   // non-2xx: a Matrix body surfaces verbatim
   try {
