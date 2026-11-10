@@ -7,6 +7,7 @@ import {
   deleteCachedMedia,
   listCachedMedia,
   publishCachedMedia,
+  thumbnailVariantCount,
   touchCachedMedia,
 } from '#engine/server/media.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -54,12 +55,13 @@ type Pending = {
 export class MediaCache {
   private lane: Promise<unknown> = Promise.resolve();
   private pending = new Map<string, Pending>();
+  private variants = new Map<string, Set<string>>();
   private leases = new Map<string, number>();
   private controller = new AbortController();
   private active = 0;
   private waiters: (() => void)[] = [];
   readonly directory: string;
-  constructor(private db: Db, root: string) {
+  constructor(private db: Db, root: string, private maxVariants = 32) {
     this.directory = root + '/cache';
   }
   private locked<T>(fn: () => Promise<T>): Promise<T> {
@@ -198,8 +200,28 @@ export class MediaCache {
     const blob = stem + '.blob';
     let file: Deno.FsFile | null = null;
     let renamed = false;
+    const media = JSON.stringify([id.origin, id.mediaId]);
+    let reservation: Set<string> | undefined;
     try {
-      const hit = await cachedMedia(this.db, key);
+      const hit = await this.locked(async () => {
+        const hit = await cachedMedia(this.db, key);
+        if (hit || id.scope !== 'thumbnail') return hit;
+        const reserved = this.variants.get(media) ?? new Set<string>();
+        if (
+          await thumbnailVariantCount(this.db, id.origin, id.mediaId) +
+              reserved.size >= this.maxVariants
+        ) {
+          throw new MatrixError(
+            429,
+            'M_LIMIT_EXCEEDED',
+            'Thumbnail variant limit reached',
+          );
+        }
+        reserved.add(key);
+        this.variants.set(media, reserved);
+        reservation = reserved;
+        return null;
+      });
       if (hit) return hit;
       file = await Deno.open(part, {
         createNew: true,
@@ -246,7 +268,10 @@ export class MediaCache {
         created_ms: now,
         accessed_ms: now,
       };
-      await this.locked(() => publishCachedMedia(this.db, row));
+      await this.locked(async () => {
+        await publishCachedMedia(this.db, row);
+        reservation?.delete(key);
+      });
       return row;
     } catch (error) {
       file?.close();
@@ -257,6 +282,8 @@ export class MediaCache {
       );
       throw error;
     } finally {
+      reservation?.delete(key);
+      if (this.variants.get(media)?.size === 0) this.variants.delete(media);
       this.active--;
       this.waiters.shift()?.();
     }
@@ -313,6 +340,12 @@ export class MediaCache {
     else this.leases.delete(blob);
   }
   async cleanup(policy: CachePolicy, now = Date.now()): Promise<void> {
+    const active = (p: Retention) =>
+      p.maxagedays > 0 || p.unopenedday > 0 || p.maxbytes > 0;
+    if (
+      policy.maxbytes <= 0 && !active(policy.remote) &&
+      !active(policy.thumbnail)
+    ) return;
     await this.locked(async () => {
       const rows = await listCachedMedia(this.db);
       let total = rows.reduce((n, r) => n + r.size, 0);

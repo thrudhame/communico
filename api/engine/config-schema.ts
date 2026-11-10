@@ -27,6 +27,7 @@ export const SCHEMA = {
     maxdimension: 'int',
     thumbnailms: 'int',
     thumbnailworkers: 'int',
+    maxvariants: 'int',
     cleanupseconds: 'int',
     blocklist: 'list',
     allowlist: 'list',

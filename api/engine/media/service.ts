@@ -83,17 +83,30 @@ export class MediaService {
   constructor(private db: Db, private tenant: Tenant) {}
   private cacheOwner(): Promise<MediaCache> {
     if (this.cache === null) {
-      this.cache = (async () => {
-        const cache = new MediaCache(this.db, config().media.root);
-        await cache.start();
-        await cache.cleanup(config().media.cache);
-        this.timer = setInterval(() => {
-          void cache.cleanup(config().media.cache).catch((error) =>
-            console.error('media cache maintenance failed:', error)
-          );
-        }, config().media.cleanupseconds * 1000);
-        return cache;
+      const owner = (async () => {
+        const cache = new MediaCache(
+          this.db,
+          config().media.root,
+          config().media.maxvariants,
+        );
+        try {
+          await cache.start();
+          await cache.cleanup(config().media.cache);
+          this.timer = setInterval(() => {
+            void cache.cleanup(config().media.cache).catch((error) =>
+              console.error('media cache maintenance failed:', error)
+            );
+          }, config().media.cleanupseconds * 1000);
+          return cache;
+        } catch (error) {
+          await cache.close();
+          throw error;
+        }
       })();
+      this.cache = owner;
+      void owner.catch(() => {
+        if (this.cache === owner) this.cache = null;
+      });
     }
     return this.cache;
   }

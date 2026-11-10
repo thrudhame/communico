@@ -114,6 +114,43 @@ Deno.test('media cache: concurrent same-key requests deduplicate; origins and va
     );
   });
 });
+
+Deno.test('media cache: one media cannot create unbounded thumbnail variants, including concurrent fills and restart', async () => {
+  await fixture(async (cache, db, root) => {
+    let calls = 0;
+    const fill = (n: number, origin = 'a.test') =>
+      cache.fetch(
+        identity(origin, 'crop:' + n + ':1:png:false'),
+        4,
+        async (out) => {
+          calls++;
+          return await producer(out);
+        },
+      );
+    const results = await Promise.allSettled(
+      Array.from({ length: 40 }, (_, n) => fill(n)),
+    );
+    assertEquals(results.filter((r) => r.status === 'fulfilled').length, 32);
+    assertEquals(calls, 32, 'over-limit variants never enter the producer');
+    assertEquals((await listCachedMedia(db)).length, 32);
+    await fill(0);
+    await fill(40, 'other.test');
+    await cache.close();
+    const reopened = new MediaCache(db, root);
+    await reopened.start();
+    try {
+      await assertRejects(() =>
+        reopened.fetch(identity('a.test', 'new'), 1, producer)
+      );
+      assertEquals((await listCachedMedia(db)).length, 33);
+      const hit = await reopened.get(identity('a.test', 'crop:0:1:png:false'));
+      assert(hit);
+      await (await reopened.open(hit)).cancel();
+    } finally {
+      await reopened.close();
+    }
+  });
+});
 Deno.test('media cache: malformed/truncated producers and byte mismatch leave no usable metadata or partial file', async () => {
   await fixture(async (cache, db) => {
     await assertRejects(() =>

@@ -36,6 +36,9 @@ maxpixels = 32000000
 maxdimension = 10000
 thumbnailms = 5000
 thumbnailworkers = 2
+# Per media ID, including in-progress renders; independent of byte retention.
+# Existing variants remain usable at the cap. COMMUNICO_MEDIA_MAXVARIANTS
+maxvariants = 32
 # Cache maintenance interval, seconds. No retention/quota policy is on by default.
 cleanupseconds = 3600
 # CA-only HTTPS CDN Location policy. All resolved addresses are checked at each

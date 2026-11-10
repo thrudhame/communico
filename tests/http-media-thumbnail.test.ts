@@ -13,7 +13,7 @@ Deno.test('HTTP thumbnail: shared local/federation engine, signed remote variant
   const old = config();
   const root = await Deno.makeTempDir({ prefix: 'http-thumbnail-' });
   setConfigForTests({
-    media: { root, maxfetches: 1 },
+    media: { root, maxfetches: 1, maxvariants: 3 },
     federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
   });
   resetCaCertsForTests();
@@ -63,6 +63,11 @@ Deno.test('HTTP thumbnail: shared local/federation engine, signed remote variant
     const absent = await get(path(serverName(), id) + query, false);
     assertEquals(absent.status, 401);
     await absent.arrayBuffer();
+    await Deno.writeTextFile(root + '/cache', 'transient directory failure');
+    const unavailable = await get(path(serverName(), id) + query);
+    assertEquals(unavailable.status, 500);
+    await unavailable.arrayBuffer();
+    await Deno.remove(root + '/cache');
     const local = await get(path(serverName(), id) + query);
     assertEquals(local.status, 200);
     assertEquals(local.headers.get('Content-Type'), 'image/png');
@@ -96,6 +101,12 @@ Deno.test('HTTP thumbnail: shared local/federation engine, signed remote variant
     assertEquals(after.status, 404);
     await after.arrayBuffer();
     assertEquals(fetches, 3);
+    const capped = await get(
+      path(fake.name, 'remote') + '?width=7&height=7&method=crop',
+    );
+    assertEquals(capped.status, 429);
+    await capped.arrayBuffer();
+    assertEquals(fetches, 3, 'a capped variant never fetches or decodes');
     const peer = await remoteServer('thumb-peer.test');
     const signer = signerFor(peer);
     const target = '/_matrix/federation/v1/media/thumbnail/' + id + query;

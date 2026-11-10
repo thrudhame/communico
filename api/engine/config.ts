@@ -346,6 +346,7 @@ export function loadConfig(opts: {
         'maxdimension',
         'thumbnailms',
         'thumbnailworkers',
+        'maxvariants',
         'cleanupseconds',
       ]
     ) {

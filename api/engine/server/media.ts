@@ -43,6 +43,17 @@ export async function listCachedMedia(db: Db): Promise<CachedMedia[]> {
     'SELECT * FROM media_cache ORDER BY accessed_ms,cache_key',
   )).map(rowOf);
 }
+export async function thumbnailVariantCount(
+  db: Db,
+  origin: string,
+  mediaId: string,
+): Promise<number> {
+  const rows = await db.query(
+    "SELECT COUNT(*) AS n FROM media_cache WHERE origin=? AND media_id=? AND scope='thumbnail'",
+    [origin, mediaId],
+  );
+  return Number(rows[0].n);
+}
 export async function publishCachedMedia(
   db: Db,
   row: CachedMedia,

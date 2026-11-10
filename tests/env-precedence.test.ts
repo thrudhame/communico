@@ -34,6 +34,27 @@ socket = ""
 [media]
 root = "./.media"
 maxbytes = 52428800
+timeoutms = 30000
+maxfetches = 4
+maxredirects = 5
+maxpixels = 32000000
+maxdimension = 10000
+thumbnailms = 5000
+thumbnailworkers = 2
+maxvariants = 32
+cleanupseconds = 3600
+blocklist = []
+allowlist = []
+[media.cache]
+maxbytes = 0
+[media.cache.remote]
+maxagedays = 0
+unopenedday = 0
+maxbytes = 0
+[media.cache.thumbnail]
+maxagedays = 0
+unopenedday = 0
+maxbytes = 0
 
 [e2ee]
 maxrequestbytes = 1048576
