@@ -20,6 +20,21 @@ export const SCHEMA = {
   media: {
     root: 'string',
     maxbytes: 'int',
+    timeoutms: 'int',
+    maxfetches: 'int',
+    maxredirects: 'int',
+    maxpixels: 'int',
+    maxdimension: 'int',
+    thumbnailms: 'int',
+    thumbnailworkers: 'int',
+    cleanupseconds: 'int',
+    blocklist: 'list',
+    allowlist: 'list',
+    cache: {
+      maxbytes: 'int',
+      remote: { maxagedays: 'int', unopenedday: 'int', maxbytes: 'int' },
+      thumbnail: { maxagedays: 'int', unopenedday: 'int', maxbytes: 'int' },
+    },
   },
   encryption: {
     allowunencryptedcreation: 'bool',

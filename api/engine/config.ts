@@ -335,7 +335,60 @@ export function loadConfig(opts: {
       );
     }
   }
-  for (const section of ['preview', 'push']) {
+  const media = built.media as Record<string, unknown> | undefined;
+  if (media) {
+    for (
+      const leaf of [
+        'maxbytes',
+        'timeoutms',
+        'maxfetches',
+        'maxpixels',
+        'maxdimension',
+        'thumbnailms',
+        'thumbnailworkers',
+        'cleanupseconds',
+      ]
+    ) {
+      const value = media[leaf];
+      if (
+        typeof value === 'number' &&
+        (!Number.isSafeInteger(value) || value <= 0)
+      ) {
+        problems.push(
+          `config: media.${leaf} (${
+            envNameOf(['media', leaf])
+          }): expected a positive safe integer`,
+        );
+      }
+    }
+    const hops = media.maxredirects;
+    if (typeof hops === 'number' && (!Number.isSafeInteger(hops) || hops < 0)) {
+      problems.push(
+        'config: media.maxredirects (COMMUNICO_MEDIA_MAXREDIRECTS): expected >= 0',
+      );
+    }
+    const cache = media.cache as Record<string, unknown> | undefined;
+    for (const [scope, values] of Object.entries(cache ?? {})) {
+      const entries = typeof values === 'number'
+        ? [[['media', 'cache', scope], values] as const]
+        : Object.entries(values as Record<string, unknown>).map((
+          [leaf, value],
+        ) => [['media', 'cache', scope, leaf], value] as const);
+      for (const [path, value] of entries) {
+        if (
+          typeof value === 'number' &&
+          (!Number.isSafeInteger(value) || value < 0)
+        ) {
+          problems.push(
+            `config: ${path.join('.')} (${
+              envNameOf([...path])
+            }): expected >= 0`,
+          );
+        }
+      }
+    }
+  }
+  for (const section of ['preview', 'push', 'media']) {
     const p = built[section] as Record<string, unknown> | undefined;
     if (!p) continue;
     for (const leaf of ['blocklist', 'allowlist']) {

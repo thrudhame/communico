@@ -9,6 +9,7 @@
 // app store (4b), engine tests keep opening schema-less stores without
 // it.
 import { config, serverName } from '#engine/config.ts';
+import { MediaService } from '#engine/media/service.ts';
 import { installRuleMigration } from '#engine/client/rule-migration.ts';
 import {
   type EduQueues,
@@ -56,6 +57,7 @@ export type App = {
   // disabled, or an endpoint-test app).
   sender: Sender | null;
   readonly pushSender: PushSender;
+  readonly media: MediaService;
   close(): Promise<void>;
 };
 
@@ -98,6 +100,8 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   try {
     const tenant = await openTenant(store, serverName(), { create: true });
     const server = await store.server();
+    const media = new MediaService(server, tenant);
+    services.push(() => media.close());
     const stopRuleMigration = await installRuleMigration(store, tenant);
     services.push(stopRuleMigration);
     const stopNotificationHistory = await startNotificationHistory(server);
@@ -116,6 +120,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       deviceLists,
       sender: null,
       pushSender,
+      media,
       close: async () => {
         try {
           try {
