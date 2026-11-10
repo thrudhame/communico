@@ -19,6 +19,15 @@ choose its storage engine. E2EE server APIs cover device and one-time/fallback
 keys, durable to-device delivery, device lists, federation, cross-signing and
 encrypted key backup. Clients own encryption, private keys and decryption.
 
+## Client data and sync
+
+Room tags use the standard tags API and the same private `m.tag` room account
+data clients can read and write directly. Tag changes wake incremental sync.
+Stored and inline sync filters support room and sender inclusion/exclusion,
+type globs, URL matching, state, presence, ephemeral and account-data selection.
+Filtered events still advance stream tokens; E2EE control streams and unread
+counts are not content-filtered.
+
 ## Jump to date
 
 Authenticated client and signed federation `timestamp_to_event` support inclusive

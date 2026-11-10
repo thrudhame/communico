@@ -117,7 +117,11 @@ export async function search(
     if (row === null) continue;
     const pdu = JSON.parse(row.pdu);
     if (
-      !eventMatchesRoomEventFilter(null, pdu, filter) ||
+      !eventMatchesRoomEventFilter(
+        null,
+        { ...pdu, room_id: c.roomId },
+        filter,
+      ) ||
       !await canSeeEvent(userId, room, c.eventId) ||
       await isIgnoredEvent(room, c.eventId, {
         userId,

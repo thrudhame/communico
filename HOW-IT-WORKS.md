@@ -182,6 +182,16 @@ body/name/topic text without altering the PDU.
 
 ## Client reads and sync
 
+Stored and inline sync filters share shape validation and pure matching across
+room selection, timeline, state, presence, ephemeral and both account-data
+streams. Denials win, empty lists exclude everything, and only `*` is special
+in type globs. Senderless stream envelopes never gain a fabricated sender.
+Selection and timeline visibility/ignore checks precede limits, while stream
+cuts advance across excluded data. E2EE control streams and notification counts
+are not content-filtered. Federation event format crosses the same viewer-aware
+renderer as client format; `event_fields` may receive the spec-permitted superset.
+(`api/engine/tenant/filters.ts`, `api/engine/syncfeed.ts`)
+
 All client timeline rendering crosses one viewer-aware `renderEvent` boundary.
 Its shared visibility policy requires accepted, grounded events; the viewer's
 own membership events are visible without a qualifying join. Other events need

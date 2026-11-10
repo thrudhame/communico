@@ -348,6 +348,7 @@ export async function eventContext(
     eventMatchesRoomEventFilter(null, {
       type: String(e.type),
       sender: String(e.sender),
+      room_id: roomId,
       content: e.content as Record<string, unknown>,
     }, opts.filter);
   const eventsBefore = before.chunk.filter(matches),

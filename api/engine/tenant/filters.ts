@@ -10,10 +10,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 
-export interface EventFilter {
-  limit?: number;
-  types?: string[];
-  not_types?: string[];
+export interface EventFilter extends RoomEventFilter {
   lazy_load_members?: boolean;
   unread_thread_notifications?: boolean;
 }
@@ -24,6 +21,11 @@ export interface RoomFilter {
   timeline: EventFilter;
   state: EventFilter;
   includeLeave: boolean;
+  presence?: EventFilter;
+  accountData?: EventFilter;
+  ephemeral?: EventFilter;
+  roomAccountData?: EventFilter;
+  eventFormat?: 'client' | 'federation';
 }
 
 export const DEFAULT_ROOM_FILTER: RoomFilter = {
@@ -55,6 +57,22 @@ export function validateFilterDocument(raw: unknown): void {
     }
   }
   const room = (doc.room ?? {}) as Record<string, unknown>;
+  if (
+    doc.event_format !== undefined &&
+    !['client', 'federation'].includes(String(doc.event_format))
+  ) {
+    throw bad('event_format');
+  }
+  if (
+    doc.event_fields !== undefined &&
+    (!Array.isArray(doc.event_fields) ||
+      !doc.event_fields.every((v) => typeof v === 'string'))
+  ) {
+    throw bad('event_fields');
+  }
+  if (
+    room.include_leave !== undefined && typeof room.include_leave !== 'boolean'
+  ) throw bad('room.include_leave');
   for (const key of ['timeline', 'state', 'ephemeral', 'account_data']) {
     const v = room[key];
     if (
@@ -103,7 +121,22 @@ export function validateFilterDocument(raw: unknown): void {
     ) {
       throw bad(name + '.limit is not a non-negative integer');
     }
+    for (
+      const key of [
+        'contains_url',
+        'lazy_load_members',
+        'include_redundant_members',
+        'unread_thread_notifications',
+      ]
+    ) {
+      if (s[key] !== undefined && typeof s[key] !== 'boolean') {
+        throw bad(name + '.' + key + ' is not a boolean');
+      }
+    }
   };
+  checkSection(doc.presence, 'presence');
+  checkSection(doc.account_data, 'account_data');
+  checkSection(room, 'room');
   for (const section of ['timeline', 'state', 'ephemeral', 'account_data']) {
     checkSection(room[section], 'room.' + section);
   }
@@ -117,7 +150,7 @@ export function validateFilterDocument(raw: unknown): void {
 }
 
 function eventFilterOf(raw: unknown): EventFilter {
-  const out: EventFilter = {};
+  const out: EventFilter = roomEventFilterOf(raw);
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out;
   const r = raw as Record<string, unknown>;
   if (
@@ -145,14 +178,17 @@ function eventFilterOf(raw: unknown): EventFilter {
 
 // Parse a filter document (already-JSON-decoded) into the typed shape.
 export function roomFilterOf(raw: unknown): RoomFilter {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    return DEFAULT_ROOM_FILTER;
-  }
+  validateFilterDocument(raw);
   const r = raw as Record<string, unknown>;
   const room = (r.room ?? {}) as Record<string, unknown>;
   return {
     timeline: eventFilterOf(room.timeline),
     state: eventFilterOf(room.state),
+    presence: eventFilterOf(r.presence),
+    accountData: eventFilterOf(r.account_data),
+    ephemeral: eventFilterOf(room.ephemeral),
+    roomAccountData: eventFilterOf(room.account_data),
+    eventFormat: r.event_format === 'federation' ? 'federation' : 'client',
     includeLeave: room.include_leave === true,
     ...(Array.isArray(room.rooms)
       ? { rooms: room.rooms.filter((v): v is string => typeof v === 'string') }
@@ -238,11 +274,13 @@ export async function resolveFilter(
 ): Promise<RoomFilter> {
   if (raw === null || raw === '') return DEFAULT_ROOM_FILTER;
   if (raw.startsWith('{')) {
+    let doc: unknown;
     try {
-      return roomFilterOf(JSON.parse(raw));
+      doc = JSON.parse(raw);
     } catch {
       throw new MatrixError(400, 'M_BAD_JSON', 'filter is not valid JSON');
     }
+    return roomFilterOf(doc);
   }
   const doc = await loadFilter(tenant, localpartOf(userId), raw);
   if (doc === null) {
@@ -270,7 +308,7 @@ export function roomEventFilterOf(raw: unknown): RoomEventFilter {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out;
   const r = raw as Record<string, unknown>;
   if (
-    typeof r.limit === 'number' && Number.isInteger(r.limit) && r.limit > 0
+    typeof r.limit === 'number' && Number.isInteger(r.limit) && r.limit >= 0
   ) {
     out.limit = r.limit;
   }
@@ -296,27 +334,22 @@ export function roomEventFilterOf(raw: unknown): RoomEventFilter {
 
 export function eventMatchesRoomEventFilter(
   _row: unknown,
-  pdu: { type: string; sender: string; content?: Record<string, unknown> },
+  pdu: { type: string; sender?: string; room_id?: string; content?: unknown },
   filter: RoomEventFilter,
 ): boolean {
-  if (filter.types !== undefined && !filter.types.includes(pdu.type)) {
-    return false;
-  }
-  if (
-    filter.not_types !== undefined && filter.not_types.includes(pdu.type)
-  ) {
-    return false;
-  }
-  if (
-    filter.senders !== undefined && !filter.senders.includes(pdu.sender)
-  ) {
-    return false;
-  }
-  if (
-    filter.not_senders !== undefined &&
-    filter.not_senders.includes(pdu.sender)
-  ) {
-    return false;
+  const checks = [
+    ['types', 'not_types', pdu.type, true],
+    ['senders', 'not_senders', pdu.sender, false],
+    ['rooms', 'not_rooms', pdu.room_id, false],
+  ] as const;
+  for (const [allow, deny, value, wildcard] of checks) {
+    const matches = (pattern: string) =>
+      value !== undefined &&
+      (wildcard ? typeGlob(value, pattern) : value === pattern);
+    if (filter[deny]?.some(matches)) return false;
+    if (filter[allow] !== undefined && !filter[allow]!.some(matches)) {
+      return false;
+    }
   }
   if (filter.contains_url !== undefined) {
     const hasUrl =
@@ -324,4 +357,36 @@ export function eventMatchesRoomEventFilter(
     if (hasUrl !== filter.contains_url) return false;
   }
   return true;
+}
+
+/** Only '*' is special. Split-and-find avoids untrusted regex compilation and
+ * exponential regex backtracking; every literal is consumed left to right. */
+function typeGlob(value: string, pattern: string): boolean {
+  const parts = pattern.split('*');
+  if (parts.length === 1) return value === pattern;
+  if (!value.startsWith(parts[0])) return false;
+  let at = parts[0].length;
+  for (let i = 1; i < parts.length - 1; i++) {
+    const found = value.indexOf(parts[i], at);
+    if (found < 0) return false;
+    at = found + parts[i].length;
+  }
+  const last = parts[parts.length - 1];
+  return value.length - last.length >= at && value.endsWith(last);
+}
+
+/** Stream envelopes without a sender stay senderless. Room context is explicit
+ * metadata, not a mutation to the wire event. Apply limits after selection. */
+export function filterEvents<
+  T extends { type: string; sender?: string; content?: unknown },
+>(events: T[], filter: EventFilter = {}, roomId?: string): T[] {
+  const selected = events.filter((event) =>
+    eventMatchesRoomEventFilter(null, {
+      ...event,
+      ...(roomId === undefined ? {} : { room_id: roomId }),
+    }, filter)
+  );
+  return filter.limit === undefined
+    ? selected
+    : selected.slice(0, filter.limit);
 }

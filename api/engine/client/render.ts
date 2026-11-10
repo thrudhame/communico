@@ -50,7 +50,11 @@ export async function renderEvent(
   room: Room,
   eventId: string,
   viewer: Viewer,
-  opts?: { omitRoomId?: boolean; bundleThreads?: boolean },
+  opts?: {
+    omitRoomId?: boolean;
+    bundleThreads?: boolean;
+    eventFormat?: 'client' | 'federation';
+  },
 ): Promise<Record<string, unknown> | null> {
   if (!await canSeeEvent(viewer.userId, room, eventId)) return null;
   if (await isIgnoredEvent(room, eventId, viewer)) return null;
@@ -63,7 +67,11 @@ export async function renderStateEvent(
   room: Room,
   eventId: string,
   viewer?: Viewer,
-  opts?: { omitRoomId?: boolean; bundleThreads?: boolean },
+  opts?: {
+    omitRoomId?: boolean;
+    bundleThreads?: boolean;
+    eventFormat?: 'client' | 'federation';
+  },
 ): Promise<Record<string, unknown> | null> {
   const loaded = await room.tx(async (tx) => {
     const row = await tx.events.get(eventId);
@@ -95,7 +103,9 @@ export async function renderStateEvent(
     pdu as unknown as Record<string, unknown>,
     version,
   ) as unknown as Pdu;
-  const event = clientShape(shown, eventId);
+  const event: Record<string, unknown> = opts?.eventFormat === 'federation'
+    ? { ...shown, event_id: eventId }
+    : clientShape(shown, eventId);
   if (opts?.omitRoomId !== true) event.room_id = room.id;
   if (shown.state_key != null) event.state_key = shown.state_key;
   if (shown.redacts != null) event.redacts = shown.redacts;

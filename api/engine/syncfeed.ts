@@ -31,7 +31,11 @@ import {
   listGlobalAccountDataSince,
 } from '#engine/tenant/accountdata.ts';
 import { pushStreamSeq, rulesetFor } from '#engine/tenant/pushrules.ts';
-import type { RoomFilter } from '#engine/tenant/filters.ts';
+import {
+  eventMatchesRoomEventFilter,
+  filterEvents,
+  type RoomFilter,
+} from '#engine/tenant/filters.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { onEventStream } from '#engine/server/stream.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
@@ -92,22 +96,27 @@ async function roomTimeline(
     Number.MAX_SAFE_INTEGER,
     end,
   );
-  const pdus = await room.tx((tx) => tx.events.list(raw.map((r) => r.event)));
-  const typeMatches = (
-    type: string,
-    f: { types?: string[]; not_types?: string[] },
-  ) =>
-    (f.types === undefined || f.types.includes(type)) &&
-    !f.not_types?.includes(type);
+  const stored = await room.tx((tx) => tx.events.list(raw.map((r) => r.event)));
+  const pdus = new Map(
+    [...stored].map(([id, row]) => [id, JSON.parse(row.pdu) as Pdu]),
+  );
   const filtered = raw.filter((r) => {
     const pdu = pdus.get(r.event);
-    return pdu !== undefined && typeMatches(pdu.type, i.filter.timeline);
+    return pdu !== undefined &&
+      eventMatchesRoomEventFilter(
+        null,
+        { ...pdu, room_id: room.id },
+        i.filter.timeline,
+      );
   });
   const limit = i.filter.timeline.limit ?? 10;
-  const trimmed = filtered.length > limit;
-  const returned = trimmed ? filtered.slice(filtered.length - limit) : filtered;
-  const events: Record<string, unknown>[] = [];
-  for (const row of returned) {
+  const eligible: {
+    row: typeof raw[number];
+    event: Record<string, unknown>;
+  }[] = [];
+  // Visibility/ignore admission precedes the limit too. Hidden newer events
+  // must not consume slots and leave eligible older messages undelivered.
+  for (const row of filtered) {
     const at = await stateAtSeq(room, row.seq, row.stay);
     const membership = at.find((s) =>
       s.type === 'm.room.member' && s.stateKey === i.userId
@@ -117,9 +126,13 @@ async function roomTimeline(
       deviceId: i.deviceId,
       tenant: app.tenant,
       membership: String(membership),
-    }, { omitRoomId: true });
-    if (event !== null) events.push(event);
+    }, { omitRoomId: true, eventFormat: i.filter.eventFormat });
+    if (event !== null) eligible.push({ row, event });
   }
+  const trimmed = eligible.length > limit;
+  const selected = trimmed ? eligible.slice(eligible.length - limit) : eligible;
+  const returned = selected.map((item) => item.row);
+  const events = selected.map((item) => item.event);
   const start = returned[0];
   const atStart = await stateAtSeq(room, start?.seq ?? end, start?.stay);
   let stateRows = atStart;
@@ -139,19 +152,19 @@ async function roomTimeline(
     );
   }
   const stateEvents: Record<string, unknown>[] = [];
-  stateRows = stateRows.filter((r) => typeMatches(r.type, i.filter.state));
-  if (i.filter.state.lazy_load_members) {
+  if (i.filter.state.lazy_load_members || i.filter.timeline.lazy_load_members) {
     const senders = new Set(events.map((ev) => String(ev.sender)));
     stateRows = stateRows.filter((r) =>
       r.type !== 'm.room.member' || senders.has(r.stateKey)
     );
   }
+  stateRows = filterEvents(stateRows, i.filter.state, room.id);
   for (const row of stateRows) {
     const ev = await renderStateEvent(room, row.eventId, {
       userId: i.userId,
       deviceId: i.deviceId,
       tenant: app.tenant,
-    }, { omitRoomId: true });
+    }, { omitRoomId: true, eventFormat: i.filter.eventFormat });
     if (ev !== null) stateEvents.push(ev);
   }
   const prevE = trimmed && returned.length ? returned[0].seq - 1 : end;
@@ -193,7 +206,13 @@ async function roomTimeline(
     for (const content of receipts) {
       ephemeral.push({ type: 'm.receipt', content });
     }
-    entry.ephemeral = { events: ephemeral };
+    entry.ephemeral = {
+      events: filterEvents(
+        ephemeral as { type: string; content: unknown }[],
+        i.filter.ephemeral,
+        room.id,
+      ),
+    };
     const members = snapshot.members;
     const heroes = members.filter((r) => r.user !== i.userId).slice(0, 5).map((
       r,
@@ -208,7 +227,11 @@ async function roomTimeline(
       ...(heroes.length ? { 'm.heroes': heroes } : {}),
     };
     entry.account_data = {
-      events: snapshot.accountData,
+      events: filterEvents(
+        snapshot.accountData,
+        i.filter.roomAccountData,
+        room.id,
+      ),
     };
   }
   const joiners: string[] = [];
@@ -580,8 +603,17 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   return {
     next_batch: nextBatch,
     rooms: { join, invite, knock, leave },
-    presence: { events: [...presenceEvents.values()] },
-    account_data: { events: accountData },
+    presence: {
+      events: filterEvents(
+        [...presenceEvents.values()] as {
+          type: string;
+          sender: string;
+          content: unknown;
+        }[],
+        i.filter.presence,
+      ),
+    },
+    account_data: { events: filterEvents(accountData, i.filter.accountData) },
     to_device: { events: delivery.events },
     device_lists: deviceLists,
     device_one_time_keys_count: delivery.pools.counts,
