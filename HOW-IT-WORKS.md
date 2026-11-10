@@ -282,6 +282,10 @@ through the existing folder-level authentication placement.
 `federation.discoveryservers` controls the server-attempt cap (default 3).
 (`api/engine/client/discovery.ts`, `api/engine/room/restricted.ts`)
 
+Remote discovery applies the shared summary schema's public default when
+`join_rule` is omitted, as standard servers may do. Held private summaries always
+serialize their explicit join rule.
+
 Client space hierarchy walks valid, redaction-aware child links depth-first,
 ordered by valid ASCII order, timestamp and room ID. Opaque five-minute sessions
 retain the pending stack and visited rooms, bind user/root/depth/suggested filters,

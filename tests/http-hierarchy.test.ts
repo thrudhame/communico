@@ -65,7 +65,7 @@ suite.test('unheld hierarchy children use signed via discovery and re-filter use
       );
       const summary: Json = {
         room_id: id,
-        join_rule: id === filteredChild ? 'invite' : 'public',
+        join_rule: id === filteredChild ? 'invite' : undefined,
         num_joined_members: 1,
         guest_can_join: false,
         world_readable: false,

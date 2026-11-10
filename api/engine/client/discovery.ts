@@ -20,6 +20,11 @@ export async function summaryAccessible(
   principal: DiscoveryPrincipal,
 ): Promise<boolean> {
   const app = theApp(), id = String(summary.room_id);
+  // The shared room-summary wire schema defaults an omitted join_rule to
+  // public. Standard servers (including tuwunel) use that omission.
+  const joinRule = summary.join_rule === undefined
+    ? 'public'
+    : summary.join_rule;
   if (
     'origin' in principal && !await roomAllows(app.store, id, principal.origin)
   ) return false;
@@ -28,9 +33,9 @@ export async function summaryAccessible(
     ? getRulebook(summary.room_version).spec
     : null;
   if (
-    summary.world_readable === true || summary.join_rule === 'public' ||
-    (summary.join_rule === 'knock' && (spec === null || spec.knockJoinRule)) ||
-    (summary.join_rule === 'knock_restricted' &&
+    summary.world_readable === true || joinRule === 'public' ||
+    (joinRule === 'knock' && (spec === null || spec.knockJoinRule)) ||
+    (joinRule === 'knock_restricted' &&
       (spec === null || spec.knockRestrictedJoinRule))
   ) return true;
   const users: string[] = [];
@@ -59,8 +64,8 @@ export async function summaryAccessible(
     );
   }
   if (
-    (summary.join_rule === 'restricted' ||
-      summary.join_rule === 'knock_restricted') &&
+    (joinRule === 'restricted' ||
+      joinRule === 'knock_restricted') &&
     Array.isArray(summary.allowed_room_ids)
   ) {
     const allowed = summary.allowed_room_ids.filter((id): id is string =>

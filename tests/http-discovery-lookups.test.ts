@@ -133,7 +133,7 @@ suite.test('known/none, disabled federation, closed mode and block list gate loo
 
 suite.test('remote room summary uses signed hierarchy, rechecks user eligibility and retains no room or peer', async () => {
   const user = await suite.registerTestUser('remote-summary', 'pw');
-  let roomId = '', joinRule = 'public';
+  let roomId = '', joinRule: string | undefined;
   const fake = await startFakeServer({
     ourKeyDoc: async () =>
       await (await suite.matrix(new Request('http://x/_matrix/key/v2/server')))
