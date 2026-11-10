@@ -185,6 +185,44 @@ known ACLs also prevent initiating participation when our server is denied.
 Events and room EDUs still go to denied peers that remain resident, following
 Matrix's delivery recommendation. Room ACLs do not govern media requests.
 
+## Media privacy and caching
+
+Authenticated client download/filename/thumbnail requests fetch foreign MXCs on
+demand. The server learns the requested MXC, contacts its origin and possibly
+its CDN, and retains the bytes. The origin/CDN normally sees our server's
+address, not the user's, but request timing remains observable. Media need not
+belong to any joined room. There is no timeline/sync prefetch.
+
+Plain uploads, avatars and thumbnails remain readable to a serving server.
+Client-encrypted attachments are cached as ciphertext, never decrypted or
+thumbnailed as plaintext. Legacy unauthenticated routes serve local uploads and
+their local thumbnails only: they never fetch or expose foreign cache entries.
+Authenticated cache hits still obey current federation policy. Federation media
+requests require a signature and serve only this server's uploads.
+
+| # | Setting                                                              | Behavior                                                                                                                                                                                                 |
+| - | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 | `media.maxbytes`                                                     | Per upload/download bound, 50 MiB by default. Downloads stream to unpublished disk files.                                                                                                                |
+| 2 | `media.maxfetches`, `timeoutms`, `maxredirects`                      | Four active cache fills, a 30-second remote deadline, at most five CDN redirects.                                                                                                                        |
+| 3 | `media.blocklist`, `allowlist`                                       | CDN URLs require CA-verified HTTPS. Check every resolved address at every hop; explicitly allow trusted private CIDRs. No client/federation credentials go to the CDN.                                   |
+| 4 | `media.cache.maxbytes`                                               | Optional total cache cap; 0 means unlimited. Never removes local uploads or room data.                                                                                                                   |
+| 5 | `media.cache.remote` / `media.cache.thumbnail`                       | Independent `maxagedays`, `unopenedday` and `maxbytes`; each defaults to 0 (off). Enabled conditions combine with OR; size caps evict least-recently-opened entries. Active serving leases are retained. |
+| 6 | `media.cleanupseconds`                                               | Cache maintenance interval, 3600 seconds. Cache partials/orphans and missing bytes are reconciled before cache use after restart.                                                                        |
+| 7 | `media.maxpixels`, `maxdimension`, `thumbnailms`, `thumbnailworkers` | 32 million decoded pixels, 10000 pixels per side, five seconds per decoder worker, two active workers.                                                                                                   |
+
+PNG/JPEG thumbnails use crop/scale without upscaling and always return static
+PNG, including an APNG's default image. Animated generation, video and other
+image formats are unsupported. The PNG/JPEG backend is pinned ImageScript
+3.20.2 (pure TypeScript, MIT or AGPL-3.0-or-later). Decoder workers are killable;
+compressed thumbnail inputs are bounded by the worker count and per-object byte
+limit, independently of streamed original downloads. Workers run trusted codec
+code with the server's permissions, not untrusted scripts.
+
+Cache cleanup and size limits are all off by default: bytes are kept forever
+unless an operator opts in. The dismissable unlimited-storage warning belongs
+to the planned admin UI; it is not emitted as a log warning. See the complete
+layered settings in `defaults/communico.toml`.
+
 ## Notification history
 
 Push rules evaluate live events, including encrypted envelopes, independently of

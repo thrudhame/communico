@@ -1,4 +1,4 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { config, serverName, setConfigForTests } from '#engine/config.ts';
 import { theApp } from '#engine/app.ts';
 import { startHttp } from '#tests/http-app.ts';
@@ -7,6 +7,7 @@ import { mediaMultipart, multipartResponse } from '#engine/media/multipart.ts';
 import { remoteServer, signerFor } from './http-federation.ts';
 import { buildXMatrixHeader } from '#engine/federation/xmatrix.ts';
 import { canonicalJson } from '#engine/canonical.ts';
+import { listCachedMedia } from '#engine/server/media.ts';
 import { addBlock, removeBlock } from '#engine/federation/peers.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 
@@ -229,6 +230,131 @@ Deno.test('HTTP federation media: signature required, local upload served as exa
   } finally {
     await http.close();
     setConfigForTests(previous);
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('HTTP remote media: Location bytes remain private and the last disconnected subscriber closes the remote socket', async () => {
+  const old = config();
+  const root = await Deno.makeTempDir({ prefix: 'http-media-cancel-' });
+  setConfigForTests({
+    media: { root, allowlist: ['127.0.0.1/32', '::1/128'] },
+    federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+  });
+  resetCaCertsForTests();
+  const http = await startHttp();
+  const seen: Headers[] = [];
+  const cdn = Deno.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    cert: await Deno.readTextFile('tests/fixtures/tls/localhost.crt'),
+    key: await Deno.readTextFile('tests/fixtures/tls/localhost.key'),
+    onListen() {},
+  }, (req) => {
+    seen.push(req.headers);
+    return new Response(new Uint8Array([9, 8, 7]), {
+      headers: { 'Content-Type': 'image/png' },
+    });
+  });
+  let cancelled = false;
+  let began!: () => void;
+  const started = new Promise<void>((r) => began = r);
+  const fake = await startFakeServer({
+    ourKeyDoc: () =>
+      Promise.resolve({
+        server_name: serverName(),
+        verify_keys: {
+          [http.app.tenant.keyId]: { key: http.app.tenant.publicB64 },
+        },
+      }),
+    handlers: (req) => {
+      if (
+        !req.path.startsWith('/_matrix/federation/v1/media/download/')
+      ) return null;
+      assert(req.verified);
+      const prefix =
+        '--media\r\nContent-Type: application/json\r\n\r\n{}\r\n--media\r\n';
+      if (req.path.endsWith('/location')) {
+        return new Response(
+          prefix +
+            `Location: https://localhost:${cdn.addr.port}/bytes?secret=hidden\r\n\r\n\r\n--media--\r\n`,
+          { headers: { 'Content-Type': 'multipart/mixed; boundary=media' } },
+        );
+      }
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(
+              new TextEncoder().encode(
+                prefix + 'Content-Type: image/png\r\n\r\n' + '.'.repeat(100),
+              ),
+            );
+            began();
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { 'Content-Type': 'multipart/mixed; boundary=media' } },
+      );
+    },
+  });
+  try {
+    const user = await http.registerTestUser('media-cancel', 'pw');
+    const get = (id: string, signal?: AbortSignal) =>
+      http.matrix(
+        new Request(
+          `http://x/_matrix/client/v1/media/download/${fake.name}/${id}`,
+          {
+            headers: {
+              Authorization: 'Bearer ' + user.access_token,
+              Cookie: 'client-cookie=private',
+            },
+            signal,
+          },
+        ),
+      );
+    const location = await get('location');
+    assertEquals(location.status, 200);
+    assertEquals(
+      new Uint8Array(await location.arrayBuffer()),
+      new Uint8Array([9, 8, 7]),
+    );
+    assertEquals(seen.length, 1);
+    assertEquals(seen[0].has('authorization'), false);
+    assertEquals(seen[0].has('cookie'), false);
+    assertEquals(
+      JSON.stringify(await listCachedMedia(http.app.server)).includes('secret'),
+      false,
+    );
+    const a = new AbortController(), b = new AbortController();
+    const first = get('slow', a.signal), second = get('slow', b.signal);
+    const rejected = Promise.all([
+      assertRejects(() => first),
+      assertRejects(() => second),
+    ]);
+    await started;
+    await new Promise((r) => setTimeout(r, 30));
+    a.abort();
+    await new Promise((r) => setTimeout(r, 30));
+    assertEquals(cancelled, false);
+    b.abort();
+    await rejected;
+    for (let n = 0; n < 100 && !cancelled; n++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assertEquals(cancelled, true);
+    assertEquals(
+      fake.requests.filter((r) => r.path.endsWith('/slow')).length,
+      1,
+    );
+  } finally {
+    await fake.close();
+    await cdn.shutdown();
+    await cdn.finished;
+    await http.close();
+    setConfigForTests(old);
+    resetCaCertsForTests();
     await Deno.remove(root, { recursive: true });
   }
 });

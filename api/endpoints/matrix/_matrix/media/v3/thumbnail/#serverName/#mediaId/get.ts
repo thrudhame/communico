@@ -10,5 +10,6 @@ export default async function (request: PathfinderRequest) {
     thumbnailQuery(request.query, config().media.maxdimension),
     false,
     true,
+    request._raw.signal,
   );
 }

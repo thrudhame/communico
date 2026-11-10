@@ -217,3 +217,39 @@ Deno.test('media cache: distinct downloads obey the shared concurrency limit and
     await rejected;
   });
 });
+
+Deno.test('media cache: one disconnected subscriber cannot cancel another; last subscriber closes the owned transfer', async () => {
+  await fixture(async (cache) => {
+    const a = new AbortController(), b = new AbortController();
+    let cancelled = false;
+    let began!: () => void;
+    const ready = new Promise<void>((resolve) => began = resolve);
+    const work = (_out: WritableStream<Uint8Array>, signal: AbortSignal) => {
+      began();
+      return new Promise<never>((_resolve, reject) =>
+        signal.addEventListener('abort', () => {
+          cancelled = true;
+          reject(signal.reason);
+        }, { once: true })
+      );
+    };
+    const first = cache.fetch(identity(), 1, work, a.signal);
+    const second = cache.fetch(identity(), 1, work, b.signal);
+    const rejected = Promise.all([
+      assertRejects(() => first),
+      assertRejects(() => second),
+    ]);
+    await ready;
+    a.abort();
+    await new Promise((r) => setTimeout(r, 10));
+    assertEquals(cancelled, false);
+    b.abort();
+    await new Promise((r) => setTimeout(r, 10));
+    try {
+      assertEquals(cancelled, true);
+    } finally {
+      await cache.close();
+      await rejected;
+    }
+  });
+});

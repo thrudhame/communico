@@ -8,5 +8,6 @@ export default async function (request: PathfinderRequest, context: Context) {
     context.state.user as string,
     null,
     request.query.get('allow_remote') !== 'false',
+    request._raw.signal,
   );
 }

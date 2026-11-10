@@ -10,6 +10,7 @@ import {
   touchCachedMedia,
 } from '#engine/server/media.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { abortable } from '#engine/net/abort.ts';
 
 export type Retention = {
   maxagedays: number;
@@ -44,9 +45,15 @@ export async function mediaCacheKey(id: CacheIdentity): Promise<string> {
     .join('');
 }
 const BLOB = /^[a-f0-9]{64}-[a-f0-9-]{36}\.blob$/;
+type Pending = {
+  run: Promise<CachedMedia>;
+  controller: AbortController;
+  users: number;
+  settled: boolean;
+};
 export class MediaCache {
   private lane: Promise<unknown> = Promise.resolve();
-  private pending = new Map<string, Promise<CachedMedia>>();
+  private pending = new Map<string, Pending>();
   private leases = new Map<string, number>();
   private controller = new AbortController();
   private active = 0;
@@ -92,7 +99,9 @@ export class MediaCache {
   async close(): Promise<void> {
     this.controller.abort();
     for (const wake of this.waiters.splice(0)) wake();
-    await Promise.allSettled([...this.pending.values()]);
+    await Promise.allSettled(
+      [...this.pending.values()].map((entry) => entry.run),
+    );
     await this.lane;
   }
   async get(id: CacheIdentity): Promise<CachedMedia | null> {
@@ -105,22 +114,55 @@ export class MediaCache {
       output: WritableStream<Uint8Array>,
       signal: AbortSignal,
     ) => Promise<ByteMetadata>,
+    signal?: AbortSignal,
   ): Promise<CachedMedia> {
     if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0) {
       throw new Error('invalid media concurrency');
     }
     const key = await mediaCacheKey(id);
+    signal?.throwIfAborted();
     const prior = this.pending.get(key);
-    if (prior) return await prior;
+    if (prior) {
+      if (prior.controller.signal.aborted) {
+        await abortable(signal, () => prior.run.catch(() => {}));
+        return await this.fetch(id, maxConcurrent, producer, signal);
+      }
+      return await this.subscribe(prior, signal);
+    }
     if (this.pending.size >= Math.max(1, maxConcurrent) * 16) {
       throw new MatrixError(429, 'M_LIMIT_EXCEEDED', 'Media cache busy');
     }
-    const run = this.produce(key, id, maxConcurrent, producer);
-    this.pending.set(key, run);
+    const controller = new AbortController();
+    const run = this.produce(
+      key,
+      id,
+      maxConcurrent,
+      producer,
+      AbortSignal.any([this.controller.signal, controller.signal]),
+    );
+    const entry: Pending = { run, controller, users: 0, settled: false };
+    this.pending.set(key, entry);
+    const settled = () => {
+      entry.settled = true;
+      if (this.pending.get(key) === entry) this.pending.delete(key);
+    };
+    void run.then(settled, settled);
+    return await this.subscribe(entry, signal);
+  }
+  private async subscribe(
+    entry: Pending,
+    signal?: AbortSignal,
+  ): Promise<CachedMedia> {
+    entry.users++;
     try {
-      return await run;
+      return await abortable(signal, () => entry.run);
     } finally {
-      if (this.pending.get(key) === run) this.pending.delete(key);
+      entry.users--;
+      if (entry.users === 0 && !entry.settled) {
+        entry.controller.abort(
+          new DOMException('No media subscribers', 'AbortError'),
+        );
+      }
     }
   }
   private async produce(
@@ -131,12 +173,25 @@ export class MediaCache {
       output: WritableStream<Uint8Array>,
       signal: AbortSignal,
     ) => Promise<ByteMetadata>,
+    signal: AbortSignal,
   ): Promise<CachedMedia> {
     while (this.active >= maxConcurrent) {
-      await new Promise<void>((wake) => this.waiters.push(wake));
-      this.controller.signal.throwIfAborted();
+      let wake: (() => void) | undefined;
+      try {
+        await abortable(signal, () =>
+          new Promise<void>((resolve) => {
+            wake = resolve;
+            this.waiters.push(resolve);
+          }));
+      } finally {
+        if (wake) {
+          const at = this.waiters.indexOf(wake);
+          if (at >= 0) this.waiters.splice(at, 1);
+        }
+      }
+      signal.throwIfAborted();
     }
-    this.controller.signal.throwIfAborted();
+    signal.throwIfAborted();
     this.active++;
     const stem = key + '-' + crypto.randomUUID();
     const part = this.directory + '/' + stem + '.part';
@@ -165,16 +220,18 @@ export class MediaCache {
           size += chunk.length;
         },
       });
-      const meta = await producer(output, this.controller.signal);
-      this.controller.signal.throwIfAborted();
+      const meta = await producer(output, signal);
+      signal.throwIfAborted();
       if (meta.size !== size) {
         throw new Error('media cache byte count mismatch');
       }
       await file.sync();
+      signal.throwIfAborted();
       file.close();
       file = null;
       await Deno.rename(part, this.directory + '/' + blob);
       renamed = true;
+      signal.throwIfAborted();
       const now = Date.now();
       const row: CachedMedia = {
         cache_key: key,

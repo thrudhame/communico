@@ -13,6 +13,8 @@ export default async function (request: PathfinderRequest) {
       '',
       thumbnailQuery(request.query, config().media.maxdimension),
       false,
+      false,
+      request._raw.signal,
     ),
   );
 }

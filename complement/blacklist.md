@@ -50,20 +50,15 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - Push rules, aggregate counts and thread notification counts run.
 - Federation — rooms landed in M5b (the room-federation files run: joins,
   sends, missing events, invites, event auth, redaction, sync, unreject,
-  bans, presence, typing, ACLs, knocking and restricted joins). What stays
-  listed: **M5c media** (`federation_media_content`). Device/E2EE federation
-  files run after E3.
-  The knocking files share
-  the `testValidationForSendMembershipEndpoint` helper defined in
-  `federation_room_join_test.go` — compilable again now that the join file
-  runs, so they are listed for their own category (M5c), not as ride-alongs.
+  bans, presence, typing, ACLs, knocking, restricted joins and media).
+  Device/E2EE federation files run after E3. Media's legacy anonymous remote
+  cases remain visible in the red baseline: local-only legacy serving does not
+  grant permission for anonymous foreign fetches.
 - Event authorization — landed M4 (rulebook M3 + room endpoints M4).
 - Room version 12 — landed (the v12 plan): v10/v12 registered in the
   rulebook; the v12 corpus runs. Federation-flavoured v12 tests stay
   red under the M5 line, not here.
 - Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in BASELINE.md.
-
-- tests/federation_media_content_test.go
 
 ## Never blacklisted
 

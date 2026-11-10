@@ -9,5 +9,7 @@ export default async function (request: PathfinderRequest, context: Context) {
     context.state.user as string,
     thumbnailQuery(request.query, config().media.maxdimension),
     request.query.get('allow_remote') !== 'false',
+    false,
+    request._raw.signal,
   );
 }

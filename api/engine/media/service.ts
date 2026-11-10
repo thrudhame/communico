@@ -112,7 +112,9 @@ export class MediaService {
     user: string,
     filename: string | null = null,
     allowRemote = true,
+    signal?: AbortSignal,
   ): Promise<Response> {
+    signal?.throwIfAborted();
     assertMxc(origin, mediaId);
     if (origin === serverName()) {
       const response = await serveMedia(origin, mediaId);
@@ -152,6 +154,7 @@ export class MediaService {
         identity,
         config().media.maxfetches,
         (output, signal) => this.remote(origin, mediaId, output, signal),
+        signal,
       );
     }
     // Network work may yield while the origin is blocked by the operator.
@@ -182,7 +185,9 @@ export class MediaService {
     options: Thumbnail,
     allowRemote = true,
     legacy = false,
+    signal?: AbortSignal,
   ): Promise<Response> {
+    signal?.throwIfAborted();
     assertMxc(origin, mediaId);
     if (legacy && origin !== serverName()) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media');
@@ -268,6 +273,7 @@ export class MediaService {
             size: bytes.length,
           };
         },
+        signal,
       );
     }
     if (origin !== serverName()) {

@@ -299,11 +299,42 @@ or redaction target as well as the room.
 (`api/engine/tenant/auth.ts:227-303`, `api/engine/tenant/txns.ts:1-52`)
 
 The shared Matrix-id parser splits at the first colon, preserving a server
-name's port. Media metadata is tenant data; bytes live under `media.root`.
-Uploads enforce the size bound while streaming to `.part`, then rename the
-completed file. Generated media ids use the shared URL-safe encoder.
-(`api/engine/ids.ts:1-24`, `api/engine/media.ts:1-16`,
-`api/engine/media.ts:84-117`, `api/engine/tenant/media.ts:1-35`)
+name's port. Local upload metadata remains tenant-owned; bytes live under
+`media.root`. Uploads enforce the size bound while streaming to `.part`, then
+rename the completed file. Generated media ids use the shared URL-safe encoder.
+(`api/engine/ids.ts`, `api/engine/media.ts`, `api/engine/tenant/media.ts`)
+
+`media/service.ts` owns authenticated remote demand and current origin admission,
+including cache hits. Server schema v21 stores origin/media-id/variant metadata;
+origin filenames are independent of a caller's response-only override. The
+disk-cache owner deduplicates fills, bounds concurrency, syncs and renames a
+unique unpublished part before metadata publication, repairs crash leftovers,
+and leases served files against retention/quota cleanup. No network or disk
+side effect runs inside a retryable transaction callback. Shared fills track
+subscribers: one disconnect cannot cancel another, and the last disconnect
+aborts the owned transfer, including queued fills. App shutdown closes the owner.
+(`api/engine/server/media.ts`, `api/engine/media/cache.ts`)
+
+Raw federation and JSON requests share signing, discovery, TLS and cancellation.
+The HTTP/1 reader streams bounded chunks with sink backpressure; node TLS pauses
+between reader requests. Media consumes exactly two multipart parts, validating
+the final envelope before publishing bytes. Only a completed 404
+`M_UNRECOGNIZED` permits legacy fallback, with `allow_remote=false`. External
+Locations use CA-only HTTPS with checked/pinned addresses, no forwarded auth or
+cookies, bounded redirects and one total deadline/byte budget. URLs are not
+cache identity or persisted metadata. Legacy serving remains local-only.
+(`api/engine/federation/client.ts`, `api/engine/net/http1.ts`,
+`api/engine/media/{multipart,location,service}.ts`)
+
+The shared thumbnail service serves local client, legacy-local and signed
+federation routes. Remote variants fetch signed federation thumbnails before
+bounded local validation/static generation. Cache identity includes format,
+method, dimensions and animated flag. PNG/JPEG geometry/bytes are checked before
+decoding; at most the configured number of workers hold compressed inputs and
+pixel-bounded image buffers. ImageScript 3.20.2 runs off the main thread, with
+termination on deadline/cancellation, and emits a fresh static PNG without
+source metadata. Nothing decrypts attachment ciphertext.
+(`api/engine/media/{thumbnail,thumbnail-worker,service}.ts`)
 
 The storage layer owns native-library loading, file transactions and
 maintenance. Startup checks the qualified Turso revision and patch set. Safe
