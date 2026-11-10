@@ -4,7 +4,8 @@ import { config } from '#engine/config.ts';
 import { redact } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import type { RoomTx } from '#engine/room/index.ts';
+import type { Room, RoomTx } from '#engine/room/index.ts';
+import { erasedView } from '#engine/erasure.ts';
 import { assertAcl } from '#engine/room/acl.ts';
 import type { Standing } from '#engine/room/events.ts';
 import { authChain } from '#engine/rulebook/state-res-v2.ts';
@@ -96,11 +97,22 @@ async function wireVisible(
   pdu: Pdu,
   version: string,
   origin: string,
+  room: Room,
 ) {
-  const visible = await serverCanSeeAt(tx, eventId, origin) ? pdu : redact(
-    pdu as unknown as Record<string, unknown>,
-    version,
-  ) as unknown as Pdu;
+  const visible = await serverCanSeeAt(tx, eventId, origin)
+    ? await erasedView(
+      room,
+      eventId,
+      pdu,
+      version,
+      { server: origin },
+      undefined,
+      tx,
+    )
+    : redact(
+      pdu as unknown as Record<string, unknown>,
+      version,
+    ) as unknown as Pdu;
   return toWire(visible, version);
 }
 
@@ -163,8 +175,38 @@ export async function serveState(
       pdus.push(pdu);
     }
     return {
-      pdus: pdus.map((p) => toWire(p, version)),
-      auth_chain: (await chainAt(tx, ids)).map((p) => toWire(p, version)),
+      pdus: await Promise.all(
+        pdus.map(async (p) =>
+          toWire(
+            await erasedView(
+              room,
+              String(p.event_id),
+              p,
+              version,
+              { server: origin },
+              undefined,
+              tx,
+            ),
+            version,
+          )
+        ),
+      ),
+      auth_chain: await Promise.all(
+        (await chainAt(tx, ids)).map(async (p) =>
+          toWire(
+            await erasedView(
+              room,
+              String(p.event_id),
+              p,
+              version,
+              { server: origin },
+              undefined,
+              tx,
+            ),
+            version,
+          )
+        ),
+      ),
     };
   });
 }
@@ -184,7 +226,7 @@ export async function serveEvent(
     return {
       origin: deps.self,
       origin_server_ts: Date.now(),
-      pdus: [await wireVisible(tx, eventId, pdu, version, origin)],
+      pdus: [await wireVisible(tx, eventId, pdu, version, origin, room)],
     };
   });
 }
@@ -202,7 +244,22 @@ export async function serveEventAuth(
       throw new MatrixError(404, 'M_NOT_FOUND', eventId);
     }
     return {
-      auth_chain: (await chainAt(tx, [eventId])).map((p) => toWire(p, version)),
+      auth_chain: await Promise.all(
+        (await chainAt(tx, [eventId])).map(async (p) =>
+          toWire(
+            await erasedView(
+              room,
+              String(p.event_id),
+              p,
+              version,
+              { server: origin },
+              undefined,
+              tx,
+            ),
+            version,
+          )
+        ),
+      ),
     };
   });
 }
@@ -279,7 +336,7 @@ export async function serveBackfill(
     const cap = Math.min(limit, config().federation.backfillmax);
     const out: Record<string, unknown>[] = [];
     for (const [id, pdu] of await historySelection(tx, v, [], cap, true)) {
-      out.push(await wireVisible(tx, id, pdu, version, origin));
+      out.push(await wireVisible(tx, id, pdu, version, origin, room));
     }
     return { origin: deps.self, origin_server_ts: Date.now(), pdus: out };
   });
@@ -324,7 +381,9 @@ export async function serveGetMissingEvents(
       ready.sort();
       for (const id of ready) {
         emitted.add(id);
-        events.push(await wireVisible(tx, id, found.get(id)!, version, origin));
+        events.push(
+          await wireVisible(tx, id, found.get(id)!, version, origin, room),
+        );
       }
     }
     return { events };

@@ -84,6 +84,7 @@ Deno.test('tenant v14 upgrades OpenID credentials without touching identity or a
       await tenantSchema.apply(db);
       await db.exec('DROP TABLE openid_tokens');
       await db.exec('DROP TABLE profile_fields');
+      await db.exec('DROP TABLE erased_users');
     },
   };
   let store = await openStore(settings, { schemas: { tenant: previous } });

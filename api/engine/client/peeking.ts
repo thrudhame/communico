@@ -98,7 +98,7 @@ export async function roomInitialSync(
         end: 's' + snapshot.cut,
         ...(page.end === undefined ? {} : { start: page.end }),
       },
-      state: await clientEventsForRows(roomId, snapshot.state),
+      state: await clientEventsForRows(roomId, snapshot.state, user),
       visibility: await visibility(app.server, roomId),
       account_data: await listRoomAccountData(
         app.tenant,

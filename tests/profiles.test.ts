@@ -73,6 +73,7 @@ Deno.test('tenant v15 migrates custom profile storage preserving legacy profile 
         apply: async (db) => {
           await tenantSchema.apply(db);
           await db.exec('DROP TABLE profile_fields');
+          await db.exec('DROP TABLE erased_users');
         },
       },
     },

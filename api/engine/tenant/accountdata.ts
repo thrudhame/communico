@@ -7,6 +7,12 @@
 // marker rides the same counter.
 import type { Conn } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+export async function clearAccountData(
+  conn: Conn,
+  localpart: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM account_data WHERE localpart=?', [localpart]);
+}
 
 /** Advance a per-tenant counter and return the new value. Three
  * statements inside the caller's write transaction — safe under the

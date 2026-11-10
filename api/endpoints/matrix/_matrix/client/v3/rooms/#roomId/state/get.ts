@@ -13,5 +13,5 @@ export default async function (
   await requireRoom(roomId);
   const at = await readPositionFor(context.state.user as string, roomId);
   const rows = await stateAtSeq(roomId, at);
-  return await clientEventsForRows(roomId, rows);
+  return await clientEventsForRows(roomId, rows, context.state.user as string);
 }

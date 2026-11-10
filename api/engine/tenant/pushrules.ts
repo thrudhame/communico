@@ -7,6 +7,15 @@
 // mutation stamps it inside the same tenant transaction (so a delete
 // that empties the table still moves the token's _a<n>).
 import type { Conn } from '#engine/store/db.ts';
+export async function clearPushRules(
+  conn: Conn,
+  localpart: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM push_rules WHERE localpart=?', [localpart]);
+  await conn.execute('DELETE FROM push_rules_stream WHERE localpart=?', [
+    localpart,
+  ]);
+}
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Tenant, TenantTx } from '#engine/tenant/index.ts';
 import {

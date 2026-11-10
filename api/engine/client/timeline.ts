@@ -280,6 +280,7 @@ export async function messages(
     result.state = await clientEventsForRows(
       room.id,
       rows.filter((r) => r.type === 'm.room.member' && senders.has(r.stateKey)),
+      w.userId,
     );
   }
   return result;
@@ -356,8 +357,9 @@ export async function eventContext(
   const at = eventsAfter.length > 0
     ? String(eventsAfter[eventsAfter.length - 1].event_id)
     : eventId;
-  let state = (await clientEventsForRows(roomId, await stateAtEvent(room, at)))
-    .filter(matches);
+  let state =
+    (await clientEventsForRows(roomId, await stateAtEvent(room, at), userId))
+      .filter(matches);
   if (opts.lazyLoadMembers) {
     const senders = new Set(
       [event, ...eventsBefore, ...eventsAfter].map((e) => String(e.sender)),

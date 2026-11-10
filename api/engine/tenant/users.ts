@@ -17,6 +17,7 @@ import {
 } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { setProfileRow } from '#engine/tenant/profiles.ts';
+import type { ErasureCut } from '#engine/room/state.ts';
 
 // Spec appendices: user_id_localpart = 1*user_id_char;
 // user_id_char = DIGIT / a-z / "-" / "." / "=" / "_" / "/" / "+".
@@ -157,6 +158,13 @@ export async function credentialHash(
     [localpart],
   );
   return rows.length === 0 ? null : String(rows[0].hash);
+}
+
+export async function clearCredential(
+  conn: Conn,
+  localpart: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM credentials WHERE localpart=?', [localpart]);
 }
 
 // --- tenant-level behaviour --------------------------------------------------
@@ -388,8 +396,12 @@ export async function changePassword(
 export async function deactivateUser(
   tenant: Tenant,
   localpart: string,
+  erasureCuts?: Record<string, ErasureCut>,
 ): Promise<void> {
   await tenant.tx(async (tx) => {
+    if (erasureCuts !== undefined) {
+      await tx.erasure.mark(localpart, erasureCuts);
+    }
     await tx.pushers.deleteForUser(localpart);
     await tx.openid.clear(localpart);
     await tx.refresh.deleteForUser(localpart);
@@ -401,6 +413,12 @@ export async function deactivateUser(
     );
     await tx.keyBackup.clear(localpart);
     await tx.profiles.clear(localpart);
+    if (erasureCuts !== undefined) {
+      await tx.accountData.clear(localpart);
+      await tx.filters.clear(localpart);
+      await tx.pushRules.clear(localpart);
+      await tx.credentials.clear(localpart);
+    }
     await tx.users.markDeactivated(localpart);
   });
 }

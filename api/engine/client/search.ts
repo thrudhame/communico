@@ -20,6 +20,7 @@ import { renderEvent } from './render.ts';
 import { messages, parseStreamToken } from './timeline.ts';
 import { clientEventsForRows } from './state.ts';
 import { canSeeEvent } from './visibility.ts';
+import { erasurePrunes } from '#engine/erasure.ts';
 export interface SearchRoomEvents {
   search_term: string;
   keys?: unknown;
@@ -116,6 +117,9 @@ export async function search(
     const row = await room.tx((tx) => tx.events.get(c.eventId));
     if (row === null) continue;
     const pdu = JSON.parse(row.pdu);
+    if (
+      await erasurePrunes(room, c.eventId, pdu, { userId }, theApp().tenant)
+    ) continue;
     if (
       !eventMatchesRoomEventFilter(
         null,
@@ -219,6 +223,7 @@ export async function search(
       state[roomId] = await clientEventsForRows(
         roomId,
         await stateAtSeq(roomId, null),
+        userId,
       );
     }
     out.state = state;

@@ -9,11 +9,21 @@ import {
 import { renderStateEvent } from './render.ts';
 export { writeStateKey } from './write.ts';
 
-export async function clientEventsForRows(roomId: string, rows: StateRow[]) {
+export async function clientEventsForRows(
+  roomId: string,
+  rows: StateRow[],
+  userId?: string,
+) {
   const room = await requireRoom(roomId);
   const out: Record<string, unknown>[] = [];
   for (const row of rows) {
-    const ev = await renderStateEvent(room, row.eventId);
+    const ev = await renderStateEvent(
+      room,
+      row.eventId,
+      userId === undefined
+        ? undefined
+        : { userId, deviceId: null, tenant: theApp().tenant },
+    );
     if (ev !== null) out.push(ev);
   }
   return out;
@@ -38,8 +48,8 @@ export async function readStateKey(
       'state key not found: ' + type + '/' + stateKey,
     );
   }
-  if (format === 'event') return (await clientEventsForRows(roomId, [row]))[0];
-  return row.content;
+  const event = (await clientEventsForRows(roomId, [row], userId))[0];
+  return format === 'event' ? event : event?.content;
 }
 
 export async function validateCanonicalAliasContent(

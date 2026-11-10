@@ -3,6 +3,7 @@
 // its module's short name. The store must have been opened with the room
 // schema provider (R14).
 import type { Store } from '#engine/store/index.ts';
+import type { ErasureCut } from '#engine/room/state.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
 import * as changes from '#engine/room/changes.ts';
 import * as events from '#engine/room/events.ts';
@@ -62,8 +63,9 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       eventStateBefore: (event: string) => state.eventStateBefore(conn, event),
       eventStateAfter: (event: string) => state.eventStateAfter(conn, event),
       eventReadState: (event: string) => state.eventReadState(conn, event),
-      publishedGroupsAfter: (event: string) =>
-        state.publishedGroupsAfter(conn, event),
+      publishedGroupsAfter: (event: string, cut?: ErasureCut) =>
+        state.publishedGroupsAfter(conn, event, cut),
+      erasureCut: () => state.erasureCut(conn),
       publishedAt: (stay: number, pos: number) =>
         state.publishedAt(conn, stay, pos),
       current: (stay: number) => state.current(conn, stay),

@@ -320,6 +320,18 @@ access, and clean up on cancellation or timeout. Layered `peeking.maxevents`
 (default 50) and `peeking.maxtimeoutms` (default 30000) bound pages and waits.
 (`api/engine/client/peeking.ts`)
 
+Account erasure records durable tenant intent with held rooms' publication
+boundaries. Client event/state/previous-content rendering and federation history
+share one serve-time policy: prior event visibility survives, including shared
+history acquired before the boundary and world-readable events. New private
+history readers receive version-pruned copies. Retries retain the first boundary;
+PDUs and auth graphs remain unchanged, with no federation erasure signal or
+synthetic redaction. Search excludes pruned content before counts and ranking.
+Account-data, filter, push-rule and credential owners clear non-event data in the
+same tenant transaction as deactivation. Existing append-only change streams
+remain intact. (`api/engine/erasure.ts`, `api/engine/client/account.ts`,
+`api/engine/tenant/erasure.ts`)
+
 The tenant profile owner assembles legacy user columns and additional JSON field
 rows, and validates whole-profile byte limits inside the write transaction.
 Legacy setters use the same owner, avoiding independent size budgets. Public

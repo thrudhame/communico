@@ -6,6 +6,12 @@
 // keys are ignored. The document validation and matching helpers are
 // pure; only store/load/resolve touch the tenant file.
 import type { Conn } from '#engine/store/db.ts';
+export async function clearFilters(
+  conn: Conn,
+  localpart: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM filters WHERE localpart=?', [localpart]);
+}
 import { MatrixError } from '#engine/matrix-error.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';

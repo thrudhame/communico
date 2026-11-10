@@ -236,8 +236,11 @@ const PROFILE_SQL = `
 CREATE TABLE profile_fields(localpart TEXT NOT NULL REFERENCES users(localpart), key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(localpart,key));
 `;
 
+const ERASURE_SQL =
+  `CREATE TABLE erased_users(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart), room_cuts TEXT NOT NULL);`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 16,
+  version: 17,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -252,8 +255,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(PUSHER_CHANGES_SQL);
     await db.exec(OPENID_SQL);
     await db.exec(PROFILE_SQL);
+    await db.exec(ERASURE_SQL);
   },
   migrations: {
+    16: (conn) => conn.exec(ERASURE_SQL),
     15: (conn) => conn.exec(PROFILE_SQL),
     14: (conn) => conn.exec(OPENID_SQL),
     13: async (conn) => {

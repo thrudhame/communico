@@ -40,6 +40,8 @@ import * as uia from '#engine/tenant/uia.ts';
 import * as users from '#engine/tenant/users.ts';
 import * as openid from '#engine/tenant/openid.ts';
 import * as profiles from '#engine/tenant/profiles.ts';
+import * as erasure from '#engine/tenant/erasure.ts';
+import type { ErasureCut } from '#engine/room/state.ts';
 import { tenantStreamCommitted } from '#engine/tenant/streams.ts';
 import { writeCertificate } from '#engine/tenant/certificate.ts';
 import {
@@ -295,6 +297,12 @@ function bind(
       snapshot: (localpart: string, owner: string, limits: e2ee.KeyLimits) =>
         e2ee.deviceSnapshot(conn, localpart, owner, limits),
     },
+    erasure: {
+      mark: (localpart: string, cuts: Record<string, ErasureCut>) =>
+        erasure.markErased(conn, localpart, cuts),
+      get: (localpart: string, roomId: string) =>
+        erasure.erasureRow(conn, localpart, roomId),
+    },
     profiles: {
       get: (localpart: string) => profiles.profileRow(conn, localpart),
       set: (localpart: string, key: string, value: unknown) =>
@@ -315,6 +323,7 @@ function bind(
         mutation(users.markDeactivated(conn, localpart)),
     },
     credentials: {
+      clear: (localpart: string) => users.clearCredential(conn, localpart),
       set: (localpart: string, phc: string) =>
         users.setCredential(conn, localpart, phc),
       hash: (localpart: string) => users.credentialHash(conn, localpart),
@@ -417,6 +426,8 @@ function bind(
       },
     },
     accountData: {
+      clear: (localpart: string) =>
+        accountdata.clearAccountData(conn, localpart),
       roomsSince: (localpart: string, since: number, until: number) =>
         accountdata.roomAccountDataSince(conn, localpart, since, until),
       snapshot: (localpart: string, roomId: string, type: string) =>
@@ -453,6 +464,7 @@ function bind(
       expire: (now: number) => openid.expireOpenId(conn, now),
     },
     pushRules: {
+      clear: (localpart: string) => pushrules.clearPushRules(conn, localpart),
       putDefault: (localpart: string, kind: string, rule: pushrules.PushRule) =>
         pushrules.putDefaultOverride(conn, localpart, kind, rule),
       kindRows: (localpart: string, kind: string) =>
@@ -513,6 +525,7 @@ function bind(
         pushrules.pushStreamSeqRow(conn, localpart),
     },
     filters: {
+      clear: (localpart: string) => filters.clearFilters(conn, localpart),
       count: (localpart: string) => filters.countFilters(conn, localpart),
       insert: (localpart: string, filterId: string, filter: string) =>
         filters.insertFilter(conn, localpart, filterId, filter),

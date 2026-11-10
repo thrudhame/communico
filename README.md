@@ -315,6 +315,11 @@ zero to clear badges. Logout, device/token revocation, account deactivation and
 matching gateway `rejected` verdicts cancel the corresponding registration's
 work. Invalid responses and HTTP/TLS errors retry; they never delete a pusher.
 
+Account deactivation accepts `erase: true`: local readers who gained visibility
+only afterward receive room-version-pruned copies, while earlier visibility is
+preserved. This is not physical deletion, a federation erasure request or a set
+of redaction events. Private account data and stored filters are cleared too.
+
 Public profiles support namespaced custom JSON fields and `m.tz`, with per-field
 GET/PUT/DELETE and `m.profile_fields` capability discovery. Keys are at most 255
 UTF-8 bytes; the whole profile must remain below 64 KiB. Custom null values are

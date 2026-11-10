@@ -11,6 +11,7 @@ import { relationView } from './relation-view.ts';
 import { isIgnoredEvent } from './ignored.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { canSeeEvent } from './visibility.ts';
+import { erasedView } from '#engine/erasure.ts';
 
 export type Viewer = {
   userId: string;
@@ -82,24 +83,36 @@ export async function renderStateEvent(
     if (stay === null) return null;
     const version = await roomVersionOf(tx, stay.id);
     let prev: Pdu | null = null;
+    let prevId: string | null = null;
     if (row.state_key !== null) {
       const before = await tx.state.eventStateBefore(eventId);
       const id = before === null
         ? null
         : await tx.state.groupKey(before.group, row.type, row.state_key);
       const old = id === null ? null : await tx.events.get(id);
-      if (old !== null) prev = JSON.parse(old.pdu) as Pdu;
+      if (old !== null) {
+        prev = JSON.parse(old.pdu) as Pdu;
+        prevId = old.id;
+      }
     }
-    return { pdu: JSON.parse(row.pdu) as Pdu, prev, version };
+    return { pdu: JSON.parse(row.pdu) as Pdu, prev, prevId, version };
   });
   if (loaded === null) return null;
-  const { pdu, prev, version } = loaded;
+  const { pdu, prev, prevId, version } = loaded;
   const server = await room.store.server();
   const redactionId = await redactionOf(server, room.id, eventId);
   const redactionRow = redactionId === null
     ? null
     : await room.tx((tx) => tx.events.get(redactionId));
-  const shown = redactionRow === null ? pdu : redact(
+  const unredacted = await erasedView(
+    room,
+    eventId,
+    pdu,
+    version,
+    viewer === undefined ? undefined : { userId: viewer.userId },
+    viewer?.tenant,
+  );
+  const shown = redactionRow === null ? unredacted : redact(
     pdu as unknown as Record<string, unknown>,
     version,
   ) as unknown as Pdu;
@@ -133,12 +146,30 @@ export async function renderStateEvent(
   }
   if (viewer?.membership !== undefined) unsigned.membership = viewer.membership;
   if (prev !== null) {
-    unsigned.prev_content = prev.content ?? {};
+    const shownPrev = await erasedView(
+      room,
+      prevId!,
+      prev,
+      version,
+      viewer === undefined ? undefined : { userId: viewer.userId },
+      viewer?.tenant,
+    );
+    const previousRedaction = await redactionOf(server, room.id, prevId!);
+    unsigned.prev_content = previousRedaction === null
+      ? (shownPrev.content ?? {})
+      : redact(prev as unknown as Record<string, unknown>, version).content;
     unsigned.prev_sender = prev.sender;
   }
   if (redactionRow !== null) {
     // The reason event is unbundled, so redaction cycles cannot recurse.
-    const reason = JSON.parse(redactionRow.pdu) as Pdu;
+    const reason = await erasedView(
+      room,
+      redactionRow.id,
+      JSON.parse(redactionRow.pdu) as Pdu,
+      version,
+      viewer === undefined ? undefined : { userId: viewer.userId },
+      viewer?.tenant,
+    );
     const redactedBecause: Record<string, unknown> = {
       event_id: redactionRow.id,
       room_id: room.id,

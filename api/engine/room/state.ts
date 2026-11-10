@@ -5,6 +5,18 @@
 import type { Conn } from '#engine/store/db.ts';
 import { childrenOf, prevsOf } from './events.ts';
 import { precedes } from './causal.ts';
+export type ErasureCut = { changePos: number; segment: number; group: number };
+
+export async function erasureCut(conn: Conn): Promise<ErasureCut> {
+  const rows = await conn.query(
+    'SELECT (SELECT COALESCE(MAX(pos),0) FROM changes) AS change_pos,(SELECT COALESCE(MAX(id),0) FROM segments) AS segment,(SELECT COALESCE(MAX(id),0) FROM state_groups) AS grp',
+  );
+  return {
+    changePos: Number(rows[0].change_pos),
+    segment: Number(rows[0].segment),
+    group: Number(rows[0].grp),
+  };
+}
 
 export type StateChange = {
   type: string;
@@ -195,6 +207,7 @@ export async function current(
 export async function publishedGroupsAfter(
   conn: Conn,
   event: string,
+  cut?: ErasureCut,
 ): Promise<number[]> {
   const isolated = await conn.query(
     `SELECT p.event FROM positions p JOIN segments s ON s.id = p.segment
@@ -207,8 +220,13 @@ export async function publishedGroupsAfter(
     // a later live cut. Imported opening groups need their real opener too.
     const snapshots = await conn.query(
       `SELECT pub.grp, c.event FROM publications pub JOIN changes c ON c.pos = pub.change_pos
+       WHERE pub.change_pos <= ?
        UNION SELECT opening_group AS grp, opened_by AS event FROM segments
-       WHERE kind = 'stay' AND opening_group IS NOT NULL AND opened_by IS NOT NULL`,
+       WHERE kind = 'stay' AND opening_group IS NOT NULL AND opened_by IS NOT NULL AND id <= ?`,
+      [
+        cut?.changePos ?? Number.MAX_SAFE_INTEGER,
+        cut?.segment ?? Number.MAX_SAFE_INTEGER,
+      ],
     );
     const groups = new Set<number>();
     const budget = { remaining: 100_000 };
@@ -235,13 +253,17 @@ export async function publishedGroupsAfter(
      SELECT pub.grp FROM publications pub
        JOIN changes c ON c.pos = pub.change_pos
        JOIN positions p ON p.event = c.event CROSS JOIN anchor a
-     WHERE pub.stay > a.stay OR (pub.stay = a.stay AND
-         (a.kind = 'history' OR p.offset >= a.offset))
+      WHERE pub.change_pos <= ? AND (pub.stay > a.stay OR (pub.stay = a.stay AND
+          (a.kind = 'history' OR p.offset >= a.offset)))
      UNION
      SELECT s.opening_group AS grp FROM segments s CROSS JOIN anchor a
-     WHERE s.kind = 'stay' AND s.opening_group IS NOT NULL AND
+      WHERE s.kind = 'stay' AND s.opening_group IS NOT NULL AND s.id <= ? AND
          (s.id > a.stay OR (s.id = a.stay AND a.kind = 'history'))`,
-    [event],
+    [
+      event,
+      cut?.changePos ?? Number.MAX_SAFE_INTEGER,
+      cut?.segment ?? Number.MAX_SAFE_INTEGER,
+    ],
   );
   return rows.map((row) => Number(row.grp));
 }
