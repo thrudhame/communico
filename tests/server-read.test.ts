@@ -3,7 +3,7 @@
 // order, the relations index and the search candidates with the old
 // matching behaviour.
 import { assert, assertEquals } from '@std/assert';
-import { sendLocal } from '#engine/room/ingest.ts';
+import { redactEvent, sendLocal } from '#engine/room/ingest.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import {
   feedAfter,
@@ -230,6 +230,79 @@ Deno.test('read: relations of an event, oldest first, relType optional', async (
     );
     assertEquals(replace.map((row) => row.eventId), [edit.eventId]);
     assertEquals(await relationsOf(server, g.roomId, '$nope:test'), []);
+  });
+});
+
+Deno.test('read: relation admission is re-evaluated for late parents, cross-room/self links and redactions', async () => {
+  await withStore(async (store, server) => {
+    const g = await genesis(store, { roomId: '!relations-valid:test' });
+    const other = await genesis(store, { roomId: '!relations-other:test' });
+    const send = (target: string) =>
+      sendLocal(g.room, {
+        type: 'm.room.message',
+        sender: g.creator,
+        content: {
+          body: 'child',
+          'm.relates_to': { event_id: target, rel_type: 'm.thread' },
+        },
+      }, g.signer);
+    const cross = await send(other.createId);
+    assertEquals(await relationsOf(server, g.roomId, other.createId), []);
+    const child = await send(g.createId);
+    // Old stores can contain links rejected by today's extractor. The shared
+    // reader is still responsible for their eligibility, including self-links.
+    await server.execute('UPDATE relations SET relates_to=? WHERE event=?', [
+      child.eventId,
+      child.eventId,
+    ]);
+    assertEquals(await relationsOf(server, g.roomId, child.eventId), []);
+    await server.execute('UPDATE relations SET relates_to=? WHERE event=?', [
+      '$late:test',
+      child.eventId,
+    ]);
+    assertEquals(await relationsOf(server, g.roomId, '$late:test'), []);
+    const original =
+      (await server.query('SELECT * FROM event_index WHERE event=?', [
+        g.createId,
+      ]))[0];
+    await server.execute(
+      'INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES(?,?,?,?,?,?)',
+      [
+        '$late:test',
+        g.roomId,
+        -Number(original.pos),
+        'accepted',
+        'grounded',
+        null,
+      ],
+    );
+    assertEquals(
+      (await relationsOf(server, g.roomId, '$late:test')).map((r) => r.eventId),
+      [child.eventId],
+    );
+    await server.execute('UPDATE event_index SET standing=? WHERE event=?', [
+      'soft_failed',
+      '$late:test',
+    ]);
+    assertEquals(await relationsOf(server, g.roomId, '$late:test'), []);
+    await server.execute('UPDATE event_index SET standing=? WHERE event=?', [
+      'accepted',
+      '$late:test',
+    ]);
+    await redactEvent(
+      g.room,
+      g.creator,
+      child.eventId,
+      g.signer,
+    );
+    assertEquals(await relationsOf(server, g.roomId, '$late:test'), []);
+    assertEquals(await relationsOf(server, other.roomId, other.createId), []);
+    assertEquals(
+      (await server.query('SELECT relates_to FROM relations WHERE event=?', [
+        cross.eventId,
+      ]))[0].relates_to,
+      other.createId,
+    );
   });
 });
 

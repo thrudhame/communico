@@ -6,7 +6,9 @@ import type { Room } from '#engine/room/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { transactionForEvent } from '#engine/tenant/txns.ts';
 import { localpartOf } from '#engine/ids.ts';
-import { redactionOf, relationsOf } from '#engine/server/read.ts';
+import { redactionOf } from '#engine/server/read.ts';
+import { relationView } from './relation-view.ts';
+import { isIgnoredEvent } from './ignored.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { canSeeEvent } from './visibility.ts';
 
@@ -14,7 +16,7 @@ export type Viewer = {
   userId: string;
   deviceId: string | null;
   membership?: string;
-  tenant?: Tenant;
+  tenant: Tenant;
 };
 
 function clientShape(pdu: Pdu, eventId: string): Record<string, unknown> {
@@ -51,6 +53,7 @@ export async function renderEvent(
   opts?: { omitRoomId?: boolean; bundleThreads?: boolean },
 ): Promise<Record<string, unknown> | null> {
   if (!await canSeeEvent(viewer.userId, room, eventId)) return null;
+  if (await isIgnoredEvent(room, eventId, viewer)) return null;
   return await renderStateEvent(room, eventId, viewer, opts);
 }
 
@@ -142,20 +145,15 @@ export async function renderStateEvent(
   }
   event.unsigned = unsigned;
   if (opts?.bundleThreads !== false && viewer !== undefined) {
-    const children = [];
-    for (
-      const child of await relationsOf(server, room.id, eventId, 'm.thread')
-    ) {
-      if (await canSeeEvent(viewer.userId, room, child.eventId)) {
-        children.push(child);
-      }
-    }
+    const children = await relationView(room, eventId, viewer, {
+      relType: 'm.thread',
+    });
     if (children.length > 0) {
       const latest = await renderEvent(
         room,
         children[children.length - 1].eventId,
         viewer,
-        { bundleThreads: false },
+        { ...opts, bundleThreads: false },
       );
       let participated = viewer?.userId === pdu.sender;
       for (const child of children) {

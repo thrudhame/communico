@@ -1,4 +1,5 @@
 import { theApp } from '#engine/app.ts';
+import { isIgnoredEvent } from './ignored.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   matchTokens,
@@ -117,7 +118,12 @@ export async function search(
     const pdu = JSON.parse(row.pdu);
     if (
       !eventMatchesRoomEventFilter(null, pdu, filter) ||
-      !await canSeeEvent(userId, room, c.eventId)
+      !await canSeeEvent(userId, room, c.eventId) ||
+      await isIgnoredEvent(room, c.eventId, {
+        userId,
+        deviceId: null,
+        tenant: theApp().tenant,
+      })
     ) continue;
     matched.push({ ...c, rank: rankOf(c.bodyLower, tokens) });
   }

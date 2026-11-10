@@ -197,17 +197,13 @@ export async function relationsOf(
   eventId: string,
   relType?: string,
 ): Promise<RelationRow[]> {
-  const rows = relType === undefined
-    ? await db.query(
-      `SELECT event, rel_type, seq FROM relations
-       WHERE room = ? AND relates_to = ? AND seq IS NOT NULL ORDER BY seq ASC`,
-      [roomId, eventId],
-    )
-    : await db.query(
-      `SELECT event, rel_type, seq FROM relations
-       WHERE room = ? AND relates_to = ? AND rel_type = ? AND seq IS NOT NULL ORDER BY seq ASC`,
-      [roomId, eventId, relType],
-    );
+  const rows = await db.query(
+    `SELECT r.event,r.rel_type,r.seq FROM relations r ${RELATION_ELIGIBILITY}
+     AND r.room=? AND r.relates_to=? ${
+      relType === undefined ? '' : 'AND r.rel_type=?'
+    } ORDER BY r.seq ASC,r.event`,
+    relType === undefined ? [roomId, eventId] : [roomId, eventId, relType],
+  );
   return rows.map((row) => ({
     eventId: String(row.event),
     relType: row.rel_type === null ? null : String(row.rel_type),
@@ -217,14 +213,23 @@ export async function relationsOf(
 
 export async function threadRootsOf(db: Db, roomId: string) {
   const rows = await db.query(
-    "SELECT relates_to,MAX(seq) AS latest FROM relations WHERE room=? AND rel_type='m.thread' AND seq IS NOT NULL GROUP BY relates_to ORDER BY latest DESC",
+    `SELECT DISTINCT r.relates_to FROM relations r ${RELATION_ELIGIBILITY} AND r.room=? AND r.rel_type='m.thread'`,
     [roomId],
   );
   return rows.map((r) => ({
     eventId: String(r.relates_to),
-    latestSeq: Number(r.latest),
   }));
 }
+
+// All index consumers use the same structural eligibility, including history
+// rows without a live-feed seq and links whose parent arrived out of order.
+const RELATION_ELIGIBILITY = `
+  JOIN event_index p ON p.event=r.relates_to AND p.room=r.room
+  JOIN event_index e ON e.event=r.event AND e.room=r.room
+  WHERE e.standing='accepted' AND e.grounding='grounded'
+  AND p.standing='accepted' AND p.grounding='grounded'
+  AND r.event<>r.relates_to AND typeof(r.rel_type)='text' AND length(r.rel_type)>0
+  AND NOT EXISTS (SELECT 1 FROM redactions WHERE room=r.room AND target=r.event)`;
 
 async function parentRelation(
   db: Pick<Db, 'query'>,
@@ -232,13 +237,7 @@ async function parentRelation(
   event: string,
 ) {
   const rows = await db.query(
-    `SELECT r.relates_to, r.rel_type FROM relations r
-     JOIN event_index p ON p.event=r.relates_to AND p.room=r.room
-     JOIN event_index e ON e.event=r.event AND e.room=r.room
-     WHERE r.room=? AND r.event=?
-     AND e.standing='accepted' AND e.grounding='grounded'
-     AND p.standing='accepted' AND p.grounding='grounded'
-     AND NOT EXISTS (SELECT 1 FROM redactions WHERE room=r.room AND target=r.event)`,
+    `SELECT r.relates_to, r.rel_type FROM relations r ${RELATION_ELIGIBILITY} AND r.room=? AND r.event=?`,
     [room, event],
   );
   return rows[0];

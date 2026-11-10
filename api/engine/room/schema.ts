@@ -1,10 +1,11 @@
-// api/engine/room/schema.ts — room schema v1 (design R1–R11): immutable
+// api/engine/room/schema.ts - room schema v2 (design R1-R11): immutable
 // events and their edges, mutable status, immutable state groups with
 // bounded delta chains, event-state refs, publications, segments and
 // positions, extremities, waits and the change log. The store owns the id
 // row and the meta table; this provider owns everything else. `materialize`
 // is the only writer of the state-group/publication/pointer tables (R7).
 import type { SchemaProvider } from '#engine/store/create.ts';
+import { rebuildTopology, TOPOLOGY_SQL } from './topology.ts';
 
 export const ROOM_SCHEMA_SQL = `
 CREATE TABLE events(
@@ -122,8 +123,14 @@ CREATE TABLE publications(
 `;
 
 export const roomSchema: SchemaProvider = {
-  version: 1,
+  version: 2,
   apply: async (db) => {
-    await db.exec(ROOM_SCHEMA_SQL);
+    await db.exec(ROOM_SCHEMA_SQL + TOPOLOGY_SQL);
+  },
+  migrations: {
+    1: async (conn) => {
+      await conn.exec(TOPOLOGY_SQL);
+      await rebuildTopology(conn);
+    },
   },
 };

@@ -246,6 +246,14 @@ notification counts. Public/private receipts clear only their applicable scope;
 `m.fully_read` alone does not clear notifications. Encrypted mentions hidden in
 ciphertext cannot contribute server-side highlights.
 
+Both `/read_markers` and `/receipt/m.fully_read/{eventId}` save the private
+fully-read account-data marker; `m.fully_read` does not accept a thread id.
+Relations and thread summaries omit redacted relationships, ignored senders and
+invisible events, including historical replies. Relation pages support `to` and
+three-level `recurse` traversal; thread lists use the latest eligible reply.
+Ignored users' ordinary timeline/search messages are hidden without suppressing
+state or rewriting stored events.
+
 `GET /_matrix/client/v3/notifications` lists the authenticated account's saved
 decisions, newest first, with `from`, `limit` (default 50, maximum 100) and
 `only=highlight`. Events use ordinary viewer-aware client rendering; ciphertext

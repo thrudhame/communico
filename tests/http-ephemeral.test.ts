@@ -194,7 +194,7 @@ suite.test('receipts and read markers round-trip; private receipts stay stored a
     receipt('m.fully_read', e4),
     a.access_token!,
     'POST',
-    {},
+    { thread_id: 'main' },
   );
   assertEquals(bad.status, 400);
   assertEquals(bad.body.errcode, 'M_INVALID_PARAM');

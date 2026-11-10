@@ -15,6 +15,8 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import { verify } from '#engine/room/verify.ts';
 import { project, sourceOf } from '#engine/server/project.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { relationsOf } from '#engine/server/read.ts';
+import { causalOrder } from '#engine/room/order.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
   notificationSnapshot,
@@ -631,7 +633,15 @@ Deno.test('project: history is indexed without a seq and never feeds news', asyn
       content: { membership: 'join' },
     });
     const genesisIds = [...fr.events.values()].slice(0, 7);
-    await fakeMessage(fr, 'old 1');
+    const relationRoot = fr.tipId;
+    const historicalReply = await fr.addEvent({
+      type: 'm.room.message',
+      content: {
+        body: 'old 1',
+        msgtype: 'm.text',
+        'm.relates_to': { event_id: relationRoot, rel_type: 'm.reference' },
+      },
+    });
     await fakeMessage(fr, 'old 2');
     const tip = await fakeMessage(fr, 'at the gap');
     const room = await openRoom(store, fr.roomId, { create: true });
@@ -707,6 +717,24 @@ Deno.test('project: history is indexed without a seq and never feeds news', asyn
     );
     assertEquals(history.length, 1);
     assertEquals(history[0].seq, null);
+    const historicalRelations = await relationsOf(
+      await store.server(),
+      room.id,
+      relationRoot,
+    );
+    assertEquals(historicalRelations.map((row) => row.eventId), [
+      historicalReply.event_id,
+    ]);
+    assertEquals(
+      await room.tx((tx) =>
+        causalOrder(tx, [
+          tip.event_id!,
+          historicalReply.event_id!,
+          relationRoot,
+        ])
+      ),
+      [relationRoot, historicalReply.event_id, tip.event_id],
+    );
     const pdu = await room.tx(async (tx) =>
       await tx.events.get(String(history[0].event))
     );

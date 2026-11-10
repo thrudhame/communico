@@ -193,6 +193,40 @@ computing count, latest reply and participation.
 (`api/engine/client/render.ts:19-30`, `api/engine/client/visibility.ts:6-62`,
 `api/engine/client/render.ts:115-145`)
 
+Relations share structural admission across live and historical projections:
+accepted, grounded, same-room parents and children, valid string relationship
+fields, no self-links or redacted children. A late parent is re-evaluated at read
+time; redacting a parent does not detach its children. The viewer relation view
+then excludes ignored senders and invisible children before count, latest,
+participation and pagination. Thread lists order by the latest eligible reply.
+The three relations routes decode messages/sync cursors directionally, support
+`from`/`to`, and issue opaque room-bound continuation tokens. Explicit `recurse`
+walks three levels before result filtering and reports `recursion_depth`; omitted
+`recurse` omits the depth. Reads beyond the explicit traversal budget fail, rather
+than claiming an incomplete walk is complete. Nested latest events inherit the
+parent's serialization options, without recursively bundling threads.
+(`api/engine/client/{relations,relation-view}.ts`, `api/engine/room/order.ts`,
+`api/engine/server/{project,read}.ts`)
+
+Paginated relation/thread order uses a room-owned derived causal height, then
+first-owner positions and event ID as tie-breakers. Heights come only from held
+prev edges, never remote PDU depth. Event insertion repairs indexed descendants
+when a missing parent arrives; the room transaction commits graph and keys
+together. Room schema v1 upgrades seed the index once without changing PDUs.
+Subsequent reads fetch only candidate/anchor keys in bounded batches, independent
+of the old room prefix, and filtering or adding an anchor cannot reorder the
+remaining IDs. The shared room ordering module retains the nearby bidirectional
+tie algorithm for non-paginated timestamp queries.
+
+Ignored non-state messages share a presentation filter across client timeline,
+context, search and standalone push readers. Renderers and relation views require
+the viewer's tenant explicitly; neither uses the application singleton to read
+ignore policy. State still reaches clients and original PDUs remain
+unchanged. Both read-marker routes validate the event's room before persisting
+`m.fully_read` through the account-data owner; it never enters the public/private read-receipt stream, changes unread
+counts, or accepts a thread id.
+(`api/engine/client/{ignored,render,search}.ts`, `api/engine/receipts.ts`)
+
 `/sync` timeline visibility follows that same event-state policy. Its state
 blocks and unsigned membership retain their separate publication-cut
 contracts; `renderStateEvent` formats admitted state snapshots, including

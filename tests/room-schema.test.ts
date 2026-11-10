@@ -1,4 +1,4 @@
-// tests/room-schema.test.ts — room schema v1: the provider's tables land on
+// tests/room-schema.test.ts - the provider's tables land on
 // create, the recorded version opens and mismatches refuse.
 import { assertEquals, assertRejects } from '@std/assert';
 import { roomSchema } from '#engine/room/schema.ts';
@@ -15,6 +15,7 @@ const config = (dir: string) => ({
 const TABLES = [
   'events',
   'event_status',
+  'event_topology',
   'prev_edges',
   'auth_edges',
   'state_groups',
@@ -64,7 +65,7 @@ Deno.test('room schema: tables and indexes land on create, version recorded', as
         `missing index ${name}`,
       );
     }
-    assertEquals(await room.query('SELECT v FROM meta'), [{ v: '1' }]);
+    assertEquals(await room.query('SELECT v FROM meta'), [{ v: '2' }]);
     await store.close();
     const again = await openStore(config(dir), {
       schemas: { room: roomSchema },

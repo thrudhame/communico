@@ -5,6 +5,7 @@
 import type { Conn } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import type { EdgeKind, EdgeOverlay } from '#engine/room/edges.ts';
+import { indexTopology } from './topology.ts';
 
 export type EventRow = {
   id: string;
@@ -94,6 +95,7 @@ export async function insertEvent(
       [id, auth, ord],
     );
   }
+  await indexTopology(conn, id);
   remember(cache, id, pdu);
 }
 

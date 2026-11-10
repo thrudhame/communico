@@ -13,6 +13,7 @@ import * as segments from '#engine/room/segments.ts';
 import { roomSchema } from '#engine/room/schema.ts';
 import * as state from '#engine/room/state.ts';
 import * as waits from '#engine/room/waits.ts';
+import { orderKeys } from '#engine/room/topology.ts';
 
 export { roomSchema };
 export { formatCursor, parseCursor } from '#engine/room/segments.ts';
@@ -37,6 +38,7 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       prevsOf: (event: string) => events.prevsOf(conn, event, edges),
       authsOf: (event: string) => events.authsOf(conn, event, edges),
       childrenOf: (prev: string) => events.childrenOf(conn, prev),
+      orderKeys: (ids: readonly string[]) => orderKeys(conn, ids),
       authChildrenOf: (auth: string) => events.authChildrenOf(conn, auth),
       authClosure: (seeds: readonly string[], limit: number) =>
         events.authClosure(conn, seeds, limit, edges),
