@@ -28,11 +28,12 @@ import {
   ungroundedPrevs,
 } from '#engine/room/build.ts';
 import { fetchOrNull, type RemoteDeps } from '#engine/room/deps.ts';
-import { projectAfterWrite } from '#engine/room/hooks.ts';
+import { admitLocalJoin, projectAfterWrite } from '#engine/room/hooks.ts';
+import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
 import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
-import { aclAllows } from '#engine/room/acl.ts';
+import { aclAllows, assertAcl } from '#engine/room/acl.ts';
 import { orderEvents } from '#engine/room/order.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { identify, verify } from '#engine/room/verify.ts';
@@ -489,8 +490,11 @@ export async function ingestRemote(
     indexes.push(item.index);
     outcomeIndex.set(item.eventId, indexes);
   }
-  const committed = await withRoomLock(room.id, () =>
-    room.tx(async (tx) => {
+  const committed = await withRoomLock(room.id, async () => {
+    if (deps.localJoin !== undefined) {
+      await admitLocalJoin(room.store, room.id, deps.localJoin.userId);
+    }
+    return await room.tx(async (tx) => {
       const grounded: string[] = [];
       const results = new Map<number, RemoteOutcome>();
       // Revalidation (G8): the fetch phase ran unlocked — the stay, the
@@ -598,6 +602,21 @@ export async function ingestRemote(
         // Invalid imported state leaves the event as non-grounding evidence.
         // The normal receipt path reports its stored rejection; children
         // remain pending instead of inheriting that invalid state.
+        if (id === deps.localJoin?.eventId) {
+          if (
+            pdu.sender !== deps.localJoin.userId ||
+            pdu.state_key !== pdu.sender || pdu.content?.membership !== 'join'
+          ) {
+            throw new Error('E_LOCAL_JOIN_IDENTITY');
+          }
+          await assertAcl(tx, deps.self);
+          await assertLocalEncryption(
+            tx,
+            await tx.state.current(stay.id),
+            pdu,
+            deps.self,
+          );
+        }
         const res = await ingestInTx(tx, room.id, item.pdu, {
           remote: {
             origin,
@@ -627,7 +646,8 @@ export async function ingestRemote(
         }
       }
       return { grounded, results };
-    }));
+    });
+  });
   for (const [index, result] of committed.results) outcomes[index] = result;
 
   // A later arrival re-runs what waited for it (R10 — each recheck is a

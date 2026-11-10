@@ -197,6 +197,56 @@ export async function verify(
   keys: KeyResolver,
   opts: VerifyOptions = {},
 ): Promise<Verified> {
+  return await verifyRequired(pdu, roomVersion, keys, opts);
+}
+
+// Only resident send_join may defer its own authorizer signature, while it
+// verifies the joining sender before deciding whether it may countersign.
+// The result must pass ordinary verify() after countersigning, before ingest.
+export async function verifyJoinForCountersign(
+  pdu: Pdu,
+  roomVersion: string,
+  keys: KeyResolver,
+  self: string,
+  roomId: string,
+): Promise<Verified> {
+  if (
+    pdu.type !== 'm.room.member' || pdu.content?.membership !== 'join' ||
+    pdu.sender !== pdu.state_key
+  ) {
+    throw new Error('M_BAD_EVENT: expected a self join');
+  }
+  const via = authorizerServer(pdu, roomVersion);
+  if (via !== null && via !== self) {
+    throw new Error('M_UNAUTHORIZED: foreign authorising server');
+  }
+  return await verifyRequired(pdu, roomVersion, keys, { roomId }, self);
+}
+
+// Required signatures are a receipt contract, not presence in a signatures
+// map. Every network receipt (live/recovery/history/snapshot/prejoin) uses
+// verify(); local builders sign in-process. Stored events already crossed
+// that boundary, so rulebook/state resolution never fetch keys under locks.
+export function authorizerServer(pdu: Pdu, roomVersion: string): string | null {
+  if (
+    pdu.type !== 'm.room.member' ||
+    !getRulebook(roomVersion).spec.restrictedJoinRule
+  ) return null;
+  const via = pdu.content?.join_authorised_via_users_server;
+  if (via === undefined) return null;
+  if (typeof via !== 'string' || !/^@[^:\s]+:[^\s]+$/.test(via)) {
+    throw new Error('M_BAD_EVENT: malformed authorising user id');
+  }
+  return domainOf(via);
+}
+
+async function verifyRequired(
+  pdu: Pdu,
+  roomVersion: string,
+  keys: KeyResolver,
+  opts: VerifyOptions,
+  deferredLocalAuthorizer?: string,
+): Promise<Verified> {
   const spec = getRulebook(roomVersion).spec;
   const { eventId, oversized } = await identify(pdu, roomVersion, opts);
 
@@ -271,6 +321,15 @@ export async function verify(
   }
   if (!sigOk) {
     throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
+  }
+  const authorizer = authorizerServer(pdu, roomVersion);
+  if (
+    authorizer !== null && authorizer !== deferredLocalAuthorizer &&
+    !(await verifiedBy(authorizer))
+  ) {
+    throw new Error(
+      'M_UNAUTHORIZED: authorising server signature missing or invalid',
+    );
   }
   return { eventId, oversized, pdu };
 }

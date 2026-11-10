@@ -14,6 +14,7 @@ import { ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { projectAfterWrite } from '#engine/room/hooks.ts';
 import { admitLocalJoin } from '#engine/room/hooks.ts';
+import { withRestrictedAdmission } from './restricted.ts';
 
 export type MembershipOpResult = {
   roomId: string;
@@ -91,10 +92,42 @@ export async function join(
   if (current?.membership === 'join') {
     return { roomId: room.id, eventId: current.eventId, created: false };
   }
-  return await authorMember(room, userId, userId, {
-    ...(extraContent ?? {}),
-    membership: 'join',
-  }, signer);
+  const result = await withRestrictedAdmission(
+    room,
+    userId,
+    signer.serverName,
+    async (tx, authorizer) => {
+      const content = { ...extraContent, membership: 'join' } as Record<
+        string,
+        unknown
+      >;
+      delete content.join_authorised_via_users_server;
+      if (authorizer !== null) {
+        content.join_authorised_via_users_server = authorizer;
+      }
+      const pdu = await buildInTx(tx, room.id, {
+        type: 'm.room.member',
+        sender: userId,
+        state_key: userId,
+        content,
+      }, signer);
+      const res = await ingestInTx(tx, room.id, pdu, {
+        self: signer.serverName,
+      });
+      if (res.standing !== 'accepted') {
+        throw new MatrixError(
+          403,
+          'M_FORBIDDEN',
+          `membership rejected (${res.rule})`,
+        );
+      }
+      return { roomId: room.id, eventId: res.eventId, created: true };
+    },
+    undefined,
+    () => admitLocalJoin(room.store, room.id, userId),
+  );
+  await projectAfterWrite(room.store, room.id);
+  return result;
 }
 
 export async function knock(

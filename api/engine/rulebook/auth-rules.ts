@@ -460,16 +460,20 @@ function rule4(
   const target = stateKey;
   const targetLevel = userPowerLevel(target, plEvent, createEvent, spec);
 
-  // 4.2 (v11.md:144-147): join_authorised_via_users_server must be validly
-  // signed by the authorising user's homeserver. The CRYPTOGRAPHIC check
-  // lives in the signing layer (ingest verifies every signature entry);
-  // here we verify the event carries a signature entry for that server.
-  // Full cross-server key verification is federation (M5).
+  // Required signatures are cryptographically verified by the shared receipt
+  // boundary before any remote event enters this store. Local authoring may
+  // nominate only its own server. These synchronous rules check the shape;
+  // optional extra signatures are deliberately not verification requirements.
   const viaUser = pdu.content?.join_authorised_via_users_server;
   if (
-    spec.restrictedJoinRule && viaUser !== undefined &&
-    typeof viaUser === 'string'
+    spec.restrictedJoinRule && viaUser !== undefined
   ) {
+    if (typeof viaUser !== 'string' || !/^@[^:\s]+:[^\s]+$/.test(viaUser)) {
+      return reject(
+        ruleId(spec, 'member.via_sig'),
+        'malformed authorising user id',
+      );
+    }
     const viaDomain = domainOf(viaUser);
     const sigs = pdu.signatures ?? {};
     if (!(viaDomain in sigs)) {
@@ -752,6 +756,27 @@ function rule4(
 
   // 4.8: unknown membership -> reject.
   return reject(ruleId(spec, 'member.unknown'), 'unknown membership');
+}
+
+// The same versioned invite-power semantics used by member auth, including
+// old string power levels and v12 creators. Restricted admission does not
+// duplicate those rules or limit candidates to the creator list.
+export function inviteCapableUsers(
+  state: StateMap,
+  store: EventStore,
+  spec: RoomVersionSpec,
+): string[] {
+  const ctx: AuthCtx = { state, store, recognisedVersions: [] };
+  const pl = plEventOf(ctx);
+  const create = createEventOf(ctx);
+  return [...state.keys()].filter((key) => key.startsWith('m.room.member\0'))
+    .map((key) => key.slice('m.room.member\0'.length))
+    .filter((user) =>
+      membershipOf(ctx, user) === 'join' &&
+      userPowerLevel(user, pl, create, spec) >=
+        namedLevel('invite', parsedPl(pl, spec))
+    )
+    .sort();
 }
 
 // Rule 9 (v11.md:226-259) — m.room.power_levels deltas vs the previous PL

@@ -107,6 +107,7 @@ test('createRoom: presets, explicit default power levels, override merge and tru
   });
   assertEquals((await call(state(override, 'm.room.power_levels'), A)).body, {
     ...defaults,
+    invite: 50,
     users: { [a.user_id]: 100, [bob]: 100 },
     users_default: 100,
   });

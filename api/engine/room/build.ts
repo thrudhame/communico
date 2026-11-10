@@ -23,6 +23,7 @@ import type { RoomTx } from '#engine/room/index.ts';
 import { edgeIds } from '#engine/room/events.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { contentHashOf } from '#engine/signing-primitives.js';
+import { domainOf } from '#engine/ids.ts';
 
 // Counts rulebook resolveState calls (the plan's instrumented guardrail:
 // a single-prev linear ingest performs no resolution).
@@ -373,18 +374,42 @@ export async function buildInTx(
   const prevs = await resolvePrevs(tx, prevIds);
   const depth = prevs.ids.length === 0 ? 1 : Math.max(...prevs.depths) + 1;
   const before = await stateBefore(tx, prevs.afterGroups, rulebook);
+  const content = { ...partial.content };
+  if (
+    partial.type === 'm.room.member' && partial.sender === partial.state_key &&
+    content.membership === 'join'
+  ) {
+    const previous = before.get('m.room.member\0' + partial.sender);
+    const row = previous === undefined ? null : await tx.events.get(previous);
+    if (row !== null && JSON.parse(row.pdu).content?.membership === 'join') {
+      // Profile updates are not fresh authorizations. Never inherit a remote
+      // vouch or trust a client-provided authorizer on join -> join.
+      delete content.join_authorised_via_users_server;
+    }
+    const via = content.join_authorised_via_users_server;
+    if (
+      via !== undefined &&
+      (typeof via !== 'string' || domainOf(via) !== signer.serverName)
+    ) {
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        'local authoring cannot forge a remote authorization',
+      );
+    }
+  }
 
   const pdu: Pdu = {
     type: partial.type,
     sender: partial.sender,
-    content: partial.content ?? {},
+    content,
     prev_events: [...prevIds],
     auth_events: rulebook.selectAuthEvents(
       {
         type: partial.type,
         sender: partial.sender,
         state_key: partial.state_key,
-        content: partial.content ?? {},
+        content,
       } as Pdu,
       before,
     ),

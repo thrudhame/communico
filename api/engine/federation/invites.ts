@@ -27,6 +27,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
 import { eventIdFor, redact } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { verify } from '#engine/room/verify.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { buildInTx, finalizeBuilt, roomVersionOf } from '#engine/room/build.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
@@ -420,6 +421,9 @@ export async function receiveInvite(
     deps.keys,
   );
   // countersign and answer
+  await verify(pdu, roomVersion, deps.keys, { roomId }).catch((error) => {
+    throw new MatrixError(403, 'M_FORBIDDEN', String(error));
+  });
   await countersign(pdu, roomVersion, deps.signer);
   // store: a room we HOLD does nothing else (the event arrives by /send
   // too, invites-v2.yaml:40-42); otherwise the out-of-band row so the
