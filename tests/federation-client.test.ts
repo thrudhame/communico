@@ -9,6 +9,7 @@
 // tests/federation-dial.test.ts, restored).
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createHash, X509Certificate } from 'node:crypto';
+import tls from 'node:tls';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { addPeer, removePeer } from '#engine/federation/peers.ts';
@@ -94,6 +95,60 @@ async function withFake<T>(
     resetCaCertsForTests();
   }
 }
+
+Deno.test('client: certificate material is acquired only for leaf-key trust', async () => {
+  const identity = await makeIdentity('certificate-material.test');
+  const pem = await Deno.readTextFile('tests/fixtures/tls/localhost.crt');
+  await withStore(async (store) => {
+    await withFake(identity, async (fake) => {
+      const server = await store.server();
+      for (const kind of ['ca', 'pinned'] as const) {
+        await addPeer(server, {
+          name: 'localhost',
+          host: '127.0.0.1',
+          port: fake.port,
+          trust: kind,
+          ...(kind === 'pinned' ? { pin: pinOf(pem) } : {}),
+          addedBy: 'operator',
+        });
+        let postHandshakeCalls = 0;
+        const connect = tls.connect;
+        // Leave the runtime's chain/hostname validation untouched. Intercept
+        // only work the consumer requests after secureConnect has fired.
+        tls.connect = ((...args: Parameters<typeof tls.connect>) => {
+          const socket = connect(...args);
+          socket.prependOnceListener('secureConnect', () => {
+            const getPeerCertificate = socket.getPeerCertificate.bind(socket);
+            socket.getPeerCertificate = ((detailed?: boolean) => {
+              postHandshakeCalls++;
+              if (kind === 'ca' || detailed === true) {
+                throw new Error('unneeded post-handshake certificate chain');
+              }
+              return getPeerCertificate(detailed);
+            }) as tls.TLSSocket['getPeerCertificate'];
+          });
+          return socket;
+        }) as typeof tls.connect;
+        try {
+          const before = fake.requests.length;
+          const response = await federationRequest(server, identity.signer, {
+            destination: 'localhost',
+            method: 'GET',
+            path: '/_matrix/key/v2/server',
+            body: null,
+          });
+          assertEquals(response.status, 200);
+          assertEquals(fake.requests.length, before + 1);
+          assert(fake.requests.at(-1)!.verified);
+          assertEquals(postHandshakeCalls, kind === 'ca' ? 0 : 1);
+        } finally {
+          tls.connect = connect;
+          await removePeer(server, 'localhost');
+        }
+      }
+    });
+  });
+});
 
 Deno.test('client: raw streaming shares verified signing and completed-error provenance', async () => {
   const identity = await makeIdentity('raw.test');

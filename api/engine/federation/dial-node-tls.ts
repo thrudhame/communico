@@ -199,43 +199,48 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
     conn = new NodeTlsConn(sock);
     opts.signal?.throwIfAborted();
     ac.signal.throwIfAborted();
-    // identity check BEFORE any request bytes are written
-    const cert = sock.getPeerCertificate(true);
-    const raw = cert !== null && typeof cert === 'object'
-      ? (cert as { raw?: Buffer }).raw
-      : undefined;
-    if (raw === undefined || raw.length === 0) {
-      conn.close();
-      throw new MatrixError(
-        502,
-        'M_UNKNOWN',
-        'peer presented no certificate',
-      );
-    }
-    if (opts.trust.kind === 'pinned') {
-      const got = spkiSha256(new Uint8Array(raw));
-      if (got !== opts.trust.spkiSha256) {
+    // CA mode already verified chain and hostname during the handshake. Only
+    // key-based trust needs certificate bytes, and only the leaf: reconstructing
+    // the legacy chain here adds synchronous work to every recovery request.
+    // Identity checks still finish BEFORE any request bytes are written.
+    if (opts.trust.kind !== 'ca') {
+      const cert = sock.getPeerCertificate();
+      const raw = cert !== null && typeof cert === 'object'
+        ? (cert as { raw?: Buffer }).raw
+        : undefined;
+      if (raw === undefined || raw.length === 0) {
         conn.close();
         throw new MatrixError(
           502,
           'M_UNKNOWN',
-          'peer certificate does not match the roster pin',
+          'peer presented no certificate',
         );
       }
-    } else if (opts.trust.kind === 'keyname') {
-      const x = new X509Certificate(raw);
-      const spki = x.publicKey.export({ type: 'spki', format: 'der' });
-      const rawKey = new Uint8Array(spki.subarray(12));
-      const expected = opts.trust.pubkey;
-      const matches = rawKey.length === expected.length &&
-        rawKey.every((b, i) => b === expected[i]);
-      if (!matches) {
-        conn.close();
-        throw new MatrixError(
-          502,
-          'M_UNKNOWN',
-          'peer certificate does not match the key-is-name key',
-        );
+      if (opts.trust.kind === 'pinned') {
+        const got = spkiSha256(new Uint8Array(raw));
+        if (got !== opts.trust.spkiSha256) {
+          conn.close();
+          throw new MatrixError(
+            502,
+            'M_UNKNOWN',
+            'peer certificate does not match the roster pin',
+          );
+        }
+      } else {
+        const x = new X509Certificate(raw);
+        const spki = x.publicKey.export({ type: 'spki', format: 'der' });
+        const rawKey = new Uint8Array(spki.subarray(12));
+        const expected = opts.trust.pubkey;
+        const matches = rawKey.length === expected.length &&
+          rawKey.every((b, i) => b === expected[i]);
+        if (!matches) {
+          conn.close();
+          throw new MatrixError(
+            502,
+            'M_UNKNOWN',
+            'peer certificate does not match the key-is-name key',
+          );
+        }
       }
     }
     return await http1Wire(conn as WireConn, {
