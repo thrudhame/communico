@@ -129,7 +129,7 @@ export async function sendLocal(
 
 function localJoiningUser(event: BuildPartial): string | undefined {
   return event.type === 'm.room.member' && event.state_key === event.sender &&
-      event.content.membership === 'join'
+      ['join', 'knock'].includes(String(event.content.membership))
     ? event.sender
     : undefined;
 }
@@ -455,7 +455,8 @@ export async function ingestInTx(
   if (remote === null) {
     if (
       pdu.type === 'm.room.member' && pdu.state_key === pdu.sender &&
-      pdu.content?.membership === 'join' && domainOf(pdu.sender) === self
+      ['join', 'knock'].includes(String(pdu.content?.membership)) &&
+      domainOf(pdu.sender) === self
     ) {
       await assertAcl(tx, self);
     }

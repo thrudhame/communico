@@ -694,7 +694,7 @@ Deno.test('E6 interrupted send_join retains visible cleanup across reopen; sende
     );
     assertEquals(calls.sendJoin.length, 1);
     assertEquals(
-      await (await store.server()).query('SELECT * FROM federation_invites'),
+      await (await store.server()).query('SELECT * FROM prejoin_memberships'),
       [],
     );
     await store.close();

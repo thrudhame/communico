@@ -282,7 +282,7 @@ export type ReviewIntent = {
   eventId: null;
   intent: { what: string; user_id: string; candidates: string[] };
   addedMs: number;
-  expiresMs: null;
+  expiresMs: number | null;
   inflightTxn: null;
 };
 

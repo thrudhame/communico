@@ -106,7 +106,7 @@ suite.test('initial, incremental and full_state; global tokens; account data; re
     Object.keys(
       (await sync(bob.access_token!, '&since=' + since)).rooms as Json,
     ).sort(),
-    ['invite', 'join', 'leave'],
+    ['invite', 'join', 'knock', 'leave'],
   );
   await putAccountData(app.tenant, 'sy-a', '', 'custom.test', { value: 1 });
   const data = await sync(

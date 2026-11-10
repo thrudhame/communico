@@ -34,7 +34,7 @@ const TABLES = [
   'federation_peers',
   'federation_blocks',
   'federation_pending',
-  'federation_invites',
+  'prejoin_memberships',
   'server_keys',
   'server_key_docs',
   'server_key_changes',

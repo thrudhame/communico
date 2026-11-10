@@ -51,7 +51,7 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - Federation — rooms landed in M5b (the room-federation files run: joins,
   sends, missing events, invites, event auth, redaction, sync, unreject,
   bans, presence, typing). What stays listed: **M5c territory**
-  (`knocking`, `knock_restricted`), media
+  (`knock_restricted`), media
   (`federation_media_content`). Device/E2EE federation files run after E3.
   The knocking files share
   the `testValidationForSendMembershipEndpoint` helper defined in
@@ -64,7 +64,6 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - Rate limiting (`M_LIMIT_EXCEEDED` — M2): case-level, triaged in BASELINE.md.
 
 - tests/federation_media_content_test.go
-- tests/knocking_test.go
 - tests/knock_restricted_test.go
 
 ## Never blacklisted

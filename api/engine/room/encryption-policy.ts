@@ -156,7 +156,8 @@ export async function assertLocalEncryption(
   if (event.state_key !== undefined) {
     if (
       event.type === 'm.room.member' && event.sender === event.state_key &&
-      event.content.membership === 'join' && !policy.allowunencryptedjoining &&
+      ['join', 'knock'].includes(String(event.content.membership)) &&
+      !policy.allowunencryptedjoining &&
       !initializing
     ) {
       const current = await stateEvent(

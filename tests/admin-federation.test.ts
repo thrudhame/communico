@@ -249,7 +249,7 @@ Deno.test('admin federation operations cross the socket and affect their consume
       'reject-invite jobs are visible and operator prune settles them',
       async () => {
         await app.server.execute(
-          "INSERT INTO federation_invites(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq) VALUES('!invite|part:remote','@a:localhost','$invite','11','{}','[]','remote.test',1,'rejecting',1)",
+          "INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq) VALUES('!invite|part:remote','@a:localhost','$invite','11','{}','[]','remote.test',1,'rejecting',1)",
         );
         const review = await call('federation-outbox/list', {
           destination: 'remote.test',
@@ -267,7 +267,7 @@ Deno.test('admin federation operations cross the socket and affect their consume
         );
         assertEquals(
           (await app.server.query(
-            "SELECT status FROM federation_invites WHERE room_id='!invite|part:remote'",
+            "SELECT status FROM prejoin_memberships WHERE room_id='!invite|part:remote'",
           ))[0].status,
           'rejected',
         );

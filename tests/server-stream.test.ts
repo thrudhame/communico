@@ -128,7 +128,7 @@ Deno.test('event stream: room publications and every OOB transition share durabl
         eventStreamTx(server, async (tx) => {
           const seq = await nextEventSeq(tx);
           await tx.execute(
-            'UPDATE federation_invites SET seq = ?, status = ? WHERE room_id = ?',
+            'UPDATE prejoin_memberships SET seq = ?, status = ? WHERE room_id = ?',
             [seq, 'rejected', roomId],
           );
           throw new Error('abort transition');

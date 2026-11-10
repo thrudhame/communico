@@ -32,8 +32,8 @@ async function assertNoJoinCleanup(
   userId: string,
 ): Promise<void> {
   const rows = await (await store.server()).query(
-    'SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=?',
-    [roomId, userId],
+    "SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? UNION ALL SELECT 1 FROM prejoin_memberships WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract')",
+    [roomId, userId, roomId, userId],
   );
   if (rows.length) {
     throw new MatrixError(

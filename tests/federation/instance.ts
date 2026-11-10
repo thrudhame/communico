@@ -29,6 +29,7 @@ import { keyDocResponse, notaryFromCache } from '#engine/federation/keydoc.ts';
 import { keyStore, ourKeyDocument } from '#engine/federation/keys.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
+import { makeKnock, sendKnock } from '#engine/federation/joins.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
 import { receiveTransaction } from '#engine/federation/transactions.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -415,12 +416,38 @@ export async function startInstance(): Promise<Instance> {
         );
         return Response.json(res);
       }
-      const makeJoinMatch =
+      const makeKnockMatch =
+        /^\/_matrix\/federation\/v1\/make_knock\/([^/]+)\/([^/]+)$/.exec(path);
+      if (makeKnockMatch && req.method === 'GET') {
+        return Response.json(
+          await makeKnock(
+            decodeURIComponent(makeKnockMatch[1]),
+            decodeURIComponent(makeKnockMatch[2]),
+            origin,
+            url.searchParams.getAll('ver'),
+            inviteDeps,
+          ),
+        );
+      }
+      const sendKnockMatch =
+        /^\/_matrix\/federation\/v1\/send_knock\/([^/]+)\/([^/]+)$/.exec(path);
+      if (sendKnockMatch && req.method === 'PUT') {
+        return Response.json(
+          await sendKnock(
+            decodeURIComponent(sendKnockMatch[1]),
+            decodeURIComponent(sendKnockMatch[2]),
+            bodyJson,
+            origin,
+            inviteDeps,
+          ),
+        );
+      }
+      const makeJoinRoute =
         /^\/_matrix\/federation\/v1\/make_join\/([^/]+)\/([^/]+)$/
           .exec(path);
-      if (makeJoinMatch && req.method === 'GET') {
-        const roomId = decodeURIComponent(makeJoinMatch[1]);
-        const userId = decodeURIComponent(makeJoinMatch[2]);
+      if (makeJoinRoute && req.method === 'GET') {
+        const roomId = decodeURIComponent(makeJoinRoute[1]);
+        const userId = decodeURIComponent(makeJoinRoute[2]);
         if (domainOf(userId) !== origin) {
           throw new MatrixError(403, 'M_FORBIDDEN', 'not your user');
         }

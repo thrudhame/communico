@@ -124,7 +124,7 @@ Deno.test('admin rooms offered list, age filter, drop cleanup and lease retireme
         'visibility',
         'receipts',
         'rooms',
-        'federation_invites',
+        'prejoin_memberships',
       ]
     ) {
       assertEquals(
@@ -193,12 +193,12 @@ for (const boundary of ['unlink', 'server cleanup'] as const) {
       const g = await genesis(app.store, { roomId: '!recover-drop:test' });
       if (boundary === 'server cleanup') {
         await app.server.execute(
-          `INSERT INTO federation_invites(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
+          `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
            VALUES(?,'@waiting:test','$waiting','11','{}','[]','waiting.test',1,'pending',1)`,
           [g.roomId],
         );
         await app.server.execute(
-          `INSERT INTO federation_invites(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
+          `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
            VALUES(?,'@rejecting:test','$rejecting','11','{}','[]','waiting.test',1,'rejecting',1)`,
           [g.roomId],
         );
@@ -329,7 +329,7 @@ for (const race of ['new rejection', 'candidate failover'] as const) {
       const g = await genesis(app.store, { roomId: '!invite-drop:test' });
       const user = '@invitee:' + app.tenant.serverName;
       await app.server.execute(
-        `INSERT INTO federation_invites(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
+        `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
          VALUES(?,?,?,'11',?,?,?,1,?,1)`,
         [
           g.roomId,
@@ -409,7 +409,7 @@ for (const race of ['new rejection', 'candidate failover'] as const) {
       assertEquals((await adminCall(admin.path, 'rooms/list')).body.result, []);
       assertEquals(
         await app.server.query(
-          'SELECT * FROM federation_invites WHERE room_id=?',
+          'SELECT * FROM prejoin_memberships WHERE room_id=?',
           [g.roomId],
         ),
         [],

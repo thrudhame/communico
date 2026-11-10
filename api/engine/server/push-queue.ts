@@ -1,6 +1,7 @@
 // Delivery intent and badges share the publication/read/removal transaction.
 // Queue lifetime never determines notification counts or listing membership.
 import type { Conn } from '#engine/store/db.ts';
+import { visiblePrejoin, visibleRoomMembership } from './prejoin.ts';
 
 async function revision(tx: Conn): Promise<number> {
   await tx.execute(
@@ -74,11 +75,17 @@ export async function cancelPushTarget(
  * per pending invited room, independently of rule matches, without OOB/held dupes. */
 export async function badgeCount(tx: Conn, user: string): Promise<number> {
   const joined = (await tx.query(
-    "SELECT COALESCE(SUM(n.unread),0) AS n FROM notification_counts n JOIN memberships m ON m.user=n.user AND m.room=n.room WHERE n.user=? AND m.membership='join' AND NOT EXISTS (SELECT 1 FROM federation_invites f WHERE f.user_id=m.user AND f.room_id=m.room AND f.status!='joined')",
+    `SELECT COALESCE(SUM(n.unread),0) AS n FROM notification_counts n JOIN memberships m ON m.user=n.user AND m.room=n.room WHERE n.user=? AND m.membership='join' AND ${
+      visibleRoomMembership('m')
+    }`,
     [user],
   ))[0];
   const invites = (await tx.query(
-    "SELECT COUNT(*) AS n FROM (SELECT room FROM memberships m WHERE user=? AND membership='invite' AND NOT EXISTS (SELECT 1 FROM federation_invites f WHERE f.user_id=m.user AND f.room_id=m.room AND f.status!='joined') UNION SELECT room_id FROM federation_invites WHERE user_id=? AND status='pending')",
+    `SELECT COUNT(*) AS n FROM (SELECT room FROM memberships m WHERE user=? AND membership='invite' AND ${
+      visibleRoomMembership('m')
+    } UNION SELECT room_id FROM prejoin_memberships p WHERE user_id=? AND status='pending' AND kind='invite' AND ${
+      visiblePrejoin('p')
+    })`,
     [user, user],
   ))[0];
   return Number(joined.n) + Number(invites.n);

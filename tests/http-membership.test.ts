@@ -244,7 +244,7 @@ test('HTTP remote join uses the stage-4c second instance; createRoom countersign
     });
     assertEquals(made.status, 200, JSON.stringify(made.body));
     const invite = await remote.server.query(
-      'SELECT event_json FROM federation_invites WHERE room_id = ?',
+      'SELECT event_json FROM prejoin_memberships WHERE room_id = ?',
       [made.body.room_id as string],
     );
     assertEquals(invite.length, 1);

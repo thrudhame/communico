@@ -102,14 +102,14 @@ Deno.test('push invites: accepted OOB invites count once, replace and withdraw a
     const body = await sync.json();
     assert(body.rooms.invite[room]);
     const cut = (await app.server.query(
-      'SELECT seq FROM federation_invites WHERE room_id=?',
+      'SELECT seq FROM prejoin_memberships WHERE room_id=?',
       [room],
     ))[0].seq;
     await receive(first);
     assertEquals(await count(), { notification_count: 1, highlight_count: 0 });
     assertEquals(
       (await app.server.query(
-        'SELECT seq FROM federation_invites WHERE room_id=?',
+        'SELECT seq FROM prejoin_memberships WHERE room_id=?',
         [room],
       ))[0].seq,
       cut,
@@ -126,7 +126,7 @@ Deno.test('push invites: accepted OOB invites count once, replace and withdraw a
     await receive(first);
     assertEquals(
       (await app.server.query(
-        'SELECT event_id FROM federation_invites WHERE room_id=?',
+        'SELECT event_id FROM prejoin_memberships WHERE room_id=?',
         [room],
       ))[0].event_id,
       second.event_id,
