@@ -59,6 +59,23 @@ export async function feedAfter(
   return rows.map(feedRowOf);
 }
 
+// Descending, bounded windows let sync admit visible events before limiting
+// without hydrating the entire room history on every initial request.
+export async function feedBefore(
+  db: Db,
+  roomId: string,
+  sinceSeq: number,
+  endSeq: number,
+  limit: number,
+): Promise<FeedRow[]> {
+  const rows = await db.query(
+    `SELECT seq, room, pos, event, stay FROM feed
+     WHERE room = ? AND seq > ? AND seq <= ? ORDER BY seq DESC LIMIT ?`,
+    [roomId, sinceSeq, endSeq, limit],
+  );
+  return rows.map(feedRowOf);
+}
+
 // The global stream maximum (the old MAX(seq) — next_batch's event part).
 export async function feedMax(db: Db): Promise<number> {
   const rows = await db.query('SELECT MAX(seq) AS m FROM feed');

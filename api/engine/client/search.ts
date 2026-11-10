@@ -110,6 +110,9 @@ export async function search(
     return { count: 0, results: [], highlights: tokens };
   }
   const matched: Hit[] = [];
+  // roomScope owns predecessor expansion and exclusions. Apply the same
+  // resolved scope to event filtering, not the unexpanded request room list.
+  const eventFilter = { ...filter, rooms };
   for (const c of await searchCandidates(theApp().server, rooms, keys)) {
     if (!matchTokens(c.bodyLower, tokens)) continue;
     const room = await lookupRoom(c.roomId);
@@ -124,7 +127,7 @@ export async function search(
       !eventMatchesRoomEventFilter(
         null,
         { ...pdu, room_id: c.roomId },
-        filter,
+        eventFilter,
       ) ||
       !await canSeeEvent(userId, room, c.eventId) ||
       await isIgnoredEvent(room, c.eventId, {
@@ -194,12 +197,18 @@ export async function search(
           );
           if (seq.length > 0) atSeq = Number(seq[0].seq);
         }
-        const state = await stateAtSeq(hit.roomId, atSeq),
+        const state = await clientEventsForRows(
+            hit.roomId,
+            (await stateAtSeq(hit.roomId, atSeq)).filter((r) =>
+              r.type === 'm.room.member' && senders.has(r.stateKey)
+            ),
+            userId,
+          ),
           profiles: Record<string, Record<string, unknown>> = {};
         for (const sender of senders) {
           const content = state.find((r) =>
-            r.type === 'm.room.member' && r.stateKey === sender
-          )?.content ?? {};
+            r.type === 'm.room.member' && r.state_key === sender
+          )?.content as Record<string, unknown> ?? {};
           const p: Record<string, unknown> = {};
           for (const k of ['displayname', 'avatar_url']) {
             if (typeof content[k] === 'string') {
