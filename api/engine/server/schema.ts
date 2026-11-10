@@ -377,7 +377,7 @@ CREATE INDEX reports_kind ON reports(kind,id);
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 22,
+  version: 23,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -399,6 +399,9 @@ export const serverSchema: SchemaProvider = {
     await db.exec(PREJOIN_SQL);
     await db.exec(MEDIA_CACHE_SQL);
     await db.exec(REPORTS_SQL);
+    await db.exec(
+      'ALTER TABLE prejoin_memberships ADD COLUMN local_leave_json TEXT',
+    );
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -420,5 +423,9 @@ export const serverSchema: SchemaProvider = {
     19: (conn) => conn.exec(PREJOIN_SQL),
     20: (conn) => conn.exec(MEDIA_CACHE_SQL),
     21: (conn) => conn.exec(REPORTS_SQL),
+    22: (conn) =>
+      conn.exec(
+        'ALTER TABLE prejoin_memberships ADD COLUMN local_leave_json TEXT',
+      ),
   },
 };

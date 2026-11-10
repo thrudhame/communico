@@ -250,6 +250,7 @@ export type StoredInvite = {
   candidates: string[];
   expiresMs: number | null;
   leaveJson: string | null;
+  localLeaveJson: string | null;
   roomId: string;
   userId: string;
   eventId: string;
@@ -270,6 +271,9 @@ export function inviteOf(row: any): StoredInvite {
     candidates: JSON.parse(String(row.candidates)),
     expiresMs: row.expires_ms === null ? null : Number(row.expires_ms),
     leaveJson: row.leave_json === null ? null : String(row.leave_json),
+    localLeaveJson: row.local_leave_json == null
+      ? null
+      : String(row.local_leave_json),
     roomId: String(row.room_id),
     userId: String(row.user_id),
     eventId: String(row.event_id),
@@ -479,7 +483,7 @@ export async function receiveInvite(
          room_version = excluded.room_version, event_json = excluded.event_json,
          invite_room_state = excluded.invite_room_state, origin = excluded.origin,
            received_ms = excluded.received_ms, status = 'pending', seq = excluded.seq,
-           kind='invite', revision=prejoin_memberships.revision+1, candidates='[]', leave_json=NULL, expires_ms=NULL`,
+            kind='invite', revision=prejoin_memberships.revision+1, candidates='[]', leave_json=NULL, local_leave_json=NULL, expires_ms=NULL`,
           [
             roomId,
             target,
@@ -539,10 +543,12 @@ export async function rejectInviteRemote(
       throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
     }
     await withdrawInvitePush(tx, userId, roomId, invite.eventId);
+    const localLeave = await buildLocalPrejoinLeave(invite, deps.signer);
     const seq = await nextEventSeq(tx);
     await tx.execute(
-      "UPDATE prejoin_memberships SET status = 'rejecting', revision=revision+1, leave_json=NULL, seq = ?, expires_ms=CASE WHEN kind='knock' THEN ? ELSE NULL END WHERE room_id = ? AND user_id = ?",
+      "UPDATE prejoin_memberships SET status = 'rejecting', revision=revision+1, leave_json=NULL, local_leave_json=?, seq = ?, expires_ms=CASE WHEN kind='knock' THEN ? ELSE NULL END WHERE room_id = ? AND user_id = ?",
       [
+        JSON.stringify(localLeave),
         seq,
         Date.now() + config().federation.refusedmillihours * 3600,
         roomId,
@@ -553,6 +559,74 @@ export async function rejectInviteRemote(
   });
   // nothing ingested an event — wake the first candidate's loop directly
   deps.wake(candidates[0]);
+}
+
+// A local OOB departure is a real signed membership, not an edited invite or
+// a stripped hint with an invented identity. Federation's make_leave result
+// remains separate and may later replace this client notification.
+async function buildLocalPrejoinLeave(
+  invite: StoredInvite,
+  signer: InviteDeps['signer'],
+) {
+  const previous = JSON.parse(invite.eventJson) as Pdu;
+  return await finalizeBuilt(
+    {
+      type: 'm.room.member',
+      room_id: invite.roomId,
+      state_key: invite.userId,
+      sender: invite.userId,
+      content: { membership: 'leave' },
+      prev_events: [previous.event_id!],
+      auth_events: [
+        ...new Set([
+          ...(previous.auth_events == null ? [] : previous.auth_events),
+          previous.event_id!,
+        ]),
+      ],
+      depth: previous.depth + 1,
+      origin_server_ts: Date.now(),
+      hashes: { sha256: '' },
+      signatures: {},
+    },
+    getRulebook(invite.roomVersion),
+    signer,
+  );
+}
+
+export async function prejoinDeparture(
+  invite: StoredInvite,
+  deps: Pick<InviteDeps, 'server' | 'signer'>,
+): Promise<Pdu> {
+  const event = JSON.parse(invite.eventJson) as Pdu;
+  if (
+    event.content?.membership === 'leave' || event.content?.membership === 'ban'
+  ) return event;
+  if (invite.localLeaveJson !== null) {
+    return JSON.parse(invite.localLeaveJson) as Pdu;
+  }
+  // Existing installations may have a pending intent without a local event.
+  // Materialize once under the same revision owner; never synthesize per read.
+  return await deps.server.tx(async (tx) => {
+    const rows = await tx.query(
+      'SELECT local_leave_json FROM prejoin_memberships WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
+      [invite.roomId, invite.userId, invite.revision, invite.seq],
+    );
+    if (rows[0]?.local_leave_json != null) {
+      return JSON.parse(String(rows[0].local_leave_json)) as Pdu;
+    }
+    const signed = await buildLocalPrejoinLeave(invite, deps.signer);
+    await tx.execute(
+      'UPDATE prejoin_memberships SET local_leave_json=? WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
+      [
+        JSON.stringify(signed),
+        invite.roomId,
+        invite.userId,
+        invite.revision,
+        invite.seq,
+      ],
+    );
+    return signed;
+  });
 }
 
 // The reject-invite performer (ruling F): make_leave → fill → sign →

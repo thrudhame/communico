@@ -202,6 +202,9 @@ export async function backfill(
     stay?: number;
     segment?: number;
     anchor?: Pdu;
+    // A missing edge inside a live stay needs its own history anchor, not the
+    // stay's pre-join history prefix. First-owner prev edges reconnect it.
+    isolated?: boolean;
   },
   deps: BackfillDeps,
 ): Promise<BackfillResult> {
@@ -367,7 +370,7 @@ export async function backfill(
       const rulebook = getRulebook(await roomVersionOf(tx, stay.id));
       const createId = await roomCreateId(tx, stay.id);
       let history = args.segment === undefined
-        ? args.anchor === undefined
+        ? args.anchor === undefined && !args.isolated
           ? await tx.segments.historyOf(stay.id)
           : null
         : await tx.segments.get(args.segment);
@@ -380,7 +383,7 @@ export async function backfill(
       }
       if (history === null && args.anchor === undefined) {
         const id = await tx.segments.create({
-          kind: args.anchor === undefined ? 'history' : 'anchor',
+          kind: args.isolated ? 'anchor' : 'history',
           prev: stay.id,
           opened_by: args.anchor === undefined ? null : ordered[0].eventId,
         });

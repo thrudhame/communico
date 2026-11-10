@@ -24,8 +24,11 @@ export type Viewer = {
   tenant: Tenant;
 };
 
-function clientShape(pdu: Pdu, eventId: string): Record<string, unknown> {
-  const event: Record<string, unknown> = {
+function clientShape(
+  pdu: Pdu,
+  eventId: string,
+): Record<string, unknown> & { type: string; sender: string } {
+  const event: Record<string, unknown> & { type: string; sender: string } = {
     event_id: eventId,
     type: pdu.type,
     sender: pdu.sender,
@@ -35,6 +38,19 @@ function clientShape(pdu: Pdu, eventId: string): Record<string, unknown> {
   if (pdu.state_key != null) event.state_key = pdu.state_key;
   if (pdu.redacts != null) event.redacts = pdu.redacts;
   return event;
+}
+
+/** Only the authoritative prejoin owner supplies these full membership PDUs.
+ * Saved stripped hints must never enter a full client state-event batch. */
+export function renderPrejoinDeparture(pdu: Pdu, userId: string) {
+  if (
+    pdu.type !== 'm.room.member' || pdu.state_key !== userId ||
+    !['leave', 'ban'].includes(String(pdu.content?.membership)) ||
+    typeof pdu.event_id !== 'string' || typeof pdu.origin_server_ts !== 'number'
+  ) {
+    throw new Error('invalid out-of-band departure');
+  }
+  return clientShape(pdu, pdu.event_id);
 }
 
 /** Only the authoritative pending OOB invite owner may call this boundary.

@@ -204,6 +204,16 @@ export async function messages(
         : step.cursor.segment;
       const signer = theApp().tenant.signer();
       let outcome = 'open';
+      const first = segment?.kind === 'stay'
+        ? await room.tx((tx) =>
+          tx.segments.positionsPage(
+            segment.id,
+            -Number.MAX_SAFE_INTEGER,
+            'f',
+            1,
+          )
+        )
+        : [];
       for (const via of candidates) {
         const res = await backfill(room, {
           from: step.prevs,
@@ -211,6 +221,8 @@ export async function messages(
           via,
           stay,
           segment: segment?.kind === 'anchor' ? segment.id : undefined,
+          isolated: segment?.kind === 'stay' &&
+            first[0]?.offset !== step.cursor.offset,
         }, {
           keys: productionKeyResolver(theApp().server, signer),
           fetcher: productionFetcher(theApp().server, signer, theApp().store),

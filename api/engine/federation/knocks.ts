@@ -198,7 +198,7 @@ export async function knockRemote(
                 config().federation.refusedmillihours * 3600;
               await tx.execute(
                 `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq,kind,revision,candidates,expires_ms)
-            VALUES(?,?,?,?,?,'[]',?,?,'attempting',?,'knock',?,?,?) ON CONFLICT(room_id,user_id) DO UPDATE SET event_id=excluded.event_id,room_version=excluded.room_version,event_json=excluded.event_json,invite_room_state='[]',origin=excluded.origin,received_ms=excluded.received_ms,status='attempting',seq=excluded.seq,kind='knock',revision=excluded.revision,candidates=excluded.candidates,leave_json=NULL,expires_ms=excluded.expires_ms`,
+            VALUES(?,?,?,?,?,'[]',?,?,'attempting',?,'knock',?,?,?) ON CONFLICT(room_id,user_id) DO UPDATE SET event_id=excluded.event_id,room_version=excluded.room_version,event_json=excluded.event_json,invite_room_state='[]',origin=excluded.origin,received_ms=excluded.received_ms,status='attempting',seq=excluded.seq,kind='knock',revision=excluded.revision,candidates=excluded.candidates,leave_json=NULL,local_leave_json=NULL,expires_ms=excluded.expires_ms`,
                 [
                   roomId,
                   userId,
@@ -229,6 +229,7 @@ export async function knockRemote(
                 candidates: via,
                 expiresMs: expires,
                 leaveJson: null,
+                localLeaveJson: null,
               } satisfies StoredInvite;
             });
           });

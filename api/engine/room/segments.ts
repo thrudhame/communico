@@ -343,6 +343,33 @@ export async function stepPosition(
   let at = cursor;
   for (;;) {
     if (dir === 'b') {
+      // Imported state can bridge a missing edge INSIDE a live stay. Numeric
+      // adjacency is not history adjacency there. Follow a held predecessor's
+      // first-owner position, or retain the exact gap-facing cursor for fetch.
+      const facing = await eventAtOffset(conn, at.segment, at.offset);
+      if (
+        facing !== null &&
+        (await eventStateAfter(conn, facing))?.provenance === 'imported'
+      ) {
+        const missing = await ungroundedPrevsOf(conn, facing);
+        if (missing.length > 0) {
+          return { kind: 'frontier', cursor: at, prevs: missing };
+        }
+        const parents = [];
+        for (const prev of await prevsOf(conn, facing)) {
+          const position = await positionOf(conn, prev);
+          if (
+            position !== null &&
+            (position.segment !== at.segment || position.offset < at.offset)
+          ) {
+            parents.push(position);
+          }
+        }
+        parents.sort((a, b) => b.segment - a.segment || b.offset - a.offset);
+        if (parents.length) {
+          at = { ...parents[0], offset: parents[0].offset + 1 };
+        }
+      }
       const rows = await conn.query(
         'SELECT offset, event FROM positions WHERE segment = ? AND offset < ? ORDER BY offset DESC LIMIT 1',
         [at.segment, at.offset],

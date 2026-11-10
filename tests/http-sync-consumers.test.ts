@@ -217,6 +217,8 @@ suite.test('HTTP v2 OOB invite exposes is_direct; delivered rejection renders si
       e.type === 'm.room.member'
     );
     assertEquals(members, [{
+      event_id: signed.event_id,
+      origin_server_ts: signed.origin_server_ts,
       type: signed.type,
       state_key: signed.state_key,
       content: signed.content,
