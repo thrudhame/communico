@@ -22,7 +22,14 @@ export async function relationView(
   for (let depth = 0; depth < (opts.recurse ? 3 : 1); depth++) {
     const next: string[] = [];
     for (const parent of parents) {
-      for (const row of await relationsOf(server, room.id, parent)) {
+      for (
+        const row of await relationsOf(
+          server,
+          room.id,
+          parent,
+          opts.recurse ? undefined : opts.relType,
+        )
+      ) {
         if (seen.has(row.eventId)) continue;
         seen.add(row.eventId);
         if (seen.size > 10_000) {

@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { theApp } from '#engine/app.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP relation views');
@@ -311,6 +312,61 @@ suite.test('thread lists order by eligible latest reply, paginate and derive par
   assertEquals(ids(await f.page()), [one]);
   assertEquals(bundle(await f.event())?.count, 1);
   assertEquals(ids(await list()), [other, f.root]);
+});
+
+suite.test('thread bundle reads only the requested relation type despite a large unrelated index', async () => {
+  const f = await setup('relation-bounded-types');
+  const reply = await f.send('reply', f.relation(f.root));
+  const server = theApp().server;
+  // Seed the projection directly: rendering a thread must not hydrate unrelated
+  // reaction PDUs, regardless of how many the shared relation index contains.
+  await server.tx(async (tx) => {
+    await tx.execute(
+      `WITH RECURSIVE n(i) AS (
+      SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10000
+    ) INSERT INTO event_index(event,room,pos,standing,grounding)
+      SELECT '$unrelated-' || i,?,-i,'accepted','grounded' FROM n`,
+      [f.room],
+    );
+    await tx.execute(
+      `INSERT INTO relations(event,relates_to,rel_type,room,seq)
+      SELECT event,?,'m.annotation',room,pos FROM event_index
+      WHERE room=? AND pos<0`,
+      [f.root, f.room],
+    );
+  });
+  const thread = bundle(await f.event())!;
+  assertEquals(thread.count, 1);
+  assertEquals((thread.latest_event as Json).event_id, reply);
+  assertEquals(ids(await f.page(f.root, '', '/m.thread')), [reply]);
+});
+
+suite.test('both fully-read routes reject cross-room and unknown events without replacing the marker', async () => {
+  const f = await setup('marker-room-owner');
+  const other = await setup('marker-other-room');
+  await ok(f.base + '/read_markers', f.b.access_token!, {
+    'm.fully_read': f.root,
+  });
+  for (const event of [other.root, '$unknown:localhost']) {
+    for (const receipt of [true, false]) {
+      const result = await call(
+        f.base +
+          (receipt
+            ? '/receipt/m.fully_read/' + encodeURIComponent(event)
+            : '/read_markers'),
+        f.b.access_token!,
+        receipt ? {} : { 'm.fully_read': event },
+      );
+      assertEquals(result.status, 404);
+      assertEquals(result.body.errcode, 'M_NOT_FOUND');
+      const marker = await ok(
+        'v3/user/' + encodeURIComponent(f.b.user_id) + '/rooms/' +
+          encodeURIComponent(f.room) + '/account_data/m.fully_read',
+        f.b.access_token!,
+      );
+      assertEquals(marker.event_id, f.root);
+    }
+  }
 });
 
 suite.test('cross-room and unknown-parent relations never appear under a held parent', async () => {

@@ -222,8 +222,8 @@ Ignored non-state messages share a presentation filter across client timeline,
 context, search and standalone push readers. Renderers and relation views require
 the viewer's tenant explicitly; neither uses the application singleton to read
 ignore policy. State still reaches clients and original PDUs remain
-unchanged. Both read-marker routes persist `m.fully_read` through the account-data
-owner; it never enters the public/private read-receipt stream, changes unread
+unchanged. Both read-marker routes validate the event's room before persisting
+`m.fully_read` through the account-data owner; it never enters the public/private read-receipt stream, changes unread
 counts, or accepts a thread id.
 (`api/engine/client/{ignored,render,search}.ts`, `api/engine/receipts.ts`)
 
