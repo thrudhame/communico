@@ -96,6 +96,7 @@ export const SCHEMA = {
     pendingmax: 'int',
     pendingdays: 'int',
     lookups: 'string',
+    discoveryservers: 'int',
     missingwaitms: 'int',
     missinglimit: 'int',
     missingbudgetms: 'int',

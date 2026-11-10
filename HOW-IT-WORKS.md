@@ -271,6 +271,14 @@ untyped rooms) before counting and pagination. User-directory candidates include
 unlisted world-readable rooms, while retaining the local-account scope.
 (`api/engine/client/{directory,summary}.ts`)
 
+Authenticated `/room_summary` reads reuse that metadata and separate discovery
+access: joined/invited users, public or supported knock rules, world-readable
+history, or current membership in a restricted room's allowed rooms. Remote
+summaries use signed federation hierarchy and are filtered again for the user;
+inspection creates neither room participation nor peer-roster entries.
+`federation.discoveryservers` controls the server-attempt cap (default 3).
+(`api/engine/client/discovery.ts`, `api/engine/room/restricted.ts`)
+
 Alias and profile discovery ask remote servers by default, including anonymous
 requests, through signed, admission-gated federation. `federation.lookups=known`
 restricts answers to held data; `none` disables remote lookup answers. Discovery

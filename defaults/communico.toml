@@ -237,6 +237,9 @@ pendingdays = 30
 # Read-only discovery never adds a participation peer.
 # COMMUNICO_FEDERATION_LOOKUPS
 lookups = "all"
+# Maximum servers tried for one room discovery, following Synapse's default.
+# COMMUNICO_FEDERATION_DISCOVERYSERVERS
+discoveryservers = 3
 # Missing prev_events on a pushed PDU: how long to wait for them to arrive
 # on their own before asking (the sender usually pushes them next), how many
 # events one get_missing_events may return to us, and the whole-transaction

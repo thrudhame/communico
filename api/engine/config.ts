@@ -452,6 +452,12 @@ export function loadConfig(opts: {
     enumLeaf('mode', ['open', 'closed']);
     enumLeaf('lookups', ['all', 'known', 'none']);
     const kvh = f.keyvalidityhours;
+    const discoveryServers = f.discoveryservers;
+    if (typeof discoveryServers === 'number' && discoveryServers < 1) {
+      problems.push(
+        'config: federation.discoveryservers (COMMUNICO_FEDERATION_DISCOVERYSERVERS): expected >= 1',
+      );
+    }
     if (typeof kvh === 'number' && kvh > 168) {
       problems.push(
         `config: federation.keyvalidityhours (${

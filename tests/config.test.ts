@@ -1,7 +1,7 @@
 // tests/config.test.ts — the config loader: merge order, leaf-only env,
 // strict types, full error listing, COMMUNICO_CONFIG, absent overlay, shell
 // quoting. Pure: temp files, no DB, no server.
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertThrows } from '@std/assert';
 import { dirname } from '@std/path';
 import {
   coerceEnv,
@@ -96,6 +96,7 @@ witnesses = 3
 pendingmax = 10000
 pendingdays = 30
 lookups = "known"
+discoveryservers = 3
 missingwaitms = 750
 missinglimit = 10
 missingbudgetms = 8000
@@ -778,7 +779,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('84 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('85 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -805,11 +806,11 @@ Deno.test('84 leaves total across the sections (the surface tripwire)', async ()
     ['push', 5],
     ['store', 5],
     ['preview', 4],
-    ['federation', 33],
+    ['federation', 34],
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    84,
+    85,
     'the whole config surface includes remote media resource and cache policy leaves',
   );
 });
@@ -912,6 +913,27 @@ Deno.test('remote discovery follows the spec by default and retains layered know
     });
     assertEquals(loaded.config.federation.lookups, mode);
     assertEquals(loaded.sources['federation.lookups'], 'env');
+  }
+});
+
+Deno.test('discovery server attempts follow the standard-server default and are admin configurable', () => {
+  const load = (env: Record<string, string>) =>
+    loadConfig({
+      defaultsPath: 'defaults/communico.toml',
+      configPath: null,
+      env,
+    }).config;
+  const value = (env: Record<string, string>) =>
+    (load(env).federation as unknown as Record<string, unknown>)
+      .discoveryservers;
+  assertEquals(value({}), 3);
+  assertEquals(value({ COMMUNICO_FEDERATION_DISCOVERYSERVERS: '7' }), 7);
+  for (const limit of ['0', '-1']) {
+    assertThrows(
+      () => load({ COMMUNICO_FEDERATION_DISCOVERYSERVERS: limit }),
+      ConfigError,
+      'discoveryservers',
+    );
   }
 });
 

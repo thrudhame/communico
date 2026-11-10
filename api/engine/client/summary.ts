@@ -2,6 +2,7 @@
 // Admission belongs to each discovery operation, not to this representation.
 import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { getRulebook } from '#engine/rulebook/index.ts';
 import { joinedUsers } from '#engine/server/directory.ts';
 import { renderStateEvent } from './render.ts';
 import { requireRoom, stateAtSeq } from './room.ts';
@@ -60,9 +61,11 @@ export async function heldRoomSummary(roomId: string) {
     if (v !== undefined) summary[key!] = v;
   }
   const allow = content.get('m.room.join_rules')?.allow;
+  const spec = getRulebook(String(summary.room_version)).spec;
   if (
-    (summary.join_rule === 'restricted' ||
-      summary.join_rule === 'knock_restricted') && Array.isArray(allow)
+    ((summary.join_rule === 'restricted' && spec.restrictedJoinRule) ||
+      (summary.join_rule === 'knock_restricted' &&
+        spec.knockRestrictedJoinRule)) && Array.isArray(allow)
   ) {
     summary.allowed_room_ids = allow.filter((entry) =>
       entry !== null && typeof entry === 'object' &&

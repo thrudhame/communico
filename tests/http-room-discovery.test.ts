@@ -34,6 +34,71 @@ async function create(token: string, content: Json) {
 }
 const roomPath = (room: string) => 'v3/rooms/' + encodeURIComponent(room);
 
+suite.test('room summaries share published metadata and enforce user access without joining', async () => {
+  const a = await suite.registerTestUser('summary-owner', 'pw');
+  const b = await suite.registerTestUser('summary-outsider', 'pw');
+  const privateRoom = await create(a.access_token!, {
+    name: 'Private summary',
+  });
+  const path = (id: string) => 'v1/room_summary/' + encodeURIComponent(id);
+  const own = await ok(path(privateRoom), a.access_token!);
+  assertEquals(own.membership, 'join');
+  assertEquals(own.name, 'Private summary');
+  assertEquals(own.num_joined_members, 1);
+  assertEquals((await call(path(privateRoom), b.access_token!)).status, 404);
+  assertEquals((await call(path(privateRoom))).status, 401);
+  await ok(roomPath(privateRoom) + '/invite', a.access_token!, {
+    user_id: b.user_id,
+  });
+  assertEquals(
+    (await ok(path(privateRoom), b.access_token!)).membership,
+    'invite',
+  );
+  const publicSpace = await create(a.access_token!, {
+    room_alias_name: 'summary-space',
+    preset: 'public_chat',
+    creation_content: { type: 'm.space' },
+  });
+  const publicSummary = await ok(path(publicSpace), b.access_token!);
+  assertEquals(publicSummary.room_type, 'm.space');
+  assertEquals(typeof publicSummary.room_version, 'string');
+  assertEquals(publicSummary.membership, 'leave');
+  assertEquals(
+    (await ok(path('#summary-space:' + a.home_server), b.access_token!))
+      .room_id,
+    publicSpace,
+  );
+  assertEquals(
+    (await ok(path(publicSpace), b.access_token!)).membership,
+    'leave',
+  );
+  const allowed = await create(a.access_token!, { preset: 'public_chat' });
+  await ok(roomPath(allowed) + '/join', b.access_token!, {});
+  const restricted = await create(a.access_token!, {
+    room_version: '10',
+    initial_state: [{
+      type: 'm.room.join_rules',
+      content: {
+        join_rule: 'restricted',
+        allow: [{ type: 'm.room_membership', room_id: allowed }],
+      },
+    }],
+  });
+  assertEquals((await ok(path(restricted), b.access_token!)).allowed_room_ids, [
+    allowed,
+  ]);
+  assertEquals((await call(path(restricted))).status, 401);
+  await ok(roomPath(allowed) + '/leave', b.access_token!, {});
+  assertEquals((await call(path(restricted), b.access_token!)).status, 404);
+  const world = await create(a.access_token!, {
+    initial_state: [{
+      type: 'm.room.history_visibility',
+      content: { history_visibility: 'world_readable' },
+    }],
+  });
+  assertEquals((await ok(path(world), b.access_token!)).world_readable, true);
+});
+
 suite.test('client and federation public directories filter room types before count and pagination', async () => {
   const a = await suite.registerTestUser('discovery-types', 'pw');
   const plain = await create(a.access_token!, {
