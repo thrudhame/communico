@@ -485,6 +485,31 @@ suite.test('state_after uses the publication end, retains timeline state, and ob
   );
 });
 
+suite.test('left-room presence excludes users who first join after departure', async () => {
+  const app = theApp();
+  const owner = await suite.registerTestUser('sy-cut-owner', 'pw');
+  const leaver = await suite.registerTestUser('sy-cut-leaver', 'pw');
+  const newcomer = await suite.registerTestUser('sy-cut-newcomer', 'pw');
+  const signer = app.tenant.signer();
+  const { roomId } = await createRoom(app.store, {
+    creator: owner.user_id,
+    preset: 'public_chat',
+  }, signer);
+  const room = await openRoom(app.store, roomId);
+  await join(room, leaver.user_id, signer);
+  const before = await sync(leaver.access_token!);
+  await leave(room, leaver.user_id, signer);
+  await join(room, newcomer.user_id, signer);
+  const after = await sync(leaver.access_token!, '&since=' + before.next_batch);
+  assert(roomSection(after, 'leave', roomId));
+  assertEquals(
+    ((after.presence as Json).events as Json[]).some((e) =>
+      e.sender === newcomer.user_id
+    ),
+    false,
+  );
+});
+
 suite.test('OOB invitation and rejection advance tokens once; ignored invitations stay hidden', async () => {
   const app = theApp();
   const user = await suite.registerTestUser('sy-oob', 'pw');

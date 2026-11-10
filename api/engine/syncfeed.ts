@@ -258,7 +258,8 @@ async function roomTimeline(
   const joiners = i.since === null
     ? []
     : snapshot.members.filter((row) =>
-      row.membership === 'join' && Number(row.seq) > i.since!.eSeq
+      row.membership === 'join' && Number(row.seq) > i.since!.eSeq &&
+      Number(row.seq) <= end
     ).map((row) => String(row.user));
   return { entry, joiners };
 }
