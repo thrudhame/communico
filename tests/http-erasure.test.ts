@@ -135,6 +135,37 @@ suite.test('erase prunes newcomers across event, state, context, search and bund
   const category = (search.body.search_categories as Json).room_events as Json;
   assertEquals(category.count, 0);
   assertEquals(category.results, []);
+  await call(roomPath + '/send/m.room.message/safe-result', b, 'PUT', {
+    msgtype: 'm.text',
+    body: 'safe-result',
+  });
+  for (
+    const [token, expected] of [[d, {}], [c, {
+      displayname: 'erase-a',
+    }]] as const
+  ) {
+    const response = await call('/search', token, 'POST', {
+      search_categories: {
+        room_events: {
+          search_term: 'safe-result',
+          filter: { rooms: [roomId] },
+          event_context: {
+            before_limit: 100,
+            after_limit: 0,
+            include_profile: true,
+          },
+        },
+      },
+    });
+    const result =
+      (((response.body.search_categories as Json).room_events as Json)
+        .results as Json[])[0];
+    assert(result);
+    assertEquals(
+      ((result.context as Json).profile_info as Json)[alice.user_id],
+      expected,
+    );
+  }
   assertEquals(
     (await call(
       '/rooms/' + encodeURIComponent(worldId) + '/event/' +

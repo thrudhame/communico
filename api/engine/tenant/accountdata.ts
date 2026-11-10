@@ -179,8 +179,9 @@ export async function updateRoomTag(
         ? Object.entries(current)
         : [],
     );
-    if (value === undefined) tags.delete(tag);
-    else tags.set(tag, value);
+    if (value === undefined) {
+      if (!tags.delete(tag)) return;
+    } else tags.set(tag, value);
     await tx.accountData.put(
       localpart,
       roomId,

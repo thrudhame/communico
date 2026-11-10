@@ -38,6 +38,11 @@ export const DEFAULT_ROOM_FILTER: RoomFilter = {
   timeline: {},
   state: {},
   includeLeave: false,
+  presence: {},
+  accountData: {},
+  ephemeral: {},
+  roomAccountData: {},
+  eventFormat: 'client',
 };
 
 // Validate a filter document's SHAPE at store time (spec filter.yaml at

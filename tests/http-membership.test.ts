@@ -189,7 +189,7 @@ test('profile changes fan out member events to all joined rooms, preserving cust
   for (
     const [field, value] of [['displayname', 'after'], [
       'avatar_url',
-      'verbatim-not-mxc',
+      'mxc://localhost/profile-member',
     ]] as const
   ) {
     assertEquals(

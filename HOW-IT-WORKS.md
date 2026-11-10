@@ -237,8 +237,12 @@ unchanged. Both read-marker routes validate the event's room before persisting
 counts, or accepts a thread id.
 (`api/engine/client/{ignored,render,search}.ts`, `api/engine/receipts.ts`)
 
-`/sync` timeline visibility follows that same event-state policy. Its state
-blocks and unsigned membership retain their separate publication-cut
+`/sync` timeline visibility follows that same event-state policy. Timeline
+selection hydrates bounded newest-first feed pages and renders only the requested
+visible window plus one lookahead. New-join presence comes from the captured
+membership projection, not a second walk over room history. Search profiles use
+the same viewer-aware state rendering as other state consumers.
+Its state blocks and unsigned membership retain their separate publication-cut
 contracts; `renderStateEvent` formats admitted state snapshots, including
 imported evidence, rather than imposing timeline eligibility on them.
 With `use_state_after=true`, joined/left rooms send `state_after` instead of

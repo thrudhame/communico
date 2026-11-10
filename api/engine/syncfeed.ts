@@ -17,7 +17,12 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { feedAfter, roomsFor } from '#engine/server/read.ts';
+import {
+  feedAfter,
+  feedBefore,
+  type FeedRow,
+  roomsFor,
+} from '#engine/server/read.ts';
 import {
   notificationSnapshot,
   syncNotificationCounts,
@@ -90,45 +95,55 @@ async function roomTimeline(
   },
 ) {
   const app = theApp();
-  const raw = await feedAfter(
-    app.server,
-    room.id,
-    i.since?.eSeq ?? 0,
-    Number.MAX_SAFE_INTEGER,
-    end,
-  );
-  const stored = await room.tx((tx) => tx.events.list(raw.map((r) => r.event)));
-  const pdus = new Map(
-    [...stored].map(([id, row]) => [id, JSON.parse(row.pdu) as Pdu]),
-  );
-  const filtered = raw.filter((r) => {
-    const pdu = pdus.get(r.event);
-    return pdu !== undefined &&
-      eventMatchesRoomEventFilter(
-        null,
-        { ...pdu, room_id: room.id },
-        i.filter.timeline,
-      );
-  });
   const limit = i.filter.timeline.limit ?? 10;
   const eligible: {
-    row: typeof raw[number];
+    row: FeedRow;
     event: Record<string, unknown>;
   }[] = [];
-  // Visibility/ignore admission precedes the limit too. Hidden newer events
-  // must not consume slots and leave eligible older messages undelivered.
-  for (const row of filtered) {
-    const at = await stateAtSeq(room, row.seq, row.stay);
-    const membership = at.find((s) =>
-      s.type === 'm.room.member' && s.stateKey === i.userId
-    )?.content.membership ?? 'leave';
-    const event = await renderEvent(room, row.event, {
-      userId: i.userId,
-      deviceId: i.deviceId,
-      tenant: app.tenant,
-      membership: String(membership),
-    }, { omitRoomId: true, eventFormat: i.filter.eventFormat });
-    if (event !== null) eligible.push({ row, event });
+  let cursor = end;
+  let scanned = 0;
+  let more = true;
+  // Bound hydration as well as rendering. Walk newest first until one
+  // eligible lookahead proves truncation; hidden rows never consume slots.
+  while (more && eligible.length <= limit) {
+    const page = await feedBefore(
+      app.server,
+      room.id,
+      i.since?.eSeq ?? 0,
+      cursor,
+      32,
+    );
+    more = page.length === 32;
+    if (!page.length) break;
+    cursor = page.at(-1)!.seq - 1;
+    const stored = await room.tx((tx) =>
+      tx.events.list(page.map((r) => r.event))
+    );
+    for (const row of page) {
+      scanned++;
+      const record = stored.get(row.event);
+      if (record === undefined) continue;
+      const pdu = JSON.parse(record.pdu) as Pdu;
+      if (
+        !eventMatchesRoomEventFilter(
+          null,
+          { ...pdu, room_id: room.id },
+          i.filter.timeline,
+        )
+      ) continue;
+      const at = await stateAtSeq(room, row.seq, row.stay);
+      const membership = at.find((s) =>
+        s.type === 'm.room.member' && s.stateKey === i.userId
+      )?.content.membership ?? 'leave';
+      const event = await renderEvent(room, row.event, {
+        userId: i.userId,
+        deviceId: i.deviceId,
+        tenant: app.tenant,
+        membership: String(membership),
+      }, { omitRoomId: true, eventFormat: i.filter.eventFormat });
+      if (event !== null) eligible.unshift({ row, event });
+      if (eligible.length > limit) break;
+    }
   }
   const trimmed = eligible.length > limit;
   const selected = limit === 0
@@ -185,7 +200,7 @@ async function roomTimeline(
     [i.useStateAfter ? 'state_after' : 'state']: { events: stateEvents },
     timeline: {
       events,
-      limited: raw.length > returned.length,
+      limited: more || scanned > returned.length,
       prev_batch: formatStreamToken(
         prevE,
         now.pSeq,
@@ -247,15 +262,13 @@ async function roomTimeline(
       ),
     };
   }
-  const joiners: string[] = [];
-  for (const row of raw) {
-    const pdu = await room.tx(async (tx) => {
-      const e = await tx.events.get(row.event);
-      return e === null ? null : JSON.parse(e.pdu) as Pdu;
-    });
-    if (pdu?.type !== 'm.room.member') continue;
-    if (pdu.content.membership === 'join') joiners.push(String(pdu.state_key));
-  }
+  // Presence needs new current joiners, independently of timeline filtering.
+  // The captured projection already owns membership and its change sequence.
+  const joiners = i.since === null
+    ? []
+    : snapshot.members.filter((row) =>
+      row.membership === 'join' && Number(row.seq) > i.since!.eSeq
+    ).map((row) => String(row.user));
   return { entry, joiners };
 }
 
@@ -403,7 +416,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
           i.since?.rSeq ?? 0,
         ),
         members: await tx.query(
-          "SELECT user,membership FROM memberships WHERE room=? AND membership IN ('join','invite') ORDER BY CASE membership WHEN 'join' THEN 0 ELSE 1 END,user",
+          "SELECT user,membership,seq FROM memberships WHERE room=? AND membership IN ('join','invite') ORDER BY CASE membership WHEN 'join' THEN 0 ELSE 1 END,user",
           [membership.roomId],
         ),
       });

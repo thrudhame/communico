@@ -70,7 +70,13 @@ suite.test('tags share atomic account data and incremental sync, including concu
   ]);
   assertEquals((await call(base + '/tags', token)).body, stored.body);
   assertEquals((await call(base + '/tags/u.one', token, 'DELETE')).status, 200);
+  const beforeNoop =
+    (await call('/_matrix/client/v3/sync?timeout=0', token)).body.next_batch;
   assertEquals((await call(base + '/tags/u.one', token, 'DELETE')).status, 200);
+  assertEquals(
+    (await call('/_matrix/client/v3/sync?timeout=0', token)).body.next_batch,
+    beforeNoop,
+  );
   assertEquals((await call(base + '/tags', bob.access_token!)).status, 403);
   assertEquals(
     (await call(base + '/tags/u.x', bob.access_token!, 'PUT', {})).status,

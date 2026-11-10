@@ -47,6 +47,9 @@ test('local profile: public combined reads, self-only writes, null clears and ab
   });
   for (const field of ['displayname', 'avatar_url']) {
     const url = base + '/' + field;
+    const value = field === 'avatar_url'
+      ? 'mxc://localhost/profile'
+      : 'verbatim';
     assertEquals((await call(url, 'PUT', { [field]: 'no-token' })).status, 401);
     assertEquals(
       (await call(url, 'PUT', { [field]: 'other' }, b.access_token)).status,
@@ -57,10 +60,10 @@ test('local profile: public combined reads, self-only writes, null clears and ab
       400,
     );
     assertEquals(
-      (await call(url, 'PUT', { [field]: 'verbatim' }, a.access_token)).status,
+      (await call(url, 'PUT', { [field]: value }, a.access_token)).status,
       200,
     );
-    assertEquals((await call(url)).body, { [field]: 'verbatim' });
+    assertEquals((await call(url)).body, { [field]: value });
     assertEquals(
       (await call(url, 'PUT', { [field]: null }, a.access_token)).status,
       200,
@@ -244,6 +247,7 @@ test('versions stays public, capabilities stays protected, discovery absent per 
     capabilities: {
       'm.room_versions': { default: '11', available },
       'm.change_password': { enabled: false },
+      'm.profile_fields': { enabled: true },
     },
   });
   for (const path of ['client', 'server']) {

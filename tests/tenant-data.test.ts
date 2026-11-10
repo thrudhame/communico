@@ -2,7 +2,7 @@
 // media metadata and transaction ids (the engine-observable parts of the
 // old account.test.ts A5/A7, pushrules.test.ts, media.test.ts, txn.test.ts
 // and refresh-token.test.ts; their wire halves stay with stage 5).
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, type Tenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -532,11 +532,17 @@ Deno.test('filters: validate, store/load verbatim, resolve, match', async () => 
         '@filt:a.test',
         '{"room":{"include_leave":true}}',
       ),
-      { timeline: {}, state: {}, includeLeave: true },
+      { ...DEFAULT_ROOM_FILTER, timeline: {}, state: {}, includeLeave: true },
     );
     assertEquals(
       await resolveFilter(tenant, '@filt:a.test', '0'),
-      { timeline: { limit: 3 }, state: {}, includeLeave: false },
+      {
+        ...DEFAULT_ROOM_FILTER,
+        timeline: { limit: 3 },
+        state: {},
+        includeLeave: false,
+        presence: { types: [] },
+      },
     );
     await assertRejects(
       () => resolveFilter(tenant, '@filt:a.test', '9'),
@@ -549,10 +555,12 @@ Deno.test('filters: validate, store/load verbatim, resolve, match', async () => 
       'M_BAD_JSON',
     );
     // roomFilterOf/eventFilterOf defaults and lazy_load_members
-    assertEquals(roomFilterOf(null), DEFAULT_ROOM_FILTER);
+    assertEquals(roomFilterOf({}), DEFAULT_ROOM_FILTER);
+    assertThrows(() => roomFilterOf(null), MatrixError, 'M_BAD_JSON');
     assertEquals(
       roomFilterOf({ room: { state: { lazy_load_members: true } } }),
       {
+        ...DEFAULT_ROOM_FILTER,
         timeline: {},
         state: { lazy_load_members: true },
         includeLeave: false,
