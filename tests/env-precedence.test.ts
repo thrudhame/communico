@@ -16,110 +16,11 @@ const pathEnv = requirePath();
 
 const PROBE = `console.log('VALUE=' + Deno.env.get('TEST_KEY'));\n`;
 
-const FULL = `[server]
-name = "localhost"
-port = 8008
-shutdowngraceseconds = 10
-
-[push]
-readretentiondays = 30
-deliverygiveuphours = 24
-blocklist = []
-allowlist = []
-cacerts = []
-
-[admin]
-socket = ""
-
-[media]
-root = "./.media"
-maxbytes = 52428800
-timeoutms = 30000
-maxfetches = 4
-maxredirects = 5
-maxpixels = 32000000
-maxdimension = 10000
-thumbnailms = 5000
-thumbnailworkers = 2
-maxvariants = 32
-cleanupseconds = 3600
-blocklist = []
-allowlist = []
-[media.cache]
-maxbytes = 0
-[media.cache.remote]
-maxagedays = 0
-unopenedday = 0
-maxbytes = 0
-[media.cache.thumbnail]
-maxagedays = 0
-unopenedday = 0
-maxbytes = 0
-
-[e2ee]
-maxrequestbytes = 1048576
-maxkeybytes = 65536
-maxkeys = 1000
-maxonetimekeys = 10000
-maxinboxmessages = 10000
-maxdestinationmessages = 1000
-maxbackupsessions = 100000
-maxbackupversions = 100
-maxbackupbytes = 67108864
-
-[encryption]
-allowunencryptedcreation = false
-allowunencryptedjoining = true
-allowunencryptedmessages = false
-
-[preview]
-enabled = false
-maxbytes = 10485760
-blocklist = []
-allowlist = []
-
-[federation]
-enabled = true
-port = 8448
-cert = "config/federation.crt"
-key = "config/federation.key"
-cacerts = []
-keyvalidityhours = 168
-keychange = "warn"
-mode = "open"
-wellknown = ""
-wellknownmaxage = 86400
-connectms = 5000
-timeoutms = 30000
-maxbytes = 1048576
-wellknownhours = 24
-wellknownmaxhours = 48
-wellknownerrorhours = 1
-keyfailminutes = 5
-witnesses = 3
-pendingmax = 10000
-pendingdays = 30
-lookups = "known"
-missingwaitms = 750
-missinglimit = 10
-missingbudgetms = 8000
-missingmax = 20
-backfillbatch = 50
-backfillmax = 100
-bulkmaxbytes = 67108864
-backoffstartmillihours = 125
-backoffmaxmillihours = 256000
-refusedmillihours = 256000
-ungroundedmillihours = 256000
-txnhours = 24
-
-[store]
-dir = "./.store"
-library = "./.native/libturso_ffi.so"
-checkpointlogbytes = 4120000
-maxopenfiles = 256
-idleseconds = 300
-`;
+// This tests layering, not a frozen config schema. Use shipped defaults so
+// adding a required setting cannot leave this independent copy incomplete.
+const FULL = await Deno.readTextFile(
+  new URL('../defaults/communico.toml', import.meta.url),
+);
 
 const CONFIG_PROBE =
   `import { loadConfig, resolvePaths } from '#engine/config.ts';

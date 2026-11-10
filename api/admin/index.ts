@@ -10,6 +10,7 @@ import metadata from '#root/deno.json' with { type: 'json' };
 import { AdminError, type Operation } from '#root/api/admin/protocol.ts';
 import { federationOperations } from '#root/api/admin/federation.ts';
 import { roomOperations } from '#root/api/admin/rooms.ts';
+import { reportOperations } from '#root/api/admin/reports.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { ServerLifetime } from '#root/api/server-lifetime.ts';
 
@@ -20,6 +21,7 @@ export function adminHandler(
   const operations: Record<string, Operation> = {
     ...federationOperations(app),
     ...roomOperations(app),
+    ...reportOperations(app),
     '/v1/status': () => ({
       server: serverName(),
       version: metadata.version,

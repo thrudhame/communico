@@ -18,3 +18,20 @@ With zero, B is dropped initially and its redelivery is its first admission.
 The native HTTP federation transaction tests cover both settings through real
 `/send`, `/sync` and `/messages` routes, including ordered and duplicate-free
 delivery. The blacklist is independent of these settings.
+
+## Reporting extension
+
+The pinned upstream corpus has no abuse-report tests. `reports_test.go` adds
+`TestCommunicoReporting` without editing that checkout or the default runner.
+In VM `communico-5c` on ark, after the normal runner prepares `work-*`, copy the
+fixture into that scratch checkout's `tests/csapi/communico_reports_test.go`.
+From the scratch checkout run:
+
+```sh
+COMPLEMENT_BASE_IMAGE=communico-complement:local go test -count=1 \
+  -tags communico_blacklist -timeout 10m -run '^TestCommunicoReporting$' ./tests/csapi
+```
+
+Keep TMPDIR in the VM's disk-backed workspace. The test checks report intake,
+membership independence, optional/required fields and typed errors against a
+real deployed homeserver. Native tests cover private admin storage and resolution.

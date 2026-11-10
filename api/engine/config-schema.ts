@@ -13,6 +13,7 @@ export const SCHEMA = {
     name: 'string',
     port: 'int',
     shutdowngraceseconds: 'int',
+    maxrequestbytes: 'int',
   },
   admin: {
     socket: 'string',

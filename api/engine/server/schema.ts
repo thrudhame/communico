@@ -370,8 +370,14 @@ CREATE TABLE media_cache(cache_key TEXT PRIMARY KEY NOT NULL,origin TEXT NOT NUL
 CREATE INDEX media_cache_lru ON media_cache(scope,accessed_ms);
 `;
 
+const REPORTS_SQL = `
+CREATE TABLE reports(id INTEGER PRIMARY KEY NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('event','room','user')),reporter TEXT NOT NULL,room_id TEXT,event_id TEXT,user_id TEXT,reason TEXT,score INTEGER,received_ms INTEGER NOT NULL,resolved_ms INTEGER,resolution TEXT);
+CREATE INDEX reports_status ON reports(resolved_ms,id);
+CREATE INDEX reports_kind ON reports(kind,id);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 21,
+  version: 22,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -392,6 +398,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(PUSH_DELIVERY_SQL);
     await db.exec(PREJOIN_SQL);
     await db.exec(MEDIA_CACHE_SQL);
+    await db.exec(REPORTS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -412,5 +419,6 @@ export const serverSchema: SchemaProvider = {
     18: (conn) => conn.exec(PUSH_DELIVERY_SQL),
     19: (conn) => conn.exec(PREJOIN_SQL),
     20: (conn) => conn.exec(MEDIA_CACHE_SQL),
+    21: (conn) => conn.exec(REPORTS_SQL),
   },
 };

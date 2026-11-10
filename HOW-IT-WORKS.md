@@ -416,6 +416,40 @@ supervisor example.
 (`api/engine/config.ts:1-5`, `api/engine/config.ts:135-165`,
 `api/engine/config.ts:253-301`, `main.ts:20-42`, `main.ts:139-162`)
 
+## Content reports
+
+Admin report pages select IDs using stored UTF-8 byte sizes before hydrating
+reasons or resolutions, in one read snapshot. The shared `server.maxrequestbytes`
+setting is also the encoded page target (including worst-case JSON escaping).
+The count limit still applies. A report larger than that target is returned
+intact as a singleton, never truncated or skipped; continue with `next`.
+Thus listing memory scales with the byte target or one oversized report, not
+the count limit times the largest allowed request. Reasons have no field cap.
+
+The shared Matrix request admission middleware bounds every non-upload body
+before JSON validation, authentication or handler dispatch, including handlers
+that ignore bodies. It checks declared size and counts actual streamed bytes;
+Pathfinder memoizes accepted bytes for downstream consumers. The layered
+`server.maxrequestbytes` setting defaults to Synapse's 200 x 64 KiB request
+budget. The existing 413 renderer emits `M_TOO_LARGE`. Only the two upload
+endpoints opt out through `mediaUpload` route metadata; their streaming media
+owner enforces `media.maxbytes`. No report-specific reason cap is applied.
+(`api/engine/body-limit.ts`, `api/endpoints/matrix/05-body.ts`)
+
+The shared client report handler validates event/room/user report bodies before
+delegating persistence to the server-owned reports table (server schema v22).
+Event reports require current joined membership and a visible same-room event;
+the room lock keeps admission ordered against local membership changes. Room
+reports do not require membership. Existing local users can be reported without
+shared rooms; unknown or nonlocal users receive a no-disclosure success response.
+(`api/engine/client/reports.ts`, `api/engine/server/reports.ts`)
+
+Reports store target identifiers, reporter, reason/score and resolution metadata,
+never copies of event content. They are not room events, projections, sync news
+or federation work. The private admin socket lists and resolves them through the
+same owner; resolving retains the first resolution and does not moderate events.
+(`api/admin/reports.ts`, `api/engine/server/schema.ts`)
+
 ## Scope and recorded evidence
 
 The checked-in Complement baseline records a red conformance baseline, not

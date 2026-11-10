@@ -177,6 +177,12 @@ Configuration uses `defaults/communico.toml`, an optional
 `config/communico.toml` overlay and `COMMUNICO_*` environment overrides.
 `deno task config` prints the merged settings; it does not initialize storage.
 
+Non-upload request bodies are limited before JSON parsing to 12.5 MiB by
+`server.maxrequestbytes` (`COMMUNICO_SERVER_MAXREQUESTBYTES`). Operators can
+override the positive byte limit through the same configuration layers.
+Oversized requests return HTTP 413 `M_TOO_LARGE`. Media uploads retain the
+separate `media.maxbytes` limit. Report reasons have no separate field cap.
+
 The Turso Complement runtime image, runner and HTTP-only continuity helper are
 restored. [complement/BASELINE.md](complement/BASELINE.md) records the
 2026-11-06 PST run: 59 failing tests (including parent/subtest entries), with
@@ -322,6 +328,30 @@ Room listings show `stay <id>` or `archived`. Outbox listings use composite
 ids shown only while the running sender owns the request. PDU expiry is derived
 from its queued timestamp and configured lifespan; reject-invite jobs have no
 expiry in the current core. CLI punctuation uses ASCII.
+
+### Content reports
+
+Authenticated clients can report events in rooms they are currently joined to,
+rooms without joining them, and local users without sharing a room. Event reports
+accept optional `reason` and integer `score`; room/user reports require a string
+`reason` (empty is allowed). Unknown/nonlocal user reports return success without
+revealing whether an account exists. Reports do not automatically redact, ban or
+send anything to other servers, and never copy event content or decrypt messages.
+
+Reports are durable server data, available only through the private admin socket:
+
+```sh
+curl --unix-socket /srv/communico/admin.sock -H 'Content-Type: application/json' \
+  -d '{"status":"open","limit":100}' http://localhost/v1/reports/list
+curl --unix-socket /srv/communico/admin.sock -H 'Content-Type: application/json' \
+  -d '{"id":1,"resolution":"Reviewed"}' http://localhost/v1/reports/resolve
+```
+
+List accepts `kind` (`event`, `room`, `user`), `status` (`open`, `resolved`),
+`limit` (1-1000) and `from` (the prior page's numeric `next`). With no filters it
+lists all reports, oldest first. Resolution is idempotent: the first resolution
+and its timestamp are retained. Reports are not deleted on resolution.
+Admin UI: TODO.
 
 ## Server lifecycle
 
