@@ -369,6 +369,30 @@ suite.test('both fully-read routes reject cross-room and unknown events without 
   }
 });
 
+suite.test('both fully-read routes accept room-owned events before the server projection catches up', async () => {
+  const f = await setup('marker-projection-lag');
+  // Model the durable room commit / failed server projection boundary. The
+  // event is still readable from room truth, just as committed history is.
+  await theApp().server.execute('DELETE FROM event_index WHERE event=?', [
+    f.root,
+  ]);
+  assertEquals((await f.event()).event_id, f.root);
+  await ok(
+    f.base + '/receipt/m.fully_read/' + encodeURIComponent(f.root),
+    f.b.access_token!,
+    {},
+  );
+  await ok(f.base + '/read_markers', f.b.access_token!, {
+    'm.fully_read': f.root,
+  });
+  const marker = await ok(
+    'v3/user/' + encodeURIComponent(f.b.user_id) + '/rooms/' +
+      encodeURIComponent(f.room) + '/account_data/m.fully_read',
+    f.b.access_token!,
+  );
+  assertEquals(marker.event_id, f.root);
+});
+
 suite.test('cross-room and unknown-parent relations never appear under a held parent', async () => {
   const f = await setup('relation-cross-room');
   const other = await setup('relation-cross-room-other');

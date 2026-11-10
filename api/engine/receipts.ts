@@ -1,7 +1,8 @@
 // doltgres receipt entry point; client and federation share one durable writer.
 import { theApp } from '#engine/app.ts';
 import * as rows from '#engine/server/ephemeral.ts';
-import { isJoined, roomOf } from '#engine/server/read.ts';
+import { isJoined } from '#engine/server/read.ts';
+import { openRoom } from '#engine/room/index.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { putAccountData } from '#engine/tenant/accountdata.ts';
 import { localpartOf } from '#engine/ids.ts';
@@ -11,11 +12,19 @@ export async function setFullyRead(
   userId: string,
   eventId: string,
 ): Promise<void> {
-  if (await roomOf(theApp().server, eventId) !== roomId) {
+  const app = theApp();
+  let known = false;
+  try {
+    const room = await openRoom(app.store, roomId);
+    known = await room.tx(async (tx) => await tx.events.get(eventId) !== null);
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+  }
+  if (!known) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'event not found in room');
   }
   await putAccountData(
-    theApp().tenant,
+    app.tenant,
     localpartOf(userId),
     roomId,
     'm.fully_read',
