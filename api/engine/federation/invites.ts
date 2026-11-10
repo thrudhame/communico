@@ -51,7 +51,7 @@ import { withRoomLock } from '#engine/room/lock.ts';
 import { admit } from './gate.ts';
 import { domainOf, toWire } from './pdu.ts';
 import { prejoinState, validatePrejoin } from './prejoin.ts';
-import { visiblePrejoin } from '#engine/server/prejoin.ts';
+import { beginPrejoinLeave, visiblePrejoin } from '#engine/server/prejoin.ts';
 import { performKnockAttempt } from './knocks.ts';
 import type {
   IntentJob,
@@ -288,13 +288,27 @@ export async function inviteFor(
   userId: string,
   deps: InviteDeps,
 ): Promise<StoredInvite | null> {
+  const snapshot = await prejoinSnapshot(roomId, userId, deps);
+  return snapshot.visible ? snapshot.row : null;
+}
+
+// Revision ownership is independent of display authority. Capture both in one
+// read so a hidden row still fences late network completions and new attempts.
+export async function prejoinSnapshot(
+  roomId: string,
+  userId: string,
+  deps: InviteDeps,
+): Promise<{ row: StoredInvite | null; visible: boolean }> {
   const rows = await deps.server.query(
-    `SELECT * FROM prejoin_memberships p WHERE room_id = ? AND user_id = ? AND ${
+    `SELECT *, (${
       visiblePrejoin('p')
-    }`,
+    }) AS visible FROM prejoin_memberships p WHERE room_id = ? AND user_id = ?`,
     [roomId, userId],
   );
-  return rows.length === 0 ? null : inviteOf(rows[0]);
+  return {
+    row: rows.length === 0 ? null : inviteOf(rows[0]),
+    visible: rows.length !== 0 && Number(rows[0].visible) === 1,
+  };
 }
 
 // Every pending invite of a user (stage 5's /sync invite section).
@@ -631,44 +645,60 @@ async function performRejectInvite(
   invite: StoredInvite,
   deps: InviteDeps,
 ): Promise<void> {
-  const signed = invite.leaveJson === null
-    ? await prepareRemoteLeave(destination, invite, deps)
-    : JSON.parse(invite.leaveJson) as Pdu;
-  const active = await inviteTransition(deps.server, async (tx) => {
-    const rows = await tx.query(
-      "SELECT 1 FROM prejoin_memberships WHERE room_id=? AND user_id=? AND revision=? AND status='rejecting'",
-      [invite.roomId, invite.userId, invite.revision],
-    );
-    if (!rows.length) return false;
-    await tx.execute(
-      'UPDATE prejoin_memberships SET leave_json=? WHERE room_id=? AND user_id=? AND revision=?',
-      [JSON.stringify(signed), invite.roomId, invite.userId, invite.revision],
-    );
-    return true;
-  });
-  if (!active) return;
-  await sendRemoteLeave(destination, signed, invite.roomVersion, deps);
-  const { roomId, userId } = invite;
-  // delivered: the row becomes 'rejected', and the SIGNED LEAVE becomes
-  // the rendered event — the out-of-band leave section of /sync carries
-  // it in state.events (stage 5; SyncLeftFrom wants a leave event there)
-  await inviteTransition(deps.server, async (tx) => {
-    const pending = await tx.query(
-      "SELECT 1 FROM prejoin_memberships WHERE room_id=? AND user_id=? AND event_id=? AND revision=? AND status='rejecting'",
-      [roomId, userId, invite.eventId, invite.revision],
-    );
-    if (pending.length === 0) return;
-    const seq = await nextEventSeq(tx);
-    await tx.execute(
-      "UPDATE prejoin_memberships SET status = 'rejected', event_json = ?, seq = ? WHERE room_id = ? AND user_id = ?",
-      [
-        JSON.stringify(signed as unknown as Record<string, unknown>),
-        seq,
-        roomId,
-        userId,
-      ],
-    );
-  });
+  const release = beginPrejoinLeave(deps.store, invite.roomId, invite.userId);
+  try {
+    const signed = invite.leaveJson === null
+      ? await prepareRemoteLeave(destination, invite, deps)
+      : JSON.parse(invite.leaveJson) as Pdu;
+    const active = await inviteTransition(deps.server, async (tx) => {
+      const rows = await tx.query(
+        `SELECT 1 FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND revision=? AND status='rejecting' AND ${
+          visiblePrejoin('p')
+        }`,
+        [invite.roomId, invite.userId, invite.revision],
+      );
+      if (!rows.length) return false;
+      await tx.execute(
+        'UPDATE prejoin_memberships SET leave_json=? WHERE room_id=? AND user_id=? AND revision=?',
+        [JSON.stringify(signed), invite.roomId, invite.userId, invite.revision],
+      );
+      return true;
+    });
+    if (!active) return;
+    await sendRemoteLeave(destination, signed, invite.roomVersion, deps);
+    const { roomId, userId } = invite;
+    // delivered: the row becomes 'rejected', and the SIGNED LEAVE becomes
+    // the rendered event — the out-of-band leave section of /sync carries
+    // it in state.events (stage 5; SyncLeftFrom wants a leave event there)
+    await inviteTransition(deps.server, async (tx) => {
+      const pending = await tx.query(
+        `SELECT (${
+          visiblePrejoin('p')
+        }) AS visible FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND revision=? AND status='rejecting'`,
+        [roomId, userId, invite.eventId, invite.revision],
+      );
+      if (pending.length === 0) return;
+      if (Number(pending[0].visible) !== 1) {
+        await tx.execute(
+          "UPDATE prejoin_memberships SET status='rejected' WHERE room_id=? AND user_id=?",
+          [roomId, userId],
+        );
+        return;
+      }
+      const seq = await nextEventSeq(tx);
+      await tx.execute(
+        "UPDATE prejoin_memberships SET status = 'rejected', event_json = ?, seq = ? WHERE room_id = ? AND user_id = ?",
+        [
+          JSON.stringify(signed as unknown as Record<string, unknown>),
+          seq,
+          roomId,
+          userId,
+        ],
+      );
+    });
+  } finally {
+    release();
+  }
 }
 
 // The sender's intent provider: 'rejecting' invites are the durable
