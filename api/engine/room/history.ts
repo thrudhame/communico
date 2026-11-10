@@ -202,6 +202,9 @@ export async function backfill(
     stay?: number;
     segment?: number;
     anchor?: Pdu;
+    // A missing edge inside a live stay needs its own history anchor, not the
+    // stay's pre-join history prefix. First-owner prev edges reconnect it.
+    isolated?: boolean;
   },
   deps: BackfillDeps,
 ): Promise<BackfillResult> {
@@ -367,7 +370,7 @@ export async function backfill(
       const rulebook = getRulebook(await roomVersionOf(tx, stay.id));
       const createId = await roomCreateId(tx, stay.id);
       let history = args.segment === undefined
-        ? args.anchor === undefined
+        ? args.anchor === undefined && !args.isolated
           ? await tx.segments.historyOf(stay.id)
           : null
         : await tx.segments.get(args.segment);
@@ -378,9 +381,9 @@ export async function backfill(
       ) {
         throw new Error('E_HISTORY_OWNER: invalid history target');
       }
-      if (history === null && args.anchor === undefined) {
+      if (history === null && args.anchor === undefined && !args.isolated) {
         const id = await tx.segments.create({
-          kind: args.anchor === undefined ? 'history' : 'anchor',
+          kind: args.isolated ? 'anchor' : 'history',
           prev: stay.id,
           opened_by: args.anchor === undefined ? null : ordered[0].eventId,
         });
@@ -664,7 +667,11 @@ export async function backfill(
           break;
         }
       }
-      if (history === null) return empty;
+      if (history === null) {
+        return complete
+          ? { outcome: 'complete' as const, segment: null, positioned }
+          : empty;
+      }
       if (complete) await tx.segments.close(history.id);
       return {
         outcome: complete

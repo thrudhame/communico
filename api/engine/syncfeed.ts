@@ -3,7 +3,12 @@
 // published state, never the last event's own DAG state.
 import { theApp } from '#engine/app.ts';
 import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
-import { renderEvent, renderStateEvent } from '#engine/client/render.ts';
+import {
+  renderEvent,
+  renderPrejoinDeparture,
+  renderStateEvent,
+} from '#engine/client/render.ts';
+import { inviteOf, prejoinDeparture } from '#engine/federation/invites.ts';
 import {
   encodeStreamToken,
   formatStreamToken,
@@ -19,6 +24,7 @@ import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
+import { formatCursor } from '#engine/room/segments.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import {
   feedAfter,
@@ -97,9 +103,11 @@ async function roomTimeline(
   let cursor = end;
   let scanned = 0;
   let more = true;
+  let gap = false;
+  let newestStay: number | undefined;
   // Bound hydration as well as rendering. Walk newest first until one
   // eligible lookahead proves truncation; hidden rows never consume slots.
-  while (more && eligible.length <= limit) {
+  while (more && !gap && eligible.length <= limit) {
     const page = await feedBefore(
       app.server,
       room.id,
@@ -110,13 +118,35 @@ async function roomTimeline(
     more = page.length === 32;
     if (!page.length) break;
     cursor = page.at(-1)!.seq - 1;
-    const stored = await room.tx((tx) =>
-      tx.events.list(page.map((r) => r.event))
-    );
+    const { stored, boundaries } = await room.tx(async (tx) => {
+      const stored = await tx.events.list(page.map((r) => r.event));
+      const boundaries = new Set<string>();
+      for (const row of page) {
+        if (
+          (await tx.state.eventStateBefore(row.event))?.provenance ===
+            'imported'
+        ) {
+          boundaries.add(row.event);
+        }
+      }
+      return { stored, boundaries };
+    });
     for (const row of page) {
+      newestStay ??= row.stay;
+      if (row.stay !== newestStay) {
+        gap = true;
+        break;
+      }
       scanned++;
+      // An imported before-state is an explicit missing live-history boundary.
+      // Retain its event, but never splice the older feed across it, including
+      // when the boundary event itself is hidden by a client filter.
+      gap = boundaries.has(row.event);
       const record = stored.get(row.event);
-      if (record === undefined) continue;
+      if (record === undefined) {
+        if (gap) break;
+        continue;
+      }
       const pdu = JSON.parse(record.pdu) as Pdu;
       if (
         !eventMatchesRoomEventFilter(
@@ -124,7 +154,10 @@ async function roomTimeline(
           { ...pdu, room_id: room.id },
           i.filter.timeline,
         )
-      ) continue;
+      ) {
+        if (gap) break;
+        continue;
+      }
       const at = await stateAtSeq(room, row.seq, row.stay);
       const membership = at.find((s) =>
         s.type === 'm.room.member' && s.stateKey === i.userId
@@ -136,7 +169,7 @@ async function roomTimeline(
         membership: String(membership),
       }, { omitRoomId: true, eventFormat: i.filter.eventFormat });
       if (event !== null) eligible.unshift({ row, event });
-      if (eligible.length > limit) break;
+      if (gap || eligible.length > limit) break;
     }
   }
   const trimmed = eligible.length > limit;
@@ -147,6 +180,7 @@ async function roomTimeline(
     : eligible;
   const returned = selected.map((item) => item.row);
   const events = selected.map((item) => item.event);
+  const limited = gap || more || scanned > returned.length;
   const start = returned[0];
   const atStart = await stateAtSeq(
     room,
@@ -154,8 +188,9 @@ async function roomTimeline(
     i.useStateAfter ? undefined : start?.stay,
   );
   let stateRows = atStart;
-  if (i.since !== null && !i.fullState) {
-    const previous = new Map(
+  let previous = new Map<string, string>();
+  if (i.since !== null) {
+    previous = new Map(
       (await stateAtSeq(
         room,
         i.since.eSeq,
@@ -164,6 +199,8 @@ async function roomTimeline(
         r,
       ) => [r.type + '\0' + r.stateKey, r.eventId]),
     );
+  }
+  if (i.since !== null && !i.fullState) {
     // Legacy deltas omit state already in the timeline. state_after is the
     // complete end-cut delta: clients must ignore timeline state in this mode.
     // Both read resolved publications, not the trigger event's DAG state.
@@ -176,8 +213,22 @@ async function roomTimeline(
   const stateEvents: Record<string, unknown>[] = [];
   if (i.filter.state.lazy_load_members || i.filter.timeline.lazy_load_members) {
     const senders = new Set(events.map((ev) => String(ev.sender)));
-    stateRows = stateRows.filter((r) =>
-      r.type !== 'm.room.member' || senders.has(r.stateKey)
+    const mandatoryOwn = i.since === null || i.fullState ||
+      atStart.some((r) =>
+        r.type === 'm.room.member' && r.stateKey === i.userId &&
+        r.content.membership === 'join' &&
+        previous.get(r.type + '\0' + r.stateKey) !== r.eventId
+      );
+    const selectedIds = new Set(stateRows.map((r) => r.eventId));
+    // Timeline senders need their membership even when unchanged since the
+    // previous cut. Gap membership changes are mandatory, not lazy hints.
+    stateRows = atStart.filter((r) =>
+      r.type !== 'm.room.member'
+        ? selectedIds.has(r.eventId)
+        : senders.has(r.stateKey) ||
+          (mandatoryOwn && r.stateKey === i.userId) ||
+          (limited && i.since !== null &&
+            previous.get(r.type + '\0' + r.stateKey) !== r.eventId)
     );
   }
   stateRows = filterEvents(stateRows, i.filter.state, room.id);
@@ -190,22 +241,27 @@ async function roomTimeline(
     if (ev !== null) stateEvents.push(ev);
   }
   const prevE = trimmed && returned.length ? returned[0].seq - 1 : end;
+  const paginationCursor = limited && start !== undefined
+    ? await room.tx((tx) => tx.segments.positionOf(start.event))
+    : null;
   const entry: Record<string, unknown> = {
     [i.useStateAfter ? 'state_after' : 'state']: { events: stateEvents },
     timeline: {
       events,
-      limited: more || scanned > returned.length,
-      prev_batch: formatStreamToken(
-        prevE,
-        now.pSeq,
-        now.tSeq,
-        now.rSeq,
-        now.aSeq,
-        now.dSeq,
-        now.mSeq,
-        now.kSeq,
-        now.nSeq,
-      ),
+      limited,
+      prev_batch: paginationCursor === null
+        ? formatStreamToken(
+          prevE,
+          now.pSeq,
+          now.tSeq,
+          now.rSeq,
+          now.aSeq,
+          now.dSeq,
+          now.mSeq,
+          now.kSeq,
+          now.nSeq,
+        )
+        : formatCursor(paginationCursor),
     },
     ephemeral: { events: [] },
     account_data: { events: [] },
@@ -481,7 +537,34 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       continue;
     }
     const event = JSON.parse(String(row.event_json)) as Record<string, unknown>;
-    if (ignoredUsers.has(String(event.sender))) continue;
+    if (row.status === 'pending' && ignoredUsers.has(String(event.sender))) {
+      continue;
+    }
+    if (row.status !== 'pending') {
+      if (
+        i.since === null
+          ? i.filter.includeLeave
+          : Number(row.seq) > i.since.eSeq
+      ) {
+        const pdu = await prejoinDeparture(inviteOf(row), {
+          server: app.server,
+          signer: app.tenant.signer(),
+        });
+        if (pdu === null) continue;
+        const departure = renderPrejoinDeparture(
+          pdu,
+          i.userId,
+          i.filter.eventFormat,
+        );
+        leave[roomId] = {
+          timeline: { events: [], limited: false, prev_batch: '' },
+          [i.useStateAfter ? 'state_after' : 'state']: {
+            events: filterEvents([departure], i.filter.state, roomId),
+          },
+        };
+      }
+      continue;
+    }
     const saved = JSON.parse(String(row.invite_room_state)) as Record<
       string,
       unknown
@@ -496,9 +579,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       {
         type: event.type,
         state_key: event.state_key,
-        content: row.status === 'rejecting' || row.status === 'failed-retract'
-          ? { membership: 'leave' }
-          : event.content,
+        content: event.content,
         sender: event.sender,
       },
     ];
@@ -506,13 +587,6 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       knock[roomId] = { knock_state: { events } };
     } else if (row.status === 'pending') {
       invite[roomId] = { invite_state: { events } };
-    } else if (
-      i.since === null ? i.filter.includeLeave : Number(row.seq) > i.since.eSeq
-    ) {
-      leave[roomId] = {
-        timeline: { events: [], limited: false, prev_batch: '' },
-        [i.useStateAfter ? 'state_after' : 'state']: { events },
-      };
     }
   }
   const allJoiners = new Set<string>();

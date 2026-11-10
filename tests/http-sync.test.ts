@@ -12,6 +12,8 @@ import { revokeToken } from '#engine/tenant/auth.ts';
 import { httpSuite } from '#tests/http-app.ts';
 import {
   acceptRescind,
+  inviteOf,
+  prejoinDeparture,
   receiveInvite,
   rejectInviteRemote,
 } from '#engine/federation/invites.ts';
@@ -555,6 +557,73 @@ suite.test('OOB invitation and rejection advance tokens once; ignored invitation
     '&since=' + invited.next_batch,
   );
   assert(roomSection(rejected, 'leave', roomId));
+  const localLeave =
+    ((roomSection(rejected, 'leave', roomId)!.state as Json).events as Json[])[
+      0
+    ];
+  assert(typeof localLeave.event_id === 'string');
+  assert(typeof localLeave.origin_server_ts === 'number');
+  assertEquals(localLeave.sender, user.user_id);
+  assertEquals((localLeave.content as Json).membership, 'leave');
+  const localAfter = roomSection(
+    await sync(
+      user.access_token!,
+      '&since=' + invited.next_batch + '&use_state_after=true',
+    ),
+    'leave',
+    roomId,
+  )!;
+  assertEquals((localAfter.state_after as Json).events, [localLeave]);
+  const assertRawDeparture = async (since: unknown, eventId: unknown) => {
+    for (const after of [false, true]) {
+      const raw = roomSection(
+        await sync(
+          user.access_token!,
+          '&since=' + since + '&use_state_after=' + after + '&filter=' +
+            encodeURIComponent(JSON.stringify({ event_format: 'federation' })),
+        ),
+        'leave',
+        roomId,
+      )!;
+      const events = (raw[after ? 'state_after' : 'state'] as Json)
+        .events as Json[];
+      assertEquals(events.length, 1);
+      assertEquals(events[0].event_id, eventId);
+      assert(Array.isArray(events[0].auth_events));
+      assert(Array.isArray(events[0].prev_events));
+      assert(events[0].signatures);
+      assert(events[0].hashes);
+    }
+  };
+  await assertRawDeparture(invited.next_batch, localLeave.event_id);
+  // Upgrade compatibility: the old pending intent has no local event yet.
+  await app.server.execute(
+    'UPDATE prejoin_memberships SET local_leave_json=NULL WHERE room_id=? AND user_id=?',
+    [roomId, user.user_id],
+  );
+  const migrated = roomSection(
+    await sync(user.access_token!, '&since=' + invited.next_batch),
+    'leave',
+    roomId,
+  )!;
+  const migratedAgain = roomSection(
+    await sync(user.access_token!, '&since=' + invited.next_batch),
+    'leave',
+    roomId,
+  )!;
+  assertEquals(
+    (migrated.state as Json).events,
+    (migratedAgain.state as Json).events,
+  );
+  const staleLegacy = {
+    ...inviteOf(
+      (await app.server.query(
+        'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+        [roomId, user.user_id],
+      ))[0],
+    ),
+    localLeaveJson: null,
+  };
   assert(rejected.next_batch !== invited.next_batch);
   assertEquals(
     roomSection(
@@ -581,6 +650,26 @@ suite.test('OOB invitation and rejection advance tokens once; ignored invitation
     (((roomSection(rescinded, 'leave', roomId)!.state as Json)
       .events as Json[])[0].content as Json).membership,
     'leave',
+  );
+  const rescindedEvents =
+    (roomSection(rescinded, 'leave', roomId)!.state as Json).events as Json[];
+  assertEquals(rescindedEvents.length, 1);
+  assertEquals(rescindedEvents[0].event_id, rescind.event_id);
+  assertEquals(rescindedEvents[0].origin_server_ts, rescind.origin_server_ts);
+  const rescindedAfter = roomSection(
+    await sync(
+      user.access_token!,
+      '&since=' + rejected.next_batch + '&use_state_after=true',
+    ),
+    'leave',
+    roomId,
+  )!;
+  assertEquals((rescindedAfter.state_after as Json).events, rescindedEvents);
+  await assertRawDeparture(rejected.next_batch, rescind.event_id);
+  assertEquals(
+    await prejoinDeparture(staleLegacy, deps),
+    null,
+    'superseded legacy intents must not invent an unpersisted departure',
   );
   await receiveInvite(
     roomId,

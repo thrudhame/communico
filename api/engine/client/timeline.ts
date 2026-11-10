@@ -50,7 +50,8 @@ export async function cursorForToken(
   );
   return position === null ? null : {
     segment: position.segment,
-    offset: position.offset + (dir === 'b' ? 1 : 0),
+    offset: position.offset,
+    ...(dir === 'b' ? { inclusive: true as const } : {}),
   };
 }
 
@@ -131,7 +132,7 @@ export async function messages(
     if (w.dir === 'b') {
       cursor = leave === null
         ? await room.tx((tx) => tx.segments.walkStart())
-        : { ...leave, offset: leave.offset + 1 };
+        : { ...leave, inclusive: true };
     } else {
       const segments = await room.tx((tx) => tx.segments.list());
       const first = segments.find((s) => s.kind === 'stay');
@@ -204,6 +205,16 @@ export async function messages(
         : step.cursor.segment;
       const signer = theApp().tenant.signer();
       let outcome = 'open';
+      const first = segment?.kind === 'stay'
+        ? await room.tx((tx) =>
+          tx.segments.positionsPage(
+            segment.id,
+            -Number.MAX_SAFE_INTEGER,
+            'f',
+            1,
+          )
+        )
+        : [];
       for (const via of candidates) {
         const res = await backfill(room, {
           from: step.prevs,
@@ -211,6 +222,8 @@ export async function messages(
           via,
           stay,
           segment: segment?.kind === 'anchor' ? segment.id : undefined,
+          isolated: segment?.kind === 'stay' &&
+            first[0]?.offset !== step.cursor.offset,
         }, {
           keys: productionKeyResolver(theApp().server, signer),
           fetcher: productionFetcher(theApp().server, signer, theApp().store),
