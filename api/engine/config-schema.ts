@@ -17,6 +17,23 @@ export const SCHEMA = {
   },
   admin: {
     socket: 'string',
+    users: 'list',
+  },
+  wellknown: {
+    client: 'string',
+    identity: 'string',
+    support: {
+      page: 'string',
+      admin: { mxids: 'list', emails: 'list' },
+      security: { mxids: 'list', emails: 'list' },
+    },
+  },
+  turn: {
+    uris: 'list',
+    secret: 'string',
+    username: 'string',
+    password: 'string',
+    ttl: 'int',
   },
   hierarchy: {
     pagesize: 'int',
