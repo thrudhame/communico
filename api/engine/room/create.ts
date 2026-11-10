@@ -30,6 +30,7 @@ import type { Store } from '#engine/store/index.ts';
 
 export type CreateRoomOptions = {
   creator: string;
+  creatorProfile?: { displayname?: string; avatar_url?: string };
   version?: string; // default '11'
   preset?: string; // private_chat | trusted_private_chat | public_chat
   name?: string;
@@ -373,6 +374,7 @@ export async function createRoom(
 
         // 2. the creator's join
         const memberEventId = await send('m.room.member', creator, {
+          ...opts.creatorProfile,
           membership: 'join',
         });
 

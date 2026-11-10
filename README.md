@@ -19,6 +19,21 @@ choose its storage engine. E2EE server APIs cover device and one-time/fallback
 keys, durable to-device delivery, device lists, federation, cross-signing and
 encrypted key backup. Clients own encryption, private keys and decryption.
 
+## Client data and sync
+
+Room tags use the standard tags API and the same private `m.tag` room account
+data clients can read and write directly. Tag changes wake incremental sync.
+Stored and inline sync filters support room and sender inclusion/exclusion,
+type globs, URL matching, state, presence, ephemeral and account-data selection.
+Filtered events still advance stream tokens; E2EE control streams and unread
+counts are not content-filtered.
+
+OpenID tokens are distinct, expiring credentials issued through the own-user
+`openid/request_token` API. Third parties can call federation `openid/userinfo`
+with that token, without a federation signature. The tokens cannot authorize
+client APIs. `openid.tokenseconds` controls their lifetime (default 3600 seconds);
+account deactivation revokes them.
+
 ## Jump to date
 
 Authenticated client and signed federation `timestamp_to_event` support inclusive
@@ -299,6 +314,16 @@ joined-room/thread notification totals plus pending invites, including explicit
 zero to clear badges. Logout, device/token revocation, account deactivation and
 matching gateway `rejected` verdicts cancel the corresponding registration's
 work. Invalid responses and HTTP/TLS errors retry; they never delete a pusher.
+
+Account deactivation accepts `erase: true`: local readers who gained visibility
+only afterward receive room-version-pruned copies, while earlier visibility is
+preserved. This is not physical deletion, a federation erasure request or a set
+of redaction events. Private account data and stored filters are cleared too.
+
+Public profiles support namespaced custom JSON fields and `m.tz`, with per-field
+GET/PUT/DELETE and `m.profile_fields` capability discovery. Keys are at most 255
+UTF-8 bytes; the whole profile must remain below 64 KiB. Custom null values are
+retained until DELETE. Only display names and avatars enter room membership.
 
 ## Operator tools
 

@@ -1,9 +1,10 @@
 import { parseJson } from '@pathfinder/pathfinder/body';
 import { theApp } from '#engine/app.ts';
-import { deactivateUser } from '#engine/tenant/users.ts';
+import { deactivateAccount } from '#engine/client/account.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import { PASSWORD_FLOWS, requireUia } from '#engine/tenant/uia.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
+import { MatrixError } from '#engine/matrix-error.ts';
 
 // POST /_matrix/client/v3/account/deactivate — "Deactivate the user's
 // account, removing all ability for the user to login again. This API
@@ -21,11 +22,14 @@ export default async function (request: PathfinderRequest, context: Context) {
     else throw e;
   }
   const caller = context.state.user as string;
+  if (body.erase !== undefined && typeof body.erase !== 'boolean') {
+    throw new MatrixError(400, 'M_BAD_JSON', 'erase must be a boolean');
+  }
   await requireUia(theApp().tenant, {
     body,
     flows: PASSWORD_FLOWS,
     caller,
   });
-  await deactivateUser(theApp().tenant, localpartOf(caller));
+  await deactivateAccount(localpartOf(caller), body.erase === true);
   return { id_server_unbind_result: 'success' };
 }

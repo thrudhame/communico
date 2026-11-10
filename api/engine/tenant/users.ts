@@ -16,6 +16,8 @@ import {
   revokeDeviceTokens,
 } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import { setProfileRow } from '#engine/tenant/profiles.ts';
+import type { ErasureCut } from '#engine/room/state.ts';
 
 // Spec appendices: user_id_localpart = 1*user_id_char;
 // user_id_char = DIGIT / a-z / "-" / "." / "=" / "_" / "/" / "+".
@@ -109,10 +111,7 @@ export async function setUserDisplayName(
   localpart: string,
   name: string | null,
 ): Promise<void> {
-  await conn.execute('UPDATE users SET display_name = ? WHERE localpart = ?', [
-    name,
-    localpart,
-  ]);
+  await setProfileRow(conn, localpart, 'displayname', name);
 }
 
 export async function setUserAvatarUrl(
@@ -120,10 +119,7 @@ export async function setUserAvatarUrl(
   localpart: string,
   url: string | null,
 ): Promise<void> {
-  await conn.execute('UPDATE users SET avatar_url = ? WHERE localpart = ?', [
-    url,
-    localpart,
-  ]);
+  await setProfileRow(conn, localpart, 'avatar_url', url);
 }
 
 export async function markDeactivated(
@@ -162,6 +158,13 @@ export async function credentialHash(
     [localpart],
   );
   return rows.length === 0 ? null : String(rows[0].hash);
+}
+
+export async function clearCredential(
+  conn: Conn,
+  localpart: string,
+): Promise<void> {
+  await conn.execute('DELETE FROM credentials WHERE localpart=?', [localpart]);
 }
 
 // --- tenant-level behaviour --------------------------------------------------
@@ -336,7 +339,7 @@ export async function setDisplayName(
   return await tenant.tx(async (tx) => {
     const row = await tx.users.byLocalpart(localpart);
     const oldValue = row === null ? null : row.display_name;
-    await tx.users.setDisplayName(localpart, name);
+    await tx.profiles.set(localpart, 'displayname', name);
     return { oldValue, newValue: name };
   });
 }
@@ -349,7 +352,7 @@ export async function setAvatarUrl(
   return await tenant.tx(async (tx) => {
     const row = await tx.users.byLocalpart(localpart);
     const oldValue = row === null ? null : row.avatar_url;
-    await tx.users.setAvatarUrl(localpart, url);
+    await tx.profiles.set(localpart, 'avatar_url', url);
     return { oldValue, newValue: url };
   });
 }
@@ -393,9 +396,14 @@ export async function changePassword(
 export async function deactivateUser(
   tenant: Tenant,
   localpart: string,
+  erasureCuts?: Record<string, ErasureCut>,
 ): Promise<void> {
   await tenant.tx(async (tx) => {
+    if (erasureCuts !== undefined) {
+      await tx.erasure.mark(localpart, erasureCuts);
+    }
     await tx.pushers.deleteForUser(localpart);
+    await tx.openid.clear(localpart);
     await tx.refresh.deleteForUser(localpart);
     await tx.tokens.deleteForUser(localpart);
     await tx.devices.deleteForUser(localpart);
@@ -404,6 +412,13 @@ export async function deactivateUser(
       '@' + localpart + ':' + tenant.serverName,
     );
     await tx.keyBackup.clear(localpart);
+    await tx.profiles.clear(localpart);
+    if (erasureCuts !== undefined) {
+      await tx.accountData.clear(localpart);
+      await tx.filters.clear(localpart);
+      await tx.pushRules.clear(localpart);
+      await tx.credentials.clear(localpart);
+    }
     await tx.users.markDeactivated(localpart);
   });
 }

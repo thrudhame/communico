@@ -1,7 +1,7 @@
 // doltgres query/profile: local profile, field filter, 400 domain/404 unknown.
 import { serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { getProfile } from '#engine/tenant/users.ts';
+import { getPublicProfile } from '#engine/tenant/profiles.ts';
 import { theApp } from '#engine/app.ts';
 import { assertFederationEnabled } from '#engine/federation/keydoc.ts';
 import { splitId } from '#engine/ids.ts';
@@ -17,7 +17,7 @@ export default async function (request: PathfinderRequest) {
   ) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid user id');
   }
-  const profile = await getProfile(theApp().tenant, parts.localpart);
+  const profile = await getPublicProfile(theApp().tenant, parts.localpart);
   if (profile === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'no such user');
   }

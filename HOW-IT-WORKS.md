@@ -182,6 +182,16 @@ body/name/topic text without altering the PDU.
 
 ## Client reads and sync
 
+Stored and inline sync filters share shape validation and pure matching across
+room selection, timeline, state, presence, ephemeral and both account-data
+streams. Denials win, empty lists exclude everything, and only `*` is special
+in type globs. Senderless stream envelopes never gain a fabricated sender.
+Selection and timeline visibility/ignore checks precede limits, while stream
+cuts advance across excluded data. E2EE control streams and notification counts
+are not content-filtered. Federation event format crosses the same viewer-aware
+renderer as client format; `event_fields` may receive the spec-permitted superset.
+(`api/engine/tenant/filters.ts`, `api/engine/syncfeed.ts`)
+
 All client timeline rendering crosses one viewer-aware `renderEvent` boundary.
 Its shared visibility policy requires accepted, grounded events; the viewer's
 own membership events are visible without a qualifying join. Other events need
@@ -227,8 +237,12 @@ unchanged. Both read-marker routes validate the event's room before persisting
 counts, or accepts a thread id.
 (`api/engine/client/{ignored,render,search}.ts`, `api/engine/receipts.ts`)
 
-`/sync` timeline visibility follows that same event-state policy. Its state
-blocks and unsigned membership retain their separate publication-cut
+`/sync` timeline visibility follows that same event-state policy. Timeline
+selection hydrates bounded newest-first feed pages and renders only the requested
+visible window plus one lookahead. New-join presence comes from the captured
+membership projection, not a second walk over room history. Search profiles use
+the same viewer-aware state rendering as other state consumers.
+Its state blocks and unsigned membership retain their separate publication-cut
 contracts; `renderStateEvent` formats admitted state snapshots, including
 imported evidence, rather than imposing timeline eligibility on them.
 (`api/engine/syncfeed.ts:99-144`, `api/engine/client/render.ts:29-54`)
@@ -309,6 +323,26 @@ caller's room account data. Event polls arm listeners before reading, recheck
 access, and clean up on cancellation or timeout. Layered `peeking.maxevents`
 (default 50) and `peeking.maxtimeoutms` (default 30000) bound pages and waits.
 (`api/engine/client/peeking.ts`)
+
+Account erasure records durable tenant intent with held rooms' publication
+boundaries. Client event/state/previous-content rendering and federation history
+share one serve-time policy: prior event visibility survives, including shared
+history acquired before the boundary and world-readable events. New private
+history readers receive version-pruned copies. Retries retain the first boundary;
+PDUs and auth graphs remain unchanged, with no federation erasure signal or
+synthetic redaction. Search excludes pruned content before counts and ranking.
+Account-data, filter, push-rule and credential owners clear non-event data in the
+same tenant transaction as deactivation. Existing append-only change streams
+remain intact. (`api/engine/erasure.ts`, `api/engine/client/account.ts`,
+`api/engine/tenant/erasure.ts`)
+
+The tenant profile owner assembles legacy user columns and additional JSON field
+rows, and validates whole-profile byte limits inside the write transaction.
+Legacy setters use the same owner, avoiding independent size budgets. Public
+client and federation queries expose the assembled profile; room creation,
+joins and profile fan-out use only the legacy display/avatar projection.
+Custom null is a stored value, while DELETE removes the row. Deactivation clears
+both sources. (`api/engine/tenant/profiles.ts`)
 
 Alias and profile discovery ask remote servers by default, including anonymous
 requests, through signed, admission-gated federation. `federation.lookups=known`
@@ -401,6 +435,21 @@ bodies and durable delivery obligations are not rewritten or discarded.
 (`api/engine/federation/{acl,client,edus,joins,serve}.ts`, `api/engine/room/remote.ts`)
 
 ## Tenant data, storage and process lifetime
+
+OpenID credentials live in the tenant's separate hashed-token table (tenant
+schema v15), never in the client access/refresh tables. Issuance and userinfo
+check the active account in the owning transaction, enforce the configured
+expiry and survive reopen. Deactivation clears the credentials. The only new
+unsigned federation route is `openid/userinfo`, which authenticates its own
+bearer; sibling federation routes retain signature admission.
+(`api/engine/tenant/openid.ts`)
+
+Room tags are atomic edits of the tenant's ordinary `m.tag` room account data,
+not a second store. Own-user reads and deletes need no current join; additions
+require an existing room membership. Tags and ordinary room account-data writes
+wake sync and include their room even when no room event changed. Incremental
+sync reads those rows between its account-data cuts; unchanged rows are omitted.
+(`api/engine/client/tags.ts`, `api/engine/tenant/accountdata.ts`)
 
 Hosted accounts are localparts under the configured homeserver's signing
 identity. The tenant generates its key once and reloads it on reopen, keeping

@@ -22,6 +22,11 @@ maxrequestbytes = 13107200
 # COMMUNICO_ADMIN_SOCKET
 socket = ""
 
+[openid]
+# Synapse's default OpenID token lifetime; separate from client access tokens.
+# COMMUNICO_OPENID_TOKENSECONDS
+tokenseconds = 3600
+
 [peeking]
 # Tuwunel's event/initialSync cap; the existing sync long-poll ceiling.
 maxevents = 50

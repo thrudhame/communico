@@ -226,8 +226,21 @@ CREATE TABLE pusher_changes(pos INTEGER PRIMARY KEY NOT NULL,localpart TEXT NOT 
 CREATE INDEX pushers_identity ON pushers(app_id,pushkey);
 `;
 
+const OPENID_SQL = `
+CREATE TABLE openid_tokens(token_hash TEXT PRIMARY KEY NOT NULL, localpart TEXT NOT NULL REFERENCES users(localpart), expires_ms INTEGER NOT NULL);
+CREATE INDEX openid_tokens_expiry ON openid_tokens(expires_ms);
+CREATE INDEX openid_tokens_user ON openid_tokens(localpart);
+`;
+
+const PROFILE_SQL = `
+CREATE TABLE profile_fields(localpart TEXT NOT NULL REFERENCES users(localpart), key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(localpart,key));
+`;
+
+const ERASURE_SQL =
+  `CREATE TABLE erased_users(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart), room_cuts TEXT NOT NULL);`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 14,
+  version: 17,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -240,8 +253,14 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(KEY_BACKUP_SQL);
     await db.exec(ACCOUNT_CHANGES_SQL);
     await db.exec(PUSHER_CHANGES_SQL);
+    await db.exec(OPENID_SQL);
+    await db.exec(PROFILE_SQL);
+    await db.exec(ERASURE_SQL);
   },
   migrations: {
+    16: (conn) => conn.exec(ERASURE_SQL),
+    15: (conn) => conn.exec(PROFILE_SQL),
+    14: (conn) => conn.exec(OPENID_SQL),
     13: async (conn) => {
       await conn.exec(PUSHER_CHANGES_SQL);
       for (const row of await conn.query('SELECT * FROM pushers')) {

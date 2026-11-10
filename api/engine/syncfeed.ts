@@ -17,7 +17,12 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { feedAfter, roomsFor } from '#engine/server/read.ts';
+import {
+  feedAfter,
+  feedBefore,
+  type FeedRow,
+  roomsFor,
+} from '#engine/server/read.ts';
 import {
   notificationSnapshot,
   syncNotificationCounts,
@@ -29,10 +34,13 @@ import {
   getAccountData,
   listGlobalAccountData,
   listGlobalAccountDataSince,
-  listRoomAccountData,
 } from '#engine/tenant/accountdata.ts';
 import { pushStreamSeq, rulesetFor } from '#engine/tenant/pushrules.ts';
-import type { RoomFilter } from '#engine/tenant/filters.ts';
+import {
+  eventMatchesRoomEventFilter,
+  filterEvents,
+  type RoomFilter,
+} from '#engine/tenant/filters.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { onEventStream } from '#engine/server/stream.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
@@ -82,44 +90,68 @@ async function roomTimeline(
     receipts: Record<string, unknown>[];
     members: Row[];
     notifications: ReturnType<typeof syncNotificationCounts>;
+    accountData: { type: string; content: unknown }[];
   },
 ) {
   const app = theApp();
-  const raw = await feedAfter(
-    app.server,
-    room.id,
-    i.since?.eSeq ?? 0,
-    Number.MAX_SAFE_INTEGER,
-    end,
-  );
-  const pdus = await room.tx((tx) => tx.events.list(raw.map((r) => r.event)));
-  const typeMatches = (
-    type: string,
-    f: { types?: string[]; not_types?: string[] },
-  ) =>
-    (f.types === undefined || f.types.includes(type)) &&
-    !f.not_types?.includes(type);
-  const filtered = raw.filter((r) => {
-    const pdu = pdus.get(r.event);
-    return pdu !== undefined && typeMatches(pdu.type, i.filter.timeline);
-  });
   const limit = i.filter.timeline.limit ?? 10;
-  const trimmed = filtered.length > limit;
-  const returned = trimmed ? filtered.slice(filtered.length - limit) : filtered;
-  const events: Record<string, unknown>[] = [];
-  for (const row of returned) {
-    const at = await stateAtSeq(room, row.seq, row.stay);
-    const membership = at.find((s) =>
-      s.type === 'm.room.member' && s.stateKey === i.userId
-    )?.content.membership ?? 'leave';
-    const event = await renderEvent(room, row.event, {
-      userId: i.userId,
-      deviceId: i.deviceId,
-      tenant: app.tenant,
-      membership: String(membership),
-    }, { omitRoomId: true });
-    if (event !== null) events.push(event);
+  const eligible: {
+    row: FeedRow;
+    event: Record<string, unknown>;
+  }[] = [];
+  let cursor = end;
+  let scanned = 0;
+  let more = true;
+  // Bound hydration as well as rendering. Walk newest first until one
+  // eligible lookahead proves truncation; hidden rows never consume slots.
+  while (more && eligible.length <= limit) {
+    const page = await feedBefore(
+      app.server,
+      room.id,
+      i.since?.eSeq ?? 0,
+      cursor,
+      32,
+    );
+    more = page.length === 32;
+    if (!page.length) break;
+    cursor = page.at(-1)!.seq - 1;
+    const stored = await room.tx((tx) =>
+      tx.events.list(page.map((r) => r.event))
+    );
+    for (const row of page) {
+      scanned++;
+      const record = stored.get(row.event);
+      if (record === undefined) continue;
+      const pdu = JSON.parse(record.pdu) as Pdu;
+      if (
+        !eventMatchesRoomEventFilter(
+          null,
+          { ...pdu, room_id: room.id },
+          i.filter.timeline,
+        )
+      ) continue;
+      const at = await stateAtSeq(room, row.seq, row.stay);
+      const membership = at.find((s) =>
+        s.type === 'm.room.member' && s.stateKey === i.userId
+      )?.content.membership ?? 'leave';
+      const event = await renderEvent(room, row.event, {
+        userId: i.userId,
+        deviceId: i.deviceId,
+        tenant: app.tenant,
+        membership: String(membership),
+      }, { omitRoomId: true, eventFormat: i.filter.eventFormat });
+      if (event !== null) eligible.unshift({ row, event });
+      if (eligible.length > limit) break;
+    }
   }
+  const trimmed = eligible.length > limit;
+  const selected = limit === 0
+    ? []
+    : trimmed
+    ? eligible.slice(eligible.length - limit)
+    : eligible;
+  const returned = selected.map((item) => item.row);
+  const events = selected.map((item) => item.event);
   const start = returned[0];
   const atStart = await stateAtSeq(room, start?.seq ?? end, start?.stay);
   let stateRows = atStart;
@@ -139,19 +171,19 @@ async function roomTimeline(
     );
   }
   const stateEvents: Record<string, unknown>[] = [];
-  stateRows = stateRows.filter((r) => typeMatches(r.type, i.filter.state));
-  if (i.filter.state.lazy_load_members) {
+  if (i.filter.state.lazy_load_members || i.filter.timeline.lazy_load_members) {
     const senders = new Set(events.map((ev) => String(ev.sender)));
     stateRows = stateRows.filter((r) =>
       r.type !== 'm.room.member' || senders.has(r.stateKey)
     );
   }
+  stateRows = filterEvents(stateRows, i.filter.state, room.id);
   for (const row of stateRows) {
     const ev = await renderStateEvent(room, row.eventId, {
       userId: i.userId,
       deviceId: i.deviceId,
       tenant: app.tenant,
-    }, { omitRoomId: true });
+    }, { omitRoomId: true, eventFormat: i.filter.eventFormat });
     if (ev !== null) stateEvents.push(ev);
   }
   const prevE = trimmed && returned.length ? returned[0].seq - 1 : end;
@@ -159,7 +191,7 @@ async function roomTimeline(
     state: { events: stateEvents },
     timeline: {
       events,
-      limited: raw.length > returned.length,
+      limited: more || scanned > returned.length,
       prev_batch: formatStreamToken(
         prevE,
         now.pSeq,
@@ -193,7 +225,13 @@ async function roomTimeline(
     for (const content of receipts) {
       ephemeral.push({ type: 'm.receipt', content });
     }
-    entry.ephemeral = { events: ephemeral };
+    entry.ephemeral = {
+      events: filterEvents(
+        ephemeral as { type: string; content: unknown }[],
+        i.filter.ephemeral,
+        room.id,
+      ),
+    };
     const members = snapshot.members;
     const heroes = members.filter((r) => r.user !== i.userId).slice(0, 5).map((
       r,
@@ -208,22 +246,20 @@ async function roomTimeline(
       ...(heroes.length ? { 'm.heroes': heroes } : {}),
     };
     entry.account_data = {
-      events: await listRoomAccountData(
-        app.tenant,
-        localpartOf(i.userId),
+      events: filterEvents(
+        snapshot.accountData,
+        i.filter.roomAccountData,
         room.id,
       ),
     };
   }
-  const joiners: string[] = [];
-  for (const row of raw) {
-    const pdu = await room.tx(async (tx) => {
-      const e = await tx.events.get(row.event);
-      return e === null ? null : JSON.parse(e.pdu) as Pdu;
-    });
-    if (pdu?.type !== 'm.room.member') continue;
-    if (pdu.content.membership === 'join') joiners.push(String(pdu.state_key));
-  }
+  // Presence needs new current joiners, independently of timeline filtering.
+  // The captured projection already owns membership and its change sequence.
+  const joiners = i.since === null
+    ? []
+    : snapshot.members.filter((row) =>
+      row.membership === 'join' && Number(row.seq) > i.since!.eSeq
+    ).map((row) => String(row.user));
   return { entry, joiners };
 }
 
@@ -371,7 +407,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
           i.since?.rSeq ?? 0,
         ),
         members: await tx.query(
-          "SELECT user,membership FROM memberships WHERE room=? AND membership IN ('join','invite') ORDER BY CASE membership WHEN 'join' THEN 0 ELSE 1 END,user",
+          "SELECT user,membership,seq FROM memberships WHERE room=? AND membership IN ('join','invite') ORDER BY CASE membership WHEN 'join' THEN 0 ELSE 1 END,user",
           [membership.roomId],
         ),
       });
@@ -406,6 +442,9 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       return { ...delivered, pools };
     });
   const nextBatch = encodeStreamToken(delivery.token);
+  const roomAccountData = await app.tenant.tx((tx) =>
+    tx.accountData.roomsSince(lp, i.since?.aSeq ?? 0, now.aSeq)
+  );
   const memberships = snapshot.memberships;
   const receiptRooms = new Set(
     [...snapshot.rooms].filter(([, r]) => r.receipts.length).map(([id]) => id),
@@ -514,6 +553,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       );
       if (
         !changed.length && !receiptRooms.has(m.roomId) &&
+        !roomAccountData.has(m.roomId) &&
         !snapshot.notifications.changed.has(m.roomId) &&
         lastTypingChange(m.roomId) <= i.since.tSeq
       ) continue;
@@ -526,6 +566,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       !left,
       {
         ...snapshot.rooms.get(m.roomId)!,
+        accountData: roomAccountData.get(m.roomId) ?? [],
         notifications: syncNotificationCounts(
           snapshot.notifications.rooms.get(m.roomId),
           i.filter.timeline.unread_thread_notifications === true,
@@ -579,8 +620,17 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   return {
     next_batch: nextBatch,
     rooms: { join, invite, knock, leave },
-    presence: { events: [...presenceEvents.values()] },
-    account_data: { events: accountData },
+    presence: {
+      events: filterEvents(
+        [...presenceEvents.values()] as {
+          type: string;
+          sender: string;
+          content: unknown;
+        }[],
+        i.filter.presence,
+      ),
+    },
+    account_data: { events: filterEvents(accountData, i.filter.accountData) },
     to_device: { events: delivery.events },
     device_lists: deviceLists,
     device_one_time_keys_count: delivery.pools.counts,

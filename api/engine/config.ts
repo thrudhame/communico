@@ -301,6 +301,16 @@ export function loadConfig(opts: {
   }
 
   const peeking = built.peeking as Record<string, unknown> | undefined;
+  const openid = built.openid as Record<string, unknown> | undefined;
+  if (
+    typeof openid?.tokenseconds !== 'number' ||
+    !Number.isSafeInteger(openid.tokenseconds) || openid.tokenseconds <= 0 ||
+    !Number.isSafeInteger(openid.tokenseconds * 1000 + Date.now())
+  ) {
+    problems.push(
+      'config: openid.tokenseconds: expected positive seconds within safe expiry range',
+    );
+  }
   for (const [key, value] of Object.entries(peeking ?? {})) {
     if (typeof value === 'number' && value < (key === 'maxevents' ? 1 : 0)) {
       problems.push(`config: peeking.${key}: invalid capacity`);
@@ -669,6 +679,7 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
+  openid?: Partial<Config['openid']>;
   peeking?: Partial<Config['peeking']>;
   hierarchy?: Partial<Config['hierarchy']>;
   push?: {

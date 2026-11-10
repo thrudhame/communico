@@ -25,5 +25,11 @@ export default async function (
     (membership === null || r.content.membership === membership) &&
     (notMembership === null || r.content.membership !== notMembership)
   );
-  return { chunk: await clientEventsForRows(roomId, rows) };
+  return {
+    chunk: await clientEventsForRows(
+      roomId,
+      rows,
+      context.state.user as string,
+    ),
+  };
 }
