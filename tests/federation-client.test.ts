@@ -7,14 +7,16 @@
 // key-is-name peers the raw 32-byte key equality, mismatches a 502
 // before any request bytes are written (doltgres
 // tests/federation-dial.test.ts, restored).
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createHash, X509Certificate } from 'node:crypto';
-import { setConfigForTests } from '#engine/config.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { addPeer, removePeer } from '#engine/federation/peers.ts';
 import { resetWellKnownCache, resolve } from '#engine/federation/resolve.ts';
 import {
+  FederationHttpError,
   federationRequest,
+  federationRequestRaw,
   resetCaCertsForTests,
 } from '#engine/federation/client.ts';
 import {
@@ -74,6 +76,7 @@ async function makeIdentity(name: string): Promise<Identity> {
 async function withFake<T>(
   identity: Identity,
   fn: (fake: FakeServer) => Promise<T>,
+  handlers?: Parameters<typeof startFakeServer>[0]['handlers'],
 ): Promise<T> {
   setConfigForTests({
     federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
@@ -81,6 +84,7 @@ async function withFake<T>(
   resetCaCertsForTests();
   const fake = await startFakeServer({
     ourKeyDoc: () => Promise.resolve(identity.doc),
+    handlers,
   });
   try {
     return await fn(fake);
@@ -90,6 +94,107 @@ async function withFake<T>(
     resetCaCertsForTests();
   }
 }
+
+Deno.test('client: raw streaming shares verified signing and completed-error provenance', async () => {
+  const identity = await makeIdentity('raw.test');
+  const bytes = new Uint8Array(100000).fill(93);
+  await withStore(async (store) => {
+    await withFake(
+      identity,
+      async (fake) => {
+        const server = await store.server();
+        let received = 0;
+        const res = await federationRequestRaw(server, identity.signer, {
+          destination: `localhost:${fake.port}`,
+          method: 'GET',
+          path: '/raw',
+          body: null,
+          sink: (status, headers) => {
+            assertEquals(status, 200);
+            assertEquals(
+              headers.get('content-type'),
+              'application/octet-stream',
+            );
+            return new WritableStream<Uint8Array>({
+              write: (part) => {
+                assert(part.every((byte) => byte === 93));
+                received += part.length;
+              },
+            });
+          },
+        });
+        assertEquals(received, bytes.length);
+        assertEquals(res.body.length, 0);
+        assertEquals(fake.requests.at(-1)!.verified, true);
+        let opened = false;
+        const err = await assertRejects(
+          () =>
+            federationRequestRaw(server, identity.signer, {
+              destination: `localhost:${fake.port}`,
+              method: 'GET',
+              path: '/missing',
+              body: null,
+              sink: () => {
+                opened = true;
+                return new WritableStream();
+              },
+            }),
+          FederationHttpError,
+        );
+        assertEquals(err.remoteStatus, 404);
+        assertEquals(err.errcode, 'M_UNRECOGNIZED');
+        assertEquals(
+          opened,
+          false,
+          'error JSON is never written to a media sink',
+        );
+      },
+      (req) =>
+        req.url.pathname === '/raw'
+          ? new Response(bytes, {
+            headers: { 'Content-Type': 'application/octet-stream' },
+          })
+          : null,
+    );
+  });
+});
+
+Deno.test('client: total deadline includes a blocked raw sink', async () => {
+  const identity = await makeIdentity('raw-timeout.test');
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await withStore(async (store) => {
+    const server = await store.server();
+    await withFake(identity, async (fake) => {
+      const previous = config().federation.timeoutms;
+      setConfigForTests({
+        federation: { timeoutms: 200, cacerts: ['tests/fixtures/tls/ca.crt'] },
+      });
+      const started = Date.now();
+      try {
+        const error = await assertRejects(
+          () =>
+            federationRequestRaw(server, identity.signer, {
+              destination: `localhost:${fake.port}`,
+              method: 'GET',
+              path: '/raw',
+              body: null,
+              sink: () =>
+                new WritableStream<Uint8Array>({ write: () => blocked }),
+            }),
+          MatrixError,
+        );
+        assert(error.message.includes('timeout'), error.message);
+        assert(Date.now() - started < 2000);
+      } finally {
+        release();
+        setConfigForTests({ federation: { timeoutms: previous } });
+      }
+    }, (req) => req.url.pathname === '/raw' ? new Response('bytes') : null);
+  });
+});
 
 Deno.test('client: GET to the fake verifies — header grammar, destination, no body type', async () => {
   const identity = await makeIdentity('client1.test');

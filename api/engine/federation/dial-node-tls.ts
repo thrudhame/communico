@@ -18,6 +18,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import {
   type Http1Response,
   http1Wire,
+  type Http1WireOpts,
   type WireConn,
 } from '#engine/net/http1.ts';
 
@@ -38,6 +39,7 @@ export type DialOpts = {
   timeoutMs: number;
   maxBytes: number;
   signal?: AbortSignal;
+  sink?: Http1WireOpts['sink'];
 };
 
 // node:tls TLSSocket → the WireConn shape
@@ -51,6 +53,7 @@ class NodeTlsConn {
   constructor(sock: tls.TLSSocket) {
     this.#sock = sock;
     sock.on('data', (d: Buffer) => {
+      sock.pause();
       this.#queue.push(new Uint8Array(d.buffer, d.byteOffset, d.byteLength));
       this.#poke();
     });
@@ -67,6 +70,7 @@ class NodeTlsConn {
       this.#ended = true;
       this.#poke();
     });
+    sock.pause();
   }
 
   #poke(): void {
@@ -81,6 +85,7 @@ class NodeTlsConn {
       if (this.#ended) return null;
       await new Promise<void>((r) => {
         this.#waiter = r;
+        this.#sock.resume();
       });
     }
     const head = this.#queue[0];
@@ -240,6 +245,8 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
       headers: opts.headers,
       body: opts.body,
       maxBytes: opts.maxBytes,
+      sink: opts.sink,
+      signal: ac.signal,
     });
   } catch (e) {
     opts.signal?.throwIfAborted();

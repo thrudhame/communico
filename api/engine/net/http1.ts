@@ -10,6 +10,7 @@
 // connection when it fires — a pending read then errors, and the error is
 // reported as a timeout.
 import { MatrixError } from '#engine/matrix-error.ts';
+import { abortable } from '#engine/net/abort.ts';
 
 export type Http1Request = {
   connectIp: string;
@@ -40,6 +41,13 @@ export type Http1WireOpts = {
   headers: Record<string, string>;
   body: Uint8Array | null;
   maxBytes: number;
+  // A sink is drained within the caller's transport lifetime/deadline. Null
+  // keeps the bounded buffered result (for errors and existing JSON callers).
+  sink?: (
+    status: number,
+    headers: Headers,
+  ) => WritableStream<Uint8Array> | null;
+  signal?: AbortSignal;
 };
 
 // The request/response half of http1Request, over ANY connection with the
@@ -64,9 +72,24 @@ export async function http1Wire(
     head += 'Content-Length: ' + String(opts.body.length) + '\r\n';
   }
   head += 'Connection: close\r\n\r\n';
-  await conn.write(new TextEncoder().encode(head));
-  if (opts.body !== null) await conn.write(opts.body);
-  return await readHttp(conn, opts.maxBytes);
+  await writeAll(conn, new TextEncoder().encode(head));
+  if (opts.body !== null) await writeAll(conn, opts.body);
+  return await readHttp(conn, opts);
+}
+
+async function writeAll(conn: WireConn, bytes: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = await conn.write(bytes.subarray(offset));
+    if (written <= 0 || written > bytes.length - offset) {
+      throw new MatrixError(
+        502,
+        'M_UNKNOWN',
+        'upstream write made no progress',
+      );
+    }
+    offset += written;
+  }
 }
 
 function connectHost(ip: string): string {
@@ -74,24 +97,9 @@ function connectHost(ip: string): string {
   return ip;
 }
 
-async function readAtLeast(
-  conn: WireConn,
-  buf: Uint8Array,
-  filled: number,
-  want: number,
-): Promise<number> {
-  let n = filled;
-  while (n < want) {
-    const got = await conn.read(buf.subarray(n));
-    if (got === null) break;
-    n += got;
-  }
-  return n;
-}
-
 async function readHttp(
   conn: WireConn,
-  maxBytes: number,
+  opts: Http1WireOpts,
 ): Promise<Http1Response> {
   const headBuf = new Uint8Array(HEADER_CAP);
   let n = 0;
@@ -113,7 +121,7 @@ async function readHttp(
   const leftover = headBuf.subarray(sep + 4, n);
   const lines = headText.split('\r\n');
   const statusLine = lines[0];
-  const sm = /^HTTP\/\d\.\d\s+(\d{3})/.exec(statusLine);
+  const sm = /^HTTP\/1\.[01] (\d{3})(?: |$)/.exec(statusLine);
   if (sm === null) {
     throw new MatrixError(502, 'M_UNKNOWN', 'bad upstream status line');
   }
@@ -121,126 +129,160 @@ async function readHttp(
   const headers = new Headers();
   for (let i = 1; i < lines.length; i++) {
     const colon = lines[i].indexOf(':');
-    if (colon < 0) continue;
+    if (colon <= 0 || /^[ \t]/.test(lines[i])) {
+      throw new MatrixError(502, 'M_UNKNOWN', 'bad upstream header');
+    }
     headers.append(
       lines[i].slice(0, colon).trim(),
       lines[i].slice(colon + 1).trim(),
     );
   }
   const clRaw = headers.get('content-length');
+  const te = headers.get('transfer-encoding');
+  if (te !== null && (clRaw !== null || te.toLowerCase() !== 'chunked')) {
+    throw new MatrixError(502, 'M_UNKNOWN', 'ambiguous upstream framing');
+  }
+  let length: number | null = null;
   if (clRaw !== null) {
-    const cl = Number(clRaw);
-    if (!Number.isFinite(cl) || cl < 0) {
+    length = Number(clRaw);
+    if (!/^\d+$/.test(clRaw) || !Number.isSafeInteger(length)) {
       throw new MatrixError(502, 'M_UNKNOWN', 'bad content-length');
     }
-    if (cl > maxBytes) {
+    if (length > opts.maxBytes) {
       throw new MatrixError(502, 'M_TOO_LARGE', 'Content is too large');
     }
-    const body = new Uint8Array(cl);
-    body.set(leftover.subarray(0, Math.min(leftover.length, cl)));
-    let filled = Math.min(leftover.length, cl);
-    filled = await readAtLeast(conn, body, filled, cl);
-    if (filled < cl) {
-      throw new MatrixError(502, 'M_UNKNOWN', 'upstream body truncated');
-    }
-    return { status, headers, body };
   }
-  const te = headers.get('transfer-encoding');
-  if (te !== null && te.toLowerCase().includes('chunked')) {
-    return {
-      status,
-      headers,
-      body: await readChunked(conn, leftover, maxBytes),
-    };
+  if (opts.method === 'HEAD' || status === 204 || status === 304) {
+    return { status, headers, body: new Uint8Array() };
   }
+  const stream = opts.sink === undefined ? null : opts.sink(status, headers);
+  const writer = stream === null ? null : stream.getWriter();
   const parts: Uint8Array[] = [];
-  let total = leftover.length;
-  if (total > maxBytes) {
-    throw new MatrixError(502, 'M_TOO_LARGE', 'Content is too large');
-  }
-  if (leftover.length > 0) parts.push(new Uint8Array(leftover));
-  const tmp = new Uint8Array(16 * 1024);
-  while (total <= maxBytes) {
-    const got = await conn.read(tmp);
-    if (got === null) break;
-    total += got;
-    if (total > maxBytes) {
+  let total = 0;
+  const emit = async (bytes: Uint8Array) => {
+    total += bytes.length;
+    if (total > opts.maxBytes) {
       throw new MatrixError(502, 'M_TOO_LARGE', 'Content is too large');
     }
-    parts.push(tmp.slice(0, got));
-  }
-  const body = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    body.set(p, off);
-    off += p.length;
-  }
-  return { status, headers, body };
-}
-
-async function readChunked(
-  conn: WireConn,
-  leftover: Uint8Array,
-  maxBytes: number,
-): Promise<Uint8Array> {
+    if (writer === null) parts.push(bytes.slice());
+    else await abortable(opts.signal, () => writer.write(bytes));
+  };
+  // Fixed-size reads and an awaited sink keep payload memory independent of
+  // Content-Length/chunk sizes. Only the explicit buffered API retains bytes.
   let pending = leftover;
+  const read = async () => {
+    opts.signal?.throwIfAborted();
+    const bytes = new Uint8Array(16 * 1024);
+    const got = await conn.read(bytes);
+    return got === null ? null : bytes.subarray(0, got);
+  };
+  const requireData = async () => {
+    if (pending.length === 0) {
+      const bytes = await read();
+      if (bytes === null) {
+        throw new MatrixError(502, 'M_UNKNOWN', 'upstream body truncated');
+      }
+      pending = bytes;
+    }
+  };
+  let framing = 0;
   const takeLine = async (): Promise<string> => {
-    while (true) {
+    for (;;) {
       const text = new TextDecoder('latin1').decode(pending);
       const idx = text.indexOf('\r\n');
       if (idx >= 0) {
+        framing += idx + 2;
+        if (framing > HEADER_CAP) {
+          throw new MatrixError(502, 'M_UNKNOWN', 'chunk framing too large');
+        }
         const line = text.slice(0, idx);
         pending = pending.subarray(idx + 2);
         return line;
       }
-      const tmp = new Uint8Array(1024);
-      const got = await conn.read(tmp);
-      if (got === null) {
+      const bytes = await read();
+      if (bytes === null) {
         throw new MatrixError(502, 'M_UNKNOWN', 'truncated chunked body');
       }
-      const next = new Uint8Array(pending.length + got);
+      const next = new Uint8Array(pending.length + bytes.length);
       next.set(pending);
-      next.set(tmp.subarray(0, got), pending.length);
+      next.set(bytes, pending.length);
       pending = next;
       if (pending.length > HEADER_CAP) {
         throw new MatrixError(502, 'M_UNKNOWN', 'chunk size line too long');
       }
     }
   };
-  const parts: Uint8Array[] = [];
-  let total = 0;
-  while (true) {
-    const line = await takeLine();
-    const size = parseInt(line.split(';', 1)[0], 16);
-    if (!Number.isFinite(size) || size < 0) {
-      throw new MatrixError(502, 'M_UNKNOWN', 'bad chunk size');
+  const take = async (length: number) => {
+    let remaining = length;
+    while (remaining > 0) {
+      await requireData();
+      const n = Math.min(remaining, pending.length);
+      await emit(pending.subarray(0, n));
+      pending = pending.subarray(n);
+      remaining -= n;
     }
-    if (size === 0) break;
-    total += size;
-    if (total > maxBytes) {
-      throw new MatrixError(502, 'M_TOO_LARGE', 'Content is too large');
-    }
-    while (pending.length < size + 2) {
-      const tmp = new Uint8Array(Math.max(size + 2 - pending.length, 1024));
-      const got = await conn.read(tmp);
-      if (got === null) {
-        throw new MatrixError(502, 'M_UNKNOWN', 'truncated chunked body');
+  };
+  try {
+    if (te !== null) {
+      for (;;) {
+        const line = await takeLine();
+        const digits = line.split(';', 1)[0];
+        const size = Number.parseInt(digits, 16);
+        if (!/^[0-9a-fA-F]+$/.test(digits) || !Number.isSafeInteger(size)) {
+          throw new MatrixError(502, 'M_UNKNOWN', 'bad chunk size');
+        }
+        if (size === 0) {
+          for (;;) {
+            const trailer = await takeLine();
+            if (trailer === '') break;
+            if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+:/.test(trailer)) {
+              throw new MatrixError(502, 'M_UNKNOWN', 'bad upstream trailer');
+            }
+          }
+          break;
+        }
+        if (size > opts.maxBytes - total) {
+          throw new MatrixError(502, 'M_TOO_LARGE', 'Content is too large');
+        }
+        await take(size);
+        // Chunk data MUST end with CRLF, even across two socket reads.
+        for (const expected of [13, 10]) {
+          await requireData();
+          if (pending[0] !== expected) {
+            throw new MatrixError(502, 'M_UNKNOWN', 'bad chunk delimiter');
+          }
+          pending = pending.subarray(1);
+        }
+        framing += 2;
       }
-      const next = new Uint8Array(pending.length + got);
-      next.set(pending);
-      next.set(tmp.subarray(0, got), pending.length);
-      pending = next;
+    } else if (length !== null) {
+      await take(length);
+    } else {
+      if (pending.length > 0) await emit(pending);
+      for (;;) {
+        const bytes = await read();
+        if (bytes === null) break;
+        await emit(bytes);
+      }
     }
-    parts.push(pending.slice(0, size));
-    pending = pending.subarray(size + 2);
+    if (writer !== null) await abortable(opts.signal, () => writer.close());
+  } catch (error) {
+    if (writer !== null) {
+      // Abort may queue behind a blocked sink write. It must not extend the
+      // request deadline; no subsequent network reads or writes are scheduled.
+      void writer.abort(error).catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    writer?.releaseLock();
   }
-  const body = new Uint8Array(total);
+  const body = new Uint8Array(writer === null ? total : 0);
   let off = 0;
   for (const p of parts) {
     body.set(p, off);
     off += p.length;
   }
-  return body;
+  return { status, headers, body };
 }
 
 export async function http1Request(
