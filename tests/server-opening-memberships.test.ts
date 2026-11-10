@@ -323,7 +323,7 @@ Deno.test('F4: imported remote membership passes inbound EDU checks and server d
   await withStore(async (store) => {
     const s = await setup(store, 'consumers');
     await project(store, s.room.id);
-    const edus = eduState(s.server, 'test');
+    const edus = eduState(s.server, 'test', store);
     try {
       await edus.dispatch(s.fr.server.name, {
         edu_type: 'm.typing',

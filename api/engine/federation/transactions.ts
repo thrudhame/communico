@@ -34,13 +34,6 @@ export type TransactionDeps = {
 
 export type TxnResult = { status: number; body: Record<string, unknown> };
 
-// The M5c hook point (SS:1236-1279): server ACLs check the origin
-// against the room's m.room.server_acl here — a no-op in M5b.
-function aclCheck(roomId: string, origin: string): void {
-  void roomId;
-  void origin;
-}
-
 // One room's PDUs through the remote pipeline, mapping outcomes to the
 // spec's per-PDU result entries ({} for handled — accepted, rejected,
 // soft-failed, known, pending-ungrounded — { error } for dropped and
@@ -80,7 +73,6 @@ async function receiveRoom(
   // Complement counts them, federation_room_get_missing_events_test.go:292-294)
   const identified: { pdu: Pdu; eventId: string }[] = [];
   for (const pdu of pdus) {
-    aclCheck(roomId, origin);
     let eventId: string;
     try {
       eventId = await eventIdFor(

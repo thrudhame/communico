@@ -15,6 +15,8 @@ import { dialNodeTls } from './dial-node-tls.ts';
 import { caCertsPem, resolve } from './resolve.ts';
 import { buildXMatrixHeader } from './xmatrix.ts';
 import { abortable } from '#engine/net/abort.ts';
+import { assertRoomAcl } from './acl.ts';
+import type { Store } from '#engine/store/index.ts';
 
 export { caCertsPem, resetCaCertsForTests } from './resolve.ts';
 
@@ -26,6 +28,8 @@ export type FederationRequest = {
   // response cap; defaults to federation.maxbytes
   maxBytes?: number;
   signal?: AbortSignal;
+  // Typed scope from the owner, never inferred from paths or mixed /send bodies.
+  room?: { store: Store; id: string; participation?: boolean };
 };
 
 export type FederationResponse = {
@@ -64,6 +68,12 @@ export async function federationRequest(
     throw new MatrixError(502, 'M_UNKNOWN', 'federation disabled');
   }
   req.signal?.throwIfAborted();
+  if (req.room !== undefined) {
+    if (req.room.participation) {
+      await assertRoomAcl(req.room.store, req.room.id, signer.serverName);
+    }
+    await assertRoomAcl(req.room.store, req.room.id, req.destination);
+  }
   const endpoint = await resolve(server, req.destination, req.signal);
   const origin = signer.serverName;
   const obj: Record<string, unknown> = {
@@ -94,6 +104,14 @@ export async function federationRequest(
     ? req.maxBytes
     : config().federation.maxbytes;
   req.signal?.throwIfAborted();
+  // Discovery/signing can yield while the ACL changes. Check again at the
+  // final network boundary; room state is never locked across network I/O.
+  if (req.room !== undefined) {
+    if (req.room.participation) {
+      await assertRoomAcl(req.room.store, req.room.id, signer.serverName);
+    }
+    await assertRoomAcl(req.room.store, req.room.id, req.destination);
+  }
   const res = await dialNodeTls({
     connectIp: endpoint.connectIp,
     port: endpoint.port,

@@ -13,7 +13,7 @@ import {
 } from '#engine/server/join-attempts.ts';
 
 export async function performJoinCleanup(
-  deps: Pick<InviteDeps, 'server' | 'signer'>,
+  deps: Pick<InviteDeps, 'server' | 'signer' | 'store'>,
   attempt: JoinAttempt,
 ): Promise<void> {
   let signed = await joinLeave(deps.server, attempt);

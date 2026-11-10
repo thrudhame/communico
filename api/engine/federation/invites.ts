@@ -43,6 +43,9 @@ import {
   withdrawInvitePush,
 } from '#engine/server/notifications.ts';
 import { federationRequest, isEndpointUnknown } from './client.ts';
+import { assertRoomAcl } from './acl.ts';
+import { assertAcl } from '#engine/room/acl.ts';
+import { withRoomLock } from '#engine/room/lock.ts';
 import { admit } from './gate.ts';
 import { domainOf, toWire } from './pdu.ts';
 import type {
@@ -162,6 +165,10 @@ export async function inviteRemote(
 ): Promise<{ eventId: string }> {
   const remote = domainOf(target);
   const room = await openRoom(deps.store, roomId);
+  await room.tx(async (tx) => {
+    await assertAcl(tx, remote);
+    await assertAcl(tx, deps.self);
+  });
   // roster growth by intent (closed mode → 403 to the client, pending row)
   await admit(deps.server, remote, {
     kind: 'outbound',
@@ -192,6 +199,7 @@ export async function inviteRemote(
   let resp: Record<string, unknown>;
   try {
     const res = await federationRequest(deps.server, deps.signer, {
+      room: { store: deps.store, id: roomId, participation: true },
       destination: remote,
       method: 'PUT',
       path: `/_matrix/federation/v2/invite/${encodeURIComponent(roomId)}/${
@@ -266,7 +274,10 @@ export async function inviteRemote(
   // so outbox rows go to the room's servers as for any local event; the
   // invitee's server receives it only if it already has joined members
   // (invites-v2.yaml:40-42)
-  await ingestLocal(room, merged, deps.self);
+  await ingestLocal(room, merged, deps.self, async (tx) => {
+    await assertAcl(tx, remote);
+    await assertAcl(tx, deps.self);
+  });
   return { eventId };
 }
 
@@ -345,6 +356,7 @@ export async function receiveInvite(
   origin: string,
   deps: InviteDeps,
 ): Promise<Record<string, unknown>> {
+  await assertRoomAcl(deps.store, roomId, origin);
   const body = (raw == null ? {} : raw) as {
     room_version?: unknown;
     event?: unknown;
@@ -445,56 +457,58 @@ export async function receiveInvite(
   // store: a room we HOLD does nothing else (the event arrives by /send
   // too, invites-v2.yaml:40-42); otherwise the out-of-band row so the
   // invitee sees it
-  await withProjectionLock(async () => {
-    if (await deps.store.roomRetired(roomId)) {
-      throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
-    }
-    if (await participating(deps.store, roomId)) return;
-    const publication = await prepareInvitePush(deps.store, deps.self, pdu);
-    const now = Date.now();
-    await eventStreamTx(deps.server, async (tx) => {
-      const evaluated = await tx.query(
-        'SELECT 1 FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
-        [deps.self, target, eventId],
-      );
-      if (evaluated.length) return;
-      const previous = await tx.query(
-        'SELECT event_id FROM federation_invites WHERE room_id=? AND user_id=?',
-        [roomId, target],
-      );
-      // Redelivery is not a new invitation, including after local rejection.
-      if (previous[0]?.event_id === eventId) return;
-      if (previous.length) {
-        await withdrawInvitePush(
-          tx,
-          target,
-          roomId,
-          String(previous[0].event_id),
-        );
+  await withRoomLock(roomId, () =>
+    withProjectionLock(async () => {
+      await assertRoomAcl(deps.store, roomId, origin);
+      if (await deps.store.roomRetired(roomId)) {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
       }
-      const seq = await nextEventSeq(tx);
-      await tx.execute(
-        `INSERT INTO federation_invites(room_id, user_id, event_id, room_version, event_json, invite_room_state, origin, received_ms, status, seq)
+      if (await participating(deps.store, roomId)) return;
+      const publication = await prepareInvitePush(deps.store, deps.self, pdu);
+      const now = Date.now();
+      await eventStreamTx(deps.server, async (tx) => {
+        const evaluated = await tx.query(
+          'SELECT 1 FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
+          [deps.self, target, eventId],
+        );
+        if (evaluated.length) return;
+        const previous = await tx.query(
+          'SELECT event_id FROM federation_invites WHERE room_id=? AND user_id=?',
+          [roomId, target],
+        );
+        // Redelivery is not a new invitation, including after local rejection.
+        if (previous[0]?.event_id === eventId) return;
+        if (previous.length) {
+          await withdrawInvitePush(
+            tx,
+            target,
+            roomId,
+            String(previous[0].event_id),
+          );
+        }
+        const seq = await nextEventSeq(tx);
+        await tx.execute(
+          `INSERT INTO federation_invites(room_id, user_id, event_id, room_version, event_json, invite_room_state, origin, received_ms, status, seq)
        VALUES(?,?,?,?,?,?,?,?,'pending',?)
        ON CONFLICT(room_id, user_id) DO UPDATE SET event_id = excluded.event_id,
          room_version = excluded.room_version, event_json = excluded.event_json,
          invite_room_state = excluded.invite_room_state, origin = excluded.origin,
           received_ms = excluded.received_ms, status = 'pending', seq = excluded.seq`,
-        [
-          roomId,
-          target,
-          eventId,
-          roomVersion,
-          JSON.stringify(pdu),
-          JSON.stringify(stripped),
-          origin,
-          now,
-          seq,
-        ],
-      );
-      await applyInvitePush(tx, roomId, eventId, seq, publication, now);
-    });
-  });
+          [
+            roomId,
+            target,
+            eventId,
+            roomVersion,
+            JSON.stringify(pdu),
+            JSON.stringify(stripped),
+            origin,
+            now,
+            seq,
+          ],
+        );
+        await applyInvitePush(tx, roomId, eventId, seq, publication, now);
+      });
+    }));
   return { event: toWire(pdu, roomVersion) };
 }
 
@@ -556,11 +570,12 @@ export async function rejectInviteRemote(
 export async function prepareRemoteLeave(
   destination: string,
   invite: Pick<StoredInvite, 'userId' | 'roomId' | 'roomVersion'>,
-  deps: Pick<InviteDeps, 'server' | 'signer'>,
+  deps: Pick<InviteDeps, 'server' | 'signer' | 'store'>,
 ): Promise<Pdu> {
   const userId = invite.userId;
   const roomId = invite.roomId;
   const mk = await federationRequest(deps.server, deps.signer, {
+    room: { store: deps.store, id: roomId },
     destination,
     method: 'GET',
     path: `/_matrix/federation/v1/make_leave/${encodeURIComponent(roomId)}/${
@@ -602,12 +617,13 @@ export async function sendRemoteLeave(
   destination: string,
   signed: Pdu,
   roomVersion: string,
-  deps: Pick<InviteDeps, 'server' | 'signer'>,
+  deps: Pick<InviteDeps, 'server' | 'signer' | 'store'>,
 ): Promise<void> {
   const roomId = String(signed.room_id);
   const eventId = String(signed.event_id);
   try {
     await federationRequest(deps.server, deps.signer, {
+      room: { store: deps.store, id: roomId },
       destination,
       method: 'PUT',
       path: `/_matrix/federation/v2/send_leave/${encodeURIComponent(roomId)}/${
@@ -620,6 +636,7 @@ export async function sendRemoteLeave(
   } catch (e) {
     if (!isEndpointUnknown(e)) throw e;
     await federationRequest(deps.server, deps.signer, {
+      room: { store: deps.store, id: roomId },
       destination,
       method: 'PUT',
       path: `/_matrix/federation/v1/send_leave/${encodeURIComponent(roomId)}/${

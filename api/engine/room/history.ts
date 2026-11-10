@@ -87,7 +87,7 @@ async function fetchBoundary(
   });
   const pack = new Map<string, Pdu>();
   for (const id of unknown) {
-    const raw = await fetchOrNull(() => deps.fetcher.event(id, via));
+    const raw = await fetchOrNull(() => deps.fetcher.event(id, via, room.id));
     if (raw === null) return null;
     try {
       const v = await verify(raw, version, deps.keys, {

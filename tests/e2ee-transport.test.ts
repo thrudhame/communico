@@ -87,7 +87,7 @@ Deno.test('E3 tenant intents survive unprojected restart, retain admission until
       await tx.devices.upsert('PHONE', 'bob', null);
     });
     const device = await deviceIdentity(recipient, 'bob', 'PHONE');
-    const edus = eduState(await remote.server(), fake.name);
+    const edus = eduState(await remote.server(), fake.name, remote);
     registerToDevice(edus, recipient);
     accept = async (id, body) => {
       await receiveTransaction('local.test', id, body, {
@@ -379,7 +379,7 @@ Deno.test('E3 destination pressure preserves healthy delivery and atomic mixed-s
       await tx.devices.upsert('PHONE', 'bob', null);
     });
     const bob = await deviceIdentity(recipient, 'bob', 'PHONE');
-    const edus = eduState(await remote.server(), healthy.name);
+    const edus = eduState(await remote.server(), healthy.name, remote);
     registerToDevice(edus, recipient);
     accept = async (id, body) => {
       await receiveTransaction('local.test', id, body, {

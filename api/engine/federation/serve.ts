@@ -5,6 +5,7 @@ import { redact } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { RoomTx } from '#engine/room/index.ts';
+import { assertAcl } from '#engine/room/acl.ts';
 import type { Standing } from '#engine/room/events.ts';
 import { authChain } from '#engine/rulebook/state-res-v2.ts';
 import { roomOf } from '#engine/server/read.ts';
@@ -22,6 +23,7 @@ import {
 export type ServeDeps = { store: Store; server: Db; self: string };
 
 async function inRoom(tx: RoomTx, origin: string) {
+  await assertAcl(tx, origin);
   const snapshot = await currentSnapshot(tx);
   if (!(await serverInState(tx, snapshot.state, origin))) {
     throw new MatrixError(403, 'M_FORBIDDEN', `${origin} is not in the room`);

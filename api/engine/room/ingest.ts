@@ -64,6 +64,7 @@ import type { Signer } from '#engine/room/signer.ts';
 import { mapEntries } from '#engine/room/state.ts';
 import { oversizedOf } from '#engine/room/verify.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
+import { assertAcl } from '#engine/room/acl.ts';
 
 export type Standing = 'accepted' | 'rejected' | 'soft_failed';
 
@@ -229,13 +230,17 @@ export async function ingestLocal(
   room: Room,
   pdu: Pdu,
   self: string,
+  admission?: (tx: RoomTx) => Promise<void>,
 ): Promise<IngestLocalResult> {
   const result = await withRoomLock(
     room.id,
     async () => {
       const user = localJoiningUser(pdu as BuildPartial);
       if (user !== undefined) await admitLocalJoin(room.store, room.id, user);
-      return await room.tx((tx) => ingestInTx(tx, room.id, pdu, { self }));
+      return await room.tx(async (tx) => {
+        await admission?.(tx);
+        return await ingestInTx(tx, room.id, pdu, { self });
+      });
     },
   );
   await maybeResume(room, result.eventId, self);
@@ -448,6 +453,12 @@ export async function ingestInTx(
     : await stateBefore(tx, prevs.afterGroups, rulebook, store);
   const priorGroup = await tx.state.current(stay.id);
   if (remote === null) {
+    if (
+      pdu.type === 'm.room.member' && pdu.state_key === pdu.sender &&
+      pdu.content?.membership === 'join' && domainOf(pdu.sender) === self
+    ) {
+      await assertAcl(tx, self);
+    }
     await assertLocalEncryption(
       tx,
       priorGroup,

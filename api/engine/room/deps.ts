@@ -35,7 +35,7 @@ export interface KeyResolver {
 export interface Fetcher {
   // GET /_matrix/federation/v1/event/{eventId} — the PDU, or null on
   // 404/unreachable.
-  event(id: string, via: string): Promise<Pdu | null>;
+  event(id: string, via: string, roomId: string): Promise<Pdu | null>;
   // POST /_matrix/federation/v1/get_missing_events/{roomId}: the events
   // between earliest (our extremities) and latest (the pushed event),
   // forward-topological, up to limit (backfill.yaml:71-141).

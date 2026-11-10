@@ -88,7 +88,7 @@ Deno.test('E6 remote leave fallback uses completed upstream endpoint status and 
     },
   });
   try {
-    const deps = { server: await store.server(), signer };
+    const deps = { server: await store.server(), signer, store };
     const signed = await prepareRemoteLeave(fake.name, {
       roomId: fr.roomId,
       userId: user,
@@ -201,7 +201,7 @@ Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup
         server: fake,
       });
       const server = await store.server();
-      const fetcher = productionFetcher(server, signer);
+      const fetcher = productionFetcher(server, signer, store);
       if (mode === 'local-error') {
         // Same status/errcode as a remote refusal, but no response provenance.
         fetcher.sendJoin = () =>
@@ -217,7 +217,7 @@ Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup
           fetcher,
           keys: fakeKeyResolver(fake),
           leave: (attempt: JoinAttempt) =>
-            performJoinCleanup({ server, signer }, attempt),
+            performJoinCleanup({ server, signer, store }, attempt),
         },
       };
       await assertRejects(() => joinRemote(store, args));
@@ -674,7 +674,10 @@ Deno.test('E6 interrupted send_join retains visible cleanup across reopen; sende
         fetcher,
         keys: fakeKeyResolver(fr.server, remote),
         leave: async (attempt: JoinAttempt) =>
-          performJoinCleanup({ server: await store.server(), signer }, attempt),
+          performJoinCleanup(
+            { server: await store.server(), signer, store },
+            attempt,
+          ),
       },
     };
     await assertRejects(

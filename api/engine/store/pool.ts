@@ -257,12 +257,11 @@ export class Pool {
       if (this.closed) throw new Error('open-file pool is closed');
       const fileKey = await keyFor(id);
       const key = kind + ':' + fileKey;
-      if (!this.incarnations.has(key)) this.incarnations.set(key, Symbol());
-      const incarnation = this.incarnations.get(key)!;
+      const previous = this.incarnations.get(key);
       if (
         this.removing.has(key) || this.retiring.has(key) ||
         (options.incarnation !== undefined &&
-          options.incarnation !== incarnation)
+          options.incarnation !== previous)
       ) {
         throw new Deno.errors.NotFound(`removed ${kind} database: ${id}`);
       }
@@ -274,6 +273,11 @@ export class Pool {
           lastUsed: Date.now(),
         };
       }
+      // Failed opens must not retain attacker-selected identities. Existing
+      // tokens survive eviction and every failure so held handles keep their
+      // retirement fence; publish a first token only after open succeeds.
+      const incarnation = previous ?? Symbol();
+      this.incarnations.set(key, incarnation);
       entry.leases++;
       entry.lastUsed = Date.now();
       this.entries.delete(key);

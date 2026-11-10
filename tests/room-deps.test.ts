@@ -86,7 +86,11 @@ Deno.test('deps: the fake fetcher answers in wire form and records calls', async
     event: new Map([[String(event.event_id), event]]),
     missingEvents: [event],
   });
-  const got = await fetcher.event(String(event.event_id), 'remote.test');
+  const got = await fetcher.event(
+    String(event.event_id),
+    'remote.test',
+    '!r:test',
+  );
   assert(got !== null && !('event_id' in got), 'wire form carries no id');
   const missing = await fetcher.missingEvents(
     '!r:test',

@@ -32,6 +32,7 @@ import { projectAfterWrite } from '#engine/room/hooks.ts';
 import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
+import { aclAllows } from '#engine/room/acl.ts';
 import { orderEvents } from '#engine/room/order.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { identify, verify } from '#engine/room/verify.ts';
@@ -320,7 +321,9 @@ async function fetchGapTip(
     if (budget.until - Date.now() <= 0) return;
     const wave = unknown.slice(start, start + concurrency);
     const fetched = await Promise.all(wave.map(async (id) => {
-      const raw = await fetchOrNull(() => deps.fetcher.event(id, origin));
+      const raw = await fetchOrNull(() =>
+        deps.fetcher.event(id, origin, room.id)
+      );
       if (raw === null) return null;
       try {
         const v = await verify(raw, version, deps.keys, { roomId: room.id });
@@ -339,7 +342,9 @@ async function fetchGapTip(
   if (budget.until - Date.now() <= 0) return;
   // the tip itself via /event
   let tipPdu: Pdu | null = null;
-  const rawTip = await fetchOrNull(() => deps.fetcher.event(tip, origin));
+  const rawTip = await fetchOrNull(() =>
+    deps.fetcher.event(tip, origin, room.id)
+  );
   if (rawTip !== null) {
     try {
       const v = await verify(rawTip, version, deps.keys, {
@@ -399,6 +404,20 @@ export async function ingestRemote(
     return await roomVersionOf(tx, stay.id);
   });
   const outcomes: (RemoteOutcome | null)[] = pdus.map(() => null);
+
+  // Denied traffic must not trigger key discovery or missing-event fetches.
+  if (!await room.tx((tx) => aclAllows(tx, origin))) {
+    return await Promise.all(pdus.map(async (pdu) => {
+      let id: string | null = null;
+      try {
+        id = await eventIdFor(
+          pdu as unknown as Record<string, unknown>,
+          version,
+        );
+      } catch { /* uncomputable */ }
+      return outcomeOf(id, 'refused', 'server denied by room ACL');
+    }));
+  }
 
   // identify every PDU (format guards, unsigned strip, recomputed id) —
   // a failure is refused before storage
@@ -521,6 +540,17 @@ export async function ingestRemote(
       );
       for (const item of ordered) {
         const { eventId: id, pdu } = item;
+        // A preceding accepted ACL event in this batch changes admission now,
+        // not on the next transaction. Refuse only this room's remaining PDUs.
+        if (!await aclAllows(tx, origin)) {
+          for (const index of outcomeIndex.get(id) ?? []) {
+            results.set(
+              index,
+              outcomeOf(id, 'refused', 'server denied by room ACL'),
+            );
+          }
+          continue;
+        }
         localRejected.delete(id);
         const boundary = acc.boundaries.get(id);
         const needsBoundary = boundary !== undefined &&
