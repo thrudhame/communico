@@ -21,6 +21,10 @@ encrypted key backup. Clients own encryption, private keys and decryption.
 
 ## Client data and sync
 
+`/sync?use_state_after=true` returns state at the response's timeline end in
+`state_after` (also when empty), not `state`. The default retains the legacy
+state-before-timeline contract. Filters and lazy member loading apply to both.
+
 Room tags use the standard tags API and the same private `m.tag` room account
 data clients can read and write directly. Tag changes wake incremental sync.
 Stored and inline sync filters support room and sender inclusion/exclusion,

@@ -241,6 +241,12 @@ counts, or accepts a thread id.
 blocks and unsigned membership retain their separate publication-cut
 contracts; `renderStateEvent` formats admitted state snapshots, including
 imported evidence, rather than imposing timeline eligibility on them.
+With `use_state_after=true`, joined/left rooms send `state_after` instead of
+`state`, even when empty. It is the resolved publication at the response end
+or departure cut, including updates already in the timeline. Initial/full-state
+responses carry the full cut; incremental responses carry its delta from since.
+Filtering and lazy member loading apply after cut selection. Later publications
+cannot leak across the captured response token.
 (`api/engine/syncfeed.ts:99-144`, `api/engine/client/render.ts:29-54`)
 
 The token grammar is `s<e>_p<p>_t<t>_r<r>_a<a>`: events, presence, typing,

@@ -36,6 +36,7 @@ export default async function (
     timeoutMs,
     filter,
     fullState,
+    useStateAfter: request.query.get('use_state_after') === 'true',
     setPresence,
   });
 }

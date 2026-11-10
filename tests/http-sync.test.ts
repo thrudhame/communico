@@ -328,6 +328,163 @@ suite.test('joined state deltas exclude returned state events but retain filtere
   );
 });
 
+suite.test('state_after uses the publication end, retains timeline state, and obeys filters and departure', async () => {
+  const app = theApp();
+  const alice = await suite.registerTestUser('sy-after-a', 'pw');
+  const bob = await suite.registerTestUser('sy-after-b', 'pw');
+  const signer = app.tenant.signer();
+  const { roomId } = await createRoom(app.store, {
+    creator: alice.user_id,
+    preset: 'public_chat',
+  }, signer);
+  const room = await openRoom(app.store, roomId);
+  await join(room, bob.user_id, signer);
+  const initial = await sync(bob.access_token!, '&use_state_after=true');
+  const first = roomSection(initial, 'join', roomId)!;
+  assert(!('state' in first));
+  assert(
+    ((first.state_after as Json).events as Json[]).some((e) =>
+      e.type === 'm.room.create'
+    ),
+  );
+  const name = await sendLocal(room, {
+    type: 'm.room.name',
+    state_key: '',
+    sender: alice.user_id,
+    content: { name: 'end of timeline' },
+  }, signer);
+  const query = '&use_state_after=true&since=' + initial.next_batch;
+  const after = roomSection(
+    await sync(bob.access_token!, query),
+    'join',
+    roomId,
+  )!;
+  assert(!('state' in after));
+  assertEquals(
+    ((after.state_after as Json).events as Json[]).map((e) => e.event_id),
+    [name.eventId],
+  );
+  for (const timeline of [{ not_types: ['m.room.name'] }, { limit: 0 }]) {
+    const entry = roomSection(
+      await sync(
+        bob.access_token!,
+        query + '&filter=' +
+          encodeURIComponent(JSON.stringify({ room: { timeline } })),
+      ),
+      'join',
+      roomId,
+    )!;
+    assertEquals((entry.timeline as Json).events, []);
+    assertEquals(
+      ((entry.state_after as Json).events as Json[]).map((e) => e.event_id),
+      [name.eventId],
+    );
+  }
+  const full = roomSection(
+    await sync(bob.access_token!, query + '&full_state=true'),
+    'join',
+    roomId,
+  )!;
+  assert(
+    ((full.state_after as Json).events as Json[]).some((e) =>
+      e.type === 'm.room.create'
+    ),
+  );
+  const baseline = await sync(bob.access_token!, '&use_state_after=true');
+  await sendLocal(room, {
+    type: 'm.room.message',
+    sender: alice.user_id,
+    content: { body: 'no state change' },
+  }, signer);
+  const empty = roomSection(
+    await sync(
+      bob.access_token!,
+      '&use_state_after=true&since=' + baseline.next_batch,
+    ),
+    'join',
+    roomId,
+  )!;
+  assertEquals((empty.state_after as Json).events, []);
+  assert(!('state' in empty));
+  const departed = await leave(room, bob.user_id, signer);
+  await sendLocal(room, {
+    type: 'm.room.name',
+    state_key: '',
+    sender: alice.user_id,
+    content: { name: 'too late' },
+  }, signer);
+  const left = roomSection(
+    await sync(
+      bob.access_token!,
+      '&use_state_after=true&since=' + baseline.next_batch,
+    ),
+    'leave',
+    roomId,
+  )!;
+  assert(!('state' in left));
+  assertEquals(
+    ((left.state_after as Json).events as Json[]).map((e) => e.event_id),
+    [departed.eventId],
+  );
+  const legacy = roomSection(
+    await sync(alice.access_token!, '&use_state_after=false'),
+    'join',
+    roomId,
+  )!;
+  assert('state' in legacy && !('state_after' in legacy));
+
+  const cut = await sync(alice.access_token!, '&use_state_after=true');
+  const beforeCut = await sendLocal(room, {
+    type: 'm.room.name',
+    state_key: '',
+    sender: alice.user_id,
+    content: { name: 'captured publication' },
+  }, signer);
+  const original = app.server.tx.bind(app.server);
+  let armed = true;
+  let later = '';
+  app.server.tx = (async (fn: Parameters<typeof original>[0]) => {
+    const result = await original(fn);
+    if (
+      armed && result !== null && typeof result === 'object' &&
+      'counters' in result
+    ) {
+      armed = false;
+      later = (await sendLocal(room, {
+        type: 'm.room.name',
+        state_key: '',
+        sender: alice.user_id,
+        content: { name: 'after snapshot' },
+      }, signer)).eventId;
+    }
+    return result;
+  }) as typeof app.server.tx;
+  let bounded: Json;
+  try {
+    bounded = await sync(
+      alice.access_token!,
+      '&use_state_after=true&since=' + cut.next_batch,
+    );
+  } finally {
+    app.server.tx = original;
+  }
+  assert(later);
+  assertEquals(
+    ((roomSection(bounded, 'join', roomId)!.state_after as Json)
+      .events as Json[]).map((e) => e.event_id),
+    [beforeCut.eventId],
+  );
+  const next = await sync(
+    alice.access_token!,
+    '&use_state_after=true&since=' + bounded.next_batch,
+  );
+  assertEquals(
+    ((roomSection(next, 'join', roomId)!.state_after as Json).events as Json[])
+      .map((e) => e.event_id),
+    [later],
+  );
+});
+
 suite.test('OOB invitation and rejection advance tokens once; ignored invitations stay hidden', async () => {
   const app = theApp();
   const user = await suite.registerTestUser('sy-oob', 'pw');
@@ -462,6 +619,23 @@ suite.test('incremental sync exposes fork-resolved published state, not just the
   assert(
     state.some((e) => e.event_id === bobJoin.eventId),
     'resolved join replacing ban must reach sync state',
+  );
+  const end = roomSection(
+    await sync(
+      alice.access_token!,
+      '&since=' + before.next_batch +
+        '&use_state_after=true&filter=' +
+        encodeURIComponent('{"room":{"timeline":{"types":[]}}}'),
+    ),
+    'join',
+    roomId,
+  )!;
+  assertEquals((end.timeline as Json).events, []);
+  assert(
+    ((end.state_after as Json).events as Json[]).some((e) =>
+      e.event_id === bobJoin.eventId
+    ),
+    'state_after is the resolved publication, not the trigger after-state',
   );
 });
 

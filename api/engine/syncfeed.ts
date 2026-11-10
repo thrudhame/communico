@@ -63,6 +63,7 @@ export interface SyncInputs {
   timeoutMs: number;
   filter: RoomFilter;
   fullState: boolean;
+  useStateAfter?: boolean;
   setPresence?: string;
 }
 
@@ -130,25 +131,37 @@ async function roomTimeline(
     if (event !== null) eligible.push({ row, event });
   }
   const trimmed = eligible.length > limit;
-  const selected = trimmed ? eligible.slice(eligible.length - limit) : eligible;
+  const selected = limit === 0
+    ? []
+    : trimmed
+    ? eligible.slice(eligible.length - limit)
+    : eligible;
   const returned = selected.map((item) => item.row);
   const events = selected.map((item) => item.event);
   const start = returned[0];
-  const atStart = await stateAtSeq(room, start?.seq ?? end, start?.stay);
+  const atStart = await stateAtSeq(
+    room,
+    i.useStateAfter ? end : start?.seq ?? end,
+    i.useStateAfter ? undefined : start?.stay,
+  );
   let stateRows = atStart;
   if (i.since !== null && !i.fullState) {
     const previous = new Map(
-      (await stateAtSeq(room, i.since.eSeq, start?.stay)).map((
+      (await stateAtSeq(
+        room,
+        i.since.eSeq,
+        i.useStateAfter ? undefined : start?.stay,
+      )).map((
         r,
       ) => [r.type + '\0' + r.stateKey, r.eventId]),
     );
-    // A delta supplies state not already delivered by the timeline. Keep
-    // the inclusive publication (fork resolution may change other keys),
-    // but subtract only events actually rendered, after filtering/visibility.
+    // Legacy deltas omit state already in the timeline. state_after is the
+    // complete end-cut delta: clients must ignore timeline state in this mode.
+    // Both read resolved publications, not the trigger event's DAG state.
     const inTimeline = new Set(events.map((event) => event.event_id));
     stateRows = atStart.filter((r) =>
       previous.get(r.type + '\0' + r.stateKey) !== r.eventId &&
-      !inTimeline.has(r.eventId)
+      (i.useStateAfter || !inTimeline.has(r.eventId))
     );
   }
   const stateEvents: Record<string, unknown>[] = [];
@@ -169,7 +182,7 @@ async function roomTimeline(
   }
   const prevE = trimmed && returned.length ? returned[0].seq - 1 : end;
   const entry: Record<string, unknown> = {
-    state: { events: stateEvents },
+    [i.useStateAfter ? 'state_after' : 'state']: { events: stateEvents },
     timeline: {
       events,
       limited: raw.length > returned.length,
@@ -487,7 +500,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     ) {
       leave[roomId] = {
         timeline: { events: [], limited: false, prev_batch: '' },
-        state: { events },
+        [i.useStateAfter ? 'state_after' : 'state']: { events },
       };
     }
   }
