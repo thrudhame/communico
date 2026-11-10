@@ -450,7 +450,7 @@ export function loadConfig(opts: {
     };
     enumLeaf('keychange', ['accept', 'warn', 'block']);
     enumLeaf('mode', ['open', 'closed']);
-    enumLeaf('lookups', ['known', 'none']);
+    enumLeaf('lookups', ['all', 'known', 'none']);
     const kvh = f.keyvalidityhours;
     if (typeof kvh === 'number' && kvh > 168) {
       problems.push(

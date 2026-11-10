@@ -897,6 +897,24 @@ Deno.test('encryption controls have independent strict booleans and real shipped
   }
 });
 
+Deno.test('remote discovery follows the spec by default and retains layered known/none opt-outs', () => {
+  const defaultsPath = 'defaults/communico.toml';
+  assertEquals(
+    loadConfig({ defaultsPath, configPath: null, env: {} }).config.federation
+      .lookups,
+    'all',
+  );
+  for (const mode of ['all', 'known', 'none']) {
+    const loaded = loadConfig({
+      defaultsPath,
+      configPath: null,
+      env: { COMMUNICO_FEDERATION_LOOKUPS: mode },
+    });
+    assertEquals(loaded.config.federation.lookups, mode);
+    assertEquals(loaded.sources['federation.lookups'], 'env');
+  }
+});
+
 Deno.test('shutdown grace defaults to ten seconds and rejects negative values', () => {
   const defaultsPath = 'defaults/communico.toml';
   assertEquals(

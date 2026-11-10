@@ -182,7 +182,11 @@ test('publicRooms: signed GET/POST, search, pagination and ignored network param
   assertEquals((post.body.chunk as Json[])[0].name, 'Published Alpha');
 });
 
-test('remote public profiles: held members only, field shapes, policy gates and no outbound proxy', async () => {
+test('known-only remote profiles: held members, field shapes and no outbound proxy', async () => {
+  setConfigForTests({
+    server: { name: self },
+    federation: { lookups: 'known' },
+  });
   const fake = await startFakeServer({
     ourKeyDoc: async () => {
       const response = await matrix(

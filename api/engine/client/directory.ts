@@ -1,5 +1,5 @@
 import { theApp } from '#engine/app.ts';
-import { serverName } from '#engine/config.ts';
+import { config, serverName } from '#engine/config.ts';
 import { localpartOf, splitId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
@@ -21,6 +21,7 @@ import {
 import { requireRoom, stateAtSeq, versionOf } from './room.ts';
 import { joinedRooms, serversInRoom } from './membership.ts';
 import { writeStateKey } from './write.ts';
+import { discoveryRequest } from '#engine/federation/discovery.ts';
 
 export function aliasIsLocal(alias: string) {
   const parts = splitId(alias);
@@ -42,6 +43,42 @@ export async function createAlias(
   await registerAlias(theApp().server, alias, roomId, creator);
 }
 export async function resolveAlias(alias: string) {
+  const parts = splitId(alias), fed = config().federation;
+  if (!aliasIsLocal(alias)) {
+    if (!fed.enabled || fed.lookups === 'none') {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'unknown alias');
+    }
+    if (
+      fed.lookups === 'all' && alias.startsWith('#') &&
+      parts.localpart.length > 0 && parts.server !== null &&
+      parts.server.length > 0
+    ) {
+      const answer = await discoveryRequest(
+        theApp().server,
+        theApp().tenant.signer(),
+        {
+          destination: parts.server,
+          path: '/_matrix/federation/v1/query/directory?room_alias=' +
+            encodeURIComponent(alias),
+        },
+      );
+      const data = answer as { room_id?: unknown; servers?: unknown } | null;
+      if (
+        data === null || typeof data !== 'object' ||
+        typeof data.room_id !== 'string' || !data.room_id.startsWith('!') ||
+        !Array.isArray(data.servers) || !data.servers.every((server) =>
+          typeof server === 'string' && server.length > 0
+        )
+      ) {
+        throw new MatrixError(
+          502,
+          'M_UNKNOWN',
+          'invalid remote directory response',
+        );
+      }
+      return { room_id: data.room_id, servers: data.servers as string[] };
+    }
+  }
   const roomId = await lookupAlias(theApp().server, alias);
   if (roomId === null || await directory.purgeable(theApp().server, roomId)) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
