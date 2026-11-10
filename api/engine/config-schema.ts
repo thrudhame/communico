@@ -18,6 +18,18 @@ export const SCHEMA = {
   admin: {
     socket: 'string',
   },
+  hierarchy: {
+    pagesize: 'int',
+    maxpagesize: 'int',
+    maxdepth: 'int',
+    sessionseconds: 'int',
+    maxsessions: 'int',
+    maxrooms: 'int',
+  },
+  peeking: {
+    maxevents: 'int',
+    maxtimeoutms: 'int',
+  },
   media: {
     root: 'string',
     maxbytes: 'int',
@@ -96,6 +108,7 @@ export const SCHEMA = {
     pendingmax: 'int',
     pendingdays: 'int',
     lookups: 'string',
+    discoveryservers: 'int',
     missingwaitms: 'int',
     missinglimit: 'int',
     missingbudgetms: 'int',

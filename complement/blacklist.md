@@ -17,14 +17,13 @@ build-tagged per file and are triaged in `complement/BASELINE.md`, not here.
 - 3PID / identity-server / email+msisdn _issuance_ and history surgery
   (retention/purge/erasure — native rooms are append-only by ruling):
   case-level, inside runnable files — triaged in BASELINE.md.
-- **Not a proxy** (M5a user ruling, `plans/m5-federation/design.md`):
-  the spec's anonymous client lookups (`/profile/{userId}`,
-  `/directory/room/{alias}`) are answered **only from what we hold** —
-  never a request on an anonymous caller's behalf. Two tests inside the
-  otherwise-runnable federation files stay red on purpose:
-  `TestOutboundFederationProfile` and
-  `TestRemoteAliasRequestsUnderstandUnicode` expect hs1 to query a server
-  it has never met on a stranger's word.
+
+The user's spec-gaps P01 ruling supersedes the old M5a no-proxy default for
+alias/profile discovery. Anonymous remote lookups now follow the spec through
+normal federation admission; `federation.lookups=known` and `none` retain the
+admin alternatives. `TestOutboundFederationProfile` and
+`TestRemoteAliasRequestsUnderstandUnicode` are required to pass, not intentional
+red cases.
 
 - tests/csapi/admin_test.go
 - tests/msc2836/msc2836_test.go

@@ -462,6 +462,7 @@ Deno.test('ACL: room-scoped federation endpoint inventory has an admitted engine
     'v1/state/#roomId/get.ts': 'serveState',
     'v1/state_ids/#roomId/get.ts': 'serveStateIds',
     'v1/timestamp_to_event/#roomId/get.ts': 'serveTimestamp',
+    'v1/hierarchy/#roomId/get.ts': 'federationHierarchy',
   };
   const found: string[] = [];
   async function walk(prefix: string) {

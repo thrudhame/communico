@@ -300,6 +300,30 @@ export function loadConfig(opts: {
     );
   }
 
+  const peeking = built.peeking as Record<string, unknown> | undefined;
+  for (const [key, value] of Object.entries(peeking ?? {})) {
+    if (typeof value === 'number' && value < (key === 'maxevents' ? 1 : 0)) {
+      problems.push(`config: peeking.${key}: invalid capacity`);
+    }
+  }
+  const hierarchy = built.hierarchy as Record<string, unknown> | undefined;
+  for (const [key, value] of Object.entries(hierarchy ?? {})) {
+    if (typeof value === 'number' && value < (key === 'maxdepth' ? 0 : 1)) {
+      problems.push(
+        `config: hierarchy.${key}: expected >= ${key === 'maxdepth' ? 0 : 1}`,
+      );
+    }
+  }
+  if (
+    typeof hierarchy?.pagesize === 'number' &&
+    typeof hierarchy.maxpagesize === 'number' &&
+    hierarchy.pagesize > hierarchy.maxpagesize
+  ) {
+    problems.push(
+      'config: hierarchy.pagesize: expected <= hierarchy.maxpagesize',
+    );
+  }
+
   const grace = (built.server as Record<string, unknown> | undefined)
     ?.shutdowngraceseconds;
   if (typeof grace === 'number' && grace < 0) {
@@ -450,8 +474,14 @@ export function loadConfig(opts: {
     };
     enumLeaf('keychange', ['accept', 'warn', 'block']);
     enumLeaf('mode', ['open', 'closed']);
-    enumLeaf('lookups', ['known', 'none']);
+    enumLeaf('lookups', ['all', 'known', 'none']);
     const kvh = f.keyvalidityhours;
+    const discoveryServers = f.discoveryservers;
+    if (typeof discoveryServers === 'number' && discoveryServers < 1) {
+      problems.push(
+        'config: federation.discoveryservers (COMMUNICO_FEDERATION_DISCOVERYSERVERS): expected >= 1',
+      );
+    }
     if (typeof kvh === 'number' && kvh > 168) {
       problems.push(
         `config: federation.keyvalidityhours (${
@@ -639,6 +669,8 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
+  peeking?: Partial<Config['peeking']>;
+  hierarchy?: Partial<Config['hierarchy']>;
   push?: {
     readretentiondays?: number;
     deliverygiveuphours?: number;

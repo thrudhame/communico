@@ -106,6 +106,8 @@ export type MessagesWindow = {
   limit: number;
   lazyLoadMembers: boolean;
   containsUrl?: boolean;
+  // Room previews never start a history fetch or change participation.
+  localOnly?: boolean;
 };
 export async function messages(
   w: MessagesWindow,
@@ -156,6 +158,10 @@ export async function messages(
       break;
     }
     if (step.kind === 'gap') {
+      if (w.localOnly) {
+        frontier = step.cursor;
+        break;
+      }
       if (!filled) {
         filled = true;
         const signer = theApp().tenant.signer();
@@ -178,6 +184,10 @@ export async function messages(
       break;
     }
     if (step.kind === 'frontier') {
+      if (w.localOnly) {
+        frontier = step.cursor;
+        break;
+      }
       if (filled) {
         frontier = step.cursor;
         break;

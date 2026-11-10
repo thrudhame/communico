@@ -5,8 +5,8 @@
 // queues the same way); (3) open mode + no roster row: inbound proceeds
 // (the knock records after the signature verifies), outbound by
 // authenticated user intent lands on the roster as trust 'ca'; (4) a
-// 'blocking' key change → 403. Anonymous lookups never reach here as
-// outbound intent. approve/reject are the operator's doors on the door
+// 'blocking' key change → 403. Read-only discovery never becomes outbound
+// participation intent or adds a roster row. approve/reject are the operator's doors on the door
 // log (a 'refused' row is a delivery record, not a knock). Ported from
 // doltgres; the server file's Db is explicit (no global database).
 import { config } from '#engine/config.ts';
@@ -22,7 +22,8 @@ import {
 
 export type GateContext =
   | { kind: 'inbound'; endpoint: string }
-  | { kind: 'outbound'; user: string; what: string };
+  | { kind: 'outbound'; user: string; what: string }
+  | { kind: 'lookup'; what: string };
 
 async function hasBlockingChange(server: Db, name: string): Promise<boolean> {
   const rows = await server.query(
@@ -51,8 +52,16 @@ export async function admit(
   if (peer === null && mode === 'closed') {
     const detail = ctx.kind === 'inbound'
       ? ctx.endpoint
-      : `${ctx.user} — ${ctx.what}`;
-    await recordPending(server, name, ctx.kind, false, detail);
+      : ctx.kind === 'outbound'
+      ? `${ctx.user} - ${ctx.what}`
+      : ctx.what;
+    await recordPending(
+      server,
+      name,
+      ctx.kind === 'inbound' ? 'inbound' : 'outbound',
+      false,
+      detail,
+    );
     throw new MatrixError(
       403,
       'M_FORBIDDEN',

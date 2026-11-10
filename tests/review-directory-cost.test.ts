@@ -2,7 +2,7 @@ import { assertEquals } from '@std/assert';
 import { type Conn, operations } from '#engine/store/db.ts';
 import { startHttp } from '#tests/http-app.ts';
 
-Deno.test('directory: live join-rule discovery reads only its selected state key', async () => {
+Deno.test('directory: discovery reads only join-rule and history-visibility state keys', async () => {
   const http = await startHttp();
   const app = http.app;
   const original = app.store.room.bind(app.store);
@@ -68,7 +68,7 @@ Deno.test('directory: live join-rule discovery reads only its selected state key
     assertEquals(found.results.map((r: { user_id: string }) => r.user_id), [
       owner.user_id,
     ]);
-    assertEquals(types, ['m.room.join_rules']);
+    assertEquals(types, ['m.room.join_rules', 'm.room.history_visibility']);
   } finally {
     app.store.room = original;
     await http.close();

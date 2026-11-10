@@ -120,7 +120,7 @@ Deno.test('gate: closed mode + a local user’s outbound → 403 + pending(outbo
       assertEquals(rows[0].kind, 'outbound');
       assertEquals(
         rows[0].detail,
-        '@alice:localhost — invite @bob:stranger.test',
+        '@alice:localhost - invite @bob:stranger.test',
       );
     } finally {
       setConfigForTests({ federation: { mode: 'open' } });

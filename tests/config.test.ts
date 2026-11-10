@@ -1,7 +1,7 @@
 // tests/config.test.ts — the config loader: merge order, leaf-only env,
 // strict types, full error listing, COMMUNICO_CONFIG, absent overlay, shell
 // quoting. Pure: temp files, no DB, no server.
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertThrows } from '@std/assert';
 import { dirname } from '@std/path';
 import {
   coerceEnv,
@@ -11,7 +11,19 @@ import {
   resolvePaths,
 } from '#engine/config.ts';
 
-const FULL = `[server]
+const FULL = `[peeking]
+maxevents = 50
+maxtimeoutms = 30000
+
+[hierarchy]
+pagesize = 50
+maxpagesize = 100
+maxdepth = 0
+sessionseconds = 300
+maxsessions = 1000
+maxrooms = 10000
+
+[server]
 name = "localhost"
 port = 8008
 shutdowngraceseconds = 10
@@ -96,6 +108,7 @@ witnesses = 3
 pendingmax = 10000
 pendingdays = 30
 lookups = "known"
+discoveryservers = 3
 missingwaitms = 750
 missinglimit = 10
 missingbudgetms = 8000
@@ -778,7 +791,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('84 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('93 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -799,18 +812,82 @@ Deno.test('84 leaves total across the sections (the surface tripwire)', async ()
   assertEquals(counts, [
     ['server', 4],
     ['admin', 1],
+    ['hierarchy', 6],
+    ['peeking', 2],
     ['media', 20],
     ['encryption', 3],
     ['e2ee', 9],
     ['push', 5],
     ['store', 5],
     ['preview', 4],
-    ['federation', 33],
+    ['federation', 34],
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    84,
+    93,
     'the whole config surface includes remote media resource and cache policy leaves',
+  );
+});
+
+Deno.test('peeking limits are layered and reject invalid capacities', () => {
+  const loaded = loadConfig({
+    defaultsPath: 'defaults/communico.toml',
+    configPath: null,
+    env: {
+      COMMUNICO_PEEKING_MAXEVENTS: '3',
+      COMMUNICO_PEEKING_MAXTIMEOUTMS: '10',
+    },
+  });
+  assertEquals(loaded.config.peeking, { maxevents: 3, maxtimeoutms: 10 });
+  for (
+    const env of [{ COMMUNICO_PEEKING_MAXEVENTS: '0' }, {
+      COMMUNICO_PEEKING_MAXTIMEOUTMS: '-1',
+    }] as Record<string, string>[]
+  ) {
+    assert(
+      loadFail({
+        defaultsPath: 'defaults/communico.toml',
+        configPath: null,
+        env,
+      }).some((p) => p.includes('peeking.')),
+    );
+  }
+});
+
+Deno.test('hierarchy limits are layered and reject invalid capacities', () => {
+  const fromEnv = loadConfig({
+    defaultsPath: 'defaults/communico.toml',
+    configPath: null,
+    env: {
+      COMMUNICO_HIERARCHY_PAGESIZE: '7',
+      COMMUNICO_HIERARCHY_MAXDEPTH: '4',
+    },
+  });
+  assertEquals(fromEnv.config.hierarchy.pagesize, 7);
+  assertEquals(fromEnv.config.hierarchy.maxdepth, 4);
+  for (
+    const key of [
+      'PAGESIZE',
+      'MAXPAGESIZE',
+      'SESSIONSECONDS',
+      'MAXSESSIONS',
+      'MAXROOMS',
+    ]
+  ) {
+    assert(
+      loadFail({
+        defaultsPath: 'defaults/communico.toml',
+        configPath: null,
+        env: { ['COMMUNICO_HIERARCHY_' + key]: '0' },
+      }).some((p) => p.includes('hierarchy.')),
+    );
+  }
+  assert(
+    loadFail({
+      defaultsPath: 'defaults/communico.toml',
+      configPath: null,
+      env: { COMMUNICO_HIERARCHY_PAGESIZE: '101' },
+    }).some((p) => p.includes('maxpagesize')),
   );
 });
 
@@ -893,6 +970,45 @@ Deno.test('encryption controls have independent strict booleans and real shipped
       loadFail({ defaultsPath, configPath: null, env: { [name]: '1' } }).some((
         problem,
       ) => problem.includes(name) && problem.includes('expected bool')),
+    );
+  }
+});
+
+Deno.test('remote discovery follows the spec by default and retains layered known/none opt-outs', () => {
+  const defaultsPath = 'defaults/communico.toml';
+  assertEquals(
+    loadConfig({ defaultsPath, configPath: null, env: {} }).config.federation
+      .lookups,
+    'all',
+  );
+  for (const mode of ['all', 'known', 'none']) {
+    const loaded = loadConfig({
+      defaultsPath,
+      configPath: null,
+      env: { COMMUNICO_FEDERATION_LOOKUPS: mode },
+    });
+    assertEquals(loaded.config.federation.lookups, mode);
+    assertEquals(loaded.sources['federation.lookups'], 'env');
+  }
+});
+
+Deno.test('discovery server attempts follow the standard-server default and are admin configurable', () => {
+  const load = (env: Record<string, string>) =>
+    loadConfig({
+      defaultsPath: 'defaults/communico.toml',
+      configPath: null,
+      env,
+    }).config;
+  const value = (env: Record<string, string>) =>
+    (load(env).federation as unknown as Record<string, unknown>)
+      .discoveryservers;
+  assertEquals(value({}), 3);
+  assertEquals(value({ COMMUNICO_FEDERATION_DISCOVERYSERVERS: '7' }), 7);
+  for (const limit of ['0', '-1']) {
+    assertThrows(
+      () => load({ COMMUNICO_FEDERATION_DISCOVERYSERVERS: limit }),
+      ConfigError,
+      'discoveryservers',
     );
   }
 });

@@ -3,7 +3,7 @@
 // cover the remaining public/protected splits and storage round-trips.
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
-import { config } from '#engine/config.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
 const { matrix, registerTestUser, test } = httpSuite('HTTP client data');
 type Json = Record<string, unknown>;
 
@@ -23,14 +23,17 @@ async function call(
   return { status: response.status, body: await response.json() as Json };
 }
 
-test('profile of a foreign-server user → 404 M_NOT_FOUND', async () => {
-  // Original http-contract.test.ts assertion; all remote-profile queries
-  // wait for 5b, including the old answer-from-held-members branch.
-  const res = await matrix(
-    new Request('http://x/_matrix/client/v3/profile/@nobody:x'),
-  );
-  assertEquals(res.status, 404);
-  assertEquals((await res.json()).errcode, 'M_NOT_FOUND');
+test('known-only profile policy returns 404 M_NOT_FOUND for an unknown foreign user', async () => {
+  setConfigForTests({ federation: { lookups: 'known' } });
+  try {
+    const res = await matrix(
+      new Request('http://x/_matrix/client/v3/profile/@nobody:x'),
+    );
+    assertEquals(res.status, 404);
+    assertEquals((await res.json()).errcode, 'M_NOT_FOUND');
+  } finally {
+    setConfigForTests({});
+  }
 });
 
 test('local profile: public combined reads, self-only writes, null clears and absent keys', async () => {

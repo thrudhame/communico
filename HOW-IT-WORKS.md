@@ -265,6 +265,57 @@ inherited value is below `state_default + 1`; 150 is not an unconditional floor.
 
 ## Federation and delivery
 
+Client and federation public directories use one published-state metadata
+serializer, including room types. Both filter `room_types` (with `null` for
+untyped rooms) before counting and pagination. User-directory candidates include
+unlisted world-readable rooms, while retaining the local-account scope.
+(`api/engine/client/{directory,summary}.ts`)
+
+`/room_summary` reads reuse that metadata and separate discovery
+access: joined/invited users, public or supported knock rules, world-readable
+history, or current membership in a restricted room's allowed rooms. Remote
+summaries use signed federation hierarchy and are filtered again for the user;
+inspection creates neither room participation nor peer-roster entries. Anonymous
+summaries use held public, knockable or world-readable data only; remote summary
+requests require authentication. Other v1 rooms and media routes stay protected
+through the existing folder-level authentication placement.
+`federation.discoveryservers` controls the server-attempt cap (default 3).
+(`api/engine/client/discovery.ts`, `api/engine/room/restricted.ts`)
+
+Remote discovery applies the shared summary schema's public default when
+`join_rule` is omitted, as standard servers may do. Held private summaries always
+serialize their explicit join rule.
+
+Client space hierarchy walks valid, redaction-aware child links depth-first,
+ordered by valid ASCII order, timestamp and room ID. Opaque five-minute sessions
+retain the pending stack and visited rooms, bind user/root/depth/suggested filters,
+and recheck access on every page. Unknown children use signed via discovery;
+remote summaries are filtered again for the user, and remote inaccessible children
+are not retried. Federation serves one held root and its immediate children only,
+distinguishing known inaccessible children from unknown rooms. Neither endpoint
+joins rooms or expands the peer roster. The layered `hierarchy` settings control
+page sizes (50 default, 100 cap), optional depth cap (0 = unrestricted), session
+lifetime/capacity and retained traversal-room budget. Exhaustion fails explicitly,
+not with a falsely complete partial walk. Sessions expire on process restart.
+(`api/engine/client/hierarchy.ts`)
+
+Authenticated room `initialSync` and room-scoped `/events` preview held rooms
+without joining or fetching history. Outsiders require world-readable state;
+banned and forgotten readers are refused. Former joined members retain their
+departure cut for both messages and state, not later publications; declining an
+invitation does not grant private state. Initial messages use the shared local-only
+timeline walk and chronological output, real pagination tokens, and only the
+caller's room account data. Event polls arm listeners before reading, recheck
+access, and clean up on cancellation or timeout. Layered `peeking.maxevents`
+(default 50) and `peeking.maxtimeoutms` (default 30000) bound pages and waits.
+(`api/engine/client/peeking.ts`)
+
+Alias and profile discovery ask remote servers by default, including anonymous
+requests, through signed, admission-gated federation. `federation.lookups=known`
+restricts answers to held data; `none` disables remote lookup answers. Discovery
+never adds a participation roster entry.
+(`api/engine/federation/{discovery,gate}.ts`)
+
 Federation has its own request-signature/admission boundary and per-version
 event-signature verification. Keys are looked up by server and key id with
 the required validity floor; failure to obtain or verify a key refuses the

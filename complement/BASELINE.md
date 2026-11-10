@@ -1,15 +1,30 @@
-# Complement baseline - 2026-11-06 23:16:36 PST
+# Complement baseline - 2026-11-10 02:13:39 PST
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit 5535f3bc81cec266f83f3d00edf691276bc656c4)
+- image: communico-complement:local (commit f2061ac71564b26ff98c01eb4df20342f31facee)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 59
+- failing tests: 18
 
-The recorded image commit predates publication's timestamp rewrite. Its reachable
-equivalent is `d618b92bc8f34b8951515b855f213d39e87ca0e9`; both commits have
-tree `5a8738d3fda39eb6537e9e19faa887ec3bac09ce` (verified with
-`git rev-parse <commit>^{tree}`). Only commit metadata changed.
+## Change from the previous baseline
+
+No new failures. The previous 59 failing tests/subtests decreased to 18;
+all 41 removed entries were observed passing, not merely absent or skipped.
+This image uses f2061ac production code; 92316a7 changes native test inventory
+and assertions only. The same production inputs passed real discovery interop
+against stock Synapse and tuwunel.
+
+| # | Newly passing coverage |
+|---|---|
+| 1 | Client space summary graph, depth, pagination, redacted links, suggested-only and join-rule cases; federated client spaces |
+| 2 | Restricted room local joins, creator-free v11/v12 joins, remote joins, failover, local-user joins and local/federation space summaries |
+| 3 | Room-summary allowed-room IDs, including restricted and non-restricted cases |
+| 4 | `TestOutboundFederationProfile` and `TestRemoteAliasRequestsUnderstandUnicode`, required by OPEN-P01 |
+| 5 | Federation/local PNG thumbnail cases, remote PNG client-v1 thumbnail case, filename override cases and client-v1 media without a filename |
+| 6 | `TestMSC4297StateResolutionV2_1_starts_from_empty_set` |
+
+Results are observations of this run, including previously flaky media cases;
+they do not imply that this discovery change corrected every listed subsystem.
 
 ## Per-setting runs
 
@@ -28,62 +43,21 @@ Package totals above count each package once, failing if any pass fails.
 
 ## Failing tests (red to beat)
 
-- github.com/matrix-org/complement/tests TestOutboundFederationProfile/Outbound_federation_can_query_profile_data
-- github.com/matrix-org/complement/tests TestOutboundFederationProfile
-- github.com/matrix-org/complement/tests TestRemoteAliasRequestsUnderstandUnicode
-- github.com/matrix-org/complement/tests TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
+- github.com/matrix-org/complement/tests TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
 - github.com/matrix-org/complement/tests TestJoinFederatedRoomFromApplicationServiceBridgeUser
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII/Can_download_specifying_a_different_ASCII_file_name_over__matrix/client/v1/media/download
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation_via__matrix/client/v1/media/download
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_specifying_a_different_Unicode_file_name_over__matrix/client/v1/media/download
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode
-- github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/ASCII
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel
 - github.com/matrix-org/complement/tests TestMediaFilenames
 - github.com/matrix-org/complement/tests TestMediaWithoutFileName/parallel/Can_download_without_a_file_name_over_federation
 - github.com/matrix-org/complement/tests TestMediaWithoutFileName/parallel
 - github.com/matrix-org/complement/tests TestMediaWithoutFileName
-- github.com/matrix-org/complement/tests TestMediaWithoutFileNameCSMediaV1/parallel/Can_download_without_a_file_name_over_federation
-- github.com/matrix-org/complement/tests TestMediaWithoutFileNameCSMediaV1/parallel
-- github.com/matrix-org/complement/tests TestMediaWithoutFileNameCSMediaV1
-- github.com/matrix-org/complement/tests TestLocalPngThumbnail/test_/_matrix/media/v3_endpoint
-- github.com/matrix-org/complement/tests TestLocalPngThumbnail/test_/_matrix/client/v1/media_endpoint
-- github.com/matrix-org/complement/tests TestLocalPngThumbnail
 - github.com/matrix-org/complement/tests TestRemotePngThumbnail/test_/_matrix/media/v3_endpoint
-- github.com/matrix-org/complement/tests TestRemotePngThumbnail/test_/_matrix/client/v1/media_endpoint
 - github.com/matrix-org/complement/tests TestRemotePngThumbnail
-- github.com/matrix-org/complement/tests TestFederationThumbnail
-- github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryLocal
-- github.com/matrix-org/complement/tests TestRestrictedRoomsSpacesSummaryFederation
-- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin/Join_should_succeed_when_joined_to_allowed_room
-- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin/Join_should_fail_when_left_allowed_room
-- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoin
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_succeed_when_joined_to_allowed_room
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin/Join_should_fail_when_left_allowed_room
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoin
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinLocalUser
-- github.com/matrix-org/complement/tests TestRestrictedRoomsRemoteJoinFailOver
-- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
-- github.com/matrix-org/complement/tests TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
-- github.com/matrix-org/complement/tests TestClientSpacesSummary/query_whole_graph
-- github.com/matrix-org/complement/tests TestClientSpacesSummary/max_depth
-- github.com/matrix-org/complement/tests TestClientSpacesSummary/suggested_only
-- github.com/matrix-org/complement/tests TestClientSpacesSummary/pagination
-- github.com/matrix-org/complement/tests TestClientSpacesSummary/redact_link
-- github.com/matrix-org/complement/tests TestClientSpacesSummary
-- github.com/matrix-org/complement/tests TestClientSpacesSummaryJoinRules
-- github.com/matrix-org/complement/tests TestFederatedClientSpaces
-- github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs/restricted_room_includes_allowed_room_ids
-- github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs/non-restricted_room_omits_allowed_room_ids
-- github.com/matrix-org/complement/tests TestRoomSummaryAllowedRoomIDs
 - github.com/matrix-org/complement/tests TestJumpToDateEndpoint
-- github.com/matrix-org/complement/tests TestMSC4297StateResolutionV2_1_starts_from_empty_set
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap/incremental
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap/full
 - github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap

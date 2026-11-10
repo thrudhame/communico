@@ -22,6 +22,22 @@ maxrequestbytes = 13107200
 # COMMUNICO_ADMIN_SOCKET
 socket = ""
 
+[peeking]
+# Tuwunel's event/initialSync cap; the existing sync long-poll ceiling.
+maxevents = 50
+maxtimeoutms = 30000
+
+[hierarchy]
+# Synapse's default page and five-minute pagination lifetime; tuwunel's page cap.
+pagesize = 50
+maxpagesize = 100
+# 0 leaves traversal depth unrestricted, like Synapse; each page has bounded work.
+maxdepth = 0
+sessionseconds = 300
+maxsessions = 1000
+# Bound retained traversal state; exceeding it returns an explicit error.
+maxrooms = 10000
+
 [media]
 # Byte-store root for the later content repository. COMMUNICO_MEDIA_ROOT
 root = "./.media"
@@ -231,11 +247,15 @@ witnesses = 3
 pendingmax = 10000
 pendingdays = 30
 # Anonymous lookups of remote users/aliases (the spec's public
-# /profile/{userId} and /directory/room/{alias}): "known" answers only
-# from what we already hold (users and rooms we share); "none" does not
-# answer them. We never ask a remote server on an anonymous caller's
-# behalf — that would make us an open proxy. COMMUNICO_FEDERATION_LOOKUPS
-lookups = "known"
+# /profile/{userId} and /directory/room/{alias}): "all" follows the spec
+# and asks the remote server through normal admission and signed transport.
+# "known" answers only from held state; "none" refuses remote lookups.
+# Read-only discovery never adds a participation peer.
+# COMMUNICO_FEDERATION_LOOKUPS
+lookups = "all"
+# Maximum servers tried for one room discovery, following Synapse's default.
+# COMMUNICO_FEDERATION_DISCOVERYSERVERS
+discoveryservers = 3
 # Missing prev_events on a pushed PDU: how long to wait for them to arrive
 # on their own before asking (the sender usually pushes them next), how many
 # events one get_missing_events may return to us, and the whole-transaction

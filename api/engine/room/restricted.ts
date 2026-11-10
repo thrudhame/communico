@@ -66,6 +66,26 @@ async function target(tx: RoomTx, user: string) {
 }
 
 type Witness = { room: Room; stay: number; group: number };
+/** Read-only discovery eligibility shares the authoritative allowed-room
+ * membership witness, without vouching, creating a stay or authoring a join. */
+export async function joinedAllowedRoom(
+  store: Room['store'],
+  user: string,
+  roomIds: readonly string[],
+): Promise<boolean> {
+  for (const id of roomIds) {
+    let room;
+    try {
+      room = await openRoom(store, id);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) continue;
+      throw error;
+    }
+    if (await witness(room, user) !== null) return true;
+  }
+  return false;
+}
+
 async function witness(room: Room, user: string): Promise<Witness | null> {
   return await room.tx(async (tx) => {
     const { stay, group } = await current(tx);
