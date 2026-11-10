@@ -300,6 +300,12 @@ export function loadConfig(opts: {
     );
   }
 
+  const peeking = built.peeking as Record<string, unknown> | undefined;
+  for (const [key, value] of Object.entries(peeking ?? {})) {
+    if (typeof value === 'number' && value < (key === 'maxevents' ? 1 : 0)) {
+      problems.push(`config: peeking.${key}: invalid capacity`);
+    }
+  }
   const hierarchy = built.hierarchy as Record<string, unknown> | undefined;
   for (const [key, value] of Object.entries(hierarchy ?? {})) {
     if (typeof value === 'number' && value < (key === 'maxdepth' ? 0 : 1)) {
@@ -663,6 +669,7 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
+  peeking?: Partial<Config['peeking']>;
   hierarchy?: Partial<Config['hierarchy']>;
   push?: {
     readretentiondays?: number;

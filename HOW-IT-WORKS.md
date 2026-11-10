@@ -295,6 +295,17 @@ lifetime/capacity and retained traversal-room budget. Exhaustion fails explicitl
 not with a falsely complete partial walk. Sessions expire on process restart.
 (`api/engine/client/hierarchy.ts`)
 
+Authenticated room `initialSync` and room-scoped `/events` preview held rooms
+without joining or fetching history. Outsiders require world-readable state;
+banned and forgotten readers are refused. Former joined members retain their
+departure cut for both messages and state, not later publications; declining an
+invitation does not grant private state. Initial messages use the shared local-only
+timeline walk and chronological output, real pagination tokens, and only the
+caller's room account data. Event polls arm listeners before reading, recheck
+access, and clean up on cancellation or timeout. Layered `peeking.maxevents`
+(default 50) and `peeking.maxtimeoutms` (default 30000) bound pages and waits.
+(`api/engine/client/peeking.ts`)
+
 Alias and profile discovery ask remote servers by default, including anonymous
 requests, through signed, admission-gated federation. `federation.lookups=known`
 restricts answers to held data; `none` disables remote lookup answers. Discovery

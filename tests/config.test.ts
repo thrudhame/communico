@@ -11,7 +11,11 @@ import {
   resolvePaths,
 } from '#engine/config.ts';
 
-const FULL = `[hierarchy]
+const FULL = `[peeking]
+maxevents = 50
+maxtimeoutms = 30000
+
+[hierarchy]
 pagesize = 50
 maxpagesize = 100
 maxdepth = 0
@@ -787,7 +791,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('91 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('93 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -809,6 +813,7 @@ Deno.test('91 leaves total across the sections (the surface tripwire)', async ()
     ['server', 4],
     ['admin', 1],
     ['hierarchy', 6],
+    ['peeking', 2],
     ['media', 20],
     ['encryption', 3],
     ['e2ee', 9],
@@ -819,9 +824,34 @@ Deno.test('91 leaves total across the sections (the surface tripwire)', async ()
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    91,
+    93,
     'the whole config surface includes remote media resource and cache policy leaves',
   );
+});
+
+Deno.test('peeking limits are layered and reject invalid capacities', () => {
+  const loaded = loadConfig({
+    defaultsPath: 'defaults/communico.toml',
+    configPath: null,
+    env: {
+      COMMUNICO_PEEKING_MAXEVENTS: '3',
+      COMMUNICO_PEEKING_MAXTIMEOUTMS: '10',
+    },
+  });
+  assertEquals(loaded.config.peeking, { maxevents: 3, maxtimeoutms: 10 });
+  for (
+    const env of [{ COMMUNICO_PEEKING_MAXEVENTS: '0' }, {
+      COMMUNICO_PEEKING_MAXTIMEOUTMS: '-1',
+    }] as Record<string, string>[]
+  ) {
+    assert(
+      loadFail({
+        defaultsPath: 'defaults/communico.toml',
+        configPath: null,
+        env,
+      }).some((p) => p.includes('peeking.')),
+    );
+  }
 });
 
 Deno.test('hierarchy limits are layered and reject invalid capacities', () => {

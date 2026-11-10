@@ -26,6 +26,10 @@ export const SCHEMA = {
     maxsessions: 'int',
     maxrooms: 'int',
   },
+  peeking: {
+    maxevents: 'int',
+    maxtimeoutms: 'int',
+  },
   media: {
     root: 'string',
     maxbytes: 'int',
