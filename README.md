@@ -323,6 +323,30 @@ ids shown only while the running sender owns the request. PDU expiry is derived
 from its queued timestamp and configured lifespan; reject-invite jobs have no
 expiry in the current core. CLI punctuation uses ASCII.
 
+### Content reports
+
+Authenticated clients can report events in rooms they are currently joined to,
+rooms without joining them, and local users without sharing a room. Event reports
+accept optional `reason` and integer `score`; room/user reports require a string
+`reason` (empty is allowed). Unknown/nonlocal user reports return success without
+revealing whether an account exists. Reports do not automatically redact, ban or
+send anything to other servers, and never copy event content or decrypt messages.
+
+Reports are durable server data, available only through the private admin socket:
+
+```sh
+curl --unix-socket /srv/communico/admin.sock -H 'Content-Type: application/json' \
+  -d '{"status":"open","limit":100}' http://localhost/v1/reports/list
+curl --unix-socket /srv/communico/admin.sock -H 'Content-Type: application/json' \
+  -d '{"id":1,"resolution":"Reviewed"}' http://localhost/v1/reports/resolve
+```
+
+List accepts `kind` (`event`, `room`, `user`), `status` (`open`, `resolved`),
+`limit` (1-1000) and `from` (the prior page's numeric `next`). With no filters it
+lists all reports, oldest first. Resolution is idempotent: the first resolution
+and its timestamp are retained. Reports are not deleted on resolution.
+Admin UI: TODO.
+
 ## Server lifecycle
 
 SIGTERM and SIGINT stop admission on all listeners. Admitted handlers and

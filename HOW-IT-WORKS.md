@@ -416,6 +416,22 @@ supervisor example.
 (`api/engine/config.ts:1-5`, `api/engine/config.ts:135-165`,
 `api/engine/config.ts:253-301`, `main.ts:20-42`, `main.ts:139-162`)
 
+## Content reports
+
+The shared client report handler validates event/room/user report bodies before
+delegating persistence to the server-owned reports table (server schema v22).
+Event reports require current joined membership and a visible same-room event;
+the room lock keeps admission ordered against local membership changes. Room
+reports do not require membership. Existing local users can be reported without
+shared rooms; unknown or nonlocal users receive a no-disclosure success response.
+(`api/engine/client/reports.ts`, `api/engine/server/reports.ts`)
+
+Reports store target identifiers, reporter, reason/score and resolution metadata,
+never copies of event content. They are not room events, projections, sync news
+or federation work. The private admin socket lists and resolves them through the
+same owner; resolving retains the first resolution and does not moderate events.
+(`api/admin/reports.ts`, `api/engine/server/schema.ts`)
+
 ## Scope and recorded evidence
 
 The checked-in Complement baseline records a red conformance baseline, not
