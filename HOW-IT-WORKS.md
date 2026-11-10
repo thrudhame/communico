@@ -280,6 +280,10 @@ nonempty, completed unfiltered walk. Alias listing also permits world-readable
 nonmembers. User directory search covers visible local accounts, not remote
 users. The v12 upgrade transformation sets tombstone power to 150 only if the
 inherited value is below `state_default + 1`; 150 is not an unconditional floor.
+Create and upgrade share version-aware creator-list validation. Malformed
+upgrade bodies, versions and v12 creator lists fail before replacement-room,
+alias, push-rule or tombstone effects; supported older versions ignore the
+v12-only creator field. Valid duplicates and the upgrader's own ID are retained.
 (`api/engine/client/timeline.ts:228-240`, `api/engine/client/directory.ts:127-144`,
 `api/engine/client/directory.ts:244-282`, `api/engine/client/upgrade.ts:65-77`)
 

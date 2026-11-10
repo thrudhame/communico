@@ -10,8 +10,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { splitId } from '#engine/ids.ts';
 import { assertCanonicalNumbers } from '#engine/canonical.ts';
-import { getRulebook } from '#engine/rulebook/index.ts';
-import { validAdditionalCreators } from '#engine/rulebook/auth-rules.ts';
+import { creationCreators, creationVersion } from './creation-input.ts';
 import {
   parsePowerLevels,
   requiredLevel,
@@ -113,12 +112,10 @@ export async function createRoom(
   if (opts.is_direct !== undefined && typeof opts.is_direct !== 'boolean') {
     throw new MatrixError(400, 'M_BAD_JSON', 'is_direct must be a boolean');
   }
-  const version = opts.version ?? '11';
-  if (typeof version !== 'string') {
-    throw new MatrixError(400, 'M_BAD_JSON', 'room_version must be a string');
-  }
-  const rulebook = getRulebook(version); // unknown: never a default
-  const spec = rulebook.spec;
+  const { version, spec } = creationVersion(
+    opts.version ?? '11',
+    'room_version',
+  );
   const visibility = opts.visibility ?? 'private';
   if (visibility !== 'public' && visibility !== 'private') {
     throw new MatrixError(
@@ -183,25 +180,14 @@ export async function createRoom(
   // power_level_content_override.users must not name a creator (rule 10.4).
   let additionalCreators: string[] | undefined;
   if (spec.additionalCreators) {
-    const raw = opts.creation_content?.['additional_creators'];
-    if (raw !== undefined && !validAdditionalCreators(raw)) {
-      throw new MatrixError(
-        400,
-        'M_INVALID_PARAM',
-        'additional_creators is not an array of valid user IDs',
-      );
-    }
-    const base = (raw as string[] | undefined) ?? [];
+    const base = creationCreators(
+      spec,
+      opts.creation_content?.additional_creators,
+    );
     const combined = preset === 'trusted_private_chat'
       ? [...new Set([...base, ...invite])]
       : base;
-    if (!validAdditionalCreators(combined)) {
-      throw new MatrixError(
-        400,
-        'M_INVALID_PARAM',
-        'additional_creators is not an array of valid user IDs',
-      );
-    }
+    creationCreators(spec, combined);
     additionalCreators = combined.length > 0 ? combined : undefined;
     const creators = [creator, ...(additionalCreators ?? [])];
     const overrideUsers = opts.power_level_content_override?.users as

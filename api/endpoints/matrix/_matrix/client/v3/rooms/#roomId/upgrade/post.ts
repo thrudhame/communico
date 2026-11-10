@@ -5,17 +5,15 @@ export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
   context: import('@pathfinder/pathfinder').Context,
 ) {
-  const body = await parseJson(request) as Record<string, unknown>;
-  if (typeof body.new_version !== 'string') {
-    throw new MatrixError(400, 'M_MISSING_PARAM', 'new_version is required');
+  const raw = await parseJson(request);
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new MatrixError(400, 'M_BAD_JSON', 'upgrade body must be an object');
   }
-  const creators = Array.isArray(body.additional_creators)
-    ? body.additional_creators.filter((x): x is string => typeof x === 'string')
-    : [];
+  const body = raw as Record<string, unknown>;
   return await upgradeRoom(
     request.params.roomId as string,
     context.state.user as string,
     body.new_version,
-    creators,
+    body.additional_creators,
   );
 }
