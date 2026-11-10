@@ -226,8 +226,14 @@ CREATE TABLE pusher_changes(pos INTEGER PRIMARY KEY NOT NULL,localpart TEXT NOT 
 CREATE INDEX pushers_identity ON pushers(app_id,pushkey);
 `;
 
+const OPENID_SQL = `
+CREATE TABLE openid_tokens(token_hash TEXT PRIMARY KEY NOT NULL, localpart TEXT NOT NULL REFERENCES users(localpart), expires_ms INTEGER NOT NULL);
+CREATE INDEX openid_tokens_expiry ON openid_tokens(expires_ms);
+CREATE INDEX openid_tokens_user ON openid_tokens(localpart);
+`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 14,
+  version: 15,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -240,8 +246,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(KEY_BACKUP_SQL);
     await db.exec(ACCOUNT_CHANGES_SQL);
     await db.exec(PUSHER_CHANGES_SQL);
+    await db.exec(OPENID_SQL);
   },
   migrations: {
+    14: (conn) => conn.exec(OPENID_SQL),
     13: async (conn) => {
       await conn.exec(PUSHER_CHANGES_SQL);
       for (const row of await conn.query('SELECT * FROM pushers')) {

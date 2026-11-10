@@ -412,6 +412,14 @@ bodies and durable delivery obligations are not rewritten or discarded.
 
 ## Tenant data, storage and process lifetime
 
+OpenID credentials live in the tenant's separate hashed-token table (tenant
+schema v15), never in the client access/refresh tables. Issuance and userinfo
+check the active account in the owning transaction, enforce the configured
+expiry and survive reopen. Deactivation clears the credentials. The only new
+unsigned federation route is `openid/userinfo`, which authenticates its own
+bearer; sibling federation routes retain signature admission.
+(`api/engine/tenant/openid.ts`)
+
 Room tags are atomic edits of the tenant's ordinary `m.tag` room account data,
 not a second store. Own-user reads and deletes need no current join; additions
 require an existing room membership. Tags and ordinary room account-data writes

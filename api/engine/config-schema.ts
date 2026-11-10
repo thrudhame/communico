@@ -30,6 +30,9 @@ export const SCHEMA = {
     maxevents: 'int',
     maxtimeoutms: 'int',
   },
+  openid: {
+    tokenseconds: 'int',
+  },
   media: {
     root: 'string',
     maxbytes: 'int',

@@ -396,6 +396,7 @@ export async function deactivateUser(
 ): Promise<void> {
   await tenant.tx(async (tx) => {
     await tx.pushers.deleteForUser(localpart);
+    await tx.openid.clear(localpart);
     await tx.refresh.deleteForUser(localpart);
     await tx.tokens.deleteForUser(localpart);
     await tx.devices.deleteForUser(localpart);

@@ -38,6 +38,7 @@ import * as pushrules from '#engine/tenant/pushrules.ts';
 import * as txns from '#engine/tenant/txns.ts';
 import * as uia from '#engine/tenant/uia.ts';
 import * as users from '#engine/tenant/users.ts';
+import * as openid from '#engine/tenant/openid.ts';
 import { tenantStreamCommitted } from '#engine/tenant/streams.ts';
 import { writeCertificate } from '#engine/tenant/certificate.ts';
 import {
@@ -436,6 +437,13 @@ function bind(
         accountdata.globalAccountDataSince(conn, localpart, aSeq),
       maxSeq: (localpart: string) =>
         accountdata.accountDataMaxSeq(conn, localpart),
+    },
+    openid: {
+      insert: (hash: string, localpart: string, expires: number) =>
+        openid.insertOpenId(conn, hash, localpart, expires),
+      user: (hash: string, now: number) => openid.openIdUser(conn, hash, now),
+      clear: (localpart: string) => openid.clearOpenId(conn, localpart),
+      expire: (now: number) => openid.expireOpenId(conn, now),
     },
     pushRules: {
       putDefault: (localpart: string, kind: string, rule: pushrules.PushRule) =>

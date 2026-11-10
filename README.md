@@ -28,6 +28,12 @@ type globs, URL matching, state, presence, ephemeral and account-data selection.
 Filtered events still advance stream tokens; E2EE control streams and unread
 counts are not content-filtered.
 
+OpenID tokens are distinct, expiring credentials issued through the own-user
+`openid/request_token` API. Third parties can call federation `openid/userinfo`
+with that token, without a federation signature. The tokens cannot authorize
+client APIs. `openid.tokenseconds` controls their lifetime (default 3600 seconds);
+account deactivation revokes them.
+
 ## Jump to date
 
 Authenticated client and signed federation `timestamp_to_event` support inclusive

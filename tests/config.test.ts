@@ -15,6 +15,9 @@ const FULL = `[peeking]
 maxevents = 50
 maxtimeoutms = 30000
 
+[openid]
+tokenseconds = 3600
+
 [hierarchy]
 pagesize = 50
 maxpagesize = 100
@@ -791,7 +794,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('93 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('94 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -814,6 +817,7 @@ Deno.test('93 leaves total across the sections (the surface tripwire)', async ()
     ['admin', 1],
     ['hierarchy', 6],
     ['peeking', 2],
+    ['openid', 1],
     ['media', 20],
     ['encryption', 3],
     ['e2ee', 9],
@@ -824,7 +828,7 @@ Deno.test('93 leaves total across the sections (the surface tripwire)', async ()
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    93,
+    94,
     'the whole config surface includes remote media resource and cache policy leaves',
   );
 });
