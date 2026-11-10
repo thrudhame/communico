@@ -7,6 +7,8 @@ import type { Room, RoomTx } from '#engine/room/index.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { verify } from '#engine/room/verify.ts';
 import { toWire } from './pdu.ts';
+import { erasedView } from '#engine/erasure.ts';
+import type { Tenant } from '#engine/tenant/index.ts';
 
 export const prejoinTypes = new Set([
   'm.room.create',
@@ -28,6 +30,19 @@ export function stripPrejoin(pdu: Record<string, unknown>) {
       : {}),
   };
 }
+async function selectedPrejoin(tx: RoomTx, ids: string[], member: string) {
+  const out: { id: string; pdu: Pdu }[] = [];
+  for (const [id, row] of await tx.events.list(ids)) {
+    const type = row.type, stateKey = row.state_key;
+    if (
+      !prejoinTypes.has(type) &&
+      !(type === 'm.room.member' && stateKey === member)
+    ) continue;
+    const pdu = JSON.parse(row.pdu) as Pdu;
+    out.push({ id, pdu });
+  }
+  return out;
+}
 export async function prejoinStateInTx(
   tx: RoomTx,
   member: string,
@@ -37,23 +52,39 @@ export async function prejoinStateInTx(
   const group = await tx.state.current(stay.id);
   if (group === null) return [];
   const version = await roomVersionOf(tx, stay.id);
-  const out: Record<string, unknown>[] = [];
-  for (const [key, id] of await tx.state.groupMap(group)) {
-    const [type, stateKey] = key.split('\0');
-    if (
-      !prejoinTypes.has(type) &&
-      !(type === 'm.room.member' && stateKey === member)
-    ) continue;
-    const row = await tx.events.get(id);
-    if (row === null) continue;
-    const pdu = JSON.parse(row.pdu) as Pdu;
-    const wire = toWire(pdu, version);
-    out.push(type === 'm.room.create' ? wire : stripPrejoin(wire));
-  }
-  return out;
+  return (await selectedPrejoin(tx, [
+    ...(await tx.state.groupMap(group)).values(),
+  ], member))
+    .map(({ pdu }) => toWire(pdu, version));
 }
 export function prejoinState(room: Room, member: string) {
   return room.tx((tx) => prejoinStateInTx(tx, member));
+}
+
+// Callers supply IDs from their authorized immutable event/publication cut.
+// Never substitute current state or synthesize a missing signed create.
+export async function prejoinDisplay(
+  room: Room,
+  ids: string[],
+  member: string,
+  viewer: { userId: string; tenant: Tenant },
+) {
+  const loaded = await room.tx(async (tx) => {
+    const stay = await tx.segments.latestStay();
+    return stay === null ? null : {
+      version: await roomVersionOf(tx, stay.id),
+      events: await selectedPrejoin(tx, ids, member),
+    };
+  });
+  if (loaded === null) return [];
+  const out: Record<string, unknown>[] = [];
+  for (const { id, pdu } of loaded.events) {
+    const shown = await erasedView(room, id, pdu, loaded.version, {
+      userId: viewer.userId,
+    }, viewer.tenant);
+    out.push(stripPrejoin(shown as unknown as Record<string, unknown>));
+  }
+  return out;
 }
 
 // v3-v11 compatibility is filter-only; admin-UI warning remains a TODO.

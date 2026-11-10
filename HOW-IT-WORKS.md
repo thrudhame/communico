@@ -259,8 +259,12 @@ feed entries and out-of-band invite transitions share one durable event
 allocator. Invites and knocks use one typed, revisioned `prejoin_memberships`
 row per room/user. They never provision a room file or open a stay. A later
 room membership publication supersedes OOB display/count truth at the shared
-sequence cut. Federation prejoin state keeps the signed full create PDU;
-validated client display strips it. Legacy malformed create hints are filtered,
+sequence cut. One prejoin owner emits signed, version-correct full PDUs for
+federation invite/knock state, including create, and stripped events for client
+display. Held sync uses its membership publication cut; unsigned membership
+hints use that event's after-state, never later current state. Those client
+forms apply viewer-aware erasure before stripping. OOB hints come only from
+their revisioned, validated prejoin record. Legacy malformed create hints are filtered,
 while v12 requires a valid create tied to the room identity. Typing is ephemeral;
 presence and receipts are server data, while
 account-data stream markers belong to the tenant.

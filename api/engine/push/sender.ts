@@ -53,7 +53,7 @@ async function rendered(
   const viewer = { userId: target.user, deviceId: null, tenant };
   const server = await store.server();
   const invite = (await server.query(
-    `SELECT event_json FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND status='pending' AND kind='invite' AND ${
+    `SELECT event_json,invite_room_state FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND status='pending' AND kind='invite' AND ${
       visiblePrejoin('p')
     }`,
     [roomId, target.user, eventId],
@@ -63,6 +63,7 @@ async function rendered(
       JSON.parse(String(invite.event_json)) as Pdu,
       eventId,
       viewer,
+      JSON.parse(String(invite.invite_room_state)),
     );
     return event ? { event: { ...event, room_id: roomId }, names: {} } : null;
   }

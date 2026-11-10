@@ -2,7 +2,7 @@
 // has no feed position and cannot enter a new timeline. R6 cuts use the
 // published state, never the last event's own DAG state.
 import { theApp } from '#engine/app.ts';
-import { heldRoom, stateAtSeq, type StateRow } from '#engine/client/read.ts';
+import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
 import { renderEvent, renderStateEvent } from '#engine/client/render.ts';
 import {
   encodeStreamToken,
@@ -10,7 +10,7 @@ import {
   type StreamToken,
 } from '#engine/client/tokens.ts';
 import { config } from '#engine/config.ts';
-import { prejoinTypes } from '#engine/federation/prejoin.ts';
+import { prejoinDisplay, stripPrejoin } from '#engine/federation/prejoin.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
 import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -71,15 +71,6 @@ export interface SyncInputs {
   useStateAfter?: boolean;
   setPresence?: string;
 }
-
-const strippedTypes = prejoinTypes;
-const stripped = (row: StateRow) => ({
-  type: row.type,
-  state_key: row.stateKey,
-  content: row.content,
-  sender: row.sender,
-  ...(row.type === 'm.room.create' ? { origin_server_ts: row.originTs } : {}),
-});
 
 async function roomTimeline(
   room: Room,
@@ -492,7 +483,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       unknown
     >[];
     const events = [
-      ...saved.filter((e) =>
+      ...saved.map(stripPrejoin).filter((e) =>
         !(e.type === 'm.room.member' && e.state_key === i.userId)
       ),
       {
@@ -532,10 +523,15 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       const section = m.membership === 'knock' ? knock : invite;
       section[m.roomId] = {
         [m.membership === 'knock' ? 'knock_state' : 'invite_state']: {
-          events: at.filter((r) =>
-            strippedTypes.has(r.type) ||
-            r.type === 'm.room.member' && r.stateKey === i.userId
-          ).map(stripped),
+          events: await prejoinDisplay(
+            room,
+            at.map((r) => r.eventId),
+            i.userId,
+            {
+              userId: i.userId,
+              tenant: app.tenant,
+            },
+          ),
         },
       };
       continue;
