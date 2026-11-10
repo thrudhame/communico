@@ -132,6 +132,59 @@ export async function accountDataMaxSeq(
   return rows[0].m == null ? 0 : Number(rows[0].m);
 }
 
+export async function roomAccountDataSince(
+  conn: Conn,
+  localpart: string,
+  since: number,
+  until: number,
+): Promise<Map<string, AccountDataRow[]>> {
+  const rows = await conn.query(
+    "SELECT room_id,type,content FROM account_data WHERE localpart=? AND room_id<>'' AND seq>? AND seq<=? ORDER BY seq",
+    [localpart, since, until],
+  );
+  const rooms = new Map<string, AccountDataRow[]>();
+  for (const row of rows) {
+    const room = String(row.room_id);
+    const events = rooms.get(room) ?? [];
+    events.push({
+      type: String(row.type),
+      content: JSON.parse(String(row.content)),
+    });
+    rooms.set(room, events);
+  }
+  return rooms;
+}
+
+/** Tags and ordinary m.tag writes share one row and one stream. Read/modify/write
+ * stays entirely in the tenant transaction, including retry-local objects. */
+export async function updateRoomTag(
+  tenant: Tenant,
+  localpart: string,
+  roomId: string,
+  tag: string,
+  value?: unknown,
+): Promise<void> {
+  await tenant.tx(async (tx) => {
+    const raw = await tx.accountData.get(localpart, roomId, 'm.tag');
+    const content = raw === null ? {} : JSON.parse(raw);
+    const current = content.tags;
+    const tags = new Map<string, unknown>(
+      current !== null && typeof current === 'object' && !Array.isArray(current)
+        ? Object.entries(current)
+        : [],
+    );
+    if (value === undefined) tags.delete(tag);
+    else tags.set(tag, value);
+    await tx.accountData.put(
+      localpart,
+      roomId,
+      'm.tag',
+      JSON.stringify({ ...content, tags: Object.fromEntries(tags) }),
+      await tx.counters.nextStream(),
+    );
+  });
+}
+
 // --- tenant-level behaviour --------------------------------------------------
 
 /** Upsert account data. roomId '' = global. The write and its stream

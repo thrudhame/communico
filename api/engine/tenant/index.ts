@@ -409,6 +409,8 @@ function bind(
       },
     },
     accountData: {
+      roomsSince: (localpart: string, since: number, until: number) =>
+        accountdata.roomAccountDataSince(conn, localpart, since, until),
       snapshot: (localpart: string, roomId: string, type: string) =>
         accountdata.accountDataSnapshot(conn, localpart, roomId, type),
       put: (

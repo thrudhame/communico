@@ -29,7 +29,6 @@ import {
   getAccountData,
   listGlobalAccountData,
   listGlobalAccountDataSince,
-  listRoomAccountData,
 } from '#engine/tenant/accountdata.ts';
 import { pushStreamSeq, rulesetFor } from '#engine/tenant/pushrules.ts';
 import type { RoomFilter } from '#engine/tenant/filters.ts';
@@ -82,6 +81,7 @@ async function roomTimeline(
     receipts: Record<string, unknown>[];
     members: Row[];
     notifications: ReturnType<typeof syncNotificationCounts>;
+    accountData: { type: string; content: unknown }[];
   },
 ) {
   const app = theApp();
@@ -208,11 +208,7 @@ async function roomTimeline(
       ...(heroes.length ? { 'm.heroes': heroes } : {}),
     };
     entry.account_data = {
-      events: await listRoomAccountData(
-        app.tenant,
-        localpartOf(i.userId),
-        room.id,
-      ),
+      events: snapshot.accountData,
     };
   }
   const joiners: string[] = [];
@@ -406,6 +402,9 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       return { ...delivered, pools };
     });
   const nextBatch = encodeStreamToken(delivery.token);
+  const roomAccountData = await app.tenant.tx((tx) =>
+    tx.accountData.roomsSince(lp, i.since?.aSeq ?? 0, now.aSeq)
+  );
   const memberships = snapshot.memberships;
   const receiptRooms = new Set(
     [...snapshot.rooms].filter(([, r]) => r.receipts.length).map(([id]) => id),
@@ -514,6 +513,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       );
       if (
         !changed.length && !receiptRooms.has(m.roomId) &&
+        !roomAccountData.has(m.roomId) &&
         !snapshot.notifications.changed.has(m.roomId) &&
         lastTypingChange(m.roomId) <= i.since.tSeq
       ) continue;
@@ -526,6 +526,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       !left,
       {
         ...snapshot.rooms.get(m.roomId)!,
+        accountData: roomAccountData.get(m.roomId) ?? [],
         notifications: syncNotificationCounts(
           snapshot.notifications.rooms.get(m.roomId),
           i.filter.timeline.unread_thread_notifications === true,

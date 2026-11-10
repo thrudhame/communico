@@ -402,6 +402,13 @@ bodies and durable delivery obligations are not rewritten or discarded.
 
 ## Tenant data, storage and process lifetime
 
+Room tags are atomic edits of the tenant's ordinary `m.tag` room account data,
+not a second store. Own-user reads and deletes need no current join; additions
+require an existing room membership. Tags and ordinary room account-data writes
+wake sync and include their room even when no room event changed. Incremental
+sync reads those rows between its account-data cuts; unchanged rows are omitted.
+(`api/engine/client/tags.ts`, `api/engine/tenant/accountdata.ts`)
+
 Hosted accounts are localparts under the configured homeserver's signing
 identity. The tenant generates its key once and reloads it on reopen, keeping
 its stored native name and key id. A newly generated key has a public-key-derived
