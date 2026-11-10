@@ -269,4 +269,31 @@ suite.test('federation returns immediate children and distinguishes known inacce
     )).status,
     404,
   );
+  await ok(base(child) + '/state/m.room.server_acl', token, {
+    allow: [],
+    deny: ['*'],
+    allow_ip_literals: true,
+  }, 'PUT');
+  const deniedChild = await fed(
+    'GET',
+    '/_matrix/federation/v1/hierarchy/' + encodeURIComponent(root),
+  );
+  assertEquals(deniedChild.status, 200);
+  assertEquals(deniedChild.body.children, []);
+  assertEquals(
+    new Set(deniedChild.body.inaccessible_children as string[]),
+    new Set([child, secret]),
+  );
+  await ok(base(root) + '/state/m.room.server_acl', token, {
+    allow: [],
+    deny: ['*'],
+    allow_ip_literals: true,
+  }, 'PUT');
+  assertEquals(
+    (await fed(
+      'GET',
+      '/_matrix/federation/v1/hierarchy/' + encodeURIComponent(root),
+    )).status,
+    404,
+  );
 });
