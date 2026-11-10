@@ -34,7 +34,7 @@ async function create(token: string, content: Json) {
 }
 const roomPath = (room: string) => 'v3/rooms/' + encodeURIComponent(room);
 
-suite.test('room summaries share published metadata and enforce user access without joining', async () => {
+suite.test('room summaries share published metadata and enforce user or anonymous access without joining', async () => {
   const a = await suite.registerTestUser('summary-owner', 'pw');
   const b = await suite.registerTestUser('summary-outsider', 'pw');
   const privateRoom = await create(a.access_token!, {
@@ -46,7 +46,7 @@ suite.test('room summaries share published metadata and enforce user access with
   assertEquals(own.name, 'Private summary');
   assertEquals(own.num_joined_members, 1);
   assertEquals((await call(path(privateRoom), b.access_token!)).status, 404);
-  assertEquals((await call(path(privateRoom))).status, 401);
+  assertEquals((await call(path(privateRoom))).status, 404);
   await ok(roomPath(privateRoom) + '/invite', a.access_token!, {
     user_id: b.user_id,
   });
@@ -59,10 +59,10 @@ suite.test('room summaries share published metadata and enforce user access with
     preset: 'public_chat',
     creation_content: { type: 'm.space' },
   });
-  const publicSummary = await ok(path(publicSpace), b.access_token!);
+  const publicSummary = await ok(path(publicSpace));
   assertEquals(publicSummary.room_type, 'm.space');
   assertEquals(typeof publicSummary.room_version, 'string');
-  assertEquals(publicSummary.membership, 'leave');
+  assertEquals('membership' in publicSummary, false);
   assertEquals(
     (await ok(path('#summary-space:' + a.home_server), b.access_token!))
       .room_id,
@@ -87,7 +87,7 @@ suite.test('room summaries share published metadata and enforce user access with
   assertEquals((await ok(path(restricted), b.access_token!)).allowed_room_ids, [
     allowed,
   ]);
-  assertEquals((await call(path(restricted))).status, 401);
+  assertEquals((await call(path(restricted))).status, 404);
   await ok(roomPath(allowed) + '/leave', b.access_token!, {});
   assertEquals((await call(path(restricted), b.access_token!)).status, 404);
   const world = await create(a.access_token!, {
@@ -96,7 +96,16 @@ suite.test('room summaries share published metadata and enforce user access with
       content: { history_visibility: 'world_readable' },
     }],
   });
-  assertEquals((await ok(path(world), b.access_token!)).world_readable, true);
+  assertEquals((await ok(path(world))).world_readable, true);
+  for (
+    const protectedPath of [
+      'v1/rooms/' + encodeURIComponent(publicSpace) + '/threads',
+      'v1/media/config',
+    ]
+  ) {
+    assertEquals((await call(protectedPath)).status, 401);
+  }
+  assertEquals((await call(path(publicSpace), 'invalid-token')).status, 401);
 });
 
 suite.test('client and federation public directories filter room types before count and pagination', async () => {

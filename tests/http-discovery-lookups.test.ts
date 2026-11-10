@@ -178,7 +178,7 @@ suite.test('remote room summary uses signed hierarchy, rechecks user eligibility
     return { status: response.status, body: await response.json() };
   };
   try {
-    assertEquals((await read(false)).status, 401);
+    assertEquals((await read(false)).status, 404);
     assertEquals(fake.requests.length, 0);
     const visible = await read(true);
     assertEquals(visible.status, 200);
