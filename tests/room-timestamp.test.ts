@@ -26,11 +26,12 @@ async function fixture(
       room: Room;
       fr: Awaited<ReturnType<typeof makeFakeRoom>>;
       deps: ReturnType<typeof dependencies>;
+      reopen: () => Promise<Room>;
     },
   ) => Promise<void>,
 ) {
   const dir = await Deno.makeTempDir();
-  const store = await openStore(options(dir), {
+  let store = await openStore(options(dir), {
     schemas: { room: roomSchema },
   });
   try {
@@ -61,7 +62,19 @@ async function fixture(
       fr.server.name,
       deps,
     );
-    await fn({ store, room, fr, deps });
+    await fn({
+      store,
+      room,
+      fr,
+      deps,
+      reopen: async () => {
+        await store.close();
+        store = await openStore(options(dir), {
+          schemas: { room: roomSchema },
+        });
+        return await openRoom(store, fr.roomId);
+      },
+    });
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
@@ -151,7 +164,7 @@ Deno.test('timestamp: causal ties cross skewed intermediate timestamps, ignore d
 });
 
 Deno.test('timestamp: verified disjoint anchor owns its gap, backfills earlier history and survives reopen without news', async () => {
-  await fixture(async ({ fr, room, deps, store }) => {
+  await fixture(async ({ fr, room, deps, reopen }) => {
     const a = await fr.addEvent(message(100, 'a'));
     const b = await fr.addEvent(message(110, 'b'));
     const anchor = await fr.addEvent(message(120, 'anchor'));
@@ -238,7 +251,7 @@ Deno.test('timestamp: verified disjoint anchor owns its gap, backfills earlier h
       tx.changes.after(before.changes.at(-1)!.pos, 10000)
     );
     assert(changes.every((c) => c.kind === 'history'));
-    const reopened = await openRoom(store, fr.roomId);
+    const reopened = await reopen();
     assertEquals(
       await reopened.tx((tx) => tx.segments.positionOf(anchor.event_id!)),
       pos,
@@ -247,6 +260,48 @@ Deno.test('timestamp: verified disjoint anchor owns its gap, backfills earlier h
       (await reopened.tx((tx) => tx.state.eventStateBefore(anchor.event_id!)))
         ?.provenance,
       'imported',
+    );
+  });
+});
+
+Deno.test('timestamp: hidden time buckets do not terminate a real viewer visibility search', async () => {
+  await fixture(async ({ fr, room, deps }) => {
+    const privateHistory = await fr.addEvent({
+      type: 'm.room.history_visibility',
+      state_key: '',
+      content: { history_visibility: 'joined' },
+      origin_server_ts: 90,
+    });
+    const hidden = await fr.addEvent(message(100, 'hidden'));
+    const publicHistory = await fr.addEvent({
+      type: 'm.room.history_visibility',
+      state_key: '',
+      content: { history_visibility: 'world_readable' },
+      origin_server_ts: 200,
+    });
+    for (const event of [privateHistory, hidden, publicHistory]) {
+      await ingestRemote(room, [event], fr.server.name, deps);
+    }
+    const viewer = '@outsider:remote.test';
+    assertEquals(
+      await room.tx((tx) =>
+        findTimestamp(
+          tx,
+          { ts: 95, dir: 'f' },
+          (id) => canSeeEventAt(viewer, tx, id),
+        )
+      ),
+      { event_id: publicHistory.event_id, origin_server_ts: 200 },
+    );
+    assertEquals(
+      await room.tx((tx) =>
+        findTimestamp(
+          tx,
+          { ts: 150, dir: 'b' },
+          (id) => canSeeEventAt(viewer, tx, id),
+        )
+      ),
+      null,
     );
   });
 });
