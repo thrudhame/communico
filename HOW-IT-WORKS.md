@@ -301,6 +301,12 @@ v12-only creator field. Valid duplicates and the upgrader's own ID are retained.
 
 ## Federation and delivery
 
+The shared outbound TLS dialer lets CA trust finish normal chain and hostname
+validation in the handshake. Only pinned/key-is-name trust reads certificate
+material afterwards, requesting the leaf alone and checking its key before
+writing HTTP bytes. It does not rebuild a legacy certificate chain per request.
+(`api/engine/federation/dial-node-tls.ts`)
+
 Client and federation public directories use one published-state metadata
 serializer, including room types. Both filter `room_types` (with `null` for
 untyped rooms) before counting and pagination. User-directory candidates include

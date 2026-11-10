@@ -1,12 +1,23 @@
-# Complement baseline - 2026-11-10 05:28:46 PST
+# Complement baseline - 2026-11-10 06:08:42 PST
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit cadcc30b6215fbc798de8973ccd4e5ca19de691f)
+- image: communico-complement:local (commit 0d485426d0e290c436b6f4f57d4b0397f101bfc5)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
 - failing tests: 18
 
 ## Change from the previous baseline
+
+G5b's clean production tip retains the same 18 failures: new[], fixed[],
+comparator exit 0. The default pass retains its red baseline; the unchanged
+settings pass exits 0. The conflicted-subgraph parent explicitly passed in
+14.53 s. That test elapsed time is not an inbound transaction measurement.
+Full-load server-side timing is a separate G5b proof, not a timeout waiver.
+No Complement fixture, test, deadline or recovery concurrency was changed.
+
+The documentation-only baseline commit does not change these tested inputs.
+
+### Historical G5 baseline
 
 G5's exact production tip has the same 18 failing tests/subtests as the G3
 baseline: no new failures and no removed entries. The full default pass and the
@@ -22,9 +33,9 @@ The documentation-only baseline commit does not change the tested runtime inputs
 | 5 | `TestAvatarUrlUpdate`, with the unchanged Complement fixture and Synapse-compatible optional semantic validation |
 | 6 | `TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph` |
 
-These are observed passes, not tests inferred passing from absence. The earlier
-load-sensitive v12 deadline failures remain a mandatory G5b latency investigation
-and correction (T-G5-3); they are not added to the baseline or waived as flakes.
+These are observed passes, not tests inferred passing from absence. At G5 merge,
+the earlier load-sensitive v12 deadline failures became the mandatory G5b latency
+investigation and correction (T-G5-3); they were not added to the baseline or waived as flakes.
 Known timeline-gap and OOB departed-state shape shortcomings remain documented;
 this run is not a claim of cumulative Matrix conformance.
 
