@@ -418,6 +418,14 @@ supervisor example.
 
 ## Content reports
 
+Admin report pages select IDs using stored UTF-8 byte sizes before hydrating
+reasons or resolutions, in one read snapshot. The shared `server.maxrequestbytes`
+setting is also the encoded page target (including worst-case JSON escaping).
+The count limit still applies. A report larger than that target is returned
+intact as a singleton, never truncated or skipped; continue with `next`.
+Thus listing memory scales with the byte target or one oversized report, not
+the count limit times the largest allowed request. Reasons have no field cap.
+
 The shared Matrix request admission middleware bounds every non-upload body
 before JSON validation, authentication or handler dispatch, including handlers
 that ignore bodies. It checks declared size and counts actual streamed bytes;
