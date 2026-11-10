@@ -6,6 +6,7 @@ import { openRoom } from '#engine/room/index.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { putAccountData } from '#engine/tenant/accountdata.ts';
 import { localpartOf } from '#engine/ids.ts';
+import { canSeeEvent } from '#engine/client/visibility.ts';
 
 export async function setFullyRead(
   roomId: string,
@@ -16,7 +17,7 @@ export async function setFullyRead(
   let known = false;
   try {
     const room = await openRoom(app.store, roomId);
-    known = await room.tx(async (tx) => await tx.events.get(eventId) !== null);
+    known = await canSeeEvent(userId, room, eventId);
   } catch (error) {
     if (!(error instanceof Deno.errors.NotFound)) throw error;
   }

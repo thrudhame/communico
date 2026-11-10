@@ -369,6 +369,62 @@ suite.test('both fully-read routes reject cross-room and unknown events without 
   }
 });
 
+suite.test('both fully-read routes hide events before a joined-history reader arrived', async () => {
+  const a = await suite.registerTestUser('marker-hidden-a', 'pw');
+  const b = await suite.registerTestUser('marker-hidden-b', 'pw');
+  const room = String(
+    (await ok('v3/createRoom', a.access_token!, {
+      invite: [b.user_id],
+      initial_state: [{
+        type: 'm.room.history_visibility',
+        content: { history_visibility: 'joined' },
+      }],
+    })).room_id,
+  );
+  const base = 'v3/rooms/' + encodeURIComponent(room);
+  const hidden = String(
+    (await ok(base + '/send/m.room.message/hidden', a.access_token!, {
+      msgtype: 'm.text',
+      body: 'before join',
+    }, 'PUT')).event_id,
+  );
+  await ok(base + '/join', b.access_token!, {});
+  const visible = String(
+    (await ok(base + '/send/m.room.message/visible', a.access_token!, {
+      msgtype: 'm.text',
+      body: 'after join',
+    }, 'PUT')).event_id,
+  );
+  await ok(base + '/read_markers', b.access_token!, {
+    'm.fully_read': visible,
+  });
+  assertEquals(
+    (await call(base + '/event/' + encodeURIComponent(hidden), b.access_token!))
+      .status,
+    404,
+  );
+  for (const event of [hidden, '$unknown:localhost']) {
+    for (const receipt of [true, false]) {
+      const response = await call(
+        base +
+          (receipt
+            ? '/receipt/m.fully_read/' + encodeURIComponent(event)
+            : '/read_markers'),
+        b.access_token!,
+        receipt ? {} : { 'm.fully_read': event },
+      );
+      assertEquals(response.status, 404);
+      assertEquals(response.body.errcode, 'M_NOT_FOUND');
+      const marker = await ok(
+        'v3/user/' + encodeURIComponent(b.user_id) + '/rooms/' +
+          encodeURIComponent(room) + '/account_data/m.fully_read',
+        b.access_token!,
+      );
+      assertEquals(marker.event_id, visible);
+    }
+  }
+});
+
 suite.test('both fully-read routes accept room-owned events before the server projection catches up', async () => {
   const f = await setup('marker-projection-lag');
   // Model the durable room commit / failed server projection boundary. The
