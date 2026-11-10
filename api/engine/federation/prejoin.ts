@@ -7,7 +7,7 @@ import type { Room, RoomTx } from '#engine/room/index.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { identify, verify } from '#engine/room/verify.ts';
 import { toWire } from './pdu.ts';
-import { erasedView } from '#engine/erasure.ts';
+import { erasurePrunes } from '#engine/erasure.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { redactionOf } from '#engine/server/read.ts';
 import { redact } from '#engine/eventid.ts';
@@ -64,6 +64,63 @@ export function prejoinState(room: Room, member: string) {
   return room.tx((tx) => prejoinStateInTx(tx, member));
 }
 
+// Shape intersection is recursive and never sources a value from room truth.
+// An incompatible array fails as a whole, rather than shifting element indexes.
+export function savedContentView(saved: unknown, allowed: unknown): unknown {
+  if (saved === null || allowed === null) {
+    return saved === allowed ? null : undefined;
+  }
+  if (typeof saved !== typeof allowed) return undefined;
+  if (Array.isArray(saved) || Array.isArray(allowed)) {
+    if (!Array.isArray(saved) || !Array.isArray(allowed)) return undefined;
+    if (saved.length > allowed.length) return undefined;
+    const out = [];
+    for (let i = 0; i < saved.length; i++) {
+      const item = savedContentView(saved[i], allowed[i]);
+      if (item === undefined) return undefined;
+      out.push(item);
+    }
+    return out;
+  }
+  if (typeof saved === 'object') {
+    const projected = allowed as Record<string, unknown>;
+    const out: [string, unknown][] = [];
+    for (const [key, value] of Object.entries(saved)) {
+      if (!Object.hasOwn(projected, key)) continue;
+      const item = savedContentView(value, projected[key]);
+      if (item !== undefined) out.push([key, item]);
+    }
+    return Object.fromEntries(out);
+  }
+  return saved;
+}
+
+// One display decision for held and saved sources. Apply the existing room-
+// version redaction algorithm to the saved event itself; a source view supplies
+// only a further shape ceiling, never values or a second redaction allow-list.
+async function shownPrejoin(
+  room: Room,
+  source: { id: string; pdu: Pdu },
+  version: string,
+  viewer: { userId: string; tenant: Tenant },
+  saved = source.pdu as unknown as Record<string, unknown>,
+) {
+  const pruned =
+    await redactionOf(await room.store.server(), room.id, source.id) !== null ||
+    await erasurePrunes(room, source.id, source.pdu, {
+      userId: viewer.userId,
+    }, viewer.tenant);
+  const ceiling = pruned
+    ? redact(source.pdu as unknown as Record<string, unknown>, version)
+    : source.pdu;
+  const shown = pruned ? redact(saved, version) : saved;
+  const content = savedContentView(shown.content, ceiling.content);
+  return stripPrejoin({
+    ...shown,
+    content: content == null ? {} : content,
+  });
+}
+
 // Callers supply IDs from their authorized immutable event/publication cut.
 // Never substitute current state or synthesize a missing signed create.
 export async function prejoinDisplay(
@@ -81,16 +138,8 @@ export async function prejoinDisplay(
   });
   if (loaded === null) return [];
   const out: Record<string, unknown>[] = [];
-  const server = await room.store.server();
-  for (const { id, pdu } of loaded.events) {
-    // Display snapshots retain immutable original PDUs. Apply current redaction
-    // effects here for every sync/unsigned hint, never on the signed wire path.
-    const shown = await redactionOf(server, room.id, id) === null
-      ? await erasedView(room, id, pdu, loaded.version, {
-        userId: viewer.userId,
-      }, viewer.tenant)
-      : redact(pdu as unknown as Record<string, unknown>, loaded.version);
-    out.push(stripPrejoin(shown as unknown as Record<string, unknown>));
+  for (const source of loaded.events) {
+    out.push(await shownPrejoin(room, source, loaded.version, viewer));
   }
   return out;
 }
@@ -105,31 +154,29 @@ export async function savedPrejoinDisplay(
   viewer: { userId: string; tenant: Tenant },
 ) {
   if (room === null) return saved.map(stripPrejoin);
-  const version = await room.tx(async (tx) => {
+  const loaded = await room.tx(async (tx) => {
     const stay = await tx.segments.latestStay();
-    return stay === null ? null : await roomVersionOf(tx, stay.id);
+    return stay === null ? null : {
+      version: await roomVersionOf(tx, stay.id),
+      events: await selectedPrejoin(
+        tx,
+        saved.flatMap((hint) =>
+          typeof hint.source_event_id === 'string' ? [hint.source_event_id] : []
+        ),
+        member,
+      ),
+    };
   });
-  if (version === null) return saved.map(stripPrejoin);
+  if (loaded === null) return saved.map(stripPrejoin);
+  const sources = new Map(loaded.events.map((event) => [event.id, event]));
   const out: Record<string, unknown>[] = [];
   for (const hint of saved) {
-    const known = typeof hint.source_event_id === 'string'
-      ? await prejoinDisplay(room, [hint.source_event_id], member, viewer)
-      : [];
-    if (!known.length) {
-      out.push(stripPrejoin(redact(hint, version)));
-      continue;
-    }
-    // A reference hash can identify a content-pruned PDU too. Room knowledge
-    // may remove fields from a saved hint, but must never restore omitted data.
-    const allowed = known[0].content as Record<string, unknown>;
-    out.push({
-      ...stripPrejoin(hint),
-      content: Object.fromEntries(
-        Object.entries(hint.content as Record<string, unknown>).filter((
-          [key],
-        ) => Object.hasOwn(allowed, key)),
-      ),
-    });
+    const source = sources.get(String(hint.source_event_id));
+    out.push(
+      source === undefined
+        ? stripPrejoin(redact(hint, loaded.version))
+        : await shownPrejoin(room, source, loaded.version, viewer, hint),
+    );
   }
   return out;
 }

@@ -269,7 +269,9 @@ retain privately computed source IDs, never remote-asserted IDs. Once a room is
 held, sync, notifications and push share the saved-hint display owner: accepted
 sources use the current redaction/erasure projection; unidentified legacy hints
 are pruned by the room-version rules instead of exposing uncheckable content.
-Source views only remove saved content; they never restore omitted hint fields.
+The shared display decision applies the room-version redaction algorithm to the
+saved event itself. Its source shape ceiling is recursive, preserves saved
+values, never restores omitted fields, and drops incompatible nested shapes.
 Private provenance is never included in client hints. Legacy malformed create hints are filtered,
 while v12 requires a valid create tied to the room identity. Typing is ephemeral;
 presence and receipts are server data, while
