@@ -3,6 +3,7 @@
 import type { Database } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { config } from '#engine/config.ts';
 
 export type ReportKind = 'event' | 'room' | 'user';
 export interface ReportInput {
@@ -82,18 +83,51 @@ export async function listReports(db: Database, options: {
       clauses.push('resolved_ms IS NOT NULL');
     } else throw bad('invalid report status');
   }
-  const rows = await db.query(
-    'SELECT * FROM reports WHERE ' + clauses.join(' AND ') +
-      ' ORDER BY id LIMIT ?',
-    [...values, (limit as number) + 1],
-  );
-  const page = rows.slice(0, limit as number).map(report);
-  return {
-    reports: page,
-    ...(rows.length > (limit as number)
-      ? { next: page[page.length - 1].id }
-      : {}),
-  };
+  // Plan the page without transporting reasons/resolutions across FFI. Every
+  // UTF-8 byte costs at most six JSON bytes (control characters -> \u00xx);
+  // fixed slack covers keys, numbers, nulls and the admin response envelope.
+  // The request byte setting is a page target, NOT a report field cap: an
+  // oversized first row travels intact, alone, so pagination always advances.
+  const textBytes = [
+    'kind',
+    'reporter',
+    'room_id',
+    'event_id',
+    'user_id',
+    'reason',
+    'resolution',
+  ]
+    .map((column) => `coalesce(length(cast(${column} AS BLOB)),0)`)
+    .join('+');
+  const budget = config().server.maxrequestbytes;
+  return await db.tx(async (tx) => {
+    const sizes = await tx.query(
+      'SELECT id, 1024 + 6 * (' + textBytes + ') AS bytes FROM reports WHERE ' +
+        clauses.join(' AND ') +
+        ' ORDER BY id LIMIT ?',
+      [...values, (limit as number) + 1],
+    );
+    const ids: number[] = [];
+    let bytes = 128;
+    for (const row of sizes) {
+      if (ids.length >= (limit as number)) break;
+      if (ids.length > 0 && bytes + Number(row.bytes) > budget) break;
+      ids.push(Number(row.id));
+      bytes += Number(row.bytes);
+    }
+    // Same snapshot as the size plan: concurrent resolution cannot enlarge the
+    // selected rows between measuring and hydration. Never hydrate lookahead.
+    const page = ids.length === 0 ? [] : (await tx.query(
+      `SELECT * FROM reports WHERE id IN (${
+        ids.map(() => '?').join(',')
+      }) ORDER BY id`,
+      ids,
+    )).map(report);
+    return {
+      reports: page,
+      ...(sizes.length > ids.length ? { next: ids[ids.length - 1] } : {}),
+    };
+  }, { mode: 'deferred' });
 }
 
 export async function resolveReport(

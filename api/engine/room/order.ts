@@ -65,92 +65,23 @@ function exhausted(): never {
   );
 }
 
-/** Order through the stored prev DAG, not remote depth or a candidate-only
- * graph. The ancestry-closed graph makes order invariant under adding page
- * anchors or filtering candidates. Each vertex/edge is read once, with an
- * explicit shared budget; first-owner positions break concurrent ties. */
+/** Globally comparable local DAG keys, not remote depth or candidate-only
+ * Kahn order. Cost depends on candidates, never their ancestral room prefix.
+ * Every known prev edge strictly increases height, including late parents. */
 export async function stableCausalOrder(
   tx: RoomTx,
   ids: string[],
 ): Promise<string[]> {
-  const wanted = new Set(ids);
-  if (wanted.size < 2) return [...wanted];
-  const parents = new Map<string, number>();
-  const children = new Map<string, string[]>();
-  const rank = new Map<string, [number, number, string]>();
-  const queue = [...wanted], seen = new Set(queue);
-  let remaining = 100_000;
-  for (let offset = 0; offset < queue.length; offset++) {
-    if (--remaining < 0) exhausted();
-    const id = queue[offset];
-    const prevs = [...new Set(await tx.events.prevsOf(id))];
-    const pos = await tx.segments.positionOf(id);
-    rank.set(id, [
-      pos?.segment ?? Number.MAX_SAFE_INTEGER,
-      pos?.offset ?? 0,
-      id,
-    ]);
-    parents.set(id, prevs.length);
-    for (const prev of prevs) {
-      if (--remaining < 0) exhausted();
-      const list = children.get(prev) ?? [];
-      list.push(id);
-      children.set(prev, list);
-      if (!seen.has(prev)) {
-        seen.add(prev);
-        queue.push(prev);
-      }
-    }
-  }
-  const compare = (a: string, b: string) => {
-    const x = rank.get(a)!, y = rank.get(b)!;
-    return x[0] - y[0] || x[1] - y[1] ||
-      (x[2] < y[2] ? -1 : x[2] === y[2] ? 0 : 1);
-  };
-  const heap: string[] = [];
-  const push = (id: string) => {
-    let i = heap.length;
-    heap.push(id);
-    while (i > 0) {
-      const p = (i - 1) >> 1;
-      if (compare(heap[p], id) <= 0) break;
-      heap[i] = heap[p];
-      i = p;
-    }
-    heap[i] = id;
-  };
-  const pop = () => {
-    const first = heap[0], last = heap.pop()!;
-    if (heap.length > 0) {
-      let i = 0;
-      while (i * 2 + 1 < heap.length) {
-        let child = i * 2 + 1;
-        if (
-          child + 1 < heap.length && compare(heap[child + 1], heap[child]) < 0
-        ) child++;
-        if (compare(last, heap[child]) <= 0) break;
-        heap[i] = heap[child];
-        i = child;
-      }
-      heap[i] = last;
-    }
-    return first;
-  };
-  for (const id of queue) if (parents.get(id) === 0) push(id);
-  const result: string[] = [];
-  let visited = 0;
-  while (heap.length > 0) {
-    const id = pop();
-    visited++;
-    if (wanted.has(id)) result.push(id);
-    for (const child of children.get(id) ?? []) {
-      const left = parents.get(child)! - 1;
-      parents.set(child, left);
-      if (left === 0) push(child);
-    }
-  }
-  if (visited !== queue.length) exhausted();
-  return result;
+  const unique = [...new Set(ids)];
+  if (unique.length < 2) return unique;
+  const keys = await tx.events.orderKeys(unique);
+  if (keys.size !== unique.length) exhausted();
+  return unique.sort((a, b) => {
+    const x = keys.get(a)!, y = keys.get(b)!;
+    return x.height - y.height || x.segment - y.segment ||
+      x.offset - y.offset ||
+      (a < b ? -1 : a === b ? 0 : 1);
+  });
 }
 
 /** Timestamp ties have no paging anchors. Meet nearby candidates from both

@@ -177,8 +177,8 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
     );
     assertEquals(
       (await relationsOf(db, fr.roomId, root.event_id!)).length,
-      0,
-      'history edge is not a live relation listing',
+      1,
+      'eligible history is readable as a relation without becoming live news',
     );
     assertEquals(
       await db.query('SELECT event,seq FROM feed ORDER BY seq'),
