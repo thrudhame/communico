@@ -282,6 +282,19 @@ through the existing folder-level authentication placement.
 `federation.discoveryservers` controls the server-attempt cap (default 3).
 (`api/engine/client/discovery.ts`, `api/engine/room/restricted.ts`)
 
+Client space hierarchy walks valid, redaction-aware child links depth-first,
+ordered by valid ASCII order, timestamp and room ID. Opaque five-minute sessions
+retain the pending stack and visited rooms, bind user/root/depth/suggested filters,
+and recheck access on every page. Unknown children use signed via discovery;
+remote summaries are filtered again for the user, and remote inaccessible children
+are not retried. Federation serves one held root and its immediate children only,
+distinguishing known inaccessible children from unknown rooms. Neither endpoint
+joins rooms or expands the peer roster. The layered `hierarchy` settings control
+page sizes (50 default, 100 cap), optional depth cap (0 = unrestricted), session
+lifetime/capacity and retained traversal-room budget. Exhaustion fails explicitly,
+not with a falsely complete partial walk. Sessions expire on process restart.
+(`api/engine/client/hierarchy.ts`)
+
 Alias and profile discovery ask remote servers by default, including anonymous
 requests, through signed, admission-gated federation. `federation.lookups=known`
 restricts answers to held data; `none` disables remote lookup answers. Discovery

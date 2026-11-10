@@ -18,6 +18,14 @@ export const SCHEMA = {
   admin: {
     socket: 'string',
   },
+  hierarchy: {
+    pagesize: 'int',
+    maxpagesize: 'int',
+    maxdepth: 'int',
+    sessionseconds: 'int',
+    maxsessions: 'int',
+    maxrooms: 'int',
+  },
   media: {
     root: 'string',
     maxbytes: 'int',

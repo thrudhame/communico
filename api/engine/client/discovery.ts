@@ -84,11 +84,12 @@ export async function localDiscoverySummary(
 
 /** Unheld-room summaries travel via the actual federation hierarchy API, never
  * a fabricated federation room_summary endpoint or participation intent. */
-export async function remoteDiscoverySummary(
+export async function remoteDiscoveryHierarchy(
   id: string,
   user: string,
   via: readonly string[],
-): Promise<Json | null> {
+  suggested = false,
+): Promise<{ room: Json; inaccessible: string[] } | null> {
   if (!config().federation.enabled) return null;
   const app = theApp();
   let failure: unknown;
@@ -102,7 +103,8 @@ export async function remoteDiscoverySummary(
       response = await discoveryRequest(app.server, app.tenant.signer(), {
         destination,
         room: { store: app.store, id },
-        path: '/_matrix/federation/v1/hierarchy/' + encodeURIComponent(id),
+        path: '/_matrix/federation/v1/hierarchy/' + encodeURIComponent(id) +
+          (suggested ? '?suggested_only=true' : ''),
       });
     } catch (error) {
       if (!(error instanceof MatrixError)) throw error;
@@ -125,11 +127,27 @@ export async function remoteDiscoverySummary(
       continue;
     }
     const summary = root as Json;
-    if (await summaryAccessible(summary, { user })) return summary;
+    if (await summaryAccessible(summary, { user })) {
+      const inaccessible = (response as Json).inaccessible_children;
+      return {
+        room: summary,
+        inaccessible: Array.isArray(inaccessible)
+          ? inaccessible.filter((id): id is string => typeof id === 'string')
+          : [],
+      };
+    }
     return null;
   }
   if (failure !== undefined) throw failure;
   return null;
+}
+
+export async function remoteDiscoverySummary(
+  id: string,
+  user: string,
+  via: readonly string[],
+): Promise<Json | null> {
+  return (await remoteDiscoveryHierarchy(id, user, via))?.room ?? null;
 }
 
 export async function roomSummary(

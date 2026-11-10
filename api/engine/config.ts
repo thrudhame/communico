@@ -300,6 +300,24 @@ export function loadConfig(opts: {
     );
   }
 
+  const hierarchy = built.hierarchy as Record<string, unknown> | undefined;
+  for (const [key, value] of Object.entries(hierarchy ?? {})) {
+    if (typeof value === 'number' && value < (key === 'maxdepth' ? 0 : 1)) {
+      problems.push(
+        `config: hierarchy.${key}: expected >= ${key === 'maxdepth' ? 0 : 1}`,
+      );
+    }
+  }
+  if (
+    typeof hierarchy?.pagesize === 'number' &&
+    typeof hierarchy.maxpagesize === 'number' &&
+    hierarchy.pagesize > hierarchy.maxpagesize
+  ) {
+    problems.push(
+      'config: hierarchy.pagesize: expected <= hierarchy.maxpagesize',
+    );
+  }
+
   const grace = (built.server as Record<string, unknown> | undefined)
     ?.shutdowngraceseconds;
   if (typeof grace === 'number' && grace < 0) {
@@ -645,6 +663,7 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
+  hierarchy?: Partial<Config['hierarchy']>;
   push?: {
     readretentiondays?: number;
     deliverygiveuphours?: number;

@@ -11,7 +11,15 @@ import {
   resolvePaths,
 } from '#engine/config.ts';
 
-const FULL = `[server]
+const FULL = `[hierarchy]
+pagesize = 50
+maxpagesize = 100
+maxdepth = 0
+sessionseconds = 300
+maxsessions = 1000
+maxrooms = 10000
+
+[server]
 name = "localhost"
 port = 8008
 shutdowngraceseconds = 10
@@ -779,7 +787,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('85 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('91 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -800,6 +808,7 @@ Deno.test('85 leaves total across the sections (the surface tripwire)', async ()
   assertEquals(counts, [
     ['server', 4],
     ['admin', 1],
+    ['hierarchy', 6],
     ['media', 20],
     ['encryption', 3],
     ['e2ee', 9],
@@ -810,8 +819,45 @@ Deno.test('85 leaves total across the sections (the surface tripwire)', async ()
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    85,
+    91,
     'the whole config surface includes remote media resource and cache policy leaves',
+  );
+});
+
+Deno.test('hierarchy limits are layered and reject invalid capacities', () => {
+  const fromEnv = loadConfig({
+    defaultsPath: 'defaults/communico.toml',
+    configPath: null,
+    env: {
+      COMMUNICO_HIERARCHY_PAGESIZE: '7',
+      COMMUNICO_HIERARCHY_MAXDEPTH: '4',
+    },
+  });
+  assertEquals(fromEnv.config.hierarchy.pagesize, 7);
+  assertEquals(fromEnv.config.hierarchy.maxdepth, 4);
+  for (
+    const key of [
+      'PAGESIZE',
+      'MAXPAGESIZE',
+      'SESSIONSECONDS',
+      'MAXSESSIONS',
+      'MAXROOMS',
+    ]
+  ) {
+    assert(
+      loadFail({
+        defaultsPath: 'defaults/communico.toml',
+        configPath: null,
+        env: { ['COMMUNICO_HIERARCHY_' + key]: '0' },
+      }).some((p) => p.includes('hierarchy.')),
+    );
+  }
+  assert(
+    loadFail({
+      defaultsPath: 'defaults/communico.toml',
+      configPath: null,
+      env: { COMMUNICO_HIERARCHY_PAGESIZE: '101' },
+    }).some((p) => p.includes('maxpagesize')),
   );
 });
 
