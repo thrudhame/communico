@@ -115,7 +115,21 @@ export async function savedPrejoinDisplay(
     const known = typeof hint.source_event_id === 'string'
       ? await prejoinDisplay(room, [hint.source_event_id], member, viewer)
       : [];
-    out.push(known.length ? known[0] : stripPrejoin(redact(hint, version)));
+    if (!known.length) {
+      out.push(stripPrejoin(redact(hint, version)));
+      continue;
+    }
+    // A reference hash can identify a content-pruned PDU too. Room knowledge
+    // may remove fields from a saved hint, but must never restore omitted data.
+    const allowed = known[0].content as Record<string, unknown>;
+    out.push({
+      ...stripPrejoin(hint),
+      content: Object.fromEntries(
+        Object.entries(hint.content as Record<string, unknown>).filter((
+          [key],
+        ) => Object.hasOwn(allowed, key)),
+      ),
+    });
   }
   return out;
 }

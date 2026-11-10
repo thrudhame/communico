@@ -119,7 +119,12 @@ export async function setUserAvatarUrl(
   localpart: string,
   url: string | null,
 ): Promise<void> {
-  await setProfileRow(conn, localpart, 'avatar_url', url);
+  await setProfileRow(
+    conn,
+    localpart,
+    'avatar_url',
+    url === null ? undefined : url,
+  );
 }
 
 export async function markDeactivated(
@@ -352,11 +357,7 @@ export async function setAvatarUrl(
   return await tenant.tx(async (tx) => {
     const row = await tx.users.byLocalpart(localpart);
     const oldValue = row === null ? null : row.avatar_url;
-    await tx.profiles.set(
-      localpart,
-      'avatar_url',
-      url === null ? undefined : url,
-    );
+    await tx.users.setAvatarUrl(localpart, url);
     return { oldValue, newValue: url };
   });
 }

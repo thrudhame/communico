@@ -284,9 +284,9 @@ Deno.test('saved OOB hints cannot bypass known held-room redactions in notificat
       assertEquals(response.status, 200);
       return await response.json();
     };
-    for (const full of [true, false]) {
+    for (const format of ['full', 'partial', 'legacy']) {
       const fake = await makeFakeRoom({
-        roomId: '!hint-' + full + ':remote.test',
+        roomId: '!hint-' + format + ':remote.test',
       });
       const name = await fake.addEvent({
         type: 'm.room.name',
@@ -306,13 +306,14 @@ Deno.test('saved OOB hints cannot bypass known held-room redactions in notificat
       });
       const keys = fakeKeyResolver(fake.server);
       const hints = [fake.events.get(fake.createId)!, name, topic].map(wireOf);
+      if (format === 'partial') hints[2] = { ...hints[2], content: {} };
       await receiveInvite(
         fake.roomId,
         invite.event_id!,
         {
           room_version: '11',
           event: wireOf(invite),
-          invite_room_state: full
+          invite_room_state: format !== 'legacy'
             ? hints
             : hints.map((e) =>
               stripPrejoin(e as unknown as Record<string, unknown>)
@@ -388,7 +389,7 @@ Deno.test('saved OOB hints cannot bypass known held-room redactions in notificat
         assertEquals(
           shown.find((e: { type: string }) => e.type === 'm.room.topic')
             .content,
-          full ? { topic: 'retained topic' } : {},
+          format === 'full' ? { topic: 'retained topic' } : {},
         );
         assert(
           shown.every((e: Record<string, unknown>) =>
