@@ -15,6 +15,7 @@
 // cursors never renumber). The gap is COMPLETE when the page's boundary
 // events' prevs are all grounded (the create is such an event).
 import { canonicalJson } from '#engine/canonical.ts';
+import { aclAllows } from '#engine/room/acl.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import {
   type EventStore,
@@ -43,7 +44,11 @@ import { orderEvents } from '#engine/room/order.ts';
 import { mapEntries } from '#engine/room/state.ts';
 import { verify } from '#engine/room/verify.ts';
 
-export type BackfillDeps = { keys: KeyResolver; fetcher: Fetcher };
+export type BackfillDeps = {
+  keys: KeyResolver;
+  fetcher: Fetcher;
+  signal?: AbortSignal;
+};
 
 export type BackfillResult = {
   // filled: the gap moved; complete: the gap closed (all boundary prevs
@@ -75,9 +80,12 @@ async function fetchBoundary(
   version: string,
   deps: BackfillDeps,
 ): Promise<{ boundary: StateMap; pack: Map<string, Pdu> } | null> {
-  const ids = await fetchOrNull(() => deps.fetcher.stateIds(room.id, at, via));
+  const ids = await fetchOrNull(() =>
+    deps.fetcher.stateIds(room.id, at, via, deps.signal)
+  );
   if (ids === null) return null;
   const wanted = [...new Set([...ids.pduIds, ...ids.authChainIds])].sort();
+  if (wanted.length > 10_000) return null;
   const unknown = await room.tx(async (tx) => {
     const out: string[] = [];
     for (const id of wanted) {
@@ -87,7 +95,10 @@ async function fetchBoundary(
   });
   const pack = new Map<string, Pdu>();
   for (const id of unknown) {
-    const raw = await fetchOrNull(() => deps.fetcher.event(id, via, room.id));
+    deps.signal?.throwIfAborted();
+    const raw = await fetchOrNull(() =>
+      deps.fetcher.event(id, via, room.id, deps.signal)
+    );
     if (raw === null) return null;
     try {
       const v = await verify(raw, version, deps.keys, {
@@ -118,9 +129,80 @@ async function fetchBoundary(
 // names the stay whose history segment receives the page (the default
 // is the live — or latest — stay, the common case); `via` is one
 // server — trying the next is the caller's loop.
+// Resolve an isolated anchor's forward gap from held newer boundaries. A
+// backfill imports only verified/authenticated history and retains first owners;
+// the segment walk crosses only when it can observe an actual positioned child.
+// Progress is durable between bounded pagination requests, not an empty forever
+// cursor and not a made-up connection to the anchor's owning stay.
+export async function bridgeForwardAnchor(
+  room: Room,
+  cursor: { segment: number; offset: number },
+  peers: string[],
+  limit: number,
+  deps: BackfillDeps,
+): Promise<boolean> {
+  const signal = deps.signal ?? AbortSignal.timeout(8000);
+  const boundaries = await room.tx(async (tx) => {
+    const out: { stay: number; segment?: number; from: string[] }[] = [];
+    const segments = await tx.segments.list();
+    const owner = (await tx.segments.get(cursor.segment))?.prev;
+    segments.sort((a, b) =>
+      Number(b.id === owner) - Number(a.id === owner) || a.id - b.id
+    );
+    for (const segment of segments) {
+      if (segment.id === cursor.segment) continue;
+      const first = await tx.segments.positionsPage(
+        segment.id,
+        -Number.MAX_SAFE_INTEGER,
+        'f',
+        1,
+      );
+      if (first.length === 0) continue;
+      const missing: string[] = [];
+      for (const prev of await tx.events.prevsOf(first[0].event)) {
+        if (await tx.state.eventStateAfter(prev) === null) missing.push(prev);
+      }
+      if (missing.length > 0) {
+        out.push({
+          stay: segment.kind === 'stay' ? segment.id : segment.prev!,
+          ...(segment.kind === 'anchor' ? { segment: segment.id } : {}),
+          from: missing,
+        });
+      }
+      if (out.length === 3) break;
+    }
+    return out;
+  });
+  let progress = false;
+  for (const boundary of boundaries) {
+    for (const via of peers.slice(0, 3)) {
+      if (signal.aborted) return progress;
+      const result = await backfill(room, { ...boundary, via, limit }, {
+        ...deps,
+        signal,
+      });
+      if (result.outcome !== 'open') {
+        progress = true;
+        break;
+      }
+    }
+    if ((await room.tx((tx) => tx.segments.step(cursor, 'f'))).kind !== 'gap') {
+      break;
+    }
+  }
+  return progress;
+}
+
 export async function backfill(
   room: Room,
-  args: { from: string[]; limit: number; via: string; stay?: number },
+  args: {
+    from: string[];
+    limit: number;
+    via: string;
+    stay?: number;
+    segment?: number;
+    anchor?: Pdu;
+  },
   deps: BackfillDeps,
 ): Promise<BackfillResult> {
   const empty: BackfillResult = {
@@ -133,9 +215,14 @@ export async function backfill(
       ? (await tx.segments.openStay()) ?? await tx.segments.latestStay()
       : await tx.segments.get(args.stay);
     if (stay === null || stay.kind !== 'stay') return null;
-    return { stay, version: await roomVersionOf(tx, stay.id) };
+    return {
+      stay,
+      version: await roomVersionOf(tx, stay.id),
+      allowed: await aclAllows(tx, args.via),
+    };
   });
   if (stayRow === null) throw new Error('M_ROOM_NOT_FOUND: ' + room.id);
+  if (!stayRow.allowed) return empty;
   const version = stayRow.version;
 
   // The fetch phase (never under the lock): the page, each event
@@ -143,12 +230,15 @@ export async function backfill(
   // means the gap is unresolved.
   let answered: Pdu[];
   try {
-    answered = await deps.fetcher.backfill(
-      room.id,
-      args.from,
-      args.limit,
-      args.via,
-    );
+    answered = args.anchor !== undefined
+      ? [args.anchor]
+      : await deps.fetcher.backfill(
+        room.id,
+        args.from,
+        args.limit,
+        args.via,
+        deps.signal,
+      );
   } catch {
     return empty;
   }
@@ -263,6 +353,11 @@ export async function backfill(
   const written = await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
       // Revalidation (G8): the fetch phase ran unlocked.
+      deps.signal?.throwIfAborted();
+      // A policy refusal is the same unresolved page as a refused fetch, not a
+      // caller exception. Every pagination/search caller can keep its local
+      // result and try the next peer; storage faults still propagate.
+      if (!await aclAllows(tx, args.via)) return empty;
       const stay = args.stay === undefined
         ? (await tx.segments.openStay()) ?? await tx.segments.latestStay()
         : await tx.segments.get(args.stay);
@@ -271,9 +366,24 @@ export async function backfill(
       }
       const rulebook = getRulebook(await roomVersionOf(tx, stay.id));
       const createId = await roomCreateId(tx, stay.id);
-      let history = await tx.segments.historyOf(stay.id);
-      if (history === null) {
-        const id = await tx.segments.create({ kind: 'history', prev: stay.id });
+      let history = args.segment === undefined
+        ? args.anchor === undefined
+          ? await tx.segments.historyOf(stay.id)
+          : null
+        : await tx.segments.get(args.segment);
+      if (
+        args.segment !== undefined &&
+        (history === null || history.kind === 'stay' ||
+          history.prev !== stay.id)
+      ) {
+        throw new Error('E_HISTORY_OWNER: invalid history target');
+      }
+      if (history === null && args.anchor === undefined) {
+        const id = await tx.segments.create({
+          kind: args.anchor === undefined ? 'history' : 'anchor',
+          prev: stay.id,
+          opened_by: args.anchor === undefined ? null : ordered[0].eventId,
+        });
         history = (await tx.segments.get(id))!;
       }
 
@@ -501,10 +611,17 @@ export async function backfill(
           entry.grounding === 'grounded' && entry.standing === 'accepted'
         )
         .map((entry) => entry.id);
-      const offsets = await tx.segments.prependPositions(
-        history.id,
-        positioned,
-      );
+      if (history === null && positioned.length > 0) {
+        const id = await tx.segments.create({
+          kind: 'anchor',
+          prev: stay.id,
+          opened_by: positioned[0],
+        });
+        history = (await tx.segments.get(id))!;
+      }
+      const offsets = history === null
+        ? []
+        : await tx.segments.prependPositions(history.id, positioned);
       const offsetOf = new Map(
         positioned.map((id, index) => [id, offsets[index]]),
       );
@@ -518,7 +635,7 @@ export async function backfill(
           sender: String(entry.pdu.sender),
           depth: entry.pdu.depth,
           origin_server_ts: entry.pdu.origin_server_ts,
-          segment: history.id,
+          segment: history?.id ?? null,
           offset: offsetOf.get(entry.id) ?? null,
           grounding: entry.grounding,
           origin: args.via,
@@ -547,6 +664,7 @@ export async function backfill(
           break;
         }
       }
+      if (history === null) return empty;
       if (complete) await tx.segments.close(history.id);
       return {
         outcome: complete

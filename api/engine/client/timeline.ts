@@ -3,7 +3,7 @@ import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { productionFetcher } from '#engine/federation/fetcher.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
-import { backfill } from '#engine/room/history.ts';
+import { backfill, bridgeForwardAnchor } from '#engine/room/history.ts';
 import {
   formatCursor,
   parseCursor,
@@ -155,6 +155,28 @@ export async function messages(
       ended = true;
       break;
     }
+    if (step.kind === 'gap') {
+      if (!filled) {
+        filled = true;
+        const signer = theApp().tenant.signer();
+        await bridgeForwardAnchor(
+          room,
+          step.cursor,
+          (await serversInRoom(room.id)).filter((s) => s !== serverName()),
+          config().federation.backfillbatch,
+          {
+            keys: productionKeyResolver(theApp().server, signer),
+            fetcher: productionFetcher(theApp().server, signer, theApp().store),
+          },
+        );
+        const resolved = await room.tx((tx) =>
+          tx.segments.step(cursor!, w.dir)
+        );
+        if (resolved.kind !== 'gap') continue;
+      }
+      frontier = step.cursor;
+      break;
+    }
     if (step.kind === 'frontier') {
       if (filled) {
         frontier = step.cursor;
@@ -167,7 +189,7 @@ export async function messages(
       const segment = await room.tx((tx) =>
         tx.segments.get(step.cursor.segment)
       );
-      const stay = segment?.kind === 'history'
+      const stay = segment !== null && segment.kind !== 'stay'
         ? segment.prev!
         : step.cursor.segment;
       const signer = theApp().tenant.signer();
@@ -178,6 +200,7 @@ export async function messages(
           limit: config().federation.backfillbatch,
           via,
           stay,
+          segment: segment?.kind === 'anchor' ? segment.id : undefined,
         }, {
           keys: productionKeyResolver(theApp().server, signer),
           fetcher: productionFetcher(theApp().server, signer, theApp().store),
@@ -236,7 +259,7 @@ export async function messages(
   } = { chunk, start: w.fromToken ?? '' };
   if (!((ended || last?.type === 'm.room.create') && !filtered)) {
     if (frontier !== null) result.end = formatCursor(frontier);
-    else if (raw.length > 0) result.end = formatCursor(cursor);
+    else if (raw.length > 0 || limit === 0) result.end = formatCursor(cursor);
   }
   if (w.lazyLoadMembers) {
     const senders = new Set(chunk.map((e) => String(e.sender)));

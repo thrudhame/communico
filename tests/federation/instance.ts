@@ -29,6 +29,12 @@ import { keyDocResponse, notaryFromCache } from '#engine/federation/keydoc.ts';
 import { keyStore, ourKeyDocument } from '#engine/federation/keys.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
+import {
+  serveBackfill,
+  serveStateIds,
+  serveTimestamp,
+} from '#engine/federation/serve.ts';
+import { parseTimestampQuery } from '#engine/room/timestamp.ts';
 import { makeKnock, sendKnock } from '#engine/federation/joins.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
 import { receiveTransaction } from '#engine/federation/transactions.ts';
@@ -382,6 +388,43 @@ export async function startInstance(): Promise<Instance> {
       }
       // everything below is authenticated
       const origin = await authed(req, bodyBytes);
+      const timestampMatch =
+        /^\/_matrix\/federation\/v1\/timestamp_to_event\/([^/]+)$/.exec(path);
+      if (timestampMatch && req.method === 'GET') {
+        return Response.json(
+          await serveTimestamp(
+            decodeURIComponent(timestampMatch[1]),
+            parseTimestampQuery(url.searchParams),
+            origin,
+            { store, server, self: name },
+          ),
+        );
+      }
+      const stateIdsMatch = /^\/_matrix\/federation\/v1\/state_ids\/([^/]+)$/
+        .exec(path);
+      if (stateIdsMatch && req.method === 'GET') {
+        return Response.json(
+          await serveStateIds(
+            decodeURIComponent(stateIdsMatch[1]),
+            url.searchParams.get('event_id')!,
+            origin,
+            { store, server, self: name },
+          ),
+        );
+      }
+      const backfillMatch = /^\/_matrix\/federation\/v1\/backfill\/([^/]+)$/
+        .exec(path);
+      if (backfillMatch && req.method === 'GET') {
+        return Response.json(
+          await serveBackfill(
+            decodeURIComponent(backfillMatch[1]),
+            url.searchParams.getAll('v'),
+            Number(url.searchParams.get('limit')),
+            origin,
+            { store, server, self: name },
+          ),
+        );
+      }
       const bodyJson = bodyBytes.length === 0
         ? null
         : JSON.parse(new TextDecoder().decode(bodyBytes));

@@ -15,6 +15,7 @@ import {
   serveGetMissingEvents,
   serveState,
   serveStateIds,
+  serveTimestamp,
 } from '#engine/federation/serve.ts';
 import {
   type InviteDeps,
@@ -83,6 +84,7 @@ Deno.test('ACL: all resident serving and membership template classes use current
       () => serveEvent(g.tipId, 'remote.test', deps),
       () => serveEventAuth(g.roomId, g.tipId, 'remote.test', deps),
       () => serveBackfill(g.roomId, [g.tipId], 10, 'remote.test', deps),
+      () => serveTimestamp(g.roomId, { ts: 0, dir: 'f' }, 'remote.test', deps),
       () =>
         serveGetMissingEvents(
           g.roomId,
@@ -459,6 +461,7 @@ Deno.test('ACL: room-scoped federation endpoint inventory has an admitted engine
     'v2/invite/#roomId/#eventId/put.ts': 'receiveInvite',
     'v1/state/#roomId/get.ts': 'serveState',
     'v1/state_ids/#roomId/get.ts': 'serveStateIds',
+    'v1/timestamp_to_event/#roomId/get.ts': 'serveTimestamp',
   };
   const found: string[] = [];
   async function walk(prefix: string) {

@@ -12,6 +12,7 @@ import { roomOf } from '#engine/server/read.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { toWire } from './pdu.ts';
+import { findTimestamp, type TimestampQuery } from '#engine/room/timestamp.ts';
 import {
   authClosure,
   currentSnapshot,
@@ -69,13 +70,11 @@ async function chainAt(tx: RoomTx, ids: string[]) {
   return events;
 }
 
-async function wireVisible(
+async function serverCanSeeAt(
   tx: RoomTx,
   eventId: string,
-  pdu: Pdu,
-  version: string,
   origin: string,
-) {
+): Promise<boolean> {
   const ref = await tx.state.eventStateBefore(eventId);
   let full = false;
   if (ref !== null) {
@@ -88,11 +87,46 @@ async function wireVisible(
       ((visibility === 'joined' || visibility === 'invited') &&
         await serverInState(tx, before, origin, visibility === 'invited'));
   }
-  const visible = full ? pdu : redact(
+  return full;
+}
+
+async function wireVisible(
+  tx: RoomTx,
+  eventId: string,
+  pdu: Pdu,
+  version: string,
+  origin: string,
+) {
+  const visible = await serverCanSeeAt(tx, eventId, origin) ? pdu : redact(
     pdu as unknown as Record<string, unknown>,
     version,
   ) as unknown as Pdu;
   return toWire(visible, version);
+}
+
+export async function serveTimestamp(
+  roomId: string,
+  query: TimestampQuery,
+  origin: string,
+  deps: ServeDeps,
+) {
+  const room = await heldRoom(deps.store, roomId);
+  return await room.tx(async (tx) => {
+    await inRoom(tx, origin);
+    const hit = await findTimestamp(
+      tx,
+      query,
+      (id) => serverCanSeeAt(tx, id, origin),
+    );
+    if (hit === null) {
+      throw new MatrixError(
+        404,
+        'M_NOT_FOUND',
+        'no visible event at timestamp',
+      );
+    }
+    return hit;
+  });
 }
 
 export async function serveStateIds(

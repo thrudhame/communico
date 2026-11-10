@@ -35,7 +35,19 @@ export interface KeyResolver {
 export interface Fetcher {
   // GET /_matrix/federation/v1/event/{eventId} — the PDU, or null on
   // 404/unreachable.
-  event(id: string, via: string, roomId: string): Promise<Pdu | null>;
+  event(
+    id: string,
+    via: string,
+    roomId: string,
+    signal?: AbortSignal,
+  ): Promise<Pdu | null>;
+  timestampToEvent(
+    roomId: string,
+    ts: number,
+    dir: 'f' | 'b',
+    via: string,
+    signal?: AbortSignal,
+  ): Promise<{ event_id: string; origin_server_ts: number } | null>;
   // POST /_matrix/federation/v1/get_missing_events/{roomId}: the events
   // between earliest (our extremities) and latest (the pushed event),
   // forward-topological, up to limit (backfill.yaml:71-141).
@@ -52,6 +64,7 @@ export interface Fetcher {
     roomId: string,
     at: string,
     via: string,
+    signal?: AbortSignal,
   ): Promise<{ pduIds: string[]; authChainIds: string[] } | null>;
   // GET /_matrix/federation/v1/event_auth/{roomId}/{eventId} — the
   // complete auth chain of the event (event_auth.yaml).
@@ -65,6 +78,7 @@ export interface Fetcher {
     from: string[],
     limit: number,
     via: string,
+    signal?: AbortSignal,
   ): Promise<Pdu[]>;
   // GET /_matrix/federation/v1/make_join/{roomId}/{userId}?ver=… — the
   // resident's template: the room's version and the unsigned member
