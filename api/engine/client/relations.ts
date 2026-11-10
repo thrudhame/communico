@@ -140,7 +140,11 @@ export async function relationsPage(
   if (!await canSeeEvent(viewer, room, eventId)) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'event not found: ' + eventId);
   }
-  const children = await relationView(room, eventId, viewer, {
+  const children = await relationView(room, eventId, {
+    userId: viewer,
+    deviceId: null,
+    tenant: theApp().tenant,
+  }, {
     ...filters,
     recurse: query.recurse === 'true',
   });
@@ -157,6 +161,7 @@ export async function relationsPage(
     const event = await renderEvent(room, row.event, {
       userId: viewer,
       deviceId: null,
+      tenant: theApp().tenant,
     });
     if (event !== null) chunk.push(event);
   }
@@ -186,6 +191,7 @@ export async function threads(
     const ev = await renderEvent(room, root.eventId, {
       userId: viewer,
       deviceId: null,
+      tenant: theApp().tenant,
     });
     if (ev === null) continue;
     const summary = ((ev.unsigned as Record<string, unknown>)['m.relations'] as

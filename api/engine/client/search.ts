@@ -119,7 +119,11 @@ export async function search(
     if (
       !eventMatchesRoomEventFilter(null, pdu, filter) ||
       !await canSeeEvent(userId, room, c.eventId) ||
-      await isIgnoredEvent(room, c.eventId, userId)
+      await isIgnoredEvent(room, c.eventId, {
+        userId,
+        deviceId: null,
+        tenant: theApp().tenant,
+      })
     ) continue;
     matched.push({ ...c, rank: rankOf(c.bodyLower, tokens) });
   }

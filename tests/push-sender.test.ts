@@ -23,6 +23,8 @@ import {
 } from '#engine/server/push-work.ts';
 import { startPushSender } from '#engine/push/sender.ts';
 import { setConfigForTests } from '#engine/config.ts';
+import { renderEvent } from '#engine/client/render.ts';
+import { putAccountData } from '#engine/tenant/accountdata.ts';
 
 type Json = Record<string, unknown>;
 async function fixture() {
@@ -109,6 +111,46 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('standalone renderer: explicit tenant owns ignored users and nested thread consumers without an app singleton', async () => {
+  const f = await fixture();
+  try {
+    const room = await openRoom(f.store, f.g.roomId);
+    const root = await sendLocal(room, {
+      type: 'm.room.message',
+      sender: '@bob:test',
+      content: { body: 'root', msgtype: 'm.text' },
+    }, f.g.signer);
+    const reply = await sendLocal(room, {
+      type: 'm.room.message',
+      sender: f.g.creator,
+      content: {
+        body: 'reply',
+        msgtype: 'm.text',
+        'm.relates_to': { rel_type: 'm.thread', event_id: root.eventId },
+      },
+    }, f.g.signer);
+    await project(f.store, f.g.roomId);
+    const viewer = { userId: '@bob:test', deviceId: null, tenant: f.tenant };
+    const shown = await renderEvent(room, root.eventId, viewer);
+    const thread =
+      ((shown!.unsigned as Json)['m.relations'] as Json)['m.thread'] as Json;
+    assertEquals(thread.count, 1);
+    assertEquals((thread.latest_event as Json).event_id, reply.eventId);
+    await putAccountData(f.tenant, 'bob', '', 'm.ignored_user_list', {
+      ignored_users: { [f.g.creator]: {} },
+    });
+    const filtered = await renderEvent(room, root.eventId, viewer);
+    assertEquals((filtered!.unsigned as Json)['m.relations'], undefined);
+    assertEquals(await renderEvent(room, reply.eventId, viewer), null);
+    assert(
+      await renderEvent(room, f.g.createId, viewer),
+      'ignoring a sender must not suppress state',
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('push sender: saved decision reaches gateway, read-before-send suppresses alerts even with retention zero, explicit badge zero', async () => {
   setConfigForTests({ push: { readretentiondays: 0 } });

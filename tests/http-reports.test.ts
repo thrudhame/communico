@@ -2,6 +2,8 @@ import { assert, assertEquals } from '@std/assert';
 import { adminHandler } from '#root/api/admin/index.ts';
 import { theApp } from '#engine/app.ts';
 import { httpSuite } from '#tests/http-app.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
+import { storeReport } from '#engine/server/reports.ts';
 
 const { matrix, registerTestUser: register, test } = httpSuite('HTTP reports');
 type Json = Record<string, unknown>;
@@ -211,5 +213,43 @@ test('admin pages, resolves idempotently and validates filters', async () => {
     }]
   ) {
     assertEquals((await admin('list', bad)).status, 400);
+  }
+});
+
+test('admin consumer gets bounded encoded pages and every complete reason', async () => {
+  const previous = config().server;
+  const existing = (await admin('list', { limit: 1000 })).body.result.reports;
+  let from = existing.at(-1)?.id ?? 0;
+  const reasons = ['\u0000'.repeat(1000), '🙂'.repeat(1200), 'last'];
+  try {
+    setConfigForTests({ server: { maxrequestbytes: 4096 } });
+    for (const reason of reasons) {
+      await storeReport(theApp().server, {
+        kind: 'user',
+        reporter: '@r:test',
+        userId: '@u:test',
+        reason,
+      });
+    }
+    const seen: string[] = [];
+    do {
+      const response = await adminHandler(theApp())(
+        new Request('http://x/v1/reports/list', {
+          method: 'POST',
+          body: JSON.stringify({ from }),
+        }),
+      );
+      assertEquals(response.status, 200);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const page = JSON.parse(new TextDecoder().decode(bytes)).result;
+      assert(bytes.length <= 4096 || page.reports.length === 1);
+      seen.push(...page.reports.map((row: Json) => row.reason as string));
+      if (page.next === undefined) break;
+      assert(page.next > from);
+      from = page.next;
+    } while (true);
+    assertEquals(seen, reasons);
+  } finally {
+    setConfigForTests({ server: previous });
   }
 });

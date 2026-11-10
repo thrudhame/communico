@@ -208,14 +208,20 @@ parent's serialization options, without recursively bundling threads.
 (`api/engine/client/{relations,relation-view}.ts`, `api/engine/room/order.ts`,
 `api/engine/server/{project,read}.ts`)
 
-Paginated relation/thread order uses the stored ancestry-closed DAG and a priority
-queue, avoiding quadratic candidate-pair searches and subset-dependent order when
-a boundary anchor is added. The shared room ordering module also retains the
-nearby, bidirectional tie algorithm for non-paginated timestamp queries, whose
-cost contract does not permit reading an old room prefix for a small tie.
+Paginated relation/thread order uses a room-owned derived causal height, then
+first-owner positions and event ID as tie-breakers. Heights come only from held
+prev edges, never remote PDU depth. Event insertion repairs indexed descendants
+when a missing parent arrives; the room transaction commits graph and keys
+together. Room schema v1 upgrades seed the index once without changing PDUs.
+Subsequent reads fetch only candidate/anchor keys in bounded batches, independent
+of the old room prefix, and filtering or adding an anchor cannot reorder the
+remaining IDs. The shared room ordering module retains the nearby bidirectional
+tie algorithm for non-paginated timestamp queries.
 
 Ignored non-state messages share a presentation filter across client timeline,
-context and search readers. State still reaches clients and original PDUs remain
+context, search and standalone push readers. Renderers and relation views require
+the viewer's tenant explicitly; neither uses the application singleton to read
+ignore policy. State still reaches clients and original PDUs remain
 unchanged. Both read-marker routes persist `m.fully_read` through the account-data
 owner; it never enters the public/private read-receipt stream, changes unread
 counts, or accepts a thread id.
@@ -445,6 +451,14 @@ supervisor example.
 `api/engine/config.ts:253-301`, `main.ts:20-42`, `main.ts:139-162`)
 
 ## Content reports
+
+Admin report pages select IDs using stored UTF-8 byte sizes before hydrating
+reasons or resolutions, in one read snapshot. The shared `server.maxrequestbytes`
+setting is also the encoded page target (including worst-case JSON escaping).
+The count limit still applies. A report larger than that target is returned
+intact as a singleton, never truncated or skipped; continue with `next`.
+Thus listing memory scales with the byte target or one oversized report, not
+the count limit times the largest allowed request. Reasons have no field cap.
 
 The shared Matrix request admission middleware bounds every non-upload body
 before JSON validation, authentication or handler dispatch, including handlers
