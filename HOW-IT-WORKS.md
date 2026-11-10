@@ -418,6 +418,16 @@ supervisor example.
 
 ## Content reports
 
+The shared Matrix request admission middleware bounds every non-upload body
+before JSON validation, authentication or handler dispatch, including handlers
+that ignore bodies. It checks declared size and counts actual streamed bytes;
+Pathfinder memoizes accepted bytes for downstream consumers. The layered
+`server.maxrequestbytes` setting defaults to Synapse's 200 x 64 KiB request
+budget. The existing 413 renderer emits `M_TOO_LARGE`. Only the two upload
+endpoints opt out through `mediaUpload` route metadata; their streaming media
+owner enforces `media.maxbytes`. No report-specific reason cap is applied.
+(`api/engine/body-limit.ts`, `api/endpoints/matrix/05-body.ts`)
+
 The shared client report handler validates event/room/user report bodies before
 delegating persistence to the server-owned reports table (server schema v22).
 Event reports require current joined membership and a visible same-room event;

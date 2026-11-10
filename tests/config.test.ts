@@ -15,6 +15,7 @@ const FULL = `[server]
 name = "localhost"
 port = 8008
 shutdowngraceseconds = 10
+maxrequestbytes = 13107200
 
 [push]
 readretentiondays = 30
@@ -168,6 +169,48 @@ Deno.test('merge order: defaults < config < env', async () => {
   assertEquals(fromEnv.sources['server.port'], 'env');
   assertEquals(fromEnv.config.server.name, 'localhost');
   assertEquals(fromEnv.sources['server.name'], 'defaults');
+});
+
+Deno.test('shared request size limit layers and rejects zero/negative values', async () => {
+  const dir = await writeTree({
+    'defaults/communico.toml': FULL,
+    'config/communico.toml': '[server]\nmaxrequestbytes = 2048\n',
+  });
+  const defaultsPath = dir + '/defaults/communico.toml';
+  const configPath = dir + '/config/communico.toml';
+  try {
+    assertEquals(
+      loadConfig({ defaultsPath, configPath: null, env: {} }).config.server
+        .maxrequestbytes,
+      13107200,
+    );
+    assertEquals(
+      loadConfig({ defaultsPath, configPath, env: {} }).config.server
+        .maxrequestbytes,
+      2048,
+    );
+    assertEquals(
+      loadConfig({
+        defaultsPath,
+        configPath,
+        env: { COMMUNICO_SERVER_MAXREQUESTBYTES: '4096' },
+      }).config.server.maxrequestbytes,
+      4096,
+    );
+    for (const value of ['0', '-1']) {
+      assert(
+        loadFail({
+          defaultsPath,
+          configPath,
+          env: { COMMUNICO_SERVER_MAXREQUESTBYTES: value },
+        }).some((p) =>
+          p.includes('server.maxrequestbytes') && p.includes('expected > 0')
+        ),
+      );
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });
 
 Deno.test('section env is an error; unknown node in env and in a file', async () => {
@@ -735,7 +778,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('83 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('84 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -754,7 +797,7 @@ Deno.test('83 leaves total across the sections (the surface tripwire)', async ()
     [name, leaves],
   ): [string, number] => [name, countLeaves(leaves)]);
   assertEquals(counts, [
-    ['server', 3],
+    ['server', 4],
     ['admin', 1],
     ['media', 20],
     ['encryption', 3],
@@ -766,7 +809,7 @@ Deno.test('83 leaves total across the sections (the surface tripwire)', async ()
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    83,
+    84,
     'the whole config surface includes remote media resource and cache policy leaves',
   );
 });

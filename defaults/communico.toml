@@ -11,6 +11,10 @@ port = 8008
 # Admission stops immediately on SIGTERM/SIGINT; admitted work gets this long.
 # COMMUNICO_SERVER_SHUTDOWNGRACESECONDS
 shutdowngraceseconds = 10
+# Maximum non-upload request body, in bytes, before JSON parsing or dispatch.
+# Synapse MAX_REQUEST_SIZE: 200 x 64 KiB = 12.5 MiB. Must be positive.
+# Media uploads retain media.maxbytes. COMMUNICO_SERVER_MAXREQUESTBYTES
+maxrequestbytes = 13107200
 
 [admin]
 # Local operator API. Empty means admin.sock beside the resolved store root.

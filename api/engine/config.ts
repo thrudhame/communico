@@ -308,6 +308,14 @@ export function loadConfig(opts: {
     );
   }
 
+  const requestBytes = (built.server as Record<string, unknown> | undefined)
+    ?.maxrequestbytes;
+  if (typeof requestBytes === 'number' && requestBytes < 1) {
+    problems.push(
+      'config: server.maxrequestbytes (COMMUNICO_SERVER_MAXREQUESTBYTES): expected > 0',
+    );
+  }
+
   const retention = (built.push as Record<string, unknown> | undefined)
     ?.readretentiondays;
   if (typeof retention === 'number' && retention < 0) {
@@ -638,7 +646,12 @@ export type ConfigPatch = {
     allowlist?: string[];
     cacerts?: string[];
   };
-  server?: { name?: string; port?: number; shutdowngraceseconds?: number };
+  server?: {
+    name?: string;
+    port?: number;
+    shutdowngraceseconds?: number;
+    maxrequestbytes?: number;
+  };
   admin?: { socket?: string };
   media?: Partial<Omit<Config['media'], 'cache'>> & {
     cache?: {

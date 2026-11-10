@@ -177,6 +177,12 @@ Configuration uses `defaults/communico.toml`, an optional
 `config/communico.toml` overlay and `COMMUNICO_*` environment overrides.
 `deno task config` prints the merged settings; it does not initialize storage.
 
+Non-upload request bodies are limited before JSON parsing to 12.5 MiB by
+`server.maxrequestbytes` (`COMMUNICO_SERVER_MAXREQUESTBYTES`). Operators can
+override the positive byte limit through the same configuration layers.
+Oversized requests return HTTP 413 `M_TOO_LARGE`. Media uploads retain the
+separate `media.maxbytes` limit. Report reasons have no separate field cap.
+
 The Turso Complement runtime image, runner and HTTP-only continuity helper are
 restored. [complement/BASELINE.md](complement/BASELINE.md) records the
 2026-11-06 PST run: 59 failing tests (including parent/subtest entries), with

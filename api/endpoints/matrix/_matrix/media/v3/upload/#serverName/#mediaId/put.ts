@@ -5,6 +5,8 @@ import { getMedia, markUploaded } from '#engine/tenant/media.ts';
 import { assertLocalMxc, storeUploadBody } from '#engine/media.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
+export const mediaUpload = true;
+
 export default async function (request: PathfinderRequest, context: Context) {
   const caller = context.state.user as string;
   const mediaId = request.params.mediaId as string;
