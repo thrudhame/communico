@@ -167,6 +167,10 @@ test('profile writes persist through every GET shape and propagate both fields t
   assertEquals(
     (await call(profile + '/avatar_url', token, { avatar_url: null }, 'PUT'))
       .status,
+    400,
+  );
+  assertEquals(
+    (await call(profile + '/avatar_url', token, undefined, 'DELETE')).status,
     200,
   );
   assertEquals((await call(profile)).body, {});

@@ -328,6 +328,8 @@ Public profiles support namespaced custom JSON fields and `m.tz`, with per-field
 GET/PUT/DELETE and `m.profile_fields` capability discovery. Keys are at most 255
 UTF-8 bytes; the whole profile must remain below 64 KiB. Custom null values are
 retained until DELETE. Only display names and avatars enter room membership.
+Avatar and timezone values must be strings but are otherwise accepted verbatim,
+matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
 ## Operator tools
 
