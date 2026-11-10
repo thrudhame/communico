@@ -5,7 +5,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
 import type { Room, RoomTx } from '#engine/room/index.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
-import { verify } from '#engine/room/verify.ts';
+import { identify, verify } from '#engine/room/verify.ts';
 import { toWire } from './pdu.ts';
 import { erasedView } from '#engine/erasure.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
@@ -35,6 +35,7 @@ export function stripPrejoin(pdu: Record<string, unknown>) {
 async function selectedPrejoin(tx: RoomTx, ids: string[], member: string) {
   const out: { id: string; pdu: Pdu }[] = [];
   for (const [id, row] of await tx.events.list(ids)) {
+    if ((await tx.events.getStatus(id))?.standing !== 'accepted') continue;
     const type = row.type, stateKey = row.state_key;
     if (
       !prejoinTypes.has(type) &&
@@ -94,6 +95,31 @@ export async function prejoinDisplay(
   return out;
 }
 
+/** Saved hints are not room truth. Once a room is held, only an identified,
+ * accepted source can supply unpruned content. Legacy/unidentified hints fail
+ * closed using the room's redaction rules, without replacing the saved cut. */
+export async function savedPrejoinDisplay(
+  room: Room | null,
+  saved: Record<string, unknown>[],
+  member: string,
+  viewer: { userId: string; tenant: Tenant },
+) {
+  if (room === null) return saved.map(stripPrejoin);
+  const version = await room.tx(async (tx) => {
+    const stay = await tx.segments.latestStay();
+    return stay === null ? null : await roomVersionOf(tx, stay.id);
+  });
+  if (version === null) return saved.map(stripPrejoin);
+  const out: Record<string, unknown>[] = [];
+  for (const hint of saved) {
+    const known = typeof hint.source_event_id === 'string'
+      ? await prejoinDisplay(room, [hint.source_event_id], member, viewer)
+      : [];
+    out.push(known.length ? known[0] : stripPrejoin(redact(hint, version)));
+  }
+  return out;
+}
+
 // v3-v11 compatibility is filter-only; admin-UI warning remains a TODO.
 // v12 identity comes from the signed create and cannot be guessed from hints.
 export async function validatePrejoin(
@@ -140,7 +166,23 @@ export async function validatePrejoin(
       }
     }
     seen.add(key);
-    display.push(stripPrejoin(entry));
+    // Keep computed provenance privately. A remote-supplied event ID or hint
+    // metadata is never trusted, and stripPrejoin removes this on every wire.
+    let source: string | undefined;
+    if (Array.isArray(entry.auth_events) && Array.isArray(entry.prev_events)) {
+      try {
+        source =
+          (await identify(structuredClone(entry) as unknown as Pdu, version, {
+            roomId,
+          })).eventId;
+      } catch {
+        // Legacy stripped hints remain display-only, with no claimed identity.
+      }
+    }
+    display.push({
+      ...stripPrejoin(entry),
+      ...(source === undefined ? {} : { source_event_id: source }),
+    });
   }
   if (version === '12' && !create) {
     throw new MatrixError(400, 'M_BAD_JSON', 'prejoin create required');

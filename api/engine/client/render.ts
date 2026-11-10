@@ -12,7 +12,10 @@ import { isIgnoredEvent } from './ignored.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { canSeeEvent } from './visibility.ts';
 import { erasedView } from '#engine/erasure.ts';
-import { prejoinDisplay, stripPrejoin } from '#engine/federation/prejoin.ts';
+import {
+  prejoinDisplay,
+  savedPrejoinDisplay,
+} from '#engine/federation/prejoin.ts';
 
 export type Viewer = {
   userId: string;
@@ -36,19 +39,27 @@ function clientShape(pdu: Pdu, eventId: string): Record<string, unknown> {
 
 /** Only the authoritative pending OOB invite owner may call this boundary.
  * It exposes the viewer's own invite, never arbitrary stripped-state PDUs. */
-export function renderInviteNotification(
+export async function renderInviteNotification(
   pdu: Pdu,
   eventId: string,
   viewer: Viewer,
   saved: Record<string, unknown>[],
-): Record<string, unknown> | null {
+  room: Room | null,
+): Promise<Record<string, unknown> | null> {
   if (
     pdu.type !== 'm.room.member' || pdu.state_key !== viewer.userId ||
     pdu.content?.membership !== 'invite'
   ) return null;
   return {
     ...clientShape(pdu, eventId),
-    unsigned: { invite_room_state: saved.map(stripPrejoin) },
+    unsigned: {
+      invite_room_state: await savedPrejoinDisplay(
+        room,
+        saved,
+        viewer.userId,
+        viewer,
+      ),
+    },
   };
 }
 

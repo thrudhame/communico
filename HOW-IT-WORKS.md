@@ -263,8 +263,13 @@ sequence cut. One prejoin owner emits signed, version-correct full PDUs for
 federation invite/knock state, including create, and stripped events for client
 display. Held sync uses its membership publication cut; unsigned membership
 hints use that event's after-state, never later current state. Those client
-forms apply viewer-aware erasure before stripping. OOB hints come only from
-their revisioned, validated prejoin record. Legacy malformed create hints are filtered,
+forms apply ordinary redactions and viewer-aware erasure before stripping.
+OOB hints come only from their revisioned, validated prejoin record. Full hints
+retain privately computed source IDs, never remote-asserted IDs. Once a room is
+held, sync, notifications and push share the saved-hint display owner: accepted
+sources use the current redaction/erasure projection; unidentified legacy hints
+are pruned by the room-version rules instead of exposing uncheckable content.
+Private provenance is never included in client hints. Legacy malformed create hints are filtered,
 while v12 requires a valid create tied to the room identity. Typing is ephemeral;
 presence and receipts are server data, while
 account-data stream markers belong to the tenant.

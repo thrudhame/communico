@@ -60,11 +60,12 @@ export async function notificationsFor(
         [roomId, userId, eventId],
       ))[0];
       if (invite) {
-        event = renderInviteNotification(
+        event = await renderInviteNotification(
           JSON.parse(String(invite.event_json)) as Pdu,
           eventId,
           viewer,
           JSON.parse(String(invite.invite_room_state)),
+          room,
         );
       }
     }

@@ -52,6 +52,13 @@ async function rendered(
 ): Promise<{ event: Json; names: Record<string, string> } | null> {
   const viewer = { userId: target.user, deviceId: null, tenant };
   const server = await store.server();
+  // Lookup never creates a room, including for OOB or removed-room jobs.
+  let room: Awaited<ReturnType<typeof openRoom>> | null = null;
+  try {
+    room = await openRoom(store, roomId);
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+  }
   const invite = (await server.query(
     `SELECT event_json,invite_room_state FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND status='pending' AND kind='invite' AND ${
       visiblePrejoin('p')
@@ -59,22 +66,16 @@ async function rendered(
     [roomId, target.user, eventId],
   ))[0];
   if (invite) {
-    const event = renderInviteNotification(
+    const event = await renderInviteNotification(
       JSON.parse(String(invite.event_json)) as Pdu,
       eventId,
       viewer,
       JSON.parse(String(invite.invite_room_state)),
+      room,
     );
     return event ? { event: { ...event, room_id: roomId }, names: {} } : null;
   }
-  // Lookup never creates a room, including for OOB or removed-room jobs.
-  let room;
-  try {
-    room = await openRoom(store, roomId);
-  } catch (error) {
-    if (error instanceof Deno.errors.NotFound) return null;
-    throw error;
-  }
+  if (room === null) return null;
   const event = await renderEvent(room, eventId, viewer, {
     bundleThreads: false,
   });

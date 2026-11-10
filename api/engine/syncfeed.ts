@@ -10,7 +10,10 @@ import {
   type StreamToken,
 } from '#engine/client/tokens.ts';
 import { config } from '#engine/config.ts';
-import { prejoinDisplay, stripPrejoin } from '#engine/federation/prejoin.ts';
+import {
+  prejoinDisplay,
+  savedPrejoinDisplay,
+} from '#engine/federation/prejoin.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
 import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -484,7 +487,10 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       unknown
     >[];
     const events = [
-      ...saved.map(stripPrejoin).filter((e) =>
+      ...(await savedPrejoinDisplay(await heldRoom(roomId), saved, i.userId, {
+        userId: i.userId,
+        tenant: app.tenant,
+      })).filter((e) =>
         !(e.type === 'm.room.member' && e.state_key === i.userId)
       ),
       {

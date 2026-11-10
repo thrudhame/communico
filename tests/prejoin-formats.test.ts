@@ -2,7 +2,11 @@ import { assert, assertEquals } from '@std/assert';
 import { createRoom } from '#engine/room/create.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { openStore } from '#engine/store/index.ts';
-import { prejoinState, validatePrejoin } from '#engine/federation/prejoin.ts';
+import {
+  prejoinState,
+  stripPrejoin,
+  validatePrejoin,
+} from '#engine/federation/prejoin.ts';
 import { verify } from '#engine/room/verify.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { fakeKeyResolver } from '#tests/fixtures/remote.ts';
@@ -45,6 +49,8 @@ Deno.test('prejoin formats: every supported version sends signed wire state and 
       const display = await validatePrejoin(wire, roomId, version, keys);
       assertEquals(display.length, wire.length);
       for (const event of display) {
+        assertEquals(typeof event.source_event_id, 'string');
+        assert(!('source_event_id' in stripPrejoin(event)));
         assert(
           !('signatures' in event) && !('hashes' in event) &&
             !('room_id' in event),
