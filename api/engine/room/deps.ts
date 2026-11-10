@@ -78,6 +78,7 @@ export interface Fetcher {
     from: string[],
     limit: number,
     via: string,
+    signal?: AbortSignal,
   ): Promise<Pdu[]>;
   // GET /_matrix/federation/v1/make_join/{roomId}/{userId}?ver=… — the
   // resident's template: the room's version and the unsigned member

@@ -12,7 +12,12 @@
 // ungrounded prevs the next backfill asks for).
 import type { Conn } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
-import { getEvent, prevsOf } from '#engine/room/events.ts';
+import {
+  childrenOf,
+  getEvent,
+  getStatus,
+  prevsOf,
+} from '#engine/room/events.ts';
 import { eventStateAfter } from '#engine/room/state.ts';
 
 export type Segment = {
@@ -437,6 +442,27 @@ export async function stepPosition(
     const seg = await getSegment(conn, at.segment);
     if (seg === null) return { kind: 'end' };
     if (seg.kind === 'anchor') {
+      // An actual positioned child proves the forward connection, even when
+      // that child was acquired in another segment. Never infer it from owner
+      // stay, depth, timestamp, or segment allocation order.
+      const tip = await eventAtOffset(conn, seg.id, at.offset);
+      const next: { event: string; cursor: WalkCursor }[] = [];
+      for (const child of tip === null ? [] : await childrenOf(conn, tip)) {
+        const position = await positionOf(conn, child);
+        const status = await getStatus(conn, child);
+        if (
+          position !== null && status?.standing === 'accepted' &&
+          status.grounding === 'grounded' &&
+          await eventStateAfter(conn, child) !== null
+        ) {
+          next.push({ event: child, cursor: position });
+        }
+      }
+      next.sort((a, b) =>
+        a.cursor.segment - b.cursor.segment ||
+        a.cursor.offset - b.cursor.offset || a.event.localeCompare(b.event)
+      );
+      if (next.length > 0) return { kind: 'event', ...next[0] };
       return { kind: 'gap', cursor: at };
     }
     if (seg.kind === 'history') {

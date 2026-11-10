@@ -126,8 +126,10 @@ search over accepted, grounded, positioned events with genuine state refs.
 Directions are inclusive; each candidate passes the caller's existing user or
 server visibility policy. Complete equal-timestamp buckets are dependency-ordered
 through the stored prev DAG, with first-owner positions breaking branch ties;
-remote depths never determine the answer. Reads fail explicitly with 503 above
-10,000 equal-time candidates or 100,000 scanned/ancestry events, rather than
+remote depths never determine the answer. Candidate-to-candidate reachability
+meets from both directions instead of walking every ancestor to genesis. Reads
+fail explicitly with 503 above 10,000 equal-time candidates, 100,000 scanned
+events, or a shared 100,000-unit causal read budget, rather than
 returning a truncated or hidden result.
 (`api/engine/room/{events,timestamp}.ts`, `api/engine/federation/serve.ts`)
 
@@ -142,8 +144,12 @@ Failure retains an eligible local result; storage errors are not peer misses.
 
 A disconnected hit gets an `anchor` segment in the existing segment owner, not
 an arbitrary prepend to a stay's connected history. Backward pagination fills
-that anchor's own gap; forward pagination retains an explicit unresolved gap
-cursor instead of inventing adjacency. Positions and event-state refs survive
+that anchor's own gap. Forward pagination imports bounded pages from held newer
+boundaries and crosses actual positioned child edges, never an assumed owner
+stay. Unavailable connections retain a resumable gap cursor. Shared visibility
+uses proved later publication/opener ancestry for isolated anchors, not arbitrary
+stay allocation; a pre-join anchor can acquire that proof through the same bridge.
+Zero-limit context retains both pagination tokens. Positions and event-state refs survive
 reopen. Import changes are history, never live news: sync/feed, notifications,
 published state, extremities and delivery stay unchanged.
 (`api/engine/room/{history,segments,state}.ts`, `api/engine/client/timeline.ts`)

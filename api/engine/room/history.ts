@@ -129,6 +129,70 @@ async function fetchBoundary(
 // names the stay whose history segment receives the page (the default
 // is the live — or latest — stay, the common case); `via` is one
 // server — trying the next is the caller's loop.
+// Resolve an isolated anchor's forward gap from held newer boundaries. A
+// backfill imports only verified/authenticated history and retains first owners;
+// the segment walk crosses only when it can observe an actual positioned child.
+// Progress is durable between bounded pagination requests, not an empty forever
+// cursor and not a made-up connection to the anchor's owning stay.
+export async function bridgeForwardAnchor(
+  room: Room,
+  cursor: { segment: number; offset: number },
+  peers: string[],
+  limit: number,
+  deps: BackfillDeps,
+): Promise<boolean> {
+  const signal = deps.signal ?? AbortSignal.timeout(8000);
+  const boundaries = await room.tx(async (tx) => {
+    const out: { stay: number; segment?: number; from: string[] }[] = [];
+    const segments = await tx.segments.list();
+    const owner = (await tx.segments.get(cursor.segment))?.prev;
+    segments.sort((a, b) =>
+      Number(b.id === owner) - Number(a.id === owner) || a.id - b.id
+    );
+    for (const segment of segments) {
+      if (segment.id === cursor.segment) continue;
+      const first = await tx.segments.positionsPage(
+        segment.id,
+        -Number.MAX_SAFE_INTEGER,
+        'f',
+        1,
+      );
+      if (first.length === 0) continue;
+      const missing: string[] = [];
+      for (const prev of await tx.events.prevsOf(first[0].event)) {
+        if (await tx.state.eventStateAfter(prev) === null) missing.push(prev);
+      }
+      if (missing.length > 0) {
+        out.push({
+          stay: segment.kind === 'stay' ? segment.id : segment.prev!,
+          ...(segment.kind === 'anchor' ? { segment: segment.id } : {}),
+          from: missing,
+        });
+      }
+      if (out.length === 3) break;
+    }
+    return out;
+  });
+  let progress = false;
+  for (const boundary of boundaries) {
+    for (const via of peers.slice(0, 3)) {
+      if (signal.aborted) return progress;
+      const result = await backfill(room, { ...boundary, via, limit }, {
+        ...deps,
+        signal,
+      });
+      if (result.outcome !== 'open') {
+        progress = true;
+        break;
+      }
+    }
+    if ((await room.tx((tx) => tx.segments.step(cursor, 'f'))).kind !== 'gap') {
+      break;
+    }
+  }
+  return progress;
+}
+
 export async function backfill(
   room: Room,
   args: {
@@ -173,6 +237,7 @@ export async function backfill(
         args.from,
         args.limit,
         args.via,
+        deps.signal,
       );
   } catch {
     return empty;

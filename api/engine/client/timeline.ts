@@ -3,7 +3,7 @@ import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { productionFetcher } from '#engine/federation/fetcher.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
-import { backfill } from '#engine/room/history.ts';
+import { backfill, bridgeForwardAnchor } from '#engine/room/history.ts';
 import {
   formatCursor,
   parseCursor,
@@ -156,6 +156,24 @@ export async function messages(
       break;
     }
     if (step.kind === 'gap') {
+      if (!filled) {
+        filled = true;
+        const signer = theApp().tenant.signer();
+        await bridgeForwardAnchor(
+          room,
+          step.cursor,
+          (await serversInRoom(room.id)).filter((s) => s !== serverName()),
+          config().federation.backfillbatch,
+          {
+            keys: productionKeyResolver(theApp().server, signer),
+            fetcher: productionFetcher(theApp().server, signer, theApp().store),
+          },
+        );
+        const resolved = await room.tx((tx) =>
+          tx.segments.step(cursor!, w.dir)
+        );
+        if (resolved.kind !== 'gap') continue;
+      }
       frontier = step.cursor;
       break;
     }
@@ -241,7 +259,7 @@ export async function messages(
   } = { chunk, start: w.fromToken ?? '' };
   if (!((ended || last?.type === 'm.room.create') && !filtered)) {
     if (frontier !== null) result.end = formatCursor(frontier);
-    else if (raw.length > 0) result.end = formatCursor(cursor);
+    else if (raw.length > 0 || limit === 0) result.end = formatCursor(cursor);
   }
   if (w.lazyLoadMembers) {
     const senders = new Set(chunk.map((e) => String(e.sender)));

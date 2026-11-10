@@ -25,7 +25,8 @@ Authenticated client and signed federation `timestamp_to_event` support inclusiv
 jump-to-date searches. Remote hits are verified and imported as usable history
 anchors, so clients can request context and paginate earlier events without
 turning old history into new sync traffic. Timestamp ties follow causal order,
-not untrusted remote depths. Disconnected forward history stays an explicit gap.
+not untrusted remote depths. Forward pagination fills from held newer boundaries
+and crosses only proved event edges; unavailable connections remain resumable gaps.
 
 ## What end-to-end encryption does not hide
 

@@ -71,12 +71,31 @@ Deno.test('timestamp: real signed remote lookup yields usable HTTP context and b
       'v1/rooms/' + encoded + '/timestamp_to_event?ts=115&dir=f',
     );
     assertEquals(hit, { event_id: events[2], origin_server_ts: 120 });
+    const emptyContext = await query(
+      'v3/rooms/' + encoded + '/context/' + encodeURIComponent(hit.event_id) +
+        '?limit=0',
+    );
+    const forward = await query(
+      'v3/rooms/' + encoded + '/messages?dir=f&limit=1&from=' +
+        encodeURIComponent(emptyContext.end),
+    );
+    assertEquals(forward.chunk[0]?.event_id, events[3]);
+    assert(typeof forward.end === 'string');
+    const continued = await query(
+      'v3/rooms/' + encoded + '/messages?dir=f&limit=1&from=' +
+        encodeURIComponent(forward.end),
+    );
+    assert(
+      continued.chunk.length > 0,
+      'forward pagination reaches the held joined stay',
+    );
     const context = await query(
       'v3/rooms/' + encoded + '/context/' + encodeURIComponent(hit.event_id) +
         '?limit=2',
     );
     assertEquals(context.event.event_id, events[2]);
     assertEquals(context.events_before[0].event_id, events[1]);
+    assertEquals(context.events_after[0]?.event_id, events[3]);
     assert(typeof context.start === 'string');
     const messages = await query(
       'v3/rooms/' + encoded + '/messages?dir=b&limit=2&from=' +

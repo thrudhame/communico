@@ -3,7 +3,7 @@ import { canSeeEventAt } from '#engine/client/visibility.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { findTimestamp } from '#engine/room/timestamp.ts';
 import { searchTimestamp } from '#engine/room/timestamp-search.ts';
-import { backfill } from '#engine/room/history.ts';
+import { backfill, bridgeForwardAnchor } from '#engine/room/history.ts';
 import { openRoom, type Room, roomSchema } from '#engine/room/index.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
@@ -11,6 +11,7 @@ import { verify } from '#engine/room/verify.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { fakeFetcher, fakeKeyResolver } from '#tests/fixtures/remote.ts';
 import { makeFakeRoom } from '#tests/fixtures/remote-room.ts';
+import type { RoomTx } from '#engine/room/index.ts';
 
 const options = (dir: string) => ({
   dir,
@@ -447,5 +448,181 @@ Deno.test('history admission: an already denied peer is never fetched', async ()
       { outcome: 'open', segment: null, positioned: [] },
     );
     assertEquals(remote.calls.backfill, []);
+  });
+});
+
+Deno.test('timestamp: a disjoint anchor after leave cannot inherit an earlier publication join', async () => {
+  await fixture(async ({ fr, room, deps }) => {
+    const viewer = '@former:' + fr.server.name;
+    const joined = await fr.addEvent({
+      type: 'm.room.member',
+      sender: viewer,
+      state_key: viewer,
+      content: { membership: 'join' },
+      origin_server_ts: 10,
+    });
+    const left = await fr.addEvent({
+      type: 'm.room.member',
+      sender: viewer,
+      state_key: viewer,
+      content: { membership: 'leave' },
+      origin_server_ts: 20,
+    });
+    await ingestRemote(room, [joined, left], fr.server.name, deps);
+    await fr.addEvent(message(25, 'unheld bridge'));
+    const anchor = await fr.addEvent(message(30, 'after leave'));
+    deps.fetcher = fakeFetcher({
+      event: fr.events,
+      stateIds: new Map([[anchor.event_id!, fr.stateIdsAt(anchor.event_id!)!]]),
+    }).fetcher;
+    await backfill(room, {
+      from: [anchor.event_id!],
+      limit: 1,
+      via: fr.server.name,
+      anchor,
+    }, deps);
+    assertEquals(
+      await room.tx((tx) => canSeeEventAt(viewer, tx, anchor.event_id!)),
+      false,
+    );
+    assertEquals(
+      await room.tx((tx) =>
+        findTimestamp(
+          tx,
+          { ts: 30, dir: 'f' },
+          (id) => canSeeEventAt(viewer, tx, id),
+        )
+      ),
+      null,
+    );
+    const rejoined = await fr.addEvent({
+      type: 'm.room.member',
+      sender: viewer,
+      state_key: viewer,
+      content: { membership: 'join' },
+      origin_server_ts: 40,
+    });
+    await ingestRemote(room, [rejoined], fr.server.name, deps);
+    assertEquals(
+      await room.tx((tx) => canSeeEventAt(viewer, tx, anchor.event_id!)),
+      true,
+    );
+  });
+});
+
+Deno.test('timestamp: nearby causal ties do not read the old room prefix', async () => {
+  let reads = 0;
+  const parents = (id: string) => {
+    reads++;
+    assert(reads < 40, 'nearby tie must not walk to room genesis');
+    const n = Number(id.slice(1));
+    return n > 0 ? ['$' + (n - 1)] : [];
+  };
+  const tx = {
+    events: {
+      timestampBucket: () =>
+        Promise.resolve([
+          { id: '$100001', ts: 100, segment: 1, offset: 0 },
+          { id: '$100002', ts: 100, segment: 1, offset: 1 },
+        ]),
+      ancestors: () => Promise.resolve({ ids: [], truncated: true }),
+      prevsOf: (id: string) => Promise.resolve(parents(id)),
+      childrenOf: (id: string) => {
+        reads++;
+        const n = Number(id.slice(1));
+        return Promise.resolve(n < 100002 ? ['$' + (n + 1)] : []);
+      },
+    },
+    segments: {
+      positionOf: (id: string) =>
+        Promise.resolve({ segment: 1, offset: Number(id.slice(1)) }),
+    },
+  } as unknown as RoomTx;
+  for (const dir of ['f', 'b'] as const) {
+    assertEquals(
+      await findTimestamp(tx, { ts: 100, dir }, () => Promise.resolve(true)),
+      { event_id: dir === 'f' ? '$100001' : '$100002', origin_server_ts: 100 },
+    );
+  }
+});
+
+Deno.test('timestamp: causal ties survive child-first anchor acquisition without renumbering', async () => {
+  await fixture(async ({ fr, room, deps }) => {
+    await fr.addEvent(message(50, 'unheld prefix'));
+    const parent = await fr.addEvent(message(100, 'parent'));
+    const child = await fr.addEvent(message(100, 'child', undefined, 1));
+    deps.fetcher = fakeFetcher({
+      event: fr.events,
+      stateIds: new Map(
+        [...fr.events.keys()].map((id) => [id, fr.stateIdsAt(id)!]),
+      ),
+    }).fetcher;
+    for (const anchor of [child, parent]) {
+      await backfill(room, {
+        from: [anchor.event_id!],
+        anchor,
+        limit: 1,
+        via: fr.server.name,
+      }, deps);
+    }
+    const pos = await room.tx((tx) => tx.segments.positionOf(child.event_id!));
+    const lookup = (dir: 'f' | 'b') =>
+      room.tx((tx) =>
+        findTimestamp(
+          tx,
+          { ts: 100, dir },
+          (id) => canSeeEventAt(fr.creator, tx, id),
+        )
+      );
+    assertEquals((await lookup('f'))?.event_id, parent.event_id);
+    assertEquals((await lookup('b'))?.event_id, child.event_id);
+    assertEquals(
+      await room.tx((tx) => tx.segments.positionOf(child.event_id!)),
+      pos,
+    );
+  });
+});
+
+Deno.test('timestamp: bounded forward bridging advances across independently owned anchors and survives reopen', async () => {
+  await fixture(async ({ fr, room, deps, reopen }) => {
+    const a = await fr.addEvent(message(100, 'a'));
+    const b = await fr.addEvent(message(110, 'b'));
+    const c = await fr.addEvent(message(120, 'c'));
+    deps.fetcher = fakeFetcher({
+      event: fr.events,
+      stateIds: new Map(
+        [...fr.events.keys()].map((id) => [id, fr.stateIdsAt(id)!]),
+      ),
+      backfill: (from, limit) => fr.backfillPdus(from, limit),
+    }).fetcher;
+    for (const anchor of [a, c]) {
+      await backfill(room, {
+        from: [anchor.event_id!],
+        anchor,
+        limit: 1,
+        via: fr.server.name,
+      }, deps);
+    }
+    const pos = (await room.tx((tx) => tx.segments.positionOf(a.event_id!)))!;
+    assertEquals(
+      (await room.tx((tx) => tx.segments.step(pos, 'f'))).kind,
+      'gap',
+    );
+    assertEquals(
+      await bridgeForwardAnchor(room, pos, [fr.server.name], 1, deps),
+      true,
+    );
+    const next = await room.tx((tx) => tx.segments.step(pos, 'f'));
+    assert(next.kind === 'event');
+    assertEquals(next.event, b.event_id);
+    const last = await room.tx((tx) => tx.segments.step(next.cursor, 'f'));
+    assert(last.kind === 'event');
+    assertEquals(last.event, c.event_id);
+    const reopened = await reopen();
+    assertEquals(await reopened.tx((tx) => tx.segments.step(pos, 'f')), next);
+    assertEquals(
+      await reopened.tx((tx) => tx.segments.positionOf(a.event_id!)),
+      pos,
+    );
   });
 });

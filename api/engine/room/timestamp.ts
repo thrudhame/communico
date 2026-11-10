@@ -1,5 +1,6 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { RoomTx } from './index.ts';
+import { precedes } from './causal.ts';
 
 export type TimestampQuery = { ts: number; dir: 'f' | 'b' };
 export type TimestampHit = { event_id: string; origin_server_ts: number };
@@ -32,24 +33,28 @@ function exhausted(): never {
 // positions and then ids break concurrent-branch ties; old positions never move.
 async function causalOrder(tx: RoomTx, ids: string[]): Promise<string[]> {
   if (ids.length < 2) return ids;
-  const walk = await tx.events.ancestors(ids, [], 100_000);
-  if (walk.truncated) exhausted();
   const graph = new Map<string, string[]>();
   const children = new Map<string, string[]>();
   const rank = new Map<string, [number, number, string]>();
-  const held = new Set(walk.ids);
-  for (const id of walk.ids) {
-    const parents = (await tx.events.prevsOf(id)).filter((p) => held.has(p));
-    graph.set(id, parents);
+  const budget = { remaining: 100_000 };
+  for (const id of ids) {
+    graph.set(id, []);
     const pos = await tx.segments.positionOf(id);
     rank.set(id, [
       pos?.segment ?? Number.MAX_SAFE_INTEGER,
       pos?.offset ?? 0,
       id,
     ]);
-    for (const parent of parents) {
+  }
+  for (const parent of ids) {
+    for (const child of ids) {
+      if (parent === child) continue;
+      const related = await precedes(tx.events, parent, child, budget);
+      if (related === null) exhausted();
+      if (!related) continue;
+      graph.get(child)!.push(parent);
       const next = children.get(parent) ?? [];
-      next.push(id);
+      next.push(child);
       children.set(parent, next);
     }
   }
@@ -58,21 +63,21 @@ async function causalOrder(tx: RoomTx, ids: string[]): Promise<string[]> {
     return x[0] - y[0] || x[1] - y[1] ||
       (x[2] < y[2] ? -1 : x[2] === y[2] ? 0 : 1);
   };
-  const ready = walk.ids.filter((id) => graph.get(id)!.length === 0);
-  const wanted = new Set(ids), result: string[] = [];
+  const ready = ids.filter((id) => graph.get(id)!.length === 0);
+  const result: string[] = [];
   let visited = 0;
   while (ready.length > 0) {
     ready.sort(compare);
     const id = ready.shift()!;
     visited++;
-    if (wanted.has(id)) result.push(id);
+    result.push(id);
     for (const child of children.get(id) ?? []) {
       const parents = graph.get(child)!;
       parents.splice(parents.indexOf(id), 1);
       if (parents.length === 0) ready.push(child);
     }
   }
-  if (visited !== walk.ids.length) exhausted();
+  if (visited !== ids.length) exhausted();
   return result;
 }
 

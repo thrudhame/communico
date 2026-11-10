@@ -3,6 +3,8 @@
 // state_entries, event_state, publications and the current pointer belong
 // to materialize.ts alone.
 import type { Conn } from '#engine/store/db.ts';
+import { childrenOf, prevsOf } from './events.ts';
+import { precedes } from './causal.ts';
 
 export type StateChange = {
   type: string;
@@ -194,9 +196,39 @@ export async function publishedGroupsAfter(
   conn: Conn,
   event: string,
 ): Promise<number[]> {
+  const isolated = await conn.query(
+    `SELECT p.event FROM positions p JOIN segments s ON s.id = p.segment
+     WHERE p.event = ? AND s.kind = 'anchor'`,
+    [event],
+  );
+  if (isolated.length > 0) {
+    // Ownership only says where bytes were acquired. An isolated anchor can
+    // lie after any publication in that stay; only actual DAG evidence proves
+    // a later live cut. Imported opening groups need their real opener too.
+    const snapshots = await conn.query(
+      `SELECT pub.grp, c.event FROM publications pub JOIN changes c ON c.pos = pub.change_pos
+       UNION SELECT opening_group AS grp, opened_by AS event FROM segments
+       WHERE kind = 'stay' AND opening_group IS NOT NULL AND opened_by IS NOT NULL`,
+    );
+    const groups = new Set<number>();
+    const budget = { remaining: 100_000 };
+    const graph = {
+      prevsOf: (id: string) => prevsOf(conn, id),
+      childrenOf: (id: string) => childrenOf(conn, id),
+    };
+    for (const row of snapshots) {
+      if (
+        row.event !== null &&
+        await precedes(graph, event, String(row.event), budget) === true
+      ) {
+        groups.add(Number(row.grp));
+      }
+    }
+    return [...groups];
+  }
   const rows = await conn.query(
     `WITH anchor AS (
-       SELECT CASE WHEN s.kind IN ('history', 'anchor') THEN s.prev ELSE s.id END AS stay,
+       SELECT CASE WHEN s.kind = 'history' THEN s.prev ELSE s.id END AS stay,
               s.kind, p.offset
        FROM positions p JOIN segments s ON s.id = p.segment WHERE p.event = ?
      )
@@ -204,11 +236,11 @@ export async function publishedGroupsAfter(
        JOIN changes c ON c.pos = pub.change_pos
        JOIN positions p ON p.event = c.event CROSS JOIN anchor a
      WHERE pub.stay > a.stay OR (pub.stay = a.stay AND
-        (a.kind IN ('history', 'anchor') OR p.offset >= a.offset))
+         (a.kind = 'history' OR p.offset >= a.offset))
      UNION
      SELECT s.opening_group AS grp FROM segments s CROSS JOIN anchor a
      WHERE s.kind = 'stay' AND s.opening_group IS NOT NULL AND
-        (s.id > a.stay OR (s.id = a.stay AND a.kind IN ('history', 'anchor')))`,
+         (s.id > a.stay OR (s.id = a.stay AND a.kind = 'history'))`,
     [event],
   );
   return rows.map((row) => Number(row.grp));

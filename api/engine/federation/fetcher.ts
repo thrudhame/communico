@@ -167,7 +167,7 @@ export function productionFetcher(
     },
 
     // GET /_matrix/federation/v1/backfill/{roomId}?v=…&limit=.
-    backfill: async (roomId, from, limit, via) => {
+    backfill: async (roomId, from, limit, via, signal) => {
       const res = await federationRequest(server, signer, {
         room: { store, id: roomId },
         destination: via,
@@ -177,6 +177,7 @@ export function productionFetcher(
         }&limit=${limit}`,
         body: null,
         maxBytes: bulk(),
+        signal,
       });
       return pdusOf(jsonObject(res), 'pdus');
     },

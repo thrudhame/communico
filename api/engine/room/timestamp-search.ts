@@ -2,7 +2,7 @@ import { domainOf } from '#engine/ids.ts';
 import { aclAllows, AclDenied } from './acl.ts';
 import { roomVersionOf } from './build.ts';
 import { fetchOrNull } from './deps.ts';
-import { backfill, type BackfillDeps } from './history.ts';
+import { backfill, type BackfillDeps, bridgeForwardAnchor } from './history.ts';
 import type { Room, RoomTx } from './index.ts';
 import {
   findTimestamp,
@@ -123,21 +123,35 @@ export async function searchTimestamp(
     const positioned = await room.tx((tx) =>
       tx.segments.positionOf(verified.eventId)
     );
-    if (positioned === null) {
-      try {
+    try {
+      if (positioned === null) {
         await backfill(room, {
           from: [verified.eventId],
           limit: 1,
           via,
           anchor: verified.pdu,
         }, { ...deps, signal });
-      } catch (error) {
-        if (signal.aborted) break;
-        // Only unavailable/denied network evidence is a peer failure. Storage
-        // errors must not be disguised as a local miss.
-        if (error instanceof AclDenied) continue;
-        throw error;
       }
+      const anchor = await room.tx((tx) =>
+        tx.segments.positionOf(verified.eventId)
+      );
+      // Shared history needs a genuinely later join, not an arbitrary owner
+      // stay. Use pagination's bounded importer to prove that connection.
+      if (
+        anchor !== null &&
+        !await room.tx((tx) => visible(tx, verified.eventId))
+      ) {
+        await bridgeForwardAnchor(room, anchor, [via], 100, {
+          ...deps,
+          signal,
+        });
+      }
+    } catch (error) {
+      if (signal.aborted) break;
+      // Only unavailable/denied network evidence is a peer failure. Storage
+      // errors must not be disguised as a local miss.
+      if (error instanceof AclDenied) continue;
+      throw error;
     }
     best = await room.tx((tx) =>
       findTimestamp(tx, query, (id) => visible(tx, id))
