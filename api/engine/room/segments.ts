@@ -271,7 +271,13 @@ export async function positionsPage(
 
 // --- the walk (G7) -----------------------------------------------------------
 
-export type WalkCursor = { segment: number; offset: number };
+export type WalkCursor = {
+  segment: number;
+  offset: number;
+  // An initial cut may include its positioned event. Returned-event cursors
+  // are exclusive; never encode inclusion as the next event's numeric slot.
+  inclusive?: true;
+};
 
 export type WalkStep =
   | { kind: 'event'; event: string; cursor: WalkCursor }
@@ -325,7 +331,7 @@ export async function walkStart(conn: Conn): Promise<WalkCursor | null> {
   const stay = await latestStay(conn);
   if (stay === null) return null;
   const top = await offsetBound(conn, stay.id, 'max');
-  return { segment: stay.id, offset: (top ?? -1) + 1 };
+  return { segment: stay.id, offset: top ?? -1, inclusive: true };
 }
 
 // One step through the book. Backward: the stay's positions descending,
@@ -346,7 +352,9 @@ export async function stepPosition(
       // Imported state can bridge a missing edge INSIDE a live stay. Numeric
       // adjacency is not history adjacency there. Follow a held predecessor's
       // first-owner position, or retain the exact gap-facing cursor for fetch.
-      const facing = await eventAtOffset(conn, at.segment, at.offset);
+      const facing = at.inclusive
+        ? null
+        : await eventAtOffset(conn, at.segment, at.offset);
       if (
         facing !== null &&
         (await eventStateAfter(conn, facing))?.provenance === 'imported'
@@ -367,11 +375,13 @@ export async function stepPosition(
         }
         parents.sort((a, b) => b.segment - a.segment || b.offset - a.offset);
         if (parents.length) {
-          at = { ...parents[0], offset: parents[0].offset + 1 };
+          at = { ...parents[0], inclusive: true };
         }
       }
       const rows = await conn.query(
-        'SELECT offset, event FROM positions WHERE segment = ? AND offset < ? ORDER BY offset DESC LIMIT 1',
+        `SELECT offset, event FROM positions WHERE segment = ? AND offset ${
+          at.inclusive ? '<=' : '<'
+        } ? ORDER BY offset DESC LIMIT 1`,
         [at.segment, at.offset],
       );
       if (rows.length > 0) {
@@ -389,7 +399,7 @@ export async function stepPosition(
           ? null
           : await offsetBound(conn, history.id, 'max');
         if (history !== null && historyTop !== null) {
-          at = { segment: history.id, offset: historyTop + 1 };
+          at = { segment: history.id, offset: historyTop, inclusive: true };
           continue;
         }
         // no fetched history: the stay's first event faces the gap
@@ -409,7 +419,7 @@ export async function stepPosition(
         }
         if (seg.prev !== null) {
           const prevTop = await offsetBound(conn, seg.prev, 'max');
-          at = { segment: seg.prev, offset: (prevTop ?? -1) + 1 };
+          at = { segment: seg.prev, offset: prevTop ?? -1, inclusive: true };
           continue;
         }
         return { kind: 'end' };
@@ -437,7 +447,7 @@ export async function stepPosition(
         for (const prev of facing === null ? [] : await prevsOf(conn, facing)) {
           const position = await positionOf(conn, prev);
           if (position !== null && position.segment !== seg.id) {
-            at = { ...position, offset: position.offset + 1 };
+            at = { ...position, inclusive: true };
             break;
           }
         }
@@ -449,14 +459,16 @@ export async function stepPosition(
       const prevStay = owner === null ? null : owner.prev;
       if (prevStay !== null) {
         const prevTop = await offsetBound(conn, prevStay, 'max');
-        at = { segment: prevStay, offset: (prevTop ?? -1) + 1 };
+        at = { segment: prevStay, offset: prevTop ?? -1, inclusive: true };
         continue;
       }
       return { kind: 'end' };
     }
     // forward
     const rows = await conn.query(
-      'SELECT offset, event FROM positions WHERE segment = ? AND offset > ? ORDER BY offset ASC LIMIT 1',
+      `SELECT offset, event FROM positions WHERE segment = ? AND offset ${
+        at.inclusive ? '>=' : '>'
+      } ? ORDER BY offset ASC LIMIT 1`,
       [at.segment, at.offset],
     );
     if (rows.length > 0) {
@@ -498,7 +510,7 @@ export async function stepPosition(
       const owner = seg.prev;
       if (owner === null) return { kind: 'end' };
       const ownerMin = await offsetBound(conn, owner, 'min');
-      at = { segment: owner, offset: (ownerMin ?? 0) - 1 };
+      at = { segment: owner, offset: ownerMin ?? 0, inclusive: true };
       continue;
     }
     // a stay's tip: the NEXT stay's history (the gap), then the next
@@ -510,22 +522,26 @@ export async function stepPosition(
       ? null
       : await offsetBound(conn, nextHistory.id, 'min');
     if (nextHistory !== null && nextHistoryMin !== null) {
-      at = { segment: nextHistory.id, offset: nextHistoryMin - 1 };
+      at = { segment: nextHistory.id, offset: nextHistoryMin, inclusive: true };
       continue;
     }
     const nextMin = await offsetBound(conn, next.id, 'min');
-    at = { segment: next.id, offset: (nextMin ?? 0) - 1 };
+    at = { segment: next.id, offset: nextMin ?? 0, inclusive: true };
   }
 }
 
-// c<segment>_<offset> — the walk's stable bookmark; offsets are signed
-// (history prepends go negative), segment ids are never reused.
+// c<segment>_<offset>[i] - stable bookmark; i includes the positioned event.
+// Offsets are signed (history prepends go negative); segment ids are never reused.
 export function formatCursor(cursor: WalkCursor): string {
-  return `c${cursor.segment}_${cursor.offset}`;
+  return `c${cursor.segment}_${cursor.offset}${cursor.inclusive ? 'i' : ''}`;
 }
 
 export function parseCursor(token: string): WalkCursor | null {
-  const m = /^c(\d+)_(-?\d+)$/.exec(token);
+  const m = /^c(\d+)_(-?\d+)(i?)$/.exec(token);
   if (m === null) return null;
-  return { segment: Number(m[1]), offset: Number(m[2]) };
+  return {
+    segment: Number(m[1]),
+    offset: Number(m[2]),
+    ...(m[3] ? { inclusive: true as const } : {}),
+  };
 }

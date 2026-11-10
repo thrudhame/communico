@@ -596,7 +596,7 @@ async function buildLocalPrejoinLeave(
 export async function prejoinDeparture(
   invite: StoredInvite,
   deps: Pick<InviteDeps, 'server' | 'signer'>,
-): Promise<Pdu> {
+): Promise<Pdu | null> {
   const event = JSON.parse(invite.eventJson) as Pdu;
   if (
     event.content?.membership === 'leave' || event.content?.membership === 'ban'
@@ -606,27 +606,30 @@ export async function prejoinDeparture(
   }
   // Existing installations may have a pending intent without a local event.
   // Materialize once under the same revision owner; never synthesize per read.
-  return await deps.server.tx(async (tx) => {
-    const rows = await tx.query(
-      'SELECT local_leave_json FROM prejoin_memberships WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
-      [invite.roomId, invite.userId, invite.revision, invite.seq],
-    );
-    if (rows[0]?.local_leave_json != null) {
-      return JSON.parse(String(rows[0].local_leave_json)) as Pdu;
-    }
-    const signed = await buildLocalPrejoinLeave(invite, deps.signer);
-    await tx.execute(
-      'UPDATE prejoin_memberships SET local_leave_json=? WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
-      [
-        JSON.stringify(signed),
-        invite.roomId,
-        invite.userId,
-        invite.revision,
-        invite.seq,
-      ],
-    );
-    return signed;
-  });
+  return await withProjectionLock(() =>
+    deps.server.tx(async (tx) => {
+      const rows = await tx.query(
+        'SELECT local_leave_json FROM prejoin_memberships WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
+        [invite.roomId, invite.userId, invite.revision, invite.seq],
+      );
+      if (rows.length === 0) return null;
+      if (rows[0]?.local_leave_json != null) {
+        return JSON.parse(String(rows[0].local_leave_json)) as Pdu;
+      }
+      const signed = await buildLocalPrejoinLeave(invite, deps.signer);
+      await tx.execute(
+        'UPDATE prejoin_memberships SET local_leave_json=? WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
+        [
+          JSON.stringify(signed),
+          invite.roomId,
+          invite.userId,
+          invite.revision,
+          invite.seq,
+        ],
+      );
+      return signed;
+    })
+  );
 }
 
 // The reject-invite performer (ruling F): make_leave → fill → sign →

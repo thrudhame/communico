@@ -280,14 +280,19 @@ The shared display decision applies the room-version redaction algorithm to the
 saved event itself. Its source shape ceiling is recursive, preserves saved
 values, never restores omitted fields, and drops incompatible nested shapes.
 Private provenance is never included in client hints. Legacy malformed create hints are filtered,
-while v12 requires a valid create tied to the room identity. Typing is ephemeral;
+while v12 requires a valid create tied to the room identity.
+
 OOB rejection intent persists a real locally signed departure membership,
 separate from the later federation make_leave result (server schema v23).
 Left-room state/state_after contains only the full departure event, never
 stripped saved hints with fabricated identities. Older pending intents acquire
 that event once under their revision owner. Saved invite/knock hint redaction
 and unsigned notification projection keep their existing shared owner.
-presence and receipts are server data, while
+The common full-event formatter also retains the requested federation/client
+format for OOB departures. Inclusive pagination cuts explicitly identify the
+event to return, not the next event's numeric slot.
+
+Typing is ephemeral; presence and receipts are server data, while
 account-data stream markers belong to the tenant.
 (`api/engine/client/tokens.ts:1-33`, `api/engine/server/stream.ts:1-52`,
 `api/engine/typing.ts:1-48`, `api/engine/server/schema.ts:115-132`,

@@ -381,7 +381,7 @@ export async function backfill(
       ) {
         throw new Error('E_HISTORY_OWNER: invalid history target');
       }
-      if (history === null && args.anchor === undefined) {
+      if (history === null && args.anchor === undefined && !args.isolated) {
         const id = await tx.segments.create({
           kind: args.isolated ? 'anchor' : 'history',
           prev: stay.id,
@@ -667,7 +667,11 @@ export async function backfill(
           break;
         }
       }
-      if (history === null) return empty;
+      if (history === null) {
+        return complete
+          ? { outcome: 'complete' as const, segment: null, positioned }
+          : empty;
+      }
       if (complete) await tx.segments.close(history.id);
       return {
         outcome: complete

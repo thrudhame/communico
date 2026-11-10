@@ -546,12 +546,15 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
           ? i.filter.includeLeave
           : Number(row.seq) > i.since.eSeq
       ) {
+        const pdu = await prejoinDeparture(inviteOf(row), {
+          server: app.server,
+          signer: app.tenant.signer(),
+        });
+        if (pdu === null) continue;
         const departure = renderPrejoinDeparture(
-          await prejoinDeparture(inviteOf(row), {
-            server: app.server,
-            signer: app.tenant.signer(),
-          }),
+          pdu,
           i.userId,
+          i.filter.eventFormat,
         );
         leave[roomId] = {
           timeline: { events: [], limited: false, prev_batch: '' },

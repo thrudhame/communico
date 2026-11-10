@@ -228,6 +228,24 @@ suite.test('remote imported gap limits sync and its cursor resumes through missi
     'cannot silently jump over an interior gap',
   );
   assert(unavailable.end, 'unfilled gap stays resumable');
+  const atCut = { ...window, fromToken: String(before.next_batch) };
+  const cutEvent =
+    ((entry(before, fr.roomId).timeline as Json).events as Json[])
+      .at(-1)!.event_id;
+  assertEquals(
+    (await messages(atCut)).chunk.map((e) => e.event_id),
+    [cutEvent],
+    'a newer imported boundary cannot control an earlier stream cut',
+  );
+  const zero = await messages({ ...atCut, limit: 0 });
+  assert(zero.end);
+  assertEquals(
+    (await messages({ ...atCut, fromToken: zero.end })).chunk.map((e) =>
+      e.event_id
+    ),
+    [cutEvent],
+    'zero-limit tokens preserve the inclusive stream cut',
+  );
   await backfill(room, {
     from: [hidden.event_id!],
     limit: 1,
@@ -236,4 +254,57 @@ suite.test('remote imported gap limits sync and its cursor resumes through missi
   }, { keys, fetcher: recovery.fetcher });
   const repaired = await messages(window);
   assertEquals(repaired.chunk.map((e) => e.event_id), [hidden.event_id]);
+});
+
+suite.test('isolated backfill does not allocate empty anchors for evidence or overlap', async () => {
+  const app = theApp();
+  const alice = await suite.registerTestUser('gap-anchor', 'pw');
+  const fr = await makeFakeRoom({ roomId: '!empty-anchor:remote.test' });
+  const keys = fakeKeyResolver(fr.server, await testRemoteServer('localhost'));
+  const transport = fakeFetcher({
+    makeJoin: (u) => fr.makeJoinAnswer(u),
+    sendJoin: (pdu) => fr.acceptSendJoin(pdu),
+  });
+  await joinRemote(app.store, {
+    roomId: fr.roomId,
+    user: alice.user_id,
+    via: [fr.server.name],
+    signer: app.tenant.signer(),
+    deps: { keys, fetcher: transport.fetcher, self: 'localhost' },
+  });
+  const room = await openRoom(app.store, fr.roomId);
+  const live = await fakeMessage(fr, 'held message');
+  assertEquals(
+    (await ingestRemote(room, [live], fr.server.name, {
+      keys,
+      fetcher: transport.fetcher,
+      self: 'localhost',
+      limits: { waitMs: 0, limit: 10, budgetMs: 8000 },
+      ungroundedMs: 3600000,
+    })).map((result) => result.outcome),
+    ['accepted'],
+  );
+  await fakeMessage(fr, 'unavailable parent');
+  const evidence = await fakeMessage(fr, 'evidence only');
+  const initial = await room.tx((tx) => tx.segments.list());
+  const fetcher = fakeFetcher({ backfill: [evidence] }).fetcher;
+  for (let retry = 0; retry < 2; retry++) {
+    const result = await backfill(room, {
+      from: [evidence.event_id!],
+      limit: 1,
+      via: fr.server.name,
+      isolated: true,
+    }, { keys, fetcher });
+    assertEquals(result.outcome, 'open');
+    assertEquals(result.segment, null);
+    assertEquals(await room.tx((tx) => tx.segments.list()), initial);
+  }
+  const overlap = await backfill(room, {
+    from: [live.event_id!],
+    limit: 1,
+    via: fr.server.name,
+    isolated: true,
+  }, { keys, fetcher: fakeFetcher({ backfill: [live] }).fetcher });
+  assertEquals(overlap, { outcome: 'complete', segment: null, positioned: [] });
+  assertEquals(await room.tx((tx) => tx.segments.list()), initial);
 });

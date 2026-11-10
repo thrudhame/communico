@@ -40,9 +40,23 @@ function clientShape(
   return event;
 }
 
+function eventShape(
+  pdu: Pdu,
+  eventId: string,
+  format: 'client' | 'federation' | undefined,
+) {
+  return format === 'federation'
+    ? { ...pdu, event_id: eventId }
+    : clientShape(pdu, eventId);
+}
+
 /** Only the authoritative prejoin owner supplies these full membership PDUs.
  * Saved stripped hints must never enter a full client state-event batch. */
-export function renderPrejoinDeparture(pdu: Pdu, userId: string) {
+export function renderPrejoinDeparture(
+  pdu: Pdu,
+  userId: string,
+  format: 'client' | 'federation' | undefined,
+) {
   if (
     pdu.type !== 'm.room.member' || pdu.state_key !== userId ||
     !['leave', 'ban'].includes(String(pdu.content?.membership)) ||
@@ -50,7 +64,7 @@ export function renderPrejoinDeparture(pdu: Pdu, userId: string) {
   ) {
     throw new Error('invalid out-of-band departure');
   }
-  return clientShape(pdu, pdu.event_id);
+  return eventShape(pdu, pdu.event_id, format);
 }
 
 /** Only the authoritative pending OOB invite owner may call this boundary.
@@ -158,9 +172,11 @@ export async function renderStateEvent(
     pdu as unknown as Record<string, unknown>,
     version,
   ) as unknown as Pdu;
-  const event: Record<string, unknown> = opts?.eventFormat === 'federation'
-    ? { ...shown, event_id: eventId }
-    : clientShape(shown, eventId);
+  const event: Record<string, unknown> = eventShape(
+    shown,
+    eventId,
+    opts?.eventFormat,
+  );
   if (opts?.omitRoomId !== true) event.room_id = room.id;
   if (shown.state_key != null) event.state_key = shown.state_key;
   if (shown.redacts != null) event.redacts = shown.redacts;

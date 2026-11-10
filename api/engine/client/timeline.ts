@@ -50,7 +50,8 @@ export async function cursorForToken(
   );
   return position === null ? null : {
     segment: position.segment,
-    offset: position.offset + (dir === 'b' ? 1 : 0),
+    offset: position.offset,
+    ...(dir === 'b' ? { inclusive: true as const } : {}),
   };
 }
 
@@ -131,7 +132,7 @@ export async function messages(
     if (w.dir === 'b') {
       cursor = leave === null
         ? await room.tx((tx) => tx.segments.walkStart())
-        : { ...leave, offset: leave.offset + 1 };
+        : { ...leave, inclusive: true };
     } else {
       const segments = await room.tx((tx) => tx.segments.list());
       const first = segments.find((s) => s.kind === 'stay');
