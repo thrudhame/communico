@@ -1,12 +1,30 @@
-# Complement baseline - 2026-11-10 06:08:42 PST
+# Complement baseline - 2026-11-10 07:34:03 PST
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit 0d485426d0e290c436b6f4f57d4b0397f101bfc5)
+- image: communico-complement:local (commit 5a4b9d4983e573c6e7124a417dcb5b7b5955b10b)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 18
+- failing tests: 15
 
 ## Change from the previous baseline
+
+G7 reduces the tracked baseline from 18 failures to 15, with no new failures.
+`TestSyncTimelineGap`, `/full` and `/incremental` were explicitly observed passing
+in the unchanged full corpus, not inferred passing from absence. The default
+pass retains the red baseline; the unchanged settings pass and the
+no-new-failure comparator exit 0.
+
+Stable `msc4222` TestSync, ordinary TestSync, federation invite rejection,
+knocking and the conflicted-subgraph parent also explicitly pass. Native full
+coverage is 949 tests and 333 steps with zero failures, including real departure
+schema, both state forms, raw event format and inclusive pagination cuts.
+The OOB departure and lazy-member contracts identified by G6 are corrected;
+the cumulative source re-check is separate from this red conformance baseline.
+No Complement fixture, test, deadline or recovery concurrency changed.
+
+The documentation-only baseline commit does not change these tested inputs.
+
+### Historical G5b baseline
 
 G5b's clean production tip retains the same 18 failures: new[], fixed[],
 comparator exit 0. The default pass retains its red baseline; the unchanged
@@ -91,6 +109,3 @@ Package totals above count each package once, failing if any pass fails.
 - github.com/matrix-org/complement/tests TestRemotePngThumbnail/test_/_matrix/media/v3_endpoint
 - github.com/matrix-org/complement/tests TestRemotePngThumbnail
 - github.com/matrix-org/complement/tests TestJumpToDateEndpoint
-- github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap/incremental
-- github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap/full
-- github.com/matrix-org/complement/tests/csapi TestSyncTimelineGap
