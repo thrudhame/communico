@@ -11,7 +11,12 @@ import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { federationRequest } from './client.ts';
 import { assertRoomAcl } from './acl.ts';
 import { admit } from './gate.ts';
-import { type InviteDeps, inviteFor, type StoredInvite } from './invites.ts';
+import {
+  type InviteDeps,
+  inviteFor,
+  prejoinSnapshot,
+  type StoredInvite,
+} from './invites.ts';
 import { toWire } from './pdu.ts';
 import { validatePrejoin } from './prejoin.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
@@ -40,7 +45,9 @@ export async function performKnockAttempt(
     ),
   });
   const stripped = await validatePrejoin(
-    (answer.json as Record<string, unknown>).knock_room_state,
+    answer.json !== null && typeof answer.json === 'object'
+      ? (answer.json as Record<string, unknown>).knock_room_state
+      : undefined,
     attempt.roomId,
     attempt.roomVersion,
     deps.keys,
@@ -80,7 +87,9 @@ export async function knockRemote(
 ) {
   await assertKnownJoinEncryption(deps.store, roomId);
   await assertRoomAcl(deps.store, roomId, deps.self);
-  const previous = await inviteFor(roomId, userId, deps);
+  const snapshot = await prejoinSnapshot(roomId, userId, deps);
+  const previous = snapshot.visible ? snapshot.row : null;
+  const previousRevision = snapshot.row === null ? 0 : snapshot.row.revision;
   if (
     previous !== null &&
     ['attempting', 'rejecting', 'failed-retract'].includes(previous.status)
@@ -146,9 +155,9 @@ export async function knockRemote(
       );
       const attempt = await withRoomLock(
         roomId,
-        () =>
-          withProjectionLock(async () => {
-            await admitLocalJoin(deps.store, roomId, userId);
+        async () => {
+          await admitLocalJoin(deps.store, roomId, userId);
+          return await withProjectionLock(async () => {
             if (await deps.store.roomRetired(roomId)) {
               throw new MatrixError(
                 404,
@@ -163,7 +172,7 @@ export async function knockRemote(
               );
               if (
                 Number(rows[0]?.revision == null ? 0 : rows[0].revision) !==
-                  (previous == null ? 0 : previous.revision)
+                  previousRevision
               ) {
                 throw new MatrixError(
                   409,
@@ -182,7 +191,7 @@ export async function knockRemote(
                   'membership changed during knock',
                 );
               }
-              const revision = (previous == null ? 0 : previous.revision) + 1;
+              const revision = previousRevision + 1;
               const now = Date.now();
               const seq = await nextEventSeq(tx);
               const expires = now +
@@ -222,7 +231,8 @@ export async function knockRemote(
                 leaveJson: null,
               } satisfies StoredInvite;
             });
-          }),
+          });
+        },
       );
       try {
         await performKnockAttempt(attempt, deps);

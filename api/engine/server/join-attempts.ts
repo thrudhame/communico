@@ -8,6 +8,9 @@ import { setJoinAdmission } from '#engine/room/hooks.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Database } from '#engine/store/db.ts';
 import type { Pdu } from '#engine/pdu.ts';
+import { prejoinLeaveActive, settleSupersededPrejoin } from './prejoin.ts';
+import { withProjectionLock } from './project.ts';
+import { eventStreamTx } from './stream.ts';
 
 export type JoinAttempt = {
   roomId: string;
@@ -31,11 +34,19 @@ async function assertNoJoinCleanup(
   roomId: string,
   userId: string,
 ): Promise<void> {
-  const rows = await (await store.server()).query(
-    "SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? UNION ALL SELECT 1 FROM prejoin_memberships WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract')",
-    [roomId, userId, roomId, userId],
-  );
-  if (rows.length) {
+  const server = await store.server();
+  const result = await withProjectionLock(() => {
+    const inflight = prejoinLeaveActive(store, roomId, userId);
+    return eventStreamTx(server, async (tx) => {
+      if (!inflight) await settleSupersededPrejoin(tx, roomId, userId);
+      const rows = await tx.query(
+        "SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? UNION ALL SELECT 1 FROM prejoin_memberships WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract')",
+        [roomId, userId, roomId, userId],
+      );
+      return { inflight, rows };
+    });
+  });
+  if (result.inflight || result.rows.length) {
     throw new MatrixError(
       409,
       'M_BAD_STATE',
