@@ -8,8 +8,33 @@ import {
   remoteUserFromMembers,
 } from '#engine/federation/query.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { getProfile } from '#engine/tenant/users.ts';
+import { getPublicProfile } from '#engine/tenant/profiles.ts';
 import { discoveryRequest } from '#engine/federation/discovery.ts';
+import { authorize } from '#engine/auth-context.ts';
+import { localpartOf } from '#engine/ids.ts';
+import { setProfileField } from '#engine/tenant/profiles.ts';
+import { propagateProfile } from '#engine/client/membership.ts';
+import type { PathfinderRequest } from '@pathfinder/pathfinder';
+
+export async function deleteProfileField(
+  request: PathfinderRequest,
+  key: string,
+) {
+  const caller = await authorize(request);
+  const userId = request.params.userId as string;
+  if (caller !== userId) {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'cannot change another user profile',
+    );
+  }
+  await setProfileField(theApp().tenant, localpartOf(userId), key, undefined);
+  if (key === 'displayname' || key === 'avatar_url') {
+    await propagateProfile(userId, key);
+  }
+  return {};
+}
 
 export async function userProfile(userId: string): Promise<Profile> {
   const app = theApp();
@@ -19,7 +44,7 @@ export async function userProfile(userId: string): Promise<Profile> {
     userId.startsWith('@') && parts.server !== null &&
     parts.server === serverName()
   ) {
-    profile = await getProfile(app.tenant, parts.localpart);
+    profile = await getPublicProfile(app.tenant, parts.localpart);
   } else {
     const fed = config().federation;
     if (
@@ -37,14 +62,9 @@ export async function userProfile(userId: string): Promise<Profile> {
       ) {
         throw new MatrixError(502, 'M_UNKNOWN', 'invalid remote profile');
       }
-      const fields = answer as Record<string, unknown>;
-      profile = {};
-      if (typeof fields.displayname === 'string') {
-        profile.displayname = fields.displayname;
-      }
-      if (typeof fields.avatar_url === 'string') {
-        profile.avatar_url = fields.avatar_url;
-      }
+      profile = { ...answer } as Profile;
+      if (typeof profile.displayname !== 'string') delete profile.displayname;
+      if (typeof profile.avatar_url !== 'string') delete profile.avatar_url;
     } else if (fed.enabled && fed.lookups === 'known') {
       profile = await remoteUserFromMembers(userId, app);
     }

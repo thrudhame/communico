@@ -18,6 +18,7 @@ import { membershipOf } from '#engine/server/read.ts';
 import { lookupAlias, registerAlias } from '#engine/server/aliases.ts';
 import { deviceIdentity, transactionSubmission } from '#engine/tenant/txns.ts';
 import { localpartOf } from '#engine/ids.ts';
+import { getProfile } from '#engine/tenant/users.ts';
 import { requireRoom, stateAtSeq, versionOf } from './room.ts';
 
 export type { CreateRoomOptions };
@@ -43,7 +44,14 @@ export async function createRoom(opts: CreateRoomOptions) {
   if (alias !== undefined && await lookupAlias(app.server, alias) !== null) {
     throw new MatrixError(409, 'M_ROOM_IN_USE', 'alias taken: ' + alias);
   }
-  const res = await create(app.store, opts, app.tenant.signer());
+  const creatorProfile = await getProfile(
+    app.tenant,
+    localpartOf(opts.creator),
+  );
+  const res = await create(app.store, {
+    ...opts,
+    creatorProfile: creatorProfile ?? {},
+  }, app.tenant.signer());
   if (res.roomAlias !== undefined) {
     await registerAlias(app.server, res.roomAlias, res.roomId, opts.creator);
   }

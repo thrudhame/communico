@@ -39,6 +39,7 @@ import * as txns from '#engine/tenant/txns.ts';
 import * as uia from '#engine/tenant/uia.ts';
 import * as users from '#engine/tenant/users.ts';
 import * as openid from '#engine/tenant/openid.ts';
+import * as profiles from '#engine/tenant/profiles.ts';
 import { tenantStreamCommitted } from '#engine/tenant/streams.ts';
 import { writeCertificate } from '#engine/tenant/certificate.ts';
 import {
@@ -293,6 +294,12 @@ function bind(
       status: (device: devices.DeviceIdentity) => e2ee.keyStatus(conn, device),
       snapshot: (localpart: string, owner: string, limits: e2ee.KeyLimits) =>
         e2ee.deviceSnapshot(conn, localpart, owner, limits),
+    },
+    profiles: {
+      get: (localpart: string) => profiles.profileRow(conn, localpart),
+      set: (localpart: string, key: string, value: unknown) =>
+        profiles.setProfileRow(conn, localpart, key, value),
+      clear: (localpart: string) => profiles.clearProfileRows(conn, localpart),
     },
     users: {
       exists: (localpart: string) => users.userExists(conn, localpart),

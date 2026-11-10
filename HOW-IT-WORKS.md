@@ -320,6 +320,14 @@ access, and clean up on cancellation or timeout. Layered `peeking.maxevents`
 (default 50) and `peeking.maxtimeoutms` (default 30000) bound pages and waits.
 (`api/engine/client/peeking.ts`)
 
+The tenant profile owner assembles legacy user columns and additional JSON field
+rows, and validates whole-profile byte limits inside the write transaction.
+Legacy setters use the same owner, avoiding independent size budgets. Public
+client and federation queries expose the assembled profile; room creation,
+joins and profile fan-out use only the legacy display/avatar projection.
+Custom null is a stored value, while DELETE removes the row. Deactivation clears
+both sources. (`api/engine/tenant/profiles.ts`)
+
 Alias and profile discovery ask remote servers by default, including anonymous
 requests, through signed, admission-gated federation. `federation.lookups=known`
 restricts answers to held data; `none` disables remote lookup answers. Discovery

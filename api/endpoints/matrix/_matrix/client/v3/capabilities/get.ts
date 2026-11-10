@@ -20,6 +20,7 @@ export default async function (
     capabilities: {
       'm.room_versions': { default: '11', available },
       'm.change_password': { enabled: false },
+      'm.profile_fields': { enabled: true },
     },
   };
 }

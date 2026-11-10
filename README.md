@@ -315,6 +315,11 @@ zero to clear badges. Logout, device/token revocation, account deactivation and
 matching gateway `rejected` verdicts cancel the corresponding registration's
 work. Invalid responses and HTTP/TLS errors retry; they never delete a pusher.
 
+Public profiles support namespaced custom JSON fields and `m.tz`, with per-field
+GET/PUT/DELETE and `m.profile_fields` capability discovery. Keys are at most 255
+UTF-8 bytes; the whole profile must remain below 64 KiB. Custom null values are
+retained until DELETE. Only display names and avatars enter room membership.
+
 ## Operator tools
 
 The tools require the server to be running with the same configuration. They

@@ -5,7 +5,8 @@ import type { Database } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { pduAt } from './room.ts';
 
-export type Profile = { displayname?: string; avatar_url?: string };
+export type { Profile } from '#engine/tenant/profiles.ts';
+import type { Profile } from '#engine/tenant/profiles.ts';
 
 export async function remoteUserFromMembers(
   userId: string,

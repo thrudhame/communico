@@ -232,8 +232,12 @@ CREATE INDEX openid_tokens_expiry ON openid_tokens(expires_ms);
 CREATE INDEX openid_tokens_user ON openid_tokens(localpart);
 `;
 
+const PROFILE_SQL = `
+CREATE TABLE profile_fields(localpart TEXT NOT NULL REFERENCES users(localpart), key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(localpart,key));
+`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 15,
+  version: 16,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -247,8 +251,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(ACCOUNT_CHANGES_SQL);
     await db.exec(PUSHER_CHANGES_SQL);
     await db.exec(OPENID_SQL);
+    await db.exec(PROFILE_SQL);
   },
   migrations: {
+    15: (conn) => conn.exec(PROFILE_SQL),
     14: (conn) => conn.exec(OPENID_SQL),
     13: async (conn) => {
       await conn.exec(PUSHER_CHANGES_SQL);
