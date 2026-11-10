@@ -232,7 +232,7 @@ test('M3: both config routes advertise a number and retain auth', async () => {
   }
 });
 
-test('filename encoding and the agreed no-thumbnail behavior are retained', async () => {
+test('filename encoding and malformed-image thumbnail refusal', async () => {
   const user = await suite.registerTestUser('media-filename', 'pw');
   const up = await upload(
     user.access_token!,
@@ -256,6 +256,6 @@ test('filename encoding and the agreed no-thumbnail behavior are retained', asyn
   assertEquals(anonymous.status, 401);
   await anonymous.json();
   const authed = await request(thumbnail, user.access_token!);
-  assertEquals(authed.status, 404);
+  assertEquals(authed.status, 400);
   await authed.json();
 });

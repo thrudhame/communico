@@ -19,6 +19,7 @@ import {
   mediaMultipart,
   type MediaPart,
 } from './multipart.ts';
+import { type Thumbnail, ThumbnailWorkers } from './thumbnail.ts';
 
 function assertMxc(origin: string, mediaId: string) {
   if (!serverAllowed(origin, null) || !/^[A-Za-z0-9_-]{1,255}$/.test(mediaId)) {
@@ -78,6 +79,7 @@ function responseHeaders(
 export class MediaService {
   private cache: Promise<MediaCache> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private thumbnails = new ThumbnailWorkers();
   constructor(private db: Db, private tenant: Tenant) {}
   private cacheOwner(): Promise<MediaCache> {
     if (this.cache === null) {
@@ -96,6 +98,7 @@ export class MediaService {
     return this.cache;
   }
   async close(): Promise<void> {
+    this.thumbnails.close();
     if (this.timer !== null) clearInterval(this.timer);
     if (this.cache !== null) {
       const cache = await this.cache;
@@ -172,11 +175,125 @@ export class MediaService {
       ),
     });
   }
+  async thumbnail(
+    origin: string,
+    mediaId: string,
+    user: string,
+    options: Thumbnail,
+    allowRemote = true,
+    legacy = false,
+  ): Promise<Response> {
+    assertMxc(origin, mediaId);
+    if (legacy && origin !== serverName()) {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media');
+    }
+    if (origin !== serverName()) {
+      if (!config().federation.enabled) {
+        throw new MatrixError(502, 'M_UNKNOWN', 'federation disabled');
+      }
+      await admit(this.db, origin, {
+        kind: 'outbound',
+        user,
+        what: 'media thumbnail',
+      });
+    } else {
+      // Validate current local upload state even on a derived-cache hit.
+      const original = await serveMedia(origin, mediaId);
+      await original.body?.cancel();
+    }
+    const cache = await this.cacheOwner();
+    const identity: CacheIdentity = {
+      origin,
+      mediaId,
+      variant:
+        `png:v1:${options.method}:${options.width}:${options.height}:${options.animated}`,
+      scope: 'thumbnail',
+    };
+    let row = await cache.get(identity);
+    if (row === null) {
+      if (!allowRemote && origin !== serverName()) {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown cached thumbnail');
+      }
+      row = await cache.fetch(
+        identity,
+        config().media.maxfetches,
+        async (output, signal) => {
+          const policy = config().media;
+          const bytes = await this.thumbnails.render(
+            async () => {
+              if (origin === serverName()) {
+                const original = await serveMedia(origin, mediaId);
+                return await boundedBytes(original.body!, policy.maxbytes);
+              }
+              // Remote thumbnail inputs are buffered only *after* obtaining a worker
+              // slot: at most thumbnailworkers x maxbytes compressed input, plus the
+              // bounded decode buffers. Ordinary downloads remain disk-streamed.
+              const chunks: Uint8Array[] = [];
+              let size = 0;
+              await this.remote(
+                origin,
+                mediaId,
+                new WritableStream({
+                  write(chunk) {
+                    chunks.push(chunk.slice());
+                    size += chunk.length;
+                  },
+                }),
+                signal,
+                options,
+              );
+              const result = new Uint8Array(size);
+              let at = 0;
+              for (const chunk of chunks) {
+                result.set(chunk, at);
+                at += chunk.length;
+              }
+              return result;
+            },
+            options,
+            policy,
+            signal,
+          );
+          const writer = output.getWriter();
+          try {
+            await writer.write(bytes);
+            await writer.close();
+          } catch (error) {
+            await writer.abort(error).catch(() => {});
+            throw error;
+          }
+          return {
+            contentType: 'image/png',
+            filename: null,
+            size: bytes.length,
+          };
+        },
+      );
+    }
+    if (origin !== serverName()) {
+      await admit(this.db, origin, {
+        kind: 'outbound',
+        user,
+        what: 'media thumbnail',
+      });
+    }
+    const stream = await cache.open(row);
+    try {
+      await cache.cleanup(config().media.cache);
+    } catch (error) {
+      await stream.cancel(error);
+      throw error;
+    }
+    return new Response(stream, {
+      headers: responseHeaders('image/png', null, row.size),
+    });
+  }
   private async remote(
     origin: string,
     mediaId: string,
     output: WritableStream<Uint8Array>,
     parentSignal: AbortSignal,
+    thumbnail?: Thumbnail,
   ): Promise<ByteMetadata> {
     const policy = config().media;
     const signal = AbortSignal.any([
@@ -200,13 +317,21 @@ export class MediaService {
         },
       });
     let part: MediaPart | null = null;
+    const query = thumbnail === undefined ? '' : '?' +
+      new URLSearchParams({
+        width: String(thumbnail.width),
+        height: String(thumbnail.height),
+        method: thumbnail.method,
+        animated: String(thumbnail.animated),
+      });
+    const kind = thumbnail === undefined ? 'download' : 'thumbnail';
     try {
       try {
         await federationRequestRaw(this.db, this.tenant.signer(), {
           destination: origin,
           method: 'GET',
-          path: '/_matrix/federation/v1/media/download/' +
-            encodeURIComponent(mediaId),
+          path: '/_matrix/federation/v1/media/' + kind + '/' +
+            encodeURIComponent(mediaId) + query,
           body: null,
           maxBytes: policy.maxbytes + MEDIA_ENVELOPE_LIMIT,
           signal,
@@ -235,8 +360,10 @@ export class MediaService {
           {
             destination: origin,
             method: 'GET',
-            path: '/_matrix/media/v3/download/' + encodeURIComponent(origin) +
-              '/' + encodeURIComponent(mediaId) + '?allow_remote=false',
+            path: '/_matrix/media/v3/' + kind + '/' +
+              encodeURIComponent(origin) +
+              '/' + encodeURIComponent(mediaId) + (query ? query + '&' : '?') +
+              'allow_remote=false',
             body: null,
             maxBytes: policy.maxbytes,
             signal,
@@ -283,4 +410,26 @@ export class MediaService {
       throw error;
     }
   }
+}
+
+async function boundedBytes(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+): Promise<Uint8Array> {
+  let size = 0;
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of stream) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      throw new MatrixError(413, 'M_TOO_LARGE', 'Image exceeds byte limit');
+    }
+    chunks.push(chunk);
+  }
+  const bytes = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, at);
+    at += chunk.length;
+  }
+  return bytes;
 }

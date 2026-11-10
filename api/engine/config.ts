@@ -639,7 +639,13 @@ export type ConfigPatch = {
   };
   server?: { name?: string; port?: number; shutdowngraceseconds?: number };
   admin?: { socket?: string };
-  media?: { root?: string; maxbytes?: number };
+  media?: Partial<Omit<Config['media'], 'cache'>> & {
+    cache?: {
+      maxbytes?: number;
+      remote?: Partial<Config['media']['cache']['remote']>;
+      thumbnail?: Partial<Config['media']['cache']['thumbnail']>;
+    };
+  };
   encryption?: {
     allowunencryptedcreation?: boolean;
     allowunencryptedjoining?: boolean;
