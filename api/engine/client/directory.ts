@@ -22,6 +22,7 @@ import { requireRoom, stateAtSeq, versionOf } from './room.ts';
 import { joinedRooms, serversInRoom } from './membership.ts';
 import { writeStateKey } from './write.ts';
 import { discoveryRequest } from '#engine/federation/discovery.ts';
+import { publicRoomSummary } from './summary.ts';
 
 export function aliasIsLocal(alias: string) {
   const parts = splitId(alias);
@@ -209,7 +210,12 @@ export async function setVisibility(
   await directory.setVisibility(theApp().server, roomId, value);
 }
 export async function publicRooms(
-  opts: { search?: string; limit?: number; since?: string },
+  opts: {
+    search?: string;
+    limit?: number;
+    since?: string;
+    roomTypes?: (string | null)[];
+  },
 ) {
   const limit = opts.limit !== undefined && opts.limit > 0 ? opts.limit : 100,
     offset = opts.since === undefined
@@ -217,48 +223,20 @@ export async function publicRooms(
       : Math.max(0, parseInt(opts.since, 10) || 0);
   const all: Record<string, unknown>[] = [];
   for (const id of await directory.listedRooms(theApp().server)) {
-    const state = await stateAtSeq(id, null, [
-      ['m.room.name', ''],
-      ['m.room.topic', ''],
-      ['m.room.canonical_alias', ''],
-      ['m.room.history_visibility', ''],
-      ['m.room.guest_access', ''],
-      ['m.room.join_rules', ''],
-      ['m.room.avatar', ''],
-    ]);
-    const value = (type: string, key: string) => {
-      const v = state.find((r) => r.type === type && r.stateKey === '')
-        ?.content[key];
-      return typeof v === 'string' ? v : undefined;
-    };
-    const name = value('m.room.name', 'name'),
-      topic = value('m.room.topic', 'topic'),
-      canonical = value('m.room.canonical_alias', 'alias');
+    const chunk = await publicRoomSummary(id);
     if (
-      opts.search !== undefined &&
-      ![name, topic, canonical].some((v) =>
-        v?.toLowerCase().includes(opts.search!.toLowerCase())
+      opts.roomTypes !== undefined &&
+      !opts.roomTypes.includes(
+        typeof chunk.room_type === 'string' ? chunk.room_type : null,
       )
     ) continue;
-    const chunk: Record<string, unknown> = {
-      room_id: id,
-      num_joined_members:
-        (await directory.joinedUsers(theApp().server, id)).length,
-      world_readable:
-        value('m.room.history_visibility', 'history_visibility') ===
-          'world_readable',
-      guest_can_join:
-        value('m.room.guest_access', 'guest_access') === 'can_join',
-    };
-    for (
-      const [key, v] of [
-        ['name', name],
-        ['topic', topic],
-        ['canonical_alias', canonical],
-        ['join_rule', value('m.room.join_rules', 'join_rule')],
-        ['avatar_url', value('m.room.avatar', 'url')],
-      ]
-    ) if (v !== undefined) chunk[key!] = v;
+    if (
+      opts.search !== undefined &&
+      ![chunk.name, chunk.topic, chunk.canonical_alias].some((v) =>
+        typeof v === 'string' &&
+        v.toLowerCase().includes(opts.search!.toLowerCase())
+      )
+    ) continue;
     all.push(chunk);
   }
   all.sort((a, b) =>
@@ -284,8 +262,13 @@ export async function searchUsers(searcher: string, term: string, limit = 10) {
   for (const id of await directory.allMemberRooms(theApp().server)) {
     if (publicIds.has(id)) continue;
     if (
-      (await stateAtSeq(id, null, [['m.room.join_rules', '']])).some((r) =>
-        r.type === 'm.room.join_rules' && r.content.join_rule === 'public'
+      (await stateAtSeq(id, null, [['m.room.join_rules', ''], [
+        'm.room.history_visibility',
+        '',
+      ]])).some((r) =>
+        (r.type === 'm.room.join_rules' && r.content.join_rule === 'public') ||
+        (r.type === 'm.room.history_visibility' &&
+          r.content.history_visibility === 'world_readable')
       )
     ) publicIds.add(id);
   }

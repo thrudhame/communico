@@ -265,6 +265,18 @@ inherited value is below `state_default + 1`; 150 is not an unconditional floor.
 
 ## Federation and delivery
 
+Client and federation public directories use one published-state metadata
+serializer, including room types. Both filter `room_types` (with `null` for
+untyped rooms) before counting and pagination. User-directory candidates include
+unlisted world-readable rooms, while retaining the local-account scope.
+(`api/engine/client/{directory,summary}.ts`)
+
+Alias and profile discovery ask remote servers by default, including anonymous
+requests, through signed, admission-gated federation. `federation.lookups=known`
+restricts answers to held data; `none` disables remote lookup answers. Discovery
+never adds a participation roster entry.
+(`api/engine/federation/{discovery,gate}.ts`)
+
 Federation has its own request-signature/admission boundary and per-version
 event-signature verification. Keys are looked up by server and key id with
 the required validity floor; failure to obtain or verify a key refuses the
