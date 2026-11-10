@@ -2,8 +2,10 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { eduState } from '#engine/federation/edus.ts';
 import {
   makeJoin,
+  makeKnock,
   makeLeave,
   sendJoin,
+  sendKnock,
   sendLeave,
 } from '#engine/federation/joins.ts';
 import {
@@ -95,6 +97,23 @@ Deno.test('ACL: all resident serving and membership template classes use current
     ];
     for (const read of readers) await read();
     await deny(g);
+    for (
+      const deniedKnock of [
+        () =>
+          makeKnock(
+            g.roomId,
+            '@knocker:remote.test',
+            'remote.test',
+            ['11'],
+            membership,
+          ),
+        () => sendKnock(g.roomId, '$missing', {}, 'remote.test', membership),
+      ]
+    ) {
+      const error = await assertRejects(deniedKnock, MatrixError);
+      assertEquals(error.status, 403);
+      assertEquals(error.message, 'M_FORBIDDEN: server denied by room ACL');
+    }
     for (const read of readers) {
       const error = await assertRejects(read, MatrixError);
       assertEquals(error.status, 403);
@@ -431,10 +450,12 @@ Deno.test('ACL: room-scoped federation endpoint inventory has an admitted engine
     'v1/get_missing_events/#roomId/post.ts': 'serveGetMissingEvents',
     'v1/make_join/#roomId/#userId/get.ts': 'makeJoin',
     'v1/make_leave/#roomId/#userId/get.ts': 'makeLeave',
+    'v1/make_knock/#roomId/#userId/get.ts': 'makeKnock',
     'v1/send_join/#roomId/#eventId/put.ts': 'sendJoin',
     'v2/send_join/#roomId/#eventId/put.ts': 'sendJoin',
     'v1/send_leave/#roomId/#eventId/put.ts': 'sendLeave',
     'v2/send_leave/#roomId/#eventId/put.ts': 'sendLeave',
+    'v1/send_knock/#roomId/#eventId/put.ts': 'sendKnock',
     'v2/invite/#roomId/#eventId/put.ts': 'receiveInvite',
     'v1/state/#roomId/get.ts': 'serveState',
     'v1/state_ids/#roomId/get.ts': 'serveStateIds',

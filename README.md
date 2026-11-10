@@ -37,11 +37,11 @@ unencrypted creation is disabled; remote events retain normal Matrix validity.
 
 Administrators control three independent settings in `[encryption]`:
 
-| # | Config name                           | Default | Effect when false                                                                                                         |
-| - | ------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------- |
-| 1 | `encryption.allowunencryptedcreation` | `false` | Insert Megolm at room creation and protect local encryption state from downgrade/removal                                  |
-| 2 | `encryption.allowunencryptedjoining`  | `true`  | Refuse local joins to known plaintext rooms; leave unknown remote plaintext rooms after the handshake and return an error |
-| 3 | `encryption.allowunencryptedmessages` | `false` | Refuse local plaintext non-state events in encrypted rooms, with the exceptions above                                     |
+| # | Config name                           | Default | Effect when false                                                                                                          |
+| - | ------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 1 | `encryption.allowunencryptedcreation` | `false` | Insert Megolm at room creation and protect local encryption state from downgrade/removal                                   |
+| 2 | `encryption.allowunencryptedjoining`  | `true`  | Refuse local joins/knocks to known plaintext rooms; leave unknown remote plaintext rooms after joining and return an error |
+| 3 | `encryption.allowunencryptedmessages` | `false` | Refuse local plaintext non-state events in encrypted rooms, with the exceptions above                                      |
 
 Environment overrides are `COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDCREATION`,
 `COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDJOINING` and
@@ -50,6 +50,23 @@ may briefly join before discovering the room's authoritative encryption state.
 Interrupted cleanup remains durable and visible in federation-outbox review;
 it retries through the federation sender. Existing members are not evicted.
 The three `io.element.e2ee_forced.*` `/versions` flags reflect creation policy.
+
+## Knocking
+
+Local users can knock on rooms whose join rule allows it. `/sync` exposes only
+`rooms.knock` prejoin state, not a joined timeline. Acceptance is a normal
+invitation; the client chooses whether to join. A repeated knock updates its
+reason and rechecks the resident's current state. Reasons, profiles and prejoin
+state are plaintext Matrix metadata, even in encrypted rooms.
+
+Unknown remote knocks are allowed under strict encryption joining policy:
+stripped state is not authoritative proof of encryption. The subsequent join
+still enforces that policy. Remote knock attempts and retractions survive restart;
+ambiguous responses retry the same signed event. Knock reconciliation/retraction
+uses `federation.refusedmillihours`, with expired work retained in outbox review
+for explicit retry. Existing invite rejection jobs remain nonexpiring. Remote
+kick/ban notification is not guaranteed by Matrix; unproven terminal events do
+not become membership truth on the knocker's server.
 
 Matrix E2EE protects payloads that clients encrypt, not the whole protocol.
 These limits apply even in an encrypted room. HTTPS protects transport, but

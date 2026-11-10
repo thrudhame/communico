@@ -19,6 +19,8 @@ export interface EventFilter {
 }
 
 export interface RoomFilter {
+  rooms?: string[];
+  notRooms?: string[];
   timeline: EventFilter;
   state: EventFilter;
   includeLeave: boolean;
@@ -152,6 +154,16 @@ export function roomFilterOf(raw: unknown): RoomFilter {
     timeline: eventFilterOf(room.timeline),
     state: eventFilterOf(room.state),
     includeLeave: room.include_leave === true,
+    ...(Array.isArray(room.rooms)
+      ? { rooms: room.rooms.filter((v): v is string => typeof v === 'string') }
+      : {}),
+    ...(Array.isArray(room.not_rooms)
+      ? {
+        notRooms: room.not_rooms.filter((v): v is string =>
+          typeof v === 'string'
+        ),
+      }
+      : {}),
   };
 }
 

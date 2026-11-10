@@ -13,6 +13,8 @@ import {
 } from '#engine/federation/invites.ts';
 import { joinRemote } from '#engine/room/join.ts';
 import { performJoinCleanup } from '#engine/federation/join-cleanup.ts';
+import { knockRemote } from '#engine/federation/knocks.ts';
+import { assertKnownJoinEncryption } from '#engine/room/encryption-policy.ts';
 import * as local from '#engine/room/membership.ts';
 import { lookupAlias } from '#engine/server/aliases.ts';
 import { membershipOf, roomsFor } from '#engine/server/read.ts';
@@ -98,6 +100,7 @@ export async function joinByIdOrAlias(
   userId: string,
   content: Record<string, unknown>,
   via: string[],
+  operation: typeof join = join,
 ) {
   const app = theApp();
   let roomId = id;
@@ -130,9 +133,38 @@ export async function joinByIdOrAlias(
   }
   candidates.push(...via);
   if (roomId.includes(':')) candidates.push(domainOf(roomId));
-  return await join(roomId, userId, content, {
+  return await operation(roomId, userId, content, {
     via: [...new Set(candidates)].filter((s) => s !== serverName()),
   });
+}
+
+export async function knock(
+  roomId: string,
+  userId: string,
+  extra: Record<string, unknown> = {},
+  opts: { via?: string[] } = {},
+) {
+  const app = theApp();
+  const profile = await getProfile(app.tenant, localpartOf(userId));
+  const content = {
+    ...profile,
+    ...(typeof extra.reason === 'string' ? { reason: extra.reason } : {}),
+    membership: 'knock',
+  };
+  await assertKnownJoinEncryption(app.store, roomId);
+  const room = await lookupRoom(roomId);
+  if (room !== null && await room.tx((tx) => tx.segments.openStay()) !== null) {
+    const result = await local.knock(
+      room,
+      userId,
+      app.tenant.signer(),
+      content,
+    );
+    await clearPurgeable(app.server, roomId, userId);
+    return result;
+  }
+  const via = [...new Set(opts.via ?? [])].filter((s) => s !== serverName());
+  return await knockRemote(roomId, userId, content, via, inviteDeps());
 }
 
 export async function leave(roomId: string, userId: string, reason?: string) {
@@ -142,7 +174,7 @@ export async function leave(roomId: string, userId: string, reason?: string) {
   const room = await lookupRoom(roomId);
   const current = await membershipOf(app.server, roomId, userId);
   if (
-    (current === null || current.membership === 'invite') &&
+    (current === null || current.seq < (invitation?.seq ?? 0)) &&
     invitation !== null && invitation.status !== 'joined'
   ) {
     await rejectInviteRemote(roomId, userId, deps);

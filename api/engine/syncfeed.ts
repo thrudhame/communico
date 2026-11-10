@@ -10,6 +10,8 @@ import {
   type StreamToken,
 } from '#engine/client/tokens.ts';
 import { config } from '#engine/config.ts';
+import { prejoinTypes } from '#engine/federation/prejoin.ts';
+import { visiblePrejoin } from '#engine/server/prejoin.ts';
 import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
@@ -61,15 +63,7 @@ export interface SyncInputs {
   setPresence?: string;
 }
 
-const strippedTypes = new Set([
-  'm.room.create',
-  'm.room.join_rules',
-  'm.room.name',
-  'm.room.topic',
-  'm.room.avatar',
-  'm.room.canonical_alias',
-  'm.room.encryption',
-]);
+const strippedTypes = prejoinTypes;
 const stripped = (row: StateRow) => ({
   type: row.type,
   state_key: row.stateKey,
@@ -262,7 +256,9 @@ async function relevantChanged(
   const rows = await app.server.query(
     `SELECT MAX(seq) AS m FROM (
        SELECT f.seq FROM feed f JOIN memberships m ON m.room = f.room WHERE m.user = ?
-       UNION ALL SELECT seq FROM federation_invites WHERE user_id = ?
+       UNION ALL SELECT seq FROM prejoin_memberships p WHERE user_id = ? AND status NOT IN ('attempting','failed-attempt') AND ${
+      visiblePrejoin('p')
+    }
      )`,
     [i.userId, i.userId],
   );
@@ -381,7 +377,9 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       });
     }
     const oob = await tx.query(
-      'SELECT * FROM federation_invites WHERE user_id=? ORDER BY seq',
+      `SELECT * FROM prejoin_memberships p WHERE user_id=? AND ${
+        visiblePrejoin('p')
+      } ORDER BY seq`,
       [i.userId],
     );
     return { counters, memberships, notifications, rooms, oob };
@@ -414,7 +412,11 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   );
   const join: Record<string, unknown> = {},
     invite: Record<string, unknown> = {},
+    knock: Record<string, unknown> = {},
     leave: Record<string, unknown> = {};
+  const roomIncluded = (id: string) =>
+    (!i.filter.rooms || i.filter.rooms.includes(id)) &&
+    !i.filter.notRooms?.includes(id);
   const ignored = await getAccountData(
     app.tenant,
     lp,
@@ -426,19 +428,39 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const oob = snapshot.oob;
   const oobRooms = new Set<string>();
   for (const row of oob) {
-    if (row.status === 'joined') continue;
+    if (
+      ['joined', 'attempting', 'failed-attempt'].includes(String(row.status))
+    ) continue;
     const roomId = String(row.room_id);
     oobRooms.add(roomId);
+    if (!roomIncluded(roomId)) continue;
+    if (i.since !== null && !i.fullState && Number(row.seq) <= i.since.eSeq) {
+      continue;
+    }
     const event = JSON.parse(String(row.event_json)) as Record<string, unknown>;
     if (ignoredUsers.has(String(event.sender))) continue;
-    const events = [...JSON.parse(String(row.invite_room_state)), {
-      type: event.type,
-      state_key: event.state_key,
-      content: event.content,
-      sender: event.sender,
-    }];
-    if (row.status === 'pending') invite[roomId] = { invite_state: { events } };
-    else if (
+    const saved = JSON.parse(String(row.invite_room_state)) as Record<
+      string,
+      unknown
+    >[];
+    const events = [
+      ...saved.filter((e) =>
+        !(e.type === 'm.room.member' && e.state_key === i.userId)
+      ),
+      {
+        type: event.type,
+        state_key: event.state_key,
+        content: row.status === 'rejecting' || row.status === 'failed-retract'
+          ? { membership: 'leave' }
+          : event.content,
+        sender: event.sender,
+      },
+    ];
+    if (row.status === 'pending' && row.kind === 'knock') {
+      knock[roomId] = { knock_state: { events } };
+    } else if (row.status === 'pending') {
+      invite[roomId] = { invite_state: { events } };
+    } else if (
       i.since === null ? i.filter.includeLeave : Number(row.seq) > i.since.eSeq
     ) {
       leave[roomId] = {
@@ -449,17 +471,19 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   }
   const allJoiners = new Set<string>();
   for (const m of memberships) {
-    if (oobRooms.has(m.roomId)) continue;
+    if (oobRooms.has(m.roomId) || !roomIncluded(m.roomId)) continue;
     const room = await heldRoom(m.roomId);
     if (room === null) continue;
-    if (m.membership === 'invite') {
+    if (m.membership === 'invite' || m.membership === 'knock') {
+      if (i.since !== null && !i.fullState && m.seq <= i.since.eSeq) continue;
       const at = await stateAtSeq(room, m.seq);
       const member = at.find((r) =>
         r.type === 'm.room.member' && r.stateKey === i.userId
       );
       if (member && ignoredUsers.has(member.sender)) continue;
-      invite[m.roomId] = {
-        invite_state: {
+      const section = m.membership === 'knock' ? knock : invite;
+      section[m.roomId] = {
+        [m.membership === 'knock' ? 'knock_state' : 'invite_state']: {
           events: at.filter((r) =>
             strippedTypes.has(r.type) ||
             r.type === 'm.room.member' && r.stateKey === i.userId
@@ -554,7 +578,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   }
   return {
     next_batch: nextBatch,
-    rooms: { join, invite, leave },
+    rooms: { join, invite, knock, leave },
     presence: { events: [...presenceEvents.values()] },
     account_data: { events: accountData },
     to_device: { events: delivery.events },

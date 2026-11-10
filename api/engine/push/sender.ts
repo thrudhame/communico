@@ -8,6 +8,7 @@ import { config } from '#engine/config.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
 import { cancelPushTarget } from '#engine/server/push-queue.ts';
+import { visiblePrejoin } from '#engine/server/prejoin.ts';
 import {
   cancelPushEvent,
   finishPushWork,
@@ -52,7 +53,9 @@ async function rendered(
   const viewer = { userId: target.user, deviceId: null, tenant };
   const server = await store.server();
   const invite = (await server.query(
-    "SELECT event_json FROM federation_invites WHERE room_id=? AND user_id=? AND event_id=? AND status='pending'",
+    `SELECT event_json FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND status='pending' AND kind='invite' AND ${
+      visiblePrejoin('p')
+    }`,
     [roomId, target.user, eventId],
   ))[0];
   if (invite) {

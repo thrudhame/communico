@@ -97,6 +97,18 @@ export async function join(
   }, signer);
 }
 
+export async function knock(
+  room: Room,
+  userId: string,
+  signer: Signer,
+  extraContent?: Record<string, unknown>,
+) {
+  return await authorMember(room, userId, userId, {
+    ...extraContent,
+    membership: 'knock',
+  }, signer);
+}
+
 // leave: self only (sender == state_key). Never a member -> 403.
 export async function leave(
   room: Room,

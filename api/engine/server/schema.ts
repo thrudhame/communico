@@ -354,8 +354,19 @@ CREATE TABLE push_badges(incarnation TEXT PRIMARY KEY NOT NULL,user TEXT NOT NUL
 CREATE INDEX push_badges_user ON push_badges(user);
 `;
 
+const PREJOIN_SQL = `
+ALTER TABLE federation_invites RENAME TO prejoin_memberships;
+ALTER TABLE prejoin_memberships ADD COLUMN kind TEXT NOT NULL DEFAULT 'invite' CHECK(kind IN ('invite','knock'));
+ALTER TABLE prejoin_memberships ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE prejoin_memberships ADD COLUMN candidates TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE prejoin_memberships ADD COLUMN leave_json TEXT;
+ALTER TABLE prejoin_memberships ADD COLUMN expires_ms INTEGER;
+CREATE INDEX prejoin_user ON prejoin_memberships(user_id,seq);
+CREATE INDEX prejoin_pending ON prejoin_memberships(status,origin);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 19,
+  version: 20,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -374,6 +385,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(NOTIFICATION_HISTORY_SQL);
     await db.exec(PUSH_TARGETS_SQL);
     await db.exec(PUSH_DELIVERY_SQL);
+    await db.exec(PREJOIN_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -392,5 +404,6 @@ export const serverSchema: SchemaProvider = {
     16: (conn) => conn.exec(NOTIFICATION_HISTORY_SQL),
     17: (conn) => conn.exec(PUSH_TARGETS_SQL),
     18: (conn) => conn.exec(PUSH_DELIVERY_SQL),
+    19: (conn) => conn.exec(PREJOIN_SQL),
   },
 };

@@ -320,27 +320,27 @@ Deno.test('push badge: joined main/thread totals plus authoritative held/OOB inv
       }
       for (const room of ['invite', 'oob']) {
         await tx.execute(
-          "INSERT INTO federation_invites VALUES(?,?,'$invite','10','{}','[]','remote',1,'pending',1)",
+          "INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq) VALUES(?,?,'$invite','10','{}','[]','remote',1,'pending',1)",
           [room, '@bob:test'],
         );
       }
     });
     assertEquals(await db.tx((tx) => badgeCount(tx, '@bob:test')), 7);
     await db.execute(
-      "UPDATE federation_invites SET status='rejecting' WHERE room_id='invite'",
+      "UPDATE prejoin_memberships SET status='rejecting',seq=2 WHERE room_id='invite'",
     );
     assertEquals(await db.tx((tx) => badgeCount(tx, '@bob:test')), 6);
-    // OOB remains the authoritative membership until its owner marks it joined,
-    // matching sync's selection even in the intermediate held-join window.
+    // A later authoritative room publication supersedes OOB membership even
+    // before a post-join marker runs; every consumer uses the same sequence cut.
     await db.execute(
       "INSERT INTO memberships VALUES('@bob:test','oob','join','$join',2)",
     );
     await db.execute(
       "INSERT INTO notification_counts VALUES('@bob:test','oob','main',4,0)",
     );
-    assertEquals(await db.tx((tx) => badgeCount(tx, '@bob:test')), 6);
+    assertEquals(await db.tx((tx) => badgeCount(tx, '@bob:test')), 9);
     await db.execute(
-      "UPDATE federation_invites SET status='joined' WHERE room_id='oob'",
+      "UPDATE prejoin_memberships SET status='joined' WHERE room_id='oob'",
     );
     assertEquals(await db.tx((tx) => badgeCount(tx, '@bob:test')), 9);
   } finally {

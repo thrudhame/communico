@@ -34,7 +34,7 @@ export async function versionOf(room: Room): Promise<string> {
 
 export async function readPositionFor(userId: string, roomId: string) {
   const m = await membershipOf(theApp().server, roomId, userId);
-  if (m === null) {
+  if (m === null || m.membership === 'knock') {
     throw new MatrixError(403, 'M_FORBIDDEN', 'not a member of ' + roomId);
   }
   if (m.forgotten) {

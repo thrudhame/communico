@@ -167,7 +167,13 @@ imported evidence, rather than imposing timeline eligibility on them.
 The token grammar is `s<e>_p<p>_t<t>_r<r>_a<a>`: events, presence, typing,
 receipts and account data. Omitted suffix components parse as zero. Room
 feed entries and out-of-band invite transitions share one durable event
-allocator. Typing is ephemeral; presence and receipts are server data, while
+allocator. Invites and knocks use one typed, revisioned `prejoin_memberships`
+row per room/user. They never provision a room file or open a stay. A later
+room membership publication supersedes OOB display/count truth at the shared
+sequence cut. Federation prejoin state keeps the signed full create PDU;
+validated client display strips it. Legacy malformed create hints are filtered,
+while v12 requires a valid create tied to the room identity. Typing is ephemeral;
+presence and receipts are server data, while
 account-data stream markers belong to the tenant.
 (`api/engine/client/tokens.ts:1-33`, `api/engine/server/stream.ts:1-52`,
 `api/engine/typing.ts:1-48`, `api/engine/server/schema.ts:115-132`,
@@ -221,7 +227,13 @@ restart; EDU-only sends are ephemeral, not durable retry jobs.
 `api/engine/federation/sender.ts:483-507`)
 
 PDU expiry marks lapsed rows failed and records refusal in one server
-transaction. Reject-invite jobs currently have no expiry. The sender's stop
+transaction. Reject-invite jobs have no expiry. Knock attempts are journaled
+before their network side effect and retry the same signed event; knock
+retractions save their signed leave before delivery. Revision checks fence late
+responses from newer invites/retractions/joins. Knock retry/retraction work uses
+the configured refusal lifetime, retains expired work for operator review and
+can be retried explicitly. Pruning an ambiguous attempt schedules compensating
+leave rather than silently discarding the remote side effect. The sender's stop
 latch prevents a new backoff sleep after stopping begins.
 (`api/engine/federation/sender.ts:388-411`, `api/engine/federation/invites.ts:706-728`,
 `api/engine/federation/sender.ts:359-371`)

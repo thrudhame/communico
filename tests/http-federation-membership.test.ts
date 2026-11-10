@@ -85,6 +85,43 @@ test('make_join: template fields; incompatible version/domain/room/ban/invite er
   );
 });
 
+test('knock routes authenticate the origin, validate membership and return prejoin wire state', async () => {
+  const { roomId } = await createRoom(theApp().store, {
+    creator: creator(),
+    version: '11',
+    initial_state: [{
+      type: 'm.room.join_rules',
+      state_key: '',
+      content: { join_rule: 'knock' },
+    }],
+  }, theApp().tenant.signer());
+  const makePath = path('make_knock', roomId, zoe) + '?ver=11';
+  const anonymous = await matrix(new Request('http://x' + makePath));
+  assertEquals(anonymous.status, 401);
+  await anonymous.arrayBuffer();
+  const made = await call('GET', makePath);
+  assertEquals(made.status, 200);
+  const knock = await signTemplate(made.body.event as Json, remote);
+  const wire = toWire(knock, '11');
+  const target = path('send_knock', roomId, String(knock.event_id));
+  assertEquals(
+    (await call('PUT', target, { ...wire, type: 'm.room.message' })).status,
+    400,
+  );
+  const sent = await call('PUT', target, wire);
+  assertEquals(sent.status, 200);
+  const state = sent.body.knock_room_state as Json[];
+  const create = state.find((e) => e.type === 'm.room.create');
+  assert(create?.signatures !== undefined);
+  assert(create?.hashes !== undefined);
+  assertEquals(sent.body.state, undefined);
+  assertEquals(sent.body.auth_chain, undefined);
+  assertEquals(
+    (await membershipOf(theApp().server, roomId, zoe))?.membership,
+    'knock',
+  );
+});
+
 test('send_join v2: validation, merged signatures, snapshot and forwarding excludes joiner', async () => {
   const id = await room();
   const join = await make(id);

@@ -532,7 +532,7 @@ Deno.test('reject: local effect at once + the intent performs make/send_leave ag
           // the intent row is spent — nothing left for the fake
           assertEquals(
             (await server.query(
-              "SELECT 1 FROM federation_invites WHERE status = 'rejecting'",
+              "SELECT 1 FROM prejoin_memberships WHERE status = 'rejecting'",
               [],
             )).length,
             0,
@@ -630,9 +630,9 @@ Deno.test('reject: an unreachable inviter leaves the dance queued; the second ca
               event: wireOf(signed),
               invite_room_state: [
                 {
-                  type: 'm.room.create',
-                  state_key: '',
-                  content: { room_version: '11', creator: `@zoe:${fake.name}` },
+                  type: 'm.room.member',
+                  state_key: `@zoe:${fake.name}`,
+                  content: { membership: 'join' },
                   sender: `@zoe:${fake.name}`,
                 },
               ],

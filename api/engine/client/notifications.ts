@@ -4,6 +4,7 @@ import { lookupRoom } from './room.ts';
 import { renderEvent, renderInviteNotification } from './render.ts';
 import { pruneNotificationHistory } from '#engine/server/notification-history.ts';
 import type { Pdu } from '#engine/pdu.ts';
+import { visiblePrejoin } from '#engine/server/prejoin.ts';
 
 function invalid(message: string): never {
   throw new MatrixError(400, 'M_INVALID_PARAM', message);
@@ -53,7 +54,9 @@ export async function notificationsFor(
       : await renderEvent(room, eventId, viewer, { omitRoomId: true });
     if (event === null) {
       const invite = (await app.server.query(
-        "SELECT event_json FROM federation_invites WHERE room_id=? AND user_id=? AND event_id=? AND status='pending'",
+        `SELECT event_json FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND status='pending' AND kind='invite' AND ${
+          visiblePrejoin('p')
+        }`,
         [roomId, userId, eventId],
       ))[0];
       if (invite) {

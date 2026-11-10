@@ -20,13 +20,15 @@ import {
   serverInState,
 } from './room.ts';
 import { verify } from '#engine/room/verify.ts';
+import { loadRulebookStore } from '#engine/room/build.ts';
+import { prejoinStateInTx } from './prejoin.ts';
 
 async function template(
   roomId: string,
   userId: string,
   origin: string,
   versions: string[],
-  membership: 'join' | 'leave',
+  membership: 'join' | 'leave' | 'knock',
   deps: InviteDeps,
 ) {
   if (domainOf(userId) !== origin) {
@@ -52,7 +54,7 @@ async function template(
       return pdu === null || pdu.content == null ? {} : pdu.content;
     };
     const joinRule = (await contentAt('m.room.join_rules')).join_rule;
-    if (joinRule === 'restricted') {
+    if (membership === 'join' && joinRule === 'restricted') {
       throw new MatrixError(
         400,
         'M_UNABLE_TO_AUTHORISE_JOIN',
@@ -84,6 +86,45 @@ async function template(
       sender: userId,
       content: { membership },
     };
+    if (membership === 'knock') {
+      const rulebook = getRulebook(version);
+      if (!rulebook.spec.knockJoinRule || !versions.includes(version)) {
+        throw new MatrixError(
+          400,
+          'M_INCOMPATIBLE_ROOM_VERSION',
+          'knock room version not negotiated',
+          {
+            errcode: 'M_INCOMPATIBLE_ROOM_VERSION',
+            error: 'knock room version not negotiated',
+            room_version: version,
+          },
+        );
+      }
+      if (stay.status !== 'open') {
+        throw new MatrixError(404, 'M_NOT_FOUND', roomId);
+      }
+      const candidate: Pdu = {
+        ...partial,
+        room_id: roomId,
+        prev_events: prevs,
+        auth_events: rulebook.selectAuthEvents(
+          partial as unknown as Pdu,
+          state,
+        ),
+        depth: Math.max(0, ...[...depths.values()].map((r) => r.depth)) + 1,
+        origin_server_ts: Date.now(),
+        hashes: { sha256: '' },
+        signatures: {},
+      };
+      const verdict = rulebook.checkAuthAgainstState(
+        candidate,
+        state,
+        await loadRulebookStore(tx, [...state.values()]),
+      );
+      if (!verdict.ok) {
+        throw new MatrixError(403, 'M_FORBIDDEN', verdict.reason);
+      }
+    }
     return {
       room_version: version,
       event: {
@@ -122,12 +163,22 @@ export function makeLeave(
   return template(roomId, userId, origin, ver, 'leave', deps);
 }
 
+export function makeKnock(
+  roomId: string,
+  userId: string,
+  origin: string,
+  ver: string[],
+  deps: InviteDeps,
+) {
+  return template(roomId, userId, origin, ver, 'knock', deps);
+}
+
 async function sendMembership(
   roomId: string,
   eventId: string,
   raw: unknown,
   origin: string,
-  membership: 'join' | 'leave',
+  membership: 'join' | 'leave' | 'knock',
   apiVersion: 'v1' | 'v2',
   deps: InviteDeps,
 ) {
@@ -188,8 +239,19 @@ async function sendMembership(
     room.tx(async (tx) => {
       await assertAcl(tx, origin);
       const snapshot = await currentSnapshot(tx);
+      if (
+        membership === 'knock' &&
+        (!getRulebook(version).spec.knockJoinRule ||
+          snapshot.stay.status !== 'open')
+      ) {
+        throw new MatrixError(
+          403,
+          'M_FORBIDDEN',
+          'room does not support knocking',
+        );
+      }
       if (!(await serverInState(tx, snapshot.state, deps.self))) {
-        if (membership === 'join' || snapshot.stay.status !== 'closed') {
+        if (membership !== 'leave' || snapshot.stay.status !== 'closed') {
           throw new MatrixError(404, 'M_NOT_FOUND', roomId);
         }
       }
@@ -223,6 +285,9 @@ async function sendMembership(
         );
       }
       if (membership === 'leave') return apiVersion === 'v2' ? {} : [200, {}];
+      if (membership === 'knock') {
+        return { knock_room_state: await prejoinStateInTx(tx, pdu.sender) };
+      }
       const event = toWire(verified.pdu, version);
       const response = {
         state: state.map((p) => toWire(p, version)),
@@ -267,4 +332,14 @@ export function sendLeave(
     apiVersion,
     deps,
   );
+}
+
+export function sendKnock(
+  roomId: string,
+  eventId: string,
+  pdu: unknown,
+  origin: string,
+  deps: InviteDeps,
+) {
+  return sendMembership(roomId, eventId, pdu, origin, 'knock', 'v1', deps);
 }
