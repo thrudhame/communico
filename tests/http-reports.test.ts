@@ -136,9 +136,19 @@ test('report bodies are typed and authentication is required', async () => {
   const f = await fixture('report-input');
   const path = rp(f.room) + '/report/' + encodeURIComponent(f.event);
   for (
-    const body of [null, [], 1, { reason: null }, { score: 'bad' }, {
-      score: 1.5,
-    }, { score: true }]
+    const body of [
+      null,
+      [],
+      1,
+      { reason: null },
+      { score: 'bad' },
+      {
+        score: 1.5,
+      },
+      { score: true },
+      { score: 1e300 },
+      { score: Number.MAX_SAFE_INTEGER + 1 },
+    ]
   ) {
     assertEquals(
       (await call(path, f.token, body)).status,
@@ -164,7 +174,16 @@ test('report bodies are typed and authentication is required', async () => {
 });
 
 test('admin pages, resolves idempotently and validates filters', async () => {
-  const first = await admin('list', { limit: 1 });
+  const previous = (await admin('list', { limit: 1000 })).body.result.reports;
+  const from = previous.at(-1)?.id ?? 0;
+  const f = await fixture('report-admin');
+  for (const reason of ['first', 'second']) {
+    assertEquals(
+      (await call(rp(f.room) + '/report', f.token, { reason })).status,
+      200,
+    );
+  }
+  const first = await admin('list', { from, limit: 1 });
   const data = first.body.result;
   assertEquals(data.reports.length, 1);
   assert(typeof data.next === 'number');
@@ -178,7 +197,7 @@ test('admin pages, resolves idempotently and validates filters', async () => {
   const repeat = await admin('resolve', { id, resolution: 'replacement' });
   assertEquals(repeat.body.result, resolved.body.result);
   const closed =
-    (await admin('list', { status: 'resolved' })).body.result.reports;
+    (await admin('list', { from, status: 'resolved' })).body.result.reports;
   assertEquals(closed.length, 1);
   assertEquals(closed[0].id, id);
   const open = (await admin('list', { status: 'open' })).body.result.reports;

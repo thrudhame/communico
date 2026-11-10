@@ -27,7 +27,7 @@ export async function reportContent(
   }
   if (
     kind === 'event' && input.score !== undefined &&
-    !Number.isInteger(input.score)
+    !Number.isSafeInteger(input.score)
   ) {
     throw new MatrixError(400, 'M_BAD_JSON', 'score must be an integer');
   }

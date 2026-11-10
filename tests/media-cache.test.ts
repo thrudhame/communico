@@ -8,6 +8,7 @@ import {
 import { listCachedMedia } from '#engine/server/media.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
+import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 
 Deno.test('media cache: v20 upgrade preserves server truth and adds only the cache owner', async () => {
   const root = await Deno.makeTempDir({ prefix: 'media-cache-upgrade-' });
@@ -21,8 +22,14 @@ Deno.test('media cache: v20 upgrade preserves server truth and adds only the cac
   const oldSchema = {
     version: 20,
     apply: async (db: Parameters<typeof serverSchema.apply>[0]) => {
-      await serverSchema.apply(db);
-      await db.exec('DROP TABLE media_cache');
+      // Build a real v20 fixture, not today's schema with an old label. New
+      // migrations must never require updating this historical fixture again.
+      await db.exec(SERVER_V13);
+      await db.tx(async (tx) => {
+        for (let version = 13; version < 20; version++) {
+          await serverSchema.migrations![version](tx);
+        }
+      }, { mode: 'deferred' });
     },
   };
   let store = await openStore(settings, { schemas: { server: oldSchema } });
