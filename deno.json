@@ -19,6 +19,7 @@
     "debug-proxy": "deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
   },
   "imports": {
+    "imagescript": "npm:imagescript@3.20.2",
     "#engine/": "./api/engine/",
     "#endpoints/": "./api/endpoints/",
     "#root/": "./",
