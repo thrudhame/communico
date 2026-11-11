@@ -147,8 +147,12 @@ async function fetchBoundary(
     () => deps.fetcher.stateIds(room.id, at, via, deps.signal),
   );
   if (ids === null) return null;
-  if (!spend(budget, ids.pduIds.length + ids.authChainIds.length)) return null;
   const wanted = [...new Set([...ids.pduIds, ...ids.authChainIds])].sort();
+  // A boundary that cannot fit is unavailable evidence, not consumption of
+  // the operation's remaining allowance. Retain the verified page and allow
+  // its other boundaries/peers to progress; never import a partial state map.
+  if (wanted.length > budget.work) return null;
+  if (!spend(budget, wanted.length)) return null;
   const unknown = await room.tx(async (tx) => {
     const out: string[] = [];
     for (const id of wanted) {
@@ -156,6 +160,9 @@ async function fetchBoundary(
     }
     return out;
   });
+  if (unknown.length > budget.requests || unknown.length > budget.work) {
+    return null;
+  }
   const pack = new Map<string, Pdu>();
   for (const id of unknown) {
     if (!spend(budget, 1, 1)) return null;

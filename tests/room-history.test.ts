@@ -127,6 +127,68 @@ async function offsetsOf(
   });
 }
 
+Deno.test('backfill: oversized boundaries retain evidence without blocking later complete boundaries', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store, {
+      roomId: '!history-boundary-cap:remote.test',
+      build: async (fr) => {
+        const live = [...fr.events.values()];
+        await fakeMessage(fr, 'gap');
+        return { live, latest: await fakeMessage(fr, 'latest') };
+      },
+    });
+    const make = (suffix: string) =>
+      remoteEvent(s.room.id, s.fr.server, s.fr.version, {
+        type: 'm.room.message',
+        sender: s.latest.sender,
+        content: { body: suffix },
+        prev_events: ['$missing-' + suffix],
+        auth_events: s.latest.auth_events,
+        depth: 100,
+      });
+    const large = await make('large'), small = await make('small');
+    const state = s.fr.stateIdsAt(s.latest.event_id!)!;
+    const recording = fakeFetcher({
+      backfill: [large, small],
+      stateIds: new Map([
+        [large.event_id!, {
+          pduIds: state.pduIds,
+          authChainIds: [
+            ...state.authChainIds,
+            ...Array.from({ length: 140 }, (_, i) => '$unknown' + i),
+          ],
+        }],
+        [small.event_id!, {
+          pduIds: state.pduIds,
+          authChainIds: Array.from({ length: 12000 }, () => state.authChainIds)
+            .flat(),
+        }],
+      ]),
+    });
+    const result = await backfill(s.room, {
+      from: [s.gapTip],
+      limit: 10,
+      via: s.fr.server.name,
+    }, { keys: s.deps.keys, fetcher: recording.fetcher });
+    assertEquals(
+      (await s.room.tx((tx) => tx.events.getStatus(large.event_id!)))
+        ?.grounding,
+      'evidence',
+    );
+    assertEquals(
+      (await s.room.tx((tx) => tx.events.getStatus(small.event_id!)))
+        ?.grounding,
+      'grounded',
+    );
+    assert(result.positioned.includes(small.event_id!));
+    assertEquals(
+      recording.calls.event.length,
+      0,
+      'unfinishable boundaries do not spend the remaining request allowance',
+    );
+  });
+});
+
 Deno.test('backfill: one operation bounds requests across all independent boundaries', async () => {
   await withStore(async (store) => {
     const s = await setup(store, {
