@@ -521,6 +521,7 @@ export type ConfigPatch = {
   peeking?: Partial<Config['peeking']>;
   hierarchy?: Partial<Config['hierarchy']>;
   uia?: Partial<Config['uia']>;
+  slidingsync?: Partial<Config['slidingsync']>;
   push?: {
     readretentiondays?: number;
     deliverygiveuphours?: number;

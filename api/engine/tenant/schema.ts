@@ -243,8 +243,15 @@ CREATE TABLE profile_fields(localpart TEXT NOT NULL REFERENCES users(localpart),
 const ERASURE_SQL =
   `CREATE TABLE erased_users(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart), room_cuts TEXT NOT NULL);`;
 
+const SLIDING_SYNC_SQL = `
+CREATE TABLE sliding_sync_connections(id TEXT PRIMARY KEY NOT NULL,localpart TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL,conn_id TEXT NOT NULL,revision INTEGER NOT NULL,expires_ms INTEGER NOT NULL,UNIQUE(localpart,device_id,generation,conn_id));
+CREATE INDEX sliding_sync_connections_expiry ON sliding_sync_connections(expires_ms);
+CREATE TABLE sliding_sync_positions(token TEXT PRIMARY KEY NOT NULL,connection_id TEXT NOT NULL,state_json TEXT NOT NULL);
+CREATE INDEX sliding_sync_positions_connection ON sliding_sync_positions(connection_id);
+`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 18,
+  version: 19,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -261,8 +268,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(PROFILE_SQL);
     await db.exec(ERASURE_SQL);
     await db.exec(BACKUP_ACCOUNTING_SQL);
+    await db.exec(SLIDING_SYNC_SQL);
   },
   migrations: {
+    18: (conn) => conn.exec(SLIDING_SYNC_SQL),
     17: migrateBackupAccounting,
     16: (conn) => conn.exec(ERASURE_SQL),
     15: (conn) => conn.exec(PROFILE_SQL),

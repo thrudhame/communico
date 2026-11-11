@@ -45,6 +45,13 @@ export const SCHEMA = {
     maxrooms: 'int',
   },
   uia: { sessionseconds: 'int', maxsessions: 'int' },
+  slidingsync: {
+    connectionseconds: 'int',
+    maxconnections: 'int',
+    maxconnectionsperdevice: 'int',
+    maxsnapshotbytes: 'int',
+    maxtimeoutms: 'int',
+  },
   peeking: {
     maxevents: 'int',
     maxtimeoutms: 'int',

@@ -80,6 +80,16 @@ maxsessions = 10000
 maxevents = 50
 maxtimeoutms = 30000
 
+[slidingsync]
+# Issued native sync positions: seven idle days, like Synapse. No feature flag
+# is advertised until the complete protocol and real-client proof have landed.
+connectionseconds = 604800
+maxconnections = 10000
+maxconnectionsperdevice = 16
+# Per issued snapshot (at most two per connection); refuse rather than truncate.
+maxsnapshotbytes = 8388608
+maxtimeoutms = 30000
+
 [hierarchy]
 # Synapse's default page and five-minute pagination lifetime; tuwunel's page cap.
 pagesize = 50
