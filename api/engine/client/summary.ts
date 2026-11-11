@@ -6,6 +6,7 @@ import { getRulebook } from '#engine/rulebook/index.ts';
 import { joinedUsers } from '#engine/server/directory.ts';
 import { renderStateEvent } from './render.ts';
 import { requireRoom, stateAtSeq } from './room.ts';
+import { admitState } from './state-admission.ts';
 
 const SUMMARY_TYPES = [
   'm.room.create',
@@ -26,9 +27,11 @@ export async function heldRoomSummary(roomId: string) {
     SUMMARY_TYPES.map((type) => [type, ''] as const),
   );
   const content = new Map<string, Record<string, unknown>>();
+  const admission = await admitState(room, { userId: null, discovery: true });
   for (const row of rows) {
     const event = await renderStateEvent(room, row.eventId, undefined, {
       bundleThreads: false,
+      admission,
     });
     if (event !== null) {
       content.set(row.type, event.content as Record<string, unknown>);

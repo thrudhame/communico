@@ -7,6 +7,7 @@ import { roomVersionOf } from '#engine/room/build.ts';
 import { openRoom, parseCursor, type Room } from '#engine/room/index.ts';
 import { membershipOf } from '#engine/server/read.ts';
 import { parseStreamToken } from './tokens.ts';
+import { admitState } from './state-admission.ts';
 
 export async function lookupRoom(roomId: string): Promise<Room | null> {
   try {
@@ -41,7 +42,10 @@ export async function readPositionFor(userId: string, roomId: string) {
   if (m.forgotten) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'room forgotten: ' + roomId);
   }
-  return m.membership === 'join' ? null : m.seq;
+  return m.membership === 'join'
+    ? null
+    : (await admitState(await requireRoom(roomId), { userId, ceiling: m.seq }))
+      .seq;
 }
 
 export type StateRow = {
@@ -58,6 +62,14 @@ export async function stateAtToken(
   raw: string | null,
   leaveAt: number | null,
 ): Promise<StateRow[]> {
+  return await stateAtSeq(roomId, await stateSeqAtToken(roomId, raw, leaveAt));
+}
+
+export async function stateSeqAtToken(
+  roomId: string,
+  raw: string | null,
+  leaveAt: number | null,
+): Promise<number | null> {
   let seq = leaveAt;
   if (raw !== null) {
     const stream = parseStreamToken(raw);
@@ -89,7 +101,7 @@ export async function stateAtToken(
     }
     seq = leaveAt === null ? requested : Math.min(requested, leaveAt);
   }
-  return await stateAtSeq(roomId, seq);
+  return seq;
 }
 
 export async function stateAtSeq(

@@ -104,6 +104,7 @@ export async function roomInitialSync(
         roomId,
         await stateAtSeq(roomId, snapshot.cut),
         user,
+        { point: { seq: snapshot.cut }, ceiling: snapshot.cut },
       ),
       visibility: await visibility(app.server, roomId),
       account_data: await listRoomAccountData(

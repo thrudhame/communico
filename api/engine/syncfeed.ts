@@ -3,6 +3,7 @@
 // published state, never the last event's own DAG state.
 import { theApp } from '#engine/app.ts';
 import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
+import { admitState } from '#engine/client/state-admission.ts';
 import {
   renderEvent,
   renderPrejoinDeparture,
@@ -202,20 +203,29 @@ async function roomTimeline(
   }
   const limited = gap || trimmed || joinGap;
   const start = returned[0];
-  const atStart = await stateAtSeq(
-    room,
-    i.useStateAfter ? end : start?.seq ?? end,
-    i.useStateAfter ? undefined : start?.stay,
-  );
+  const admission = await admitState(room, {
+    userId: i.userId,
+    ceiling: end,
+    point: {
+      seq: i.useStateAfter ? end : start?.seq ?? end,
+      ...(i.useStateAfter || start === undefined ? {} : { stay: start.stay }),
+    },
+  });
+  const atStart = admission.rows;
   let stateRows = atStart;
   let previous = new Map<string, string>();
   if (i.since !== null) {
     previous = new Map(
-      (await stateAtSeq(
-        room,
-        i.since.eSeq,
-        i.useStateAfter ? undefined : start?.stay,
-      )).map((
+      (await admitState(room, {
+        userId: i.userId,
+        ceiling: i.since.eSeq,
+        point: {
+          seq: i.since.eSeq,
+          ...(i.useStateAfter || start === undefined
+            ? {}
+            : { stay: start.stay }),
+        },
+      })).rows.map((
         r,
       ) => [r.type + '\0' + r.stateKey, r.eventId]),
     );
@@ -257,7 +267,7 @@ async function roomTimeline(
       userId: i.userId,
       deviceId: i.deviceId,
       tenant: app.tenant,
-    }, { omitRoomId: true, eventFormat: i.filter.eventFormat });
+    }, { omitRoomId: true, eventFormat: i.filter.eventFormat, admission });
     if (ev !== null) stateEvents.push(ev);
   }
   const prevE = trimmed && returned.length ? returned[0].seq - 1 : end;

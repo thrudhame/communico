@@ -18,7 +18,7 @@ import { joinedRooms } from './membership.ts';
 import { lookupRoom, stateAtSeq } from './room.ts';
 import { renderEvent } from './render.ts';
 import { messages, parseStreamToken } from './timeline.ts';
-import { clientEventsForRows } from './state.ts';
+import { clientEventsForRows, clientStateFor } from './state.ts';
 import { canSeeEvent } from './visibility.ts';
 import { erasurePrunes } from '#engine/erasure.ts';
 export interface SearchRoomEvents {
@@ -203,6 +203,7 @@ export async function search(
               r.type === 'm.room.member' && senders.has(r.stateKey)
             ),
             userId,
+            { point: { seq: atSeq } },
           ),
           profiles: Record<string, Record<string, unknown>> = {};
         for (const sender of senders) {
@@ -229,11 +230,7 @@ export async function search(
   if (req.include_state === true) {
     const state: Record<string, unknown> = {};
     for (const roomId of new Set(page.map((h) => h.roomId))) {
-      state[roomId] = await clientEventsForRows(
-        roomId,
-        await stateAtSeq(roomId, null),
-        userId,
-      );
+      state[roomId] = await clientStateFor(roomId, userId);
     }
     out.state = state;
   }

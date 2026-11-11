@@ -294,6 +294,10 @@ export async function messages(
       room.id,
       rows.filter((r) => r.type === 'm.room.member' && senders.has(r.stateKey)),
       w.userId,
+      {
+        ...(anchor === undefined ? {} : { point: { eventId: anchor.event } }),
+        ...(w.leaveAt === null ? {} : { ceiling: w.leaveAt }),
+      },
     );
   }
   return result;
@@ -371,7 +375,12 @@ export async function eventContext(
     ? String(eventsAfter[eventsAfter.length - 1].event_id)
     : eventId;
   let state =
-    (await clientEventsForRows(roomId, await stateAtEvent(room, at), userId))
+    (await clientEventsForRows(roomId, await stateAtEvent(room, at), userId, {
+      point: { eventId: at },
+      ...(member === null || member.membership === 'join'
+        ? {}
+        : { ceiling: member.seq }),
+    }))
       .filter(matches);
   if (opts.lazyLoadMembers) {
     const senders = new Set(
