@@ -67,7 +67,15 @@ Deno.test('remote signing revision rejects a late device snapshot over rotation;
       'retained',
     );
     await db.tx((tx) =>
-      reconcileDeviceRoom(tx, '!shared:local', [observer, user], false, null, 1)
+      reconcileDeviceRoom(
+        tx,
+        '!shared:local',
+        [observer, user],
+        false,
+        null,
+        1,
+        ['local.test'],
+      )
     );
     const first = await master(), second = await master();
     const snapshot = (key?: Record<string, unknown>) =>

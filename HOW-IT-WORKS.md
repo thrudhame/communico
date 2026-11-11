@@ -482,6 +482,17 @@ bodies and durable delivery obligations are not rewritten or discarded.
 
 ## Tenant data, storage and process lifetime
 
+Encrypted backup ciphertext, per-room entry sizes and per-version restore bytes
+share one tenant transaction. PUT capacity checks use those exact UTF-8 JSON
+totals, including escaped identifiers and separators, instead of scanning all
+retained sessions. Session caps still span every version for a user. Tenant v18
+upgrades backfill the aggregates once in bounded pages without changing payloads
+or etags. Device replacement/deletion also publishes changed public signing views;
+reliable EDU packing preserves their queue order under byte pressure. Shared
+device recovery has subscriber-owned cancellation, not first-caller ownership.
+(`api/engine/tenant/{key-backup,backup-accounting,devices}.ts`,
+`api/engine/federation/{device-lists,sender}.ts`)
+
 OpenID credentials live in the tenant's separate hashed-token table (tenant
 schema v15), never in the client access/refresh tables. Issuance and userinfo
 check the active account in the owning transaction, enforce the configured

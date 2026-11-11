@@ -923,7 +923,7 @@ Deno.test('sender: reliable and room backlogs both get slots and alternate first
               edus,
             ),
           ).length;
-        const maxBytes = Math.max(size([pdu], []), size([], [edu])) + 20;
+        const maxBytes = Math.max(size([pdu], []), size([], [edu])) + 250;
         assert(size([pdu], [edu]) > maxBytes);
         const oldBytes = runtimeConfig().federation.bulkmaxbytes;
         try {
@@ -934,8 +934,8 @@ Deno.test('sender: reliable and room backlogs both get slots and alternate first
                 conn,
                 'bytes-' + i,
                 dest,
-                edu.edu_type,
-                edu.content,
+                'm.signing_key_update',
+                i === 1 ? { order: i } : { ...edu.content, order: i },
               );
             }
           });
@@ -949,6 +949,13 @@ Deno.test('sender: reliable and room backlogs both get slots and alternate first
           const batches = sends.slice(before);
           assertEquals(batches.reduce((n, b) => n + b.pdus.length, 0), 3);
           assertEquals(batches.reduce((n, b) => n + b.edus.length, 0), 3);
+          assertEquals(
+            batches.flatMap((b) =>
+              b.edus.map((e) => (e.content as Record<string, unknown>).order)
+            ),
+            [0, 1, 2],
+            'byte pressure must not reorder reliable signing rotations',
+          );
           assert(
             batches[0].pdus.length !== batches[1].pdus.length,
             'opposite family wins next byte-limited turn',

@@ -102,7 +102,15 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
   try {
     let db = await store.server();
     await db.tx((tx) =>
-      reconcileDeviceRoom(tx, '!shared:local', [observer, user], false, null, 1)
+      reconcileDeviceRoom(
+        tx,
+        '!shared:local',
+        [observer, user],
+        false,
+        null,
+        1,
+        ['local.test'],
+      )
     );
     await acceptDeviceDelta(db, delta(10, []), limits());
     assertEquals(
@@ -145,7 +153,7 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
     assertEquals((cached.A as { keys: unknown }).keys, { 'ed25519:A': '900' });
     assertEquals(
       (await deviceListsBetween(db, observer, 0, head, 'sync')).changed,
-      [user],
+      [observer, user],
     );
     // Unknown predecessor cannot turn a gap into a complete cache.
     await acceptDeviceDelta(db, delta(1001, [9999]), limits());
@@ -159,7 +167,9 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
     // Losing the last room and then rejoining invalidates atomically, even
     // without an intervening origin mutation or an incoming EDU.
     await db.tx((tx) =>
-      reconcileDeviceRoom(tx, '!shared:local', [observer], false, null, 2)
+      reconcileDeviceRoom(tx, '!shared:local', [observer], false, null, 2, [
+        'local.test',
+      ])
     );
     assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
     const leaveCut = (await recoveryCut(db, user))!;
@@ -168,7 +178,15 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
     assertEquals(await recoveryCut(db, user), leaveCut);
     assertEquals(await deviceStreamMax(db), leaveHead);
     await db.tx((tx) =>
-      reconcileDeviceRoom(tx, '!shared:local', [observer, user], false, null, 3)
+      reconcileDeviceRoom(
+        tx,
+        '!shared:local',
+        [observer, user],
+        false,
+        null,
+        3,
+        ['local.test'],
+      )
     );
     assertEquals(
       await installDeviceSnapshot(db, leaveCut, snapshot(1001), limits()),
@@ -237,7 +255,15 @@ Deno.test('reset hints and empty snapshots do not repeat a join notification; au
   try {
     const db = await store.server();
     await db.tx((tx) =>
-      reconcileDeviceRoom(tx, '!reset:local', [observer, user], false, null, 1)
+      reconcileDeviceRoom(
+        tx,
+        '!reset:local',
+        [observer, user],
+        false,
+        null,
+        1,
+        ['local.test'],
+      )
     );
     const joined = await deviceStreamMax(db);
     const reset = (stream: number) =>

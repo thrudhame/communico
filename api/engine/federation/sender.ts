@@ -484,6 +484,7 @@ export function startSender(deps: SenderDeps): Sender {
         // Alternate the first family durably, then interleave candidates. A
         // large PDU and an EDU that cannot fit together each get their turn.
         const eduFirst = (await deliveryTurn(server, destination)) % 2 === 1;
+        let reliableBlocked = false;
         for (let i = 0; i < Math.max(candidates.length, pending.length); i++) {
           for (const family of eduFirst ? ['edu', 'pdu'] : ['pdu', 'edu']) {
             if (family === 'pdu' && i < candidates.length) {
@@ -493,12 +494,17 @@ export function startSender(deps: SenderDeps): Sender {
               if (new TextEncoder().encode(encode()).length <= maxBytes) {
                 rows.push(row);
               } else if (pdu !== null) pdus.pop();
-            } else if (family === 'edu' && i < pending.length) {
+            } else if (
+              family === 'edu' && !reliableBlocked && i < pending.length
+            ) {
               const row = pending[i];
               edus.push({ edu_type: row.edu_type, content: row.content });
               if (new TextEncoder().encode(encode()).length <= maxBytes) {
                 reliable.push(row);
-              } else edus.pop();
+              } else {
+                edus.pop();
+                reliableBlocked = true;
+              }
             }
           }
         }

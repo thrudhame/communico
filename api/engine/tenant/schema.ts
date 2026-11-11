@@ -9,6 +9,10 @@
 // id row and the meta table; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
 import { recordPusherChange } from '#engine/tenant/pushers.ts';
+import {
+  BACKUP_ACCOUNTING_SQL,
+  migrateBackupAccounting,
+} from '#engine/tenant/backup-accounting.ts';
 
 const E2EE_SQL = `
 CREATE TABLE device_keys(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, key_json TEXT NOT NULL, PRIMARY KEY(localpart,device_id,generation));
@@ -240,7 +244,7 @@ const ERASURE_SQL =
   `CREATE TABLE erased_users(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart), room_cuts TEXT NOT NULL);`;
 
 export const tenantSchema: SchemaProvider = {
-  version: 17,
+  version: 18,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -256,8 +260,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(OPENID_SQL);
     await db.exec(PROFILE_SQL);
     await db.exec(ERASURE_SQL);
+    await db.exec(BACKUP_ACCOUNTING_SQL);
   },
   migrations: {
+    17: migrateBackupAccounting,
     16: (conn) => conn.exec(ERASURE_SQL),
     15: (conn) => conn.exec(PROFILE_SQL),
     14: (conn) => conn.exec(OPENID_SQL),

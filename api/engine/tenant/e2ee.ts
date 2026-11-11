@@ -7,10 +7,9 @@ import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Config } from '#engine/config-schema.ts';
-import {
-  forgetKeySignatures,
-  signatureView,
-} from '#engine/tenant/signature-view.ts';
+import { config } from '#engine/config.ts';
+import { forgetDeviceSignatures } from '#engine/tenant/cross-signing.ts';
+import { signatureView } from '#engine/tenant/signature-view.ts';
 
 export type Json = Record<string, unknown>;
 export type KeyLimits = Config['e2ee'];
@@ -164,10 +163,11 @@ export async function uploadKeys(
         material(String(old[0].key_json)) !== material(input.device)
       ) {
         const rows = await conn.query('SELECT server_name FROM tenant');
-        await forgetKeySignatures(
+        await forgetDeviceSignatures(
           conn,
           '@' + device.localpart + ':' + rows[0].server_name,
           device.deviceId,
+          config().federation.bulkmaxbytes,
         );
       }
       await conn.execute(
