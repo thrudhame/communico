@@ -53,27 +53,67 @@ export async function setTyping(
   isTyping: boolean,
   timeoutMs?: number,
 ): Promise<boolean> {
-  if (!await isJoined(server, roomId, userId)) return false;
-  if (isTyping) {
-    const timeout = timeoutMs ?? 30000;
-    let room = typing.get(roomId);
-    if (room === undefined) {
-      room = new Map();
-      typing.set(roomId, room);
+  // Serialize admission with the projection's membership transaction. The
+  // synchronous memory update cannot land behind its departure reconciliation.
+  return await server.tx(async (tx) => {
+    if (!await isJoined(tx, roomId, userId)) {
+      clearTyping(roomId, userId);
+      return false;
     }
-    room.set(userId, Date.now() + timeout);
-  } else {
-    typing.get(roomId)?.delete(userId);
-  }
+    if (isTyping) {
+      const timeout = timeoutMs ?? 30000;
+      let room = typing.get(roomId);
+      if (room === undefined) {
+        room = new Map();
+        typing.set(roomId, room);
+      }
+      room.set(userId, Date.now() + timeout);
+    } else {
+      typing.get(roomId)?.delete(userId);
+    }
+    bump(roomId);
+    for (const l of listeners) {
+      try {
+        l(roomId, userId, isTyping);
+      } catch (e) {
+        console.error('typing listener error:', e);
+      }
+    }
+    return true;
+  });
+}
+
+/** All removal paths share the same stream and federation stop notification. */
+function clearTyping(roomId: string, userId: string): void {
+  if (!typing.get(roomId)?.delete(userId)) return;
+  if (typing.get(roomId)?.size === 0) typing.delete(roomId);
   bump(roomId);
-  for (const l of listeners) {
+  for (const listener of listeners) {
     try {
-      l(roomId, userId, isTyping);
-    } catch (e) {
-      console.error('typing listener error:', e);
+      listener(roomId, userId, false);
+    } catch (error) {
+      console.error('typing listener error:', error);
     }
   }
-  return true;
+}
+
+/** Called after durable projection, including imported resets/removals, before
+ * publication listeners wake clients. No endpoint owns membership cleanup. */
+export async function reconcileTyping(
+  server: Database,
+  roomId: string,
+): Promise<void> {
+  const room = typing.get(roomId);
+  if (room === undefined || room.size === 0) return;
+  await server.tx(async (tx) => {
+    const joined = new Set((await tx.query(
+      "SELECT user FROM memberships WHERE room=? AND membership='join'",
+      [roomId],
+    )).map((row) => String(row.user)));
+    for (const user of room.keys()) {
+      if (!joined.has(user)) clearTyping(roomId, user);
+    }
+  });
 }
 
 // Sweep every room's expired entries. syncfeed calls this up front, so

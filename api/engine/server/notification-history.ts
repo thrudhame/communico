@@ -3,12 +3,16 @@
 import { config } from '#engine/config.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
 
+export function notificationHistoryCutoff(now: number): number {
+  return now - config().push.readretentiondays * 86400000;
+}
+
 export async function syncNotificationHistory(
   tx: Conn,
   seq: number,
   now: number,
 ): Promise<void> {
-  const cutoff = now - config().push.readretentiondays * 86400000;
+  const cutoff = notificationHistoryCutoff(now);
   await tx.execute('DELETE FROM notification_history WHERE seq=?', [seq]);
   await tx.execute(
     `INSERT INTO notification_history(seq,user,room,highlight,read_ms)
@@ -21,7 +25,7 @@ export async function pruneNotificationHistory(
   tx: Conn,
   now: number,
 ): Promise<void> {
-  const cutoff = now - config().push.readretentiondays * 86400000;
+  const cutoff = notificationHistoryCutoff(now);
   await tx.execute(
     'DELETE FROM notification_history WHERE read_ms<=?',
     [cutoff],

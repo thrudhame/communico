@@ -6,6 +6,21 @@ import { eventStreamTx } from '#engine/server/stream.ts';
 import { isJoined, receiptTargetInThread } from '#engine/server/read.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
 
+const MAX_UNKNOWN_THREADS = 100;
+/** Protocol identifiers, not arbitrary durable keys. Adapters must not coerce
+ * malformed metadata into the distinct unthreaded identity. */
+export function receiptThreadId(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value !== 'string' ||
+    (value !== 'main' && !/^\$\S+$/.test(value)) ||
+    new TextEncoder().encode(value).length > 255
+  ) {
+    throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid receipt thread_id');
+  }
+  return value;
+}
+
 export type PresenceRow = {
   presence: string;
   statusMsg: string | null;
@@ -173,16 +188,29 @@ export async function setReceipt(
     {},
 ): Promise<boolean> {
   const ts = opts.ts ?? Date.now();
-  const threadId = opts.threadId ?? null;
-  if (threadId === '') {
-    throw new MatrixError(
-      400,
-      'M_INVALID_PARAM',
-      'thread_id must be non-empty',
-    );
-  }
+  const threadId = receiptThreadId(opts.threadId);
   const row = await eventStreamTx(server, async (tx) => {
     if (!await isJoined(tx, roomId, userId)) return null;
+    if (threadId !== null && threadId !== 'main') {
+      const existing = await tx.query(
+        'SELECT 1 FROM receipts WHERE room_id=? AND user_id=? AND receipt_type=? AND thread_id=?',
+        [roomId, userId, receiptType, threadId],
+      );
+      const known = await tx.query(
+        'SELECT 1 FROM event_index WHERE room=? AND event=?',
+        [roomId, threadId],
+      );
+      if (!existing.length && !known.length) {
+        const pending = await tx.query(
+          `SELECT 1 FROM receipts r WHERE room_id=? AND user_id=? AND receipt_type=?
+          AND thread_id NOT IN ('','main') AND NOT EXISTS (
+            SELECT 1 FROM event_index e WHERE e.room=r.room_id AND e.event=r.thread_id
+          ) LIMIT ?`,
+          [roomId, userId, receiptType, MAX_UNKNOWN_THREADS],
+        );
+        if (pending.length >= MAX_UNKNOWN_THREADS) return null;
+      }
+    }
     // Local API admission and read effects share the same relation snapshot.
     // Inbound EDUs may reference targets not held yet and retain their identity.
     if (
@@ -201,7 +229,7 @@ export async function setReceipt(
       ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_id=excluded.event_id,ts_ms=excluded.ts_ms,seq=excluded.seq`,
       [roomId, userId, receiptType, threadId ?? '', eventId, ts, seq],
     );
-    await advanceNotificationRead(
+    const admitted = await advanceNotificationRead(
       tx,
       userId,
       roomId,
@@ -209,6 +237,13 @@ export async function setReceipt(
       eventId,
       Date.now(),
     );
+    if (!admitted) {
+      throw new MatrixError(
+        429,
+        'M_LIMIT_EXCEEDED',
+        'pending receipt capacity reached',
+      );
+    }
     return { userId, receiptType, threadId, eventId, ts, seq };
   });
   if (row === null) return false;
@@ -258,6 +293,38 @@ export async function receiptsSince(
   since: number,
 ): Promise<Record<string, unknown>[]> {
   const rows = await receiptRows(server, roomId, since, viewer);
+  return receiptContents(rows);
+}
+
+/** One set-based capture for all the viewer's membership rooms. The caller
+ * supplies the same transaction that owns membership, counts and maxima. */
+export async function receiptSnapshot(
+  server: Pick<Db, 'query'>,
+  viewer: string,
+  since: number,
+): Promise<Map<string, Record<string, unknown>[]>> {
+  const rows = await server.query(
+    `SELECT r.* FROM receipts r WHERE seq>? AND ${VISIBLE_RECEIPTS}
+    AND EXISTS (SELECT 1 FROM memberships m WHERE m.room=r.room_id AND m.user=?) ORDER BY seq`,
+    [since, viewer, viewer],
+  );
+  const rooms = new Map<string, ReceiptRow[]>();
+  for (const r of rows) {
+    const room = String(r.room_id);
+    if (!rooms.has(room)) rooms.set(room, []);
+    rooms.get(room)!.push({
+      userId: String(r.user_id),
+      receiptType: String(r.receipt_type) as ReceiptRow['receiptType'],
+      threadId: r.thread_id === '' ? null : String(r.thread_id),
+      eventId: String(r.event_id),
+      ts: Number(r.ts_ms),
+      seq: Number(r.seq),
+    });
+  }
+  return new Map([...rooms].map(([id, marks]) => [id, receiptContents(marks)]));
+}
+
+function receiptContents(rows: ReceiptRow[]): Record<string, unknown>[] {
   // Batch separately by thread: the wire map cannot hold both an unthreaded
   // and a main receipt at the same event/type/user key in one event.
   const threads = new Map<

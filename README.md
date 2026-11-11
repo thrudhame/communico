@@ -313,8 +313,9 @@ is not decrypted. Redacted or withdrawn entries are not listed.
 they are read. Unread entries do not expire. Minimal projection facts remain so
 late thread relations can reconcile exact counts and restore newly unread
 entries without re-evaluating rules or issuing historical alerts. Retention
-runs on startup, periodically and when listing; zero-day receipt effects commit
-immediately. This is separate from event storage and gateway delivery.
+runs on startup, periodically and on receipts; listing only filters expired
+entries and never deletes them. Zero-day receipt effects commit immediately.
+This is separate from event storage and gateway delivery.
 
 ## What a push notification reveals
 

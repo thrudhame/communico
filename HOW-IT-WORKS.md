@@ -328,6 +328,22 @@ Receipts are keyed by room, user, public/private type and thread. Sync exposes
 public receipts plus the viewer's private receipts; federation consumes only
 public receipts. Thread identity survives both sync and federation, with
 unthreaded receipts kept distinct from `main` and named threads.
+
+Sync captures member and visible-receipt sets with two set-based queries inside
+the existing server transaction for maxima, memberships and notification counts.
+Long-poll relevance checks notification-change existence, not the full count map.
+Notification listing filters the shared retention cutoff without owning deletion.
+Push-rule bodies and action updates are validated by their shared tenant writer.
+
+Typing admission is serialized with server membership writes; completed room
+projection reconciles retained typing before notifying consumers. Leave, ban,
+imported resets and outsider stops clear retained entries and publish a stop.
+Receipt ingress rejects malformed thread metadata instead of treating it as
+unthreaded. Unknown roots retain their identities, with admission capped at 100
+per room/user/receipt type; known slots remain writable. Pending notification
+references admit at most 256 per room/user, refusing additional writes atomically
+without evicting existing references. Malformed or capacity-refused inbound
+receipt entries do not suppress later valid entries; storage failures still do.
 (`api/engine/server/ephemeral.ts:165-264`, `api/engine/federation/ephemeral.ts:40-56`,
 `api/engine/federation/edus.ts:157-188`)
 

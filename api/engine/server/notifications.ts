@@ -78,7 +78,9 @@ async function delta(
 }
 
 /** Effective read positions never move backwards, regardless of wire echo.
- * Unknown targets remain durable references, never a numeric-zero shortcut. */
+ * Unknown targets remain durable references, never a numeric-zero shortcut.
+ * False means pending-reference admission is full, with no read effect. Replay
+ * may defer that admission; a new receipt writer must reject atomically. */
 export async function advanceNotificationRead(
   tx: Conn,
   user: string,
@@ -86,7 +88,7 @@ export async function advanceNotificationRead(
   scope: string,
   event: string,
   now: number,
-): Promise<void> {
+): Promise<boolean> {
   const rows = await tx.query(
     'SELECT room,seq,standing,grounding FROM event_index WHERE event=?',
     [event],
@@ -101,11 +103,26 @@ export async function advanceNotificationRead(
   if (
     pending || (invalidScope && await receiptRelationPending(tx, room, event))
   ) {
+    const existing = await tx.query(
+      'SELECT 1 FROM notification_receipt_refs WHERE user=? AND room=? AND scope=? AND event=?',
+      [user, room, scope, event],
+    );
+    if (
+      !existing.length &&
+      Number(
+          (await tx.query(
+            'SELECT COUNT(*) AS n FROM notification_receipt_refs WHERE user=? AND room=?',
+            [user, room],
+          ))[0].n,
+        ) >= 256
+    ) {
+      return false;
+    }
     await tx.execute(
       'INSERT INTO notification_receipt_refs(user,room,scope,event) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
       [user, room, scope, event],
     );
-    return;
+    return true;
   }
   await tx.execute(
     'DELETE FROM notification_receipt_refs WHERE user=? AND room=? AND scope=? AND event=?',
@@ -117,7 +134,7 @@ export async function advanceNotificationRead(
     target.room !== room || target.seq === null ||
     target.standing !== 'accepted' || target.grounding !== 'grounded' ||
     invalidScope
-  ) return;
+  ) return true;
   const seq = Number(target.seq);
   await tx.execute(
     `INSERT INTO notification_horizons(user,room,scope,event_seq) VALUES(?,?,?,?)
@@ -156,6 +173,7 @@ export async function advanceNotificationRead(
     );
     await pruneNotificationHistory(tx, now);
   }
+  return true;
 }
 
 export async function applyPushPublication(
@@ -468,6 +486,17 @@ export async function withdrawInvitePush(
 }
 
 /** Counts and change-room membership are read by sync in its maxima snapshot. */
+export async function notificationChanged(
+  tx: Reader,
+  user: string,
+  since: number,
+): Promise<boolean> {
+  return (await tx.query(
+    'SELECT 1 FROM notification_changes WHERE user=? AND seq>? LIMIT 1',
+    [user, since],
+  )).length > 0;
+}
+
 export async function notificationSnapshot(
   tx: Reader,
   user: string,
