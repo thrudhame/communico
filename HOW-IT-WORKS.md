@@ -665,6 +665,9 @@ admin Unix socket. Admin operations are versioned JSON POSTs calling engine
 functions; socket ownership/mode checks and inode-checked cleanup protect the
 local boundary. Tools use the running server, not direct file access. Whole-room
 operator drop/purge records durable removal intent, distinct from event redaction.
+Outbox destination selection applies to queued work and status-only peers alike;
+omitting it lists all destinations. CLI retry and expiry times retain their real
+past/future direction, including retained expired work.
 (`main.ts:90-135`, `api/admin/index.ts:16-66`, `api/admin/index.ts:72-148`,
 `tools/admin.sh:1-12`, `api/engine/room/operator.ts:55-134`)
 

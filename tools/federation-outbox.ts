@@ -9,13 +9,20 @@ function usage(): never {
   Deno.exit(2);
 }
 
-function ago(ms: number | null): string {
+function relative(ms: number | null, now: number, expiry = false): string {
   if (ms === null) return '-';
-  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
+  const s = Math.floor(Math.abs(now - ms) / 1000);
+  const magnitude = s < 60
+    ? `${s}s`
+    : s < 3600
+    ? `${Math.floor(s / 60)}m`
+    : s < 86400
+    ? `${Math.floor(s / 3600)}h`
+    : `${Math.floor(s / 86400)}d`;
+  if (expiry) {
+    return ms > now ? `expires in ${magnitude}` : `expired ${magnitude} ago`;
+  }
+  return ms > now ? `in ${magnitude}` : `${magnitude} ago`;
 }
 
 if (import.meta.main) {
@@ -34,6 +41,7 @@ if (import.meta.main) {
       }
       const statusOf = new Map(statuses.map((s) => [s.destination, s]));
       const dests = [...new Set([...byDest.keys(), ...statusOf.keys()])].sort();
+      const now = Date.now();
       if (!dests.length) console.log('outbox empty');
       for (const d of dests) {
         const s = statusOf.get(d), queued = byDest.get(d) ?? [];
@@ -44,12 +52,10 @@ if (import.meta.main) {
             (s
               ? `, failures ${s.failures} (${s.failuresTotal} lifetime / ${s.attemptsTotal} attempts)` +
                 (s.unreachableSinceMs !== null
-                  ? `, unreachable since ${ago(s.unreachableSinceMs)}`
+                  ? `, unreachable since ${relative(s.unreachableSinceMs, now)}`
                   : '') +
-                (s.nextAttemptMs > Date.now()
-                  ? `, next attempt ${
-                    ago(s.nextAttemptMs).replace(' ago', ' from now')
-                  }`
+                (s.nextAttemptMs > now
+                  ? `, next attempt ${relative(s.nextAttemptMs, now)}`
                   : '') +
                 (s.lastError ? `, last error: ${s.lastError}` : '')
               : ''),
@@ -58,8 +64,8 @@ if (import.meta.main) {
           console.log(
             `  #${r.id} ${r.kind} ${
               r.eventId ?? JSON.stringify(r.intent)
-            } added ${ago(r.addedMs)}, expires ${
-              ago(r.expiresMs).replace(' ago', ' from now')
+            } added ${relative(r.addedMs, now)}, ${
+              relative(r.expiresMs, now, true)
             }${r.inflightTxn ? ` [${r.inflightTxn}]` : ''}`,
           );
         }

@@ -157,6 +157,18 @@ Deno.test('operator task clients preserve CLI contracts through the running serv
       (await cli('federation-outbox', ['list', 'delivery.test'])).stdout
         .includes('delivery.test: 0 queued, failures 0'),
     );
+    await cli('federation-outbox', ['retry', 'unrelated.test']);
+    assert(
+      !(await cli('federation-outbox', ['list', 'delivery.test'])).stdout
+        .includes('unrelated.test'),
+      'destination selection must also filter status-only peers',
+    );
+    assert(
+      (await cli('federation-outbox', ['list'])).stdout.includes(
+        'unrelated.test',
+      ),
+      'omitted destination must retain status-only peers',
+    );
     assertEquals(
       (await cli('federation-outbox', ['prune', 'delivery.test'])).stdout,
       'pruned 0 row(s) for delivery.test\n',

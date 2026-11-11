@@ -12,6 +12,7 @@ import { installServerHooks } from '#engine/server/startup.ts';
 import { integrityCheck } from '#engine/store/create.ts';
 import { get } from '#engine/store/watermark.ts';
 import { openStore } from '#engine/store/index.ts';
+import { runCrashChild } from './crash-child.ts';
 
 installServerHooks();
 
@@ -19,35 +20,7 @@ const CHILD = new URL('./fixtures/server-crash-child.ts', import.meta.url)
   .pathname;
 const LIBRARY = './.native/libturso_ffi.so';
 const ROOM = '!pc:test';
-const delay = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
-
 type ChildEvent = { projected?: number };
-
-async function* linesOf(
-  stream: ReadableStream<Uint8Array>,
-): AsyncGenerator<ChildEvent> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let index: number;
-      while ((index = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, index).trim();
-        buffer = buffer.slice(index + 1);
-        if (line !== '') yield JSON.parse(line) as ChildEvent;
-      }
-    }
-    const last = (buffer + decoder.decode()).trim();
-    if (last !== '') yield JSON.parse(last) as ChildEvent;
-  } finally {
-    reader.releaseLock();
-  }
-}
 
 Deno.test('server crash: 10 SIGKILLs during projection — watermark at the last pos, no duplicates', async () => {
   const dir = await Deno.makeTempDir();
@@ -57,39 +30,38 @@ Deno.test('server crash: 10 SIGKILLs during projection — watermark at the last
     iteration: number,
     deadlineMs: number,
   ): Promise<void> {
-    const child = new Deno.Command(Deno.execPath(), {
-      args: [
-        'run',
-        '--allow-read',
-        '--allow-write',
-        '--allow-env',
-        '--allow-ffi',
-        CHILD,
-        'loop',
-        dir,
-        LIBRARY,
-      ],
-      stdout: 'piped',
-      stderr: 'piped',
-    }).spawn();
-    const reader = linesOf(child.stdout);
     let reported = 0;
-    const deadline = Date.now() + deadlineMs;
-    for (;;) {
-      const next = await Promise.race([
-        reader.next(),
-        delay(60000).then(() => 'timeout' as const),
-      ]);
-      if (next === 'timeout' || next.done === true) break;
-      if (next.value.projected !== undefined) reported = next.value.projected;
-      if (Date.now() >= deadline) break;
-    }
-    child.kill('SIGKILL');
-    for await (const event of reader) {
-      if (event.projected !== undefined) reported = event.projected;
-    }
-    const status = await child.status;
-    assertEquals(status.signal, 'SIGKILL', 'child must die by SIGKILL');
+    let sampleTimer: ReturnType<typeof setTimeout> | undefined;
+    const result = await runCrashChild<ChildEvent>(
+      new Deno.Command(Deno.execPath(), {
+        args: [
+          'run',
+          '--allow-read',
+          '--allow-write',
+          '--allow-env',
+          '--allow-ffi',
+          CHILD,
+          'loop',
+          dir,
+          LIBRARY,
+        ],
+        stdout: 'piped',
+        stderr: 'piped',
+      }),
+      {
+        // One lifetime bounds startup and sampling. Sample only after the
+        // first real projection, not while the child is still booting.
+        deadlineMs: 60000,
+        onEvent(event, stop) {
+          if (event.projected !== undefined) {
+            reported = event.projected;
+            sampleTimer ??= setTimeout(() => stop('sample'), deadlineMs);
+          }
+        },
+      },
+    ).finally(() => clearTimeout(sampleTimer));
+    assertEquals(result.status.signal, 'SIGKILL', 'child must die by SIGKILL');
+    assertEquals(result.reason, 'sample', result.stderr);
     kills.push({ iteration, reported });
 
     // Reopen with the hooks installed: the startup roll-forward completes

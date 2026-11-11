@@ -7,37 +7,13 @@
 import { assert, assertEquals } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { integrityCheck } from '#engine/store/create.ts';
+import { runCrashChild } from './crash-child.ts';
 
 const CHILD = new URL('./fixtures/store-crash-child.ts', import.meta.url)
   .pathname;
 const LIBRARY = './.native/libturso_ffi.so';
 
 type ChildEvent = { row?: number; barrier?: 'start' | 'end' };
-
-async function* linesOf(
-  stream: ReadableStream<Uint8Array>,
-): AsyncGenerator<ChildEvent> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let index: number;
-      while ((index = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, index).trim();
-        buffer = buffer.slice(index + 1);
-        if (line !== '') yield JSON.parse(line) as ChildEvent;
-      }
-    }
-    const last = (buffer + decoder.decode()).trim();
-    if (last !== '') yield JSON.parse(last) as ChildEvent;
-  } finally {
-    reader.releaseLock();
-  }
-}
 
 Deno.test('store crash: 30 SIGKILLs, reopen passes integrity and keeps every reported row', async () => {
   const dir = await Deno.makeTempDir();
@@ -67,7 +43,7 @@ Deno.test('store crash: 30 SIGKILLs, reopen passes integrity and keeps every rep
     fraction = 0,
     killOnBarrierStart = false,
   ): Promise<void> {
-    const child = new Deno.Command(Deno.execPath(), {
+    const command = new Deno.Command(Deno.execPath(), {
       args: [
         'run',
         '--allow-read',
@@ -79,71 +55,62 @@ Deno.test('store crash: 30 SIGKILLs, reopen passes integrity and keeps every rep
         LIBRARY,
       ],
       stdout: 'piped',
-      stderr: 'inherit',
-    }).spawn();
-    const reader = linesOf(child.stdout);
+      stderr: 'piped',
+    });
     let barrierOpen = false;
     let barrierStartedAt = 0;
     let duringBarrier = false;
-    let killed = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = Date.now() + deadlineMs;
-    for (;;) {
-      let readTimer: ReturnType<typeof setTimeout> | undefined;
-      const next = await Promise.race([
-        reader.next(),
-        new Promise<'timeout'>((resolve) => {
-          readTimer = setTimeout(() => resolve('timeout'), 60000);
-        }),
-      ]).finally(() => clearTimeout(readTimer));
-      if (next === 'timeout' || next.done === true) break;
-      const event = next.value;
-      if (event.row !== undefined) reported.add(event.row);
-      const now = performance.now();
-      if (event.barrier === 'start') {
-        barrierOpen = true;
-        barrierStartedAt = now;
-        if (mode === 'aimed') {
-          killTimer = setTimeout(() => {
-            duringBarrier = true;
-            killed = true;
-            child.kill('SIGKILL');
-          }, Math.max(1, medianDuration() * fraction));
-          Deno.unrefTimer(killTimer);
+    let targetFired = false;
+    const result = await runCrashChild<ChildEvent>(command, {
+      deadlineMs,
+      deadlineReason: mode === 'random' && !killOnBarrierStart
+        ? 'sample'
+        : 'watchdog',
+      onEvent(event, stop) {
+        if (event.row !== undefined) reported.add(event.row);
+        if (targetFired) return;
+        const now = performance.now();
+        if (event.barrier === 'start') {
+          barrierOpen = true;
+          barrierStartedAt = now;
+          if (mode === 'aimed') {
+            killTimer = setTimeout(() => {
+              duringBarrier = barrierOpen;
+              targetFired = true;
+              stop('checkpoint');
+            }, Math.max(1, medianDuration() * fraction));
+          }
         }
-      }
-      if (event.barrier === 'end') {
-        barrierOpen = false;
-        if (barrierStartedAt !== 0) durations.push(now - barrierStartedAt);
-        barrierStartedAt = 0;
-        if (killTimer !== undefined) {
+        if (event.barrier === 'end') {
+          barrierOpen = false;
+          if (barrierStartedAt !== 0) durations.push(now - barrierStartedAt);
+          barrierStartedAt = 0;
           clearTimeout(killTimer);
           killTimer = undefined;
         }
-      }
-      const measured = mode === 'measure' && durations.length >= 5;
-      const barrierTarget = killOnBarrierStart && event.barrier === 'start';
-      if (
-        mode !== 'aimed' &&
-        (measured || barrierTarget || Date.now() >= deadline)
-      ) {
-        duringBarrier = barrierOpen;
-        killed = true;
-        child.kill('SIGKILL');
-      }
-      if (killed) break;
+        const measured = mode === 'measure' && durations.length >= 5;
+        const barrierTarget = killOnBarrierStart && event.barrier === 'start';
+        if (mode !== 'aimed' && (measured || barrierTarget)) {
+          duringBarrier = barrierOpen;
+          targetFired = true;
+          stop(barrierTarget ? 'checkpoint' : 'sample');
+        }
+      },
+    }).finally(() => clearTimeout(killTimer));
+    assertEquals(result.status.signal, 'SIGKILL', 'child must die by SIGKILL');
+    assert(
+      result.reason !== 'watchdog',
+      'crash child exceeded its lifetime without reaching the target',
+    );
+    if (mode === 'aimed') {
+      assertEquals(
+        result.reason,
+        'checkpoint',
+        'watchdog kills are not aimed hits',
+      );
+      assert(duringBarrier, 'aimed kill missed its window');
     }
-    if (killTimer !== undefined) clearTimeout(killTimer);
-    if (!killed) {
-      duringBarrier = barrierOpen;
-      child.kill('SIGKILL');
-    }
-    for await (const event of reader) {
-      if (event.row !== undefined) reported.add(event.row);
-    }
-    const status = await child.status;
-    assertEquals(status.signal, 'SIGKILL', 'child must die by SIGKILL');
-    if (mode === 'aimed') assert(duringBarrier, 'aimed kill missed its window');
     kills.push({ iteration, mode, duringBarrier, rows: reported.size });
     // Reopen with the store: open, integrity, and every reported row.
     const store = await openStore({
