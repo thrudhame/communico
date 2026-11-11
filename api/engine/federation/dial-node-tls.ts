@@ -110,6 +110,24 @@ class NodeTlsConn {
   }
 }
 
+// Configured PEM arrays are snapshots owned by resolve.ts. Its reset replaces
+// their identity; a WeakMap neither retains old configurations nor alters trust.
+const rootSnapshots = new WeakMap<string[], string[]>();
+function caRoots(configured: string[]): string[] {
+  let roots = rootSnapshots.get(configured);
+  if (roots === undefined) {
+    roots = [
+      ...new Set([
+        ...tls.getCACertificates('default'),
+        ...tls.getCACertificates('system'),
+        ...configured,
+      ]),
+    ];
+    rootSnapshots.set(configured, roots);
+  }
+  return roots;
+}
+
 function connectWithDeadline(opts: {
   connectIp: string;
   port: number;
@@ -124,13 +142,7 @@ function connectWithDeadline(opts: {
     const trust = opts.trust.kind === 'ca'
       ? {
         rejectUnauthorized: true,
-        ca: [
-          ...new Set([
-            ...tls.getCACertificates('default'),
-            ...tls.getCACertificates('system'),
-            ...opts.trust.caCerts,
-          ]),
-        ],
+        ca: caRoots(opts.trust.caCerts),
       }
       : { rejectUnauthorized: false }; // Identity is checked below against the roster pin/key.
     const sock = tls.connect({

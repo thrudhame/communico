@@ -8,16 +8,28 @@ import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { remoteServer, signerFor } from './http-federation.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { buildXMatrixHeader } from '#engine/federation/xmatrix.ts';
+import { MediaCache } from '#engine/media/cache.ts';
 
 Deno.test('HTTP thumbnail: shared local/federation engine, signed remote variants, static output and legacy isolation', async () => {
   const old = config();
   const root = await Deno.makeTempDir({ prefix: 'http-thumbnail-' });
   setConfigForTests({
-    media: { root, maxfetches: 1, maxvariants: 3 },
+    media: {
+      root,
+      maxfetches: 1,
+      maxvariants: 3,
+      cache: { maxbytes: 1000000 },
+    },
     federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
   });
   resetCaCertsForTests();
   const http = await startHttp();
+  const cleanup = MediaCache.prototype.cleanup;
+  let cleanups = 0;
+  MediaCache.prototype.cleanup = function (...args) {
+    cleanups++;
+    return cleanup.apply(this, args);
+  };
   const image = new Image(16, 12);
   image.bitmap.fill(255);
   const png = new Uint8Array(await image.encodePNG());
@@ -74,9 +86,15 @@ Deno.test('HTTP thumbnail: shared local/federation engine, signed remote variant
     const localBytes = new Uint8Array(await local.arrayBuffer());
     const decoded = await Image.decode(localBytes);
     assertEquals([decoded.width, decoded.height], [8, 6]);
+    const beforeHits = cleanups;
     const legacyLocal = await get(path(serverName(), id, true) + query, false);
     assertEquals(legacyLocal.status, 200);
     assertEquals(new Uint8Array(await legacyLocal.arrayBuffer()), localBytes);
+    assertEquals(
+      cleanups,
+      beforeHits,
+      'thumbnail hits must not own maintenance',
+    );
     const before = await get(path(fake.name, 'remote', true) + query, false);
     assertEquals(before.status, 404);
     await before.arrayBuffer();
@@ -166,6 +184,7 @@ Deno.test('HTTP thumbnail: shared local/federation engine, signed remote variant
     assertEquals(noDecrypt.status, 400);
     await noDecrypt.arrayBuffer();
   } finally {
+    MediaCache.prototype.cleanup = cleanup;
     await fake.close();
     await http.close();
     setConfigForTests(old);
