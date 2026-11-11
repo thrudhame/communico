@@ -416,6 +416,32 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function validCondition(condition: unknown): boolean {
+  if (!object(condition) || typeof condition.kind !== 'string') return false;
+  switch (condition.kind) {
+    case 'event_match':
+      return typeof condition.key === 'string' &&
+        typeof condition.pattern === 'string';
+    case 'event_property_is':
+    case 'event_property_contains':
+      return typeof condition.key === 'string' &&
+        Object.hasOwn(condition, 'value') &&
+        (condition.value === null || typeof condition.value === 'string' ||
+          typeof condition.value === 'boolean' ||
+          (typeof condition.value === 'number' &&
+            Number.isSafeInteger(condition.value)));
+    case 'room_member_count':
+      return typeof condition.is === 'string' &&
+        /^(==|<=|>=|<|>)?[0-9]+$/.test(condition.is) &&
+        Number.isSafeInteger(Number(condition.is.replace(/^[=<>]+/, '')));
+    case 'sender_notification_permission':
+      return typeof condition.key === 'string';
+    default:
+      // contains_display_name has no fields; unknown future kinds round-trip.
+      return true;
+  }
+}
+
 function assertActions(actions: unknown): asserts actions is unknown[] {
   if (
     !Array.isArray(actions) ||
@@ -433,18 +459,17 @@ export async function putRule(
   localpart: string,
   kind: string,
   ruleId: string,
-  body: { actions: unknown[]; conditions?: unknown[]; pattern?: string },
+  body: { actions: unknown[]; conditions?: unknown[]; pattern?: unknown },
   placement: { before?: string; after?: string },
 ): Promise<void> {
   assertScopeKind('global', kind);
   assertActions(body.actions);
+  const pattern = body.pattern;
   if (
     (body.conditions !== undefined &&
       (!Array.isArray(body.conditions) ||
-        !body.conditions.every((condition) =>
-          object(condition) && typeof condition.kind === 'string'
-        ))) ||
-    (body.pattern !== undefined && typeof body.pattern !== 'string')
+        !body.conditions.every(validCondition))) ||
+    (pattern !== undefined && typeof pattern !== 'string')
   ) {
     throw new MatrixError(
       400,
@@ -563,7 +588,7 @@ export async function putRule(
       priority,
       JSON.stringify(body.actions),
       body.conditions !== undefined ? JSON.stringify(body.conditions) : null,
-      body.pattern ?? null,
+      pattern ?? null,
       seq,
     );
     await tx.pushRules.stampStream(localpart, await tx.counters.nextStream());

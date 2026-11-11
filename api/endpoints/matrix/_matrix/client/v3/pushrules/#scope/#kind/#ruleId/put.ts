@@ -28,7 +28,7 @@ export default async function (
     {
       actions: body.actions,
       conditions: body.conditions as unknown[] | undefined,
-      pattern: typeof body.pattern === 'string' ? body.pattern : undefined,
+      pattern: body.pattern,
     },
     {
       before: request.query.get('before') ?? undefined,

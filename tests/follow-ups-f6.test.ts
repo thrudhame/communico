@@ -40,7 +40,7 @@ Deno.test('F6 expired notification listing is a read, not retention maintenance'
 Deno.test('F6 push-rule shared writers reject malformed shapes without changing rule or stream', async () => {
   const http = await startHttp();
   try {
-    await http.registerTestUser('rules', 'pw');
+    const account = await http.registerTestUser('rules', 'pw');
     const tenant = http.app.tenant;
     const tenantDb = await http.app.store.tenant(tenant.serverName);
     const valid = {
@@ -50,8 +50,38 @@ Deno.test('F6 push-rule shared writers reject malformed shapes without changing 
     await putRule(tenant, 'rules', 'override', 'mine', valid, {});
     const before = await getRule(tenant, 'rules', 'override', 'mine');
     const stream = await tenantDb.query('SELECT * FROM push_rules_stream');
+    const invalidPattern = await http.matrix(
+      new Request(
+        'http://x/_matrix/client/v3/pushrules/global/content/bad-pattern',
+        {
+          method: 'PUT',
+          headers: { Authorization: 'Bearer ' + account.access_token },
+          body: JSON.stringify({ actions: ['notify'], pattern: 7 }),
+        },
+      ),
+    );
+    assertEquals(invalidPattern.status, 400);
+    await invalidPattern.body?.cancel();
+    assertEquals(
+      await tenantDb.query('SELECT * FROM push_rules_stream'),
+      stream,
+    );
     for (
-      const conditions of [{}, null, 'bad', [null], [[]], [{}], [{ kind: 3 }]]
+      const conditions of [
+        {},
+        null,
+        'bad',
+        [null],
+        [[]],
+        [{}],
+        [{ kind: 3 }],
+        [{ kind: 'event_match' }],
+        [{ kind: 'event_match', key: 'content.body', pattern: 3 }],
+        [{ kind: 'event_property_is', key: 'content.x' }],
+        [{ kind: 'event_property_contains', key: 'content.x', value: [] }],
+        [{ kind: 'room_member_count' }],
+        [{ kind: 'sender_notification_permission' }],
+      ]
     ) {
       await assertRejects(() =>
         putRule(tenant, 'rules', 'override', 'mine', {
@@ -94,6 +124,101 @@ Deno.test('F6 push-rule shared writers reject malformed shapes without changing 
     assertEquals(
       (await getRule(tenant, 'rules', 'override', 'mine')).actions.length,
       2,
+    );
+    for (
+      const condition of [
+        { kind: 'event_match', key: 'content.body', pattern: '*' },
+        { kind: 'event_property_is', key: 'content.x', value: null },
+        { kind: 'event_property_contains', key: 'content.x', value: true },
+        { kind: 'room_member_count', is: '>=2' },
+        { kind: 'sender_notification_permission', key: 'room' },
+        { kind: 'contains_display_name' },
+        { kind: 'future_condition', extra: [] },
+      ]
+    ) {
+      await putRule(tenant, 'rules', 'override', 'valid', {
+        actions: ['dont_notify'],
+        conditions: [condition],
+      }, {});
+      assertEquals(
+        (await getRule(tenant, 'rules', 'override', 'valid')).conditions,
+        [condition],
+      );
+    }
+  } finally {
+    await http.close();
+  }
+});
+
+Deno.test('F6 receipt capacity cannot block notification projection of legacy receipts', async () => {
+  const http = await startHttp();
+  try {
+    const a = await http.registerTestUser('capacity-a', 'pw');
+    const b = await http.registerTestUser('capacity-b', 'pw');
+    const call = async (
+      path: string,
+      token: string,
+      body: unknown,
+      method = 'POST',
+    ) => {
+      const response = await http.matrix(
+        new Request('http://x/_matrix/client/v3/' + path, {
+          method,
+          headers: { Authorization: 'Bearer ' + token },
+          body: JSON.stringify(body),
+        }),
+      );
+      assertEquals(response.status, 200, await response.clone().text());
+      return await response.json();
+    };
+    const room =
+      (await call('createRoom', a.access_token!, { invite: [b.user_id] }))
+        .room_id;
+    const base = 'rooms/' + encodeURIComponent(room);
+    await call(base + '/join', b.access_token!, {});
+    const db = http.app.server;
+    await db.tx(async (tx) => {
+      for (let i = 0; i < 256; i++) {
+        await tx.execute(
+          'INSERT INTO notification_receipt_refs(user,room,scope,event) VALUES(?,?,?,?)',
+          [a.user_id, room, '', '$pending-' + i],
+        );
+      }
+      // Supported upgrades can have a retained wire receipt without a pending ref.
+      await tx.execute(
+        "INSERT INTO receipts VALUES(?,?,'m.read','','$legacy',1,1)",
+        [room, a.user_id],
+      );
+    });
+    const sent = await call(
+      base + '/send/m.room.message/capacity',
+      b.access_token!,
+      { body: 'still published', msgtype: 'm.text' },
+      'PUT',
+    );
+    assertEquals(
+      (await db.query(
+        'SELECT event FROM notifications WHERE user=? AND event=?',
+        [a.user_id, sent.event_id],
+      )).length,
+      1,
+    );
+    assertEquals(
+      (await db.query(
+        'SELECT COUNT(*) AS n FROM notification_receipt_refs WHERE user=? AND room=?',
+        [a.user_id, room],
+      ))[0].n,
+      256,
+    );
+    await assertRejects(() =>
+      setReceipt(db, room, a.user_id, 'm.read', '$overflow')
+    );
+    assertEquals(
+      (await db.query(
+        'SELECT event_id FROM receipts WHERE user_id=? AND room_id=?',
+        [a.user_id, room],
+      ))[0].event_id,
+      '$legacy',
     );
   } finally {
     await http.close();

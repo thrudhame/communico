@@ -229,7 +229,7 @@ export async function setReceipt(
       ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_id=excluded.event_id,ts_ms=excluded.ts_ms,seq=excluded.seq`,
       [roomId, userId, receiptType, threadId ?? '', eventId, ts, seq],
     );
-    await advanceNotificationRead(
+    const admitted = await advanceNotificationRead(
       tx,
       userId,
       roomId,
@@ -237,6 +237,13 @@ export async function setReceipt(
       eventId,
       Date.now(),
     );
+    if (!admitted) {
+      throw new MatrixError(
+        429,
+        'M_LIMIT_EXCEEDED',
+        'pending receipt capacity reached',
+      );
+    }
     return { userId, receiptType, threadId, eventId, ts, seq };
   });
   if (row === null) return false;
