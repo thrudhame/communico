@@ -172,7 +172,8 @@ async function fetchBoundary(
     concurrency: 1,
     active: () => spend(budget, 0),
     work: () => spend(budget, 1),
-    canReadAll: (count) => count <= budget.requests && count <= budget.work,
+    canReadAll: (count, reservedRequests = 0) =>
+      count + reservedRequests <= budget.requests && count <= budget.work,
     read: (op) =>
       spend(budget, 0, 1) ? historyFetch(deps, op) : Promise.resolve(null),
     exemptPrevAuthLimits: true,

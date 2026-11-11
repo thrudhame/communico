@@ -19,6 +19,10 @@ for (const route of ['remote', 'history'] as const) {
       'invalid',
       'foreign',
       'duplicates',
+      'scan-overflow',
+      ...(route === 'history'
+        ? ['work-budget', 'request-budget'] as const
+        : []),
     ] as const
   ) {
     Deno.test(`boundary fetch: ${route} dense state (${mode})`, async () => {
@@ -48,7 +52,8 @@ for (const route of ['remote', 'history'] as const) {
         });
         const room = await openRoom(store, fr.roomId);
         const state: Pdu[] = [];
-        for (let i = 0; i < 24; i++) {
+        const tight = mode === 'work-budget' || mode === 'request-budget';
+        for (let i = 0; i < (tight ? 1 : 24); i++) {
           state.push(
             await fr.addEvent({
               type: 'org.communico.state',
@@ -90,9 +95,14 @@ for (const route of ['remote', 'history'] as const) {
             return Promise.resolve({
               state: [...returned, ...(mode === 'duplicates' ? returned : [])]
                 .map((id) => wireOf(fr.events.get(id)!)),
-              authChain: ids.authChainIds.filter((id) =>
-                mode !== 'partial' || id !== state[0].event_id
-              ).map((id) => wireOf(fr.events.get(id)!)),
+              authChain: mode === 'scan-overflow'
+                ? Array.from(
+                  { length: 100 },
+                  () => wireOf(fr.events.get(fr.createId)!),
+                )
+                : ids.authChainIds.filter((id) =>
+                  mode !== 'partial' || id !== state[0].event_id
+                ).map((id) => wireOf(fr.events.get(id)!)),
             });
           },
         });
@@ -107,22 +117,33 @@ for (const route of ['remote', 'history'] as const) {
           if (invalid) assertNotEquals(result[0].outcome, 'accepted');
           else assertEquals(result[0].outcome, 'accepted');
         } else {
+          const budget = tight
+            ? {
+              signal: AbortSignal.timeout(8000),
+              requests: mode === 'request-budget' ? 3 : 128,
+              work: new Set([...ids.pduIds, ...ids.authChainIds]).size + 4,
+              exhausted: false,
+            }
+            : undefined;
           const result = await backfill(room, {
             from: [gap.event_id!],
             via: fr.server.name,
             limit: 100,
-          }, { keys, fetcher });
+          }, { keys, fetcher, budget });
           assertEquals(result.positioned.includes(gap.event_id!), !invalid);
         }
-        assertEquals(bulkCalls, 1);
+        assertEquals(bulkCalls, mode === 'request-budget' ? 0 : 1);
         const fetched = scripted.calls.event.filter((id) =>
           state.some((p) => p.event_id === id)
         );
         assertEquals(
           fetched.length,
-          mode === 'unavailable'
+          mode === 'request-budget'
+            ? 1
+            : mode === 'unavailable' || mode === 'scan-overflow'
             ? 24
-            : mode === 'complete' || mode === 'duplicates'
+            : mode === 'complete' || mode === 'duplicates' ||
+                mode === 'work-budget'
             ? 0
             : 1,
         );
@@ -210,4 +231,59 @@ Deno.test('boundary fetch: sparse recovery excludes bulk and unrelated snapshot 
     1,
     'only the missing requested event crosses signature verification once',
   );
+});
+
+Deno.test('boundary fetch: only missing unique candidates spend admission work', async () => {
+  const fr = await makeFakeRoom({ roomId: '!work:remote.test' });
+  const first = await fr.addEvent({
+    type: 'org.communico.state',
+    state_key: 'a',
+    content: {},
+  });
+  const second = await fr.addEvent({
+    type: 'org.communico.state',
+    state_key: 'b',
+    content: {},
+  });
+  const other = await fr.addEvent({ type: 'm.room.message', content: {} });
+  const scripted = fakeFetcher({ event: fr.events });
+  let work = 2;
+  let exhausted = false;
+  const pack = await fetchBoundaryEvents(
+    [first.event_id!, second.event_id!],
+    3,
+    {
+      roomId: fr.roomId,
+      at: other.event_id!,
+      via: fr.server.name,
+      version: fr.version,
+      fetcher: Object.assign(scripted.fetcher, {
+        state: () =>
+          Promise.resolve({
+            authChain: [
+              wireOf(fr.events.get(fr.createId)!),
+              wireOf(first),
+              wireOf(first),
+            ],
+            state: [wireOf(other), wireOf(second)],
+          }),
+      }),
+      keys: fakeKeyResolver(fr.server),
+      concurrency: 1,
+      active: () => !exhausted,
+      work: () => {
+        if (work === 0) {
+          exhausted = true;
+          return false;
+        }
+        work--;
+        return true;
+      },
+      read: (op) => op(),
+    },
+  );
+  assertEquals([...pack!.keys()], [first.event_id!, second.event_id!]);
+  assertEquals(work, 0);
+  assertEquals(exhausted, false);
+  assertEquals(scripted.calls.event, []);
 });

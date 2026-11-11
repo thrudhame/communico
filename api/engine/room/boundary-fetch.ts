@@ -21,7 +21,7 @@ export async function fetchBoundaryEvents(
     active: () => boolean;
     read: <T>(op: () => Promise<T | null>) => Promise<T | null>;
     work?: () => boolean;
-    canReadAll?: (count: number) => boolean;
+    canReadAll?: (count: number, reservedRequests?: number) => boolean;
     exemptPrevAuthLimits?: boolean;
   },
 ): Promise<Map<string, Pdu> | null> {
@@ -36,27 +36,38 @@ export async function fetchBoundaryEvents(
   // duplicate and unrequested events cannot consume signature work or enter the
   // evidence pack. A failed candidate never prevents a later valid copy.
   const admit = async (raw: Pdu, expected?: string): Promise<void> => {
-    if (!opts.active() || (opts.work !== undefined && !opts.work())) return;
+    if (!opts.active()) return;
     try {
       const id = (await identify(raw, opts.version, verification)).eventId;
       if (
         !wanted.has(id) || pack.has(id) ||
         (expected !== undefined && id !== expected)
       ) return;
+      if (opts.work !== undefined && !opts.work()) return;
       const verified = await verify(raw, opts.version, opts.keys, verification);
       pack.set(id, verified.pdu);
     } catch {
       // Verification failure is missing evidence, never an accepted prefix.
     }
   };
-  if (unknown.length * 10 >= wantedCount && opts.active()) {
+  // Do not spend the last feasible individual read on a speculative bulk read.
+  // If individual recovery cannot fit at all, bulk can still complete it.
+  const bulkFits = opts.canReadAll === undefined ||
+    !opts.canReadAll(unknown.length) || opts.canReadAll(unknown.length, 1);
+  if (unknown.length * 10 >= wantedCount && bulkFits && opts.active()) {
     const snapshot = await opts.read(() =>
       opts.fetcher.state(opts.roomId, opts.at, opts.via, opts.signal)
     );
     if (snapshot !== null) {
-      for (const raw of [...snapshot.authChain, ...snapshot.state]) {
-        if (!opts.active()) return null;
-        await admit(raw);
+      // Each wanted ID can occur in state and auth. Bound raw identification
+      // independently from admission work; excess input falls back to /event.
+      let scanned = 0;
+      bulk: for (const events of [snapshot.authChain, snapshot.state]) {
+        for (const raw of events) {
+          if (!opts.active()) return null;
+          if (scanned++ >= 2 * wantedCount) break bulk;
+          await admit(raw);
+        }
       }
     }
   }

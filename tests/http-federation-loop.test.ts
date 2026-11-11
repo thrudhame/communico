@@ -267,7 +267,7 @@ Deno.test('HTTP/TLS loop: create -> invite -> join -> messages -> backfill -> co
         '/_matrix/federation/v2/send_join/',
         '/_matrix/federation/v1/backfill/',
         '/_matrix/federation/v1/state_ids/',
-        '/_matrix/federation/v1/event/',
+        '/_matrix/federation/v1/state/',
         '/_matrix/federation/v1/send/',
       ]
     ) {
