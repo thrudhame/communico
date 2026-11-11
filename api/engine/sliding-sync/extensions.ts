@@ -3,6 +3,52 @@ import type { RoomExtension } from './types.ts';
 import type { AccountDataRow } from '#engine/tenant/accountdata.ts';
 import { receiptContent, type ReceiptRow } from '#engine/server/ephemeral.ts';
 import type { TypingSnapshot } from '#engine/typing.ts';
+import type { Database } from '#engine/store/db.ts';
+import type { Tenant } from '#engine/tenant/index.ts';
+import type { DeviceIdentity } from '#engine/tenant/devices.ts';
+import { deviceListsBetween } from '#engine/server/e2ee.ts';
+
+export type E2eeExtensionState = { deviceCut: number; poolSeq: number };
+
+/** The coordinator supplies this connection's last enabled device cut, or its
+ * creation baseline when enabling later. Disabled calls read nothing and cannot
+ * advance either cut. Initial no-pos requests intentionally have empty deltas. */
+export async function e2eeExtension(input: {
+  enabled: boolean;
+  server: Database;
+  tenant: Tenant;
+  device: DeviceIdentity;
+  since: number | null;
+  through: number;
+  previousPoolSeq?: number;
+}) {
+  if (!input.enabled) return null;
+  const { server, tenant, device, since, through } = input;
+  const pools = await tenant.tx((tx) => tx.e2ee.status(device));
+  const lists = since === null
+    ? { changed: [], left: [] }
+    : await deviceListsBetween(
+      server,
+      `@${device.localpart}:${tenant.serverName}`,
+      since,
+      through,
+      'sync',
+    );
+  return {
+    response: {
+      device_lists: lists,
+      device_one_time_keys_count: pools.counts,
+      device_unused_fallback_key_types: pools.unused,
+    },
+    state: {
+      deviceCut: through,
+      poolSeq: pools.seq,
+    } satisfies E2eeExtensionState,
+    relevant: lists.changed.length > 0 || lists.left.length > 0 ||
+      (input.previousPoolSeq !== undefined &&
+        input.previousPoolSeq !== pools.seq),
+  };
+}
 
 export type ExtensionScope = {
   lists: ReadonlyMap<string, ReadonlySet<string>>;

@@ -292,6 +292,19 @@ ordinary sync shares that capture, and a process epoch invalidates persisted
 sliding typing cuts after restart. Empty stops remain real updates.
 (`api/engine/sliding-sync/extensions.ts`, `api/engine/typing.ts`)
 
+The E2EE extension reuses the existing all-shared-room device-list audience and
+tenant OTK/fallback status. No-pos requests have empty device-list deltas;
+disabled extensions do not read or advance their independent cuts. Later enable
+reads from the connection's retained baseline, not an unrelated room-list cut.
+Unchanged status envelopes are not poll updates, while key-pool changes are.
+(`api/engine/sliding-sync/extensions.ts`)
+
+Final sliding publication runs only after rendering: one tenant transaction
+validates the lease, applies the connection-scoped inbox acknowledgment, selects
+its bounded page and commits the successor. Stale/oversized snapshots and aborts
+roll back all those effects. A disabled inbox extension performs no inbox work.
+(`api/engine/sliding-sync/delivery.ts`)
+
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data
 streams. Denials win, empty lists exclude everything, and only `*` is special
