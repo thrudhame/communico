@@ -58,10 +58,7 @@ suite.test('initial, incremental and full_state; global tokens; account data; re
   const initial = await sync(alice.access_token!);
   const tl = roomSection(initial, 'join', roomId)!.timeline as Json;
   assertEquals(tl.limited, false);
-  assert(
-    String(tl.prev_batch).startsWith('c'),
-    'nonempty timeline has a before-event bookmark',
-  );
+  assertEquals(tl.prev_batch, initial.next_batch);
   assert((tl.events as Json[]).every((e) => !('room_id' in e)));
   assertEquals(
     ((initial.account_data as Json).events as Json[]).some((e) =>

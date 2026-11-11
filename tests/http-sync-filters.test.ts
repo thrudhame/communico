@@ -49,21 +49,37 @@ suite.test('prev_batch reads the same historical membership via /members?at=', a
     })).status,
     200,
   );
-  const before = await sync(
-    alice.access_token!,
-    '&filter=' +
+  const bookmarks: { prev: unknown; end: unknown }[] = [];
+  for (
+    const query of [
+      '',
+      '&filter=' +
       encodeURIComponent('{"room":{"timeline":{"types":["m.room.message"]}}}'),
-  );
-  const prev = (joined(before, roomId).timeline as Json).prev_batch;
+    ]
+  ) {
+    const before = await sync(alice.access_token!, query);
+    const timeline = joined(before, roomId).timeline as Json;
+    assertEquals(timeline.limited, false);
+    bookmarks.push({ prev: timeline.prev_batch, end: before.next_batch });
+  }
   assertEquals(
     (await call(base + '/join', bob.access_token!, 'POST', {})).status,
     200,
   );
-  const members = await call(base + '/members?at=' + prev, alice.access_token!);
-  assertEquals(members.status, 200);
-  assertEquals((members.body.chunk as Json[]).map((e) => e.state_key).sort(), [
-    alice.user_id,
-  ]);
+  for (const { prev, end } of bookmarks) {
+    const members = await call(
+      base + '/members?at=' + prev,
+      alice.access_token!,
+    );
+    assertEquals(members.status, 200);
+    assertEquals(
+      (members.body.chunk as Json[]).map((e) => e.state_key).sort(),
+      [
+        alice.user_id,
+      ],
+    );
+    assertEquals(prev, end, 'untrimmed bookmarks retain the captured end cut');
+  }
   for (const at of ['unknown', 'c999999_0']) {
     assertEquals(
       (await call(base + '/members?at=' + at, alice.access_token!)).status,

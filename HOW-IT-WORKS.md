@@ -276,10 +276,12 @@ Filtering and lazy member loading apply after cut selection. Later publications
 cannot leak across the captured response token.
 Imported before-state boundaries stop live sync windows rather than splicing
 older feed rows across missing remote history. Filtering or visibility omissions
-alone do not set `limited`; eligible limit trimming and real gaps do. Every
-nonempty window supplies a room cursor before its first returned event, so
-follow-on pagination does not repeat that window. Limited windows use real room
-cursors; backward pagination follows the missing predecessor into an isolated
+alone do not set `limited`; eligible limit trimming and real gaps do. A newly
+joined client's global since cut does not establish continuity with older room
+history; a retained pre-since prefix remains a paginatable gap. Untrimmed
+windows retain their captured end token, including for historical membership
+reads. Limited windows use real room cursors before their first returned event;
+backward pagination follows the missing predecessor into an isolated
 history anchor even when the gap is inside a stay. These imports remain history,
 never new feed events. Lazy state retains timeline sender memberships, mandatory
 own membership on initial/full-state/new-join responses, and changed memberships
