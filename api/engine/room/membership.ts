@@ -8,7 +8,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { validEventUserId } from '#engine/ids.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Room } from '#engine/room/index.ts';
-import { sendLocal } from '#engine/room/ingest.ts';
+import { afterLocalCommit, sendLocal } from '#engine/room/ingest.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
@@ -127,7 +127,7 @@ export async function join(
     undefined,
     () => admitLocalJoin(room.store, room.id, userId),
   );
-  await projectAfterWrite(room.store, room.id);
+  await afterLocalCommit(room, result.eventId, signer.serverName);
   return result;
 }
 

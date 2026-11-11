@@ -120,7 +120,19 @@ async function setup(
   const boundary = await current();
   boundary.set('m.room.power_levels\0', pl1);
   boundary.set('m.room.member\0' + user, chain[13].event_id!);
-  return { room, server, deps, current, created, join, pl3, chain, boundary };
+  return {
+    room,
+    server,
+    deps,
+    current,
+    created,
+    join,
+    pl3,
+    chain,
+    boundary,
+    signer,
+    creator,
+  };
 }
 
 Deno.test('recovery: v12 auth stores include the implicit room create', async () => {
@@ -277,4 +289,96 @@ Deno.test('recovery: an auth response arriving after the budget cannot expose a 
       }
     });
   });
+});
+
+Deno.test('recovery: large evidence packs yield bounded writes to ordinary room mutations', async (t) => {
+  for (const deny of [false, true]) {
+    await t.step(
+      deny
+        ? 'ACL changes invalidate the staged cut'
+        : 'ordinary writes interleave',
+      () =>
+        withRecovery(10, async (s) => {
+          const pack: Pdu[] = [];
+          for (let i = 0; i < 160; i++) {
+            pack.push(
+              await remoteEvent(s.room.id, s.server, '12', {
+                type: 'm.room.message',
+                sender: s.join.sender,
+                content: { body: 'evidence ' + i },
+                prev_events: ['$absent'],
+                auth_events: [s.join.event_id!, s.pl3.event_id!],
+                depth: 100,
+              }),
+            );
+          }
+          const pushed = await remoteEvent(s.room.id, s.server, '12', {
+            type: 'm.room.message',
+            sender: s.join.sender,
+            content: {},
+            prev_events: ['$absent'],
+            auth_events: [pack[159].event_id!],
+            depth: 101,
+          });
+          s.deps.fetcher = fakeFetcher({
+            eventAuth: new Map([[pushed.event_id!, pack]]),
+          }).fetcher;
+          const ids = new Set(pack.map((p) => p.event_id!));
+          const original = s.room.tx.bind(s.room);
+          let inserted = 0;
+          let peak = 0;
+          let ordinaryAt = Infinity;
+          let ordinary: Promise<unknown> | undefined;
+          s.room.tx = (body) =>
+            original(async (tx) => {
+              let count = 0;
+              const insert = tx.events.insert;
+              tx.events.insert = async (id, pdu) => {
+                if (ids.has(id)) {
+                  count++;
+                  inserted++;
+                  if (ordinary === undefined) {
+                    ordinary = sendLocal(s.room, {
+                      type: deny ? 'm.room.server_acl' : 'm.room.topic',
+                      state_key: '',
+                      sender: s.creator,
+                      content: deny
+                        ? { allow: [], deny: ['*'] }
+                        : { topic: 'ordinary writer' },
+                    }, s.signer).then(() => {
+                      ordinaryAt = inserted;
+                    });
+                  }
+                }
+                return await insert(id, pdu);
+              };
+              const result = await body(tx);
+              peak = Math.max(peak, count);
+              return result;
+            });
+          const out = await ingestRemote(
+            s.room,
+            [pushed],
+            s.server.name,
+            s.deps,
+          );
+          await ordinary;
+          assertEquals(out[0].outcome, deny ? 'refused' : 'pending');
+          assert(peak <= 32, 'evidence transaction must be bounded: ' + peak);
+          assert(
+            ordinaryAt < pack.length,
+            'ordinary mutation waited for the entire pack',
+          );
+          assertEquals(inserted, deny ? 32 : pack.length);
+          for (const pdu of pack) {
+            const status = await s.room.tx((tx) =>
+              tx.events.getStatus(pdu.event_id!)
+            );
+            if (deny && status === null) continue;
+            assertEquals(status?.grounding, 'evidence');
+            assertEquals(status?.standing, 'accepted');
+          }
+        }),
+    );
+  }
 });

@@ -13,6 +13,34 @@ import {
 
 const ROOM = '!verify:test';
 
+Deno.test('verify: required edge arrays and object content share the format boundary for every supported version', async () => {
+  const server = await makeRemoteServer('remote.test');
+  for (const version of ['3', '4', '5', '6', '7', '8', '9', '10', '11', '12']) {
+    for (
+      const field of [
+        'prev_events',
+        'auth_events',
+        'content',
+        'hashes',
+        'signatures',
+      ]
+    ) {
+      const event = await msg(server, 'required', version);
+      delete event.event_id;
+      const raw = event as unknown as Record<string, unknown>;
+      if (field === 'content') raw.content = [];
+      else delete raw[field];
+      await assertRejects(() => identify(event, version), Error, 'M_BAD_EVENT');
+    }
+    for (const value of [{}, { sha256: 2 }, []]) {
+      const event = await msg(server, 'hash shape', version);
+      delete event.event_id;
+      (event as unknown as Record<string, unknown>).hashes = value;
+      await assertRejects(() => identify(event, version), Error, 'M_BAD_EVENT');
+    }
+  }
+});
+
 async function msg(
   server: Awaited<ReturnType<typeof makeRemoteServer>>,
   body: string,

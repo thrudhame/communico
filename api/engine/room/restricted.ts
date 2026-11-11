@@ -18,22 +18,23 @@ async function current(tx: RoomTx) {
   return { stay, group };
 }
 
-async function target(tx: RoomTx, user: string) {
+async function target(tx: RoomTx, user: string, needAuthorizers = false) {
   const { stay, group } = await current(tx);
   if (stay === null || group === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'not resident');
   }
   const version = await roomVersionOf(tx, stay.id);
   const rulebook = getRulebook(version);
-  const state = await tx.state.groupMap(group);
-  const store = await loadRulebookStore(tx, [...state.values()]);
-  const content = (type: string, key = '') =>
-    store.get(state.get(type + '\0' + key) ?? '')?.content;
-  const previous = content('m.room.member', user)?.membership;
+  const content = async (type: string, key = '') => {
+    const id = await tx.state.groupKey(group, type, key);
+    const event = id === null ? null : await tx.events.get(id);
+    return event === null ? undefined : JSON.parse(event.pdu).content;
+  };
+  const previous = (await content('m.room.member', user))?.membership;
   if (previous === 'ban') {
     throw new MatrixError(403, 'M_FORBIDDEN', 'user is banned');
   }
-  const rules = content('m.room.join_rules');
+  const rules = await content('m.room.join_rules');
   const restricted =
     (rules?.join_rule === 'restricted' && rulebook.spec.restrictedJoinRule) ||
     (rules?.join_rule === 'knock_restricted' &&
@@ -55,13 +56,19 @@ async function target(tx: RoomTx, user: string) {
       }
     }
   }
+  let authorizers: string[] = [];
+  if (required || needAuthorizers) {
+    const state = await tx.state.groupMap(group);
+    const store = await loadRulebookStore(tx, [...state.values()]);
+    authorizers = inviteCapableUsers(state, store, rulebook.spec);
+  }
   return {
     group,
     stay: stay.id,
     required,
     rooms: [...new Set(rooms)],
     unknown,
-    authorizers: inviteCapableUsers(state, store, rulebook.spec),
+    authorizers,
   };
 }
 
@@ -109,7 +116,9 @@ export async function withRestrictedAdmission<T>(
   before?: () => Promise<void>,
 ): Promise<T> {
   for (let attempt = 0; attempt < 3; attempt++) {
-    const captured = await room.tx((tx) => target(tx, user));
+    const captured = await room.tx((tx) =>
+      target(tx, user, nominated !== undefined)
+    );
     let proof: Witness | null = null;
     let unknown = captured.unknown;
     if (captured.required) {
@@ -139,7 +148,7 @@ export async function withRestrictedAdmission<T>(
         ) return changed;
       }
       return await room.tx(async (tx) => {
-        const now = await target(tx, user);
+        const now = await target(tx, user, nominated !== undefined);
         if (now.group !== captured.group || now.stay !== captured.stay) {
           return changed;
         }
@@ -189,6 +198,9 @@ export async function restrictedResidents(
   room: Room,
   user: string,
 ): Promise<string[]> {
-  const snapshot = await room.tx((tx) => target(tx, user));
-  return [...new Set(snapshot.authorizers.map(domainOf))];
+  return await room.tx(async (tx) => {
+    if (await tx.segments.openStay() === null) return [];
+    const snapshot = await target(tx, user, true);
+    return [...new Set(snapshot.authorizers.map(domainOf))];
+  });
 }

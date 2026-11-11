@@ -216,8 +216,7 @@ async function submitLocal(
   });
   // A wait naming this event (a redaction target, a missing prev) is
   // re-run now that it has arrived (R10 — the 3c recheck driver).
-  await maybeResume(room, result.eventId, signer.serverName);
-  await projectAfterWrite(room.store, room.id);
+  await afterLocalCommit(room, result.eventId, signer.serverName);
   return result;
 }
 
@@ -243,15 +242,14 @@ export async function ingestLocal(
       });
     },
   );
-  await maybeResume(room, result.eventId, self);
-  await projectAfterWrite(room.store, room.id);
+  await afterLocalCommit(room, result.eventId, self);
   return result;
 }
 
 // The recheck trigger: an event that gained waiters re-runs them after
 // the current lock is released (each recheck is a locked ingest of its
 // own; network never runs here).
-async function maybeResume(
+export async function afterLocalCommit(
   room: Room,
   eventId: string,
   self: string,
@@ -260,6 +258,7 @@ async function maybeResume(
     (await tx.waits.for(eventId)).length > 0
   );
   if (hasWaiters) await resumeWaits(room, { self });
+  await projectAfterWrite(room.store, room.id);
 }
 
 // The tx-scoped core: the caller holds the room lock and composes (the
@@ -960,6 +959,12 @@ export async function resumeWaits(
       } else {
         await withRoomLock(room.id, () =>
           room.tx(async (tx) => {
+            const waiting = await tx.waits.of(job.eventId);
+            if (
+              !waiting.some((wait) =>
+                wait.kind === 'redaction' && wait.missing === job.target
+              )
+            ) return;
             const row = await tx.events.get(job.eventId);
             const target = await tx.events.get(job.target);
             if (row === null || target === null) return;

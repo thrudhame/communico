@@ -83,9 +83,7 @@ export async function join(
     const deps = inviteDeps();
     const invitation = await inviteFor(roomId, userId, deps);
     const held = room === null ? [] : await serversInRoom(roomId);
-    const qualified = room === null || await room.tx((tx) =>
-          tx.segments.openStay()
-        ) === null
+    const qualified = room === null
       ? []
       : await restrictedResidents(room, userId);
     const via = remoteJoinCandidates(

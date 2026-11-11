@@ -61,6 +61,56 @@ suite.test('default creation publishes encryption and refuses plaintext messages
   assertEquals(cipher.status, 200, await cipher.clone().text());
 });
 
+suite.test('permissive encryption state has the same contract at creation, ordinary writes and upgrade', async () => {
+  const a = await suite.registerTestUser('policy-initial-parity', 'pw');
+  const token = a.access_token!;
+  try {
+    for (const content of [{}, { algorithm: 'unknown' }]) {
+      setConfigForTests({
+        encryption: {
+          allowunencryptedcreation: true,
+          allowunencryptedjoining: true,
+        },
+      });
+      const made = await call(token, 'createRoom', {
+        initial_state: [{ type: 'm.room.encryption', state_key: '', content }],
+      });
+      const room = encodeURIComponent(made.room_id);
+      assertEquals(
+        await call(token, 'rooms/' + room + '/state/m.room.encryption/'),
+        content,
+      );
+      await call(
+        token,
+        'rooms/' + room + '/state/m.room.encryption/',
+        content,
+        'PUT',
+      );
+      const upgraded = await call(token, 'rooms/' + room + '/upgrade', {
+        new_version: '12',
+      });
+      assertEquals(
+        await call(
+          token,
+          'rooms/' + encodeURIComponent(upgraded.replacement_room) +
+            '/state/m.room.encryption/',
+        ),
+        content,
+      );
+      setConfigForTests({ encryption: { allowunencryptedcreation: false } });
+      await call(
+        token,
+        'createRoom',
+        { initial_state: [{ type: 'm.room.encryption', content }] },
+        'POST',
+        400,
+      );
+    }
+  } finally {
+    reset();
+  }
+});
+
 suite.test('creation preserves supported settings, rejects contradictory plans atomically, exempts only spaces', async () => {
   reset();
   const a = await suite.registerTestUser('policy-create', 'pw');

@@ -12,6 +12,10 @@ import {
   joinByIdOrAlias,
   remoteJoinCandidates,
 } from '#engine/client/membership.ts';
+import {
+  restrictedResidents,
+  withRestrictedAdmission,
+} from '#engine/room/restricted.ts';
 
 const { matrix, registerTestUser, test } = httpSuite(
   'HTTP restricted membership',
@@ -114,6 +118,47 @@ test('versioned restricted authorization: eligibility, invite bypass, malformed 
       403,
     );
   }
+});
+
+test('ordinary admission avoids auth closure; archived resident discovery checks its own snapshot', async () => {
+  const owner = await registerTestUser('restricted-lazy-owner', 'pw');
+  const guest = await registerTestUser('restricted-lazy-guest', 'pw');
+  const made = await call('createRoom', owner.access_token!, {
+    preset: 'public_chat',
+  });
+  assertEquals(made.status, 200);
+  const room = await requireRoom(made.body.room_id);
+  const original = room.tx;
+  let fullStateReads = 0;
+  room.tx = (fn) =>
+    original(async (tx) => {
+      const groupMap = tx.state.groupMap;
+      tx.state.groupMap = (...args) => {
+        fullStateReads++;
+        return groupMap(...args);
+      };
+      return await fn(tx);
+    });
+  try {
+    await withRestrictedAdmission(
+      room,
+      guest.user_id!,
+      theApp().tenant.serverName,
+      () => null,
+    );
+  } finally {
+    room.tx = original;
+  }
+  console.log(JSON.stringify({ ordinaryJoinFullStateReads: fullStateReads }));
+  assertEquals(fullStateReads, 0);
+  assertEquals(
+    (await call(
+      'rooms/' + encodeURIComponent(room.id) + '/leave',
+      owner.access_token!,
+    )).status,
+    200,
+  );
+  assertEquals(await restrictedResidents(room, guest.user_id!), []);
 });
 
 test('federation restricted make/send: fresh eligibility, countersignature, foreign authorizer and missing knowledge', async () => {

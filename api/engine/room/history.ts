@@ -48,7 +48,67 @@ export type BackfillDeps = {
   keys: KeyResolver;
   fetcher: Fetcher;
   signal?: AbortSignal;
+  // Shared by a forward bridge's multiple pages, never reset per boundary.
+  budget?: HistoryBudget;
 };
+
+type HistoryBudget = {
+  signal: AbortSignal;
+  requests: number;
+  work: number;
+  exhausted: boolean;
+};
+
+class HistoryExhausted extends Error {}
+
+function historyDeps(
+  deps: BackfillDeps,
+): BackfillDeps & { budget: HistoryBudget } {
+  const budget = deps.budget ?? {
+    signal: deps.signal === undefined
+      ? AbortSignal.timeout(8000)
+      : AbortSignal.any([deps.signal, AbortSignal.timeout(8000)]),
+    requests: 128,
+    work: 10_000,
+    exhausted: false,
+  };
+  return { ...deps, signal: budget.signal, budget };
+}
+
+function spend(budget: HistoryBudget, work: number, requests = 0): boolean {
+  if (
+    budget.exhausted || budget.signal.aborted ||
+    budget.work < work || budget.requests < requests
+  ) {
+    budget.exhausted = true;
+    return false;
+  }
+  budget.work -= work;
+  budget.requests -= requests;
+  return true;
+}
+
+// Bound even an injected fetcher that fails to honor cancellation. Real
+// federation fetches also receive the signal, so the transport closes its I/O.
+async function historyFetch<T>(
+  deps: BackfillDeps,
+  read: () => Promise<T | null>,
+): Promise<T | null> {
+  const signal = deps.signal!;
+  return await fetchOrNull(async () => {
+    signal.throwIfAborted();
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(signal.reason);
+      signal.addEventListener('abort', abort, { once: true });
+    });
+    try {
+      return await Promise.race([read(), cancelled]);
+    } finally {
+      signal.removeEventListener('abort', abort);
+    }
+  });
+}
 
 export type BackfillResult = {
   // filled: the gap moved; complete: the gap closed (all boundary prevs
@@ -80,12 +140,15 @@ async function fetchBoundary(
   version: string,
   deps: BackfillDeps,
 ): Promise<{ boundary: StateMap; pack: Map<string, Pdu> } | null> {
-  const ids = await fetchOrNull(() =>
-    deps.fetcher.stateIds(room.id, at, via, deps.signal)
+  const budget = deps.budget!;
+  if (!spend(budget, 1, 1)) return null;
+  const ids = await historyFetch(
+    deps,
+    () => deps.fetcher.stateIds(room.id, at, via, deps.signal),
   );
   if (ids === null) return null;
+  if (!spend(budget, ids.pduIds.length + ids.authChainIds.length)) return null;
   const wanted = [...new Set([...ids.pduIds, ...ids.authChainIds])].sort();
-  if (wanted.length > 10_000) return null;
   const unknown = await room.tx(async (tx) => {
     const out: string[] = [];
     for (const id of wanted) {
@@ -95,9 +158,10 @@ async function fetchBoundary(
   });
   const pack = new Map<string, Pdu>();
   for (const id of unknown) {
-    deps.signal?.throwIfAborted();
-    const raw = await fetchOrNull(() =>
-      deps.fetcher.event(id, via, room.id, deps.signal)
+    if (!spend(budget, 1, 1)) return null;
+    const raw = await historyFetch(
+      deps,
+      () => deps.fetcher.event(id, via, room.id, deps.signal),
     );
     if (raw === null) return null;
     try {
@@ -118,7 +182,7 @@ async function fetchBoundary(
         const row = await tx.events.get(id);
         return row === null ? null : (JSON.parse(row.pdu) as Pdu);
       });
-    if (pdu === null || pdu.state_key === undefined) continue;
+    if (pdu === null || pdu.state_key === undefined) return null;
     boundary.set(String(pdu.type) + '\0' + String(pdu.state_key), id);
   }
   return { boundary, pack };
@@ -141,7 +205,8 @@ export async function bridgeForwardAnchor(
   limit: number,
   deps: BackfillDeps,
 ): Promise<boolean> {
-  const signal = deps.signal ?? AbortSignal.timeout(8000);
+  deps = historyDeps(deps);
+  const signal = deps.signal!;
   const boundaries = await room.tx(async (tx) => {
     const out: { stay: number; segment?: number; from: string[] }[] = [];
     const segments = await tx.segments.list();
@@ -208,6 +273,8 @@ export async function backfill(
   },
   deps: BackfillDeps,
 ): Promise<BackfillResult> {
+  deps = historyDeps(deps);
+  const budget = deps.budget!;
   const empty: BackfillResult = {
     outcome: 'open',
     segment: null,
@@ -232,22 +299,26 @@ export async function backfill(
   // verified. A fetch/verify failure drops the event; nothing verified
   // means the gap is unresolved.
   let answered: Pdu[];
+  if (!spend(budget, 1, args.anchor === undefined ? 1 : 0)) return empty;
   try {
     answered = args.anchor !== undefined
       ? [args.anchor]
-      : await deps.fetcher.backfill(
-        room.id,
-        args.from,
-        args.limit,
-        args.via,
-        deps.signal,
-      );
+      : await historyFetch(deps, () =>
+        deps.fetcher.backfill(
+          room.id,
+          args.from,
+          args.limit,
+          args.via,
+          deps.signal,
+        )) ?? [];
   } catch {
     return empty;
   }
   const page: PageItem[] = [];
+  if (!spend(budget, answered.length)) return empty;
   const seen = new Set<string>();
   for (const raw of answered) {
+    if (!spend(budget, 0)) return empty;
     try {
       const v = await verify(raw, version, deps.keys, {
         roomId: room.id,
@@ -317,6 +388,7 @@ export async function backfill(
   const evidencePack = new Map<string, Pdu>();
   const groundedPage = new Set<string>();
   for (const item of ordered) {
+    if (!spend(budget, 0)) return empty;
     if (heldGrounded.has(item.eventId)) {
       // already grounded (the overlap) — first writer wins; it still
       // grounds its page children
@@ -353,336 +425,356 @@ export async function backfill(
     groundedPage.add(item.eventId);
   }
 
-  const written = await withRoomLock(room.id, () =>
-    room.tx(async (tx) => {
-      // Revalidation (G8): the fetch phase ran unlocked.
-      deps.signal?.throwIfAborted();
-      // A policy refusal is the same unresolved page as a refused fetch, not a
-      // caller exception. Every pagination/search caller can keep its local
-      // result and try the next peer; storage faults still propagate.
-      if (!await aclAllows(tx, args.via)) return empty;
-      const stay = args.stay === undefined
-        ? (await tx.segments.openStay()) ?? await tx.segments.latestStay()
-        : await tx.segments.get(args.stay);
-      if (stay === null || stay.kind !== 'stay') {
-        throw new Error('E_ROOM_ARCHIVED: no stay for ' + room.id);
-      }
-      const rulebook = getRulebook(await roomVersionOf(tx, stay.id));
-      const createId = await roomCreateId(tx, stay.id);
-      let history = args.segment === undefined
-        ? args.anchor === undefined && !args.isolated
-          ? await tx.segments.historyOf(stay.id)
-          : null
-        : await tx.segments.get(args.segment);
-      if (
-        args.segment !== undefined &&
-        (history === null || history.kind === 'stay' ||
-          history.prev !== stay.id)
-      ) {
-        throw new Error('E_HISTORY_OWNER: invalid history target');
-      }
-      if (history === null && args.anchor === undefined && !args.isolated) {
-        const id = await tx.segments.create({
-          kind: args.isolated ? 'anchor' : 'history',
-          prev: stay.id,
-          opened_by: args.anchor === undefined ? null : ordered[0].eventId,
-        });
-        history = (await tx.segments.get(id))!;
-      }
-
-      // The rulebook store: held events plus the page and the fetched
-      // evidence; rejections decided in this pass ride along.
-      const seeds = new Set<string>();
-      for (const item of ordered) {
-        for (const id of item.pdu.auth_events ?? []) seeds.add(id);
-      }
-      for (const [id, pdu] of evidencePack) {
-        seeds.add(id);
-        for (const auth of pdu.auth_events ?? []) seeds.add(auth);
-      }
-      for (const classification of classified.values()) {
-        if (classification.kind === 'imported') {
-          for (const id of classification.boundary.values()) seeds.add(id);
+  if (!spend(budget, 0)) return empty;
+  let written: BackfillResult;
+  try {
+    written = await withRoomLock(room.id, () =>
+      room.tx(async (tx) => {
+        // Revalidation (G8): the fetch phase ran unlocked.
+        if (!spend(budget, 0)) return empty;
+        // A policy refusal is the same unresolved page as a refused fetch, not a
+        // caller exception. Every pagination/search caller can keep its local
+        // result and try the next peer; storage faults still propagate.
+        if (!await aclAllows(tx, args.via)) return empty;
+        const stay = args.stay === undefined
+          ? (await tx.segments.openStay()) ?? await tx.segments.latestStay()
+          : await tx.segments.get(args.stay);
+        if (stay === null || stay.kind !== 'stay') {
+          throw new Error('E_ROOM_ARCHIVED: no stay for ' + room.id);
         }
-      }
-      const candidates = new Map<string, PageItem>();
-      for (const [eventId, pdu] of evidencePack) {
-        candidates.set(eventId, { eventId, pdu });
-      }
-      for (const item of ordered) {
-        candidates.set(item.eventId, item);
-      }
-      const allOrdered = orderEvents([...candidates.values()], [
-        'prev_events',
-        'auth_events',
-      ], (item) => {
-        const c = classified.get(item.eventId);
-        return c?.kind === 'imported' ? [...c.boundary.values()] : [];
-      });
-      const localRejected = new Set<string>(candidates.keys());
-      const store: EventStore = await loadRulebookStore(tx, [...seeds], [
-        ...candidates.values().map((item) => item.pdu),
-      ], localRejected);
-
-      // The page, in topology order: each event's own auth-chain and
-      // state-before checks, explicit before/after refs, first-owner
-      // positions. Rejected events get pass-through refs and no
-      // position; already-grounded events are the overlap (first writer
-      // wins — never relocated).
-      type Stored = {
-        id: string;
-        pdu: Pdu;
-        standing: 'accepted' | 'rejected';
-        reason: 'auth' | 'state' | null;
-        rule: string | null;
-        grounding: 'grounded' | 'evidence';
-      };
-      const stored: Stored[] = [];
-      const overlapped: string[] = [];
-      const positionedCandidates = new Set(ordered.map((item) => item.eventId));
-      for (const item of allOrdered) {
-        localRejected.delete(item.eventId);
-        if (!positionedCandidates.has(item.eventId)) {
-          const { eventId: id, pdu } = item;
-          if ((await tx.events.get(id)) !== null) continue;
-          const chain = checkDeclaredAuth(pdu, rulebook, store, createId);
-          if (!chain.ok) localRejected.add(id);
-          await tx.events.insert(
-            id,
-            canonicalJson(pdu as unknown as Record<string, unknown>),
-          );
-          await tx.events.setStatus(id, {
-            standing: chain.ok ? 'accepted' : 'rejected',
-            grounding: 'evidence',
-            origin: args.via,
-            received_ts: Date.now(),
-          });
-          await tx.changes.append('event', id, {
-            standing: chain.ok ? 'accepted' : 'rejected',
-            reason: chain.ok ? null : 'auth',
-            rule: chain.ok ? null : chain.rule,
-            type: pdu.type,
-            state_key: pdu.state_key ?? null,
-            sender: pdu.sender,
-            depth: pdu.depth,
-            origin_server_ts: pdu.origin_server_ts,
-            stay: null,
-            offset: null,
-            grounding: 'evidence',
-            origin: args.via,
-          });
-          continue;
-        }
-        const existing = await tx.events.get(item.eventId);
-        const refs = existing === null
-          ? null
-          : await tx.state.eventStateAfter(item.eventId);
-        if (existing !== null && refs !== null) {
-          // the overlap: first writer wins, never relocated — and it
-          // CLOSES this segment's gap: what lies behind the held event
-          // belongs to the segment it lives in (the walk's frontier
-          // there), not to this history segment
-          overlapped.push(item.eventId);
-          continue;
-        }
-        const absent = await ungroundedPrevs(tx, item.pdu.prev_events ?? []);
-        const classification = classified.get(item.eventId)!;
-        const invalidBoundary = classification.kind === 'imported' &&
-          !authorizedBoundary(classification.boundary, store, createId);
+        const rulebook = getRulebook(await roomVersionOf(tx, stay.id));
+        const createId = await roomCreateId(tx, stay.id);
+        let history = args.segment === undefined
+          ? args.anchor === undefined && !args.isolated
+            ? await tx.segments.historyOf(stay.id)
+            : null
+          : await tx.segments.get(args.segment);
         if (
-          absent.length > 0 &&
-          (classification.kind !== 'imported' || invalidBoundary)
+          args.segment !== undefined &&
+          (history === null || history.kind === 'stay' ||
+            history.prev !== stay.id)
         ) {
-          // the boundary fetch failed for it (or for a page parent):
-          // evidence — held, auth-checked, never positioned
-          const chain = invalidBoundary
-            ? { ok: false as const, rule: 'unverifiable' }
-            : checkDeclaredAuth(item.pdu, rulebook, store, createId);
-          if (!chain.ok) localRejected.add(item.eventId);
+          throw new Error('E_HISTORY_OWNER: invalid history target');
+        }
+        if (history === null && args.anchor === undefined && !args.isolated) {
+          const id = await tx.segments.create({
+            kind: args.isolated ? 'anchor' : 'history',
+            prev: stay.id,
+            opened_by: args.anchor === undefined ? null : ordered[0].eventId,
+          });
+          history = (await tx.segments.get(id))!;
+        }
+
+        // The rulebook store: held events plus the page and the fetched
+        // evidence; rejections decided in this pass ride along.
+        const seeds = new Set<string>();
+        for (const item of ordered) {
+          for (const id of item.pdu.auth_events ?? []) seeds.add(id);
+        }
+        for (const [id, pdu] of evidencePack) {
+          seeds.add(id);
+          for (const auth of pdu.auth_events ?? []) seeds.add(auth);
+        }
+        for (const classification of classified.values()) {
+          if (classification.kind === 'imported') {
+            for (const id of classification.boundary.values()) seeds.add(id);
+          }
+        }
+        const candidates = new Map<string, PageItem>();
+        for (const [eventId, pdu] of evidencePack) {
+          candidates.set(eventId, { eventId, pdu });
+        }
+        for (const item of ordered) {
+          candidates.set(item.eventId, item);
+        }
+        const allOrdered = orderEvents([...candidates.values()], [
+          'prev_events',
+          'auth_events',
+        ], (item) => {
+          const c = classified.get(item.eventId);
+          return c?.kind === 'imported' ? [...c.boundary.values()] : [];
+        });
+        const localRejected = new Set<string>(candidates.keys());
+        const store: EventStore = await loadRulebookStore(tx, [...seeds], [
+          ...candidates.values().map((item) => item.pdu),
+        ], localRejected);
+
+        // The page, in topology order: each event's own auth-chain and
+        // state-before checks, explicit before/after refs, first-owner
+        // positions. Rejected events get pass-through refs and no
+        // position; already-grounded events are the overlap (first writer
+        // wins — never relocated).
+        type Stored = {
+          id: string;
+          pdu: Pdu;
+          standing: 'accepted' | 'rejected';
+          reason: 'auth' | 'state' | null;
+          rule: string | null;
+          grounding: 'grounded' | 'evidence';
+        };
+        const stored: Stored[] = [];
+        const overlapped: string[] = [];
+        const positionedCandidates = new Set(
+          ordered.map((item) => item.eventId),
+        );
+        for (const item of allOrdered) {
+          if (!spend(budget, 0)) throw new HistoryExhausted();
+          localRejected.delete(item.eventId);
+          if (!positionedCandidates.has(item.eventId)) {
+            const { eventId: id, pdu } = item;
+            if ((await tx.events.get(id)) !== null) continue;
+            const chain = checkDeclaredAuth(pdu, rulebook, store, createId);
+            if (!chain.ok) localRejected.add(id);
+            await tx.events.insert(
+              id,
+              canonicalJson(pdu as unknown as Record<string, unknown>),
+            );
+            await tx.events.setStatus(id, {
+              standing: chain.ok ? 'accepted' : 'rejected',
+              grounding: 'evidence',
+              origin: args.via,
+              received_ts: Date.now(),
+            });
+            await tx.changes.append('event', id, {
+              standing: chain.ok ? 'accepted' : 'rejected',
+              reason: chain.ok ? null : 'auth',
+              rule: chain.ok ? null : chain.rule,
+              type: pdu.type,
+              state_key: pdu.state_key ?? null,
+              sender: pdu.sender,
+              depth: pdu.depth,
+              origin_server_ts: pdu.origin_server_ts,
+              stay: null,
+              offset: null,
+              grounding: 'evidence',
+              origin: args.via,
+            });
+            continue;
+          }
+          const existing = await tx.events.get(item.eventId);
+          const refs = existing === null
+            ? null
+            : await tx.state.eventStateAfter(item.eventId);
+          if (existing !== null && refs !== null) {
+            // the overlap: first writer wins, never relocated — and it
+            // CLOSES this segment's gap: what lies behind the held event
+            // belongs to the segment it lives in (the walk's frontier
+            // there), not to this history segment
+            overlapped.push(item.eventId);
+            continue;
+          }
+          const absent = await ungroundedPrevs(tx, item.pdu.prev_events ?? []);
+          const classification = classified.get(item.eventId)!;
+          const invalidBoundary = classification.kind === 'imported' &&
+            !authorizedBoundary(classification.boundary, store, createId);
+          if (
+            absent.length > 0 &&
+            (classification.kind !== 'imported' || invalidBoundary)
+          ) {
+            // the boundary fetch failed for it (or for a page parent):
+            // evidence — held, auth-checked, never positioned
+            const chain = invalidBoundary
+              ? { ok: false as const, rule: 'unverifiable' }
+              : checkDeclaredAuth(item.pdu, rulebook, store, createId);
+            if (!chain.ok) localRejected.add(item.eventId);
+            if (existing === null) {
+              await tx.events.insert(
+                item.eventId,
+                canonicalJson(item.pdu as unknown as Record<string, unknown>),
+              );
+            }
+            await tx.events.setStatus(item.eventId, {
+              standing: chain.ok ? 'accepted' : 'rejected',
+              grounding: 'evidence',
+              origin: args.via,
+              received_ts: Date.now(),
+            });
+            stored.push({
+              id: item.eventId,
+              pdu: item.pdu,
+              standing: chain.ok ? 'accepted' : 'rejected',
+              reason: chain.ok ? null : 'auth',
+              rule: chain.ok ? null : chain.rule,
+              grounding: 'evidence',
+            });
+            continue;
+          }
+
+          // before(E): resolved from the prevs — or the imported boundary
+          // when some prev is genuinely absent (R5, G1)
+          let before: StateMap;
+          let beforeGroup: number;
+          let provenance: 'dag' | 'imported';
+          if (absent.length === 0) {
+            const prevs = await resolvePrevs(tx, item.pdu.prev_events ?? []);
+            before = await stateBefore(tx, prevs.afterGroups, rulebook, store);
+            beforeGroup = prevs.afterGroups.length === 1
+              ? prevs.afterGroups[0]
+              : await tx.materialize.newGroup(null, mapEntries(before));
+            provenance = 'dag';
+          } else {
+            before = (classification as { boundary: StateMap }).boundary;
+            beforeGroup = await tx.materialize.newGroup(
+              null,
+              mapEntries(before),
+            );
+            provenance = 'imported';
+          }
+
+          let standing: 'accepted' | 'rejected' = 'accepted';
+          let reason: 'auth' | 'state' | null = null;
+          let rule: string | null = null;
+          const chain = checkDeclaredAuth(item.pdu, rulebook, store, createId);
+          if (!chain.ok) {
+            standing = 'rejected';
+            reason = 'auth';
+            rule = chain.rule;
+          } else {
+            const state = rulebook.checkAuthAgainstState(
+              item.pdu,
+              before,
+              store,
+            );
+            if (!state.ok) {
+              standing = 'rejected';
+              reason = 'state';
+              rule = state.rule;
+            }
+          }
+          if (standing === 'rejected') localRejected.add(item.eventId);
+
+          let afterGroup = beforeGroup;
+          if (standing === 'accepted' && item.pdu.state_key !== undefined) {
+            afterGroup = await tx.materialize.newGroup(beforeGroup, [{
+              type: String(item.pdu.type),
+              state_key: String(item.pdu.state_key),
+              event: item.eventId,
+            }]);
+          }
+
           if (existing === null) {
             await tx.events.insert(
               item.eventId,
               canonicalJson(item.pdu as unknown as Record<string, unknown>),
             );
           }
+          const status = await tx.events.getStatus(item.eventId);
           await tx.events.setStatus(item.eventId, {
-            standing: chain.ok ? 'accepted' : 'rejected',
-            grounding: 'evidence',
+            standing,
+            grounding: 'grounded',
             origin: args.via,
             received_ts: Date.now(),
           });
+          await tx.materialize.setEventState(
+            item.eventId,
+            beforeGroup,
+            afterGroup,
+            provenance,
+          );
+          if (status !== null && status.grounding === 'pending') {
+            // a pending event promoted by the page: its prev waits are
+            // spent (the resume driver sees the grounded status)
+            for (const wait of await tx.waits.of(item.eventId)) {
+              if (wait.kind === 'prev') {
+                await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
+              }
+            }
+          }
           stored.push({
             id: item.eventId,
             pdu: item.pdu,
-            standing: chain.ok ? 'accepted' : 'rejected',
-            reason: chain.ok ? null : 'auth',
-            rule: chain.ok ? null : chain.rule,
-            grounding: 'evidence',
+            standing,
+            reason,
+            rule,
+            grounding: 'grounded',
           });
-          continue;
         }
 
-        // before(E): resolved from the prevs — or the imported boundary
-        // when some prev is genuinely absent (R5, G1)
-        let before: StateMap;
-        let beforeGroup: number;
-        let provenance: 'dag' | 'imported';
-        if (absent.length === 0) {
-          const prevs = await resolvePrevs(tx, item.pdu.prev_events ?? []);
-          before = await stateBefore(tx, prevs.afterGroups, rulebook, store);
-          beforeGroup = prevs.afterGroups.length === 1
-            ? prevs.afterGroups[0]
-            : await tx.materialize.newGroup(null, mapEntries(before));
-          provenance = 'dag';
-        } else {
-          before = (classification as { boundary: StateMap }).boundary;
-          beforeGroup = await tx.materialize.newGroup(null, mapEntries(before));
-          provenance = 'imported';
+        // First-owner positions (R8): accepted events only, oldest first,
+        // prepended below every existing offset — old cursors never
+        // renumber. An event that is also an auth/prev of live events was
+        // held as evidence and is promoted HERE (one position, first owner).
+        const positioned = stored
+          .filter((entry) =>
+            entry.grounding === 'grounded' && entry.standing === 'accepted'
+          )
+          .map((entry) => entry.id);
+        if (history === null && positioned.length > 0) {
+          const id = await tx.segments.create({
+            kind: 'anchor',
+            prev: stay.id,
+            opened_by: positioned[0],
+          });
+          history = (await tx.segments.get(id))!;
+        }
+        const offsets = history === null
+          ? []
+          : await tx.segments.prependPositions(history.id, positioned);
+        const offsetOf = new Map(
+          positioned.map((id, index) => [id, offsets[index]]),
+        );
+        for (const entry of stored) {
+          if (!spend(budget, 0)) throw new HistoryExhausted();
+          await tx.changes.append('history', entry.id, {
+            standing: entry.standing,
+            reason: entry.reason,
+            rule: entry.rule,
+            type: String(entry.pdu.type),
+            state_key: entry.pdu.state_key ?? null,
+            sender: String(entry.pdu.sender),
+            depth: entry.pdu.depth,
+            origin_server_ts: entry.pdu.origin_server_ts,
+            segment: history?.id ?? null,
+            offset: offsetOf.get(entry.id) ?? null,
+            grounding: entry.grounding,
+            origin: args.via,
+          });
         }
 
-        let standing: 'accepted' | 'rejected' = 'accepted';
-        let reason: 'auth' | 'state' | null = null;
-        let rule: string | null = null;
-        const chain = checkDeclaredAuth(item.pdu, rulebook, store, createId);
-        if (!chain.ok) {
-          standing = 'rejected';
-          reason = 'auth';
-          rule = chain.rule;
-        } else {
-          const state = rulebook.checkAuthAgainstState(item.pdu, before, store);
-          if (!state.ok) {
-            standing = 'rejected';
-            reason = 'state';
-            rule = state.rule;
-          }
-        }
-        if (standing === 'rejected') localRejected.add(item.eventId);
-
-        let afterGroup = beforeGroup;
-        if (standing === 'accepted' && item.pdu.state_key !== undefined) {
-          afterGroup = await tx.materialize.newGroup(beforeGroup, [{
-            type: String(item.pdu.type),
-            state_key: String(item.pdu.state_key),
-            event: item.eventId,
-          }]);
-        }
-
-        if (existing === null) {
-          await tx.events.insert(
-            item.eventId,
-            canonicalJson(item.pdu as unknown as Record<string, unknown>),
+        // The gap closes when every boundary event of the processed page
+        // (no parents inside the processed set) has all of its prevs
+        // grounded — the create is such an event; an imported boundary is
+        // not (the gap continues behind it). A held overlap event closes
+        // regardless of its own prevs: what lies behind it belongs to the
+        // segment it lives in, not to this one.
+        const processedIds = new Set(ordered.map((item) => item.eventId));
+        const overlappedIds = new Set(overlapped);
+        let complete = true;
+        for (const item of ordered) {
+          if (overlappedIds.has(item.eventId)) continue;
+          const inPage = (item.pdu.prev_events ?? []).some((prev) =>
+            processedIds.has(prev)
           );
-        }
-        const status = await tx.events.getStatus(item.eventId);
-        await tx.events.setStatus(item.eventId, {
-          standing,
-          grounding: 'grounded',
-          origin: args.via,
-          received_ts: Date.now(),
-        });
-        await tx.materialize.setEventState(
-          item.eventId,
-          beforeGroup,
-          afterGroup,
-          provenance,
-        );
-        if (status !== null && status.grounding === 'pending') {
-          // a pending event promoted by the page: its prev waits are
-          // spent (the resume driver sees the grounded status)
-          for (const wait of await tx.waits.of(item.eventId)) {
-            if (wait.kind === 'prev') {
-              await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
-            }
+          if (inPage) continue;
+          if (
+            (await ungroundedPrevs(tx, item.pdu.prev_events ?? [])).length > 0
+          ) {
+            complete = false;
+            break;
           }
         }
-        stored.push({
-          id: item.eventId,
-          pdu: item.pdu,
-          standing,
-          reason,
-          rule,
-          grounding: 'grounded',
-        });
-      }
-
-      // First-owner positions (R8): accepted events only, oldest first,
-      // prepended below every existing offset — old cursors never
-      // renumber. An event that is also an auth/prev of live events was
-      // held as evidence and is promoted HERE (one position, first owner).
-      const positioned = stored
-        .filter((entry) =>
-          entry.grounding === 'grounded' && entry.standing === 'accepted'
-        )
-        .map((entry) => entry.id);
-      if (history === null && positioned.length > 0) {
-        const id = await tx.segments.create({
-          kind: 'anchor',
-          prev: stay.id,
-          opened_by: positioned[0],
-        });
-        history = (await tx.segments.get(id))!;
-      }
-      const offsets = history === null
-        ? []
-        : await tx.segments.prependPositions(history.id, positioned);
-      const offsetOf = new Map(
-        positioned.map((id, index) => [id, offsets[index]]),
-      );
-      for (const entry of stored) {
-        await tx.changes.append('history', entry.id, {
-          standing: entry.standing,
-          reason: entry.reason,
-          rule: entry.rule,
-          type: String(entry.pdu.type),
-          state_key: entry.pdu.state_key ?? null,
-          sender: String(entry.pdu.sender),
-          depth: entry.pdu.depth,
-          origin_server_ts: entry.pdu.origin_server_ts,
-          segment: history?.id ?? null,
-          offset: offsetOf.get(entry.id) ?? null,
-          grounding: entry.grounding,
-          origin: args.via,
-        });
-      }
-
-      // The gap closes when every boundary event of the processed page
-      // (no parents inside the processed set) has all of its prevs
-      // grounded — the create is such an event; an imported boundary is
-      // not (the gap continues behind it). A held overlap event closes
-      // regardless of its own prevs: what lies behind it belongs to the
-      // segment it lives in, not to this one.
-      const processedIds = new Set(ordered.map((item) => item.eventId));
-      const overlappedIds = new Set(overlapped);
-      let complete = true;
-      for (const item of ordered) {
-        if (overlappedIds.has(item.eventId)) continue;
-        const inPage = (item.pdu.prev_events ?? []).some((prev) =>
-          processedIds.has(prev)
-        );
-        if (inPage) continue;
-        if (
-          (await ungroundedPrevs(tx, item.pdu.prev_events ?? [])).length > 0
-        ) {
-          complete = false;
-          break;
+        if (!spend(budget, 0)) throw new HistoryExhausted();
+        if (history === null) {
+          return complete
+            ? { outcome: 'complete' as const, segment: null, positioned }
+            : empty;
         }
-      }
-      if (history === null) {
-        return complete
-          ? { outcome: 'complete' as const, segment: null, positioned }
-          : empty;
-      }
-      if (complete) await tx.segments.close(history.id);
-      return {
-        outcome: complete
-          ? 'complete'
-          : positioned.length > 0
-          ? 'filled'
-          : 'open',
-        segment: history.id,
-        positioned,
-      } satisfies BackfillResult;
-    }));
+        if (complete) await tx.segments.close(history.id);
+        if (!spend(budget, 0)) throw new HistoryExhausted();
+        return {
+          outcome: complete
+            ? 'complete'
+            : positioned.length > 0
+            ? 'filled'
+            : 'open',
+          segment: history.id,
+          positioned,
+        } satisfies BackfillResult;
+      }));
+  } catch (error) {
+    if (error instanceof HistoryExhausted) return empty;
+    throw error;
+  }
   await projectAfterWrite(room.store, room.id);
   return written;
 }

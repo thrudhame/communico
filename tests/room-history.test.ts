@@ -5,7 +5,7 @@
 // page-edge state event takes the imported boundary (G1/G3), and a
 // failing state_ids lands evidence; history is never news (no
 // publication/delivery/membership change entries).
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { backfill } from '#engine/room/history.ts';
@@ -16,7 +16,11 @@ import { getRulebook } from '#engine/rulebook/index.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { verify } from '#engine/room/verify.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
-import { fakeFetcher, fakeKeyResolver } from './fixtures/remote.ts';
+import {
+  fakeFetcher,
+  fakeKeyResolver,
+  remoteEvent,
+} from './fixtures/remote.ts';
 import {
   fakeMessage,
   type FakeRoom,
@@ -122,6 +126,118 @@ async function offsetsOf(
     return out;
   });
 }
+
+Deno.test('backfill: one operation bounds requests across all independent boundaries', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store, {
+      roomId: '!history-budget:remote.test',
+      build: async (fr) => {
+        const live = [...fr.events.values()];
+        await fakeMessage(fr, 'gap');
+        const latest = await fakeMessage(fr, 'latest');
+        return { live, latest };
+      },
+    });
+    const page: Pdu[] = [];
+    for (let i = 0; i < 140; i++) {
+      page.push(
+        await remoteEvent(s.room.id, s.fr.server, s.fr.version, {
+          type: 'm.room.message',
+          sender: s.latest.sender,
+          content: { body: 'boundary ' + i },
+          prev_events: ['$missing-' + i],
+          auth_events: s.latest.auth_events,
+          depth: 100,
+        }),
+      );
+    }
+    const recording = fakeFetcher({ backfill: page });
+    await backfill(s.room, {
+      from: [s.gapTip],
+      limit: 200,
+      via: s.fr.server.name,
+    }, {
+      keys: s.deps.keys,
+      fetcher: recording.fetcher,
+    });
+    assert(
+      recording.calls.stateIds.length <= 127,
+      'the page request and all boundary reads share a 128-request budget: ' +
+        recording.calls.stateIds.length,
+    );
+  });
+});
+
+Deno.test('backfill: cancellation settles a stalled injected fetcher; storage faults still escape', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store, {
+      roomId: '!history-cancel:remote.test',
+      build: async (fr) => {
+        const live = [...fr.events.values()];
+        await fakeMessage(fr, 'gap');
+        return { live, latest: await fakeMessage(fr, 'latest') };
+      },
+    });
+    const abort = new AbortController();
+    const recording = fakeFetcher({
+      onBackfill: () => {
+        queueMicrotask(() => abort.abort());
+        return new Promise(() => {});
+      },
+    });
+    const args = { from: [s.gapTip], limit: 10, via: s.fr.server.name };
+    const out = await backfill(s.room, args, {
+      keys: s.deps.keys,
+      fetcher: recording.fetcher,
+      signal: abort.signal,
+    });
+    assertEquals(out, { outcome: 'open', segment: null, positioned: [] });
+    assertEquals(recording.calls.backfill.length, 1);
+    const original = s.room.tx.bind(s.room);
+    const duringWrite = new AbortController();
+    const cancelled = await fakeMessage(s.fr, 'cancelled-history');
+    const before = await s.room.tx((tx) => tx.changes.head());
+    s.room.tx = (body) =>
+      original(async (tx) => {
+        const insert = tx.events.insert;
+        tx.events.insert = async (id, pdu) => {
+          const result = await insert(id, pdu);
+          if (id === cancelled.event_id) duringWrite.abort();
+          return result;
+        };
+        return await body(tx);
+      });
+    try {
+      const rolledBack = await backfill(s.room, args, {
+        keys: s.deps.keys,
+        fetcher: fakeFetcher({ backfill: [cancelled] }).fetcher,
+        signal: duringWrite.signal,
+      });
+      assertEquals(rolledBack, {
+        outcome: 'open',
+        segment: null,
+        positioned: [],
+      });
+    } finally {
+      s.room.tx = original;
+    }
+    assertEquals(await s.room.tx((tx) => tx.changes.head()), before);
+    assertEquals(
+      await s.room.tx((tx) => tx.events.get(cancelled.event_id!)),
+      null,
+    );
+    s.room.tx = () => Promise.reject(new Error('storage-fault'));
+    try {
+      await assertRejects(
+        () => backfill(s.room, args, s.deps),
+        Error,
+        'storage-fault',
+      );
+    } finally {
+      s.room.tx = original;
+    }
+  });
+});
 
 Deno.test('backfill: a linear page lands oldest-first; evidence promoted first-owner; complete at the create', async () => {
   await withStore(async (store) => {
