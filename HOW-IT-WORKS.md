@@ -381,7 +381,10 @@ are not retried. Federation serves one held root and its immediate children only
 distinguishing known inaccessible children from unknown rooms. Neither endpoint
 joins rooms or expands the peer roster. The layered `hierarchy` settings control
 page sizes (50 default, 100 cap), optional depth cap (0 = unrestricted), session
-lifetime/capacity and retained traversal-room budget. Exhaustion fails explicitly,
+lifetime/capacity, per-user retained cursor capacity (100 by default, against
+1000 shared), and retained traversal-room budget. Repeated continuations reuse
+identical saved cursors without allocating another slot, while rechecking access.
+Exhaustion fails explicitly,
 not with a falsely complete partial walk. Sessions expire on process restart.
 (`api/engine/client/hierarchy.ts`)
 
@@ -392,7 +395,8 @@ departure cut for both messages and state, not later publications; declining an
 invitation does not grant private state. Initial messages use the shared local-only
 timeline walk and chronological output, real pagination tokens, and only the
 caller's room account data. Event polls arm listeners before reading, recheck
-access, and clean up on cancellation or timeout. Layered `peeking.maxevents`
+access using only history_visibility at the captured cut, and clean up on
+cancellation or timeout. Only initialSync materializes full state. Layered `peeking.maxevents`
 (default 50) and `peeking.maxtimeoutms` (default 30000) bound pages and waits.
 (`api/engine/client/peeking.ts`)
 
@@ -408,18 +412,28 @@ same tenant transaction as deactivation. Existing append-only change streams
 remain intact. (`api/engine/erasure.ts`, `api/engine/client/account.ts`,
 `api/engine/tenant/erasure.ts`)
 
+Persisted UIA flows use one expiry boundary for lookup and stage completion.
+The layered `uia.sessionseconds` defaults to Synapse's 48 hours; creation prunes
+expired rows and `uia.maxsessions` bounds retained flows (10000 default). Capacity
+refuses new flows with 429, never evicts an active continuation. No IP or user-agent
+metadata is retained. (`api/engine/tenant/uia.ts`)
+
 The tenant profile owner assembles legacy user columns and additional JSON field
 rows, and validates whole-profile byte limits inside the write transaction.
 Legacy setters use the same owner, avoiding independent size budgets. Public
 client and federation queries expose the assembled profile; room creation,
 joins and profile fan-out use only the legacy display/avatar projection.
 Custom null is a stored value, while DELETE removes the row. Deactivation clears
-both sources. (`api/engine/tenant/profiles.ts`)
+both sources. Profile fan-out attempts every joined room after saving the global
+profile. Partial failure returns 503 with failed_rooms, keeps failed membership
+content unchanged, and preserves successes in later rooms.
+(`api/engine/tenant/profiles.ts`, `api/engine/client/membership.ts`)
 
 Alias and profile discovery ask remote servers by default, including anonymous
 requests, through signed, admission-gated federation. `federation.lookups=known`
 restricts answers to held data; `none` disables remote lookup answers. Discovery
-never adds a participation roster entry.
+never adds a participation roster entry. Closed-mode lookup refusals do not
+populate the actionable pending queue or displace real participation requests.
 (`api/engine/federation/{discovery,gate}.ts`)
 
 Federation has its own request-signature/admission boundary and per-version

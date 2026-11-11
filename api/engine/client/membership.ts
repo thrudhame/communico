@@ -272,23 +272,46 @@ export async function propagateProfile(
     localpartOf(userId),
   );
   const value = profile?.[field];
+  const failures: { room: string; error: unknown }[] = [];
   for (const roomId of await joinedRooms(userId)) {
-    const row = (await stateAtSeq(roomId, null)).find((r) =>
-      r.type === 'm.room.member' && r.stateKey === userId
-    );
-    const content = { ...(row?.content ?? {}) };
-    if (value == null) delete content[field];
-    else content[field] = value;
-    const room = await requireRoom(roomId);
-    const { sendLocal } = await import('#engine/room/ingest.ts');
-    const res = await sendLocal(room, {
-      type: 'm.room.member',
-      state_key: userId,
-      sender: userId,
-      content,
-    }, app.tenant.signer());
-    if (res.standing === 'rejected') {
-      throw new MatrixError(403, 'M_FORBIDDEN', 'profile membership rejected');
+    try {
+      const row = (await stateAtSeq(roomId, null)).find((r) =>
+        r.type === 'm.room.member' && r.stateKey === userId
+      );
+      const content = { ...(row?.content ?? {}) };
+      if (value == null) delete content[field];
+      else content[field] = value;
+      const room = await requireRoom(roomId);
+      const { sendLocal } = await import('#engine/room/ingest.ts');
+      const res = await sendLocal(room, {
+        type: 'm.room.member',
+        state_key: userId,
+        sender: userId,
+        content,
+      }, app.tenant.signer());
+      if (res.standing === 'rejected') {
+        throw new MatrixError(
+          403,
+          'M_FORBIDDEN',
+          'profile membership rejected',
+        );
+      }
+    } catch (error) {
+      failures.push({ room: roomId, error });
     }
+  }
+  if (failures.length > 0) {
+    const error = new MatrixError(
+      503,
+      'M_UNKNOWN',
+      'profile saved but some room memberships were not updated',
+      {
+        errcode: 'M_UNKNOWN',
+        error: 'profile saved but some room memberships were not updated',
+        failed_rooms: failures.map((failure) => failure.room),
+      },
+    );
+    error.cause = new AggregateError(failures.map((failure) => failure.error));
+    throw error;
   }
 }

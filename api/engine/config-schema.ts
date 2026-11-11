@@ -41,8 +41,10 @@ export const SCHEMA = {
     maxdepth: 'int',
     sessionseconds: 'int',
     maxsessions: 'int',
+    maxsessionsperuser: 'int',
     maxrooms: 'int',
   },
+  uia: { sessionseconds: 'int', maxsessions: 'int' },
   peeking: {
     maxevents: 'int',
     maxtimeoutms: 'int',

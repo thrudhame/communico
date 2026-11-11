@@ -50,11 +50,16 @@ export async function admit(
   const mode = config().federation.mode;
   // (2) closed mode: the unverified claim is bucketed, then refused
   if (peer === null && mode === 'closed') {
+    if (ctx.kind === 'lookup') {
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        `server ${name} is not in this federation`,
+      );
+    }
     const detail = ctx.kind === 'inbound'
       ? ctx.endpoint
-      : ctx.kind === 'outbound'
-      ? `${ctx.user} - ${ctx.what}`
-      : ctx.what;
+      : `${ctx.user} - ${ctx.what}`;
     await recordPending(
       server,
       name,

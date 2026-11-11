@@ -55,7 +55,8 @@ export async function summaryAccessible(
       members.some((row) => domainOf(String(row.user)) === principal.origin)
     ) return true;
     const joined = await app.server.query(
-      "SELECT DISTINCT user FROM memberships WHERE membership='join'",
+      "SELECT DISTINCT user FROM memberships WHERE membership='join' AND substr(user,instr(user,':')+1)=?",
+      [principal.origin],
     );
     users.push(
       ...joined.map((row) => String(row.user)).filter((user) =>
