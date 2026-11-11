@@ -1,7 +1,6 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { RoomTx } from './index.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { precedes } from './causal.ts';
 
 // One dependency order for held/fetched event packs. Depth is only a stable
 // preference among ready events; remote depth can never precede dependencies.
@@ -84,36 +83,85 @@ export async function stableCausalOrder(
   });
 }
 
-/** Timestamp ties have no paging anchors. Meet nearby candidates from both
- * ends, preserving the existing cost contract for very old room prefixes. */
+/** Timestamp ties keep first-owner preference between unrelated branches.
+ * Read the shared ancestor DAG once, stopping below the lowest candidate's
+ * indexed height. Nearest candidate dependencies imply all transitive ties,
+ * without pairwise walks or reading an irrelevant old room prefix. */
 export async function causalOrder(
   tx: RoomTx,
   ids: string[],
 ): Promise<string[]> {
+  ids = [...new Set(ids)];
   if (ids.length < 2) return ids;
+  const candidates = new Set(ids);
+  const keys = await tx.events.orderKeys(ids);
+  if (keys.size !== ids.length) exhausted();
+  const floor = Math.min(...[...keys.values()].map((key) => key.height));
+  let remaining = 100_000;
+  const spend = () => {
+    if (--remaining < 0) exhausted();
+  };
+  const queue = [...ids];
+  const seen = new Set(ids);
+  const prevs = new Map<string, string[]>();
+  for (let i = 0; i < queue.length; i++) {
+    spend();
+    const id = queue[i];
+    if (keys.get(id)!.height <= floor) {
+      prevs.set(id, []);
+      continue;
+    }
+    const parents = await tx.events.prevsOf(id);
+    const missing = parents.filter((parent) => !keys.has(parent));
+    for (const [parent, key] of await tx.events.orderKeys(missing)) {
+      keys.set(parent, key);
+    }
+    const relevant: string[] = [];
+    for (const parent of parents) {
+      spend();
+      const key = keys.get(parent);
+      if (key === undefined || key.height < floor) continue;
+      if (key.height >= keys.get(id)!.height) exhausted();
+      relevant.push(parent);
+      if (!seen.has(parent)) {
+        seen.add(parent);
+        queue.push(parent);
+      }
+    }
+    prevs.set(id, relevant);
+  }
   const graph = new Map<string, string[]>();
   const children = new Map<string, string[]>();
   const rank = new Map<string, [number, number, string]>();
-  const budget = { remaining: 100_000 };
   for (const id of ids) {
     graph.set(id, []);
-    const pos = await tx.segments.positionOf(id);
+    const pos = keys.get(id)!;
     rank.set(id, [
-      pos?.segment ?? Number.MAX_SAFE_INTEGER,
-      pos?.offset ?? 0,
+      pos.segment,
+      pos.offset,
       id,
     ]);
   }
-  for (const parent of ids) {
-    for (const child of ids) {
-      if (parent === child) continue;
-      const related = await precedes(tx.events, parent, child, budget);
-      if (related === null) exhausted();
-      if (!related) continue;
-      graph.get(child)!.push(parent);
-      const next = children.get(parent) ?? [];
-      next.push(child);
-      children.set(parent, next);
+  const frontier = new Map<string, Set<string>>();
+  queue.sort((a, b) => keys.get(a)!.height - keys.get(b)!.height);
+  for (const id of queue) {
+    const nearest = new Set<string>();
+    for (const parent of prevs.get(id)!) {
+      for (const candidate of frontier.get(parent)!) {
+        spend();
+        nearest.add(candidate);
+      }
+    }
+    if (candidates.has(id)) {
+      graph.set(id, [...nearest]);
+      for (const parent of nearest) {
+        const next = children.get(parent) ?? [];
+        next.push(id);
+        children.set(parent, next);
+      }
+      frontier.set(id, new Set([id]));
+    } else {
+      frontier.set(id, nearest);
     }
   }
   const compare = (a: string, b: string) => {

@@ -49,7 +49,11 @@ suite.test('prev_batch reads the same historical membership via /members?at=', a
     })).status,
     200,
   );
-  const before = await sync(alice.access_token!);
+  const before = await sync(
+    alice.access_token!,
+    '&filter=' +
+      encodeURIComponent('{"room":{"timeline":{"types":["m.room.message"]}}}'),
+  );
   const prev = (joined(before, roomId).timeline as Json).prev_batch;
   assertEquals(
     (await call(base + '/join', bob.access_token!, 'POST', {})).status,
@@ -60,6 +64,12 @@ suite.test('prev_batch reads the same historical membership via /members?at=', a
   assertEquals((members.body.chunk as Json[]).map((e) => e.state_key).sort(), [
     alice.user_id,
   ]);
+  for (const at of ['unknown', 'c999999_0']) {
+    assertEquals(
+      (await call(base + '/members?at=' + at, alice.access_token!)).status,
+      400,
+    );
+  }
 });
 
 suite.test('late S2 fork off E1 survives later E3/E4 and filtered E5 in start-state', async () => {

@@ -39,6 +39,10 @@ const INDEXES = [
   'positions_event',
   'waits_waiting',
   'waits_expires',
+  'changes_event',
+  'changes_redaction_target',
+  'publications_change',
+  'segments_opener',
 ];
 
 Deno.test('room schema: tables and indexes land on create, version recorded', async () => {
@@ -65,7 +69,7 @@ Deno.test('room schema: tables and indexes land on create, version recorded', as
         `missing index ${name}`,
       );
     }
-    assertEquals(await room.query('SELECT v FROM meta'), [{ v: '2' }]);
+    assertEquals(await room.query('SELECT v FROM meta'), [{ v: '3' }]);
     await store.close();
     const again = await openStore(config(dir), {
       schemas: { room: roomSchema },

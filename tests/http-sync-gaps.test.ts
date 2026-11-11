@@ -30,6 +30,94 @@ function entry(body: Json, id: string) {
   return ((body.rooms as Json).join as Json)[id] as Json;
 }
 
+suite.test('filter and visibility omissions are not truncation; every nonempty timeline has a usable before cursor', async () => {
+  const app = theApp();
+  const alice = await suite.registerTestUser('gap-filter-a', 'pw');
+  const bob = await suite.registerTestUser('gap-filter-b', 'pw');
+  const signer = app.tenant.signer();
+  const { roomId } = await createRoom(app.store, {
+    creator: alice.user_id,
+    preset: 'public_chat',
+  }, signer);
+  const room = await openRoom(app.store, roomId);
+  await join(room, bob.user_id, signer);
+  const baseline = await sync(alice.access_token!);
+  const old = await sendLocal(room, {
+    type: 'm.room.message',
+    sender: alice.user_id,
+    content: { body: 'old' },
+  }, signer);
+  const first = await sync(alice.access_token!);
+  const kept = await sendLocal(room, {
+    type: 'm.room.message',
+    sender: alice.user_id,
+    content: { body: 'kept' },
+  }, signer);
+  await sendLocal(room, {
+    type: 'u.hidden',
+    sender: alice.user_id,
+    content: {},
+  }, signer);
+  const ignored = await suite.matrix(
+    new Request(
+      'http://x/_matrix/client/v3/user/' + encodeURIComponent(alice.user_id) +
+        '/account_data/m.ignored_user_list',
+      {
+        method: 'PUT',
+        headers: { Authorization: 'Bearer ' + alice.access_token },
+        body: JSON.stringify({ ignored_users: { [bob.user_id]: {} } }),
+      },
+    ),
+  );
+  assertEquals(ignored.status, 200);
+  await sendLocal(room, {
+    type: 'm.room.message',
+    sender: bob.user_id,
+    content: { body: 'ignored' },
+  }, signer);
+  for (const limit of [1, 100]) {
+    const result = entry(
+      await sync(alice.access_token!, '&since=' + first.next_batch, {
+        room: { timeline: { types: ['m.room.message'], limit } },
+      }),
+      roomId,
+    );
+    const timeline = result.timeline as Json;
+    assertEquals(
+      timeline.limited,
+      false,
+      'excluded events do not imply a missing eligible event',
+    );
+    assertEquals((timeline.events as Json[]).map((e) => e.event_id), [
+      kept.eventId,
+    ]);
+    const response = await suite.matrix(
+      new Request(
+        'http://x/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
+          '/messages?dir=b&limit=1&from=' +
+          encodeURIComponent(String(timeline.prev_batch)) + '&filter=' +
+          encodeURIComponent('{"types":["m.room.message"]}'),
+        { headers: { Authorization: 'Bearer ' + alice.access_token } },
+      ),
+    );
+    assertEquals(response.status, 200);
+    assertEquals(
+      ((await response.json()).chunk as Json[]).map((e) => e.event_id),
+      [old.eventId],
+    );
+  }
+  const trimmed = entry(
+    await sync(alice.access_token!, '&since=' + baseline.next_batch, {
+      room: { timeline: { types: ['m.room.message'], limit: 1 } },
+    }),
+    roomId,
+  ).timeline as Json;
+  assertEquals(trimmed.limited, true);
+  assertEquals((trimmed.events as Json[]).map((e) => e.event_id), [
+    kept.eventId,
+  ]);
+});
+
 suite.test('lazy full-state zero timeline keeps own membership in both state forms', async () => {
   const app = theApp();
   const alice = await suite.registerTestUser('gap-own', 'pw');

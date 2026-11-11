@@ -30,12 +30,20 @@ export async function canSeeEventAt(
   }
   const refs = await tx.state.eventReadState(eventId);
   if (refs === null) return false;
+  const contents = new Map<string, Record<string, unknown>>();
   const content = async (group: number, type: string, key: string) => {
     const id = await tx.state.groupKey(group, type, key);
-    const row = id === null ? null : await tx.events.get(id);
-    return row === null
-      ? {}
-      : JSON.parse(row.pdu).content as Record<string, unknown>;
+    if (id === null) return {};
+    if (!contents.has(id)) {
+      const row = await tx.events.get(id);
+      contents.set(
+        id,
+        row === null
+          ? {}
+          : JSON.parse(row.pdu).content as Record<string, unknown>,
+      );
+    }
+    return contents.get(id)!;
   };
   const atGroup = async (group: number) => ({
     hv: (await content(group, 'm.room.history_visibility', ''))

@@ -16,8 +16,22 @@ import { verify } from './verify.ts';
 async function unresolved(tx: RoomTx): Promise<boolean> {
   for (const segment of await tx.segments.list()) {
     if (segment.kind !== 'stay') {
-      if (segment.kind === 'anchor') return true;
       if (segment.status !== 'complete') return true;
+      if (segment.kind === 'anchor') {
+        const last = await tx.segments.positionsPage(
+          segment.id,
+          Number.MAX_SAFE_INTEGER,
+          'b',
+          1,
+        );
+        if (
+          last.length === 0 ||
+          (await tx.segments.step({
+              segment: segment.id,
+              offset: last[0].offset,
+            }, 'f')).kind === 'gap'
+        ) return true;
+      }
       continue;
     }
     const first = await tx.segments.positionsPage(
