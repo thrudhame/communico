@@ -73,6 +73,7 @@ async function withStore(
 type Scripted = {
   missingAnswers: Pdu[];
   stateIds: Map<string, { pdu_ids: string[]; auth_chain_ids: string[] }>;
+  states: Map<string, { pdus: Pdu[]; auth_chain: Pdu[] }>;
   events: Map<string, Pdu | null>;
   authChains: Map<string, Pdu[]>;
   missingBodies: Record<string, unknown>[];
@@ -84,6 +85,7 @@ function newScripted(): Scripted {
   return {
     missingAnswers: [],
     stateIds: new Map(),
+    states: new Map(),
     events: new Map(),
     authChains: new Map(),
     missingBodies: [],
@@ -113,6 +115,12 @@ function handlersOf(s: Scripted) {
           auth_chain_ids: fromRoom.authChainIds,
         },
       );
+    }
+    if (path.startsWith('/_matrix/federation/v1/state/')) {
+      const answer = s.states.get(req.url.searchParams.get('event_id') ?? '');
+      return answer === undefined
+        ? new Response(null, { status: 404 })
+        : Response.json(answer);
     }
     if (path.startsWith('/_matrix/federation/v1/event_auth/')) {
       const id = decodeURIComponent(path.split('/').pop()!);
@@ -279,6 +287,41 @@ async function msg(
     origin_server_ts: 1000 + depth,
   });
 }
+
+Deno.test('fetcher: bulk state uses signed room-scoped TLS and unwraps state/auth PDUs', async () => {
+  await withCa(async () => {
+    await withStore(async (store) => {
+      const b = await boot(store, { roomId: '!bulk-fetcher:test' });
+      try {
+        const pdu = wireOf(await msg(b, 'state payload', [b.joinId], 50));
+        b.scripted.states.set('$boundary', { pdus: [pdu], auth_chain: [pdu] });
+        assertEquals(
+          await b.deps.fetcher.state(b.g.roomId, '$boundary', b.remote.name),
+          { state: [pdu], authChain: [pdu] },
+        );
+        const request = b.fake.requests.at(-1)!;
+        assertEquals(request.method, 'GET');
+        assert(request.path.startsWith('/_matrix/federation/v1/state/'));
+        assert(request.verified);
+        assertEquals(
+          await b.deps.fetcher.state(b.g.roomId, '$unavailable', b.remote.name),
+          null,
+        );
+        assertEquals(
+          await b.deps.fetcher.state(
+            b.g.roomId,
+            '$boundary',
+            b.remote.name,
+            AbortSignal.abort(),
+          ),
+          null,
+        );
+      } finally {
+        await b.fake.close();
+      }
+    });
+  });
+});
 
 Deno.test('fetcher: the first contact acquires the peer key document (signed, cached) and verifies its PDUs', async () => {
   await withCa(async () => {

@@ -155,6 +155,7 @@ export type FetchCalls = {
     limit: number;
   }[];
   stateIds: string[]; // `at` event ids asked
+  state: string[];
   eventAuth: string[]; // event ids asked
   backfill: { from: string[]; limit: number; via: string }[];
   makeJoin: {
@@ -171,6 +172,7 @@ export type FetchCalls = {
 export function fakeFetcher(script: {
   missingEvents?: Pdu[];
   stateIds?: Map<string, { pduIds: string[]; authChainIds: string[] }>;
+  state?: Map<string, { state: Pdu[]; authChain: Pdu[] }>;
   event?: Map<string, Pdu | null>;
   eventAuth?: Map<string, Pdu[]>;
   backfill?: Pdu[] | ((from: string[], limit: number) => Pdu[]);
@@ -201,6 +203,7 @@ export function fakeFetcher(script: {
     event: [],
     missingEvents: [],
     stateIds: [],
+    state: [],
     eventAuth: [],
     backfill: [],
     makeJoin: [],
@@ -228,6 +231,16 @@ export function fakeFetcher(script: {
         if (script.onStateIds !== undefined) await script.onStateIds(at);
         const answer = script.stateIds?.get(at);
         return answer === undefined ? null : answer;
+      },
+      state: (_roomId, at) => {
+        calls.state.push(at);
+        const answer = script.state?.get(at);
+        return Promise.resolve(
+          answer === undefined ? null : {
+            state: answer.state.map(wireOf),
+            authChain: answer.authChain.map(wireOf),
+          },
+        );
       },
       eventAuth: async (_roomId, id) => {
         calls.eventAuth.push(id);

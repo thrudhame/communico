@@ -145,6 +145,26 @@ export function productionFetcher(
       }
     },
 
+    state: async (roomId, at, via, signal) => {
+      try {
+        const res = await federationRequest(server, signer, {
+          room: { store, id: roomId },
+          destination: via,
+          method: 'GET',
+          path: `/_matrix/federation/v1/state/${
+            encodeURIComponent(roomId)
+          }?event_id=${encodeURIComponent(at)}`,
+          body: null,
+          signal,
+          maxBytes: bulk(),
+        });
+        const j = jsonObject(res);
+        return { state: pdusOf(j, 'pdus'), authChain: pdusOf(j, 'auth_chain') };
+      } catch {
+        return null;
+      }
+    },
+
     // GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}.
     eventAuth: async (roomId, id, via) => {
       try {
