@@ -43,6 +43,7 @@ import { withRoomLock } from '#engine/room/lock.ts';
 import { orderEvents } from '#engine/room/order.ts';
 import { mapEntries } from '#engine/room/state.ts';
 import { verify } from '#engine/room/verify.ts';
+import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
 
 export type BackfillDeps = {
   keys: KeyResolver;
@@ -154,34 +155,29 @@ async function fetchBoundary(
   if (wanted.length > budget.work) return null;
   if (!spend(budget, wanted.length)) return null;
   const unknown = await room.tx(async (tx) => {
-    const out: string[] = [];
-    for (const id of wanted) {
-      if ((await tx.events.get(id)) === null) out.push(id);
-    }
-    return out;
+    const held = await tx.events.list(wanted);
+    return wanted.filter((id) => !held.has(id));
   });
-  if (unknown.length > budget.requests || unknown.length > budget.work) {
+  if (unknown.length > budget.work) {
     return null;
   }
-  const pack = new Map<string, Pdu>();
-  for (const id of unknown) {
-    if (!spend(budget, 1, 1)) return null;
-    const raw = await historyFetch(
-      deps,
-      () => deps.fetcher.event(id, via, room.id, deps.signal),
-    );
-    if (raw === null) return null;
-    try {
-      const v = await verify(raw, version, deps.keys, {
-        roomId: room.id,
-        exemptPrevAuthLimits: true,
-      });
-      if (v.eventId !== id) return null;
-      pack.set(id, v.pdu);
-    } catch {
-      return null;
-    }
-  }
+  const pack = await fetchBoundaryEvents(unknown, wanted.length, {
+    roomId: room.id,
+    at,
+    via,
+    version,
+    fetcher: deps.fetcher,
+    keys: deps.keys,
+    signal: deps.signal,
+    concurrency: 1,
+    active: () => spend(budget, 0),
+    work: () => spend(budget, 1),
+    canReadAll: (count) => count <= budget.requests && count <= budget.work,
+    read: (op) =>
+      spend(budget, 0, 1) ? historyFetch(deps, op) : Promise.resolve(null),
+    exemptPrevAuthLimits: true,
+  });
+  if (pack === null || pack.size !== unknown.length) return null;
   const boundary: StateMap = new Map();
   for (const id of ids.pduIds) {
     const pdu = pack.get(id) ??

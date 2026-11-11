@@ -119,6 +119,14 @@ too, without rewriting the stored target PDU.
 (`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,
 `api/engine/room/ingest.ts:654-681`)
 
+Inbound and history boundaries share one event retrieval strategy: after
+`/state_ids` and held-event deduplication, missing at least 10% of the required
+events selects bulk `/state`. Sparse sets and incomplete/unavailable snapshots
+use bounded `/event` reads. Only requested missing events with recomputed IDs
+and verified room-version signatures/hashes enter the evidence pack; complete
+boundary authorization and the original operation budgets still apply.
+(`api/engine/room/boundary-fetch.ts`)
+
 Recovery authorizes complete evidence graphs outside the mutation lock, reading
 and inserting at most 32 evidence events per transaction. Every snapshot and
 write revalidates the room change cut; concurrent ordinary writes can interleave

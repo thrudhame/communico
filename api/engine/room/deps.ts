@@ -66,6 +66,14 @@ export interface Fetcher {
     via: string,
     signal?: AbortSignal,
   ): Promise<{ pduIds: string[]; authChainIds: string[] } | null>;
+  // GET /_matrix/federation/v1/state/{roomId}?event_id=at. Dense boundary
+  // recovery avoids one signed round trip per missing state/auth event.
+  state(
+    roomId: string,
+    at: string,
+    via: string,
+    signal?: AbortSignal,
+  ): Promise<{ state: Pdu[]; authChain: Pdu[] } | null>;
   // GET /_matrix/federation/v1/event_auth/{roomId}/{eventId} — the
   // complete auth chain of the event (event_auth.yaml).
   eventAuth(roomId: string, id: string, via: string): Promise<Pdu[] | null>;

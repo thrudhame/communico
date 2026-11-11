@@ -36,6 +36,7 @@ import { withRoomLock } from '#engine/room/lock.ts';
 import { aclAllows, assertAcl } from '#engine/room/acl.ts';
 import { orderEvents } from '#engine/room/order.ts';
 import { stageRecoveryEvidence } from '#engine/room/recovery.ts';
+import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { identify, verify } from '#engine/room/verify.ts';
 
@@ -304,44 +305,25 @@ async function fetchGapTip(
   const authSet = new Set(ids.authChainIds);
   const wanted = [...new Set([...ids.pduIds, ...ids.authChainIds])].sort();
   const unknown = await room.tx(async (tx) => {
-    const out: string[] = [];
-    for (const id of wanted) {
-      if ((await tx.events.get(id)) === null) out.push(id);
-    }
-    return out;
+    const held = await tx.events.list(wanted);
+    return wanted.filter((id) => !held.has(id));
   });
-  const pack = new Map<string, Pdu>();
-  let corruptedAuth = false;
   // A state/auth boundary must not lose dependencies to the unrelated
   // get_missing_events batch size. The whole-batch time budget still
   // bounds fetching; an unfinished pack supplies no imported state.
-  // Independent reads overlap in bounded waves, then enter the pack in
-  // stable id order. Serial round trips can exhaust the budget even for
-  // an ordinary member auth chain; no network runs under the room lock.
-  const concurrency = 8;
-  for (let start = 0; start < unknown.length; start += concurrency) {
-    if (budget.until - Date.now() <= 0) return;
-    const wave = unknown.slice(start, start + concurrency);
-    const fetched = await Promise.all(wave.map(async (id) => {
-      const raw = await fetchOrNull(() =>
-        deps.fetcher.event(id, origin, room.id)
-      );
-      if (raw === null) return null;
-      try {
-        const v = await verify(raw, version, deps.keys, { roomId: room.id });
-        return v.eventId === id ? v.pdu : null;
-      } catch {
-        return null;
-      }
-    }));
-    if (budget.until - Date.now() <= 0) return;
-    for (const [index, pdu] of fetched.entries()) {
-      const id = wave[index];
-      if (pdu !== null) pack.set(id, pdu);
-      else if (authSet.has(id)) corruptedAuth = true;
-    }
-  }
-  if (budget.until - Date.now() <= 0) return;
+  const pack = await fetchBoundaryEvents(unknown, wanted.length, {
+    roomId: room.id,
+    at: tip,
+    via: origin,
+    version,
+    fetcher: deps.fetcher,
+    keys: deps.keys,
+    concurrency: 8,
+    active: () => budget.until > Date.now(),
+    read: (op) => fetchOrNull(op),
+  });
+  if (pack === null) return;
+  const corruptedAuth = unknown.some((id) => authSet.has(id) && !pack.has(id));
   // the tip itself via /event
   let tipPdu: Pdu | null = null;
   const rawTip = await fetchOrNull(() =>
