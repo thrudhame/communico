@@ -4,6 +4,30 @@ import versions from '#endpoints/matrix/_matrix/client/versions/get.ts';
 const root = new URL('../', import.meta.url);
 const expected = Array.from({ length: 16 }, (_, i) => `v1.${i + 1}`);
 
+function contractSuites(checklist: string): string[] {
+  return [
+    ...new Set(
+      checklist.split('\n').filter((line) => /^\|\s+\d+\s+\|\s+v1\./.test(line))
+        .flatMap((
+          line,
+        ) => [...(line.split('|')[4] ?? '').matchAll(/`([\w-]+)`/g)])
+        .map((match) => match[1]),
+    ),
+  ];
+}
+
+Deno.test('version suite parsing ignores prose and other table columns', () => {
+  assertEquals(
+    contractSuites([
+      'Prose references `http-not-a-suite`.',
+      '| 1 | v1.1 | A contract mentioning `http-not-a-suite` | `http-sync`, `e2ee-keys` |',
+      '| 2 | v1.2 | More | `http-sync`, `http-room-read` |',
+      '| 1 | `http-unrelated-table` | Other table |',
+    ].join('\n')),
+    ['http-sync', 'e2ee-keys', 'http-room-read'],
+  );
+});
+
 Deno.test('versions advertisement is cumulative and retains its endpoint/contract checklist', async () => {
   assertEquals((await versions()).versions, expected);
   const checklist = await Deno.readTextFile(
@@ -53,20 +77,7 @@ Deno.test('advertised version behavioral checklist executes at the real consumer
   const checklist = await Deno.readTextFile(
     new URL('MATRIX-VERSIONS.md', root),
   );
-  const files = [
-    ...new Set(
-      [...checklist.matchAll(/`([\w-]+)`/g)]
-        .map((match) => match[1]).filter((name) =>
-          name.startsWith('http-') ||
-          [
-            'e2ee-keys',
-            'push-evaluator',
-            'historical-identifiers',
-            'federation-acl',
-          ].includes(name)
-        ),
-    ),
-  ];
+  const files = contractSuites(checklist);
   assert(files.length > 20, 'behavioral checklist must not become empty');
   const dir = await Deno.makeTempDir({ prefix: 'versions-contracts-' });
   try {

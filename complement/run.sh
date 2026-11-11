@@ -116,7 +116,7 @@ while read -r test settings; do
   done
   SEEN[$test]=1
   TESTS+=("$test")
-  SETTINGS+=("$settings")
+  SETTINGS+=("${overrides[*]}")
 done < complement/settings.tsv
 
 # Enumerate the compiled top-level tests once. This lets each settings pass

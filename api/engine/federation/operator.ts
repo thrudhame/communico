@@ -47,7 +47,9 @@ export async function reviewOutbox(app: App, destination: string | null) {
         destination === null || r.destination === destination
       ),
     ],
-    statuses: await listPeerStatus(app.server),
+    statuses: (await listPeerStatus(app.server)).filter((status) =>
+      destination === null || status.destination === destination
+    ),
   };
 }
 

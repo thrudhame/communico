@@ -1,7 +1,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { startAdmin } from '#root/api/admin/index.ts';
 import { startFederationServices } from '#engine/app.ts';
-import { setConfigForTests } from '#engine/config.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
 import { recordPending } from '#engine/federation/peers.ts';
 import { ourKeyDocument } from '#engine/federation/keys.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
@@ -271,6 +271,64 @@ Deno.test('admin federation operations cross the socket and affect their consume
           ))[0].status,
           'rejected',
         );
+      },
+    );
+    await t.step(
+      'outbox destination selects statuses as well as queued work',
+      async () => {
+        await call('federation-outbox/retry', { destination: 'selected.test' });
+        await call('federation-outbox/retry', {
+          destination: 'status-only.test',
+        });
+        const selected = await call('federation-outbox/list', {
+          destination: 'selected.test',
+        });
+        assertEquals(
+          selected.statuses.map((s: { destination: string }) => s.destination),
+          ['selected.test'],
+        );
+        for (const body of [{}, { destination: null }]) {
+          const all = await call('federation-outbox/list', body);
+          assert(
+            all.statuses.some((s: { destination: string }) =>
+              s.destination === 'status-only.test'
+            ),
+          );
+        }
+      },
+    );
+    await t.step(
+      'real outbox CLI preserves future retry and expired age',
+      async () => {
+        const now = Date.now();
+        await app.server.execute(
+          'INSERT INTO peer_status(destination,next_attempt_ms,unreachable_since_ms) VALUES(?,?,?)',
+          ['clock.test', now + 125000, now - 125000],
+        );
+        await app.server.execute(
+          "INSERT INTO outbox(room,pos,destination,event,state,added_ms) VALUES('!clock:test',1,'clock.test','$clock','pending',?)",
+          [now - 125000 - config().federation.refusedmillihours * 3600],
+        );
+        const out = await new Deno.Command(Deno.execPath(), {
+          args: [
+            'run',
+            '--allow-env',
+            '--allow-read',
+            '--allow-write',
+            '--allow-net',
+            'tools/federation-outbox.ts',
+            'list',
+            'clock.test',
+          ],
+          env: { COMMUNICO_ADMIN_SOCKET: admin.path },
+          stdout: 'piped',
+          stderr: 'piped',
+        }).output();
+        assertEquals(out.code, 0, new TextDecoder().decode(out.stderr));
+        const text = new TextDecoder().decode(out.stdout);
+        assert(text.includes('next attempt in 2m'), text);
+        assert(text.includes('expired 2m ago'), text);
+        assert(!text.includes('from now'), text);
       },
     );
   } finally {

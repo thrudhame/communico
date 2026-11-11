@@ -8,14 +8,10 @@ cd "$REPO_ROOT"
 NAME="${CONTINUITY_NAME:-cc-continuity}"
 SERVER_NAME="${CONTINUITY_SERVER:-cont.local}"
 IMAGE="${COMPLEMENT_IMAGE:-communico-complement:local}"
+source "$REPO_ROOT/complement/readiness.sh"
 
 wait_ready() {
-  for i in $(seq 1 90); do
-    if timeout 5s docker exec "$NAME" curl -sf --max-time 3 localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
-      return
-    fi
-    sleep 1
-  done
+  wait_ready_within 90 docker exec "$NAME" curl -sf --max-time 3 localhost:8008/_matrix/client/versions && return 0
   timeout 10s docker logs "$NAME" >&2
   echo "container never healthy" >&2
   return 1
