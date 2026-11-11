@@ -4,8 +4,9 @@ import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
-import { openRoom, type Room } from '#engine/room/index.ts';
+import { openRoom, parseCursor, type Room } from '#engine/room/index.ts';
 import { membershipOf } from '#engine/server/read.ts';
+import { parseStreamToken } from './tokens.ts';
 
 export async function lookupRoom(roomId: string): Promise<Room | null> {
   try {
@@ -49,6 +50,47 @@ export type StateRow = {
   eventId: string;
   content: Record<string, unknown>;
 };
+
+/** Translate either sync bookmark form to its live publication cut. Unknown
+ * tokens are errors, never an omitted cut that leaks newer room membership. */
+export async function stateAtToken(
+  roomId: string,
+  raw: string | null,
+  leaveAt: number | null,
+): Promise<StateRow[]> {
+  let seq = leaveAt;
+  if (raw !== null) {
+    const stream = parseStreamToken(raw);
+    let requested = stream?.eSeq;
+    if (requested === undefined) {
+      const cursor = parseCursor(raw);
+      if (cursor === null) {
+        throw new MatrixError(400, 'M_INVALID_PARAM', 'unknown state token');
+      }
+      const room = await requireRoom(roomId);
+      const position = await room.tx((tx) =>
+        tx.segments.positionsPage(cursor.segment, cursor.offset, 'f', 1)
+      );
+      const event = position[0]?.offset === cursor.offset
+        ? position[0].event
+        : null;
+      const rows = event === null ? [] : await theApp().server.query(
+        'SELECT seq FROM feed WHERE room=? AND event=? LIMIT 1',
+        [roomId, event],
+      );
+      if (rows.length === 0) {
+        throw new MatrixError(
+          400,
+          'M_INVALID_PARAM',
+          'unknown sync state token',
+        );
+      }
+      requested = Number(rows[0].seq) - 1;
+    }
+    seq = leaveAt === null ? requested : Math.min(requested, leaveAt);
+  }
+  return await stateAtSeq(roomId, seq);
+}
 
 export async function stateAtSeq(
   roomId: string,
