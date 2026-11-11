@@ -179,7 +179,28 @@ async function roomTimeline(
     : eligible;
   const returned = selected.map((item) => item.row);
   const events = selected.map((item) => item.event);
-  const limited = gap || trimmed;
+  let joinGap = false;
+  const since = i.since?.eSeq;
+  if (
+    summary && since !== undefined &&
+    snapshot.members.some((row) =>
+      row.user === i.userId && Number(row.seq) > since
+    )
+  ) {
+    const previous = await stateAtSeq(room, since);
+    if (
+      !previous.some((row) =>
+        row.type === 'm.room.member' && row.stateKey === i.userId &&
+        row.content.membership === 'join'
+      )
+    ) {
+      // A global since token does not mean this newly joined client has seen
+      // the room's earlier history. Keep that real discontinuity paginatable.
+      joinGap = (await feedBefore(app.server, room.id, 0, since, 1))
+        .length > 0;
+    }
+  }
+  const limited = gap || trimmed || joinGap;
   const start = returned[0];
   const atStart = await stateAtSeq(
     room,
@@ -240,7 +261,9 @@ async function roomTimeline(
     if (ev !== null) stateEvents.push(ev);
   }
   const prevE = trimmed && returned.length ? returned[0].seq - 1 : end;
-  const paginationCursor = start !== undefined
+  // Like Synapse, an untrimmed window retains its captured end cut. Only a
+  // limited window needs a before-event cursor for the missing older history.
+  const paginationCursor = limited && start !== undefined
     ? await room.tx((tx) => tx.segments.positionOf(start.event))
     : null;
   const entry: Record<string, unknown> = {

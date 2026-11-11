@@ -30,7 +30,7 @@ function entry(body: Json, id: string) {
   return ((body.rooms as Json).join as Json)[id] as Json;
 }
 
-suite.test('filter and visibility omissions are not truncation; every nonempty timeline has a usable before cursor', async () => {
+suite.test('filter and visibility omissions retain end cuts; limited windows have usable before cursors', async () => {
   const app = theApp();
   const alice = await suite.registerTestUser('gap-filter-a', 'pw');
   const bob = await suite.registerTestUser('gap-filter-b', 'pw');
@@ -53,7 +53,7 @@ suite.test('filter and visibility omissions are not truncation; every nonempty t
     sender: alice.user_id,
     content: { body: 'kept' },
   }, signer);
-  await sendLocal(room, {
+  const hidden = await sendLocal(room, {
     type: 'u.hidden',
     sender: alice.user_id,
     content: {},
@@ -76,12 +76,10 @@ suite.test('filter and visibility omissions are not truncation; every nonempty t
     content: { body: 'ignored' },
   }, signer);
   for (const limit of [1, 100]) {
-    const result = entry(
-      await sync(alice.access_token!, '&since=' + first.next_batch, {
-        room: { timeline: { types: ['m.room.message'], limit } },
-      }),
-      roomId,
-    );
+    const body = await sync(alice.access_token!, '&since=' + first.next_batch, {
+      room: { timeline: { types: ['m.room.message'], limit } },
+    });
+    const result = entry(body, roomId);
     const timeline = result.timeline as Json;
     assertEquals(
       timeline.limited,
@@ -91,20 +89,26 @@ suite.test('filter and visibility omissions are not truncation; every nonempty t
     assertEquals((timeline.events as Json[]).map((e) => e.event_id), [
       kept.eventId,
     ]);
-    const response = await suite.matrix(
-      new Request(
-        'http://x/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
-          '/messages?dir=b&limit=1&from=' +
-          encodeURIComponent(String(timeline.prev_batch)) + '&filter=' +
-          encodeURIComponent('{"types":["m.room.message"]}'),
-        { headers: { Authorization: 'Bearer ' + alice.access_token } },
-      ),
-    );
-    assertEquals(response.status, 200);
-    assertEquals(
-      ((await response.json()).chunk as Json[]).map((e) => e.event_id),
-      [old.eventId],
-    );
+    assertEquals(timeline.prev_batch, body.next_batch);
+    let from = String(timeline.prev_batch);
+    const found: unknown[] = [];
+    for (let page = 0; page < 3; page++) {
+      const response = await suite.matrix(
+        new Request(
+          'http://x/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
+            '/messages?dir=b&limit=1&from=' + encodeURIComponent(from),
+          { headers: { Authorization: 'Bearer ' + alice.access_token } },
+        ),
+      );
+      assertEquals(response.status, 200);
+      const body = await response.json() as Json;
+      found.push(...(body.chunk as Json[]).map((event) => event.event_id));
+      if (page < 2) {
+        assert(typeof body.end === 'string');
+        from = body.end;
+      }
+    }
+    assertEquals(found, [hidden.eventId, kept.eventId]);
   }
   const trimmed = entry(
     await sync(alice.access_token!, '&since=' + baseline.next_batch, {
@@ -116,6 +120,93 @@ suite.test('filter and visibility omissions are not truncation; every nonempty t
   assertEquals((trimmed.events as Json[]).map((e) => e.event_id), [
     kept.eventId,
   ]);
+  const page = await suite.matrix(
+    new Request(
+      'http://x/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
+        '/messages?dir=b&limit=1&from=' +
+        encodeURIComponent(String(trimmed.prev_batch)) + '&filter=' +
+        encodeURIComponent('{"types":["m.room.message"]}'),
+      { headers: { Authorization: 'Bearer ' + alice.access_token } },
+    ),
+  );
+  assertEquals(page.status, 200);
+  assertEquals(
+    ((await page.json()).chunk as Json[]).map((e) => e.event_id),
+    [old.eventId],
+  );
+});
+
+suite.test('a newly joined room retains a real missing prefix across a global since cut', async () => {
+  const app = theApp();
+  const alice = await suite.registerTestUser('gap-join-a', 'pw');
+  const bob = await suite.registerTestUser('gap-join-b', 'pw');
+  const signer = app.tenant.signer();
+  const { roomId } = await createRoom(app.store, {
+    creator: alice.user_id,
+    preset: 'public_chat',
+  }, signer);
+  const room = await openRoom(app.store, roomId);
+  const old: string[] = [];
+  const recent: string[] = [];
+  const message = async (body: string) =>
+    (await sendLocal(room, {
+      type: 'm.room.message',
+      sender: alice.user_id,
+      content: { body },
+    }, signer)).eventId;
+  for (let n = 0; n < 4; n++) old.push(await message('old-' + n));
+  const before = await sync(bob.access_token!);
+  for (let n = 0; n < 4; n++) recent.push(await message('recent-' + n));
+  await join(room, bob.user_id, signer);
+  for (const after of [false, true]) {
+    const timeline = entry(
+      await sync(
+        bob.access_token!,
+        '&since=' + before.next_batch + '&use_state_after=' + after,
+        { room: { timeline: { types: ['m.room.message'], limit: 10 } } },
+      ),
+      roomId,
+    ).timeline as Json;
+    assertEquals(
+      (timeline.events as Json[]).map((event) => event.event_id),
+      recent,
+    );
+    assertEquals(
+      timeline.limited,
+      true,
+      'the client has not received pre-since room history',
+    );
+    const page = await suite.matrix(
+      new Request(
+        'http://x/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
+          '/messages?dir=b&limit=4&from=' +
+          encodeURIComponent(String(timeline.prev_batch)),
+        { headers: { Authorization: 'Bearer ' + bob.access_token } },
+      ),
+    );
+    assertEquals(page.status, 200);
+    assertEquals(
+      ((await page.json()).chunk as Json[]).map((event) => event.event_id),
+      [...old].reverse(),
+    );
+  }
+  const freshBefore = await sync(bob.access_token!);
+  const fresh = await createRoom(app.store, {
+    creator: alice.user_id,
+    preset: 'public_chat',
+  }, signer);
+  await join(await openRoom(app.store, fresh.roomId), bob.user_id, signer);
+  const body = await sync(
+    bob.access_token!,
+    '&since=' + freshBefore.next_batch,
+  );
+  const timeline = entry(body, fresh.roomId).timeline as Json;
+  assertEquals(
+    timeline.limited,
+    false,
+    'a room created after since has no missing prefix',
+  );
+  assertEquals(timeline.prev_batch, body.next_batch);
 });
 
 suite.test('lazy full-state zero timeline keeps own membership in both state forms', async () => {
