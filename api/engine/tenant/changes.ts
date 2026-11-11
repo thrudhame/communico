@@ -3,6 +3,9 @@ import { nextCounter } from '#engine/tenant/accountdata.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { signatureView } from '#engine/tenant/signature-view.ts';
+import { config } from '#engine/config.ts';
+import { bounded } from '#engine/tenant/e2ee.ts';
+import { encodeEnvelope } from '#engine/federation-envelope.ts';
 
 /** Immutable public snapshot/tombstone, committed with its owning mutation. */
 export async function appendDeviceChange(
@@ -44,6 +47,25 @@ export async function appendDeviceChange(
       );
     }
   }
+  const [tenant] = await conn.query('SELECT server_name FROM tenant');
+  const server = String(tenant.server_name);
+  const { generation: _generation, ...wire } = payload;
+  void _generation;
+  // Like to-device and public signing, reject undeliverable snapshots in their
+  // owning transaction, before accepting a durable reliable obligation. Reserve
+  // the widest timestamps/stream IDs and causal predecessor, including resets.
+  bounded(
+    JSON.parse(encodeEnvelope(server, Number.MAX_SAFE_INTEGER, [], [{
+      edu_type: 'm.device_list_update',
+      content: {
+        ...wire,
+        user_id: '@' + device.localpart + ':' + server,
+        stream_id: Number.MAX_SAFE_INTEGER,
+        prev_id: [Number.MAX_SAFE_INTEGER],
+      },
+    }])),
+    config().federation.bulkmaxbytes,
+  );
   await conn.execute('INSERT INTO e2ee_changes VALUES(?,?,?,?,?,?)', [
     pos,
     device.localpart,

@@ -1,4 +1,4 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -144,6 +144,92 @@ Deno.test('E2EE follow-ups: clearing absent signing keys does not publish public
     );
     assertEquals(await db.query('SELECT * FROM e2ee_changes'), []);
     await tenant.tx((tx) => tx.users.insert('a', 'A'));
+  }));
+
+Deno.test('E2EE follow-ups: local unchanged subscriptions use bounded batch reads', () =>
+  fixture(async (store) => {
+    const db = await store.server();
+    const subjects = Array.from(
+      { length: 100 },
+      (_, i) => '@u' + i + ':local.test',
+    );
+    await db.tx(async (tx) => {
+      for (const user of subjects) {
+        await tx.execute(
+          "INSERT INTO device_tracking VALUES(?,?,'keys',1,NULL)",
+          ['@peer:remote.test', user],
+        );
+        await tx.execute(
+          'INSERT INTO device_subscriptions VALUES(?,?,1,?,?,NULL)',
+          [user, 'remote.test', 1, 0],
+        );
+      }
+      const query = tx.query.bind(tx);
+      let reads = 0;
+      tx.query = (...args) => {
+        reads++;
+        return query(...args);
+      };
+      try {
+        await reconcileDeviceSubscriptions(tx, subjects, ['local.test']);
+      } finally {
+        tx.query = query;
+      }
+      assertEquals(reads, 2);
+    });
+  }));
+
+Deno.test('E2EE follow-ups: device snapshots must fit a standalone reliable envelope before acceptance', () =>
+  fixture(async (store) => {
+    const tenant = await openTenant(store, 'local.test', { create: true });
+    const previous = config().federation;
+    const db = await store.tenant('local.test');
+    await tenant.tx((tx) => tx.users.insert('a', 'A'));
+    try {
+      setConfigForTests({ federation: { bulkmaxbytes: 512 } });
+      await assertRejects(() =>
+        tenant.tx((tx) => tx.devices.upsert('D', 'a', 'x'.repeat(1000)))
+      );
+      assertEquals(await tenant.tx((tx) => tx.devices.ofUser('a')), []);
+      assertEquals(await db.query('SELECT * FROM e2ee_changes'), []);
+      await tenant.tx((tx) => tx.devices.upsert('D', 'a', 'D'));
+      const device = (await tenant.tx((tx) => tx.devices.byId('D', 'a')))!;
+      const before = await db.query('SELECT * FROM e2ee_changes');
+      await assertRejects(() =>
+        tenant.tx((tx) => tx.devices.rename('D', 'a', 'x'.repeat(1000)))
+      );
+      const input = validateUpload(
+        {
+          device_keys: {
+            user_id: '@a:local.test',
+            device_id: 'D',
+            algorithms: [],
+            keys: { 'ed25519:D': 'x'.repeat(1000) },
+            signatures: {},
+          },
+        },
+        '@a:local.test',
+        'D',
+        config().e2ee,
+      );
+      await assertRejects(() =>
+        tenant.tx((tx) =>
+          tx.e2ee.upload({
+            localpart: 'a',
+            deviceId: 'D',
+            generation: device.generation,
+          }, input)
+        )
+      );
+      assertEquals(await db.query('SELECT * FROM e2ee_changes'), before);
+      assertEquals(await db.query('SELECT * FROM device_keys'), []);
+      assertEquals(
+        (await tenant.tx((tx) => tx.devices.byId('D', 'a')))!.display_name,
+        'D',
+      );
+    } finally {
+      setConfigForTests({ federation: previous });
+    }
   }));
 
 Deno.test('E2EE follow-ups: device replacement and deletion publish removed public master signatures', () =>
