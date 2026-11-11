@@ -36,11 +36,9 @@ import type { Row } from '#engine/store/ffi.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import {
   accountDataMax,
+  captureAccountData,
   getAccountData,
-  listGlobalAccountData,
-  listGlobalAccountDataSince,
 } from '#engine/tenant/accountdata.ts';
-import { pushStreamSeq, rulesetFor } from '#engine/tenant/pushrules.ts';
 import { filterEvents, type RoomFilter } from '#engine/tenant/filters.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { onEventStream } from '#engine/server/stream.ts';
@@ -437,12 +435,15 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     );
     return { counters, memberships, notifications, rooms, oob };
   });
+  const accountSnapshot = await app.tenant.tx((tx) =>
+    captureAccountData(tx, lp, app.tenant.serverName, i.since?.aSeq ?? null)
+  );
   const now: StreamToken = {
     eSeq: snapshot.counters.get('events') ?? 0,
     pSeq: snapshot.counters.get('presence') ?? 0,
     tSeq: typingSeq(),
     rSeq: snapshot.counters.get('receipts') ?? 0,
-    aSeq: await accountDataMax(app.tenant, lp),
+    aSeq: accountSnapshot.seq,
     dSeq: snapshot.counters.get('devices') ?? 0,
     mSeq: 0,
     kSeq: 0,
@@ -459,9 +460,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       return { ...delivered, pools };
     });
   const nextBatch = encodeStreamToken(delivery.token);
-  const roomAccountData = await app.tenant.tx((tx) =>
-    tx.accountData.roomsSince(lp, i.since?.aSeq ?? 0, now.aSeq)
-  );
+  const roomAccountData = accountSnapshot.rooms;
   const memberships = snapshot.memberships;
   const receiptRooms = new Set(
     [...snapshot.rooms].filter(([, r]) => r.receipts.length).map(([id]) => id),
@@ -651,15 +650,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       now.dSeq,
       'sync',
     );
-  const accountData: { type: string; content: unknown }[] = i.since === null
-    ? await listGlobalAccountData(app.tenant, lp)
-    : await listGlobalAccountDataSince(app.tenant, lp, i.since.aSeq);
-  if (i.since === null || await pushStreamSeq(app.tenant, lp) > i.since.aSeq) {
-    accountData.push({
-      type: 'm.push_rules',
-      content: { global: await rulesetFor(app.tenant, lp) },
-    });
-  }
+  const accountData = accountSnapshot.global;
   return {
     next_batch: nextBatch,
     rooms: { join, invite, knock, leave },

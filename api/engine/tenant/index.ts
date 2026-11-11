@@ -494,8 +494,12 @@ function bind(
         ),
       get: (localpart: string, roomId: string, type: string) =>
         accountdata.accountDataRow(conn, localpart, roomId, type),
-      ofRoom: (localpart: string, roomId: string) =>
-        accountdata.accountDataOfRoom(conn, localpart, roomId),
+      ofRoom: (
+        localpart: string,
+        roomId: string,
+        since?: number,
+        until?: number,
+      ) => accountdata.accountDataOfRoom(conn, localpart, roomId, since, until),
       globalSince: (localpart: string, aSeq: number) =>
         accountdata.globalAccountDataSince(conn, localpart, aSeq),
       maxSeq: (localpart: string) =>

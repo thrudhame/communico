@@ -274,6 +274,15 @@ replays rather than consumes data. Ordinary sync remains a direct consumer of
 the same owner. This is internal groundwork, not an exposed sync endpoint.
 (`api/engine/tenant/todevice.ts`)
 
+Account-data delivery captures the global/selected room bodies, push rules and
+their shared maximum in one tenant transaction. Ordinary sync consumes that
+same capture; slow rendering cannot read a later body under an older cursor.
+Sliding room selection supplies independent per-room account cuts. Receipt
+reads accept an explicit captured maximum and share the wire formatter with
+ordinary sync. Single-event receipt maps follow MSC4102's unthreaded-wins
+collision behavior, without removing the independently stored thread slots.
+(`api/engine/tenant/accountdata.ts`, `api/engine/server/ephemeral.ts`)
+
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data
 streams. Denials win, empty lists exclude everything, and only `*` is special
