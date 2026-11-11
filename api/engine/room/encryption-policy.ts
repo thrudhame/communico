@@ -69,6 +69,17 @@ function validateEncryption(content: unknown): void {
   }
 }
 
+// Creation and later local state writes apply the same independent switch.
+// Permissive creation retains unknown encryption algorithms like ordinary
+// Matrix state; a supported algorithm still validates its supported settings.
+function assertEncryptionState(content: unknown): void {
+  if (
+    !config().encryption.allowunencryptedcreation || usableEncryption(content)
+  ) {
+    validateEncryption(content);
+  }
+}
+
 // Return a new plan; never mutate the caller's initial_state. Spaces have
 // state content only. There is no client-controlled server-notice exemption.
 export function encryptedInitialState(
@@ -79,7 +90,7 @@ export function encryptedInitialState(
   if (entries.length > 1 || entries.some((e) => (e.state_key ?? '') !== '')) {
     throw encryptionError('One empty-key encryption state event is required');
   }
-  if (entries.length) validateEncryption(entries[0].content);
+  if (entries.length) assertEncryptionState(entries[0].content);
   const result = [...initial];
   if (
     !entries.length && roomType !== 'm.space' &&
@@ -140,9 +151,7 @@ export async function assertLocalEncryption(
     if (event.state_key !== '') {
       throw encryptionError('Encryption state key must be empty');
     }
-    if (!policy.allowunencryptedcreation || usableEncryption(event.content)) {
-      validateEncryption(event.content);
-    }
+    assertEncryptionState(event.content);
   }
   if (!policy.allowunencryptedcreation && event.type === 'm.room.redaction') {
     const targetId = event.redacts ?? event.content.redacts;

@@ -11,6 +11,13 @@ export type Change = {
   data: string;
 };
 
+export async function head(conn: Conn): Promise<number> {
+  const rows = await conn.query(
+    'SELECT COALESCE(MAX(pos), 0) AS pos FROM changes',
+  );
+  return Number(rows[0].pos);
+}
+
 function changeOf(row: Row): Change {
   return {
     pos: Number(row.pos),

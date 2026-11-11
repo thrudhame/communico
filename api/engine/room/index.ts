@@ -134,6 +134,7 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       removeOf: (waiting: string) => waits.removeWaitsOf(conn, waiting),
     },
     changes: {
+      head: () => changes.head(conn),
       append: (kind: string, event: string | null, data: unknown) =>
         changes.appendChange(conn, kind, event, data),
       after: (pos: number, limit: number) =>

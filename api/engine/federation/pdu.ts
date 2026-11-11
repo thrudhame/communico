@@ -5,7 +5,7 @@
 // covered by signatures — appendices.md:341-343 — nor by the content
 // hash, SS:1355-1361). toWire is the ONE place that strips.
 import { getRulebook } from '#engine/policy.ts';
-import { canonicalJson } from '#engine/canonical.ts';
+import { checkPduFormat } from '#engine/room/verify.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { RoomVersionSpec } from '#engine/rulebook/types.ts';
 
@@ -37,62 +37,5 @@ export function checkRemoteFormat(
   spec: RoomVersionSpec,
   opts: { exemptPrevAuthLimits: boolean },
 ): { oversized: boolean } {
-  const prevIds = pdu.prev_events == null ? [] : pdu.prev_events;
-  const declaredAuth = pdu.auth_events == null ? [] : pdu.auth_events;
-  if (!opts.exemptPrevAuthLimits) {
-    if (prevIds.length > 20) {
-      throw new Error('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
-    }
-    if (declaredAuth.length > 10) {
-      throw new Error('M_TOO_MANY_AUTH_EVENTS: v11 allows at most 10');
-    }
-  }
-  if (
-    typeof pdu.type !== 'string' || typeof pdu.sender !== 'string' ||
-    typeof pdu.depth !== 'number' || !Number.isInteger(pdu.depth) ||
-    pdu.depth < 0 ||
-    typeof pdu.origin_server_ts !== 'number' ||
-    pdu.content === null || typeof pdu.content !== 'object'
-  ) {
-    throw new Error('M_BAD_EVENT: missing or malformed required fields');
-  }
-  if (!spec.roomIdFromCreateEvent && typeof pdu.room_id !== 'string') {
-    throw new Error('M_BAD_EVENT: room_id required before v12');
-  }
-  // depth bounded only (components/depth_v6.yaml:19-25 — the only MUST)
-  const depthBound = spec.depthLimit === 'int53' ? 2 ** 53 - 1 : 2 ** 63 - 1;
-  if (pdu.depth > depthBound) {
-    throw new Error('M_BAD_EVENT: depth exceeds the room version limit');
-  }
-  // whole canonical event ≤ 65536 bytes (CS:2869-2871)
-  if (
-    new TextEncoder().encode(
-      canonicalJson(pdu as unknown as Record<string, unknown>),
-    ).length > 65536
-  ) {
-    throw new Error('M_TOO_LARGE: event exceeds the 65536-byte limit');
-  }
-  // per-key limits: type/state_key ≤ 255 — BYTES for strictByteLimits
-  // versions (v11+), codepoints for ≤ v10 (CS:2874-2877;
-  // TestOutboundFederationEventSizeGetMissingEvents sends a 70-codepoint /
-  // 280-byte state_key at a v10 room, which must pass)
-  const measure = (s: string): number =>
-    spec.strictByteLimits ? new TextEncoder().encode(s).length : [...s].length;
-  let oversized = false;
-  const keyFail = measure(pdu.type) > 255 ||
-    (pdu.state_key !== undefined && measure(String(pdu.state_key)) > 255);
-  if (keyFail) {
-    if (spec.strictByteLimits) {
-      throw new Error('M_BAD_EVENT: type/state_key exceed 255 bytes');
-    }
-    oversized = true;
-  }
-  // sender/room_id/event_id bounded by their identifier grammars
-  // (CS:2873,2878; appendices user/room/event-id sections — 255 bytes)
-  for (const id of [pdu.sender, pdu.room_id, pdu.event_id]) {
-    if (typeof id === 'string' && new TextEncoder().encode(id).length > 255) {
-      throw new Error('M_BAD_EVENT: identifier exceeds its grammar limit');
-    }
-  }
-  return { oversized };
+  return { oversized: checkPduFormat(pdu, spec, opts.exemptPrevAuthLimits) };
 }

@@ -10,7 +10,15 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { roomSchema } from '#engine/room/index.ts';
-import { redactEvent, sendLocal } from '#engine/room/ingest.ts';
+import {
+  ingestInTx,
+  redactEvent,
+  resumeWaits,
+  sendLocal,
+} from '#engine/room/ingest.ts';
+import { buildInTx } from '#engine/room/build.ts';
+import { join } from '#engine/room/membership.ts';
+import { canonicalJson } from '#engine/canonical.ts';
 import { openStore } from '#engine/store/index.ts';
 import { bobJoins, type Genesis, genesis } from './fixtures/genesis.ts';
 
@@ -68,6 +76,108 @@ async function redactionChanges(g: Genesis): Promise<ChangeView> {
       })),
   }));
 }
+
+Deno.test('redact: competing resume drivers consume one locked wait and publish one effect', async () => {
+  await withRoom({}, async (g) => {
+    const target = await g.room.tx((tx) =>
+      buildInTx(tx, g.room.id, {
+        type: 'm.room.message',
+        sender: g.creator,
+        content: { body: 'arrives later' },
+      }, g.signer)
+    );
+    const redaction = await redactEvent(
+      g.room,
+      g.creator,
+      target.event_id!,
+      g.signer,
+    );
+    await g.room.tx((tx) =>
+      ingestInTx(tx, g.room.id, target, { self: g.signer.serverName })
+    );
+    const original = g.room.tx;
+    let scanned = 0;
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    g.room.tx = async (fn) => {
+      const result = await original(fn);
+      if (
+        result && typeof result === 'object' && 'kind' in result &&
+        result.kind === 'redaction' && scanned < 2
+      ) {
+        if (++scanned === 2) release();
+        await ready;
+      }
+      return result;
+    };
+    try {
+      await Promise.all([
+        resumeWaits(g.room, { self: 'test' }),
+        resumeWaits(g.room, { self: 'test' }),
+      ]);
+    } finally {
+      g.room.tx = original;
+    }
+    assertEquals((await redactionChanges(g)).redactions, [{
+      event: redaction.eventId,
+      data: { target: target.event_id },
+    }]);
+    assertEquals(await g.room.tx((tx) => tx.waits.of(redaction.eventId)), []);
+  });
+});
+
+Deno.test('membership: local join resumes children waiting at its post-commit boundary', async () => {
+  await withRoom({ joinRule: 'public' }, async (g) => {
+    const original = g.room.tx;
+    let child: string | undefined;
+    g.room.tx = async (fn) => {
+      const result = await original(fn);
+      if (
+        !child && result && typeof result === 'object' && 'created' in result &&
+        result.created && 'eventId' in result
+      ) {
+        const parent = String(result.eventId);
+        await original(async (tx) => {
+          const pdu = await buildInTx(tx, g.room.id, {
+            type: 'm.room.message',
+            sender: g.creator,
+            content: { body: 'waiting child' },
+          }, g.signer);
+          child = pdu.event_id!;
+          await tx.events.insert(child, canonicalJson(pdu));
+          await tx.events.setStatus(child, {
+            standing: 'rejected',
+            grounding: 'pending',
+            origin: 'test',
+            received_ts: Date.now(),
+          });
+          await tx.waits.add({
+            missing: parent,
+            waiting: child,
+            kind: 'prev',
+            since: Date.now(),
+            expires: null,
+            state: 'pending',
+          });
+        });
+      }
+      return result;
+    };
+    try {
+      await join(g.room, '@bob:test', g.signer);
+    } finally {
+      g.room.tx = original;
+    }
+    assert(child);
+    assertEquals(
+      (await g.room.tx((tx) => tx.events.getStatus(child!)))?.grounding,
+      'grounded',
+    );
+    assertEquals(await g.room.tx((tx) => tx.waits.of(child!)), []);
+  });
+});
 
 Deno.test('redact: own event redacts — the effect lands; the target PDU is untouched', async () => {
   await withRoom({}, async (g) => {

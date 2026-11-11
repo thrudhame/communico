@@ -59,15 +59,28 @@ type VerifyOptions = {
 // lenient size case is returned. The backfill count exemption
 // (backfill.yaml's note: prev/auth counts MUST NOT be validated on a
 // backfill response) is the caller's option — /backfill answers only.
-function checkFormat(
+export function checkPduFormat(
   pdu: Pdu,
   spec: RoomVersionSpec,
   exemptPrevAuthLimits: boolean,
 ): boolean {
+  const object = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (
+    !object(pdu) || !object(pdu.hashes) ||
+    typeof pdu.hashes.sha256 !== 'string' || !object(pdu.signatures) ||
+    Object.values(pdu.signatures).some((signatures) =>
+      !object(signatures) ||
+      Object.values(signatures).some((signature) =>
+        typeof signature !== 'string'
+      )
+    )
+  ) {
+    throw new Error('M_BAD_EVENT: missing or malformed required fields');
+  }
   for (const list of [pdu.prev_events, pdu.auth_events]) {
     if (
-      list !== undefined &&
-      (!Array.isArray(list) || list.some((id) => typeof id !== 'string'))
+      !Array.isArray(list) || list.some((id) => typeof id !== 'string')
     ) {
       throw new Error(
         'M_BAD_EVENT: prev_events/auth_events must be string arrays',
@@ -89,7 +102,8 @@ function checkFormat(
     typeof pdu.depth !== 'number' || !Number.isInteger(pdu.depth) ||
     pdu.depth < 0 ||
     typeof pdu.origin_server_ts !== 'number' ||
-    pdu.content === null || typeof pdu.content !== 'object'
+    pdu.content === null || typeof pdu.content !== 'object' ||
+    Array.isArray(pdu.content)
   ) {
     throw new Error('M_BAD_EVENT: missing or malformed required fields');
   }
@@ -158,7 +172,11 @@ export async function identify(
   opts: { roomId?: string; exemptPrevAuthLimits?: boolean } = {},
 ): Promise<Identified> {
   const spec = getRulebook(roomVersion).spec; // unknown: never a default
-  const oversized = checkFormat(pdu, spec, opts.exemptPrevAuthLimits === true);
+  const oversized = checkPduFormat(
+    pdu,
+    spec,
+    opts.exemptPrevAuthLimits === true,
+  );
   // `unsigned` stripped on receipt — never stored (appendices.md:341-343)
   delete pdu.unsigned;
   let eventId: string;

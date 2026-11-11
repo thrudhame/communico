@@ -35,6 +35,7 @@ import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { aclAllows, assertAcl } from '#engine/room/acl.ts';
 import { orderEvents } from '#engine/room/order.ts';
+import { stageRecoveryEvidence } from '#engine/room/recovery.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { identify, verify } from '#engine/room/verify.ts';
 
@@ -481,6 +482,23 @@ export async function ingestRemote(
   const budget = { until: Date.now() + deps.limits.budgetMs };
   for (const item of items) {
     await fetchMissing(room, item, origin, deps, version, budget, acc);
+  }
+
+  if (
+    !await stageRecoveryEvidence(
+      room,
+      acc.evidence,
+      new Set(acc.live.keys()),
+      origin,
+      version,
+    )
+  ) {
+    // Nothing fetched was accepted as live truth. Retain any staged outliers,
+    // but no partial imported state: original inputs use normal pending/waits.
+    acc.evidence.clear();
+    acc.corrupted.clear();
+    acc.boundaries.clear();
+    acc.live = new Map(items.map((item) => [item.eventId, item]));
   }
 
   // One room transaction for the accepted batch, under the per-room lock

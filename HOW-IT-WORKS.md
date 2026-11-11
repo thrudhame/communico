@@ -119,6 +119,22 @@ too, without rewriting the stored target PDU.
 (`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,
 `api/engine/room/ingest.ts:654-681`)
 
+Recovery authorizes complete evidence graphs outside the mutation lock, reading
+and inserting at most 32 evidence events per transaction. Every snapshot and
+write revalidates the room change cut; concurrent ordinary writes can interleave
+and invalidate prepared decisions. Staged evidence has no event-state refs,
+positions or publications. Imported boundaries still enter live ingest whole,
+with current lifecycle, ACL and authorization checks. Evidence dependent on live
+candidates stays with their real verdict; a dependency tail larger than 32 leaves
+the recovery unresolved, never a partial imported state.
+(`api/engine/room/recovery.ts`)
+
+One history operation shares an eight-second deadline, 128 network requests and
+10,000 work units across its page and all state/auth boundaries. Forward bridges
+share that budget across pages and peers. Exhaustion or cancellation leaves an
+unresolved gap without partial publication; storage errors still propagate.
+(`api/engine/room/history.ts`)
+
 ## Timestamp lookup and isolated history anchors
 
 Client and federation `timestamp_to_event` routes share a room-owned indexed
@@ -434,6 +450,11 @@ resident. Candidate attempts are deterministic, capped at eight, with a
 60-second scheduling budget and the transport's per-request deadline. A
 resident remote-vouch response enters normal verified recovery in the existing
 stay, never installs the returned snapshot over published state.
+
+That scheduling budget bounds when another candidate may start, not a new total
+join deadline. Synapse likewise retries destination callbacks with per-request
+transport bounds. Ordinary nonrestricted admission reads only its member and
+join-rule keys; it does not hydrate unrelated room state or an auth closure.
 
 Explicit remote join candidates constrain the attempted servers. Automatic
 invite/qualified-resident discovery is used only when no remote candidate was
