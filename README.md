@@ -21,6 +21,11 @@ encrypted key backup. Clients own encryption, private keys and decryption.
 
 ## Client data and sync
 
+`/_matrix/client/versions` advertises v1.1 through v1.16, individually and
+cumulatively. [MATRIX-VERSIONS.md](MATRIX-VERSIONS.md) records the endpoint and
+behavioral regression checklist, including optional-module exclusions. This is
+not a claim that every Complement case passes; see `complement/BASELINE.md`.
+
 `/sync?use_state_after=true` returns state at the response's timeline end in
 `state_after` (also when empty), not `state`. The default retains the legacy
 state-before-timeline contract. Filters and lazy member loading apply to both.

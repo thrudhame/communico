@@ -233,7 +233,24 @@ test('versions stays public, capabilities stays protected, discovery absent per 
   assertEquals(await call('/_matrix/client/versions'), {
     status: 200,
     body: {
-      versions: ['v1.1'],
+      versions: [
+        'v1.1',
+        'v1.2',
+        'v1.3',
+        'v1.4',
+        'v1.5',
+        'v1.6',
+        'v1.7',
+        'v1.8',
+        'v1.9',
+        'v1.10',
+        'v1.11',
+        'v1.12',
+        'v1.13',
+        'v1.14',
+        'v1.15',
+        'v1.16',
+      ],
       unstable_features: {
         'io.element.e2ee_forced.public': !config().encryption
           .allowunencryptedcreation,

@@ -1,16 +1,29 @@
-// No auth (per spec). matrix-nio's observed flows never call this
-// (capture conclusion 3) — provided for spec shape / other clients.
-// Honesty (amendment-1 C): advertise only labels whose requirements we
-// meet — this list grows per milestone; a label is added when its
-// Complement set is green. M2: v1.1 only (every later label implies
-// room/sync features M3/M4 don't have yet). The inherited r0.6.1/v1.6
-// placeholder is gone. Do not add v1.16 until the user rules it.
+// Public, cumulative API labels approved after the v1.16 source audit.
+// MATRIX-VERSIONS.md and versions-checklist.test.ts guard routes/contracts;
+// the known-red Complement baseline is not itself an advertising criterion.
 // The three Element creation-policy flags describe the configured presets.
 import { config } from '#engine/config.ts';
 // deno-lint-ignore require-await
 export default async function () {
   return {
-    versions: ['v1.1'],
+    versions: [
+      'v1.1',
+      'v1.2',
+      'v1.3',
+      'v1.4',
+      'v1.5',
+      'v1.6',
+      'v1.7',
+      'v1.8',
+      'v1.9',
+      'v1.10',
+      'v1.11',
+      'v1.12',
+      'v1.13',
+      'v1.14',
+      'v1.15',
+      'v1.16',
+    ],
     unstable_features: {
       'io.element.e2ee_forced.public': !config().encryption
         .allowunencryptedcreation,
