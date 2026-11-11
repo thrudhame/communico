@@ -305,6 +305,13 @@ its bounded page and commits the successor. Stale/oversized snapshots and aborts
 roll back all those effects. A disabled inbox extension performs no inbox work.
 (`api/engine/sliding-sync/delivery.ts`)
 
+Ordinary and sliding sync share the same stream-wait owner. Listeners are armed
+before capture; projection, event, tenant and ephemeral notifications are only
+hints to recapture, never proof of relevance. One absolute deadline survives
+unrelated writes. Polling sweeps typing expiry at the existing bounded cadence;
+abort, capture failure and successful return all remove listeners and timers.
+(`api/engine/sync-wait.ts`)
+
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data
 streams. Denials win, empty lists exclude everything, and only `*` is special

@@ -40,12 +40,9 @@ import {
   getAccountData,
 } from '#engine/tenant/accountdata.ts';
 import { filterEvents, type RoomFilter } from '#engine/tenant/filters.ts';
-import { onProjected } from '#engine/server/project.ts';
-import { onEventStream } from '#engine/server/stream.ts';
-import { onTenantStream } from '#engine/tenant/streams.ts';
+import { waitForSync } from '#engine/sync-wait.ts';
 import {
   getPresence,
-  onEphemeral,
   receiptRoomsSince,
   receiptSnapshot,
   setPresenceValue,
@@ -54,7 +51,6 @@ import {
 import {
   captureTyping,
   lastTypingChange,
-  onTypingChange,
   sweepTyping,
 } from '#engine/typing.ts';
 
@@ -331,41 +327,10 @@ async function waitForRelevant(
 ): Promise<void> {
   if (i.since === null || i.timeoutMs <= 0) return;
   const app = theApp();
-  const deadline = Date.now() + Math.min(i.timeoutMs, 30000);
-  while (Date.now() < deadline) {
-    let wake!: () => void;
-    const changed = new Promise<void>((resolve) => {
-      wake = resolve;
-    });
-    // Arm BEFORE reading maxima: a commit between the read and await
-    // remains signalled. Unrelated writes only trigger a relevance recheck.
-    const removers = [
-      onTypingChange(() => wake()),
-      onEphemeral((server) => {
-        if (server.path === app.server.path) wake();
-      }),
-      onProjected((store) => {
-        if (store === app.store) wake();
-      }),
-      onEventStream((path) => {
-        if (path === app.server.path) wake();
-      }),
-      onTenantStream((store, tenant) => {
-        if (store === app.store && tenant === app.tenant.serverName) wake();
-      }),
-    ];
-    const timer = setTimeout(
-      wake,
-      Math.min(500, Math.max(0, deadline - Date.now())),
-    );
-    try {
-      if (await relevantChanged(i, device)) return;
-      await changed;
-    } finally {
-      clearTimeout(timer);
-      for (const remove of removers) remove();
-    }
-  }
+  await waitForSync(app, { timeoutMs: i.timeoutMs }, async () => ({
+    relevant: await relevantChanged(i, device),
+    value: undefined,
+  }));
 }
 
 export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
