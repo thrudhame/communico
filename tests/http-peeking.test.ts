@@ -60,6 +60,62 @@ async function fixture(prefix: string) {
   return { a, b, room, send };
 }
 
+suite.test('event polling admission reads selected visibility state, not the full room state', async () => {
+  const f = await fixture('peek-cost');
+  for (let i = 0; i < 40; i++) {
+    await ok(base(f.room) + '/state/u.large/' + i, f.a.access_token!, {
+      value: i,
+    }, 'PUT');
+  }
+  const initial = await ok(base(f.room) + '/initialSync', f.b.access_token!);
+  const original = theApp().store.room.bind(theApp().store);
+  let hydrated = 0;
+  theApp().store.room = async (id, options) => {
+    const db = await original(id, options);
+    const transact = db.tx.bind(db);
+    db.tx = (body) =>
+      transact((tx) =>
+        body(
+          new Proxy(tx, {
+            get(target, key) {
+              if (key === 'query') {
+                return async (...args: Parameters<typeof tx.query>) => {
+                  const rows = await target.query(...args);
+                  if (args[0].includes('state_entries')) {
+                    hydrated += rows.length;
+                  }
+                  return rows;
+                };
+              }
+              const value = Reflect.get(target, key);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          }),
+        )
+      );
+    return db;
+  };
+  const start = performance.now();
+  try {
+    const result = await ok(
+      events(f.room, String((initial.messages as Json).end)),
+      f.b.access_token!,
+    );
+    assertEquals(chunk(result), []);
+    console.log(
+      'native preview state rows/time',
+      hydrated,
+      performance.now() - start,
+    );
+    assert(
+      hydrated <= 1,
+      'polling admission must not hydrate full state: ' + hydrated,
+    );
+  } finally {
+    theApp().store.room = original;
+  }
+});
+
 suite.test('initialSync previews held world-readable rooms without joining and exposes only caller account data', async () => {
   const f = await fixture('peek-initial');
   const one = await f.send('one'), two = await f.send('two');

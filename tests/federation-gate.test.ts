@@ -61,6 +61,32 @@ async function forbid(
   }
 }
 
+Deno.test('gate: anonymous discovery refusals cannot populate or evict actionable pending requests', async () => {
+  await withStore(async (store) => {
+    const server = await store.server();
+    setConfigForTests({ federation: { mode: 'closed', pendingmax: 2 } });
+    try {
+      await forbid(store, 'intent.test', {
+        kind: 'outbound',
+        user: '@a:test',
+        what: 'join',
+      });
+      for (let i = 0; i < 5; i++) {
+        await forbid(store, 'lookup' + i + '.test', {
+          kind: 'lookup',
+          what: 'profile',
+        });
+      }
+      assertEquals((await listPending(server)).map((row) => row.name), [
+        'intent.test',
+      ]);
+      assertEquals(await listPeers(server), []);
+    } finally {
+      setConfigForTests({});
+    }
+  });
+});
+
 Deno.test('gate: block glob → 403 both directions', async () => {
   await withStore(async (store) => {
     const server = await store.server();

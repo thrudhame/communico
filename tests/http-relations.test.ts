@@ -84,6 +84,27 @@ const bundle = (event: Json) =>
     | Json
     | undefined;
 
+suite.test('empty relation and thread cursors mean omitted; nonempty malformed cursors still fail', async () => {
+  const f = await setup('relation-empty');
+  await f.send('reply', f.relation(f.root));
+  for (
+    const route of [
+      f.v1 + '/relations/' + encodeURIComponent(f.root),
+      f.v1 + '/threads',
+    ]
+  ) {
+    const ordinary = await ok(route, f.b.access_token!);
+    assertEquals(
+      ids(await ok(route + '?from=&to=', f.b.access_token!)),
+      ids(ordinary),
+    );
+    assertEquals(
+      (await call(route + '?from=not-a-token', f.b.access_token!)).status,
+      400,
+    );
+  }
+});
+
 suite.test('malformed, redacted and ignored relations share eligibility with thread bundles and list', async () => {
   const f = await setup('relation-view');
   await f.send('missing-type', { event_id: f.root });

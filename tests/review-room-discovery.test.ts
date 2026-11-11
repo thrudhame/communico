@@ -1,12 +1,76 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { dirname, join } from '@std/path';
 import { startHttp } from '#tests/http-app.ts';
 import { genesis } from '#tests/fixtures/genesis.ts';
 import { registerRoom } from '#engine/server/registry.ts';
+import { summaryAccessible } from '#engine/client/discovery.ts';
 import {
   listOperatorRooms,
   purgeOperatorRooms,
 } from '#engine/room/operator.ts';
+
+Deno.test('summary admission: native reads return only the exact origin, including ports and IPv6', async () => {
+  const http = await startHttp();
+  try {
+    const g = await genesis(http.app.store, { roomId: '!origin-summary:test' });
+    const server = http.app.server;
+    await server.tx(async (tx) => {
+      for (let i = 0; i < 200; i++) {
+        await tx.execute(
+          "INSERT INTO memberships VALUES(?,?,'join','$member',1)",
+          ['@user' + i + ':other.test', '!other:test'],
+        );
+      }
+      for (
+        const origin of [
+          'remote.test',
+          'remote.test:8448',
+          '[2001:db8::1]:8448',
+        ]
+      ) {
+        await tx.execute(
+          "INSERT INTO memberships VALUES(?,?,'join','$member',1)",
+          ['@remote:' + origin, '!other:test'],
+        );
+      }
+    });
+    const query = server.query.bind(server);
+    let hydrated = 0;
+    server.query = async (...args) => {
+      const rows = await query(...args);
+      if (args[0].includes('DISTINCT user')) hydrated += rows.length;
+      return rows;
+    };
+    try {
+      for (const origin of ['remote.test:8448', '[2001:db8::1]:8448']) {
+        hydrated = 0;
+        const start = performance.now();
+        assertEquals(
+          await summaryAccessible({
+            room_id: g.roomId,
+            room_version: '10',
+            join_rule: 'restricted',
+            allowed_room_ids: [],
+          }, { origin }),
+          false,
+        );
+        console.log(
+          'native summary membership rows/time',
+          hydrated,
+          performance.now() - start,
+        );
+        assert(
+          hydrated <= 1,
+          'unrelated origin members must not be hydrated: ' + hydrated,
+        );
+      }
+    } finally {
+      server.query = query;
+    }
+  } finally {
+    await http.close();
+  }
+});
 
 Deno.test('review discovery: an absent database is skipped without creating an empty file', async () => {
   const http = await startHttp();

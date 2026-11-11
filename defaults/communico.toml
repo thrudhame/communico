@@ -67,6 +67,14 @@ ttl = 3600
 # COMMUNICO_OPENID_TOKENSECONDS
 tokenseconds = 3600
 
+[uia]
+# UIA session lifetime follows Synapse SESSION_EXPIRE_MS (48 hours).
+# COMMUNICO_UIA_SESSIONSECONDS
+sessionseconds = 172800
+# Reject new flows at capacity; never evict an active authentication flow.
+# COMMUNICO_UIA_MAXSESSIONS
+maxsessions = 10000
+
 [peeking]
 # Tuwunel's event/initialSync cap; the existing sync long-poll ceiling.
 maxevents = 50
@@ -80,6 +88,9 @@ maxpagesize = 100
 maxdepth = 0
 sessionseconds = 300
 maxsessions = 1000
+# One user's retained cursors cannot monopolize the shared pool.
+# COMMUNICO_HIERARCHY_MAXSESSIONSPERUSER
+maxsessionsperuser = 100
 # Bound retained traversal state; exceeding it returns an explicit error.
 maxrooms = 10000
 

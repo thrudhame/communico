@@ -33,7 +33,7 @@ async function boundary(
   raw: string | null,
   dir: 'b' | 'f',
 ): Promise<Bound> {
-  if (raw === null) return null;
+  if (raw === null || raw === '') return null;
   if (raw.startsWith('rel_')) {
     let value;
     try {

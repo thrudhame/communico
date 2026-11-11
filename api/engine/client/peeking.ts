@@ -43,7 +43,10 @@ async function previewCut(roomId: string, user: string) {
   const cut = membership?.membership === 'leave'
     ? Math.min(membership.seq, head)
     : head;
-  const state = await stateAtSeq(roomId, cut);
+  const state = await stateAtSeq(roomId, cut, [[
+    'm.room.history_visibility',
+    '',
+  ]]);
   const world =
     state.find((s) =>
       s.type === 'm.room.history_visibility' && s.stateKey === ''
@@ -65,7 +68,6 @@ async function previewCut(roomId: string, user: string) {
     room,
     cut,
     head,
-    state,
     membership: membership?.membership ?? 'leave',
   };
 }
@@ -98,7 +100,11 @@ export async function roomInitialSync(
         end: 's' + snapshot.cut,
         ...(page.end === undefined ? {} : { start: page.end }),
       },
-      state: await clientEventsForRows(roomId, snapshot.state, user),
+      state: await clientEventsForRows(
+        roomId,
+        await stateAtSeq(roomId, snapshot.cut),
+        user,
+      ),
       visibility: await visibility(app.server, roomId),
       account_data: await listRoomAccountData(
         app.tenant,

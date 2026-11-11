@@ -9,6 +9,7 @@ import { localpartOf } from '#engine/tenant/auth.ts';
 import { splitId } from '#engine/ids.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { verifyUserPassword } from '#engine/tenant/users.ts';
+import { config } from '#engine/config.ts';
 
 export const PASSWORD_FLOWS = [{ stages: ['m.login.password'] }];
 export const DUMMY_FLOWS = [{ stages: ['m.login.dummy'] }];
@@ -26,9 +27,21 @@ export async function insertUiaSession(
   session: string,
   flows: { stages: string[] }[],
 ): Promise<void> {
+  const now = Date.now(), limits = config().uia;
+  await conn.execute('DELETE FROM uia_sessions WHERE created_ms <= ?', [
+    now - limits.sessionseconds * 1000,
+  ]);
+  const count = await conn.query('SELECT count(*) AS n FROM uia_sessions');
+  if (Number(count[0].n) >= limits.maxsessions) {
+    throw new MatrixError(
+      429,
+      'M_LIMIT_EXCEEDED',
+      'UIA session capacity reached; retry an existing flow',
+    );
+  }
   await conn.execute(
     'INSERT INTO uia_sessions (session, flows, completed, created_ms) VALUES (?, ?, ?, ?)',
-    [session, JSON.stringify(flows), '[]', Date.now()],
+    [session, JSON.stringify(flows), '[]', now],
   );
 }
 
@@ -37,8 +50,8 @@ export async function uiaSessionById(
   session: string,
 ): Promise<UiaSession | null> {
   const rows = await conn.query(
-    'SELECT flows, completed FROM uia_sessions WHERE session = ?',
-    [session],
+    'SELECT flows, completed FROM uia_sessions WHERE session = ? AND created_ms > ?',
+    [session, Date.now() - config().uia.sessionseconds * 1000],
   );
   if (rows.length === 0) return null;
   return {

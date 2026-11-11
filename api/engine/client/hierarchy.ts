@@ -229,14 +229,24 @@ export async function clientHierarchy(
     }
   }
   if (!walk.pending.length) return { rooms };
-  if (cache.size >= limits.maxsessions) {
+  walk.visited = [...visited];
+  // Replaying a continuation must not allocate another retained cursor. Access
+  // is still recomputed above, so this reuses state, not an authorization result.
+  const serialized = JSON.stringify(walk);
+  for (const [token, saved] of cache) {
+    if (saved.user === user && JSON.stringify(saved) === serialized) {
+      return { rooms, next_batch: token };
+    }
+  }
+  const owned =
+    [...cache.values()].filter((saved) => saved.user === user).length;
+  if (cache.size >= limits.maxsessions || owned >= limits.maxsessionsperuser) {
     throw new MatrixError(
       503,
       'M_UNKNOWN',
       'hierarchy pagination capacity reached',
     );
   }
-  walk.visited = [...visited];
   const next = crypto.randomUUID();
   cache.set(next, walk);
   return { rooms, next_batch: next };

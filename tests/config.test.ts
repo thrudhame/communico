@@ -18,12 +18,17 @@ maxtimeoutms = 30000
 [openid]
 tokenseconds = 3600
 
+[uia]
+sessionseconds = 172800
+maxsessions = 10000
+
 [hierarchy]
 pagesize = 50
 maxpagesize = 100
 maxdepth = 0
 sessionseconds = 300
 maxsessions = 1000
+maxsessionsperuser = 100
 maxrooms = 10000
 
 [server]
@@ -861,7 +866,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('107 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('110 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -884,7 +889,8 @@ Deno.test('107 leaves total across the sections (the surface tripwire)', async (
     ['admin', 2],
     ['wellknown', 7],
     ['turn', 5],
-    ['hierarchy', 6],
+    ['hierarchy', 7],
+    ['uia', 2],
     ['peeking', 2],
     ['openid', 1],
     ['media', 20],
@@ -897,9 +903,37 @@ Deno.test('107 leaves total across the sections (the surface tripwire)', async (
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    107,
+    110,
     'the whole config surface includes discovery, TURN and HTTP administrators',
   );
+});
+
+Deno.test('UIA retention and hierarchy user capacity layer and reject zero/negative values', async () => {
+  const dir = await writeTree({ 'defaults/communico.toml': FULL });
+  const load = (env: Record<string, string>) =>
+    loadConfig({
+      defaultsPath: `${dir}/defaults/communico.toml`,
+      configPath: null,
+      env,
+    });
+  const loaded = load({
+    COMMUNICO_UIA_SESSIONSECONDS: '60',
+    COMMUNICO_UIA_MAXSESSIONS: '7',
+    COMMUNICO_HIERARCHY_MAXSESSIONSPERUSER: '3',
+  });
+  assertEquals(loaded.config.uia, { sessionseconds: 60, maxsessions: 7 });
+  assertEquals(loaded.config.hierarchy.maxsessionsperuser, 3);
+  for (
+    const key of [
+      'COMMUNICO_UIA_SESSIONSECONDS',
+      'COMMUNICO_UIA_MAXSESSIONS',
+      'COMMUNICO_HIERARCHY_MAXSESSIONSPERUSER',
+    ]
+  ) {
+    for (const value of ['0', '-1']) {
+      assertThrows(() => load({ [key]: value }), ConfigError);
+    }
+  }
 });
 
 Deno.test('peeking limits are layered and reject invalid capacities', () => {

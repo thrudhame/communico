@@ -520,6 +520,7 @@ export type ConfigPatch = {
   openid?: Partial<Config['openid']>;
   peeking?: Partial<Config['peeking']>;
   hierarchy?: Partial<Config['hierarchy']>;
+  uia?: Partial<Config['uia']>;
   push?: {
     readretentiondays?: number;
     deliverygiveuphours?: number;

@@ -1,5 +1,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { theApp } from '#engine/app.ts';
+import { joinedRooms } from '#engine/client/membership.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP extended profile fields');
@@ -140,6 +142,55 @@ suite.test('one public profile supports arbitrary JSON, explicit delete and lega
   assertEquals((await call(profile)).body.displayname, undefined);
   const after = await call(profile);
   assert(Object.hasOwn(after.body, validKey));
+});
+
+suite.test('profile fanout attempts later rooms and reports partial outcomes after global persistence', async () => {
+  const alice = await suite.registerTestUser('pf-partial', 'pw');
+  const token = alice.access_token!;
+  const profile = '/_matrix/client/v3/profile/' +
+    encodeURIComponent(alice.user_id);
+  const rooms: string[] = [];
+  for (let i = 0; i < 2; i++) {
+    const made = await call('/_matrix/client/v3/createRoom', token, 'POST', {});
+    assertEquals(made.status, 200);
+    rooms.push(String(made.body.room_id));
+  }
+  rooms.splice(0, rooms.length, ...await joinedRooms(alice.user_id));
+  const member = (room: string) =>
+    '/_matrix/client/v3/rooms/' + encodeURIComponent(room) +
+    '/state/m.room.member/' + encodeURIComponent(alice.user_id);
+  for (const field of ['displayname', 'avatar_url']) {
+    for (const method of ['PUT', 'DELETE']) {
+      // Seed a successful value before testing an explicit deletion as well.
+      assertEquals(
+        (await call(profile + '/' + field, token, 'PUT', { [field]: 'old' }))
+          .status,
+        200,
+      );
+      const original = theApp().store.room.bind(theApp().store);
+      theApp().store.room = (id, options) =>
+        id === rooms[0]
+          ? Promise.reject(new Error('one-room-storage-fault'))
+          : original(id, options);
+      let result: Awaited<ReturnType<typeof call>>;
+      try {
+        result = await call(
+          profile + '/' + field,
+          token,
+          method,
+          method === 'PUT' ? { [field]: 'new' } : undefined,
+        );
+      } finally {
+        theApp().store.room = original;
+      }
+      assertEquals(result.status, 503);
+      assertEquals(result.body.failed_rooms, [rooms[0]]);
+      const expected = method === 'PUT' ? 'new' : undefined;
+      assertEquals((await call(profile)).body[field], expected);
+      assertEquals((await call(member(rooms[0]), token)).body[field], 'old');
+      assertEquals((await call(member(rooms[1]), token)).body[field], expected);
+    }
+  }
 });
 
 suite.test('avatar and timezone strings remain opaque while non-strings are rejected', async () => {

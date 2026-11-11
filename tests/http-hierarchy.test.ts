@@ -192,6 +192,63 @@ suite.test('hierarchy walks stable depth-first pages, binds tokens and rechecks 
   }
 });
 
+suite.test('one user cannot fill the hierarchy pool and repeated continuations reuse their saved cursor', async () => {
+  const a = await suite.registerTestUser('hierarchy-quota-a', 'pw');
+  const b = await suite.registerTestUser('hierarchy-quota-b', 'pw');
+  const create = async (space = false) =>
+    String(
+      (await ok('v3/createRoom', a.access_token!, {
+        preset: 'public_chat',
+        ...(space ? { creation_content: { type: 'm.space' } } : {}),
+      })).room_id,
+    );
+  const root = await create(true),
+    child = await create(true),
+    grand = await create();
+  for (const [parent, target] of [[root, child], [child, grand]]) {
+    await ok(
+      base(parent) + '/state/m.space.child/' + encodeURIComponent(target),
+      a.access_token!,
+      { via: ['localhost'] },
+      'PUT',
+    );
+  }
+  try {
+    setConfigForTests({
+      hierarchy: { maxsessions: 100, maxsessionsperuser: 2 },
+    });
+    const first = await ok(path(root) + '?limit=1', a.access_token!);
+    const next = await ok(
+      path(root) + '?limit=1&from=' + first.next_batch,
+      a.access_token!,
+    );
+    const repeated = await ok(
+      path(root) + '?limit=1&from=' + first.next_batch,
+      a.access_token!,
+    );
+    assertEquals(repeated, next);
+    assertEquals(
+      (await call(path(root) + '?limit=1', a.access_token!)).status,
+      503,
+    );
+    assertEquals(
+      (await call(path(root) + '?limit=1', b.access_token!)).status,
+      200,
+    );
+    assertEquals(
+      ids(
+        await ok(
+          path(root) + '?limit=1&from=' + next.next_batch,
+          a.access_token!,
+        ),
+      ),
+      [grand],
+    );
+  } finally {
+    setConfigForTests({});
+  }
+});
+
 suite.test('pagination expiry and traversal capacity fail explicitly rather than truncate', async () => {
   const a = await suite.registerTestUser('hierarchy-limits', 'pw');
   const token = a.access_token!;

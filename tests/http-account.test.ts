@@ -1,7 +1,8 @@
 // Restored doltgres:tests/account.test.ts wire assertions, on a fresh
 // Turso app and real loopback HTTP. A8 lives in http-contract.test.ts.
 import { assert, assertEquals } from '@std/assert';
-import { serverName } from '#engine/config.ts';
+import { serverName, setConfigForTests } from '#engine/config.ts';
+import { theApp } from '#engine/app.ts';
 import { httpSuite } from '#tests/http-app.ts';
 const { matrix, registerTestUser, test } = httpSuite('HTTP account endpoints');
 const SN = serverName();
@@ -85,6 +86,51 @@ test('register: dummy auth WITHOUT a session → 401 (session required); with th
   });
   assertEquals(r2.status, 200);
   assertEquals(r2.body.user_id, `@nosess:${SN}`);
+});
+
+test('UIA expiry and capacity reach registration without invalidating its active continuation', async () => {
+  setConfigForTests({ uia: { sessionseconds: 10, maxsessions: 1 } });
+  try {
+    const path = '/_matrix/client/v3/register';
+    const body = { username: 'uia-expired-registration', password: 'pw' };
+    const expired = await call(path, { method: 'POST', body });
+    assertEquals(expired.status, 401);
+    const db = await theApp().store.tenant(SN);
+    await db.execute('UPDATE uia_sessions SET created_ms=? WHERE session=?', [
+      Date.now() - 10001,
+      String(expired.body.session),
+    ]);
+    const renewed = await call(path, {
+      method: 'POST',
+      body: {
+        ...body,
+        auth: { type: 'm.login.dummy', session: expired.body.session },
+      },
+    });
+    assertEquals(renewed.status, 401, 'expired completion cannot register');
+    assert(renewed.body.session !== expired.body.session);
+    const refused = await call(path, { method: 'POST', body });
+    assertEquals([refused.status, refused.body.errcode], [
+      429,
+      'M_LIMIT_EXCEEDED',
+    ]);
+    assertEquals(
+      (await call(path, {
+        method: 'POST',
+        body: {
+          ...body,
+          auth: { type: 'm.login.dummy', session: renewed.body.session },
+        },
+      })).status,
+      200,
+    );
+    assertEquals(
+      Number((await db.query('SELECT count(*) AS n FROM uia_sessions'))[0].n),
+      0,
+    );
+  } finally {
+    setConfigForTests({});
+  }
 });
 
 test('A1: login honors device_id + display name; GET/list/PUT; unknown → 404', async () => {
