@@ -305,6 +305,17 @@ function bind(
         ),
       acknowledge: (d: devices.DeviceIdentity, since: StreamToken | null) =>
         todevice.acknowledge(conn, d, since),
+      acknowledgeSliding: (
+        d: devices.DeviceIdentity,
+        connection: string,
+        since: string | null,
+      ) => todevice.acknowledgeSliding(conn, d, connection, since),
+      deliverSliding: (
+        d: devices.DeviceIdentity,
+        connection: string,
+        limit: number,
+        limits: e2ee.KeyLimits,
+      ) => todevice.deliverSliding(conn, d, connection, limit, limits),
       deliver: (
         d: devices.DeviceIdentity,
         token: StreamToken,

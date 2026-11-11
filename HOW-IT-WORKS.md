@@ -265,6 +265,15 @@ explicitly empty state selection is never overridden. DM removal resets the
 last delivered value for prejoin rooms as well as joined rooms.
 (`api/engine/client/sync-window.ts`, `api/engine/sliding-sync/{rooms,state}.ts`)
 
+Sliding inbox groundwork reuses the tenant's durable queue, acknowledgment and
+bounded issued-delivery receipts. Opaque receipts are scoped to the protocol and
+connection as well as the device generation; a room-list position, forged token
+or another connection cannot acknowledge unseen keys. Zero-size pages issue no
+deletion authority, count/byte limits preserve the tail, and an evicted receipt
+replays rather than consumes data. Ordinary sync remains a direct consumer of
+the same owner. This is internal groundwork, not an exposed sync endpoint.
+(`api/engine/tenant/todevice.ts`)
+
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data
 streams. Denials win, empty lists exclude everything, and only `*` is special
