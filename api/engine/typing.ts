@@ -14,6 +14,28 @@ import { isJoined } from '#engine/server/read.ts';
 const typing = new Map<string, Map<string, number>>();
 const lastChangeT = new Map<string, number>();
 let t = 0;
+const epoch = crypto.randomUUID();
+
+export type TypingSnapshot = {
+  epoch: string;
+  seq: number;
+  rooms: Map<string, { userIds: string[]; changed: number }>;
+};
+
+/** Copy ephemeral values and their cut synchronously, before async rendering.
+ * A persisted sliding position must not compare an old process's counter with
+ * this process's reset counter. No new durable typing owner is introduced. */
+export function captureTyping(rooms: Iterable<string>): TypingSnapshot {
+  sweepTyping();
+  return {
+    epoch,
+    seq: t,
+    rooms: new Map([...rooms].map((room) => [room, {
+      userIds: [...(typing.get(room)?.keys() ?? [])],
+      changed: lastTypingChange(room),
+    }])),
+  };
+}
 
 // M5b: change listeners for the federation EDU queues (sender.ts).
 // Fired on explicit set calls only — expiry is ephemeral by nature and

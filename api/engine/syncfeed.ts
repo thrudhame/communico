@@ -52,11 +52,10 @@ import {
   sharedUsers,
 } from '#engine/server/ephemeral.ts';
 import {
+  captureTyping,
   lastTypingChange,
   onTypingChange,
   sweepTyping,
-  typingIn,
-  typingSeq,
 } from '#engine/typing.ts';
 
 export interface SyncInputs {
@@ -82,6 +81,7 @@ async function roomTimeline(
     members: Row[];
     notifications: ReturnType<typeof syncNotificationCounts>;
     accountData: { type: string; content: unknown }[];
+    typing: { userIds: string[]; changed: number };
   },
 ) {
   const app = theApp();
@@ -218,11 +218,11 @@ async function roomTimeline(
   };
   if (summary) {
     const ephemeral: Record<string, unknown>[] = [];
-    const typing = typingIn(room.id);
+    const typing = snapshot.typing;
     if (
       i.since === null
         ? typing.userIds.length > 0
-        : lastTypingChange(room.id) > i.since.tSeq
+        : typing.changed > i.since.tSeq
     ) {
       ephemeral.push({
         type: 'm.typing',
@@ -438,10 +438,13 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const accountSnapshot = await app.tenant.tx((tx) =>
     captureAccountData(tx, lp, app.tenant.serverName, i.since?.aSeq ?? null)
   );
+  const typingSnapshot = captureTyping(
+    snapshot.memberships.map((m) => m.roomId),
+  );
   const now: StreamToken = {
     eSeq: snapshot.counters.get('events') ?? 0,
     pSeq: snapshot.counters.get('presence') ?? 0,
-    tSeq: typingSeq(),
+    tSeq: typingSnapshot.seq,
     rSeq: snapshot.counters.get('receipts') ?? 0,
     aSeq: accountSnapshot.seq,
     dSeq: snapshot.counters.get('devices') ?? 0,
@@ -597,7 +600,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
         !changed.length && !receiptRooms.has(m.roomId) &&
         !roomAccountData.has(m.roomId) &&
         !snapshot.notifications.changed.has(m.roomId) &&
-        lastTypingChange(m.roomId) <= i.since.tSeq
+        (typingSnapshot.rooms.get(m.roomId)?.changed ?? 0) <= i.since.tSeq
       ) continue;
     }
     const result = await roomTimeline(
@@ -609,6 +612,8 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       {
         ...snapshot.rooms.get(m.roomId)!,
         accountData: roomAccountData.get(m.roomId) ?? [],
+        typing: typingSnapshot.rooms.get(m.roomId) ??
+          { userIds: [], changed: 0 },
         notifications: syncNotificationCounts(
           snapshot.notifications.rooms.get(m.roomId),
           i.filter.timeline.unread_thread_notifications === true,

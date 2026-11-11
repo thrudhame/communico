@@ -283,6 +283,15 @@ ordinary sync. Single-event receipt maps follow MSC4102's unthreaded-wins
 collision behavior, without removing the independently stored thread slots.
 (`api/engine/tenant/accountdata.ts`, `api/engine/server/ephemeral.ts`)
 
+Room extensions select the union of admitted named list windows and actual
+subscriptions, not arbitrary requested room IDs. Their account/receipt/typing
+cuts advance only for selected rooms. First or expanded receipt windows include
+timeline-target marks plus the viewer's own marks, with private rows scoped to
+their viewer. Typing snapshots copy values and counters before rendering;
+ordinary sync shares that capture, and a process epoch invalidates persisted
+sliding typing cuts after restart. Empty stops remain real updates.
+(`api/engine/sliding-sync/extensions.ts`, `api/engine/typing.ts`)
+
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data
 streams. Denials win, empty lists exclude everything, and only `*` is special
