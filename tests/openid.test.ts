@@ -5,6 +5,7 @@ import { deactivateUser, registerUser } from '#engine/tenant/users.ts';
 import { issueOpenIdToken, openIdUserInfo } from '#engine/tenant/openid.ts';
 import { hashToken, lookupToken } from '#engine/tenant/auth.ts';
 import { config, loadConfig } from '#engine/config.ts';
+import { TENANT_V14 } from '#tests/fixtures/tenant-versions.ts';
 
 Deno.test('OpenID hashes, exact expiry, tenant separation, reopen and deactivation', async () => {
   const dir = await Deno.makeTempDir();
@@ -81,10 +82,7 @@ Deno.test('tenant v14 upgrades OpenID credentials without touching identity or a
   const previous = {
     version: 14,
     apply: async (db: Parameters<typeof tenantSchema.apply>[0]) => {
-      await tenantSchema.apply(db);
-      await db.exec('DROP TABLE openid_tokens');
-      await db.exec('DROP TABLE profile_fields');
-      await db.exec('DROP TABLE erased_users');
+      await db.exec(TENANT_V14);
     },
   };
   let store = await openStore(settings, { schemas: { tenant: previous } });
