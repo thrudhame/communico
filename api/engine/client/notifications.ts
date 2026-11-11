@@ -2,7 +2,7 @@ import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { lookupRoom } from './room.ts';
 import { renderEvent, renderInviteNotification } from './render.ts';
-import { pruneNotificationHistory } from '#engine/server/notification-history.ts';
+import { notificationHistoryCutoff } from '#engine/server/notification-history.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
 
@@ -34,14 +34,17 @@ export async function notificationsFor(
   if (only !== null && only !== 'highlight') invalid('only must be highlight');
   const app = theApp();
   const now = Date.now();
-  const rows = await app.server.tx(async (tx) => {
-    await pruneNotificationHistory(tx, now);
-    return await tx.query(
-      `SELECT n.* FROM notification_history h JOIN notifications n ON n.seq=h.seq
-      WHERE h.user=? AND h.seq<? AND (?=0 OR h.highlight=1) ORDER BY h.seq DESC LIMIT 501`,
-      [userId, cursor, only === 'highlight' ? 1 : 0],
-    );
-  });
+  const rows = await app.server.query(
+    `SELECT n.* FROM notification_history h JOIN notifications n ON n.seq=h.seq
+      WHERE h.user=? AND h.seq<? AND (?=0 OR h.highlight=1)
+      AND (h.read_ms IS NULL OR h.read_ms>?) ORDER BY h.seq DESC LIMIT 501`,
+    [
+      userId,
+      cursor,
+      only === 'highlight' ? 1 : 0,
+      notificationHistoryCutoff(now),
+    ],
+  );
   const notifications: Record<string, unknown>[] = [];
   let scanned = 0;
   for (const row of rows.slice(0, 500)) {

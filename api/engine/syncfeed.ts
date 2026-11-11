@@ -33,6 +33,7 @@ import {
   roomsFor,
 } from '#engine/server/read.ts';
 import {
+  notificationChanged,
   notificationSnapshot,
   syncNotificationCounts,
 } from '#engine/server/notifications.ts';
@@ -57,7 +58,7 @@ import {
   getPresence,
   onEphemeral,
   receiptRoomsSince,
-  receiptsSince,
+  receiptSnapshot,
   setPresenceValue,
   sharedUsers,
 } from '#engine/server/ephemeral.ts';
@@ -329,8 +330,7 @@ async function relevantChanged(
   sweepTyping();
   const app = theApp();
   if (
-    (await notificationSnapshot(app.server, i.userId, i.since.nSeq ?? 0))
-      .changed.size
+    await notificationChanged(app.server, i.userId, i.since.nSeq ?? 0)
   ) return true;
   const lists = await deviceListsBetween(
     app.server,
@@ -456,18 +456,25 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       string,
       { receipts: Record<string, unknown>[]; members: Row[] }
     >();
+    const receipts = await receiptSnapshot(tx, i.userId, i.since?.rSeq ?? 0);
+    const members = new Map<string, Row[]>();
+    for (
+      const row of await tx.query(
+        `SELECT m.room,m.user,m.membership,m.seq FROM memberships m
+      WHERE m.membership IN ('join','invite') AND EXISTS (
+        SELECT 1 FROM memberships mine WHERE mine.user=? AND mine.room=m.room
+      ) ORDER BY m.room,CASE m.membership WHEN 'join' THEN 0 ELSE 1 END,m.user`,
+        [i.userId],
+      )
+    ) {
+      const room = String(row.room);
+      if (!members.has(room)) members.set(room, []);
+      members.get(room)!.push(row);
+    }
     for (const membership of memberships) {
       rooms.set(membership.roomId, {
-        receipts: await receiptsSince(
-          tx,
-          membership.roomId,
-          i.userId,
-          i.since?.rSeq ?? 0,
-        ),
-        members: await tx.query(
-          "SELECT user,membership,seq FROM memberships WHERE room=? AND membership IN ('join','invite') ORDER BY CASE membership WHEN 'join' THEN 0 ELSE 1 END,user",
-          [membership.roomId],
-        ),
+        receipts: receipts.get(membership.roomId) ?? [],
+        members: members.get(membership.roomId) ?? [],
       });
     }
     const oob = await tx.query(

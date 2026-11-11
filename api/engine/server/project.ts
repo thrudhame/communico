@@ -22,6 +22,7 @@ import { advance, get } from '#engine/store/watermark.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
+import { reconcileTyping } from '#engine/typing.ts';
 import {
   preparePush,
   type PushPublication,
@@ -69,6 +70,7 @@ export async function project(store: Store, roomId: string): Promise<void> {
   for (;;) {
     const complete = await withProjectionLock(async () => {
       if (!await projectNow(store, roomId)) return false;
+      await reconcileTyping(await store.server(), roomId);
       for (const fn of projectedListeners) {
         try {
           await fn(store, roomId);

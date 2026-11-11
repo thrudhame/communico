@@ -1,6 +1,7 @@
 // Server-owned push ledger and exact summaries. All effects use the caller's
 // connection, committing with live publication or the receipt that caused them.
 import type { Conn, Database } from '#engine/store/db.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import type { PushPublication } from '#engine/server/push-project.ts';
 import { enqueuePush, queueBadge, removePushWork } from './push-queue.ts';
 import {
@@ -101,6 +102,25 @@ export async function advanceNotificationRead(
   if (
     pending || (invalidScope && await receiptRelationPending(tx, room, event))
   ) {
+    const existing = await tx.query(
+      'SELECT 1 FROM notification_receipt_refs WHERE user=? AND room=? AND scope=? AND event=?',
+      [user, room, scope, event],
+    );
+    if (
+      !existing.length &&
+      Number(
+          (await tx.query(
+            'SELECT COUNT(*) AS n FROM notification_receipt_refs WHERE user=? AND room=?',
+            [user, room],
+          ))[0].n,
+        ) >= 256
+    ) {
+      throw new MatrixError(
+        429,
+        'M_LIMIT_EXCEEDED',
+        'pending receipt capacity reached',
+      );
+    }
     await tx.execute(
       'INSERT INTO notification_receipt_refs(user,room,scope,event) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
       [user, room, scope, event],
@@ -468,6 +488,17 @@ export async function withdrawInvitePush(
 }
 
 /** Counts and change-room membership are read by sync in its maxima snapshot. */
+export async function notificationChanged(
+  tx: Reader,
+  user: string,
+  since: number,
+): Promise<boolean> {
+  return (await tx.query(
+    'SELECT 1 FROM notification_changes WHERE user=? AND seq>? LIMIT 1',
+    [user, since],
+  )).length > 0;
+}
+
 export async function notificationSnapshot(
   tx: Reader,
   user: string,

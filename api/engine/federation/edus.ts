@@ -29,6 +29,7 @@ import { recordPending } from './peers.ts';
 import type { Store } from '#engine/store/index.ts';
 import { roomAllows } from './acl.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 
 export type Edu = { edu_type: string; content: Record<string, unknown> };
 
@@ -289,12 +290,21 @@ export function eduState(server: Db, self: string, store: Store): EduState {
     // content: { <roomId>: { 'm.read': { <userId>: { event_ids, data } } } }
     for (const [roomId, perRoom] of Object.entries(content)) {
       await admitted(roomId, origin, async () => {
+        if (
+          perRoom === null || typeof perRoom !== 'object' ||
+          Array.isArray(perRoom)
+        ) return;
         const reads = (perRoom as Record<string, unknown>)['m.read'] as
           | Record<string, { event_ids?: unknown; data?: unknown }>
           | undefined;
-        if (reads === undefined || typeof reads !== 'object') return;
+        if (
+          reads == null || typeof reads !== 'object' || Array.isArray(reads)
+        ) return;
         for (const [userId, mark] of Object.entries(reads)) {
           if (domainOf(userId) !== origin) continue;
+          if (
+            mark === null || typeof mark !== 'object' || Array.isArray(mark)
+          ) continue;
           const eventIds = Array.isArray(mark.event_ids) ? mark.event_ids : [];
           if (eventIds.length === 0 || typeof eventIds[0] !== 'string') {
             continue;
@@ -303,20 +313,31 @@ export function eduState(server: Db, self: string, store: Store): EduState {
             ts?: unknown;
             thread_id?: unknown;
           };
-          if (data.thread_id === '') continue;
-          await setReceipt(
-            server,
-            roomId,
-            userId,
-            'm.read',
-            String(eventIds[0]),
-            {
-              ts: typeof data.ts === 'number' ? data.ts : Date.now(),
-              threadId: typeof data.thread_id === 'string'
-                ? data.thread_id
-                : null,
-            },
-          );
+          if (typeof data !== 'object' || Array.isArray(data)) continue;
+          if (
+            Object.hasOwn(data, 'thread_id') &&
+            typeof data.thread_id !== 'string'
+          ) continue;
+          try {
+            await setReceipt(
+              server,
+              roomId,
+              userId,
+              'm.read',
+              String(eventIds[0]),
+              {
+                ts: typeof data.ts === 'number' ? data.ts : Date.now(),
+                threadId: data.thread_id as string | null | undefined,
+              },
+            );
+          } catch (error) {
+            // Malformed/capacity-refused entries do not suppress later valid
+            // entries. Durable storage failures remain visible and retryable.
+            if (
+              !(error instanceof MatrixError) ||
+              ![400, 429].includes(error.status)
+            ) throw error;
+          }
         }
       });
     }

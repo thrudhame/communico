@@ -412,6 +412,22 @@ type TenantTxPushRules = {
 // rule at the top of its kind. New rules are enabled by default. The
 // priority computation, the upsert and the stream stamp are one tenant
 // transaction.
+function object(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assertActions(actions: unknown): asserts actions is unknown[] {
+  if (
+    !Array.isArray(actions) ||
+    !actions.every((action) =>
+      ['notify', 'dont_notify', 'coalesce'].includes(action) ||
+      (object(action) && typeof action.set_tweak === 'string')
+    )
+  ) {
+    throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid push rule actions');
+  }
+}
+
 export async function putRule(
   tenant: Tenant,
   localpart: string,
@@ -420,6 +436,22 @@ export async function putRule(
   body: { actions: unknown[]; conditions?: unknown[]; pattern?: string },
   placement: { before?: string; after?: string },
 ): Promise<void> {
+  assertScopeKind('global', kind);
+  assertActions(body.actions);
+  if (
+    (body.conditions !== undefined &&
+      (!Array.isArray(body.conditions) ||
+        !body.conditions.every((condition) =>
+          object(condition) && typeof condition.kind === 'string'
+        ))) ||
+    (body.pattern !== undefined && typeof body.pattern !== 'string')
+  ) {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'invalid push rule conditions or pattern',
+    );
+  }
   if (ruleId.startsWith('.') || ruleId.includes('/') || ruleId.includes('\\')) {
     throw new MatrixError(
       400,
@@ -582,6 +614,8 @@ export async function setRuleActions(
   ruleId: string,
   actions: unknown[],
 ): Promise<void> {
+  assertScopeKind('global', kind);
+  assertActions(actions);
   await tenant.tx(async (tx) => {
     await requireStored(tx, localpart, tenant.serverName, kind, ruleId);
     await tx.pushRules.setActions(
