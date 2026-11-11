@@ -3,8 +3,8 @@
 // state_entries, event_state, publications and the current pointer belong
 // to materialize.ts alone.
 import type { Conn } from '#engine/store/db.ts';
-import { childrenOf, prevsOf } from './events.ts';
-import { precedes } from './causal.ts';
+import { childrenOf } from './events.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 export type ErasureCut = { changePos: number; segment: number; group: number };
 
 export async function erasureCut(conn: Conn): Promise<ErasureCut> {
@@ -218,27 +218,48 @@ export async function publishedGroupsAfter(
     // Ownership only says where bytes were acquired. An isolated anchor can
     // lie after any publication in that stay; only actual DAG evidence proves
     // a later live cut. Imported opening groups need their real opener too.
-    const snapshots = await conn.query(
-      `SELECT pub.grp, c.event FROM publications pub JOIN changes c ON c.pos = pub.change_pos
-       WHERE pub.change_pos <= ?
-       UNION SELECT opening_group AS grp, opened_by AS event FROM segments
-       WHERE kind = 'stay' AND opening_group IS NOT NULL AND opened_by IS NOT NULL AND id <= ?`,
-      [
-        cut?.changePos ?? Number.MAX_SAFE_INTEGER,
-        cut?.segment ?? Number.MAX_SAFE_INTEGER,
-      ],
-    );
-    const groups = new Set<number>();
-    const budget = { remaining: 100_000 };
-    const graph = {
-      prevsOf: (id: string) => prevsOf(conn, id),
-      childrenOf: (id: string) => childrenOf(conn, id),
+    // One bounded graph walk, then indexed selection of only proved snapshots.
+    // Allocation order cannot establish causal visibility for isolated anchors.
+    const seen = new Set([event]);
+    const queue = [event];
+    let remaining = 100_000;
+    const spend = () => {
+      if (--remaining < 0) {
+        throw new MatrixError(
+          503,
+          'M_UNKNOWN',
+          'publication visibility exceeds bounded history read',
+        );
+      }
     };
-    for (const row of snapshots) {
-      if (
-        row.event !== null &&
-        await precedes(graph, event, String(row.event), budget) === true
-      ) {
+    for (let i = 0; i < queue.length; i++) {
+      spend();
+      for (const child of await childrenOf(conn, queue[i])) {
+        spend();
+        if (seen.has(child)) continue;
+        seen.add(child);
+        queue.push(child);
+      }
+    }
+    const groups = new Set<number>();
+    for (let i = 0; i < queue.length; i += 200) {
+      const batch = queue.slice(i, i + 200);
+      const slots = batch.map(() => '?').join(',');
+      const snapshots = await conn.query(
+        `SELECT pub.grp FROM changes c JOIN publications pub ON pub.change_pos = c.pos
+         WHERE c.event IN (${slots}) AND c.kind IN ('event', 'transition') AND pub.change_pos <= ?
+         UNION SELECT opening_group AS grp FROM segments
+         WHERE kind = 'stay' AND opening_group IS NOT NULL AND opened_by IN (${slots}) AND id <= ? LIMIT ?`,
+        [
+          ...batch,
+          cut?.changePos ?? Number.MAX_SAFE_INTEGER,
+          ...batch,
+          cut?.segment ?? Number.MAX_SAFE_INTEGER,
+          remaining + 1,
+        ],
+      );
+      for (const row of snapshots) {
+        spend();
         groups.add(Number(row.grp));
       }
     }

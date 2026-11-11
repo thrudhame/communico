@@ -73,14 +73,8 @@ export async function redactionOf(
   target: string,
 ): Promise<string | null> {
   const rows = await conn.query(
-    "SELECT event, data FROM changes WHERE kind = 'redaction' ORDER BY pos",
+    "SELECT event FROM changes WHERE kind = 'redaction' AND json_extract(data, '$.target') = ? ORDER BY pos LIMIT 1",
+    [target],
   );
-  for (const row of rows) {
-    if (
-      (JSON.parse(String(row.data)) as { target?: unknown }).target === target
-    ) {
-      return String(row.event);
-    }
-  }
-  return null;
+  return rows.length === 0 ? null : String(rows[0].event);
 }

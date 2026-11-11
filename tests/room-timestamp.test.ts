@@ -520,6 +520,18 @@ Deno.test('timestamp: nearby causal ties do not read the old room prefix', async
   };
   const tx = {
     events: {
+      orderKeys: (ids: string[]) =>
+        Promise.resolve(
+          new Map(
+            ids.map((
+              id,
+            ) => [id, {
+              height: Number(id.slice(1)),
+              segment: 1,
+              offset: Number(id.slice(1)),
+            }]),
+          ),
+        ),
       timestampBucket: () =>
         Promise.resolve([
           { id: '$100001', ts: 100, segment: 1, offset: 0 },
@@ -580,6 +592,99 @@ Deno.test('timestamp: causal ties survive child-first anchor acquisition without
       await room.tx((tx) => tx.segments.positionOf(child.event_id!)),
       pos,
     );
+  });
+});
+
+Deno.test('timestamp: complete connected anchors stop remote fanout, genuine forward gaps do not', async () => {
+  await fixture(async ({ fr, room, deps }) => {
+    const anchor = await fr.addEvent(message(100, 'complete anchor'));
+    deps.fetcher = fakeFetcher({
+      event: fr.events,
+      stateIds: new Map(
+        [...fr.events.keys()].map((id) => [id, fr.stateIdsAt(id)!]),
+      ),
+    }).fetcher;
+    await backfill(room, {
+      from: [anchor.event_id!],
+      anchor,
+      limit: 1,
+      via: fr.server.name,
+    }, deps);
+    let queries = 0;
+    deps.fetcher.timestampToEvent = () => {
+      queries++;
+      return Promise.resolve(null);
+    };
+    const search = () =>
+      searchTimestamp(
+        room,
+        { ts: 100, dir: 'f' },
+        () => Promise.resolve(true),
+        deps,
+      );
+    assertEquals((await search())?.event_id, anchor.event_id);
+    assert(queries > 0, 'the real forward gap remains unresolved');
+    const child = await fr.addEvent(message(110, 'positioned child'));
+    await ingestRemote(room, [child], fr.server.name, deps);
+    queries = 0;
+    assertEquals((await search())?.event_id, anchor.event_id);
+    assertEquals(
+      queries,
+      0,
+      'a complete backward edge and proved forward connection need no remote lookup',
+    );
+  });
+});
+
+Deno.test('history bridge: cancellation after a locked page commit preserves durable progress and its cursor', async () => {
+  await fixture(async ({ fr, room, deps, reopen }) => {
+    const a = await fr.addEvent(message(100, 'a'));
+    const b = await fr.addEvent(message(110, 'b'));
+    const c = await fr.addEvent(message(120, 'c'));
+    deps.fetcher = fakeFetcher({
+      event: fr.events,
+      stateIds: new Map(
+        [...fr.events.keys()].map((id) => [id, fr.stateIdsAt(id)!]),
+      ),
+      backfill: (from, limit) => fr.backfillPdus(from, limit),
+    }).fetcher;
+    for (const anchor of [a, c]) {
+      await backfill(room, {
+        from: [anchor.event_id!],
+        anchor,
+        limit: 1,
+        via: fr.server.name,
+      }, deps);
+    }
+    const cursor = (await room.tx((tx) =>
+      tx.segments.positionOf(a.event_id!)
+    ))!;
+    const abort = new AbortController();
+    const original = room.tx.bind(room);
+    room.tx = async (body) => {
+      const result = await original(body);
+      if (
+        await original((tx) => tx.segments.positionOf(b.event_id!)) !== null
+      ) abort.abort();
+      return result;
+    };
+    try {
+      assertEquals(
+        await bridgeForwardAnchor(room, cursor, [fr.server.name], 1, {
+          ...deps,
+          signal: abort.signal,
+        }),
+        true,
+      );
+      assert(abort.signal.aborted);
+    } finally {
+      room.tx = original;
+    }
+    const after = await (await reopen()).tx((tx) =>
+      tx.segments.step(cursor, 'f')
+    );
+    assert(after.kind === 'event');
+    assertEquals(after.event, b.event_id);
   });
 });
 

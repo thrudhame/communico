@@ -101,7 +101,6 @@ async function roomTimeline(
     event: Record<string, unknown>;
   }[] = [];
   let cursor = end;
-  let scanned = 0;
   let more = true;
   let gap = false;
   let newestStay: number | undefined;
@@ -137,7 +136,6 @@ async function roomTimeline(
         gap = true;
         break;
       }
-      scanned++;
       // An imported before-state is an explicit missing live-history boundary.
       // Retain its event, but never splice the older feed across it, including
       // when the boundary event itself is hidden by a client filter.
@@ -180,7 +178,7 @@ async function roomTimeline(
     : eligible;
   const returned = selected.map((item) => item.row);
   const events = selected.map((item) => item.event);
-  const limited = gap || more || scanned > returned.length;
+  const limited = gap || trimmed;
   const start = returned[0];
   const atStart = await stateAtSeq(
     room,
@@ -241,7 +239,7 @@ async function roomTimeline(
     if (ev !== null) stateEvents.push(ev);
   }
   const prevE = trimmed && returned.length ? returned[0].seq - 1 : end;
-  const paginationCursor = limited && start !== undefined
+  const paginationCursor = start !== undefined
     ? await room.tx((tx) => tx.segments.positionOf(start.event))
     : null;
   const entry: Record<string, unknown> = {

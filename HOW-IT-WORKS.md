@@ -142,8 +142,9 @@ search over accepted, grounded, positioned events with genuine state refs.
 Directions are inclusive; each candidate passes the caller's existing user or
 server visibility policy. Complete equal-timestamp buckets are dependency-ordered
 through the stored prev DAG, with first-owner positions breaking branch ties;
-remote depths never determine the answer. Candidate-to-candidate reachability
-meets from both directions instead of walking every ancestor to genesis. Reads
+remote depths never determine the answer. One shared ancestor DAG establishes
+nearest candidate dependencies, stopping below the lowest candidate's indexed
+local height instead of repeating pairwise walks or reading to genesis. Reads
 fail explicitly with 503 above 10,000 equal-time candidates, 100,000 scanned
 events, or a shared 100,000-unit causal read budget, rather than
 returning a truncated or hidden result.
@@ -155,6 +156,7 @@ fetch deadline. Timestamp distance is not evidence of a complete history. Servin
 federation lookup is local-only. A remote claim must match its fetched, verified
 PDU's room, id, timestamp and direction, then pass the shared history importer's
 auth and state checks. Key acquisition retains its transport's own request bound.
+Complete anchors with proved forward connections no longer count as gaps.
 Failure retains an eligible local result; storage errors are not peer misses.
 (`api/engine/room/timestamp-search.ts`, `api/engine/federation/fetcher.ts`)
 
@@ -165,6 +167,11 @@ boundaries and crosses actual positioned child edges, never an assumed owner
 stay. Unavailable connections retain a resumable gap cursor. Shared visibility
 uses proved later publication/opener ancestry for isolated anchors, not arbitrary
 stay allocation; a pre-join anchor can acquire that proof through the same bridge.
+An isolated anchor's visibility uses one bounded descendant walk and indexed,
+cut-qualified publication selection. Budget exhaustion is an explicit 503, not
+partial permission. Membership content is reused per visibility read. Room schema
+v3 upgrades existing files with selective event/change and redaction-target JSON
+indexes, preserving the earliest applied redaction effect.
 Zero-limit context retains both pagination tokens. Positions and event-state refs survive
 reopen. Import changes are history, never live news: sync/feed, notifications,
 published state, extremities and delivery stay unchanged.
@@ -268,7 +275,10 @@ responses carry the full cut; incremental responses carry its delta from since.
 Filtering and lazy member loading apply after cut selection. Later publications
 cannot leak across the captured response token.
 Imported before-state boundaries stop live sync windows rather than splicing
-older feed rows across missing remote history. Limited windows use real room
+older feed rows across missing remote history. Filtering or visibility omissions
+alone do not set `limited`; eligible limit trimming and real gaps do. Every
+nonempty window supplies a room cursor before its first returned event, so
+follow-on pagination does not repeat that window. Limited windows use real room
 cursors; backward pagination follows the missing predecessor into an isolated
 history anchor even when the gap is inside a stay. These imports remain history,
 never new feed events. Lazy state retains timeline sender memberships, mandatory

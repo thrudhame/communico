@@ -456,7 +456,10 @@ test('shared HTTP history remains readable after departure, including imported u
       );
     }
   }
-  await call(path(fr.roomId) + '/leave', a.access_token, {}, 'POST');
+  assertEquals(
+    (await call(path(fr.roomId) + '/leave', a.access_token, {}, 'POST')).status,
+    200,
+  );
   assertEquals(
     (await call(
       path(fr.roomId) + '/event/' + encodeURIComponent(String(old.event_id)),
