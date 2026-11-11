@@ -300,6 +300,17 @@ export function loadConfig(opts: {
     );
   }
 
+  const turn = built.turn as Record<string, unknown> | undefined;
+  if (
+    typeof turn?.ttl === 'number' &&
+    (turn.ttl < 0 ||
+      !Number.isSafeInteger(Math.floor(Date.now() / 1000) + turn.ttl))
+  ) {
+    problems.push(
+      'config: turn.ttl (COMMUNICO_TURN_TTL): expected nonnegative seconds within safe expiry range',
+    );
+  }
+
   const peeking = built.peeking as Record<string, unknown> | undefined;
   const openid = built.openid as Record<string, unknown> | undefined;
   if (
@@ -679,6 +690,14 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
+  wellknown?: Partial<Omit<Config['wellknown'], 'support'>> & {
+    support?: {
+      page?: string;
+      admin?: Partial<Config['wellknown']['support']['admin']>;
+      security?: Partial<Config['wellknown']['support']['security']>;
+    };
+  };
+  turn?: Partial<Config['turn']>;
   openid?: Partial<Config['openid']>;
   peeking?: Partial<Config['peeking']>;
   hierarchy?: Partial<Config['hierarchy']>;
@@ -695,7 +714,7 @@ export type ConfigPatch = {
     shutdowngraceseconds?: number;
     maxrequestbytes?: number;
   };
-  admin?: { socket?: string };
+  admin?: Partial<Config['admin']>;
   media?: Partial<Omit<Config['media'], 'cache'>> & {
     cache?: {
       maxbytes?: number;

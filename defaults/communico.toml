@@ -21,6 +21,46 @@ maxrequestbytes = 13107200
 # The parent directory must exist and belong to the server user.
 # COMMUNICO_ADMIN_SOCKET
 socket = ""
+# Full local Matrix user IDs permitted to inspect other users with client whois.
+# No HTTP administrators by default; this does not change the private Unix API.
+# COMMUNICO_ADMIN_USERS
+users = []
+
+[wellknown]
+# Public client API base URL; empty disables /.well-known/matrix/client (404).
+# Explicit URL, independent of federation.enabled. COMMUNICO_WELLKNOWN_CLIENT
+client = ""
+# Optional identity-server base URL, discovery only. COMMUNICO_WELLKNOWN_IDENTITY
+identity = ""
+
+[wellknown.support]
+# Public support page URL; empty page and contact lists disable support (404).
+# COMMUNICO_WELLKNOWN_SUPPORT_PAGE
+page = ""
+[wellknown.support.admin]
+# Each address becomes an m.role.admin contact; no positional pairing.
+# COMMUNICO_WELLKNOWN_SUPPORT_ADMIN_MXIDS / EMAILS
+mxids = []
+emails = []
+[wellknown.support.security]
+# Sensitive support contacts, m.role.security. These grant no server privileges.
+# COMMUNICO_WELLKNOWN_SUPPORT_SECURITY_MXIDS / EMAILS
+mxids = []
+emails = []
+
+[turn]
+# TURN service discovery only; no TURN daemon is started. Empty URIs disables it.
+# COMMUNICO_TURN_URIS
+uris = []
+# HMAC-SHA1 shared secret wins over static credentials. Never returned to clients.
+# COMMUNICO_TURN_SECRET
+secret = ""
+# Static credential alternative. COMMUNICO_TURN_USERNAME / PASSWORD
+username = ""
+password = ""
+# Credential lifetime in seconds, Synapse default; 0 disables credentials.
+# COMMUNICO_TURN_TTL
+ttl = 3600
 
 [openid]
 # Synapse's default OpenID token lifetime; separate from client access tokens.

@@ -601,6 +601,29 @@ supervisor example.
 (`api/engine/config.ts:1-5`, `api/engine/config.ts:135-165`,
 `api/engine/config.ts:253-301`, `main.ts:20-42`, `main.ts:139-162`)
 
+## Discovery, TURN and whois
+
+Public client/support well-known responses read explicit layered settings and
+share the root CORS middleware, independently of federation admission. Missing
+client URL or all support fields yields 404; identity discovery is optional.
+Support contact addresses are individual role-qualified entries, not paired lists.
+(`api/engine/wellknown.ts`, `defaults/communico.toml`)
+
+TURN credential discovery uses the authenticated user, configured TTL and URIs.
+A shared secret takes precedence over static credentials: expiry seconds and
+full user ID form the username; HMAC-SHA1 with padded standard base64 forms the
+password. No external request, credential storage or TURN server is involved.
+Incomplete configuration or zero TTL returns an empty object.
+(`api/engine/turn.ts`)
+
+Global push-rule reads share `tenant/pushrules.ts:rulesetFor`. Whois authorizes
+self or the exact configured `admin.users` entry before checking target locality
+or reading data. One tenant transaction reads devices and active access-token
+sessions; no token identifiers, IPs, user agents or last-seen data are exposed or
+newly recorded. Unknown local users have no devices, like Synapse's response.
+The private Unix admin boundary remains separate.
+(`api/engine/tenant/whois.ts`)
+
 ## Content reports
 
 Admin report pages select IDs using stored UTF-8 byte sizes before hydrating

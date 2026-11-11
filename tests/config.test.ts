@@ -41,6 +41,26 @@ cacerts = []
 
 [admin]
 socket = ""
+users = []
+
+[wellknown]
+client = ""
+identity = ""
+[wellknown.support]
+page = ""
+[wellknown.support.admin]
+mxids = []
+emails = []
+[wellknown.support.security]
+mxids = []
+emails = []
+
+[turn]
+uris = []
+secret = ""
+username = ""
+password = ""
+ttl = 3600
 
 [media]
 root = "./.media"
@@ -222,6 +242,53 @@ Deno.test('shared request size limit layers and rejects zero/negative values', a
         }).some((p) =>
           p.includes('server.maxrequestbytes') && p.includes('expected > 0')
         ),
+      );
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('discovery, TURN and whois settings layer by leaf and reject invalid expiry', async () => {
+  const dir = await writeTree({
+    'defaults/communico.toml': FULL,
+    'config/communico.toml':
+      '[turn]\nuris = ["turn:relay.example"]\nttl = 600\n[wellknown]\nclient = "https://matrix.example/"\n[admin]\nusers = ["@admin:localhost"]\n',
+  });
+  const defaultsPath = dir + '/defaults/communico.toml';
+  const configPath = dir + '/config/communico.toml';
+  try {
+    const base = loadConfig({ defaultsPath, configPath: null, env: {} }).config;
+    assertEquals(base.turn.uris, []);
+    assertEquals(base.wellknown.client, '');
+    assertEquals(base.admin.users, []);
+    const overlay = loadConfig({ defaultsPath, configPath, env: {} }).config;
+    assertEquals(overlay.turn.uris, ['turn:relay.example']);
+    assertEquals(overlay.turn.ttl, 600);
+    assertEquals(overlay.wellknown.client, 'https://matrix.example/');
+    assertEquals(overlay.admin.users, ['@admin:localhost']);
+    const overridden = loadConfig({
+      defaultsPath,
+      configPath,
+      env: {
+        COMMUNICO_TURN_TTL: '0',
+        COMMUNICO_TURN_URIS: '',
+        COMMUNICO_ADMIN_USERS: '',
+        COMMUNICO_WELLKNOWN_SUPPORT_SECURITY_EMAILS: 'security@example.org',
+      },
+    }).config;
+    assertEquals(overridden.turn.ttl, 0);
+    assertEquals(overridden.turn.uris, []);
+    assertEquals(overridden.admin.users, []);
+    assertEquals(overridden.wellknown.support.security.emails, [
+      'security@example.org',
+    ]);
+    for (const ttl of ['-1', String(Number.MAX_SAFE_INTEGER)]) {
+      assert(
+        loadFail({ defaultsPath, configPath, env: { COMMUNICO_TURN_TTL: ttl } })
+          .some((p) =>
+            p.includes('turn.ttl') && p.includes('COMMUNICO_TURN_TTL')
+          ),
       );
     }
   } finally {
@@ -794,7 +861,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('94 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('107 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -814,7 +881,9 @@ Deno.test('94 leaves total across the sections (the surface tripwire)', async ()
   ): [string, number] => [name, countLeaves(leaves)]);
   assertEquals(counts, [
     ['server', 4],
-    ['admin', 1],
+    ['admin', 2],
+    ['wellknown', 7],
+    ['turn', 5],
     ['hierarchy', 6],
     ['peeking', 2],
     ['openid', 1],
@@ -828,8 +897,8 @@ Deno.test('94 leaves total across the sections (the surface tripwire)', async ()
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    94,
-    'the whole config surface includes remote media resource and cache policy leaves',
+    107,
+    'the whole config surface includes discovery, TURN and HTTP administrators',
   );
 });
 

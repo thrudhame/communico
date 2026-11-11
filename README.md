@@ -179,6 +179,28 @@ That longer-term direction has no promised coverage or dates.
 [e2ee-connections]: https://spec.matrix.org/unstable/client-server-api/#get_matrixclientv3adminwhoisuserid
 [e2ee-search]: https://spec.matrix.org/unstable/client-server-api/#server-side-search
 
+## Client discovery, calls and account inspection
+
+`wellknown.client` publishes the explicit public homeserver base URL at
+`/.well-known/matrix/client`; `wellknown.identity` optionally advertises an
+identity server, without implementing one. Empty client URL returns 404.
+`wellknown.support.page` and the `admin`/`security` `mxids`/`emails` lists
+publish support information; no page or contacts returns 404. Both discovery
+routes are public, allow cross-origin reads and work with federation disabled.
+
+Authenticated `GET /_matrix/client/v3/voip/turnServer` returns `{}` until
+`turn.uris` and credentials are configured. Use `turn.secret` for expiring
+coturn-compatible HMAC credentials or `turn.username`/`turn.password` for static
+credentials. The secret takes precedence. `turn.ttl` is seconds (default 3600;
+0 disables credentials). This advertises an external TURN service, not a daemon.
+
+`GET /_matrix/client/v3/pushrules/global/` returns the caller's global rule set.
+Client `admin/whois/{userId}` permits self-inspection or a requester explicitly
+listed by full local Matrix ID in `admin.users` (default empty). It returns
+devices and active token sessions with empty `connections`: no IP, user-agent
+or last-seen history is recorded. Public support contacts grant no privileges;
+the private admin Unix socket's authorization is unchanged.
+
 ## Checks
 
 Run inside the named, authorized project test VM or dedicated project LXC on
