@@ -150,6 +150,56 @@ Deno.test('client: certificate material is acquired only for leaf-key trust', as
   });
 });
 
+Deno.test('client: CA root expansion belongs to the configured trust snapshot', async () => {
+  const identity = await makeIdentity('roots.test');
+  await withStore(async (store) => {
+    await withFake(identity, async (fake) => {
+      const server = await store.server();
+      const getRoots = tls.getCACertificates;
+      let reads = 0;
+      tls.getCACertificates = ((type) => {
+        reads++;
+        return getRoots(type);
+      }) as typeof getRoots;
+      try {
+        const start = performance.now();
+        for (let i = 0; i < 10; i++) {
+          const response = await federationRequest(server, identity.signer, {
+            destination: `localhost:${fake.port}`,
+            method: 'GET',
+            path: '/_matrix/key/v2/server',
+            body: null,
+          });
+          assertEquals(response.status, 200);
+        }
+        console.log(
+          JSON.stringify({
+            tlsRequests: 10,
+            elapsedMs: performance.now() - start,
+            rootReads: reads,
+          }),
+        );
+        assertEquals(
+          reads,
+          2,
+          'bundled/system roots expanded once per trust snapshot',
+        );
+        resetCaCertsForTests();
+        const response = await federationRequest(server, identity.signer, {
+          destination: `localhost:${fake.port}`,
+          method: 'GET',
+          path: '/_matrix/key/v2/server',
+          body: null,
+        });
+        assertEquals(response.status, 200);
+        assertEquals(reads, 4, 'reset creates a new trust snapshot');
+      } finally {
+        tls.getCACertificates = getRoots;
+      }
+    });
+  });
+});
+
 Deno.test('client: raw streaming shares verified signing and completed-error provenance', async () => {
   const identity = await makeIdentity('raw.test');
   const bytes = new Uint8Array(100000).fill(93);

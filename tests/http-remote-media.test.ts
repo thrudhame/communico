@@ -10,16 +10,23 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { listCachedMedia } from '#engine/server/media.ts';
 import { addBlock, removeBlock } from '#engine/federation/peers.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
+import { MediaCache } from '#engine/media/cache.ts';
 
 Deno.test('HTTP remote media: signed multipart demand/cache/dedup, filenames, policy, strict fallback and legacy isolation', async () => {
   const previous = config();
   const root = await Deno.makeTempDir({ prefix: 'http-remote-media-' });
   setConfigForTests({
-    media: { root, maxbytes: 100000 },
+    media: { root, maxbytes: 100000, cache: { maxbytes: 1000000 } },
     federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
   });
   resetCaCertsForTests();
   const http = await startHttp();
+  const cleanup = MediaCache.prototype.cleanup;
+  let cleanups = 0;
+  MediaCache.prototype.cleanup = function (...args) {
+    cleanups++;
+    return cleanup.apply(this, args);
+  };
   let mode = 'bytes';
   let fetches = 0;
   let legacy = 0;
@@ -108,6 +115,21 @@ Deno.test('HTTP remote media: signed multipart demand/cache/dedup, filenames, po
       );
     }
     assertEquals(fetches, 1);
+    const beforeHits = cleanups;
+    const started = performance.now();
+    for (let i = 0; i < 20; i++) {
+      const hit = await get('m');
+      assertEquals(hit.status, 200);
+      assertEquals(new Uint8Array(await hit.arrayBuffer()), bytes);
+    }
+    console.log(
+      JSON.stringify({
+        mediaHits: 20,
+        elapsedMs: performance.now() - started,
+        cleanupScans: cleanups - beforeHits,
+      }),
+    );
+    assertEquals(cleanups, beforeHits, 'cache hits must not own maintenance');
     const filename = await get('m', '/different.png');
     assertEquals(filename.status, 200);
     assertEquals(
@@ -153,6 +175,7 @@ Deno.test('HTTP remote media: signed multipart demand/cache/dedup, filenames, po
       false,
     );
   } finally {
+    MediaCache.prototype.cleanup = cleanup;
     await fake.close();
     await http.close();
     setConfigForTests(previous);

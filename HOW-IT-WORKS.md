@@ -533,6 +533,8 @@ and leases served files against retention/quota cleanup. No network or disk
 side effect runs inside a retryable transaction callback. Shared fills track
 subscribers: one disconnect cannot cancel another, and the last disconnect
 aborts the owned transfer, including queued fills. App shutdown closes the owner.
+Maintenance runs at startup, after fills and on the configured interval, not on
+cache hits. A fill's serving lease is acquired before cleanup can evict bytes.
 (`api/engine/server/media.ts`, `api/engine/media/cache.ts`)
 
 Raw federation and JSON requests share signing, discovery, TLS and cancellation.
@@ -558,6 +560,8 @@ source metadata. Nothing decrypts attachment ciphertext.
 
 The storage layer owns native-library loading, file transactions and
 maintenance. Startup checks the qualified Turso revision and patch set. Safe
+integer validation applies to native query results as well as parameters;
+out-of-range integers fail before callers receive rounded database values. Safe
 creation applies the schema in a `.new` directory, closes/reopens, verifies,
 syncs files, renames, then syncs the parent. Opens apply only explicitly
 supported version steps in one store-owned transaction with the version

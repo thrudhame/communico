@@ -159,6 +159,7 @@ export class MediaService {
       scope: 'remote',
     };
     let row = await cache.get(identity);
+    const filled = row === null;
     if (row === null) {
       if (!allowRemote) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown cached media');
@@ -178,7 +179,7 @@ export class MediaService {
     });
     const stream = await cache.open(row);
     try {
-      await cache.cleanup(config().media.cache);
+      if (filled) await cache.cleanup(config().media.cache);
     } catch (error) {
       await stream.cancel(error);
       throw error;
@@ -228,6 +229,7 @@ export class MediaService {
       scope: 'thumbnail',
     };
     let row = await cache.get(identity);
+    const filled = row === null;
     if (row === null) {
       if (!allowRemote && origin !== serverName()) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown cached thumbnail');
@@ -298,7 +300,7 @@ export class MediaService {
     }
     const stream = await cache.open(row);
     try {
-      await cache.cleanup(config().media.cache);
+      if (filled) await cache.cleanup(config().media.cache);
     } catch (error) {
       await stream.cancel(error);
       throw error;

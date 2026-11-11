@@ -176,7 +176,17 @@ export class Turso {
       Object.fromEntries(
         Object.entries(row).map((
           [key, value],
-        ) => [key, Array.isArray(value) ? new Uint8Array(value) : value]),
+        ) => {
+          if (
+            typeof value === 'number' && (!Number.isFinite(value) ||
+              (Number.isInteger(value) && !Number.isSafeInteger(value)))
+          ) {
+            throw new TypeError(
+              'SQL results must be finite and integers must be safe',
+            );
+          }
+          return [key, Array.isArray(value) ? new Uint8Array(value) : value];
+        }),
       )
     );
   }

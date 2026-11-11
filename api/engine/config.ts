@@ -15,6 +15,7 @@ import {
   type Schema,
 } from './config-schema.ts';
 import { parseCidr } from './preview/cidr.ts';
+import { validateNumbers } from './config-numbers.ts';
 
 export type { Config } from './config-schema.ts';
 export { envNameOf, leaves, SCHEMA } from './config-schema.ts';
@@ -201,6 +202,8 @@ export function loadConfig(opts: {
   let defaultsObj: Record<string, unknown> = {};
   if (defaultsRead.ok) {
     defaultsObj = defaultsRead.value;
+  } else if (defaultsRead.kind === 'missing') {
+    problems.push(`config: ${opts.defaultsPath}: missing defaults file`);
   } else if (defaultsRead.kind === 'parse') {
     problems.push(
       `config: ${opts.defaultsPath}: parse error: ${defaultsRead.detail}`,
@@ -300,41 +303,8 @@ export function loadConfig(opts: {
     );
   }
 
-  const turn = built.turn as Record<string, unknown> | undefined;
-  if (
-    typeof turn?.ttl === 'number' &&
-    (turn.ttl < 0 ||
-      !Number.isSafeInteger(Math.floor(Date.now() / 1000) + turn.ttl))
-  ) {
-    problems.push(
-      'config: turn.ttl (COMMUNICO_TURN_TTL): expected nonnegative seconds within safe expiry range',
-    );
-  }
-
-  const peeking = built.peeking as Record<string, unknown> | undefined;
-  const openid = built.openid as Record<string, unknown> | undefined;
-  if (
-    typeof openid?.tokenseconds !== 'number' ||
-    !Number.isSafeInteger(openid.tokenseconds) || openid.tokenseconds <= 0 ||
-    !Number.isSafeInteger(openid.tokenseconds * 1000 + Date.now())
-  ) {
-    problems.push(
-      'config: openid.tokenseconds: expected positive seconds within safe expiry range',
-    );
-  }
-  for (const [key, value] of Object.entries(peeking ?? {})) {
-    if (typeof value === 'number' && value < (key === 'maxevents' ? 1 : 0)) {
-      problems.push(`config: peeking.${key}: invalid capacity`);
-    }
-  }
+  problems.push(...validateNumbers(built as Partial<Config>));
   const hierarchy = built.hierarchy as Record<string, unknown> | undefined;
-  for (const [key, value] of Object.entries(hierarchy ?? {})) {
-    if (typeof value === 'number' && value < (key === 'maxdepth' ? 0 : 1)) {
-      problems.push(
-        `config: hierarchy.${key}: expected >= ${key === 'maxdepth' ? 0 : 1}`,
-      );
-    }
-  }
   if (
     typeof hierarchy?.pagesize === 'number' &&
     typeof hierarchy.maxpagesize === 'number' &&
@@ -345,103 +315,6 @@ export function loadConfig(opts: {
     );
   }
 
-  const grace = (built.server as Record<string, unknown> | undefined)
-    ?.shutdowngraceseconds;
-  if (typeof grace === 'number' && grace < 0) {
-    problems.push(
-      `config: server.shutdowngraceseconds (COMMUNICO_SERVER_SHUTDOWNGRACESECONDS): expected >= 0, got ${grace}`,
-    );
-  }
-
-  const requestBytes = (built.server as Record<string, unknown> | undefined)
-    ?.maxrequestbytes;
-  if (typeof requestBytes === 'number' && requestBytes < 1) {
-    problems.push(
-      'config: server.maxrequestbytes (COMMUNICO_SERVER_MAXREQUESTBYTES): expected > 0',
-    );
-  }
-
-  const retention = (built.push as Record<string, unknown> | undefined)
-    ?.readretentiondays;
-  if (typeof retention === 'number' && retention < 0) {
-    problems.push(
-      `config: push.readretentiondays (COMMUNICO_PUSH_READRETENTIONDAYS): expected >= 0, got ${retention}`,
-    );
-  }
-  const deliveryHours = (built.push as Record<string, unknown> | undefined)
-    ?.deliverygiveuphours;
-  if (typeof deliveryHours === 'number' && deliveryHours < 0) {
-    problems.push(
-      `config: push.deliverygiveuphours (COMMUNICO_PUSH_DELIVERYGIVEUPHOURS): expected >= 0, got ${deliveryHours}`,
-    );
-  }
-  for (
-    const [leaf, value] of Object.entries(
-      (built.e2ee ?? {}) as Record<string, unknown>,
-    )
-  ) {
-    if (typeof value === 'number' && value < 0) {
-      problems.push(
-        `config: e2ee.${leaf} (${
-          envNameOf(['e2ee', leaf])
-        }): expected >= 0, got ${value}`,
-      );
-    }
-  }
-  const media = built.media as Record<string, unknown> | undefined;
-  if (media) {
-    for (
-      const leaf of [
-        'maxbytes',
-        'timeoutms',
-        'maxfetches',
-        'maxpixels',
-        'maxdimension',
-        'thumbnailms',
-        'thumbnailworkers',
-        'maxvariants',
-        'cleanupseconds',
-      ]
-    ) {
-      const value = media[leaf];
-      if (
-        typeof value === 'number' &&
-        (!Number.isSafeInteger(value) || value <= 0)
-      ) {
-        problems.push(
-          `config: media.${leaf} (${
-            envNameOf(['media', leaf])
-          }): expected a positive safe integer`,
-        );
-      }
-    }
-    const hops = media.maxredirects;
-    if (typeof hops === 'number' && (!Number.isSafeInteger(hops) || hops < 0)) {
-      problems.push(
-        'config: media.maxredirects (COMMUNICO_MEDIA_MAXREDIRECTS): expected >= 0',
-      );
-    }
-    const cache = media.cache as Record<string, unknown> | undefined;
-    for (const [scope, values] of Object.entries(cache ?? {})) {
-      const entries = typeof values === 'number'
-        ? [[['media', 'cache', scope], values] as const]
-        : Object.entries(values as Record<string, unknown>).map((
-          [leaf, value],
-        ) => [['media', 'cache', scope, leaf], value] as const);
-      for (const [path, value] of entries) {
-        if (
-          typeof value === 'number' &&
-          (!Number.isSafeInteger(value) || value < 0)
-        ) {
-          problems.push(
-            `config: ${path.join('.')} (${
-              envNameOf([...path])
-            }): expected >= 0`,
-          );
-        }
-      }
-    }
-  }
   for (const section of ['preview', 'push', 'media']) {
     const p = built[section] as Record<string, unknown> | undefined;
     if (!p) continue;
@@ -496,66 +369,12 @@ export function loadConfig(opts: {
     enumLeaf('keychange', ['accept', 'warn', 'block']);
     enumLeaf('mode', ['open', 'closed']);
     enumLeaf('lookups', ['all', 'known', 'none']);
-    const kvh = f.keyvalidityhours;
-    const discoveryServers = f.discoveryservers;
-    if (typeof discoveryServers === 'number' && discoveryServers < 1) {
-      problems.push(
-        'config: federation.discoveryservers (COMMUNICO_FEDERATION_DISCOVERYSERVERS): expected >= 1',
-      );
-    }
-    if (typeof kvh === 'number' && kvh > 168) {
-      problems.push(
-        `config: federation.keyvalidityhours (${
-          envOf('keyvalidityhours')
-        }): spec cap is 168 (7 days), got ${kvh}`,
-      );
-    }
-    const witnesses = f.witnesses;
-    if (typeof witnesses === 'number' && witnesses < 1) {
-      problems.push(
-        `config: federation.witnesses (${
-          envOf('witnesses')
-        }): expected >= 1, got ${witnesses}`,
-      );
-    }
     // M5b delivery/history family: ordering rules across the leaves and
     // the backoff ceiling's ladder rule (plan §3.1).
     const intLeaf = (leaf: string): number | null => {
       const v = f[leaf];
       return typeof v === 'number' ? v : null;
     };
-    for (
-      const leaf of [
-        'missingwaitms',
-        'missinglimit',
-        'missingbudgetms',
-        'missingmax',
-        'backfillbatch',
-        'backfillmax',
-        'bulkmaxbytes',
-        'backoffstartmillihours',
-        'backoffmaxmillihours',
-        'refusedmillihours',
-        'txnhours',
-      ]
-    ) {
-      const v = intLeaf(leaf);
-      if (v !== null && v < 1) {
-        problems.push(
-          `config: federation.${leaf} (${
-            envOf(leaf)
-          }): expected >= 1, got ${v}`,
-        );
-      }
-    }
-    const ungrounded = intLeaf('ungroundedmillihours');
-    if (ungrounded !== null && ungrounded < 0) {
-      problems.push(
-        `config: federation.ungroundedmillihours (${
-          envOf('ungroundedmillihours')
-        }): expected >= 0, got ${ungrounded}`,
-      );
-    }
     const missinglimit = intLeaf('missinglimit');
     const missingmax = intLeaf('missingmax');
     if (

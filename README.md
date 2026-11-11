@@ -222,6 +222,10 @@ shipped defaults and all eight control combinations.
 Configuration uses `defaults/communico.toml`, an optional
 `config/communico.toml` overlay and `COMMUNICO_*` environment overrides.
 `deno task config` prints the merged settings; it does not initialize storage.
+The shipped defaults file is required even with a complete environment. Every
+numeric setting has explicit safe-integer bounds; durations are checked after
+unit conversion, including the signed 32-bit limit for timer delays. Invalid
+settings fail startup rather than wrapping a timer or rounding a value.
 
 Non-upload request bodies are limited before JSON parsing to 12.5 MiB by
 `server.maxrequestbytes` (`COMMUNICO_SERVER_MAXREQUESTBYTES`). Operators can

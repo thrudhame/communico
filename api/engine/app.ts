@@ -9,6 +9,7 @@
 // app store (4b), engine tests keep opening schema-less stores without
 // it.
 import { config, serverName } from '#engine/config.ts';
+import { drainResources } from '#engine/lifetime.ts';
 import { MediaService } from '#engine/media/service.ts';
 import { installRuleMigration } from '#engine/client/rule-migration.ts';
 import {
@@ -84,19 +85,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
     schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
   });
   const services: (() => void | Promise<void>)[] = [];
-  const stopServices = async () => {
-    const errors: unknown[] = [];
-    for (const stop of services.splice(0).reverse()) {
-      try {
-        await stop();
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    if (errors.length) {
-      throw new AggregateError(errors, 'app service shutdown failed');
-    }
-  };
+  const stopServices = () => drainResources(services.splice(0).reverse());
   try {
     const tenant = await openTenant(store, serverName(), { create: true });
     const server = await store.server();
@@ -122,27 +111,20 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       pushSender,
       media,
       close: async () => {
-        try {
-          try {
-            await app.sender?.stop();
-          } finally {
-            app.sender = null;
-            await stopServices();
-          }
-        } finally {
-          await store.close();
-        }
+        const sender = app.sender;
+        app.sender = null;
+        await drainResources([
+          () => sender?.stop(),
+          stopServices,
+          () => store.close(),
+        ]);
       },
     };
     registerToDevice(app.federationEdus, tenant);
     current = app;
     return app;
   } catch (error) {
-    try {
-      await stopServices();
-    } finally {
-      await store.close();
-    }
+    await drainResources([stopServices, () => store.close()], [error]);
     throw error;
   }
 }
@@ -187,8 +169,7 @@ export function startFederationServices(app: App): void {
   app.sender = {
     ...sender,
     stop: async () => {
-      await unwire();
-      await sender.stop();
+      await drainResources([unwire, () => sender.stop()]);
     },
   };
 }
