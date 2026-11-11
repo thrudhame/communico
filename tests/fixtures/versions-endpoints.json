@@ -1,0 +1,2504 @@
+[
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/account-data.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/user/{userId}/account_data/{type}",
+    "operation": "setAccountData",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/account_data/#type/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/account-data.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/user/{userId}/account_data/{type}",
+    "operation": "getAccountData",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/account_data/#type/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/account-data.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}",
+    "operation": "setAccountDataPerRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/rooms/#roomId/account_data/#type/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/account-data.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}",
+    "operation": "getAccountDataPerRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/rooms/#roomId/account_data/#type/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/account_deactivation.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/deactivate",
+    "operation": "deactivateAccount",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/account/deactivate/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/admin.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/admin/whois/{userId}",
+    "operation": "getWhoIs",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/admin/whois/#userId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/administrative_contact.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/account/3pid",
+    "operation": "getAccount3PIDs",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/administrative_contact.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/3pid",
+    "operation": "post3PIDs",
+    "deprecated": true,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/administrative_contact.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/3pid/add",
+    "operation": "add3PID",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/administrative_contact.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/3pid/bind",
+    "operation": "bind3PID",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/administrative_contact.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/3pid/delete",
+    "operation": "delete3pidFromAccount",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/administrative_contact.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/3pid/unbind",
+    "operation": "unbind3pidFromAccount",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/administrative_contact.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/3pid/email/requestToken",
+    "operation": "requestTokenTo3PIDEmail",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/administrative_contact.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/3pid/msisdn/requestToken",
+    "operation": "requestTokenTo3PIDMSISDN",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/appservice_ping.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v1/appservice/{appserviceId}/ping",
+    "operation": "pingAppservice",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional appservices; [existing TODO](../../todos/application-services.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/appservice_room_directory.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/directory/list/appservice/{networkId}/{roomId}",
+    "operation": "updateAppserviceRoomDirectoryVisibility",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional appservices; [existing TODO](../../todos/application-services.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/authed-content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/media/download/{serverName}/{mediaId}",
+    "operation": "getContentAuthed",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/media/download/#serverName/#mediaId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/authed-content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/media/download/{serverName}/{mediaId}/{fileName}",
+    "operation": "getContentOverrideNameAuthed",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/media/download/#serverName/#mediaId/#filename/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/authed-content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/media/thumbnail/{serverName}/{mediaId}",
+    "operation": "getContentThumbnailAuthed",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/media/thumbnail/#serverName/#mediaId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/authed-content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/media/preview_url",
+    "operation": "getUrlPreviewAuthed",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/media/preview_url/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/authed-content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/media/config",
+    "operation": "getConfigAuthed",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/media/config/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/banning.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/ban",
+    "operation": "ban",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/ban/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/banning.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/unban",
+    "operation": "unban",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/unban/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/capabilities.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/capabilities",
+    "operation": "getCapabilities",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/capabilities/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/content-repo.yaml",
+    "method": "POST",
+    "path": "/_matrix/media/v3/upload",
+    "operation": "uploadContent",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/media/v3/upload/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/content-repo.yaml",
+    "method": "PUT",
+    "path": "/_matrix/media/v3/upload/{serverName}/{mediaId}",
+    "operation": "uploadContentToMXC",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/media/v3/upload/#serverName/#mediaId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/content-repo.yaml",
+    "method": "POST",
+    "path": "/_matrix/media/v1/create",
+    "operation": "createContent",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/media/v1/create/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/media/v3/download/{serverName}/{mediaId}",
+    "operation": "getContent",
+    "deprecated": true,
+    "routes": [
+      "api/endpoints/matrix/_matrix/media/v3/download/#serverName/#mediaId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/media/v3/download/{serverName}/{mediaId}/{fileName}",
+    "operation": "getContentOverrideName",
+    "deprecated": true,
+    "routes": [
+      "api/endpoints/matrix/_matrix/media/v3/download/#serverName/#mediaId/#filename/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/media/v3/thumbnail/{serverName}/{mediaId}",
+    "operation": "getContentThumbnail",
+    "deprecated": true,
+    "routes": [
+      "api/endpoints/matrix/_matrix/media/v3/thumbnail/#serverName/#mediaId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/media/v3/preview_url",
+    "operation": "getUrlPreview",
+    "deprecated": true,
+    "routes": [
+      "api/endpoints/matrix/_matrix/media/v3/preview_url/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/content-repo.yaml",
+    "method": "GET",
+    "path": "/_matrix/media/v3/config",
+    "operation": "getConfig",
+    "deprecated": true,
+    "routes": [
+      "api/endpoints/matrix/_matrix/media/v3/config/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/create_room.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/createRoom",
+    "operation": "createRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/createRoom/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/cross_signing.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/keys/device_signing/upload",
+    "operation": "uploadCrossSigningKeys",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/keys/device_signing/upload/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/cross_signing.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/keys/signatures/upload",
+    "operation": "uploadCrossSigningSignatures",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/keys/signatures/upload/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/device_management.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/devices",
+    "operation": "getDevices",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/devices/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/device_management.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/devices/{deviceId}",
+    "operation": "getDevice",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/devices/#deviceId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/device_management.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/devices/{deviceId}",
+    "operation": "updateDevice",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/devices/#deviceId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/device_management.yaml",
+    "method": "DELETE",
+    "path": "/_matrix/client/v3/devices/{deviceId}",
+    "operation": "deleteDevice",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/devices/#deviceId/delete.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/device_management.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/delete_devices",
+    "operation": "deleteDevices",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/delete_devices/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/directory.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/directory/room/{roomAlias}",
+    "operation": "setRoomAlias",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/directory/room/#roomAlias/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/directory.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/directory/room/{roomAlias}",
+    "operation": "getRoomIdByAlias",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/directory/room/#roomAlias/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/directory.yaml",
+    "method": "DELETE",
+    "path": "/_matrix/client/v3/directory/room/{roomAlias}",
+    "operation": "deleteRoomAlias",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/directory/room/#roomAlias/delete.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/directory.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/rooms/{roomId}/aliases",
+    "operation": "getLocalAliases",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/aliases/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/event_context.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/rooms/{roomId}/context/{eventId}",
+    "operation": "getEventContext",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/context/#eventId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/filter.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/user/{userId}/filter",
+    "operation": "defineFilter",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/filter/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/filter.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/user/{userId}/filter/{filterId}",
+    "operation": "getFilter",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/filter/#filterId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/inviting.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/invite",
+    "operation": "inviteUser",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/invite/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/joining.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/join",
+    "operation": "joinRoomById",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/join/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/joining.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/join/{roomIdOrAlias}",
+    "operation": "joinRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/join/#roomIdOrAlias/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/room_keys/version",
+    "operation": "postRoomKeysVersion",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/version/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/room_keys/version",
+    "operation": "getRoomKeysVersionCurrent",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/version/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/room_keys/version/{version}",
+    "operation": "getRoomKeysVersion",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/version/#version/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/room_keys/version/{version}",
+    "operation": "putRoomKeysVersion",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/version/#version/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "DELETE",
+    "path": "/_matrix/client/v3/room_keys/version/{version}",
+    "operation": "deleteRoomKeysVersion",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/version/#version/delete.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}",
+    "operation": "putRoomKeyBySessionId",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/keys/#roomId/#sessionId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}",
+    "operation": "getRoomKeyBySessionId",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/keys/#roomId/#sessionId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "DELETE",
+    "path": "/_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}",
+    "operation": "deleteRoomKeyBySessionId",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/keys/#roomId/#sessionId/delete.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/room_keys/keys/{roomId}",
+    "operation": "putRoomKeysByRoomId",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/keys/#roomId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/room_keys/keys/{roomId}",
+    "operation": "getRoomKeysByRoomId",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/keys/#roomId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "DELETE",
+    "path": "/_matrix/client/v3/room_keys/keys/{roomId}",
+    "operation": "deleteRoomKeysByRoomId",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/keys/#roomId/delete.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/room_keys/keys",
+    "operation": "putRoomKeys",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/keys/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/room_keys/keys",
+    "operation": "getRoomKeys",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/keys/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/key_backup.yaml",
+    "method": "DELETE",
+    "path": "/_matrix/client/v3/room_keys/keys",
+    "operation": "deleteRoomKeys",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/room_keys/keys/delete.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/keys.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/keys/upload",
+    "operation": "uploadKeys",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/keys/upload/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/keys.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/keys/query",
+    "operation": "queryKeys",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/keys/query/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/keys.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/keys/claim",
+    "operation": "claimKeys",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/keys/claim/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/keys.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/keys/changes",
+    "operation": "getKeysChanges",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/keys/changes/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/kicking.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/kick",
+    "operation": "kick",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/kick/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/knocking.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/knock/{roomIdOrAlias}",
+    "operation": "knockRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/knock/#roomIdOrAlias/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/leaving.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/leave",
+    "operation": "leaveRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/leave/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/leaving.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/forget",
+    "operation": "forgetRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/forget/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/list_joined_rooms.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/joined_rooms",
+    "operation": "getJoinedRooms",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/joined_rooms/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/list_public_rooms.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/directory/list/room/{roomId}",
+    "operation": "getRoomVisibilityOnDirectory",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/directory/list/room/#roomId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/list_public_rooms.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/directory/list/room/{roomId}",
+    "operation": "setRoomVisibilityOnDirectory",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/directory/list/room/#roomId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/list_public_rooms.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/publicRooms",
+    "operation": "getPublicRooms",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/publicRooms/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/list_public_rooms.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/publicRooms",
+    "operation": "queryPublicRooms",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/publicRooms/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/login.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/login",
+    "operation": "getLoginFlows",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/login/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/login.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/login",
+    "operation": "login",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/login/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/login_token.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v1/login/get_token",
+    "operation": "generateLoginToken",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional login tokens; [existing TODO](../../todos/login-token.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/logout.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/logout",
+    "operation": "logout",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/logout/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/logout.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/logout/all",
+    "operation": "logout_all",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/logout/all/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/message_pagination.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/rooms/{roomId}/messages",
+    "operation": "getRoomEvents",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/messages/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/notifications.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/notifications",
+    "operation": "getNotifications",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/notifications/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/oauth_server_metadata.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/auth_metadata",
+    "operation": "getAuthMetadata",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional OAuth; [existing TODO](../../todos/oauth-login.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/old_sync.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/events",
+    "operation": "getEvents",
+    "deprecated": true,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/events/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/old_sync.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/initialSync",
+    "operation": "initialSync",
+    "deprecated": true,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Deprecated global sync/event APIs; [existing TODO](../../todos/deprecated-endpoints.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/old_sync.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/events/{eventId}",
+    "operation": "getOneEvent",
+    "deprecated": true,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Deprecated global sync/event APIs; [existing TODO](../../todos/deprecated-endpoints.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/openid.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/user/{userId}/openid/request_token",
+    "operation": "requestOpenIdToken",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/openid/request_token/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/password_management.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/password",
+    "operation": "changePassword",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/account/password/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/password_management.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/password/email/requestToken",
+    "operation": "requestTokenToResetPasswordEmail",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID password reset; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/password_management.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/account/password/msisdn/requestToken",
+    "operation": "requestTokenToResetPasswordMSISDN",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID password reset; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/peeking_events.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/events",
+    "operation": "peekEvents",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/events/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/presence.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/presence/{userId}/status",
+    "operation": "setPresence",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/presence/#userId/status/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/presence.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/presence/{userId}/status",
+    "operation": "getPresence",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/presence/#userId/status/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/profile.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/profile/{userId}/{keyName}",
+    "operation": "setProfileField",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/profile/#userId/#keyName/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/profile.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/profile/{userId}/{keyName}",
+    "operation": "getProfileField",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/profile/#userId/#keyName/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/profile.yaml",
+    "method": "DELETE",
+    "path": "/_matrix/client/v3/profile/{userId}/{keyName}",
+    "operation": "deleteProfileField",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/profile/#userId/#keyName/delete.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/profile.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/profile/{userId}",
+    "operation": "getUserProfile",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/profile/#userId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pusher.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/pushers",
+    "operation": "getPushers",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushers/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pusher.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/pushers/set",
+    "operation": "postPusher",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushers/set/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pushrules.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/pushrules/",
+    "operation": "getPushRules",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushrules/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pushrules.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/pushrules/global/",
+    "operation": "getPushRulesGlobal",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushrules/global/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pushrules.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}",
+    "operation": "getPushRule",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushrules/#scope/#kind/#ruleId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pushrules.yaml",
+    "method": "DELETE",
+    "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}",
+    "operation": "deletePushRule",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushrules/#scope/#kind/#ruleId/delete.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pushrules.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}",
+    "operation": "setPushRule",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushrules/#scope/#kind/#ruleId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pushrules.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}/enabled",
+    "operation": "isPushRuleEnabled",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushrules/#scope/#kind/#ruleId/enabled/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pushrules.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}/enabled",
+    "operation": "setPushRuleEnabled",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushrules/#scope/#kind/#ruleId/enabled/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pushrules.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions",
+    "operation": "getPushRuleActions",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushrules/#scope/#kind/#ruleId/actions/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/pushrules.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions",
+    "operation": "setPushRuleActions",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/pushrules/#scope/#kind/#ruleId/actions/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/read_markers.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/read_markers",
+    "operation": "setReadMarker",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/read_markers/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/receipts.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/receipt/{receiptType}/{eventId}",
+    "operation": "postReceipt",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/receipt/#receiptType/#eventId/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/redaction.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}",
+    "operation": "redactEvent",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/redact/#eventId/#txnId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/refresh.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/refresh",
+    "operation": "refresh",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/refresh/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/registration.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/register",
+    "operation": "register",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/register/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/registration.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/register/email/requestToken",
+    "operation": "requestTokenToRegisterEmail",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID registration; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/registration.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/register/msisdn/requestToken",
+    "operation": "requestTokenToRegisterMSISDN",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional 3PID registration; [existing TODO](../../todos/account-3pid.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/registration.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/register/available",
+    "operation": "checkUsernameAvailability",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/register/available/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/registration_tokens.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/register/m.login.registration_token/validity",
+    "operation": "registrationTokenValidity",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional registration tokens; [existing TODO](../../todos/registration-tokens.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/relations.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/rooms/{roomId}/relations/{eventId}",
+    "operation": "getRelatingEvents",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/rooms/#roomId/relations/#eventId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/relations.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/rooms/{roomId}/relations/{eventId}/{relType}",
+    "operation": "getRelatingEventsWithRelType",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/rooms/#roomId/relations/#eventId/#relType/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/relations.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}",
+    "operation": "getRelatingEventsWithRelTypeAndEventType",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/rooms/#roomId/relations/#eventId/#relType/#eventType/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/report_content.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/report",
+    "operation": "reportRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/report/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/report_content.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/report/{eventId}",
+    "operation": "reportEvent",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/report/#eventId/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/report_content.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/users/{userId}/report",
+    "operation": "reportUser",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/users/#userId/report/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/room_event_by_timestamp.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/rooms/{roomId}/timestamp_to_event",
+    "operation": "getEventByTimestamp",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/rooms/#roomId/timestamp_to_event/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/room_initial_sync.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/rooms/{roomId}/initialSync",
+    "operation": "roomInitialSync",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/initialSync/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/room_send.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}",
+    "operation": "sendMessage",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/send/#type/#txnId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/room_state.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}",
+    "operation": "setRoomStateWithKey",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/state/#type/#stateKey/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/room_summary.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/room_summary/{roomIdOrAlias}",
+    "operation": "getRoomSummary",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/room_summary/#roomIdOrAlias/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/room_upgrades.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/upgrade",
+    "operation": "upgradeRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/upgrade/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/rooms.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/rooms/{roomId}/event/{eventId}",
+    "operation": "getOneRoomEvent",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/event/#eventId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/rooms.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}",
+    "operation": "getRoomStateWithKey",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/state/#type/#stateKey/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/rooms.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/rooms/{roomId}/state",
+    "operation": "getRoomState",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/state/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/rooms.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/rooms/{roomId}/members",
+    "operation": "getMembersByRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/members/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/rooms.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/rooms/{roomId}/joined_members",
+    "operation": "getJoinedMembersByRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/joined_members/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/search.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/search",
+    "operation": "search",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/search/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/space_hierarchy.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/rooms/{roomId}/hierarchy",
+    "operation": "getSpaceHierarchy",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/rooms/#roomId/hierarchy/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/sso_login_redirect.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/login/sso/redirect",
+    "operation": "redirectToSSO",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional SSO; [existing TODO](../../todos/sso-login.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/sso_login_redirect.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/login/sso/redirect/{idpId}",
+    "operation": "redirectToIdP",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional SSO; [existing TODO](../../todos/sso-login.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/support.yaml",
+    "method": "GET",
+    "path": "/.well-known/matrix/support",
+    "operation": "getWellknownSupport",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/.well-known/matrix/support/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/sync.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/sync",
+    "operation": "sync",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/sync/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/tags.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/user/{userId}/rooms/{roomId}/tags",
+    "operation": "getRoomTags",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/rooms/#roomId/tags/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/tags.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/user/{userId}/rooms/{roomId}/tags/{tag}",
+    "operation": "setRoomTag",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/rooms/#roomId/tags/#tag/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/tags.yaml",
+    "method": "DELETE",
+    "path": "/_matrix/client/v3/user/{userId}/rooms/{roomId}/tags/{tag}",
+    "operation": "deleteRoomTag",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user/#userId/rooms/#roomId/tags/#tag/delete.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/third_party_lookup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/thirdparty/protocols",
+    "operation": "getProtocols",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/third_party_lookup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/thirdparty/protocol/{protocol}",
+    "operation": "getProtocolMetadata",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/third_party_lookup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/thirdparty/location/{protocol}",
+    "operation": "queryLocationByProtocol",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/third_party_lookup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/thirdparty/user/{protocol}",
+    "operation": "queryUserByProtocol",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/third_party_lookup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/thirdparty/location",
+    "operation": "queryLocationByAlias",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/third_party_lookup.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/thirdparty/user",
+    "operation": "queryUserByID",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/third_party_membership.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/rooms/{roomId}/invite",
+    "operation": "inviteBy3PID",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/invite/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/threads_list.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v1/rooms/{roomId}/threads",
+    "operation": "getThreadRoots",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v1/rooms/#roomId/threads/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/to_device.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/sendToDevice/{eventType}/{txnId}",
+    "operation": "sendToDevice",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/sendToDevice/#eventType/#txnId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/typing.yaml",
+    "method": "PUT",
+    "path": "/_matrix/client/v3/rooms/{roomId}/typing/{userId}",
+    "operation": "setTyping",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/typing/#userId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/users.yaml",
+    "method": "POST",
+    "path": "/_matrix/client/v3/user_directory/search",
+    "operation": "searchUserDirectory",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/user_directory/search/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/versions.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/versions",
+    "operation": "getVersions",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/versions/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/voip.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/voip/turnServer",
+    "operation": "getTurnServer",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/voip/turnServer/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/wellknown.yaml",
+    "method": "GET",
+    "path": "/.well-known/matrix/client",
+    "operation": "getWellknown",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/.well-known/matrix/client/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "client-server",
+    "file": "data/api/client-server/whoami.yaml",
+    "method": "GET",
+    "path": "/_matrix/client/v3/account/whoami",
+    "operation": "getTokenOwner",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/account/whoami/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/backfill.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/backfill/{roomId}",
+    "operation": "backfillRoom",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/backfill/#roomId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/backfill.yaml",
+    "method": "POST",
+    "path": "/_matrix/federation/v1/get_missing_events/{roomId}",
+    "operation": "getMissingPreviousEvents",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/get_missing_events/#roomId/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/content_repository.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/media/download/{mediaId}",
+    "operation": "getContent",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/media/download/#mediaId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/content_repository.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/media/thumbnail/{mediaId}",
+    "operation": "getContentThumbnail",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/media/thumbnail/#mediaId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/event_auth.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/event_auth/{roomId}/{eventId}",
+    "operation": "getEventAuth",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/event_auth/#roomId/#eventId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/events.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/state/{roomId}",
+    "operation": "getRoomState",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/state/#roomId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/events.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/state_ids/{roomId}",
+    "operation": "getRoomStateIds",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/state_ids/#roomId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/events.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/event/{eventId}",
+    "operation": "getEvent",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/event/#eventId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/events.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/timestamp_to_event/{roomId}",
+    "operation": "getEventByTimestamp",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/timestamp_to_event/#roomId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/invites-v1.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v1/invite/{roomId}/{eventId}",
+    "operation": "sendInviteV1",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Unsupported room versions 1/2; tagged spec requires v1 invite to assume these versions"
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/invites-v2.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v2/invite/{roomId}/{eventId}",
+    "operation": "sendInviteV2",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v2/invite/#roomId/#eventId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/joins-v1.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/make_join/{roomId}/{userId}",
+    "operation": "makeJoin",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/make_join/#roomId/#userId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/joins-v1.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v1/send_join/{roomId}/{eventId}",
+    "operation": "sendJoinV1",
+    "deprecated": true,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/send_join/#roomId/#eventId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/joins-v2.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v2/send_join/{roomId}/{eventId}",
+    "operation": "sendJoinV2",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v2/send_join/#roomId/#eventId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/keys_query.yaml",
+    "method": "GET",
+    "path": "/_matrix/key/v2/query/{serverName}",
+    "operation": "perspectivesKeyQuery",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/key/v2/query/#serverName/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/keys_query.yaml",
+    "method": "POST",
+    "path": "/_matrix/key/v2/query",
+    "operation": "bulkPerspectivesKeyQuery",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/key/v2/query/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/keys_server.yaml",
+    "method": "GET",
+    "path": "/_matrix/key/v2/server",
+    "operation": "getServerKey",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/key/v2/server/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/knocks.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/make_knock/{roomId}/{userId}",
+    "operation": "makeKnock",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/make_knock/#roomId/#userId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/knocks.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v1/send_knock/{roomId}/{eventId}",
+    "operation": "sendKnock",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/send_knock/#roomId/#eventId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/leaving-v1.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/make_leave/{roomId}/{userId}",
+    "operation": "makeLeave",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/make_leave/#roomId/#userId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/leaving-v1.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v1/send_leave/{roomId}/{eventId}",
+    "operation": "sendLeaveV1",
+    "deprecated": true,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/send_leave/#roomId/#eventId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/leaving-v2.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v2/send_leave/{roomId}/{eventId}",
+    "operation": "sendLeaveV2",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v2/send_leave/#roomId/#eventId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/openid.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/openid/userinfo",
+    "operation": "exchangeOpenIdToken",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/openid/userinfo/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/public_rooms.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/publicRooms",
+    "operation": "getPublicRooms",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/publicRooms/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/public_rooms.yaml",
+    "method": "POST",
+    "path": "/_matrix/federation/v1/publicRooms",
+    "operation": "queryPublicRooms",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/publicRooms/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/query.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/query/{queryType}",
+    "operation": "queryInfo",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/query/directory/get.ts",
+      "api/endpoints/matrix/_matrix/federation/v1/query/profile/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/query.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/query/directory",
+    "operation": "queryRoomDirectory",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/query/directory/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/query.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/query/profile",
+    "operation": "queryProfile",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/query/profile/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/space_hierarchy.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/hierarchy/{roomId}",
+    "operation": "getSpaceHierarchy",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/hierarchy/#roomId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/third_party_invite.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v1/exchange_third_party_invite/{roomId}",
+    "operation": "exchangeThirdPartyInvite",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional identity-server invites; [existing TODO](../../todos/identity-server-invites.md)"
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/third_party_invite.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v1/3pid/onbind",
+    "operation": "onBindThirdPartyIdentifier",
+    "deprecated": false,
+    "routes": [],
+    "status": "Excluded",
+    "reason": "Optional identity-server invites; [existing TODO](../../todos/identity-server-invites.md)"
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/transactions.yaml",
+    "method": "PUT",
+    "path": "/_matrix/federation/v1/send/{txnId}",
+    "operation": "sendTransaction",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/send/#txnId/put.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/user_devices.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/user/devices/{userId}",
+    "operation": "getUserDevices",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/user/devices/#userId/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/user_keys.yaml",
+    "method": "POST",
+    "path": "/_matrix/federation/v1/user/keys/claim",
+    "operation": "claimUserEncryptionKeys",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/user/keys/claim/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/user_keys.yaml",
+    "method": "POST",
+    "path": "/_matrix/federation/v1/user/keys/query",
+    "operation": "queryUserEncryptionKeys",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/user/keys/query/post.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/version.yaml",
+    "method": "GET",
+    "path": "/_matrix/federation/v1/version",
+    "operation": "getVersion",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/_matrix/federation/v1/version/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  },
+  {
+    "family": "server-server",
+    "file": "data/api/server-server/wellknown.yaml",
+    "method": "GET",
+    "path": "/.well-known/matrix/server",
+    "operation": "getWellKnown",
+    "deprecated": false,
+    "routes": [
+      "api/endpoints/matrix/.well-known/matrix/server/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
+  }
+]

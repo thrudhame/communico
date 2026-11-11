@@ -660,6 +660,14 @@ same owner; resolving retains the first resolution and does not moderate events.
 
 ## Scope and recorded evidence
 
+The public `/versions` route lists v1.1-v1.16 individually. The cumulative
+[requirement checklist](MATRIX-VERSIONS.md) retains the tagged endpoint inventory,
+explicit exclusions and executable consumer contracts, including inherited
+sync continuity, OOB departure and lazy-membership obligations. Its guard checks
+route handlers and executes the listed suites; the red Complement baseline
+alone neither grants nor removes an advertised label. Creation-policy flags
+remain independent of API version labels.
+
 The checked-in Complement baseline records a red conformance baseline, not
 universal protocol correctness. Native checks and HTTP integration tests are
 available through the current tasks. This document was verified by source
