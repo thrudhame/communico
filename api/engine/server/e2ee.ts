@@ -19,7 +19,7 @@ export async function reconcileDeviceRoom(
   encrypted: boolean,
   encryptionEvent: string | null,
   position: number,
-  localServers: string[] = [],
+  localServers: string[],
 ): Promise<void> {
   const priorRoom = (await tx.query(
     'SELECT encrypted,publication_pos FROM e2ee_rooms WHERE room=?',
@@ -97,7 +97,9 @@ export async function reconcileDeviceRoom(
           [observer, subject],
         );
         if (Boolean(prior.length) === Boolean(shared.length)) continue;
-        if (scope === 'keys') await invalidateDeviceCache(tx, subject);
+        if (scope === 'keys' && localServers.includes(domainOf(observer)!)) {
+          await invalidateDeviceCache(tx, subject);
+        }
         const seq = await nextDeviceSeq(tx);
         if (shared.length) {
           await tx.execute('INSERT INTO device_tracking VALUES(?,?,?,?,NULL)', [

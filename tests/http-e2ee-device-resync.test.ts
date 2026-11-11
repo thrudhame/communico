@@ -1,4 +1,4 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { httpSuite, startHttp } from '#tests/http-app.ts';
 import { fedCaller, remoteServer } from '#tests/http-federation.ts';
 import { theApp } from '#engine/app.ts';
@@ -9,12 +9,91 @@ import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { cachedDeviceKeys } from '#engine/server/remote-devices.ts';
 
 const suite = httpSuite('HTTP causal device cache');
+
+Deno.test('device recovery: cancellation is subscriber-owned and does not back off the origin', async () => {
+  const previous = config().federation;
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  const http = await startHttp();
+  let user = '',
+    release: (() => void) | undefined,
+    entered: (() => void) | undefined;
+  const fake = await startFakeServer({
+    ourKeyDoc: () =>
+      Promise.resolve({
+        server_name: http.app.tenant.serverName,
+        verify_keys: {
+          [http.app.tenant.keyId]: { key: http.app.tenant.publicB64 },
+        },
+      }),
+    handlers: (req) => {
+      if (!req.path.includes('/user/devices/')) return null;
+      return (async () => {
+        entered?.();
+        await new Promise<void>((r) => {
+          release = r;
+        });
+        return Response.json({ user_id: user, stream_id: 1, devices: [] });
+      })();
+    },
+  });
+  user = '@remote:' + fake.name;
+  try {
+    const a = await http.registerTestUser('cancel-recovery', 'pw');
+    await http.app.server.tx((tx) =>
+      reconcileDeviceRoom(
+        tx,
+        '!cancel:local',
+        [a.user_id, user],
+        false,
+        null,
+        1,
+        [http.app.tenant.serverName],
+      )
+    );
+    const first = new AbortController();
+    const arrived = new Promise<void>((r) => {
+      entered = r;
+    });
+    const work = http.app.deviceLists.recover(user, first.signal);
+    await arrived;
+    const second = http.app.deviceLists.recover(user);
+    const rejected = assertRejects(
+      () => work,
+      DOMException,
+      'cancel subscriber',
+    );
+    first.abort(new DOMException('cancel subscriber', 'AbortError'));
+    await rejected;
+    release!();
+    await second;
+    assertEquals(
+      await cachedDeviceKeys(http.app.server, user, [], a.user_id),
+      {},
+    );
+    assertEquals(
+      (await http.app.server.query(
+        'SELECT failures FROM remote_device_users WHERE user_id=?',
+        [user],
+      ))[0].failures,
+      0,
+    );
+  } finally {
+    release?.();
+    await http.close();
+    await fake.close();
+    setConfigForTests({ federation: previous });
+    resetCaCertsForTests();
+  }
+});
 suite.test('device-list EDU invalidates the shared peer at sync, ignores origin spoofing', async () => {
   const a = await suite.registerTestUser('resync-client', 'pw');
   const remote = await remoteServer();
   const user = '@bob:' + remote.name;
   await theApp().server.tx((tx) =>
-    reconcileDeviceRoom(tx, '!cache:local', [a.user_id, user], false, null, 1)
+    reconcileDeviceRoom(tx, '!cache:local', [a.user_id, user], false, null, 1, [
+      theApp().tenant.serverName,
+    ])
   );
   const sync = async (since = '') => {
     const r = await suite.matrix(
@@ -201,6 +280,14 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
       null,
       'late snapshot cannot publish after cancellation',
     );
+    assertEquals(
+      (await http.app.server.query(
+        'SELECT failures FROM remote_device_users WHERE user_id=?',
+        [user],
+      ))[0].failures,
+      0,
+      'caller cancellation must not back off the origin',
+    );
     const claim = await http.matrix(
       new Request('http://x/_matrix/client/v3/keys/claim', {
         method: 'POST',
@@ -352,6 +439,7 @@ suite.test('single-flight signed snapshot reaches C-S query; malformed and overs
         false,
         null,
         1,
+        [theApp().tenant.serverName],
       )
     );
     await send(2, []);

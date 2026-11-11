@@ -32,7 +32,12 @@ export function deviceListService(
   tenant: Tenant,
   edus: EduState,
 ): DeviceListService {
-  const inFlight = new Map<string, Promise<void>>();
+  type Flight = {
+    run: Promise<void>;
+    abort: AbortController;
+    subscribers: number;
+  };
+  const inFlight = new Map<string, Flight>();
   const shutdown = new AbortController();
   let timer: ReturnType<typeof setInterval> | undefined;
   let scan: Promise<void> | undefined;
@@ -44,87 +49,99 @@ export function deviceListService(
     callerSignal?: AbortSignal,
   ): Promise<void> {
     callerSignal?.throwIfAborted();
-    const current = inFlight.get(user);
-    if (current !== undefined) {
-      return await abortable(callerSignal, () => current);
+    let flight = inFlight.get(user);
+    if (flight?.abort.signal.aborted) {
+      await abortable(callerSignal, () => flight!.run);
+      return await recover(user, callerSignal);
     }
-    const run = (async () => {
-      const cut = await recoveryCut(db, user);
-      if (cut === null || shutdown.signal.aborted) return;
-      const observers = await db.query(
-        "SELECT observer FROM device_tracking WHERE subject=? AND scope='keys' AND end_seq IS NULL",
-        [user],
-      );
-      const observer = observers.map((r) => String(r.observer)).find((id) =>
-        domainOf(id) === tenant.serverName
-      );
-      if (observer === undefined) return;
-      await requestDeviceRecovery(db, user);
-      const signal = AbortSignal.any([
-        shutdown.signal,
-        ...(callerSignal ? [callerSignal] : []),
-        AbortSignal.timeout(config().federation.timeoutms),
-      ]);
-      try {
-        await abortable(
-          signal,
-          () =>
-            admit(db, domainOf(user)!, {
-              kind: 'outbound',
-              user: observer,
-              what: 'recover device list',
-            }),
-        );
-        const response = await federationRequest(db, tenant.signer(), {
-          destination: domainOf(user)!,
-          method: 'GET',
-          body: null,
-          path: '/_matrix/federation/v1/user/devices/' +
-            encodeURIComponent(user),
-          maxBytes: config().e2ee.maxrequestbytes,
-          signal,
-        });
-        signal.throwIfAborted();
-        const snapshot = remoteDeviceSnapshot(
-          response.json,
-          user,
-          config().e2ee,
-        );
-        if (await installDeviceSnapshot(db, cut, snapshot, config().e2ee)) {
-          return;
-        }
-      } catch (error) {
-        if (!shutdown.signal.aborted) {
-          console.error(
-            `device-list[${user}]: snapshot remains stale: ${String(error)}`,
-          );
-        }
-      }
-      if (shutdown.signal.aborted) return;
-      const now = Date.now(), fed = config().federation;
-      await db.tx(async (tx) => {
-        const row = (await tx.query(
-          'SELECT failures FROM remote_device_users WHERE user_id=? AND stale=1',
-          [user],
-        ))[0];
-        if (!row) return;
-        const failures = Math.min(20, Number(row.failures) + 1);
-        const delay = Math.min(
-          fed.backoffmaxmillihours,
-          fed.backoffstartmillihours * 2 ** (failures - 1),
-        ) * 3600;
-        await tx.execute(
-          'UPDATE remote_device_users SET failures=?,retry_at=? WHERE user_id=? AND stale=1',
-          [failures, now + delay, user],
-        );
-      });
-    })();
-    inFlight.set(user, run);
+    if (flight === undefined) {
+      const abort = new AbortController();
+      const run = runRecovery(user, abort.signal);
+      flight = { run, abort, subscribers: 0 };
+      inFlight.set(user, flight);
+      const owned = flight;
+      void run.finally(() => {
+        if (inFlight.get(user) === owned) inFlight.delete(user);
+      }).catch(() => {}); // The original run's error is observed by subscribers.
+    }
+    flight.subscribers++;
     try {
-      await run;
+      await abortable(callerSignal, () => flight!.run);
     } finally {
-      if (inFlight.get(user) === run) inFlight.delete(user);
+      flight.subscribers--;
+      if (flight.subscribers === 0) flight.abort.abort();
     }
+  }
+  async function runRecovery(user: string, demand: AbortSignal): Promise<void> {
+    const cut = await recoveryCut(db, user);
+    if (cut === null || shutdown.signal.aborted || demand.aborted) return;
+    const observers = await db.query(
+      "SELECT observer FROM device_tracking WHERE subject=? AND scope='keys' AND end_seq IS NULL",
+      [user],
+    );
+    const observer = observers.map((r) => String(r.observer)).find((id) =>
+      domainOf(id) === tenant.serverName
+    );
+    if (observer === undefined) return;
+    await requestDeviceRecovery(db, user);
+    const signal = AbortSignal.any([
+      shutdown.signal,
+      demand,
+      AbortSignal.timeout(config().federation.timeoutms),
+    ]);
+    try {
+      await abortable(
+        signal,
+        () =>
+          admit(db, domainOf(user)!, {
+            kind: 'outbound',
+            user: observer,
+            what: 'recover device list',
+          }),
+      );
+      const response = await federationRequest(db, tenant.signer(), {
+        destination: domainOf(user)!,
+        method: 'GET',
+        body: null,
+        path: '/_matrix/federation/v1/user/devices/' +
+          encodeURIComponent(user),
+        maxBytes: config().e2ee.maxrequestbytes,
+        signal,
+      });
+      signal.throwIfAborted();
+      const snapshot = remoteDeviceSnapshot(
+        response.json,
+        user,
+        config().e2ee,
+      );
+      if (await installDeviceSnapshot(db, cut, snapshot, config().e2ee)) {
+        return;
+      }
+    } catch (error) {
+      if (!shutdown.signal.aborted && !demand.aborted) {
+        console.error(
+          `device-list[${user}]: snapshot remains stale: ${String(error)}`,
+        );
+      }
+    }
+    if (shutdown.signal.aborted || demand.aborted) return;
+    const now = Date.now(), fed = config().federation;
+    await db.tx(async (tx) => {
+      const row = (await tx.query(
+        'SELECT failures FROM remote_device_users WHERE user_id=? AND stale=1',
+        [user],
+      ))[0];
+      if (!row) return;
+      const failures = Math.min(20, Number(row.failures) + 1);
+      const delay = Math.min(
+        fed.backoffmaxmillihours,
+        fed.backoffstartmillihours * 2 ** (failures - 1),
+      ) * 3600;
+      await tx.execute(
+        'UPDATE remote_device_users SET failures=?,retry_at=? WHERE user_id=? AND stale=1',
+        [failures, now + delay, user],
+      );
+    });
   }
   function wake(): void {
     if (timer === undefined || shutdown.signal.aborted) {
@@ -212,7 +229,9 @@ export function deviceListService(
       unlisten = undefined;
       shutdown.abort();
       await scan;
-      await Promise.allSettled(inFlight.values());
+      await Promise.allSettled(
+        [...inFlight.values()].map((flight) => flight.run),
+      );
     },
   };
 }

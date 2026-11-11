@@ -7,6 +7,7 @@ import {
   setDisplayName,
 } from '#engine/tenant/users.ts';
 import { getPublicProfile, setProfileField } from '#engine/tenant/profiles.ts';
+import { TENANT_V15 } from '#tests/fixtures/tenant-versions.ts';
 
 Deno.test('profiles persist, enforce atomic whole-profile UTF8 bounds and clear on deactivation', async () => {
   const dir = await Deno.makeTempDir();
@@ -87,9 +88,7 @@ Deno.test('tenant v15 migrates custom profile storage preserving legacy profile 
       tenant: {
         version: 15,
         apply: async (db) => {
-          await tenantSchema.apply(db);
-          await db.exec('DROP TABLE profile_fields');
-          await db.exec('DROP TABLE erased_users');
+          await db.exec(TENANT_V15);
         },
       },
     },

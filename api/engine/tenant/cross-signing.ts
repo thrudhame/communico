@@ -11,7 +11,7 @@ import {
 import type { Json } from '#engine/tenant/e2ee.ts';
 import { bounded } from '#engine/tenant/e2ee.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
-import { domainOf } from '#engine/ids.ts';
+import { domainOf, localpartOf } from '#engine/ids.ts';
 import {
   forgetKeySignatures,
   signatureView,
@@ -230,6 +230,7 @@ export async function clearSigningKeys(
   user: string,
   maxEnvelopeBytes: number,
 ): Promise<void> {
+  const old = await signingState(conn, localpart);
   await conn.execute('DELETE FROM cross_signing_keys WHERE localpart=?', [
     localpart,
   ]);
@@ -237,5 +238,32 @@ export async function clearSigningKeys(
     'DELETE FROM key_signatures WHERE signer_localpart=? OR target_user=?',
     [localpart, user],
   );
-  await appendSigningChange(conn, localpart, user, true, maxEnvelopeBytes);
+  if (Object.keys(old).length) {
+    await appendSigningChange(
+      conn,
+      localpart,
+      user,
+      old.master !== undefined || old.self_signing !== undefined,
+      maxEnvelopeBytes,
+    );
+  }
+}
+
+/** Device lifecycle owns invalidation; public signing publication follows the
+ * changed public view, not merely the removal of a stored overlay row. */
+export async function forgetDeviceSignatures(
+  conn: Conn,
+  user: string,
+  deviceId: string,
+  maxEnvelopeBytes: number,
+): Promise<void> {
+  if (await forgetKeySignatures(conn, user, deviceId)) {
+    await appendSigningChange(
+      conn,
+      localpartOf(user),
+      user,
+      true,
+      maxEnvelopeBytes,
+    );
+  }
 }

@@ -77,9 +77,27 @@ export async function forgetKeySignatures(
   conn: Conn,
   user: string,
   id: string,
-): Promise<void> {
+): Promise<boolean> {
+  const localpart = localpartOf(user);
+  const keys = await conn.query(
+    "SELECT key_id,key_json FROM cross_signing_keys WHERE localpart=? AND usage IN ('master','self_signing') ORDER BY usage",
+    [localpart],
+  );
+  const publicView = async () =>
+    canonicalJson(
+      await Promise.all(keys.map(async (row) =>
+        await signatureView(
+          conn,
+          JSON.parse(String(row.key_json)),
+          user,
+          String(row.key_id).slice(8),
+        )
+      )),
+    );
+  const before = await publicView();
   await conn.execute(
     'DELETE FROM key_signatures WHERE (target_user=? AND target_key=?) OR (signer_localpart=? AND signer_key=?)',
     [user, id, localpartOf(user), 'ed25519:' + id],
   );
+  return before !== await publicView();
 }

@@ -5,6 +5,11 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { bounded, limitEntries, object } from '#engine/tenant/e2ee.ts';
 import type { Json } from '#engine/tenant/e2ee.ts';
+import {
+  accountSession,
+  EMPTY_BACKUP_BYTES,
+  forgetBackupEntries,
+} from '#engine/tenant/backup-accounting.ts';
 
 type Limits = Config['e2ee'];
 export type Action = 'get' | 'put' | 'delete' | 'post';
@@ -59,14 +64,12 @@ async function versionRow(
 }
 async function stats(conn: Conn, user: string, row: VersionRow) {
   const result = await conn.query(
-    'SELECT COUNT(*) AS n FROM backup_sessions WHERE localpart=? AND version_no=?',
+    'SELECT session_count AS n FROM backup_versions WHERE localpart=? AND version_no=?',
     [user, row.version_no],
   );
   return { count: Number(result[0].n), etag: String(row.etag) };
 }
 
-const encoder = new TextEncoder();
-const bytes = (text: string) => encoder.encode(text).byteLength;
 function backupOverflow(): never {
   throw new MatrixError(
     413,
@@ -75,9 +78,8 @@ function backupOverflow(): never {
   );
 }
 
-// Measure the exact whole-backup JSON without loading or parsing ciphertext.
-// This runs in the writing transaction, so every accepted set can be restored
-// without depending on the much smaller individual upload request budget.
+// Counters and ciphertext share the writing transaction. Capacity is independent
+// of individual request size and reads no retained session identifiers/payloads.
 async function assertRestoreCapacity(
   conn: Conn,
   user: string,
@@ -85,24 +87,10 @@ async function assertRestoreCapacity(
   limits: Limits,
 ): Promise<void> {
   const rows = await conn.query(
-    'SELECT room_id,session_id,length(CAST(payload AS BLOB)) AS payload_bytes FROM backup_sessions WHERE localpart=? AND version_no=? ORDER BY room_id,session_id LIMIT ?',
-    [user, version, limits.maxbackupsessions + 1],
+    'SELECT restore_bytes FROM backup_versions WHERE localpart=? AND version_no=?',
+    [user, version],
   );
-  limitEntries(rows.length, limits.maxbackupsessions);
-  let size = bytes('{"rooms":{}}');
-  let previousRoom: string | undefined;
-  for (const row of rows) {
-    const room = String(row.room_id);
-    if (room !== previousRoom) {
-      size += bytes(JSON.stringify(room)) + bytes(':{"sessions":{}}') +
-        (previousRoom === undefined ? 0 : 1);
-    } else size++;
-    size += bytes(JSON.stringify(String(row.session_id))) + 1 +
-      Number(row.payload_bytes);
-    if (size > limits.maxbackupbytes) backupOverflow();
-    previousRoom = room;
-  }
-  if (size > limits.maxbackupbytes) backupOverflow();
+  if (Number(rows[0].restore_bytes) > limits.maxbackupbytes) backupOverflow();
 }
 
 export async function backupVersion(
@@ -136,10 +124,7 @@ export async function backupVersion(
   }
   const row = await versionRow(conn, user, version);
   if (action === 'delete') {
-    await conn.execute(
-      'DELETE FROM backup_sessions WHERE localpart=? AND version_no=?',
-      [user, row.version_no],
-    );
+    await forgetBackupEntries(conn, user, row.version_no);
     await conn.execute(
       "UPDATE backup_versions SET deleted=1,auth_data='{}' WHERE localpart=? AND version_no=?",
       [user, row.version_no],
@@ -294,6 +279,7 @@ export async function backupKeys(
         !previous.length ||
         better(entry.data, JSON.parse(String(previous[0].payload)))
       ) {
+        const payload = JSON.stringify(entry.data);
         await conn.execute(
           'INSERT INTO backup_sessions(localpart,version_no,room_id,session_id,payload) VALUES(?,?,?,?,?) ON CONFLICT(localpart,version_no,room_id,session_id) DO UPDATE SET payload=excluded.payload',
           [
@@ -301,27 +287,35 @@ export async function backupKeys(
             row.version_no,
             entry.room,
             entry.session,
-            JSON.stringify(entry.data),
+            payload,
           ],
+        );
+        await accountSession(
+          conn,
+          user,
+          row.version_no,
+          entry.room,
+          entry.session,
+          payload,
+          previous.length ? String(previous[0].payload) : undefined,
         );
         changed = true;
       }
     }
     const total = await conn.query(
-      'SELECT COUNT(*) AS n FROM backup_sessions WHERE localpart=?',
+      'SELECT COALESCE(SUM(session_count),0) AS n FROM backup_versions WHERE localpart=?',
       [user],
     );
     limitEntries(Number(total[0].n), limits.maxbackupsessions);
     await assertRestoreCapacity(conn, user, row.version_no, limits);
   } else if (action === 'delete') {
-    const exists = await conn.query(
-      'SELECT 1 FROM backup_sessions WHERE ' + where + ' LIMIT 1',
-      args,
+    changed = await forgetBackupEntries(
+      conn,
+      user,
+      row.version_no,
+      room,
+      session,
     );
-    changed = exists.length > 0;
-    if (changed) {
-      await conn.execute('DELETE FROM backup_sessions WHERE ' + where, args);
-    }
   } else {
     const rows = await conn.query(
       'SELECT room_id,session_id,payload FROM backup_sessions WHERE ' + where +
@@ -368,8 +362,9 @@ export async function backupKeys(
 
 export async function clearBackup(conn: Conn, user: string): Promise<void> {
   await conn.execute('DELETE FROM backup_sessions WHERE localpart=?', [user]);
+  await conn.execute('DELETE FROM backup_rooms WHERE localpart=?', [user]);
   await conn.execute(
-    "UPDATE backup_versions SET deleted=1,auth_data='{}' WHERE localpart=?",
-    [user],
+    "UPDATE backup_versions SET deleted=1,auth_data='{}',session_count=0,restore_bytes=? WHERE localpart=?",
+    [EMPTY_BACKUP_BYTES, user],
   );
 }

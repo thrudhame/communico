@@ -26,7 +26,7 @@ Deno.test('E2: publication reconciliation queries only relationship pairs affect
     const server = await store.server();
     const members = Array.from({ length: 12 }, (_, i) => `@u${i}:test`);
     await server.tx((tx) =>
-      reconcileDeviceRoom(tx, '!pairs:test', members, true, '$enc', 1)
+      reconcileDeviceRoom(tx, '!pairs:test', members, true, '$enc', 1, ['test'])
     );
     const reconcile = (users: string[], encrypted: boolean, pos: number) =>
       server.tx(async (tx) => {
@@ -47,6 +47,7 @@ Deno.test('E2: publication reconciliation queries only relationship pairs affect
           encrypted,
           encrypted ? '$enc' : null,
           pos,
+          ['test'],
         );
         return pairQueries;
       });
