@@ -403,6 +403,10 @@ only afterward receive room-version-pruned copies, while earlier visibility is
 preserved. This is not physical deletion, a federation erasure request or a set
 of redaction events. Private account data and stored filters are cleared too.
 
+Room previews support the stable room-summary URL and both historical
+`im.nheko.summary` URLs through the same visibility and discovery owner.
+Extended profiles advertise `uk.tcpip.msc4133.stable` for older client gates.
+
 Public profiles support namespaced custom JSON fields and `m.tz`, with per-field
 GET/PUT/DELETE and `m.profile_fields` capability discovery. Keys are at most 255
 UTF-8 bytes; the whole profile must remain below 64 KiB. Custom null values are

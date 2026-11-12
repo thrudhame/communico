@@ -30,6 +30,7 @@ export default async function () {
       'org.matrix.simplified_msc3575': true,
       'org.matrix.msc4143': rtcTransports().length !== 0,
       'org.matrix.msc4140': delayedEventsEnabled(),
+      'uk.tcpip.msc4133.stable': true,
       'io.element.e2ee_forced.public': !config().encryption
         .allowunencryptedcreation,
       'io.element.e2ee_forced.private': !config().encryption
