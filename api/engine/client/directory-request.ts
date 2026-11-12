@@ -9,6 +9,7 @@ import {
   stringParameter,
 } from '#engine/operation.ts';
 import { roomTypesFilter } from './summary.ts';
+import { parseIp } from '#engine/preview/cidr.ts';
 
 export type DirectoryNetwork = { kind: 'native' } | { kind: 'all' } | {
   kind: 'instance';
@@ -86,4 +87,37 @@ export function localDirectoryOffset(token: string | undefined): number {
   if (token === undefined) return 0;
   if (!/^\d+$/.test(token)) invalidParameter('since');
   return integerParameter(Number(token), 'since', 0)!;
+}
+
+export function directoryDestination(
+  query: URLSearchParams,
+): string | undefined {
+  const server = query.get('server');
+  if (server === null || server === '') return undefined;
+  const match = /^(\[[0-9a-fA-F:.]+\]|[0-9A-Za-z.-]+)(?::([0-9]{1,5}))?$/.exec(
+    server,
+  );
+  if (
+    match === null ||
+    (match[1].startsWith('[') && parseIp(match[1].slice(1, -1)) === null) ||
+    (match[2] !== undefined &&
+      (Number(match[2]) < 1 || Number(match[2]) > 65535))
+  ) invalidParameter('server');
+  return server;
+}
+
+// Encode the normalized request once for either federation method. Preserve
+// extension filters and opaque tokens; never interpret a remote cursor locally.
+export function directoryWireRequest(
+  request: DirectoryRequest,
+): Record<string, unknown> {
+  return {
+    ...(request.limit === undefined ? {} : { limit: request.limit }),
+    ...(request.since === undefined ? {} : { since: request.since }),
+    ...(request.filter === undefined ? {} : { filter: request.filter }),
+    ...(request.network.kind === 'all' ? { include_all_networks: true } : {}),
+    ...(request.network.kind === 'instance'
+      ? { third_party_instance_id: request.network.id }
+      : {}),
+  };
 }

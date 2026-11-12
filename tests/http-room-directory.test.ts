@@ -1,6 +1,7 @@
 // doltgres aliases/directory/relations/search/upgrade/user-directory contracts.
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { setConfigForTests } from '#engine/config.ts';
 const { matrix, registerTestUser, test } = httpSuite(
   'HTTP room directory/search/relations/upgrade',
 );
@@ -154,6 +155,7 @@ test('aliases: public resolve, Unicode, duplicates/syntax/domain, list access, d
 });
 
 test('directory: public GET/protected POST, chunk shapes, search, visibility toggles and pagination', async () => {
+  setConfigForTests({ directory: { allowanonymous: true } });
   const a = await registerTestUser('directory-a', 'pw'),
     b = await registerTestUser('directory-b', 'pw');
   const A = a.access_token;

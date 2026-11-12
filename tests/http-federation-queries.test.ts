@@ -151,6 +151,10 @@ test('query/directory: raw Unicode URI, aliases with server port, local validati
 });
 
 test('publicRooms: signed GET/POST, search, pagination and truthful network selection', async () => {
+  setConfigForTests({
+    server: { name: self },
+    federation: { publicrooms: true },
+  });
   assertEquals(
     (await client(
       'createRoom',

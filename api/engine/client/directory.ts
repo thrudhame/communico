@@ -26,8 +26,10 @@ import { directoryResponse } from '#engine/federation/discovery-response.ts';
 import { publicRoomSummary } from './summary.ts';
 import {
   type DirectoryRequest,
+  directoryWireRequest,
   localDirectoryOffset,
 } from './directory-request.ts';
+import { remoteDirectoryResponse } from './directory-response.ts';
 
 export function aliasIsLocal(alias: string) {
   const parts = splitId(alias);
@@ -200,7 +202,58 @@ export async function setVisibility(
   }
   await directory.setVisibility(theApp().server, roomId, value);
 }
-export async function publicRooms(
+export async function queryDirectory(
+  opts: DirectoryRequest,
+  destination?: string,
+) {
+  if (destination === undefined || destination === serverName()) {
+    return await listLocalPublishedRooms(opts);
+  }
+  const fed = config().federation;
+  if (!fed.enabled || fed.lookups !== 'all') {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'remote public directory lookup disabled',
+    );
+  }
+  const wire = directoryWireRequest(opts);
+  const post = opts.filter !== undefined;
+  const query = new URLSearchParams();
+  if (!post) {
+    for (const [key, value] of Object.entries(wire)) {
+      query.set(key, String(value));
+    }
+  }
+  const answer = await discoveryRequest(
+    theApp().server,
+    theApp().tenant.signer(),
+    {
+      destination,
+      path: '/_matrix/federation/v1/publicRooms' +
+        (query.size === 0 ? '' : '?' + query),
+      ...(post
+        ? {
+          method: 'POST' as const,
+          body: new TextEncoder().encode(JSON.stringify(wire)),
+        }
+        : {}),
+    },
+  );
+  return remoteDirectoryResponse(answer);
+}
+
+export function assertFederationDirectoryAllowed() {
+  if (!config().federation.publicrooms) {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'public directory federation disabled',
+    );
+  }
+}
+
+export async function listLocalPublishedRooms(
   opts: DirectoryRequest,
 ) {
   const limit = opts.limit !== undefined && opts.limit > 0

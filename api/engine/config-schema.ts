@@ -36,6 +36,7 @@ export const SCHEMA = {
     ttl: 'int',
   },
   matrixrtc: { livekitserviceurl: 'string' },
+  directory: { allowanonymous: 'bool' },
   hierarchy: {
     pagesize: 'int',
     maxpagesize: 'int',
@@ -139,6 +140,7 @@ export const SCHEMA = {
     pendingmax: 'int',
     pendingdays: 'int',
     lookups: 'string',
+    publicrooms: 'bool',
     discoveryservers: 'int',
     missingwaitms: 'int',
     missinglimit: 'int',
