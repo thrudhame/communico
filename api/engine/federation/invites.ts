@@ -44,7 +44,17 @@ import {
   applyInvitePush,
   withdrawInvitePush,
 } from '#engine/server/notifications.ts';
-import { federationRequest, isEndpointUnknown } from './client.ts';
+import {
+  FederationHttpError,
+  federationRequest,
+  isEndpointUnknown,
+} from './client.ts';
+import {
+  inviteResponse,
+  leaveResponse,
+  membershipTemplate,
+} from './responses.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { assertRoomAcl } from './acl.ts';
 import { assertAcl } from '#engine/room/acl.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -157,7 +167,7 @@ export async function inviteRemote(
   );
   const eventId = String(pdu.event_id);
   const inviteRoomState = await prejoinState(room, sender);
-  let resp: Record<string, unknown>;
+  let merged: Pdu;
   try {
     const res = await federationRequest(deps.server, deps.signer, {
       room: { store: deps.store, id: roomId, participation: true },
@@ -174,35 +184,33 @@ export async function inviteRemote(
         }),
       ),
     });
-    resp = res.json as Record<string, unknown>;
+    merged = inviteResponse(res.json);
   } catch (e) {
-    const err = e as { status?: number; errcode?: string; message?: string };
     // only 400 M_MISSING_PARAM becomes a 5xx to our client
-    // (invites-v2.yaml:171-173); network failure → 502
-    if (err.status === 400 && err.errcode === 'M_MISSING_PARAM') {
+    // (invites-v2.yaml:171-173). Typed peer errors and local failures keep
+    // their provenance; public rendering owns the eventual HTTP mapping.
+    if (
+      e instanceof FederationHttpError && e.remoteStatus === 400 &&
+      e.matrixBody && e.errcode === 'M_MISSING_PARAM'
+    ) {
       throw new MatrixError(
         502,
         'M_UNKNOWN',
-        err.message == null ? 'M_MISSING_PARAM' : err.message,
+        String(e.responseBody().error),
       );
-    }
-    if (err.status === undefined) {
-      throw new MatrixError(502, 'M_UNKNOWN', `network failure: ${String(e)}`);
     }
     throw e; // 403 M_FORBIDDEN and 400 M_INCOMPATIBLE_ROOM_VERSION pass through
   }
   // the invitee's signature: our id unchanged, their signature verifies
-  const returned = resp.event as Record<string, unknown> | undefined;
-  if (returned === undefined) {
-    throw new MatrixError(502, 'M_UNKNOWN', 'no event in the invite answer');
-  }
-  const merged = returned as unknown as Pdu;
   const returnedId = await eventIdFor(
     merged as unknown as Record<string, unknown>,
     version,
   );
   if (returnedId !== eventId) {
-    throw new MatrixError(502, 'M_UNKNOWN', 'the invitee changed the event');
+    throw new UpstreamError('validation', {
+      phase: 'invite',
+      reason: 'the invitee changed the event',
+    });
   }
   let theirSigOk = false;
   const mergedSigs = merged.signatures == null ? {} : merged.signatures;
@@ -222,7 +230,10 @@ export async function inviteRemote(
     }
   }
   if (!theirSigOk) {
-    throw new MatrixError(502, 'M_UNKNOWN', 'bad invitee signature');
+    throw new UpstreamError('validation', {
+      phase: 'invite',
+      reason: 'bad invitee signature',
+    });
   }
   (merged as unknown as Record<string, unknown>).event_id = eventId;
   // merge signatures (ours is already on the event — author signed it)
@@ -651,24 +662,29 @@ export async function prepareRemoteLeave(
     }`,
     body: null,
   });
-  // the spec's wrapper (leaving-v1.yaml): room_version + event
-  const mkBody = mk.json as { event?: unknown };
-  const template = (mkBody.event == null ? {} : mkBody.event) as Record<
-    string,
-    unknown
-  >;
   const roomVersion = invite.roomVersion;
+  const { event: template } = membershipTemplate(mk.json, 'make-leave', [
+    roomVersion,
+  ]);
+  if (
+    template.type !== 'm.room.member' || template.room_id !== roomId ||
+    template.sender !== userId || template.state_key !== userId ||
+    template.content.membership !== 'leave'
+  ) {
+    throw new UpstreamError('validation', {
+      phase: 'make-leave',
+      reason: 'invalid leave template identity',
+    });
+  }
   const pdu: Pdu = {
     type: 'm.room.member',
     state_key: userId,
     sender: userId,
     room_id: roomId,
     content: { membership: 'leave' },
-    prev_events:
-      (template.prev_events == null ? [] : template.prev_events) as string[],
-    auth_events:
-      (template.auth_events == null ? [] : template.auth_events) as string[],
-    depth: Number(template.depth == null ? 1 : template.depth),
+    prev_events: template.prev_events,
+    auth_events: template.auth_events,
+    depth: template.depth,
     origin_server_ts: Date.now(),
     hashes: { sha256: '' },
     signatures: {},
@@ -690,7 +706,7 @@ export async function sendRemoteLeave(
   const roomId = String(signed.room_id);
   const eventId = String(signed.event_id);
   try {
-    await federationRequest(deps.server, deps.signer, {
+    const response = await federationRequest(deps.server, deps.signer, {
       room: { store: deps.store, id: roomId },
       destination,
       method: 'PUT',
@@ -701,9 +717,10 @@ export async function sendRemoteLeave(
         JSON.stringify(toWire(signed, roomVersion)),
       ),
     });
+    leaveResponse(response.json);
   } catch (e) {
     if (!isEndpointUnknown(e)) throw e;
-    await federationRequest(deps.server, deps.signer, {
+    const response = await federationRequest(deps.server, deps.signer, {
       room: { store: deps.store, id: roomId },
       destination,
       method: 'PUT',
@@ -714,6 +731,7 @@ export async function sendRemoteLeave(
         JSON.stringify(toWire(signed, roomVersion)),
       ),
     });
+    leaveResponse(response.json, true);
   }
 }
 

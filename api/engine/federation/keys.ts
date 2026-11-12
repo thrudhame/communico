@@ -32,6 +32,7 @@ import {
 } from './witness.ts';
 import { listWitnesses } from './peers.ts';
 import { federationRequest } from './client.ts';
+import { UpstreamHttpError } from '#engine/net/upstream-error.ts';
 
 export type KeyDoc = KeyDocShape;
 
@@ -480,7 +481,7 @@ export function keyStore(
         name,
         Date.now() + config().federation.keyfailminutes * 60_000,
       );
-      if (e instanceof MatrixError) throw e;
+      if (e instanceof MatrixError || e instanceof UpstreamHttpError) throw e;
       throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
     }
   }

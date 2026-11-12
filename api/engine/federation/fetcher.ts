@@ -11,28 +11,27 @@
 // missingEvents/backfill/makeJoin/sendJoin throw (the caller catches
 // into its ladder/failover).
 import { config } from '#engine/config.ts';
-import type { Pdu } from '#engine/pdu.ts';
 import { type Fetcher, SendJoinRefused } from '#engine/room/deps.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
+import { objectOf } from '#engine/net/json.ts';
+import {
+  eventResponse,
+  membershipTemplate,
+  pduList,
+  sendJoinResponse,
+  stateIdsResponse,
+  stateResponse,
+  timestampResponse,
+  transactionPdus,
+} from './responses.ts';
 import {
   FederationHttpError,
   federationRequest,
   isEndpointUnknown,
 } from './client.ts';
-
-function jsonObject(res: { json: unknown }): Record<string, unknown> {
-  return res.json !== null && typeof res.json === 'object' &&
-      !Array.isArray(res.json)
-    ? res.json as Record<string, unknown>
-    : {};
-}
-
-function pdusOf(obj: Record<string, unknown>, key: string): Pdu[] {
-  const list = obj[key];
-  return Array.isArray(list) ? list as Pdu[] : [];
-}
 
 function sendJoinFailure(error: unknown): never {
   if (
@@ -68,10 +67,10 @@ export function productionFetcher(
           body: null,
           signal,
         });
-        const pdus = pdusOf(jsonObject(res), 'pdus');
-        return pdus.length === 0 ? null : pdus[0];
-      } catch {
-        return null; // a 404 on the id — the caller decides what it means
+        return eventResponse(res.json);
+      } catch (error) {
+        if (recoverableUpstream(error, signal)) return null;
+        throw error;
       }
     },
 
@@ -87,16 +86,10 @@ export function productionFetcher(
           body: null,
           signal,
         });
-        const j = jsonObject(res);
-        return typeof j.event_id === 'string' &&
-            Number.isSafeInteger(j.origin_server_ts)
-          ? {
-            event_id: j.event_id,
-            origin_server_ts: j.origin_server_ts as number,
-          }
-          : null;
-      } catch {
-        return null;
+        return timestampResponse(res.json);
+      } catch (error) {
+        if (recoverableUpstream(error, signal)) return null;
+        throw error;
       }
     },
 
@@ -119,7 +112,10 @@ export function productionFetcher(
         ),
         maxBytes: bulk(),
       });
-      return pdusOf(jsonObject(res), 'events');
+      return pduList(
+        objectOf(res.json, 'missing-events').events,
+        'missing-events',
+      );
     },
 
     // GET /_matrix/federation/v1/state_ids/{roomId}?event_id=at.
@@ -135,13 +131,10 @@ export function productionFetcher(
           body: null,
           signal,
         });
-        const j = jsonObject(res);
-        return {
-          pduIds: pdusOf(j, 'pdu_ids').map((p) => String(p)),
-          authChainIds: pdusOf(j, 'auth_chain_ids').map((p) => String(p)),
-        };
-      } catch {
-        return null; // the prev stays missing — the caller's terminal decides
+        return stateIdsResponse(res.json);
+      } catch (error) {
+        if (recoverableUpstream(error, signal)) return null;
+        throw error;
       }
     },
 
@@ -158,10 +151,10 @@ export function productionFetcher(
           signal,
           maxBytes: bulk(),
         });
-        const j = jsonObject(res);
-        return { state: pdusOf(j, 'pdus'), authChain: pdusOf(j, 'auth_chain') };
-      } catch {
-        return null;
+        return stateResponse(res.json);
+      } catch (error) {
+        if (recoverableUpstream(error, signal)) return null;
+        throw error;
       }
     },
 
@@ -178,11 +171,13 @@ export function productionFetcher(
           body: null,
           maxBytes: bulk(),
         });
-        const j = jsonObject(res);
-        const chain = j.auth_chain;
-        return Array.isArray(chain) ? chain as Pdu[] : null;
-      } catch {
-        return null;
+        return pduList(
+          objectOf(res.json, 'event-auth').auth_chain,
+          'event-auth',
+        );
+      } catch (error) {
+        if (recoverableUpstream(error)) return null;
+        throw error;
       }
     },
 
@@ -199,7 +194,7 @@ export function productionFetcher(
         maxBytes: bulk(),
         signal,
       });
-      return pdusOf(jsonObject(res), 'pdus');
+      return transactionPdus(res.json, 'backfill');
     },
 
     // GET /_matrix/federation/v1/make_join/{roomId}/{userId}?ver=…
@@ -213,17 +208,7 @@ export function productionFetcher(
         }?ver=${versions.map(encodeURIComponent).join('&ver=')}`,
         body: null,
       });
-      const j = jsonObject(res);
-      // the spec's wrapper (joins-v1.yaml:55-81): room_version + event;
-      // an absent version is the pre-v1 default
-      const version = j.room_version;
-      return {
-        roomVersion: version === undefined || version === null
-          ? '11'
-          : String(version),
-        event:
-          (j.event !== undefined && j.event !== null ? j.event : {}) as Pdu,
-      };
+      return membershipTemplate(res.json, 'make-join', versions);
     },
 
     // PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}; v1 only
@@ -235,13 +220,6 @@ export function productionFetcher(
       delete wire.event_id;
       delete wire.unsigned;
       const body = new TextEncoder().encode(JSON.stringify(wire));
-      const unwrap = (j: Record<string, unknown>) => ({
-        state: pdusOf(j, 'state'),
-        authChain: pdusOf(j, 'auth_chain'),
-        event: j.event !== undefined && j.event !== null
-          ? j.event as Pdu
-          : undefined,
-      });
       try {
         const res = await federationRequest(server, signer, {
           room: { store, id: roomId, participation: true },
@@ -253,7 +231,7 @@ export function productionFetcher(
           body,
           maxBytes: bulk(),
         });
-        return unwrap(jsonObject(res));
+        return sendJoinResponse(res.json);
       } catch (e) {
         if (!isEndpointUnknown(e)) sendJoinFailure(e);
         let res;
@@ -271,13 +249,7 @@ export function productionFetcher(
         } catch (error) {
           sendJoinFailure(error);
         }
-        // the v1 wrapper: [statusCode, body]
-        const arr = Array.isArray(res.json) ? res.json : [];
-        const inner = arr.length > 1 && arr[1] !== null &&
-            typeof arr[1] === 'object' && !Array.isArray(arr[1])
-          ? arr[1] as Record<string, unknown>
-          : {};
-        return unwrap(inner);
+        return sendJoinResponse(res.json, true);
       }
     },
   };

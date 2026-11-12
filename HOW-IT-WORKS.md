@@ -824,6 +824,16 @@ local signing/storage faults are not cached as peer failures. Completed HTTP
 refusals keep their separate status and Matrix-error provenance.
 (`api/engine/federation/{client,responses,sender}.ts`)
 
+Endpoint envelopes validate required object/array and scalar shapes without
+coercing IDs or inventing missing graph edges. Join, leave and knock templates
+negotiate explicit supported versions; omitted legacy versions never become v11.
+Recovery may treat typed peer failures and cancellation as unavailable evidence,
+but local signing/store faults propagate. Protocol diagnostics retain the original
+cause internally while console/JSON projections exclude raw response snippets;
+completed HTTP refusals keep the remote body separately from their safe message.
+(`api/engine/federation/{fetcher,responses,invites,knocks}.ts`,
+`api/engine/net/upstream-error.ts`, `api/engine/room/deps.ts`)
+
 The shared thumbnail service serves local client, legacy-local and signed
 federation routes. Remote variants fetch signed federation thumbnails before
 bounded local validation/static generation. Cache identity includes format,

@@ -102,15 +102,24 @@ export async function searchTimestamp(
   let best = snapshot.local;
   for (const via of snapshot.peers) {
     if (signal.aborted) break;
-    const claim = await fetchOrNull(() =>
-      deps.fetcher.timestampToEvent(room.id, query.ts, query.dir, via, signal)
+    const claim = await fetchOrNull(
+      () =>
+        deps.fetcher.timestampToEvent(
+          room.id,
+          query.ts,
+          query.dir,
+          via,
+          signal,
+        ),
+      signal,
     );
     if (
       claim === null || typeof claim.event_id !== 'string' ||
       !Number.isSafeInteger(claim.origin_server_ts)
     ) continue;
-    const raw = await fetchOrNull(() =>
-      deps.fetcher.event(claim.event_id, via, room.id, signal)
+    const raw = await fetchOrNull(
+      () => deps.fetcher.event(claim.event_id, via, room.id, signal),
+      signal,
     );
     if (raw === null || signal.aborted) continue;
     let verified;

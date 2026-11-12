@@ -17,11 +17,25 @@ export type UpstreamContext = {
 };
 export class UpstreamError extends Error {
   override readonly name = 'UpstreamError';
+  readonly context: Readonly<Omit<UpstreamContext, 'cause'>>;
   constructor(
     readonly category: UpstreamCategory,
-    readonly context: UpstreamContext,
+    context: UpstreamContext,
   ) {
     super(`upstream ${category}: ${context.reason}`, { cause: context.cause });
+    // Native causes may include private response snippets or credential-bearing
+    // URLs. Keep the original Error.cause for investigation, never in diagnostics.
+    const { cause: _cause, ...safe } = context;
+    this.context = Object.freeze(safe);
+  }
+  toJSON() {
+    return { name: this.name, category: this.category, ...this.context };
+  }
+  [Symbol.for('Deno.customInspect')]() {
+    return JSON.stringify(this.toJSON());
+  }
+  [Symbol.for('nodejs.util.inspect.custom')]() {
+    return this.toJSON();
   }
 }
 
@@ -29,8 +43,27 @@ export class UpstreamError extends Error {
 // not a grammar failure. Its status remains available to endpoint fallback.
 export class UpstreamHttpError extends Error {
   override readonly name: string = 'UpstreamHttpError';
+  readonly status: number = 502;
+  readonly errcode: string = 'M_UNKNOWN';
   constructor(readonly remoteStatus: number, readonly phase: string) {
     super(`upstream returned ${remoteStatus}`);
+  }
+  responseBody(): Record<string, unknown> {
+    return { errcode: this.errcode, error: this.message };
+  }
+  toJSON() {
+    return {
+      name: this.name,
+      category: 'http',
+      phase: this.phase,
+      remoteStatus: this.remoteStatus,
+    };
+  }
+  [Symbol.for('Deno.customInspect')]() {
+    return JSON.stringify(this.toJSON());
+  }
+  [Symbol.for('nodejs.util.inspect.custom')]() {
+    return this.toJSON();
   }
 }
 export function protocol(
@@ -54,6 +87,22 @@ export function upstreamCategory(
     return 'cancellation';
   }
   return 'local';
+}
+
+// Deliberately scoped to the network call. Peer failures may be unavailable
+// evidence, while arbitrary signing/store/programming faults must propagate.
+// Cancellation is unavailable control flow, not a peer diagnostic or backoff.
+export function recoverableUpstream(
+  error: unknown,
+  signal?: AbortSignal,
+): boolean {
+  const category = upstreamCategory(error, signal);
+  if (category === 'cancellation') return true;
+  if (['transport', 'protocol', 'validation', 'http'].includes(category)) {
+    console.warn('upstream unavailable:', error);
+    return true;
+  }
+  return false;
 }
 
 export function upstreamDeadline(parent: AbortSignal, ms: number): AbortSignal {

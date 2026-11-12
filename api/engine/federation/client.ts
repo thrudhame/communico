@@ -19,7 +19,10 @@ import { assertRoomAcl } from './acl.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Http1Response, Http1WireOpts } from '#engine/net/http1.ts';
 import { decodeJson, objectOf } from '#engine/net/json.ts';
-import { UpstreamError } from '#engine/net/upstream-error.ts';
+import {
+  UpstreamError,
+  UpstreamHttpError,
+} from '#engine/net/upstream-error.ts';
 
 export { caCertsPem, resetCaCertsForTests } from './resolve.ts';
 
@@ -42,14 +45,22 @@ export type FederationResponse = {
 
 // Only a completed HTTP response carries this provenance. Local validation,
 // discovery, signing and uncertain transport failures remain ordinary errors.
-export class FederationHttpError extends MatrixError {
+export class FederationHttpError extends UpstreamHttpError {
+  override readonly name = 'FederationHttpError';
+  override readonly status: number;
+  #remoteMessage: string;
   constructor(
-    readonly remoteStatus: number,
+    remoteStatus: number,
     readonly matrixBody: boolean,
-    errcode: string,
+    override readonly errcode: string,
     message: string,
   ) {
-    super(matrixBody ? remoteStatus : 502, errcode, message);
+    super(remoteStatus, 'federation');
+    this.status = matrixBody ? remoteStatus : 502;
+    this.#remoteMessage = message;
+  }
+  override responseBody(): Record<string, unknown> {
+    return { errcode: this.errcode, error: this.#remoteMessage };
   }
 }
 

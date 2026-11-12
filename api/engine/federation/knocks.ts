@@ -20,6 +20,8 @@ import {
 import { toWire } from './pdu.ts';
 import { validatePrejoin } from './prejoin.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
+import { knockResponse, membershipTemplate } from './responses.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 
 // A signed attempt is durable BEFORE send_knock. Retry the exact same event,
 // never a reconstructed knock whose new ID could resurrect an old request.
@@ -45,9 +47,7 @@ export async function performKnockAttempt(
     ),
   });
   const stripped = await validatePrejoin(
-    answer.json !== null && typeof answer.json === 'object'
-      ? (answer.json as Record<string, unknown>).knock_room_state
-      : undefined,
+    knockResponse(answer.json),
     attempt.roomId,
     attempt.roomVersion,
     deps.keys,
@@ -128,19 +128,22 @@ export async function knockRemote(
           }?` + versions.map((v) => 'ver=' + v).join('&'),
         body: null,
       });
-      const { room_version: version, event } = made.json as {
-        room_version?: unknown;
-        event?: Pdu;
-      };
+      const { roomVersion: version, event } = membershipTemplate(
+        made.json,
+        'make-knock',
+        versions,
+      );
       if (
-        typeof version !== 'string' || !versions.includes(version) ||
-        event === undefined || event.type !== 'm.room.member' ||
+        event.type !== 'm.room.member' ||
         event.room_id !== roomId || event.sender !== userId ||
         event.state_key !== userId || event.content?.membership !== 'knock' ||
         !Array.isArray(event.prev_events) ||
         !Array.isArray(event.auth_events) || !Number.isSafeInteger(event.depth)
       ) {
-        throw new MatrixError(502, 'M_BAD_JSON', 'invalid make_knock template');
+        throw new UpstreamError('validation', {
+          phase: 'make-knock',
+          reason: 'invalid make_knock template identity',
+        });
       }
       const pdu = await finalizeBuilt(
         {

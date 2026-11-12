@@ -10,8 +10,8 @@ import {
 // deno-lint-ignore require-await
 export default async function (_request: PathfinderRequest, context: Context) {
   if (context.error instanceof UpstreamHttpError) {
-    return json({ errcode: 'M_UNKNOWN', error: context.error.message }, {
-      status: 502,
+    return json(context.error.responseBody(), {
+      status: context.error.status,
     });
   }
   if (

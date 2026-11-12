@@ -11,7 +11,6 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createHash, X509Certificate } from 'node:crypto';
 import tls from 'node:tls';
 import { config, setConfigForTests } from '#engine/config.ts';
-import { MatrixError } from '#engine/matrix-error.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { addPeer, removePeer } from '#engine/federation/peers.ts';
 import { resetWellKnownCache, resolve } from '#engine/federation/resolve.ts';
@@ -373,8 +372,8 @@ Deno.test('client: POST carries Content-Type and signs the content', async () =>
           body,
         },
       ).then(() => 'ok', (e: unknown) => e);
-      assert((err as MatrixError) instanceof MatrixError);
-      assertEquals((err as MatrixError).status, 404);
+      assert(err instanceof FederationHttpError);
+      assertEquals(err.status, 404);
       const last = fake.requests[fake.requests.length - 1];
       assertEquals(last.method, 'POST');
       const gotBody = last.body;
@@ -400,9 +399,9 @@ Deno.test('client: a Matrix error body passes through with its own status and er
         },
       ).then(
         () => 'resolved',
-        (e) => e as MatrixError,
+        (e) => e as FederationHttpError,
       );
-      assert(err instanceof MatrixError);
+      assert(err instanceof FederationHttpError);
       assertEquals(err.status, 404);
       assertEquals(err.errcode, 'M_UNRECOGNIZED');
     });

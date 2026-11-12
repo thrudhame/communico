@@ -108,7 +108,7 @@ async function historyFetch<T>(
     } finally {
       signal.removeEventListener('abort', abort);
     }
-  });
+  }, signal);
 }
 
 export type BackfillResult = {
