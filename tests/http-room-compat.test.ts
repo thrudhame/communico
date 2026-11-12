@@ -249,7 +249,7 @@ test('search: original body/context/20-result pagination/predecessor/keys/visibi
     event_context: { before_limit: 2, after_limit: 2 },
   });
   assertEquals(context.count, 1);
-  assert(typeof context.next_batch === 'string');
+  assertEquals(context.next_batch, undefined);
   const row = (context.results as Json[])[0], ctx = row.context as Json;
   assertEquals((row.result as Json).content, {
     msgtype: 'm.text',
@@ -293,10 +293,7 @@ test('search: original body/context/20-result pagination/predecessor/keys/visibi
     (p2.results as Json[]).map((e) => (e.result as Json).event_id),
     ids.slice(0, 10).reverse(),
   );
-  const p3 = await search(A, req, p2.next_batch as string);
-  assertEquals(p3.count, 20);
-  assertEquals(p3.results, []);
-  assertEquals(p3.next_batch, undefined);
+  assertEquals(p2.next_batch, undefined);
   const old = await create(A, { room_version: '8' }),
     beforeId = await send(old, A, 'Message before upgrade');
   const up = await call(rp(old) + '/upgrade', A, { new_version: '9' }, 'POST');
@@ -354,7 +351,7 @@ test('search: original body/context/20-result pagination/predecessor/keys/visibi
   });
   assertEquals(limit.count, 15);
   assertEquals((limit.results as Json[]).length, 10);
-  assertEquals(limit.next_batch, undefined);
+  assertEquals(typeof limit.next_batch, 'string');
   await call('profile/' + encodeURIComponent(a.user_id) + '/displayname', A, {
     displayname: 'Search Alice',
   });

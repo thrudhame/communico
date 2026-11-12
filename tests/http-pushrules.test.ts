@@ -266,3 +266,31 @@ test('absent rule resources return not found across kinds while unsupported muta
     }
   }
 });
+
+test('existing push rules honor placement and before alone owns precedence', async () => {
+  const alice = await registerTestUser('pr-placement', 'pw');
+  const token = alice.access_token!;
+  const put = (id: string, query = '') =>
+    call('/_matrix/client/v3/pushrules/global/override/' + id + query, {
+      token,
+      method: 'PUT',
+      body: { actions: ['notify'] },
+    });
+  const order = async () =>
+    (((await call('/_matrix/client/v3/pushrules/', { token })).body
+      .global as Json).override as Json[]).filter((r) => !r.default).map((r) =>
+        r.rule_id
+      );
+  for (const id of ['a', 'b', 'c']) assertEquals((await put(id)).status, 200);
+  assertEquals(await order(), ['c', 'b', 'a']);
+  assertEquals((await put('a', '?before=c')).status, 200);
+  assertEquals(await order(), ['a', 'c', 'b']);
+  assertEquals((await put('c', '?after=b')).status, 200);
+  assertEquals(await order(), ['a', 'b', 'c']);
+  assertEquals((await put('c', '?before=a&after=.m.rule.message')).status, 200);
+  assertEquals(await order(), ['c', 'a', 'b']);
+  assertEquals((await put('b', '?before=c&after=missing')).status, 200);
+  assertEquals(await order(), ['b', 'c', 'a']);
+  assertEquals((await put('b')).status, 200);
+  assertEquals(await order(), ['b', 'c', 'a']);
+});

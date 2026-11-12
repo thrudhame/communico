@@ -358,6 +358,15 @@ and numeric parameters, and returns full-state requests immediately even with
 a since token and positive timeout.
 (`api/engine/client/{timeline-request,sync-request,timeline}.ts`)
 
+Search has one normalized operation contract and one keyset pagination owner for
+rank and recent ordering, including room and sender scopes. Equal ranks retain a
+deterministic sequence/event tie-break. Global and per-group continuations exist
+only when more visible matches remain in that scope; using a group token keeps
+subsequent global continuations in the same group. Multiple matching indexed keys
+still produce one event result. Known search keys, context, grouping and boolean
+fields are validated before selection rather than silently discarded.
+(`api/engine/client/{search-request,search-page,search}.ts`)
+
 All client timeline rendering crosses one viewer-aware `renderEvent` boundary.
 Its shared visibility policy requires accepted, grounded events; the viewer's
 own membership events are visible without a qualifying join. Other events need

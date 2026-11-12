@@ -14,6 +14,7 @@ import {
   decodeVisibility,
   localDirectoryOffset,
 } from '#engine/client/directory-request.ts';
+import { searchRequest } from '#engine/client/search-request.ts';
 
 Deno.test('operation primitives preserve absence, false, zero and empty strings without coercion', () => {
   assertEquals(booleanParameter(undefined, 'x'), undefined);
@@ -98,4 +99,43 @@ Deno.test('directory operation normalization preserves every selector and opaque
   assertThrows(() => decodeVisibility({ visibility: null }));
   assertEquals(localDirectoryOffset('0'), 0);
   assertThrows(() => localDirectoryOffset('opaque/cursor'));
+});
+
+Deno.test('search normalization distinguishes absence, explicit empty values and context defaults', () => {
+  assertEquals(searchRequest({ search_term: '' }), {
+    term: '',
+    keys: ['content.body', 'content.name', 'content.topic'],
+    filter: {},
+    order: 'rank',
+    context: undefined,
+    state: false,
+    groups: [],
+  });
+  assertEquals(
+    searchRequest({
+      search_term: 'needle',
+      keys: [],
+      filter: { limit: 0 },
+      order_by: 'recent',
+      event_context: {},
+      include_state: true,
+      groupings: { group_by: [{ key: 'sender' }, { key: 'room_id' }] },
+    }),
+    {
+      term: 'needle',
+      keys: [],
+      filter: { limit: 0 },
+      order: 'recent',
+      context: { before: 5, after: 5, profile: false },
+      state: true,
+      groups: ['sender', 'room_id'],
+    },
+  );
+  assertEquals(
+    searchRequest({
+      search_term: 'needle',
+      event_context: { before_limit: 0, after_limit: 1, include_profile: true },
+    }).context,
+    { before: 0, after: 1, profile: true },
+  );
 });
