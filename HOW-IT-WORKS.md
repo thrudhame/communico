@@ -672,6 +672,23 @@ bodies and durable delivery obligations are not rewritten or discarded.
 
 ## Tenant data, storage and process lifetime
 
+The tenant's delayed-event owner stores schedules, send-transaction receipts and
+prepared signed PDUs (schema v20). The app owns scheduler startup and draining
+shutdown. Due selection is only a hint: claiming a command rechecks its current
+deadline, so a heartbeat restart fences stale selection. Disabling new scheduling
+preserves existing durable delivery obligations.
+
+Delayed writes compose the existing room LocalSubmission contract: persist exact
+signed bytes before room ingest, reconcile by event ID on retry, then finish the
+receipt. No tenant transaction encloses a room transaction. Before preparation,
+the room authoring lock protects current membership and publication-history
+cancellation checks; ordinary ingest retains current authorization/encryption.
+Other-sender changes to the selected published state key cancel pending work,
+including resolved/federated changes and changes followed by an own-user update.
+Own updates preserve a pending call leave. An app reopen resumes overdue work
+and reconciles a crash after room commit without publishing a duplicate event.
+(`api/engine/delayed-events.ts`, `tenant/delayed-events.ts`, `room/state.ts`)
+
 The access logger has one URL disclosure owner. It omits every query string and
 redacts credential-bearing path values, including delayed-event bearer IDs and
 third-party invitation state keys, before both the head and completion lines.

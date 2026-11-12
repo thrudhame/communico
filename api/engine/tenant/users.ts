@@ -133,6 +133,12 @@ export async function markDeactivated(
 ): Promise<void> {
   const old = await userByLocalpart(conn, localpart);
   if (old === null || old.deactivated) return;
+  await conn.execute('DELETE FROM delayed_events WHERE localpart=?', [
+    localpart,
+  ]);
+  await conn.execute('DELETE FROM delayed_event_receipts WHERE localpart=?', [
+    localpart,
+  ]);
   await conn.execute(
     'UPDATE users SET deactivated = 1, display_name = NULL, avatar_url = NULL WHERE localpart = ?',
     [localpart],

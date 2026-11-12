@@ -9,6 +9,7 @@
 // app store (4b), engine tests keep opening schema-less stores without
 // it.
 import { config, serverName } from '#engine/config.ts';
+import { DelayedEvents } from '#engine/delayed-events.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { MediaService } from '#engine/media/service.ts';
 import { installRuleMigration } from '#engine/client/rule-migration.ts';
@@ -59,6 +60,7 @@ export type App = {
   sender: Sender | null;
   readonly pushSender: PushSender;
   readonly media: MediaService;
+  delayedEvents: DelayedEvents;
   close(): Promise<void>;
 };
 
@@ -101,6 +103,8 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
     services.push(() => deviceLists.stop());
     const pushSender = await startPushSender({ store, tenant });
     services.push(() => pushSender.stop());
+    const delayedEvents = new DelayedEvents({ store, tenant });
+    services.push(() => delayedEvents.stop());
     const app: App = {
       store,
       server,
@@ -111,6 +115,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       sender: null,
       pushSender,
       media,
+      delayedEvents,
       close: async () => {
         const sender = app.sender;
         app.sender = null;
@@ -123,6 +128,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
     };
     registerToDevice(app.federationEdus, tenant);
     current = app;
+    app.delayedEvents.wake();
     return app;
   } catch (error) {
     await drainResources([stopServices, () => store.close()], [error]);

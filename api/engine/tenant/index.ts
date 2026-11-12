@@ -36,6 +36,7 @@ import * as media from '#engine/tenant/media.ts';
 import * as pushers from '#engine/tenant/pushers.ts';
 import * as pushrules from '#engine/tenant/pushrules.ts';
 import * as txns from '#engine/tenant/txns.ts';
+import * as delayedEvents from '#engine/tenant/delayed-events.ts';
 import * as uia from '#engine/tenant/uia.ts';
 import * as slidingSync from '#engine/tenant/sliding-sync.ts';
 import * as users from '#engine/tenant/users.ts';
@@ -603,6 +604,29 @@ function bind(
       byId: (mediaId: string) => media.mediaById(conn, mediaId),
       markUploaded: (mediaId: string, meta: media.MediaMeta) =>
         media.markMediaUploaded(conn, mediaId, meta),
+    },
+    delayedEvents: {
+      get: (id: string) => delayedEvents.get(conn, id),
+      list: (localpart: string) => delayedEvents.list(conn, localpart),
+      receipt: (receipt: delayedEvents.DelayReceipt) =>
+        delayedEvents.receipt(conn, receipt),
+      add: (
+        event: delayedEvents.DelayedEvent,
+        limit: number,
+        receipt?: delayedEvents.DelayReceipt,
+      ) => delayedEvents.add(conn, event, limit, receipt),
+      remove: (id: string) => delayedEvents.remove(conn, id),
+      action: (
+        id: string,
+        action: 'cancel' | 'restart' | 'send',
+        now: number,
+      ) => delayedEvents.action(conn, id, action, now),
+      next: () => delayedEvents.next(conn),
+      due: (now: number) => delayedEvents.due(conn, now),
+      claim: (id: string, now: number) => delayedEvents.claim(conn, id, now),
+      submission: (id: string) => delayedEvents.submission(conn, id),
+      prepare: (id: string, pdu: Pdu) => delayedEvents.prepare(conn, id, pdu),
+      finish: (id: string) => delayedEvents.finish(conn, id),
     },
     txns: {
       submission: (

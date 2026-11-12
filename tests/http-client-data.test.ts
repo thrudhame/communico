@@ -254,6 +254,7 @@ test('versions stays public, capabilities stays protected, discovery absent per 
       unstable_features: {
         'org.matrix.simplified_msc3575': true,
         'org.matrix.msc4143': false,
+        'org.matrix.msc4140': false,
         'io.element.e2ee_forced.public': !config().encryption
           .allowunencryptedcreation,
         'io.element.e2ee_forced.private': !config().encryption
@@ -278,6 +279,10 @@ test('versions stays public, capabilities stays protected, discovery absent per 
       'm.room_versions': { default: '11', available },
       'm.change_password': { enabled: false },
       'm.profile_fields': { enabled: true },
+      'org.matrix.msc4140.delayed_events': {
+        max_delay_ms: 0,
+        max_scheduled: 100,
+      },
     },
   });
   for (const path of ['client', 'server']) {

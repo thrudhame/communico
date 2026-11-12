@@ -250,8 +250,15 @@ CREATE TABLE sliding_sync_positions(token TEXT PRIMARY KEY NOT NULL,connection_i
 CREATE INDEX sliding_sync_positions_connection ON sliding_sync_positions(connection_id);
 `;
 
+const DELAYED_EVENTS_SQL = `
+CREATE TABLE delayed_events(id TEXT PRIMARY KEY NOT NULL,localpart TEXT NOT NULL,room_id TEXT NOT NULL,type TEXT NOT NULL,state_key TEXT,content TEXT NOT NULL,delay_ms INTEGER NOT NULL,since_ms INTEGER NOT NULL,due_ms INTEGER NOT NULL,room_pos INTEGER NOT NULL,state_event TEXT,phase TEXT NOT NULL DEFAULT 'pending',event_id TEXT,pending_pdu TEXT,completed INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX delayed_events_due ON delayed_events(due_ms);
+CREATE INDEX delayed_events_user ON delayed_events(localpart);
+CREATE TABLE delayed_event_receipts(localpart TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL,endpoint TEXT NOT NULL,txn_id TEXT NOT NULL,delay_id TEXT NOT NULL,PRIMARY KEY(localpart,device_id,generation,endpoint,txn_id));
+`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 19,
+  version: 20,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -269,8 +276,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(ERASURE_SQL);
     await db.exec(BACKUP_ACCOUNTING_SQL);
     await db.exec(SLIDING_SYNC_SQL);
+    await db.exec(DELAYED_EVENTS_SQL);
   },
   migrations: {
+    19: (conn) => conn.exec(DELAYED_EVENTS_SQL),
     18: (conn) => conn.exec(SLIDING_SYNC_SQL),
     17: migrateBackupAccounting,
     16: (conn) => conn.exec(ERASURE_SQL),

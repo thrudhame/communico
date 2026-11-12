@@ -1,4 +1,5 @@
 import { supportedRoomVersions } from '#engine/policy.ts';
+import { config } from '#engine/config.ts';
 
 // M0: server capabilities (Complement 10apidoc/45server-capabilities).
 // Room versions: 11 only — v12 is designed for (the rulebook carries its
@@ -21,6 +22,10 @@ export default async function (
       'm.room_versions': { default: '11', available },
       'm.change_password': { enabled: false },
       'm.profile_fields': { enabled: true },
+      'org.matrix.msc4140.delayed_events': {
+        max_delay_ms: config().delayedevents.maxdelayms,
+        max_scheduled: config().delayedevents.maxperuser,
+      },
     },
   };
 }

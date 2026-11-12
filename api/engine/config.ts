@@ -537,6 +537,7 @@ export type ConfigPatch = {
   peeking?: Partial<Config['peeking']>;
   hierarchy?: Partial<Config['hierarchy']>;
   uia?: Partial<Config['uia']>;
+  delayedevents?: Partial<Config['delayedevents']>;
   slidingsync?: Partial<Config['slidingsync']>;
   push?: {
     readretentiondays?: number;

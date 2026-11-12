@@ -36,7 +36,11 @@ export default async function (
     timeoutMs,
     filter,
     fullState,
-    useStateAfter: request.query.get('use_state_after') === 'true',
+    useStateAfter: (request.query.get('use_state_after') ??
+      request.query.get('org.matrix.msc4222.use_state_after')) === 'true',
+    stateAfterKey: request.query.has('use_state_after')
+      ? 'state_after'
+      : 'org.matrix.msc4222.state_after',
     setPresence,
   });
 }

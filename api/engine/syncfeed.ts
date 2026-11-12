@@ -63,6 +63,7 @@ export interface SyncInputs {
   filter: RoomFilter;
   fullState: boolean;
   useStateAfter?: boolean;
+  stateAfterKey?: 'state_after' | 'org.matrix.msc4222.state_after';
   setPresence?: string;
 }
 
@@ -190,7 +191,9 @@ async function roomTimeline(
     ? await room.tx((tx) => tx.segments.positionOf(start.event))
     : null;
   const entry: Record<string, unknown> = {
-    [i.useStateAfter ? 'state_after' : 'state']: { events: stateEvents },
+    [i.useStateAfter ? (i.stateAfterKey ?? 'state_after') : 'state']: {
+      events: stateEvents,
+    },
     timeline: {
       events,
       limited,
@@ -482,7 +485,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
         );
         leave[roomId] = {
           timeline: { events: [], limited: false, prev_batch: '' },
-          [i.useStateAfter ? 'state_after' : 'state']: {
+          [i.useStateAfter ? (i.stateAfterKey ?? 'state_after') : 'state']: {
             events: filterEvents([departure], i.filter.state, roomId),
           },
         };
