@@ -1,14 +1,19 @@
 import { config } from '#engine/config.ts';
 import { HttpError } from '@pathfinder/pathfinder';
+import { rtcTransports } from '#engine/matrixrtc.ts';
 
 export function clientDiscovery() {
   const settings = config().wellknown;
   if (settings.client === '') throw new HttpError(404, 'not found');
+  const transports = rtcTransports();
   return {
     'm.homeserver': { base_url: settings.client },
     ...(settings.identity === ''
       ? {}
       : { 'm.identity_server': { base_url: settings.identity } }),
+    ...(transports.length === 0
+      ? {}
+      : { 'org.matrix.msc4143.rtc_foci': transports }),
   };
 }
 

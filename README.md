@@ -215,6 +215,19 @@ coturn-compatible HMAC credentials or `turn.username`/`turn.password` for static
 credentials. The secret takes precedence. `turn.ttl` is seconds (default 3600;
 0 disables credentials). This advertises an external TURN service, not a daemon.
 
+`matrixrtc.livekitserviceurl` advertises an external LiveKit authorization
+service through both well-known `org.matrix.msc4143.rtc_foci` and authenticated
+`/_matrix/client/unstable/org.matrix.msc4143/rtc/transports`. Empty (default)
+disables discovery and its versions flag. Configure `wellknown.client` as usual
+for public well-known. For example, set the service URL to
+`https://rtc.example/livekit/jwt`; configure that service with the actual SFU
+URL and credentials, and make this server's existing OpenID userinfo endpoint
+reachable from it. No SFU or JWT service is bundled. This is the legacy
+`livekit_service_url` transport for Element Call compatibility mode, not the
+new URL-only token proxy. Standalone JWT-service authorization has its upstream
+room-membership limitations; deploying it is an operator trust boundary, not
+homeserver room authorization. Keep the service's allowed homeservers explicit.
+
 `GET /_matrix/client/v3/pushrules/global/` returns the caller's global rule set.
 Client `admin/whois/{userId}` permits self-inspection or a requester explicitly
 listed by full local Matrix ID in `admin.users` (default empty). It returns
