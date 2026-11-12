@@ -1,6 +1,6 @@
 // The key/notary wire schema never edits signed JSON. Cryptographic identity
 // and signatures are admitted by KeyStore, not this representation boundary.
-import { objectOf, stringOf } from '#engine/net/json.ts';
+import { objectOf, optionalField, stringOf } from '#engine/net/json.ts';
 import { protocol } from '#engine/net/upstream-error.ts';
 import { matrixBase64 } from '#engine/signing-primitives.js';
 import { canonicalJson } from '#engine/canonical.ts';
@@ -8,7 +8,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 export type KeyDocShape = {
   server_name: string;
   verify_keys: Record<string, { key: string }>;
-  old_verify_keys?: Record<string, { key: string; expired_ts: number }>;
+  old_verify_keys?: Record<string, { key: string; expired_ts: number }> | null;
   valid_until_ts: number;
   signatures: Record<string, Record<string, string>>;
 };
@@ -17,7 +17,11 @@ export type KeyDocShape = {
 export function oldKeysOf(
   doc: KeyDocShape,
 ): NonNullable<KeyDocShape['old_verify_keys']> {
-  return doc.old_verify_keys === undefined ? {} : doc.old_verify_keys;
+  const keys = optionalField(
+    doc.old_verify_keys,
+    (raw) => raw as NonNullable<KeyDocShape['old_verify_keys']>,
+  );
+  return keys === undefined ? {} : keys;
 }
 
 function integer(raw: unknown): void {
@@ -46,7 +50,7 @@ export function keyDocument(raw: unknown): KeyDocShape {
   stringOf(doc.server_name, 'key-doc');
   integer(doc.valid_until_ts);
   keyMap(doc.verify_keys);
-  if (doc.old_verify_keys !== undefined) keyMap(doc.old_verify_keys, true);
+  optionalField(doc.old_verify_keys, (raw) => keyMap(raw, true));
   for (const signatures of Object.values(objectOf(doc.signatures, 'key-doc'))) {
     for (const signature of Object.values(objectOf(signatures, 'key-doc'))) {
       stringOf(signature, 'key-doc');

@@ -15,6 +15,7 @@ import {
 } from '#engine/signing-primitives.js';
 import * as wire from '#engine/e2ee-wire.ts';
 import { protocol } from '#engine/net/upstream-error.ts';
+import { optionalField } from '#engine/net/json.ts';
 
 export const signingUsages = [
   'master',
@@ -86,9 +87,7 @@ export function decodeSigningKey(
   if (id !== 'ed25519:' + normalized) {
     wire.identity('invalid signing public key ID');
   }
-  if (key.signatures !== undefined) {
-    wire.signatures(key.signatures);
-  }
+  optionalField(key.signatures, wire.signatures);
   if (typeof pub !== 'string') {
     protocol('e2ee-schema', 'invalid signing public key');
   }

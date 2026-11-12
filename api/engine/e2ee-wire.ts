@@ -4,6 +4,7 @@ import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { limit, protocol, UpstreamError } from '#engine/net/upstream-error.ts';
 import { matrixBase64 } from '#engine/signing-primitives.js';
+import { booleanOf, optionalField, stringOf } from '#engine/net/json.ts';
 
 export type Json = Record<string, unknown>;
 export type KeyLimits = Config['e2ee'];
@@ -83,16 +84,22 @@ export function deviceKey(raw: unknown, limits: KeyLimits): Json {
     }
   }
   signatures(key.signatures);
-  if (key.unsigned !== undefined) {
-    const unsigned = object(key.unsigned, 'unsigned device info');
-    if (
-      unsigned.device_display_name !== undefined &&
-      typeof unsigned.device_display_name !== 'string'
-    ) {
-      protocol(phase, 'invalid device display name');
-    }
+  const decoded = { ...key };
+  const unsigned = optionalField(
+    key.unsigned,
+    (raw) => ({ ...object(raw, 'unsigned device info') }),
+  );
+  if (unsigned === undefined) delete decoded.unsigned;
+  else {
+    const name = optionalField(
+      unsigned.device_display_name,
+      (raw) => stringOf(raw, phase),
+    );
+    if (name === undefined) delete unsigned.device_display_name;
+    else unsigned.device_display_name = name;
+    decoded.unsigned = unsigned;
   }
-  return JSON.parse(canonical(key));
+  return JSON.parse(canonical(decoded));
 }
 export function claimedKey(
   raw: unknown,
@@ -109,12 +116,10 @@ export function claimedKey(
     }
   } else {
     const key = object(raw, 'claimed signed key');
-    if (
-      typeof key.key !== 'string' ||
-      (key.fallback !== undefined && typeof key.fallback !== 'boolean')
-    ) {
+    if (typeof key.key !== 'string') {
       protocol(phase, 'invalid signed key');
     }
+    optionalField(key.fallback, (raw) => booleanOf(raw, phase));
     signatures(key.signatures);
     if (algorithm === 'signed_curve25519') material(key.key, 32);
   }

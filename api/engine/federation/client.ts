@@ -18,7 +18,12 @@ import { abortable } from '#engine/net/abort.ts';
 import { assertRoomAcl } from './acl.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Http1Response, Http1WireOpts } from '#engine/net/http1.ts';
-import { decodeJson, objectOf } from '#engine/net/json.ts';
+import {
+  decodeJson,
+  objectOf,
+  optionalField,
+  stringOf,
+} from '#engine/net/json.ts';
 import {
   UpstreamError,
   UpstreamHttpError,
@@ -175,15 +180,16 @@ export async function federationRequestRaw(
       'matrix-error',
     );
     // Matrix's error schema requires errcode; the human message is optional.
-    if (
-      typeof o.errcode === 'string' &&
-      (o.error === undefined || typeof o.error === 'string')
-    ) {
+    const message = optionalField(
+      o.error,
+      (raw) => stringOf(raw, 'matrix-error'),
+    );
+    if (typeof o.errcode === 'string') {
       throw new FederationHttpError(
         res.status,
         true,
         o.errcode,
-        o.error === undefined ? o.errcode : o.error,
+        message === undefined ? o.errcode : message,
       );
     }
   } catch (e) {

@@ -1,6 +1,11 @@
 // Directory, profile and hierarchy schemas belong to the wire boundary, not
 // individual lookup/join/traversal callers. Extensions remain intact.
-import { arrayOf, objectOf, stringOf } from '#engine/net/json.ts';
+import {
+  arrayOf,
+  objectOf,
+  optionalField,
+  stringOf,
+} from '#engine/net/json.ts';
 import { protocol, UpstreamError } from '#engine/net/upstream-error.ts';
 import type { Profile } from './query.ts';
 import { splitServerName } from './server-name.ts';
@@ -27,14 +32,15 @@ export function profileResponse(raw: unknown): Profile {
   for (const field of ['displayname', 'avatar_url', 'm.tz']) {
     // SS query/profile explicitly permits null for an unset field. Preserve
     // the existing client projection of absent legacy display/avatar fields.
-    if (body[field] === null) delete body[field];
-    else if (body[field] !== undefined) stringOf(body[field], 'profile');
+    const value = optionalField(body[field], (raw) => stringOf(raw, 'profile'));
+    if (value === undefined) delete body[field];
+    else body[field] = value;
   }
   return body as Profile;
 }
 
 export function roomSummaryResponse(raw: unknown) {
-  const summary = objectOf(raw, 'hierarchy');
+  const summary = { ...objectOf(raw, 'hierarchy') };
   roomId(summary.room_id, 'hierarchy');
   if (!Number.isSafeInteger(summary.num_joined_members)) {
     protocol('hierarchy', 'invalid member count');
@@ -56,15 +62,21 @@ export function roomSummaryResponse(raw: unknown) {
       'room_version',
     ]
   ) {
-    if (summary[field] !== undefined) stringOf(summary[field], 'hierarchy');
+    const value = optionalField(
+      summary[field],
+      (raw) => stringOf(raw, 'hierarchy'),
+    );
+    if (value === undefined) delete summary[field];
+    else summary[field] = value;
   }
-  if (summary.allowed_room_ids !== undefined) {
+  const allowed = optionalField(summary.allowed_room_ids, (raw) =>
     arrayOf(
-      summary.allowed_room_ids,
+      raw,
       (id) => roomId(id, 'hierarchy'),
       'hierarchy',
-    );
-  }
+    ));
+  if (allowed === undefined) delete summary.allowed_room_ids;
+  else summary.allowed_room_ids = allowed;
   return summary;
 }
 

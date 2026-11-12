@@ -37,3 +37,22 @@ export function stringOf(value: unknown, endpoint = 'response'): string {
   if (typeof value !== 'string') protocol(endpoint, 'expected string');
   return value;
 }
+
+// Peer-response schemas call this only for fields declared optional. Null means
+// absence unless that field's specification gives null a value of its own.
+// This is a shallow decoded view: never rewrite signed JSON or opaque content.
+export function optionalField<T>(
+  value: unknown,
+  decode: (value: unknown) => T,
+  options: { nullIsValue?: boolean } = {},
+): T | undefined {
+  if (
+    value === undefined || (value === null && options.nullIsValue !== true)
+  ) return undefined;
+  return decode(value);
+}
+
+export function booleanOf(value: unknown, endpoint = 'response'): boolean {
+  if (typeof value !== 'boolean') protocol(endpoint, 'expected boolean');
+  return value;
+}

@@ -14,6 +14,7 @@ import {
   object,
 } from '#engine/e2ee-wire.ts';
 import { protocol } from '#engine/net/upstream-error.ts';
+import { optionalField, stringOf } from '#engine/net/json.ts';
 
 /** Causal identifiers compare by normalized equality, never arithmetic order. */
 export function deviceStreamId(value: unknown): string {
@@ -55,20 +56,22 @@ function entry(raw: unknown, user: string, limits: KeyLimits, reset = false) {
   ) {
     protocol('e2ee-schema', 'invalid device ID');
   }
-  if (
-    value.device_display_name !== undefined &&
-    typeof value.device_display_name !== 'string'
-  ) protocol('e2ee-schema', 'invalid device name');
-  const key = value.keys === undefined
-    ? null
-    : publicDeviceKey(value.keys, user, value.device_id, limits);
+  const name = optionalField(
+    value.device_display_name,
+    (raw) => stringOf(raw, 'e2ee-schema'),
+  );
+  const decodedKey = optionalField(
+    value.keys,
+    (raw) => publicDeviceKey(raw, user, value.device_id as string, limits),
+  );
+  const key = decodedKey === undefined ? null : decodedKey;
   if (key !== null) {
     const unsigned = {
       ...object(key.unsigned === undefined ? {} : key.unsigned, 'unsigned'),
     };
     delete unsigned.device_display_name;
-    if (value.device_display_name !== undefined) {
-      unsigned.device_display_name = value.device_display_name;
+    if (name !== undefined) {
+      unsigned.device_display_name = name;
     }
     key.unsigned = unsigned;
     bounded(key, limits.maxkeybytes);
@@ -119,26 +122,14 @@ export function remoteDeviceSnapshot(
   }
   limitEntries(value.devices.length, limits.maxkeys);
   const devices = value.devices.map((d) => {
-    if (object(d, 'snapshot device').keys === undefined) {
-      protocol('e2ee-schema', 'snapshot device keys are required');
-    }
+    // Snapshot keys are required, unlike a device-update's optional key patch.
+    object(object(d, 'snapshot device').keys, 'snapshot device keys');
     return entry(d, user, limits);
   });
   if (new Set(devices.map((d) => d.id)).size !== devices.length) {
     protocol('e2ee-schema', 'duplicate snapshot device');
   }
-  // Deployed Synapse /user/devices replies use null for absent signing keys.
-  // This compatibility is endpoint-specific, not an upload/query/EDU default.
-  const signing = publicSigning(
-    {
-      master_key: value.master_key === null ? undefined : value.master_key,
-      self_signing_key: value.self_signing_key === null
-        ? undefined
-        : value.self_signing_key,
-    },
-    user,
-    limits,
-  );
+  const signing = publicSigning(value, user, limits);
   limitEntries(devices.length + Object.keys(signing).length, limits.maxkeys);
   return {
     user,

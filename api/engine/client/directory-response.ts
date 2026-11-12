@@ -1,4 +1,5 @@
 import { MatrixError } from '#engine/matrix-error.ts';
+import { optionalField } from '#engine/net/json.ts';
 
 // A remote page is discovery metadata, not room membership or local publication.
 // Validate the whole page before exposing any of it; retain optional extensions.
@@ -17,16 +18,22 @@ export function remoteDirectoryResponse(
     );
   };
   if (!object(value) || !Array.isArray(value.chunk)) return bad();
+  const result = { ...value };
   for (const token of ['next_batch', 'prev_batch']) {
-    if (value[token] !== undefined && typeof value[token] !== 'string') {
-      return bad();
-    }
+    const decoded = optionalField(value[token], (raw) => {
+      if (typeof raw !== 'string') return bad();
+      return raw;
+    });
+    if (decoded === undefined) delete result[token];
+    else result[token] = decoded;
   }
-  if (
-    value.total_room_count_estimate !== undefined &&
-    !count(value.total_room_count_estimate)
-  ) return bad();
-  for (const entry of value.chunk) {
+  const total = optionalField(value.total_room_count_estimate, (raw) => {
+    if (!count(raw)) return bad();
+    return raw;
+  });
+  if (total === undefined) delete result.total_room_count_estimate;
+  else result.total_room_count_estimate = total;
+  result.chunk = value.chunk.map((entry) => {
     if (
       !object(entry) || typeof entry.room_id !== 'string' ||
       !entry.room_id.startsWith('!') ||
@@ -34,6 +41,7 @@ export function remoteDirectoryResponse(
       typeof entry.world_readable !== 'boolean' ||
       typeof entry.guest_can_join !== 'boolean'
     ) return bad();
+    const decoded = { ...entry };
     for (
       const key of [
         'name',
@@ -44,10 +52,14 @@ export function remoteDirectoryResponse(
         'join_rule',
       ]
     ) {
-      if (entry[key] !== undefined && typeof entry[key] !== 'string') {
-        return bad();
-      }
+      const field = optionalField(entry[key], (raw) => {
+        if (typeof raw !== 'string') return bad();
+        return raw;
+      });
+      if (field === undefined) delete decoded[key];
+      else decoded[key] = field;
     }
-  }
-  return value;
+    return decoded;
+  });
+  return result;
 }

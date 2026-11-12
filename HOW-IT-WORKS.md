@@ -542,6 +542,16 @@ v12-only creator field. Valid duplicates and the upgrader's own ID are retained.
 
 ## Federation and delivery
 
+Remote response schemas share one optional-field boundary: JSON null for a
+declared optional field is decoded as absence unless that field's specification
+gives null meaning. Required fields and wrong non-null types still fail. Decoded
+projections omit absent fields without rewriting signed key JSON, opaque event
+content or unknown extension values. This includes membership/delivery envelopes,
+directory/profile/hierarchy metadata, key documents, remote E2EE records and
+completed Matrix error responses. It does not relax authenticated client request
+decoding or required transaction/EDU fields.
+(`api/engine/net/json.ts:optionalField`, `tests/peer-response-optionals.test.ts`)
+
 The shared outbound TLS dialer lets CA trust finish normal chain and hostname
 validation in the handshake. Only pinned/key-is-name trust reads certificate
 material afterwards, requesting the leaf alone and checking its key before

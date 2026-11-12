@@ -28,7 +28,7 @@ Deno.test('C1 DeviceKeys requires signatures instead of inventing a signed field
   assertEquals(error.category, 'protocol');
 });
 
-Deno.test('C1 snapshot compatibility accepts Synapse null signing optionals only there', () => {
+Deno.test('C1 snapshot and public signing share optional peer-field null absence', () => {
   const raw = {
     user_id: user,
     stream_id: '00023',
@@ -39,7 +39,7 @@ Deno.test('C1 snapshot compatibility accepts Synapse null signing optionals only
   const parsed = remoteDeviceSnapshot(raw, user, config().e2ee);
   assertEquals(parsed.stream, '23');
   assertEquals(parsed.signing, {});
-  assertThrows(() => publicSigning(raw, user, config().e2ee));
+  assertEquals(publicSigning(raw, user, config().e2ee), {});
   assertEquals(raw.master_key, null, 'decoding must not edit signed input');
 });
 
@@ -134,6 +134,7 @@ Deno.test('C1 claimed signed keys are decoded completely and never retried', asy
       [{ key: material, signatures: null }, false],
       [{ key: material, signatures: { [remote]: { 'ed25519:D': 3 } } }, false],
       [{ key: material, signatures: {}, fallback: 'true' }, false],
+      [{ key: material, signatures: {}, fallback: null }, true],
       [material, false],
       [
         { key: material + '=', signatures: {}, fallback: true, extension: 1 },
@@ -162,6 +163,52 @@ Deno.test('C1 claimed signed keys are decoded completely and never retried', asy
         );
         assertEquals(Boolean(body.failures[fake.name]), !valid);
       });
+    }
+  } finally {
+    await fake.close();
+    await http.close();
+    setConfigForTests({ federation: previous });
+    resetCaCertsForTests();
+  }
+});
+
+Deno.test('C1 key query treats null optional signing maps as absent but rejects null map values', async () => {
+  const previous = config().federation;
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  const http = await startHttp();
+  let remote = '', malformed = false;
+  const fake = await startFakeServer({
+    ourKeyDoc: () =>
+      Promise.resolve({
+        server_name: http.app.tenant.serverName,
+        verify_keys: {
+          [http.app.tenant.keyId]: { key: http.app.tenant.publicB64 },
+        },
+      }),
+    handlers: (request) =>
+      request.path.endsWith('/user/keys/query')
+        ? Response.json({
+          device_keys: { [remote]: {} },
+          master_keys: malformed ? { [remote]: null } : null,
+          self_signing_keys: null,
+        })
+        : null,
+  });
+  remote = '@bob:' + fake.name;
+  try {
+    const client = await http.registerTestUser('null-optional-maps', 'pw');
+    for (const invalid of [false, true]) {
+      malformed = invalid;
+      const answer = await queryKeys(client.user_id, {
+        device_keys: { [remote]: [] },
+      });
+      assertEquals(
+        Boolean((answer.failures as Record<string, unknown>)[fake.name]),
+        invalid,
+      );
+      assertEquals(answer.master_keys, {});
+      assertEquals(answer.self_signing_keys, {});
     }
   } finally {
     await fake.close();
