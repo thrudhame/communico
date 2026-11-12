@@ -5,7 +5,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { joinedUsers } from '#engine/server/directory.ts';
 import { renderStateEvent } from './render.ts';
-import { requireRoom, stateAtSeq } from './room.ts';
+import { requireRoom } from './room.ts';
 import { admitState } from './state-admission.ts';
 
 const SUMMARY_TYPES = [
@@ -21,14 +21,10 @@ const SUMMARY_TYPES = [
 ];
 export async function heldRoomSummary(roomId: string) {
   const room = await requireRoom(roomId);
-  const rows = await stateAtSeq(
-    roomId,
-    null,
-    SUMMARY_TYPES.map((type) => [type, ''] as const),
-  );
   const content = new Map<string, Record<string, unknown>>();
   const admission = await admitState(room, { userId: null, discovery: true });
-  for (const row of rows) {
+  for (const row of admission.rows) {
+    if (row.stateKey !== '' || !SUMMARY_TYPES.includes(row.type)) continue;
     const event = await renderStateEvent(room, row.eventId, undefined, {
       bundleThreads: false,
       admission,

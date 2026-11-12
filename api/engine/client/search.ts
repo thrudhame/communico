@@ -15,7 +15,8 @@ import {
   roomEventFilterOf,
 } from '#engine/tenant/filters.ts';
 import { joinedRooms } from './membership.ts';
-import { lookupRoom, stateAtSeq } from './room.ts';
+import { lookupRoom, requireRoom, stateAtSeq } from './room.ts';
+import { admitState } from './state-admission.ts';
 import { renderEvent } from './render.ts';
 import { messages, parseStreamToken } from './timeline.ts';
 import { clientEventsForRows, clientStateFor } from './state.ts';
@@ -197,13 +198,17 @@ export async function search(
           );
           if (seq.length > 0) atSeq = Number(seq[0].seq);
         }
+        const admission = await admitState(await requireRoom(hit.roomId), {
+          userId,
+          point: { seq: atSeq },
+        });
         const state = await clientEventsForRows(
             hit.roomId,
-            (await stateAtSeq(hit.roomId, atSeq)).filter((r) =>
+            admission.rows.filter((r) =>
               r.type === 'm.room.member' && senders.has(r.stateKey)
             ),
             userId,
-            { point: { seq: atSeq } },
+            { admission },
           ),
           profiles: Record<string, Record<string, unknown>> = {};
         for (const sender of senders) {

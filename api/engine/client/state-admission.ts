@@ -148,7 +148,8 @@ export async function admitState(
       const full = membership === 'join' || visibility === 'world_readable' ||
         (membership === 'invite' &&
           (visibility === 'invited' ||
-            (input.allowInvited && visibility !== 'joined'))) ||
+            (input.allowInvited && member?.membership === 'invite' &&
+              visibility !== 'joined'))) ||
         (participation !== null && visibility === 'shared') ||
         (joinedAtPoint && (membership === 'leave' || membership === 'ban'));
       for (const id of entries.values()) {

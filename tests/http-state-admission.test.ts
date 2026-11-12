@@ -4,6 +4,7 @@ import { createRoom } from '#engine/room/create.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { eventStreamMax } from '#engine/server/stream.ts';
+import { heldRoomSummary } from '#engine/client/summary.ts';
 import { httpSuite } from '#tests/http-app.ts';
 
 type Json = Record<string, unknown>;
@@ -280,6 +281,87 @@ suite.test('world-readable state and bounded invited discovery are not mistaken 
   );
   assertEquals(hierarchy.status, 200);
   assert(!json(hierarchy.body).includes(secret));
+});
+
+suite.test('historical members cannot reuse a shared invitation grant after an unjoined decline', async () => {
+  const f = await fixture('admit-historical-decline');
+  const invited = await call(
+    f.base + '/members?at=s' + f.invited,
+    f.bob.access_token!,
+  );
+  assertEquals(invited.status, 200);
+  assert(
+    json(invited.body).includes(secret),
+    'a current invitation retains the existing historical shared-state contract',
+  );
+  await f.decline();
+  const declined = await call(
+    f.base + '/members?at=s' + f.invited,
+    f.bob.access_token!,
+  );
+  assertEquals(declined.status, 200);
+  assert(
+    !json(declined.body).includes(secret),
+    'the at parameter is not an ongoing invitation grant',
+  );
+});
+
+suite.test('context at a later own ban retains the real departure snapshot instead of omitting overwritten keys', async () => {
+  const f = await fixture('admit-context-departure');
+  await f.send(
+    'm.room.member',
+    { membership: 'join' },
+    f.bob.user_id,
+    f.bob.user_id,
+  );
+  await f.decline();
+  await f.send(
+    'org.example.private',
+    { secret: 'AFTER-DEPARTURE-CONTEXT' },
+    '',
+  );
+  const ban = await f.send(
+    'm.room.member',
+    { membership: 'ban' },
+    f.bob.user_id,
+  );
+  const response = await call(
+    f.base + '/context/' + encodeURIComponent(ban) + '?limit=0',
+    f.bob.access_token!,
+  );
+  assertEquals(response.status, 200);
+  const rows = response.body.state as Json[];
+  assertEquals(
+    (rows.find((row) => row.type === 'org.example.private')?.content as
+      | Json
+      | undefined)?.secret,
+    secret,
+  );
+  assert(!json(rows).includes('AFTER-DEPARTURE-CONTEXT'));
+});
+
+suite.test('summary metadata and permission IDs come from one admitted publication', async () => {
+  const f = await fixture('admit-summary-race');
+  const original = f.app.server.query.bind(f.app.server);
+  let changed = false;
+  f.app.server.query = async (sql, params) => {
+    if (
+      !changed && sql === "SELECT value FROM counters WHERE name = 'events'"
+    ) {
+      changed = true;
+      await f.send('m.room.name', { name: 'SUMMARY-NEW-NAME' }, '');
+      await f.send('m.room.join_rules', { join_rule: 'public' }, '');
+    }
+    return await original(sql, params);
+  };
+  try {
+    const summary = await heldRoomSummary(f.roomId);
+    assert(changed);
+    assertEquals(summary.name, 'SUMMARY-NEW-NAME');
+    assertEquals(summary.join_rule, 'public');
+  } finally {
+    f.app.server.query = original;
+  }
 });
 
 suite.test('a later join cannot authorize a joined-only snapshot from an earlier declined invitation', async () => {
