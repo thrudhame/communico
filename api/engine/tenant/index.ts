@@ -322,6 +322,12 @@ function bind(
         limits: e2ee.KeyLimits,
       ) => todevice.deliverMessages(conn, d, token, limits),
       pending: (d: devices.DeviceIdentity) => todevice.pendingMessages(conn, d),
+      pendingSliding: (
+        d: devices.DeviceIdentity,
+        connection: string,
+        since: string | null,
+        limit: number,
+      ) => todevice.pendingSliding(conn, d, connection, since, limit),
       head: () => todevice.inboxHead(conn),
     },
     e2ee: {

@@ -238,8 +238,8 @@ rejects stale in-flight publishers. Completed responses retain at most the
 input and one successor. Device deletion removes both connection and position
 rows. Startup and new admission prune expired connections; seven idle days,
 per-device/tenant capacity and snapshot bytes are layered `slidingsync` settings.
-This groundwork neither exposes a sync endpoint nor advertises native support,
-and never acknowledges or reads the to-device inbox.
+Connection persistence never acknowledges or reads the to-device inbox;
+protocol coordination and inbox publication have separate owners.
 (`api/engine/sliding-sync/request.ts`, `api/engine/tenant/sliding-sync.ts`)
 
 The simplified-sync list owner captures server membership/activity cuts and
@@ -248,8 +248,8 @@ counts and inclusive ranges; overlapping requests union required state and take
 the largest timeline limit. Activity is received live-feed order, frozen at
 departure for nonmembers. Metadata reads use publication cuts or saved prejoin
 display, not current private state. Plain joined-room windows and encryption-only
-requests hydrate no room files or timelines. This remains internal groundwork,
-without an endpoint or native-support advertisement.
+requests hydrate no room files or timelines. List eligibility is independent
+from authorization of explicit historical room subscriptions.
 (`api/engine/sliding-sync/lists.ts`, `api/engine/server/read.ts`)
 
 Both sync protocols share visibility-before-limit live-window selection. Sliding
@@ -257,8 +257,8 @@ room payloads retain independent state and timeline delivery cuts, expand histor
 reload after a real participation interruption. Required-state and display
 metadata use the same captured admission grant, including actual departure
 ceilings and lazy membership IDs. Prejoin payloads use stripped display only;
-saved invitation departures never provision a room. This layer is internal and
-still does not advertise or expose simplified sync.
+saved invitation departures never provision a room. Room assembly does not own
+authentication, polling or position publication.
 Zero timeline limits do not acknowledge unseen events. Saved departures follow
 the requested timeline limit and required-state selection independently; an
 explicitly empty state selection is never overridden. DM removal resets the
@@ -271,7 +271,8 @@ connection as well as the device generation; a room-list position, forged token
 or another connection cannot acknowledge unseen keys. Zero-size pages issue no
 deletion authority, count/byte limits preserve the tail, and an evicted receipt
 replays rather than consumes data. Ordinary sync remains a direct consumer of
-the same owner. This is internal groundwork, not an exposed sync endpoint.
+the same owner. Polling inspects the same issued acknowledgment boundary without
+consuming it, so received pages do not make every encryption poll immediate.
 (`api/engine/tenant/todevice.ts`)
 
 Account-data delivery captures the global/selected room bodies, push rules and
@@ -311,6 +312,16 @@ hints to recapture, never proof of relevance. One absolute deadline survives
 unrelated writes. Polling sweeps typing expiry at the existing bounded cadence;
 abort, capture failure and successful return all remove listeners and timers.
 (`api/engine/sync-wait.ts`)
+
+The authenticated deployed unstable simplified-sync POST composes these owners.
+Per-device connection serialization precedes lease acquisition; independent SDK
+room-list and encryption connections do not block each other. Relevance compares
+requested windows/configuration, admitted payloads and enabled extension data,
+not constant SYNC operations or fresh position tokens. Counts come from the same
+notification buckets as ordinary sync; count-only read changes can update a
+zero-timeline room. Request cancellation reaches both polling and atomic final
+publication. Native support remains unadvertised pending real SDK acceptance.
+(`api/engine/sliding-sync/index.ts`, `api/engine/sliding-sync/lock.ts`)
 
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data

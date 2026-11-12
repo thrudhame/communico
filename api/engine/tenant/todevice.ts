@@ -283,18 +283,7 @@ async function acknowledgeIssued(
   tokenHash: string | null,
 ): Promise<number> {
   const owner = args(d);
-  const rows = await conn.query(
-    'SELECT msg_pos FROM device_ack WHERE localpart=? AND device_id=? AND generation=?',
-    owner,
-  );
-  let ack = rows.length ? Number(rows[0].msg_pos) : 0;
-  if (tokenHash !== null) {
-    const proof = await conn.query(
-      'SELECT to_msg_pos FROM sync_deliveries WHERE localpart=? AND device_id=? AND generation=? AND token_hash=?',
-      [...owner, tokenHash],
-    );
-    if (proof.length) ack = Math.max(ack, Number(proof[0].to_msg_pos));
-  }
+  const ack = await issuedAck(conn, d, tokenHash);
   await conn.execute(
     'INSERT INTO device_ack VALUES(?,?,?,?) ON CONFLICT(localpart,device_id,generation) DO UPDATE SET msg_pos=excluded.msg_pos',
     [...owner, ack],
@@ -308,6 +297,48 @@ async function acknowledgeIssued(
     [...owner, ack],
   );
   return ack;
+}
+
+// Polling can inspect the exact issued-receipt boundary without consuming it.
+async function issuedAck(
+  conn: Conn,
+  d: DeviceIdentity,
+  tokenHash: string | null,
+) {
+  const owner = args(d);
+  const rows = await conn.query(
+    'SELECT msg_pos FROM device_ack WHERE localpart=? AND device_id=? AND generation=?',
+    owner,
+  );
+  let ack = rows.length ? Number(rows[0].msg_pos) : 0;
+  if (tokenHash !== null) {
+    const proof = await conn.query(
+      'SELECT to_msg_pos FROM sync_deliveries WHERE localpart=? AND device_id=? AND generation=? AND token_hash=?',
+      [...owner, tokenHash],
+    );
+    if (proof.length) ack = Math.max(ack, Number(proof[0].to_msg_pos));
+  }
+  return ack;
+}
+
+export async function pendingSliding(
+  conn: Conn,
+  d: DeviceIdentity,
+  connection: string,
+  since: string | null,
+  limit: number,
+): Promise<boolean> {
+  await current(conn, d);
+  if (limit === 0) return false;
+  const ack = await issuedAck(
+    conn,
+    d,
+    since === null ? null : await hashToken(slidingReceipt(connection, since)),
+  );
+  return (await conn.query(
+    'SELECT 1 FROM to_device_inbox WHERE localpart=? AND device_id=? AND generation=? AND msg_pos>? LIMIT 1',
+    [...args(d), ack],
+  )).length > 0;
 }
 
 export async function pendingMessages(
