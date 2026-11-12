@@ -34,13 +34,19 @@ export function accessLogPath(target: string): string {
   } catch {
     return '[REDACTED-PATH]';
   }
+  // Encoded query delimiters can carry a whole credential query inside a
+  // nominal path segment. Never return that raw target as a logging fallback.
+  // Encoded '#' remains valid in ordinary room aliases.
+  if (decoded.some((segment) => segment.includes('?'))) {
+    return '[REDACTED-PATH]';
+  }
   for (let i = 0; i < decoded.length - 1; i++) {
     const label = decoded[i].replace(/[-_]/g, '').toLowerCase();
     const delayed = label === 'delayedevents';
     const invitation = decoded[i - 1] === 'state' &&
       decoded[i] === 'm.room.third_party_invite';
     if (!delayed && !invitation && !credentialLabels.has(label)) continue;
-    if (raw[i + 1] === '') continue;
+    if (raw[i + 1] === '' && i + 2 === raw.length) continue;
     const safe = [...raw.slice(0, i + 1), '[REDACTED]'];
     // Keep only a recognized action label, not an arbitrary suffix on a
     // miss that might be another piece of the same bearer credential.

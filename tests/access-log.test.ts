@@ -8,6 +8,27 @@ import logRequest from '#engine/access-log.ts';
 const secret = 'privateCredentialForLogTest';
 const forms: [string, string, string][] = [
   [
+    'encoded query delimiter',
+    '/_matrix/client/v3/sync%3Faccess_token=' + secret,
+    '[REDACTED-PATH]',
+  ],
+  [
+    'empty delayed segment',
+    '/_matrix/client/unstable/org.matrix.msc4140/delayed_events//' + secret,
+    '/_matrix/client/unstable/org.matrix.msc4140/delayed_events/[REDACTED]',
+  ],
+  [
+    'empty credential segment',
+    '/unknown/token//' + secret,
+    '/unknown/token/[REDACTED]',
+  ],
+  [
+    'empty invitation segment',
+    '/_matrix/client/v3/rooms/!room:test/state/m.room.third_party_invite//' +
+    secret,
+    '/_matrix/client/v3/rooms/!room:test/state/m.room.third_party_invite/[REDACTED]',
+  ],
+  [
     'client access_token',
     '/_matrix/client/v3/sync?access_token=' + secret,
     '/_matrix/client/v3/sync',
@@ -154,6 +175,19 @@ for (const [name, target, safe] of forms) {
     },
   );
 }
+
+Deno.test('access log preserves encoded room aliases and empty credential collections', async () => {
+  for (
+    const path of [
+      '/_matrix/client/v3/directory/room/%23public%3Atest',
+      '/_matrix/client/unstable/org.matrix.msc4140/delayed_events/',
+    ]
+  ) {
+    const lines = await capture(path);
+    assertEquals(lines.length, 2);
+    assert(lines.every((line) => line.includes(path + ' ')));
+  }
+});
 Deno.test('access log retains public path diagnostics and aborted disposition', async () => {
   const path =
     '/_matrix/client/v3/rooms/%21public%3Atest/state/m.room.topic/public-key';
