@@ -2,6 +2,7 @@
 import { pathfinder } from '@pathfinder/pathfinder';
 import { closeApp, openApp } from '#engine/app.ts';
 import { registerUser } from '#engine/tenant/users.ts';
+import { assertSpecHttpResponse } from '#tests/spec-contract.ts';
 
 /** Preserve old test cases as named steps, sharing one fresh store per
  * file and closing all resources within the enclosing test. */
@@ -44,9 +45,13 @@ export async function startHttp(roots = ['api/endpoints/matrix/']) {
     return {
       app,
       // Keep the old matrix(Request) call shape, but observe real HTTP.
-      matrix: (request: Request) => {
+      matrix: async (request: Request) => {
         const url = new URL(request.url);
-        return fetch(new Request(base + url.pathname + url.search, request));
+        const response = await fetch(
+          new Request(base + url.pathname + url.search, request),
+        );
+        await assertSpecHttpResponse(request, response);
+        return response;
       },
       registerTestUser: (localpart: string, password: string) =>
         registerUser(app.tenant, { localpart, password }),
