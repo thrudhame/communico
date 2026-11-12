@@ -116,6 +116,13 @@ suite.test('sync defaults presence to online at the real presence reader', async
   );
   assertEquals((await call('sync?timeout=0', token)).status, 200);
   assertEquals((await call(presence, token)).body.presence, 'online');
+  for (const value of ['offline', 'unavailable', 'online']) {
+    assertEquals(
+      (await call('sync?timeout=0&set_presence=' + value, token)).status,
+      200,
+    );
+    assertEquals((await call(presence, token)).body.presence, value);
+  }
 });
 suite.test('full_state with since ignores the long-poll timeout', async () => {
   const initial = await call('sync?set_presence=offline', token);

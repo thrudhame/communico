@@ -160,7 +160,13 @@ suite.test('version tombstones, numeric latest, immutable algorithm and metadata
     version: '10',
     auth_data: { changed: true },
   });
-  assertEquals((await request(token, 'GET', 'version/10')).etag, '0');
+  assertEquals(await request(token, 'GET', 'version/10'), {
+    version: '10',
+    algorithm,
+    auth_data: { changed: true },
+    count: 0,
+    etag: '0',
+  });
   await request(token, 'DELETE', 'version/10');
   await request(token, 'DELETE', 'version/10');
   await request(token, 'DELETE', 'version/unknown', undefined, 404);

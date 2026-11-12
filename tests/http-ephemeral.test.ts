@@ -636,6 +636,7 @@ suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, 
             push: [{
               user_id: remoteUser,
               presence: 'online',
+              last_active_ago: 0,
               status_msg: 'remote',
             }],
           },

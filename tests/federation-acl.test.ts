@@ -159,15 +159,19 @@ Deno.test('ACL: all resident serving and membership template classes use current
       403,
     );
     const fetcher = productionFetcher(server, g.signer, store);
-    assertEquals(await fetcher.event(g.tipId, 'remote.test', g.roomId), null);
-    assertEquals(
-      await fetcher.stateIds(g.roomId, g.tipId, 'remote.test'),
-      null,
-    );
-    assertEquals(
-      await fetcher.eventAuth(g.roomId, g.tipId, 'remote.test'),
-      null,
-    );
+    // Local policy refusals are not malformed-peer/cache misses. The shared
+    // fetch boundary preserves the original denial for every read class.
+    for (
+      const read of [
+        () => fetcher.event(g.tipId, 'remote.test', g.roomId),
+        () => fetcher.stateIds(g.roomId, g.tipId, 'remote.test'),
+        () => fetcher.eventAuth(g.roomId, g.tipId, 'remote.test'),
+      ]
+    ) {
+      const error = await assertRejects(read, MatrixError);
+      assertEquals(error.status, 403);
+      assertEquals(error.errcode, 'M_FORBIDDEN');
+    }
     assertEquals(
       (await assertRejects(
         () => fetcher.backfill(g.roomId, [g.tipId], 10, 'remote.test'),

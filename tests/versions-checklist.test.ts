@@ -1,5 +1,9 @@
 import { assert, assertEquals } from '@std/assert';
 import versions from '#endpoints/matrix/_matrix/client/versions/get.ts';
+import {
+  assertConsumptionProofs,
+  consumptionProofs,
+} from '#tests/spec-consumption.ts';
 
 const root = new URL('../', import.meta.url);
 const expected = Array.from({ length: 16 }, (_, i) => `v1.${i + 1}`);
@@ -77,7 +81,12 @@ Deno.test('advertised version behavioral checklist executes at the real consumer
   const checklist = await Deno.readTextFile(
     new URL('MATRIX-VERSIONS.md', root),
   );
-  const files = contractSuites(checklist);
+  const files = [
+    ...new Set([
+      ...contractSuites(checklist),
+      ...consumptionProofs().map((proof) => proof.suite),
+    ]),
+  ];
   assert(files.length > 20, 'behavioral checklist must not become empty');
   const dir = await Deno.makeTempDir({ prefix: 'versions-contracts-' });
   try {
@@ -104,6 +113,7 @@ Deno.test('advertised version behavioral checklist executes at the real consumer
       new TextDecoder().decode(output.stderr);
     assertEquals(output.code, 0, text);
     const result = await Deno.readTextFile(dir + '/results.xml');
+    assertConsumptionProofs(result);
     assert(
       !result.includes('<skipped'),
       'version contracts must not be skipped',
