@@ -799,6 +799,8 @@ source metadata. Nothing decrypts attachment ciphertext.
 The storage layer owns native-library loading, file transactions and
 maintenance. Startup checks the qualified Turso revision and patch set. Safe
 integer validation applies to native query results as well as parameters;
+nonfinite REAL results fail in the native binding before JSON serialization can
+turn infinities into a SQL-null lookalike.
 out-of-range integers fail before callers receive rounded database values. Safe
 creation applies the schema in a `.new` directory, closes/reopens, verifies,
 syncs files, renames, then syncs the parent. Opens apply only explicitly

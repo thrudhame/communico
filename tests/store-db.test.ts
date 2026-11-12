@@ -4,6 +4,46 @@ import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { Conn, Db } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
 
+Deno.test('store FFI: nonfinite REAL results fail instead of becoming SQL null', async () => {
+  const dir = await Deno.makeTempDir();
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const file = await ffi.open(dir + '/data.db');
+  const connection = await ffi.connect(file);
+  try {
+    for (
+      const sql of [
+        'SELECT 1e999 AS n',
+        'SELECT -1e999 AS n',
+        'SELECT 1e308 * 1e308 AS n',
+      ]
+    ) {
+      await assertRejects(
+        () => ffi.query(connection, sql),
+        StoreError,
+        'nonfinite REAL',
+      );
+    }
+    await ffi.exec(
+      connection,
+      'CREATE TABLE reals(n REAL); INSERT INTO reals VALUES(1e999),(-1e999)',
+    );
+    await assertRejects(
+      () => ffi.query(connection, 'SELECT n FROM reals'),
+      StoreError,
+      'nonfinite REAL',
+    );
+    assertEquals(await ffi.query(connection, 'SELECT NULL AS z, 1.25 AS n'), [{
+      z: null,
+      n: 1.25,
+    }]);
+  } finally {
+    await ffi.closeConnection(connection);
+    await ffi.closeFile(file);
+    ffi.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('store FFI: MVCC/FULL, values, checkpoint and explicit engine errors', async () => {
   const dir = await Deno.makeTempDir();
   const ffi = new Turso('./.native/libturso_ffi.so');
