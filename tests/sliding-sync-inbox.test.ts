@@ -189,6 +189,7 @@ Deno.test('sliding inbox: receipt issuance rolls back with failed position commi
   try {
     await f.send(1);
     const page = await f.deliver(1);
+    await f.send(2);
     await f.tenant().tx((tx) =>
       tx.slidingSync.commit(f.bob, f.encryption, { cut: 1 })
     );
@@ -201,12 +202,18 @@ Deno.test('sliding inbox: receipt issuance rolls back with failed position commi
             f.encryption.connection,
             page.nextBatch,
           );
-          rolledBack = (await f.txApi(tx).deliverSliding(
+          const successor = await f.txApi(tx).deliverSliding(
             f.bob,
             f.encryption.connection,
             100,
             config().e2ee,
-          )).nextBatch;
+          );
+          assertEquals(
+            numbers(successor),
+            [2],
+            'rollback includes a nonempty successor page',
+          );
+          rolledBack = successor.nextBatch;
           await tx.slidingSync.commit(f.bob, f.encryption, { cut: 2 });
         }),
       MatrixError,
@@ -216,17 +223,17 @@ Deno.test('sliding inbox: receipt issuance rolls back with failed position commi
     await f.acknowledge(rolledBack);
     assertEquals(
       numbers(await f.deliver()),
-      [1],
+      [1, 2],
       'rollback cannot consume the original page',
     );
     await f.tenant().tx((tx) => tx.devices.delete('B', 'bob'));
     await f.tenant().tx((tx) => tx.devices.upsert('B', 'bob', null));
     const replacement = await deviceIdentity(f.tenant(), 'bob', 'B');
-    await f.send(2);
+    await f.send(3);
     await f.acknowledge(page.nextBatch, f.encryption.connection, replacement);
     assertEquals(
       numbers(await f.deliver(100, f.encryption.connection, replacement)),
-      [2],
+      [3],
     );
   } finally {
     await f.close();
