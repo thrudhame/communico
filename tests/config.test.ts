@@ -22,6 +22,13 @@ tokenseconds = 3600
 sessionseconds = 172800
 maxsessions = 10000
 
+[slidingsync]
+connectionseconds = 604800
+maxconnections = 10000
+maxconnectionsperdevice = 16
+maxsnapshotbytes = 8388608
+maxtimeoutms = 30000
+
 [hierarchy]
 pagesize = 50
 maxpagesize = 100
@@ -866,7 +873,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('110 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('115 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -891,6 +898,7 @@ Deno.test('110 leaves total across the sections (the surface tripwire)', async (
     ['turn', 5],
     ['hierarchy', 7],
     ['uia', 2],
+    ['slidingsync', 5],
     ['peeking', 2],
     ['openid', 1],
     ['media', 20],
@@ -903,7 +911,7 @@ Deno.test('110 leaves total across the sections (the surface tripwire)', async (
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    110,
+    115,
     'the whole config surface includes discovery, TURN and HTTP administrators',
   );
 });
@@ -933,6 +941,49 @@ Deno.test('UIA retention and hierarchy user capacity layer and reject zero/negat
     for (const value of ['0', '-1']) {
       assertThrows(() => load({ [key]: value }), ConfigError);
     }
+  }
+});
+
+Deno.test('sliding sync connection limits layer independently and reject unsafe capacity', async () => {
+  const dir = await writeTree({ 'defaults/communico.toml': FULL });
+  try {
+    const load = (env: Record<string, string>) =>
+      loadConfig({
+        defaultsPath: `${dir}/defaults/communico.toml`,
+        configPath: null,
+        env,
+      });
+    assertEquals(load({}).config.slidingsync, {
+      connectionseconds: 604800,
+      maxconnections: 10000,
+      maxconnectionsperdevice: 16,
+      maxsnapshotbytes: 8388608,
+      maxtimeoutms: 30000,
+    });
+    const env = {
+      COMMUNICO_SLIDINGSYNC_CONNECTIONSECONDS: '60',
+      COMMUNICO_SLIDINGSYNC_MAXCONNECTIONS: '8',
+      COMMUNICO_SLIDINGSYNC_MAXCONNECTIONSPERDEVICE: '2',
+      COMMUNICO_SLIDINGSYNC_MAXSNAPSHOTBYTES: '1024',
+      COMMUNICO_SLIDINGSYNC_MAXTIMEOUTMS: '0',
+    };
+    assertEquals(load(env).config.slidingsync, {
+      connectionseconds: 60,
+      maxconnections: 8,
+      maxconnectionsperdevice: 2,
+      maxsnapshotbytes: 1024,
+      maxtimeoutms: 0,
+    });
+    for (const key of Object.keys(env)) {
+      for (const value of ['-1', '9007199254740992']) {
+        assertThrows(() => load({ [key]: value }), ConfigError);
+      }
+      if (!key.endsWith('MAXTIMEOUTMS')) {
+        assertThrows(() => load({ [key]: '0' }), ConfigError);
+      }
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
   }
 });
 

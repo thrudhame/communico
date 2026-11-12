@@ -37,6 +37,7 @@ import * as pushers from '#engine/tenant/pushers.ts';
 import * as pushrules from '#engine/tenant/pushrules.ts';
 import * as txns from '#engine/tenant/txns.ts';
 import * as uia from '#engine/tenant/uia.ts';
+import * as slidingSync from '#engine/tenant/sliding-sync.ts';
 import * as users from '#engine/tenant/users.ts';
 import * as openid from '#engine/tenant/openid.ts';
 import * as profiles from '#engine/tenant/profiles.ts';
@@ -225,6 +226,37 @@ function bind(
             config().federation.bulkmaxbytes,
           ),
         ),
+    },
+    slidingSync: {
+      begin: (
+        d: devices.DeviceIdentity,
+        name: string,
+        position: string | null,
+        now = Date.now(),
+      ) =>
+        slidingSync.beginPosition(
+          conn,
+          d,
+          name,
+          position,
+          config().slidingsync,
+          now,
+        ),
+      commit: (
+        d: devices.DeviceIdentity,
+        lease: slidingSync.PositionLease,
+        state: Record<string, unknown>,
+        now = Date.now(),
+      ) =>
+        slidingSync.commitPosition(
+          conn,
+          d,
+          lease,
+          state,
+          config().slidingsync,
+          now,
+        ),
+      prune: (now = Date.now()) => slidingSync.prunePositions(conn, now),
     },
     toDevice: {
       send: (

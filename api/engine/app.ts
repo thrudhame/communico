@@ -88,6 +88,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   const stopServices = () => drainResources(services.splice(0).reverse());
   try {
     const tenant = await openTenant(store, serverName(), { create: true });
+    await tenant.tx((tx) => tx.slidingSync.prune());
     const server = await store.server();
     const media = new MediaService(server, tenant);
     services.push(() => media.close());

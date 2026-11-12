@@ -230,6 +230,18 @@ owners. Prejoin display keeps its existing stripped/provenance ceiling.
 (`api/engine/client/state-admission.ts`, `client/{render,state}.ts`,
 `api/engine/room/state.ts`)
 
+Native simplified-sync groundwork validates the deployed MSC4186 request
+dialect separately from ordinary sync. Tenant schema v19 owns issued connection
+positions, scoped to user/device generation and connection ID. A response's
+immutable snapshot is not consumed by a retry of its input; revision fencing
+rejects stale in-flight publishers. Completed responses retain at most the
+input and one successor. Device deletion removes both connection and position
+rows. Startup and new admission prune expired connections; seven idle days,
+per-device/tenant capacity and snapshot bytes are layered `slidingsync` settings.
+This groundwork neither exposes a sync endpoint nor advertises native support,
+and never acknowledges or reads the to-device inbox.
+(`api/engine/sliding-sync/request.ts`, `api/engine/tenant/sliding-sync.ts`)
+
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data
 streams. Denials win, empty lists exclude everything, and only `*` is special
