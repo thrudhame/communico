@@ -283,7 +283,7 @@ Deno.test('sliding positions: v18 upgrade keeps account and device data', async 
     apply: async (db: Parameters<typeof tenantSchema.apply>[0]) => {
       await tenantSchema.apply(db);
       await db.exec(
-        'DROP TABLE sliding_sync_positions; DROP TABLE sliding_sync_connections',
+        'DROP TABLE sliding_sync_positions; DROP TABLE sliding_sync_connections; DROP TABLE delayed_events; DROP TABLE delayed_event_receipts',
       );
     },
   };

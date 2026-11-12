@@ -12,6 +12,7 @@ import {
   setEventState,
 } from '#engine/room/materialize.ts';
 import {
+  changedByOther,
   current,
   eventStateAfter,
   eventStateBefore,
@@ -73,6 +74,135 @@ function mulberry32(seed: number): () => number {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+}
+
+Deno.test('room state: keyed publication journal follows resolved snapshots, not unrelated state', async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    await withRoom(dir, async (conn) => {
+      for (
+        const [id, sender] of [['$own', '@a:test'], ['$other', '@b:test'], [
+          '$unrelated',
+          '@b:test',
+        ]]
+      ) await insertEvent(conn, id, pdu({ sender }));
+      const opening = await newGroup(conn, null, [{
+        type: 'call',
+        state_key: 'key',
+        event: '$own',
+      }]);
+      await conn.execute(
+        "INSERT INTO segments(id,kind,opening_group,status) VALUES(1,'stay',?,'open')",
+        [opening],
+      );
+      const unchanged = await newGroup(conn, null, [{
+        type: 'call',
+        state_key: 'key',
+        event: '$own',
+      }, { type: 'elsewhere', state_key: 'key', event: '$unrelated' }]);
+      await publish(conn, 1, 1, unchanged);
+      assertEquals(
+        await changedByOther(conn, 'call', 'key', '@a:test', 0, null),
+        false,
+      );
+      const resolved = await newGroup(conn, null, [{
+        type: 'call',
+        state_key: 'key',
+        event: '$other',
+      }]);
+      await publish(conn, 2, 1, resolved);
+      const returned = await newGroup(conn, null, [{
+        type: 'call',
+        state_key: 'key',
+        event: '$own',
+      }]);
+      await publish(conn, 3, 1, returned);
+      assertEquals(
+        await changedByOther(conn, 'call', 'key', '@a:test', 1, null),
+        true,
+      );
+      assertEquals(
+        await changedByOther(conn, 'call', 'key', '@a:test', 2, null),
+        false,
+      );
+      await planUsesIndex(
+        conn,
+        'SELECT 1 FROM publication_keys WHERE type=? AND state_key=? AND change_pos>? AND sender<>? LIMIT 1',
+        ['call', 'key', 0, '@a:test'],
+      );
+    });
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+async function rejoinPublication(extra: boolean, unpublishedStays = 0) {
+  const dir = await Deno.makeTempDir();
+  try {
+    await withRoom(dir, async (conn) => {
+      for (
+        const [id, sender] of [
+          ['$old', '@a:test'],
+          ['$replacement', '@b:test'],
+          ['$join', '@a:test'],
+        ]
+      ) await insertEvent(conn, id, pdu({ sender }));
+      const old = await newGroup(conn, null, [{
+        type: 'call',
+        state_key: 'key',
+        event: '$old',
+      }]);
+      await conn.execute(
+        "INSERT INTO segments(id,kind,status) VALUES(1,'stay','closed')",
+      );
+      await publish(conn, 1, 1, old);
+      for (let id = 2; id < unpublishedStays + 2; id++) {
+        await conn.execute(
+          "INSERT INTO segments(id,kind,prev,opening_group,status) VALUES(?,'stay',?,?,'closed')",
+          [id, id - 1, old],
+        );
+        assertEquals(await publish(conn, id, id, old), false);
+      }
+      const imported = await newGroup(conn, null, [{
+        type: 'call',
+        state_key: 'key',
+        event: '$replacement',
+      }]);
+      await conn.execute(
+        "INSERT INTO segments(id,kind,prev,opening_group,status) VALUES(?,'stay',?,?,'open')",
+        [unpublishedStays + 2, unpublishedStays + 1, imported],
+      );
+      const joined = extra
+        ? await newGroup(conn, imported, [{
+          type: 'join',
+          state_key: 'key',
+          event: '$join',
+        }])
+        : imported;
+      assertEquals(
+        await publish(conn, unpublishedStays + 2, unpublishedStays + 2, joined),
+        true,
+        'a rejoin publication compares against the predecessor, not its imported opening',
+      );
+      assertEquals(
+        await changedByOther(conn, 'call', 'key', '@a:test', 1, null),
+        true,
+        'foreign replacement during the gap must cancel old delayed work',
+      );
+    });
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+Deno.test('room state: rejoin snapshot records replacement made during the gap', () =>
+  rejoinPublication(false));
+Deno.test('room state: first rejoin delta also records imported replacement made during the gap', () =>
+  rejoinPublication(true));
+for (const unpublishedStays of [1, 3]) {
+  Deno.test(`room state: rejoin snapshot crosses ${unpublishedStays} unpublished predecessor stays`, () =>
+    rejoinPublication(false, unpublishedStays));
+  Deno.test(`room state: first rejoin delta crosses ${unpublishedStays} unpublished predecessor stays`, () =>
+    rejoinPublication(true, unpublishedStays));
 }
 
 Deno.test('room state: groups — deltas, removal, dedup, selected-key reads', async () => {

@@ -7,7 +7,11 @@
 // newGroup returns the parent (R4; dedup documented in the stage notes).
 import type { Conn } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
-import { groupEntries, type StateChange } from '#engine/room/state.ts';
+import {
+  groupEntries,
+  groupKey,
+  type StateChange,
+} from '#engine/room/state.ts';
 
 export const SNAPSHOT_DEPTH = 32;
 
@@ -165,24 +169,80 @@ export async function publish(
     'SELECT grp FROM publications WHERE stay = ? ORDER BY change_pos DESC LIMIT 1',
     [stay],
   );
+  let previous: number | null = null;
   if (latest.length > 0) {
+    previous = Number(latest[0].grp);
     if (Number(latest[0].grp) === group) return false;
   } else {
     const opening = await conn.query(
-      'SELECT opening_group FROM segments WHERE id = ?',
-      [stay],
+      `WITH RECURSIVE ancestors(id) AS (
+         SELECT prev FROM segments WHERE id = ? AND prev IS NOT NULL
+         UNION
+         SELECT s.prev FROM segments s JOIN ancestors a ON s.id = a.id
+          WHERE s.prev IS NOT NULL
+       )
+       SELECT s.opening_group,
+        (SELECT p.grp FROM publications p WHERE p.stay IN (SELECT id FROM ancestors)
+         ORDER BY p.change_pos DESC LIMIT 1) AS predecessor_group
+       FROM segments s WHERE s.id = ?`,
+      [stay, stay],
     );
-    if (
-      opening.length > 0 && opening[0].opening_group !== null &&
-      Number(opening[0].opening_group) === group
-    ) {
-      return false;
+    if (opening.length > 0) {
+      const baseline = opening[0].predecessor_group ?? opening[0].opening_group;
+      previous = baseline === null ? null : Number(baseline);
     }
+    if (previous === group) return false;
   }
   await conn.execute(
     'INSERT INTO publications(stay, change_pos, grp) VALUES(?,?,?)',
     [stay, changePos, group],
   );
+  // Ordinary single-state writes inspect only their new delta. Resolution,
+  // imported state and flattened snapshots compare the two state maps once.
+  const row = await groupRow(conn, group);
+  let entries: StateChange[];
+  if (previous !== null && row.parent === previous) {
+    const delta = await conn.query(
+      'SELECT type,state_key,event FROM state_entries WHERE grp=?',
+      [group],
+    );
+    entries = [];
+    for (const entry of delta) {
+      const type = String(entry.type), state_key = String(entry.state_key);
+      const event = entry.event === null ? null : String(entry.event);
+      if (await groupKey(conn, previous, type, state_key) !== event) {
+        entries.push({ type, state_key, event });
+      }
+    }
+  } else {
+    const old = new Map(
+      (previous === null ? [] : await groupEntries(conn, previous)).map(
+        (e) => [e.type + '\0' + e.state_key, e],
+      ),
+    );
+    entries = [];
+    for (const entry of await groupEntries(conn, group)) {
+      const key = entry.type + '\0' + entry.state_key;
+      if (old.get(key)?.event !== entry.event) entries.push(entry);
+      old.delete(key);
+    }
+    entries.push(...[...old.values()].map((e) => ({ ...e, event: null })));
+  }
+  for (const entry of entries) {
+    const sender = entry.event === null
+      ? []
+      : await conn.query('SELECT sender FROM events WHERE id=?', [entry.event]);
+    await conn.execute(
+      'INSERT INTO publication_keys(type,state_key,change_pos,event,sender) VALUES(?,?,?,?,?)',
+      [
+        entry.type,
+        entry.state_key,
+        changePos,
+        entry.event,
+        sender[0]?.sender ?? null,
+      ],
+    );
+  }
   return true;
 }
 

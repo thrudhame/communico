@@ -14,6 +14,10 @@ import {
 const FULL = `[matrixrtc]
 livekitserviceurl = ""
 
+[delayedevents]
+maxdelayms = 0
+maxperuser = 100
+
 [peeking]
 maxevents = 50
 maxtimeoutms = 30000
@@ -876,7 +880,7 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('116 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('118 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -902,6 +906,7 @@ Deno.test('116 leaves total across the sections (the surface tripwire)', async (
     ['matrixrtc', 1],
     ['hierarchy', 7],
     ['uia', 2],
+    ['delayedevents', 2],
     ['slidingsync', 5],
     ['peeking', 2],
     ['openid', 1],
@@ -915,7 +920,7 @@ Deno.test('116 leaves total across the sections (the surface tripwire)', async (
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    116,
+    118,
     'the whole config surface includes discovery, TURN and HTTP administrators',
   );
 });

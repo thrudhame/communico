@@ -96,7 +96,7 @@ Deno.test('room read costs: existing v2 files upgrade selective JSON and event r
       }
       assertEquals(
         (await tx.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-        '3',
+        String(roomSchema.version),
       );
     });
   } finally {

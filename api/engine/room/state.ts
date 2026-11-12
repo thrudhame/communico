@@ -26,6 +26,22 @@ export type StateChange = {
 
 export type StateMap = Map<string, string>; // type + '\0' + state_key → event id
 
+// Follow actual publications, including resolved/imported state, rather than
+// treating every arriving state PDU as a change to current room state.
+export async function changedByOther(
+  conn: Conn,
+  type: string,
+  stateKey: string,
+  sender: string,
+  after: number,
+  _initial: string | null,
+): Promise<boolean> {
+  return (await conn.query(
+    'SELECT 1 FROM publication_keys WHERE type=? AND state_key=? AND change_pos>? AND sender<>? LIMIT 1',
+    [type, stateKey, after, sender],
+  )).length !== 0;
+}
+
 // Published participation, not a current invite/leave row, proves shared history.
 export async function hasJoinedBefore(
   conn: Conn,

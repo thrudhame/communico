@@ -3,6 +3,7 @@ import {
   writeStateKey,
 } from '#engine/client/state.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
+import { scheduleDelayed } from '#engine/client/delayed.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
@@ -13,6 +14,8 @@ export default async function (
   if (request.params.type === 'm.room.canonical_alias') {
     await validateCanonicalAliasContent(roomId, content);
   }
+  const delayed = await scheduleDelayed(request, context, content, '');
+  if (delayed !== null) return delayed;
   return await writeStateKey(
     roomId,
     context.state.user as string,

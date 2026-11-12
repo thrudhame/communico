@@ -45,6 +45,24 @@ cover OAuth/MAS, QR login or calls.
 `/sync?use_state_after=true` returns state at the response's timeline end in
 `state_after` (also when empty), not `state`. The default retains the legacy
 state-before-timeline contract. Filters and lazy member loading apply to both.
+The older `org.matrix.msc4222.use_state_after` query uses the same state cut and
+returns `org.matrix.msc4222.state_after`; an explicit stable query wins.
+
+MSC4140 delayed events are off by default, like Synapse. Set
+`delayedevents.maxdelayms` to a positive millisecond limit (for example 86400000
+for 24 hours) and `delayedevents.maxperuser` to a positive pending-event limit
+(default 100) to enable scheduling and the `org.matrix.msc4140` flag. Capabilities
+publish both limits. Ordinary send/state routes accept `org.matrix.msc4140.delay`;
+they return a `delay_id`, not an immediate event. Scheduling, heartbeat restart,
+cancel and immediate-send management are durable across server restart. Disabling
+new scheduling does not abandon previously scheduled work.
+
+Delayed delivery rechecks current room authorization and encryption policy.
+Another sender's published change to the target state cancels a pending command;
+the owner's own state updates do not cancel its delayed call leave. List/get
+require the owner's authentication. Cancel/restart/send accept the unguessable
+delay ID as a bearer credential, as current Synapse does, so clients must keep it
+private. The shared access logger redacts these path credentials.
 
 Room tags use the standard tags API and the same private `m.tag` room account
 data clients can read and write directly. Tag changes wake incremental sync.

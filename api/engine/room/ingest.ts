@@ -136,6 +136,7 @@ function localJoiningUser(event: BuildPartial): string | undefined {
 
 export type PreparedSubmission = { eventId: string; pdu: Pdu | null };
 export type LocalSubmission = {
+  admit?(tx: RoomTx): Promise<void>;
   lookup(): Promise<PreparedSubmission | null>;
   prepare(pdu: Pdu): Promise<PreparedSubmission>;
   finish(eventId: string, accepted: boolean): Promise<void>;
@@ -185,6 +186,7 @@ async function submitLocal(
     let prepared = await submission.lookup();
     if (prepared === null) {
       const built = await room.tx(async (tx) => {
+        await submission.admit?.(tx);
         const pdu = await build(tx);
         const stay = await tx.segments.openStay();
         const group = stay === null ? null : await tx.state.current(stay.id);

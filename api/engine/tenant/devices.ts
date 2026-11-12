@@ -108,6 +108,10 @@ export async function deleteDevice(
   localpart: string,
 ): Promise<void> {
   // Sole device lifecycle deletion: all consumers revoke through this owner.
+  await conn.execute(
+    'DELETE FROM delayed_event_receipts WHERE localpart=? AND device_id=?',
+    [localpart, deviceId],
+  );
   const device = await deviceById(conn, deviceId, localpart);
   await conn.execute(
     'DELETE FROM sliding_sync_positions WHERE connection_id IN (SELECT id FROM sliding_sync_connections WHERE localpart=? AND device_id=?)',

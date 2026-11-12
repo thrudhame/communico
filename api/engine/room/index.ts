@@ -72,6 +72,13 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       membershipInterrupted: (userId: string, after: number, through: number) =>
         state.membershipInterrupted(conn, userId, after, through),
       erasureCut: () => state.erasureCut(conn),
+      changedByOther: (
+        type: string,
+        stateKey: string,
+        sender: string,
+        after: number,
+        initial: string | null,
+      ) => state.changedByOther(conn, type, stateKey, sender, after, initial),
       publishedAt: (stay: number, pos: number) =>
         state.publishedAt(conn, stay, pos),
       current: (stay: number) => state.current(conn, stay),

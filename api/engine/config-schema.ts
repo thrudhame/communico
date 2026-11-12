@@ -46,6 +46,7 @@ export const SCHEMA = {
     maxrooms: 'int',
   },
   uia: { sessionseconds: 'int', maxsessions: 'int' },
+  delayedevents: { maxdelayms: 'int', maxperuser: 'int' },
   slidingsync: {
     connectionseconds: 'int',
     maxconnections: 'int',

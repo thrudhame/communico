@@ -87,6 +87,12 @@ maxsessions = 10000
 maxevents = 50
 maxtimeoutms = 30000
 
+[delayedevents]
+# Synapse defaults: disabled until both limits are positive. Durations are ms.
+# COMMUNICO_DELAYEDEVENTS_MAXDELAYMS / COMMUNICO_DELAYEDEVENTS_MAXPERUSER
+maxdelayms = 0
+maxperuser = 100
+
 [slidingsync]
 # Issued native sync positions: seven idle days, like Synapse. No feature flag
 # is advertised until the complete protocol and real-client proof have landed.

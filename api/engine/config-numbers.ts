@@ -31,6 +31,11 @@ export const INTEGER_DOMAINS = {
   'openid.tokenseconds': seconds,
   'uia.sessionseconds': seconds,
   'uia.maxsessions': positive,
+  'delayedevents.maxdelayms': {
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER - Date.now(),
+  },
+  'delayedevents.maxperuser': nonnegative,
   'slidingsync.connectionseconds': seconds,
   'slidingsync.maxconnections': positive,
   'slidingsync.maxconnectionsperdevice': positive,
