@@ -26,6 +26,7 @@ import type { RoomConfig } from './types.ts';
 type Json = Record<string, unknown>;
 export type SentRoom = {
   cut: number;
+  timelineCut: number;
   membership: string;
   membershipEvent: string;
   config: RoomConfig;
@@ -206,6 +207,15 @@ export async function roomPayloads(
           renderPrejoinDeparture(departure, viewer.userId, 'client'),
         ];
       }
+      if (config.timelineLimit > 0 && c.seq > (previous?.timelineCut ?? 0)) {
+        entry.timeline = [
+          renderPrejoinDeparture(departure, viewer.userId, 'client'),
+        ];
+        entry.limited = false;
+        entry.num_live =
+          input.requestSince !== null && c.seq > input.requestSince ? 1 : 0;
+        // A saved prejoin departure has no room-history pagination cursor.
+      }
       members = required.members;
       meta = {
         bump_stamp: c.seq,
@@ -248,7 +258,7 @@ export async function roomPayloads(
       const window = config.timelineLimit === 0
         ? { rows: [], events: [], gap: false, trimmed: false }
         : await syncWindow(room, viewer, {
-          since: initial || expanded ? 0 : previous!.cut,
+          since: initial || expanded ? 0 : previous!.timelineCut ?? 0,
           end,
           limit: config.timelineLimit,
         });
@@ -317,6 +327,8 @@ export async function roomPayloads(
         );
       }
     }
+    // Optional wire omission must not erase the last value held by the client.
+    meta.is_dm = dm.has(id);
     let changed = initial || eventsPresent(entry.timeline) ||
       eventsPresent(entry.required_state) ||
       entry.unstable_expanded_timeline === true;
@@ -340,6 +352,9 @@ export async function roomPayloads(
     }
     sent[id] = {
       cut: end,
+      timelineCut: config.timelineLimit > 0 && !prejoin
+        ? end
+        : previous?.timelineCut ?? 0,
       membership: c.membership,
       membershipEvent: c.eventId,
       config: {

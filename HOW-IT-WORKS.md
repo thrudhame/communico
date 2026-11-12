@@ -253,12 +253,16 @@ without an endpoint or native-support advertisement.
 (`api/engine/sliding-sync/lists.ts`, `api/engine/server/read.ts`)
 
 Both sync protocols share visibility-before-limit live-window selection. Sliding
-room payloads retain per-room delivery cuts, expand history on limit growth and
+room payloads retain independent state and timeline delivery cuts, expand history on limit growth and
 reload after a real participation interruption. Required-state and display
 metadata use the same captured admission grant, including actual departure
 ceilings and lazy membership IDs. Prejoin payloads use stripped display only;
 saved invitation departures never provision a room. This layer is internal and
 still does not advertise or expose simplified sync.
+Zero timeline limits do not acknowledge unseen events. Saved departures follow
+the requested timeline limit and required-state selection independently; an
+explicitly empty state selection is never overridden. DM removal resets the
+last delivered value for prejoin rooms as well as joined rooms.
 (`api/engine/client/sync-window.ts`, `api/engine/sliding-sync/{rooms,state}.ts`)
 
 Stored and inline sync filters share shape validation and pure matching across

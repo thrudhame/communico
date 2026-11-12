@@ -162,6 +162,85 @@ suite.test('out-of-window room cuts survive JSON positions; request cut alone ne
   assertEquals(returned.entry.limited, false);
 });
 
+suite.test('zero-limit intervals preserve their independent timeline delivery cut', async () => {
+  const { roomId, send, sync } = await fixture('payload-zero-cut');
+  const first = await sync({ limit: 20, required: [['m.room.name', '']] });
+  const missed = await send('m.room.message', {
+    body: 'not delivered while disabled',
+  });
+  const renamed = await send(
+    'm.room.name',
+    { name: 'State still advances' },
+    '',
+  );
+  const paused = await sync({
+    previous: first.sent,
+    since: first.cut,
+    limit: 0,
+    required: [['m.room.name', '']],
+  });
+  assertEquals(paused.entry.timeline, undefined);
+  assertEquals(ids(paused.entry.required_state), [renamed]);
+  assertEquals(paused.sent[roomId].cut, paused.cut);
+  const resumed = await sync({
+    previous: JSON.parse(JSON.stringify(paused.sent)),
+    since: paused.cut,
+    limit: 20,
+    required: [['m.room.name', '']],
+  });
+  assert(
+    ids(resumed.entry.timeline).includes(missed),
+    'state delivery cannot acknowledge an undelivered timeline',
+  );
+  assertEquals(events(resumed.entry.required_state), []);
+  assertEquals(resumed.entry.num_live, 0);
+});
+
+suite.test('prejoin DM metadata clears a previously delivered true value', async () => {
+  const { app, alice, bob, roomId, send } = await fixture('payload-prejoin-dm');
+  await send('m.room.member', { membership: 'invite' }, bob.user_id);
+  const request = slidingSyncRequest(
+    {
+      room_subscriptions: {
+        [roomId]: { required_state: [], timeline_limit: 0 },
+      },
+    },
+    new URLSearchParams(),
+    30000,
+  );
+  const viewer = {
+    userId: bob.user_id,
+    deviceId: bob.device_id,
+    tenant: app.tenant,
+  };
+  const sync = async (previous: Record<string, SentRoom> = {}) => {
+    const snapshot = await captureLists(bob.user_id);
+    return await roomPayloads(
+      viewer,
+      await selectLists(bob.user_id, request, { snapshot }),
+      {
+        eventCut: snapshot.eventCut,
+        requestSince: null,
+        direct: snapshot.direct,
+        previous,
+      },
+    );
+  };
+  await putAccountData(app.tenant, localpartOf(bob.user_id), '', 'm.direct', {
+    [alice.user_id]: [roomId],
+  });
+  const first = await sync();
+  assertEquals(first.rooms[roomId].is_dm, true);
+  await putAccountData(
+    app.tenant,
+    localpartOf(bob.user_id),
+    '',
+    'm.direct',
+    {},
+  );
+  assertEquals((await sync(first.sent)).rooms[roomId].is_dm, false);
+});
+
 suite.test('required-state growth, wildcards and ME select end publications even with a zero timeline', async () => {
   const { alice, send, sync } = await fixture('payload-state');
   const topic = await send('m.room.topic', { topic: 'old topic' }, '');
@@ -507,6 +586,34 @@ suite.test('OOB invites and durable departures use their saved owner without pro
   assertEquals(content(left[0]).membership, 'leave');
   assertEquals(typeof left[0].event_id, 'string');
   assertEquals(next.rooms[roomId].invite_state, undefined);
+  const timelineRequest = slidingSyncRequest(
+    {
+      room_subscriptions: {
+        [roomId]: { required_state: [], timeline_limit: 1 },
+      },
+    },
+    new URLSearchParams(),
+    30000,
+  );
+  const timeline = await roomPayloads(
+    viewer,
+    await selectLists(alice.user_id, timelineRequest, {
+      snapshot: nextSnapshot,
+      since: snapshot.eventCut,
+      previousRooms: new Set([roomId]),
+    }),
+    {
+      eventCut: nextSnapshot.eventCut,
+      requestSince: snapshot.eventCut,
+      direct: nextSnapshot.direct,
+      previous: first.sent,
+    },
+  );
+  assertEquals(timeline.rooms[roomId].required_state, undefined);
+  assertEquals(
+    content(events(timeline.rooms[roomId].timeline)[0]).membership,
+    'leave',
+  );
   assertEquals(
     await app.server.query('SELECT room_id FROM rooms WHERE room_id=?', [
       roomId,
