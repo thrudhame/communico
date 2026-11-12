@@ -87,7 +87,9 @@ export async function relationBundles(
 
 // Walk structurally valid edges first, then apply the viewer's presentation
 // policy. An ignored/invisible intermediary cannot hide an otherwise visible
-// descendant. The bound is explicit, never a silently complete truncated page.
+// descendant. Recursive expansion has an explicit traversal budget. Direct
+// children are the result set itself, not an expanding graph: enumerate them
+// completely, as required for reference bundles, without imposing that budget.
 export async function relationView(
   room: Room,
   root: string,
@@ -111,7 +113,7 @@ export async function relationView(
       ) {
         if (seen.has(row.eventId)) continue;
         seen.add(row.eventId);
-        if (seen.size > 10_000) {
+        if (opts.recurse && seen.size > 10_000) {
           throw new MatrixError(
             503,
             'M_UNKNOWN',

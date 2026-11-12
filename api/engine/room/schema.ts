@@ -1,4 +1,4 @@
-// api/engine/room/schema.ts - room schema v4 (design R1-R11): immutable
+// api/engine/room/schema.ts - room schema v5 (design R1-R11): immutable
 // events and their edges, mutable status, immutable state groups with
 // bounded delta chains, event-state refs, publications, segments and
 // positions, extremities, waits and the change log. The store owns the id
@@ -140,14 +140,25 @@ CREATE TABLE publication_keys(
 );
 `;
 
+const ANNOTATION_INDEX_SQL = `
+CREATE INDEX events_annotation_target ON events(
+  json_extract(pdu, '$.content."m.relates_to".event_id'), sender, type,
+  json_extract(pdu, '$.content."m.relates_to".key')
+) WHERE json_extract(pdu, '$.content."m.relates_to".rel_type')='m.annotation';
+`;
+
 export const roomSchema: SchemaProvider = {
-  version: 4,
+  version: 5,
   apply: async (db) => {
     await db.exec(
-      ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL,
+      ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL +
+        ANNOTATION_INDEX_SQL,
     );
   },
   migrations: {
+    4: async (conn) => {
+      await conn.exec(ANNOTATION_INDEX_SQL);
+    },
     1: async (conn) => {
       await conn.exec(TOPOLOGY_SQL);
       await rebuildTopology(conn);
