@@ -111,6 +111,29 @@ function eventOf(row: Row): EventRow {
   };
 }
 
+/** Local duplicate admission uses room truth, including committed history and
+ * redaction effects, even when the server projection has not caught up. */
+export async function hasAnnotation(
+  conn: Conn,
+  target: string,
+  type: string,
+  sender: string,
+  key: string,
+): Promise<boolean> {
+  const rows = await conn.query(
+    `SELECT 1 FROM events e JOIN event_status s ON s.event=e.id
+     WHERE e.sender=? AND e.type=? AND s.standing='accepted' AND s.grounding='grounded'
+       AND json_extract(e.pdu, '$.content."m.relates_to".event_id')=?
+       AND json_extract(e.pdu, '$.content."m.relates_to".rel_type')='m.annotation'
+       AND json_extract(e.pdu, '$.content."m.relates_to".key')=?
+       AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.kind='redaction'
+         AND json_extract(c.data, '$.target')=e.id)
+     LIMIT 1`,
+    [sender, type, target, key],
+  );
+  return rows.length > 0;
+}
+
 export async function getEvent(
   conn: Conn,
   id: string,
