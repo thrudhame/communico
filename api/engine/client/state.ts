@@ -1,5 +1,6 @@
 import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { stateFormat } from './state-request.ts';
 import { readPositionFor, requireRoom, type StateRow } from './room.ts';
 import { renderStateEvent } from './render.ts';
 import {
@@ -53,6 +54,7 @@ export async function readStateKey(
   stateKey: string,
   format: string | null,
 ): Promise<unknown> {
+  const selectedFormat = stateFormat(format);
   await requireRoom(roomId);
   const at = await readPositionFor(userId, roomId);
   const admission = await admitState(await requireRoom(roomId), {
@@ -74,7 +76,7 @@ export async function readStateKey(
   if (event === undefined) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'state key not visible');
   }
-  return format === 'event' ? event : event?.content;
+  return selectedFormat === 'event' ? event : event?.content;
 }
 
 export async function validateCanonicalAliasContent(

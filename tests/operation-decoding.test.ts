@@ -15,6 +15,8 @@ import {
   localDirectoryOffset,
 } from '#engine/client/directory-request.ts';
 import { searchRequest } from '#engine/client/search-request.ts';
+import { membershipContent } from '#engine/client/membership-request.ts';
+import { memberFilters, stateFormat } from '#engine/client/state-request.ts';
 
 Deno.test('operation primitives preserve absence, false, zero and empty strings without coercion', () => {
   assertEquals(booleanParameter(undefined, 'x'), undefined);
@@ -138,4 +140,31 @@ Deno.test('search normalization distinguishes absence, explicit empty values and
     }).context,
     { before: 0, after: 1, profile: true },
   );
+});
+
+Deno.test('membership and state operation decoders retain valid values and distinguish malformed fields', () => {
+  assertEquals(membershipContent({}), {});
+  assertEquals(membershipContent({ reason: '', extension: true }), {
+    reason: '',
+    extension: true,
+  });
+  for (const reason of [null, false, 1, []]) {
+    assertThrows(() => membershipContent({ reason }));
+  }
+  assertEquals(stateFormat(null), 'content');
+  for (const format of ['event', 'content']) {
+    assertEquals(stateFormat(format), format);
+  }
+  assertEquals(memberFilters(new URLSearchParams()), {
+    membership: undefined,
+    notMembership: undefined,
+  });
+  for (const value of ['invite', 'join', 'knock', 'leave', 'ban'] as const) {
+    assertEquals(
+      memberFilters(
+        new URLSearchParams({ membership: value, not_membership: value }),
+      ),
+      { membership: value, notMembership: value },
+    );
+  }
 });

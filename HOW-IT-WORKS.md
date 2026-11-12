@@ -367,6 +367,14 @@ still produce one event result. Known search keys, context, grouping and boolean
 fields are validated before selection rather than silently discarded.
 (`api/engine/client/{search-request,search-page,search}.ts`)
 
+Membership and redaction adapters validate the common optional string reason
+before dispatch, including idempotent joins. State format and member filters
+validate their enumerations without turning malformed intent into a different
+projection. Federation profile fields follow their own explicit enum. Signed
+one-time/fallback key objects require signature maps before any pool publication;
+this is structural validation, not a new cryptographic verification requirement.
+(`client/{membership-request,state-request}.ts`, `tenant/e2ee.ts`)
+
 All client timeline rendering crosses one viewer-aware `renderEvent` boundary.
 Its shared visibility policy requires accepted, grounded events; the viewer's
 own membership events are visible without a qualifying join. Other events need

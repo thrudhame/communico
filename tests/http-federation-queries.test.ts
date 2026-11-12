@@ -57,10 +57,7 @@ test('query/profile: local fields, unset nulls, malformed/domain 400, unknown 40
   assertEquals((await call('GET', path + '&field=avatar_url')).body, {
     avatar_url: 'mxc://localhost/avatar',
   });
-  assertEquals(
-    (await call('GET', path + '&field=other')).body,
-    (await call('GET', path)).body,
-  );
+  assertEquals((await call('GET', path + '&field=other')).status, 400);
   for (const id of ['', 'bad', '@alice:else.test', '@alice:localhost:http']) {
     const result = await call('GET', fed + 'query/profile?user_id=' + enc(id));
     assertEquals([result.status, result.body.errcode], [
