@@ -127,6 +127,35 @@ export async function sendLocal(
   );
 }
 
+async function assertLocalAnnotation(
+  tx: RoomTx,
+  partial: BuildPartial,
+): Promise<void> {
+  const relation = partial.content['m.relates_to'] as {
+    rel_type?: unknown;
+    event_id?: unknown;
+    key?: unknown;
+  } | null;
+  if (
+    relation?.rel_type !== 'm.annotation' ||
+    typeof relation.event_id !== 'string' || typeof relation.key !== 'string'
+  ) return;
+  if (
+    await tx.events.hasAnnotation(
+      relation.event_id,
+      partial.type,
+      partial.sender,
+      relation.key,
+    )
+  ) {
+    throw new MatrixError(
+      400,
+      'M_DUPLICATE_ANNOTATION',
+      "Can't send same reaction twice",
+    );
+  }
+}
+
 function localJoiningUser(event: BuildPartial): string | undefined {
   return event.type === 'm.room.member' && event.state_key === event.sender &&
       ['join', 'knock'].includes(String(event.content.membership))
@@ -179,15 +208,18 @@ async function submitLocal(
       await admitLocalJoin(room.store, room.id, joiningUser);
     }
     if (submission === undefined) {
-      return await room.tx(async (tx) =>
-        ingestInTx(tx, room.id, await build(tx), { self: signer.serverName })
-      );
+      return await room.tx(async (tx) => {
+        const pdu = await build(tx);
+        await assertLocalAnnotation(tx, pdu);
+        return await ingestInTx(tx, room.id, pdu, { self: signer.serverName });
+      });
     }
     let prepared = await submission.lookup();
     if (prepared === null) {
       const built = await room.tx(async (tx) => {
         await submission.admit?.(tx);
         const pdu = await build(tx);
+        await assertLocalAnnotation(tx, pdu);
         const stay = await tx.segments.openStay();
         const group = stay === null ? null : await tx.state.current(stay.id);
         await assertLocalEncryption(
@@ -209,6 +241,7 @@ async function submitLocal(
       if (prepared.pdu.event_id !== prepared.eventId) {
         throw new Error('E_SUBMISSION_ID_MISMATCH');
       }
+      await assertLocalAnnotation(tx, prepared.pdu);
       return await ingestInTx(tx, room.id, prepared.pdu, {
         self: signer.serverName,
       });

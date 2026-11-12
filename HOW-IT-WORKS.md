@@ -365,6 +365,15 @@ walks three levels before result filtering and reports `recursion_depth`; omitte
 `recurse` omits the depth. Reads beyond the explicit traversal budget fail, rather
 than claiming an incomplete walk is complete. Nested latest events inherit the
 parent's serialization options, without recursively bundling threads.
+The same owner bundles reference IDs and the most recent valid edit, selected by
+origin timestamp then event ID. State, annotation and replacement parents have no
+bundles. Replacements retain full event shape, never mutate original content,
+and require the original sender/type and non-state events (cleartext edits also
+require new content). Redacted originals omit replacements; redacted edits fall
+back to the prior revision. Latest thread replies retain their own edit/reference
+bundles. Local annotation duplicate admission reads accepted, grounded room truth
+and its applied redaction log under the existing authoring lock, before a new
+transaction receipt is prepared; retry receipts reconcile before admission.
 (`api/engine/client/{relations,relation-view}.ts`, `api/engine/room/order.ts`,
 `api/engine/server/{project,read}.ts`)
 
