@@ -26,6 +26,84 @@ export type StateChange = {
 
 export type StateMap = Map<string, string>; // type + '\0' + state_key → event id
 
+// Published participation, not a current invite/leave row, proves shared history.
+export async function hasJoinedBefore(
+  conn: Conn,
+  userId: string,
+  changePos: number,
+): Promise<boolean> {
+  const groups = await conn.query(
+    `SELECT DISTINCT p.grp FROM events e
+     JOIN changes c ON c.event=e.id AND c.kind IN ('event','transition')
+     JOIN publications p ON p.change_pos=c.pos
+     WHERE e.type='m.room.member' AND e.state_key=?
+       AND json_extract(e.pdu,'$.content.membership')='join' AND c.pos<=?`,
+    [userId, changePos],
+  );
+  for (const row of groups) {
+    const event = await groupKey(
+      conn,
+      Number(row.grp),
+      'm.room.member',
+      userId,
+    );
+    if (event === null) continue;
+    const membership = await conn.query('SELECT pdu FROM events WHERE id=?', [
+      event,
+    ]);
+    if (
+      membership.length &&
+      JSON.parse(String(membership[0].pdu)).content?.membership === 'join'
+    ) return true;
+  }
+  return false;
+}
+
+// Find the most recent published participation interval at a room change cut.
+// A later ban/reinvitation/decline cannot move the real departure boundary.
+export async function participationAt(
+  conn: Conn,
+  userId: string,
+  through: number,
+  stay: number,
+) {
+  let cursor = through;
+  let cursorStay = stay;
+  let inclusive = true;
+  let departure: { pos: number; stay: number; group: number } | null = null;
+  while (cursor >= 0) {
+    const page = await conn.query(
+      `SELECT change_pos,stay,grp FROM publications WHERE stay<=? AND change_pos${
+        inclusive ? '<=' : '<'
+      }? ORDER BY stay DESC,change_pos DESC LIMIT 32`,
+      [cursorStay, cursor],
+    );
+    const cache = new Map<number, string>();
+    for (const row of page) {
+      const pos = Number(row.change_pos), group = Number(row.grp);
+      cursor = pos;
+      cursorStay = Number(row.stay);
+      if (!cache.has(group)) {
+        const id = await groupKey(conn, group, 'm.room.member', userId);
+        const pdu = id === null
+          ? []
+          : await conn.query('SELECT pdu FROM events WHERE id=?', [id]);
+        cache.set(
+          group,
+          pdu.length
+            ? String(JSON.parse(String(pdu[0].pdu)).content?.membership)
+            : 'leave',
+        );
+      }
+      if (cache.get(group) === 'join') return { joined: pos, departure };
+      departure = { pos, stay: Number(row.stay), group };
+    }
+    if (page.length < 32) break;
+    inclusive = false;
+  }
+  return null;
+}
+
 // A state map as a change batch (a base snapshot's entries).
 export function mapEntries(map: StateMap): StateChange[] {
   const out: StateChange[] = [];

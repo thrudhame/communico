@@ -65,6 +65,10 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       eventReadState: (event: string) => state.eventReadState(conn, event),
       publishedGroupsAfter: (event: string, cut?: ErasureCut) =>
         state.publishedGroupsAfter(conn, event, cut),
+      hasJoinedBefore: (userId: string, changePos: number) =>
+        state.hasJoinedBefore(conn, userId, changePos),
+      participationAt: (userId: string, through: number, stay: number) =>
+        state.participationAt(conn, userId, through, stay),
       erasureCut: () => state.erasureCut(conn),
       publishedAt: (stay: number, pos: number) =>
         state.publishedAt(conn, stay, pos),

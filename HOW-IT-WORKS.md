@@ -213,6 +213,23 @@ body/name/topic text without altering the PDU.
 
 ## Client reads and sync
 
+Client state disclosure has one admission owner, separate from raw state reads
+and event serialization. A grant names the room, viewer and exact publication
+or event-state snapshot. Joined/authorized snapshots retain old and imported
+state keys; a declined invitation alone never grants a private snapshot.
+Without snapshot permission, only individually visible state survives. Published
+participation history fixes the real departure boundary: a later ban, declined
+reinvitation or current join cannot disclose a different private interval.
+Sync compares admitted snapshots at both cuts. State/members, context, lazy
+messages state, search state/profiles and initialSync share this boundary;
+search hydrates the admitted departure snapshot rather than current room state.
+Discovery explicitly admits only its existing summary/child-link state types
+and retains its separate access gate. The common event serializer is private;
+timeline events and state snapshots reach it through their respective admission
+owners. Prejoin display keeps its existing stripped/provenance ceiling.
+(`api/engine/client/state-admission.ts`, `client/{render,state}.ts`,
+`api/engine/room/state.ts`)
+
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data
 streams. Denials win, empty lists exclude everything, and only `*` is special

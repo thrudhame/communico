@@ -12,6 +12,7 @@ import { isIgnoredEvent } from './ignored.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { canSeeEvent } from './visibility.ts';
 import { erasedView } from '#engine/erasure.ts';
+import { admitState, type StateAdmission } from './state-admission.ts';
 import {
   prejoinDisplay,
   savedPrejoinDisplay,
@@ -105,12 +106,35 @@ export async function renderEvent(
 ): Promise<Record<string, unknown> | null> {
   if (!await canSeeEvent(viewer.userId, room, eventId)) return null;
   if (await isIgnoredEvent(room, eventId, viewer)) return null;
-  return await renderStateEvent(room, eventId, viewer, opts);
+  return await serializeEvent(room, eventId, viewer, opts);
 }
 
 // Published state snapshots have their own admission/cut contract, including
 // imported evidence. They share formatting, not timeline visibility.
 export async function renderStateEvent(
+  room: Room,
+  eventId: string,
+  viewer?: Viewer,
+  opts?: {
+    omitRoomId?: boolean;
+    bundleThreads?: boolean;
+    eventFormat?: 'client' | 'federation';
+    admission?: StateAdmission;
+  },
+): Promise<Record<string, unknown> | null> {
+  const admission = opts?.admission ??
+    await admitState(room, { userId: viewer?.userId ?? null });
+  if (
+    admission.roomId !== room.id ||
+    admission.userId !== (viewer?.userId ?? null) ||
+    !admission.events.has(eventId)
+  ) return null;
+  return await serializeEvent(room, eventId, viewer, opts);
+}
+
+// The timeline entry point checks event visibility; state entry points check an
+// exact snapshot grant. Neither exports an unchecked serializer to consumers.
+async function serializeEvent(
   room: Room,
   eventId: string,
   viewer?: Viewer,

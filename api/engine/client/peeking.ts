@@ -10,6 +10,7 @@ import { eventStreamMax, onEventStream } from '#engine/server/stream.ts';
 import { visibility } from '#engine/server/directory.ts';
 import { listRoomAccountData } from '#engine/tenant/accountdata.ts';
 import { requireRoom, stateAtSeq } from './room.ts';
+import { admitState } from './state-admission.ts';
 import { renderEvent } from './render.ts';
 import { clientEventsForRows } from './state.ts';
 import { messages } from './timeline.ts';
@@ -92,6 +93,11 @@ export async function roomInitialSync(
       lazyLoadMembers: false,
       localOnly: true,
     });
+    const admission = await admitState(await requireRoom(roomId), {
+      userId: user,
+      point: { seq: snapshot.cut },
+      ceiling: snapshot.cut,
+    });
     return {
       room_id: roomId,
       membership: snapshot.membership,
@@ -102,8 +108,9 @@ export async function roomInitialSync(
       },
       state: await clientEventsForRows(
         roomId,
-        await stateAtSeq(roomId, snapshot.cut),
+        admission.rows,
         user,
+        { admission },
       ),
       visibility: await visibility(app.server, roomId),
       account_data: await listRoomAccountData(

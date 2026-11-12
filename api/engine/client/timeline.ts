@@ -20,6 +20,7 @@ import { serversInRoom } from './membership.ts';
 import { renderEvent } from './render.ts';
 import { requireRoom, type StateRow } from './room.ts';
 import { clientEventsForRows } from './state.ts';
+import { admitState } from './state-admission.ts';
 import { canSeeEvent } from './visibility.ts';
 
 import { parseStreamToken } from './tokens.ts';
@@ -287,13 +288,17 @@ export async function messages(
   if (w.lazyLoadMembers) {
     const senders = new Set(chunk.map((e) => String(e.sender)));
     const anchor = w.dir === 'f' ? raw[raw.length - 1] : raw[0];
-    const rows = anchor === undefined
-      ? []
-      : await stateAtEvent(room, anchor.event);
+    const admission = await admitState(room, {
+      userId: w.userId,
+      ...(anchor === undefined ? {} : { point: { eventId: anchor.event } }),
+      ...(w.leaveAt === null ? {} : { ceiling: w.leaveAt }),
+    });
+    const rows = anchor === undefined ? [] : admission.rows;
     result.state = await clientEventsForRows(
       room.id,
       rows.filter((r) => r.type === 'm.room.member' && senders.has(r.stateKey)),
       w.userId,
+      { admission },
     );
   }
   return result;
@@ -370,8 +375,15 @@ export async function eventContext(
   const at = eventsAfter.length > 0
     ? String(eventsAfter[eventsAfter.length - 1].event_id)
     : eventId;
+  const admission = await admitState(room, {
+    userId,
+    point: { eventId: at },
+    ...(member === null || member.membership === 'join'
+      ? {}
+      : { ceiling: member.seq }),
+  });
   let state =
-    (await clientEventsForRows(roomId, await stateAtEvent(room, at), userId))
+    (await clientEventsForRows(roomId, admission.rows, userId, { admission }))
       .filter(matches);
   if (opts.lazyLoadMembers) {
     const senders = new Set(

@@ -8,8 +8,9 @@ import {
   localDiscoverySummary,
   remoteDiscoveryHierarchy,
 } from './discovery.ts';
-import { lookupRoom, requireRoom, stateAtSeq } from './room.ts';
+import { lookupRoom, requireRoom } from './room.ts';
 import { renderStateEvent } from './render.ts';
+import { admitState } from './state-admission.ts';
 
 type Json = Record<string, unknown>;
 type Child = {
@@ -71,10 +72,12 @@ async function withChildren(summary: Json, suggested: boolean): Promise<Json> {
   const out = { ...summary, children_state: [] as Child[] };
   if (summary.room_type === 'm.space') {
     const room = await requireRoom(String(summary.room_id));
-    for (const row of await stateAtSeq(room.id, null)) {
+    const admission = await admitState(room, { userId: null, discovery: true });
+    for (const row of admission.rows) {
       if (row.type !== 'm.space.child') continue;
       const event = await renderStateEvent(room, row.eventId, undefined, {
         bundleThreads: false,
+        admission,
       });
       if (validChild(event, suggested)) {
         out.children_state.push({
