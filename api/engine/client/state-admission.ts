@@ -37,6 +37,7 @@ export async function admitState(
     ceiling?: number;
     allowInvited?: boolean;
     discovery?: boolean;
+    keys?: readonly (readonly [string, string])[];
   },
 ): Promise<StateAdmission> {
   const events = new Set<string>();
@@ -109,7 +110,33 @@ export async function admitState(
           : 0,
       );
     if (group === null) return grant;
-    const original = await tx.state.groupMap(group);
+    // Project IDs before hydrating PDUs; permission checks still use the full
+    // snapshot's membership/history owners, never the projection as a grant.
+    const matches = (key: string) => {
+      const sep = key.indexOf('\0');
+      return input.keys === undefined ||
+        input.keys.some(([type, stateKey]) =>
+          (type === '*' || type === key.slice(0, sep)) &&
+          (stateKey === '*' || stateKey === key.slice(sep + 1))
+        );
+    };
+    const projected = async (selected: number) => {
+      if (input.keys === undefined) return await tx.state.groupMap(selected);
+      if (input.keys.some(([type, key]) => type === '*' || key === '*')) {
+        return new Map(
+          [...await tx.state.groupMap(selected)].filter(([key]) =>
+            matches(key)
+          ),
+        );
+      }
+      const entries = new Map<string, string>();
+      for (const [type, key] of input.keys) {
+        const id = await tx.state.groupKey(selected, type, key);
+        if (id !== null) entries.set(type + '\0' + key, id);
+      }
+      return entries;
+    };
+    const original = await projected(group);
     const pointPos = event === null
       ? selected.length ? Number(selected[0].pos) : 0
       : await tx.changes.posOf(event) ?? 0;
@@ -117,7 +144,7 @@ export async function admitState(
       group = boundary.group;
     }
     const entries = group === boundary?.group
-      ? await tx.state.groupMap(group)
+      ? await projected(group)
       : original;
     if (input.discovery) {
       for (const [key, id] of entries) {

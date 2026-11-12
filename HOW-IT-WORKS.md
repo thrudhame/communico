@@ -242,6 +242,16 @@ This groundwork neither exposes a sync endpoint nor advertises native support,
 and never acknowledges or reads the to-device inbox.
 (`api/engine/sliding-sync/request.ts`, `api/engine/tenant/sliding-sync.ts`)
 
+The simplified-sync list owner captures server membership/activity cuts and
+tenant DM/tag/ignore values before selecting windows. Filters compose before
+counts and inclusive ranges; overlapping requests union required state and take
+the largest timeline limit. Activity is received live-feed order, frozen at
+departure for nonmembers. Metadata reads use publication cuts or saved prejoin
+display, not current private state. Plain joined-room windows and encryption-only
+requests hydrate no room files or timelines. This remains internal groundwork,
+without an endpoint or native-support advertisement.
+(`api/engine/sliding-sync/lists.ts`, `api/engine/server/read.ts`)
+
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data
 streams. Denials win, empty lists exclude everything, and only `*` is special
