@@ -26,6 +26,7 @@ export default async function (
     name: body.name as string | undefined,
     topic: body.topic as string | undefined,
     invite: body.invite as string[] | undefined,
+    invite_3pid: body.invite_3pid as unknown[] | undefined,
     is_direct: body.is_direct as boolean | undefined,
     alias: body.room_alias_name as string | undefined,
     creation_content: body.creation_content as

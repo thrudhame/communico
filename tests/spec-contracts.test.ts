@@ -1,5 +1,6 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import {
+  assertSpecHttpResponse,
   assertSpecResponse,
   manifest,
   schemaErrors,
@@ -148,4 +149,31 @@ Deno.test('tagged federation profile prose permits null only for unset profile f
     avatar_url: null,
   });
   assertSpecResponse('GET', '/_matrix/federation/v1/query/profile', 200, {});
+});
+
+Deno.test('state response format selects its tagged content or event contract before validating', async () => {
+  const path = 'http://x/_matrix/client/v3/rooms/room/state/m.room.name/name';
+  await assertSpecHttpResponse(new Request(path), Response.json({}));
+  await assertSpecHttpResponse(
+    new Request(path + '?format=content'),
+    Response.json({}),
+  );
+  await assertRejects(() =>
+    assertSpecHttpResponse(
+      new Request(path + '?format=event'),
+      Response.json({}),
+    )
+  );
+  await assertSpecHttpResponse(
+    new Request(path + '?format=event'),
+    Response.json({
+      event_id: '$event',
+      type: 'm.room.name',
+      state_key: 'name',
+      sender: '@sender:example.test',
+      room_id: '!room:example.test',
+      origin_server_ts: 0,
+      content: {},
+    }),
+  );
 });

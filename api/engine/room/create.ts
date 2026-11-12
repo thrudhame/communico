@@ -37,6 +37,7 @@ export type CreateRoomOptions = {
   alias?: string; // the canonical alias's localpart
   initial_state?: { type: string; state_key?: string; content: unknown }[];
   invite?: string[];
+  invite_3pid?: unknown[];
   creation_content?: Record<string, unknown>;
   power_level_content_override?: Record<string, unknown>;
   is_direct?: boolean;
@@ -87,6 +88,18 @@ export async function createRoom(
     value !== null && typeof value === 'object' && !Array.isArray(value);
   if (!validEventUserId(creator)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid creator');
+  }
+  if (opts.invite_3pid !== undefined) {
+    if (!Array.isArray(opts.invite_3pid)) {
+      throw new MatrixError(400, 'M_BAD_JSON', 'invite_3pid must be an array');
+    }
+    if (opts.invite_3pid.length > 0) {
+      throw new MatrixError(
+        400,
+        'M_UNRECOGNIZED',
+        'Identity-server invitations are disabled',
+      );
+    }
   }
   for (
     const value of [opts.creation_content, opts.power_level_content_override]

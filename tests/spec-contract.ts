@@ -220,7 +220,23 @@ export function schemaErrors(
   return errors;
 }
 
-function responseSchema(operation: SpecOperation, field: SpecField): Schema {
+function responseSchema(
+  operation: SpecOperation,
+  field: SpecField,
+  query = new URLSearchParams(),
+): Schema {
+  // The tagged oneOf includes an arbitrary content object and a client event,
+  // so those branches overlap structurally. Its response prose discriminates
+  // them by the request's format, not by counting schema matches.
+  if (
+    operation.id ===
+      'data/api/client-server/rooms.yaml#GET /_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}'
+  ) {
+    assert(field.responseDescription?.includes('if `?format=event` was used'));
+    const schema = manifest.schemas[field.source];
+    assert(typeof schema === 'object' && schema.oneOf?.length === 2);
+    return schema.oneOf[query.get('format') === 'event' ? 1 : 0];
+  }
   // v1.16 query.yaml explicitly permits absent profile fields to be null in
   // response prose, although its property schemas only say string. Retain the
   // tagged schema unchanged and apply that exact, reviewed prose permission.
@@ -307,7 +323,10 @@ export async function assertSpecHttpResponse(
           parsed = true;
         }
         assertEquals(
-          schemaErrors(value, responseSchema(operation, field)),
+          schemaErrors(
+            value,
+            responseSchema(operation, field, new URL(request.url).searchParams),
+          ),
           [],
           operation.id + ' HTTP response',
         );
