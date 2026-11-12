@@ -17,6 +17,7 @@ export async function stateAtSeq(
   room: Room,
   seq: number,
   stay?: number,
+  keys?: readonly (readonly [string, string])[],
 ): Promise<StateRow[]> {
   const rows = await theApp().server.query(
     'SELECT pos, stay FROM feed WHERE room = ? AND seq <= ? ORDER BY seq DESC LIMIT 1',
@@ -30,16 +31,31 @@ export async function stateAtSeq(
       : 0;
     const group = await tx.state.publishedAt(selected, pos);
     if (group === null) return [];
-    const map = await tx.state.groupMap(group);
+    const map = keys === undefined || keys.some((k) => k.includes('*'))
+      ? await tx.state.groupMap(group)
+      : new Map<string, string>();
+    if (keys !== undefined && !keys.some((k) => k.includes('*'))) {
+      for (const [type, key] of keys) {
+        const id = await tx.state.groupKey(group, type, key);
+        if (id !== null) map.set(type + '\0' + key, id);
+      }
+    }
     const out: StateRow[] = [];
     for (const [key, eventId] of map) {
+      const sep = key.indexOf('\0');
+      const type = key.slice(0, sep), stateKey = key.slice(sep + 1);
+      if (
+        keys !== undefined &&
+        !keys.some(([t, k]) =>
+          (t === '*' || t === type) && (k === '*' || k === stateKey)
+        )
+      ) continue;
       const row = await tx.events.get(eventId);
       if (row === null) continue;
       const pdu = JSON.parse(row.pdu) as Pdu;
-      const sep = key.indexOf('\0');
       out.push({
-        type: key.slice(0, sep),
-        stateKey: key.slice(sep + 1),
+        type,
+        stateKey,
         eventId,
         content: pdu.content,
         sender: pdu.sender,

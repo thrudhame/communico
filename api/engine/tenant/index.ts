@@ -458,6 +458,8 @@ function bind(
       },
     },
     accountData: {
+      listSelection: (localpart: string) =>
+        accountdata.listSelectionSnapshot(conn, localpart),
       clear: (localpart: string) =>
         accountdata.clearAccountData(conn, localpart),
       roomsSince: (localpart: string, since: number, until: number) =>

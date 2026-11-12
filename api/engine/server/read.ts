@@ -7,6 +7,7 @@
 // matchTokens/rankOf, federation/outbox.ts's eventBatchFor.
 import type { Database as Db } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
+import { visiblePrejoin, visibleRoomMembership } from './prejoin.ts';
 
 export async function redactionOf(
   db: Db,
@@ -118,6 +119,41 @@ export async function roomsFor(
     userId,
   ]);
   return rows.map(membershipRowOf);
+}
+
+// Capture candidates and activity in the same server transaction as the cuts.
+// No per-room timeline/state hydration is needed to order list windows.
+export async function slidingListSnapshot(
+  db: Pick<Db, 'query'>,
+  userId: string,
+) {
+  const counters = new Map((await db.query('SELECT name,value FROM counters'))
+    .map((r) => [String(r.name), Number(r.value)]));
+  const eventCut = counters.get('events') ?? 0;
+  const rows = await db.query(
+    `${MEMBERSHIP_SELECT}
+    WHERE m.user=? AND ${visibleRoomMembership('m')}`,
+    [userId],
+  );
+  const memberships = rows.map(membershipRowOf);
+  const activities = new Map((await db.query(
+    `
+    SELECT f.room,MAX(f.seq) AS activity FROM feed f
+    JOIN memberships m ON m.room=f.room AND m.user=?
+    WHERE f.seq<=? AND (m.membership='join' OR f.seq<=m.seq)
+    GROUP BY f.room`,
+    [userId, eventCut],
+  ))
+    .map((r) => [String(r.room), Number(r.activity)]));
+  const purgeable = new Set((await db.query(
+    'SELECT room_id FROM directory WHERE purgeable_ms IS NOT NULL',
+  )).map((r) => String(r.room_id)));
+  const prejoin = await db.query(
+    `SELECT * FROM prejoin_memberships p
+    WHERE user_id=? AND ${visiblePrejoin('p')} ORDER BY seq`,
+    [userId],
+  );
+  return { counters, eventCut, memberships, activities, purgeable, prejoin };
 }
 
 // The user's membership in one room (the old membershipOf), null when

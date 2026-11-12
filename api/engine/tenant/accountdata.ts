@@ -92,6 +92,28 @@ export async function accountDataSnapshot(
     : null;
 }
 
+// List filtering consumes immutable values captured with their owning cut.
+// Only m.tag is read here, never unrelated room account-data payloads.
+export async function listSelectionSnapshot(conn: Conn, localpart: string) {
+  const direct = await accountDataSnapshot(conn, localpart, '', 'm.direct');
+  const ignored = await accountDataSnapshot(
+    conn,
+    localpart,
+    '',
+    'm.ignored_user_list',
+  );
+  const tags = new Map((await conn.query(
+    "SELECT room_id,content FROM account_data WHERE localpart=? AND type='m.tag' AND room_id<>''",
+    [localpart],
+  )).map((r) => [String(r.room_id), JSON.parse(String(r.content)) as unknown]));
+  return {
+    accountCut: await accountDataMaxSeq(conn, localpart),
+    direct: direct?.content,
+    ignored: ignored?.content,
+    tags,
+  };
+}
+
 function toAccountDataRows(
   rows: Record<string, unknown>[],
 ): AccountDataRow[] {
