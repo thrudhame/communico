@@ -879,6 +879,16 @@ decoder failures and sink failures cannot replay on another address. Delegated
 Host and TLS identities never acquire the SRV target's port.
 (`api/engine/federation/{xmatrix,server-name,well-known,resolve,dial-node-tls}.ts`)
 
+Push verdicts cross the same fatal UTF-8, JSON media-type and endpoint-schema
+boundary before a target can be rejected or delivery acknowledged. Only typed
+peer failures schedule retry; local faults and cancellation retain their identity.
+URL previews follow only defined HTTP redirect statuses. HTML metadata uses the
+HTML parser and encoding-sniffing standards (BOM, transport, meta, fallback),
+not text matches inside comments, scripts or quoted attributes. XHTML retains
+XML namespace, case and well-formedness rules. Neither parser executes scripts
+or resolves external entities. Existing SSRF, byte and image-codec limits remain.
+(`api/engine/push/{transport,sender}.ts`, `api/engine/preview/{guard,og,index}.ts`)
+
 The shared thumbnail service serves local client, legacy-local and signed
 federation routes. Remote variants fetch signed federation thumbnails before
 bounded local validation/static generation. Cache identity includes format,

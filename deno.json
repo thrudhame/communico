@@ -20,6 +20,10 @@
   },
   "imports": {
     "imagescript": "npm:imagescript@3.20.2",
+    "parse5": "npm:parse5@8.0.0",
+    "html-encoding-sniffer": "npm:html-encoding-sniffer@4.0.0",
+    "whatwg-encoding": "npm:whatwg-encoding@3.1.1",
+    "saxes": "npm:saxes@6.0.0",
     "#engine/": "./api/engine/",
     "#endpoints/": "./api/endpoints/",
     "#root/": "./",
