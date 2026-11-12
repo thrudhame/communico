@@ -19,7 +19,9 @@ import {
   frozenBatch,
   pendingEdus,
 } from '#engine/server/delivery.ts';
-import { federationRequest } from './client.ts';
+import { FederationHttpError, federationRequest } from './client.ts';
+import { sendVerdicts } from './responses.ts';
+import { upstreamCategory } from '#engine/net/upstream-error.ts';
 import { isBlocked, recordPending } from './peers.ts';
 
 export type Edu = { edu_type: string; content: Record<string, unknown> };
@@ -543,20 +545,28 @@ export function startSender(deps: SenderDeps): Sender {
         retryTxn = txnId;
         quickAttempts = 0;
       }
-      let res;
+      let verdicts: ReturnType<typeof sendVerdicts>;
       try {
         inFlight.set(destination, {
           txnId,
           rows: batch.map((row) => `${row.room}:${row.pos}`),
         });
-        res = await federationRequest(server, deps.signer, {
+        const res = await federationRequest(server, deps.signer, {
           destination,
           method: 'PUT',
           path: `/_matrix/federation/v1/send/${encodeURIComponent(txnId)}`,
           body: new TextEncoder().encode(delivered.body),
           maxBytes: config().federation.bulkmaxbytes,
         });
+        verdicts = sendVerdicts(res.json);
       } catch (e) {
+        const category = upstreamCategory(e);
+        // A local signer/store/programming fault is not a peer outage. Abort is
+        // control flow, not evidence for backoff. Completed HTTP keeps status.
+        if (
+          !(e instanceof FederationHttpError) &&
+          (category === 'local' || category === 'cancellation')
+        ) throw e;
         const err = e as {
           status?: number;
           errcode?: string;
@@ -588,7 +598,7 @@ export function startSender(deps: SenderDeps): Sender {
           await recordFailure(
             tx,
             destination,
-            `${err.status == null ? 'net' : err.status} ${
+            `${err.status == null ? category : err.status} ${
               err.message == null ? String(e) : err.message
             }`,
             backoff,
@@ -630,10 +640,6 @@ export function startSender(deps: SenderDeps): Sender {
         await recordSuccess(tx, destination);
       });
       await deps.onDelivered?.();
-      const body = res.json as
-        | { pdus?: Record<string, { error?: string }> }
-        | null;
-      const verdicts = body == null || body.pdus == null ? {} : body.pdus;
       for (const [id, verdict] of Object.entries(verdicts)) {
         if (verdict?.error !== undefined) {
           console.warn(

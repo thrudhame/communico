@@ -522,7 +522,7 @@ Deno.test('dial: pinned peer → SPKI match round trips; wrong pin → 502', asy
         pin,
         addedBy: 'operator',
       });
-      const ok = await federationRequest(server, identity.signer, {
+      const ok = await federationRequestRaw(server, identity.signer, {
         destination: 'localhost',
         method: 'GET',
         path: '/x',
@@ -594,7 +594,7 @@ Deno.test('dial: key-is-name peer → raw key equality round trips', async () =>
         trust: 'keyname',
         addedBy: 'operator',
       });
-      const ok = await federationRequest(server, identity.signer, {
+      const ok = await federationRequestRaw(server, identity.signer, {
         destination: name,
         method: 'GET',
         path: '/x',

@@ -801,7 +801,7 @@ cache identity or persisted metadata. Legacy serving remains local-only.
 The HTTP representation boundary handles informational heads, HTTP field and
 chunk grammar, and gzip/deflate/Brotli content decoding before any consumer.
 Encoded, decoded and intermediate bodies retain the request's byte limit.
-Unsupported codings and malformed HTTP/MIME/metadata JSON are protocol failures, not
+Unsupported codings and malformed HTTP/MIME/JSON are protocol failures, not
 connection failures. Only network primitives classify transport faults; sink
 and store errors remain local, and caller cancellation retains its identity.
 Public Matrix outcome rendering maps typed upstream failures once.
@@ -814,6 +814,15 @@ before complete envelope validation. Remote filenames use RFC8187 UTF-8 language
 tags and preserve quoted spaces before the existing filename sanitization.
 (`api/engine/net/{upstream-error,fields,json,http1}.ts`,
 `api/engine/media/{multipart,service}.ts`)
+
+Federation JSON successes require the JSON media type and fatal UTF-8 decoding;
+empty or malformed replies cannot become null success. Endpoint consumers still
+own the decoded root/schema. Outgoing transactions validate the required PDU
+verdict map before acknowledging their frozen durable batch or recording peer
+success. Malformed 2xx keeps delivery pending and retries the same transaction;
+local signing/storage faults are not cached as peer failures. Completed HTTP
+refusals keep their separate status and Matrix-error provenance.
+(`api/engine/federation/{client,responses,sender}.ts`)
 
 The shared thumbnail service serves local client, legacy-local and signed
 federation routes. Remote variants fetch signed federation thumbnails before

@@ -18,6 +18,8 @@ import { abortable } from '#engine/net/abort.ts';
 import { assertRoomAcl } from './acl.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Http1Response, Http1WireOpts } from '#engine/net/http1.ts';
+import { decodeJson, objectOf } from '#engine/net/json.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 
 export { caCertsPem, resetCaCertsForTests } from './resolve.ts';
 
@@ -65,13 +67,12 @@ export async function federationRequest(
   req: FederationRequest,
 ): Promise<FederationResponse> {
   const res = await federationRequestRaw(server, signer, req);
-  let json: unknown = null;
-  if (res.body.length > 0) {
-    try {
-      json = JSON.parse(new TextDecoder().decode(res.body));
-    } catch { /* existing JSON callers tolerate empty/non-JSON success */ }
-  }
-  return { status: res.status, json };
+  // Wire grammar is shared; roots (including v1 tuples) and endpoint schemas
+  // belong to their consumers. Malformed success is never absence or success.
+  return {
+    status: res.status,
+    json: decodeJson(res.body, res.headers.get('content-type')),
+  };
 }
 
 // Raw bytes and streaming sinks share signing, ACL admission, discovery, TLS
@@ -157,18 +158,24 @@ export async function federationRequestRaw(
   }
   // non-2xx: a Matrix body surfaces verbatim
   try {
-    const j = JSON.parse(new TextDecoder().decode(res.body));
-    const o = j as Record<string, unknown>;
-    if (o !== null && typeof o === 'object' && typeof o.errcode === 'string') {
+    const o = objectOf(
+      decodeJson(res.body, res.headers.get('content-type')),
+      'matrix-error',
+    );
+    // Matrix's error schema requires errcode; the human message is optional.
+    if (
+      typeof o.errcode === 'string' &&
+      (o.error === undefined || typeof o.error === 'string')
+    ) {
       throw new FederationHttpError(
         res.status,
         true,
         o.errcode,
-        typeof o.error === 'string' ? o.error : o.errcode,
+        o.error === undefined ? o.errcode : o.error,
       );
     }
   } catch (e) {
-    if (e instanceof MatrixError) throw e;
+    if (!(e instanceof UpstreamError)) throw e;
   }
   throw new FederationHttpError(
     res.status,

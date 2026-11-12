@@ -21,6 +21,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { lookupPeer, type PeerRow } from './peers.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import { abortable } from '#engine/net/abort.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 
 export type Trust =
   | { kind: 'ca' }
@@ -406,7 +407,10 @@ async function resolveHost(host: string, deps: ResolveDeps): Promise<string[]> {
   if (viaAAAA.length > 0) return viaAAAA;
   const literal = parseIp(host);
   if (literal !== null) return [host];
-  throw new MatrixError(502, 'M_UNKNOWN', `could not resolve ${host}`);
+  throw new UpstreamError('transport', {
+    phase: 'dns',
+    reason: 'could not resolve server hostname',
+  });
 }
 
 // SRV: _matrix-fed._tcp, then legacy _matrix._tcp — lowest priority, then
