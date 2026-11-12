@@ -311,7 +311,14 @@ export async function propagateProfile(
         failed_rooms: failures.map((failure) => failure.room),
       },
     );
-    error.cause = new AggregateError(failures.map((failure) => failure.error));
+    error.cause = new AggregateError(
+      failures.map((failure) =>
+        new Error('profile update failed for ' + failure.room, {
+          cause: failure.error,
+        })
+      ),
+    );
+    console.error('profile propagation:', error.cause);
     throw error;
   }
 }

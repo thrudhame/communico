@@ -36,11 +36,12 @@ export async function canSeeEventAt(
     if (id === null) return {};
     if (!contents.has(id)) {
       const row = await tx.events.get(id);
+      const value: unknown = row === null ? null : JSON.parse(row.pdu).content;
       contents.set(
         id,
-        row === null
-          ? {}
-          : JSON.parse(row.pdu).content as Record<string, unknown>,
+        value !== null && typeof value === 'object' && !Array.isArray(value)
+          ? value as Record<string, unknown>
+          : {},
       );
     }
     return contents.get(id)!;

@@ -160,6 +160,8 @@ suite.test('recursive traversal filters results, not intermediates, and reports 
   for (
     const query of [
       '?from=garbage',
+      '?from=c9007199254740992_0',
+      '?to=c1_-9007199254740992',
       '?to=garbage',
       '?recurse=yes',
       '?limit=-1',
