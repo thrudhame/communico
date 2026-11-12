@@ -459,6 +459,9 @@ while v12 requires a valid create tied to the room identity.
 
 OOB rejection intent persists a real locally signed departure membership,
 separate from the later federation make_leave result (server schema v23).
+The caller's leave reason, including an empty string, belongs to that durable
+intent and is copied into the separately signed federation departure. Remote
+templates cannot replace it; frozen retries retain the same signed leave.
 Left-room state/state_after contains only the full departure event, never
 stripped saved hints with fabricated identities. Older pending intents acquire
 that event once under their revision owner. Saved invite/knock hint redaction

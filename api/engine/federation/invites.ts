@@ -544,6 +544,7 @@ export async function rejectInviteRemote(
   roomId: string,
   userId: string,
   deps: InviteDeps,
+  reason?: string,
 ): Promise<void> {
   const candidates = await inviteTransition(deps.server, async (tx) => {
     if (await deps.store.roomRetired(roomId)) {
@@ -558,7 +559,11 @@ export async function rejectInviteRemote(
       throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
     }
     await withdrawInvitePush(tx, userId, roomId, invite.eventId);
-    const localLeave = await buildLocalPrejoinLeave(invite, deps.signer);
+    const localLeave = await buildLocalPrejoinLeave(
+      invite,
+      deps.signer,
+      reason,
+    );
     const seq = await nextEventSeq(tx);
     await tx.execute(
       "UPDATE prejoin_memberships SET status = 'rejecting', revision=revision+1, leave_json=NULL, local_leave_json=?, seq = ?, expires_ms=CASE WHEN kind='knock' THEN ? ELSE NULL END WHERE room_id = ? AND user_id = ?",
@@ -582,6 +587,7 @@ export async function rejectInviteRemote(
 async function buildLocalPrejoinLeave(
   invite: StoredInvite,
   signer: InviteDeps['signer'],
+  reason?: string,
 ) {
   const previous = JSON.parse(invite.eventJson) as Pdu;
   return await finalizeBuilt(
@@ -590,7 +596,10 @@ async function buildLocalPrejoinLeave(
       room_id: invite.roomId,
       state_key: invite.userId,
       sender: invite.userId,
-      content: { membership: 'leave' },
+      content: {
+        membership: 'leave',
+        ...(reason === undefined ? {} : { reason }),
+      },
       prev_events: [previous.event_id!],
       auth_events: [
         ...new Set([
@@ -652,7 +661,9 @@ export async function prejoinDeparture(
 // destination; the loop advances candidates on failure.
 export async function prepareRemoteLeave(
   destination: string,
-  invite: Pick<StoredInvite, 'userId' | 'roomId' | 'roomVersion'>,
+  invite:
+    & Pick<StoredInvite, 'userId' | 'roomId' | 'roomVersion'>
+    & Partial<Pick<StoredInvite, 'localLeaveJson'>>,
   deps: Pick<InviteDeps, 'server' | 'signer' | 'store'>,
 ): Promise<Pdu> {
   const userId = invite.userId;
@@ -667,6 +678,14 @@ export async function prepareRemoteLeave(
     body: null,
   });
   const roomVersion = invite.roomVersion;
+  // Only our durable departure carries the user's reason. A remote template
+  // cannot substitute its content, and a retry keeps the same frozen leave.
+  const reason = invite.localLeaveJson == null
+    ? undefined
+    : (JSON.parse(invite.localLeaveJson) as Pdu).content.reason;
+  if (reason !== undefined && typeof reason !== 'string') {
+    throw new Error('invalid stored prejoin departure reason');
+  }
   const { event: template } = membershipTemplate(mk.json, 'make-leave', [
     roomVersion,
   ]);
@@ -685,7 +704,10 @@ export async function prepareRemoteLeave(
     state_key: userId,
     sender: userId,
     room_id: roomId,
-    content: { membership: 'leave' },
+    content: {
+      membership: 'leave',
+      ...(reason === undefined ? {} : { reason }),
+    },
     prev_events: template.prev_events,
     auth_events: template.auth_events,
     depth: template.depth,

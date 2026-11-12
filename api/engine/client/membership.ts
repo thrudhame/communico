@@ -205,7 +205,7 @@ export async function leave(roomId: string, userId: string, reason?: string) {
     (current === null || current.seq < (invitation?.seq ?? 0)) &&
     invitation !== null && invitation.status !== 'joined'
   ) {
-    await rejectInviteRemote(roomId, userId, deps);
+    await rejectInviteRemote(roomId, userId, deps, reason);
     return { roomId, eventId: invitation.eventId, created: false };
   }
   if (room === null) {
