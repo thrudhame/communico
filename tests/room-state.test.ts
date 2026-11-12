@@ -136,6 +136,62 @@ Deno.test('room state: keyed publication journal follows resolved snapshots, not
   }
 });
 
+async function rejoinPublication(extra: boolean) {
+  const dir = await Deno.makeTempDir();
+  try {
+    await withRoom(dir, async (conn) => {
+      for (
+        const [id, sender] of [
+          ['$old', '@a:test'],
+          ['$replacement', '@b:test'],
+          ['$join', '@a:test'],
+        ]
+      ) await insertEvent(conn, id, pdu({ sender }));
+      const old = await newGroup(conn, null, [{
+        type: 'call',
+        state_key: 'key',
+        event: '$old',
+      }]);
+      await conn.execute(
+        "INSERT INTO segments(id,kind,status) VALUES(1,'stay','closed')",
+      );
+      await publish(conn, 1, 1, old);
+      const imported = await newGroup(conn, null, [{
+        type: 'call',
+        state_key: 'key',
+        event: '$replacement',
+      }]);
+      await conn.execute(
+        "INSERT INTO segments(id,kind,prev,opening_group,status) VALUES(2,'stay',1,?,'open')",
+        [imported],
+      );
+      const joined = extra
+        ? await newGroup(conn, imported, [{
+          type: 'join',
+          state_key: 'key',
+          event: '$join',
+        }])
+        : imported;
+      assertEquals(
+        await publish(conn, 2, 2, joined),
+        true,
+        'a rejoin publication compares against the predecessor, not its imported opening',
+      );
+      assertEquals(
+        await changedByOther(conn, 'call', 'key', '@a:test', 1, null),
+        true,
+        'foreign replacement during the gap must cancel old delayed work',
+      );
+    });
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+Deno.test('room state: rejoin snapshot records replacement made during the gap', () =>
+  rejoinPublication(false));
+Deno.test('room state: first rejoin delta also records imported replacement made during the gap', () =>
+  rejoinPublication(true));
+
 Deno.test('room state: groups — deltas, removal, dedup, selected-key reads', async () => {
   const dir = await Deno.makeTempDir();
   try {
