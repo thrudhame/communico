@@ -5,6 +5,7 @@ import { theApp } from '#engine/app.ts';
 import { serverName } from '#engine/config.ts';
 import { splitId } from '#engine/ids.ts';
 import { ensurePresenceRow } from '#engine/server/ephemeral.ts';
+import { decodeLoginRequest } from '#engine/tenant/session-request.ts';
 
 // m.login.password (F1 step 18): argon2id verify against the tenant
 // credentials; `identifier.type m.id.user` plus the legacy `user` shape
@@ -13,27 +14,8 @@ import { ensurePresenceRow } from '#engine/server/ephemeral.ts';
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
 ) {
-  const body = await parseJson(request) as Record<string, unknown>;
-  if (body?.type !== 'm.login.password') {
-    throw new MatrixError(400, 'M_BAD_REQUEST', 'expected m.login.password');
-  }
-  const ident = body?.identifier as Record<string, unknown> | undefined;
-  let rawUser: unknown;
-  if (ident && typeof ident === 'object') {
-    if (ident.type !== 'm.id.user') {
-      throw new MatrixError(
-        400,
-        'M_BAD_REQUEST',
-        'unsupported identifier type',
-      );
-    }
-    rawUser = ident.user;
-  } else {
-    rawUser = body?.user;
-  }
-  if (typeof rawUser !== 'string' || typeof body?.password !== 'string') {
-    throw new MatrixError(400, 'M_BAD_REQUEST', 'user + password required');
-  }
+  const decoded = decodeLoginRequest(await parseJson(request));
+  const rawUser = decoded.user;
   // Full MXID must name this server; bare localparts are accepted and
   // downcased (registration downcases too).
   let localpart: string;
@@ -50,17 +32,15 @@ export default async function (
     localpart = rawUser.toLowerCase();
   }
   const deviceId: string =
-    typeof body.device_id === 'string' && body.device_id.length > 0
-      ? body.device_id
+    decoded.deviceId !== undefined && decoded.deviceId.length > 0
+      ? decoded.deviceId
       : crypto.randomUUID().replaceAll('-', '').slice(0, 10);
   const session = await loginUser(theApp().tenant, {
     localpart,
     deviceId,
-    password: body.password,
-    displayName: typeof body.initial_device_display_name === 'string'
-      ? body.initial_device_display_name
-      : undefined,
-    refresh: body.refresh_token === true,
+    password: decoded.password,
+    displayName: decoded.displayName,
+    refresh: decoded.refresh,
   });
   // Band C (D8): refresh_token: true asks for the refresh flow
   // (login.yaml:158-161) — the access token then carries an

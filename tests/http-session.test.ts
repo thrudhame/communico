@@ -79,7 +79,6 @@ test('registration availability, validation before UIA, inhibit_login; login/log
   assertEquals(registered.status, 200);
   assertEquals(registered.body, {
     user_id: `@sessions:${serverName()}`,
-    device_id: 'inhibited',
     home_server: serverName(),
   });
   const taken = await call('v3/register', 'POST', { username: 'Sessions' });
@@ -120,7 +119,7 @@ test('registration availability, validation before UIA, inhibit_login; login/log
   const devices = await call('v3/devices', 'GET', undefined, firstToken);
   assertEquals(
     (devices.body.devices as Json[]).map((d) => d.device_id).sort(),
-    ['first', 'inhibited'],
+    ['first'],
   );
   assertEquals(await call('v3/logout/all', 'POST', undefined, firstToken), {
     status: 200,

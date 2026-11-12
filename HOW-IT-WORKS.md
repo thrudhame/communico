@@ -769,6 +769,14 @@ identity. The tenant generates its key once and reloads it on reopen, keeping
 its stored native name and key id. A newly generated key has a public-key-derived
 id; existing ids are retained. Passwords use Argon2id PHC strings; access and
 refresh credentials are stored only as SHA-256 digests.
+Registration allocates a unique localpart when omitted. Inhibited registration
+creates the account without a device or session; disabled guest intent is refused,
+never converted to ordinary registration. Login's initial device name applies
+only to a new device, not an existing device rename. Operation-specific session,
+password and ephemeral decoders validate known scalar types before UIA or effects;
+malformed typing cannot become a stop or advance the typing stream. Room creation
+distinguishes missing fields from explicit null values before applying defaults.
+(`tenant/session-request.ts`, `client/ephemeral-request.ts`, `room/create.ts`)
 (`api/engine/tenant/index.ts:337-401`, `api/engine/tenant/index.ts:51-62`,
 `api/engine/tenant/users.ts:1-3`, `api/engine/tenant/users.ts:39-55`,
 `api/engine/tenant/auth.ts:1-6`, `api/engine/tenant/auth.ts:17-48`)
