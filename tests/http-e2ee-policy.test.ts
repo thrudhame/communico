@@ -292,7 +292,14 @@ suite.test('all create/join/message combinations and Element flags match the ind
           new Request('http://x/_matrix/client/versions'),
         );
         const flags = (await versions.json()).unstable_features;
-        assertEquals(flags, {
+        // This matrix owns the encryption-policy namespace. The complete
+        // discovery response is asserted independently in http-client-data.
+        const encryptionFlags = Object.fromEntries(
+          Object.entries(flags).filter(([name]) =>
+            name.startsWith('io.element.e2ee_forced.')
+          ),
+        );
+        assertEquals(encryptionFlags, {
           'io.element.e2ee_forced.public': !creation,
           'io.element.e2ee_forced.private': !creation,
           'io.element.e2ee_forced.trusted_private': !creation,

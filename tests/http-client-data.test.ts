@@ -252,6 +252,7 @@ test('versions stays public, capabilities stays protected, discovery absent per 
         'v1.16',
       ],
       unstable_features: {
+        'org.matrix.simplified_msc3575': true,
         'io.element.e2ee_forced.public': !config().encryption
           .allowunencryptedcreation,
         'io.element.e2ee_forced.private': !config().encryption

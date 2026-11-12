@@ -26,6 +26,15 @@ cumulatively. [MATRIX-VERSIONS.md](MATRIX-VERSIONS.md) records the endpoint and
 behavioral regression checklist, including optional-module exclusions. This is
 not a claim that every Complement case passes; see `complement/BASELINE.md`.
 
+Native simplified sliding sync (MSC4186) is advertised as
+`org.matrix.simplified_msc3575`. Clients use the authenticated
+`POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync` directly,
+without a sliding-sync proxy. It supports list windows, room subscriptions,
+required state and independent E2EE, to-device, account-data, receipt and typing
+extensions. Password login remains supported. The layered `slidingsync` settings
+bound connections, retained positions, request sizes and poll timeouts; unknown
+or expired positions return `M_UNKNOWN_POS` rather than silently resetting.
+
 `/sync?use_state_after=true` returns state at the response's timeline end in
 `state_after` (also when empty), not `state`. The default retains the legacy
 state-before-timeline contract. Filters and lazy member loading apply to both.
