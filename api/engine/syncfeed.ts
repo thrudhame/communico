@@ -4,6 +4,7 @@
 import { theApp } from '#engine/app.ts';
 import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
 import { admitState } from '#engine/client/state-admission.ts';
+import { StateDelivery } from '#engine/client/state-delivery.ts';
 import { syncWindow } from '#engine/client/sync-window.ts';
 import {
   renderPrejoinDeparture,
@@ -96,19 +97,18 @@ async function roomTimeline(
   });
   let joinGap = false;
   const since = i.since?.eSeq;
+  const delivery = await StateDelivery.capture(room, i.userId, {
+    protocol: 'ordinary',
+    since: since ?? null,
+    fullState: i.fullState,
+  }, end);
   if (
     summary && since !== undefined &&
     snapshot.members.some((row) =>
       row.user === i.userId && Number(row.seq) > since
     )
   ) {
-    const previous = await stateAtSeq(room, since);
-    if (
-      !previous.some((row) =>
-        row.type === 'm.room.member' && row.stateKey === i.userId &&
-        row.content.membership === 'join'
-      )
-    ) {
+    if (delivery.participationReset) {
       // A global since token does not mean this newly joined client has seen
       // the room's earlier history. Keep that real discontinuity paginatable.
       joinGap = (await feedBefore(app.server, room.id, 0, since, 1))
@@ -125,59 +125,16 @@ async function roomTimeline(
       ...(i.useStateAfter || start === undefined ? {} : { stay: start.stay }),
     },
   });
-  const atStart = admission.rows;
-  let stateRows = atStart;
-  let previous = new Map<string, string>();
-  if (i.since !== null) {
-    previous = new Map(
-      (await admitState(room, {
-        userId: i.userId,
-        ceiling: i.since.eSeq,
-        point: {
-          seq: i.since.eSeq,
-          ...(i.useStateAfter || start === undefined
-            ? {}
-            : { stay: start.stay }),
-        },
-      })).rows.map((
-        r,
-      ) => [r.type + '\0' + r.stateKey, r.eventId]),
-    );
-  }
-  if (i.since !== null && !i.fullState) {
-    // Legacy deltas omit state already in the timeline. state_after is the
-    // complete end-cut delta: clients must ignore timeline state in this mode.
-    // Both read resolved publications, not the trigger event's DAG state.
-    const inTimeline = new Set(events.map((event) => event.event_id));
-    stateRows = atStart.filter((r) =>
-      previous.get(r.type + '\0' + r.stateKey) !== r.eventId &&
-      (i.useStateAfter || !inTimeline.has(r.eventId))
-    );
-  }
+  const prepared = delivery.ordinary(admission, {
+    timeline: events,
+    limited,
+    filter: i.filter,
+    stateAfter: i.useStateAfter === true,
+    incremental: i.since !== null,
+    fullState: i.fullState,
+  });
   const stateEvents: Record<string, unknown>[] = [];
-  if (i.filter.state.lazy_load_members || i.filter.timeline.lazy_load_members) {
-    const senders = new Set(events.map((ev) => String(ev.sender)));
-    const mandatoryOwn = i.since === null || i.fullState ||
-      atStart.some((r) =>
-        r.type === 'm.room.member' && r.stateKey === i.userId &&
-        r.content.membership === 'join' &&
-        previous.get(r.type + '\0' + r.stateKey) !== r.eventId
-      );
-    const selectedIds = new Set(stateRows.map((r) => r.eventId));
-    // Timeline senders need their membership even when unchanged since the
-    // previous cut. Gap and incremental state-after membership changes are
-    // mandatory deltas, not lazy hints: timeline state is ignored in that mode.
-    stateRows = atStart.filter((r) =>
-      r.type !== 'm.room.member'
-        ? selectedIds.has(r.eventId)
-        : senders.has(r.stateKey) ||
-          (mandatoryOwn && r.stateKey === i.userId) ||
-          ((limited || (i.useStateAfter && !i.fullState)) && i.since !== null &&
-            previous.get(r.type + '\0' + r.stateKey) !== r.eventId)
-    );
-  }
-  stateRows = filterEvents(stateRows, i.filter.state, room.id);
-  for (const row of stateRows) {
+  for (const row of prepared.rows) {
     const ev = await renderStateEvent(room, row.eventId, {
       userId: i.userId,
       deviceId: i.deviceId,
