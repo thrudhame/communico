@@ -31,7 +31,7 @@ import { eventIdFor, redact } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { getRulebook, type RoomVersionSpec } from '#engine/rulebook/index.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
-import { contentHashOf } from '#engine/signing-primitives.js';
+import { contentHashOf, matrixBase64 } from '#engine/signing-primitives.js';
 import {
   recoverableUpstream,
   UpstreamError,
@@ -85,6 +85,11 @@ export function checkPduFormat(
     )
   ) {
     invalidEvent('M_BAD_EVENT: missing or malformed required fields');
+  }
+  try {
+    matrixBase64(pdu.hashes.sha256, 32);
+  } catch (cause) {
+    invalidEvent('M_BAD_EVENT: invalid SHA-256 content hash encoding', cause);
   }
   for (const list of [pdu.prev_events, pdu.auth_events]) {
     if (
@@ -287,7 +292,13 @@ async function verifyRequired(
       unknown
     >;
     void _drop;
-    hashOk = (await contentHashOf(noId)) === pdu.hashes?.sha256;
+    const expected = matrixBase64(await contentHashOf(noId), 32);
+    const received = matrixBase64(pdu.hashes.sha256, 32);
+    // Hashes are binary values. Equivalent permitted padding must not redact
+    // content, and the original signed representation must remain untouched.
+    hashOk = expected.every((byte: number, index: number) =>
+      byte === received[index]
+    );
   } catch (e) {
     invalidEvent('M_BAD_EVENT: content cannot be canonicalized', e);
   }

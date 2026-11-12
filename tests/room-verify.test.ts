@@ -14,6 +14,7 @@ import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
 import { fakeFetcher } from './fixtures/remote.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { validatePrejoin } from '#engine/federation/prejoin.ts';
+import { hashBytesOf, signWithHash } from '#tests/fixtures/hash-event.ts';
 import { signJson, verifyJson } from '#engine/signing-primitives.js';
 import {
   fakeKeyResolver,
@@ -259,6 +260,51 @@ Deno.test('verify: the event id is recomputed, never trusted; uncanonicalizable 
   delete (wire as unknown as Record<string, unknown>).event_id;
   const verified = await verify(wire, '11', keys, { roomId: ROOM });
   assert(verified.eventId.startsWith('$'));
+});
+
+Deno.test('hash wire: padded content hashes compare bytes and retain signed content for every supported version', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const keys = fakeKeyResolver(server);
+  for (const version of ['3', '4', '5', '6', '7', '8', '9', '10', '11', '12']) {
+    const base = await msg(server, 'intact padded body', version);
+    const hash = await hashBytesOf(base);
+    assertEquals(hash.length, 44);
+    const event = await signWithHash(base, server, version, hash);
+    const signatures = structuredClone(event.signatures);
+    const verified = await verify(event, version, keys, { roomId: ROOM });
+    assertEquals(verified.pdu.content.body, 'intact padded body');
+    assertEquals(
+      verified.pdu.hashes.sha256,
+      hash,
+      'must not normalize the signed representation',
+    );
+    assertEquals(verified.pdu.signatures, signatures);
+  }
+});
+
+Deno.test('hash wire: malformed alphabet, padding, pad bits and digest length are validation failures', async (t) => {
+  const server = await makeRemoteServer('remote.test');
+  const base = await msg(server, 'not published');
+  for (
+    const hash of [
+      '_'.repeat(43),
+      'A'.repeat(43) + '==',
+      'A'.repeat(42) + 'B',
+      'AA',
+      '',
+      'A'.repeat(44),
+      'A'.repeat(43) + ' ',
+    ]
+  ) {
+    await t.step('hash:' + JSON.stringify(hash), async () => {
+      const event = await signWithHash(base, server, '11', hash);
+      const error = await assertRejects(
+        () => verify(event, '11', fakeKeyResolver(server)),
+        UpstreamError,
+      );
+      assertEquals(error.category, 'validation');
+    });
+  }
 });
 
 Deno.test('verify: a content-hash mismatch stores the redacted copy we calculated', async () => {

@@ -843,7 +843,9 @@ Event, prejoin, history and join consumers distinguish peer verification refusal
 from a local resolver fault, which never becomes missing evidence or resident
 failover. Matrix wire Base64 uses the standard alphabet and accepts the optional
 padding recommended by the specification; the legacy stored-data decoder remains
-separate.
+separate. Remote content hashes require valid SHA-256 binary material and compare
+decoded bytes. Equivalent padding never causes redaction, and verification never
+normalizes the signed hash representation or opaque room-version reference IDs.
 (`api/engine/federation/{key-document,keys,witness,keyresolver,auth}.ts`,
 `api/engine/room/verify.ts`, `api/engine/signing-primitives.js`)
 
