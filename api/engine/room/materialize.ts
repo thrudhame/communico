@@ -175,18 +175,16 @@ export async function publish(
     if (Number(latest[0].grp) === group) return false;
   } else {
     const opening = await conn.query(
-      'SELECT opening_group FROM segments WHERE id = ?',
+      `SELECT s.opening_group,
+        (SELECT p.grp FROM publications p WHERE p.stay=s.prev ORDER BY p.change_pos DESC LIMIT 1) AS predecessor_group
+       FROM segments s WHERE s.id = ?`,
       [stay],
     );
-    if (opening.length > 0 && opening[0].opening_group !== null) {
-      previous = Number(opening[0].opening_group);
+    if (opening.length > 0) {
+      const baseline = opening[0].predecessor_group ?? opening[0].opening_group;
+      previous = baseline === null ? null : Number(baseline);
     }
-    if (
-      opening.length > 0 && opening[0].opening_group !== null &&
-      Number(opening[0].opening_group) === group
-    ) {
-      return false;
-    }
+    if (previous === group) return false;
   }
   await conn.execute(
     'INSERT INTO publications(stay, change_pos, grp) VALUES(?,?,?)',
