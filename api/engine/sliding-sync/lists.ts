@@ -1,7 +1,7 @@
 // Protocol selection over captured server/tenant owners. Timelines are hydrated
 // by the room payload owner only after this module chooses the windows.
 import { theApp } from '#engine/app.ts';
-import { heldRoom } from '#engine/client/read.ts';
+import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
 import { renderStateEvent } from '#engine/client/render.ts';
 import { admitState } from '#engine/client/state-admission.ts';
 import {
@@ -107,6 +107,7 @@ export async function selectLists(
     ),
   );
   const candidates = new Map<string, ListCandidate>();
+  const unlisted = new Set<string>();
   const rooms = new Map<string, Room | null>();
   const roomFor = async (id: string) => {
     if (!rooms.has(id)) rooms.set(id, await heldRoom(id));
@@ -131,7 +132,7 @@ export async function selectLists(
         m.membership === 'leave' && member.sender === userId &&
         !(options.since !== undefined && m.seq > options.since) &&
         !options.previousRooms?.has(m.roomId)
-      ) continue;
+      ) unlisted.add(m.roomId);
       if (m.membership === 'ban') {
         const feed = await app.server.query(
           'SELECT pos FROM feed WHERE room=? AND seq<=? ORDER BY seq DESC LIMIT 1',
@@ -192,15 +193,13 @@ export async function selectLists(
               );
           }
           if (room === null) return [];
-          const admission = await admitState(room, {
-            userId,
-            point: { seq: c.cut },
-            ceiling: c.cut,
-            allowInvited: c.membership === 'invite',
-            keys: [[type, key]],
-          });
-          const rows = admission.rows;
           if (c.membership === 'invite' || c.membership === 'knock') {
+            // Prejoin display is its own stripped-state contract, not a full
+            // private-state grant. Select its IDs at the captured membership cut.
+            const rows = await stateAtSeq(room, c.cut, undefined, [[
+              type,
+              key,
+            ]]);
             return await prejoinDisplay(
               room,
               rows.map((r) => r.eventId),
@@ -208,6 +207,13 @@ export async function selectLists(
               viewer,
             );
           }
+          const admission = await admitState(room, {
+            userId,
+            point: { seq: c.cut },
+            ceiling: c.cut,
+            keys: [[type, key]],
+          });
+          const rows = admission.rows;
           const out: Json[] = [];
           for (const row of rows) {
             const shown = await renderStateEvent(room, row.eventId, viewer, {
@@ -235,8 +241,7 @@ export async function selectLists(
     if (f.tags !== undefined && !f.tags.some((t) => tags.has(t))) return false;
     if (f.not_tags?.some((t) => tags.has(t))) return false;
     if (f.is_encrypted !== undefined) {
-      const encrypted =
-        typeof (await content(c, 'm.room.encryption')).algorithm === 'string';
+      const encrypted = (await metadata(c, 'm.room.encryption')).length > 0;
       if (encrypted !== f.is_encrypted) return false;
     }
     if (f.room_types !== undefined || f.not_room_types !== undefined) {
@@ -276,7 +281,9 @@ export async function selectLists(
     }
     return true;
   };
-  const ordered = [...candidates.values()].sort((a, b) =>
+  const ordered = [...candidates.values()].filter((c) =>
+    !unlisted.has(c.roomId)
+  ).sort((a, b) =>
     b.activity - a.activity ||
     (a.roomId < b.roomId ? -1 : a.roomId > b.roomId ? 1 : 0)
   );

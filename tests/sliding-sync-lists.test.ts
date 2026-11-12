@@ -373,6 +373,83 @@ suite.test('encryption-only connection does not open rooms or hydrate state/time
   }
 });
 
+suite.test('historical self-left subscriptions are independent from list eligibility', async () => {
+  const { user, create, send } = await fixture('lists-sub-left');
+  const room = await create('Left subscription');
+  await send(room, 'm.room.member', { membership: 'leave' }, user.user_id);
+  const selected = await selectLists(
+    user.user_id,
+    request({ a: {} }, { [room]: {} }),
+  );
+  assertEquals(ids(selected), [], 'old self-leaves stay out of list windows');
+  assertEquals(selected.rooms.get(room)?.candidate.membership, 'leave');
+  assertEquals(selected.listRooms.get('a'), new Set());
+});
+
+suite.test('held invite and knock filters use stripped display even in joined-only rooms', async () => {
+  const { create, send } = await fixture('lists-prejoin-display');
+  const other = await suite.registerTestUser(
+    'lists-prejoin-display-other',
+    'pw',
+  );
+  for (const membership of ['invite', 'knock']) {
+    const room = await create('STRIPPED DISPLAY ' + membership, {
+      preset: 'private_chat',
+    });
+    await send(room, 'm.room.history_visibility', {
+      history_visibility: 'joined',
+    }, '');
+    if (membership === 'knock') {
+      await send(room, 'm.room.join_rules', { join_rule: 'knock' }, '');
+    }
+    await send(
+      room,
+      'm.room.member',
+      { membership },
+      other.user_id,
+      membership === 'knock' ? other.user_id : undefined,
+    );
+    const selected = await selectLists(
+      other.user_id,
+      request({
+        a: { filters: { room_name_like: 'STRIPPED DISPLAY ' + membership } },
+      }),
+    );
+    assertEquals(ids(selected), [room], membership);
+  }
+});
+
+suite.test('redacted encryption state still classifies a room as encrypted', async () => {
+  const { user, create, send } = await fixture('lists-redacted-encryption');
+  const room = await create('Encrypted');
+  const encryption = await send(room, 'm.room.encryption', {
+    algorithm: 'm.megolm.v1.aes-sha2',
+  }, '');
+  assertEquals(encryption.standing, 'accepted');
+  const redaction = await send(room, 'm.room.redaction', {
+    redacts: encryption.eventId,
+  });
+  assertEquals(redaction.standing, 'accepted');
+  assertEquals(
+    ids(
+      await selectLists(
+        user.user_id,
+        request({ a: { filters: { is_encrypted: true } } }),
+      ),
+    ),
+    [room],
+  );
+  assertEquals(
+    ids(
+      await selectLists(
+        user.user_id,
+        request({ a: { filters: { is_encrypted: false } } }),
+      ),
+    ),
+    [],
+  );
+});
+
 suite.test('OOB invitations filter saved hints without provisioning rooms; ignored and rejected invitations disappear', async () => {
   const { app, user } = await fixture('lists-oob');
   const remote = await makeRemoteServer('remote.test');
