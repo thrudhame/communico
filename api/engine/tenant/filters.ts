@@ -70,7 +70,8 @@ export function validateFilterDocument(raw: unknown): void {
   const room = (doc.room ?? {}) as Record<string, unknown>;
   if (
     doc.event_format !== undefined &&
-    !['client', 'federation'].includes(String(doc.event_format))
+    (typeof doc.event_format !== 'string' ||
+      !['client', 'federation'].includes(doc.event_format))
   ) {
     throw bad('event_format');
   }
@@ -316,7 +317,8 @@ export interface RoomEventFilter {
 
 export function roomEventFilterOf(raw: unknown): RoomEventFilter {
   const out: RoomEventFilter = {};
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  if (raw === undefined) return out;
+  validateFilterDocument({ room: { timeline: raw } });
   const r = raw as Record<string, unknown>;
   if (
     typeof r.limit === 'number' && Number.isInteger(r.limit) && r.limit >= 0

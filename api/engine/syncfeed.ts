@@ -286,7 +286,7 @@ async function waitForRelevant(
   i: SyncInputs,
   device: DeviceIdentity | null,
 ): Promise<void> {
-  if (i.since === null || i.timeoutMs <= 0) return;
+  if (i.fullState || i.since === null || i.timeoutMs <= 0) return;
   const app = theApp();
   await waitForSync(app, { timeoutMs: i.timeoutMs }, async () => ({
     relevant: await relevantChanged(i, device),

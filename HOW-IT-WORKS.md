@@ -349,6 +349,15 @@ are not content-filtered. Federation event format crosses the same viewer-aware
 renderer as client format; `event_fields` may receive the spec-permitted superset.
 (`api/engine/tenant/filters.ts`, `api/engine/syncfeed.ts`)
 
+Messages, context and search use that same validated room-event filter rather
+than independently dropping malformed fields. Messages applies the complete
+type/sender/room/URL predicate before its result limit, retaining only scan-cut
+anchors across excluded prefixes. Filter limits can further reduce a page.
+Ordinary sync normalizes omitted presence to online, rejects malformed booleans
+and numeric parameters, and returns full-state requests immediately even with
+a since token and positive timeout.
+(`api/engine/client/{timeline-request,sync-request,timeline}.ts`)
+
 All client timeline rendering crosses one viewer-aware `renderEvent` boundary.
 Its shared visibility policy requires accepted, grounded events; the viewer's
 own membership events are visible without a qualifying join. Other events need
