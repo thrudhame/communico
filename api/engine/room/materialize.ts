@@ -175,10 +175,17 @@ export async function publish(
     if (Number(latest[0].grp) === group) return false;
   } else {
     const opening = await conn.query(
-      `SELECT s.opening_group,
-        (SELECT p.grp FROM publications p WHERE p.stay=s.prev ORDER BY p.change_pos DESC LIMIT 1) AS predecessor_group
+      `WITH RECURSIVE ancestors(id) AS (
+         SELECT prev FROM segments WHERE id = ? AND prev IS NOT NULL
+         UNION
+         SELECT s.prev FROM segments s JOIN ancestors a ON s.id = a.id
+          WHERE s.prev IS NOT NULL
+       )
+       SELECT s.opening_group,
+        (SELECT p.grp FROM publications p WHERE p.stay IN (SELECT id FROM ancestors)
+         ORDER BY p.change_pos DESC LIMIT 1) AS predecessor_group
        FROM segments s WHERE s.id = ?`,
-      [stay],
+      [stay, stay],
     );
     if (opening.length > 0) {
       const baseline = opening[0].predecessor_group ?? opening[0].opening_group;

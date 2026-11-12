@@ -136,7 +136,7 @@ Deno.test('room state: keyed publication journal follows resolved snapshots, not
   }
 });
 
-async function rejoinPublication(extra: boolean) {
+async function rejoinPublication(extra: boolean, unpublishedStays = 0) {
   const dir = await Deno.makeTempDir();
   try {
     await withRoom(dir, async (conn) => {
@@ -156,14 +156,21 @@ async function rejoinPublication(extra: boolean) {
         "INSERT INTO segments(id,kind,status) VALUES(1,'stay','closed')",
       );
       await publish(conn, 1, 1, old);
+      for (let id = 2; id < unpublishedStays + 2; id++) {
+        await conn.execute(
+          "INSERT INTO segments(id,kind,prev,opening_group,status) VALUES(?,'stay',?,?,'closed')",
+          [id, id - 1, old],
+        );
+        assertEquals(await publish(conn, id, id, old), false);
+      }
       const imported = await newGroup(conn, null, [{
         type: 'call',
         state_key: 'key',
         event: '$replacement',
       }]);
       await conn.execute(
-        "INSERT INTO segments(id,kind,prev,opening_group,status) VALUES(2,'stay',1,?,'open')",
-        [imported],
+        "INSERT INTO segments(id,kind,prev,opening_group,status) VALUES(?,'stay',?,?,'open')",
+        [unpublishedStays + 2, unpublishedStays + 1, imported],
       );
       const joined = extra
         ? await newGroup(conn, imported, [{
@@ -173,7 +180,7 @@ async function rejoinPublication(extra: boolean) {
         }])
         : imported;
       assertEquals(
-        await publish(conn, 2, 2, joined),
+        await publish(conn, unpublishedStays + 2, unpublishedStays + 2, joined),
         true,
         'a rejoin publication compares against the predecessor, not its imported opening',
       );
@@ -191,6 +198,12 @@ Deno.test('room state: rejoin snapshot records replacement made during the gap',
   rejoinPublication(false));
 Deno.test('room state: first rejoin delta also records imported replacement made during the gap', () =>
   rejoinPublication(true));
+for (const unpublishedStays of [1, 3]) {
+  Deno.test(`room state: rejoin snapshot crosses ${unpublishedStays} unpublished predecessor stays`, () =>
+    rejoinPublication(false, unpublishedStays));
+  Deno.test(`room state: first rejoin delta crosses ${unpublishedStays} unpublished predecessor stays`, () =>
+    rejoinPublication(true, unpublishedStays));
+}
 
 Deno.test('room state: groups — deltas, removal, dedup, selected-key reads', async () => {
   const dir = await Deno.makeTempDir();
