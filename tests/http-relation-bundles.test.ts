@@ -374,3 +374,58 @@ suite.test('duplicate admission reads room truth even if server relation project
   assertEquals(result.status, 400);
   assertEquals(result.body.errcode, 'M_DUPLICATE_ANNOTATION');
 });
+
+suite.test('ten thousand direct references remain complete and do not make their parent unreadable', async () => {
+  const f = await setup('bundle-many-references');
+  const db = await theApp().store.room(f.room);
+  const prefix = '$many-reference-';
+  await db.tx(async (tx) => {
+    await tx.execute(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10000)
+       INSERT INTO events(id,pdu,type,sender,depth,origin_ts)
+       SELECT ? || i,json_set(e.pdu,'$.event_id',? || i,
+         '$.content."m.relates_to"',json_object('rel_type','m.reference','event_id',e.id)),e.type,e.sender,e.depth,e.origin_ts
+       FROM n,events e WHERE e.id=?`,
+      [prefix, prefix, f.root],
+    );
+    await tx.execute(
+      `INSERT INTO event_status(event,standing,grounding,received_ts)
+      SELECT id,'accepted','grounded',0 FROM events WHERE id LIKE ?`,
+      [prefix + '%'],
+    );
+    await tx.execute(
+      `INSERT INTO event_state(event,before_group,after_group,provenance)
+      SELECT e.id,s.before_group,s.after_group,s.provenance FROM events e,event_state s
+      WHERE e.id LIKE ? AND s.event=?`,
+      [prefix + '%', f.root],
+    );
+    await tx.execute(
+      `INSERT INTO event_topology(event,height) SELECT id,1 FROM events WHERE id LIKE ?`,
+      [prefix + '%'],
+    );
+  });
+  await theApp().server.tx(async (tx) => {
+    await tx.execute(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10000)
+      INSERT INTO event_index(event,room,pos,standing,grounding)
+      SELECT ? || i,?,-i,'accepted','grounded' FROM n`,
+      [prefix, f.room],
+    );
+    await tx.execute(
+      `INSERT INTO relations(event,relates_to,rel_type,room,seq)
+      SELECT event,?,'m.reference',room,pos FROM event_index WHERE room=? AND pos<0`,
+      [f.root, f.room],
+    );
+  });
+  const chunk = (bundles(await f.event())?.['m.reference'] as Json)
+    ?.chunk as Json[];
+  assertEquals(chunk?.length, 10000);
+  assertEquals(new Set(chunk.map((e) => e.event_id)).size, 10000);
+  const page = await ok(
+    f.v1 + '/relations/' + encodeURIComponent(f.root) +
+      '/m.reference?limit=100',
+    f.b.access_token!,
+  );
+  assertEquals((page.chunk as Json[]).length, 100);
+  assertEquals(typeof page.next_batch, 'string');
+});
