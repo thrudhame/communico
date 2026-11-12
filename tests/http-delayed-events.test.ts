@@ -258,3 +258,87 @@ suite.test('stable/unstable state-after use one captured cut and matching wire n
   );
   assert(legacy.body.rooms.join[a.room].state);
 });
+
+for (const unstable of [false, true]) {
+  suite.test(`state-after lazy membership retains third-party changes (${unstable ? 'unstable' : 'stable'})`, async () => {
+    const suffix = unstable ? 'u' : 's';
+    const owner = await fixture('lazy-after-owner-' + suffix);
+    const target = await suite.registerTestUser(
+      'lazy-after-target-' + suffix,
+      'pw',
+    );
+    const viewer = await suite.registerTestUser(
+      'lazy-after-viewer-' + suffix,
+      'pw',
+    );
+    const roomPath = '/_matrix/client/v3/rooms/' +
+      encodeURIComponent(owner.room);
+    for (const user of [target, viewer]) {
+      assertEquals(
+        (await call(roomPath + '/invite', owner.token, 'POST', {
+          user_id: user.user_id,
+        })).status,
+        200,
+      );
+      assertEquals(
+        (await call(roomPath + '/join', user.access_token!, 'POST', {})).status,
+        200,
+      );
+    }
+    const dialect = unstable ? 'org.matrix.msc4222.' : '';
+    const key = dialect + 'state_after';
+    const base = '/_matrix/client/v3/sync?set_presence=offline&' + dialect +
+      'use_state_after=true';
+    const baseline = await call(base, viewer.access_token!);
+    const kick = await call(roomPath + '/kick', owner.token, 'POST', {
+      user_id: target.user_id,
+    });
+    assertEquals(kick.status, 200);
+    for (const filteredTimeline of [false, true]) {
+      const filter = {
+        room: {
+          state: { lazy_load_members: true },
+          timeline: filteredTimeline ? { not_types: ['m.room.member'] } : {},
+        },
+      };
+      const query = base + '&since=' + baseline.body.next_batch + '&filter=' +
+        encodeURIComponent(JSON.stringify(filter));
+      const response = await call(query, viewer.access_token!);
+      assertEquals(response.status, 200);
+      const room = response.body.rooms.join[owner.room];
+      assertEquals(room.timeline.limited, false);
+      assert(
+        room[key].events.some((
+          event: {
+            type: string;
+            state_key: string;
+            content: { membership?: string };
+          },
+        ) =>
+          event.type === 'm.room.member' &&
+          event.state_key === target.user_id &&
+          event.content.membership === 'leave'
+        ),
+        'state-after must retain a changed non-sender membership',
+      );
+      const excluded = await call(
+        query.replace(
+          encodeURIComponent(JSON.stringify(filter)),
+          encodeURIComponent(JSON.stringify({
+            room: {
+              ...filter.room,
+              state: { lazy_load_members: true, not_types: ['m.room.member'] },
+            },
+          })),
+        ),
+        viewer.access_token!,
+      );
+      assertEquals(
+        excluded.body.rooms.join[owner.room][key].events.some((
+          event: { type: string },
+        ) => event.type === 'm.room.member'),
+        false,
+      );
+    }
+  });
+}
