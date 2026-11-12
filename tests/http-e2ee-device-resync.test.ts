@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { wireKey } from '#tests/fixtures/e2ee-wire.ts';
 import { httpSuite, startHttp } from '#tests/http-app.ts';
 import { fedCaller, remoteServer } from '#tests/http-federation.ts';
 import { theApp } from '#engine/app.ts';
@@ -143,7 +144,7 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
     user_id: '',
     device_id: 'D',
     algorithms: [],
-    keys: { 'ed25519:D': 'origin-key' },
+    keys: { 'ed25519:D': wireKey('origin-key') },
     signatures: {},
   };
   const fake = await startFakeServer({
@@ -175,7 +176,14 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
         claims++;
         return Response.json({
           one_time_keys: {
-            [user]: { D: { 'signed_curve25519:one': { key: 'once' } } },
+            [user]: {
+              D: {
+                'signed_curve25519:one': {
+                  key: wireKey('once'),
+                  signatures: {},
+                },
+              },
+            },
           },
         });
       }
@@ -299,7 +307,7 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
     );
     assertEquals(claim.status, 200);
     assertEquals((await claim.json()).one_time_keys[user].D, {
-      'signed_curve25519:one': { key: 'once' },
+      'signed_curve25519:one': { key: wireKey('once'), signatures: {} },
     });
     assertEquals(snapshots, 4);
     assertEquals(claims, 1, 'consuming claim remains one-shot');
@@ -324,7 +332,7 @@ suite.test('single-flight signed snapshot reaches C-S query; malformed and overs
     user_id: user,
     device_id: id,
     algorithms: [],
-    keys: { ['ed25519:' + id]: 'origin-' + id },
+    keys: { ['ed25519:' + id]: wireKey('origin-' + id) },
     signatures: {},
   });
   const fake = await startFakeServer({
@@ -476,7 +484,7 @@ suite.test('single-flight signed snapshot reaches C-S query; malformed and overs
     await recovery;
     const cached = await query();
     assertEquals(Object.keys(cached).sort(), ['D', 'NEW']);
-    assertEquals(cached.NEW.keys, { 'ed25519:NEW': 'origin-NEW' });
+    assertEquals(cached.NEW.keys, { 'ed25519:NEW': wireKey('origin-NEW') });
     assertEquals(
       queries,
       1,

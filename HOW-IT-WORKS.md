@@ -847,6 +847,16 @@ separate.
 (`api/engine/federation/{key-document,keys,witness,keyresolver,auth}.ts`,
 `api/engine/room/verify.ts`, `api/engine/signing-primitives.js`)
 
+Remote E2EE schemas are separate from authenticated-upload validation. Device
+snapshots require keys per device; only that endpoint accepts Synapse's deployed
+null optional signing keys. Queries, claims, snapshots and EDUs share wire key,
+signature and Base64 checks before publication. Malformed claimed keys never
+publish and claims are never retried. Peer failures retain typed unavailable or
+backoff behavior; local admission, cache and persistence faults propagate instead
+of becoming peer outages. Subscriber cancellation does not charge peer backoff.
+(`api/engine/{e2ee-wire,e2ee-remote,e2ee-public-signing}.ts`,
+`api/engine/client/e2ee.ts`, `api/engine/federation/device-lists.ts`)
+
 The shared thumbnail service serves local client, legacy-local and signed
 federation routes. Remote variants fetch signed federation thumbnails before
 bounded local validation/static generation. Cache identity includes format,

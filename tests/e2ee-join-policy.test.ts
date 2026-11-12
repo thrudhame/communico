@@ -70,7 +70,10 @@ Deno.test('E6 remote leave fallback uses completed upstream endpoint status and 
     }),
     handlers: (req) => {
       if (req.path.includes('/make_leave/')) {
-        return Response.json({ event: fr.makeJoinAnswer(user).event });
+        return Response.json({
+          room_version: fr.version,
+          event: fr.makeLeaveAnswer(user).event,
+        });
       }
       if (req.path.includes('/send_leave/')) {
         assert(req.verified);
@@ -182,7 +185,7 @@ Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup
         }
         return Response.json({
           room_version: '11',
-          event: fr.makeJoinAnswer(user).event,
+          event: fr.makeLeaveAnswer(user).event,
         });
       }
       if (req.path.includes('/send_leave/')) {
@@ -617,7 +620,7 @@ Deno.test('E6 interrupted send_join retains visible cleanup across reopen; sende
       if (req.url.pathname.includes('/make_leave/')) {
         return Response.json({
           room_version: '11',
-          event: fr.makeJoinAnswer(user).event,
+          event: fr.makeLeaveAnswer(user).event,
         });
       }
       if (req.url.pathname.includes('/send_leave/')) {

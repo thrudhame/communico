@@ -182,7 +182,9 @@ Deno.test('HTTP E6 unknown joins, aliases, invite acceptance and authoritative e
         const user = decodeURIComponent(req.url.pathname.split('/').at(-1)!);
         return Response.json({
           room_version: '11',
-          event: room.makeJoinAnswer(user).event,
+          event: req.path.includes('/make_leave/')
+            ? room.makeLeaveAnswer(user).event
+            : room.makeJoinAnswer(user).event,
         });
       }
       if (req.path.includes('/send_join/')) {
@@ -316,10 +318,16 @@ Deno.test('E6 production federation startup discovers interrupted join cleanup a
     ourKeyDoc: () => Promise.resolve(tenantKey),
     handlers: (req) => {
       if (req.path.includes('/make_leave/')) {
+        const user = decodeURIComponent(req.url.pathname.split('/').at(-1)!);
+        const roomId = decodeURIComponent(req.url.pathname.split('/').at(-2)!);
         return Response.json({
           room_version: '11',
           event: {
             type: 'm.room.member',
+            room_id: roomId,
+            sender: user,
+            state_key: user,
+            content: { membership: 'leave' },
             prev_events: [],
             auth_events: [],
             depth: 1,

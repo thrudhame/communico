@@ -7,6 +7,13 @@ import {
 } from '#engine/e2ee-public-signing.ts';
 import { domainOf } from '#engine/ids.ts';
 import { abortable } from '#engine/net/abort.ts';
+import {
+  recoverableUpstream,
+  upstreamCategory,
+  upstreamDeadline,
+  UpstreamError,
+} from '#engine/net/upstream-error.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import type { Database } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { onEventStream } from '#engine/server/stream.ts';
@@ -84,21 +91,35 @@ export function deviceListService(
     );
     if (observer === undefined) return;
     await requestDeviceRecovery(db, user);
-    const signal = AbortSignal.any([
-      shutdown.signal,
-      demand,
-      AbortSignal.timeout(config().federation.timeoutms),
-    ]);
+    const signal = upstreamDeadline(
+      AbortSignal.any([
+        shutdown.signal,
+        demand,
+      ]),
+      config().federation.timeoutms,
+    );
     try {
-      await abortable(
-        signal,
-        () =>
-          admit(db, domainOf(user)!, {
-            kind: 'outbound',
-            user: observer,
-            what: 'recover device list',
-          }),
-      );
+      try {
+        await abortable(
+          signal,
+          () =>
+            admit(db, domainOf(user)!, {
+              kind: 'outbound',
+              user: observer,
+              what: 'recover device list',
+            }),
+        );
+      } catch (error) {
+        if (
+          !(error instanceof MatrixError && error.status === 403 &&
+            error.errcode === 'M_FORBIDDEN')
+        ) throw error;
+        throw new UpstreamError('validation', {
+          phase: 'e2ee-admission',
+          reason: 'device recovery refused by policy',
+          cause: error,
+        });
+      }
       const response = await federationRequest(db, tenant.signer(), {
         destination: domainOf(user)!,
         method: 'GET',
@@ -114,15 +135,12 @@ export function deviceListService(
         user,
         config().e2ee,
       );
-      if (await installDeviceSnapshot(db, cut, snapshot, config().e2ee)) {
-        return;
-      }
+      await installDeviceSnapshot(db, cut, snapshot, config().e2ee);
+      // A false installation is a local revision fence, not a peer failure.
+      return;
     } catch (error) {
-      if (!shutdown.signal.aborted && !demand.aborted) {
-        console.error(
-          `device-list[${user}]: snapshot remains stale: ${String(error)}`,
-        );
-      }
+      if (!recoverableUpstream(error, signal)) throw error;
+      if (upstreamCategory(error, signal) === 'cancellation') return;
     }
     if (shutdown.signal.aborted || demand.aborted) return;
     const now = Date.now(), fed = config().federation;
@@ -180,6 +198,7 @@ export function deviceListService(
     try {
       delta = deviceDelta(raw, config().e2ee);
     } catch (e) {
+      if (!(e instanceof UpstreamError)) throw e;
       throw new PermanentEduRefusal('M_BAD_JSON', String(e));
     }
     await acceptDeviceDelta(db, delta, config().e2ee, tenant.serverName);
@@ -194,6 +213,7 @@ export function deviceListService(
     try {
       keys = publicSigning(raw, raw.user_id, config().e2ee);
     } catch (e) {
+      if (!(e instanceof UpstreamError)) throw e;
       throw new PermanentEduRefusal('M_BAD_JSON', String(e));
     }
     try {

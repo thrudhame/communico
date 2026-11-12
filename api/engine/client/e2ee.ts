@@ -3,13 +3,13 @@ import { theApp } from '#engine/app.ts';
 import { config } from '#engine/config.ts';
 import { domainOf, localpartOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { type Json, object, validateUpload } from '#engine/tenant/e2ee.ts';
+import * as wire from '#engine/e2ee-wire.ts';
 import {
-  bounded,
-  type Json,
-  limitEntries,
-  object,
-  validateUpload,
-} from '#engine/tenant/e2ee.ts';
+  protocol,
+  recoverableUpstream,
+  UpstreamError,
+} from '#engine/net/upstream-error.ts';
 import {
   claimRequest,
   localClaim,
@@ -68,9 +68,9 @@ async function remoteKeys(
   requester: string,
 ): Promise<{ keys: Json; signing: Json; count: number }> {
   const limits = config().e2ee;
-  bounded(value, limits.maxrequestbytes);
-  const source = object(
-    object(value, 'response')[claim ? 'one_time_keys' : 'device_keys'],
+  wire.bounded(value, limits.maxrequestbytes);
+  const source = wire.object(
+    wire.object(value, 'response')[claim ? 'one_time_keys' : 'device_keys'],
     'keys',
   );
   const wanted = new Map(requests);
@@ -79,28 +79,28 @@ async function remoteKeys(
   let count = 0;
   for (const [user, devices] of Object.entries(source)) {
     const ids = wanted.get(user);
-    if (ids === undefined) throw new Error('origin returned unrequested user');
+    if (ids === undefined) wire.identity('origin returned unrequested user');
     const result: Json = Object.create(null);
-    for (const [id, raw] of Object.entries(object(devices, 'devices'))) {
+    for (const [id, raw] of Object.entries(wire.object(devices, 'devices'))) {
       if (
         Array.isArray(ids)
           ? ids.length > 0 && !ids.includes(id)
           : !Object.hasOwn(ids, id)
-      ) throw new Error('origin returned unrequested device');
-      limitEntries(++count, limits.maxkeys);
-      bounded(raw, limits.maxkeybytes);
+      ) wire.identity('origin returned unrequested device');
+      wire.limitEntries(++count, limits.maxkeys);
+      wire.bounded(raw, limits.maxkeybytes);
       if (claim) {
-        const entries = Object.entries(object(raw, 'claimed key'));
-        if (entries.length !== 1) throw new Error('invalid claimed key count');
+        const entries = Object.entries(wire.object(raw, 'claimed key'));
+        if (entries.length !== 1) {
+          protocol('e2ee-schema', 'invalid claimed key count');
+        }
         const [keyId, key] = entries[0];
         if (
           !keyId.startsWith((ids as Record<string, string>)[id] + ':') ||
           keyId.endsWith(':')
-        ) throw new Error('invalid claimed algorithm');
-        if (
-          typeof key !== 'string' &&
-          typeof object(key, 'claimed key').key !== 'string'
-        ) throw new Error('invalid claimed material');
+        ) wire.identity('invalid claimed algorithm');
+        const [algorithm] = wire.keyId(keyId);
+        wire.claimedKey(key, algorithm, limits);
         result[id] = raw;
       } else {
         result[id] = publicDeviceKey(raw, user, id, limits, requester);
@@ -109,12 +109,12 @@ async function remoteKeys(
     keys[user] = result;
   }
   if (!claim) {
-    const answer = object(value, 'response');
+    const answer = wire.object(value, 'response');
     for (const field of ['master_keys', 'self_signing_keys']) {
       if (answer[field] === undefined) continue;
-      for (const user of Object.keys(object(answer[field], field))) {
+      for (const user of Object.keys(wire.object(answer[field], field))) {
         if (!wanted.has(user)) {
-          throw new Error('origin returned unrequested signing user');
+          wire.identity('origin returned unrequested signing user');
         }
       }
     }
@@ -130,7 +130,7 @@ async function remoteKeys(
       );
       const publicKeys = await verifiedPublicSigning(supplied, user, limits);
       count += Object.keys(publicKeys).length;
-      limitEntries(count, limits.maxkeys);
+      wire.limitEntries(count, limits.maxkeys);
       mergeViews(signing, signingViews(publicKeys, user, requester));
     }
   }
@@ -212,17 +212,29 @@ async function composed(
   if (timeout === 0) deadline.abort();
   try {
     // Four bounded answers in flight, never one unbounded Promise per user.
-    await Promise.all(
+    const outcomes = await Promise.allSettled(
       Array.from({ length: Math.min(4, groups.size) }, async () => {
         for (const [origin, requests] of iterator) {
           if (deadline.signal.aborted) break;
           try {
-            await abortable(deadline.signal, () =>
-              admit(app.server, origin, {
-                kind: 'outbound',
-                user: requester,
-                what: claim ? 'claim device keys' : 'query device keys',
-              }));
+            try {
+              await abortable(deadline.signal, () =>
+                admit(app.server, origin, {
+                  kind: 'outbound',
+                  user: requester,
+                  what: claim ? 'claim device keys' : 'query device keys',
+                }));
+            } catch (error) {
+              if (
+                !(error instanceof MatrixError && error.status === 403 &&
+                  error.errcode === 'M_FORBIDDEN')
+              ) throw error;
+              throw new UpstreamError('validation', {
+                phase: 'e2ee-admission',
+                reason: 'remote key request refused by policy',
+                cause: error,
+              });
+            }
             const cached: Json = Object.create(null), cachedSigning: Json = {};
             const missing: Requests = [];
             const revisions = new Map<string, number>();
@@ -295,7 +307,7 @@ async function composed(
                       async (state) => {
                         if (
                           state.revision !== revisions.get(user)
-                        ) throw new Error('remote signing keys changed');
+                        ) wire.identity('remote signing keys changed');
                         const key = raw as Json;
                         const id = Object.keys(key.keys as Json)[0].slice(8);
                         return await app.tenant.tx((tx) =>
@@ -317,7 +329,7 @@ async function composed(
               0,
             );
             deadline.signal.throwIfAborted();
-            limitEntries(count + answer.count, limits.maxkeys);
+            wire.limitEntries(count + answer.count, limits.maxkeys);
             const merged = { ...(response[field] as Json), ...answer.keys };
             const remaining = { ...failures };
             delete remaining[origin];
@@ -327,7 +339,7 @@ async function composed(
               failures: remaining,
             };
             mergeViews(next, answer.signing);
-            bounded(
+            wire.bounded(
               next,
               limits.maxrequestbytes,
             );
@@ -336,12 +348,20 @@ async function composed(
             for (const f of Object.keys(answer.signing)) response[f] = next[f];
             delete failures[origin];
             count += answer.count;
-          } catch {
+          } catch (error) {
+            if (!recoverableUpstream(error, deadline.signal)) {
+              deadline.abort(error);
+              throw error;
+            }
             /* Destination failed; keep its bounded reservation. Claims are never retried. */
           }
         }
       }),
     );
+    // Drain all in-flight consumers before exposing a local failure to callers.
+    // Claims are not replayed and no worker outlives its deadline owner.
+    const failed = outcomes.find((outcome) => outcome.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
   } finally {
     clearTimeout(timer);
   }
