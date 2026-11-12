@@ -34,28 +34,12 @@ export async function changedByOther(
   stateKey: string,
   sender: string,
   after: number,
-  initial: string | null,
+  _initial: string | null,
 ): Promise<boolean> {
-  let cursor = after, previous = initial;
-  while (true) {
-    const page = await conn.query(
-      'SELECT change_pos,grp FROM publications WHERE change_pos>? ORDER BY change_pos LIMIT 32',
-      [cursor],
-    );
-    for (const row of page) {
-      cursor = Number(row.change_pos);
-      const id = await groupKey(conn, Number(row.grp), type, stateKey);
-      if (id === previous) continue;
-      previous = id;
-      if (id !== null) {
-        const event = await conn.query('SELECT sender FROM events WHERE id=?', [
-          id,
-        ]);
-        if (event.length && event[0].sender !== sender) return true;
-      }
-    }
-    if (page.length < 32) return false;
-  }
+  return (await conn.query(
+    'SELECT 1 FROM publication_keys WHERE type=? AND state_key=? AND change_pos>? AND sender<>? LIMIT 1',
+    [type, stateKey, after, sender],
+  )).length !== 0;
 }
 
 // Published participation, not a current invite/leave row, proves shared history.

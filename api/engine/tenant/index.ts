@@ -622,6 +622,8 @@ function bind(
         now: number,
       ) => delayedEvents.action(conn, id, action, now),
       next: () => delayedEvents.next(conn),
+      retry: (ids: readonly string[], due: number) =>
+        delayedEvents.retry(conn, ids, due),
       due: (now: number) => delayedEvents.due(conn, now),
       claim: (id: string, now: number) => delayedEvents.claim(conn, id, now),
       submission: (id: string) => delayedEvents.submission(conn, id),

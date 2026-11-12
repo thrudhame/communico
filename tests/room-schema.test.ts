@@ -22,6 +22,7 @@ const TABLES = [
   'state_entries',
   'event_state',
   'publications',
+  'publication_keys',
   'segments',
   'positions',
   'extremities',
@@ -69,7 +70,7 @@ Deno.test('room schema: tables and indexes land on create, version recorded', as
         `missing index ${name}`,
       );
     }
-    assertEquals(await room.query('SELECT v FROM meta'), [{ v: '3' }]);
+    assertEquals(await room.query('SELECT v FROM meta'), [{ v: '4' }]);
     await store.close();
     const again = await openStore(config(dir), {
       schemas: { room: roomSchema },
@@ -97,6 +98,38 @@ Deno.test('room schema: the empty provider refuses a room file and vice versa', 
     );
     await plain.close();
   } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('room schema: v3 upgrade preserves old data and starts the future publication-key journal', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: {
+      room: {
+        version: 3,
+        apply: async (db) => {
+          await roomSchema.apply(db);
+          await db.exec('DROP TABLE publication_keys');
+        },
+      },
+    },
+  });
+  try {
+    const room = await store.room('!upgrade:test', { create: true });
+    await room.execute(
+      "INSERT INTO events(id,pdu,type,sender,depth,origin_ts) VALUES('$old','{}','test','@a:test',1,1)",
+    );
+    await store.close();
+    store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    const upgraded = await store.room('!upgrade:test');
+    assertEquals(await upgraded.query('SELECT id FROM events'), [{
+      id: '$old',
+    }]);
+    assertEquals(await upgraded.query('SELECT * FROM publication_keys'), []);
+    assertEquals(await upgraded.query('SELECT v FROM meta'), [{ v: '4' }]);
+  } finally {
+    await store.close();
     await Deno.remove(dir, { recursive: true });
   }
 });
