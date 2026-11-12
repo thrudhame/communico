@@ -165,13 +165,14 @@ async function roomTimeline(
       );
     const selectedIds = new Set(stateRows.map((r) => r.eventId));
     // Timeline senders need their membership even when unchanged since the
-    // previous cut. Gap membership changes are mandatory, not lazy hints.
+    // previous cut. Gap and incremental state-after membership changes are
+    // mandatory deltas, not lazy hints: timeline state is ignored in that mode.
     stateRows = atStart.filter((r) =>
       r.type !== 'm.room.member'
         ? selectedIds.has(r.eventId)
         : senders.has(r.stateKey) ||
           (mandatoryOwn && r.stateKey === i.userId) ||
-          (limited && i.since !== null &&
+          ((limited || (i.useStateAfter && !i.fullState)) && i.since !== null &&
             previous.get(r.type + '\0' + r.stateKey) !== r.eventId)
     );
   }
