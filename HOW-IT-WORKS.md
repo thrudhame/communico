@@ -374,6 +374,10 @@ back to the prior revision. Latest thread replies retain their own edit/referenc
 bundles. Local annotation duplicate admission reads accepted, grounded room truth
 and its applied redaction log under the existing authoring lock, before a new
 transaction receipt is prepared; retry receipts reconcile before admission.
+Room schema v5 adds the target/sender/type/key annotation expression index for
+that locked lookup, preserving existing PDUs and redaction indexes on upgrade.
+Direct reference bundles remain complete even above the recursive traversal
+budget; only recursive graph expansion applies that budget.
 (`api/engine/client/{relations,relation-view}.ts`, `api/engine/room/order.ts`,
 `api/engine/server/{project,read}.ts`)
 
