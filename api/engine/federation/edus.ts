@@ -57,6 +57,14 @@ export type PresencePush = {
   currently_active: boolean;
 };
 
+// Queue input reflects nullable stored status. The wire schema has an optional
+// string instead: absence clears status remotely, while an empty string is real.
+type PresenceWire = Omit<PresencePush, 'status_msg'> & { status_msg?: string };
+function presenceWire(push: PresencePush): PresenceWire {
+  const { status_msg, ...fields } = push;
+  return status_msg === null ? fields : { ...fields, status_msg };
+}
+
 export type ReceiptMark = {
   roomId: string;
   userId: string;
@@ -219,9 +227,9 @@ export function eduQueues(
     }
     const pq = presenceQ.get(destination);
     if (pq !== undefined && out.length < limit) {
-      const push: PresencePush[] = [];
+      const push: PresenceWire[] = [];
       for (const [k, entry] of pq) {
-        push.push(entry.push);
+        push.push(presenceWire(entry.push));
         pq.delete(k);
       }
       if (pq.size === 0) presenceQ.delete(destination);

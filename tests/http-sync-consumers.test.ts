@@ -9,6 +9,7 @@ import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { seedServer } from '#tests/federation/doc-helper.ts';
 import { fedCaller } from '#tests/http-federation.ts';
 import { remoteEvent, wireOf } from '#tests/fixtures/remote.ts';
+import { type FakeRoom, makeFakeRoom } from '#tests/fixtures/remote-room.ts';
 import { httpSuite } from '#tests/http-app.ts';
 
 type Json = Record<string, unknown>;
@@ -133,6 +134,7 @@ suite.test('HTTP v2 OOB invite exposes is_direct; delivered rejection renders si
   setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
   resetCaCertsForTests();
   let sent: Json | null = null;
+  let fixture: FakeRoom | null = null;
   const fake = await startFakeServer({
     ourKeyDoc: () =>
       Promise.resolve({
@@ -141,8 +143,12 @@ suite.test('HTTP v2 OOB invite exposes is_direct; delivered rejection renders si
       }),
     handlers: (req) => {
       if (req.path.startsWith('/_matrix/federation/v1/make_leave/')) {
+        assert(fixture !== null);
+        const userId = decodeURIComponent(req.path.split('/').pop()!);
+        const { roomVersion, event } = fixture.makeLeaveAnswer(userId);
         return Response.json({
-          event: { prev_events: [], auth_events: [], depth: 2 },
+          room_version: roomVersion,
+          event,
         });
       }
       if (req.path.startsWith('/_matrix/federation/v2/send_leave/')) {
@@ -155,6 +161,7 @@ suite.test('HTTP v2 OOB invite exposes is_direct; delivered rejection renders si
   });
   try {
     const roomId = '!delivered:' + fake.name;
+    fixture = await makeFakeRoom({ roomId, server: fake });
     const event = await remoteEvent(roomId, fake, '11', {
       type: 'm.room.member',
       state_key: user.user_id,
