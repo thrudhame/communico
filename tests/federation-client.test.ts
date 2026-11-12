@@ -12,6 +12,7 @@ import { createHash, X509Certificate } from 'node:crypto';
 import tls from 'node:tls';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { addPeer, removePeer } from '#engine/federation/peers.ts';
 import { resetWellKnownCache, resolve } from '#engine/federation/resolve.ts';
 import {
@@ -289,7 +290,7 @@ Deno.test('client: total deadline includes a blocked raw sink', async () => {
               sink: () =>
                 new WritableStream<Uint8Array>({ write: () => blocked }),
             }),
-          MatrixError,
+          UpstreamError,
         );
         assert(error.message.includes('timeout'), error.message);
         assert(Date.now() - started < 2000);
@@ -298,6 +299,38 @@ Deno.test('client: total deadline includes a blocked raw sink', async () => {
         setConfigForTests({ federation: { timeoutms: previous } });
       }
     }, (req) => req.url.pathname === '/raw' ? new Response('bytes') : null);
+  });
+});
+
+Deno.test('client: valid TLS cannot rename protocol or local sink failures to transport', async () => {
+  const identity = await makeIdentity('sink-errors.test');
+  await withStore(async (store) => {
+    await withFake(identity, async (fake) => {
+      const server = await store.server();
+      for (
+        const fault of [
+          new Error('disk full'),
+          new UpstreamError('protocol', {
+            phase: 'media-multipart',
+            reason: 'invalid envelope',
+          }),
+        ]
+      ) {
+        const result = await federationRequestRaw(server, identity.signer, {
+          destination: `localhost:${fake.port}`,
+          method: 'GET',
+          path: '/bytes',
+          body: null,
+          sink: () =>
+            new WritableStream({
+              write() {
+                throw fault;
+              },
+            }),
+        }).catch((e) => e);
+        assertEquals(result, fault);
+      }
+    }, (req) => req.path === '/bytes' ? new Response('bytes') : null);
   });
 });
 
@@ -386,10 +419,10 @@ Deno.test('client: connect timeout → 502 within connectms + margin', async () 
       method: 'GET',
       path: '/x',
       body: null,
-    }).then(() => 'ok', (e) => e as MatrixError);
+    }).then(() => 'ok', (e: unknown) => e);
     const ms = Date.now() - t0;
-    assert(err instanceof MatrixError);
-    assertEquals(err.status, 502);
+    assert(err instanceof UpstreamError);
+    assertEquals(err.category, 'transport');
     assert(ms < 3000, `took ${ms}ms`);
   });
   setConfigForTests({ federation: { connectms: 5000 } });
@@ -510,10 +543,10 @@ Deno.test('dial: pinned peer → SPKI match round trips; wrong pin → 502', asy
         method: 'GET',
         path: '/x',
         body: null,
-      }).then(() => 'ok', (e: unknown) => e as MatrixError);
-      assert((err as MatrixError) instanceof MatrixError);
-      assertEquals((err as MatrixError).status, 502);
-      assert((err as MatrixError).message.includes('pin'));
+      }).then(() => 'ok', (e: unknown) => e);
+      assert(err instanceof UpstreamError);
+      assertEquals(err.category, 'validation');
+      assert(err.message.includes('pin'));
       await removePeer(server, 'localhost');
     });
   });
@@ -585,10 +618,10 @@ Deno.test('dial: key-is-name peer → raw key equality round trips', async () =>
         method: 'GET',
         path: '/x',
         body: null,
-      }).then(() => 'ok', (e: unknown) => e as MatrixError);
-      assert((err as MatrixError) instanceof MatrixError);
-      assertEquals((err as MatrixError).status, 502);
-      assert((err as MatrixError).message.includes('key'));
+      }).then(() => 'ok', (e: unknown) => e);
+      assert(err instanceof UpstreamError);
+      assertEquals(err.category, 'validation');
+      assert(err.message.includes('key'));
       await removePeer(server, name);
       await removePeer(server, otherName);
     });
@@ -662,7 +695,8 @@ Deno.test('client: caller cancellation closes both CA and pinned sockets during 
             ]);
             assert(
               mode === 'handshake-deadline'
-                ? result instanceof MatrixError &&
+                ? result instanceof UpstreamError &&
+                  result.category === 'transport' &&
                   result.message.includes('timeout')
                 : result instanceof DOMException,
               `${trust}/${mode}: ${result}`,
@@ -803,7 +837,11 @@ Deno.test('client: CA transport verifies configured roots, IP SAN and server ide
             assertEquals(result, 200);
             assertEquals(requests, 1);
           } else {
-            assert(result instanceof MatrixError, kind + ': ' + String(result));
+            assert(
+              result instanceof UpstreamError,
+              kind + ': ' + String(result),
+            );
+            assertEquals(result.category, 'transport');
             assertEquals(
               requests,
               0,

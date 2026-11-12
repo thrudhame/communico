@@ -798,6 +798,23 @@ cache identity or persisted metadata. Legacy serving remains local-only.
 (`api/engine/federation/client.ts`, `api/engine/net/http1.ts`,
 `api/engine/media/{multipart,location,service}.ts`)
 
+The HTTP representation boundary handles informational heads, HTTP field and
+chunk grammar, and gzip/deflate/Brotli content decoding before any consumer.
+Encoded, decoded and intermediate bodies retain the request's byte limit.
+Unsupported codings and malformed HTTP/MIME/metadata JSON are protocol failures, not
+connection failures. Only network primitives classify transport faults; sink
+and store errors remain local, and caller cancellation retains its identity.
+Public Matrix outcome rendering maps typed upstream failures once.
+MIME receivers ignore bounded preambles/epilogues and accept transport padding,
+quoted parameters, folded MIME fields and headerless media parts. The Matrix
+adapter separately requires exactly two parts and object metadata. Binary/7bit/
+8bit transfer encodings preserve octets; other transfer encodings are explicitly
+unsupported rather than cached as original bytes. No cache entry is published
+before complete envelope validation. Remote filenames use RFC8187 UTF-8 language
+tags and preserve quoted spaces before the existing filename sanitization.
+(`api/engine/net/{upstream-error,fields,json,http1}.ts`,
+`api/engine/media/{multipart,service}.ts`)
+
 The shared thumbnail service serves local client, legacy-local and signed
 federation routes. Remote variants fetch signed federation thumbnails before
 bounded local validation/static generation. Cache identity includes format,

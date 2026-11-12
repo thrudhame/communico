@@ -14,7 +14,7 @@
 import tls from 'node:tls';
 import { createHash, X509Certificate } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { MatrixError } from '#engine/matrix-error.ts';
+import { networkOperation, UpstreamError } from '#engine/net/upstream-error.ts';
 import {
   type Http1Response,
   http1Wire,
@@ -164,7 +164,12 @@ function connectWithDeadline(opts: {
     const timer = setTimeout(() => {
       cleanup();
       sock.destroy();
-      reject(new Error(`connect timeout after ${opts.connectMs}ms`));
+      reject(
+        new UpstreamError('transport', {
+          phase: 'connect',
+          reason: 'upstream connect timeout',
+        }),
+      );
     }, opts.connectMs);
     sock.once('secureConnect', () => {
       cleanup();
@@ -185,11 +190,17 @@ function spkiSha256(raw: Uint8Array): string {
 
 export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
   opts.signal?.throwIfAborted();
-  const deadline = Date.now() + opts.timeoutMs;
   let conn: NodeTlsConn | null = null;
   const ac = new AbortController();
   const cancel = () => {
-    ac.abort();
+    ac.abort(
+      opts.signal?.aborted
+        ? opts.signal.reason
+        : new UpstreamError('transport', {
+          phase: 'deadline',
+          reason: 'upstream timeout',
+        }),
+    );
     try {
       if (conn !== null) conn.close();
     } catch { /* already closed */ }
@@ -200,14 +211,19 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
     opts.timeoutMs,
   );
   try {
-    const sock = await connectWithDeadline({
-      connectIp: opts.connectIp,
-      port: opts.port,
-      sni: opts.sni,
-      connectMs: opts.connectMs,
-      signal: ac.signal,
-      trust: opts.trust,
-    });
+    const sock = await networkOperation(
+      'tls',
+      ac.signal,
+      () =>
+        connectWithDeadline({
+          connectIp: opts.connectIp,
+          port: opts.port,
+          sni: opts.sni,
+          connectMs: opts.connectMs,
+          signal: ac.signal,
+          trust: opts.trust,
+        }),
+    );
     conn = new NodeTlsConn(sock);
     opts.signal?.throwIfAborted();
     ac.signal.throwIfAborted();
@@ -222,40 +238,60 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
         : undefined;
       if (raw === undefined || raw.length === 0) {
         conn.close();
-        throw new MatrixError(
-          502,
-          'M_UNKNOWN',
-          'peer presented no certificate',
-        );
+        throw new UpstreamError('validation', {
+          phase: 'tls-identity',
+          reason: 'peer presented no certificate',
+        });
       }
       if (opts.trust.kind === 'pinned') {
         const got = spkiSha256(new Uint8Array(raw));
         if (got !== opts.trust.spkiSha256) {
           conn.close();
-          throw new MatrixError(
-            502,
-            'M_UNKNOWN',
-            'peer certificate does not match the roster pin',
-          );
+          throw new UpstreamError('validation', {
+            phase: 'tls-identity',
+            reason: 'peer certificate does not match the roster pin',
+          });
         }
       } else {
         const x = new X509Certificate(raw);
         const spki = x.publicKey.export({ type: 'spki', format: 'der' });
-        const rawKey = new Uint8Array(spki.subarray(12));
+        const prefix = new Uint8Array([
+          0x30,
+          0x2a,
+          0x30,
+          0x05,
+          0x06,
+          0x03,
+          0x2b,
+          0x65,
+          0x70,
+          0x03,
+          0x21,
+          0x00,
+        ]);
+        const ed25519 = x.publicKey.asymmetricKeyType === 'ed25519' &&
+          spki.length === 44 && prefix.every((b, i) => spki[i] === b);
+        const rawKey = new Uint8Array(spki.subarray(prefix.length));
         const expected = opts.trust.pubkey;
-        const matches = rawKey.length === expected.length &&
+        const matches = ed25519 && rawKey.length === expected.length &&
           rawKey.every((b, i) => b === expected[i]);
         if (!matches) {
           conn.close();
-          throw new MatrixError(
-            502,
-            'M_UNKNOWN',
-            'peer certificate does not match the key-is-name key',
-          );
+          throw new UpstreamError('validation', {
+            phase: 'tls-identity',
+            reason: 'peer certificate does not match the key-is-name key',
+          });
         }
       }
     }
-    return await http1Wire(conn as WireConn, {
+    const connected = conn;
+    const network: WireConn = {
+      read: (p) => networkOperation('read', ac.signal, () => connected.read(p)),
+      write: (p) =>
+        networkOperation('write', ac.signal, () => connected.write(p)),
+      close: () => connected.close(),
+    };
+    return await http1Wire(network, {
       method: opts.method,
       path: opts.path,
       hostHeader: opts.hostHeader,
@@ -265,13 +301,6 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
       sink: opts.sink,
       signal: ac.signal,
     });
-  } catch (e) {
-    opts.signal?.throwIfAborted();
-    if (e instanceof MatrixError) throw e;
-    if (Date.now() >= deadline) {
-      throw new MatrixError(502, 'M_UNKNOWN', 'upstream timeout');
-    }
-    throw new MatrixError(502, 'M_UNKNOWN', 'upstream connection failed');
   } finally {
     opts.signal?.removeEventListener('abort', cancel);
     clearTimeout(totalTimer);

@@ -1,6 +1,6 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { http1Wire } from '#engine/net/http1.ts';
-import { MatrixError } from '#engine/matrix-error.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 
 const enc = new TextEncoder();
 function wire(raw: string, chunk = 7) {
@@ -87,7 +87,7 @@ Deno.test('http1 streaming: framing rejects ambiguity, malformed chunks and miss
   ) {
     await assertRejects(
       () => http1Wire(wire('HTTP/1.1 200 OK\r\n' + body, 1), opts),
-      MatrixError,
+      UpstreamError,
     );
   }
 });
@@ -112,7 +112,7 @@ Deno.test('http1 streaming: sink aborts on truncated/oversize input and sink fai
     };
     await assertRejects(
       () => http1Wire(wire('HTTP/1.1 200 OK\r\n' + body), request),
-      MatrixError,
+      UpstreamError,
     );
     // Declared oversize is rejected before opening the sink; chunked oversize
     // is discovered after its lifetime has begun and must abort that writer.

@@ -4,7 +4,7 @@
 // leaked sockets (the test server counts its own open sockets).
 import { assert, assertEquals } from '@std/assert';
 import { http1Request } from '#engine/net/http1.ts';
-import { MatrixError } from '#engine/matrix-error.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 
 type RawServer = {
   port: number;
@@ -204,8 +204,9 @@ Deno.test('http1: oversized headers error at the cap', async () => {
     await get(srv.port);
     throw new Error('expected an error');
   } catch (e) {
-    assert(e instanceof MatrixError);
-    assert((e as MatrixError).message.includes('headers too large'));
+    assert(e instanceof UpstreamError);
+    assertEquals(e.category, 'validation');
+    assert(e.message.includes('headers too large'));
   } finally {
     srv.close();
   }
@@ -226,8 +227,9 @@ Deno.test('http1: malformed chunk size errors, no hang', async () => {
     await get(srv.port, { timeoutMs: 1500 });
     throw new Error('expected an error');
   } catch (e) {
-    assert(e instanceof MatrixError);
-    assert((e as MatrixError).message.includes('bad chunk size'));
+    assert(e instanceof UpstreamError);
+    assertEquals(e.category, 'protocol');
+    assert(e.message.includes('bad chunk size'));
   } finally {
     srv.close();
   }
@@ -255,10 +257,11 @@ Deno.test('http1: slow-loris body fires the total timeout', async () => {
     throw new Error('expected an error');
   } catch (e) {
     const ms = Date.now() - t0;
-    assert(e instanceof MatrixError);
+    assert(e instanceof UpstreamError);
+    assertEquals(e.category, 'transport');
     assert(
-      (e as MatrixError).message.includes('timeout'),
-      `message: ${(e as MatrixError).message}`,
+      e.message.includes('timeout'),
+      `message: ${e.message}`,
     );
     assert(ms < 3000, `took ${ms}ms`);
   } finally {
@@ -281,8 +284,9 @@ Deno.test('http1: Content-Length over maxBytes errors immediately', async () => 
     await get(srv.port, { maxBytes: 1024 });
     throw new Error('expected an error');
   } catch (e) {
-    assert(e instanceof MatrixError);
-    assertEquals((e as MatrixError).errcode, 'M_TOO_LARGE');
+    assert(e instanceof UpstreamError);
+    assertEquals(e.category, 'validation');
+    assertEquals(e.context.resourceLimit, true);
   } finally {
     srv.close();
   }
@@ -309,8 +313,9 @@ Deno.test('http1: EOF body over maxBytes errors after exactly maxBytes, before E
     throw new Error('expected an error');
   } catch (e) {
     const ms = Date.now() - t0;
-    assert(e instanceof MatrixError);
-    assertEquals((e as MatrixError).errcode, 'M_TOO_LARGE');
+    assert(e instanceof UpstreamError);
+    assertEquals(e.category, 'validation');
+    assertEquals(e.context.resourceLimit, true);
     assert(ms < 900, `took ${ms}ms — did not stop after exactly maxBytes`);
   } finally {
     srv.close();
@@ -330,7 +335,9 @@ Deno.test('http1: connection closed mid-headers errors', async () => {
     await get(srv.port);
     throw new Error('expected an error');
   } catch (e) {
-    assert(e instanceof MatrixError);
+    assert(e instanceof UpstreamError);
+    assertEquals(e.category, 'protocol');
+    assertEquals(e.context.reason, 'upstream headers truncated');
   } finally {
     srv.close();
   }
@@ -356,7 +363,8 @@ Deno.test('http1: connect timeout on a blackholed address', async () => {
     throw new Error('expected an error');
   } catch (e) {
     const ms = Date.now() - t0;
-    assert(e instanceof MatrixError);
+    assert(e instanceof UpstreamError);
+    assertEquals(e.category, 'transport');
     assert(ms < 3000, `took ${ms}ms`);
   }
 });
@@ -391,7 +399,8 @@ Deno.test('http1: the total deadline closes a stalled upgraded TLS connection', 
         timer = setTimeout(() => resolve('stalled'), 750);
       }),
     ]);
-    assert(outcome instanceof MatrixError, String(outcome));
+    assert(outcome instanceof UpstreamError, String(outcome));
+    assertEquals(outcome.category, 'transport');
     assert(outcome.message.includes('timeout'));
   } finally {
     clearTimeout(timer);

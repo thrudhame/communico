@@ -5,6 +5,13 @@ import {
 import { abortable } from '#engine/net/abort.ts';
 import { cidrContains, parseCidr, parseIp } from '#engine/preview/cidr.ts';
 import type { MediaPart } from './multipart.ts';
+import {
+  limit,
+  protocol,
+  upstreamDeadline,
+  UpstreamError,
+  UpstreamHttpError,
+} from '#engine/net/upstream-error.ts';
 
 export type LocationPolicy = {
   maxBytes: number;
@@ -40,17 +47,14 @@ export async function fetchLocation(
   policy: LocationPolicy,
   deps: Deps = {},
 ): Promise<MediaPart> {
-  const bounded = AbortSignal.any([
-    signal,
-    AbortSignal.timeout(policy.timeoutMs),
-  ]);
+  const bounded = upstreamDeadline(signal, policy.timeoutMs);
   const allowed = policy.allowlist.map((c) => parseCidr(c)!);
   const blocked = policy.blocklist.map((c) => parseCidr(c)!);
   let url: URL;
   try {
     url = new URL(rawUrl);
   } catch {
-    throw new Error('invalid media Location');
+    protocol('media-location', 'invalid media Location');
   }
   let budget = policy.maxBytes;
   for (let hop = 0; hop <= policy.maxRedirects; hop++) {
@@ -58,19 +62,34 @@ export async function fetchLocation(
     if (
       url.protocol !== 'https:' || url.username || url.password || url.hash ||
       url.href.length > 8192
-    ) throw new Error('invalid media Location');
+    ) {
+      throw new UpstreamError('validation', {
+        phase: 'media-location',
+        reason: 'media Location refused by HTTPS/credential/fragment policy',
+      });
+    }
     const host = url.hostname.replace(/^\[|\]$/g, '');
     const ips = await abortable(
       bounded,
       () => (deps.resolve ?? resolve)(host, bounded),
     );
-    if (!ips.length) throw new Error('media Location has no address');
+    if (!ips.length) {
+      throw new UpstreamError('transport', {
+        phase: 'dns',
+        reason: 'media Location has no address',
+      });
+    }
     for (const ip of ips) {
       if (
         !parseIp(ip) ||
         (!allowed.some((c) => cidrContains(c, ip)) &&
           blocked.some((c) => cidrContains(c, ip)))
-      ) throw new Error('media Location address blocked');
+      ) {
+        throw new UpstreamError('validation', {
+          phase: 'media-location',
+          reason: 'media Location address blocked',
+        });
+      }
     }
     let size = 0;
     const opts: DialOpts = {
@@ -94,7 +113,7 @@ export async function fetchLocation(
             size += chunk.length;
             budget -= chunk.length;
             if (budget < 0 || (writer === null && size > 16384)) {
-              throw new Error('media Location response too large');
+              limit('media-location', 'media Location response too large');
             }
             if (writer) await writer.write(chunk);
           },
@@ -114,17 +133,17 @@ export async function fetchLocation(
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const next = response.headers.get('location');
       if (next === null) {
-        throw new Error('media Location redirect has no target');
+        protocol('media-location', 'media Location redirect has no target');
       }
       try {
         url = new URL(next, url);
       } catch {
-        throw new Error('invalid media Location redirect');
+        protocol('media-location', 'invalid media Location redirect');
       }
       continue;
     }
     if (response.status !== 200) {
-      throw new Error('media Location returned a non-200 response');
+      throw new UpstreamHttpError(response.status, 'media-location');
     }
     return {
       contentType: response.headers.get('content-type') ??
@@ -134,5 +153,5 @@ export async function fetchLocation(
       size,
     };
   }
-  throw new Error('too many media Location redirects');
+  limit('media-location', 'too many media Location redirects');
 }

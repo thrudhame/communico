@@ -1,13 +1,15 @@
 // A bounded two-part Matrix media envelope. Bytes remain unpublished until
 // the *whole* envelope has closed; a malformed tail aborts the disk writer.
+import { field, fieldText, mediaType } from '#engine/net/fields.ts';
+import { decodeJson, objectOf } from '#engine/net/json.ts';
+import { limit, protocol } from '#engine/net/upstream-error.ts';
 const enc = new TextEncoder();
-const dec = new TextDecoder('utf-8', { fatal: true });
 const HEADER_LIMIT = 16384;
 const METADATA_LIMIT = 65536;
 export const MEDIA_ENVELOPE_LIMIT = 2 * HEADER_LIMIT + METADATA_LIMIT + 1024;
 
 function invalid(): never {
-  throw new Error('invalid federation media envelope');
+  protocol('media-multipart', 'invalid federation media envelope');
 }
 function indexOf(bytes: Uint8Array, needle: Uint8Array, from = 0): number {
   outer: for (let i = from; i <= bytes.length - needle.length; i++) {
@@ -20,10 +22,22 @@ function indexOf(bytes: Uint8Array, needle: Uint8Array, from = 0): number {
 }
 function headers(bytes: Uint8Array): Headers {
   const result = new Headers();
-  for (const line of dec.decode(bytes).split('\r\n')) {
-    const m = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*([^\r\n\0]*)$/.exec(line);
-    if (!m || result.has(m[1])) invalid();
-    result.set(m[1], m[2].trim());
+  if (bytes.length === 0) return result;
+  // MIME permits continuation lines, unlike HTTP response heads. Decode the
+  // field octets directly rather than interpreting them as UTF-8 text.
+  const text = fieldText(bytes).replace(/\r\n[ \t]+/g, ' ');
+  for (const line of text.split('\r\n')) {
+    const [name, value] = field(line, 'media-multipart');
+    if (
+      result.has(name) &&
+      [
+        'content-type',
+        'content-disposition',
+        'content-transfer-encoding',
+        'location',
+      ].includes(name)
+    ) invalid();
+    result.append(name, value);
   }
   return result;
 }
@@ -94,15 +108,20 @@ export function mediaMultipart(
   output: WritableStream<Uint8Array>,
   maxBytes: number,
 ): { stream: WritableStream<Uint8Array>; result: MediaPart } {
-  // RFC boundary alphabet, quoted or token; reject duplicate/unknown parameters.
-  const match =
-    /^multipart\/mixed\s*;\s*boundary=(?:"([0-9A-Za-z'()+_,.\/:=? -]{1,70})"|([0-9A-Za-z'()+_,.\/:=?-]{1,70}))\s*$/i
-      .exec(contentType);
-  if (!match || !Number.isSafeInteger(maxBytes) || maxBytes < 0) invalid();
-  const boundary = match[1] ?? match[2];
-  if (boundary.endsWith(' ')) invalid();
-  const opening = enc.encode('--' + boundary + '\r\n');
+  const type = mediaType(contentType);
+  const boundaries = type.parameters.get('boundary');
+  if (
+    type.value !== 'multipart/mixed' || boundaries?.length !== 1 ||
+    !Number.isSafeInteger(maxBytes) || maxBytes < 0
+  ) invalid();
+  const boundary = boundaries[0];
+  if (
+    !/^[0-9A-Za-z'()+_,.\/:=? -]{1,70}$/.test(boundary) ||
+    boundary.endsWith(' ')
+  ) invalid();
+  const opening = enc.encode('--' + boundary);
   const delimiter = enc.encode('\r\n--' + boundary);
+  const newline = enc.encode('\r\n');
   const headerEnd = enc.encode('\r\n\r\n');
   const writer = output.getWriter();
   const result: MediaPart = {
@@ -128,65 +147,124 @@ export function mediaMultipart(
     buffer = buffer.slice(n);
     if (envelope) {
       envelopeBytes += n;
-      if (envelopeBytes > MEDIA_ENVELOPE_LIMIT) invalid();
+      if (envelopeBytes > MEDIA_ENVELOPE_LIMIT) {
+        limit('media-multipart', 'media envelope exceeds byte limit');
+      }
     }
   }
   async function bytes(n: number) {
     if (part === 0) {
       metadataBytes += n;
-      if (metadataBytes > METADATA_LIMIT) invalid();
+      if (metadataBytes > METADATA_LIMIT) {
+        limit('media-multipart', 'media metadata exceeds byte limit');
+      }
       metadata.push(buffer.slice(0, n));
       consume(n);
     } else {
       result.size += n;
-      if (result.size > maxBytes || (result.location !== null && n > 0)) {
-        invalid();
+      if (result.size > maxBytes) {
+        limit('media-multipart', 'media exceeds byte limit');
       }
+      if (result.location !== null && n > 0) invalid();
       if (n) await writer.write(buffer.slice(0, n));
       consume(n, false);
     }
   }
-  async function drain() {
+  // A delimiter is a complete MIME line, not merely a matching byte prefix.
+  // null means the suffix needs more bytes; false means payload lookalike.
+  function boundaryLine(
+    at: number,
+    marker: Uint8Array,
+    eof: boolean,
+  ): { final: boolean; length: number } | null | false {
+    let end = at + marker.length;
+    if (end >= buffer.length) return eof ? false : null;
+    let final = false;
+    if (buffer[end] === 45) {
+      if (end + 1 >= buffer.length) return eof ? false : null;
+      if (buffer[end + 1] !== 45) return false;
+      final = true;
+      end += 2;
+    }
+    while (buffer[end] === 32 || buffer[end] === 9) {
+      end++;
+      if (end - at > HEADER_LIMIT) {
+        limit('media-multipart', 'delimiter line exceeds byte limit');
+      }
+    }
+    if (end === buffer.length) {
+      return final && eof ? { final, length: end - at } : eof ? false : null;
+    }
+    if (buffer[end] !== 13) return false;
+    if (end + 1 === buffer.length) return eof ? false : null;
+    return buffer[end + 1] === 10 ? { final, length: end + 2 - at } : false;
+  }
+  async function drain(eof = false) {
     while (true) {
       if (state === 'opening') {
-        if (buffer.length < opening.length) return;
-        if (indexOf(buffer, opening) !== 0) invalid();
-        consume(opening.length);
-        state = 'headers';
-      } else if (state === 'headers') {
-        const end = indexOf(buffer, headerEnd);
+        if (indexOf(buffer, opening) === 0) {
+          const line = boundaryLine(0, opening, eof);
+          if (line === null) return;
+          if (line !== false) {
+            if (line.final) invalid();
+            consume(line.length);
+            state = 'headers';
+            continue;
+          }
+        }
+        const end = indexOf(buffer, newline);
         if (end < 0) {
-          if (buffer.length > HEADER_LIMIT) invalid();
+          if (buffer.length + envelopeBytes > MEDIA_ENVELOPE_LIMIT) {
+            limit('media-multipart', 'preamble exceeds byte limit');
+          }
           return;
         }
-        if (end > HEADER_LIMIT) invalid();
+        consume(end + 2);
+      } else if (state === 'headers') {
+        const empty = buffer[0] === 13 && buffer[1] === 10;
+        const end = empty ? 0 : indexOf(buffer, headerEnd);
+        if (end < 0) {
+          if (buffer.length > HEADER_LIMIT) {
+            limit('media-multipart', 'part headers exceed byte limit');
+          }
+          return;
+        }
+        if (end > HEADER_LIMIT) {
+          limit('media-multipart', 'part headers exceed byte limit');
+        }
         const h = headers(buffer.subarray(0, end));
+        // HTTP carries binary octets already. Identity MIME encodings preserve
+        // them; never cache base64/quoted-printable text as the original media.
+        const cte = h.get('content-transfer-encoding')?.toLowerCase();
+        if (cte !== undefined && !['binary', '8bit', '7bit'].includes(cte)) {
+          protocol('media-multipart', 'unsupported content-transfer-encoding');
+        }
         if (part === 0) {
           if (
-            !/^application\/json(?:\s*;|$)/i.test(
-              h.get('content-type') ?? '',
-            ) || h.has('location')
+            mediaType(h.get('content-type') ?? '').value !==
+              'application/json' || h.has('location')
           ) invalid();
         } else {
           result.contentType = h.get('content-type') ??
             'application/octet-stream';
+          mediaType(result.contentType);
           result.disposition = h.get('content-disposition');
           result.location = h.get('location');
           if (result.location === '') invalid();
         }
-        consume(end + 4);
+        consume(end + (empty ? 2 : 4));
         state = 'body';
       } else if (state === 'body') {
         let at = indexOf(buffer, delimiter);
         // Boundary-like payload bytes are legal unless the suffix is a delimiter.
+        let line: ReturnType<typeof boundaryLine> = false;
         while (at >= 0) {
-          if (buffer.length < at + delimiter.length + 2) {
+          line = boundaryLine(at, delimiter, eof);
+          if (line === null) {
             if (at) await bytes(at);
             return;
           }
-          const a = buffer[at + delimiter.length],
-            b = buffer[at + delimiter.length + 1];
-          if ((a === 45 && b === 45) || (a === 13 && b === 10)) break;
+          if (line !== false) break;
           at = indexOf(buffer, delimiter, at + 1);
         }
         if (at < 0) {
@@ -195,8 +273,9 @@ export function mediaMultipart(
           return;
         }
         await bytes(at);
-        const final = buffer[delimiter.length] === 45;
-        consume(delimiter.length + 2);
+        if (line === false || line === null) invalid();
+        const final = line.final;
+        consume(line.length);
         if (part === 0) {
           if (final) invalid();
           const joined = new Uint8Array(metadataBytes);
@@ -205,10 +284,7 @@ export function mediaMultipart(
             joined.set(chunk, offset);
             offset += chunk.length;
           }
-          const value = JSON.parse(dec.decode(joined));
-          if (!value || typeof value !== 'object' || Array.isArray(value)) {
-            invalid();
-          }
+          objectOf(decodeJson(joined, 'application/json'), 'media-metadata');
           metadata = [];
           part = 1;
           state = 'headers';
@@ -217,10 +293,7 @@ export function mediaMultipart(
           state = 'end';
         }
       } else {
-        if (
-          buffer.length > 2 || (buffer.length > 0 && buffer[0] !== 13) ||
-          (buffer.length > 1 && buffer[1] !== 10)
-        ) invalid();
+        consume(buffer.length); // RFC2046 epilogue is ignored, but still bounded.
         return;
       }
     }
@@ -244,8 +317,8 @@ export function mediaMultipart(
     },
     async close() {
       try {
-        await drain();
-        if (state !== 'end' || (buffer.length !== 0 && buffer.length !== 2)) {
+        await drain(true);
+        if (state !== 'end') {
           invalid();
         }
         await writer.close();
