@@ -1,5 +1,4 @@
 // Protocol room payloads compose existing publication, display and live-window owners.
-import { theApp } from '#engine/app.ts';
 import { heldRoom, stateAtSeq, type StateRow } from '#engine/client/read.ts';
 import {
   admitState,
@@ -11,16 +10,16 @@ import {
   type Viewer,
 } from '#engine/client/render.ts';
 import { syncWindow } from '#engine/client/sync-window.ts';
+import { StateDelivery } from '#engine/client/state-delivery.ts';
 import { formatStreamToken } from '#engine/client/tokens.ts';
+import type { Room } from '#engine/room/index.ts';
 import {
   prejoinDisplay,
   savedPrejoinDisplay,
   stripPrejoin,
 } from '#engine/federation/prejoin.ts';
-import type { Room } from '#engine/room/index.ts';
 import { formatCursor } from '#engine/room/segments.ts';
 import type { ListSelection } from './lists.ts';
-import { requiredState } from './state.ts';
 import type { RoomConfig } from './types.ts';
 import type { Counts } from '#engine/server/notifications.ts';
 
@@ -45,28 +44,6 @@ const bumpTypes = [
   'm.poll.start',
   'm.beacon_info',
 ];
-
-async function rejoined(
-  room: Room,
-  viewer: Viewer,
-  previous: SentRoom,
-  end: number,
-) {
-  if (previous.membership !== 'join') return true;
-  // A profile-only join is not a rejoin. Translate both feed cuts before looking
-  // for a real intervening departure, even if a later profile superseded it.
-  const cuts = await theApp().server.query(
-    'SELECT (SELECT pos FROM feed WHERE room=? AND seq<=? ORDER BY seq DESC LIMIT 1) AS a, (SELECT pos FROM feed WHERE room=? AND seq<=? ORDER BY seq DESC LIMIT 1) AS b',
-    [room.id, previous.cut, room.id, end],
-  );
-  return await room.tx((tx) =>
-    tx.state.membershipInterrupted(
-      viewer.userId,
-      Number(cuts[0].a ?? 0),
-      Number(cuts[0].b ?? 0),
-    )
-  );
-}
 
 async function metadata(
   room: Room,
@@ -171,16 +148,24 @@ export async function roomPayloads(
       throw new Error('room exceeds captured event cut');
     }
     const prejoin = c.membership === 'invite' || c.membership === 'knock';
-    let initial = previous === undefined;
-    if (
-      !prejoin && c.membership === 'join' && previous &&
-      (c.cut > previous.cut || previous.membership !== 'join')
-    ) {
-      initial = await rejoined(room!, viewer, previous, c.cut);
-    }
+    const admission = !prejoin && !c.departure && room !== null
+      ? await admitState(room, {
+        userId: viewer.userId,
+        ceiling: c.cut,
+        point: { seq: c.cut },
+      })
+      : null;
+    const delivery = admission === null || room === null
+      ? null
+      : await StateDelivery.capture(room, viewer.userId, {
+        protocol: 'sliding',
+        previous,
+      }, Math.min(c.cut, admission.seq));
+    const initial = delivery?.reset ?? previous === undefined;
     const entry: Json = { ...(initial ? { initial: true } : {}) };
     let meta: Json;
     let members: Record<string, string> = {};
+    let requiredCoverage = config.requiredState;
     let effectiveLimit = config.timelineLimit;
     let end = c.cut;
     if (c.departure) {
@@ -193,22 +178,14 @@ export async function roomPayloads(
         sender: departure.sender,
         originTs: departure.origin_server_ts,
       };
-      const required = requiredState({
-        rows: [row],
-        before: [],
+      const required = StateDelivery.departure(id, viewer.userId, row, {
+        previous,
         required: config.requiredState,
-        previousRequired: previous?.config.requiredState ?? [],
-        userId: viewer.userId,
-        timeline: [],
-        initial,
-        limited: false,
-        members: previous?.members ?? {},
       });
-      if (required.rows.length) {
-        entry.required_state = [
-          renderPrejoinDeparture(departure, viewer.userId, 'client'),
-        ];
-      }
+      const rendered = required.rows.length
+        ? [renderPrejoinDeparture(departure, viewer.userId, 'client')]
+        : [];
+      if (rendered.length) entry.required_state = rendered;
       if (config.timelineLimit > 0 && c.seq > (previous?.timelineCut ?? 0)) {
         entry.timeline = [
           renderPrejoinDeparture(departure, viewer.userId, 'client'),
@@ -218,7 +195,7 @@ export async function roomPayloads(
           input.requestSince !== null && c.seq > input.requestSince ? 1 : 0;
         // A saved prejoin departure has no room-history pagination cursor.
       }
-      members = required.members;
+      ({ members, required: requiredCoverage } = required.rendered(rendered));
       meta = {
         bump_stamp: c.seq,
         ...(dm.has(id) || previous?.metadata.is_dm === true
@@ -248,12 +225,7 @@ export async function roomPayloads(
         );
       meta = { invite_state: hints, ...(dm.has(id) ? { is_dm: true } : {}) };
     } else {
-      if (room === null) continue;
-      const admission = await admitState(room, {
-        userId: viewer.userId,
-        ceiling: c.cut,
-        point: { seq: c.cut },
-      });
+      if (room === null || admission === null || delivery === null) continue;
       end = Math.min(c.cut, admission.seq);
       const expanded = !initial && previous !== undefined &&
         config.timelineLimit > previous.config.timelineLimit;
@@ -280,22 +252,10 @@ export async function roomPayloads(
           : window.rows.filter((r) => r.seq > input.requestSince!).length;
       }
       if (expanded) entry.unstable_expanded_timeline = true;
-      const rows = admission.rows;
-      const before = initial ? [] : (await admitState(room, {
-        userId: viewer.userId,
-        ceiling: previous!.cut,
-        point: { seq: previous!.cut },
-      })).rows;
-      const required = requiredState({
-        rows,
-        before,
+      const required = delivery.required(admission, {
         required: config.requiredState,
-        previousRequired: initial ? [] : previous!.config.requiredState,
-        userId: viewer.userId,
         timeline: window.events,
-        initial,
         limited,
-        members: initial ? {} : previous!.members,
       });
       const state: Json[] = [];
       for (const row of required.rows) {
@@ -306,7 +266,7 @@ export async function roomPayloads(
         if (event !== null) state.push(event);
       }
       if (state.length) entry.required_state = state;
-      members = required.members;
+      ({ members, required: requiredCoverage } = required.rendered(state));
       const bump = c.membership === 'join'
         ? (await syncWindow(room, viewer, {
           since: 0,
@@ -363,7 +323,7 @@ export async function roomPayloads(
       membership: c.membership,
       membershipEvent: c.eventId,
       config: {
-        requiredState: config.requiredState,
+        requiredState: requiredCoverage,
         timelineLimit: effectiveLimit,
       },
       members,

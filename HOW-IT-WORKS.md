@@ -220,14 +220,21 @@ state keys; a declined invitation alone never grants a private snapshot.
 Without snapshot permission, only individually visible state survives. Published
 participation history fixes the real departure boundary: a later ban, declined
 reinvitation or current join cannot disclose a different private interval.
-Sync compares admitted snapshots at both cuts. State/members, context, lazy
+Sync uses a separate client state-delivery owner to decide whether an admitted
+old snapshot is a reusable baseline. Stripped prejoin display is not full-event
+delivery. A new participation interval, including a departure/rejoin hidden
+between polls or an imported new stay, resets selected full state in ordinary
+and sliding sync. Continuous joins keep snapshot deltas; profile-only changes
+do not reset them. Ordinary stream tokens remain stateless, not filter-history
+receipts: arbitrary filter expansion still uses explicit `full_state`.
+State/members, context, lazy
 messages state, search state/profiles and initialSync share this boundary;
 search hydrates the admitted departure snapshot rather than current room state.
 Discovery explicitly admits only its existing summary/child-link state types
 and retains its separate access gate. The common event serializer is private;
 timeline events and state snapshots reach it through their respective admission
 owners. Prejoin display keeps its existing stripped/provenance ceiling.
-(`api/engine/client/state-admission.ts`, `client/{render,state}.ts`,
+(`api/engine/client/{state-admission,state-delivery}.ts`, `client/{render,state}.ts`,
 `api/engine/room/state.ts`)
 
 Native simplified sync validates the deployed MSC4186 request
@@ -265,7 +272,7 @@ Zero timeline limits do not acknowledge unseen events. Saved departures follow
 the requested timeline limit and required-state selection independently; an
 explicitly empty state selection is never overridden. DM removal resets the
 last delivered value for prejoin rooms as well as joined rooms.
-(`api/engine/client/sync-window.ts`, `api/engine/sliding-sync/{rooms,state}.ts`)
+(`api/engine/client/{sync-window,state-delivery}.ts`, `api/engine/sliding-sync/rooms.ts`)
 
 Sliding inbox delivery reuses the tenant's durable queue, acknowledgment and
 bounded issued-delivery receipts. Opaque receipts are scoped to the protocol and
