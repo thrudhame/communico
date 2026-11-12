@@ -9,6 +9,8 @@ import {
   savedPrejoinDisplay,
 } from '#engine/federation/prejoin.ts';
 import { localpartOf } from '#engine/ids.ts';
+import { inviteOf, prejoinDeparture } from '#engine/federation/invites.ts';
+import type { Pdu } from '#engine/pdu.ts';
 import type { Room } from '#engine/room/index.ts';
 import {
   type MembershipRow,
@@ -23,6 +25,7 @@ export type ListCandidate = MembershipRow & {
   activity: number;
   cut: number;
   prejoin?: { event: Json; state: Json[] };
+  departure?: Pdu;
 };
 export type ListSelection = {
   lists: Record<
@@ -152,7 +155,33 @@ export async function selectLists(
     });
   }
   for (const row of snapshot.prejoin) {
-    if (row.status !== 'pending') continue;
+    if (
+      ['joined', 'attempting', 'failed-attempt'].includes(String(row.status))
+    ) continue;
+    if (row.status !== 'pending') {
+      const roomId = String(row.room_id), seq = Number(row.seq);
+      if (
+        !options.previousRooms?.has(roomId) &&
+        !(options.since !== undefined && seq > options.since)
+      ) continue;
+      const departure = await prejoinDeparture(inviteOf(row), {
+        server: app.server,
+        signer: app.tenant.signer(),
+      });
+      if (departure !== null) {
+        candidates.set(roomId, {
+          roomId,
+          membership: String(departure.content.membership),
+          eventId: departure.event_id!,
+          seq,
+          forgotten: false,
+          activity: seq,
+          cut: seq,
+          departure,
+        });
+      }
+      continue;
+    }
     const event = JSON.parse(String(row.event_json)) as Json;
     if (row.kind === 'invite' && ignored.has(String(event.sender))) continue;
     const roomId = String(row.room_id), seq = Number(row.seq);

@@ -69,6 +69,8 @@ function bind(conn: Conn, edges: EdgeOverlay) {
         state.hasJoinedBefore(conn, userId, changePos),
       participationAt: (userId: string, through: number, stay: number) =>
         state.participationAt(conn, userId, through, stay),
+      membershipInterrupted: (userId: string, after: number, through: number) =>
+        state.membershipInterrupted(conn, userId, after, through),
       erasureCut: () => state.erasureCut(conn),
       publishedAt: (stay: number, pos: number) =>
         state.publishedAt(conn, stay, pos),

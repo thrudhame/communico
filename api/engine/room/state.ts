@@ -104,6 +104,41 @@ export async function participationAt(
   return null;
 }
 
+// Did published participation stop between two room change cuts? Event-DAG
+// membership alone cannot answer this across resolved/imported publications.
+export async function membershipInterrupted(
+  conn: Conn,
+  userId: string,
+  after: number,
+  through: number,
+): Promise<boolean> {
+  let cursor = after;
+  const seen = new Set<number>();
+  while (cursor < through) {
+    seen.clear();
+    const page = await conn.query(
+      'SELECT change_pos,grp FROM publications WHERE change_pos>? AND change_pos<=? ORDER BY change_pos LIMIT 32',
+      [cursor, through],
+    );
+    if (!page.length) break;
+    for (const row of page) {
+      cursor = Number(row.change_pos);
+      const group = Number(row.grp);
+      if (seen.has(group)) continue;
+      seen.add(group);
+      const id = await groupKey(conn, group, 'm.room.member', userId);
+      if (id === null) return true;
+      const event = await conn.query('SELECT pdu FROM events WHERE id=?', [id]);
+      if (
+        !event.length ||
+        JSON.parse(String(event[0].pdu)).content?.membership !== 'join'
+      ) return true;
+    }
+    if (page.length < 32) break;
+  }
+  return false;
+}
+
 // A state map as a change batch (a base snapshot's entries).
 export function mapEntries(map: StateMap): StateChange[] {
   const out: StateChange[] = [];

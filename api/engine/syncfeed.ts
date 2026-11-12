@@ -4,8 +4,8 @@
 import { theApp } from '#engine/app.ts';
 import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
 import { admitState } from '#engine/client/state-admission.ts';
+import { syncWindow } from '#engine/client/sync-window.ts';
 import {
-  renderEvent,
   renderPrejoinDeparture,
   renderStateEvent,
 } from '#engine/client/render.ts';
@@ -26,13 +26,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import { formatCursor } from '#engine/room/segments.ts';
-import type { Pdu } from '#engine/pdu.ts';
-import {
-  feedAfter,
-  feedBefore,
-  type FeedRow,
-  roomsFor,
-} from '#engine/server/read.ts';
+import { feedAfter, feedBefore, roomsFor } from '#engine/server/read.ts';
 import {
   notificationChanged,
   notificationSnapshot,
@@ -47,11 +41,7 @@ import {
   listGlobalAccountDataSince,
 } from '#engine/tenant/accountdata.ts';
 import { pushStreamSeq, rulesetFor } from '#engine/tenant/pushrules.ts';
-import {
-  eventMatchesRoomEventFilter,
-  filterEvents,
-  type RoomFilter,
-} from '#engine/tenant/filters.ts';
+import { filterEvents, type RoomFilter } from '#engine/tenant/filters.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { onEventStream } from '#engine/server/stream.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
@@ -98,88 +88,17 @@ async function roomTimeline(
 ) {
   const app = theApp();
   const limit = i.filter.timeline.limit ?? 10;
-  const eligible: {
-    row: FeedRow;
-    event: Record<string, unknown>;
-  }[] = [];
-  let cursor = end;
-  let more = true;
-  let gap = false;
-  let newestStay: number | undefined;
-  // Bound hydration as well as rendering. Walk newest first until one
-  // eligible lookahead proves truncation; hidden rows never consume slots.
-  while (more && !gap && eligible.length <= limit) {
-    const page = await feedBefore(
-      app.server,
-      room.id,
-      i.since?.eSeq ?? 0,
-      cursor,
-      32,
-    );
-    more = page.length === 32;
-    if (!page.length) break;
-    cursor = page.at(-1)!.seq - 1;
-    const { stored, boundaries } = await room.tx(async (tx) => {
-      const stored = await tx.events.list(page.map((r) => r.event));
-      const boundaries = new Set<string>();
-      for (const row of page) {
-        if (
-          (await tx.state.eventStateBefore(row.event))?.provenance ===
-            'imported'
-        ) {
-          boundaries.add(row.event);
-        }
-      }
-      return { stored, boundaries };
-    });
-    for (const row of page) {
-      newestStay ??= row.stay;
-      if (row.stay !== newestStay) {
-        gap = true;
-        break;
-      }
-      // An imported before-state is an explicit missing live-history boundary.
-      // Retain its event, but never splice the older feed across it, including
-      // when the boundary event itself is hidden by a client filter.
-      gap = boundaries.has(row.event);
-      const record = stored.get(row.event);
-      if (record === undefined) {
-        if (gap) break;
-        continue;
-      }
-      const pdu = JSON.parse(record.pdu) as Pdu;
-      if (
-        !eventMatchesRoomEventFilter(
-          null,
-          { ...pdu, room_id: room.id },
-          i.filter.timeline,
-        )
-      ) {
-        if (gap) break;
-        continue;
-      }
-      const at = await stateAtSeq(room, row.seq, row.stay);
-      const membership = at.find((s) =>
-        s.type === 'm.room.member' && s.stateKey === i.userId
-      )?.content.membership ?? 'leave';
-      const event = await renderEvent(room, row.event, {
-        userId: i.userId,
-        deviceId: i.deviceId,
-        tenant: app.tenant,
-        membership: String(membership),
-      }, { omitRoomId: true, eventFormat: i.filter.eventFormat });
-      if (event !== null) eligible.unshift({ row, event });
-      if (gap || eligible.length > limit) break;
-    }
-  }
-  const trimmed = eligible.length > limit;
-  const selected = limit === 0
-    ? []
-    : trimmed
-    ? eligible.slice(eligible.length - limit)
-    : eligible;
-  const returned = selected.map((item) => item.row);
-  const events = selected.map((item) => item.event);
+  const { rows: returned, events, gap, trimmed } = await syncWindow(room, {
+    userId: i.userId,
+    deviceId: i.deviceId,
+    tenant: app.tenant,
+  }, {
+    since: i.since?.eSeq ?? 0,
+    end,
+    limit,
+    filter: i.filter.timeline,
+    eventFormat: i.filter.eventFormat,
+  });
   let joinGap = false;
   const since = i.since?.eSeq;
   if (
