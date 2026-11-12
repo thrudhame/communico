@@ -1,4 +1,4 @@
-// api/engine/room/schema.ts - room schema v3 (design R1-R11): immutable
+// api/engine/room/schema.ts - room schema v4 (design R1-R11): immutable
 // events and their edges, mutable status, immutable state groups with
 // bounded delta chains, event-state refs, publications, segments and
 // positions, extremities, waits and the change log. The store owns the id
@@ -129,10 +129,23 @@ CREATE INDEX publications_change ON publications(change_pos, grp);
 CREATE INDEX segments_opener ON segments(opened_by, id) WHERE kind = 'stay' AND opening_group IS NOT NULL;
 `;
 
+const PUBLICATION_KEYS_SQL = `
+CREATE TABLE publication_keys(
+  type TEXT NOT NULL,
+  state_key TEXT NOT NULL,
+  change_pos INTEGER NOT NULL REFERENCES changes(pos),
+  event TEXT REFERENCES events(id),
+  sender TEXT,
+  PRIMARY KEY(type,state_key,change_pos)
+);
+`;
+
 export const roomSchema: SchemaProvider = {
-  version: 3,
+  version: 4,
   apply: async (db) => {
-    await db.exec(ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL);
+    await db.exec(
+      ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL,
+    );
   },
   migrations: {
     1: async (conn) => {
@@ -141,6 +154,11 @@ export const roomSchema: SchemaProvider = {
     },
     2: async (conn) => {
       await conn.exec(CHANGE_INDEX_SQL);
+    },
+    3: async (conn) => {
+      // Released v3 rooms have no delayed commands. New scheduling captures
+      // its cut after this upgrade, so only future publications are needed.
+      await conn.exec(PUBLICATION_KEYS_SQL);
     },
   },
 };

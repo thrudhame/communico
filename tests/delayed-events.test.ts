@@ -10,6 +10,8 @@ import { readStateKey } from '#engine/client/state.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { openStore } from '#engine/store/index.ts';
 import { tenantSchema } from '#engine/tenant/index.ts';
+import { buildInTx } from '#engine/room/build.ts';
+import { changedByOther } from '#engine/room/state.ts';
 
 async function setup(name: string) {
   const dir = await Deno.makeTempDir({ prefix: 'delayed-' });
@@ -378,6 +380,281 @@ Deno.test('delayed: disabling new scheduling still delivers previously durable w
   } finally {
     await delivery?.stop();
     await owner.stop();
+    await f.cleanup();
+  }
+});
+
+Deno.test('delayed: non-string actions never mutate an existing command', async () => {
+  const f = await setup('delay-actions');
+  const worker = new DelayedEvents(f.app);
+  try {
+    const { delay_id: id } = await worker.schedule(schedule(f.room, f.user));
+    const before = await f.app.tenant.tx((tx) => tx.delayedEvents.get(id));
+    for (
+      const action of [['cancel'], ['restart'], ['send'], null, {}, true, 42]
+    ) {
+      await assertRejects(
+        () => worker.action(id, action),
+        MatrixError,
+        'M_INVALID_PARAM',
+      );
+      assertEquals(
+        await f.app.tenant.tx((tx) => tx.delayedEvents.get(id)),
+        before,
+      );
+    }
+  } finally {
+    await worker.stop();
+    await f.cleanup();
+  }
+});
+
+Deno.test('delayed: a prepared PDU soft-failed after power change is not successful delivery', async () => {
+  const f = await setup('delay-soft-owner');
+  const worker = new DelayedEvents(f.app);
+  try {
+    const b = await registerUser(f.app.tenant, {
+      localpart: 'delay-soft-writer',
+      password: 'pw',
+    });
+    await writeStateKey(f.room, f.user, 'm.room.join_rules', '', {
+      join_rule: 'public',
+    });
+    await joinRoom(f.room, b.user_id);
+    await writeStateKey(f.room, f.user, 'm.room.power_levels', '', {
+      users: { [f.user]: 100 },
+      state_default: 0,
+    });
+    const { delay_id: id } = await worker.schedule(schedule(f.room, b.user_id));
+    const room = await openRoom(f.app.store, f.room);
+    const pdu = await room.tx((tx) =>
+      buildInTx(tx, f.room, {
+        type: 'test.delayed',
+        state_key: 'key',
+        sender: b.user_id,
+        content: { value: 'later' },
+        origin_server_ts: Date.now(),
+      }, f.app.tenant.signer())
+    );
+    await f.app.tenant.tx((tx) => tx.delayedEvents.prepare(id, pdu));
+    await writeStateKey(f.room, f.user, 'm.room.power_levels', '', {
+      users: { [f.user]: 100 },
+      state_default: 100,
+    });
+    await assertRejects(
+      () => worker.action(id, 'send'),
+      MatrixError,
+      'M_FORBIDDEN',
+    );
+    assertEquals(
+      (await room.tx((tx) => tx.events.getStatus(String(pdu.event_id))))
+        ?.standing,
+      'soft_failed',
+    );
+    await assertRejects(
+      () => readStateKey(f.room, f.user, 'test.delayed', 'key', null),
+      MatrixError,
+      'M_NOT_FOUND',
+    );
+    assertEquals(await f.app.tenant.tx((tx) => tx.delayedEvents.get(id)), null);
+  } finally {
+    await worker.stop();
+    await f.cleanup();
+  }
+});
+
+Deno.test('delayed: a failed deadline query retains autonomous retry and delivery', async () => {
+  const f = await setup('delay-next-retry');
+  let failed = false;
+  const worker = new DelayedEvents({
+    store: f.app.store,
+    tenant: {
+      ...f.app.tenant,
+      tx: (fn) =>
+        f.app.tenant.tx((tx) =>
+          fn({
+            ...tx,
+            delayedEvents: {
+              ...tx.delayedEvents,
+              next: async () => {
+                if (!failed) {
+                  failed = true;
+                  throw new Error('injected transient deadline failure');
+                }
+                return await tx.delayedEvents.next();
+              },
+            },
+          })
+        ),
+    },
+  });
+  try {
+    const { delay_id: id } = await worker.schedule({
+      ...schedule(f.room, f.user),
+      delay: 200,
+    });
+    const deadline = Date.now() + 5000;
+    while (
+      await f.app.tenant.tx((tx) => tx.delayedEvents.get(id)) &&
+      Date.now() < deadline
+    ) await new Promise((r) => setTimeout(r, 25));
+    assert(failed, 'exercise deadline-query failure');
+    assertEquals(
+      await readStateKey(f.room, f.user, 'test.delayed', 'key', null),
+      { value: 'later' },
+    );
+  } finally {
+    await worker.stop();
+    await f.cleanup();
+  }
+});
+
+Deno.test('delayed: a retained failing batch cannot starve a later command', async () => {
+  const f = await setup('delay-fair-retry');
+  const owner = new DelayedEvents(f.app);
+  await owner.stop();
+  const failures = new Set<string>();
+  const worker = new DelayedEvents({
+    store: f.app.store,
+    tenant: {
+      ...f.app.tenant,
+      tx: (fn) =>
+        f.app.tenant.tx((tx) =>
+          fn({
+            ...tx,
+            delayedEvents: {
+              ...tx.delayedEvents,
+              prepare: async (id, pdu) => {
+                if (failures.has(id)) {
+                  throw new Error('injected transient preparation failure');
+                }
+                return await tx.delayedEvents.prepare(id, pdu);
+              },
+            },
+          })
+        ),
+    },
+  });
+  try {
+    for (let i = 0; i < 32; i++) {
+      const { delay_id: id } = await owner.schedule(
+        schedule(f.room, f.user, 'failed-' + i),
+      );
+      failures.add(id);
+      await f.app.tenant.tx((tx) =>
+        tx.delayedEvents.action(id, 'send', Date.now() - 10000 + i)
+      );
+    }
+    const { delay_id: later } = await owner.schedule(
+      schedule(f.room, f.user, 'later'),
+    );
+    await f.app.tenant.tx((tx) =>
+      tx.delayedEvents.action(later, 'send', Date.now() - 1)
+    );
+    await worker.drain();
+    await worker.drain();
+    assertEquals(
+      await readStateKey(f.room, f.user, 'test.delayed', 'later', null),
+      { value: 'later' },
+    );
+    assertEquals(
+      (await f.app.tenant.tx((tx) => tx.delayedEvents.list('delay-fair-retry')))
+        .length,
+      32,
+    );
+  } finally {
+    await worker.stop();
+    await f.cleanup();
+  }
+});
+
+Deno.test('delayed: reconciliation uses one indexed state-key query despite unrelated publications', async () => {
+  const f = await setup('delay-key-index');
+  try {
+    const room = await openRoom(f.app.store, f.room);
+    const cut = await room.tx((tx) => tx.changes.head());
+    for (let i = 0; i < 40; i++) {
+      await writeStateKey(f.room, f.user, 'test.unrelated', 'k' + i, { i });
+    }
+    const db = await f.app.store.room(f.room);
+    let queries = 0;
+    assertEquals(
+      await db.tx((conn) =>
+        changedByOther(
+          new Proxy(conn, {
+            get(target, key, receiver) {
+              if (key === 'query') {
+                return (...args: Parameters<typeof conn.query>) => {
+                  queries++;
+                  return target.query(...args);
+                };
+              }
+              return Reflect.get(target, key, receiver);
+            },
+          }),
+          'test.delayed',
+          'key',
+          f.user,
+          cut,
+          null,
+        )
+      ),
+      false,
+    );
+    assertEquals(
+      queries,
+      1,
+      'unrelated state history must not cause per-publication group lookups',
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+Deno.test('delayed: a failed explicit send reschedules its retained receipt autonomously', async () => {
+  const f = await setup('delay-send-retry');
+  let failed = false;
+  const worker = new DelayedEvents({
+    store: f.app.store,
+    tenant: {
+      ...f.app.tenant,
+      tx: (fn) =>
+        f.app.tenant.tx((tx) =>
+          fn({
+            ...tx,
+            delayedEvents: {
+              ...tx.delayedEvents,
+              finish: async (id) => {
+                if (!failed) {
+                  failed = true;
+                  throw new Error('injected explicit-send receipt failure');
+                }
+                await tx.delayedEvents.finish(id);
+              },
+            },
+          })
+        ),
+    },
+  });
+  try {
+    const { delay_id: id } = await worker.schedule(schedule(f.room, f.user));
+    await assertRejects(
+      () => worker.action(id, 'send'),
+      Error,
+      'injected explicit-send receipt failure',
+    );
+    const deadline = Date.now() + 5000;
+    while (
+      await f.app.tenant.tx((tx) => tx.delayedEvents.get(id)) &&
+      Date.now() < deadline
+    ) await new Promise((r) => setTimeout(r, 25));
+    assertEquals(await f.app.tenant.tx((tx) => tx.delayedEvents.get(id)), null);
+    assertEquals(
+      await readStateKey(f.room, f.user, 'test.delayed', 'key', null),
+      { value: 'later' },
+    );
+  } finally {
+    await worker.stop();
     await f.cleanup();
   }
 });

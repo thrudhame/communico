@@ -212,29 +212,37 @@ export class DelayedEvents {
     return { delayed_events: out };
   }
   async action(id: string, action: unknown): Promise<Record<string, never>> {
-    if (!['cancel', 'restart', 'send'].includes(String(action))) {
+    if (
+      typeof action !== 'string' ||
+      !['cancel', 'restart', 'send'].includes(action)
+    ) {
       throw new MatrixError(
         400,
         'M_INVALID_PARAM',
         'unknown delayed event action',
       );
     }
-    await this.#locked(id, async () => {
-      const event = await this.#app.tenant.tx((tx) => tx.delayedEvents.get(id));
-      if (
-        event === null || event.phase !== 'pending' ||
-        await this.#reconcile(event)
-      ) notFound();
-      await this.#app.tenant.tx((tx) =>
-        tx.delayedEvents.action(
-          id,
-          action as 'cancel' | 'restart' | 'send',
-          Date.now(),
-        )
-      );
-      if (action === 'send') await this.#deliver(id);
-    });
-    this.wake();
+    try {
+      await this.#locked(id, async () => {
+        const event = await this.#app.tenant.tx((tx) =>
+          tx.delayedEvents.get(id)
+        );
+        if (
+          event === null || event.phase !== 'pending' ||
+          await this.#reconcile(event)
+        ) notFound();
+        await this.#app.tenant.tx((tx) =>
+          tx.delayedEvents.action(
+            id,
+            action as 'cancel' | 'restart' | 'send',
+            Date.now(),
+          )
+        );
+        if (action === 'send') await this.#deliver(id);
+      });
+    } finally {
+      this.wake();
+    }
     return {};
   }
   async #deliver(id: string) {
@@ -271,7 +279,7 @@ export class DelayedEvents {
         submission,
       );
       await tenant.tx((tx) => tx.delayedEvents.remove(id));
-      if (result.standing === 'rejected') {
+      if (result.standing !== 'accepted') {
         throw new MatrixError(
           403,
           'M_FORBIDDEN',
@@ -285,6 +293,10 @@ export class DelayedEvents {
           error.status < 500)
       ) {
         await tenant.tx((tx) => tx.delayedEvents.remove(id));
+      } else {
+        await tenant.tx((tx) =>
+          tx.delayedEvents.retry([id], Date.now() + 1000)
+        );
       }
       throw error;
     }
@@ -294,6 +306,7 @@ export class DelayedEvents {
     const events = await this.#app.tenant.tx((tx) =>
       tx.delayedEvents.due(Date.now())
     );
+    const retained: string[] = [];
     for (const event of events) {
       if (this.#stopped) break;
       try {
@@ -303,7 +316,15 @@ export class DelayedEvents {
         if (!(error instanceof MatrixError)) {
           console.error('delayed event delivery failed; retry pending');
         }
+        retained.push(event.id);
       }
+    }
+    // Rebase the whole failed batch after processing it. Even a slow batch
+    // must leave a window for later due commands, not refill its own 32 slots.
+    if (retained.length !== 0) {
+      await this.#app.tenant.tx((tx) =>
+        tx.delayedEvents.retry(retained, Date.now() + 1000)
+      );
     }
   }
   wake(): void {
@@ -322,6 +343,11 @@ export class DelayedEvents {
             () => this.wake(),
             next <= Date.now() ? 1000 : Math.min(2147483647, next - Date.now()),
           );
+        }
+      } catch {
+        // Storage failures must not discard the scheduler's only future wake.
+        if (!this.#stopped) {
+          this.#timer = setTimeout(() => this.wake(), 1000);
         }
       } finally {
         this.#running = null;

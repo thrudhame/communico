@@ -150,6 +150,19 @@ export async function next(conn: Conn): Promise<number | null> {
   const rows = await conn.query('SELECT MIN(due_ms) AS n FROM delayed_events');
   return rows[0].n === null ? null : Number(rows[0].n);
 }
+export async function retry(
+  conn: Conn,
+  ids: readonly string[],
+  due: number,
+): Promise<void> {
+  if (ids.length === 0) return;
+  await conn.execute(
+    `UPDATE delayed_events SET due_ms=? WHERE phase='sending' AND id IN (${
+      ids.map(() => '?').join(',')
+    })`,
+    [due, ...ids],
+  );
+}
 export async function due(conn: Conn, now: number): Promise<DelayedEvent[]> {
   return (await conn.query(
     'SELECT * FROM delayed_events WHERE due_ms<=? ORDER BY due_ms,id LIMIT 32',
