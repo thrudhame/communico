@@ -10,6 +10,7 @@ import {
   type TimestampQuery,
 } from './timestamp.ts';
 import { verify } from './verify.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 // Conservative gap relevance: timestamps may be skewed in either direction,
 // including across stays. An unresolved boundary cannot be excluded by distance.
@@ -128,7 +129,8 @@ export async function searchTimestamp(
         roomId: room.id,
         exemptPrevAuthLimits: true,
       });
-    } catch {
+    } catch (error) {
+      if (!recoverableUpstream(error, signal)) throw error;
       continue;
     }
     const ts = verified.pdu.origin_server_ts;

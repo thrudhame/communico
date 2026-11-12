@@ -834,6 +834,19 @@ completed HTTP refusals keep the remote body separately from their safe message.
 (`api/engine/federation/{fetcher,responses,invites,knocks}.ts`,
 `api/engine/net/upstream-error.ts`, `api/engine/room/deps.ts`)
 
+Server-key and notary schemas decode every entry before persistence without
+adding optional fields or rewriting signed validity. The seven-day effective
+expiry is stored beside the intact signed document and remains tied to its
+acquisition time on cache reads. Only typed peer failures enter negative key
+memory; local storage/signing faults and cancellation retain their identity.
+Event, prejoin, history and join consumers distinguish peer verification refusal
+from a local resolver fault, which never becomes missing evidence or resident
+failover. Matrix wire Base64 uses the standard alphabet and accepts the optional
+padding recommended by the specification; the legacy stored-data decoder remains
+separate.
+(`api/engine/federation/{key-document,keys,witness,keyresolver,auth}.ts`,
+`api/engine/room/verify.ts`, `api/engine/signing-primitives.js`)
+
 The shared thumbnail service serves local client, legacy-local and signed
 federation routes. Remote variants fetch signed federation thumbnails before
 bounded local validation/static generation. Cache identity includes format,

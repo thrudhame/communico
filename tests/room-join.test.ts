@@ -4,9 +4,15 @@
 // fail-over on network failure and 404, abort on 403; unusable snapshot
 // events are excluded without blocking an otherwise authorized join;
 // missing critical auth or a returned join that does not match is refused.
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import type { Pdu } from '#engine/pdu.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { assertRoomAcl } from '#engine/federation/acl.ts';
 import { joinRemote } from '#engine/room/join.ts';
 import { openRoom, type Room, roomSchema } from '#engine/room/index.ts';
@@ -49,6 +55,60 @@ async function withStore(
 }
 
 const ANNA = '@anna:test';
+
+Deno.test('key fault ownership: remote join preserves local faults and never tries another resident', async () => {
+  for (const phase of ['make-join', 'snapshot', 'returned-signature']) {
+    await withStore(async (store) => {
+      const fr = await makeFakeRoom({ roomId: '!local-key:remote.test' });
+      const fault = new Error('local ' + phase);
+      let returning = false;
+      const valid = fakeKeyResolver(fr.server, await testRemoteServer());
+      const signer = await testSigner();
+      const { fetcher, calls } = fakeFetcher({
+        makeJoin: (user) => {
+          if (phase === 'make-join') throw fault;
+          return fr.makeJoinAnswer(user);
+        },
+        sendJoin: async (event) => {
+          const result = await fr.acceptSendJoin(event);
+          if (phase === 'returned-signature') {
+            result.event.signatures![fr.server.name] = {
+              'ed25519:local': 'invalid',
+            };
+          }
+          returning = true;
+          return result;
+        },
+      });
+      assertStrictEquals(
+        await assertRejects(() =>
+          joinRemote(store, {
+            roomId: fr.roomId,
+            user: ANNA,
+            via: [fr.server.name, 'other.test'],
+            signer,
+            deps: {
+              fetcher,
+              self: 'test',
+              keys: {
+                verifyEventSignature: (args) => {
+                  if (
+                    returning &&
+                    (phase === 'snapshot' || args.keyId === 'ed25519:local')
+                  ) throw fault;
+                  return valid.verifyEventSignature(args);
+                },
+              },
+            },
+          })
+        ),
+        fault,
+      );
+      assertEquals(calls.makeJoin.length, 1);
+      await assertRejects(() => openRoom(store, fr.roomId));
+    });
+  }
+});
 
 Deno.test('join remote: candidate ACL refusal fails over, own-server refusal aborts', async (t) => {
   for (
@@ -223,7 +283,10 @@ for (const restricted of [false, true]) {
                 keys: {
                   verifyEventSignature: (args) => {
                     if (args.keyId === 'ed25519:unobtainable') {
-                      throw new Error('key fetch failed');
+                      throw new UpstreamError('transport', {
+                        phase: 'key-doc',
+                        reason: 'key fetch failed',
+                      });
                     }
                     return keys.verifyEventSignature(args);
                   },
@@ -364,7 +427,10 @@ Deno.test('join remote: fail-over on network failure and 404; abort on 403', asy
     // a dead first candidate (network error), the fake second
     const dead = fakeFetcher({
       makeJoin: () => {
-        throw new Error('connection refused');
+        throw new UpstreamError('transport', {
+          phase: 'make-join',
+          reason: 'connection refused',
+        });
       },
     });
     const { deps } = await joinDepsFor(fr);
@@ -606,7 +672,10 @@ Deno.test('join remote: unusable snapshot events do not block an authorized join
             keys: {
               verifyEventSignature: (args) => {
                 if (args.keyId === 'ed25519:unobtainable') {
-                  throw new Error('key fetch failed');
+                  throw new UpstreamError('transport', {
+                    phase: 'key-doc',
+                    reason: 'key fetch failed',
+                  });
                 }
                 return keys.verifyEventSignature(args);
               },

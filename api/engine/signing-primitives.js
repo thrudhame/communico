@@ -53,6 +53,32 @@ export function b64decode(s) {
   return out;
 }
 
+// Matrix wire binary uses the standard alphabet. Appendices "Unpadded Base64"
+// recommends accepting padding too; do not coerce values or accept base64url.
+// The legacy helper above also serves stored private data and opaque IDs.
+/** @param {unknown} value @param {number} [length] */
+export function matrixBase64(value, length = undefined) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+    throw new TypeError('invalid Matrix base64');
+  }
+  const unpadded = value.replace(/=+$/, '');
+  const padding = '='.repeat((4 - (unpadded.length % 4)) % 4);
+  if (
+    unpadded.length % 4 === 1 ||
+    (value !== unpadded && value !== unpadded + padding)
+  ) {
+    throw new TypeError('invalid Matrix base64 padding');
+  }
+  const bytes = b64decode(unpadded);
+  if (
+    b64encodeStd(bytes) !== unpadded ||
+    (length !== undefined && bytes.length !== length)
+  ) {
+    throw new TypeError('invalid Matrix base64 material');
+  }
+  return bytes;
+}
+
 export async function sha256bytes(data) {
   const buf = await crypto.subtle.digest('SHA-256', data);
   return new Uint8Array(buf);
@@ -106,7 +132,7 @@ export async function verifyJson(obj, entity, keyId, publicKey) {
   if (typeof sigB64 !== 'string') return false;
   let sig;
   try {
-    sig = b64decode(sigB64);
+    sig = matrixBase64(sigB64, 64);
   } catch {
     return false;
   }

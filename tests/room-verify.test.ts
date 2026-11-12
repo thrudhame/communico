@@ -2,9 +2,19 @@
 // format guards, recomputed ids, unsigned strip, content-hash redaction,
 // the sender-domain signature through the resolver, key validity per
 // room version, and the lenient/strict size limits.
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import type { Pdu } from '#engine/pdu.ts';
 import { identify, verify } from '#engine/room/verify.ts';
+import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
+import { fakeFetcher } from './fixtures/remote.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { validatePrejoin } from '#engine/federation/prejoin.ts';
+import { signJson, verifyJson } from '#engine/signing-primitives.js';
 import {
   fakeKeyResolver,
   makeRemoteServer,
@@ -12,6 +22,115 @@ import {
 } from './fixtures/remote.ts';
 
 const ROOM = '!verify:test';
+
+Deno.test('key fault ownership: prejoin create verification never filters a local key failure', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const create = await remoteEvent(ROOM, server, '11', {
+    type: 'm.room.create',
+    sender: '@rudy:remote.test',
+    state_key: '',
+    content: { room_version: '11' },
+    prev_events: [],
+    auth_events: [],
+  });
+  const fault = new Error('prejoin key store fault');
+  assertStrictEquals(
+    await assertRejects(() =>
+      validatePrejoin([create], ROOM, '11', {
+        verifyEventSignature: () => {
+          throw fault;
+        },
+      })
+    ),
+    fault,
+  );
+});
+
+Deno.test('wire base64: signatures accept Matrix padding but reject URL-safe and nonzero pad bits', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const doc = { value: 'wire-base64', signatures: {} } as Record<
+    string,
+    unknown
+  >;
+  await signJson(doc, server.name, server.keyId, server.kp.privateKey);
+  const signatures = doc.signatures as Record<string, Record<string, string>>;
+  const original = signatures[server.name][server.keyId];
+  assert(await verifyJson(doc, server.name, server.keyId, server.kp.publicKey));
+  signatures[server.name][server.keyId] = original + '==';
+  assert(await verifyJson(doc, server.name, server.keyId, server.kp.publicKey));
+  const alphabet =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  signatures[server.name][server.keyId] = original.slice(0, -1) +
+    alphabet[alphabet.indexOf(original.at(-1)!) + 1];
+  assertEquals(
+    await verifyJson(doc, server.name, server.keyId, server.kp.publicKey),
+    false,
+  );
+  if (/[+/]/.test(original)) {
+    signatures[server.name][server.keyId] = original.replaceAll('+', '-')
+      .replaceAll('/', '_');
+    assertEquals(
+      await verifyJson(doc, server.name, server.keyId, server.kp.publicKey),
+      false,
+    );
+  }
+});
+
+Deno.test('key fault ownership: verification and boundary retrieval preserve local resolver faults', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const event = await msg(server, 'local-fault');
+  const fault = new Error('local key store fault');
+  const keys = {
+    verifyEventSignature: () => {
+      throw fault;
+    },
+  };
+  assertStrictEquals(
+    await assertRejects(() => verify(structuredClone(event), '11', keys)),
+    fault,
+  );
+  const { fetcher } = fakeFetcher({
+    state: new Map([[event.event_id!, { state: [event], authChain: [] }]]),
+    event: new Map([[event.event_id!, event]]),
+  });
+  assertStrictEquals(
+    await assertRejects(() =>
+      fetchBoundaryEvents([event.event_id!], 1, {
+        roomId: ROOM,
+        at: event.event_id!,
+        via: server.name,
+        version: '11',
+        keys,
+        fetcher,
+        active: () => true,
+        concurrency: 1,
+        read: (op) => op(),
+      })
+    ),
+    fault,
+  );
+  // Peer acquisition failure remains unavailable, never admitted evidence.
+  const failedKeys = {
+    verifyEventSignature: () => {
+      throw new UpstreamError('transport', {
+        phase: 'key-doc',
+        reason: 'unreachable',
+      });
+    },
+  };
+  const pack = await fetchBoundaryEvents([event.event_id!], 1, {
+    roomId: ROOM,
+    at: event.event_id!,
+    via: server.name,
+    version: '11',
+    keys: failedKeys,
+    fetcher,
+    active: () => true,
+    concurrency: 1,
+    read: (op) => op(),
+  });
+  assertEquals(pack?.size, 0);
+});
 
 Deno.test('verify: required edge arrays and object content share the format boundary for every supported version', async () => {
   const server = await makeRemoteServer('remote.test');

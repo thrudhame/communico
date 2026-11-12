@@ -54,7 +54,10 @@ import {
   leaveResponse,
   membershipTemplate,
 } from './responses.ts';
-import { UpstreamError } from '#engine/net/upstream-error.ts';
+import {
+  recoverableUpstream,
+  UpstreamError,
+} from '#engine/net/upstream-error.ts';
 import { assertRoomAcl } from './acl.ts';
 import { assertAcl } from '#engine/room/acl.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -451,6 +454,7 @@ export async function receiveInvite(
   );
   // countersign and answer
   await verify(pdu, roomVersion, deps.keys, { roomId }).catch((error) => {
+    if (!recoverableUpstream(error)) throw error;
     throw new MatrixError(403, 'M_FORBIDDEN', String(error));
   });
   await countersign(pdu, roomVersion, deps.signer);

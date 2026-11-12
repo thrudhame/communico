@@ -4,7 +4,12 @@
 // fallback, failure memory, one in-flight per name. Stub transport over
 // a real server file (doltgres tests/federation-keys.test.ts, restored)
 // — plus the notary-from-cache serving data (keydoc.ts).
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import { setConfigForTests } from '#engine/config.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -16,6 +21,7 @@ import {
   exportPublicKeyRaw,
   generateSigningKeypair,
   importPublicKeyFromRaw,
+  signJson,
   verifyJson,
 } from '#engine/signing-primitives.js';
 import {
@@ -31,6 +37,10 @@ import {
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { randomSigner } from './fixtures/signer.ts';
+import type { Database } from '#engine/store/db.ts';
+import { documentsFromAnswer } from '#engine/federation/witness.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import {
   directOnly,
   makeDoc,
@@ -123,10 +133,11 @@ Deno.test('cache: second acquire does not refetch; horizon past valid_until_ts r
     const ks = keyStore(server, { deps: directOnly(far) });
     const got = await ks.acquireKeyDoc(s.name, 0);
     const cap = Date.now() + 7 * 86400_000;
-    assert(
-      got.valid_until_ts <= cap,
-      `valid_until_ts ${got.valid_until_ts} > cap ${cap}`,
-    );
+    assertEquals(got, far, 'the signed document is never rewritten');
+    assert(await verifyJson(got, s.name, s.keyId, s.kp.publicKey));
+    const [{ rows, doc }] = await ks.listServerKeys(s.name);
+    assert(rows.every((row) => row.valid_until_ts <= cap));
+    assertEquals(JSON.parse(doc!.key_json), far);
   });
 });
 
@@ -357,7 +368,13 @@ Deno.test('open-mode direct fallback only when zero witnesses answered', async (
     let directCalls = 0;
     const ks = keyStore(server, {
       deps: stubDeps({
-        witnessQuery: () => Promise.reject(new Error('witness unreachable')),
+        witnessQuery: () =>
+          Promise.reject(
+            new UpstreamError('transport', {
+              phase: 'test',
+              reason: 'witness unreachable',
+            }),
+          ),
         listWitnesses: () => Promise.resolve(['deaf.test']),
         directGet: () => {
           directCalls++;
@@ -383,7 +400,12 @@ Deno.test('a failed fetch is remembered for keyfailminutes (no re-dial)', async 
       deps: stubDeps({
         directGet: () => {
           calls++;
-          return Promise.reject(new Error('connection refused'));
+          return Promise.reject(
+            new UpstreamError('transport', {
+              phase: 'test',
+              reason: 'connection refused',
+            }),
+          );
         },
       }),
     });
@@ -463,4 +485,363 @@ Deno.test('federation disabled → the keydoc precondition 404s', () => {
     assertEquals((e as MatrixError).errcode, 'M_UNRECOGNIZED');
   }
   setConfigForTests({ federation: { enabled: true } });
+});
+
+Deno.test('key boundary: optional old keys stay absent and far-future witness signatures survive', async () => {
+  await withStore(async (store) => {
+    const db = await store.server();
+    const origin = await makeServer('intact-origin.test');
+    const witness = await makeServer('intact-witness.test');
+    await seedServer(db, witness);
+    const doc = await makeDoc(origin, {
+      validUntilMs: Date.now() + 30 * 86400_000,
+    });
+    delete (doc as { old_verify_keys?: unknown }).old_verify_keys;
+    await signJson(doc, origin.name, origin.keyId, origin.kp.privateKey);
+    const answer = await notaryAnswer(doc, witness);
+    const original = structuredClone(doc);
+    const ks = keyStore(db, {
+      deps: stubDeps({
+        listWitnesses: () => Promise.resolve([witness.name]),
+        witnessQuery: () => Promise.resolve(answer),
+        directGet: () => {
+          throw new Error('must use the signed witness document');
+        },
+      }),
+    });
+    const got = await ks.acquireKeyDoc(origin.name, 0);
+    assertEquals(got, original);
+    assertEquals(Object.hasOwn(got, 'old_verify_keys'), false);
+    assert(
+      await verifyJson(got, origin.name, origin.keyId, origin.kp.publicKey),
+    );
+    assert(
+      await verifyJson(got, witness.name, witness.keyId, witness.kp.publicKey),
+    );
+    const [{ rows, doc: saved }] = await ks.listServerKeys(origin.name);
+    assertEquals(JSON.parse(saved!.key_json), original);
+    assertEquals(rows[0].valid_until_ts, saved!.fetched_ms + 7 * 86400_000);
+    // Cache eligibility uses the original acquisition cap, not the signed date.
+    let refreshed = 0;
+    const reloaded = keyStore(db, {
+      deps: directOnly(doc, {
+        get calls() {
+          return refreshed;
+        },
+        set calls(n) {
+          refreshed = n;
+        },
+      }),
+    });
+    await reloaded.acquireKeyDoc(
+      origin.name,
+      saved!.fetched_ms + 8 * 86400_000,
+    );
+    assertEquals(refreshed, 1);
+  });
+});
+
+Deno.test('key boundary: decode every key entry before persistence, including unknown algorithms', async () => {
+  await withStore(async (store) => {
+    const db = await store.server();
+    const origin = await makeServer('schema-origin.test');
+    const publicKey = b64encodeStd(
+      await exportPublicKeyRaw(origin.kp.publicKey),
+    );
+    const mutations: ((doc: Record<string, unknown>) => void)[] = [
+      (d) => {
+        d.valid_until_ts = 1.5;
+      },
+      (d) => {
+        d.verify_keys = [];
+      },
+      (d) => {
+        d.old_verify_keys = null;
+      },
+      (d) => {
+        d.old_verify_keys = [];
+      },
+      (d) => {
+        d.old_verify_keys = { 'ed25519:old': { key: publicKey } };
+      },
+      (d) => {
+        d.old_verify_keys = {
+          'ed25519:old': { key: publicKey, expired_ts: '1' },
+        };
+      },
+      (d) => {
+        d.old_verify_keys = { 'future:old': { key: 12, expired_ts: 1 } };
+      },
+      (d) => {
+        (d.verify_keys as Record<string, unknown>)['future:new'] = { key: 12 };
+      },
+      (d) => {
+        (d.verify_keys as Record<string, unknown>)['future:bad-version'] = {
+          key: 'AA',
+        };
+      },
+      (d) => {
+        (d.verify_keys as Record<string, unknown>)['ed25519:short'] = {
+          key: 'AA',
+        };
+      },
+      (d) => {
+        (d.verify_keys as Record<string, unknown>)['future:padding'] = {
+          key: 'AA=',
+        };
+      },
+      (d) => {
+        (d.verify_keys as Record<string, unknown>)['future:padbits'] = {
+          key: 'AB',
+        };
+      },
+      (d) => {
+        (d.signatures as Record<string, unknown>)['other.test'] = [];
+      },
+      (d) => {
+        (d.signatures as Record<string, unknown>)['other.test'] = {
+          'ed25519:a': 12,
+        };
+      },
+    ];
+    for (const mutate of mutations) {
+      const doc = await makeDoc(origin);
+      mutate(doc as unknown as Record<string, unknown>);
+      // Re-sign every canonicalizable mutation, proving schema not stale signature.
+      if (Number.isInteger(doc.valid_until_ts)) {
+        await signJson(doc, origin.name, origin.keyId, origin.kp.privateKey);
+      }
+      const ks = keyStore(db, { deps: directOnly(doc) });
+      const error = await assertRejects(() => ks.acquireKeyDoc(origin.name, 0));
+      assert(error instanceof UpstreamError);
+      assertEquals(error.category, 'protocol');
+      assertEquals((await ks.listServerKeys(origin.name))[0].doc, null);
+    }
+    // Unknown algorithms obey the shared entry grammar but not Ed25519 length.
+    const valid = await makeDoc(origin, {
+      extraVerifyKeys: {
+        'future:a': 'AA',
+        'future:padded': 'AA==',
+        'future:ed': b64encodeStd(
+          await exportPublicKeyRaw(origin.kp.publicKey),
+        ),
+      },
+    });
+    const validStore = keyStore(db, { deps: directOnly(valid) });
+    await validStore.acquireKeyDoc(origin.name, 0);
+    await assertRejects(
+      () => validStore.getVerifyKey(origin.name, 'future:ed', 0, 'request'),
+      UpstreamError,
+    );
+  });
+});
+
+Deno.test('key boundary: notary envelope is an array of objects, not a bare document or false empty', async () => {
+  const origin = await makeServer('notary-shape.test');
+  const doc = await makeDoc(origin);
+  for (
+    const raw of [doc, {}, [], { server_keys: null }, { server_keys: [null] }, {
+      server_keys: [12],
+    }]
+  ) {
+    try {
+      documentsFromAnswer(raw, origin.name);
+      throw new Error('malformed notary answer accepted');
+    } catch (error) {
+      assert(error instanceof UpstreamError);
+      assertEquals(error.category, 'protocol');
+    }
+  }
+  assertEquals(documentsFromAnswer({ server_keys: [] }, origin.name), []);
+  assertEquals(documentsFromAnswer({ server_keys: [doc] }, origin.name), [doc]);
+});
+
+Deno.test('key boundary: an unverifiable notary document cannot hide a later usable document', async () => {
+  await withStore(async (store) => {
+    const db = await store.server();
+    const origin = await makeServer('notary-multiple.test');
+    const witness = await makeServer('notary-multi-witness.test');
+    await seedServer(db, witness);
+    const bad = await makeDoc(origin);
+    bad.signatures[origin.name][origin.keyId] = 'invalid';
+    await notaryAnswer(bad, witness);
+    const good = await makeDoc(origin);
+    await notaryAnswer(good, witness);
+    const ks = keyStore(db, {
+      deps: stubDeps({
+        listWitnesses: () => Promise.resolve([witness.name]),
+        witnessQuery: () => Promise.resolve({ server_keys: [bad, good] }),
+        directGet: () => {
+          throw new Error('valid notary document was hidden');
+        },
+      }),
+    });
+    assertEquals(await ks.acquireKeyDoc(origin.name, 0), good);
+  });
+});
+
+Deno.test('key boundary: expired cached witness keys cannot authenticate a notary answer', async () => {
+  await withStore(async (store) => {
+    const db = await store.server();
+    const origin = await makeServer('witness-expiry-origin.test');
+    const witness = await makeServer('expired-witness.test');
+    await seedServer(
+      db,
+      witness,
+      await makeDoc(witness, { validUntilMs: Date.now() - 1000 }),
+    );
+    const doc = await makeDoc(origin);
+    const answer = await notaryAnswer(doc, witness);
+    let direct = 0;
+    const ks = keyStore(db, {
+      deps: stubDeps({
+        listWitnesses: () => Promise.resolve([witness.name]),
+        witnessQuery: () => Promise.resolve(answer),
+        directGet: () => {
+          direct++;
+          return Promise.resolve(doc);
+        },
+      }),
+    });
+    await ks.acquireKeyDoc(origin.name, 0);
+    assertEquals(direct, 1);
+    assertEquals((await ks.listServerKeys(origin.name))[0].doc!.via, 'direct');
+  });
+});
+
+Deno.test('key boundary: local and cancellation faults never poison failure memory', async () => {
+  await withStore(async (store) => {
+    const db = await store.server();
+    const origin = await makeServer('local-key.test');
+    const witness = await makeServer('local-witness.test');
+    await seedServer(db, witness);
+    const doc = await makeDoc(origin);
+    const answer = await notaryAnswer(doc, witness);
+    for (
+      const phase of [
+        'direct',
+        'roster',
+        'witness-query',
+        'witness-store',
+        'persist',
+        'cancel',
+      ]
+    ) {
+      const fault = phase === 'cancel'
+        ? new DOMException('cancelled', 'AbortError')
+        : new Error('local ' + phase);
+      let fail = true;
+      const patched = new Proxy(db, {
+        get(target, property) {
+          if (property === 'query') {
+            return (sql: string, params: unknown[]) => {
+              if (
+                fail && phase === 'witness-store' &&
+                sql.includes('FROM server_keys') && params[0] === witness.name
+              ) throw fault;
+              return target.query(
+                sql,
+                params as Parameters<Database['query']>[1],
+              );
+            };
+          }
+          if (property === 'tx') {
+            return (...args: Parameters<Database['tx']>) => {
+              if (fail && phase === 'persist') throw fault;
+              return target.tx(...args);
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const ks = keyStore(patched, {
+        deps: stubDeps({
+          directGet: () => {
+            if (fail && ['direct', 'cancel'].includes(phase)) throw fault;
+            return Promise.resolve(doc);
+          },
+          listWitnesses: () => {
+            if (fail && phase === 'roster') throw fault;
+            return Promise.resolve(
+              phase.startsWith('witness') ? [witness.name] : [],
+            );
+          },
+          witnessQuery: () => {
+            if (fail && phase === 'witness-query') throw fault;
+            return Promise.resolve(answer);
+          },
+        }),
+      });
+      assertStrictEquals(
+        await assertRejects(() => ks.acquireKeyDoc(origin.name, 0)),
+        fault,
+      );
+      fail = false;
+      assertEquals(
+        (await ks.acquireKeyDoc(origin.name, 0)).server_name,
+        origin.name,
+      );
+      await ks.forgetServerKeys(origin.name);
+    }
+  });
+});
+
+Deno.test('key fault ownership: production event resolver does not turn local reads into bad signatures', async () => {
+  await withStore(async (store) => {
+    const db = await store.server();
+    const fault = new Error('key cache read fault');
+    const broken = new Proxy(db, {
+      get(target, property) {
+        if (property === 'query') {
+          return () => {
+            throw fault;
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const { signer } = await randomSigner('local.test');
+    const resolver = productionKeyResolver(broken, signer);
+    assertStrictEquals(
+      await assertRejects(() =>
+        resolver.verifyEventSignature({
+          server: 'origin.test',
+          keyId: 'ed25519:1',
+          pdu: {} as never,
+          roomVersion: '11',
+          minValidUntilMs: 0,
+        })
+      ),
+      fault,
+    );
+  });
+});
+
+Deno.test('key boundary: negative memory preserves the peer failure category', async () => {
+  await withStore(async (store) => {
+    const fault = new UpstreamError('protocol', {
+      phase: 'key-doc',
+      reason: 'invalid key document',
+    });
+    let calls = 0;
+    const ks = keyStore(await store.server(), {
+      deps: stubDeps({
+        directGet: () => {
+          calls++;
+          throw fault;
+        },
+      }),
+    });
+    assertStrictEquals(
+      await assertRejects(() => ks.acquireKeyDoc('bad.test', 0)),
+      fault,
+    );
+    assertStrictEquals(
+      await assertRejects(() => ks.acquireKeyDoc('bad.test', 0)),
+      fault,
+    );
+    assertEquals(calls, 1);
+  });
 });

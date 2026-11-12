@@ -32,9 +32,21 @@ import {
 } from './witness.ts';
 import { listWitnesses } from './peers.ts';
 import { federationRequest } from './client.ts';
-import { UpstreamHttpError } from '#engine/net/upstream-error.ts';
+import { upstreamCategory, UpstreamError } from '#engine/net/upstream-error.ts';
+import { keyDocument, oldKeysOf } from './key-document.ts';
 
 export type KeyDoc = KeyDocShape;
+
+// The existing admin key-change policy is a refusal, not an acquisition fault.
+export class KeyChangeRefused extends MatrixError {
+  constructor(name: string) {
+    super(
+      403,
+      'M_FORBIDDEN',
+      `signing key changed for ${name}; paused until the admin accepts`,
+    );
+  }
+}
 
 export type KeysDeps = {
   // unsigned GET of the origin's own key document (client.ts)
@@ -136,7 +148,7 @@ export function keyStore(
     ? opts.deps
     : productionDeps(server, opts.signer!);
   const inFlight = new Map<string, Promise<KeyDoc>>();
-  const failureMemory = new Map<string, number>(); // name → untilMs
+  const failureMemory = new Map<string, { until: number; error: unknown }>();
   const warnedOnce = new Set<string>(); // name|fingerprint, per instance
 
   // ---------------------------------------------------------------- DB ----
@@ -173,6 +185,10 @@ export function keyStore(
     via: string,
   ): Promise<void> {
     const fetchedMs = Date.now();
+    const effectiveUntil = Math.min(
+      doc.valid_until_ts,
+      fetchedMs + 7 * 86400_000,
+    );
     await server.tx(async (tx) => {
       await tx.execute(
         'INSERT INTO server_key_docs(server_name, key_json, fetched_ms, via) VALUES(?,?,?,?) ON CONFLICT(server_name) DO UPDATE SET key_json = excluded.key_json, fetched_ms = excluded.fetched_ms, via = excluded.via',
@@ -183,17 +199,17 @@ export function keyStore(
       for (const [keyId, entry] of Object.entries(doc.verify_keys)) {
         await tx.execute(
           'INSERT INTO server_keys(server_name, key_id, pubkey_b64, valid_until_ts, fetched_ms, expired_ts) VALUES(?,?,?,?,?,NULL)',
-          [name, keyId, entry.key, doc.valid_until_ts, fetchedMs],
+          [name, keyId, entry.key, effectiveUntil, fetchedMs],
         );
       }
-      for (const [keyId, entry] of Object.entries(doc.old_verify_keys)) {
+      for (const [keyId, entry] of Object.entries(oldKeysOf(doc))) {
         await tx.execute(
           'INSERT INTO server_keys(server_name, key_id, pubkey_b64, valid_until_ts, fetched_ms, expired_ts) VALUES(?,?,?,?,?,?)',
           [
             name,
             keyId,
             entry.key,
-            doc.valid_until_ts,
+            effectiveUntil,
             fetchedMs,
             entry.expired_ts,
           ],
@@ -204,47 +220,34 @@ export function keyStore(
 
   // ------------------------------------------------------- validation ----
 
-  // Required fields (definitions/keys.yaml:101), server_name equality,
-  // self-signature with one of the document's own verify_keys; caps
-  // valid_until_ts at now + 7d (definitions/keys.yaml:96-99). Throws 502
-  // on any failure — the caller maps as it sees fit.
+  // Decode before signature admission. The signed document stays intact;
+  // effective capped validity is persisted separately in server_keys.
   async function validateCandidate(
     name: string,
     raw: unknown,
   ): Promise<KeyDoc> {
-    if (raw === null || typeof raw !== 'object') {
-      throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
-    }
-    const doc = raw as KeyDoc;
-    if (
-      typeof doc.server_name !== 'string' || doc.server_name !== name ||
-      doc.verify_keys === null || typeof doc.verify_keys !== 'object' ||
-      doc.signatures === null || typeof doc.signatures !== 'object' ||
-      typeof doc.valid_until_ts !== 'number'
-    ) {
-      throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
-    }
-    if (
-      doc.old_verify_keys === null || typeof doc.old_verify_keys !== 'object'
-    ) {
-      doc.old_verify_keys = {};
+    const doc = keyDocument(raw);
+    if (doc.server_name !== name) {
+      throw new UpstreamError('validation', {
+        phase: 'key-doc',
+        reason: 'server identity mismatch',
+      });
     }
     let selfSigned = false;
     for (const [keyId, entry] of Object.entries(doc.verify_keys)) {
       if (!keyId.startsWith('ed25519:')) continue;
-      try {
-        const pub = await importPublicKeyFromRaw(b64decode(entry.key));
-        if (await verifyJson(doc, name, keyId, pub)) {
-          selfSigned = true;
-          break;
-        }
-      } catch { /* malformed key entry — try the next */ }
+      const pub = await importPublicKeyFromRaw(b64decode(entry.key));
+      if (await verifyJson(doc, name, keyId, pub)) {
+        selfSigned = true;
+        break;
+      }
     }
     if (!selfSigned) {
-      throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
+      throw new UpstreamError('validation', {
+        phase: 'key-doc',
+        reason: 'invalid self signature',
+      });
     }
-    const cap = Date.now() + 7 * 24 * 3600 * 1000;
-    if (doc.valid_until_ts > cap) doc.valid_until_ts = cap;
     return doc;
   }
 
@@ -315,9 +318,9 @@ export function keyStore(
         signatures: {},
       };
     }
-    const until = failureMemory.get(name);
-    if (until !== undefined && Date.now() < until) {
-      throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
+    const failed = failureMemory.get(name);
+    if (failed !== undefined && Date.now() < failed.until) {
+      throw failed.error;
     }
     // Check each caller's demand before coalescing. Only actual refreshes
     // enter inFlight: a generic cached answer cannot satisfy a rotated-key
@@ -327,8 +330,12 @@ export function keyStore(
       const cached = JSON.parse(row.key_json) as KeyDoc;
       const hasKey = wantKeyId === undefined ||
         Object.hasOwn(cached.verify_keys, wantKeyId) ||
-        Object.hasOwn(cached.old_verify_keys, wantKeyId);
-      if (hasKey && cached.valid_until_ts >= minimumValidUntilTs) return cached;
+        Object.hasOwn(oldKeysOf(cached), wantKeyId);
+      const effectiveUntil = Math.min(
+        cached.valid_until_ts,
+        row.fetched_ms + 7 * 86400_000,
+      );
+      if (hasKey && effectiveUntil >= minimumValidUntilTs) return cached;
     }
     const existing = inFlight.get(name);
     if (existing !== undefined) return await existing;
@@ -363,23 +370,16 @@ export function keyStore(
           minimumValidUntilTs,
           peers,
           query: deps.witnessQuery,
-          selfCheck: async (doc) => {
-            try {
-              return await validateCandidate(name, doc);
-            } catch {
-              return null;
-            }
-          },
+          selfCheck: (doc) => validateCandidate(name, doc),
           witnessCheck: async (peer, doc) => {
             const witnessRows = await readKeyRows(peer);
             for (const w of witnessRows) {
-              if (w.expired_ts !== null) continue;
-              try {
-                const pub = await importPublicKeyFromRaw(
-                  b64decode(w.pubkey_b64),
-                );
-                if (await verifyJson(doc, peer, w.key_id, pub)) return true;
-              } catch { /* try the next cached key */ }
+              if (
+                w.expired_ts !== null || w.valid_until_ts < Date.now() ||
+                !w.key_id.startsWith('ed25519:')
+              ) continue;
+              const pub = await importPublicKeyFromRaw(b64decode(w.pubkey_b64));
+              if (await verifyJson(doc, peer, w.key_id, pub)) return true;
             }
             return false;
           },
@@ -446,11 +446,7 @@ export function keyStore(
             acknowledgedOld,
             candidate: { via: candidate.via, doc: candidate.doc },
           });
-          throw new MatrixError(
-            403,
-            'M_FORBIDDEN',
-            `signing key changed for ${name}; paused until the admin accepts`,
-          );
+          throw new KeyChangeRefused(name);
         }
         await recordChange({
           name,
@@ -476,13 +472,17 @@ export function keyStore(
       await persistDoc(name, candidate.doc, candidate.via);
       return candidate.doc;
     } catch (e) {
-      if (e instanceof MatrixError && e.status === 403) throw e;
-      failureMemory.set(
-        name,
-        Date.now() + config().federation.keyfailminutes * 60_000,
-      );
-      if (e instanceof MatrixError || e instanceof UpstreamHttpError) throw e;
-      throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
+      if (
+        ['transport', 'protocol', 'validation', 'http'].includes(
+          upstreamCategory(e),
+        )
+      ) {
+        failureMemory.set(name, {
+          until: Date.now() + config().federation.keyfailminutes * 60_000,
+          error: e,
+        });
+      }
+      throw e;
     }
   }
 
@@ -520,9 +520,18 @@ export function keyStore(
     purpose: 'request' | 'event',
     ctx?: { roomId?: string },
   ): Promise<CryptoKey> {
+    if (!/^ed25519:[a-zA-Z0-9_]+$/.test(keyId)) {
+      throw new UpstreamError('validation', {
+        phase: 'key-lookup',
+        reason: 'unsupported key algorithm or identifier',
+      });
+    }
     if (isKeyName(name)) {
       if (keyId !== 'ed25519:0') {
-        throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
+        throw new UpstreamError('validation', {
+          phase: 'key-lookup',
+          reason: 'unknown key identifier',
+        });
       }
       return await importPublicKeyFromRaw(b32decode(name)!);
     }
@@ -544,11 +553,15 @@ export function keyStore(
     // A valid answer without the demanded key is still a failed lookup.
     // Remember it per server so varying random key ids cannot force dials.
     // Known cached keys above remain usable during this negative window.
-    failureMemory.set(
-      name,
-      Date.now() + config().federation.keyfailminutes * 60_000,
-    );
-    throw new MatrixError(502, 'M_UNKNOWN', `key fetch failed: ${name}`);
+    const error = new UpstreamError('validation', {
+      phase: 'key-lookup',
+      reason: 'key unavailable for required purpose and validity',
+    });
+    failureMemory.set(name, {
+      until: Date.now() + config().federation.keyfailminutes * 60_000,
+      error,
+    });
+    throw error;
   }
 
   // ------------------------------------------------------- review tools --

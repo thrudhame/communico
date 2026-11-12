@@ -4,11 +4,17 @@
 // sequence, soft-fail, the relaxed remote checks, pending/dropped
 // terminals, redelivery receipts, no delivery intent for remote events,
 // fetch-phase staleness revalidation, and batch rollback (G11).
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { type Room, roomSchema } from '#engine/room/index.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
+import { backfill } from '#engine/room/history.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { genesis } from './fixtures/genesis.ts';
@@ -138,6 +144,46 @@ async function frontierOf(room: Room): Promise<string[]> {
     return stay === null ? [] : await tx.extremities.frontier(stay.id);
   });
 }
+
+Deno.test('key fault ownership: live and historical consumers propagate local faults without publication', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store, { roomId: '!keyfault:test' });
+    const msg = await remoteMsg(s, 'unpublished', [s.joinId], {});
+    const before = await frontierOf(s.room);
+    const fault = new Error('local resolver database fault');
+    const keys = {
+      verifyEventSignature: () => {
+        throw fault;
+      },
+    };
+    assertStrictEquals(
+      await assertRejects(() =>
+        ingestRemote(s.room, [structuredClone(msg)], s.server.name, {
+          ...s.deps,
+          keys,
+        })
+      ),
+      fault,
+    );
+    assertStrictEquals(
+      await assertRejects(() =>
+        backfill(s.room, {
+          from: [s.joinId],
+          limit: 10,
+          via: s.server.name,
+          anchor: structuredClone(msg),
+        }, { ...s.deps, keys })
+      ),
+      fault,
+    );
+    assertEquals(await frontierOf(s.room), before);
+    assertEquals(await s.room.tx((tx) => tx.events.get(msg.event_id!)), null);
+    assertEquals(
+      await s.room.tx((tx) => tx.segments.positionOf(msg.event_id!)),
+      null,
+    );
+  });
+});
 
 async function currentKey(
   room: Room,

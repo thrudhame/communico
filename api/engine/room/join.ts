@@ -50,6 +50,11 @@ import { orderEvents } from '#engine/room/order.ts';
 import { mapEntries, type StateMap } from '#engine/room/state.ts';
 import { identify, oversizedOf, verify } from '#engine/room/verify.ts';
 import { authorizerServer } from '#engine/room/verify.ts';
+import {
+  recoverableUpstream,
+  upstreamCategory,
+  UpstreamHttpError,
+} from '#engine/net/upstream-error.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import type { Store } from '#engine/store/index.ts';
 import {
@@ -94,7 +99,8 @@ async function verifySnapshotEvent(
       roomId,
       localSnapshotFallback: { self, resident: candidate },
     });
-  } catch {
+  } catch (error) {
+    if (!recoverableUpstream(error)) throw error;
     return null;
   }
 }
@@ -103,8 +109,12 @@ async function verifySnapshotEvent(
 // 404 M_NOT_FOUND and the M_UNABLE_TO_* join errcodes; abort on other
 // 4xx (403, M_INCOMPATIBLE_ROOM_VERSION — the old classification).
 function isFailover(e: unknown): boolean {
-  const err = e as { status?: number; errcode?: string };
-  if (typeof err.status !== 'number') return true;
+  if (!(e instanceof MatrixError) && !(e instanceof UpstreamHttpError)) {
+    return ['transport', 'protocol', 'validation'].includes(
+      upstreamCategory(e),
+    );
+  }
+  const err = e;
   if (err.status >= 500) return true;
   if (err.status === 404 && err.errcode === 'M_NOT_FOUND') return true;
   return err.errcode === 'M_UNABLE_TO_AUTHORISE_JOIN' ||
@@ -380,7 +390,8 @@ async function joinVia(
             verifiedSigs[keyId] = residentSigs[keyId];
             break;
           }
-        } catch {
+        } catch (error) {
+          if (!recoverableUpstream(error)) throw error;
           // key unobtainable under this id — try the next
         }
       }

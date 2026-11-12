@@ -44,6 +44,7 @@ import { orderEvents } from '#engine/room/order.ts';
 import { mapEntries } from '#engine/room/state.ts';
 import { verify } from '#engine/room/verify.ts';
 import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 export type BackfillDeps = {
   keys: KeyResolver;
@@ -315,7 +316,8 @@ export async function backfill(
           args.via,
           deps.signal,
         )) ?? [];
-  } catch {
+  } catch (error) {
+    if (!recoverableUpstream(error, deps.signal)) throw error;
     return empty;
   }
   const page: PageItem[] = [];
@@ -331,7 +333,8 @@ export async function backfill(
       if (seen.has(v.eventId)) continue;
       seen.add(v.eventId);
       page.push({ pdu: v.pdu, eventId: v.eventId });
-    } catch {
+    } catch (error) {
+      if (!recoverableUpstream(error, deps.signal)) throw error;
       continue;
     }
   }

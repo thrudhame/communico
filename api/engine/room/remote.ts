@@ -39,6 +39,7 @@ import { stageRecoveryEvidence } from '#engine/room/recovery.ts';
 import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { identify, verify } from '#engine/room/verify.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 export type RemoteOutcomeKind =
   | 'accepted'
@@ -275,7 +276,8 @@ async function fetchMissing(
             roomId: room.id,
           });
           if (!acc.live.has(v.eventId)) verified.set(v.eventId, v.pdu);
-        } catch {
+        } catch (error) {
+          if (!recoverableUpstream(error)) throw error;
           // an unverifiable auth-chain event is simply not evidence
         }
       }
@@ -343,7 +345,8 @@ async function fetchGapTip(
           oversized: v.oversized,
         });
       }
-    } catch {
+    } catch (error) {
+      if (!recoverableUpstream(error)) throw error;
       // stays missing — the caller's terminal decides
     }
   }
@@ -411,6 +414,7 @@ export async function ingestRemote(
       const pre = await identify(pdu, version, { roomId: room.id });
       identified.push({ index, pdu, eventId: pre.eventId });
     } catch (e) {
+      if (!recoverableUpstream(e)) throw e;
       let eventId: string | null = null;
       try {
         eventId = await eventIdFor(
@@ -448,6 +452,7 @@ export async function ingestRemote(
         oversized: v.oversized,
       });
     } catch (e) {
+      if (!recoverableUpstream(e)) throw e;
       outcomes[item.index] = outcomeOf(item.eventId, 'refused', String(e));
     }
   }

@@ -12,7 +12,8 @@ import type { KeyResolver } from '#engine/room/deps.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import { verifyJson } from '#engine/signing-primitives.js';
-import { keyStore } from './keys.ts';
+import { KeyChangeRefused, keyStore } from './keys.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 export function productionKeyResolver(server: Db, signer: Signer): KeyResolver {
   const keys = keyStore(server, { signer });
@@ -26,7 +27,10 @@ export function productionKeyResolver(server: Db, signer: Signer): KeyResolver {
           args.minValidUntilMs,
           'event',
         );
-      } catch {
+      } catch (error) {
+        if (
+          !(error instanceof KeyChangeRefused) && !recoverableUpstream(error)
+        ) throw error;
         return false; // key unknown, expired before the floor, unobtainable
       }
       let redacted: Record<string, unknown>;
