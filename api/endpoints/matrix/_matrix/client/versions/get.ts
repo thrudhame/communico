@@ -3,6 +3,7 @@
 // the known-red Complement baseline is not itself an advertising criterion.
 // The three Element creation-policy flags describe the configured presets.
 import { config } from '#engine/config.ts';
+import { rtcTransports } from '#engine/matrixrtc.ts';
 // deno-lint-ignore require-await
 export default async function () {
   return {
@@ -26,6 +27,7 @@ export default async function () {
     ],
     unstable_features: {
       'org.matrix.simplified_msc3575': true,
+      'org.matrix.msc4143': rtcTransports().length !== 0,
       'io.element.e2ee_forced.public': !config().encryption
         .allowunencryptedcreation,
       'io.element.e2ee_forced.private': !config().encryption

@@ -304,6 +304,21 @@ export function loadConfig(opts: {
   }
 
   problems.push(...validateNumbers(built as Partial<Config>));
+  const rtcUrl = (built.matrixrtc as Record<string, unknown> | undefined)
+    ?.livekitserviceurl;
+  if (typeof rtcUrl === 'string' && rtcUrl !== '') {
+    try {
+      const url = new URL(rtcUrl);
+      if (
+        !['http:', 'https:'].includes(url.protocol) || url.username ||
+        url.password || url.hash
+      ) throw new Error('invalid service URL');
+    } catch {
+      problems.push(
+        'config: matrixrtc.livekitserviceurl (COMMUNICO_MATRIXRTC_LIVEKITSERVICEURL): expected absolute HTTP(S) URL without credentials or fragment',
+      );
+    }
+  }
   const hierarchy = built.hierarchy as Record<string, unknown> | undefined;
   if (
     typeof hierarchy?.pagesize === 'number' &&
@@ -517,6 +532,7 @@ export type ConfigPatch = {
     };
   };
   turn?: Partial<Config['turn']>;
+  matrixrtc?: Partial<Config['matrixrtc']>;
   openid?: Partial<Config['openid']>;
   peeking?: Partial<Config['peeking']>;
   hierarchy?: Partial<Config['hierarchy']>;

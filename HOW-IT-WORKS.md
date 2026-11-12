@@ -824,6 +824,14 @@ password. No external request, credential storage or TURN server is involved.
 Incomplete configuration or zero TTL returns an empty object.
 (`api/engine/turn.ts`)
 
+MatrixRTC discovery reads one `matrixrtc.livekitserviceurl` setting, empty/off
+by default. The shared owner supplies legacy well-known `rtc_foci` and the
+authenticated unstable MSC4143 transports registry; versions advertises the
+feature only when configured. The external authorization service owns LiveKit
+credentials and SFU selection and uses the existing Matrix OpenID flow. This
+server neither proxies LiveKit tokens nor runs the SFU. Client well-known still
+requires its explicit homeserver URL. (`api/engine/matrixrtc.ts`)
+
 Global push-rule reads share `tenant/pushrules.ts:rulesetFor`. Whois authorizes
 self or the exact configured `admin.users` entry before checking target locality
 or reading data. One tenant transaction reads devices and active access-token

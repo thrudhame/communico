@@ -35,6 +35,7 @@ export const SCHEMA = {
     password: 'string',
     ttl: 'int',
   },
+  matrixrtc: { livekitserviceurl: 'string' },
   hierarchy: {
     pagesize: 'int',
     maxpagesize: 'int',

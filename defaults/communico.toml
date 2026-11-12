@@ -62,6 +62,13 @@ password = ""
 # COMMUNICO_TURN_TTL
 ttl = 3600
 
+[matrixrtc]
+# External LiveKit authorization service base URL; empty disables RTC discovery.
+# Shared by authenticated transports and legacy well-known rtc_foci. The service
+# owns its SFU URL/credentials and validates Matrix OpenID tokens; communico does
+# not run an SFU or proxy tokens. COMMUNICO_MATRIXRTC_LIVEKITSERVICEURL
+livekitserviceurl = ""
+
 [openid]
 # Synapse's default OpenID token lifetime; separate from client access tokens.
 # COMMUNICO_OPENID_TOKENSECONDS
