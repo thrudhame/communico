@@ -141,6 +141,28 @@ suite.test('unthreaded/main/two threads and both receipt types survive sync with
   );
 });
 
+suite.test('unknown-thread capacity is a 429 rather than a not-joined error, with no partial receipt', async () => {
+  const f = await setup('thread-capacity');
+  await theApp().server.execute(
+    `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100)
+    INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_id,ts_ms,seq)
+    SELECT ?,?,'m.read','$unknown-' || i,?,0,0 FROM n`,
+    [f.room, f.a.user_id, f.root],
+  );
+  const result = await call(f.receipt(f.root), f.a.access_token!, {
+    thread_id: '$overflow',
+  });
+  assertEquals([result.status, result.body.errcode], [429, 'M_LIMIT_EXCEEDED']);
+  assertEquals(
+    await theApp().server.query(
+      'SELECT 1 FROM receipts WHERE room_id=? AND thread_id=?',
+      [f.room, '$overflow'],
+    ),
+    [],
+  );
+  await ok(f.receipt(f.reply), f.a.access_token!, { thread_id: f.root });
+});
+
 suite.test('thread roots and their non-thread relations stay on main; reply relations stay in their thread', async () => {
   const f = await setup('thread-membership');
   const noBody = await suite.matrix(
