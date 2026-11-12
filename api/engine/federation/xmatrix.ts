@@ -4,8 +4,10 @@
 // OR `signature` (the spec's example says sig, its parameter list says
 // signature; gmsl reads sig). RFC 9110 §11.4 auth params: quoted or
 // token values, backslash unescape, case-insensitive names, unknown
-// params ignored, unquoted colons tolerated. A request MAY carry several
+// params ignored. A request MAY carry several
 // Authorization headers — the parser returns ALL usable ones.
+import { fieldList, parameterized, TOKEN } from '#engine/net/fields.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 export type XMatrixParams = {
   origin: string;
   destination: string | null;
@@ -28,83 +30,78 @@ export function buildXMatrixHeader(p: XMatrixParams): string {
   ];
   return 'X-Matrix ' + parts.filter((x) => x !== null).join(',');
 }
-// Parse the auth-param list after the X-Matrix scheme token: k=v pairs,
-// values quoted with backslash escapes or bare tokens. A request MAY
-// carry several Authorization headers — fetch Headers joins them on
-// commas; a second scheme token starts a NEW candidate, so the joined
-// strings are split on scheme boundaries before parsing (each candidate
-// needs origin+key+sig anyway). Escaped pairs are unescaped one level.
-function splitSchemes(raw: string): string[] {
-  return raw.split(/,(?=\s*X-Matrix\s)/i).filter((p) => p.length > 0);
+// Headers can join several schemes. Only commas outside quoted strings can
+// separate parameters or schemes; an unterminated string cannot be recovered by
+// treating its contents as a fresh credential.
+function commaFields(raw: string): string[] | null {
+  try {
+    return fieldList(raw, 'x-matrix');
+  } catch (error) {
+    if (!(error instanceof UpstreamError) || error.category !== 'protocol') {
+      throw error;
+    }
+    return null;
+  }
 }
 
-function parseParamBlock(raw: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  let rest = raw.trim();
-  while (rest.length > 0) {
-    const eq = rest.indexOf('=');
-    if (eq < 0) break;
-    const name = rest.slice(0, eq).trim().toLowerCase();
-    rest = rest.slice(eq + 1).trimStart();
-    let value = '';
-    if (rest.startsWith('"')) {
-      let i = 1;
-      while (i < rest.length) {
-        const ch = rest[i];
-        if (ch === '\\' && i + 1 < rest.length) {
-          value += rest[i + 1];
-          i += 2;
-        } else if (ch === '"') {
-          i++;
-          break;
-        } else {
-          value += ch;
-          i++;
-        }
-      }
-      rest = rest.slice(i);
-    } else {
-      let i = 0;
-      while (i < rest.length && rest[i] !== ',') {
-        value += rest[i];
-        i++;
-      }
-      rest = rest.slice(i);
-      value = value.trim();
+function candidate(fields: string[]): XMatrixParams | null {
+  const params = new Map<string, string>();
+  try {
+    for (const field of fields) {
+      // Reuse the token/quoted-pair grammar, with exactly one auth-param per
+      // comma field. A semicolon must not become an alternate list delimiter.
+      const parsed = parameterized('auth;' + field, 'x-matrix').parameters;
+      if (parsed.size !== 1) return null;
+      const [name, values] = [...parsed][0];
+      if (values.length !== 1 || params.has(name)) return null;
+      params.set(name, values[0]);
     }
-    if (name.length > 0) out[name] = value;
-    const comma = rest.indexOf(',');
-    rest = comma < 0 ? '' : rest.slice(comma + 1).trim();
+  } catch (error) {
+    if (!(error instanceof UpstreamError) || error.category !== 'protocol') {
+      throw error;
+    }
+    return null;
   }
-  return out;
+  const origin = params.get('origin'), key = params.get('key');
+  const sig = params.get('sig'), signature = params.get('signature');
+  if (sig !== undefined && signature !== undefined && sig !== signature) {
+    return null;
+  }
+  const value = sig === undefined ? signature : sig;
+  if (!origin || !key || !value) return null;
+  const destination = params.get('destination');
+  return {
+    origin,
+    key,
+    signature: value,
+    destination: destination === undefined || destination === ''
+      ? null
+      : destination,
+  };
 }
 
 export function parseXMatrixHeaders(all: string[]): XMatrixParams[] {
   const out: XMatrixParams[] = [];
   for (const header of all) {
-    for (const b of splitSchemes(header)) {
-      const block = b.trim();
-      const space = block.indexOf(' ');
-      if (space < 0) continue;
-      if (block.slice(0, space).toLowerCase() !== 'x-matrix') continue;
-      const params = parseParamBlock(block.slice(space + 1));
-      const sig = params.sig !== undefined ? params.sig : params.signature;
+    const fields = commaFields(header);
+    if (fields === null) continue;
+    let active = false, params: string[] = [];
+    const finish = () => {
+      const value = active ? candidate(params) : null;
+      if (value !== null) out.push(value);
+    };
+    for (const field of fields) {
+      if (!field) continue; // RFC9110 list recipients tolerate empty elements.
+      const scheme = /^([^ \t]+) +(.+)$/.exec(field);
       if (
-        typeof params.origin === 'string' && params.origin.length > 0 &&
-        typeof sig === 'string' && sig.length > 0 &&
-        typeof params.key === 'string' && params.key.length > 0
+        scheme !== null && TOKEN.test(scheme[1]) && !/^[ \t]*=/.test(scheme[2])
       ) {
-        out.push({
-          origin: params.origin,
-          destination: typeof params.destination === 'string' &&
-              params.destination.length > 0
-            ? params.destination
-            : null,
-          key: params.key,
-          signature: sig,
-        });
-      }
+        finish();
+        active = scheme[1].toLowerCase() === 'x-matrix';
+        params = [scheme[2]];
+      } else params.push(field);
     }
+    finish();
   }
   return out;
 }

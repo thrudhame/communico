@@ -4,6 +4,26 @@ export const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 export function trimOws(value: string): string {
   return value.replace(/^[ \t]+|[ \t]+$/g, '');
 }
+// RFC9110 comma lists share quoted-string boundaries, including quoted-pairs.
+// Callers own each element's grammar and duplicate semantics.
+export function fieldList(raw: string, phase = 'http-field'): string[] {
+  const out: string[] = [];
+  let quoted = false, start = 0;
+  for (let i = 0; i < raw.length; i++) {
+    if (quoted && raw[i] === '\\') {
+      i++;
+      continue;
+    }
+    if (raw[i] === '"') quoted = !quoted;
+    else if (!quoted && raw[i] === ',') {
+      out.push(trimOws(raw.slice(start, i)));
+      start = i + 1;
+    }
+  }
+  if (quoted) protocol(phase, 'unterminated quoted field');
+  out.push(trimOws(raw.slice(start)));
+  return out;
+}
 // Headers uses ByteString, not TextDecoder('latin1')'s Windows-1252 mapping.
 export function fieldText(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => String.fromCharCode(b)).join('');

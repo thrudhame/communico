@@ -30,6 +30,7 @@ export type Http1Request = {
   connectMs: number;
   timeoutMs: number;
   maxBytes: number;
+  signal?: AbortSignal;
 };
 
 export type Http1Response = {
@@ -411,6 +412,7 @@ async function readHttp(
 export async function http1Request(
   req: Http1Request,
 ): Promise<Http1Response> {
+  req.signal?.throwIfAborted();
   const ac = new AbortController();
   const timeout = () =>
     ac.abort(
@@ -420,6 +422,13 @@ export async function http1Request(
       }),
     );
   let conn: Deno.Conn | null = null;
+  const cancel = () => {
+    ac.abort(req.signal?.reason);
+    try {
+      if (conn !== null) conn.close();
+    } catch { /* already closed */ }
+  };
+  req.signal?.addEventListener('abort', cancel, { once: true });
   // the whole-request budget: on fire, close the connection — a pending
   // read/handshake errors and is reported below as a timeout
   const totalTimer = setTimeout(
@@ -479,6 +488,7 @@ export async function http1Request(
       signal: ac.signal,
     });
   } finally {
+    req.signal?.removeEventListener('abort', cancel);
     clearTimeout(totalTimer);
     if (conn !== null) {
       try {

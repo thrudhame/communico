@@ -867,6 +867,18 @@ cannot become typing stops, invented receipt timestamps or default presence.
 Unknown local handler failures propagate without caching transaction success.
 (`api/engine/federation/{discovery,discovery-response,peer-json,transactions,edus}.ts`)
 
+X-Matrix authorization parses quote-aware comma lists, token/quoted parameter
+values and unique names before signature verification. Discovery validates
+Matrix server names, preserves redirect queries, follows HTTP(S) using the
+matching transport, and caches according to Cache-Control and response age.
+Only classified peer failures fall back; local CA faults and cancellation
+propagate. SRV selection uses priority and RFC2782 weighted ordering, recognizes
+an unavailable service, and retains alternate targets and A/AAAA answers.
+Dial failover stops before the first HTTP write: completed or uncertain requests,
+decoder failures and sink failures cannot replay on another address. Delegated
+Host and TLS identities never acquire the SRV target's port.
+(`api/engine/federation/{xmatrix,server-name,well-known,resolve,dial-node-tls}.ts`)
+
 The shared thumbnail service serves local client, legacy-local and signed
 federation routes. Remote variants fetch signed federation thumbnails before
 bounded local validation/static generation. Cache identity includes format,

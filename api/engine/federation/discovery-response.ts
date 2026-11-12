@@ -3,6 +3,7 @@
 import { arrayOf, objectOf, stringOf } from '#engine/net/json.ts';
 import { protocol, UpstreamError } from '#engine/net/upstream-error.ts';
 import type { Profile } from './query.ts';
+import { splitServerName } from './server-name.ts';
 
 function roomId(raw: unknown, phase: string): string {
   const value = stringOf(raw, phase);
@@ -15,9 +16,7 @@ export function directoryResponse(raw: unknown) {
     room_id: roomId(body.room_id, 'directory'),
     servers: arrayOf(body.servers, (raw) => {
       const server = stringOf(raw, 'directory');
-      if (!server || /\s/.test(server)) {
-        protocol('directory', 'invalid server name');
-      }
+      splitServerName(server);
       return server;
     }, 'directory'),
   };

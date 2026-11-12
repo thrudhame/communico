@@ -3,13 +3,243 @@
 // priority pick, roster overrides, key-is-name 502s. No network, no DB —
 // plus the production roster wiring over a real server file (doltgres
 // tests/federation-resolve.test.ts, restored).
-import { assertEquals, assertRejects } from '@std/assert';
+import { assertEquals, assertRejects, assertThrows } from '@std/assert';
 import {
   resetWellKnownCache,
   resolve,
   type ResolveDeps,
   resolveWith,
+  splitServerName,
 } from '#engine/federation/resolve.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
+import { resetCaCertsForTests } from '#engine/federation/client.ts';
+
+Deno.test('discovery grammar: server-name syntax is not URL syntax or numeric coercion', () => {
+  for (
+    const raw of [
+      'name:',
+      'name:+443',
+      'name:1e3',
+      'name:65536',
+      '[::1]garbage',
+      '[bad]:443',
+      '::1',
+      'https://name',
+      'name/path',
+      'name?x=1',
+      'name#fragment',
+      'name: 443',
+      'bad_name',
+      '256.1.1.1',
+    ]
+  ) {
+    assertThrows(() => splitServerName(raw), UpstreamError, undefined, raw);
+  }
+  assertEquals(splitServerName('[::ffff:192.0.2.1]:8448'), {
+    host: '::ffff:192.0.2.1',
+    port: 8448,
+  });
+  assertEquals(splitServerName('name.test:00443'), {
+    host: 'name.test',
+    port: 443,
+  });
+});
+
+Deno.test('discovery grammar: weighted SRV order, unavailable target and alternate eligible answers', async () => {
+  const weighted = Object.assign(
+    deps({
+      dnsSrv: (h) =>
+        Promise.resolve(
+          h.startsWith('_matrix-fed.')
+            ? [
+              { target: 'light.test', port: 1111, priority: 1, weight: 2 },
+              { target: 'heavy.test', port: 2222, priority: 1, weight: 8 },
+            ]
+            : [],
+        ),
+      dnsA: () => Promise.resolve(['127.0.0.1']),
+    }),
+    { random: () => 0.1 },
+  );
+  assertEquals((await resolveWith('weighted.test', weighted)).port, 1111);
+  const visited: string[] = [];
+  const unavailable = deps({
+    dnsSrv: (h) => {
+      visited.push(h);
+      return Promise.resolve([{
+        target: '.',
+        port: 0,
+        priority: 0,
+        weight: 0,
+      }]);
+    },
+    dnsA: (h) => {
+      visited.push(h);
+      return Promise.resolve(['127.0.0.1']);
+    },
+  });
+  assertEquals(
+    (await assertRejects(
+      () => resolveWith('unavailable.test', unavailable),
+      UpstreamError,
+    )).category,
+    'transport',
+  );
+  assertEquals(visited, ['_matrix-fed._tcp.unavailable.test']);
+  const alternate = deps({
+    wellKnownGet: () =>
+      Promise.resolve({ mServer: 'delegate.test', maxAgeMs: null }),
+    dnsSrv: (h) =>
+      Promise.resolve(
+        h.startsWith('_matrix-fed.')
+          ? [
+            { target: 'missing.test', port: 1234, priority: 0, weight: 1 },
+            { target: 'working.test', port: 4321, priority: 1, weight: 1 },
+          ]
+          : [],
+      ),
+    dnsA: (h) => Promise.resolve(h === 'working.test' ? ['127.0.0.1'] : []),
+    dnsAAAA: (h) => Promise.resolve(h === 'working.test' ? ['::1'] : []),
+  });
+  const endpoint = await resolveWith('main.test', alternate);
+  assertEquals([
+    endpoint.connectIp,
+    endpoint.port,
+    endpoint.hostHeader,
+    endpoint.sni,
+  ], ['127.0.0.1', 4321, 'delegate.test', 'delegate.test']);
+});
+
+Deno.test('discovery grammar: production well-known follows only real redirects, retains queries, validates JSON and honors cache directives', async () => {
+  const oldDns = Deno.resolveDns;
+  Deno.resolveDns = ((_: string, type: string) =>
+    Promise.resolve(
+      type === 'A' ? ['127.0.0.1'] : [],
+    )) as typeof Deno.resolveDns;
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  let mode = 'redirect', calls = 0;
+  const requests: string[] = [];
+  const plain = Deno.serve(
+    { hostname: '127.0.0.1', port: 0, onListen() {} },
+    (request) => {
+      calls++;
+      assertEquals(
+        new URL(request.url).pathname + new URL(request.url).search,
+        '/delegate?keep=yes',
+      );
+      assertEquals(request.headers.get('authorization'), null);
+      return Response.json({ 'm.server': 'delegate.test:8452' });
+    },
+  );
+  const server = Deno.serve({
+    hostname: '127.0.0.1',
+    port: 443,
+    cert: await Deno.readTextFile('tests/fixtures/tls/localhost.crt'),
+    key: await Deno.readTextFile('tests/fixtures/tls/localhost.key'),
+    onListen() {},
+  }, (request) => {
+    calls++;
+    const url = new URL(request.url);
+    requests.push(url.pathname + url.search);
+    if (mode === 'http-redirect') {
+      return new Response(null, {
+        status: 307,
+        headers: {
+          Location: 'http://localhost:' + plain.addr.port +
+            '/delegate?keep=yes',
+        },
+      });
+    }
+    if (mode === 'redirect' && url.pathname.startsWith('/.well-known')) {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: '/delegate?keep=yes' },
+      });
+    }
+    if (mode === 'redirect' && url.search !== '?keep=yes') {
+      return new Response(null, { status: 404 });
+    }
+    if (mode === 'not-redirect') {
+      return new Response(null, {
+        status: 304,
+        headers: { Location: '/delegate?keep=yes' },
+      });
+    }
+    if (mode === 'scheme') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'ftp://localhost/delegate' },
+      });
+    }
+    if (mode === 'invalid') {
+      return Response.json({ 'm.server': 'delegate.test/path' });
+    }
+    if (mode === 'root') return Response.json([]);
+    if (mode === 'utf8') {
+      return new Response(new Uint8Array([123, 255, 125]), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    const headers: Record<string, string> = mode === 'no-store'
+      ? { 'Cache-Control': 'no-store' }
+      : mode === 'no-cache'
+      ? { 'Cache-Control': 'public, no-cache' }
+      : mode === 'age'
+      ? { 'Cache-Control': 'MAX-AGE="60"', Age: '61' }
+      : { 'Cache-Control': 'public, MAX-AGE="60"' };
+    return Response.json({ 'm.server': 'delegate.test:8451' }, { headers });
+  });
+  try {
+    await withStore(async (store) => {
+      const db = await store.server();
+      const read = () => resolve(db, 'localhost');
+      resetWellKnownCache();
+      assertEquals((await read()).port, 8451);
+      assertEquals(requests, [
+        '/.well-known/matrix/server',
+        '/delegate?keep=yes',
+      ]);
+      mode = 'http-redirect';
+      resetWellKnownCache();
+      assertEquals((await read()).port, 8452);
+      for (mode of ['not-redirect', 'scheme', 'invalid', 'root', 'utf8']) {
+        resetWellKnownCache();
+        const before = calls;
+        assertEquals((await read()).port, 8448, mode);
+        assertEquals(calls, before + 1, mode);
+      }
+      for (mode of ['no-store', 'no-cache', 'age']) {
+        resetWellKnownCache();
+        const before = calls;
+        assertEquals((await read()).port, 8451);
+        assertEquals((await read()).port, 8451);
+        assertEquals(calls, before + 2, mode);
+      }
+      mode = 'cache';
+      resetWellKnownCache();
+      const before = calls;
+      await read();
+      await read();
+      assertEquals(calls, before + 1);
+      setConfigForTests({
+        federation: { cacerts: ['does-not-exist-local-ca.pem'] },
+      });
+      resetCaCertsForTests();
+      resetWellKnownCache();
+      await assertRejects(read, Deno.errors.NotFound);
+    });
+  } finally {
+    Deno.resolveDns = oldDns;
+    resetWellKnownCache();
+    setConfigForTests({});
+    resetCaCertsForTests();
+    await server.shutdown();
+    await plain.shutdown();
+  }
+  assertEquals(config().federation.enabled, true);
+});
 import { addPeer, removePeer } from '#engine/federation/peers.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
@@ -32,6 +262,7 @@ function deps(over: Partial<ResolveDeps>): ResolveDeps {
     lookupPeer: over.lookupPeer !== undefined
       ? over.lookupPeer
       : () => Promise.resolve(null),
+    random: over.random,
   };
 }
 
@@ -116,8 +347,9 @@ Deno.test('resolve: .well-known to an IP literal delegation → sni null', async
   assertEquals(ep.port, 8449);
 });
 
-Deno.test('resolve: .well-known failing → SRV _matrix-fed first, lowest priority + highest weight', async () => {
+Deno.test('resolve: .well-known failing → SRV _matrix-fed first, lowest priority and weighted choice', async () => {
   const d = deps({
+    random: () => 0.9,
     wellKnownGet: () => Promise.resolve({ mServer: null, maxAgeMs: null }),
     dnsSrv: (h) =>
       h === '_matrix-fed._tcp.main.test'
@@ -130,7 +362,8 @@ Deno.test('resolve: .well-known failing → SRV _matrix-fed first, lowest priori
     dnsA: () => Promise.resolve(['10.0.0.1']),
   });
   const ep = await resolveWith('main.test', d);
-  // priority 1 wins over 10; within priority 1, highest weight is c.test:8449
+  // Priority 1 wins over 10; the injected draw selects c.test, not a permanent
+  // highest-weight preference. The independent grammar test selects light weight.
   assertEquals(ep.port, 8449);
 });
 

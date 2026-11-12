@@ -145,6 +145,7 @@ export async function federationRequestRaw(
   }
   const res = await dialNodeTls({
     connectIp: endpoint.connectIp,
+    alternatives: endpoint.alternatives,
     port: endpoint.port,
     sni: endpoint.sni,
     hostHeader: endpoint.hostHeader,
