@@ -255,6 +255,7 @@ test('versions stays public, capabilities stays protected, discovery absent per 
         'org.matrix.simplified_msc3575': true,
         'org.matrix.msc4143': false,
         'org.matrix.msc4140': false,
+        'uk.tcpip.msc4133.stable': true,
         'io.element.e2ee_forced.public': !config().encryption
           .allowunencryptedcreation,
         'io.element.e2ee_forced.private': !config().encryption
