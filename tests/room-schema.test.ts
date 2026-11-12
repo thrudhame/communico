@@ -70,7 +70,9 @@ Deno.test('room schema: tables and indexes land on create, version recorded', as
         `missing index ${name}`,
       );
     }
-    assertEquals(await room.query('SELECT v FROM meta'), [{ v: '4' }]);
+    assertEquals(await room.query('SELECT v FROM meta'), [{
+      v: String(roomSchema.version),
+    }]);
     await store.close();
     const again = await openStore(config(dir), {
       schemas: { room: roomSchema },
@@ -127,7 +129,9 @@ Deno.test('room schema: v3 upgrade preserves old data and starts the future publ
       id: '$old',
     }]);
     assertEquals(await upgraded.query('SELECT * FROM publication_keys'), []);
-    assertEquals(await upgraded.query('SELECT v FROM meta'), [{ v: '4' }]);
+    assertEquals(await upgraded.query('SELECT v FROM meta'), [{
+      v: String(roomSchema.version),
+    }]);
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
