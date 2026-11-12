@@ -107,7 +107,7 @@ suite.test('authentication, position ownership and discovery remain honest at th
   );
   assertEquals(
     object(versions.body.unstable_features)['org.matrix.simplified_msc3575'],
-    undefined,
+    true,
   );
 });
 

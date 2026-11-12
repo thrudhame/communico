@@ -230,13 +230,15 @@ owners. Prejoin display keeps its existing stripped/provenance ceiling.
 (`api/engine/client/state-admission.ts`, `client/{render,state}.ts`,
 `api/engine/room/state.ts`)
 
-Native simplified-sync groundwork validates the deployed MSC4186 request
+Native simplified sync validates the deployed MSC4186 request
 dialect separately from ordinary sync. Tenant schema v19 owns issued connection
 positions, scoped to user/device generation and connection ID. A response's
 immutable snapshot is not consumed by a retry of its input; revision fencing
 rejects stale in-flight publishers. Completed responses retain at most the
 input and one successor. Device deletion removes both connection and position
-rows. Startup and new admission prune expired connections; seven idle days,
+rows. A no-position replacement fences stale publishers immediately, but only
+successful publication retires the previous connection and issued positions.
+Startup and new admission prune expired connections; seven idle days,
 per-device/tenant capacity and snapshot bytes are layered `slidingsync` settings.
 Connection persistence never acknowledges or reads the to-device inbox;
 protocol coordination and inbox publication have separate owners.
@@ -265,7 +267,7 @@ explicitly empty state selection is never overridden. DM removal resets the
 last delivered value for prejoin rooms as well as joined rooms.
 (`api/engine/client/sync-window.ts`, `api/engine/sliding-sync/{rooms,state}.ts`)
 
-Sliding inbox groundwork reuses the tenant's durable queue, acknowledgment and
+Sliding inbox delivery reuses the tenant's durable queue, acknowledgment and
 bounded issued-delivery receipts. Opaque receipts are scoped to the protocol and
 connection as well as the device generation; a room-list position, forged token
 or another connection cannot acknowledge unseen keys. Zero-size pages issue no
@@ -278,7 +280,10 @@ consuming it, so received pages do not make every encryption poll immediate.
 Account-data delivery captures the global/selected room bodies, push rules and
 their shared maximum in one tenant transaction. Ordinary sync consumes that
 same capture; slow rendering cannot read a later body under an older cursor.
-Sliding room selection supplies independent per-room account cuts. Receipt
+Sliding room selection supplies independent per-room account cuts. Bounded
+set-based reads capture membership and pending-prejoin room data; only explicit
+capture entries, including empty results, authorize advancing a room cut.
+Global-only scopes do no room-body reads. Receipt
 reads accept an explicit captured maximum and share the wire formatter with
 ordinary sync. Single-event receipt maps follow MSC4102's unthreaded-wins
 collision behavior, without removing the independently stored thread slots.
@@ -288,7 +293,10 @@ Room extensions select the union of admitted named list windows and actual
 subscriptions, not arbitrary requested room IDs. Their account/receipt/typing
 cuts advance only for selected rooms. First or expanded receipt windows include
 timeline-target marks plus the viewer's own marks, with private rows scoped to
-their viewer. Typing snapshots copy values and counters before rendering;
+their viewer.
+Incremental receipt captures read from each room's own delivered cut; initial
+and expanded timeline windows retain full receipt snapshots.
+Typing snapshots copy values and counters before rendering;
 ordinary sync shares that capture, and a process epoch invalidates persisted
 sliding typing cuts after restart. Empty stops remain real updates.
 (`api/engine/sliding-sync/extensions.ts`, `api/engine/typing.ts`)
@@ -320,7 +328,8 @@ requested windows/configuration, admitted payloads and enabled extension data,
 not constant SYNC operations or fresh position tokens. Counts come from the same
 notification buckets as ordinary sync; count-only read changes can update a
 zero-timeline room. Request cancellation reaches both polling and atomic final
-publication. Native support remains unadvertised pending real SDK acceptance.
+publication. The versions response advertises `org.matrix.simplified_msc3575`;
+clients discover native support without a proxy URL or an SDK override.
 (`api/engine/sliding-sync/index.ts`, `api/engine/sliding-sync/lock.ts`)
 
 Stored and inline sync filters share shape validation and pure matching across
