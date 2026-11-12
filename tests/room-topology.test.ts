@@ -89,7 +89,7 @@ Deno.test('room topology: v1 upgrade, child-first anchors, late parents, rollbac
     db = await store.room(id);
     assertEquals(
       (await db.query("SELECT v FROM meta WHERE k='schema_version'"))[0].v,
-      '3',
+      String(roomSchema.version),
     );
     const before = await room.tx((tx) =>
       tx.events.orderKeys(Object.keys(graph))
