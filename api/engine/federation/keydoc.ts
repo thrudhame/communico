@@ -26,6 +26,7 @@ export async function notaryFromCache(
   server: Db,
   signer: Signer,
   name: string,
+  minimumValidUntil = Date.now(),
 ): Promise<KeyDoc | null> {
   const rows = await server.query(
     'SELECT key_json FROM server_key_docs WHERE server_name = ?',
@@ -33,6 +34,7 @@ export async function notaryFromCache(
   );
   if (rows.length === 0) return null;
   const doc = JSON.parse(String(rows[0].key_json)) as KeyDoc;
+  if (doc.valid_until_ts < minimumValidUntil) return null;
   await signWithSigner(doc as unknown as Record<string, unknown>, signer);
   return doc;
 }

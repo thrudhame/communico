@@ -664,6 +664,15 @@ client user's boolean timeline-visibility question.
 (`api/engine/federation/serve.ts:32-54`, `api/engine/federation/serve.ts:70-94`,
 `api/engine/federation/serve.ts:174-177`)
 
+Federation request decoders retain required arrays and integer envelopes instead
+of accepting malformed empty requests. Missing-event selection filters declared
+depth before its result limit, without trusting that depth as DAG order or a walk
+boundary. Absent make_join versions negotiate only version 1. The cache-only
+notary signs a held document only when its validity meets every requested floor;
+omitted floors use one current-time cut. Transaction timestamp/array validation
+precedes replay publication, so malformed requests cannot cache empty success.
+(`federation/{history-request,notary-request,transaction-request}.ts`)
+
 Joining verifies the returned snapshot and our join. A returned join must
 recompute to our id; only its verified resident signature is merged into our
 authored copy, retaining our signed content. Restricted authorization preserves

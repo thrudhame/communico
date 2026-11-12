@@ -48,7 +48,7 @@ async function join(room: Room) {
   const user = '@rudy:' + remote.name;
   const template = await call(
     'GET',
-    prefix + 'make_join/' + enc(room.id) + '/' + enc(user),
+    prefix + 'make_join/' + enc(room.id) + '/' + enc(user) + '?ver=11',
   );
   assertEquals(template.status, 200);
   const pdu = await signTemplate(template.body.event as Json, remote);
@@ -167,6 +167,7 @@ test('joined/invited pre-join visibility redacts; shared/world-readable full; st
           prefix + op + '/' + enc(room.id) + '?v=' + enc(after) + '&limit=20',
         )
         : await call('POST', prefix + op + '/' + enc(room.id), {
+          earliest_events: [],
           latest_events: [after],
           limit: 20,
         });
@@ -195,7 +196,10 @@ test('auth closure recurses, excludes seed and later unrelated state', async () 
   let last = joined;
   for (const membership of ['leave', 'join']) {
     const op = membership === 'join' ? 'make_join/' : 'make_leave/';
-    const mk = await call('GET', prefix + op + enc(room.id) + '/' + enc(user));
+    const mk = await call(
+      'GET',
+      prefix + op + enc(room.id) + '/' + enc(user) + '?ver=11',
+    );
     assertEquals(mk.status, 200);
     const pdu = await signTemplate(mk.body.event as Json, remote);
     last = String(pdu.event_id);
@@ -403,7 +407,7 @@ test('pending content is excluded by every serving path and the shared send_join
   const user = '@second:' + remote.name;
   const template = await call(
     'GET',
-    prefix + 'make_join/' + enc(room.id) + '/' + enc(user),
+    prefix + 'make_join/' + enc(room.id) + '/' + enc(user) + '?ver=11',
   );
   assertEquals(template.status, 200);
   const pdu = await signTemplate(template.body.event as Json, remote);

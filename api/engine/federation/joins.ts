@@ -156,7 +156,14 @@ export function makeJoin(
   ver: string[],
   deps: InviteDeps,
 ) {
-  return template(roomId, userId, origin, ver, 'join', deps);
+  return template(
+    roomId,
+    userId,
+    origin,
+    ver.length === 0 ? ['1'] : ver,
+    'join',
+    deps,
+  );
 }
 
 export function makeLeave(

@@ -84,3 +84,21 @@ export function requiredParameter<T>(value: T | undefined, name: string): T {
   }
   return value;
 }
+
+export function arrayParameter(
+  value: unknown,
+  name: string,
+): unknown[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) invalidParameter(name);
+  return value;
+}
+
+export function stringArrayParameter(
+  value: unknown,
+  name: string,
+): string[] | undefined {
+  return arrayParameter(value, name)?.map((item) =>
+    requiredParameter(stringParameter(item, name), name)
+  );
+}

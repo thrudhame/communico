@@ -224,7 +224,7 @@ test('known-only remote profiles: held members, field shapes and no outbound pro
     const id = created.body.room_id as string;
     const mk = await remoteCall(
       'GET',
-      fed + 'make_join/' + enc(id) + '/' + enc(user),
+      fed + 'make_join/' + enc(id) + '/' + enc(user) + '?ver=11',
     );
     assertEquals(mk.status, 200);
     const pdu = await signTemplate({

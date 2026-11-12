@@ -88,12 +88,18 @@ Deno.test('ACL: all resident serving and membership template classes use current
       () =>
         serveGetMissingEvents(
           g.roomId,
-          { latest_events: [g.tipId] },
+          { earliest_events: [], latest_events: [g.tipId] },
           'remote.test',
           deps,
         ),
       () =>
-        makeJoin(g.roomId, '@bob:remote.test', 'remote.test', [], membership),
+        makeJoin(
+          g.roomId,
+          '@bob:remote.test',
+          'remote.test',
+          ['11'],
+          membership,
+        ),
       () =>
         makeLeave(g.roomId, '@bob:remote.test', 'remote.test', [], membership),
     ];
@@ -237,6 +243,7 @@ Deno.test('ACL: denied room PDUs and EDU entries do not prevent allowed-room tra
     }, true);
     const result = await receiveTransaction(remote.name, 'acl-mixed', {
       origin: remote.name,
+      origin_server_ts: Date.now(),
       pdus,
       edus: [
         {
@@ -364,6 +371,7 @@ Deno.test('ACL: an accepted ACL change in the same transaction refuses later PDU
     const server = await store.server();
     const result = await receiveTransaction(remote.name, 'acl-change', {
       origin: remote.name,
+      origin_server_ts: Date.now(),
       pdus: [acl, message],
     }, {
       store,

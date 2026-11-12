@@ -5,6 +5,7 @@ import {
   notaryFromCache,
 } from '#engine/federation/keydoc.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { notaryRequests } from '#engine/federation/notary-request.ts';
 import { parseJson } from '@pathfinder/pathfinder/body';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
@@ -16,17 +17,17 @@ export default async function (request: PathfinderRequest) {
   } catch {
     throw new MatrixError(400, 'M_BAD_JSON', 'body is not valid JSON');
   }
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    throw new MatrixError(400, 'M_BAD_JSON', 'body is not an object');
-  }
-  const requested = (body as Record<string, unknown>).server_keys;
+  const requested = notaryRequests(body);
   const app = theApp();
   const out: unknown[] = [];
-  if (requested !== null && typeof requested === 'object') {
-    for (const name of Object.keys(requested as Record<string, unknown>)) {
-      const doc = await notaryFromCache(app.server, app.tenant.signer(), name);
-      if (doc !== null) out.push(doc);
-    }
+  for (const { server, minimum } of requested) {
+    const doc = await notaryFromCache(
+      app.server,
+      app.tenant.signer(),
+      server,
+      minimum,
+    );
+    if (doc !== null) out.push(doc);
   }
   return keyDocResponse({ server_keys: out });
 }
