@@ -6,7 +6,8 @@
 // same tenant transaction as the write it stamps; the push-rule stream
 // marker rides the same counter.
 import type { Conn } from '#engine/store/db.ts';
-import type { Tenant } from '#engine/tenant/index.ts';
+import type { Tenant, TenantTx } from '#engine/tenant/index.ts';
+import { rulesetAt } from '#engine/tenant/pushrules.ts';
 export async function clearAccountData(
   conn: Conn,
   localpart: string,
@@ -127,11 +128,13 @@ export async function accountDataOfRoom(
   conn: Conn,
   localpart: string,
   roomId: string,
+  since = -1,
+  until = Number.MAX_SAFE_INTEGER,
 ): Promise<AccountDataRow[]> {
   return toAccountDataRows(
     await conn.query(
-      'SELECT type, content FROM account_data WHERE localpart = ? AND room_id = ?',
-      [localpart, roomId],
+      'SELECT type,content FROM account_data WHERE localpart=? AND room_id=? AND seq>? AND seq<=? ORDER BY seq',
+      [localpart, roomId, since, until],
     ),
   );
 }
@@ -141,12 +144,7 @@ export async function globalAccountDataSince(
   localpart: string,
   aSeq: number,
 ): Promise<AccountDataRow[]> {
-  return toAccountDataRows(
-    await conn.query(
-      "SELECT type, content FROM account_data WHERE localpart = ? AND room_id = '' AND seq > ? ORDER BY seq ASC",
-      [localpart, aSeq],
-    ),
-  );
+  return await accountDataOfRoom(conn, localpart, '', aSeq);
 }
 
 export async function accountDataMaxSeq(
@@ -181,6 +179,69 @@ export async function roomAccountDataSince(
     rooms.set(room, events);
   }
   return rooms;
+}
+
+/** Bounded set reads avoid a round trip per membership. Empty arrays are
+ * deliberate capture proofs: an absent room was not read and cannot advance. */
+export async function selectedAccountDataSince(
+  conn: Conn,
+  localpart: string,
+  selected: ReadonlyMap<string, number>,
+  until: number,
+): Promise<Map<string, AccountDataRow[]>> {
+  const rooms = new Map<string, AccountDataRow[]>(
+    [...selected.keys()].map((id) => [id, []]),
+  );
+  const ids = [...selected.keys()];
+  for (let offset = 0; offset < ids.length; offset += 256) {
+    const batch = ids.slice(offset, offset + 256);
+    const since = Math.min(...batch.map((id) => selected.get(id)!));
+    const rows = await conn.query(
+      `SELECT room_id,type,content,seq FROM account_data WHERE localpart=?
+       AND room_id<>'' AND room_id IN (${batch.map(() => '?').join(',')})
+       AND seq>? AND seq<=? ORDER BY seq`,
+      [localpart, ...batch, since, until],
+    );
+    for (const row of rows) {
+      const room = String(row.room_id);
+      if (Number(row.seq) <= selected.get(room)!) continue;
+      rooms.get(room)!.push({
+        type: String(row.type),
+        content: JSON.parse(String(row.content)),
+      });
+    }
+  }
+  return rooms;
+}
+
+/** Bodies and the cursor describing them belong to one tenant snapshot. A
+ * selected room has its own last delivered cut; a connection's global cut must
+ * not skip data while that room was outside the extension window. Undefined
+ * rooms preserves ordinary sync's all-room delta; an empty map selects none. */
+export async function captureAccountData(
+  tx: TenantTx,
+  localpart: string,
+  serverName: string,
+  since: number | null,
+  selected?: ReadonlyMap<string, number>,
+): Promise<{
+  seq: number;
+  global: AccountDataRow[];
+  rooms: Map<string, AccountDataRow[]>;
+}> {
+  const pushSeq = await tx.pushRules.streamSeq(localpart);
+  const seq = Math.max(await tx.accountData.maxSeq(localpart), pushSeq);
+  const global = await tx.accountData.ofRoom(localpart, '', since ?? -1, seq);
+  if (since === null || pushSeq > since) {
+    global.push({
+      type: 'm.push_rules',
+      content: { global: await rulesetAt(tx, localpart, serverName) },
+    });
+  }
+  const rooms = selected === undefined
+    ? await tx.accountData.roomsSince(localpart, since ?? -1, seq)
+    : await tx.accountData.selectedSince(localpart, selected, seq);
+  return { seq, global, rooms };
 }
 
 /** Tags and ordinary m.tag writes share one row and one stream. Read/modify/write

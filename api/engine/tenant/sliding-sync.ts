@@ -11,6 +11,7 @@ export type PositionLease = {
   revision: number;
   position: string | null;
   state: Record<string, unknown> | null;
+  replaces?: { connection: string; revision: number; name: string };
 };
 const scope = (d: DeviceIdentity) => [d.localpart, d.deviceId, d.generation];
 function unknown(): never {
@@ -64,13 +65,20 @@ export async function beginPosition(
   }
   await prunePositions(conn, now);
   if (row && Number(row.expires_ms) > now) {
+    const revision = Number(row.revision) + 1;
     await conn.execute(
-      'DELETE FROM sliding_sync_positions WHERE connection_id=?',
-      [row.id],
+      'UPDATE sliding_sync_connections SET revision=? WHERE id=?',
+      [revision, row.id],
     );
-    await conn.execute('DELETE FROM sliding_sync_connections WHERE id=?', [
-      row.id,
-    ]);
+    // Keep the issued response usable until the replacement commits. Its fresh
+    // ID also fences inbox receipts from the prior connection incarnation.
+    return {
+      connection: crypto.randomUUID(),
+      revision: 0,
+      position: null,
+      state: null,
+      replaces: { connection: String(row.id), revision, name },
+    };
   }
   const total = await conn.query(
     'SELECT COUNT(*) AS n FROM sliding_sync_connections',
@@ -107,10 +115,11 @@ export async function commitPosition(
   await current(conn, d);
   const rows = await conn.query(
     'SELECT revision,expires_ms FROM sliding_sync_connections WHERE id=? AND localpart=? AND device_id=? AND generation=?',
-    [lease.connection, ...scope(d)],
+    [lease.replaces?.connection ?? lease.connection, ...scope(d)],
   );
   if (
-    !rows.length || Number(rows[0].revision) !== lease.revision ||
+    !rows.length ||
+    Number(rows[0].revision) !== (lease.replaces?.revision ?? lease.revision) ||
     Number(rows[0].expires_ms) <= now
   ) unknown();
   if (
@@ -123,6 +132,25 @@ export async function commitPosition(
   const json = JSON.stringify(state);
   if (new TextEncoder().encode(json).length > limits.maxsnapshotbytes) {
     unknown();
+  }
+  if (lease.replaces) {
+    await conn.execute(
+      'DELETE FROM sliding_sync_positions WHERE connection_id=?',
+      [lease.replaces.connection],
+    );
+    await conn.execute('DELETE FROM sliding_sync_connections WHERE id=?', [
+      lease.replaces.connection,
+    ]);
+    await conn.execute(
+      'INSERT INTO sliding_sync_connections VALUES(?,?,?,?,?,?,?)',
+      [
+        lease.connection,
+        ...scope(d),
+        lease.replaces.name,
+        0,
+        now + limits.connectionseconds * 1000,
+      ],
+    );
   }
   // Only a completed response retires old input/forks. Begin/cancel/failed render
   // cannot consume unseen data, and an in-flight older lease cannot publish.

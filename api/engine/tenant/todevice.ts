@@ -240,12 +240,6 @@ export async function acknowledge(
   since: StreamToken | null,
 ): Promise<number> {
   await current(conn, d);
-  const owner = args(d);
-  const rows = await conn.query(
-    'SELECT msg_pos FROM device_ack WHERE localpart=? AND device_id=? AND generation=?',
-    owner,
-  );
-  let ack = rows.length ? Number(rows[0].msg_pos) : 0;
   if (since !== null) {
     const pools = await conn.query(
       "SELECT value FROM counters WHERE name='key_pools'",
@@ -256,12 +250,40 @@ export async function acknowledge(
     if (since.mSeq > await inboxHead(conn)) {
       throw new MatrixError(400, 'M_INVALID_PARAM', 'future inbox token');
     }
-    const proof = await conn.query(
-      'SELECT to_msg_pos FROM sync_deliveries WHERE localpart=? AND device_id=? AND generation=? AND token_hash=?',
-      [...owner, await hashToken(encodeStreamToken(since))],
-    );
-    if (proof.length) ack = Math.max(ack, Number(proof[0].to_msg_pos));
   }
+  return await acknowledgeIssued(
+    conn,
+    d,
+    since === null ? null : await hashToken(encodeStreamToken(since)),
+  );
+}
+
+// A sliding position is never a delivery receipt. Even another connection's
+// genuine receipt has a different domain, while both protocols share one ack.
+const slidingReceipt = (connection: string, token: string) =>
+  JSON.stringify(['sliding-sync', connection, token]);
+
+export async function acknowledgeSliding(
+  conn: Conn,
+  d: DeviceIdentity,
+  connection: string,
+  since: string | null,
+): Promise<number> {
+  await current(conn, d);
+  return await acknowledgeIssued(
+    conn,
+    d,
+    since === null ? null : await hashToken(slidingReceipt(connection, since)),
+  );
+}
+
+async function acknowledgeIssued(
+  conn: Conn,
+  d: DeviceIdentity,
+  tokenHash: string | null,
+): Promise<number> {
+  const owner = args(d);
+  const ack = await issuedAck(conn, d, tokenHash);
   await conn.execute(
     'INSERT INTO device_ack VALUES(?,?,?,?) ON CONFLICT(localpart,device_id,generation) DO UPDATE SET msg_pos=excluded.msg_pos',
     [...owner, ack],
@@ -275,6 +297,48 @@ export async function acknowledge(
     [...owner, ack],
   );
   return ack;
+}
+
+// Polling can inspect the exact issued-receipt boundary without consuming it.
+async function issuedAck(
+  conn: Conn,
+  d: DeviceIdentity,
+  tokenHash: string | null,
+) {
+  const owner = args(d);
+  const rows = await conn.query(
+    'SELECT msg_pos FROM device_ack WHERE localpart=? AND device_id=? AND generation=?',
+    owner,
+  );
+  let ack = rows.length ? Number(rows[0].msg_pos) : 0;
+  if (tokenHash !== null) {
+    const proof = await conn.query(
+      'SELECT to_msg_pos FROM sync_deliveries WHERE localpart=? AND device_id=? AND generation=? AND token_hash=?',
+      [...owner, tokenHash],
+    );
+    if (proof.length) ack = Math.max(ack, Number(proof[0].to_msg_pos));
+  }
+  return ack;
+}
+
+export async function pendingSliding(
+  conn: Conn,
+  d: DeviceIdentity,
+  connection: string,
+  since: string | null,
+  limit: number,
+): Promise<boolean> {
+  await current(conn, d);
+  if (limit === 0) return false;
+  const ack = await issuedAck(
+    conn,
+    d,
+    since === null ? null : await hashToken(slidingReceipt(connection, since)),
+  );
+  return (await conn.query(
+    'SELECT 1 FROM to_device_inbox WHERE localpart=? AND device_id=? AND generation=? AND msg_pos>? LIMIT 1',
+    [...args(d), ack],
+  )).length > 0;
 }
 
 export async function pendingMessages(
@@ -294,12 +358,60 @@ export async function deliverMessages(
   token: StreamToken,
   limits: KeyLimits,
 ): Promise<{ events: Json[]; token: StreamToken }> {
+  const page = await inboxPage(conn, d, limits, 100);
+  const next = { ...token, mSeq: page.cut };
+  await recordDelivery(
+    conn,
+    d,
+    page,
+    await hashToken(encodeStreamToken(next)),
+    limits,
+  );
+  return { events: page.events, token: next };
+}
+
+export async function deliverSliding(
+  conn: Conn,
+  d: DeviceIdentity,
+  connection: string,
+  limit: number,
+  limits: KeyLimits,
+): Promise<{ events: Json[]; nextBatch: string }> {
+  const page = await inboxPage(conn, d, limits, limit);
+  const nextBatch = crypto.randomUUID();
+  await recordDelivery(
+    conn,
+    d,
+    page,
+    await hashToken(slidingReceipt(connection, nextBatch)),
+    limits,
+  );
+  return { events: page.events, nextBatch };
+}
+
+async function inboxPage(
+  conn: Conn,
+  d: DeviceIdentity,
+  limits: KeyLimits,
+  requestedLimit: number,
+) {
   await current(conn, d);
+  if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 0) {
+    throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid to-device limit');
+  }
+  const limit = Math.min(requestedLimit, 100);
   const owner = args(d);
   const head = await inboxHead(conn);
+  const acks = await conn.query(
+    'SELECT msg_pos FROM device_ack WHERE localpart=? AND device_id=? AND generation=?',
+    owner,
+  );
+  const ack = acks.length ? Number(acks[0].msg_pos) : 0;
+  // A zero-size page cannot authorize deletion of any pending message.
+  if (limit === 0) return { events: [] as Json[], cut: ack, ack };
   const rows = await conn.query(
-    'SELECT msg_pos,event_json FROM to_device_inbox WHERE localpart=? AND device_id=? AND generation=? AND msg_pos<=? ORDER BY msg_pos LIMIT 100',
-    [...owner, head],
+    'SELECT msg_pos,event_json FROM to_device_inbox WHERE localpart=? AND device_id=? AND generation=? AND msg_pos<=? ORDER BY msg_pos LIMIT ?',
+    [...owner, head, limit],
   );
   const events: Json[] = [];
   let cut = head;
@@ -316,17 +428,22 @@ export async function deliverMessages(
     }
     events.push(event);
   }
-  if (events.length === 100) cut = Number(rows[99].msg_pos);
-  const next = { ...token, mSeq: cut };
-  const ack = await conn.query(
-    'SELECT msg_pos FROM device_ack WHERE localpart=? AND device_id=? AND generation=?',
-    owner,
-  );
-  if (cut > (ack.length ? Number(ack[0].msg_pos) : 0)) {
-    const hash = await hashToken(encodeStreamToken(next));
+  if (events.length === limit) cut = Number(rows[limit - 1].msg_pos);
+  return { events, cut, ack };
+}
+
+async function recordDelivery(
+  conn: Conn,
+  d: DeviceIdentity,
+  page: { cut: number; ack: number },
+  hash: string,
+  limits: KeyLimits,
+) {
+  const owner = args(d);
+  if (page.cut > page.ack) {
     await conn.execute(
       'INSERT INTO sync_deliveries VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
-      [...owner, hash, cut],
+      [...owner, hash, page.cut],
     );
     // The just-issued token survives even when several proofs have the same cut.
     // Evicted tokens replay from the durable ack, never acknowledge unseen data.
@@ -341,5 +458,4 @@ export async function deliverMessages(
       );
     }
   }
-  return { events, token: next };
 }

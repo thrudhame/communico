@@ -36,29 +36,22 @@ import type { Row } from '#engine/store/ffi.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import {
   accountDataMax,
+  captureAccountData,
   getAccountData,
-  listGlobalAccountData,
-  listGlobalAccountDataSince,
 } from '#engine/tenant/accountdata.ts';
-import { pushStreamSeq, rulesetFor } from '#engine/tenant/pushrules.ts';
 import { filterEvents, type RoomFilter } from '#engine/tenant/filters.ts';
-import { onProjected } from '#engine/server/project.ts';
-import { onEventStream } from '#engine/server/stream.ts';
-import { onTenantStream } from '#engine/tenant/streams.ts';
+import { waitForSync } from '#engine/sync-wait.ts';
 import {
   getPresence,
-  onEphemeral,
   receiptRoomsSince,
   receiptSnapshot,
   setPresenceValue,
   sharedUsers,
 } from '#engine/server/ephemeral.ts';
 import {
+  captureTyping,
   lastTypingChange,
-  onTypingChange,
   sweepTyping,
-  typingIn,
-  typingSeq,
 } from '#engine/typing.ts';
 
 export interface SyncInputs {
@@ -84,6 +77,7 @@ async function roomTimeline(
     members: Row[];
     notifications: ReturnType<typeof syncNotificationCounts>;
     accountData: { type: string; content: unknown }[];
+    typing: { userIds: string[]; changed: number };
   },
 ) {
   const app = theApp();
@@ -220,11 +214,11 @@ async function roomTimeline(
   };
   if (summary) {
     const ephemeral: Record<string, unknown>[] = [];
-    const typing = typingIn(room.id);
+    const typing = snapshot.typing;
     if (
       i.since === null
         ? typing.userIds.length > 0
-        : lastTypingChange(room.id) > i.since.tSeq
+        : typing.changed > i.since.tSeq
     ) {
       ephemeral.push({
         type: 'm.typing',
@@ -333,41 +327,10 @@ async function waitForRelevant(
 ): Promise<void> {
   if (i.since === null || i.timeoutMs <= 0) return;
   const app = theApp();
-  const deadline = Date.now() + Math.min(i.timeoutMs, 30000);
-  while (Date.now() < deadline) {
-    let wake!: () => void;
-    const changed = new Promise<void>((resolve) => {
-      wake = resolve;
-    });
-    // Arm BEFORE reading maxima: a commit between the read and await
-    // remains signalled. Unrelated writes only trigger a relevance recheck.
-    const removers = [
-      onTypingChange(() => wake()),
-      onEphemeral((server) => {
-        if (server.path === app.server.path) wake();
-      }),
-      onProjected((store) => {
-        if (store === app.store) wake();
-      }),
-      onEventStream((path) => {
-        if (path === app.server.path) wake();
-      }),
-      onTenantStream((store, tenant) => {
-        if (store === app.store && tenant === app.tenant.serverName) wake();
-      }),
-    ];
-    const timer = setTimeout(
-      wake,
-      Math.min(500, Math.max(0, deadline - Date.now())),
-    );
-    try {
-      if (await relevantChanged(i, device)) return;
-      await changed;
-    } finally {
-      clearTimeout(timer);
-      for (const remove of removers) remove();
-    }
-  }
+  await waitForSync(app, { timeoutMs: i.timeoutMs }, async () => ({
+    relevant: await relevantChanged(i, device),
+    value: undefined,
+  }));
 }
 
 export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
@@ -437,12 +400,18 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     );
     return { counters, memberships, notifications, rooms, oob };
   });
+  const accountSnapshot = await app.tenant.tx((tx) =>
+    captureAccountData(tx, lp, app.tenant.serverName, i.since?.aSeq ?? null)
+  );
+  const typingSnapshot = captureTyping(
+    snapshot.memberships.map((m) => m.roomId),
+  );
   const now: StreamToken = {
     eSeq: snapshot.counters.get('events') ?? 0,
     pSeq: snapshot.counters.get('presence') ?? 0,
-    tSeq: typingSeq(),
+    tSeq: typingSnapshot.seq,
     rSeq: snapshot.counters.get('receipts') ?? 0,
-    aSeq: await accountDataMax(app.tenant, lp),
+    aSeq: accountSnapshot.seq,
     dSeq: snapshot.counters.get('devices') ?? 0,
     mSeq: 0,
     kSeq: 0,
@@ -459,9 +428,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       return { ...delivered, pools };
     });
   const nextBatch = encodeStreamToken(delivery.token);
-  const roomAccountData = await app.tenant.tx((tx) =>
-    tx.accountData.roomsSince(lp, i.since?.aSeq ?? 0, now.aSeq)
-  );
+  const roomAccountData = accountSnapshot.rooms;
   const memberships = snapshot.memberships;
   const receiptRooms = new Set(
     [...snapshot.rooms].filter(([, r]) => r.receipts.length).map(([id]) => id),
@@ -598,7 +565,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
         !changed.length && !receiptRooms.has(m.roomId) &&
         !roomAccountData.has(m.roomId) &&
         !snapshot.notifications.changed.has(m.roomId) &&
-        lastTypingChange(m.roomId) <= i.since.tSeq
+        (typingSnapshot.rooms.get(m.roomId)?.changed ?? 0) <= i.since.tSeq
       ) continue;
     }
     const result = await roomTimeline(
@@ -610,6 +577,8 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       {
         ...snapshot.rooms.get(m.roomId)!,
         accountData: roomAccountData.get(m.roomId) ?? [],
+        typing: typingSnapshot.rooms.get(m.roomId) ??
+          { userIds: [], changed: 0 },
         notifications: syncNotificationCounts(
           snapshot.notifications.rooms.get(m.roomId),
           i.filter.timeline.unread_thread_notifications === true,
@@ -651,15 +620,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       now.dSeq,
       'sync',
     );
-  const accountData: { type: string; content: unknown }[] = i.since === null
-    ? await listGlobalAccountData(app.tenant, lp)
-    : await listGlobalAccountDataSince(app.tenant, lp, i.since.aSeq);
-  if (i.since === null || await pushStreamSeq(app.tenant, lp) > i.since.aSeq) {
-    accountData.push({
-      type: 'm.push_rules',
-      content: { global: await rulesetFor(app.tenant, lp) },
-    });
-  }
+  const accountData = accountSnapshot.global;
   return {
     next_batch: nextBatch,
     rooms: { join, invite, knock, leave },

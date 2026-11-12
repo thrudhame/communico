@@ -305,12 +305,29 @@ function bind(
         ),
       acknowledge: (d: devices.DeviceIdentity, since: StreamToken | null) =>
         todevice.acknowledge(conn, d, since),
+      acknowledgeSliding: (
+        d: devices.DeviceIdentity,
+        connection: string,
+        since: string | null,
+      ) => todevice.acknowledgeSliding(conn, d, connection, since),
+      deliverSliding: (
+        d: devices.DeviceIdentity,
+        connection: string,
+        limit: number,
+        limits: e2ee.KeyLimits,
+      ) => todevice.deliverSliding(conn, d, connection, limit, limits),
       deliver: (
         d: devices.DeviceIdentity,
         token: StreamToken,
         limits: e2ee.KeyLimits,
       ) => todevice.deliverMessages(conn, d, token, limits),
       pending: (d: devices.DeviceIdentity) => todevice.pendingMessages(conn, d),
+      pendingSliding: (
+        d: devices.DeviceIdentity,
+        connection: string,
+        since: string | null,
+        limit: number,
+      ) => todevice.pendingSliding(conn, d, connection, since, limit),
       head: () => todevice.inboxHead(conn),
     },
     e2ee: {
@@ -464,6 +481,12 @@ function bind(
         accountdata.clearAccountData(conn, localpart),
       roomsSince: (localpart: string, since: number, until: number) =>
         accountdata.roomAccountDataSince(conn, localpart, since, until),
+      selectedSince: (
+        localpart: string,
+        selected: ReadonlyMap<string, number>,
+        until: number,
+      ) =>
+        accountdata.selectedAccountDataSince(conn, localpart, selected, until),
       snapshot: (localpart: string, roomId: string, type: string) =>
         accountdata.accountDataSnapshot(conn, localpart, roomId, type),
       put: (
@@ -483,8 +506,12 @@ function bind(
         ),
       get: (localpart: string, roomId: string, type: string) =>
         accountdata.accountDataRow(conn, localpart, roomId, type),
-      ofRoom: (localpart: string, roomId: string) =>
-        accountdata.accountDataOfRoom(conn, localpart, roomId),
+      ofRoom: (
+        localpart: string,
+        roomId: string,
+        since?: number,
+        until?: number,
+      ) => accountdata.accountDataOfRoom(conn, localpart, roomId, since, until),
       globalSince: (localpart: string, aSeq: number) =>
         accountdata.globalAccountDataSince(conn, localpart, aSeq),
       maxSeq: (localpart: string) =>

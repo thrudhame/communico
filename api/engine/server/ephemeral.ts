@@ -272,10 +272,11 @@ export async function receiptRows(
   roomId: string,
   since = 0,
   viewer: string | null = null,
+  until = Number.MAX_SAFE_INTEGER,
 ): Promise<ReceiptRow[]> {
   const rows = await server.query(
-    `SELECT * FROM receipts WHERE room_id=? AND seq>? AND ${VISIBLE_RECEIPTS} ORDER BY seq`,
-    [roomId, since, viewer],
+    `SELECT * FROM receipts WHERE room_id=? AND seq>? AND seq<=? AND ${VISIBLE_RECEIPTS} ORDER BY seq`,
+    [roomId, since, until, viewer],
   );
   return rows.map((r) => ({
     userId: String(r.user_id),
@@ -324,25 +325,45 @@ export async function receiptSnapshot(
   return new Map([...rooms].map(([id, marks]) => [id, receiptContents(marks)]));
 }
 
+type ReceiptContent = Record<string, Record<string, Record<string, unknown>>>;
+
+function putReceipt(content: ReceiptContent, row: ReceiptRow): void {
+  content[row.eventId] ??= {};
+  content[row.eventId][row.receiptType] ??= {};
+  content[row.eventId][row.receiptType][row.userId] = {
+    ts: row.ts,
+    ...(row.threadId === null ? {} : { thread_id: row.threadId }),
+  };
+}
+
+/** Single-event MSC4102 wire map: unthreaded wins a colliding slot, while
+ * representable threaded slots retain their identity. Durable rows stay intact;
+ * ordinary sync can still emit all slots as separate per-thread events. */
+export function receiptContent(rows: ReceiptRow[]): ReceiptContent {
+  const content: ReceiptContent = {};
+  for (const row of rows) {
+    const previous = content[row.eventId]?.[row.receiptType]?.[row.userId] as {
+      thread_id?: string;
+    } | undefined;
+    if (row.threadId !== null && previous && previous.thread_id === undefined) {
+      continue;
+    }
+    putReceipt(content, row);
+  }
+  return content;
+}
+
 function receiptContents(rows: ReceiptRow[]): Record<string, unknown>[] {
   // Batch separately by thread: the wire map cannot hold both an unthreaded
   // and a main receipt at the same event/type/user key in one event.
-  const threads = new Map<
-    string | null,
-    Record<string, Record<string, Record<string, unknown>>>
-  >();
+  const threads = new Map<string | null, ReceiptContent>();
   for (const row of rows) {
     let content = threads.get(row.threadId);
     if (content === undefined) {
       content = {};
       threads.set(row.threadId, content);
     }
-    content[row.eventId] ??= {};
-    content[row.eventId][row.receiptType] ??= {};
-    content[row.eventId][row.receiptType][row.userId] = {
-      ts: row.ts,
-      ...(row.threadId === null ? {} : { thread_id: row.threadId }),
-    };
+    putReceipt(content, row);
   }
   return [...threads.values()];
 }

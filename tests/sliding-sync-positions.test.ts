@@ -219,6 +219,63 @@ Deno.test('sliding positions: atomic expiry/capacity/snapshot bounds and initial
   }
 });
 
+Deno.test('sliding positions: cancelled or failed initial replacements preserve the old issued position', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(configuration(dir), {
+    schemas: { tenant: tenantSchema },
+  });
+  try {
+    const tenant = await openTenant(store, 'reset.test', { create: true });
+    await tenant.tx(async (tx) => {
+      await tx.users.insert('a', 'A');
+      await tx.devices.upsert('P', 'a', null);
+    });
+    const device = await deviceIdentity(tenant, 'a', 'P');
+    const first = await tenant.tx((tx) =>
+      tx.slidingSync.begin(device, 'x', null)
+    );
+    const pos = await tenant.tx((tx) =>
+      tx.slidingSync.commit(device, first, { cut: 1 })
+    );
+    const reset = await tenant.tx((tx) =>
+      tx.slidingSync.begin(device, 'x', null)
+    );
+    await assertRejects(
+      () =>
+        tenant.tx(async (tx) => {
+          await tx.slidingSync.commit(device, reset, { cut: 2 });
+          throw new Error('response cancelled');
+        }),
+      Error,
+      'response cancelled',
+    );
+    assertEquals(
+      (await tenant.tx((tx) => tx.slidingSync.begin(device, 'x', pos))).state,
+      { cut: 1 },
+    );
+    // The new lease fences earlier work, but only successful publication resets
+    // issued positions and the connection-scoped inbox receipt domain.
+    const final = await tenant.tx((tx) =>
+      tx.slidingSync.begin(device, 'x', null)
+    );
+    const next = await tenant.tx((tx) =>
+      tx.slidingSync.commit(device, final, { cut: 3 })
+    );
+    await assertRejects(
+      () => tenant.tx((tx) => tx.slidingSync.begin(device, 'x', pos)),
+      MatrixError,
+      'M_UNKNOWN_POS',
+    );
+    assertEquals(
+      (await tenant.tx((tx) => tx.slidingSync.begin(device, 'x', next))).state,
+      { cut: 3 },
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('sliding positions: v18 upgrade keeps account and device data', async () => {
   const dir = await Deno.makeTempDir();
   const previous = {

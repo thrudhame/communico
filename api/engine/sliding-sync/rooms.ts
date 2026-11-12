@@ -22,6 +22,7 @@ import { formatCursor } from '#engine/room/segments.ts';
 import type { ListSelection } from './lists.ts';
 import { requiredState } from './state.ts';
 import type { RoomConfig } from './types.ts';
+import type { Counts } from '#engine/server/notifications.ts';
 
 type Json = Record<string, unknown>;
 export type SentRoom = {
@@ -152,6 +153,7 @@ export async function roomPayloads(
     requestSince: number | null;
     direct: unknown;
     previous: Record<string, SentRoom>;
+    notifications?: ReadonlyMap<string, Counts>;
   },
 ) {
   const sent = structuredClone(input.previous);
@@ -329,6 +331,9 @@ export async function roomPayloads(
     }
     // Optional wire omission must not erase the last value held by the client.
     meta.is_dm = dm.has(id);
+    const counts = input.notifications?.get(id) ??
+      { notification_count: 0, highlight_count: 0 };
+    meta = { ...meta, ...counts };
     let changed = initial || eventsPresent(entry.timeline) ||
       eventsPresent(entry.required_state) ||
       entry.unstable_expanded_timeline === true;
@@ -348,7 +353,7 @@ export async function roomPayloads(
       }
     }
     if (changed) {
-      rooms[id] = { notification_count: 0, highlight_count: 0, ...entry };
+      rooms[id] = { ...entry, ...counts };
     }
     sent[id] = {
       cut: end,

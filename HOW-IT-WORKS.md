@@ -238,8 +238,8 @@ rejects stale in-flight publishers. Completed responses retain at most the
 input and one successor. Device deletion removes both connection and position
 rows. Startup and new admission prune expired connections; seven idle days,
 per-device/tenant capacity and snapshot bytes are layered `slidingsync` settings.
-This groundwork neither exposes a sync endpoint nor advertises native support,
-and never acknowledges or reads the to-device inbox.
+Connection persistence never acknowledges or reads the to-device inbox;
+protocol coordination and inbox publication have separate owners.
 (`api/engine/sliding-sync/request.ts`, `api/engine/tenant/sliding-sync.ts`)
 
 The simplified-sync list owner captures server membership/activity cuts and
@@ -248,8 +248,8 @@ counts and inclusive ranges; overlapping requests union required state and take
 the largest timeline limit. Activity is received live-feed order, frozen at
 departure for nonmembers. Metadata reads use publication cuts or saved prejoin
 display, not current private state. Plain joined-room windows and encryption-only
-requests hydrate no room files or timelines. This remains internal groundwork,
-without an endpoint or native-support advertisement.
+requests hydrate no room files or timelines. List eligibility is independent
+from authorization of explicit historical room subscriptions.
 (`api/engine/sliding-sync/lists.ts`, `api/engine/server/read.ts`)
 
 Both sync protocols share visibility-before-limit live-window selection. Sliding
@@ -257,13 +257,71 @@ room payloads retain independent state and timeline delivery cuts, expand histor
 reload after a real participation interruption. Required-state and display
 metadata use the same captured admission grant, including actual departure
 ceilings and lazy membership IDs. Prejoin payloads use stripped display only;
-saved invitation departures never provision a room. This layer is internal and
-still does not advertise or expose simplified sync.
+saved invitation departures never provision a room. Room assembly does not own
+authentication, polling or position publication.
 Zero timeline limits do not acknowledge unseen events. Saved departures follow
 the requested timeline limit and required-state selection independently; an
 explicitly empty state selection is never overridden. DM removal resets the
 last delivered value for prejoin rooms as well as joined rooms.
 (`api/engine/client/sync-window.ts`, `api/engine/sliding-sync/{rooms,state}.ts`)
+
+Sliding inbox groundwork reuses the tenant's durable queue, acknowledgment and
+bounded issued-delivery receipts. Opaque receipts are scoped to the protocol and
+connection as well as the device generation; a room-list position, forged token
+or another connection cannot acknowledge unseen keys. Zero-size pages issue no
+deletion authority, count/byte limits preserve the tail, and an evicted receipt
+replays rather than consumes data. Ordinary sync remains a direct consumer of
+the same owner. Polling inspects the same issued acknowledgment boundary without
+consuming it, so received pages do not make every encryption poll immediate.
+(`api/engine/tenant/todevice.ts`)
+
+Account-data delivery captures the global/selected room bodies, push rules and
+their shared maximum in one tenant transaction. Ordinary sync consumes that
+same capture; slow rendering cannot read a later body under an older cursor.
+Sliding room selection supplies independent per-room account cuts. Receipt
+reads accept an explicit captured maximum and share the wire formatter with
+ordinary sync. Single-event receipt maps follow MSC4102's unthreaded-wins
+collision behavior, without removing the independently stored thread slots.
+(`api/engine/tenant/accountdata.ts`, `api/engine/server/ephemeral.ts`)
+
+Room extensions select the union of admitted named list windows and actual
+subscriptions, not arbitrary requested room IDs. Their account/receipt/typing
+cuts advance only for selected rooms. First or expanded receipt windows include
+timeline-target marks plus the viewer's own marks, with private rows scoped to
+their viewer. Typing snapshots copy values and counters before rendering;
+ordinary sync shares that capture, and a process epoch invalidates persisted
+sliding typing cuts after restart. Empty stops remain real updates.
+(`api/engine/sliding-sync/extensions.ts`, `api/engine/typing.ts`)
+
+The E2EE extension reuses the existing all-shared-room device-list audience and
+tenant OTK/fallback status. No-pos requests have empty device-list deltas;
+disabled extensions do not read or advance their independent cuts. Later enable
+reads from the connection's retained baseline, not an unrelated room-list cut.
+Unchanged status envelopes are not poll updates, while key-pool changes are.
+(`api/engine/sliding-sync/extensions.ts`)
+
+Final sliding publication runs only after rendering: one tenant transaction
+validates the lease, applies the connection-scoped inbox acknowledgment, selects
+its bounded page and commits the successor. Stale/oversized snapshots and aborts
+roll back all those effects. A disabled inbox extension performs no inbox work.
+(`api/engine/sliding-sync/delivery.ts`)
+
+Ordinary and sliding sync share the same stream-wait owner. Listeners are armed
+before capture; projection, event, tenant and ephemeral notifications are only
+hints to recapture, never proof of relevance. One absolute deadline survives
+unrelated writes. Polling sweeps typing expiry at the existing bounded cadence;
+abort, capture failure and successful return all remove listeners and timers.
+(`api/engine/sync-wait.ts`)
+
+The authenticated deployed unstable simplified-sync POST composes these owners.
+Per-device connection serialization precedes lease acquisition; independent SDK
+room-list and encryption connections do not block each other. Relevance compares
+requested windows/configuration, admitted payloads and enabled extension data,
+not constant SYNC operations or fresh position tokens. Counts come from the same
+notification buckets as ordinary sync; count-only read changes can update a
+zero-timeline room. Request cancellation reaches both polling and atomic final
+publication. Native support remains unadvertised pending real SDK acceptance.
+(`api/engine/sliding-sync/index.ts`, `api/engine/sliding-sync/lock.ts`)
 
 Stored and inline sync filters share shape validation and pure matching across
 room selection, timeline, state, presence, ephemeral and both account-data
