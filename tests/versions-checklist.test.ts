@@ -49,7 +49,7 @@ Deno.test('versions advertisement is cumulative and retains its endpoint/contrac
     reason: string;
   }[];
   assertEquals(endpoints.length, 197);
-  assertEquals(endpoints.filter((e) => e.status === 'Routed').length, 167);
+  assertEquals(endpoints.filter((e) => e.status === 'Routed').length, 174);
   for (const endpoint of endpoints) {
     if (endpoint.status !== 'Routed') {
       assert(

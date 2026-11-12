@@ -1,14 +1,8 @@
 import { supportedRoomVersions } from '#engine/policy.ts';
 import { config } from '#engine/config.ts';
 
-// M0: server capabilities (Complement 10apidoc/45server-capabilities).
-// Room versions: 11 only — v12 is designed for (the rulebook carries its
-// switches) but deliberately unregistered until after M4 (plan §3f).
-// m.change_password is advertised DISABLED (no endpoint exists — the
-// plan's "no m.change_password" means no endpoint, not no key: the
-// capabilities test requires the key present). Auth required (401
-// otherwise — the same test asserts unauthenticated calls fail; the
-// 20-auth middleware enforces it).
+// Capability discovery includes the legacy profile flags required alongside
+// m.profile_fields. Authentication is enforced by this folder's middleware.
 // deno-lint-ignore require-await
 export default async function (
   _request: import('@pathfinder/pathfinder').PathfinderRequest,
@@ -22,6 +16,8 @@ export default async function (
       'm.room_versions': { default: '11', available },
       'm.change_password': { enabled: false },
       'm.profile_fields': { enabled: true },
+      'm.set_displayname': { enabled: true },
+      'm.set_avatar_url': { enabled: true },
       'org.matrix.msc4140.delayed_events': {
         max_delay_ms: config().delayedevents.maxdelayms,
         max_scheduled: config().delayedevents.maxperuser,

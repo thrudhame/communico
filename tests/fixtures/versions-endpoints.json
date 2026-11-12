@@ -84,9 +84,9 @@
     "path": "/_matrix/client/v3/account/3pid",
     "operation": "getAccount3PIDs",
     "deprecated": false,
-    "routes": [],
-    "status": "Excluded",
-    "reason": "Optional 3PID; [existing TODO](../../todos/account-3pid.md)"
+    "routes": ["api/endpoints/matrix/_matrix/client/v3/account/3pid/get.ts"],
+    "status": "Routed",
+    "reason": ""
   },
   {
     "family": "client-server",
@@ -1849,9 +1849,11 @@
     "path": "/_matrix/client/v3/thirdparty/protocols",
     "operation": "getProtocols",
     "deprecated": false,
-    "routes": [],
-    "status": "Excluded",
-    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/thirdparty/protocols/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
   },
   {
     "family": "client-server",
@@ -1860,9 +1862,11 @@
     "path": "/_matrix/client/v3/thirdparty/protocol/{protocol}",
     "operation": "getProtocolMetadata",
     "deprecated": false,
-    "routes": [],
-    "status": "Excluded",
-    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/thirdparty/protocol/#protocol/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
   },
   {
     "family": "client-server",
@@ -1871,9 +1875,11 @@
     "path": "/_matrix/client/v3/thirdparty/location/{protocol}",
     "operation": "queryLocationByProtocol",
     "deprecated": false,
-    "routes": [],
-    "status": "Excluded",
-    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/thirdparty/location/#protocol/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
   },
   {
     "family": "client-server",
@@ -1882,9 +1888,11 @@
     "path": "/_matrix/client/v3/thirdparty/user/{protocol}",
     "operation": "queryUserByProtocol",
     "deprecated": false,
-    "routes": [],
-    "status": "Excluded",
-    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/thirdparty/user/#protocol/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
   },
   {
     "family": "client-server",
@@ -1893,9 +1901,11 @@
     "path": "/_matrix/client/v3/thirdparty/location",
     "operation": "queryLocationByAlias",
     "deprecated": false,
-    "routes": [],
-    "status": "Excluded",
-    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+    "routes": [
+      "api/endpoints/matrix/_matrix/client/v3/thirdparty/location/get.ts"
+    ],
+    "status": "Routed",
+    "reason": ""
   },
   {
     "family": "client-server",
@@ -1904,9 +1914,9 @@
     "path": "/_matrix/client/v3/thirdparty/user",
     "operation": "queryUserByID",
     "deprecated": false,
-    "routes": [],
-    "status": "Excluded",
-    "reason": "Optional appservice networks; [existing TODO](../../todos/application-services.md)"
+    "routes": ["api/endpoints/matrix/_matrix/client/v3/thirdparty/user/get.ts"],
+    "status": "Routed",
+    "reason": ""
   },
   {
     "family": "client-server",

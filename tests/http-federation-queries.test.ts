@@ -153,7 +153,7 @@ test('query/directory: raw Unicode URI, aliases with server port, local validati
   );
 });
 
-test('publicRooms: signed GET/POST, search, pagination and ignored network parameters', async () => {
+test('publicRooms: signed GET/POST, search, pagination and truthful network selection', async () => {
   assertEquals(
     (await client(
       'createRoom',
@@ -175,11 +175,21 @@ test('publicRooms: signed GET/POST, search, pagination and ignored network param
   const post = await call('POST', target, {
     filter: { generic_search_term: 'Alpha' },
     include_all_networks: true,
-    third_party_instance_id: 'ignored',
   });
   assertEquals(post.status, 200);
   assertEquals((post.body.chunk as Json[]).map((r) => r.room_id), [room]);
   assertEquals((post.body.chunk as Json[])[0].name, 'Published Alpha');
+  const bridge = await call('POST', target, {
+    third_party_instance_id: 'unknown',
+  });
+  assertEquals(bridge.body, { chunk: [], total_room_count_estimate: 0 });
+  assertEquals(
+    (await call('POST', target, {
+      include_all_networks: true,
+      third_party_instance_id: 'unknown',
+    })).status,
+    400,
+  );
 });
 
 test('known-only remote profiles: held members, field shapes and no outbound proxy', async () => {

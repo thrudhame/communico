@@ -9,7 +9,7 @@ This is a regression checklist, not exhaustive conformance certification.
 
 [`tests/fixtures/versions-endpoints.json`](tests/fixtures/versions-endpoints.json)
 retains all 197 tagged client-server/server-server operation definitions from the
-G10 audit: 167 routed and 30 explicitly excluded. Duplicate definitions remain.
+G10 audit, with ordinary-client empty reads restored: 174 routed and 23 explicitly excluded. Duplicate definitions remain.
 The guard checks every concrete route and its callable handler, not a passing
 test count. Generic federation query maps to directory/profile. Optional 3PID,
 identity servers, appservices, SSO/OAuth, tokens and deprecated global sync APIs

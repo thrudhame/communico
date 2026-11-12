@@ -24,6 +24,10 @@ import { writeStateKey } from './write.ts';
 import { discoveryRequest } from '#engine/federation/discovery.ts';
 import { directoryResponse } from '#engine/federation/discovery-response.ts';
 import { publicRoomSummary } from './summary.ts';
+import {
+  type DirectoryRequest,
+  localDirectoryOffset,
+} from './directory-request.ts';
 
 export function aliasIsLocal(alias: string) {
   const parts = splitId(alias);
@@ -197,31 +201,31 @@ export async function setVisibility(
   await directory.setVisibility(theApp().server, roomId, value);
 }
 export async function publicRooms(
-  opts: {
-    search?: string;
-    limit?: number;
-    since?: string;
-    roomTypes?: (string | null)[];
-  },
+  opts: DirectoryRequest,
 ) {
-  const limit = opts.limit !== undefined && opts.limit > 0 ? opts.limit : 100,
-    offset = opts.since === undefined
-      ? 0
-      : Math.max(0, parseInt(opts.since, 10) || 0);
+  const limit = opts.limit !== undefined && opts.limit > 0
+      ? Math.min(opts.limit, 100)
+      : 100,
+    offset = localDirectoryOffset(opts.since);
+  if (opts.network.kind === 'instance') {
+    return { chunk: [], total_room_count_estimate: 0 };
+  }
+  const roomTypes = opts.filter?.room_types,
+    search = opts.filter?.generic_search_term;
   const all: Record<string, unknown>[] = [];
   for (const id of await directory.listedRooms(theApp().server)) {
     const chunk = await publicRoomSummary(id);
     if (
-      opts.roomTypes !== undefined &&
-      !opts.roomTypes.includes(
+      roomTypes !== undefined &&
+      !roomTypes.includes(
         typeof chunk.room_type === 'string' ? chunk.room_type : null,
       )
     ) continue;
     if (
-      opts.search !== undefined &&
+      search !== undefined &&
       ![chunk.name, chunk.topic, chunk.canonical_alias].some((v) =>
         typeof v === 'string' &&
-        v.toLowerCase().includes(opts.search!.toLowerCase())
+        v.toLowerCase().includes(search.toLowerCase())
       )
     ) continue;
     all.push(chunk);

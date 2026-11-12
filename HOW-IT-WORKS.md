@@ -524,9 +524,23 @@ writing HTTP bytes. It does not rebuild a legacy certificate chain per request.
 
 Client and federation public directories use one published-state metadata
 serializer, including room types. Both filter `room_types` (with `null` for
-untyped rooms) before counting and pagination. User-directory candidates include
+untyped rooms) before counting and pagination. One operation decoder validates
+known query/body fields without turning malformed values into defaults. Network
+selection distinguishes native, all and a named bridge instance; with no bridges,
+a named instance has no rooms, not the native list. Conflicting all/instance
+selectors are rejected. Local cursors are validated by their local owner;
+directory pages retain Synapse's 100-room local cap. Omitted publication visibility
+means public. User-directory candidates include
 unlisted world-readable rooms, while retaining the local-account scope.
-(`api/engine/client/{directory,summary}.ts`)
+(`api/engine/client/{directory,directory-request,summary}.ts`)
+
+Ordinary authenticated clients can read third-party discovery independently of
+optional producers: protocols is an empty object, mapping queries are empty lists,
+unknown protocol metadata is not found, and account 3PID discovery has an empty
+`threepids` list. Required mapping query parameters remain required. These reads
+do not implement bridges, application-service writes or identity-server actions.
+Profile capabilities include matching legacy display-name and avatar flags.
+(`api/engine/client/thirdparty.ts`, client v3 discovery adapters)
 
 `/room_summary` reads reuse that metadata and separate discovery
 access: joined/invited users, public or supported knock rules, world-readable
