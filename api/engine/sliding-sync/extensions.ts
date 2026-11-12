@@ -98,6 +98,7 @@ export function accountDataExtension(
   const cuts = { ...previous };
   const rooms: Record<string, AccountDataRow[]> = {};
   for (const room of selected) {
+    if (!snapshot.rooms.has(room)) continue;
     cuts[room] = snapshot.seq;
     const events = snapshot.rooms.get(room);
     if (events?.length) rooms[room] = events;
@@ -115,6 +116,21 @@ type Timeline = {
   timeline?: { event_id?: unknown }[];
 };
 
+function initialReceipts(
+  timeline: Timeline | undefined,
+  previous: number | undefined,
+) {
+  return previous === undefined || timeline?.initial === true ||
+    timeline?.unstable_expanded_timeline === true;
+}
+
+export function receiptCaptureSince(
+  timeline: Timeline | undefined,
+  previous: number | undefined,
+): number {
+  return initialReceipts(timeline, previous) ? 0 : previous!;
+}
+
 export function receiptsExtension(
   viewer: string,
   selected: ReadonlySet<string>,
@@ -130,9 +146,7 @@ export function receiptsExtension(
   > = {};
   for (const room of selected) {
     const timeline = timelines[room];
-    const initial = previous[room] === undefined ||
-      timeline?.initial === true ||
-      timeline?.unstable_expanded_timeline === true;
+    const initial = initialReceipts(timeline, previous[room]);
     const eventIds = new Set(timeline?.timeline?.map((e) => e.event_id) ?? []);
     const rows = (snapshot.get(room) ?? []).filter((row) =>
       row.seq <= through &&

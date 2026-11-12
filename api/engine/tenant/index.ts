@@ -481,6 +481,12 @@ function bind(
         accountdata.clearAccountData(conn, localpart),
       roomsSince: (localpart: string, since: number, until: number) =>
         accountdata.roomAccountDataSince(conn, localpart, since, until),
+      selectedSince: (
+        localpart: string,
+        selected: ReadonlyMap<string, number>,
+        until: number,
+      ) =>
+        accountdata.selectedAccountDataSince(conn, localpart, selected, until),
       snapshot: (localpart: string, roomId: string, type: string) =>
         accountdata.accountDataSnapshot(conn, localpart, roomId, type),
       put: (

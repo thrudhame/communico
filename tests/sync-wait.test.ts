@@ -102,6 +102,27 @@ Deno.test('sync wait: config-only relevance returns immediately and timeout stay
   }
 });
 
+Deno.test('sync wait: an operator-validated timeout above thirty seconds is not silently capped', async () => {
+  const f = await fixture();
+  const original = Date.now;
+  let now = original(), calls = 0;
+  Date.now = () => now;
+  try {
+    const result = await waitForSync(f, { timeoutMs: 60000 }, async () => {
+      calls++;
+      if (calls === 1) {
+        now += 31000;
+        await eventStreamTx(f.server, async () => {});
+      }
+      return { relevant: calls > 1, value: calls };
+    });
+    assertEquals(result, 2);
+  } finally {
+    Date.now = original;
+    await f.close();
+  }
+});
+
 Deno.test('sync wait: abort while waiting or capturing rejects without returning a stale result; capture failures propagate', async () => {
   const f = await fixture();
   try {

@@ -15,7 +15,7 @@ export async function waitForSync<T>(
   capture: () => Promise<{ relevant: boolean; value: T }>,
 ): Promise<T> {
   const { signal } = options;
-  const deadline = Date.now() + Math.min(30000, Math.max(0, options.timeoutMs));
+  const deadline = Date.now() + Math.max(0, options.timeoutMs);
   while (true) {
     signal?.throwIfAborted();
     let wake!: () => void;

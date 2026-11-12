@@ -26,6 +26,7 @@ import {
   e2eeExtension,
   type E2eeExtensionState,
   extensionRooms,
+  receiptCaptureSince,
   receiptsExtension,
   type RoomExtensionCuts,
   type TypingCuts,
@@ -91,6 +92,19 @@ export async function slidingSync(input: {
         }));
         // List filters and account-data bodies share one tenant snapshot. Capture
         // eligible candidates once, then disclose only the extension's windows.
+        const accountRequest = request.extensions.account_data;
+        const captureRoomData = accountRequest?.enabled && (
+          accountRequest.lists.some((name) =>
+            name === '*'
+              ? Object.keys(request.lists).length > 0
+              : name in request.lists
+          ) ||
+          accountRequest.rooms.some((id) =>
+            id === '*'
+              ? Object.keys(request.subscriptions).length > 0
+              : id in request.subscriptions
+          )
+        );
         const tenant = await app.tenant.tx(async (tx) => ({
           ...await tx.accountData.listSelection(localpart),
           account: request.extensions.account_data?.enabled
@@ -100,10 +114,16 @@ export async function slidingSync(input: {
               app.tenant.serverName,
               previous?.account?.global ?? null,
               new Map(
-                server.memberships.filter((m) => !m.forgotten)
-                  .map((
-                    m,
-                  ) => [m.roomId, previous?.account?.rooms[m.roomId] ?? -1]),
+                (captureRoomData
+                  ? [
+                    ...new Set([
+                      ...server.memberships.filter((m) => !m.forgotten).map((
+                        m,
+                      ) => m.roomId),
+                      ...server.prejoin.map((p) => String(p.room_id)),
+                    ]),
+                  ]
+                  : []).map((id) => [id, previous?.account?.rooms[id] ?? -1]),
               ),
             )
             : null,
@@ -154,19 +174,6 @@ export async function slidingSync(input: {
         );
         const typing = captureTyping(typingRooms);
         const receiptCut = server.counters.get('receipts') ?? 0;
-        const receipts = new Map<string, ReceiptRow[]>();
-        if (receiptRooms.size) {
-          await app.server.tx(async (tx) => {
-            for (const id of receiptRooms) {
-              // A captured maximum cannot skip a row overwritten after that cut;
-              // its newer revision remains pending for the next issued position.
-              receipts.set(
-                id,
-                await receiptRows(tx, id, 0, input.userId, receiptCut),
-              );
-            }
-          });
-        }
         const notifications = new Map(
           [...joined].map((
             id,
@@ -191,6 +198,28 @@ export async function slidingSync(input: {
             notifications,
           },
         );
+        const receipts = new Map<string, ReceiptRow[]>();
+        if (receiptRooms.size) {
+          await app.server.tx(async (tx) => {
+            for (const id of receiptRooms) {
+              // Initial/expanded timelines need older marks. Quiet incremental
+              // captures read only rows newer than this room's delivered cut.
+              receipts.set(
+                id,
+                await receiptRows(
+                  tx,
+                  id,
+                  receiptCaptureSince(
+                    payloads.rooms[id],
+                    previous?.receipts?.[id],
+                  ),
+                  input.userId,
+                  receiptCut,
+                ),
+              );
+            }
+          });
+        }
         const deviceCut = server.counters.get('devices') ?? 0;
         const state: ConnectionState = {
           ...previous,

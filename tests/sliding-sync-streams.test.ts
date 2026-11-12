@@ -112,6 +112,55 @@ Deno.test('sliding streams: captured account bodies, push rules and their maximu
   }
 });
 
+Deno.test('sliding streams: selected account capture uses bounded set reads, not one query per room', async () => {
+  const f = await fixture();
+  try {
+    await putAccountData(
+      f.tenant,
+      'alice',
+      '!selected:streams.test',
+      'u.keep',
+      { n: 1 },
+    );
+    await putAccountData(f.tenant, 'alice', '!outside:streams.test', 'u.hide', {
+      n: 2,
+    });
+    const selected = new Map(
+      Array.from({ length: 5000 }, (_, i) => [`!empty${i}:streams.test`, -1]),
+    );
+    selected.set('!selected:streams.test', -1);
+    let singleRoomReads = 0;
+    const snapshot = await f.tenant.tx((tx) =>
+      captureAccountData(
+        {
+          ...tx,
+          accountData: {
+            ...tx.accountData,
+            ofRoom: (...args: Parameters<typeof tx.accountData.ofRoom>) => {
+              singleRoomReads++;
+              return tx.accountData.ofRoom(...args);
+            },
+          },
+        },
+        'alice',
+        f.tenant.serverName,
+        null,
+        selected,
+      )
+    );
+    assertEquals([...snapshot.rooms].filter(([, events]) => events.length), [
+      ['!selected:streams.test', [{ type: 'u.keep', content: { n: 1 } }]],
+    ]);
+    assertEquals(
+      singleRoomReads,
+      1,
+      'only global account data uses a single-room read',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('sliding streams: receipt cuts and single-event collisions preserve viewer and thread contracts', async () => {
   const f = await fixture();
   try {

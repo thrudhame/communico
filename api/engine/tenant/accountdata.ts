@@ -181,6 +181,39 @@ export async function roomAccountDataSince(
   return rooms;
 }
 
+/** Bounded set reads avoid a round trip per membership. Empty arrays are
+ * deliberate capture proofs: an absent room was not read and cannot advance. */
+export async function selectedAccountDataSince(
+  conn: Conn,
+  localpart: string,
+  selected: ReadonlyMap<string, number>,
+  until: number,
+): Promise<Map<string, AccountDataRow[]>> {
+  const rooms = new Map<string, AccountDataRow[]>(
+    [...selected.keys()].map((id) => [id, []]),
+  );
+  const ids = [...selected.keys()];
+  for (let offset = 0; offset < ids.length; offset += 256) {
+    const batch = ids.slice(offset, offset + 256);
+    const since = Math.min(...batch.map((id) => selected.get(id)!));
+    const rows = await conn.query(
+      `SELECT room_id,type,content,seq FROM account_data WHERE localpart=?
+       AND room_id<>'' AND room_id IN (${batch.map(() => '?').join(',')})
+       AND seq>? AND seq<=? ORDER BY seq`,
+      [localpart, ...batch, since, until],
+    );
+    for (const row of rows) {
+      const room = String(row.room_id);
+      if (Number(row.seq) <= selected.get(room)!) continue;
+      rooms.get(room)!.push({
+        type: String(row.type),
+        content: JSON.parse(String(row.content)),
+      });
+    }
+  }
+  return rooms;
+}
+
 /** Bodies and the cursor describing them belong to one tenant snapshot. A
  * selected room has its own last delivered cut; a connection's global cut must
  * not skip data while that room was outside the extension window. Undefined
@@ -207,13 +240,7 @@ export async function captureAccountData(
   }
   const rooms = selected === undefined
     ? await tx.accountData.roomsSince(localpart, since ?? -1, seq)
-    : new Map<string, AccountDataRow[]>();
-  if (selected !== undefined) {
-    for (const [room, cut] of selected) {
-      const events = await tx.accountData.ofRoom(localpart, room, cut, seq);
-      if (events.length) rooms.set(room, events);
-    }
-  }
+    : await tx.accountData.selectedSince(localpart, selected, seq);
   return { seq, global, rooms };
 }
 

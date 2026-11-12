@@ -3,6 +3,13 @@ import { theApp } from '#engine/app.ts';
 import { createRoom } from '#engine/room/create.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
+import { receiveInvite } from '#engine/federation/invites.ts';
+import {
+  fakeKeyResolver,
+  makeRemoteServer,
+  remoteEvent,
+  wireOf,
+} from '#tests/fixtures/remote.ts';
 import { httpSuite } from '#tests/http-app.ts';
 
 type Json = Record<string, unknown>;
@@ -211,6 +218,66 @@ suite.test('room-list positions and another connection receipt cannot consume en
         .content,
     ).body,
     'client-compat-inbox-tail',
+  );
+});
+
+suite.test('pending remote invite account data is delivered before its room cut advances', async () => {
+  const f = await fixture('http-sliding-prejoin-data');
+  const remote = await makeRemoteServer('remote.test');
+  const room = '!sliding-account:remote.test';
+  const event = await remoteEvent(room, remote, '11', {
+    type: 'm.room.member',
+    state_key: f.alice.user_id,
+    sender: '@zoe:remote.test',
+    content: { membership: 'invite' },
+    prev_events: [],
+    auth_events: [],
+  });
+  await receiveInvite(
+    room,
+    event.event_id!,
+    {
+      room_version: '11',
+      event: wireOf(event),
+      invite_room_state: [],
+    },
+    remote.name,
+    {
+      store: f.app.store,
+      server: f.app.server,
+      signer: f.signer,
+      keys: fakeKeyResolver(remote),
+      self: 'localhost',
+      wake: () => {},
+    },
+  );
+  assertEquals(
+    (await call(
+      '/_matrix/client/v3/user/' + encodeURIComponent(f.alice.user_id) +
+        '/rooms/' + encodeURIComponent(room) +
+        '/account_data/org.example.invite',
+      f.alice.access_token!,
+      { before_join: true },
+      'PUT',
+    )).status,
+    200,
+  );
+  const request = {
+    ...f.request,
+    extensions: { account_data: { enabled: true } },
+  };
+  const first = await f.sync(request);
+  assertEquals(first.status, 200);
+  assertEquals(object(object(first.body.rooms)[room]).initial, true);
+  const data = object(object(first.body.extensions).account_data);
+  assertEquals(object(data.rooms)[room], [{
+    type: 'org.example.invite',
+    content: { before_join: true },
+  }]);
+  const next = await f.sync(request, first.body.pos);
+  assertEquals(
+    object(object(object(next.body.extensions).account_data).rooms)[room],
+    undefined,
   );
 });
 

@@ -2,6 +2,7 @@ import { assert, assertEquals } from '@std/assert';
 import {
   accountDataExtension,
   extensionRooms,
+  receiptCaptureSince,
   receiptsExtension,
   typingExtension,
 } from '#engine/sliding-sync/extensions.ts';
@@ -73,16 +74,29 @@ Deno.test('sliding extensions: account-data cuts advance selected rooms only and
   });
   assertEquals(old, { '!a:test': 5, '!b:test': 4 });
   const quiet = accountDataExtension(
-    { seq: 21, global: [], rooms: new Map() },
+    { seq: 21, global: [], rooms: new Map([['!a:test', []]]) },
     new Set(['!a:test']),
     result.cuts,
   );
   assertEquals(quiet.relevant, false);
   assertEquals(quiet.response, { global: [], rooms: {} });
   assertEquals(quiet.cuts, { '!a:test': 21, '!b:test': 4 });
+  const uncaptured = accountDataExtension(
+    { seq: 22, global: [], rooms: new Map() },
+    new Set(['!a:test', '!missing:test']),
+    quiet.cuts,
+  );
+  assertEquals(uncaptured.cuts, quiet.cuts);
 });
 
 Deno.test('sliding extensions: initial/expanded receipts include timeline targets plus own marks; private rows never cross viewers', () => {
+  assertEquals(receiptCaptureSince(undefined, undefined), 0);
+  assertEquals(receiptCaptureSince(undefined, 10), 10);
+  assertEquals(receiptCaptureSince({ initial: true }, 10), 0);
+  assertEquals(
+    receiptCaptureSince({ unstable_expanded_timeline: true }, 10),
+    0,
+  );
   const viewer = '@alice:test';
   const mark = (
     userId: string,
