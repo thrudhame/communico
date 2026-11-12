@@ -672,6 +672,13 @@ bodies and durable delivery obligations are not rewritten or discarded.
 
 ## Tenant data, storage and process lifetime
 
+The access logger has one URL disclosure owner. It omits every query string and
+redacts credential-bearing path values, including delayed-event bearer IDs and
+third-party invitation state keys, before both the head and completion lines.
+Malformed/miss paths cross the same boundary. The real routing/authentication
+request is unchanged; this adds neither log lines nor IP/user-agent collection.
+(`api/engine/access-log.ts`)
+
 Encrypted backup ciphertext, per-room entry sizes and per-version restore bytes
 share one tenant transaction. PUT capacity checks use those exact UTF-8 JSON
 totals, including escaped identifiers and separators, instead of scanning all
