@@ -81,6 +81,74 @@ const page = (response: Json) =>
 const numbers = (response: Json) =>
   page(response).events.map((e) => (e.content as Json).n);
 
+Deno.test('sliding delivery: aborted initial replacement retains the old position until successful publication', async () => {
+  const f = await fixture();
+  try {
+    await f.send(1);
+    await f.send(2);
+    const old = await f.publish(await f.begin('encryption'));
+    const replacement = await f.begin('encryption');
+    assert(replacement.replaces !== undefined);
+    const controller = new AbortController();
+    const original = f.tenant.tx;
+    f.tenant.tx = (fn) =>
+      original((tx) =>
+        fn({
+          ...tx,
+          toDevice: {
+            ...tx.toDevice,
+            deliverSliding: async (...args) => {
+              const result = await tx.toDevice.deliverSliding(...args);
+              assertEquals(result.events.map((e) => (e.content as Json).n), [
+                1,
+              ]);
+              controller.abort();
+              return result;
+            },
+          },
+        })
+      );
+    try {
+      await assertRejects(
+        () =>
+          f.publish(
+            replacement,
+            page(old).next_batch,
+            { replacement: true },
+            controller.signal,
+          ),
+        DOMException,
+        'aborted',
+      );
+    } finally {
+      f.tenant.tx = original;
+    }
+    const surviving = await f.begin('encryption', String(old.pos));
+    assertEquals(surviving.state, {});
+    const fresh = await f.publish(
+      await f.begin('encryption'),
+      page(old).next_batch,
+      { replacement: true },
+    );
+    assertEquals(
+      numbers(fresh),
+      [1],
+      'old-connection receipt cannot acknowledge in the replacement',
+    );
+    await assertRejects(
+      () => f.begin('encryption', String(old.pos)),
+      MatrixError,
+      'M_UNKNOWN_POS',
+    );
+    const current = await f.begin('encryption', String(fresh.pos));
+    assertEquals(current.state, { replacement: true });
+    const tail = await f.publish(current, page(fresh).next_batch);
+    assertEquals(numbers(tail), [2]);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('sliding delivery: rendered response, scoped inbox page and successor commit publish atomically', async () => {
   const f = await fixture();
   try {
