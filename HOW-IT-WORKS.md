@@ -482,6 +482,9 @@ per room/user/receipt type; known slots remain writable. Pending notification
 references admit at most 256 per room/user, refusing additional writes atomically
 without evicting existing references. Malformed or capacity-refused inbound
 receipt entries do not suppress later valid entries; storage failures still do.
+Unknown-thread and pending-reference capacity refusals both use 429, while a
+membership refusal remains a separate not-joined outcome. Failed admissions
+publish neither a receipt nor a sequence advance.
 (`api/engine/server/ephemeral.ts:165-264`, `api/engine/federation/ephemeral.ts:40-56`,
 `api/engine/federation/edus.ts:157-188`)
 
@@ -581,6 +584,8 @@ Custom null is a stored value, while DELETE removes the row. Deactivation clears
 both sources. Profile fan-out attempts every joined room after saving the global
 profile. Partial failure returns 503 with failed_rooms, keeps failed membership
 content unchanged, and preserves successes in later rooms.
+Operator diagnostics pair each failed room with its propagation cause; the
+client response still contains only the existing failed-room IDs and status.
 (`api/engine/tenant/profiles.ts`, `api/engine/client/membership.ts`)
 
 Alias and profile discovery ask remote servers by default, including anonymous

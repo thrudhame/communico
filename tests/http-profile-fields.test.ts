@@ -173,6 +173,9 @@ suite.test('profile fanout attempts later rooms and reports partial outcomes aft
           ? Promise.reject(new Error('one-room-storage-fault'))
           : original(id, options);
       let result: Awaited<ReturnType<typeof call>>;
+      const diagnostics: unknown[][] = [];
+      const originalError = console.error;
+      console.error = (...args) => diagnostics.push(args);
       try {
         result = await call(
           profile + '/' + field,
@@ -182,9 +185,20 @@ suite.test('profile fanout attempts later rooms and reports partial outcomes aft
         );
       } finally {
         theApp().store.room = original;
+        console.error = originalError;
       }
       assertEquals(result.status, 503);
       assertEquals(result.body.failed_rooms, [rooms[0]]);
+      const diagnostic = diagnostics.find((args) =>
+        args[0] === 'profile propagation:'
+      )?.[1] as AggregateError | undefined;
+      assert(diagnostic instanceof AggregateError);
+      assertEquals(diagnostic.errors.length, 1);
+      assert(String(diagnostic.errors[0].message).includes(rooms[0]));
+      assertEquals(
+        diagnostic.errors[0].cause.message,
+        'one-room-storage-fault',
+      );
       const expected = method === 'PUT' ? 'new' : undefined;
       assertEquals((await call(profile)).body[field], expected);
       assertEquals((await call(member(rooms[0]), token)).body[field], 'old');
