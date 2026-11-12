@@ -288,16 +288,38 @@ Deno.test('backfill: cancellation settles a stalled injected fetcher; storage fa
       await s.room.tx((tx) => tx.events.get(cancelled.event_id!)),
       null,
     );
-    s.room.tx = () => Promise.reject(new Error('storage-fault'));
+    let injected = false;
+    s.room.tx = (body) =>
+      original(async (tx) => {
+        const insert = tx.events.insert;
+        tx.events.insert = async (id, pdu) => {
+          await insert(id, pdu);
+          if (id === cancelled.event_id) {
+            injected = true;
+            throw new Error('storage-fault-inside-write');
+          }
+        };
+        return await body(tx);
+      });
     try {
       await assertRejects(
-        () => backfill(s.room, args, s.deps),
+        () =>
+          backfill(s.room, args, {
+            ...s.deps,
+            fetcher: fakeFetcher({ backfill: [cancelled] }).fetcher,
+          }),
         Error,
-        'storage-fault',
+        'storage-fault-inside-write',
       );
     } finally {
       s.room.tx = original;
     }
+    assertEquals(injected, true);
+    assertEquals(await s.room.tx((tx) => tx.changes.head()), before);
+    assertEquals(
+      await s.room.tx((tx) => tx.events.get(cancelled.event_id!)),
+      null,
+    );
   });
 });
 

@@ -9,19 +9,17 @@ function command(source: string) {
   });
 }
 
-Deno.test('crash child lifetime bounds silent and noisy children and drains both pipes', async () => {
+Deno.test('crash child lifetime bounds silent children including a closed stdout pipe', async () => {
   for (
     const source of [
       'setInterval(() => {}, 1000)',
       'Deno.stdout.close(); setInterval(() => {}, 1000)',
-      'for (;;) { await Deno.stderr.write(new Uint8Array(65536)); console.log(JSON.stringify({row:1})); }',
     ]
   ) {
     const started = performance.now();
-    let rows = 0;
     const result = await runCrashChild<{ row: number }>(command(source), {
       deadlineMs: 250,
-      onEvent: () => rows++,
+      onEvent: () => {},
     });
     assertEquals(result.reason, 'watchdog');
     assertEquals(result.status.signal, 'SIGKILL');
@@ -29,9 +27,39 @@ Deno.test('crash child lifetime bounds silent and noisy children and drains both
       performance.now() - started < 3000,
       'absolute child deadline exceeded',
     );
-    if (source.includes('stderr')) {
-      assert(rows > 0, 'stderr backpressure blocked stdout');
-    }
+  }
+});
+
+Deno.test('crash child drains stderr flood within a readiness-relative progress window', async () => {
+  let readyAt: number | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rows = 0;
+  try {
+    const result = await runCrashChild<{ ready?: boolean; row?: number }>(
+      command(
+        'await new Promise(r => setTimeout(r,600)); console.log(JSON.stringify({ready:true})); for (;;) { await Deno.stderr.write(new Uint8Array(65536)); console.log(JSON.stringify({row:1})); }',
+      ),
+      {
+        deadlineMs: 3000,
+        onEvent: (event, stop) => {
+          if (event.ready) {
+            readyAt = performance.now();
+            timer = setTimeout(() => stop('checkpoint'), 250);
+          } else rows++;
+        },
+      },
+    );
+    assert(readyAt !== null, 'child never reached readiness');
+    assertEquals(result.reason, 'checkpoint');
+    assertEquals(result.status.signal, 'SIGKILL');
+    assert(rows > 0, 'stderr backpressure blocked stdout after readiness');
+    assert(result.stderr.length > 0, 'stderr was actually drained');
+    assert(
+      performance.now() - readyAt < 2000,
+      'readiness-relative pipe window exceeded',
+    );
+  } finally {
+    clearTimeout(timer);
   }
 });
 

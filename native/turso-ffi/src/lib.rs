@@ -221,7 +221,14 @@ async fn query(connection: &Connection, sql: &str, parameters: Vec<Value>) -> Re
             let value = match row.get_value(index)? {
                 Value::Null => Json::Null,
                 Value::Integer(value) => json!(value),
-                Value::Real(value) => json!(value),
+                Value::Real(value) => {
+                    // serde_json maps infinities to null. Reject before that
+                    // lossy boundary so callers never mistake an error for SQL NULL.
+                    if !value.is_finite() {
+                        return Err(Failure::binding("query returned nonfinite REAL"));
+                    }
+                    json!(value)
+                }
                 Value::Text(value) => json!(value),
                 Value::Blob(value) => json!(value),
             };

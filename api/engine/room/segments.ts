@@ -539,9 +539,13 @@ export function formatCursor(cursor: WalkCursor): string {
 export function parseCursor(token: string): WalkCursor | null {
   const m = /^c(\d+)_(-?\d+)(i?)$/.exec(token);
   if (m === null) return null;
+  const segment = Number(m[1]), offset = Number(m[2]);
+  if (!Number.isSafeInteger(segment) || !Number.isSafeInteger(offset)) {
+    return null;
+  }
   return {
-    segment: Number(m[1]),
-    offset: Number(m[2]),
+    segment,
+    offset,
     ...(m[3] ? { inclusive: true as const } : {}),
   };
 }

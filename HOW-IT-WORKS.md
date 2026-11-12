@@ -372,6 +372,19 @@ walks three levels before result filtering and reports `recursion_depth`; omitte
 `recurse` omits the depth. Reads beyond the explicit traversal budget fail, rather
 than claiming an incomplete walk is complete. Nested latest events inherit the
 parent's serialization options, without recursively bundling threads.
+The same owner bundles reference IDs and the most recent valid edit, selected by
+origin timestamp then event ID. State, annotation and replacement parents have no
+bundles. Replacements retain full event shape, never mutate original content,
+and require the original sender/type and non-state events (cleartext edits also
+require new content). Redacted originals omit replacements; redacted edits fall
+back to the prior revision. Latest thread replies retain their own edit/reference
+bundles. Local annotation duplicate admission reads accepted, grounded room truth
+and its applied redaction log under the existing authoring lock, before a new
+transaction receipt is prepared; retry receipts reconcile before admission.
+Room schema v5 adds the target/sender/type/key annotation expression index for
+that locked lookup, preserving existing PDUs and redaction indexes on upgrade.
+Direct reference bundles remain complete even above the recursive traversal
+budget; only recursive graph expansion applies that budget.
 (`api/engine/client/{relations,relation-view}.ts`, `api/engine/room/order.ts`,
 `api/engine/server/{project,read}.ts`)
 
@@ -480,6 +493,9 @@ per room/user/receipt type; known slots remain writable. Pending notification
 references admit at most 256 per room/user, refusing additional writes atomically
 without evicting existing references. Malformed or capacity-refused inbound
 receipt entries do not suppress later valid entries; storage failures still do.
+Unknown-thread and pending-reference capacity refusals both use 429, while a
+membership refusal remains a separate not-joined outcome. Failed admissions
+publish neither a receipt nor a sequence advance.
 (`api/engine/server/ephemeral.ts:165-264`, `api/engine/federation/ephemeral.ts:40-56`,
 `api/engine/federation/edus.ts:157-188`)
 
@@ -579,6 +595,8 @@ Custom null is a stored value, while DELETE removes the row. Deactivation clears
 both sources. Profile fan-out attempts every joined room after saving the global
 profile. Partial failure returns 503 with failed_rooms, keeps failed membership
 content unchanged, and preserves successes in later rooms.
+Operator diagnostics pair each failed room with its propagation cause; the
+client response still contains only the existing failed-room IDs and status.
 (`api/engine/tenant/profiles.ts`, `api/engine/client/membership.ts`)
 
 Alias and profile discovery ask remote servers by default, including anonymous
@@ -793,6 +811,8 @@ source metadata. Nothing decrypts attachment ciphertext.
 The storage layer owns native-library loading, file transactions and
 maintenance. Startup checks the qualified Turso revision and patch set. Safe
 integer validation applies to native query results as well as parameters;
+nonfinite REAL results fail in the native binding before JSON serialization can
+turn infinities into a SQL-null lookalike.
 out-of-range integers fail before callers receive rounded database values. Safe
 creation applies the schema in a `.new` directory, closes/reopens, verifies,
 syncs files, renames, then syncs the parent. Opens apply only explicitly

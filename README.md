@@ -348,6 +348,12 @@ fully-read account-data marker; `m.fully_read` does not accept a thread id.
 Relations and thread summaries omit redacted relationships, ignored senders and
 invisible events, including historical replies. Relation pages support `to` and
 three-level `recurse` traversal; thread lists use the latest eligible reply.
+Client events bundle reference IDs, the latest valid full replacement event and
+thread summaries in `unsigned.m.relations`, including edits/references on the
+latest thread reply. Original content is never replaced. Redacting the latest
+edit restores the previous valid edit; redacting the original omits its edits.
+Local duplicate annotations with the same sender, event type, target and key
+return `400 M_DUPLICATE_ANNOTATION` until the earlier annotation is redacted.
 Ignored users' ordinary timeline/search messages are hidden without suppressing
 state or rewriting stored events.
 

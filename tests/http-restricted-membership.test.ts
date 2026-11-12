@@ -151,6 +151,43 @@ test('ordinary admission avoids auth closure; archived resident discovery checks
   }
   console.log(JSON.stringify({ ordinaryJoinFullStateReads: fullStateReads }));
   assertEquals(fullStateReads, 0);
+  fullStateReads = 0;
+  let nominatedCalls = 0;
+  room.tx = (fn) =>
+    original(async (tx) => {
+      const groupMap = tx.state.groupMap;
+      tx.state.groupMap = (...args) => {
+        fullStateReads++;
+        return groupMap(...args);
+      };
+      return await fn(tx);
+    });
+  try {
+    const admitted = await withRestrictedAdmission(
+      room,
+      guest.user_id!,
+      theApp().tenant.serverName,
+      (_tx, authorizer) => {
+        nominatedCalls++;
+        assertEquals(
+          authorizer,
+          null,
+          'public admission needs no restricted vouch',
+        );
+        return 'public-nominee-admitted';
+      },
+      owner.user_id,
+    );
+    assertEquals(admitted, 'public-nominee-admitted');
+    assertEquals(nominatedCalls, 1);
+    assertEquals(
+      fullStateReads,
+      2,
+      'capture and locked revalidation both read the nominee authorizer snapshot',
+    );
+  } finally {
+    room.tx = original;
+  }
   assertEquals(
     (await call(
       'rooms/' + encodeURIComponent(room.id) + '/leave',

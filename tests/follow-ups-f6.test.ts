@@ -254,7 +254,7 @@ Deno.test('F6 receipt ingress preserves unthreaded state and bounds unknown dura
       );
       assertEquals(await streamMax(db, 'receipts'), seq);
     }
-    for (let i = 0; i < 105; i++) {
+    for (let i = 0; i < 100; i++) {
       await setReceipt(db, room, user, 'm.read', '$event' + i, {
         threadId: '$unknown' + i,
       });
@@ -267,11 +267,16 @@ Deno.test('F6 receipt ingress preserves unthreaded state and bounds unknown dura
     assertEquals(rows[0], { thread_id: '', event_id: '$first' });
     assertEquals(rows[1], { thread_id: '$unknown0', event_id: '$event0' });
     const capSeq = await streamMax(db, 'receipts');
+    const overflow = await assertRejects(
+      () =>
+        setReceipt(db, room, user, 'm.read', '$overflow', {
+          threadId: '$overflow',
+        }),
+    );
+    assertEquals((overflow as { status?: number }).status, 429);
     assertEquals(
-      await setReceipt(db, room, user, 'm.read', '$overflow', {
-        threadId: '$overflow',
-      }),
-      false,
+      (overflow as { errcode?: string }).errcode,
+      'M_LIMIT_EXCEEDED',
     );
     assertEquals(await streamMax(db, 'receipts'), capSeq);
     assert(

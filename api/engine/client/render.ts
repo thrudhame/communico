@@ -7,7 +7,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { transactionForEvent } from '#engine/tenant/txns.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { redactionOf } from '#engine/server/read.ts';
-import { relationView } from './relation-view.ts';
+import { relationBundles } from './relation-view.ts';
 import { isIgnoredEvent } from './ignored.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { canSeeEvent } from './visibility.ts';
@@ -277,32 +277,42 @@ async function serializeEvent(
     unsigned.redacted_because = redactedBecause;
   }
   event.unsigned = unsigned;
-  if (opts?.bundleThreads !== false && viewer !== undefined) {
-    const children = await relationView(room, eventId, viewer, {
-      relType: 'm.thread',
+  if (viewer !== undefined) {
+    const selection = await relationBundles(room, eventId, pdu, viewer, {
+      threads: opts?.bundleThreads !== false,
+      redacted: redactionRow !== null,
     });
-    if (children.length > 0) {
-      const latest = await renderEvent(
+    const relations: Record<string, unknown> = {};
+    if (selection.references.length > 0) {
+      relations['m.reference'] = {
+        chunk: selection.references.map((event_id) => ({ event_id })),
+      };
+    }
+    if (selection.replacement !== null) {
+      const replacement = await renderEvent(
         room,
-        children[children.length - 1].eventId,
+        selection.replacement,
         viewer,
         { ...opts, bundleThreads: false },
       );
-      let participated = viewer?.userId === pdu.sender;
-      for (const child of children) {
-        const row = await room.tx((tx) => tx.events.get(child.eventId));
-        if (row?.sender === viewer?.userId) participated = true;
-      }
+      if (replacement !== null) relations['m.replace'] = replacement;
+    }
+    if (selection.thread !== null) {
+      const latest = await renderEvent(
+        room,
+        selection.thread.latest,
+        viewer,
+        { ...opts, bundleThreads: false },
+      );
       if (latest !== null) {
-        unsigned['m.relations'] = {
-          'm.thread': {
-            latest_event: latest,
-            count: children.length,
-            current_user_participated: participated,
-          },
+        relations['m.thread'] = {
+          latest_event: latest,
+          count: selection.thread.count,
+          current_user_participated: selection.thread.participated,
         };
       }
     }
+    if (Object.keys(relations).length > 0) unsigned['m.relations'] = relations;
   }
   return event;
 }

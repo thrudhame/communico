@@ -54,6 +54,12 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       statuses: (ids: readonly string[]) => events.statuses(conn, ids),
       timestampBucket: (ts: number, dir: 'f' | 'b', inclusive: boolean) =>
         events.timestampBucket(conn, ts, dir, inclusive),
+      hasAnnotation: (
+        target: string,
+        type: string,
+        sender: string,
+        key: string,
+      ) => events.hasAnnotation(conn, target, type, sender, key),
     },
     state: {
       groupEntries: (group: number) => state.groupEntries(conn, group),

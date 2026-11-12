@@ -208,7 +208,13 @@ export async function setReceipt(
           ) LIMIT ?`,
           [roomId, userId, receiptType, MAX_UNKNOWN_THREADS],
         );
-        if (pending.length >= MAX_UNKNOWN_THREADS) return null;
+        if (pending.length >= MAX_UNKNOWN_THREADS) {
+          throw new MatrixError(
+            429,
+            'M_LIMIT_EXCEEDED',
+            'unknown receipt thread capacity reached',
+          );
+        }
       }
     }
     // Local API admission and read effects share the same relation snapshot.
