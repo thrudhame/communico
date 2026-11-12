@@ -1,4 +1,5 @@
 import { assert, assertEquals } from '@std/assert';
+import { config } from '#engine/config.ts';
 
 export type Schema = boolean | {
   $ref?: string;
@@ -225,6 +226,21 @@ function responseSchema(
   field: SpecField,
   query = new URLSearchParams(),
 ): Schema {
+  // The approved unconfigured TURN read follows Synapse's empty-object
+  // contract. It is not permission to omit credentials for configured TURN,
+  // or to return a partial credential object when unconfigured.
+  if (
+    operation.id ===
+      'data/api/client-server/voip.yaml#GET /_matrix/client/v3/voip/turnServer'
+  ) {
+    const turn = config().turn;
+    if (
+      turn.uris.length === 0 || turn.ttl === 0 ||
+      (turn.secret === '' && (turn.username === '' || turn.password === ''))
+    ) {
+      return { type: 'object', maxProperties: 0 };
+    }
+  }
   // The tagged oneOf includes an arbitrary content object and a client event,
   // so those branches overlap structurally. Its response prose discriminates
   // them by the request's format, not by counting schema matches.

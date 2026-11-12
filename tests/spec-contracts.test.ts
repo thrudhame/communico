@@ -1,4 +1,5 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
+import { config, setConfigForTests } from '#engine/config.ts';
 import {
   assertSpecHttpResponse,
   assertSpecResponse,
@@ -176,4 +177,51 @@ Deno.test('state response format selects its tagged content or event contract be
       content: {},
     }),
   );
+});
+
+Deno.test('TURN response guard permits only the empty unconfigured branch or complete configured credentials', () => {
+  const previous = config().turn;
+  const check = (value: unknown) =>
+    assertSpecResponse('GET', '/_matrix/client/v3/voip/turnServer', 200, value);
+  try {
+    setConfigForTests({
+      turn: { uris: [], ttl: 0, secret: '', username: '', password: '' },
+    });
+    check({});
+    assertThrows(() => check({ username: 'partial' }));
+    setConfigForTests({
+      turn: {
+        uris: ['turn:example.test'],
+        ttl: 60,
+        username: 'user',
+        password: 'password',
+      },
+    });
+    assertThrows(() => check({}));
+    assertThrows(() => check({ username: 'user' }));
+    check({
+      username: 'user',
+      password: 'password',
+      ttl: 60,
+      uris: ['turn:example.test'],
+    });
+    setConfigForTests({
+      turn: {
+        uris: ['turn:example.test'],
+        ttl: 60,
+        username: '',
+        password: '',
+        secret: 'secret',
+      },
+    });
+    assertThrows(() => check({}));
+    check({
+      username: 'user',
+      password: 'password',
+      ttl: 60,
+      uris: ['turn:example.test'],
+    });
+  } finally {
+    setConfigForTests({ turn: previous });
+  }
 });

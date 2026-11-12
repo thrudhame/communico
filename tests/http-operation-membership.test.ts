@@ -5,6 +5,41 @@ import { fedCaller, remoteServer } from './http-federation.ts';
 const suite = httpSuite('HTTP membership and state operation contracts');
 type Json = Record<string, unknown>;
 let token = '', targetToken = '', target = '', room = '', event = '';
+
+suite.test('joined member summaries omit absent optional profile strings and retain empty strings', async () => {
+  const user = await suite.registerTestUser('operation-member-summary', 'pw');
+  const made = await call('createRoom', {}, 'POST', user.access_token!);
+  assertEquals(made.status, 200);
+  const base = 'rooms/' + encodeURIComponent(String(made.body.room_id));
+  const state = base + '/state/m.room.member/' +
+    encodeURIComponent(user.user_id);
+  for (
+    const content of [{ membership: 'join' }, {
+      membership: 'join',
+      displayname: '',
+      avatar_url: 'mxc://outside.test/avatar',
+      'org.example.secret': true,
+    }]
+  ) {
+    assertEquals(
+      (await call(state, content, 'PUT', user.access_token!)).status,
+      200,
+    );
+    const members = await call(
+      base + '/joined_members',
+      undefined,
+      'GET',
+      user.access_token!,
+    );
+    assertEquals(members.status, 200);
+    assertEquals(
+      (members.body.joined as Json)[user.user_id],
+      content.displayname === undefined
+        ? {}
+        : { display_name: '', avatar_url: 'mxc://outside.test/avatar' },
+    );
+  }
+});
 async function call(
   path: string,
   body?: unknown,
