@@ -19,6 +19,9 @@ import { openRoom, type Room } from '#engine/room/index.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import type { Store } from '#engine/store/index.ts';
 import { ReliableEduError } from '#engine/federation/edus.ts';
+import { objectOf, stringOf } from '#engine/net/json.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { transactionEnvelope } from './peer-json.ts';
 
 export type TransactionDeps = {
   store: Store;
@@ -139,27 +142,29 @@ export async function receiveTransaction(
   rawBody: unknown,
   deps: TransactionDeps,
 ): Promise<TxnResult> {
-  const body = (rawBody == null ? {} : rawBody) as {
-    origin?: unknown;
-    origin_server_ts?: unknown;
-    pdus?: unknown;
-    edus?: unknown;
-  };
-  // body origin must equal the authenticated origin (design.md — our
-  // rule, stricter than the spec; tuwunel send.rs:84-88)
-  if (body.origin !== origin) {
-    throw new MatrixError(
-      403,
-      'M_FORBIDDEN',
-      'transaction origin does not match the authenticated server',
+  let envelope: ReturnType<typeof transactionEnvelope>;
+  try {
+    const body = objectOf(rawBody, 'transaction');
+    // Keep authenticated-origin equality separate from the wire schema.
+    if (stringOf(body.origin, 'transaction') !== origin) {
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        'transaction origin does not match the authenticated server',
+      );
+    }
+    envelope = transactionEnvelope(body);
+  } catch (error) {
+    if (!(error instanceof UpstreamError)) throw error;
+    const failure = new MatrixError(
+      400,
+      error.context.resourceLimit ? 'M_TOO_LARGE' : 'M_BAD_JSON',
+      error.context.reason,
     );
+    failure.cause = error;
+    throw failure;
   }
-  const pdus = Array.isArray(body.pdus) ? body.pdus : [];
-  const edus = Array.isArray(body.edus) ? body.edus : [];
-  // 50 PDUs / 100 EDUs per transaction (SS:423-424)
-  if (pdus.length > 50 || edus.length > 100) {
-    throw new MatrixError(400, 'M_TOO_LARGE', 'too many PDUs or EDUs');
-  }
+  const { pdus, edus } = envelope;
 
   const server = await deps.store.server();
   // replay: a retried transaction gets the stored answer
@@ -218,6 +223,10 @@ export async function receiveTransaction(
       await deps.edus.dispatch(origin, raw);
     } catch (e) {
       if (e instanceof ReliableEduError) throw e;
+      if (
+        !(e instanceof UpstreamError) ||
+        !['protocol', 'validation'].includes(e.category)
+      ) throw e;
       console.error(`transactions[${origin}]: EDU dropped:`, e);
     }
   }

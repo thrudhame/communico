@@ -8,7 +8,10 @@ import { type FederationRequest, federationRequest } from './client.ts';
 export async function discoveryRequest(
   server: Database,
   signer: Signer,
-  request: Omit<FederationRequest, 'method' | 'body'>,
+  request: Omit<FederationRequest, 'method' | 'body'> & {
+    method?: 'GET' | 'POST';
+    body?: FederationRequest['body'];
+  },
 ): Promise<unknown> {
   await admit(server, request.destination, {
     kind: 'lookup',
@@ -16,7 +19,7 @@ export async function discoveryRequest(
   });
   return (await federationRequest(server, signer, {
     ...request,
-    method: 'GET',
-    body: null,
+    method: request.method === undefined ? 'GET' : request.method,
+    body: request.body === undefined ? null : request.body,
   })).json;
 }

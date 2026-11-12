@@ -29,7 +29,6 @@ export default async function (request: PathfinderRequest, _context: Context) {
       error: 'Content not JSON.',
     });
   }
-  if (text.trim() === '') return;
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);

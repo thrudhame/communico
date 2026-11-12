@@ -6,6 +6,8 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { getRulebook, supportedRoomVersions } from '#engine/rulebook/index.ts';
 import { roomAllows } from '#engine/federation/acl.ts';
 import { discoveryRequest } from '#engine/federation/discovery.ts';
+import { hierarchyResponse } from '#engine/federation/discovery-response.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import { joinedAllowedRoom } from '#engine/room/restricted.ts';
 import { membershipOf } from '#engine/server/read.ts';
 import { resolveAlias } from './directory.ts';
@@ -104,42 +106,30 @@ export async function remoteDiscoveryHierarchy(
       name !== serverName()
     ).slice(0, config().federation.discoveryservers)
   ) {
-    let response: unknown;
+    let response: ReturnType<typeof hierarchyResponse>;
     try {
-      response = await discoveryRequest(app.server, app.tenant.signer(), {
-        destination,
-        room: { store: app.store, id },
-        path: '/_matrix/federation/v1/hierarchy/' + encodeURIComponent(id) +
-          (suggested ? '?suggested_only=true' : ''),
-      });
+      response = hierarchyResponse(
+        await discoveryRequest(app.server, app.tenant.signer(), {
+          destination,
+          room: { store: app.store, id },
+          path: '/_matrix/federation/v1/hierarchy/' + encodeURIComponent(id) +
+            (suggested ? '?suggested_only=true' : ''),
+        }),
+        id,
+      );
     } catch (error) {
-      if (!(error instanceof MatrixError)) throw error;
+      if (
+        !(error instanceof MatrixError && error.status < 500) &&
+        !recoverableUpstream(error)
+      ) throw error;
       failure = error;
       continue;
     }
-    const root = response !== null && typeof response === 'object' &&
-        !Array.isArray(response)
-      ? (response as Json).room
-      : undefined;
-    if (
-      root === null || typeof root !== 'object' || Array.isArray(root) ||
-      (root as Json).room_id !== id
-    ) {
-      failure = new MatrixError(
-        502,
-        'M_UNKNOWN',
-        'invalid remote hierarchy summary',
-      );
-      continue;
-    }
-    const summary = root as Json;
+    const summary = response.room;
     if (await summaryAccessible(summary, { user })) {
-      const inaccessible = (response as Json).inaccessible_children;
       return {
         room: summary,
-        inaccessible: Array.isArray(inaccessible)
-          ? inaccessible.filter((id): id is string => typeof id === 'string')
-          : [],
+        inaccessible: response.inaccessible,
       };
     }
     return null;

@@ -857,6 +857,16 @@ of becoming peer outages. Subscriber cancellation does not charge peer backoff.
 (`api/engine/{e2ee-wire,e2ee-remote,e2ee-public-signing}.ts`,
 `api/engine/client/e2ee.ts`, `api/engine/federation/device-lists.ts`)
 
+Alias lookup and joining share one directory response decoder. Profile and
+hierarchy consumers validate endpoint schemas before returning data or applying
+access policy, preserving extensions, unset profile nulls and the public default
+for omitted join rules. Read-only discovery supports signed GET and POST bodies
+without adding participation records. Inbound transactions validate required
+metadata and PDU/EDU containers before persistence; malformed ephemeral entries
+cannot become typing stops, invented receipt timestamps or default presence.
+Unknown local handler failures propagate without caching transaction success.
+(`api/engine/federation/{discovery,discovery-response,peer-json,transactions,edus}.ts`)
+
 The shared thumbnail service serves local client, legacy-local and signed
 federation routes. Remote variants fetch signed federation thumbnails before
 bounded local validation/static generation. Cache identity includes format,
