@@ -469,7 +469,7 @@ async function joinVia(
         },
         ungroundedMs: 0,
         localJoin: { eventId, userId: args.user },
-      });
+      }, 'pulled');
       const landed = await held.tx(async (tx) => {
         const status = await tx.events.getStatus(eventId);
         return status?.standing === 'accepted' &&

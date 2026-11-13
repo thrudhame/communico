@@ -105,7 +105,8 @@ Deno.test('push reconciliation: a history parent moves only existing live decisi
       ),
     }).fetcher;
     assertEquals(
-      (await ingestRemote(room, [child], fr.server.name, deps))[0].outcome,
+      (await ingestRemote(room, [child], fr.server.name, deps, 'pulled'))[0]
+        .outcome,
       'accepted',
     );
     await project(store, fr.roomId);

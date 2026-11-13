@@ -112,8 +112,9 @@ export function productionFetcher(
         ),
         maxBytes: bulk(),
       });
+      const body = objectOf(res.json, 'missing-events');
       return pduList(
-        objectOf(res.json, 'missing-events').events,
+        body.events === undefined ? [] : body.events,
         'missing-events',
       );
     },

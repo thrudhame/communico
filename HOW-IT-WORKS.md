@@ -111,9 +111,12 @@ or enters the live feed: history is never news.
 (`api/engine/room/schema.ts:83-89`, `api/engine/room/segments.ts:1-12`,
 `api/engine/room/history.ts:1-16`, `api/engine/server/project.ts:535-556`)
 
-Remote recovery waits briefly, asks for missing events, then requests state
-and events for gap tips within a batch budget. Remaining ungrounded events
-become pending with waits; later arrivals re-run the shared pipeline. A zero
+Remote recovery waits briefly and asks for missing events. Only pulled events
+permit state/event recovery behind their missing parents, within a batch budget;
+pushed events whose own parents remain unavailable return a per-PDU error. A
+missing `events` field in a missing-events answer is an empty list, not malformed
+JSON. Remaining ungrounded events become pending with waits; later arrivals
+re-run the shared pipeline. A zero
 ungrounded lifetime drops them instead. Delayed redaction targets use waits
 too, without rewriting the stored target PDU.
 (`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,

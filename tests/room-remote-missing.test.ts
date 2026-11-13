@@ -18,6 +18,7 @@ import { openStore, type Store } from '#engine/store/index.ts';
 import { genesis } from './fixtures/genesis.ts';
 import { authAt } from './fixtures/auth.ts';
 import { testRemoteServer } from './fixtures/signer.ts';
+import { UpstreamHttpError } from '#engine/net/upstream-error.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -228,7 +229,7 @@ Deno.test('missing: complete pushed batches need no recovery, including rejected
   }
 });
 
-Deno.test('missing: recovery follows the real hole behind pushed parents only once', async () => {
+Deno.test('missing: pushed parents cannot lend state recovery permission to a batch', async () => {
   await withStore(async (store) => {
     const s = await setup(store);
     const far = await msg(s, 'far', [s.joinId], 100);
@@ -248,11 +249,13 @@ Deno.test('missing: recovery follows the real hole behind pushed parents only on
       s.server.name,
       s.deps,
     );
-    assertEquals(out.map((o) => o.outcome), ['accepted', 'accepted']);
-    assertEquals(recording.calls.missingEvents.length, 1);
-    assertEquals(recording.calls.stateIds, [String(far.event_id)]);
-    assertEquals(recording.calls.event, [String(far.event_id)]);
-    assertEquals(await frontierOf(s.g.room), [String(tip.event_id)]);
+    assertEquals(out.map((o) => o.outcome), ['pending', 'pending']);
+    assertEquals(out[0].error, null); // the child supplied its own direct parent
+    assert(out[1].error?.includes('prev_events')); // the parent withheld its prev
+    assertEquals(recording.calls.missingEvents.length, 2);
+    assertEquals(recording.calls.stateIds, []);
+    assertEquals(recording.calls.event, []);
+    assertEquals(await frontierOf(s.g.room), [s.joinId]);
   });
 });
 
@@ -298,6 +301,57 @@ Deno.test('missing: request shape (earliest = our extremities); answers land liv
     assertEquals(await frontierOf(s.g.room), [String(pushed.event_id)]);
   });
 });
+
+for (const answer of ['empty', 'partial', 'unavailable', 'shared-gap']) {
+  Deno.test(
+    'missing: pushed own prevs must be supplied before state recovery: ' +
+      answer,
+    async () => {
+      await withStore(async (store) => {
+        const s = await setup(store);
+        const withheld = await msg(s, 'withheld', [s.joinId], 50);
+        const returned = await msg(s, 'returned', [
+          answer === 'shared-gap' ? withheld.event_id! : s.joinId,
+        ], 51);
+        const pushed = await msg(s, 'pushed', [
+          withheld.event_id!,
+          returned.event_id!,
+        ], 52);
+        const recording = fakeFetcher({
+          missingEvents: answer === 'partial' || answer === 'shared-gap'
+            ? [returned]
+            : [],
+          stateIds: new Map([[withheld.event_id!, {
+            pduIds: [s.g.createId, s.joinId],
+            authChainIds: [],
+          }]]),
+          event: new Map([[withheld.event_id!, withheld]]),
+        });
+        if (answer === 'unavailable') {
+          recording.fetcher.missingEvents = () => {
+            throw new UpstreamHttpError(503, 'federation');
+          };
+        }
+        s.deps.fetcher = recording.fetcher;
+        const [out] = await ingestRemote(
+          s.g.room,
+          [pushed],
+          s.server.name,
+          s.deps,
+        );
+        assertEquals(recording.calls.stateIds, []);
+        assertEquals(recording.calls.event, []);
+        assertEquals(out.outcome, 'pending');
+        assert(out.error?.includes('prev_events'));
+        await s.g.room.tx(async (tx) => {
+          assertEquals(await tx.events.get(withheld.event_id!), null);
+          assertEquals(await tx.state.eventStateAfter(pushed.event_id!), null);
+          assertEquals(await tx.segments.positionOf(pushed.event_id!), null);
+        });
+      });
+    },
+  );
+}
 
 Deno.test('missing: budget exhausted → pending + wait; the later arrival resumes it', async () => {
   await withStore(async (store) => {
@@ -427,7 +481,9 @@ Deno.test('missing: /state_ids + /event packs the gap tip with its fetched state
       const ids = [...(await tx.state.groupMap(group!)).values()];
       return ids;
     });
+    const pulled = await msg(s, 'pulled', [String(zoe.event_id)], 51);
     const recording = fakeFetcher({
+      missingEvents: [pulled],
       stateIds: new Map([[String(zoe.event_id), {
         pduIds: [...stateIds, String(topic.event_id)],
         authChainIds: [s.g.createId],
@@ -438,7 +494,7 @@ Deno.test('missing: /state_ids + /event packs the gap tip with its fetched state
       ]),
     });
     s.deps.fetcher = recording.fetcher;
-    const pushed = await msg(s, 'pushed', [String(zoe.event_id)], 51);
+    const pushed = await msg(s, 'pushed', [String(pulled.event_id)], 52);
     const outcomes = await ingestRemote(
       s.g.room,
       [pushed],
@@ -568,11 +624,64 @@ Deno.test('missing: a format-dropped answer event is terminal — no /state_ids 
   });
 });
 
+Deno.test('missing: later child after bad JSON retains the trusted frontier when recovery replies are malformed or absent', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const bad = await msg(s, 'invalid float', [s.joinId], 50);
+    bad.content.bad_val = 1.1;
+    const good = await msg(s, 'Message 2', [String(bad.event_id)], 51);
+    const next = await msg(s, 'Message 3', [String(good.event_id)], 52);
+    const initial = fakeFetcher({ missingEvents: [bad] });
+    s.deps.fetcher = initial.fetcher;
+    assertEquals(
+      (await ingestRemote(s.g.room, [good], s.server.name, s.deps))[0].outcome,
+      'pending',
+    );
+    assertEquals(initial.calls.stateIds, []);
+    assertEquals(initial.calls.missingEvents[0].earliest, [s.joinId]);
+    assertEquals(initial.calls.missingEvents[0].latest, [
+      String(good.event_id),
+    ]);
+    // Complement's second handler returns {}, which decodes as no events.
+    // Held pending bytes do not grant state recovery for the new pushed PDU.
+    const missing: { earliest: string[]; latest: string[] }[] = [];
+    const stateIds: string[] = [];
+    s.deps.fetcher.missingEvents = (_room, earliest, latest) => {
+      missing.push({ earliest: [...earliest], latest: [...latest] });
+      return Promise.resolve([]);
+    };
+    s.deps.fetcher.stateIds = (_room, event) => {
+      stateIds.push(event);
+      throw new UpstreamHttpError(404, 'federation');
+    };
+    assertEquals(
+      (await ingestRemote(s.g.room, [next], s.server.name, s.deps))[0].outcome,
+      'pending',
+    );
+    assertEquals(missing, [{
+      earliest: [s.joinId],
+      latest: [String(next.event_id)],
+    }]);
+    assertEquals(stateIds, []);
+    assertEquals(await frontierOf(s.g.room), [s.joinId]);
+    await s.g.room.tx(async (tx) => {
+      assertEquals(await tx.events.get(String(bad.event_id)), null);
+      for (const id of [good.event_id, next.event_id].map(String)) {
+        assertEquals((await tx.events.getStatus(id))?.grounding, 'pending');
+        assertEquals(await tx.state.eventStateAfter(id), null);
+        assertEquals(await tx.segments.positionOf(id), null);
+      }
+    });
+  });
+});
+
 Deno.test('missing: an unfetchable auth chain stores the gap tip rejected as evidence — it grounds nothing', async () => {
   await withStore(async (store) => {
     const s = await setup(store, { roomId: '!m7:test' });
     const far = await msg(s, 'far', [s.joinId], 50);
+    const pulled = await msg(s, 'pulled', [String(far.event_id)], 51);
     const recording = fakeFetcher({
+      missingEvents: [pulled],
       stateIds: new Map([[String(far.event_id), {
         pduIds: [s.g.createId],
         authChainIds: ['$unfetchable'],
@@ -583,7 +692,7 @@ Deno.test('missing: an unfetchable auth chain stores the gap tip rejected as evi
       ]),
     });
     s.deps.fetcher = recording.fetcher;
-    const pushed = await msg(s, 'pushed', [String(far.event_id)], 51);
+    const pushed = await msg(s, 'pushed', [String(pulled.event_id)], 52);
     const outcomes = await ingestRemote(
       s.g.room,
       [pushed],
@@ -593,6 +702,9 @@ Deno.test('missing: an unfetchable auth chain stores the gap tip rejected as evi
     // TestCorruptedAuthChain: the tip must not become accepted — a
     // standing rejected record, never grounding (requirements §4.2 R5)
     assertEquals(outcomes[0].outcome, 'pending');
+    // Its direct parent WAS divulged by missing-events. Failed auth behind
+    // that pulled parent is not a missing-parent refusal of the pushed PDU.
+    assertEquals(outcomes[0].error, null);
     await s.g.room.tx(async (tx) => {
       const status = await tx.events.getStatus(String(far.event_id));
       assertEquals(status?.standing, 'rejected');
@@ -606,6 +718,7 @@ Deno.test('missing: an auth-chain event that fails its own auth check is stored 
   await withStore(async (store) => {
     const s = await setup(store, { roomId: '!m8:test' });
     const far = await msg(s, 'far', [s.joinId], 50);
+    const pulled = await msg(s, 'pulled', [String(far.event_id)], 51);
     // a state event whose declared auth events are unresolvable — it
     // fails checkAuthChain (rule 2.2) under the lock
     const shady = await remoteEvent(s.g.roomId, s.server, '11', {
@@ -619,6 +732,7 @@ Deno.test('missing: an auth-chain event that fails its own auth check is stored 
       origin_server_ts: 140,
     });
     const recording = fakeFetcher({
+      missingEvents: [pulled],
       stateIds: new Map([[String(far.event_id), {
         pduIds: [s.g.createId, s.joinId],
         authChainIds: [String(shady.event_id)],
@@ -629,7 +743,7 @@ Deno.test('missing: an auth-chain event that fails its own auth check is stored 
       ]),
     });
     s.deps.fetcher = recording.fetcher;
-    const pushed = await msg(s, 'pushed', [String(far.event_id)], 51);
+    const pushed = await msg(s, 'pushed', [String(pulled.event_id)], 52);
     const outcomes = await ingestRemote(
       s.g.room,
       [pushed],

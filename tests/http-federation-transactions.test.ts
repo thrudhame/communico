@@ -297,10 +297,14 @@ test('send: missing prevs persist pending waits without news; zero retention dro
     const pending = await message(s, 'pending', {
       prev_events: ['$missing-one', '$missing-two'],
     });
-    assertEquals(await send('pending', [pending]), {
-      status: 200,
-      body: { pdus: { [String(pending.event_id)]: {} } },
-    });
+    const response = await send('pending', [pending]);
+    assertEquals(response.status, 200);
+    assert(
+      String(
+        ((response.body.pdus as Json)[String(pending.event_id)] as Json).error,
+      )
+        .includes('prev_events'),
+    );
     await s.held.tx(async (tx) => {
       const status = await tx.events.getStatus(String(pending.event_id));
       assertEquals(status?.grounding, 'pending');
@@ -397,8 +401,7 @@ for (const retention of ['default', 'zero'] as const) {
       const first = await send(`unreject-${retention}-B`, [b]);
       assertEquals(first.status, 200);
       const receipt = (first.body.pdus as Json)[bId] as Json;
-      if (retention === 'default') assertEquals(receipt, {});
-      else assert(typeof receipt.error === 'string');
+      assert(typeof receipt.error === 'string');
       const waiting = await sync(before.next);
       assertEquals(waiting.ids, []);
       assertEquals(await send(`unreject-${retention}-A`, [a]), {
@@ -412,7 +415,10 @@ for (const retention of ['default', 'zero'] as const) {
         status: 200,
         body: { pdus: { [bId]: {} } },
       });
-      if (retention === 'default') assertEquals(resent, first);
+      // Redelivery is now grounded and succeeds, unlike the original refusal.
+      assert(
+        typeof ((first.body.pdus as Json)[bId] as Json).error === 'string',
+      );
       const after = await sync(arrived.next);
       assertEquals(after.ids, retention === 'default' ? [] : [bId]);
       assertEquals((await sync(after.next)).ids, []);

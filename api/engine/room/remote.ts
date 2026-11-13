@@ -4,7 +4,7 @@
 // path (verify.ts, G9/G10) and return known-event receipts without
 // re-verification (I2); gather what is missing — the wait
 // (missingwaitms), ONE get_missing_events (missinglimit), then
-// /state_ids + /event for the gap tips behind held placeholders and
+// /state_ids + /event only for gap tips behind pulled events and
 // /event_auth for missing declared auth events, all inside the
 // whole-batch budget (missingbudgetms) and NEVER under the lock (R13);
 // then one room transaction under the per-room lock: revalidated
@@ -70,6 +70,7 @@ function outcomeOf(
 
 type VerifiedItem = {
   index: number; // position in the input; -1 for fetched events
+  source: 'pushed' | 'pulled';
   pdu: Pdu;
   eventId: string;
   oversized: boolean;
@@ -88,6 +89,9 @@ type FetchAcc = {
   corrupted: Map<string, Pdu>;
   // Gap tip → the imported before-state boundary (R5, G1).
   boundaries: Map<string, StateMap>;
+  // Pushed events whose direct parents stayed unavailable after missing-events.
+  // Distinct from a supplied pulled parent's later auth/state failure.
+  unavailablePrevs: Set<string>;
   // Verify-failed ids in this chain: terminal, no /state_ids fallthrough
   // (the BadJSON case).
   terminal: Set<string>;
@@ -110,7 +114,8 @@ async function groundingOf(
 // The bounded fetch ladder for one PDU with ungrounded prevs (old §3.4),
 // all with the room lock RELEASED: the brief wait, ONE
 // get_missing_events, then /state_ids + /event for the gap tips — never
-// for an id we hold or one this chain proved terminal.
+// for an id we hold or one this chain proved terminal. State recovery is
+// permitted by a pulled event, never by a pushed event withholding its parents.
 async function fetchMissing(
   room: Room,
   item: VerifiedItem,
@@ -187,6 +192,7 @@ async function fetchMissing(
         if (!acc.live.has(v.eventId)) {
           acc.live.set(v.eventId, {
             index: -1,
+            source: 'pulled',
             pdu: v.pdu,
             eventId: v.eventId,
             oversized: v.oversized,
@@ -211,7 +217,10 @@ async function fetchMissing(
   //    (pending or evidence) is never /state_ids'd — the gap behind it is
   const gapTips: string[] = [];
   const chased = new Set<string>();
-  const chase = async (ids: readonly string[]): Promise<void> => {
+  const chase = async (
+    ids: readonly string[],
+    source: VerifiedItem['source'],
+  ): Promise<void> => {
     for (const id of ids) {
       if (
         chased.has(id) || acc.terminal.has(id) || acc.boundaries.has(id) ||
@@ -219,25 +228,43 @@ async function fetchMissing(
       ) {
         continue;
       }
-      chased.add(id);
       // an event the answer already landed joins this batch — it is
       // "held" for the chase: never /state_ids'd, the gap is behind it
       const answered = acc.live.get(id);
       if (answered !== undefined) {
-        await chase(answered.pdu.prev_events ?? []);
+        chased.add(id);
+        await chase(answered.pdu.prev_events ?? [], answered.source);
         continue;
       }
       const grounding = await groundingOf(room, id);
       if (grounding === 'grounded') continue;
+      // A pushed event must disclose its own parents via missing-events.
+      // Only a pulled event can justify an imported state boundary behind it;
+      // walking through another pushed parent must not inherit that permission.
+      if (source === 'pushed') continue;
+      chased.add(id);
       if (grounding === 'unknown') {
         gapTips.push(id);
         continue;
       }
       const prevs = await room.tx((tx) => tx.events.prevsOf(id));
-      await chase(prevs);
+      await chase(prevs, source);
     }
   };
-  await chase(item.pdu.prev_events ?? []);
+  // Check the whole direct-parent set before chasing any branch. Otherwise a
+  // fetched sibling can route state recovery back to a withheld direct parent.
+  const parentsPresent = item.source === 'pulled' ||
+    await room.tx(async (tx) => {
+      for (const id of item.pdu.prev_events ?? []) {
+        if (
+          !acc.live.has(id) &&
+          (await tx.state.eventStateAfter(id)) === null
+        ) return false;
+      }
+      return true;
+    });
+  if (parentsPresent) await chase(item.pdu.prev_events ?? [], item.source);
+  else acc.unavailablePrevs.add(item.eventId);
   for (const tip of gapTips) {
     if (budgetLeft() <= 0) return;
     await fetchGapTip(room, tip, origin, deps, version, budget, acc);
@@ -342,6 +369,7 @@ async function fetchGapTip(
         tipPdu = v.pdu;
         acc.live.set(tip, {
           index: -1,
+          source: 'pulled',
           pdu: v.pdu,
           eventId: tip,
           oversized: v.oversized,
@@ -379,11 +407,14 @@ async function fetchGapTip(
 // Ingest a batch of PDUs received from `origin` for one room. Per-PDU
 // outcomes in input order; room-level failures (unknown room, archived
 // stay) throw. One room transaction for the whole batch (G11).
+// The only pulled-input caller is the verified resident send_join response;
+// transaction receipt uses the default pushed source.
 export async function ingestRemote(
   room: Room,
   pdus: Pdu[],
   origin: string,
   deps: RemoteDeps,
+  source: VerifiedItem['source'] = 'pushed',
 ): Promise<RemoteOutcome[]> {
   const version = await room.tx(async (tx) => {
     const stay = await tx.segments.openStay();
@@ -449,6 +480,7 @@ export async function ingestRemote(
       });
       items.push({
         index: item.index,
+        source,
         pdu: v.pdu,
         eventId: v.eventId,
         oversized: v.oversized,
@@ -466,6 +498,7 @@ export async function ingestRemote(
     evidence: new Map(),
     corrupted: new Map(),
     boundaries: new Map(),
+    unavailablePrevs: new Set(),
     terminal: new Set(),
   };
   const budget = { until: Date.now() + deps.limits.budgetMs };
@@ -531,7 +564,13 @@ export async function ingestRemote(
       ]);
       const candidates = new Map<string, VerifiedItem>();
       for (const [eventId, pdu] of pack) {
-        candidates.set(eventId, { eventId, pdu, index: -1, oversized: false });
+        candidates.set(eventId, {
+          eventId,
+          pdu,
+          index: -1,
+          source: 'pulled',
+          oversized: false,
+        });
       }
       for (const [id, item] of merged) candidates.set(id, item);
       const ordered = orderEvents([...candidates.values()], [
@@ -648,6 +687,12 @@ export async function ingestRemote(
             rule: res.rule,
             error: null,
           };
+        if (
+          res.grounding === 'pending' && acc.unavailablePrevs.has(id)
+        ) {
+          result.error =
+            'Your server is not divulging the referenced prev_events';
+        }
         for (const index of outcomeIndex.get(item.eventId) ?? []) {
           results.set(index, result);
         }

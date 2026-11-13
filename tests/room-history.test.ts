@@ -98,7 +98,7 @@ async function setup(
     const first = await ingestRemote(room, rest, fr.server.name, deps);
     for (const outcome of first) assertEquals(outcome.outcome, 'accepted');
   }
-  // deliver the latest event; the chase fetches the gap tip behind it
+  // A pulled latest event permits recovery behind its missing parent.
   const gapTip = String(latest.prev_events![0]);
   const chase = fakeFetcher({
     missingEvents: [],
@@ -108,7 +108,13 @@ async function setup(
     ),
   });
   deps.fetcher = chase.fetcher;
-  const second = await ingestRemote(room, [latest], fr.server.name, deps);
+  const second = await ingestRemote(
+    room,
+    [latest],
+    fr.server.name,
+    deps,
+    'pulled',
+  );
   assertEquals(second[0].outcome, 'accepted');
   return { fr, room, deps, gapTip, live, latest };
 }

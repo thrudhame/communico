@@ -283,13 +283,14 @@ for (
           backfill: route === 'history-page' ? [tip, member, key] : [tip],
         });
         if (route === 'remote-evidence') {
+          // A pulled child exercises the imported evidence boundary.
           const outcome = await ingestRemote(room, [child], fr.server.name, {
             self: 'test',
             keys,
             fetcher: scripted.fetcher,
             limits: { waitMs: 0, budgetMs: 10000, limit: 100 },
             ungroundedMs: 0,
-          });
+          }, 'pulled');
           assertEquals(outcome[0].outcome, valid ? 'accepted' : 'dropped');
         } else {
           const result = await backfill(room, {
@@ -386,13 +387,14 @@ for (const route of ['remote', 'history'] as const) {
         backfill: [tip],
       });
       if (route === 'remote') {
+        // The imported state path belongs to pulled, not pushed, events.
         const result = await ingestRemote(room, [child], fr.server.name, {
           self: 'test',
           keys,
           fetcher: scripted.fetcher,
           limits: { waitMs: 0, budgetMs: 10000, limit: 100 },
           ungroundedMs: 0,
-        });
+        }, 'pulled');
         assertEquals(result[0].outcome, 'dropped');
       } else {
         const result = await backfill(room, {

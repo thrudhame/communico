@@ -360,13 +360,14 @@ suite.test('remote imported gap limits sync and its cursor resumes through missi
     event: new Map(fr.events),
     backfill: (from, limit) => fr.backfillPdus(from, limit),
   });
+  // Import a pulled remote cut before testing its HTTP sync/history consumers.
   const outcomes = await ingestRemote(room, [tip, newest], fr.server.name, {
     keys,
     fetcher: recovery.fetcher,
     self: 'localhost',
     limits: { waitMs: 0, limit: 10, budgetMs: 8000 },
     ungroundedMs: 3600000,
-  });
+  }, 'pulled');
   assertEquals(outcomes.map((o) => o.outcome), ['accepted', 'accepted']);
   let prevBatch = '';
   for (const query of ['', '&since=' + before.next_batch]) {

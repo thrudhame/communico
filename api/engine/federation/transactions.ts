@@ -121,9 +121,13 @@ async function receiveRoom(
       case 'rejected':
       case 'soft_failed':
       case 'known':
-      case 'pending':
         // handled — rejection is NOT a transaction error (SS:565-566)
         results[outcome.eventId] = {};
+        break;
+      case 'pending':
+        results[outcome.eventId] = outcome.error === null
+          ? {}
+          : { error: outcome.error };
         break;
       case 'dropped':
       case 'refused':

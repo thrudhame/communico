@@ -104,7 +104,7 @@ for (const batch of [false, true]) {
   });
 }
 
-Deno.test('review recovery: supplied parents expose their actual gap without refetching supplied bytes', async () => {
+Deno.test('review recovery: pulled batches expose their actual gap without refetching supplied bytes', async () => {
   await withStore(async (store) => {
     const { fr, keys, room } = await setup(store, 'batch-gap');
     const gap = await fr.addEvent({
@@ -129,7 +129,7 @@ Deno.test('review recovery: supplied parents expose their actual gap without ref
       fetcher: scripted.fetcher,
       limits: { waitMs: 0, budgetMs: 10000, limit: 100 },
       ungroundedMs: 0,
-    });
+    }, 'pulled');
     assertEquals(result.map((item) => item.outcome), ['accepted', 'accepted']);
     assertEquals(scripted.calls.stateIds, [gap.event_id!]);
     assertEquals(scripted.calls.missingEvents.length, 1);
