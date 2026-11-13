@@ -844,8 +844,9 @@ adding optional fields or rewriting signed validity. The seven-day effective
 expiry is stored beside the intact signed document and remains tied to its
 acquisition time on cache reads. Only typed peer failures enter negative key
 memory; local storage/signing faults and cancellation retain their identity.
-Policy-refused key changes have separate acquisition backoff. Accepting or
-forgetting a server clears both acquisition memories immediately.
+Policy-refused key changes have separate acquisition backoff. The store's stable
+server database capability owns acquisition memory shared by every key-store
+view; accepting or forgetting a server clears both memories immediately.
 Event, prejoin, history and join consumers distinguish peer verification refusal
 from a local resolver fault, which never becomes missing evidence or resident
 failover. Matrix wire Base64 uses the standard alphabet and accepts the optional
@@ -884,9 +885,10 @@ Only classified peer failures fall back; local CA faults and cancellation
 propagate. SRV selection uses priority and RFC2782 weighted ordering, recognizes
 an unavailable service, and retains alternate targets and A/AAAA answers.
 Address families resolve concurrently; a usable answer is dialable immediately.
-Later SRV targets resolve only when connection failover reaches them, never before
-the selected target can connect. Deferred address reads share caller cancellation
-and the dialer's total deadline.
+Later SRV targets remain unresolved until connection failover begins, then race
+the failed target's remaining families so a stalled answer cannot block a healthy
+backup. Deferred address reads share caller cancellation and the dialer's total
+deadline.
 Dial failover stops before the first HTTP write: completed or uncertain requests,
 decoder failures and sink failures cannot replay on another address. Delegated
 Host and TLS identities never acquire the SRV target's port.

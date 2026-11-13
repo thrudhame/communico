@@ -53,17 +53,20 @@ export type StoreStats = {
 
 export class Store implements StartupStore {
   private stopped = false;
+  private readonly serverOperations: Database;
   constructor(
     private readonly ffi: Turso,
     private readonly serverDb: Db,
     private readonly pool: Pool,
-  ) {}
-
-  server(): Promise<Database> {
-    return Promise.resolve(operations((fn, options) => {
+  ) {
+    this.serverOperations = operations((fn, options) => {
       if (this.stopped) throw new Error('store is closed');
       return this.serverDb.tx(fn, options);
-    }, this.serverDb.path));
+    }, this.serverDb.path);
+  }
+
+  server(): Promise<Database> {
+    return Promise.resolve(this.serverOperations);
   }
 
   async room(

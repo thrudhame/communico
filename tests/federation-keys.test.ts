@@ -473,8 +473,14 @@ Deno.test('key policy refusal is remembered separately and admin decisions clear
           1,
           'one pending admin decision',
         );
-        if (decision === 'accept') assert(await ks.acceptKeyChange(old.name));
-        else await ks.forgetServerKeys(old.name);
+        // Admin and production resolvers can hold separate key-store views of
+        // the same server file. A decision must invalidate both views.
+        const admin = keyStore(await store.server(), {
+          deps: directOnly(candidate),
+        });
+        if (decision === 'accept') {
+          assert(await admin.acceptKeyChange(old.name));
+        } else await admin.forgetServerKeys(old.name);
         assertEquals(await ks.acquireKeyDoc(old.name, Date.now()), candidate);
         assertEquals(calls, decision === 'accept' ? 1 : 2);
       });
@@ -488,7 +494,8 @@ Deno.test('forget clears peer failure memory as well as persisted keys', async (
   await withStore(async (store) => {
     const doc = await makeDoc(await makeServer('forget-failure.test'));
     let failing = true;
-    const ks = keyStore(await store.server(), {
+    const server = await store.server();
+    const ks = keyStore(server, {
       deps: stubDeps({
         directGet: () => {
           if (failing) {
@@ -503,7 +510,9 @@ Deno.test('forget clears peer failure memory as well as persisted keys', async (
     });
     await assertRejects(() => ks.acquireKeyDoc(doc.server_name, 0));
     failing = false;
-    await ks.forgetServerKeys(doc.server_name);
+    await keyStore(await store.server(), {
+      deps: directOnly(doc),
+    }).forgetServerKeys(doc.server_name);
     assertEquals(await ks.acquireKeyDoc(doc.server_name, 0), doc);
   });
 });
@@ -685,6 +694,9 @@ Deno.test('key boundary: decode every key entry before persistence, including un
       assert(error instanceof UpstreamError);
       assertEquals(error.category, 'protocol');
       assertEquals((await ks.listServerKeys(origin.name))[0].doc, null);
+      // Each mutation is a fresh contact, not a repeat of the first cached
+      // protocol failure. Use the actual admin owner to clear shared memory.
+      await ks.forgetServerKeys(origin.name);
     }
     // Unknown algorithms obey the shared entry grammar but not Ed25519 length.
     const valid = await makeDoc(origin, {

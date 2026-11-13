@@ -435,21 +435,48 @@ async function resolveSrv(
     );
     return (async function* () {
       let yielded = false;
-      for (const row of ordered) {
+      const sources = ordered.map((row) =>
+        hostAddresses(row.target.replace(/\.$/, ''), row.port, deps, signal)
+      );
+      type Answer = {
+        index: number;
+        result?: IteratorResult<{ ip: string; port: number }>;
+        error?: unknown;
+      };
+      const pending = new Map<number, Promise<Answer>>();
+      const advance = (index: number) => {
+        pending.set(
+          index,
+          sources[index].next().then(
+            (result) => ({ index, result }),
+            (error: unknown) => ({ index, error }),
+          ),
+        );
+      };
+      let started = 0;
+      advance(started++);
+      while (pending.size) {
+        const answer = await abortable(
+          signal,
+          () => Promise.race(pending.values()),
+        );
+        pending.delete(answer.index);
         try {
-          for await (
-            const address of hostAddresses(
-              row.target.replace(/\.$/, ''),
-              row.port,
-              deps,
-              signal,
-            )
-          ) {
+          if (answer.result === undefined) throw answer.error;
+          if (!answer.result.done) {
             yielded = true;
-            yield address;
+            yield answer.result.value;
+            // Resumption means the dialer could not connect. Retain this
+            // target's pending family, but race it with later targets so no
+            // stalled DNS answer can consume the whole failover deadline.
+            advance(answer.index);
+            while (started < sources.length) advance(started++);
           }
         } catch (error) {
           discoveryFallback(error, signal);
+        }
+        if (!yielded && pending.size === 0 && started < sources.length) {
+          advance(started++);
         }
       }
       if (!yielded) {

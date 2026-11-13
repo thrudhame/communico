@@ -9,6 +9,89 @@ import { dialNodeTls } from '#engine/federation/dial-node-tls.ts';
 import { decodeJson } from '#engine/net/json.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { http1Request } from '#engine/net/http1.ts';
+import { resolveWith } from '#engine/federation/resolve.ts';
+
+Deno.test('discovery alternates: failed primary with stalled family cannot block healthy later SRV targets', async () => {
+  let received = 0;
+  const server = Deno.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    cert: await Deno.readTextFile('tests/fixtures/tls/localhost.crt'),
+    key: await Deno.readTextFile('tests/fixtures/tls/localhost.key'),
+    onListen() {},
+  }, () => {
+    received++;
+    return Response.json({ reached: 'healthy' });
+  });
+  const visited: string[] = [];
+  const ac = new AbortController();
+  try {
+    const endpoint = await resolveWith('localhost', {
+      dnsA: (host) => {
+        visited.push(host);
+        return host === 'middle.test'
+          ? new Promise(() => {})
+          : Promise.resolve([
+            host === 'primary.test' ? '127.0.0.2' : '127.0.0.1',
+          ]);
+      },
+      dnsAAAA: (host) =>
+        host === 'healthy.test' ? Promise.resolve([]) : new Promise(() => {}),
+      dnsSrv: () =>
+        Promise.resolve([
+          {
+            target: 'primary.test',
+            port: server.addr.port,
+            priority: 0,
+            weight: 1,
+          },
+          {
+            target: 'middle.test',
+            port: server.addr.port,
+            priority: 1,
+            weight: 1,
+          },
+          {
+            target: 'healthy.test',
+            port: server.addr.port,
+            priority: 2,
+            weight: 1,
+          },
+        ]),
+      wellKnownGet: () => Promise.resolve({ mServer: null, maxAgeMs: null }),
+      lookupPeer: () => Promise.resolve(null),
+    }, ac.signal);
+    assertEquals(
+      visited,
+      ['primary.test'],
+      'backup DNS stays lazy before connection failure',
+    );
+    const response = await dialNodeTls({
+      ...endpoint,
+      trust: {
+        kind: 'ca',
+        caCerts: [await Deno.readTextFile('tests/fixtures/tls/ca.crt')],
+      },
+      method: 'GET',
+      path: '/',
+      headers: {},
+      body: null,
+      connectMs: 200,
+      timeoutMs: 1000,
+      maxBytes: 1000,
+      signal: ac.signal,
+    });
+    assertEquals(
+      decodeJson(response.body, response.headers.get('content-type')),
+      { reached: 'healthy' },
+    );
+    assertEquals(received, 1);
+    assertEquals(visited, ['primary.test', 'middle.test', 'healthy.test']);
+  } finally {
+    ac.abort();
+    await server.shutdown();
+  }
+});
 
 Deno.test('discovery alternates: a plain connect timeout retains connect-phase failover eligibility', async () => {
   const original = Deno.connect;

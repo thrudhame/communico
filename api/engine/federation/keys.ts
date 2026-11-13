@@ -4,10 +4,10 @@
 // happens only when no witness answered (open mode) or for a roster peer
 // (closed mode — the gate stops strangers first). Key changes are decided
 // by (id, bytes) MATERIAL before anything is persisted; `block` keeps the
-// candidate only inside the change row. One KeyStore per server file: the
-// in-flight dedup, the failure memory and the warn-once set live in the
-// instance (the old module-level maps served the one global database;
-// the Turso core keeps them per store so nothing leaks across stores).
+// candidate only inside the change row. Acquisition state belongs to the
+// store's stable server database capability, shared by admin and resolver
+// views. Weak ownership keeps separate/reopened stores isolated without
+// retaining a closed store's acquisition memory by its filesystem path.
 // The cache tables are shared across tenants of the same server file
 // (a fetched key serves every tenant). Ported from doltgres.
 import { config } from '#engine/config.ts';
@@ -137,6 +137,15 @@ function productionDeps(server: Db, signer: Signer): KeysDeps {
   };
 }
 
+type AcquisitionState = {
+  inFlight: Map<string, Promise<KeyDoc>>;
+  failureMemory: Map<string, { until: number; error: unknown }>;
+  refusalMemory: Map<string, { until: number; error: KeyChangeRefused }>;
+  warnedOnce: Set<string>;
+};
+
+const acquisitionStates = new WeakMap<Db, AcquisitionState>();
+
 export function keyStore(
   server: Db,
   opts: { signer?: Signer; deps?: KeysDeps } = {},
@@ -147,13 +156,17 @@ export function keyStore(
   const deps = opts.deps !== undefined
     ? opts.deps
     : productionDeps(server, opts.signer!);
-  const inFlight = new Map<string, Promise<KeyDoc>>();
-  const failureMemory = new Map<string, { until: number; error: unknown }>();
-  const refusalMemory = new Map<
-    string,
-    { until: number; error: KeyChangeRefused }
-  >();
-  const warnedOnce = new Set<string>(); // name|fingerprint, per instance
+  let state = acquisitionStates.get(server);
+  if (state === undefined) {
+    state = {
+      inFlight: new Map(),
+      failureMemory: new Map(),
+      refusalMemory: new Map(),
+      warnedOnce: new Set(),
+    };
+    acquisitionStates.set(server, state);
+  }
+  const { inFlight, failureMemory, refusalMemory, warnedOnce } = state;
 
   // ---------------------------------------------------------------- DB ----
 
