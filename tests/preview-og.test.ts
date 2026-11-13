@@ -1,5 +1,5 @@
 // tests/preview-og.test.ts — OG scanner shapes (plan D6). Pure.
-import { assertEquals } from '@std/assert';
+import { assert, assertEquals } from '@std/assert';
 import { openGraphFor, parseOpenGraph } from '#engine/preview/og.ts';
 
 Deno.test('og: property and name, attribute order, quotes, self-closing, multiline', () => {
@@ -57,5 +57,40 @@ Deno.test('og: image content-type is the URL; other types empty; html parsed', (
   assertEquals(
     openGraphFor(bytes, 'text/html; charset=utf-8', 'http://x/'),
     { 'og:title': 'Hi' },
+  );
+});
+
+Deno.test('og: XHTML declaration sniffing only allocates its byte prefix', () => {
+  const declaration = '<?xml version="1.0" encoding="iso-8859-1"?>';
+  const xml = declaration +
+    '<html xmlns="http://www.w3.org/1999/xhtml"><title>caf\u00e9</title>' +
+    ' '.repeat(128 * 1024) + '</html>';
+  let iterated = 0;
+  class ObservedBytes extends Uint8Array {
+    override *[Symbol.iterator](): ArrayIterator<number> {
+      iterated += this.length;
+      yield* super[Symbol.iterator]();
+    }
+  }
+  const body = ObservedBytes.from(xml, (c) => c.charCodeAt(0));
+  assertEquals(openGraphFor(body, 'application/xhtml+xml', 'http://x/'), {
+    'og:title': 'caf\u00e9',
+  });
+  assert(
+    iterated <= declaration.length,
+    'declaration sniff iterated body bytes',
+  );
+});
+
+Deno.test('og: XHTML declarations have no independent length quota', () => {
+  const xml = '<?xml version="1.0"' + ' '.repeat(16 * 1024) +
+    'encoding="iso-8859-1"?><html xmlns="http://www.w3.org/1999/xhtml"><title>caf\u00e9</title></html>';
+  assertEquals(
+    openGraphFor(
+      Uint8Array.from(xml, (c) => c.charCodeAt(0)),
+      'application/xhtml+xml',
+      'http://x/',
+    ),
+    { 'og:title': 'caf\u00e9' },
   );
 });
