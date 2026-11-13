@@ -565,6 +565,7 @@ export type ConfigPatch = {
     allowunencryptedcreation?: boolean;
     allowunencryptedjoining?: boolean;
     allowunencryptedmessages?: boolean;
+    allowunencryptedreactions?: boolean;
   };
   e2ee?: {
     maxrequestbytes?: number;

@@ -789,6 +789,20 @@ bodies and durable delivery obligations are not rewritten or discarded.
 
 ## Tenant data, storage and process lifetime
 
+Local encryption policy belongs to the shared room authoring gate, not individual
+client routes or Matrix remote-event auth. In encrypted rooms the independent
+`encryption.allowunencryptedreactions` toggle (default true) admits only
+`m.reaction` content containing one `m.relates_to` object with exactly
+`rel_type: "m.annotation"`, string `event_id` and string `key`. Extra fields,
+other relations and custom call-reaction types follow `allowunencryptedmessages`.
+Keys have no emoji/length restriction: Matrix exposes them regardless of outer
+encryption. Redaction and verification exceptions are unchanged.
+Direct sends, durable prepared retries, already-built local PDUs and delayed
+scheduling/delivery share this classification. Current locked state/policy is
+rechecked before ingest; completed receipts still replay before policy admission.
+Remote validity and state-event behavior do not change.
+(`api/engine/room/encryption-policy.ts`, `room/ingest.ts`, `delayed-events.ts`)
+
 The tenant's delayed-event owner stores schedules, send-transaction receipts and
 prepared signed PDUs (schema v20). The app owns scheduler startup and draining
 shutdown. Due selection is only a hint: claiming a command rechecks its current

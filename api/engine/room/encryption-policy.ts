@@ -133,6 +133,25 @@ function plaintextException(event: BuildPartial): boolean {
       event.content.msgtype === 'm.key.verification.request');
 }
 
+// Matrix exposes the entire annotation relation, even on encrypted envelopes.
+// Admit that exact content contract, not arbitrary payloads under a trusted type.
+function relationOnlyReaction(event: BuildPartial): boolean {
+  if (event.type !== 'm.reaction' || Object.keys(event.content).length !== 1) {
+    return false;
+  }
+  const relation = event.content['m.relates_to'];
+  if (!relation || typeof relation !== 'object' || Array.isArray(relation)) {
+    return false;
+  }
+  const fields = relation as Record<string, unknown>;
+  return Object.keys(fields).length === 3 &&
+    ['rel_type', 'event_id', 'key'].every((key) =>
+      Object.hasOwn(fields, key)
+    ) &&
+    fields.rel_type === 'm.annotation' && typeof fields.event_id === 'string' &&
+    typeof fields.key === 'string';
+}
+
 // Called inside the shared locked ingest, AFTER receipt lookup and BEFORE
 // storage. Current resolved state, not the event's possibly old parents,
 // decides local policy. Imports/remote events never cross this boundary.
@@ -188,7 +207,8 @@ export async function assertLocalEncryption(
   }
   if (
     encrypted && !policy.allowunencryptedmessages &&
-    event.type !== 'm.room.encrypted' && !plaintextException(event)
+    event.type !== 'm.room.encrypted' && !plaintextException(event) &&
+    !(policy.allowunencryptedreactions && relationOnlyReaction(event))
   ) {
     throw encryptionError(
       'Unencrypted messages in encrypted rooms are disabled',

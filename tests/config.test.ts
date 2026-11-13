@@ -124,6 +124,7 @@ maxbackupbytes = 67108864
 allowunencryptedcreation = false
 allowunencryptedjoining = true
 allowunencryptedmessages = false
+allowunencryptedreactions = true
 
 [preview]
 enabled = false
@@ -936,7 +937,7 @@ Deno.test('public directory settings use complete defaults and strict leaf-wise 
   }
 });
 
-Deno.test('120 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('121 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -968,7 +969,7 @@ Deno.test('120 leaves total across the sections (the surface tripwire)', async (
     ['peeking', 2],
     ['openid', 1],
     ['media', 20],
-    ['encryption', 3],
+    ['encryption', 4],
     ['e2ee', 9],
     ['push', 5],
     ['store', 5],
@@ -977,7 +978,7 @@ Deno.test('120 leaves total across the sections (the surface tripwire)', async (
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    120,
+    121,
     'the whole config surface includes discovery, TURN and HTTP administrators',
   );
 });
@@ -1168,6 +1169,7 @@ Deno.test('encryption controls have independent strict booleans and real shipped
       allowunencryptedcreation: false,
       allowunencryptedjoining: true,
       allowunencryptedmessages: false,
+      allowunencryptedreactions: true,
     },
   );
   for (
@@ -1175,6 +1177,7 @@ Deno.test('encryption controls have independent strict booleans and real shipped
       'allowunencryptedcreation',
       'allowunencryptedjoining',
       'allowunencryptedmessages',
+      'allowunencryptedreactions',
     ]
   ) {
     const name = 'COMMUNICO_ENCRYPTION_' + leaf.toUpperCase();
