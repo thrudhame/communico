@@ -1,6 +1,6 @@
 import { authorize } from '#engine/auth-context.ts';
 import { createAlias } from '#engine/client/directory.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
   _context: import('@pathfinder/pathfinder').Context,

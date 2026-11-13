@@ -249,7 +249,16 @@ test('search: original body/context/20-result pagination/predecessor/keys/visibi
     event_context: { before_limit: 2, after_limit: 2 },
   });
   assertEquals(context.count, 1);
-  assertEquals(context.next_batch, undefined);
+  assert(typeof context.next_batch === 'string');
+  const contextEnd = await search(A, {
+    keys: ['content.body'],
+    search_term: 'Message 4',
+    order_by: 'recent',
+    filter: { limit: 1, rooms: [contextRoom] },
+    event_context: { before_limit: 2, after_limit: 2 },
+  }, context.next_batch);
+  assertEquals(contextEnd.results, []);
+  assertEquals(contextEnd.next_batch, undefined);
   const row = (context.results as Json[])[0], ctx = row.context as Json;
   assertEquals((row.result as Json).content, {
     msgtype: 'm.text',
@@ -293,7 +302,10 @@ test('search: original body/context/20-result pagination/predecessor/keys/visibi
     (p2.results as Json[]).map((e) => (e.result as Json).event_id),
     ids.slice(0, 10).reverse(),
   );
-  assertEquals(p2.next_batch, undefined);
+  assert(typeof p2.next_batch === 'string');
+  const p3 = await search(A, req, p2.next_batch);
+  assertEquals(p3.results, []);
+  assertEquals(p3.next_batch, undefined);
   const old = await create(A, { room_version: '8' }),
     beforeId = await send(old, A, 'Message before upgrade');
   const up = await call(rp(old) + '/upgrade', A, { new_version: '9' }, 'POST');

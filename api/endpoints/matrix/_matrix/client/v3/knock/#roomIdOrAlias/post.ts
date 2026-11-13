@@ -1,5 +1,5 @@
 import { joinByIdOrAlias, knock } from '#engine/client/membership.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import { membershipContent } from '#engine/client/membership-request.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 export default async function (request: PathfinderRequest, context: Context) {

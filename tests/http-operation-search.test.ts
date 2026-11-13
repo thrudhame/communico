@@ -75,7 +75,7 @@ suite.test('prepare distinct rooms, senders, keys and tied ranks', async () => {
 for (const order_by of ['rank', 'recent']) {
   suite.test(
     order_by +
-      ' consumes every continuation once and omits completed continuations',
+      ' consumes every continuation once and ends after the empty terminal page',
     async () => {
       const criteria = { order_by, filter: { limit: 2 } };
       let next: string | undefined;
@@ -84,12 +84,14 @@ for (const order_by of ['rank', 'recent']) {
         const page = await search(criteria, next);
         assertEquals(page.count, 5);
         found.push(...eventIds(page));
-        if (i < 2) {
-          assert(typeof page.next_batch === 'string');
-          next = page.next_batch;
-        } else assertEquals(page.next_batch, undefined);
+        assert(typeof page.next_batch === 'string');
+        next = page.next_batch;
       }
       assertEquals(found, [...ids].reverse());
+      const end = await search(criteria, next);
+      assertEquals(end.count, 5);
+      assertEquals(eventIds(end), []);
+      assertEquals(end.next_batch, undefined);
     },
   );
   for (const key of ['room_id', 'sender']) {
@@ -115,17 +117,22 @@ for (const order_by of ['rank', 'recent']) {
         assertEquals(new Set(all).size, all.length);
         if (key === 'room_id') {
           assertEquals(all.length, 3);
-          assertEquals(second.next_batch, undefined);
+          assert(typeof second.next_batch === 'string');
+          const end = await search(criteria, second.next_batch);
+          assertEquals(eventIds(end), []);
+          assertEquals(end.next_batch, undefined);
         }
       },
     );
   }
 }
-suite.test('exact and zero limits do not advertise nonexistent progress', async () => {
-  assertEquals(
-    (await search({ filter: { limit: 5 }, order_by: 'recent' })).next_batch,
-    undefined,
-  );
+suite.test('terminal nonempty pages have valid cursors while zero limits advertise no progress', async () => {
+  const criteria = { filter: { limit: 5 }, order_by: 'recent' };
+  const complete = await search(criteria);
+  assert(typeof complete.next_batch === 'string');
+  const end = await search(criteria, complete.next_batch);
+  assertEquals(eventIds(end), []);
+  assertEquals(end.next_batch, undefined);
   const zero = await search({ filter: { limit: 0 } });
   assertEquals(zero.count, 5);
   assertEquals(zero.results, []);

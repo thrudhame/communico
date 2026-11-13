@@ -1,6 +1,6 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setReceipt } from '#engine/receipts.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
@@ -17,14 +17,7 @@ export default async function (
       'unsupported receipt type: ' + receiptType,
     );
   }
-  // Pathfinder always exposes a memoized body view, even for an empty POST.
-  const bytes = await request.body.bytes();
-  const body = new TextDecoder().decode(bytes).trim() === ''
-    ? {}
-    : await parseJson(request);
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    throw new MatrixError(400, 'M_BAD_JSON', 'receipt body must be an object');
-  }
+  const body = await parseJson(request);
   await setReceipt(
     request.params.roomId as string,
     context.state.user as string,

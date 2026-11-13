@@ -4,6 +4,7 @@ import {
   assertSpecHttpResponse,
   assertSpecResponse,
   manifest,
+  responseCompatibility,
   schemaErrors,
 } from '#tests/spec-contract.ts';
 
@@ -152,6 +153,35 @@ Deno.test('tagged federation profile prose permits null only for unset profile f
   assertSpecResponse('GET', '/_matrix/federation/v1/query/profile', 200, {});
 });
 
+Deno.test('explicit Synapse response compatibility is scoped and never changes pinned schemas', () => {
+  const path = '/_matrix/client/v3/rooms/{roomId}/joined_members';
+  const operation = manifest.operations.find((op) => op.path === path)!;
+  const root = operation.response.find((f) =>
+    f.field === 'response/200/application/json'
+  )!;
+  const value = {
+    joined: {
+      '@member:example.test': { display_name: null, avatar_url: null },
+    },
+  };
+  assert(schemaErrors(value, { $ref: root.source }).length > 0);
+  assertSpecResponse('GET', path, 200, value);
+  assertThrows(() =>
+    assertSpecResponse('GET', path, 200, {
+      joined: { '@member:example.test': { avatar_url: false } },
+    })
+  );
+  assertEquals(Object.keys(responseCompatibility).sort(), [
+    'data/api/client-server/rooms.yaml#GET /_matrix/client/v3/rooms/{roomId}/joined_members',
+    'data/api/client-server/search.yaml#POST /_matrix/client/v3/search',
+  ]);
+  for (const [id, exception] of Object.entries(responseCompatibility)) {
+    assert(manifest.operations.some((op) => op.id === id));
+    assert(exception.reason.includes('Synapse'));
+    assert(exception.reason.includes('Complement'));
+  }
+});
+
 Deno.test('state response format selects its tagged content or event contract before validating', async () => {
   const path = 'http://x/_matrix/client/v3/rooms/room/state/m.room.name/name';
   await assertSpecHttpResponse(new Request(path), Response.json({}));
@@ -177,6 +207,80 @@ Deno.test('state response format selects its tagged content or event contract be
       content: {},
     }),
   );
+});
+
+Deno.test('send response guard selects delayed scheduling without weakening ordinary writes', async () => {
+  for (
+    const suffix of [
+      'state/test',
+      'state/test/',
+      'state/test/key',
+      'send/test/txn',
+    ]
+  ) {
+    const path = 'http://x/_matrix/client/v3/rooms/room/' + suffix;
+    const request = (query = '') =>
+      new Request(path + query, { method: 'PUT' });
+    await assertSpecHttpResponse(
+      request(),
+      Response.json({ event_id: '$event' }),
+    );
+    await assertRejects(() =>
+      assertSpecHttpResponse(request(), Response.json({ delay_id: 'schedule' }))
+    );
+    for (const delay of ['0', '60000']) {
+      const delayed = () => request('?org.matrix.msc4140.delay=' + delay);
+      await assertSpecHttpResponse(
+        delayed(),
+        Response.json({ delay_id: 'schedule' }),
+      );
+      for (
+        const value of [{}, { delay_id: 1 }, { delay_id: '' }, {
+          event_id: '$event',
+        }, { delay_id: 'schedule', event_id: '$event' }]
+      ) {
+        await assertRejects(() =>
+          assertSpecHttpResponse(delayed(), Response.json(value))
+        );
+      }
+    }
+  }
+  await assertRejects(() =>
+    assertSpecHttpResponse(
+      new Request(
+        'http://x/_matrix/client/v3/createRoom?org.matrix.msc4140.delay=0',
+        { method: 'POST' },
+      ),
+      Response.json({ delay_id: 'schedule' }),
+    )
+  );
+});
+
+Deno.test('v2 invite response follows the room event format without inventing origin', () => {
+  const path = '/_matrix/federation/v2/invite/{roomId}/{eventId}';
+  const event = {
+    type: 'm.room.member',
+    state_key: '@member:example.test',
+    sender: '@sender:remote.test',
+    origin_server_ts: 1,
+    content: { membership: 'invite' },
+  };
+  assertSpecResponse('PUT', path, 200, { event });
+  assertSpecResponse('PUT', path, 200, {
+    event: { ...event, origin: 'remote.test' },
+  });
+  assertThrows(() =>
+    assertSpecResponse('PUT', path, 200, { event: { ...event, origin: 1 } })
+  );
+  for (
+    const key of ['sender', 'state_key', 'origin_server_ts', 'type', 'content']
+  ) {
+    const missing: Record<string, unknown> = { ...event };
+    delete missing[key];
+    assertThrows(() =>
+      assertSpecResponse('PUT', path, 200, { event: missing })
+    );
+  }
 });
 
 Deno.test('TURN response guard permits only the empty unconfigured branch or complete configured credentials', () => {

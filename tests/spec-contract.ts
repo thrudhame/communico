@@ -221,11 +221,113 @@ export function schemaErrors(
   return errors;
 }
 
+// Test-only compatibility contracts. They never transform runtime responses or
+// alter the pinned OpenAPI source. Each exception retains its exact owner.
+export const responseCompatibility: Record<string, { reason: string }> = {
+  'data/api/client-server/rooms.yaml#GET /_matrix/client/v3/rooms/{roomId}/joined_members':
+    {
+      reason:
+        'TL 2026-11-12: Synapse handlers/message.py returns null for absent display_name/avatar_url, and unchanged Complement requires both keys; only those two optional string fields gain null.',
+    },
+  'data/api/client-server/search.yaml#POST /_matrix/client/v3/search': {
+    reason:
+      'TL 2026-11-12: Synapse and unchanged Complement allow a valid next_batch on a terminal nonempty page, followed by an empty page without next_batch. Tokens remain strings and preserve scope; no schema relaxation is needed.',
+  },
+};
+
+function schemaObject(input: Schema): Exclude<Schema, boolean> {
+  assert(typeof input === 'object');
+  return input.$ref === undefined
+    ? input
+    : schemaObject(manifest.schemas[input.$ref]);
+}
+
 function responseSchema(
   operation: SpecOperation,
   field: SpecField,
   query = new URLSearchParams(),
 ): Schema {
+  // MSC4140 changes the successful send contract, not the underlying route.
+  // Synapse room.py returns only delay_id for both state and message schedules.
+  // Keep ordinary writes on their pinned event_id contract, including sibling
+  // endpoints carrying an unrelated extension query.
+  if (
+    query.has('org.matrix.msc4140.delay') && operation.method === 'PUT' &&
+    [
+      '/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}',
+      '/_matrix/client/v3/rooms/{roomId}/state/{eventType}',
+      '/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}',
+    ].includes(operation.path)
+  ) {
+    return {
+      type: 'object',
+      required: ['delay_id'],
+      properties: { delay_id: { type: 'string', minLength: 1 } },
+      not: { required: ['event_id'] },
+    };
+  }
+  // invites-v2's response prose explicitly delegates to the room event format
+  // and requires all other input fields to remain untouched. The pinned common
+  // PDU format has no required origin, unlike the legacy InviteEvent schema.
+  // Do not invent one in a signed response. If present it must still be a string;
+  // all other InviteEvent requirements remain checked.
+  if (
+    operation.id ===
+      'data/api/server-server/invites-v2.yaml#PUT /_matrix/federation/v2/invite/{roomId}/{eventId}'
+  ) {
+    assert(field.responseDescription?.includes('room version'));
+    const root = schemaObject(manifest.schemas[field.source]);
+    const event = schemaObject(root.properties!.event);
+    return {
+      ...root,
+      properties: {
+        ...root.properties,
+        event: {
+          ...event,
+          allOf: event.allOf!.map((branch) => {
+            const schema = schemaObject(branch);
+            return {
+              ...schema,
+              required: schema.required?.filter((key) => key !== 'origin'),
+            };
+          }),
+        },
+      },
+    };
+  }
+  if (
+    operation.id ===
+      'data/api/client-server/rooms.yaml#GET /_matrix/client/v3/rooms/{roomId}/joined_members'
+  ) {
+    assert(responseCompatibility[operation.id].reason.length > 0);
+    const root = schemaObject(manifest.schemas[field.source]);
+    const joined = schemaObject(root.properties!.joined);
+    const member = schemaObject(joined.patternProperties!['^@']);
+    return {
+      ...root,
+      properties: {
+        ...root.properties,
+        joined: {
+          ...joined,
+          patternProperties: {
+            ...joined.patternProperties,
+            '^@': {
+              ...member,
+              properties: {
+                ...member.properties,
+                display_name: {
+                  anyOf: [member.properties!.display_name, { type: 'null' }],
+                },
+                avatar_url: {
+                  anyOf: [member.properties!.avatar_url, { type: 'null' }],
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+  }
   // The approved unconfigured TURN read follows Synapse's empty-object
   // contract. It is not permission to omit credentials for configured TURN,
   // or to return a partial credential object when unconfigured.
@@ -313,9 +415,20 @@ export function assertSpecResponse(
 }
 
 function matchesPath(template: string, actual: string): boolean {
-  const pattern = template.split(/(\{[^}]+\})/).map((part) =>
-    part.startsWith('{') ? '[^/]+' : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  ).join('');
+  // The tagged stateKey prose permits the empty value with or without the
+  // trailing slash. Both spellings belong to this operation, not an unguarded
+  // extension route.
+  const emptyStateKey = template.includes('/state/') &&
+    template.endsWith('/{stateKey}');
+  const base = emptyStateKey
+    ? template.slice(0, -'/{stateKey}'.length)
+    : template;
+  const pattern =
+    base.split(/(\{[^}]+\})/).map((part) =>
+      part.startsWith('{')
+        ? '[^/]+'
+        : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    ).join('') + (emptyStateKey ? '(?:/[^/]*)?' : '');
   return new RegExp('^' + pattern + '$').test(actual);
 }
 

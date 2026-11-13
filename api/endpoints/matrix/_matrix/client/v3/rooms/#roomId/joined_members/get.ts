@@ -13,8 +13,10 @@ export default async function (
     (await membershipOf(theApp().server, roomId, context.state.user as string))
       ?.membership !== 'join'
   ) throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);
-  const joined: Record<string, { display_name?: string; avatar_url?: string }> =
-    {};
+  const joined: Record<
+    string,
+    { display_name: string | null; avatar_url: string | null }
+  > = {};
   for (
     const row of await clientEventsForRows(
       roomId,
@@ -25,12 +27,12 @@ export default async function (
     const content = row.content as Record<string, unknown>;
     if (row.type === 'm.room.member' && content.membership === 'join') {
       joined[String(row.state_key)] = {
-        ...(typeof content.displayname === 'string'
-          ? { display_name: content.displayname }
-          : {}),
-        ...(typeof content.avatar_url === 'string'
-          ? { avatar_url: content.avatar_url }
-          : {}),
+        display_name: typeof content.displayname === 'string'
+          ? content.displayname
+          : null,
+        avatar_url: typeof content.avatar_url === 'string'
+          ? content.avatar_url
+          : null,
       };
     }
   }

@@ -2,7 +2,7 @@ import { join } from '#engine/client/membership.ts';
 import { joinContent } from '#engine/client/membership-request.ts';
 import { domainOf } from '#engine/federation/pdu.ts';
 import { serverName } from '#engine/config.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
   context: import('@pathfinder/pathfinder').Context,

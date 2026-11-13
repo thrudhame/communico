@@ -360,12 +360,32 @@ a since token and positive timeout.
 
 Search has one normalized operation contract and one keyset pagination owner for
 rank and recent ordering, including room and sender scopes. Equal ranks retain a
-deterministic sequence/event tie-break. Global and per-group continuations exist
-only when more visible matches remain in that scope; using a group token keeps
-subsequent global continuations in the same group. Multiple matching indexed keys
+deterministic sequence/event tie-break. Global and per-group continuations name
+the last real result in their scope, including on a terminal nonempty page as in
+Synapse. Following a terminal cursor yields an empty page with no further token;
+zero-size pages issue no cursor. Using a group token keeps subsequent global
+continuations in the same group. Multiple matching indexed keys
 still produce one event result. Known search keys, context, grouping and boolean
 fields are validated before selection rather than silently discarded.
 (`api/engine/client/{search-request,search-page,search}.ts`)
+
+Joined-member summaries retain Synapse's explicit null display/avatar strings
+when absent and preserve empty strings when present. The OpenAPI response guard
+is test-only: its explicit compatibility table documents this nullable-profile
+exception and the terminal-search-page contract without changing pinned schemas
+or rewriting runtime responses. Other field types remain checked.
+(`tests/spec-contract.ts:responseCompatibility`)
+
+Matrix JSON middleware and adapters share one body decoder. Its generated
+operation metadata preserves the tagged requestBody.required flags. Absent bytes
+are an empty object for optional bodies and, as in Synapse/Complement, for required
+body schemas that accept an empty object (including join). Required fields still
+reject before dispatch; malformed nonempty JSON, whitespace, UTF-8 and non-object
+roots never gain omission semantics. The all-operation native guard compares
+every generated flag and empty-object decision with the pinned schemas, and
+prevents adapters from bypassing the shared decoder. Binary media retains its
+streaming owner. Response-schema compatibility remains exclusively test-time.
+(`api/engine/operation-body.ts`, `tools/spec-contracts.py`, `tests/operation-body.test.ts`)
 
 Membership and redaction adapters validate the common optional string reason
 before dispatch, including idempotent joins. State format and member filters

@@ -156,19 +156,64 @@ def generate(source):
     return {"schema": 1, "generatorVersion": 1, "specTag": tag, "specCommit": commit, "sources": dict(sorted(hashes.items())), "schemas": dict(sorted(schemas.items())), "operations": sorted(operations, key=lambda operation: operation["id"])}
 
 
+def body_contracts(manifest):
+    """Keep requestBody.required intact; derive the empty-object compatibility.
+
+    Synapse/Complement accept missing JSON bytes for operations such as join,
+    whose v1.16 body is marked required but whose object has no required fields.
+    This does not make required fields optional or accept whitespace as absence.
+    """
+    def accepts_empty(schema):
+        if isinstance(schema, bool):
+            return schema
+        if "$ref" in schema:
+            return accepts_empty(manifest["schemas"][schema["$ref"]])
+        types = schema.get("type", "object")
+        if isinstance(types, str):
+            types = [types]
+        if "object" not in types or schema.get("required") or schema.get("minProperties", 0) > 0:
+            return False
+        if "enum" in schema and {} not in schema["enum"]:
+            return False
+        if "const" in schema and schema["const"] != {}:
+            return False
+        if not all(accepts_empty(s) for s in schema.get("allOf", [])):
+            return False
+        if "anyOf" in schema and not any(accepts_empty(s) for s in schema["anyOf"]):
+            return False
+        if "oneOf" in schema and sum(accepts_empty(s) for s in schema["oneOf"]) != 1:
+            return False
+        return "not" not in schema or not accepts_empty(schema["not"])
+
+    operations = []
+    for operation in manifest["operations"]:
+        for field in operation["request"]:
+            if field["field"] == "body/application/json":
+                operations.append(dict(id=operation["id"], method=operation["method"],
+                    path=operation["path"], required=field["required"],
+                    emptyObject=accepts_empty(manifest["schemas"][field["source"]])))
+    return dict(schema=1, specCommit=manifest["specCommit"], operations=operations)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=pathlib.Path)
     parser.add_argument("output", type=pathlib.Path)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--body-output", type=pathlib.Path)
     args = parser.parse_args()
     result = generate(args.source)
+    bodies = body_contracts(result)
+    body_output = args.body_output or pathlib.Path(__file__).resolve().parents[1] / "api/engine/operation-bodies.json"
     if args.check:
         if json.loads(args.output.read_text()) != result:
             raise SystemExit("OpenAPI manifest differs from the pinned source")
+        if json.loads(body_output.read_text()) != bodies:
+            raise SystemExit("Operation body contracts differ from the pinned source")
         print("OpenAPI manifest matches pinned source")
     else:
         args.output.write_text(json.dumps(result, indent=2, ensure_ascii=True) + "\n")
+        body_output.write_text(json.dumps(bodies, indent=2, ensure_ascii=True) + "\n")
         print("Generated", len(result["operations"]), "operations")
 
 

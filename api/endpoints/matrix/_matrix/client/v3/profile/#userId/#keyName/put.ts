@@ -1,4 +1,4 @@
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import { theApp } from '#engine/app.ts';
 import { authorize } from '#engine/auth-context.ts';
 import { localpartOf } from '#engine/ids.ts';

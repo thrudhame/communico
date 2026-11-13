@@ -1,6 +1,6 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setFullyRead, setReceipt } from '#engine/receipts.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,

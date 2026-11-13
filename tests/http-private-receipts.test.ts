@@ -34,6 +34,9 @@ async function fixture(prefix: string) {
   const room = String(created.room_id);
   const base = 'rooms/' + encodeURIComponent(room);
   await call(base + '/join', b.access_token!, {});
+  // Settle both default-online transitions before receipt-only token cuts.
+  await sync(a.access_token!);
+  await sync(b.access_token!);
   // Unthreaded receipt targets can be unknown, as before F15.
   return { a, b, room, base, target: '$' + prefix };
 }
@@ -107,6 +110,12 @@ suite.test('private receipt wakes its owner, never another joined user', async (
     stayedPending,
     'another user must not observe a private receipt through early sync completion',
   );
-  assert(JSON.stringify(receipts(owner, room)).includes('m.read.private'));
+  assert(
+    JSON.stringify(receipts(owner, room)).includes('m.read.private'),
+    JSON.stringify({
+      presence: owner.presence,
+      receipts: receipts(owner, room),
+    }),
+  );
   assert(!JSON.stringify(receipts(observer, room)).includes('m.read.private'));
 });

@@ -2,7 +2,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { theApp } from '#engine/app.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import { storeFilter, validateFilterDocument } from '#engine/tenant/filters.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 
 // POST /_matrix/client/v3/user/#userId/filter — store a filter for the
 // own user (403 otherwise); the document's shape is validated (400

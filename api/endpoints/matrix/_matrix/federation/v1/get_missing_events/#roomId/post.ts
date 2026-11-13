@@ -1,4 +1,5 @@
 import { serveGetMissingEvents } from '#engine/federation/serve.ts';
+import { parseJson } from '#engine/operation-body.ts';
 import { serveDeps } from '#engine/federation/context.ts';
 import { assertFederationEnabled } from '#engine/federation/keydoc.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -17,9 +18,7 @@ export default async function (
       'missing or invalid signature',
     );
   }
-  const body = await request.body.json().catch(() => {
-    throw new MatrixError(400, 'M_BAD_JSON', 'body must be JSON');
-  });
+  const body = await parseJson(request);
   return await serveGetMissingEvents(
     request.params.roomId as string,
     body as Record<string, unknown>,

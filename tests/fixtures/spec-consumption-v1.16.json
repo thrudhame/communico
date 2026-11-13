@@ -196,8 +196,8 @@
       "proofs": [
         {
           "suite": "http-operation-membership",
-          "case": "joined member summaries omit absent optional profile strings and retain empty strings",
-          "test": "HTTP membership and state operation contracts > joined member summaries omit absent optional profile strings and retain empty strings",
+          "case": "joined member summaries retain Synapse null profile strings and empty strings",
+          "test": "HTTP membership and state operation contracts > joined member summaries retain Synapse null profile strings and empty strings",
           "testClass": "tests/http-app.ts"
         }
       ],
@@ -1714,20 +1714,20 @@
         },
         {
           "suite": "http-operation-search",
-          "case": "exact and zero limits do not advertise nonexistent progress",
-          "test": "HTTP search operation contracts > exact and zero limits do not advertise nonexistent progress",
+          "case": "terminal nonempty pages have valid cursors while zero limits advertise no progress",
+          "test": "HTTP search operation contracts > terminal nonempty pages have valid cursors while zero limits advertise no progress",
           "testClass": "tests/http-app.ts"
         },
         {
           "suite": "http-operation-search",
-          "case": "rank consumes every continuation once and omits completed continuations",
-          "test": "HTTP search operation contracts > rank consumes every continuation once and omits completed continuations",
+          "case": "rank consumes every continuation once and ends after the empty terminal page",
+          "test": "HTTP search operation contracts > rank consumes every continuation once and ends after the empty terminal page",
           "testClass": "tests/http-app.ts"
         },
         {
           "suite": "http-operation-search",
-          "case": "recent consumes every continuation once and omits completed continuations",
-          "test": "HTTP search operation contracts > recent consumes every continuation once and omits completed continuations",
+          "case": "recent consumes every continuation once and ends after the empty terminal page",
+          "test": "HTTP search operation contracts > recent consumes every continuation once and ends after the empty terminal page",
           "testClass": "tests/http-app.ts"
         },
         {
@@ -28116,7 +28116,7 @@
       "operation": "data/api/client-server/search.yaml#POST /_matrix/client/v3/search",
       "source": "data/api/client-server/search.yaml#/paths/~1search/post/responses/200/content/application~1json/schema",
       "binding": "data/api/client-server/search.yaml",
-      "condition": "Missing next_batch means complete: rank/recent global and room/sender group pages must emit a continuation whenever more visible results remain."
+      "condition": "Missing next_batch means complete: rank/recent global and room/sender group pages retain real last-result cursors on nonempty pages, including terminal pages as in Synapse; the following empty page has no cursor."
     },
     {
       "id": "unconfigured-turn-empty-read",

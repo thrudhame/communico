@@ -1,6 +1,6 @@
 import { authorize } from '#engine/auth-context.ts';
 import { setVisibility } from '#engine/client/directory.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import { decodeVisibility } from '#engine/client/directory-request.ts';
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,

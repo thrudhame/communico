@@ -98,7 +98,9 @@ export function searchPage<
   const limit = request.filter.limit ?? 10;
   const page = remaining.slice(0, limit);
   const last = page.at(-1);
-  const nextBatch = last !== undefined && remaining.length > page.length
+  // Like Synapse, a nonempty terminal page has a real last-result cursor.
+  // Following it yields an empty page without a cursor, never a repeated page.
+  const nextBatch = last !== undefined
     ? token(last, request.order, boundary?.scope)
     : undefined;
   const groups: Record<
@@ -114,13 +116,7 @@ export function searchPage<
         order: Object.keys(grouped).length,
       };
       group.results.push(hit.eventId);
-      if (
-        remaining.some((h) =>
-          valueOf(h, key) === value && compare(h, hit, request.order) > 0
-        )
-      ) {
-        group.next_batch = token(hit, request.order, { key, value });
-      } else delete group.next_batch;
+      group.next_batch = token(hit, request.order, { key, value });
     }
     groups[key] = grouped;
   }

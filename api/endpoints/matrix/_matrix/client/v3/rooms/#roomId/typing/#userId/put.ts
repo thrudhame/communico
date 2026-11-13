@@ -1,7 +1,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { theApp } from '#engine/app.ts';
 import { setTyping } from '#engine/typing.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import { decodeTypingRequest } from '#engine/client/ephemeral-request.ts';
 
 export default async function (

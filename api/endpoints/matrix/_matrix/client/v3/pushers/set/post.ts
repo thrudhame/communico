@@ -1,4 +1,4 @@
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setPusher } from '#engine/tenant/pushers.ts';

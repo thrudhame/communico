@@ -5,7 +5,7 @@ import {
 } from '#engine/client/directory.ts';
 import { decodeDirectoryRequest } from '#engine/client/directory-request.ts';
 import { assertFederationEnabled } from '#engine/federation/keydoc.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 export default async function (request: PathfinderRequest) {

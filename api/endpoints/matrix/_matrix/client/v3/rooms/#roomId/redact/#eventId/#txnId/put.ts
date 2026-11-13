@@ -1,6 +1,6 @@
 import { redactEvent } from '#engine/client/write.ts';
 import { membershipContent } from '#engine/client/membership-request.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,

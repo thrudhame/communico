@@ -2,7 +2,7 @@ import { requireRoom } from '#engine/client/room.ts';
 import { memberOperation } from '#engine/client/membership.ts';
 import { membershipContent } from '#engine/client/membership-request.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
   context: import('@pathfinder/pathfinder').Context,

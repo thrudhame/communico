@@ -6,7 +6,7 @@ const suite = httpSuite('HTTP membership and state operation contracts');
 type Json = Record<string, unknown>;
 let token = '', targetToken = '', target = '', room = '', event = '';
 
-suite.test('joined member summaries omit absent optional profile strings and retain empty strings', async () => {
+suite.test('joined member summaries retain Synapse null profile strings and empty strings', async () => {
   const user = await suite.registerTestUser('operation-member-summary', 'pw');
   const made = await call('createRoom', {}, 'POST', user.access_token!);
   assertEquals(made.status, 200);
@@ -35,7 +35,7 @@ suite.test('joined member summaries omit absent optional profile strings and ret
     assertEquals(
       (members.body.joined as Json)[user.user_id],
       content.displayname === undefined
-        ? {}
+        ? { display_name: null, avatar_url: null }
         : { display_name: '', avatar_url: 'mxc://outside.test/avatar' },
     );
   }

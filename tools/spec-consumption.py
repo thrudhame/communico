@@ -136,9 +136,9 @@ def reviewed_bindings():
        "state format and membership enums are validated without changing their valid meanings")
     cs("search", "api/engine/client/search-request.ts", "api/engine/client/search.ts", "http-operation-search",
        "explicit search keys, scope, context and state reach their consumers",
-       "exact and zero limits do not advertise nonexistent progress",
-       "rank consumes every continuation once and omits completed continuations",
-       "recent consumes every continuation once and omits completed continuations",
+       "terminal nonempty pages have valid cursors while zero limits advertise no progress",
+       "rank consumes every continuation once and ends after the empty terminal page",
+       "recent consumes every continuation once and ends after the empty terminal page",
        "rank room_id continuation stays in its group and has an honest end",
        "rank sender continuation stays in its group and has an honest end",
        "recent room_id continuation stays in its group and has an honest end",
@@ -307,7 +307,7 @@ def request_reviews():
         "The selected event is returned only under its own room/version/visibility policy; the consumer checks exact content and room identity."))
     joined = proof("joined-member-profiles", "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/joined_members/get.ts",
                    "api/endpoints/matrix/_matrix/client/v3/rooms/#roomId/joined_members/get.ts", "http-operation-membership", [
-                       "joined member summaries omit absent optional profile strings and retain empty strings"])
+                        "joined member summaries retain Synapse null profile strings and empty strings"])
     cs("rooms", "GET", "v3/rooms/{roomId}/joined_members", (
         "path/roomId", joined, "The selected room returns its actual joined users, preserving empty profile strings and omitting absent optional strings."))
     snapshot = proof("admitted-state-snapshot", "api/engine/client/state.ts",
@@ -604,7 +604,7 @@ def generate():
         if family.endswith("/search.yaml"):
             result["proseContracts"].append(dict(id="search-global-and-group-continuations", operation=op["id"],
                 source=op["response"][0]["source"], binding=key,
-                condition="Missing next_batch means complete: rank/recent global and room/sender group pages must emit a continuation whenever more visible results remain."))
+                 condition="Missing next_batch means complete: rank/recent global and room/sender group pages retain real last-result cursors on nonempty pages, including terminal pages as in Synapse; the following empty page has no cursor."))
         if family.endswith("/voip.yaml"):
             result["proseContracts"].append(dict(id="unconfigured-turn-empty-read", operation=op["id"],
                 source=op["response"][0]["source"], binding=key,

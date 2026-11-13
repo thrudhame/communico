@@ -1,6 +1,6 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setPresence } from '#engine/presence.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import { decodePresenceRequest } from '#engine/client/ephemeral-request.ts';
 
 export default async function (
