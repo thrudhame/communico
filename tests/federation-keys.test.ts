@@ -517,6 +517,108 @@ Deno.test('forget clears peer failure memory as well as persisted keys', async (
   });
 });
 
+for (const outcome of ['success', 'failure']) {
+  Deno.test(
+    'forget fences an in-flight acquisition and its ' + outcome,
+    async () => {
+      await withStore(async (store) => {
+        const db = await store.server();
+        const origin = await makeServer('forgotten-' + outcome + '.test');
+        const oldDoc = await makeDoc(origin);
+        const freshDoc = await makeDoc(
+          await makeServer(origin.name, 'ed25519:fresh'),
+        );
+        let enterOld!: () => void, enterFresh!: () => void;
+        let releaseOld!: () => void, releaseFresh!: () => void;
+        const oldEntered = new Promise<void>((resolve) => enterOld = resolve);
+        const freshEntered = new Promise<void>((resolve) =>
+          enterFresh = resolve
+        );
+        const oldHeld = new Promise<void>((resolve) => releaseOld = resolve);
+        const freshHeld = new Promise<void>((resolve) =>
+          releaseFresh = resolve
+        );
+        const fault = new UpstreamError('transport', {
+          phase: 'test',
+          reason: 'old acquisition failed',
+        });
+        let calls = 0;
+        const ks = keyStore(db, {
+          deps: stubDeps({
+            directGet: async () => {
+              const call = ++calls;
+              if (call === 1) {
+                enterOld();
+                await oldHeld;
+                if (outcome === 'failure') throw fault;
+                return oldDoc;
+              }
+              enterFresh();
+              await freshHeld;
+              return freshDoc;
+            },
+          }),
+        });
+        const old = ks.acquireKeyDoc(origin.name, 0);
+        const oldResult = old.then(
+          (value) => ({ value, error: undefined }),
+          (error: unknown) => ({ value: undefined, error }),
+        );
+        let fresh: Promise<unknown> | undefined,
+          joined: Promise<unknown> | undefined;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await oldEntered;
+          await keyStore(await store.server(), { deps: directOnly(freshDoc) })
+            .forgetServerKeys(origin.name);
+          fresh = ks.acquireKeyDoc(origin.name, 0);
+          // A post-forget lookup must start first contact, never join the held
+          // pre-forget request. The timeout only bounds a broken implementation.
+          await Promise.race([
+            freshEntered,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() =>
+                reject(
+                  new Error('post-forget lookup joined obsolete acquisition'),
+                ), 2000);
+            }),
+          ]);
+          clearTimeout(timer);
+          releaseOld();
+          const obsolete = await oldResult;
+          if (outcome === 'failure') assertStrictEquals(obsolete.error, fault);
+          else {assert(
+              obsolete.error instanceof Error,
+              'obsolete success must not publish or return keys',
+            );}
+          assertEquals(
+            (await ks.listServerKeys(origin.name))[0].doc,
+            null,
+            'obsolete acquisition cannot restore forgotten rows',
+          );
+          joined = ks.acquireKeyDoc(origin.name, 0);
+          releaseFresh();
+          assertEquals(await fresh, freshDoc);
+          assertEquals(await joined, freshDoc);
+          assertEquals(
+            calls,
+            2,
+            'obsolete completion cannot remove the new in-flight owner or cache a failure',
+          );
+          assertEquals(await ks.acquireKeyDoc(origin.name, 0), freshDoc);
+        } finally {
+          clearTimeout(timer);
+          releaseOld();
+          releaseFresh();
+          await Promise.allSettled(
+            [old, fresh, joined].filter((p) => p !== undefined),
+          );
+        }
+      });
+    },
+  );
+}
+
 // --- keydoc: the notary answer from cache ---------------------------------
 
 Deno.test('notary: the cached document verbatim with our signature added; canonical bytes', async () => {

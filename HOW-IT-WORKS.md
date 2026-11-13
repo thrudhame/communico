@@ -847,6 +847,10 @@ memory; local storage/signing faults and cancellation retain their identity.
 Policy-refused key changes have separate acquisition backoff. The store's stable
 server database capability owns acquisition memory shared by every key-store
 view; accepting or forgetting a server clears both memories immediately.
+Admin decisions also invalidate active lookup generations. Network acquisition
+runs outside the per-name mutation lock; publication rechecks its generation
+inside that lock, so obsolete work cannot restore forgotten keys, decisions or
+negative memory. A later contact never joins the superseded acquisition.
 Event, prejoin, history and join consumers distinguish peer verification refusal
 from a local resolver fault, which never becomes missing evidence or resident
 failover. Matrix wire Base64 uses the standard alphabet and accepts the optional
