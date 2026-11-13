@@ -74,18 +74,25 @@ Deno.test('media multipart: Location is separate from binary and cannot contain 
     parse(prefix + 'Location: https://cdn.example/x\r\n\r\nx' + suffix)
   );
 });
-Deno.test('media multipart: truncation, extra parts and epilogue never commit output', async () => {
+Deno.test('media multipart: truncation and extra parts never commit output', async () => {
   for (
     const body of [
       prefix + 'Content-Type: image/png\r\n\r\nx',
       prefix +
       'Content-Type: image/png\r\n\r\nx\r\n--test\r\nContent-Type: text/plain\r\n\r\nx' +
       suffix,
-      prefix + 'Content-Type: image/png\r\n\r\nx' + suffix + 'extra',
     ]
   ) {
     await assertRejects(() => parse(body));
   }
+});
+Deno.test('media multipart: epilogue is ignored without adding bytes to media', async () => {
+  assertEquals(
+    (await parse(
+      prefix + 'Content-Type: image/png\r\n\r\nx' + suffix + 'extra',
+    )).body,
+    'x',
+  );
 });
 Deno.test('media multipart: metadata must be bounded JSON object with correct type', async () => {
   for (const metadata of ['[]', 'null', 'oops', '"text"', ' '.repeat(65537)]) {

@@ -3,7 +3,7 @@ import { Image } from 'imagescript';
 import { config, serverName, setConfigForTests } from '#engine/config.ts';
 import { startHttp } from '#tests/http-app.ts';
 import { startFakeServer } from './federation/fake-server.ts';
-import { mediaMultipart, multipartResponse } from '#engine/media/multipart.ts';
+import { mediaMultipart } from '#engine/media/multipart.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { remoteServer, signerFor } from './http-federation.ts';
 import { canonicalJson } from '#engine/canonical.ts';
@@ -48,8 +48,21 @@ Deno.test('HTTP thumbnail: shared local/federation engine, signed remote variant
       ) return null;
       assert(req.verified);
       fetches++;
-      return multipartResponse(
-        new Response(png, { headers: { 'Content-Type': 'image/png' } }),
+      // Independently framed legal MIME, not our producer serialization. The
+      // thumbnail consumer must share the download parser's grammar contract.
+      const head = new TextEncoder().encode(
+        'thumbnail preamble\r\n--thumb \t\r\nContent-Type: application/json\r\n\r\n{}\r\n--thumb\r\nContent-Type: image/png\r\n\r\n',
+      );
+      const tail = new TextEncoder().encode(
+        '\r\n--thumb--\t\r\nthumbnail epilogue',
+      );
+      return new Response(
+        Uint8Array.from([head, png, tail].flatMap((c) => [...c])),
+        {
+          headers: {
+            'Content-Type': 'multipart/mixed; x=extra; boundary="thumb"',
+          },
+        },
       );
     },
   });

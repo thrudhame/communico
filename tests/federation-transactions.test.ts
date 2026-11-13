@@ -8,7 +8,7 @@
 // tests/federation-send.test.ts, restored at the engine functions; the
 // middleware's backoff reset is the sender's contact hook, covered in
 // federation-sender.test.ts.)
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { eduQueues, type EduState, eduState } from '#engine/federation/edus.ts';
@@ -31,6 +31,161 @@ import {
 } from './fixtures/remote.ts';
 
 installServerHooks();
+
+Deno.test('peer JSON: malformed transaction envelopes cannot reach persistence or dispatch', async () => {
+  const local = new Error('store must not be reached');
+  const deps = {
+    store: {
+      server: () => {
+        throw local;
+      },
+    },
+    edus: {
+      dispatch: () => Promise.reject(local),
+    },
+  } as unknown as Parameters<typeof receiveTransaction>[3];
+  for (
+    const body of [
+      null,
+      [],
+      { origin: 'remote.test' },
+      { origin: 'remote.test', origin_server_ts: 1, pdus: {} },
+      { origin: 'remote.test', origin_server_ts: '1', pdus: [] },
+      { origin: 'remote.test', origin_server_ts: 1, pdus: [null] },
+      { origin: 'remote.test', origin_server_ts: 1, pdus: [], edus: null },
+      {
+        origin: 'remote.test',
+        origin_server_ts: 1,
+        pdus: [],
+        edus: [{ edu_type: 'custom', content: [] }],
+      },
+    ]
+  ) {
+    const error = await assertRejects(
+      () => receiveTransaction('remote.test', 'invalid', body, deps),
+      MatrixError,
+    );
+    assertEquals(error.status, 400);
+    assertEquals(error.errcode, 'M_BAD_JSON');
+  }
+});
+
+Deno.test('peer JSON: invalid typing cannot stop typing', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store);
+    const typing = { room_id: s.g.roomId, user_id: s.user, typing: true };
+    await s.edus.dispatch('remote.test', {
+      edu_type: 'm.typing',
+      content: typing,
+    });
+    assertEquals(s.edus.typingOf(s.g.roomId).userIds, [s.user]);
+    for (const value of [undefined, null, 0, 'false']) {
+      await s.edus.dispatch('remote.test', {
+        edu_type: 'm.typing',
+        content: { ...typing, typing: value },
+      });
+      assertEquals(s.edus.typingOf(s.g.roomId).userIds, [s.user]);
+    }
+    await s.edus.dispatch('remote.test', {
+      edu_type: 'm.typing',
+      content: { ...typing, typing: false },
+    });
+    assertEquals(s.edus.typingOf(s.g.roomId).userIds, []);
+  });
+});
+
+Deno.test('peer JSON: invalid receipt metadata cannot publish fabricated data', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store);
+    const event = await msg(s, 'receipt boundary', [s.tip]);
+    await sendTxn(s, store, 'json-target', {
+      origin: 'remote.test',
+      origin_server_ts: 1,
+      pdus: [event],
+    });
+    for (
+      const mark of [
+        { event_ids: [event.event_id], data: {} },
+        { event_ids: [event.event_id], data: { ts: '1' } },
+        { event_ids: [event.event_id, '$other'], data: { ts: 1 } },
+      ]
+    ) {
+      await s.edus.dispatch('remote.test', {
+        edu_type: 'm.receipt',
+        content: { [s.g.roomId]: { 'm.read': { [s.user]: mark } } },
+      });
+      assertEquals(await s.edus.receiptsIn(s.g.roomId), []);
+    }
+    await s.edus.dispatch('remote.test', {
+      edu_type: 'm.receipt',
+      content: {
+        '!malformed:test': false,
+        [s.g.roomId]: {
+          'm.read': {
+            [s.user]: { event_ids: [event.event_id], data: { ts: 123 } },
+          },
+        },
+      },
+    });
+    assertEquals(
+      (await s.edus.receiptsIn(s.g.roomId)).map((receipt) => receipt.ts),
+      [123],
+    );
+  });
+});
+
+Deno.test('peer JSON: invalid presence shapes cannot publish fabricated data', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store);
+    for (
+      const presence of [null, { user_id: s.user, presence: 'online' }, {
+        user_id: s.user,
+        presence: 'invented',
+        last_active_ago: 0,
+      }, { user_id: s.user, presence: 'online', last_active_ago: '0' }]
+    ) {
+      await s.edus.dispatch('remote.test', {
+        edu_type: 'm.presence',
+        content: { push: [presence] },
+      });
+      assertEquals(await s.edus.presenceOf(s.user), null);
+    }
+    await s.edus.dispatch('remote.test', {
+      edu_type: 'm.presence',
+      content: {
+        push: [
+          null,
+          { user_id: s.user, presence: 'online', last_active_ago: 0 },
+        ],
+      },
+    });
+    assertEquals((await s.edus.presenceOf(s.user))?.presence, 'online');
+  });
+});
+
+Deno.test('peer JSON: unknown local EDU failures propagate without caching a successful transaction', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store),
+      local = new Error('local handler fault');
+    s.edus.register('custom.local', () => Promise.reject(local));
+    const error = await assertRejects(() =>
+      sendTxn(s, store, 'local-fault', {
+        origin: 'remote.test',
+        origin_server_ts: 1,
+        pdus: [],
+        edus: [{ edu_type: 'custom.local', content: {} }],
+      })
+    );
+    assertEquals(error, local);
+    assertEquals(
+      await (await store.server()).query(
+        'SELECT * FROM federation_txns WHERE txn_id=?',
+        ['local-fault'],
+      ),
+      [],
+    );
+  });
+});
 
 const config = (dir: string) => ({
   dir,

@@ -5,6 +5,7 @@ import { theApp } from '#engine/app.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { startFakeServer } from '#tests/federation/fake-server.ts';
+import { wireKey } from '#tests/fixtures/e2ee-wire.ts';
 
 type Json = Record<string, unknown>;
 type KeyResponse = {
@@ -141,7 +142,7 @@ suite.test('signed remote grouping preserves local successes, rejects injection 
         if (mode === 'claim-ok') {
           return Response.json({
             one_time_keys: {
-              [remote]: { D: { 'curve25519:r': 'remote-one-time' } },
+              [remote]: { D: { 'curve25519:r': wireKey('remote-one-time') } },
             },
           });
         }
@@ -151,7 +152,7 @@ suite.test('signed remote grouping preserves local successes, rejects injection 
         user_id: remote,
         device_id: 'D',
         algorithms: [],
-        keys: { 'ed25519:D': 'remote-public' },
+        keys: { 'ed25519:D': wireKey('remote-public') },
         signatures: {},
       };
       return Response.json({
@@ -186,7 +187,7 @@ suite.test('signed remote grouping preserves local successes, rejects injection 
     };
     const queried = await post(a.access_token!, 'query', body);
     assertEquals(queried.device_keys[remote].D.keys, {
-      'ed25519:D': 'remote-public',
+      'ed25519:D': wireKey('remote-public'),
     });
     assert(queried.device_keys[a.user_id][a.device_id]);
     assert(queried.failures['127.0.0.1:1']);
@@ -222,7 +223,7 @@ suite.test('signed remote grouping preserves local successes, rejects injection 
       },
     });
     assertEquals(received.one_time_keys[remote].D, {
-      'curve25519:r': 'remote-one-time',
+      'curve25519:r': wireKey('remote-one-time'),
     });
     assertEquals(received.failures, {});
     assertEquals(claims, 2);

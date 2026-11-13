@@ -4,6 +4,7 @@ import { localpartOf, validEventUserId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { domainOf } from '#engine/federation/pdu.ts';
 import { federationRequest } from '#engine/federation/client.ts';
+import { directoryResponse } from '#engine/federation/discovery-response.ts';
 import { productionFetcher } from '#engine/federation/fetcher.ts';
 import {
   inviteFor,
@@ -148,14 +149,11 @@ export async function joinByIdOrAlias(
           encodeURIComponent(id),
         body: null,
       });
-      const answer = res.json as { room_id?: unknown; servers?: unknown };
-      if (typeof answer.room_id !== 'string') {
-        throw new MatrixError(404, 'M_NOT_FOUND', 'unknown alias: ' + id);
-      }
+      const answer = directoryResponse(res.json);
       roomId = answer.room_id;
       candidates.push(
         destination,
-        ...(Array.isArray(answer.servers) ? answer.servers.map(String) : []),
+        ...answer.servers,
       );
     }
   }
@@ -207,7 +205,7 @@ export async function leave(roomId: string, userId: string, reason?: string) {
     (current === null || current.seq < (invitation?.seq ?? 0)) &&
     invitation !== null && invitation.status !== 'joined'
   ) {
-    await rejectInviteRemote(roomId, userId, deps);
+    await rejectInviteRemote(roomId, userId, deps, reason);
     return { roomId, eventId: invitation.eventId, created: false };
   }
   if (room === null) {

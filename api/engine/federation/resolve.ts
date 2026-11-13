@@ -14,13 +14,21 @@
 // Ported from doltgres; one repair: the well-known fetch reads the
 // configured cacerts FILES (the old code passed the paths as PEM).
 import { config } from '#engine/config.ts';
-import { dialNodeTls } from './dial-node-tls.ts';
-import { parseIp } from '#engine/preview/cidr.ts';
 import { b32decode, isKeyName } from '#engine/signing-primitives.js';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { lookupPeer, type PeerRow } from './peers.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import { abortable } from '#engine/net/abort.ts';
+import {
+  protocol,
+  recoverableUpstream,
+  upstreamCategory,
+  UpstreamError,
+} from '#engine/net/upstream-error.ts';
+import { isIpLiteral, splitServerName } from './server-name.ts';
+import { wellKnownGet } from './well-known.ts';
+export { splitServerName } from './server-name.ts';
+export { resetWellKnownCache } from './well-known.ts';
 
 export type Trust =
   | { kind: 'ca' }
@@ -33,6 +41,7 @@ export type Endpoint = {
   hostHeader: string;
   sni: string | null;
   trust: Trust;
+  alternatives?: AsyncIterable<{ connectIp: string; port: number }>;
 };
 
 export type ResolveDeps = {
@@ -47,6 +56,7 @@ export type ResolveDeps = {
     host: string,
   ) => Promise<{ mServer: string | null; maxAgeMs: number | null }>;
   lookupPeer: (name: string) => Promise<PeerRow | null>;
+  random?: () => number;
 };
 
 async function defaultDns(
@@ -59,12 +69,15 @@ async function defaultDns(
       signal,
       () => Deno.resolveDns(host, type, { signal }),
     );
-    return r.map((x: unknown) =>
-      typeof x === 'string' ? x : String((x as Record<string, unknown>).addr)
-    );
-  } catch {
+    return r;
+  } catch (cause) {
     signal?.throwIfAborted();
-    return [];
+    if (cause instanceof Deno.errors.NotFound) return [];
+    throw new UpstreamError('transport', {
+      phase: 'dns',
+      reason: 'DNS address query failed',
+      cause,
+    });
   }
 }
 
@@ -93,9 +106,14 @@ async function defaultSrv(
         weight: o.weight,
       };
     });
-  } catch {
+  } catch (cause) {
     signal?.throwIfAborted();
-    return [];
+    if (cause instanceof Deno.errors.NotFound) return [];
+    throw new UpstreamError('transport', {
+      phase: 'dns',
+      reason: 'DNS service query failed',
+      cause,
+    });
   }
 }
 
@@ -116,115 +134,20 @@ export function resetCaCertsForTests(): void {
   _cacertsPem = null;
 }
 
-// .well-known answers and failures are cached in-memory with the
-// configured horizons; a module-level cache, resettable for tests.
-const wellKnownCache = new Map<
-  string,
-  {
-    answer: { mServer: string | null; maxAgeMs: number | null } | 'error';
-    expiresMs: number;
-  }
->();
-
-export function resetWellKnownCache(): void {
-  wellKnownCache.clear();
-}
-
 async function defaultWellKnownGet(
   host: string,
   signal?: AbortSignal,
 ): Promise<{ mServer: string | null; maxAgeMs: number | null }> {
-  const now = Date.now();
-  const hit = wellKnownCache.get(host);
-  if (hit !== undefined && hit.expiresMs > now) {
-    return hit.answer === 'error'
-      ? { mServer: null, maxAgeMs: null }
-      : hit.answer;
-  }
-  const fed = config().federation;
-  let answer: { mServer: string | null; maxAgeMs: number | null } | 'error';
-  try {
-    const ips = [
-      ...(await defaultDns(host, 'A', signal)),
-      ...(await defaultDns(host, 'AAAA', signal)),
-    ];
-    if (ips.length === 0) throw new MatrixError(502, 'M_UNKNOWN', 'no address');
-    let url = 'https://' + host + '/.well-known/matrix/server';
-    let hops = 0;
-    while (true) {
-      const parsed = new URL(url);
-      const hopIps = [
-        ...(await defaultDns(parsed.hostname, 'A', signal)),
-        ...(await defaultDns(parsed.hostname, 'AAAA', signal)),
-      ];
-      if (hopIps.length === 0) {
-        throw new MatrixError(502, 'M_UNKNOWN', 'no address');
-      }
-      const port = parsed.port === '' ? 443 : Number(parsed.port);
-      const res = await dialNodeTls({
-        connectIp: hopIps[0],
-        port,
-        sni: parseIp(parsed.hostname) === null ? parsed.hostname : null,
-        trust: { kind: 'ca', caCerts: caCertsPem() },
-        hostHeader: port === 443
-          ? parsed.hostname
-          : parsed.hostname + ':' + port,
-        method: 'GET',
-        path: parsed.pathname,
-        headers: { Accept: 'application/json' },
-        body: null,
-        connectMs: fed.connectms,
-        timeoutMs: fed.timeoutms,
-        maxBytes: fed.maxbytes,
-        signal,
-      });
-      if (res.status >= 300 && res.status < 400) {
-        const loc = res.headers.get('location');
-        if (loc === null) throw new MatrixError(502, 'M_UNKNOWN', 'redirect');
-        hops++;
-        if (hops > 5) {
-          throw new MatrixError(502, 'M_UNKNOWN', 'too many redirects');
-        }
-        url = new URL(loc, parsed).href;
-        continue;
-      }
-      if (res.status !== 200) {
-        throw new MatrixError(
-          502,
-          'M_UNKNOWN',
-          'well-known returned ' + res.status,
-        );
-      }
-      const body = JSON.parse(new TextDecoder().decode(res.body)) as Record<
-        string,
-        unknown
-      >;
-      const cc = res.headers.get('cache-control');
-      const m = cc !== null ? /max-age=(\d+)/.exec(cc) : null;
-      const maxAgeMs = m !== null ? Number(m[1]) * 1000 : null;
-      answer = {
-        mServer: typeof body['m.server'] === 'string'
-          ? body['m.server'] as string
-          : null,
-        maxAgeMs,
-      };
-      break;
-    }
-  } catch {
-    signal?.throwIfAborted(); // A caller's cancellation is not a discovery failure to cache.
-    answer = 'error';
-  }
-  const fed2 = config().federation;
-  wellKnownCache.set(host, {
-    answer,
-    expiresMs: now +
-      (answer === 'error'
-        ? fed2.wellknownerrorhours * 3600_000
-        : (answer.maxAgeMs === null
-          ? fed2.wellknownhours * 3600_000
-          : Math.min(answer.maxAgeMs, fed2.wellknownmaxhours * 3600_000))),
-  });
-  return answer === 'error' ? { mServer: null, maxAgeMs: null } : answer;
+  return await wellKnownGet(
+    host,
+    (name) =>
+      resolveHost(name, {
+        dnsA: (h) => defaultDns(h, 'A', signal),
+        dnsAAAA: (h) => defaultDns(h, 'AAAA', signal),
+      }, signal),
+    caCertsPem,
+    signal,
+  );
 }
 
 function trustOf(row: PeerRow): Trust {
@@ -241,30 +164,6 @@ function trustOf(row: PeerRow): Trust {
   return { kind: 'ca' };
 }
 
-// <name> split into host + optional port — handles [v6]:port and v4/name:port
-export function splitServerName(
-  name: string,
-): { host: string; port: number | null } {
-  if (name.startsWith('[')) {
-    const end = name.indexOf(']');
-    if (end > 0) {
-      const host = name.slice(1, end);
-      const rest = name.slice(end + 1);
-      if (rest.startsWith(':')) {
-        const port = Number(rest.slice(1));
-        return { host, port: Number.isInteger(port) ? port : null };
-      }
-      return { host, port: null };
-    }
-  }
-  const idx = name.lastIndexOf(':');
-  if (idx > 0 && name.indexOf(':') === idx) {
-    const port = Number(name.slice(idx + 1));
-    if (Number.isInteger(port)) return { host: name.slice(0, idx), port };
-  }
-  return { host: name, port: null };
-}
-
 export async function resolveWith(
   name: string,
   deps: ResolveDeps,
@@ -277,12 +176,13 @@ export async function resolveWith(
     dnsSrv: (h) => abortable(signal, () => source.dnsSrv(h)),
     wellKnownGet: (h) => abortable(signal, () => source.wellKnownGet(h)),
     lookupPeer: (n) => abortable(signal, () => source.lookupPeer(n)),
+    random: source.random,
   };
   // (0) roster row: trust comes from the row whatever the address source
   const row = await deps.lookupPeer(name);
   const trust = row !== null ? trustOf(row) : { kind: 'ca' } as Trust;
-  const nameHost = splitServerName(name).host;
-  const sniOf = parseIp(nameHost) === null ? nameHost : null;
+  const { host, port } = splitServerName(name);
+  const sniOf = isIpLiteral(host) ? null : host;
   if (isKeyName(name)) {
     if (row === null || row.host === null || row.port === null) {
       throw new MatrixError(
@@ -291,138 +191,301 @@ export async function resolveWith(
         `key-is-name peer ${name} has no address`,
       );
     }
-    const ips = await resolveHost(row.host, deps);
-    return {
-      connectIp: ips[0],
-      port: row.port,
-      hostHeader: name,
-      sni: sniOf,
+    return endpoint(
+      hostAddresses(row.host, row.port, deps, signal),
+      name,
+      sniOf,
       trust,
-    };
+    );
   }
   if (row !== null && row.host !== null && row.port !== null) {
-    const ips = await resolveHost(row.host, deps);
-    return {
-      connectIp: ips[0],
-      port: row.port,
-      hostHeader: name,
-      sni: sniOf,
+    return endpoint(
+      hostAddresses(row.host, row.port, deps, signal),
+      name,
+      sniOf,
       trust,
-    };
+    );
   }
 
-  const trustDefault = trust;
-  const { host, port } = splitServerName(name);
   // (1) IP literal
-  const literal = parseIp(host);
-  if (literal !== null) {
-    return {
-      connectIp: host,
-      port: port !== null ? port : 8448,
-      hostHeader: name,
-      sni: null,
-      trust: trustDefault,
-    };
+  if (isIpLiteral(host)) {
+    return endpoint(
+      [{ ip: host, port: port !== null ? port : 8448 }],
+      name,
+      null,
+      trust,
+    );
   }
   // (2) explicit port
   if (port !== null) {
-    const ips = await resolveHost(host, deps);
-    return {
-      connectIp: ips[0],
-      port,
-      hostHeader: name,
-      sni: host,
-      trust: trustDefault,
-    };
+    return endpoint(hostAddresses(host, port, deps, signal), name, host, trust);
   }
   // (3) .well-known
-  const wk = await deps.wellKnownGet(host);
-  if (wk.mServer !== null) {
-    const delegated = splitServerName(wk.mServer);
-    const delegatedLiteral = parseIp(delegated.host);
-    if (delegatedLiteral !== null) {
-      return {
-        connectIp: delegated.host,
-        port: delegated.port !== null ? delegated.port : 8448,
-        hostHeader: wk.mServer,
-        sni: null,
-        trust: trustDefault,
-      };
+  let delegation: string | null = null;
+  try {
+    const wk = await deps.wellKnownGet(host);
+    if (wk.mServer !== null) {
+      splitServerName(wk.mServer);
+      delegation = wk.mServer;
     }
-    if (delegated.port !== null) {
-      const ips = await resolveHost(delegated.host, deps);
-      return {
-        connectIp: ips[0],
-        port: delegated.port,
-        hostHeader: wk.mServer,
-        sni: delegated.host,
-        trust: trustDefault,
-      };
-    }
-    const bySrv = await resolveSrv(delegated.host, deps);
-    if (bySrv !== null) {
-      return {
-        connectIp: bySrv.ip,
-        port: bySrv.port,
-        hostHeader: delegated.host +
-          (bySrv.port === 8448 ? '' : ':' + bySrv.port),
-        sni: delegated.host,
-        trust: trustDefault,
-      };
-    }
-    return {
-      connectIp: (await resolveHost(delegated.host, deps))[0],
-      port: 8448,
-      hostHeader: delegated.host,
-      sni: delegated.host,
-      trust: trustDefault,
-    };
+  } catch (error) {
+    discoveryFallback(error, signal);
   }
-  // (4) SRV, then <host>:8448
-  const bySrv = await resolveSrv(host, deps);
+  const target = delegation === null
+    ? { host, port: null }
+    : splitServerName(delegation);
+  const identity = delegation === null ? name : delegation;
+  if (isIpLiteral(target.host)) {
+    return endpoint(
+      [{ ip: target.host, port: target.port === null ? 8448 : target.port }],
+      identity,
+      null,
+      trust,
+    );
+  }
+  if (target.port !== null) {
+    const targetPort = target.port;
+    return endpoint(
+      hostAddresses(target.host, targetPort, deps, signal),
+      identity,
+      target.host,
+      trust,
+    );
+  }
+  // An SRV port changes the dial target, never the delegated Host/TLS identity.
+  const bySrv = await resolveSrv(target.host, deps, signal);
   if (bySrv !== null) {
-    return {
-      connectIp: bySrv.ip,
-      port: bySrv.port,
-      hostHeader: name + (bySrv.port === 8448 ? '' : ''),
-      sni: host,
-      trust: trustDefault,
-    };
+    return endpoint(bySrv, identity, target.host, trust);
   }
-  const ips = await resolveHost(host, deps);
+  return endpoint(
+    hostAddresses(target.host, 8448, deps, signal),
+    identity,
+    target.host,
+    trust,
+  );
+}
+
+async function endpoint(
+  addresses:
+    | Iterable<{ ip: string; port: number }>
+    | AsyncIterable<{ ip: string; port: number }>,
+  hostHeader: string,
+  sni: string | null,
+  trust: Trust,
+): Promise<Endpoint> {
+  const remaining = (async function* () {
+    yield* addresses;
+  })();
+  const next = await remaining.next();
+  if (next.done) {
+    throw new UpstreamError('transport', {
+      phase: 'dns',
+      reason: 'no eligible server address',
+    });
+  }
+  const first = next.value;
   return {
-    connectIp: ips[0],
-    port: 8448,
-    hostHeader: name,
-    sni: host,
-    trust: trustDefault,
+    connectIp: first.ip,
+    port: first.port,
+    hostHeader,
+    sni,
+    trust,
+    alternatives: (async function* () {
+      for await (const { ip, port } of remaining) yield { connectIp: ip, port };
+    })(),
   };
 }
 
-async function resolveHost(host: string, deps: ResolveDeps): Promise<string[]> {
-  const viaA = await deps.dnsA(host);
-  if (viaA.length > 0) return viaA;
-  const viaAAAA = await deps.dnsAAAA(host);
-  if (viaAAAA.length > 0) return viaAAAA;
-  const literal = parseIp(host);
-  if (literal !== null) return [host];
-  throw new MatrixError(502, 'M_UNKNOWN', `could not resolve ${host}`);
+function discoveryFallback(error: unknown, signal?: AbortSignal): void {
+  signal?.throwIfAborted();
+  if (
+    upstreamCategory(error, signal) === 'cancellation' ||
+    !recoverableUpstream(error, signal)
+  ) throw error;
 }
 
-// SRV: _matrix-fed._tcp, then legacy _matrix._tcp — lowest priority, then
-// highest weight (simple sorted pick; documented, not randomised).
+async function* resolveHost(
+  host: string,
+  deps: Pick<ResolveDeps, 'dnsA' | 'dnsAAAA'>,
+  signal?: AbortSignal,
+): AsyncGenerator<string> {
+  if (isIpLiteral(host)) {
+    yield host;
+    return;
+  }
+  // Neither address family waits for the other. Keep the unconsumed answer
+  // available for connection failover, with every rejection observed immediately.
+  const queries = new Map(
+    [deps.dnsA, deps.dnsAAAA].map((
+      query,
+      index,
+    ) => [
+      index,
+      Promise.resolve().then(() => query(host)).then(
+        (addresses) => ({ index, addresses, error: undefined }),
+        (error: unknown) => ({ index, addresses: [] as string[], error }),
+      ),
+    ]),
+  );
+  const seen = new Set<string>();
+  while (queries.size) {
+    const result = await abortable(
+      signal,
+      () => Promise.race(queries.values()),
+    );
+    queries.delete(result.index);
+    try {
+      if (result.error !== undefined) throw result.error;
+      for (const address of result.addresses) {
+        if (typeof address !== 'string' || !isIpLiteral(address)) {
+          protocol('dns', 'invalid address answer');
+        }
+      }
+      for (const address of result.addresses) {
+        if (!seen.has(address)) {
+          seen.add(address);
+          yield address;
+        }
+      }
+    } catch (error) {
+      discoveryFallback(error, signal);
+    }
+  }
+  if (seen.size) return;
+  throw new UpstreamError('transport', {
+    phase: 'dns',
+    reason: 'could not resolve server hostname',
+  });
+}
+
+async function* hostAddresses(
+  host: string,
+  port: number,
+  deps: Pick<ResolveDeps, 'dnsA' | 'dnsAAAA'>,
+  signal?: AbortSignal,
+) {
+  for await (const ip of resolveHost(host, deps, signal)) yield { ip, port };
+}
+
+// RFC2782: increasing priority, weighted draws without replacement within each
+// priority. Zero weights lead the cumulative list and retain a chance at draw0.
+function srvOrder(
+  rows: Awaited<ReturnType<ResolveDeps['dnsSrv']>>,
+  random: () => number,
+) {
+  const result: typeof rows = [];
+  const priorities = [...new Set(rows.map((r) => r.priority))].sort((a, b) =>
+    a - b
+  );
+  for (const priority of priorities) {
+    const remaining = rows.filter((r) => r.priority === priority).sort((a, b) =>
+      Number(a.weight !== 0) - Number(b.weight !== 0)
+    );
+    while (remaining.length) {
+      const sum = remaining.reduce((n, r) => n + r.weight, 0);
+      let index: number;
+      if (sum > 0) {
+        const draw = Math.floor(random() * (sum + 1));
+        let running = 0;
+        index = remaining.findIndex((r) => {
+          running += r.weight;
+          return running >= draw;
+        });
+      } else index = Math.floor(random() * remaining.length);
+      result.push(remaining.splice(index, 1)[0]);
+    }
+  }
+  return result;
+}
+
 async function resolveSrv(
   host: string,
   deps: ResolveDeps,
-): Promise<{ ip: string; port: number } | null> {
+  signal?: AbortSignal,
+): Promise<AsyncIterable<{ ip: string; port: number }> | null> {
   for (const label of ['_matrix-fed._tcp.', '_matrix._tcp.']) {
-    const rows = await deps.dnsSrv(label + host);
+    let rows: Awaited<ReturnType<ResolveDeps['dnsSrv']>>;
+    try {
+      rows = await deps.dnsSrv(label + host);
+    } catch (error) {
+      discoveryFallback(error, signal);
+      continue;
+    }
     if (rows.length === 0) continue;
-    const sorted = [...rows].sort(
-      (a, b) => a.priority - b.priority || b.weight - a.weight,
+    if (rows.length === 1 && rows[0].target === '.') {
+      throw new UpstreamError('transport', {
+        phase: 'dns',
+        reason: 'federation service is unavailable',
+      });
+    }
+    for (const row of rows) {
+      if (
+        ![row.port, row.priority, row.weight].every((n) =>
+          Number.isInteger(n) && n >= 0 && n <= 65535
+        ) || typeof row.target !== 'string' || row.target === '.'
+      ) protocol('dns', 'invalid SRV answer');
+      const target = splitServerName(row.target.replace(/\.$/, ''));
+      if (target.port !== null || isIpLiteral(target.host)) {
+        protocol('dns', 'invalid SRV target');
+      }
+    }
+    const ordered = srvOrder(
+      rows,
+      deps.random === undefined ? Math.random : deps.random,
     );
-    const ips = await resolveHost(sorted[0].target, deps);
-    return { ip: ips[0], port: sorted[0].port };
+    return (async function* () {
+      let yielded = false;
+      const sources = ordered.map((row) =>
+        hostAddresses(row.target.replace(/\.$/, ''), row.port, deps, signal)
+      );
+      type Answer = {
+        index: number;
+        result?: IteratorResult<{ ip: string; port: number }>;
+        error?: unknown;
+      };
+      const pending = new Map<number, Promise<Answer>>();
+      const advance = (index: number) => {
+        pending.set(
+          index,
+          sources[index].next().then(
+            (result) => ({ index, result }),
+            (error: unknown) => ({ index, error }),
+          ),
+        );
+      };
+      let started = 0;
+      advance(started++);
+      while (pending.size) {
+        const answer = await abortable(
+          signal,
+          () => Promise.race(pending.values()),
+        );
+        pending.delete(answer.index);
+        try {
+          if (answer.result === undefined) throw answer.error;
+          if (!answer.result.done) {
+            yielded = true;
+            yield answer.result.value;
+            // Resumption means the dialer could not connect. Retain this
+            // target's pending family, but race it with later targets so no
+            // stalled DNS answer can consume the whole failover deadline.
+            advance(answer.index);
+            while (started < sources.length) advance(started++);
+          }
+        } catch (error) {
+          discoveryFallback(error, signal);
+        }
+        if (!yielded && pending.size === 0 && started < sources.length) {
+          advance(started++);
+        }
+      }
+      if (!yielded) {
+        throw new UpstreamError('transport', {
+          phase: 'dns',
+          reason: 'no federation service target could be resolved',
+        });
+      }
+    })();
   }
   return null;
 }

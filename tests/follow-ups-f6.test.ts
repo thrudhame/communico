@@ -434,8 +434,11 @@ Deno.test('F6 HTTP departure clears typing and notification listing filters with
       content: {
         [room]: {
           'm.read': {
-            [a.user_id]: { event_ids: ['$bad'], data: { thread_id: 7 } },
-            [b.user_id]: { event_ids: ['$valid'], data: { thread_id: 'main' } },
+            [a.user_id]: { event_ids: ['$bad'], data: { ts: 1, thread_id: 7 } },
+            [b.user_id]: {
+              event_ids: ['$valid'],
+              data: { ts: 2, thread_id: 'main' },
+            },
           },
         },
       },
@@ -454,11 +457,11 @@ Deno.test('F6 HTTP departure clears typing and notification listing filters with
           'm.read': {
             [b.user_id]: {
               event_ids: ['$bad-null'],
-              data: { thread_id: null },
+              data: { ts: 3, thread_id: null },
             },
             [a.user_id]: {
               event_ids: ['$later'],
-              data: { thread_id: '$unknown-root' },
+              data: { ts: 4, thread_id: '$unknown-root' },
             },
           },
         },

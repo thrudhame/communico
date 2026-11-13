@@ -7,6 +7,7 @@ import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { keyView } from '#engine/e2ee-key-view.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { wireSignature } from '#tests/fixtures/e2ee-wire.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -32,7 +33,7 @@ async function signing(user: string) {
   const master = await make('master'), self = await make('self_signing');
   await signJson(self.json, user, master.id, master.pair.privateKey);
   master.json.signatures = {
-    '@hidden:elsewhere': { 'ed25519:private': 'graph' },
+    '@hidden:elsewhere': { 'ed25519:private': wireSignature },
   };
   return { master_key: master.json, self_signing_key: self.json };
 }

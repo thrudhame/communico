@@ -332,7 +332,13 @@ Deno.test('F4: imported remote membership passes inbound EDU checks and server d
       assertEquals(edus.typingOf(s.room.id).userIds, [s.fr.creator]);
       await edus.dispatch(s.fr.server.name, {
         edu_type: 'm.presence',
-        content: { push: [{ user_id: s.fr.creator, presence: 'online' }] },
+        content: {
+          push: [{
+            user_id: s.fr.creator,
+            presence: 'online',
+            last_active_ago: 0,
+          }],
+        },
       });
       assertEquals((await edus.presenceOf(s.fr.creator))?.presence, 'online');
       assertEquals(

@@ -26,6 +26,7 @@ import {
   frozenBatch,
 } from '#engine/server/delivery.ts';
 import { deviceDelta } from '#engine/e2ee-remote.ts';
+import { wireKey } from '#tests/fixtures/e2ee-wire.ts';
 
 const options = (dir: string) => ({
   dir,
@@ -79,7 +80,7 @@ Deno.test('all-room subscriptions seed empty lists, freeze per-peer chains and r
               user_id: bob,
               device_id: 'REMOTE',
               algorithms: [],
-              keys: { 'ed25519:REMOTE': 'origin' },
+              keys: { 'ed25519:REMOTE': wireKey('origin') },
               signatures: {},
             },
           }],
@@ -122,7 +123,7 @@ Deno.test('all-room subscriptions seed empty lists, freeze per-peer chains and r
       user_id: bob,
       device_id: 'REMOTE',
       algorithms: [],
-      keys: { 'ed25519:REMOTE': 'origin' },
+      keys: { 'ed25519:REMOTE': wireKey('origin') },
       signatures: {},
       unsigned: {},
     });

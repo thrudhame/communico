@@ -22,6 +22,7 @@ import { requireRoom, stateAtSeq, versionOf } from './room.ts';
 import { joinedRooms, serversInRoom } from './membership.ts';
 import { writeStateKey } from './write.ts';
 import { discoveryRequest } from '#engine/federation/discovery.ts';
+import { directoryResponse } from '#engine/federation/discovery-response.ts';
 import { publicRoomSummary } from './summary.ts';
 
 export function aliasIsLocal(alias: string) {
@@ -63,21 +64,7 @@ export async function resolveAlias(alias: string) {
             encodeURIComponent(alias),
         },
       );
-      const data = answer as { room_id?: unknown; servers?: unknown } | null;
-      if (
-        data === null || typeof data !== 'object' ||
-        typeof data.room_id !== 'string' || !data.room_id.startsWith('!') ||
-        !Array.isArray(data.servers) || !data.servers.every((server) =>
-          typeof server === 'string' && server.length > 0
-        )
-      ) {
-        throw new MatrixError(
-          502,
-          'M_UNKNOWN',
-          'invalid remote directory response',
-        );
-      }
-      return { room_id: data.room_id, servers: data.servers as string[] };
+      return directoryResponse(answer);
     }
   }
   const roomId = await lookupAlias(theApp().server, alias);

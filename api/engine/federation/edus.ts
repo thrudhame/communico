@@ -30,6 +30,22 @@ import type { Store } from '#engine/store/index.ts';
 import { roomAllows } from './acl.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { arrayOf, objectOf } from '#engine/net/json.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import {
+  eduEnvelope,
+  presenceContent,
+  receiptContent,
+  typingContent,
+} from './peer-json.ts';
+
+function malformedEntry(error: unknown): boolean {
+  if (!(error instanceof UpstreamError) || error.category !== 'protocol') {
+    return false;
+  }
+  console.warn('federation EDU entry ignored:', error);
+  return true;
+}
 
 export type Edu = { edu_type: string; content: Record<string, unknown> };
 
@@ -40,6 +56,14 @@ export type PresencePush = {
   last_active_ago: number;
   currently_active: boolean;
 };
+
+// Queue input reflects nullable stored status. The wire schema has an optional
+// string instead: absence clears status remotely, while an empty string is real.
+type PresenceWire = Omit<PresencePush, 'status_msg'> & { status_msg?: string };
+function presenceWire(push: PresencePush): PresenceWire {
+  const { status_msg, ...fields } = push;
+  return status_msg === null ? fields : { ...fields, status_msg };
+}
 
 export type ReceiptMark = {
   roomId: string;
@@ -203,9 +227,9 @@ export function eduQueues(
     }
     const pq = presenceQ.get(destination);
     if (pq !== undefined && out.length < limit) {
-      const push: PresencePush[] = [];
+      const push: PresenceWire[] = [];
       for (const [k, entry] of pq) {
-        push.push(entry.push);
+        push.push(presenceWire(entry.push));
         pq.delete(k);
       }
       if (pq.size === 0) presenceQ.delete(destination);
@@ -272,16 +296,14 @@ export function eduState(server: Db, self: string, store: Store): EduState {
     });
 
   handlers.set('m.typing', async (origin, content) => {
-    const roomId = typeof content.room_id === 'string' ? content.room_id : null;
-    const userId = typeof content.user_id === 'string' ? content.user_id : null;
-    if (roomId === null || userId === null) return;
+    const { roomId, userId, typing } = typingContent(content);
     if (domainOf(userId) !== origin) return; // users belong to origin
     await admitted(roomId, origin, () =>
       setTyping(
         server,
         roomId,
         userId,
-        content.typing === true,
+        typing,
         REMOTE_TYPING_TTL_MS,
       ));
   });
@@ -289,48 +311,31 @@ export function eduState(server: Db, self: string, store: Store): EduState {
   handlers.set('m.receipt', async (origin, content) => {
     // content: { <roomId>: { 'm.read': { <userId>: { event_ids, data } } } }
     for (const [roomId, perRoom] of Object.entries(content)) {
+      let reads: Record<string, unknown>;
+      try {
+        reads = objectOf(objectOf(perRoom, 'receipt')['m.read'], 'receipt');
+      } catch (error) {
+        if (!malformedEntry(error)) throw error;
+        continue;
+      }
       await admitted(roomId, origin, async () => {
-        if (
-          perRoom === null || typeof perRoom !== 'object' ||
-          Array.isArray(perRoom)
-        ) return;
-        const reads = (perRoom as Record<string, unknown>)['m.read'] as
-          | Record<string, { event_ids?: unknown; data?: unknown }>
-          | undefined;
-        if (
-          reads == null || typeof reads !== 'object' || Array.isArray(reads)
-        ) return;
         for (const [userId, mark] of Object.entries(reads)) {
           if (domainOf(userId) !== origin) continue;
-          if (
-            mark === null || typeof mark !== 'object' || Array.isArray(mark)
-          ) continue;
-          const eventIds = Array.isArray(mark.event_ids) ? mark.event_ids : [];
-          if (eventIds.length === 0 || typeof eventIds[0] !== 'string') {
-            continue;
-          }
-          const data = (mark.data == null ? {} : mark.data) as {
-            ts?: unknown;
-            thread_id?: unknown;
-          };
-          if (typeof data !== 'object' || Array.isArray(data)) continue;
-          if (
-            Object.hasOwn(data, 'thread_id') &&
-            typeof data.thread_id !== 'string'
-          ) continue;
           try {
+            const receipt = receiptContent(mark);
             await setReceipt(
               server,
               roomId,
               userId,
               'm.read',
-              String(eventIds[0]),
+              receipt.eventId,
               {
-                ts: typeof data.ts === 'number' ? data.ts : Date.now(),
-                threadId: data.thread_id as string | null | undefined,
+                ts: receipt.ts,
+                threadId: receipt.threadId,
               },
             );
           } catch (error) {
+            if (malformedEntry(error)) continue;
             // Malformed/capacity-refused entries do not suppress later valid
             // entries. Durable storage failures remain visible and retryable.
             if (
@@ -344,19 +349,16 @@ export function eduState(server: Db, self: string, store: Store): EduState {
   });
 
   handlers.set('m.presence', async (origin, content) => {
-    const push = Array.isArray(content.push) ? content.push : [];
+    const push = arrayOf(content.push, (entry) => entry, 'presence');
     for (const entry of push) {
-      const p = entry as {
-        user_id?: unknown;
-        presence?: unknown;
-        status_msg?: unknown;
-        last_active_ago?: unknown;
-        currently_active?: unknown;
-      };
-      if (typeof p.user_id !== 'string' || typeof p.presence !== 'string') {
+      let p: ReturnType<typeof presenceContent>;
+      try {
+        p = presenceContent(entry);
+      } catch (error) {
+        if (!malformedEntry(error)) throw error;
         continue;
       }
-      if (domainOf(p.user_id) !== origin) continue;
+      if (domainOf(p.userId) !== origin) continue;
       // only for users sharing a room with a local user
       const shares = await server.query(
         `SELECT 1 FROM memberships m1
@@ -364,19 +366,17 @@ export function eduState(server: Db, self: string, store: Store): EduState {
          WHERE m1.user = ? AND m1.membership = 'join'
            AND m2.membership = 'join' AND m2.user LIKE '%:' || ?
          LIMIT 1`,
-        [p.user_id, self],
+        [p.userId, self],
       );
       if (shares.length === 0) continue;
       await setPresence(
         server,
-        p.user_id,
+        p.userId,
         p.presence,
-        typeof p.status_msg === 'string' ? p.status_msg : undefined,
+        p.status,
         {
-          lastActiveAgo: typeof p.last_active_ago === 'number'
-            ? p.last_active_ago
-            : 0,
-          currentlyActive: p.currently_active === true,
+          lastActiveAgo: p.lastActiveAgo,
+          currentlyActive: p.currentlyActive,
         },
       );
     }
@@ -384,17 +384,13 @@ export function eduState(server: Db, self: string, store: Store): EduState {
 
   return {
     dispatch: async (origin, raw) => {
-      const edu = raw as { edu_type?: unknown; content?: unknown };
-      const type = typeof edu.edu_type === 'string' ? edu.edu_type : '';
-      const content = (edu.content == null ? {} : edu.content) as Record<
-        string,
-        unknown
-      >;
+      const { type, content } = eduEnvelope(raw);
       const handler = handlers.get(type);
       if (handler === undefined) return; // unknown types ignored silently
       try {
         await handler(origin, content);
       } catch (error) {
+        if (malformedEntry(error)) return;
         if (error instanceof PermanentEduRefusal) {
           const detail = {
             direction: 'inbound',

@@ -13,6 +13,8 @@ import {
   importPublicKeyFromRaw,
   verifyJson,
 } from '#engine/signing-primitives.js';
+import * as wire from '#engine/e2ee-wire.ts';
+import { protocol } from '#engine/net/upstream-error.ts';
 
 export const signingUsages = [
   'master',
@@ -63,6 +65,34 @@ export function signingKey(
     }
   }
   return { id, public: pub as string, json: canonicalJson(key) };
+}
+export function decodeSigningKey(
+  value: unknown,
+  user: string,
+  usage: SigningUsage,
+  limits: KeyLimits,
+): SigningKey {
+  wire.bounded(value, limits.maxkeybytes);
+  const key = wire.object(value, 'signing key');
+  const entries = Object.entries(wire.object(key.keys, 'keys'));
+  if (
+    key.user_id !== user || !Array.isArray(key.usage) ||
+    key.usage.length !== 1 || key.usage[0] !== usage || entries.length !== 1
+  ) {
+    wire.identity('invalid signing key owner, usage or key count');
+  }
+  const [id, pub] = entries[0];
+  const normalized = b64encodeStd(wire.material(pub, 32));
+  if (id !== 'ed25519:' + normalized) {
+    wire.identity('invalid signing public key ID');
+  }
+  if (key.signatures !== undefined) {
+    wire.signatures(key.signatures);
+  }
+  if (typeof pub !== 'string') {
+    protocol('e2ee-schema', 'invalid signing public key');
+  }
+  return { id, public: normalized, json: wire.canonical(key) };
 }
 export function signingUpload(
   body: unknown,

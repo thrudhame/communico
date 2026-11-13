@@ -40,7 +40,14 @@ function hextetsToBig(h: number[]): bigint {
 }
 
 function parseIpv6(addr: string): bigint | null {
-  if (addr.includes('.')) return null;
+  if (addr.includes('.')) {
+    const last = addr.lastIndexOf(':');
+    if (last < 0) return null;
+    const v4 = parseIpv4(addr.slice(last + 1));
+    if (v4 === null) return null;
+    addr = addr.slice(0, last + 1) + (v4 >> 16n).toString(16) + ':' +
+      (v4 & 0xffffn).toString(16);
+  }
   const sides = addr.split('::');
   if (sides.length > 2) return null;
   if (sides.length === 1) {
@@ -98,8 +105,15 @@ export function parseCidr(raw: string): Cidr | null {
 }
 
 export function cidrContains(cidr: Cidr, ip: string): boolean {
-  const parsed = parseIp(ip);
+  let parsed = parseIp(ip);
   if (parsed === null) return false;
+  // A mapped address reaches the same IPv4 endpoint. Evaluate IPv4 policy
+  // against that identity without losing explicit IPv6-range policy.
+  if (
+    cidr.version === 4 && parsed.version === 6 && parsed.addr >> 32n === 0xffffn
+  ) {
+    parsed = { version: 4, addr: parsed.addr & 0xffffffffn };
+  }
   if (parsed.version !== cidr.version) return false;
   const mask = maskOf(cidr.version, cidr.prefix);
   return (parsed.addr & mask) === cidr.network;

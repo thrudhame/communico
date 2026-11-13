@@ -10,6 +10,7 @@ import {
   type TimestampQuery,
 } from './timestamp.ts';
 import { verify } from './verify.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 // Conservative gap relevance: timestamps may be skewed in either direction,
 // including across stays. An unresolved boundary cannot be excluded by distance.
@@ -102,15 +103,24 @@ export async function searchTimestamp(
   let best = snapshot.local;
   for (const via of snapshot.peers) {
     if (signal.aborted) break;
-    const claim = await fetchOrNull(() =>
-      deps.fetcher.timestampToEvent(room.id, query.ts, query.dir, via, signal)
+    const claim = await fetchOrNull(
+      () =>
+        deps.fetcher.timestampToEvent(
+          room.id,
+          query.ts,
+          query.dir,
+          via,
+          signal,
+        ),
+      signal,
     );
     if (
       claim === null || typeof claim.event_id !== 'string' ||
       !Number.isSafeInteger(claim.origin_server_ts)
     ) continue;
-    const raw = await fetchOrNull(() =>
-      deps.fetcher.event(claim.event_id, via, room.id, signal)
+    const raw = await fetchOrNull(
+      () => deps.fetcher.event(claim.event_id, via, room.id, signal),
+      signal,
     );
     if (raw === null || signal.aborted) continue;
     let verified;
@@ -119,7 +129,8 @@ export async function searchTimestamp(
         roomId: room.id,
         exemptPrevAuthLimits: true,
       });
-    } catch {
+    } catch (error) {
+      if (!recoverableUpstream(error, signal)) throw error;
       continue;
     }
     const ts = verified.pdu.origin_server_ts;

@@ -1,17 +1,22 @@
 // Public cross-signing validation shared by federation query, snapshots and EDUs.
 import { canonicalJson } from '#engine/canonical.ts';
 import { keyView } from '#engine/e2ee-key-view.ts';
-import { signingKey, verifySigningKey } from '#engine/e2ee-signing.ts';
+import { decodeSigningKey, verifySigningKey } from '#engine/e2ee-signing.ts';
 import {
   bounded,
   type Json,
   type KeyLimits,
   limitEntries,
   object,
-} from '#engine/tenant/e2ee.ts';
+} from '#engine/e2ee-wire.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 
 export type PublicSigning = { master_key?: Json; self_signing_key?: Json };
-export class InvalidPublicSigning extends Error {}
+export class InvalidPublicSigning extends UpstreamError {
+  constructor(reason: string) {
+    super('validation', { phase: 'e2ee-signature', reason });
+  }
+}
 export function publicSigning(
   raw: unknown,
   user: string,
@@ -22,7 +27,7 @@ export function publicSigning(
   for (const usage of ['master', 'self_signing'] as const) {
     const field = `${usage}_key` as keyof PublicSigning;
     if (value[field] === undefined) continue;
-    const key = signingKey(value[field], user, usage, limits);
+    const key = decodeSigningKey(value[field], user, usage, limits);
     result[field] = keyView(JSON.parse(key.json), user);
   }
   limitEntries(Object.keys(result).length, limits.maxkeys);
@@ -51,7 +56,7 @@ export async function verifiedPublicSigning(
       result.master_key === undefined || !await verifySigningKey(
         result.self_signing_key,
         user,
-        signingKey(result.master_key, user, 'master', limits),
+        decodeSigningKey(result.master_key, user, 'master', limits),
       )
     ) throw new InvalidPublicSigning('invalid public subordinate signature');
   }
@@ -59,6 +64,7 @@ export async function verifiedPublicSigning(
     limitEntries(Object.keys(result).length, limits.maxkeys);
     bounded(result, limits.maxrequestbytes);
   } catch (e) {
+    if (!(e instanceof UpstreamError)) throw e;
     throw new InvalidPublicSigning(String(e));
   }
   return result;

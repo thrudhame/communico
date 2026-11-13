@@ -8,6 +8,13 @@ import { abortable } from '#engine/net/abort.ts';
 import { config } from '#engine/config.ts';
 import { cidrContains, parseCidr, parseIp } from '#engine/preview/cidr.ts';
 import { gatewayUrl } from './registration.ts';
+import { arrayOf, decodeJson, objectOf, stringOf } from '#engine/net/json.ts';
+import {
+  limit,
+  upstreamDeadline,
+  UpstreamError,
+  UpstreamHttpError,
+} from '#engine/net/upstream-error.ts';
 
 export type GatewayPolicy = {
   blocklist: string[];
@@ -54,16 +61,20 @@ export async function sendGateway(
 ): Promise<string[]> {
   const url = gatewayUrl(rawUrl);
   const body = new TextEncoder().encode(JSON.stringify(payload));
-  if (body.length > 262144) throw new Error('push request exceeds 256 KiB');
-  const deadline = AbortSignal.timeout(policy.timeoutMs);
-  const bounded = AbortSignal.any([signal, deadline]);
+  if (body.length > 262144) limit('push', 'push request exceeds 256 KiB');
+  const bounded = upstreamDeadline(signal, policy.timeoutMs);
   bounded.throwIfAborted();
   const host = url.hostname.replace(/^\[|\]$/g, '');
   const ips = await abortable(
     bounded,
     () => (deps.resolve ?? resolve)(host, bounded),
   );
-  if (!ips.length) throw new Error('gateway has no address');
+  if (!ips.length) {
+    throw new UpstreamError('transport', {
+      phase: 'dns',
+      reason: 'gateway has no address',
+    });
+  }
   const allowed = policy.allowlist.map((s) => parseCidr(s)!);
   const blocked = policy.blocklist.map((s) => parseCidr(s)!);
   for (const ip of ips) {
@@ -72,7 +83,10 @@ export async function sendGateway(
       (!allowed.some((c) => cidrContains(c, ip)) &&
         blocked.some((c) => cidrContains(c, ip)))
     ) {
-      throw new Error('gateway address blocked by push policy');
+      throw new UpstreamError('validation', {
+        phase: 'push-policy',
+        reason: 'gateway address blocked by push policy',
+      });
     }
   }
   const opts: DialOpts = {
@@ -95,14 +109,11 @@ export async function sendGateway(
     () => (deps.dial ?? dialNodeTls)(opts),
   );
   if (response.status !== 200) {
-    throw new Error('gateway returned a non-200 status');
+    throw new UpstreamHttpError(response.status, 'push');
   }
-  const json = JSON.parse(new TextDecoder().decode(response.body));
-  if (
-    !json || typeof json !== 'object' || !Array.isArray(json.rejected) ||
-    !json.rejected.every((key: unknown) => typeof key === 'string')
-  ) {
-    throw new Error('invalid push gateway verdict');
-  }
-  return json.rejected;
+  const json = objectOf(
+    decodeJson(response.body, response.headers.get('content-type')),
+    'push',
+  );
+  return arrayOf(json.rejected, (key) => stringOf(key, 'push'), 'push');
 }

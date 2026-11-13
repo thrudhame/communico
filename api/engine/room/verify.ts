@@ -31,7 +31,15 @@ import { eventIdFor, redact } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { getRulebook, type RoomVersionSpec } from '#engine/rulebook/index.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
-import { contentHashOf } from '#engine/signing-primitives.js';
+import { contentHashOf, matrixBase64 } from '#engine/signing-primitives.js';
+import {
+  recoverableUpstream,
+  UpstreamError,
+} from '#engine/net/upstream-error.ts';
+
+function invalidEvent(reason: string, cause?: unknown): never {
+  throw new UpstreamError('validation', { phase: 'event', reason, cause });
+}
 
 export type Identified = {
   eventId: string;
@@ -76,13 +84,18 @@ export function checkPduFormat(
       )
     )
   ) {
-    throw new Error('M_BAD_EVENT: missing or malformed required fields');
+    invalidEvent('M_BAD_EVENT: missing or malformed required fields');
+  }
+  try {
+    matrixBase64(pdu.hashes.sha256, 32);
+  } catch (cause) {
+    invalidEvent('M_BAD_EVENT: invalid SHA-256 content hash encoding', cause);
   }
   for (const list of [pdu.prev_events, pdu.auth_events]) {
     if (
       !Array.isArray(list) || list.some((id) => typeof id !== 'string')
     ) {
-      throw new Error(
+      invalidEvent(
         'M_BAD_EVENT: prev_events/auth_events must be string arrays',
       );
     }
@@ -91,10 +104,10 @@ export function checkPduFormat(
   const declaredAuth = pdu.auth_events ?? [];
   if (!exemptPrevAuthLimits) {
     if (prevIds.length > 20) {
-      throw new Error('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
+      invalidEvent('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
     }
     if (declaredAuth.length > 10) {
-      throw new Error('M_TOO_MANY_AUTH_EVENTS: v11 allows at most 10');
+      invalidEvent('M_TOO_MANY_AUTH_EVENTS: v11 allows at most 10');
     }
   }
   if (
@@ -105,28 +118,28 @@ export function checkPduFormat(
     pdu.content === null || typeof pdu.content !== 'object' ||
     Array.isArray(pdu.content)
   ) {
-    throw new Error('M_BAD_EVENT: missing or malformed required fields');
+    invalidEvent('M_BAD_EVENT: missing or malformed required fields');
   }
   if (pdu.state_key !== undefined && typeof pdu.state_key !== 'string') {
-    throw new Error('M_BAD_EVENT: state_key must be a string when present');
+    invalidEvent('M_BAD_EVENT: state_key must be a string when present');
   }
   if (!spec.roomIdFromCreateEvent && typeof pdu.room_id !== 'string') {
-    throw new Error('M_BAD_EVENT: room_id required before v12');
+    invalidEvent('M_BAD_EVENT: room_id required before v12');
   }
   // depth bounded only (components/depth_v6.yaml:19-25 — the only MUST)
   const depthBound = spec.depthLimit === 'int53' ? 2 ** 53 - 1 : 2 ** 63 - 1;
   if (pdu.depth > depthBound) {
-    throw new Error('M_BAD_EVENT: depth exceeds the room version limit');
+    invalidEvent('M_BAD_EVENT: depth exceeds the room version limit');
   }
   let canonical: string;
   try {
     canonical = canonicalJson(pdu as unknown as Record<string, unknown>);
   } catch (e) {
-    throw new Error('M_BAD_EVENT: ' + String(e));
+    invalidEvent('M_BAD_EVENT: event cannot be canonicalized', e);
   }
   // whole canonical event ≤ 65536 bytes (CS:2869-2871)
   if (new TextEncoder().encode(canonical).length > 65536) {
-    throw new Error('M_TOO_LARGE: event exceeds the 65536-byte limit');
+    invalidEvent('M_TOO_LARGE: event exceeds the 65536-byte limit');
   }
   // per-key limits: type/state_key ≤ 255 — BYTES for strictByteLimits
   // versions (v11+), codepoints for ≤ v10 (CS:2874-2877)
@@ -137,14 +150,14 @@ export function checkPduFormat(
   let oversized = false;
   if (keyFail) {
     if (spec.strictByteLimits) {
-      throw new Error('M_BAD_EVENT: type/state_key exceed 255 bytes');
+      invalidEvent('M_BAD_EVENT: type/state_key exceed 255 bytes');
     }
     oversized = true;
   }
   // sender/room_id/event_id bounded by their identifier grammars
   for (const id of [pdu.sender, pdu.room_id, pdu.event_id]) {
     if (typeof id === 'string' && new TextEncoder().encode(id).length > 255) {
-      throw new Error('M_BAD_EVENT: identifier exceeds its grammar limit');
+      invalidEvent('M_BAD_EVENT: identifier exceeds its grammar limit');
     }
   }
   return oversized;
@@ -186,10 +199,10 @@ export async function identify(
       roomVersion,
     );
   } catch (e) {
-    throw new Error('M_BAD_EVENT: ' + String(e));
+    invalidEvent('M_BAD_EVENT: event identity cannot be computed', e);
   }
   if (pdu.event_id !== undefined && pdu.event_id !== eventId) {
-    throw new Error('M_BAD_EVENT: event_id does not recompute');
+    invalidEvent('M_BAD_EVENT: event_id does not recompute');
   }
   // the wire form has no event_id (v3+, transported out-of-band) —
   // restore the computed one: the stored PDU carries its derived id
@@ -198,7 +211,7 @@ export async function identify(
     spec.roomIdFromCreateEvent && pdu.type === 'm.room.create' &&
     opts.roomId !== undefined && opts.roomId !== '!' + eventId.slice(1)
   ) {
-    throw new Error(
+    invalidEvent(
       'E_ROOM_ID_MISMATCH: v12 room id is not the create event id',
     );
   }
@@ -232,11 +245,11 @@ export async function verifyJoinForCountersign(
     pdu.type !== 'm.room.member' || pdu.content?.membership !== 'join' ||
     pdu.sender !== pdu.state_key
   ) {
-    throw new Error('M_BAD_EVENT: expected a self join');
+    invalidEvent('M_BAD_EVENT: expected a self join');
   }
   const via = authorizerServer(pdu, roomVersion);
   if (via !== null && via !== self) {
-    throw new Error('M_UNAUTHORIZED: foreign authorising server');
+    invalidEvent('M_UNAUTHORIZED: foreign authorising server');
   }
   return await verifyRequired(pdu, roomVersion, keys, { roomId }, self);
 }
@@ -253,7 +266,7 @@ export function authorizerServer(pdu: Pdu, roomVersion: string): string | null {
   const via = pdu.content?.join_authorised_via_users_server;
   if (via === undefined) return null;
   if (!validEventUserId(via)) {
-    throw new Error('M_BAD_EVENT: malformed authorising user id');
+    invalidEvent('M_BAD_EVENT: malformed authorising user id');
   }
   return domainOf(via);
 }
@@ -279,11 +292,15 @@ async function verifyRequired(
       unknown
     >;
     void _drop;
-    hashOk = (await contentHashOf(noId)) === pdu.hashes?.sha256;
-  } catch (e) {
-    throw new Error(
-      'M_BAD_EVENT: content cannot be canonicalized — ' + String(e),
+    const expected = matrixBase64(await contentHashOf(noId), 32);
+    const received = matrixBase64(pdu.hashes.sha256, 32);
+    // Hashes are binary values. Equivalent permitted padding must not redact
+    // content, and the original signed representation must remain untouched.
+    hashOk = expected.every((byte: number, index: number) =>
+      byte === received[index]
     );
+  } catch (e) {
+    invalidEvent('M_BAD_EVENT: content cannot be canonicalized', e);
   }
   if (!hashOk) {
     // We were given a redacted version of the event: use the redacted
@@ -326,7 +343,8 @@ async function verifyRequired(
         ) {
           return true;
         }
-      } catch {
+      } catch (error) {
+        if (!recoverableUpstream(error)) throw error;
         // key unobtainable under this id - try the next
       }
     }
@@ -338,14 +356,14 @@ async function verifyRequired(
     sigOk = await verifiedBy(fallback.resident);
   }
   if (!sigOk) {
-    throw new Error('M_UNAUTHORIZED: PDU signature missing or invalid');
+    invalidEvent('M_UNAUTHORIZED: PDU signature missing or invalid');
   }
   const authorizer = authorizerServer(pdu, roomVersion);
   if (
     authorizer !== null && authorizer !== deferredLocalAuthorizer &&
     !(await verifiedBy(authorizer))
   ) {
-    throw new Error(
+    invalidEvent(
       'M_UNAUTHORIZED: authorising server signature missing or invalid',
     );
   }

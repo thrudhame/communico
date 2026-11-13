@@ -7,6 +7,10 @@ import { createMedia } from '#engine/tenant/media.ts';
 import { imageDimensions } from './dimensions.ts';
 import { guardedGet } from './guard.ts';
 import { openGraphFor } from './og.ts';
+import {
+  recoverableUpstream,
+  UpstreamError,
+} from '#engine/net/upstream-error.ts';
 
 export { cidrContains, parseCidr, parseIp } from './cidr.ts';
 export { imageDimensions } from './dimensions.ts';
@@ -37,12 +41,34 @@ export async function previewUrl(
       'URL previews are disabled on this server',
     );
   }
-  const page = await guardedGet(url, {
-    maxBytes: cfg.maxbytes,
-    blocklist: cfg.blocklist,
-    allowlist: cfg.allowlist,
-    acceptLanguage,
-  });
+  // Client input errors are public errors, separate from remote redirect grammar.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid url');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'url scheme must be http or https',
+    );
+  }
+  let page;
+  try {
+    page = await guardedGet(url, {
+      maxBytes: cfg.maxbytes,
+      blocklist: cfg.blocklist,
+      allowlist: cfg.allowlist,
+      acceptLanguage,
+    });
+  } catch (error) {
+    if (
+      error instanceof UpstreamError && error.context.phase === 'preview-policy'
+    ) throw new MatrixError(403, 'M_FORBIDDEN', error.context.reason);
+    throw error;
+  }
   const mime = page.contentType.split(';')[0].trim().toLowerCase();
   const og: Record<string, string | number> = openGraphFor(
     page.body,
@@ -68,7 +94,8 @@ export async function previewUrl(
       allowlist: cfg.allowlist,
       acceptLanguage,
     });
-  } catch {
+  } catch (error) {
+    if (!recoverableUpstream(error)) throw error;
     delete og['og:image'];
     return og;
   }

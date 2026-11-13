@@ -6,7 +6,8 @@ import {
   type Json,
   type KeyLimits,
   limitEntries,
-} from '#engine/tenant/e2ee.ts';
+} from '#engine/e2ee-wire.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import {
   nextDeviceSeq,
   publishDeviceChange,
@@ -218,7 +219,10 @@ export async function acceptDeviceDelta(
         );
         s.anchor = d.stream;
         s.seen = [...s.seen, d.stream].slice(-limits.maxkeys);
-      } catch {
+      } catch (error) {
+        if (!(error instanceof UpstreamError && error.context.resourceLimit)) {
+          throw error;
+        }
         s.stale = true;
       }
     } else s.stale = true;
@@ -231,7 +235,10 @@ export async function acceptDeviceDelta(
       try {
         limitEntries(s.pending.length, limits.maxkeys);
         bounded(s.pending, limits.maxrequestbytes);
-      } catch {
+      } catch (error) {
+        if (!(error instanceof UpstreamError && error.context.resourceLimit)) {
+          throw error;
+        }
         // Losing cache hints is safe only with a durable invalidation. Revision
         // still rejects an older in-flight snapshot which cannot replay them.
         s.pending = [];

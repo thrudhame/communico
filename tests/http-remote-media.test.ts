@@ -12,6 +12,113 @@ import { addBlock, removeBlock } from '#engine/federation/peers.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { MediaCache } from '#engine/media/cache.ts';
 
+Deno.test('HTTP remote media: recorded stock envelopes publish exact ciphertext, never partial data', async (t) => {
+  const previous = config();
+  const root = await Deno.makeTempDir({ prefix: 'recorded-media-' });
+  setConfigForTests({
+    media: { root },
+    federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+  });
+  resetCaCertsForTests();
+  const http = await startHttp();
+  const fixtures = new Map<
+    string,
+    { body: Uint8Array; type: string; hash: string; filename?: string }
+  >();
+  for (const peer of ['synapse', 'tuwunel']) {
+    const capture = JSON.parse(
+      await Deno.readTextFile(`tests/fixtures/federation-media/${peer}.json`),
+    );
+    fixtures.set(peer, {
+      body: await Deno.readFile(`tests/fixtures/federation-media/${peer}.bin`),
+      type: capture.headers['Content-Type'],
+      hash: capture.payload_sha256,
+    });
+  }
+  for (
+    const [id, disposition, filename] of [
+      ['language', "attachment; filename*=UTF-8'en'english.txt", 'english.txt'],
+      ['spaces', 'attachment; filename=" a.txt "', ' a.txt '],
+    ]
+  ) {
+    fixtures.set(id, {
+      body: new TextEncoder().encode(
+        '--name\r\nContent-Type: application/json\r\n\r\n{}\r\n--name\r\nContent-Disposition: ' +
+          disposition + '\r\n\r\nabc\r\n--name--',
+      ),
+      type: 'multipart/mixed; boundary=name',
+      hash: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+      filename,
+    });
+  }
+  const fake = await startFakeServer({
+    ourKeyDoc: () =>
+      Promise.resolve({
+        server_name: serverName(),
+        verify_keys: {
+          [http.app.tenant.keyId]: { key: http.app.tenant.publicB64 },
+        },
+      }),
+    handlers: (req) => {
+      const fixture = fixtures.get(req.url.pathname.split('/').at(-1)!);
+      if (!fixture) return null;
+      assert(req.verified);
+      return new Response(fixture.body.slice(), {
+        headers: { 'Content-Type': fixture.type },
+      });
+    },
+  });
+  try {
+    const user = await http.registerTestUser('stock-media', 'pw');
+    for (const [peer, fixture] of fixtures) {
+      await t.step(peer, async () => {
+        const response = await http.matrix(
+          new Request(
+            `http://x/_matrix/client/v1/media/download/${fake.name}/${peer}`,
+            { headers: { Authorization: 'Bearer ' + user.access_token } },
+          ),
+        );
+        assertEquals(response.status, 200);
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        assertEquals(bytes.length, fixture.filename === undefined ? 51 : 3);
+        if (fixture.filename !== undefined) {
+          assertEquals(
+            response.headers.get('content-disposition'),
+            `attachment; filename="${fixture.filename}"`,
+          );
+        }
+        const digest = new Uint8Array(
+          await crypto.subtle.digest('SHA-256', bytes),
+        );
+        assertEquals(
+          Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join(''),
+          fixture.hash,
+        );
+      });
+    }
+    const rows = await listCachedMedia(http.app.server);
+    assertEquals(rows.length, 4);
+    assertEquals(rows.map((row) => row.size).sort((a, b) => a - b), [
+      3,
+      3,
+      51,
+      51,
+    ]);
+    assertEquals(
+      [...Deno.readDirSync(root + '/cache')].some((e) =>
+        e.name.endsWith('.part')
+      ),
+      false,
+    );
+  } finally {
+    await fake.close();
+    await http.close();
+    setConfigForTests(previous);
+    resetCaCertsForTests();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 Deno.test('HTTP remote media: signed multipart demand/cache/dedup, filenames, policy, strict fallback and legacy isolation', async () => {
   const previous = config();
   const root = await Deno.makeTempDir({ prefix: 'http-remote-media-' });
@@ -160,7 +267,13 @@ Deno.test('HTTP remote media: signed multipart demand/cache/dedup, filenames, po
       mode = next;
       const response = await get(next);
       assert(response.status >= 400);
-      await response.arrayBuffer();
+      if (next === 'broken') {
+        assertEquals(response.status, 502);
+        assertEquals(await response.json(), {
+          errcode: 'M_UNKNOWN',
+          error: 'Upstream protocol failure',
+        });
+      } else await response.arrayBuffer();
       assertEquals(legacy, 0, next + ' must not downgrade');
     }
     mode = 'unknown';

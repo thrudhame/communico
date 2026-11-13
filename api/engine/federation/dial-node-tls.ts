@@ -14,7 +14,8 @@
 import tls from 'node:tls';
 import { createHash, X509Certificate } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { MatrixError } from '#engine/matrix-error.ts';
+import { abortable } from '#engine/net/abort.ts';
+import { networkOperation, UpstreamError } from '#engine/net/upstream-error.ts';
 import {
   type Http1Response,
   http1Wire,
@@ -25,6 +26,9 @@ import {
 export type DialOpts = {
   connectIp: string;
   port: number;
+  alternatives?:
+    | Iterable<{ connectIp: string; port: number }>
+    | AsyncIterable<{ connectIp: string; port: number }>;
   sni: string | null;
   hostHeader: string;
   trust:
@@ -134,22 +138,15 @@ function connectWithDeadline(opts: {
   sni: string | null;
   connectMs: number;
   signal: AbortSignal;
-  trust: DialOpts['trust'];
+  trust: { rejectUnauthorized: boolean; ca?: string[] };
 }): Promise<tls.TLSSocket> {
   opts.signal.throwIfAborted();
   return new Promise((resolve, reject) => {
-    // Explicit CA roots extend normal bundled/system trust; they never replace it.
-    const trust = opts.trust.kind === 'ca'
-      ? {
-        rejectUnauthorized: true,
-        ca: caRoots(opts.trust.caCerts),
-      }
-      : { rejectUnauthorized: false }; // Identity is checked below against the roster pin/key.
     const sock = tls.connect({
       host: opts.connectIp,
       port: opts.port,
       servername: opts.sni !== null ? opts.sni : undefined,
-      ...trust,
+      ...opts.trust,
     });
     const cleanup = () => {
       clearTimeout(timer);
@@ -164,7 +161,12 @@ function connectWithDeadline(opts: {
     const timer = setTimeout(() => {
       cleanup();
       sock.destroy();
-      reject(new Error(`connect timeout after ${opts.connectMs}ms`));
+      reject(
+        new UpstreamError('transport', {
+          phase: 'connect',
+          reason: 'upstream connect timeout',
+        }),
+      );
     }, opts.connectMs);
     sock.once('secureConnect', () => {
       cleanup();
@@ -183,13 +185,75 @@ function spkiSha256(raw: Uint8Array): string {
   return createHash('sha256').update(spki).digest('hex');
 }
 
+function verifyIdentity(sock: tls.TLSSocket, trust: DialOpts['trust']): void {
+  if (trust.kind === 'ca') return; // Chain and name were verified in the handshake.
+  const cert = sock.getPeerCertificate();
+  const raw = cert !== null && typeof cert === 'object'
+    ? (cert as { raw?: Buffer }).raw
+    : undefined;
+  if (raw === undefined || raw.length === 0) {
+    throw new UpstreamError('validation', {
+      phase: 'tls-identity',
+      reason: 'peer presented no certificate',
+    });
+  }
+  if (trust.kind === 'pinned') {
+    if (spkiSha256(new Uint8Array(raw)) !== trust.spkiSha256) {
+      throw new UpstreamError('validation', {
+        phase: 'tls-identity',
+        reason: 'peer certificate does not match the roster pin',
+      });
+    }
+    return;
+  }
+  const x = new X509Certificate(raw);
+  const spki = x.publicKey.export({ type: 'spki', format: 'der' });
+  const prefix = new Uint8Array([
+    0x30,
+    0x2a,
+    0x30,
+    0x05,
+    0x06,
+    0x03,
+    0x2b,
+    0x65,
+    0x70,
+    0x03,
+    0x21,
+    0x00,
+  ]);
+  const ed25519 = x.publicKey.asymmetricKeyType === 'ed25519' &&
+    spki.length === 44 && prefix.every((b, i) => spki[i] === b);
+  const rawKey = new Uint8Array(spki.subarray(prefix.length));
+  const matches = ed25519 && rawKey.length === trust.pubkey.length &&
+    rawKey.every((b, i) => b === trust.pubkey[i]);
+  if (!matches) {
+    throw new UpstreamError('validation', {
+      phase: 'tls-identity',
+      reason: 'peer certificate does not match the key-is-name key',
+    });
+  }
+}
+
 export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
   opts.signal?.throwIfAborted();
-  const deadline = Date.now() + opts.timeoutMs;
+  // Local trust preparation is outside networkOperation's peer classification.
+  // Explicit CA roots extend bundled/system trust; pin/keyname identity is
+  // checked separately before any HTTP bytes leave the verified connection.
+  const trust = opts.trust.kind === 'ca'
+    ? { rejectUnauthorized: true, ca: caRoots(opts.trust.caCerts) }
+    : { rejectUnauthorized: false };
   let conn: NodeTlsConn | null = null;
   const ac = new AbortController();
   const cancel = () => {
-    ac.abort();
+    ac.abort(
+      opts.signal?.aborted
+        ? opts.signal.reason
+        : new UpstreamError('transport', {
+          phase: 'deadline',
+          reason: 'upstream timeout',
+        }),
+    );
     try {
       if (conn !== null) conn.close();
     } catch { /* already closed */ }
@@ -200,62 +264,64 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
     opts.timeoutMs,
   );
   try {
-    const sock = await connectWithDeadline({
-      connectIp: opts.connectIp,
-      port: opts.port,
-      sni: opts.sni,
-      connectMs: opts.connectMs,
-      signal: ac.signal,
-      trust: opts.trust,
-    });
+    let sock: tls.TLSSocket | null = null;
+    let failure: unknown;
+    const addresses = async function* () {
+      yield { connectIp: opts.connectIp, port: opts.port };
+      if (opts.alternatives !== undefined) {
+        const rest = (async function* () {
+          yield* opts.alternatives!;
+        })();
+        for (;;) {
+          const next = await abortable(ac.signal, () => rest.next());
+          if (next.done) break;
+          yield next.value;
+        }
+      }
+    };
+    // Alternate addresses are eligible ONLY until a verified connection is
+    // selected. HTTP writes/reads, decoding and sinks are deliberately outside
+    // this loop: an uncertain or consuming request can never be replayed here.
+    for await (const address of addresses()) {
+      ac.signal.throwIfAborted();
+      try {
+        sock = await networkOperation(
+          'tls',
+          ac.signal,
+          () =>
+            connectWithDeadline({
+              ...address,
+              sni: opts.sni,
+              connectMs: opts.connectMs,
+              signal: ac.signal,
+              trust,
+            }),
+        );
+        verifyIdentity(sock, opts.trust);
+        break;
+      } catch (error) {
+        sock?.destroy();
+        sock = null;
+        ac.signal.throwIfAborted();
+        if (
+          !(error instanceof UpstreamError) ||
+          !['transport', 'validation'].includes(error.category)
+        ) throw error;
+        failure = error;
+      }
+    }
+    if (sock === null) throw failure;
     conn = new NodeTlsConn(sock);
     opts.signal?.throwIfAborted();
     ac.signal.throwIfAborted();
-    // CA mode already verified chain and hostname during the handshake. Only
-    // key-based trust needs certificate bytes, and only the leaf: reconstructing
-    // the legacy chain here adds synchronous work to every recovery request.
-    // Identity checks still finish BEFORE any request bytes are written.
-    if (opts.trust.kind !== 'ca') {
-      const cert = sock.getPeerCertificate();
-      const raw = cert !== null && typeof cert === 'object'
-        ? (cert as { raw?: Buffer }).raw
-        : undefined;
-      if (raw === undefined || raw.length === 0) {
-        conn.close();
-        throw new MatrixError(
-          502,
-          'M_UNKNOWN',
-          'peer presented no certificate',
-        );
-      }
-      if (opts.trust.kind === 'pinned') {
-        const got = spkiSha256(new Uint8Array(raw));
-        if (got !== opts.trust.spkiSha256) {
-          conn.close();
-          throw new MatrixError(
-            502,
-            'M_UNKNOWN',
-            'peer certificate does not match the roster pin',
-          );
-        }
-      } else {
-        const x = new X509Certificate(raw);
-        const spki = x.publicKey.export({ type: 'spki', format: 'der' });
-        const rawKey = new Uint8Array(spki.subarray(12));
-        const expected = opts.trust.pubkey;
-        const matches = rawKey.length === expected.length &&
-          rawKey.every((b, i) => b === expected[i]);
-        if (!matches) {
-          conn.close();
-          throw new MatrixError(
-            502,
-            'M_UNKNOWN',
-            'peer certificate does not match the key-is-name key',
-          );
-        }
-      }
-    }
-    return await http1Wire(conn as WireConn, {
+    const connected = conn;
+    const network: WireConn = {
+      read: (p) => networkOperation('read', ac.signal, () => connected.read(p)),
+      write: (p) =>
+        networkOperation('write', ac.signal, () => connected.write(p)),
+      close: () => connected.close(),
+    };
+    return await http1Wire(network, {
       method: opts.method,
       path: opts.path,
       hostHeader: opts.hostHeader,
@@ -265,13 +331,6 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
       sink: opts.sink,
       signal: ac.signal,
     });
-  } catch (e) {
-    opts.signal?.throwIfAborted();
-    if (e instanceof MatrixError) throw e;
-    if (Date.now() >= deadline) {
-      throw new MatrixError(502, 'M_UNKNOWN', 'upstream timeout');
-    }
-    throw new MatrixError(502, 'M_UNKNOWN', 'upstream connection failed');
   } finally {
     opts.signal?.removeEventListener('abort', cancel);
     clearTimeout(totalTimer);

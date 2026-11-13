@@ -2,9 +2,20 @@
 // format guards, recomputed ids, unsigned strip, content-hash redaction,
 // the sender-domain signature through the resolver, key validity per
 // room version, and the lenient/strict size limits.
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import type { Pdu } from '#engine/pdu.ts';
 import { identify, verify } from '#engine/room/verify.ts';
+import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
+import { fakeFetcher } from './fixtures/remote.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { validatePrejoin } from '#engine/federation/prejoin.ts';
+import { hashBytesOf, signWithHash } from '#tests/fixtures/hash-event.ts';
+import { signJson, verifyJson } from '#engine/signing-primitives.js';
 import {
   fakeKeyResolver,
   makeRemoteServer,
@@ -12,6 +23,115 @@ import {
 } from './fixtures/remote.ts';
 
 const ROOM = '!verify:test';
+
+Deno.test('key fault ownership: prejoin create verification never filters a local key failure', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const create = await remoteEvent(ROOM, server, '11', {
+    type: 'm.room.create',
+    sender: '@rudy:remote.test',
+    state_key: '',
+    content: { room_version: '11' },
+    prev_events: [],
+    auth_events: [],
+  });
+  const fault = new Error('prejoin key store fault');
+  assertStrictEquals(
+    await assertRejects(() =>
+      validatePrejoin([create], ROOM, '11', {
+        verifyEventSignature: () => {
+          throw fault;
+        },
+      })
+    ),
+    fault,
+  );
+});
+
+Deno.test('wire base64: signatures accept Matrix padding but reject URL-safe and nonzero pad bits', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const doc = { value: 'wire-base64', signatures: {} } as Record<
+    string,
+    unknown
+  >;
+  await signJson(doc, server.name, server.keyId, server.kp.privateKey);
+  const signatures = doc.signatures as Record<string, Record<string, string>>;
+  const original = signatures[server.name][server.keyId];
+  assert(await verifyJson(doc, server.name, server.keyId, server.kp.publicKey));
+  signatures[server.name][server.keyId] = original + '==';
+  assert(await verifyJson(doc, server.name, server.keyId, server.kp.publicKey));
+  const alphabet =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  signatures[server.name][server.keyId] = original.slice(0, -1) +
+    alphabet[alphabet.indexOf(original.at(-1)!) + 1];
+  assertEquals(
+    await verifyJson(doc, server.name, server.keyId, server.kp.publicKey),
+    false,
+  );
+  if (/[+/]/.test(original)) {
+    signatures[server.name][server.keyId] = original.replaceAll('+', '-')
+      .replaceAll('/', '_');
+    assertEquals(
+      await verifyJson(doc, server.name, server.keyId, server.kp.publicKey),
+      false,
+    );
+  }
+});
+
+Deno.test('key fault ownership: verification and boundary retrieval preserve local resolver faults', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const event = await msg(server, 'local-fault');
+  const fault = new Error('local key store fault');
+  const keys = {
+    verifyEventSignature: () => {
+      throw fault;
+    },
+  };
+  assertStrictEquals(
+    await assertRejects(() => verify(structuredClone(event), '11', keys)),
+    fault,
+  );
+  const { fetcher } = fakeFetcher({
+    state: new Map([[event.event_id!, { state: [event], authChain: [] }]]),
+    event: new Map([[event.event_id!, event]]),
+  });
+  assertStrictEquals(
+    await assertRejects(() =>
+      fetchBoundaryEvents([event.event_id!], 1, {
+        roomId: ROOM,
+        at: event.event_id!,
+        via: server.name,
+        version: '11',
+        keys,
+        fetcher,
+        active: () => true,
+        concurrency: 1,
+        read: (op) => op(),
+      })
+    ),
+    fault,
+  );
+  // Peer acquisition failure remains unavailable, never admitted evidence.
+  const failedKeys = {
+    verifyEventSignature: () => {
+      throw new UpstreamError('transport', {
+        phase: 'key-doc',
+        reason: 'unreachable',
+      });
+    },
+  };
+  const pack = await fetchBoundaryEvents([event.event_id!], 1, {
+    roomId: ROOM,
+    at: event.event_id!,
+    via: server.name,
+    version: '11',
+    keys: failedKeys,
+    fetcher,
+    active: () => true,
+    concurrency: 1,
+    read: (op) => op(),
+  });
+  assertEquals(pack?.size, 0);
+});
 
 Deno.test('verify: required edge arrays and object content share the format boundary for every supported version', async () => {
   const server = await makeRemoteServer('remote.test');
@@ -140,6 +260,51 @@ Deno.test('verify: the event id is recomputed, never trusted; uncanonicalizable 
   delete (wire as unknown as Record<string, unknown>).event_id;
   const verified = await verify(wire, '11', keys, { roomId: ROOM });
   assert(verified.eventId.startsWith('$'));
+});
+
+Deno.test('hash wire: padded content hashes compare bytes and retain signed content for every supported version', async () => {
+  const server = await makeRemoteServer('remote.test');
+  const keys = fakeKeyResolver(server);
+  for (const version of ['3', '4', '5', '6', '7', '8', '9', '10', '11', '12']) {
+    const base = await msg(server, 'intact padded body', version);
+    const hash = await hashBytesOf(base);
+    assertEquals(hash.length, 44);
+    const event = await signWithHash(base, server, version, hash);
+    const signatures = structuredClone(event.signatures);
+    const verified = await verify(event, version, keys, { roomId: ROOM });
+    assertEquals(verified.pdu.content.body, 'intact padded body');
+    assertEquals(
+      verified.pdu.hashes.sha256,
+      hash,
+      'must not normalize the signed representation',
+    );
+    assertEquals(verified.pdu.signatures, signatures);
+  }
+});
+
+Deno.test('hash wire: malformed alphabet, padding, pad bits and digest length are validation failures', async (t) => {
+  const server = await makeRemoteServer('remote.test');
+  const base = await msg(server, 'not published');
+  for (
+    const hash of [
+      '_'.repeat(43),
+      'A'.repeat(43) + '==',
+      'A'.repeat(42) + 'B',
+      'AA',
+      '',
+      'A'.repeat(44),
+      'A'.repeat(43) + ' ',
+    ]
+  ) {
+    await t.step('hash:' + JSON.stringify(hash), async () => {
+      const event = await signWithHash(base, server, '11', hash);
+      const error = await assertRejects(
+        () => verify(event, '11', fakeKeyResolver(server)),
+        UpstreamError,
+      );
+      assertEquals(error.category, 'validation');
+    });
+  }
 });
 
 Deno.test('verify: a content-hash mismatch stores the redacted copy we calculated', async () => {

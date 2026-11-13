@@ -24,6 +24,7 @@ import {
 import type { Pdu } from '#engine/pdu.ts';
 import { gatewayPayload } from './payload.ts';
 import { gatewayPolicy, sendGateway } from './transport.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 type Json = Record<string, unknown>;
 export type PushSender = { tick(): Promise<void>; stop(): Promise<void> };
@@ -171,7 +172,8 @@ export async function startPushSender(deps: Deps): Promise<PushSender> {
         payload,
         abort.signal,
       );
-    } catch {
+    } catch (error) {
+      if (!recoverableUpstream(error, abort.signal)) throw error;
       if (!abort.signal.aborted) {
         const at = now(), jitter = random();
         await server.tx((tx) => retryPushWork(tx, target, work, at, jitter));

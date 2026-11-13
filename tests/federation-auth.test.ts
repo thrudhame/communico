@@ -7,7 +7,8 @@
 // the open-mode knock is recorded only after verification, the contact
 // hook fires. (doltgres tests/federation-auth.test.ts, restored at the
 // function — HTTP routing is stage 5.)
-import { assertEquals } from '@std/assert';
+import { assertEquals, assertRejects, assertStrictEquals } from '@std/assert';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { authenticateRequest } from '#engine/federation/auth.ts';
@@ -25,6 +26,31 @@ import { directOnly, makeDoc, makeServer } from './federation/doc-helper.ts';
 
 const OURS = 'our.test';
 const TARGET = '/_matrix/federation/v1/send/txn-1?x=1';
+
+Deno.test('key fault ownership: request authentication preserves local key lookup faults', async () => {
+  await withStore(async (store) => {
+    const origin = await makeServer('local-origin.test');
+    const fault = new Error('local signing cache fault');
+    const server = await store.server();
+    const deps = directOnly(await makeDoc(origin));
+    deps.directGet = () => {
+      throw fault;
+    };
+    const keys = keyStore(server, { deps });
+    const authorization = await headerFor(origin, 'PUT', TARGET);
+    assertStrictEquals(
+      await assertRejects(() =>
+        authenticateRequest({ server, keys }, OURS, {
+          method: 'PUT',
+          uri: TARGET,
+          authorization,
+          body: new Uint8Array(),
+        })
+      ),
+      fault,
+    );
+  });
+});
 
 type Origin = Awaited<ReturnType<typeof makeServer>>;
 
@@ -113,7 +139,13 @@ async function attempt(
   const keys = keyStore(server, {
     deps: opts.unreachable === true
       ? {
-        directGet: () => Promise.reject(new Error('unreachable')),
+        directGet: () =>
+          Promise.reject(
+            new UpstreamError('transport', {
+              phase: 'test',
+              reason: 'unreachable',
+            }),
+          ),
         witnessQuery: () => Promise.reject(new Error('no witnesses')),
         listWitnesses: () => Promise.resolve([]),
       }

@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { wireKey } from '#tests/fixtures/e2ee-wire.ts';
 import { httpSuite, startHttp } from '#tests/http-app.ts';
 import { fedCaller, remoteServer } from '#tests/http-federation.ts';
 import { theApp } from '#engine/app.ts';
@@ -6,9 +7,101 @@ import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { startFakeServer } from '#tests/federation/fake-server.ts';
-import { cachedDeviceKeys } from '#engine/server/remote-devices.ts';
+import {
+  acceptDeviceDelta,
+  cachedDeviceKeys,
+} from '#engine/server/remote-devices.ts';
+import { deviceDelta } from '#engine/e2ee-remote.ts';
 
 const suite = httpSuite('HTTP causal device cache');
+
+Deno.test('device recovery: a local revision fence schedules retry without charging the peer', async () => {
+  const previous = config().federation;
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  const http = await startHttp();
+  let user = '', calls = 0;
+  const fake = await startFakeServer({
+    ourKeyDoc: () =>
+      Promise.resolve({
+        server_name: http.app.tenant.serverName,
+        verify_keys: {
+          [http.app.tenant.keyId]: { key: http.app.tenant.publicB64 },
+        },
+      }),
+    handlers: (req) => {
+      if (!req.path.includes('/user/devices/')) return null;
+      return (async () => {
+        calls++;
+        if (calls === 1) {
+          await acceptDeviceDelta(
+            http.app.server,
+            deviceDelta({
+              user_id: user,
+              device_id: 'D',
+              stream_id: 20,
+              prev_id: [],
+            }, config().e2ee),
+            config().e2ee,
+          );
+        }
+        return Response.json({
+          user_id: user,
+          stream_id: calls === 1 ? 1 : 20,
+          devices: [],
+        });
+      })();
+    },
+  });
+  user = '@remote:' + fake.name;
+  try {
+    const a = await http.registerTestUser('fenced-recovery', 'pw');
+    await http.app.server.tx((tx) =>
+      reconcileDeviceRoom(
+        tx,
+        '!fenced:local',
+        [a.user_id, user],
+        false,
+        null,
+        1,
+        [http.app.tenant.serverName],
+      )
+    );
+    const before = Date.now();
+    await http.app.deviceLists.recover(user);
+    const [row] = await http.app.server.query(
+      'SELECT retry_at,failures,stale FROM remote_device_users WHERE user_id=?',
+      [user],
+    );
+    assert(
+      Number(row.retry_at) > before,
+      'fenced recovery must schedule a future local retry',
+    );
+    assertEquals(row.failures, 0);
+    assertEquals(row.stale, 1);
+    http.app.deviceLists.start();
+    const until = Date.now() + 5000;
+    while (
+      await cachedDeviceKeys(http.app.server, user, [], a.user_id) === null
+    ) {
+      assert(Date.now() < until, 'fenced recovery did not eventually install');
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assertEquals(calls, 2);
+    assertEquals(
+      await http.app.server.query(
+        'SELECT failures,retry_at FROM remote_device_users WHERE user_id=?',
+        [user],
+      ),
+      [{ failures: 0, retry_at: 0 }],
+    );
+  } finally {
+    await http.close();
+    await fake.close();
+    setConfigForTests({ federation: previous });
+    resetCaCertsForTests();
+  }
+});
 
 Deno.test('device recovery: cancellation is subscriber-owned and does not back off the origin', async () => {
   const previous = config().federation;
@@ -143,7 +236,7 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
     user_id: '',
     device_id: 'D',
     algorithms: [],
-    keys: { 'ed25519:D': 'origin-key' },
+    keys: { 'ed25519:D': wireKey('origin-key') },
     signatures: {},
   };
   const fake = await startFakeServer({
@@ -175,7 +268,14 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
         claims++;
         return Response.json({
           one_time_keys: {
-            [user]: { D: { 'signed_curve25519:one': { key: 'once' } } },
+            [user]: {
+              D: {
+                'signed_curve25519:one': {
+                  key: wireKey('once'),
+                  signatures: {},
+                },
+              },
+            },
           },
         });
       }
@@ -299,7 +399,7 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
     );
     assertEquals(claim.status, 200);
     assertEquals((await claim.json()).one_time_keys[user].D, {
-      'signed_curve25519:one': { key: 'once' },
+      'signed_curve25519:one': { key: wireKey('once'), signatures: {} },
     });
     assertEquals(snapshots, 4);
     assertEquals(claims, 1, 'consuming claim remains one-shot');
@@ -324,7 +424,7 @@ suite.test('single-flight signed snapshot reaches C-S query; malformed and overs
     user_id: user,
     device_id: id,
     algorithms: [],
-    keys: { ['ed25519:' + id]: 'origin-' + id },
+    keys: { ['ed25519:' + id]: wireKey('origin-' + id) },
     signatures: {},
   });
   const fake = await startFakeServer({
@@ -476,7 +576,7 @@ suite.test('single-flight signed snapshot reaches C-S query; malformed and overs
     await recovery;
     const cached = await query();
     assertEquals(Object.keys(cached).sort(), ['D', 'NEW']);
-    assertEquals(cached.NEW.keys, { 'ed25519:NEW': 'origin-NEW' });
+    assertEquals(cached.NEW.keys, { 'ed25519:NEW': wireKey('origin-NEW') });
     assertEquals(
       queries,
       1,

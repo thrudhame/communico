@@ -4,15 +4,22 @@
 // sequence, soft-fail, the relaxed remote checks, pending/dropped
 // terminals, redelivery receipts, no delivery intent for remote events,
 // fetch-phase staleness revalidation, and batch rollback (G11).
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { type Room, roomSchema } from '#engine/room/index.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
+import { backfill } from '#engine/room/history.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { genesis } from './fixtures/genesis.ts';
 import { authAt } from './fixtures/auth.ts';
+import { hashBytesOf, signWithHash } from '#tests/fixtures/hash-event.ts';
 import {
   fakeFetcher,
   fakeKeyResolver,
@@ -139,6 +146,46 @@ async function frontierOf(room: Room): Promise<string[]> {
   });
 }
 
+Deno.test('key fault ownership: live and historical consumers propagate local faults without publication', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store, { roomId: '!keyfault:test' });
+    const msg = await remoteMsg(s, 'unpublished', [s.joinId], {});
+    const before = await frontierOf(s.room);
+    const fault = new Error('local resolver database fault');
+    const keys = {
+      verifyEventSignature: () => {
+        throw fault;
+      },
+    };
+    assertStrictEquals(
+      await assertRejects(() =>
+        ingestRemote(s.room, [structuredClone(msg)], s.server.name, {
+          ...s.deps,
+          keys,
+        })
+      ),
+      fault,
+    );
+    assertStrictEquals(
+      await assertRejects(() =>
+        backfill(s.room, {
+          from: [s.joinId],
+          limit: 10,
+          via: s.server.name,
+          anchor: structuredClone(msg),
+        }, { ...s.deps, keys })
+      ),
+      fault,
+    );
+    assertEquals(await frontierOf(s.room), before);
+    assertEquals(await s.room.tx((tx) => tx.events.get(msg.event_id!)), null);
+    assertEquals(
+      await s.room.tx((tx) => tx.segments.positionOf(msg.event_id!)),
+      null,
+    );
+  });
+});
+
 async function currentKey(
   room: Room,
   type: string,
@@ -177,6 +224,53 @@ Deno.test('remote: a verified event lands — standing, refs, frontier, publicat
       assertEquals(deliveries.length, 0);
     });
     assertEquals(await frontierOf(s.room), [eventId]);
+  });
+});
+
+Deno.test('hash wire: native ingest stores padded-hash content and the original signed representation', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store, { roomId: '!padded-hash:test' });
+    const base = await remoteMsg(s, 'visible padded message', [s.joinId], {
+      ts: 200,
+    });
+    const hash = await hashBytesOf(base);
+    const message = await signWithHash(base, s.server, '11', hash);
+    const signatures = structuredClone(message.signatures);
+    const outcomes = await ingestRemote(
+      s.room,
+      [message],
+      s.server.name,
+      s.deps,
+    );
+    assertEquals(outcomes[0].outcome, 'accepted');
+    const row = await s.room.tx((tx) => tx.events.get(message.event_id!));
+    assert(row);
+    const stored = JSON.parse(row.pdu);
+    assertEquals(stored.content.body, 'visible padded message');
+    assertEquals(stored.hashes.sha256, hash);
+    assertEquals(stored.signatures, signatures);
+    assertEquals(await frontierOf(s.room), [message.event_id!]);
+  });
+});
+
+Deno.test('hash wire: malformed signed hash is refused before native storage and publication', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store, { roomId: '!malformed-hash:test' });
+    const base = await remoteMsg(s, 'not published', [s.joinId], { ts: 200 });
+    const message = await signWithHash(base, s.server, '11', '_'.repeat(43));
+    const before = await frontierOf(s.room);
+    const outcomes = await ingestRemote(
+      s.room,
+      [message],
+      s.server.name,
+      s.deps,
+    );
+    assertEquals(outcomes[0].outcome, 'refused');
+    assertEquals(
+      await s.room.tx((tx) => tx.events.get(message.event_id!)),
+      null,
+    );
+    assertEquals(await frontierOf(s.room), before);
   });
 });
 

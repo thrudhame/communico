@@ -220,7 +220,7 @@ Deno.test('a pure key drop (strict subset) is NOT a change', async () => {
   });
 });
 
-Deno.test('block 403 is not remembered as a fetch failure (immediate retry still 403s, no dial)', async () => {
+Deno.test('block 403 retains separate policy memory without repeated fetches or decisions', async () => {
   setConfigForTests({ federation: { keychange: 'block' } });
   await withStore(async (store) => {
     const server = await store.server();
@@ -229,9 +229,11 @@ Deno.test('block 403 is not remembered as a fetch failure (immediate retry still
     const rotated = await makeDoc(s, { kp: (await makeServer('u.test')).kp });
     const counter = { calls: 0 };
     const ks = keyStore(server, { deps: directOnly(rotated, counter) });
-    await assertRejects(() => ks.acquireKeyDoc(s.name, FAR));
-    await assertRejects(() => ks.acquireKeyDoc(s.name, FAR));
-    assertEquals(counter.calls, 2); // each attempt dials — no failure memory for 403
+    const first = await assertRejects(() => ks.acquireKeyDoc(s.name, FAR));
+    const second = await assertRejects(() => ks.acquireKeyDoc(s.name, FAR));
+    assert(first === second, 'the original policy refusal is retained');
+    assertEquals(counter.calls, 1);
+    assertEquals((await changeRows(server, s.name)).length, 1);
   });
   setConfigForTests({ federation: { keychange: 'warn' } });
 });

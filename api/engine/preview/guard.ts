@@ -5,8 +5,12 @@
 // hostname. Max 5 redirects; 10 s per hop; size cap streamed.
 // The connection mechanics live in #engine/net/http1.ts — this file is
 // the SSRF policy on top.
-import { MatrixError } from '#engine/matrix-error.ts';
 import { http1Request } from '#engine/net/http1.ts';
+import {
+  protocol,
+  UpstreamError,
+  UpstreamHttpError,
+} from '#engine/net/upstream-error.ts';
 import { type Cidr, cidrContains, parseCidr, parseIp } from './cidr.ts';
 
 export type GuardOpts = {
@@ -73,33 +77,37 @@ async function hopGet(
   allow: Cidr[],
 ): Promise<GuardedBody> {
   if (hop > MAX_REDIRECTS) {
-    throw new MatrixError(502, 'M_UNKNOWN', 'too many redirects');
+    throw new UpstreamError('validation', {
+      phase: 'preview',
+      reason: 'too many redirects',
+    });
   }
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid url');
+    protocol('preview', 'invalid url');
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new MatrixError(
-      400,
-      'M_INVALID_PARAM',
-      'url scheme must be http or https',
-    );
+    throw new UpstreamError('validation', {
+      phase: 'preview',
+      reason: 'url scheme must be http or https',
+    });
   }
   const https = parsed.protocol === 'https:';
-  const addrs = await resolveAll(parsed.hostname);
+  const addrs = await resolveAll(parsed.hostname.replace(/^\[|\]$/g, ''));
   if (addrs.length === 0) {
-    throw new MatrixError(502, 'M_UNKNOWN', 'could not resolve hostname');
+    throw new UpstreamError('transport', {
+      phase: 'dns',
+      reason: 'could not resolve hostname',
+    });
   }
   for (const ip of addrs) {
     if (blocked(ip, block, allow)) {
-      throw new MatrixError(
-        403,
-        'M_FORBIDDEN',
-        'URL blocked by preview policy',
-      );
+      throw new UpstreamError('validation', {
+        phase: 'preview-policy',
+        reason: 'URL blocked by preview policy',
+      });
     }
   }
   const ip = addrs[0];
@@ -122,20 +130,21 @@ async function hopGet(
     timeoutMs: HOP_MS,
     maxBytes: opts.maxBytes,
   });
-  if (res.status >= 300 && res.status < 400) {
+  if ([301, 302, 303, 307, 308].includes(res.status)) {
     const loc = res.headers.get('location');
     if (loc === null || loc.length === 0) {
-      throw new MatrixError(502, 'M_UNKNOWN', 'redirect without Location');
+      protocol('preview', 'redirect without Location');
     }
-    const next = new URL(loc, parsed).href;
+    let next: string;
+    try {
+      next = new URL(loc, parsed).href;
+    } catch {
+      protocol('preview', 'invalid redirect Location');
+    }
     return await hopGet(next, hop + 1, opts, block, allow);
   }
   if (res.status < 200 || res.status >= 300) {
-    throw new MatrixError(
-      502,
-      'M_UNKNOWN',
-      'upstream returned ' + res.status,
-    );
+    throw new UpstreamHttpError(res.status, 'preview');
   }
   const ct = res.headers.get('content-type');
   return {

@@ -5,6 +5,7 @@
 // the fakes in tests/fixtures/.
 import type { Pdu } from '#engine/pdu.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 // A Fetcher may prove that send_join was refused before membership changed.
 // All other throws, including locally constructed MatrixErrors, are uncertain.
@@ -115,11 +116,13 @@ export interface Fetcher {
 // injected network call, never the surrounding storage/auth processing.
 export async function fetchOrNull<T>(
   read: () => Promise<T | null>,
+  signal?: AbortSignal,
 ): Promise<T | null> {
   try {
     return await read();
-  } catch {
-    return null;
+  } catch (error) {
+    if (recoverableUpstream(error, signal)) return null;
+    throw error;
   }
 }
 

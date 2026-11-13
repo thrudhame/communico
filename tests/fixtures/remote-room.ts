@@ -51,6 +51,7 @@ export type FakeRoom = {
   // The /make_join answer: the resident's template for the user
   // (joins-v1.yaml) — unsigned, unhashed.
   makeJoinAnswer(userId: string): { roomVersion: string; event: Pdu };
+  makeLeaveAnswer(userId: string): { roomVersion: string; event: Pdu };
   // The resident's send_join: counter-signs the join, answers the state
   // PRIOR to it plus the auth chain and the signed copy, and applies it
   // to the DAG (joins-v2.yaml).
@@ -201,6 +202,26 @@ export async function makeFakeRoom(opts: {
     return [...seen].sort();
   }
 
+  function membershipAnswer(userId: string, membership: 'join' | 'leave') {
+    const before = resolveBefore([tip]);
+    const probe = {
+      type: 'm.room.member',
+      sender: userId,
+      state_key: userId,
+      content: { membership },
+    } as unknown as Pdu;
+    return {
+      roomVersion: version,
+      event: {
+        ...probe,
+        room_id: opts.roomId,
+        prev_events: [tip],
+        auth_events: rulebook.selectAuthEvents(probe, before),
+        depth: events.get(tip)!.depth + 1,
+        origin_server_ts: Date.now(),
+      } as Pdu,
+    };
+  }
   const room: FakeRoom = {
     roomId: opts.roomId,
     version,
@@ -250,27 +271,10 @@ export async function makeFakeRoom(opts: {
       return events.get(id) ?? null;
     },
     makeJoinAnswer(userId) {
-      const before = resolveBefore([tip]);
-      const probe = {
-        type: 'm.room.member',
-        sender: userId,
-        state_key: userId,
-        content: { membership: 'join' },
-      } as unknown as Pdu;
-      return {
-        roomVersion: version,
-        event: {
-          type: 'm.room.member',
-          state_key: userId,
-          sender: userId,
-          room_id: opts.roomId,
-          content: { membership: 'join' },
-          prev_events: [tip],
-          auth_events: rulebook.selectAuthEvents(probe, before),
-          depth: events.get(tip)!.depth + 1,
-          origin_server_ts: Date.now(),
-        } as unknown as Pdu,
-      };
+      return membershipAnswer(userId, 'join');
+    },
+    makeLeaveAnswer(userId) {
+      return membershipAnswer(userId, 'leave');
     },
     async acceptSendJoin(join, tamper) {
       // the state PRIOR to the join (joins-v2.yaml) plus its auth chain

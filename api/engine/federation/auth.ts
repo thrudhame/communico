@@ -12,11 +12,12 @@
 // open-mode knock is recorded, nowhere before the verification.
 import { MatrixError } from '#engine/matrix-error.ts';
 import { canonicalJson } from '#engine/canonical.ts';
-import { b64decode } from '#engine/signing-primitives.js';
+import { matrixBase64 } from '#engine/signing-primitives.js';
 import type { Database as Db } from '#engine/store/db.ts';
 import { admit } from './gate.ts';
 import { assertFederationEnabled } from './keydoc.ts';
-import type { KeyStore } from './keys.ts';
+import { KeyChangeRefused, type KeyStore } from './keys.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import { lookupPeer, recordPending } from './peers.ts';
 import { parseXMatrixHeaders } from './xmatrix.ts';
 
@@ -90,9 +91,9 @@ export async function authenticateRequest(
     } catch {
       unauthorized();
     }
-    let sig: ReturnType<typeof b64decode>;
+    let sig: Uint8Array<ArrayBuffer>;
     try {
-      sig = b64decode(candidate.signature);
+      sig = matrixBase64(candidate.signature, 64);
     } catch {
       continue;
     }
@@ -106,7 +107,10 @@ export async function authenticateRequest(
         now,
         'request',
       );
-    } catch {
+    } catch (error) {
+      if (!(error instanceof KeyChangeRefused) && !recoverableUpstream(error)) {
+        throw error;
+      }
       continue; // key unobtainable → try the next candidate
     }
     const ok = await crypto.subtle.verify(

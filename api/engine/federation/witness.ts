@@ -5,14 +5,13 @@
 // admin, never acted on. A single usable answer is single-source trust;
 // the caller's comment says so.
 import { b64decode } from '#engine/signing-primitives.js';
-
-export type KeyDocShape = {
-  server_name: string;
-  verify_keys: Record<string, { key: string }>;
-  old_verify_keys: Record<string, { key: string; expired_ts: number }>;
-  valid_until_ts: number;
-  signatures: Record<string, Record<string, string>>;
-};
+import { arrayOf, objectOf } from '#engine/net/json.ts';
+import {
+  recoverableUpstream,
+  upstreamCategory,
+} from '#engine/net/upstream-error.ts';
+import { type KeyDocShape, keyDocument, oldKeysOf } from './key-document.ts';
+export type { KeyDocShape } from './key-document.ts';
 
 export type WitnessDisagreement = {
   senior: string;
@@ -28,7 +27,7 @@ export function materialFingerprint(doc: KeyDocShape): string {
   for (const [id, entry] of Object.entries(doc.verify_keys)) {
     pairs.push(id + ' ' + hexOf(b64decode(entry.key)));
   }
-  for (const [id, entry] of Object.entries(doc.old_verify_keys)) {
+  for (const [id, entry] of Object.entries(oldKeysOf(doc))) {
     pairs.push(id + ' ' + hexOf(b64decode(entry.key)));
   }
   return pairs.sort().join('\n');
@@ -39,7 +38,7 @@ export function keyMapOf(doc: KeyDocShape): Record<string, string> {
   for (const [id, entry] of Object.entries(doc.verify_keys)) {
     out[id] = entry.key;
   }
-  for (const [id, entry] of Object.entries(doc.old_verify_keys)) {
+  for (const [id, entry] of Object.entries(oldKeysOf(doc))) {
     out[id] = entry.key;
   }
   return out;
@@ -52,24 +51,14 @@ function hexOf(bytes: Uint8Array): string {
 }
 
 // Extract candidate documents for `serverName` from a notary answer
-// ({server_keys: [...]}); a bare document is also accepted.
+// ({server_keys: [...]}). A malformed answer is not a valid empty answer.
 export function documentsFromAnswer(
   raw: unknown,
   serverName: string,
 ): KeyDocShape[] {
-  if (raw === null || typeof raw !== 'object') return [];
-  const obj = raw as Record<string, unknown>;
-  const list: unknown[] = Array.isArray(obj.server_keys)
-    ? obj.server_keys
-    : [raw];
-  const out: KeyDocShape[] = [];
-  for (const item of list) {
-    if (item === null || typeof item !== 'object') continue;
-    const doc = item as KeyDocShape;
-    if (doc.server_name !== serverName) continue;
-    out.push(doc);
-  }
-  return out;
+  const obj = objectOf(raw, 'notary');
+  return arrayOf(obj.server_keys, keyDocument, 'notary')
+    .filter((doc) => doc.server_name === serverName);
 }
 
 export async function askWitnesses(opts: {
@@ -101,14 +90,29 @@ export async function askWitnesses(opts: {
           opts.minimumValidUntilTs,
         );
         for (const doc of documentsFromAnswer(raw, opts.serverName)) {
-          const checked = await opts.selfCheck(doc);
-          if (checked === null) continue;
-          if (!(await opts.witnessCheck(peer, checked))) continue;
-          return { peer, doc: checked };
+          try {
+            const checked = await opts.selfCheck(doc);
+            if (checked === null) continue;
+            if (!(await opts.witnessCheck(peer, checked))) continue;
+            return { peer, doc: checked };
+          } catch (error) {
+            if (
+              upstreamCategory(error) === 'cancellation' ||
+              !recoverableUpstream(error)
+            ) throw error;
+            // A well-shaped but unverifiable document does not hide a later
+            // usable document from this same notary answer.
+          }
         }
         return null;
-      } catch {
-        return null; // an unreachable or misbehaving witness is no answer
+      } catch (error) {
+        // Cancellation and local/store failures belong to the caller, not a
+        // witness fallback. Only a classified peer failure is no answer.
+        if (
+          upstreamCategory(error) === 'cancellation' ||
+          !recoverableUpstream(error)
+        ) throw error;
+        return null;
       }
     }),
   );

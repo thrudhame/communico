@@ -20,6 +20,13 @@ import {
   type MediaPart,
 } from './multipart.ts';
 import { type Thumbnail, ThumbnailWorkers } from './thumbnail.ts';
+import { mediaType, parameterized, TOKEN } from '#engine/net/fields.ts';
+import {
+  limit,
+  protocol,
+  upstreamDeadline,
+  UpstreamError,
+} from '#engine/net/upstream-error.ts';
 
 function assertMxc(origin: string, mediaId: string) {
   if (!serverAllowed(origin, null) || !/^[A-Za-z0-9_-]{1,255}$/.test(mediaId)) {
@@ -39,27 +46,39 @@ export function safeFilename(value: string | null): string | null {
 }
 function filenameOf(disposition: string | null): string | null {
   if (disposition === null) return null;
-  const extended = /(?:^|;)\s*filename\*\s*=\s*UTF-8''([^;]*)/i.exec(
-    disposition,
-  );
-  if (extended) {
-    try {
-      return safeFilename(decodeURIComponent(extended[1]));
-    } catch {
-      return null;
+  // RFC6266 permits recipients to ignore invalid disposition fields. Recover
+  // only the ordinary filename if an extended value cannot be decoded.
+  try {
+    const parsed = parameterized(disposition, 'content-disposition');
+    if (
+      !TOKEN.test(parsed.value) ||
+      [...parsed.parameters.values()].some((v) => v.length !== 1)
+    ) return null;
+    const extended = parsed.parameters.get('filename*')?.[0];
+    if (extended !== undefined) {
+      const match =
+        /^UTF-8'[A-Za-z0-9-]*'((?:[!#$&+.^_`|~0-9A-Za-z-]|%[0-9A-Fa-f]{2})*)$/i
+          .exec(extended);
+      if (match) {
+        try {
+          return safeFilename(decodeURIComponent(match[1]));
+        } catch { /* Invalid extended value may fall back to filename. */ }
+      }
     }
+    return safeFilename(parsed.parameters.get('filename')?.[0] ?? null);
+  } catch (error) {
+    if (error instanceof UpstreamError) return null;
+    throw error;
   }
-  const match = /(?:^|;)\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]*))/i
-    .exec(disposition);
-  return safeFilename(
-    match ? (match[1] ?? match[2]).replace(/\\(.)/g, '$1').trim() : null,
-  );
 }
 function safeType(value: string): string {
-  return /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:\s*;[^\r\n\0]*)?$/
-      .test(value)
-    ? value
-    : 'application/octet-stream';
+  try {
+    mediaType(value);
+    return value;
+  } catch (error) {
+    if (error instanceof UpstreamError) return 'application/octet-stream';
+    throw error;
+  }
 }
 function responseHeaders(
   type: string,
@@ -317,10 +336,7 @@ export class MediaService {
     thumbnail?: Thumbnail,
   ): Promise<ByteMetadata> {
     const policy = config().media;
-    const signal = AbortSignal.any([
-      parentSignal,
-      AbortSignal.timeout(policy.timeoutms),
-    ]);
+    const signal = upstreamDeadline(parentSignal, policy.timeoutms);
     const writer = output.getWriter();
     let size = 0;
     const target = () =>
@@ -328,11 +344,7 @@ export class MediaService {
         write: async (chunk) => {
           size += chunk.length;
           if (size > policy.maxbytes) {
-            throw new MatrixError(
-              502,
-              'M_TOO_LARGE',
-              'Remote media exceeds the server limit',
-            );
+            limit('media', 'Remote media exceeds the server limit');
           }
           await writer.write(chunk);
         },
@@ -357,7 +369,9 @@ export class MediaService {
           maxBytes: policy.maxbytes + MEDIA_ENVELOPE_LIMIT,
           signal,
           sink: (status, headers) => {
-            if (status !== 200) throw new Error('invalid media success status');
+            if (status !== 200) {
+              protocol('media', 'invalid media success status');
+            }
             const parser = mediaMultipart(
               headers.get('content-type') ?? '',
               target(),
@@ -390,7 +404,7 @@ export class MediaService {
             signal,
             sink: (status, headers) => {
               if (status !== 200) {
-                throw new Error('invalid media success status');
+                protocol('media', 'invalid media success status');
               }
               part = {
                 contentType: headers.get('content-type') ??
@@ -404,11 +418,11 @@ export class MediaService {
           },
         );
         if (response.status !== 200) {
-          throw new Error('invalid media fallback status');
+          protocol('media', 'invalid media fallback status');
         }
       }
       const received = part as MediaPart | null;
-      if (received === null) throw new Error('missing media envelope');
+      if (received === null) protocol('media', 'missing media envelope');
       let content = received;
       if (received.location !== null) {
         content = await fetchLocation(received.location, target(), signal, {

@@ -23,6 +23,8 @@ import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { createFakeRoom } from '#tests/federation/fake-room.ts';
 import { fakeKeyResolver } from '#tests/fixtures/remote.ts';
 import { testRemoteServer, testSigner } from '#tests/fixtures/signer.ts';
+import { assertAuthored } from '#tests/fixtures/authored.ts';
+import type { Pdu } from '#engine/pdu.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -35,7 +37,8 @@ async function fixture(
     user: string;
     origin: string;
     publish: () => Promise<number>;
-    reject: () => Promise<void>;
+    reject: (reason?: string) => Promise<void>;
+    sentLeave: () => Pdu | null;
     sent: Promise<void>;
     finish: () => void;
   }) => Promise<void>,
@@ -55,6 +58,7 @@ async function fixture(
   const sent = new Promise<void>((r) => signal = r);
   const gate = new Promise<void>((r) => finish = r);
   let room: Awaited<ReturnType<typeof createFakeRoom>>;
+  let sentLeave: Pdu | null = null;
   const us = await testRemoteServer('test');
   const fake = await startFakeServer({
     ourKeyDoc: async () => ({
@@ -70,6 +74,7 @@ async function fixture(
         return Response.json(room.makeLeaveTemplate('@dev:test'));
       }
       if (req.url.pathname.includes('/send_leave/')) {
+        sentLeave = req.json() as Pdu;
         signal();
         await gate;
         return Response.json({});
@@ -131,13 +136,22 @@ async function fixture(
         );
         return seq;
       });
+    // A fewer-arguments function is assignable here on the old source too,
+    // so failing-first observes the dropped value rather than a type error.
+    const reject: (
+      room: string,
+      user: string,
+      deps: InviteDeps,
+      reason?: string,
+    ) => Promise<void> = rejectInviteRemote;
     await run({
       deps,
       roomId: room.roomId,
       user,
       origin: fake.name,
       publish,
-      reject: () => rejectInviteRemote(room.roomId, user, deps),
+      reject: (reason) => reject(room.roomId, user, deps, reason),
+      sentLeave: () => sentLeave,
       sent,
       finish,
     });
@@ -166,6 +180,42 @@ Deno.test('prejoin: late rejection completion cannot overtake a room publication
     assertEquals(await inviteFor(f.roomId, f.user, f.deps), null);
     await admitLocalJoin(f.deps.store, f.roomId, f.user);
   }));
+
+Deno.test('prejoin reason: invite and knock departures persist and send the user reason, including empty', async () => {
+  for (const kind of ['invite', 'knock']) {
+    for (const reason of ['not now', '', undefined]) {
+      await fixture(async (f) => {
+        if (kind === 'knock') {
+          await f.publish();
+          await knockRemote(f.roomId, f.user, {}, [f.origin], f.deps);
+        }
+        await f.reject(reason);
+        const saved = await inviteFor(f.roomId, f.user, f.deps);
+        assert(saved?.localLeaveJson);
+        const local = JSON.parse(saved.localLeaveJson) as Pdu;
+        assertEquals(local.content.reason, reason);
+        await assertAuthored(local);
+        // This freshly reads durable intent, not the object saved above.
+        const job = await inviteIntentProvider(f.deps)(f.deps.server, f.origin);
+        assert(job);
+        const running = job.run();
+        try {
+          await f.sent;
+          const sent = f.sentLeave();
+          assert(sent);
+          assertEquals(sent.content.reason, reason);
+          await assertAuthored(sent);
+          const pending = await inviteFor(f.roomId, f.user, f.deps);
+          assert(pending?.leaveJson);
+          assertEquals(JSON.parse(pending.leaveJson).content.reason, reason);
+        } finally {
+          f.finish();
+          await running;
+        }
+      });
+    }
+  }
+});
 
 Deno.test('prejoin: superseded unsent rejection is settled without blocking admission', () =>
   fixture(async (f) => {

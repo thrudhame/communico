@@ -10,6 +10,7 @@ import {
 import { MatrixError } from '#engine/matrix-error.ts';
 import { getPublicProfile } from '#engine/tenant/profiles.ts';
 import { discoveryRequest } from '#engine/federation/discovery.ts';
+import { profileResponse } from '#engine/federation/discovery-response.ts';
 import { authorize } from '#engine/auth-context.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { setProfileField } from '#engine/tenant/profiles.ts';
@@ -57,14 +58,7 @@ export async function userProfile(userId: string): Promise<Profile> {
         path: '/_matrix/federation/v1/query/profile?user_id=' +
           encodeURIComponent(userId),
       });
-      if (
-        answer === null || typeof answer !== 'object' || Array.isArray(answer)
-      ) {
-        throw new MatrixError(502, 'M_UNKNOWN', 'invalid remote profile');
-      }
-      profile = { ...answer } as Profile;
-      if (typeof profile.displayname !== 'string') delete profile.displayname;
-      if (typeof profile.avatar_url !== 'string') delete profile.avatar_url;
+      profile = profileResponse(answer);
     } else if (fed.enabled && fed.lookups === 'known') {
       profile = await remoteUserFromMembers(userId, app);
     }

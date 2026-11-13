@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertThrows } from '@std/assert';
 import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { config } from '#engine/config.ts';
+import { wireKey } from '#tests/fixtures/e2ee-wire.ts';
 import {
   deviceDelta,
   deviceStreamId,
@@ -34,7 +35,7 @@ const key = (id: string, material = id) => ({
   user_id: user,
   device_id: id,
   algorithms: [],
-  keys: { ['ed25519:' + id]: material },
+  keys: { ['ed25519:' + id]: wireKey(material) },
   signatures: {},
 });
 const delta = (
@@ -150,7 +151,9 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
     const cached = await cachedDeviceKeys(db, user, [], observer);
     assert(cached);
     assertEquals(Object.keys(cached).sort(), ['A', 'B', 'D']);
-    assertEquals((cached.A as { keys: unknown }).keys, { 'ed25519:A': '900' });
+    assertEquals((cached.A as { keys: unknown }).keys, {
+      'ed25519:A': wireKey('900'),
+    });
     assertEquals(
       (await deviceListsBetween(db, observer, 0, head, 'sync')).changed,
       [observer, user],
@@ -392,7 +395,7 @@ Deno.test('snapshot race replays only provably subsequent deltas and never overw
     const covered = (await cachedDeviceKeys(db, user, [], observer))!;
     assertEquals(Object.keys(covered).sort(), ['AFTER', 'AT']);
     assertEquals((covered.AT as { keys: unknown }).keys, {
-      'ed25519:AT': '70',
+      'ed25519:AT': wireKey('70'),
     });
   } finally {
     await store.close();

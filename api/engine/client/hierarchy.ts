@@ -3,6 +3,7 @@ import { theApp } from '#engine/app.ts';
 import { config } from '#engine/config.ts';
 import { domainOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import type { Store } from '#engine/store/index.ts';
 import {
   localDiscoverySummary,
@@ -147,7 +148,10 @@ async function clientRoom(
       inaccessible: remote.inaccessible,
     };
   } catch (error) {
-    if (!(error instanceof MatrixError)) throw error;
+    if (
+      !(error instanceof MatrixError && error.status < 500) &&
+      !recoverableUpstream(error)
+    ) throw error;
     return null;
   }
 }

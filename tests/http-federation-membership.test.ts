@@ -234,12 +234,14 @@ test('send: body memoization, origin/caps and empty replay', async () => {
   assertEquals(
     (await call('PUT', target, {
       origin: remote.name,
+      origin_server_ts: Date.now(),
       pdus: Array(51).fill({}),
     })).status,
     400,
   );
   const body = {
     origin: remote.name,
+    origin_server_ts: Date.now(),
     pdus: [],
     edus: [{ edu_type: 'unknown', content: {} }],
   };

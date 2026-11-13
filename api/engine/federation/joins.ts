@@ -20,6 +20,7 @@ import {
   serverInState,
 } from './room.ts';
 import { verify, verifyJoinForCountersign } from '#engine/room/verify.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import { withRestrictedAdmission } from '#engine/room/restricted.ts';
 import { loadRulebookStore } from '#engine/room/build.ts';
 import { prejoinStateInTx } from './prejoin.ts';
@@ -242,6 +243,7 @@ async function sendMembership(
     await (membership === 'join'
       ? verifyJoinForCountersign(pdu, version, deps.keys, deps.self, roomId)
       : verify(pdu, version, deps.keys, { roomId })).catch((error) => {
+        if (!recoverableUpstream(error)) throw error;
         throw new MatrixError(403, 'M_FORBIDDEN', String(error));
       });
   const nominated = prepared.pdu.content?.join_authorised_via_users_server;

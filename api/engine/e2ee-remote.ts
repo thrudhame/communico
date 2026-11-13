@@ -6,12 +6,14 @@ import {
 } from '#engine/e2ee-public-signing.ts';
 import {
   bounded,
+  deviceKey,
+  identity,
   type Json,
   type KeyLimits,
   limitEntries,
   object,
-  validateUpload,
-} from '#engine/tenant/e2ee.ts';
+} from '#engine/e2ee-wire.ts';
+import { protocol } from '#engine/net/upstream-error.ts';
 
 /** Causal identifiers compare by normalized equality, never arithmetic order. */
 export function deviceStreamId(value: unknown): string {
@@ -21,7 +23,7 @@ export function deviceStreamId(value: unknown): string {
   if (typeof value === 'string' && /^\d{1,128}$/.test(value)) {
     return value.replace(/^0+(?=\d)/, '');
   }
-  throw new Error('invalid device stream identifier');
+  protocol('e2ee-schema', 'invalid device stream identifier');
 }
 
 export function publicDeviceKey(
@@ -31,19 +33,11 @@ export function publicDeviceKey(
   limits: KeyLimits,
   requester = '',
 ): Json {
-  const key = object(raw, 'device key');
-  const input = validateUpload(
-    {
-      device_keys: {
-        ...key,
-        signatures: key.signatures === undefined ? {} : key.signatures,
-      },
-    },
-    user,
-    id,
-    limits,
-  );
-  return keyView(JSON.parse(input.device!), user, requester);
+  const key = deviceKey(raw, limits);
+  if (key.user_id !== user || key.device_id !== id) {
+    identity('remote device key owner does not match requested device');
+  }
+  return keyView(key, user, requester);
 }
 
 export type DeviceDelta = {
@@ -59,12 +53,12 @@ function entry(raw: unknown, user: string, limits: KeyLimits, reset = false) {
   if (
     typeof value.device_id !== 'string' || (!value.device_id.length && !reset)
   ) {
-    throw new Error('invalid device ID');
+    protocol('e2ee-schema', 'invalid device ID');
   }
   if (
     value.device_display_name !== undefined &&
     typeof value.device_display_name !== 'string'
-  ) throw new Error('invalid device name');
+  ) protocol('e2ee-schema', 'invalid device name');
   const key = value.keys === undefined
     ? null
     : publicDeviceKey(value.keys, user, value.device_id, limits);
@@ -85,13 +79,13 @@ export function deviceDelta(raw: unknown, limits: KeyLimits): DeviceDelta {
   bounded(raw, limits.maxrequestbytes);
   const value = object(raw, 'device update');
   if (typeof value.user_id !== 'string' || !/^@[^:]+:.+$/.test(value.user_id)) {
-    throw new Error('invalid user ID');
+    protocol('e2ee-schema', 'invalid user ID');
   }
   if (value.deleted !== undefined && typeof value.deleted !== 'boolean') {
-    throw new Error('invalid deletion');
+    protocol('e2ee-schema', 'invalid deletion');
   }
   const prev = value.prev_id === undefined ? [] : value.prev_id;
-  if (!Array.isArray(prev)) throw new Error('invalid predecessors');
+  if (!Array.isArray(prev)) protocol('e2ee-schema', 'invalid predecessors');
   limitEntries(prev.length, limits.maxkeys);
   return {
     user: value.user_id,
@@ -119,15 +113,32 @@ export function remoteDeviceSnapshot(
 ): DeviceSnapshot {
   bounded(raw, limits.maxrequestbytes);
   const value = object(raw, 'device snapshot');
-  if (value.user_id !== user || !Array.isArray(value.devices)) {
-    throw new Error('invalid snapshot owner/devices');
+  if (value.user_id !== user) identity('invalid snapshot owner');
+  if (!Array.isArray(value.devices)) {
+    protocol('e2ee-schema', 'invalid snapshot devices');
   }
   limitEntries(value.devices.length, limits.maxkeys);
-  const devices = value.devices.map((d) => entry(d, user, limits));
+  const devices = value.devices.map((d) => {
+    if (object(d, 'snapshot device').keys === undefined) {
+      protocol('e2ee-schema', 'snapshot device keys are required');
+    }
+    return entry(d, user, limits);
+  });
   if (new Set(devices.map((d) => d.id)).size !== devices.length) {
-    throw new Error('duplicate snapshot device');
+    protocol('e2ee-schema', 'duplicate snapshot device');
   }
-  const signing = publicSigning(value, user, limits);
+  // Deployed Synapse /user/devices replies use null for absent signing keys.
+  // This compatibility is endpoint-specific, not an upload/query/EDU default.
+  const signing = publicSigning(
+    {
+      master_key: value.master_key === null ? undefined : value.master_key,
+      self_signing_key: value.self_signing_key === null
+        ? undefined
+        : value.self_signing_key,
+    },
+    user,
+    limits,
+  );
   limitEntries(devices.length + Object.keys(signing).length, limits.maxkeys);
   return {
     user,

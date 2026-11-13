@@ -1,0 +1,16 @@
+{
+  "status": 200,
+  "headers": {
+    "Connection": "close",
+    "Server": "Synapse/1.156.0",
+    "Date": "Thu, 12 Nov 2026 11:59:04 GMT",
+    "Cache-Control": "public,max-age=86400,s-maxage=0,proxy-revalidate",
+    "ETag": "1",
+    "Content-Length": "278",
+    "Content-Type": "multipart/mixed; boundary=907da5d7f9694c6c916aded9b39c1bab"
+  },
+  "bytes": 278,
+  "body_sha256": "e70503146c65f3bcc59de6d4bb6dc697151a2f8fb0b056d3182894c05893fde0",
+  "payload_sha256": "25ea21bccb91a529f05b2f01767cdc717760d3b05840a9ccd6bf19e3d102b719",
+  "provenance": "Stock signed federation download captured 2026-11-12; evidence-c/synapse-media-envelope.{json,bin}. Body unchanged. HTTP replay framing synthetic."
+}

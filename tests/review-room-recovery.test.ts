@@ -1,6 +1,7 @@
 // Recovery is over verified batch dependencies; auth recovery is independent
 // of prev recovery, and a network failure cannot abort unrelated PDUs.
 import { assert, assertEquals } from '@std/assert';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { backfill } from '#engine/room/history.ts';
@@ -163,7 +164,13 @@ for (const route of ['remote', 'history'] as const) {
           content: { body: 'good' },
           prev_events: [base],
         });
-        const fail = () => Promise.reject(new Error('network unavailable'));
+        const fail = () =>
+          Promise.reject(
+            new UpstreamError('transport', {
+              phase: 'read',
+              reason: 'network unavailable',
+            }),
+          );
         const scripted = fakeFetcher({
           stateIds: new Map([[gap.event_id!, fr.stateIdsAt(gap.event_id!)!]]),
           event: fr.events,
@@ -258,7 +265,13 @@ Deno.test('review recovery: event_auth failure does not prevent a grounded sibli
       content: { body: 'good' },
     });
     const scripted = fakeFetcher({
-      onEventAuth: () => Promise.reject(new Error('unreachable')),
+      onEventAuth: () =>
+        Promise.reject(
+          new UpstreamError('transport', {
+            phase: 'read',
+            reason: 'unreachable',
+          }),
+        ),
     });
     const result = await ingestRemote(room, [orphan, good], fr.server.name, {
       keys,

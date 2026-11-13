@@ -6,6 +6,10 @@ import type { KeyResolver } from '#engine/room/deps.ts';
 import type { Room, RoomTx } from '#engine/room/index.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { identify, verify } from '#engine/room/verify.ts';
+import {
+  recoverableUpstream,
+  UpstreamError,
+} from '#engine/net/upstream-error.ts';
 import { toWire } from './pdu.ts';
 import { erasurePrunes } from '#engine/erasure.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
@@ -216,10 +220,16 @@ export async function validatePrejoin(
           entry.state_key !== '' ||
           (entry.content as Record<string, unknown>).room_version !== version ||
           (version !== '12' && entry.room_id !== roomId)
-        ) throw new Error('wrong create identity');
+        ) {
+          throw new UpstreamError('validation', {
+            phase: 'prejoin',
+            reason: 'wrong create identity',
+          });
+        }
         await verify(entry as unknown as Pdu, version, keys, { roomId });
         create = true;
-      } catch {
+      } catch (error) {
+        if (!recoverableUpstream(error)) throw error;
         if (version === '12') {
           throw new MatrixError(400, 'M_BAD_JSON', 'invalid prejoin create');
         }

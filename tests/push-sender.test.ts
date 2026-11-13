@@ -25,6 +25,8 @@ import { startPushSender } from '#engine/push/sender.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { renderEvent } from '#engine/client/render.ts';
 import { putAccountData } from '#engine/tenant/accountdata.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { sendGateway } from '#engine/push/transport.ts';
 
 type Json = Record<string, unknown>;
 async function fixture() {
@@ -238,7 +240,12 @@ Deno.test('push sender: retry backoff persists across reopen; expiry never delet
     giveUpMs: 5000,
     send: () => {
       calls++;
-      return Promise.reject(new Error('retryable'));
+      return Promise.reject(
+        new UpstreamError('transport', {
+          phase: 'connect',
+          reason: 'retryable',
+        }),
+      );
     },
   });
   try {
@@ -262,7 +269,12 @@ Deno.test('push sender: retry backoff persists across reopen; expiry never delet
       giveUpMs: 5000,
       send: () => {
         calls++;
-        return Promise.reject(new Error('retryable'));
+        return Promise.reject(
+          new UpstreamError('transport', {
+            phase: 'connect',
+            reason: 'retryable',
+          }),
+        );
       },
     });
     await sender.tick();
@@ -478,6 +490,81 @@ Deno.test('push sender: response acknowledges only the badge revision sent; shut
       ))[0],
       { state: 'pending', attempts: 0 },
     );
+  } finally {
+    await sender.stop();
+    await f.close();
+  }
+});
+
+Deno.test('push sender: local faults are not peer retries or successful verdicts', async () => {
+  const f = await fixture();
+  const fault = new Error('local gateway dependency');
+  const sender = await startPushSender({
+    store: f.store,
+    tenant: f.tenant,
+    automatic: false,
+    send: () => Promise.reject(fault),
+  });
+  try {
+    await f.send('must stay pending');
+    assertEquals(await assertRejects(() => sender.tick()), fault);
+    const db = await f.store.server();
+    const row =
+      (await db.query('SELECT state, attempts FROM push_delivery'))[0];
+    assertEquals(row, { state: 'pending', attempts: 0 });
+    assertEquals(
+      (await f.tenant.tx((tx) => tx.pushers.ofUser('bob'))).length,
+      1,
+    );
+  } finally {
+    await sender.stop();
+    await f.close();
+  }
+});
+
+Deno.test('push sender: invalid UTF8 rejected target cannot remove a pusher or acknowledge delivery', async () => {
+  const f = await fixture();
+  let calls = 0;
+  const sender = await startPushSender({
+    store: f.store,
+    tenant: f.tenant,
+    automatic: false,
+    send: (url, payload, signal) =>
+      sendGateway(url, payload, signal, {
+        blocklist: [],
+        allowlist: [],
+        caCerts: [],
+        timeoutMs: 1000,
+      }, {
+        resolve: () => Promise.resolve(['8.8.8.8']),
+        dial: () => {
+          calls++;
+          return Promise.resolve({
+            status: 200,
+            headers: new Headers({ 'content-type': 'application/json' }),
+            body: new Uint8Array([
+              ...new TextEncoder().encode('{"rejected":["key"],"extension":"'),
+              255,
+              ...new TextEncoder().encode('"}'),
+            ]),
+          });
+        },
+      }),
+  });
+  try {
+    await f.send('invalid verdict');
+    await sender.tick();
+    assertEquals(calls, 1);
+    assertEquals(
+      (await f.tenant.tx((tx) => tx.pushers.ofUser('bob'))).length,
+      1,
+    );
+    const db = await f.store.server();
+    assertEquals(
+      (await db.query('SELECT state, attempts FROM push_delivery'))[0],
+      { state: 'pending', attempts: 1 },
+    );
+    assertEquals(await db.query('SELECT * FROM push_rejections'), []);
   } finally {
     await sender.stop();
     await f.close();

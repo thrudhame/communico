@@ -5,6 +5,7 @@
 import type { Pdu } from '#engine/pdu.ts';
 import type { Fetcher, KeyResolver } from './deps.ts';
 import { identify, verify } from './verify.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 export async function fetchBoundaryEvents(
   unknown: readonly string[],
@@ -46,7 +47,8 @@ export async function fetchBoundaryEvents(
       if (opts.work !== undefined && !opts.work()) return;
       const verified = await verify(raw, opts.version, opts.keys, verification);
       pack.set(id, verified.pdu);
-    } catch {
+    } catch (error) {
+      if (!recoverableUpstream(error, opts.signal)) throw error;
       // Verification failure is missing evidence, never an accepted prefix.
     }
   };

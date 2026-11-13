@@ -459,6 +459,9 @@ while v12 requires a valid create tied to the room identity.
 
 OOB rejection intent persists a real locally signed departure membership,
 separate from the later federation make_leave result (server schema v23).
+The caller's leave reason, including an empty string, belongs to that durable
+intent and is copied into the separately signed federation departure. Remote
+templates cannot replace it; frozen retries retain the same signed leave.
 Left-room state/state_after contains only the full departure event, never
 stripped saved hints with fabricated identities. Older pending intents acquire
 that event once under their revision owner. Saved invite/knock hint redaction
@@ -797,6 +800,113 @@ cookies, bounded redirects and one total deadline/byte budget. URLs are not
 cache identity or persisted metadata. Legacy serving remains local-only.
 (`api/engine/federation/client.ts`, `api/engine/net/http1.ts`,
 `api/engine/media/{multipart,location,service}.ts`)
+
+The HTTP representation boundary handles informational heads, HTTP field and
+chunk grammar, and gzip/deflate/Brotli content decoding before any consumer.
+Encoded, decoded and intermediate bodies retain the request's byte limit.
+Unsupported codings and malformed HTTP/MIME/JSON are protocol failures, not
+connection failures. Only network primitives classify transport faults; sink
+and store errors remain local, and caller cancellation retains its identity.
+Public Matrix outcome rendering maps typed upstream failures once.
+MIME receivers ignore bounded preambles/epilogues and accept transport padding,
+quoted parameters, folded MIME fields and headerless media parts. The Matrix
+adapter separately requires exactly two parts and object metadata. Binary/7bit/
+8bit transfer encodings preserve octets; other transfer encodings are explicitly
+unsupported rather than cached as original bytes. No cache entry is published
+before complete envelope validation. Remote filenames use RFC8187 UTF-8 language
+tags and preserve quoted spaces before the existing filename sanitization.
+(`api/engine/net/{upstream-error,fields,json,http1}.ts`,
+`api/engine/media/{multipart,service}.ts`)
+
+Federation JSON successes require the JSON media type and fatal UTF-8 decoding;
+well-known discovery explicitly ignores the media type as required by its schema,
+while retaining the same fatal UTF-8, JSON and endpoint validation.
+Empty or malformed replies cannot become null success. Endpoint consumers still
+own the decoded root/schema. Outgoing transactions validate the required PDU
+verdict map before acknowledging their frozen durable batch or recording peer
+success. Malformed 2xx keeps delivery pending and retries the same transaction;
+local signing/storage faults are not cached as peer failures. Completed HTTP
+refusals keep their separate status and Matrix-error provenance.
+(`api/engine/federation/{client,responses,sender}.ts`)
+
+Endpoint envelopes validate required object/array and scalar shapes without
+coercing IDs or inventing missing graph edges. Join, leave and knock templates
+negotiate explicit supported versions; omitted legacy versions never become v11.
+Recovery may treat typed peer failures and cancellation as unavailable evidence,
+but local signing/store faults propagate. Protocol diagnostics retain the original
+cause internally while console/JSON projections exclude raw response snippets;
+completed HTTP refusals keep the remote body separately from their safe message.
+(`api/engine/federation/{fetcher,responses,invites,knocks}.ts`,
+`api/engine/net/upstream-error.ts`, `api/engine/room/deps.ts`)
+
+Server-key and notary schemas decode every entry before persistence without
+adding optional fields or rewriting signed validity. The seven-day effective
+expiry is stored beside the intact signed document and remains tied to its
+acquisition time on cache reads. Only typed peer failures enter negative key
+memory; local storage/signing faults and cancellation retain their identity.
+Policy-refused key changes have separate acquisition backoff. The store's stable
+server database capability owns acquisition memory shared by every key-store
+view; accepting or forgetting a server clears both memories immediately.
+Admin decisions also invalidate active lookup generations. Network acquisition
+runs outside the per-name mutation lock; publication rechecks its generation
+inside that lock, so obsolete work cannot restore forgotten keys, decisions or
+negative memory. A later contact never joins the superseded acquisition.
+Event, prejoin, history and join consumers distinguish peer verification refusal
+from a local resolver fault, which never becomes missing evidence or resident
+failover. Matrix wire Base64 uses the standard alphabet and accepts the optional
+padding recommended by the specification; the legacy stored-data decoder remains
+separate. Remote content hashes require valid SHA-256 binary material and compare
+decoded bytes. Equivalent padding never causes redaction, and verification never
+normalizes the signed hash representation or opaque room-version reference IDs.
+(`api/engine/federation/{key-document,keys,witness,keyresolver,auth}.ts`,
+`api/engine/room/verify.ts`, `api/engine/signing-primitives.js`)
+
+Remote E2EE schemas are separate from authenticated-upload validation. Device
+snapshots require keys per device; only that endpoint accepts Synapse's deployed
+null optional signing keys. Queries, claims, snapshots and EDUs share wire key,
+signature and Base64 checks before publication. Malformed claimed keys never
+publish and claims are never retried. Peer failures retain typed unavailable or
+backoff behavior; local admission, cache and persistence faults propagate instead
+of becoming peer outages. Subscriber cancellation does not charge peer backoff.
+(`api/engine/{e2ee-wire,e2ee-remote,e2ee-public-signing}.ts`,
+`api/engine/client/e2ee.ts`, `api/engine/federation/device-lists.ts`)
+
+Alias lookup and joining share one directory response decoder. Profile and
+hierarchy consumers validate endpoint schemas before returning data or applying
+access policy, preserving extensions, unset profile nulls and the public default
+for omitted join rules. Read-only discovery supports signed GET and POST bodies
+without adding participation records. Inbound transactions validate required
+metadata and PDU/EDU containers before persistence; malformed ephemeral entries
+cannot become typing stops, invented receipt timestamps or default presence.
+Unknown local handler failures propagate without caching transaction success.
+(`api/engine/federation/{discovery,discovery-response,peer-json,transactions,edus}.ts`)
+
+X-Matrix authorization parses quote-aware comma lists, token/quoted parameter
+values and unique names before signature verification. Discovery validates
+Matrix server names, preserves redirect queries, follows HTTP(S) using the
+matching transport, and caches according to Cache-Control and response age.
+Only classified peer failures fall back; local CA faults and cancellation
+propagate. SRV selection uses priority and RFC2782 weighted ordering, recognizes
+an unavailable service, and retains alternate targets and A/AAAA answers.
+Address families resolve concurrently; a usable answer is dialable immediately.
+Later SRV targets remain unresolved until connection failover begins, then race
+the failed target's remaining families so a stalled answer cannot block a healthy
+backup. Deferred address reads share caller cancellation and the dialer's total
+deadline.
+Dial failover stops before the first HTTP write: completed or uncertain requests,
+decoder failures and sink failures cannot replay on another address. Delegated
+Host and TLS identities never acquire the SRV target's port.
+(`api/engine/federation/{xmatrix,server-name,well-known,resolve,dial-node-tls}.ts`)
+
+Push verdicts cross the same fatal UTF-8, JSON media-type and endpoint-schema
+boundary before a target can be rejected or delivery acknowledged. Only typed
+peer failures schedule retry; local faults and cancellation retain their identity.
+URL previews follow only defined HTTP redirect statuses. HTML metadata uses the
+HTML parser and encoding-sniffing standards (BOM, transport, meta, fallback),
+not text matches inside comments, scripts or quoted attributes. XHTML retains
+XML namespace, case and well-formedness rules. Neither parser executes scripts
+or resolves external entities. Existing SSRF, byte and image-codec limits remain.
+(`api/engine/push/{transport,sender}.ts`, `api/engine/preview/{guard,og,index}.ts`)
 
 The shared thumbnail service serves local client, legacy-local and signed
 federation routes. Remote variants fetch signed federation thumbnails before

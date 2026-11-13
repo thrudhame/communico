@@ -22,6 +22,7 @@ import {
 } from '#engine/federation/sender.ts';
 import { addBlock, removeBlock } from '#engine/federation/peers.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import type { Room } from '#engine/room/index.ts';
@@ -734,7 +735,12 @@ Deno.test('sender: intents on their own path — one attempt per wake, the ladde
               run: () => {
                 job.runs++;
                 calls.push(`${destination}:${id}`);
-                if (job.fail) throw new Error(`${id} down`);
+                if (job.fail) {
+                  throw new UpstreamError('transport', {
+                    phase: 'connect',
+                    reason: `${id} down`,
+                  });
+                }
                 jobs.delete(id);
                 return Promise.resolve();
               },
@@ -801,7 +807,12 @@ Deno.test('review sender: a persistent failed intent cannot bypass the peer back
           id: 'persistent',
           run: () => {
             calls++;
-            return Promise.reject(new Error('unreachable'));
+            return Promise.reject(
+              new UpstreamError('transport', {
+                phase: 'connect',
+                reason: 'unreachable',
+              }),
+            );
           },
           failed: () => Promise.resolve(),
         })
