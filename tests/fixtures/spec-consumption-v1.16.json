@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "specCommit": "81a864545f7d948a881f5227700e5312c64f506e",
-  "manifestSha256": "fcb0c7aff089b89be593cc9d36de0c034b8bcb4e2eaec59cb2c5883f036d1497",
+  "manifestSha256": "2a7973022e8dd00f2a7bfad8753b031157bdc4283c1b683ded3908c758ca0c61",
   "bindings": {
     "keys-changes-cuts": {
       "decoder": "api/engine/client/device-lists.ts",
@@ -1714,8 +1714,8 @@
         },
         {
           "suite": "http-operation-search",
-          "case": "terminal nonempty pages have valid cursors while zero limits advertise no progress",
-          "test": "HTTP search operation contracts > terminal nonempty pages have valid cursors while zero limits advertise no progress",
+          "case": "terminal nonempty pages have valid cursors while zero search limits are rejected",
+          "test": "HTTP search operation contracts > terminal nonempty pages have valid cursors while zero search limits are rejected",
           "testClass": "tests/http-app.ts"
         },
         {

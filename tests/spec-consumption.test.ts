@@ -191,3 +191,32 @@ Deno.test('decoder flow follows the actual tenant argument binding', () => {
     ),
   );
 });
+
+Deno.test('decoder flow discards overwritten spread provenance and disconnected parser names', () => {
+  const entry = 'tests/decoder-provenance-entry.ts';
+  const read = (source: string) =>
+    decoderReads(entry, new Map([[entry, source]]));
+  const overwritten = read(`export default function(request) {
+    const input = { ...request.body.json(), reason: 'fixed' };
+    return input.reason;
+  }`);
+  assert(!decodedField('body/application/json/reason', overwritten));
+});
+
+Deno.test('decoder flow requires the actual shared parser and its request input', () => {
+  const entry = 'tests/decoder-provenance-entry.ts';
+  const read = (source: string) =>
+    decoderReads(entry, new Map([[entry, source]]));
+  const disconnected = read(`function parseJson() { return {}; }
+    export default function(request) { return parseJson().reason; }`);
+  assert(!decodedField('body/application/json/reason', disconnected));
+  const alias = `import { parseJson as body } from '#engine/operation-body.ts';
+    export default async function(request) { return (await body(request)).reason; }`;
+  assert(decodedField('body/application/json/reason', read(alias)));
+  assert(
+    !decodedField(
+      'body/application/json/reason',
+      read(alias.replace('body(request)', 'body({})')),
+    ),
+  );
+});

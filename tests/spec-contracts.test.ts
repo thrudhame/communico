@@ -153,6 +153,18 @@ Deno.test('tagged federation profile prose permits null only for unset profile f
   assertSpecResponse('GET', '/_matrix/federation/v1/query/profile', 200, {});
 });
 
+Deno.test('HTTP response guard rejects undeclared successful statuses', async () => {
+  const request = new Request('http://x/_matrix/client/v3/publicRooms');
+  await assertRejects(() =>
+    assertSpecHttpResponse(request, Response.json({}, { status: 201 }))
+  );
+  await assertSpecHttpResponse(request, Response.json({ chunk: [] }));
+  await assertSpecHttpResponse(
+    new Request('http://x/_matrix/federation/v1/query/custom'),
+    new Response(null, { status: 200 }),
+  );
+});
+
 Deno.test('explicit Synapse response compatibility is scoped and never changes pinned schemas', () => {
   const path = '/_matrix/client/v3/rooms/{roomId}/joined_members';
   const operation = manifest.operations.find((op) => op.path === path)!;

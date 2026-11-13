@@ -128,7 +128,7 @@ def generate(source):
                 if fullpath in {"/_matrix/client/v3/pushrules", "/_matrix/client/v3/pushrules/global"}:
                     fullpath += "/"
                 loc = ("paths", path, method)
-                entry = {"id": file + "#" + method.upper() + " " + fullpath, "operationId": operation.get("operationId"), "method": method.upper(), "path": fullpath, "description": operation.get("description", ""), "request": [], "response": []}
+                entry = {"id": file + "#" + method.upper() + " " + fullpath, "operationId": operation.get("operationId"), "method": method.upper(), "path": fullpath, "description": operation.get("description", ""), "request": [], "response": [], "successStatuses": []}
                 for owner, ploc in [(item, ("paths", path)), (operation, loc)]:
                     for index, param in enumerate(owner.get("parameters", [])):
                         param, pf, pp, _ = resolve(param, file, ploc + ("parameters", index))
@@ -143,6 +143,7 @@ def generate(source):
                 for status, response in operation.get("responses", {}).items():
                     if not str(status).startswith("2"):
                         continue
+                    entry["successStatuses"].append(int(status))
                     response, rf, rp, _ = resolve(response, file, loc + ("responses", status))
                     for header, value in response.get("headers", {}).items():
                         value, hf, hp, _ = resolve(value, rf, rp + ("headers", header))

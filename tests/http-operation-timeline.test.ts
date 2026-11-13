@@ -1,5 +1,8 @@
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { theApp } from '#engine/app.ts';
+import { openRoom } from '#engine/room/index.ts';
+import { sendLocal } from '#engine/room/ingest.ts';
 
 const suite = httpSuite('HTTP timeline and sync operation contracts');
 type Json = Record<string, unknown>;
@@ -108,6 +111,47 @@ for (const target of ['messages', 'context']) {
     });
   }
 }
+suite.test('messages fills a filtered page across excluded prefixes with page-sized transactions', async () => {
+  const app = theApp();
+  const held = await openRoom(app.store, room);
+  for (let i = 0; i < 96; i++) {
+    await sendLocal(held, {
+      type: 'm.room.message',
+      sender: userId,
+      content: { body: 'excluded-' + i, msgtype: 'm.text' },
+    }, app.tenant.signer());
+  }
+  const roomDb = app.store.room.bind(app.store);
+  let transactions = 0;
+  app.store.room = async (...args) => {
+    const db = await roomDb(...args);
+    const tx = db.tx.bind(db);
+    db.tx = (fn, options) => {
+      transactions++;
+      return tx(fn, options);
+    };
+    return db;
+  };
+  try {
+    const response = await call(
+      'rooms/' + encodeURIComponent(room) +
+        '/messages?dir=b&limit=1&filter=' +
+        encodeURIComponent(JSON.stringify({ types: ['org.example.other'] })),
+      token,
+    );
+    assertEquals(response.status, 200);
+    assertEquals(
+      (response.body.chunk as Json[]).map((e) => (e.content as Json).body),
+      ['latest'],
+    );
+    assert(
+      transactions < 40,
+      'filtered history used ' + transactions + ' room transactions',
+    );
+  } finally {
+    app.store.room = roomDb;
+  }
+});
 suite.test('sync defaults presence to online at the real presence reader', async () => {
   const presence = 'presence/' + encodeURIComponent(userId) + '/status';
   assertEquals(

@@ -136,7 +136,7 @@ def reviewed_bindings():
        "state format and membership enums are validated without changing their valid meanings")
     cs("search", "api/engine/client/search-request.ts", "api/engine/client/search.ts", "http-operation-search",
        "explicit search keys, scope, context and state reach their consumers",
-       "terminal nonempty pages have valid cursors while zero limits advertise no progress",
+       "terminal nonempty pages have valid cursors while zero search limits are rejected",
        "rank consumes every continuation once and ends after the empty terminal page",
        "recent consumes every continuation once and ends after the empty terminal page",
        "rank room_id continuation stays in its group and has an honest end",

@@ -2,7 +2,7 @@ import { theApp } from '#engine/app.ts';
 import {
   assertFederationEnabled,
   keyDocResponse,
-  notaryFromCache,
+  notaryDocumentsFromCache,
 } from '#engine/federation/keydoc.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { notaryRequests } from '#engine/federation/notary-request.ts';
@@ -19,15 +19,10 @@ export default async function (request: PathfinderRequest) {
   }
   const requested = notaryRequests(body);
   const app = theApp();
-  const out: unknown[] = [];
-  for (const { server, minimum } of requested) {
-    const doc = await notaryFromCache(
-      app.server,
-      app.tenant.signer(),
-      server,
-      minimum,
-    );
-    if (doc !== null) out.push(doc);
-  }
+  const out = await notaryDocumentsFromCache(
+    app.server,
+    app.tenant.signer(),
+    requested,
+  );
   return keyDocResponse({ server_keys: out });
 }

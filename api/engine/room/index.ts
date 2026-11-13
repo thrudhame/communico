@@ -52,6 +52,13 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       setStatus: (event: string, status: events.Status) =>
         events.setStatus(conn, event, status),
       statuses: (ids: readonly string[]) => events.statuses(conn, ids),
+      missingCandidates: (
+        latest: readonly string[],
+        earliest: readonly string[],
+        minimumDepth: number,
+        limit: number,
+      ) =>
+        events.missingCandidates(conn, latest, earliest, minimumDepth, limit),
       timestampBucket: (ts: number, dir: 'f' | 'b', inclusive: boolean) =>
         events.timestampBucket(conn, ts, dir, inclusive),
       hasAnnotation: (
@@ -133,6 +140,8 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       walkStart: () => segments.walkStart(conn),
       step: (cursor: segments.WalkCursor, dir: 'f' | 'b') =>
         segments.stepPosition(conn, cursor, dir),
+      page: (cursor: segments.WalkCursor, dir: 'f' | 'b', size: number) =>
+        segments.pagePositions(conn, cursor, dir, size),
       nextStayOf: (stay: number) => segments.nextStayOf(conn, stay),
     },
     extremities: {

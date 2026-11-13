@@ -319,6 +319,57 @@ export async function statuses(
 // are visited but never expanded; `truncated` marks an unfinished walk.
 export type Walk = { ids: string[]; truncated: boolean };
 
+// Missing-event output depth is not a traversal boundary. Let the native graph
+// query visit lightweight IDs/depths, then hydrate only the requested results.
+// The pre-existing 100000-event failure boundary remains independent of depth.
+export async function missingCandidates(
+  conn: Conn,
+  latest: readonly string[],
+  earliest: readonly string[],
+  minimumDepth: number,
+  limit: number,
+): Promise<Walk> {
+  if (limit === 0 || latest.length === 0) return { ids: [], truncated: false };
+  const roots = JSON.stringify(latest), stops = JSON.stringify(earliest);
+  // Use the stored depth index only to prove there is no possible held result,
+  // never to prune low-depth parents on a path to a higher-depth ancestor.
+  const eligible = await conn.query(
+    `SELECT 1 FROM events e JOIN event_status s ON s.event=e.id
+     WHERE e.depth >= ? AND s.grounding != 'pending'
+       AND e.id NOT IN (SELECT value FROM json_each(?))
+       AND e.id NOT IN (SELECT value FROM json_each(?)) LIMIT 1`,
+    [minimumDepth, roots, stops],
+  );
+  if (eligible.length === 0) return { ids: [], truncated: false };
+  const graph = (bound: number) =>
+    `WITH RECURSIVE roots(id) AS (SELECT value FROM json_each(?)),
+     stops(id) AS (SELECT value FROM json_each(?)),
+     walk(id) AS (
+       SELECT r.id FROM roots r JOIN events e ON e.id=r.id
+       JOIN event_status s ON s.event=e.id WHERE s.grounding != 'pending'
+       UNION
+       SELECT p.prev FROM walk w JOIN prev_edges p ON p.event=w.id
+       JOIN events e ON e.id=p.prev JOIN event_status s ON s.event=e.id
+       WHERE s.grounding != 'pending' AND p.prev NOT IN (SELECT id FROM stops)
+       LIMIT ${bound}
+     ) `;
+  const rows = await conn.query(
+    graph(100000) + `SELECT w.id FROM walk w CROSS JOIN events e ON e.id=w.id
+      WHERE e.depth >= ? AND w.id NOT IN (SELECT id FROM roots)
+        AND w.id NOT IN (SELECT id FROM stops) LIMIT ?`,
+    [roots, stops, minimumDepth, limit],
+  );
+  const ids = rows.map((row) => String(row.id));
+  if (ids.length >= limit) return { ids, truncated: false };
+  // A short result is complete only if the independent visited bound was not
+  // exhausted. Count metadata in native SQL, not a JS array of every PDU.
+  const count = await conn.query(
+    graph(100001) + 'SELECT COUNT(*) AS n FROM walk',
+    [roots, stops],
+  );
+  return { ids, truncated: Number(count[0].n) > 100000 };
+}
+
 async function forwardEdges(
   conn: Conn,
   ids: readonly string[],

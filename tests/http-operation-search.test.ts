@@ -126,17 +126,20 @@ for (const order_by of ['rank', 'recent']) {
     );
   }
 }
-suite.test('terminal nonempty pages have valid cursors while zero limits advertise no progress', async () => {
+suite.test('terminal nonempty pages have valid cursors while zero search limits are rejected', async () => {
   const criteria = { filter: { limit: 5 }, order_by: 'recent' };
   const complete = await search(criteria);
   assert(typeof complete.next_batch === 'string');
   const end = await search(criteria, complete.next_batch);
   assertEquals(eventIds(end), []);
   assertEquals(end.next_batch, undefined);
-  const zero = await search({ filter: { limit: 0 } });
-  assertEquals(zero.count, 5);
-  assertEquals(zero.results, []);
-  assertEquals(zero.next_batch, undefined);
+  const zero = await call('search', {
+    search_categories: {
+      room_events: { search_term: 'needle', filter: { limit: 0 } },
+    },
+  });
+  assertEquals(zero.status, 400);
+  assertEquals(zero.body.errcode, 'M_INVALID_PARAM');
 });
 suite.test('explicit search keys, scope, context and state reach their consumers', async () => {
   assertEquals(eventIds(await search({ keys: [] })), []);

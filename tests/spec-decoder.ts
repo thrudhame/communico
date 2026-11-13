@@ -8,6 +8,7 @@ type Value = {
   strings: string[];
   fields: Record<string, Value>;
   functions: Callable[];
+  shadowed: Set<string>;
 };
 type Callable = {
   file: string;
@@ -19,6 +20,7 @@ const empty = (): Value => ({
   strings: [],
   fields: Object.create(null),
   functions: [],
+  shadowed: new Set(),
 });
 const symbolic = (...paths: string[]): Value => ({ ...empty(), paths });
 const carriesInput = (value: Value): boolean =>
@@ -36,6 +38,14 @@ function union(...values: Value[]): Value {
   }
   out.paths = [...new Set(out.paths)];
   out.strings = [...new Set(out.strings)];
+  const sources = values.filter((value) => value.paths.length > 0);
+  if (sources.length > 0) {
+    out.shadowed = new Set(
+      [...sources[0].shadowed].filter((name) =>
+        sources.every((value) => value.shadowed.has(name))
+      ),
+    );
+  }
   return out;
 }
 type Module = {
@@ -190,6 +200,8 @@ export function decoderReads(
     );
     for (const path of value.paths) {
       for (const name of names) {
+        // Explicit properties replace spread values, including their source.
+        if (value.shadowed.has(name)) continue;
         const selected = path + '/' + name;
         out.paths.push(selected);
         if (/^(body|query|path|header)\//.test(selected)) reads.add(selected);
@@ -289,6 +301,7 @@ export function decoderReads(
               file,
               env,
             );
+            out.shadowed.add(name);
           }
         }
       }
@@ -332,7 +345,17 @@ export function decoderReads(
     if (ts.isCallExpression(node)) {
       const args = node.arguments.map((arg) => expression(arg, file, env));
       const name = node.expression.getText();
-      if (name === 'parseJson') return symbolic('body/application/json');
+      const functions = expression(node.expression, file, env).functions;
+      if (
+        functions.some((fn) =>
+          fn.file === 'api/engine/operation-body.ts' &&
+          fn.node.name?.getText() === 'parseJson'
+        )
+      ) {
+        return args[0]?.paths.includes('request')
+          ? symbolic('body/application/json')
+          : empty();
+      }
       if (ts.isPropertyAccessExpression(node.expression)) {
         const receiver = expression(node.expression.expression, file, env);
         const method = node.expression.name.text;
@@ -385,7 +408,6 @@ export function decoderReads(
         }
         if (name === 'JSON.parse') return args[0] ?? empty();
       }
-      const functions = expression(node.expression, file, env).functions;
       if (functions.length) {
         return union(
           ...functions.filter((fn) =>

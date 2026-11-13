@@ -54,13 +54,15 @@ export function searchRequest(value: unknown) {
       ) ?? false,
     };
   }
+  const filter = roomEventFilterOf(raw.filter);
+  if (filter.limit === 0) invalidParameter('filter.limit');
   return {
     term: requiredParameter(
       stringParameter(raw.search_term, 'search_term'),
       'search_term',
     ),
     keys,
-    filter: roomEventFilterOf(raw.filter),
+    filter,
     order: enumParameter(raw.order_by, 'order_by', ['rank', 'recent']) ??
       'rank',
     context,

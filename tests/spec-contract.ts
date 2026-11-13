@@ -45,6 +45,7 @@ export type SpecOperation = {
   path: string;
   request: SpecField[];
   response: SpecField[];
+  successStatuses: number[];
 };
 export const manifest = JSON.parse(Deno.readTextFileSync(
   new URL('fixtures/spec-contracts-v1.16.json', import.meta.url),
@@ -445,6 +446,10 @@ export async function assertSpecHttpResponse(
   let value: unknown;
   let parsed = false;
   for (const operation of operations) {
+    assert(
+      operation.successStatuses.includes(response.status),
+      operation.id + ': undeclared successful status ' + response.status,
+    );
     for (const field of operation.response) {
       if (field.field === 'response/' + response.status + '/application/json') {
         if (!parsed) {

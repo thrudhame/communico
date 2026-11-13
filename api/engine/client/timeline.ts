@@ -5,10 +5,12 @@ import { productionFetcher } from '#engine/federation/fetcher.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { backfill, bridgeForwardAnchor } from '#engine/room/history.ts';
 import {
+  type EventRow,
   formatCursor,
   parseCursor,
   type Room,
   type WalkCursor,
+  type WalkStep,
 } from '#engine/room/index.ts';
 import { membershipOf } from '#engine/server/read.ts';
 import {
@@ -165,8 +167,29 @@ export async function messages(
   let filtered = false;
   let ended = false, filled = false;
   let frontier: WalkCursor | null = null;
+  let pending: Extract<WalkStep, { kind: 'event' }>[] = [];
+  let storedPage = new Map<string, EventRow>();
   while (chunk.length < limit) {
-    const step = await room.tx((tx) => tx.segments.step(cursor!, w.dir));
+    let step: WalkStep;
+    if (pending.length > 0) step = pending.shift()!;
+    else {
+      const page = await room.tx(async (tx) => {
+        const page = await tx.segments.page(cursor!, w.dir, 32);
+        return page.kind === 'events'
+          ? {
+            ...page,
+            stored: await tx.events.list(
+              page.events.map((entry) => entry.event),
+            ),
+          }
+          : page;
+      });
+      if (page.kind === 'events') {
+        pending = page.events;
+        storedPage = page.stored;
+        step = pending.shift()!;
+      } else step = page;
+    }
     if (step.kind === 'end') {
       ended = true;
       break;
@@ -263,8 +286,17 @@ export async function messages(
     firstScanned ??= step;
     lastScanned = step;
     const row = step;
-    const stored = await room.tx((tx) => tx.events.get(row.event));
-    const pdu = stored === null ? null : JSON.parse(stored.pdu);
+    const stored = storedPage.get(row.event);
+    // Indexed fields suffice for most filters. Only contains_url needs JSON;
+    // excluded prefixes do not deserialize every unrelated stored event.
+    const pdu = stored === undefined ? null : {
+      type: stored.type,
+      sender: stored.sender,
+      room_id: w.roomId,
+      ...(filter.contains_url === undefined ? {} : {
+        content: JSON.parse(stored.pdu).content,
+      }),
+    };
     if (
       pdu === null ||
       !eventMatchesRoomEventFilter(

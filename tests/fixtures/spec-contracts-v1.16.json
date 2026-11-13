@@ -11041,6 +11041,9 @@
           "type": "object",
           "responseDescription": "The account data content for the given type."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11080,6 +11083,9 @@
           "type": "object",
           "responseDescription": "The account data content for the given type."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11118,6 +11124,9 @@
           "type": "object",
           "responseDescription": "The account data was successfully added."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11163,6 +11172,9 @@
           "type": "object",
           "responseDescription": "The account data was successfully added."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11245,6 +11257,9 @@
           ],
           "description": "An indicator as to whether or not the homeserver was able to unbind\nthe user's 3PIDs from the identity server(s). `success` indicates\nthat all identifiers have been unbound from the identity server while\n`no-support` indicates that one or more identifiers failed to unbind\ndue to the identity server refusing the request or the homeserver\nbeing unable to determine an identity server to unbind from. This\nmust be `success` if the homeserver has no identifiers to unbind\nfor the user."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11337,6 +11352,9 @@
           "type": "string",
           "description": "User agent string last seen in the session."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11398,6 +11416,9 @@
           "type": "integer",
           "description": "The timestamp, in milliseconds, when the homeserver associated the third-party identifier with the user."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11464,6 +11485,9 @@
           "type": "string",
           "description": "An optional field containing a URL where the client must\nsubmit the validation token to, with identical parameters\nto the Identity Service API's `POST\n/validate/email/submitToken` endpoint (without the requirement\nfor an access token). The homeserver must send this token to the\nuser (if applicable), who should then be prompted to provide it\nto the client.\n\nIf this field is not present, the client can assume that\nverification will happen without the client's involvement\nprovided the homeserver advertises this specification version\nin the `/versions` response (ie: r0.5.0)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11535,6 +11559,9 @@
           "type": "object",
           "responseDescription": "The addition was successful."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11587,6 +11614,9 @@
           "type": "object",
           "responseDescription": "The addition was successful."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11647,6 +11677,9 @@
           ],
           "description": "An indicator as to whether or not the homeserver was able to unbind\nthe 3PID from the identity server. `success` indicates that the\nidentity server has unbound the identifier whereas `no-support`\nindicates that the identity server refuses to support the request\nor the homeserver was not able to determine an identity server to\nunbind from."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11739,6 +11772,9 @@
           "type": "string",
           "description": "An optional field containing a URL where the client must submit the\nvalidation token to, with identical parameters to the Identity Service\nAPI's `POST /validate/email/submitToken` endpoint (without the requirement\nfor an access token). The homeserver must send this token to the user (if\napplicable), who should then be prompted to provide it to the client.\n\nIf this field is not present, the client can assume that verification\nwill happen without the client's involvement provided the homeserver\nadvertises this specification version in the `/versions` response\n(ie: r0.5.0)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11838,6 +11874,9 @@
           "type": "string",
           "description": "An optional field containing a URL where the client must submit the\nvalidation token to, with identical parameters to the Identity Service\nAPI's `POST /validate/email/submitToken` endpoint (without the requirement\nfor an access token). The homeserver must send this token to the user (if\napplicable), who should then be prompted to provide it to the client.\n\nIf this field is not present, the client can assume that verification\nwill happen without the client's involvement provided the homeserver\nadvertises this specification version in the `/versions` response\n(ie: r0.5.0)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11898,6 +11937,9 @@
           ],
           "description": "An indicator as to whether or not the identity server was able to unbind\nthe 3PID. `success` indicates that the identity server has unbound the\nidentifier whereas `no-support` indicates that the identity server\nrefuses to support the request or the homeserver was not able to determine\nan identity server to unbind from."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11943,6 +11985,9 @@
           "type": "integer",
           "description": "The duration in milliseconds that the\n[`/_matrix/app/v1/ping`](/application-service-api/#post_matrixappv1ping)\nrequest took from the homeserver's point of view."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -11992,6 +12037,9 @@
           "type": "object",
           "responseDescription": "The room's directory visibility has been updated."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12016,6 +12064,9 @@
           "type": "integer",
           "description": "The maximum size an upload can be in bytes.\nClients SHOULD use this as a guide when uploading content.\nIf not listed or null, the size limit should be treated as unknown."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12068,6 +12119,9 @@
           "description": "**Required.** The bytes for the uploaded file.",
           "responseDescription": "The content that was previously uploaded."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12127,6 +12181,9 @@
           "description": "**Required.** The bytes for the uploaded file.",
           "responseDescription": "The content that was previously uploaded."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12173,6 +12230,9 @@
           "type": "string",
           "description": "An [`mxc://` URI](/client-server-api/#matrix-content-mxc-uris) to the image. Omitted if there is no image."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12292,6 +12352,9 @@
           "description": "**Required.** The bytes for the *animated* thumbnail.",
           "responseDescription": "A thumbnail of the requested content."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12337,6 +12400,9 @@
           "type": "object",
           "responseDescription": "The user has been kicked and banned from the room."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12382,6 +12448,9 @@
           "type": "object",
           "responseDescription": "The user has been unbanned from the room."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12566,6 +12635,9 @@
           "required": false,
           "description": "Application-dependent keys using the\n[Common Namespaced Identifier Grammar](/appendices/#common-namespaced-identifier-grammar)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12590,6 +12662,9 @@
           "type": "integer",
           "description": "The maximum size an upload can be in bytes.\nClients SHOULD use this as a guide when uploading content.\nIf not listed or null, the size limit should be treated as unknown."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12658,6 +12733,9 @@
           "description": "**Required.** The bytes for the uploaded file.",
           "responseDescription": "The content that was previously uploaded."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12733,6 +12811,9 @@
           "description": "**Required.** The bytes for the uploaded file.",
           "responseDescription": "The content that was previously uploaded."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12779,6 +12860,9 @@
           "type": "string",
           "description": "An [`mxc://` URI](/client-server-api/#matrix-content-mxc-uris) to the image. Omitted if there is no image."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12914,6 +12998,9 @@
           "description": "**Required.** The bytes for the *animated* thumbnail.",
           "responseDescription": "A thumbnail of the requested content."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12946,6 +13033,9 @@
           "type": "integer",
           "description": "The timestamp (in milliseconds since the unix epoch) when the\ngenerated media id will expire, if media is not uploaded."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -12992,6 +13082,9 @@
           "pattern": "^mxc:\\/\\/",
           "description": "The [`mxc://` URI](/client-server-api/#matrix-content-mxc-uris) to the uploaded content."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13044,6 +13137,9 @@
           "type": "object",
           "responseDescription": "The upload was successful."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13236,6 +13332,9 @@
           "type": "string",
           "description": "The created room's ID."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13467,6 +13566,9 @@
           "type": "object",
           "responseDescription": "The provided keys were successfully uploaded."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13523,6 +13625,9 @@
           "required": false,
           "type": "object"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13587,6 +13692,9 @@
           "type": "object",
           "responseDescription": "The device was successfully removed, or had been removed\npreviously."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13646,6 +13754,9 @@
           "type": "integer",
           "description": "The timestamp (in milliseconds since the unix epoch) when this devices\nwas last seen. (May be a few minutes out of date, for efficiency\nreasons)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13700,6 +13811,9 @@
           "type": "integer",
           "description": "The timestamp (in milliseconds since the unix epoch) when this devices\nwas last seen. (May be a few minutes out of date, for efficiency\nreasons)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13771,6 +13885,9 @@
           "type": "object",
           "responseDescription": "The devices were successfully removed, or had been removed\npreviously."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13809,6 +13926,9 @@
           "type": "object",
           "responseDescription": "The device was successfully updated."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13834,6 +13954,9 @@
           "type": "object",
           "responseDescription": "The mapping was deleted."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13880,6 +14003,9 @@
           "type": "string",
           "description": "A server which is aware of this room alias."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13918,6 +14044,9 @@
           "required": false,
           "type": "string"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -13956,6 +14085,9 @@
           "type": "object",
           "responseDescription": "The mapping was created."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -14528,6 +14660,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -15311,6 +15446,9 @@
           "type": "boolean",
           "description": "If `true`, includes only events with a `url` key in their content. If `false`, excludes those events. If omitted, `url` key is not considered for filtering."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16106,6 +16244,9 @@
           "type": "string",
           "description": "The ID of the filter that was created. Cannot start\nwith a `{` as this character is used to determine\nif the filter provided is inline JSON or a previously\ndeclared filter by homeservers on some APIs."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16151,6 +16292,9 @@
           "type": "object",
           "responseDescription": "The user has been invited to join the room, or was already invited to the room."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16262,6 +16406,9 @@
           "type": "string",
           "description": "The joined room ID."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16360,6 +16507,9 @@
           "type": "string",
           "description": "The joined room ID."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16399,6 +16549,9 @@
           "type": "integer",
           "description": "The number of keys stored in the backup"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16445,6 +16598,9 @@
           "type": "integer",
           "description": "The number of keys stored in the backup"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16498,6 +16654,9 @@
           "type": "integer",
           "description": "The number of keys stored in the backup"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16523,6 +16682,9 @@
           "type": "object",
           "responseDescription": "The delete succeeded, or the specified backup was previously\ndeleted."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16609,6 +16771,9 @@
           "type": "object",
           "description": "Algorithm-dependent data.  See the documentation for the backup\nalgorithms in [Server-side key backups](/client-server-api/#server-side-key-backups) for more information on the\nexpected format of the data."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16687,6 +16852,9 @@
           "type": "object",
           "description": "Algorithm-dependent data.  See the documentation for the backup\nalgorithms in [Server-side key backups](/client-server-api/#server-side-key-backups) for more information on the\nexpected format of the data."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16755,6 +16923,9 @@
           "type": "object",
           "description": "Algorithm-dependent data.  See the documentation for the backup\nalgorithms in [Server-side key backups](/client-server-api/#server-side-key-backups) for more information on the\nexpected format of the data."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16810,6 +16981,9 @@
           "type": "string",
           "description": "The backup version."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16873,6 +17047,9 @@
           "type": "string",
           "description": "The backup version."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -16921,6 +17098,9 @@
           "type": "string",
           "description": "The backup version. This is an opaque string."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -17027,6 +17207,9 @@
           "type": "integer",
           "description": "The number of keys stored in the backup"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -17122,6 +17305,9 @@
           "type": "integer",
           "description": "The number of keys stored in the backup"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -17210,6 +17396,9 @@
           "type": "integer",
           "description": "The number of keys stored in the backup"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -17265,6 +17454,9 @@
           "type": "object",
           "responseDescription": "The update succeeded."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -17323,6 +17515,9 @@
           "required": false,
           "type": "string"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -17444,6 +17639,9 @@
           "required": false,
           "type": "object"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -17798,6 +17996,9 @@
           "type": "object",
           "description": "Signatures of the key, calculated using the process described at [Signing JSON](/appendices/#signing-json).\nOptional for the master key. Other keys must be signed by the\nuser\\'s master key."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18009,6 +18210,9 @@
           "required": false,
           "type": "integer"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18054,6 +18258,9 @@
           "type": "object",
           "responseDescription": "The user has been kicked from the room."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18112,6 +18319,9 @@
           "type": "string",
           "description": "The knocked room ID."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18137,6 +18347,9 @@
           "type": "object",
           "responseDescription": "The room has been forgotten."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18175,6 +18388,9 @@
           "type": "object",
           "responseDescription": "The room has been left."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18205,6 +18421,9 @@
           "required": false,
           "type": "string"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18241,6 +18460,9 @@
           ],
           "description": "The visibility of the room in the directory."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18387,6 +18609,9 @@
           "type": "integer",
           "description": "An estimate on the total number of published rooms, if the\nserver has an estimate."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18583,6 +18808,9 @@
           "type": "integer",
           "description": "An estimate on the total number of published rooms, if the\nserver has an estimate."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18625,6 +18853,9 @@
           "type": "object",
           "responseDescription": "The visibility was updated, or no change was needed."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18669,6 +18900,9 @@
           "type": "boolean",
           "description": "If `type` is `m.login.token`, an optional field to indicate\nto the unauthenticated client that the homeserver supports\nthe [`POST /login/get_token`](/client-server-api/#post_matrixclientv1loginget_token)\nendpoint. Note that supporting the endpoint does not\nnecessarily indicate that the user attempting to log in will\nbe able to generate such a token."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18866,6 +19100,9 @@
           "required": false,
           "description": "Application-dependent keys using Java package naming convention."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18937,6 +19174,9 @@
           "type": "integer",
           "description": "The time remaining in milliseconds until the homeserver will no longer accept the token. `120000`\n(2 minutes) is recommended as a default."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18954,6 +19194,9 @@
           "type": "object",
           "responseDescription": "The access token used in the request was successfully invalidated."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -18971,6 +19214,9 @@
           "type": "object",
           "responseDescription": "The user's access tokens were successfully invalidated."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -19306,6 +19552,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -19506,6 +19755,9 @@
           "type": "integer",
           "description": "The unix timestamp at which the event notification was sent,\nin milliseconds."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -19628,6 +19880,9 @@
           "type": "string",
           "description": "A prompt value that the server supports."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -19802,6 +20057,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -19942,6 +20200,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -20513,6 +20774,9 @@
           "type": "string",
           "description": "The type of event. This SHOULD be namespaced similar to Java package naming conventions e.g. 'com.example.subdomain.event.type'"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -20572,6 +20836,9 @@
           "type": "integer",
           "description": "The number of seconds before this token expires and a new one must\nbe generated."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -20643,6 +20910,9 @@
           "type": "object",
           "responseDescription": "The password has been changed."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -20735,6 +21005,9 @@
           "type": "string",
           "description": "An optional field containing a URL where the client must submit the\nvalidation token to, with identical parameters to the Identity Service\nAPI's `POST /validate/email/submitToken` endpoint (without the requirement\nfor an access token). The homeserver must send this token to the user (if\napplicable), who should then be prompted to provide it to the client.\n\nIf this field is not present, the client can assume that verification\nwill happen without the client's involvement provided the homeserver\nadvertises this specification version in the `/versions` response\n(ie: r0.5.0)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -20834,6 +21107,9 @@
           "type": "string",
           "description": "An optional field containing a URL where the client must submit the\nvalidation token to, with identical parameters to the Identity Service\nAPI's `POST /validate/email/submitToken` endpoint (without the requirement\nfor an access token). The homeserver must send this token to the user (if\napplicable), who should then be prompted to provide it to the client.\n\nIf this field is not present, the client can assume that verification\nwill happen without the client's involvement provided the homeserver\nadvertises this specification version in the `/versions` response\n(ie: r0.5.0)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21021,6 +21297,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21082,6 +21361,9 @@
           "type": "boolean",
           "description": "Whether the user is currently active"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21132,6 +21414,9 @@
           "type": "object",
           "responseDescription": "The new presence state was set."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21165,6 +21450,9 @@
           "type": "object",
           "responseDescription": "The profile field was deleted or it doesn't exist."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21217,6 +21505,9 @@
           "required": false,
           "description": "Additional profile fields."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21251,6 +21542,9 @@
           "description": "An object with one property, whose key matches the `keyName` specified\nin the URL, and whose value is the current setting of that profile field.\n",
           "responseDescription": "The profile field value was retrieved."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21291,6 +21585,9 @@
           "type": "object",
           "responseDescription": "The profile field was set."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21391,6 +21688,9 @@
           "type": "string",
           "description": "The format to use when sending notifications to the Push\nGateway."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21496,6 +21796,9 @@
           "description": "An empty object.",
           "responseDescription": "The pusher was set."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -21535,6 +21838,9 @@
           "type": "object",
           "responseDescription": "The push rule was deleted."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -22110,6 +22416,9 @@
           "type": "string",
           "description": "The [glob-style pattern](/appendices#glob-style-matching) to match against.\nOnly applicable to `content` rules."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -22672,6 +22981,9 @@
           "type": "string",
           "description": "The [glob-style pattern](/appendices#glob-style-matching) to match against.\nOnly applicable to `content` rules."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -22815,6 +23127,9 @@
           "type": "string",
           "description": "The [glob-style pattern](/appendices#glob-style-matching) to match against.\nOnly applicable to `content` rules."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -22870,6 +23185,9 @@
             "object"
           ]
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -22916,6 +23234,9 @@
           "type": "boolean",
           "description": "Whether the push rule is enabled or not."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23051,6 +23372,9 @@
           "type": "object",
           "responseDescription": "The push rule was created/updated."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23112,6 +23436,9 @@
           "type": "object",
           "responseDescription": "The actions for the push rule were set."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23164,6 +23491,9 @@
           "type": "object",
           "responseDescription": "The push rule was enabled or disabled."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23216,6 +23546,9 @@
           "type": "object",
           "responseDescription": "The read marker, and read receipt(s) if provided, have been updated."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23273,6 +23606,9 @@
           "type": "object",
           "responseDescription": "The receipt was sent."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23332,6 +23668,9 @@
           "type": "string",
           "description": "A unique identifier for the event."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23384,6 +23723,9 @@
           "type": "integer",
           "description": "The lifetime of the access token, in milliseconds. If not\ngiven, the client can assume that the access token will not\nexpire."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23417,6 +23759,9 @@
           "type": "boolean",
           "description": "A flag to indicate that the username is available. This should always\nbe `true` when the server replies with 200 OK."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23571,6 +23916,9 @@
           "type": "string",
           "description": "ID of the registered device. Will be the same as the\ncorresponding parameter in the request, if one was specified.\nRequired if the `inhibit_login` option is false."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23663,6 +24011,9 @@
           "type": "string",
           "description": "An optional field containing a URL where the client must submit the\nvalidation token to, with identical parameters to the Identity Service\nAPI's `POST /validate/email/submitToken` endpoint (without the requirement\nfor an access token). The homeserver must send this token to the user (if\napplicable), who should then be prompted to provide it to the client.\n\nIf this field is not present, the client can assume that verification\nwill happen without the client's involvement provided the homeserver\nadvertises this specification version in the `/versions` response\n(ie: r0.5.0)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23762,6 +24113,9 @@
           "type": "string",
           "description": "An optional field containing a URL where the client must submit the\nvalidation token to, with identical parameters to the Identity Service\nAPI's `POST /validate/email/submitToken` endpoint (without the requirement\nfor an access token). The homeserver must send this token to the user (if\napplicable), who should then be prompted to provide it to the client.\n\nIf this field is not present, the client can assume that verification\nwill happen without the client's involvement provided the homeserver\nadvertises this specification version in the `/versions` response\n(ie: r0.5.0)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -23794,6 +24148,9 @@
           "type": "boolean",
           "description": "True if the token is still valid, false otherwise. This should\nadditionally be false if the token is not a recognised token by\nthe server."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -24025,6 +24382,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -24263,6 +24623,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -24508,6 +24871,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -24546,6 +24912,9 @@
           "type": "object",
           "responseDescription": "The room has been reported successfully."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -24598,6 +24967,9 @@
           "type": "object",
           "responseDescription": "The event has been reported successfully."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -24637,6 +25009,9 @@
           "type": "object",
           "responseDescription": "The user has been reported successfully or the server chose\nto not disclose whether the users exists.\n"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -24694,6 +25069,9 @@
           "type": "integer",
           "description": "The event's timestamp, in milliseconds since the Unix epoch.\nThis makes it easy to do a quick comparison to see if the\n`event_id` fetched is too far out of range to be useful for your\nuse case."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -25061,6 +25439,9 @@
           "type": "string",
           "description": "The type of event. This SHOULD be namespaced similar to Java package naming conventions e.g. 'com.example.subdomain.event.type'"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -25113,6 +25494,9 @@
           "type": "string",
           "description": "A unique identifier for the event."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -25165,6 +25549,9 @@
           "type": "string",
           "description": "A unique identifier for the event."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -25364,6 +25751,9 @@
           ],
           "description": "The membership state of the user if the user is joined to the room. Absent\nif the API was called unauthenticated."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -25423,6 +25813,9 @@
           "type": "string",
           "description": "The ID of the new room."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -25570,6 +25963,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -25622,6 +26018,9 @@
           "type": "string",
           "description": "The avatar of the user this object is representing, as an [`mxc://` URI](/client-server-api/#matrix-content-mxc-uris)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -25809,6 +26208,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -25956,6 +26358,9 @@
           "source": "data/api/client-server/definitions/client_event.yaml#/allOf/1/properties/unsigned/properties/redacted_because",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -26192,6 +26597,9 @@
           "type": "string",
           "description": "A unique key which defines the overwriting semantics for this piece of room state. This value is often a zero-length string. The presence of this key makes this event a State Event.\nState keys starting with an `@` are reserved for referencing user IDs, such as room members. With the exception of a few events, state events set with a given user's ID as the state key MUST only be set by that user."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -27159,6 +27567,9 @@
           "type": "string",
           "description": "Token that can be used to get the next batch of\nresults, by passing as the `next_batch` parameter to\nthe next call. If this field is absent, there are no\nmore results."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -27445,6 +27856,9 @@
           "type": "string",
           "description": "A token to supply to `from` to keep paginating the responses. Not present when there are\nno further results."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -27462,7 +27876,8 @@
           "description": "URI to which the user will be redirected after the homeserver has\nauthenticated the user with SSO."
         }
       ],
-      "response": []
+      "response": [],
+      "successStatuses": []
     },
     {
       "id": "data/api/client-server/sso_login_redirect.yaml#GET /_matrix/client/v3/login/sso/redirect/{idpId}",
@@ -27486,7 +27901,8 @@
           "description": "URI to which the user will be redirected after the homeserver has\nauthenticated the user with SSO."
         }
       ],
-      "response": []
+      "response": [],
+      "successStatuses": []
     },
     {
       "id": "data/api/client-server/support.yaml#GET /.well-known/matrix/support",
@@ -27550,6 +27966,9 @@
           "type": "string",
           "description": "The URL of a page to give users help specific to the\nhomeserver, like extra login/registration steps.\n\nAt least one of `contacts` or `support_page` is required."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -28787,6 +29206,9 @@
           "required": false,
           "type": "integer"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -28826,6 +29248,9 @@
           "type": "object",
           "responseDescription": "The tag was successfully removed."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -28877,6 +29302,9 @@
           "type": "number",
           "description": "A number in a range `[0,1]` describing a relative\nposition of the room under the given tag."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -28929,6 +29357,9 @@
           "type": "object",
           "responseDescription": "The tag was successfully added."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -28982,6 +29413,9 @@
           "type": "object",
           "description": "Information used to identify this third-party location."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29048,6 +29482,9 @@
           "type": "object",
           "description": "Information used to identify this third-party location."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29206,6 +29643,9 @@
           "type": "string",
           "description": "A unique identifier for this instance on the homeserver. This field is added\nto the response of [`GET /_matrix/app/v1/thirdparty/protocol/{protocol}`](/application-service-api/#get_matrixappv1thirdpartyprotocolprotocol)\nby the homeserver.\n\nThis is the identifier to use as the `third_party_instance_id` in a request to\n[`POST /_matrix/client/v3/publicRooms`](/client-server-api/#post_matrixclientv3publicrooms)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29363,6 +29803,9 @@
           "type": "string",
           "description": "A unique identifier for this instance on the homeserver. This field is added\nto the response of [`GET /_matrix/app/v1/thirdparty/protocol/{protocol}`](/application-service-api/#get_matrixappv1thirdpartyprotocolprotocol)\nby the homeserver.\n\nThis is the identifier to use as the `third_party_instance_id` in a request to\n[`POST /_matrix/client/v3/publicRooms`](/client-server-api/#post_matrixclientv3publicrooms)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29416,6 +29859,9 @@
           "type": "object",
           "description": "Information used to identify this third-party location."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29482,6 +29928,9 @@
           "type": "object",
           "description": "Information used to identify this third-party location."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29542,6 +29991,9 @@
           "type": "object",
           "responseDescription": "The user has been invited to join the room."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29727,6 +30179,9 @@
           "type": "string",
           "description": "A token to supply to `from` to keep paginating the responses. Not present when there are\nno further results."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29785,6 +30240,9 @@
           "type": "object",
           "responseDescription": "The message was successfully sent."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29837,6 +30295,9 @@
           "type": "object",
           "responseDescription": "The new typing state was set."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29916,6 +30377,9 @@
           "type": "boolean",
           "description": "Indicates if the result list has been truncated by the limit."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -29961,6 +30425,9 @@
           "type": "boolean",
           "description": "Whether or not the namespaced feature is supported."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30012,6 +30479,9 @@
           "type": "integer",
           "description": "The time-to-live in seconds"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30064,6 +30534,9 @@
           "required": false,
           "description": "Application-dependent keys using Java package naming convention."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30103,6 +30576,9 @@
           "type": "boolean",
           "description": "When `true`, the user is a [Guest User](/client-server-api/#guest-access).\nWhen not present or `false`, the user is presumed to be a \nnon-guest user."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30197,6 +30673,9 @@
           "type": "object",
           "description": "The [PDUs](/server-server-api/#pdus) contained in the transaction. The event format varies depending\non the room version - check the [room version specification](/rooms) for precise event formats."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30281,6 +30760,9 @@
           "required": false,
           "type": "object"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30320,6 +30802,9 @@
           "description": "**Required.** MUST contain a `boundary` (per [RFC 2046](https://datatracker.ietf.org/doc/html/rfc2046#section-5.1))\ndelineating exactly two parts:\n\nThe first part has a `Content-Type` header of `application/json`\nand describes the media's metadata, if any. Currently, this will\nalways be an empty object.\n\nThe second part is either:\n\n1. the bytes of the media itself, using `Content-Type` and\n   `Content-Disposition` headers as appropriate;\n2. or a `Location` header to redirect the caller to where the media\n   can be retrieved. The URL at `Location` SHOULD have appropriate\n   `Content-Type` and `Content-Disposition` headers which describe\n   the media.\n\n   When `Location` is present, servers SHOULD NOT cache the URL.\n   The remote server may have applied time limits on its validity.\n   If the caller requires an up-to-date URL, it SHOULD re-request\n   the media download.",
           "responseDescription": "The content that was previously uploaded."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30391,6 +30876,9 @@
           "description": "**Required.** MUST contain a `boundary` (per [RFC 2046](https://datatracker.ietf.org/doc/html/rfc2046#section-5.1))\ndelineating exactly two parts:\n\nThe first part has a `Content-Type` header of `application/json`\nand describes the media's metadata, if any. Currently, this will\nalways be an empty object.\n\nThe second part is either:\n\n1. the bytes of the media itself, using `Content-Type` and\n   `Content-Disposition` headers as appropriate;\n2. or a `Location` header to redirect the caller to where the media\n   can be retrieved. The URL at `Location` SHOULD have appropriate\n   `Content-Type` and `Content-Disposition` headers which describe\n   the media.\n\n   When `Location` is present, servers SHOULD NOT cache the URL.\n   The remote server may have applied time limits on its validity.\n   If the caller requires an up-to-date URL, it SHOULD re-request\n   the media download.\n\n{{% boxes/note %}}\nThe `Content-Type` for the second part SHOULD be one of:\n* `image/png` (possibly of the APNG variety)\n* `image/apng`\n* `image/jpeg`\n* `image/gif`\n* `image/webp`\n{{% /boxes/note %}}",
           "responseDescription": "A thumbnail of the requested content."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30436,6 +30924,9 @@
           "required": false,
           "type": "object"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30510,6 +31001,9 @@
           "type": "object",
           "description": "The [PDUs](/server-server-api/#pdus) contained in the transaction. The event format varies depending\non the room version - check the [room version specification](/rooms) for precise event formats."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30570,6 +31064,9 @@
           "type": "object",
           "description": "The [PDUs](/server-server-api/#pdus) for the fully resolved state of the room. The event format\nvaries depending on the room version - check the [room version specification](/rooms)\nfor precise event formats."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30628,6 +31125,9 @@
           "required": false,
           "type": "string"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30685,6 +31185,9 @@
           "type": "integer",
           "description": "The event's timestamp, in milliseconds since the Unix epoch."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -30895,6 +31398,9 @@
           "type": "string",
           "description": "The value `invite`."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -31079,6 +31585,9 @@
           "type": "string",
           "description": "The value `invite`."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -31194,6 +31703,9 @@
           "type": "string",
           "description": "Required if the room is [restricted](/client-server-api/#restricted-rooms)\nand is joining through one of the conditions available. If the\nuser is responding to an invite, this is not required.\n\nAn arbitrary user ID belonging to the resident server in\nthe room being joined that is able to issue invites to other\nusers. This is used in later validation of the auth rules for\nthe `m.room.member` event."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -31337,6 +31849,9 @@
           "type": "object",
           "description": "The [PDUs](/server-server-api/#pdus) for the fully resolved state of the room. The event format varies depending\non the room version - check the [room version specification](/rooms) for precise event formats."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -31491,6 +32006,9 @@
           "required": false,
           "type": "string"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -31618,6 +32136,9 @@
           "type": "integer",
           "description": "POSIX timestamp in milliseconds when the list of valid keys should be refreshed.\nThis field MUST be ignored in room versions 1, 2, 3, and 4. Keys used beyond this\ntimestamp MUST be considered invalid, depending on the\n[room version specification](/rooms).\n\nServers MUST use the lesser of this field and 7 days into the future when\ndetermining if a key is valid. This is to avoid a situation where an attacker\npublishes a key which is valid for a significant amount of time without a way\nfor the homeserver owner to revoke it."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -31765,6 +32286,9 @@
           "type": "integer",
           "description": "POSIX timestamp in milliseconds when the list of valid keys should be refreshed.\nThis field MUST be ignored in room versions 1, 2, 3, and 4. Keys used beyond this\ntimestamp MUST be considered invalid, depending on the\n[room version specification](/rooms).\n\nServers MUST use the lesser of this field and 7 days into the future when\ndetermining if a key is valid. This is to avoid a situation where an attacker\npublishes a key which is valid for a significant amount of time without a way\nfor the homeserver owner to revoke it."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -31863,6 +32387,9 @@
           "type": "integer",
           "description": "POSIX timestamp in milliseconds when the list of valid keys should be refreshed.\nThis field MUST be ignored in room versions 1, 2, 3, and 4. Keys used beyond this\ntimestamp MUST be considered invalid, depending on the\n[room version specification](/rooms).\n\nServers MUST use the lesser of this field and 7 days into the future when\ndetermining if a key is valid. This is to avoid a situation where an attacker\npublishes a key which is valid for a significant amount of time without a way\nfor the homeserver owner to revoke it."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -31971,6 +32498,9 @@
           "type": "string",
           "description": "The value `knock`."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32072,6 +32602,9 @@
           "type": "object",
           "description": "Note that events have a different format depending on the room\nversion - check the [room version specification](/rooms) for\nprecise event formats."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32167,6 +32700,9 @@
           "type": "string",
           "description": "The value `leave`."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32282,6 +32818,9 @@
           "type": "object",
           "description": "An empty object."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32377,6 +32916,9 @@
           "description": "An empty object.",
           "responseDescription": "An empty response to indicate the event was accepted into the graph by\nthe receiving homeserver."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32409,6 +32951,9 @@
           "type": "string",
           "description": "The Matrix User ID who generated the token."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32562,6 +33107,9 @@
           "type": "integer",
           "description": "An estimate on the total number of published rooms, if the\nserver has an estimate."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32751,6 +33299,9 @@
           "type": "integer",
           "description": "An estimate on the total number of published rooms, if the\nserver has an estimate."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32796,6 +33347,9 @@
           "required": false,
           "type": "string"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32846,6 +33400,9 @@
           "type": "string",
           "description": "The avatar URL for the user's avatar. May be omitted if the user does not\nhave an avatar set."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -32863,7 +33420,10 @@
           "description": "The type of query to make"
         }
       ],
-      "response": []
+      "response": [],
+      "successStatuses": [
+        200
+      ]
     },
     {
       "id": "data/api/server-server/space_hierarchy.yaml#GET /_matrix/federation/v1/hierarchy/{roomId}",
@@ -33284,6 +33844,9 @@
           "required": false,
           "type": "string"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -33423,6 +33986,9 @@
           "description": "An empty object",
           "responseDescription": "The homeserver has processed the notification."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -33555,6 +34121,9 @@
           "description": "An empty object",
           "responseDescription": "The invite has been issued successfully."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -33687,6 +34256,9 @@
           "type": "string",
           "description": "A human readable description about what went wrong in processing this PDU.\nIf no error is present, the PDU can be considered successfully handled."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -33954,6 +34526,9 @@
           "source": "data/api/server-server/user_devices.yaml#/paths/~1user~1devices~1{userId}/get/responses/200/content/application~1json/schema/properties/self_signing_key/allOf/1",
           "required": false
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -34060,6 +34635,9 @@
           "required": false,
           "type": "string"
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -34330,6 +34908,9 @@
           "type": "object",
           "description": "Signatures of the key, calculated using the process described at [Signing JSON](/appendices/#signing-json).\nOptional for the master key. Other keys must be signed by the\nuser\\'s master key."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -34367,6 +34948,9 @@
           "type": "string",
           "description": "Version of this implementation. The version format depends on the implementation."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     },
     {
@@ -34391,6 +34975,9 @@
           "type": "string",
           "description": "The server name to delegate server-server communications to, with optional\nport. The delegated server name uses the same grammar as\n[server names in the appendices](/appendices/#server-name)."
         }
+      ],
+      "successStatuses": [
+        200
       ]
     }
   ]

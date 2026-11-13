@@ -28,15 +28,36 @@ export async function notaryFromCache(
   name: string,
   minimumValidUntil = Date.now(),
 ): Promise<KeyDoc | null> {
+  const documents = await notaryDocumentsFromCache(server, signer, [{
+    server: name,
+    minimum: minimumValidUntil,
+  }]);
+  return documents.length === 0 ? null : documents[0];
+}
+
+// Input size is already bounded by request admission. A set-based lookup makes
+// misses cheap without a new entry quota, and signs only eligible held hits.
+export async function notaryDocumentsFromCache(
+  server: Db,
+  signer: Signer,
+  requests: readonly { server: string; minimum: number }[],
+): Promise<KeyDoc[]> {
+  if (requests.length === 0) return [];
   const rows = await server.query(
-    'SELECT key_json FROM server_key_docs WHERE server_name = ?',
-    [name],
+    `SELECT d.key_json, json_extract(r.value, '$.minimum') AS minimum
+     FROM json_each(?) r JOIN server_key_docs d
+       ON d.server_name = json_extract(r.value, '$.server')
+     ORDER BY CAST(r.key AS INTEGER)`,
+    [JSON.stringify(requests)],
   );
-  if (rows.length === 0) return null;
-  const doc = JSON.parse(String(rows[0].key_json)) as KeyDoc;
-  if (doc.valid_until_ts < minimumValidUntil) return null;
-  await signWithSigner(doc as unknown as Record<string, unknown>, signer);
-  return doc;
+  const documents: KeyDoc[] = [];
+  for (const row of rows) {
+    const doc = JSON.parse(String(row.key_json)) as KeyDoc;
+    if (doc.valid_until_ts < Number(row.minimum)) continue;
+    await signWithSigner(doc as unknown as Record<string, unknown>, signer);
+    documents.push(doc);
+  }
+  return documents;
 }
 
 // The signed bytes: a key document is served as CANONICAL JSON so that a

@@ -353,6 +353,9 @@ Messages, context and search use that same validated room-event filter rather
 than independently dropping malformed fields. Messages applies the complete
 type/sender/room/URL predicate before its result limit, retaining only scan-cut
 anchors across excluded prefixes. Filter limits can further reduce a page.
+Contiguous history is read and hydrated in 32-event segment pages; the shared
+walk still stops at imported or isolated boundaries before crossing their DAG.
+Indexed event fields reject unrelated events without deserializing their PDUs.
 Ordinary sync normalizes omitted presence to online, rejects malformed booleans
 and numeric parameters, and returns full-state requests immediately even with
 a since token and positive timeout.
@@ -362,11 +365,12 @@ Search has one normalized operation contract and one keyset pagination owner for
 rank and recent ordering, including room and sender scopes. Equal ranks retain a
 deterministic sequence/event tie-break. Global and per-group continuations name
 the last real result in their scope, including on a terminal nonempty page as in
-Synapse. Following a terminal cursor yields an empty page with no further token;
-zero-size pages issue no cursor. Using a group token keeps subsequent global
+Synapse. Following a terminal cursor yields an empty page with no further token.
+Search rejects an explicit zero result limit. Using a group token keeps subsequent global
 continuations in the same group. Multiple matching indexed keys
 still produce one event result. Known search keys, context, grouping and boolean
 fields are validated before selection rather than silently discarded.
+Group order is assigned once on insertion, without rescanning existing groups.
 (`api/engine/client/{search-request,search-page,search}.ts`)
 
 Joined-member summaries retain Synapse's explicit null display/avatar strings
@@ -701,6 +705,12 @@ boundary. Absent make_join versions negotiate only version 1. The cache-only
 notary signs a held document only when its validity meets every requested floor;
 omitted floors use one current-time cut. Transaction timestamp/array validation
 precedes replay publication, so malformed requests cannot cache empty success.
+Notary POST selects all held hits in one cache query and signs only eligible
+documents, with no network fetch or per-miss transaction. Missing-event reads
+walk lightweight native graph metadata and hydrate only selected results; an
+indexed no-candidate check avoids a walk when no held depth can qualify.
+Low-depth predecessors still expand, and the existing independent 100000-event
+failure boundary never becomes a silently truncated successful answer.
 (`federation/{history-request,notary-request,transaction-request}.ts`)
 
 Joining verifies the returned snapshot and our join. A returned join must

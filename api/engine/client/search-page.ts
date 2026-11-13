@@ -109,11 +109,12 @@ export function searchPage<
   > = {};
   for (const key of request.groups) {
     const grouped: typeof groups[string] = {};
+    let order = 0;
     for (const hit of page) {
       const value = valueOf(hit, key);
       const group = grouped[value] ??= {
         results: [],
-        order: Object.keys(grouped).length,
+        order: order++,
       };
       group.results.push(hit.eventId);
       group.next_batch = token(hit, request.order, { key, value });

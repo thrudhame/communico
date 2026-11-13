@@ -277,6 +277,21 @@ async function historySelection(
   includeRoots: boolean,
   minimumDepth = 0,
 ): Promise<Map<string, Pdu>> {
+  if (!includeRoots) {
+    const walk = await tx.events.missingCandidates(
+      roots,
+      stops,
+      minimumDepth,
+      cap,
+    );
+    if (walk.truncated) {
+      throw new MatrixError(503, 'M_UNKNOWN', 'history walk exceeds bound');
+    }
+    const rows = await tx.events.list(walk.ids);
+    return new Map(
+      walk.ids.map((id) => [id, JSON.parse(rows.get(id)!.pdu) as Pdu]),
+    );
+  }
   const stop = new Set(stops);
   const excluded = new Set(includeRoots ? [] : roots);
   const held = new Map<

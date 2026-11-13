@@ -1,4 +1,4 @@
-import { assertEquals, assertThrows } from '@std/assert';
+import { assert, assertEquals, assertThrows } from '@std/assert';
 import { missingEventsRequest } from '#engine/federation/history-request.ts';
 import { transactionRequest } from '#engine/federation/transaction-request.ts';
 import { httpSuite } from '#tests/http-app.ts';
@@ -76,6 +76,83 @@ suite.test('missing-event depth applies before the result limit, inclusively, wi
   const excluded = await fed('POST', path, { ...base, min_depth: depth + 1 });
   assertEquals(excluded.status, 200);
   assertEquals(excluded.body.events, []);
+});
+
+suite.test('missing-event selection skips low-depth PDU hydration without pruning their ancestors', async () => {
+  const app = theApp();
+  const template = JSON.parse(
+    (await room.tx((tx) => tx.events.get(middle)))!.pdu,
+  );
+  const ids = Array.from({ length: 160 }, (_, i) => '$depth-work-' + i);
+  await room.tx(async (tx) => {
+    for (const [i, id] of ids.entries()) {
+      await tx.events.insert(
+        id,
+        JSON.stringify({
+          ...template,
+          event_id: id,
+          depth: i === 0 ? 1000000 : 1,
+          prev_events: [i === 0 ? earliest : ids[i - 1]],
+          content: { body: 'depth-' + i, msgtype: 'm.text' },
+        }),
+      );
+      await tx.events.setStatus(id, {
+        standing: 'accepted',
+        grounding: 'grounded',
+        origin,
+        received_ts: Date.now(),
+      });
+    }
+  });
+  const roomDb = app.store.room.bind(app.store);
+  let individualReads = 0;
+  app.store.room = async (...args) => {
+    const handle = await roomDb(...args);
+    const transaction = handle.tx.bind(handle);
+    handle.tx = (fn, options) =>
+      transaction(async (conn) => {
+        const query = conn.query.bind(conn);
+        conn.query = (sql, params) => {
+          if (/SELECT \* FROM events WHERE id = \?/.test(sql)) {
+            individualReads++;
+          }
+          return query(sql, params);
+        };
+        try {
+          return await fn(conn);
+        } finally {
+          conn.query = query;
+        }
+      }, options);
+    return handle;
+  };
+  try {
+    const path = prefix + 'get_missing_events/' + encodeURIComponent(room.id);
+    const selected = await fed('POST', path, {
+      earliest_events: [earliest],
+      latest_events: [ids.at(-1)],
+      limit: 1,
+      min_depth: 1000000,
+    });
+    assertEquals(selected.status, 200);
+    assertEquals((selected.body.events as Json[]).map((e) => e.depth), [
+      1000000,
+    ]);
+    assert(
+      individualReads < 40,
+      'depth selection hydrated ' + individualReads + ' individual PDUs',
+    );
+    const empty = await fed('POST', path, {
+      earliest_events: [],
+      latest_events: [ids.at(-1)],
+      limit: 1,
+      min_depth: 1000001,
+    });
+    assertEquals(empty.status, 200);
+    assertEquals(empty.body.events, []);
+  } finally {
+    app.store.room = roomDb;
+  }
 });
 suite.test('backfill requires v and strictly decodes limit', async () => {
   const path = prefix + 'backfill/' + encodeURIComponent(room.id);
@@ -199,6 +276,28 @@ suite.test('notary honors explicit/default floors and validates all nested crite
     );
   }
   assertEquals((await notary({ server_keys: {} })).body, { server_keys: [] });
+});
+
+suite.test('notary cache misses use one set-based read instead of one query per input', async () => {
+  const server = theApp().server;
+  const query = server.query.bind(server);
+  let reads = 0;
+  server.query = (sql, params) => {
+    if (sql.includes('server_key_docs')) reads++;
+    return query(sql, params);
+  };
+  try {
+    const response = await notary({
+      server_keys: Object.fromEntries(
+        Array.from({ length: 2000 }, (_, i) => ['absent-' + i + '.test', {}]),
+      ),
+    });
+    assertEquals(response.status, 200);
+    assertEquals(response.body.server_keys, []);
+    assertEquals(reads, 1);
+  } finally {
+    server.query = query;
+  }
 });
 for (
   const fields of [
