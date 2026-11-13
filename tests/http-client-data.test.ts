@@ -280,6 +280,8 @@ test('versions stays public, capabilities stays protected, discovery absent per 
       'm.room_versions': { default: '11', available },
       'm.change_password': { enabled: false },
       'm.profile_fields': { enabled: true },
+      'm.set_displayname': { enabled: true },
+      'm.set_avatar_url': { enabled: true },
       'org.matrix.msc4140.delayed_events': {
         max_delay_ms: 0,
         max_scheduled: 100,

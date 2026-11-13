@@ -2,7 +2,7 @@ import {
   validateCanonicalAliasContent,
   writeStateKey,
 } from '#engine/client/state.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import { scheduleDelayed } from '#engine/client/delayed.ts';
 
 export default async function (

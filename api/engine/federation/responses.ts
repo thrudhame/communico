@@ -1,6 +1,12 @@
 // Endpoint-owned envelopes. Parsing one of these is not PDU/signature/identity
 // admission: the room/key owner still verifies the parsed records before use.
-import { arrayOf, objectOf, stringOf } from '#engine/net/json.ts';
+import {
+  arrayOf,
+  booleanOf,
+  objectOf,
+  optionalField,
+  stringOf,
+} from '#engine/net/json.ts';
 import { protocol, UpstreamError } from '#engine/net/upstream-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 
@@ -59,10 +65,12 @@ export function membershipTemplate(
   versions: readonly string[],
 ) {
   const body = objectOf(raw, endpoint);
-  // Only omission means legacy v1/v2. It never means our preferred version.
-  const roomVersion = body.room_version === undefined
-    ? '1'
-    : stringOf(body.room_version, endpoint);
+  // An absent optional version means legacy v1/v2, never our preferred version.
+  const version = optionalField(
+    body.room_version,
+    (raw) => stringOf(raw, endpoint),
+  );
+  const roomVersion = version === undefined ? '1' : version;
   if (!versions.includes(roomVersion)) {
     throw new UpstreamError('validation', {
       phase: endpoint,
@@ -94,25 +102,19 @@ export function sendJoinResponse(raw: unknown, legacy = false) {
   const body = legacy
     ? legacyResponse(raw, 'send-join')
     : objectOf(raw, 'send-join');
-  if (
-    body.members_omitted !== undefined &&
-    typeof body.members_omitted !== 'boolean'
-  ) {
-    protocol('send-join', 'invalid members_omitted');
-  }
-  if (body.servers_in_room !== undefined) {
-    strings(body.servers_in_room, 'send-join');
-  }
+  const omitted = optionalField(
+    body.members_omitted,
+    (raw) => booleanOf(raw, 'send-join'),
+  );
+  optionalField(body.servers_in_room, (raw) => strings(raw, 'send-join'));
   // This caller did not request partial state and has no partial-state owner.
-  if (body.members_omitted === true) {
+  if (omitted === true) {
     protocol('send-join', 'unsolicited partial state');
   }
   return {
     state: pduList(body.state, 'send-join'),
     authChain: pduList(body.auth_chain, 'send-join'),
-    event: body.event === undefined
-      ? undefined
-      : pduOf(body.event, 'send-join'),
+    event: optionalField(body.event, (raw) => pduOf(raw, 'send-join')),
   };
 }
 export function inviteResponse(raw: unknown): Pdu {
@@ -129,11 +131,17 @@ export function leaveResponse(raw: unknown, legacy = false): void {
 export function sendVerdicts(raw: unknown): Record<string, { error?: string }> {
   const body = objectOf(raw, 'send-verdict');
   const pdus = objectOf(body.pdus, 'send-verdict');
-  for (const value of Object.values(pdus)) {
+  const result: Record<string, { error?: string }> = Object.create(null);
+  for (const [id, value] of Object.entries(pdus)) {
     const verdict = objectOf(value, 'send-verdict');
-    if (verdict.error !== undefined && typeof verdict.error !== 'string') {
-      protocol('send-verdict', 'invalid PDU verdict');
-    }
+    const error = optionalField(
+      verdict.error,
+      (raw) => stringOf(raw, 'send-verdict'),
+    );
+    const decoded = { ...verdict };
+    if (error === undefined) delete decoded.error;
+    else decoded.error = error;
+    result[id] = decoded;
   }
-  return pdus as Record<string, { error?: string }>;
+  return result;
 }

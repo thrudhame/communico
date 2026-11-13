@@ -1,6 +1,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setPresence } from '#engine/presence.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
+import { decodePresenceRequest } from '#engine/client/ephemeral-request.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
@@ -10,17 +11,11 @@ export default async function (
   if (request.params.userId !== userId) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'presence is per-user');
   }
-  const body = (await parseJson(request)) as {
-    presence?: unknown;
-    status_msg?: unknown;
-  };
-  if (typeof body.presence !== 'string') {
-    throw new MatrixError(400, 'M_MISSING_PARAM', 'presence is required');
-  }
+  const body = decodePresenceRequest(await parseJson(request));
   await setPresence(
     userId,
     body.presence,
-    typeof body.status_msg === 'string' ? body.status_msg : undefined,
+    body.status,
   );
   return {};
 }

@@ -1,4 +1,5 @@
 import { theApp } from '#engine/app.ts';
+import { notaryGetFloor } from '#engine/federation/notary-request.ts';
 import {
   assertFederationEnabled,
   keyDocResponse,
@@ -13,6 +14,7 @@ export default async function (request: PathfinderRequest) {
     app.server,
     app.tenant.signer(),
     request.params.serverName as string,
+    notaryGetFloor(request.query),
   );
   return keyDocResponse({ server_keys: doc === null ? [] : [doc] });
 }

@@ -37,6 +37,7 @@ export type CreateRoomOptions = {
   alias?: string; // the canonical alias's localpart
   initial_state?: { type: string; state_key?: string; content: unknown }[];
   invite?: string[];
+  invite_3pid?: unknown[];
   creation_content?: Record<string, unknown>;
   power_level_content_override?: Record<string, unknown>;
   is_direct?: boolean;
@@ -88,6 +89,18 @@ export async function createRoom(
   if (!validEventUserId(creator)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid creator');
   }
+  if (opts.invite_3pid !== undefined) {
+    if (!Array.isArray(opts.invite_3pid)) {
+      throw new MatrixError(400, 'M_BAD_JSON', 'invite_3pid must be an array');
+    }
+    if (opts.invite_3pid.length > 0) {
+      throw new MatrixError(
+        400,
+        'M_UNRECOGNIZED',
+        'Identity-server invitations are disabled',
+      );
+    }
+  }
   for (
     const value of [opts.creation_content, opts.power_level_content_override]
   ) {
@@ -115,7 +128,9 @@ export async function createRoom(
     opts.version ?? '11',
     'room_version',
   );
-  const visibility = opts.visibility ?? 'private';
+  const visibility = opts.visibility === undefined
+    ? 'private'
+    : opts.visibility;
   if (visibility !== 'public' && visibility !== 'private') {
     throw new MatrixError(
       400,
@@ -123,15 +138,16 @@ export async function createRoom(
       'unknown visibility: ' + visibility,
     );
   }
-  const preset = opts.preset ??
-    (visibility === 'public' ? 'public_chat' : 'private_chat');
+  const preset = opts.preset === undefined
+    ? (visibility === 'public' ? 'public_chat' : 'private_chat')
+    : opts.preset;
   if (
     preset !== 'private_chat' && preset !== 'trusted_private_chat' &&
     preset !== 'public_chat'
   ) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'unknown preset: ' + preset);
   }
-  const invite = opts.invite ?? [];
+  const invite = opts.invite === undefined ? [] : opts.invite;
   if (!Array.isArray(invite)) {
     throw new MatrixError(400, 'M_BAD_JSON', 'invite must be an array');
   }
@@ -140,7 +156,9 @@ export async function createRoom(
       throw new MatrixError(400, 'M_INVALID_PARAM', 'not a user id: ' + u);
     }
   }
-  const requestedState = opts.initial_state ?? [];
+  const requestedState = opts.initial_state === undefined
+    ? []
+    : opts.initial_state;
   if (!Array.isArray(requestedState)) {
     throw new MatrixError(400, 'M_BAD_JSON', 'initial_state must be an array');
   }

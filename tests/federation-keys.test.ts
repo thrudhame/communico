@@ -736,7 +736,7 @@ Deno.test('key boundary: decode every key entry before persistence, including un
         d.verify_keys = [];
       },
       (d) => {
-        d.old_verify_keys = null;
+        d.old_verify_keys = false;
       },
       (d) => {
         d.old_verify_keys = [];
@@ -837,6 +837,21 @@ Deno.test('key boundary: notary envelope is an array of objects, not a bare docu
   }
   assertEquals(documentsFromAnswer({ server_keys: [] }, origin.name), []);
   assertEquals(documentsFromAnswer({ server_keys: [doc] }, origin.name), [doc]);
+});
+
+Deno.test('key boundary: null optional old-key map persists signed bytes without inventing a field', async () => {
+  await withStore(async (store) => {
+    const db = await store.server();
+    const origin = await makeServer('null-oldkeys.test');
+    const doc = await makeDoc(origin);
+    (doc as unknown as Record<string, unknown>).old_verify_keys = null;
+    await signJson(doc, origin.name, origin.keyId, origin.kp.privateKey);
+    const ks = keyStore(db, { deps: directOnly(doc) });
+    assertEquals(await ks.acquireKeyDoc(origin.name, 0), doc);
+    const saved = (await ks.listServerKeys(origin.name))[0].doc;
+    assertEquals(JSON.parse(saved!.key_json), doc);
+    assertEquals(JSON.parse(saved!.key_json).old_verify_keys, null);
+  });
 });
 
 Deno.test('key boundary: an unverifiable notary document cannot hide a later usable document', async () => {

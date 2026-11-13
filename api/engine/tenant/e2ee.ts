@@ -107,7 +107,7 @@ export function validateUpload(
             (signed.fallback !== undefined &&
               typeof signed.fallback !== 'boolean')
           ) throw new MatrixError(400, 'M_BAD_JSON', 'invalid signed key');
-          if (signed.signatures !== undefined) signatures(signed.signatures);
+          signatures(signed.signatures);
         }
         bounded(key, limits.maxkeybytes);
         return { algorithm, id, json: canonicalJson(key) };

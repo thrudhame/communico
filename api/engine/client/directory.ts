@@ -24,6 +24,12 @@ import { writeStateKey } from './write.ts';
 import { discoveryRequest } from '#engine/federation/discovery.ts';
 import { directoryResponse } from '#engine/federation/discovery-response.ts';
 import { publicRoomSummary } from './summary.ts';
+import {
+  type DirectoryRequest,
+  directoryWireRequest,
+  localDirectoryOffset,
+} from './directory-request.ts';
+import { remoteDirectoryResponse } from './directory-response.ts';
 
 export function aliasIsLocal(alias: string) {
   const parts = splitId(alias);
@@ -196,32 +202,83 @@ export async function setVisibility(
   }
   await directory.setVisibility(theApp().server, roomId, value);
 }
-export async function publicRooms(
-  opts: {
-    search?: string;
-    limit?: number;
-    since?: string;
-    roomTypes?: (string | null)[];
-  },
+export async function queryDirectory(
+  opts: DirectoryRequest,
+  destination?: string,
 ) {
-  const limit = opts.limit !== undefined && opts.limit > 0 ? opts.limit : 100,
-    offset = opts.since === undefined
-      ? 0
-      : Math.max(0, parseInt(opts.since, 10) || 0);
+  if (destination === undefined || destination === serverName()) {
+    return await listLocalPublishedRooms(opts);
+  }
+  const fed = config().federation;
+  if (!fed.enabled || fed.lookups !== 'all') {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'remote public directory lookup disabled',
+    );
+  }
+  const wire = directoryWireRequest(opts);
+  const post = opts.filter !== undefined;
+  const query = new URLSearchParams();
+  if (!post) {
+    for (const [key, value] of Object.entries(wire)) {
+      query.set(key, String(value));
+    }
+  }
+  const answer = await discoveryRequest(
+    theApp().server,
+    theApp().tenant.signer(),
+    {
+      destination,
+      path: '/_matrix/federation/v1/publicRooms' +
+        (query.size === 0 ? '' : '?' + query),
+      ...(post
+        ? {
+          method: 'POST' as const,
+          body: new TextEncoder().encode(JSON.stringify(wire)),
+        }
+        : {}),
+    },
+  );
+  return remoteDirectoryResponse(answer);
+}
+
+export function assertFederationDirectoryAllowed() {
+  if (!config().federation.publicrooms) {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'public directory federation disabled',
+    );
+  }
+}
+
+export async function listLocalPublishedRooms(
+  opts: DirectoryRequest,
+) {
+  const limit = opts.limit !== undefined && opts.limit > 0
+      ? Math.min(opts.limit, 100)
+      : 100,
+    offset = localDirectoryOffset(opts.since);
+  if (opts.network.kind === 'instance') {
+    return { chunk: [], total_room_count_estimate: 0 };
+  }
+  const roomTypes = opts.filter?.room_types,
+    search = opts.filter?.generic_search_term;
   const all: Record<string, unknown>[] = [];
   for (const id of await directory.listedRooms(theApp().server)) {
     const chunk = await publicRoomSummary(id);
     if (
-      opts.roomTypes !== undefined &&
-      !opts.roomTypes.includes(
+      roomTypes !== undefined &&
+      !roomTypes.includes(
         typeof chunk.room_type === 'string' ? chunk.room_type : null,
       )
     ) continue;
     if (
-      opts.search !== undefined &&
+      search !== undefined &&
       ![chunk.name, chunk.topic, chunk.canonical_alias].some((v) =>
         typeof v === 'string' &&
-        v.toLowerCase().includes(opts.search!.toLowerCase())
+        v.toLowerCase().includes(search.toLowerCase())
       )
     ) continue;
     all.push(chunk);

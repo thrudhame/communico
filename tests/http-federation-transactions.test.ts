@@ -49,7 +49,7 @@ async function setup(): Promise<Setup> {
   }, theApp().tenant.signer());
   const mk = await fed(
     'GET',
-    prefix + 'make_join/' + enc(id) + '/' + enc(user()),
+    prefix + 'make_join/' + enc(id) + '/' + enc(user()) + '?ver=11',
   );
   assertEquals(mk.status, 200);
   const join = await signTemplate(mk.body.event as Json, remote);
@@ -112,6 +112,7 @@ test('send: origin/caps and changed-body replay preserve the first per-PDU answe
   ) {
     const result = await fed('PUT', prefix + 'send/caps', {
       origin: remote.name,
+      origin_server_ts: Date.now(),
       ...excess,
     });
     assertEquals([result.status, result.body.errcode], [400, 'M_TOO_LARGE']);

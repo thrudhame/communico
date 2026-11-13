@@ -2,7 +2,7 @@ import { localpartOf } from '#engine/tenant/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { assertScopeKind, putRule } from '#engine/tenant/pushrules.ts';
 import { theApp } from '#engine/app.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 
 // PUT /_matrix/client/v3/pushrules/#scope/#kind/#ruleId — create or
 // update a rule (pushrules.yaml:185-309): actions required; created

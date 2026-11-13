@@ -1,16 +1,15 @@
 import { leave } from '#engine/client/membership.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { membershipContent } from '#engine/client/membership-request.ts';
+import { parseJson } from '#engine/operation-body.ts';
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
   context: import('@pathfinder/pathfinder').Context,
 ) {
-  const body = await parseJson(request).catch(() => ({})) as {
-    reason?: unknown;
-  };
+  const body = membershipContent(await parseJson(request));
   await leave(
     request.params.roomId as string,
     context.state.user as string,
-    typeof body.reason === 'string' ? body.reason : undefined,
+    body.reason,
   );
   return {};
 }

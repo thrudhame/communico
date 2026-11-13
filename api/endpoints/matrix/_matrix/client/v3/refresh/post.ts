@@ -1,7 +1,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { consumeRefreshToken } from '#engine/tenant/auth.ts';
 import { theApp } from '#engine/app.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 
 // POST /_matrix/client/v3/refresh — rotate the token pair (spec v1.16
 // refresh.yaml; band C D8/3h). PUBLIC: "this endpoint does not require

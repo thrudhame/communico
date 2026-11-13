@@ -5,10 +5,16 @@ import { getPublicProfile } from '#engine/tenant/profiles.ts';
 import { theApp } from '#engine/app.ts';
 import { assertFederationEnabled } from '#engine/federation/keydoc.ts';
 import { splitId } from '#engine/ids.ts';
+import { enumParameter } from '#engine/operation.ts';
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 export default async function (request: PathfinderRequest) {
   assertFederationEnabled();
+  const field = enumParameter(
+    request.query.get('field') ?? undefined,
+    'field',
+    ['displayname', 'avatar_url'],
+  );
   const userId = request.query.get('user_id');
   const parts = userId === null ? null : splitId(userId);
   if (
@@ -21,7 +27,6 @@ export default async function (request: PathfinderRequest) {
   if (profile === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'no such user');
   }
-  const field = request.query.get('field');
   if (field === 'displayname') {
     return {
       displayname: profile.displayname === undefined

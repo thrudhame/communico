@@ -244,7 +244,7 @@ Deno.test('peer envelopes: join version/template and v1 status/body are explicit
         {},
         { state: [], auth_chain: null },
         { state: [null], auth_chain: [] },
-        { state: [], auth_chain: [], event: null },
+        { state: [], auth_chain: [], event: [] },
         { state: [], auth_chain: [], members_omitted: true },
       ]
     ) {
@@ -254,6 +254,18 @@ Deno.test('peer envelopes: join version/template and v1 status/body are explicit
         UpstreamError,
       );
     }
+    h.answer({
+      state: [],
+      auth_chain: [],
+      event: null,
+      members_omitted: null,
+      servers_in_room: null,
+    });
+    assertEquals(await h.fetcher.sendJoin(roomId, event, h.fake.name), {
+      state: [],
+      authChain: [],
+      event: undefined,
+    });
     h.legacy();
     for (
       const bad of [

@@ -1,6 +1,6 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { createRoom, type CreateRoomOptions } from '#engine/client/write.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
@@ -26,7 +26,8 @@ export default async function (
     name: body.name as string | undefined,
     topic: body.topic as string | undefined,
     invite: body.invite as string[] | undefined,
-    is_direct: body.is_direct === true,
+    invite_3pid: body.invite_3pid as unknown[] | undefined,
+    is_direct: body.is_direct as boolean | undefined,
     alias: body.room_alias_name as string | undefined,
     creation_content: body.creation_content as
       | Record<string, unknown>

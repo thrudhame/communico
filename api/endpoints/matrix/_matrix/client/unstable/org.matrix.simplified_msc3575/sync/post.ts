@@ -1,7 +1,7 @@
 import { config } from '#engine/config.ts';
 import { slidingSync } from '#engine/sliding-sync/index.ts';
 import { slidingSyncRequest } from '#engine/sliding-sync/request.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,

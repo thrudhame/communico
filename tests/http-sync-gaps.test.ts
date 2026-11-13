@@ -108,7 +108,8 @@ suite.test('filter and visibility omissions retain end cuts; limited windows hav
         from = body.end;
       }
     }
-    assertEquals(found, [hidden.eventId, kept.eventId]);
+    // An ignored row no longer consumes a message page's result limit.
+    assertEquals(found, [hidden.eventId, kept.eventId, old.eventId]);
   }
   const trimmed = entry(
     await sync(alice.access_token!, '&since=' + baseline.next_batch, {

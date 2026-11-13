@@ -2,7 +2,7 @@ import { sendKnock } from '#engine/federation/joins.ts';
 import { inviteDeps } from '#engine/federation/context.ts';
 import { assertFederationEnabled } from '#engine/federation/keydoc.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 export default async function (request: PathfinderRequest, context: Context) {
   assertFederationEnabled();

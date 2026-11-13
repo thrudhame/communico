@@ -488,7 +488,10 @@ export async function putRule(
     // User rules stay ahead of defaults, with master unconditionally first.
     // Placement relative to a default can only name that boundary.
     let boundary: 'top' | 'bottom' | null = null;
-    for (const direction of ['before', 'after'] as const) {
+    const directions = placement.before !== undefined
+      ? ['before'] as const
+      : ['after'] as const;
+    for (const direction of directions) {
       const id = placement[direction];
       if (
         id === undefined || !builtin(localpart, tenant.serverName, kind, id)
@@ -507,7 +510,10 @@ export async function putRule(
     }
     const existing = await tx.pushRules.byId(localpart, kind, ruleId);
     let priority: number;
-    if (existing !== null) {
+    if (
+      existing !== null && placement.before === undefined &&
+      placement.after === undefined
+    ) {
       priority = existing.priority; // an update keeps its place
     } else if (boundary !== null) {
       const rows = (await tx.pushRules.kindRows(localpart, kind)).filter((r) =>

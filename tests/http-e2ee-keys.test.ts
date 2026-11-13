@@ -22,6 +22,40 @@ async function post(
 }
 const otk = (key: string) => ({ key, signatures: {} });
 
+suite.test('signed one-time and fallback key envelopes require signature maps before publishing any pool changes', async () => {
+  const a = await suite.registerTestUser('key-shapes', 'pw');
+  const token = a.access_token!;
+  for (const field of ['one_time_keys', 'fallback_keys']) {
+    for (
+      const signatures of [undefined, null, [], 'sig', { [a.user_id]: [] }, {
+        [a.user_id]: { 'ed25519:x': false },
+      }]
+    ) {
+      await post(token, 'upload', {
+        one_time_keys: { 'curve25519:atomic': 'must-not-publish' },
+        [field]: { 'signed_curve25519:bad': { key: 'public', signatures } },
+      }, 400);
+      assertEquals((await post(token, 'upload', {})).one_time_key_counts, {});
+    }
+  }
+  const key = {
+    key: 'public',
+    signatures: {
+      [a.user_id]: { 'ed25519:x': 'not-cryptographically-checked' },
+    },
+  };
+  await post(token, 'upload', {
+    one_time_keys: { 'signed_curve25519:valid': key },
+  });
+  const claimed = await post(token, 'claim', {
+    one_time_keys: { [a.user_id]: { [a.device_id]: 'signed_curve25519' } },
+  });
+  assertEquals(
+    ((claimed.one_time_keys as Json)[a.user_id] as Json)[a.device_id],
+    { 'signed_curve25519:valid': key },
+  );
+});
+
 suite.test('response budget failure rolls back every consuming key claim', async () => {
   const a = await suite.registerTestUser('budget-a', 'pw');
   const b = await suite.registerTestUser('budget-b', 'pw');
@@ -50,6 +84,38 @@ suite.test('response budget failure rolls back every consuming key claim', async
   }
 });
 
+suite.test('string-valued one-time and fallback variants retain exact material and distinct consumption', async () => {
+  const user = await suite.registerTestUser('key-string-variants', 'pw');
+  await post(user.access_token!, 'upload', {
+    one_time_keys: { 'curve25519:once': 'one-time-material' },
+    fallback_keys: { 'curve25519:fallback': 'fallback-material' },
+  });
+  const claim = () =>
+    post(user.access_token!, 'claim', {
+      one_time_keys: { [user.user_id]: { [user.device_id]: 'curve25519' } },
+    });
+  const first = await claim();
+  assertEquals(
+    ((first.one_time_keys as Json)[user.user_id] as Json)[user.device_id],
+    {
+      'curve25519:once': 'one-time-material',
+    },
+  );
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const fallback = await claim();
+    assertEquals(
+      ((fallback.one_time_keys as Json)[user.user_id] as Json)[user.device_id],
+      {
+        'curve25519:fallback': 'fallback-material',
+      },
+    );
+  }
+  assertEquals(
+    (await post(user.access_token!, 'upload', {})).one_time_key_counts,
+    {},
+  );
+});
+
 suite.test('upload -> another user queries exact signed material and display metadata', async () => {
   const a = await suite.registerTestUser('keys-a', 'pw');
   const b = await suite.registerTestUser('keys-b', 'pw');
@@ -61,7 +127,9 @@ suite.test('upload -> another user queries exact signed material and display met
       ['ed25519:' + a.device_id]: 'public',
       ['curve25519:' + a.device_id]: 'curve',
     },
-    signatures: {},
+    signatures: {
+      [a.user_id]: { ['ed25519:' + a.device_id]: 'opaque-signature' },
+    },
     custom: { retained: true },
   };
   assertEquals(

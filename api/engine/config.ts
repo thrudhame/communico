@@ -533,6 +533,7 @@ export type ConfigPatch = {
   };
   turn?: Partial<Config['turn']>;
   matrixrtc?: Partial<Config['matrixrtc']>;
+  directory?: Partial<Config['directory']>;
   openid?: Partial<Config['openid']>;
   peeking?: Partial<Config['peeking']>;
   hierarchy?: Partial<Config['hierarchy']>;
@@ -604,6 +605,7 @@ export type ConfigPatch = {
     pendingmax?: number;
     pendingdays?: number;
     lookups?: string;
+    publicrooms?: boolean;
     missingwaitms?: number;
     missinglimit?: number;
     missingbudgetms?: number;

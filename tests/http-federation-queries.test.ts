@@ -57,10 +57,7 @@ test('query/profile: local fields, unset nulls, malformed/domain 400, unknown 40
   assertEquals((await call('GET', path + '&field=avatar_url')).body, {
     avatar_url: 'mxc://localhost/avatar',
   });
-  assertEquals(
-    (await call('GET', path + '&field=other')).body,
-    (await call('GET', path)).body,
-  );
+  assertEquals((await call('GET', path + '&field=other')).status, 400);
   for (const id of ['', 'bad', '@alice:else.test', '@alice:localhost:http']) {
     const result = await call('GET', fed + 'query/profile?user_id=' + enc(id));
     assertEquals([result.status, result.body.errcode], [
@@ -153,7 +150,11 @@ test('query/directory: raw Unicode URI, aliases with server port, local validati
   );
 });
 
-test('publicRooms: signed GET/POST, search, pagination and ignored network parameters', async () => {
+test('publicRooms: signed GET/POST, search, pagination and truthful network selection', async () => {
+  setConfigForTests({
+    server: { name: self },
+    federation: { publicrooms: true },
+  });
   assertEquals(
     (await client(
       'createRoom',
@@ -175,11 +176,21 @@ test('publicRooms: signed GET/POST, search, pagination and ignored network param
   const post = await call('POST', target, {
     filter: { generic_search_term: 'Alpha' },
     include_all_networks: true,
-    third_party_instance_id: 'ignored',
   });
   assertEquals(post.status, 200);
   assertEquals((post.body.chunk as Json[]).map((r) => r.room_id), [room]);
   assertEquals((post.body.chunk as Json[])[0].name, 'Published Alpha');
+  const bridge = await call('POST', target, {
+    third_party_instance_id: 'unknown',
+  });
+  assertEquals(bridge.body, { chunk: [], total_room_count_estimate: 0 });
+  assertEquals(
+    (await call('POST', target, {
+      include_all_networks: true,
+      third_party_instance_id: 'unknown',
+    })).status,
+    400,
+  );
 });
 
 test('known-only remote profiles: held members, field shapes and no outbound proxy', async () => {
@@ -217,7 +228,7 @@ test('known-only remote profiles: held members, field shapes and no outbound pro
     const id = created.body.room_id as string;
     const mk = await remoteCall(
       'GET',
-      fed + 'make_join/' + enc(id) + '/' + enc(user),
+      fed + 'make_join/' + enc(id) + '/' + enc(user) + '?ver=11',
     );
     assertEquals(mk.status, 200);
     const pdu = await signTemplate({

@@ -37,7 +37,7 @@ async function room(preset: 'public_chat' | 'private_chat' = 'public_chat') {
   )).roomId;
 }
 async function make(roomId: string, op = 'make_join') {
-  const answer = await call('GET', path(op, roomId, zoe));
+  const answer = await call('GET', path(op, roomId, zoe) + '?ver=11');
   assertEquals(answer.status, 200);
   return await signTemplate(answer.body.event as Json, remote);
 }
@@ -77,9 +77,15 @@ test('make_join: template fields; incompatible version/domain/room/ban/invite er
   );
   const held = await openRoom(theApp().store, id);
   await ban(held, creator(), zoe, theApp().tenant.signer());
-  assertEquals((await call('GET', path('make_join', id, zoe))).status, 403);
   assertEquals(
-    (await call('GET', path('make_join', await room('private_chat'), zoe)))
+    (await call('GET', path('make_join', id, zoe) + '?ver=11')).status,
+    403,
+  );
+  assertEquals(
+    (await call(
+      'GET',
+      path('make_join', await room('private_chat'), zoe) + '?ver=11',
+    ))
       .status,
     403,
   );

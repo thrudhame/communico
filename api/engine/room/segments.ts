@@ -288,6 +288,45 @@ export type WalkStep =
   | { kind: 'gap'; cursor: WalkCursor }
   | { kind: 'end' };
 
+export type WalkPage = Exclude<WalkStep, { kind: 'event' }> | {
+  kind: 'events';
+  events: Extract<WalkStep, { kind: 'event' }>[];
+};
+
+// Reuse the gap-aware first step, then read only its contiguous segment page.
+// An imported backward boundary is included but never crossed speculatively:
+// the next page re-enters stepPosition and follows its actual predecessor DAG.
+export async function pagePositions(
+  conn: Conn,
+  cursor: WalkCursor,
+  dir: 'f' | 'b',
+  size: number,
+): Promise<WalkPage> {
+  if (!Number.isSafeInteger(size) || size < 1) throw new TypeError('page size');
+  const first = await stepPosition(conn, cursor, dir);
+  if (first.kind !== 'event') return first;
+  const rows = await conn.query(
+    `SELECT p.offset, p.event, s.provenance FROM positions p
+     LEFT JOIN event_state s ON s.event = p.event
+     WHERE p.segment = ? AND p.offset ${dir === 'f' ? '>=' : '<='} ?
+     ORDER BY p.offset ${dir === 'f' ? 'ASC' : 'DESC'} LIMIT ?`,
+    [first.cursor.segment, first.cursor.offset, size],
+  );
+  const events: Extract<WalkStep, { kind: 'event' }>[] = [];
+  for (const row of rows) {
+    events.push({
+      kind: 'event',
+      event: String(row.event),
+      cursor: {
+        segment: first.cursor.segment,
+        offset: Number(row.offset),
+      },
+    });
+    if (dir === 'b' && row.provenance === 'imported') break;
+  }
+  return { kind: 'events', events };
+}
+
 async function offsetBound(
   conn: Conn,
   segment: number,

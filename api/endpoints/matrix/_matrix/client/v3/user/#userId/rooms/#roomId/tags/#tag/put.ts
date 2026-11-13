@@ -1,5 +1,5 @@
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import { changeTag } from '#engine/client/tags.ts';
 export default async function (request: PathfinderRequest, context: Context) {
   return await changeTag(

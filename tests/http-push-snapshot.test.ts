@@ -37,11 +37,15 @@ Deno.test('push sync snapshot: later event and private receipt cannot leak into 
     const original = server.tx.bind(server);
     let captured = false;
     let second: { event_id: string } | undefined;
-    // Interleave real writes immediately after sync's server transaction commits,
-    // before it renders room events. No result is mocked or altered.
+    // Select sync's read snapshot, not an earlier presence write transaction.
+    // Interleave after that cut commits, before it renders room events.
+    // No result is mocked or altered.
     server.tx = async (fn, options) => {
       const result = await original(fn, options);
-      if (!captured) {
+      if (
+        !captured && result !== null && typeof result === 'object' &&
+        'counters' in result
+      ) {
         captured = true;
         server.tx = original;
         second = await send('two');

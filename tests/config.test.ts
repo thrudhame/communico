@@ -14,6 +14,9 @@ import {
 const FULL = `[matrixrtc]
 livekitserviceurl = ""
 
+[directory]
+allowanonymous = false
+
 [delayedevents]
 maxdelayms = 0
 maxperuser = 100
@@ -150,6 +153,7 @@ witnesses = 3
 pendingmax = 10000
 pendingdays = 30
 lookups = "known"
+publicrooms = false
 discoveryservers = 3
 missingwaitms = 750
 missinglimit = 10
@@ -880,7 +884,59 @@ Deno.test('push gateway CIDRs and root files are validated in every layer', () =
   assert(error.problems.some((problem) => problem.includes('push.cacerts')));
 });
 
-Deno.test('118 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('public directory settings use complete defaults and strict leaf-wise file/env overrides', async () => {
+  const dir = await writeTree({
+    'defaults/communico.toml': FULL,
+    'config/communico.toml':
+      '[directory]\nallowanonymous = true\n[federation]\npublicrooms = true\n',
+  });
+  try {
+    const paths = {
+      defaultsPath: `${dir}/defaults/communico.toml`,
+      configPath: `${dir}/config/communico.toml`,
+    };
+    const defaults = loadConfig({ ...paths, configPath: null, env: {} }).config;
+    assertEquals(defaults.directory.allowanonymous, false);
+    assertEquals(defaults.federation.publicrooms, false);
+    const overlay = loadConfig({ ...paths, env: {} }).config;
+    assertEquals(overlay.directory.allowanonymous, true);
+    assertEquals(overlay.federation.publicrooms, true);
+    const env = loadConfig({
+      ...paths,
+      env: {
+        COMMUNICO_DIRECTORY_ALLOWANONYMOUS: 'false',
+        COMMUNICO_FEDERATION_PUBLICROOMS: 'false',
+      },
+    }).config;
+    assertEquals(env.directory.allowanonymous, false);
+    assertEquals(env.federation.publicrooms, false);
+    for (
+      const leaf of [
+        'COMMUNICO_DIRECTORY_ALLOWANONYMOUS',
+        'COMMUNICO_FEDERATION_PUBLICROOMS',
+      ]
+    ) {
+      assert(
+        loadFail({ ...paths, env: { [leaf]: '1' } }).some((problem) =>
+          problem.includes(leaf)
+        ),
+      );
+    }
+    await Deno.writeTextFile(
+      paths.defaultsPath,
+      FULL.replace('allowanonymous = false', ''),
+    );
+    assert(
+      loadFail({ ...paths, configPath: null, env: {} }).some((problem) =>
+        problem.includes('directory.allowanonymous')
+      ),
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('120 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -904,6 +960,7 @@ Deno.test('118 leaves total across the sections (the surface tripwire)', async (
     ['wellknown', 7],
     ['turn', 5],
     ['matrixrtc', 1],
+    ['directory', 1],
     ['hierarchy', 7],
     ['uia', 2],
     ['delayedevents', 2],
@@ -916,11 +973,11 @@ Deno.test('118 leaves total across the sections (the surface tripwire)', async (
     ['push', 5],
     ['store', 5],
     ['preview', 4],
-    ['federation', 34],
+    ['federation', 35],
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    118,
+    120,
     'the whole config surface includes discovery, TURN and HTTP administrators',
   );
 });

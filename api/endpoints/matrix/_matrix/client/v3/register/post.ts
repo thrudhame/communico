@@ -1,13 +1,10 @@
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import {
-  checkLocalpart,
-  isRegistered,
-  registerUser,
-} from '#engine/tenant/users.ts';
+import { isRegistered, registerUser } from '#engine/tenant/users.ts';
 import { DUMMY_FLOWS, requireUia } from '#engine/tenant/uia.ts';
 import { theApp } from '#engine/app.ts';
 import { ensurePresenceRow } from '#engine/server/ephemeral.ts';
+import { decodeRegistrationRequest } from '#engine/tenant/session-request.ts';
 
 // POST /_matrix/client/v3/register — UIA (F1 step 17; M2: via the shared
 // requireUia helper). Complement's contract (read off
@@ -30,9 +27,9 @@ export default async function (
   }
   // 1. body validation first (Complement: "validate request bodies
   // before handling UIA").
-  let localpart: string | null = null;
-  if (body.username !== undefined) {
-    localpart = checkLocalpart(body.username);
+  const decoded = decodeRegistrationRequest(body, request.query);
+  const localpart = decoded.localpart;
+  if (localpart !== undefined) {
     const taken = await isRegistered(theApp().tenant, localpart);
     if (taken) {
       throw new MatrixError(400, 'M_USER_IN_USE', 'user in use: ' + localpart);
@@ -45,31 +42,23 @@ export default async function (
     flows: DUMMY_FLOWS,
   });
 
-  // Finalize: username was grammar-checked pre-UIA (localpart is set);
-  // missing username/password here is a 400 (the UIA dance always
-  // carries them in Complement's flows).
-  if (localpart === null) {
-    throw new MatrixError(400, 'M_INVALID_USERNAME', 'username required');
-  }
-  if (typeof body.password !== 'string' || body.password.length === 0) {
+  // The tenant allocates a localpart when the client omitted username.
+  if (decoded.password === undefined || decoded.password.length === 0) {
     throw new MatrixError(400, 'M_BAD_REQUEST', 'password required');
   }
-  const inhibit = body.inhibit_login === true;
   const result = await registerUser(theApp().tenant, {
     localpart,
-    password: body.password,
-    deviceId: typeof body.device_id === 'string' ? body.device_id : undefined,
-    deviceDisplayName: typeof body.initial_device_display_name === 'string'
-      ? body.initial_device_display_name
-      : undefined,
-    accessToken: inhibit ? null : undefined,
+    password: decoded.password,
+    deviceId: decoded.deviceId,
+    deviceDisplayName: decoded.displayName,
+    accessToken: decoded.inhibit ? null : undefined,
   });
   await ensurePresenceRow(theApp().server, result.user_id);
   const out: Record<string, unknown> = {
     user_id: result.user_id,
-    device_id: result.device_id,
     home_server: result.home_server,
   };
+  if ('device_id' in result) out.device_id = result.device_id;
   if (result.access_token !== undefined) out.access_token = result.access_token;
   return out;
 }

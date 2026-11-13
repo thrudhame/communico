@@ -1,0 +1,594 @@
+{
+  "schema": 1,
+  "specCommit": "81a864545f7d948a881f5227700e5312c64f506e",
+  "operations": [
+    {
+      "id": "data/api/client-server/account-data.yaml#PUT /_matrix/client/v3/user/{userId}/account_data/{type}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/user/{userId}/account_data/{type}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/account-data.yaml#PUT /_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/account_deactivation.yaml#POST /_matrix/client/v3/account/deactivate",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/deactivate",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/administrative_contact.yaml#POST /_matrix/client/v3/account/3pid",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/3pid",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/administrative_contact.yaml#POST /_matrix/client/v3/account/3pid/add",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/3pid/add",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/administrative_contact.yaml#POST /_matrix/client/v3/account/3pid/bind",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/3pid/bind",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/administrative_contact.yaml#POST /_matrix/client/v3/account/3pid/delete",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/3pid/delete",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/administrative_contact.yaml#POST /_matrix/client/v3/account/3pid/email/requestToken",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/3pid/email/requestToken",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/administrative_contact.yaml#POST /_matrix/client/v3/account/3pid/msisdn/requestToken",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/3pid/msisdn/requestToken",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/administrative_contact.yaml#POST /_matrix/client/v3/account/3pid/unbind",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/3pid/unbind",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/appservice_ping.yaml#POST /_matrix/client/v1/appservice/{appserviceId}/ping",
+      "method": "POST",
+      "path": "/_matrix/client/v1/appservice/{appserviceId}/ping",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/appservice_room_directory.yaml#PUT /_matrix/client/v3/directory/list/appservice/{networkId}/{roomId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/directory/list/appservice/{networkId}/{roomId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/banning.yaml#POST /_matrix/client/v3/rooms/{roomId}/ban",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/ban",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/banning.yaml#POST /_matrix/client/v3/rooms/{roomId}/unban",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/unban",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/create_room.yaml#POST /_matrix/client/v3/createRoom",
+      "method": "POST",
+      "path": "/_matrix/client/v3/createRoom",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/cross_signing.yaml#POST /_matrix/client/v3/keys/device_signing/upload",
+      "method": "POST",
+      "path": "/_matrix/client/v3/keys/device_signing/upload",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/cross_signing.yaml#POST /_matrix/client/v3/keys/signatures/upload",
+      "method": "POST",
+      "path": "/_matrix/client/v3/keys/signatures/upload",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/device_management.yaml#DELETE /_matrix/client/v3/devices/{deviceId}",
+      "method": "DELETE",
+      "path": "/_matrix/client/v3/devices/{deviceId}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/device_management.yaml#POST /_matrix/client/v3/delete_devices",
+      "method": "POST",
+      "path": "/_matrix/client/v3/delete_devices",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/device_management.yaml#PUT /_matrix/client/v3/devices/{deviceId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/devices/{deviceId}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/directory.yaml#PUT /_matrix/client/v3/directory/room/{roomAlias}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/directory/room/{roomAlias}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/filter.yaml#POST /_matrix/client/v3/user/{userId}/filter",
+      "method": "POST",
+      "path": "/_matrix/client/v3/user/{userId}/filter",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/inviting.yaml#POST /_matrix/client/v3/rooms/{roomId}/invite",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/invite",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/joining.yaml#POST /_matrix/client/v3/join/{roomIdOrAlias}",
+      "method": "POST",
+      "path": "/_matrix/client/v3/join/{roomIdOrAlias}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/joining.yaml#POST /_matrix/client/v3/rooms/{roomId}/join",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/join",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/key_backup.yaml#POST /_matrix/client/v3/room_keys/version",
+      "method": "POST",
+      "path": "/_matrix/client/v3/room_keys/version",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/key_backup.yaml#PUT /_matrix/client/v3/room_keys/keys",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/room_keys/keys",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/key_backup.yaml#PUT /_matrix/client/v3/room_keys/keys/{roomId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/room_keys/keys/{roomId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/key_backup.yaml#PUT /_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/key_backup.yaml#PUT /_matrix/client/v3/room_keys/version/{version}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/room_keys/version/{version}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/keys.yaml#POST /_matrix/client/v3/keys/claim",
+      "method": "POST",
+      "path": "/_matrix/client/v3/keys/claim",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/keys.yaml#POST /_matrix/client/v3/keys/query",
+      "method": "POST",
+      "path": "/_matrix/client/v3/keys/query",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/keys.yaml#POST /_matrix/client/v3/keys/upload",
+      "method": "POST",
+      "path": "/_matrix/client/v3/keys/upload",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/kicking.yaml#POST /_matrix/client/v3/rooms/{roomId}/kick",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/kick",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/knocking.yaml#POST /_matrix/client/v3/knock/{roomIdOrAlias}",
+      "method": "POST",
+      "path": "/_matrix/client/v3/knock/{roomIdOrAlias}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/leaving.yaml#POST /_matrix/client/v3/rooms/{roomId}/leave",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/leave",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/list_public_rooms.yaml#POST /_matrix/client/v3/publicRooms",
+      "method": "POST",
+      "path": "/_matrix/client/v3/publicRooms",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/list_public_rooms.yaml#PUT /_matrix/client/v3/directory/list/room/{roomId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/directory/list/room/{roomId}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/login.yaml#POST /_matrix/client/v3/login",
+      "method": "POST",
+      "path": "/_matrix/client/v3/login",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/login_token.yaml#POST /_matrix/client/v1/login/get_token",
+      "method": "POST",
+      "path": "/_matrix/client/v1/login/get_token",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/openid.yaml#POST /_matrix/client/v3/user/{userId}/openid/request_token",
+      "method": "POST",
+      "path": "/_matrix/client/v3/user/{userId}/openid/request_token",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/password_management.yaml#POST /_matrix/client/v3/account/password",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/password",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/password_management.yaml#POST /_matrix/client/v3/account/password/email/requestToken",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/password/email/requestToken",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/password_management.yaml#POST /_matrix/client/v3/account/password/msisdn/requestToken",
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/password/msisdn/requestToken",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/presence.yaml#PUT /_matrix/client/v3/presence/{userId}/status",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/presence/{userId}/status",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/profile.yaml#PUT /_matrix/client/v3/profile/{userId}/{keyName}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/profile/{userId}/{keyName}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/pusher.yaml#POST /_matrix/client/v3/pushers/set",
+      "method": "POST",
+      "path": "/_matrix/client/v3/pushers/set",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/pushrules.yaml#PUT /_matrix/client/v3/pushrules/global/{kind}/{ruleId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/pushrules.yaml#PUT /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/pushrules.yaml#PUT /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/enabled",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}/enabled",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/read_markers.yaml#POST /_matrix/client/v3/rooms/{roomId}/read_markers",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/read_markers",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/receipts.yaml#POST /_matrix/client/v3/rooms/{roomId}/receipt/{receiptType}/{eventId}",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/receipt/{receiptType}/{eventId}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/redaction.yaml#PUT /_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/refresh.yaml#POST /_matrix/client/v3/refresh",
+      "method": "POST",
+      "path": "/_matrix/client/v3/refresh",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/registration.yaml#POST /_matrix/client/v3/register",
+      "method": "POST",
+      "path": "/_matrix/client/v3/register",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/registration.yaml#POST /_matrix/client/v3/register/email/requestToken",
+      "method": "POST",
+      "path": "/_matrix/client/v3/register/email/requestToken",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/registration.yaml#POST /_matrix/client/v3/register/msisdn/requestToken",
+      "method": "POST",
+      "path": "/_matrix/client/v3/register/msisdn/requestToken",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/report_content.yaml#POST /_matrix/client/v3/rooms/{roomId}/report",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/report",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/report_content.yaml#POST /_matrix/client/v3/rooms/{roomId}/report/{eventId}",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/report/{eventId}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/report_content.yaml#POST /_matrix/client/v3/users/{userId}/report",
+      "method": "POST",
+      "path": "/_matrix/client/v3/users/{userId}/report",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/room_send.yaml#PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/room_state.yaml#PUT /_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/room_upgrades.yaml#POST /_matrix/client/v3/rooms/{roomId}/upgrade",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/upgrade",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/search.yaml#POST /_matrix/client/v3/search",
+      "method": "POST",
+      "path": "/_matrix/client/v3/search",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/tags.yaml#PUT /_matrix/client/v3/user/{userId}/rooms/{roomId}/tags/{tag}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/user/{userId}/rooms/{roomId}/tags/{tag}",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/client-server/third_party_membership.yaml#POST /_matrix/client/v3/rooms/{roomId}/invite",
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/invite",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/to_device.yaml#PUT /_matrix/client/v3/sendToDevice/{eventType}/{txnId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/sendToDevice/{eventType}/{txnId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/typing.yaml#PUT /_matrix/client/v3/rooms/{roomId}/typing/{userId}",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{roomId}/typing/{userId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/client-server/users.yaml#POST /_matrix/client/v3/user_directory/search",
+      "method": "POST",
+      "path": "/_matrix/client/v3/user_directory/search",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/backfill.yaml#POST /_matrix/federation/v1/get_missing_events/{roomId}",
+      "method": "POST",
+      "path": "/_matrix/federation/v1/get_missing_events/{roomId}",
+      "required": false,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/invites-v1.yaml#PUT /_matrix/federation/v1/invite/{roomId}/{eventId}",
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/invite/{roomId}/{eventId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/invites-v2.yaml#PUT /_matrix/federation/v2/invite/{roomId}/{eventId}",
+      "method": "PUT",
+      "path": "/_matrix/federation/v2/invite/{roomId}/{eventId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/joins-v1.yaml#PUT /_matrix/federation/v1/send_join/{roomId}/{eventId}",
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send_join/{roomId}/{eventId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/joins-v2.yaml#PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}",
+      "method": "PUT",
+      "path": "/_matrix/federation/v2/send_join/{roomId}/{eventId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/keys_query.yaml#POST /_matrix/key/v2/query",
+      "method": "POST",
+      "path": "/_matrix/key/v2/query",
+      "required": false,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/knocks.yaml#PUT /_matrix/federation/v1/send_knock/{roomId}/{eventId}",
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send_knock/{roomId}/{eventId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/leaving-v1.yaml#PUT /_matrix/federation/v1/send_leave/{roomId}/{eventId}",
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send_leave/{roomId}/{eventId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/leaving-v2.yaml#PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}",
+      "method": "PUT",
+      "path": "/_matrix/federation/v2/send_leave/{roomId}/{eventId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/public_rooms.yaml#POST /_matrix/federation/v1/publicRooms",
+      "method": "POST",
+      "path": "/_matrix/federation/v1/publicRooms",
+      "required": true,
+      "emptyObject": true
+    },
+    {
+      "id": "data/api/server-server/third_party_invite.yaml#PUT /_matrix/federation/v1/3pid/onbind",
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/3pid/onbind",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/third_party_invite.yaml#PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}",
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/exchange_third_party_invite/{roomId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/transactions.yaml#PUT /_matrix/federation/v1/send/{txnId}",
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send/{txnId}",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/user_keys.yaml#POST /_matrix/federation/v1/user/keys/claim",
+      "method": "POST",
+      "path": "/_matrix/federation/v1/user/keys/claim",
+      "required": true,
+      "emptyObject": false
+    },
+    {
+      "id": "data/api/server-server/user_keys.yaml#POST /_matrix/federation/v1/user/keys/query",
+      "method": "POST",
+      "path": "/_matrix/federation/v1/user/keys/query",
+      "required": true,
+      "emptyObject": false
+    }
+  ]
+}

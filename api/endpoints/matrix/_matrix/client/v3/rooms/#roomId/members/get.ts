@@ -5,6 +5,7 @@ import {
 } from '#engine/client/room.ts';
 import { clientEventsForRows } from '#engine/client/state.ts';
 import { admitState } from '#engine/client/state-admission.ts';
+import { memberFilters } from '#engine/client/state-request.ts';
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
   context: import('@pathfinder/pathfinder').Context,
@@ -12,8 +13,7 @@ export default async function (
   const roomId = request.params.roomId as string;
   const room = await requireRoom(roomId);
   const leaveAt = await readPositionFor(context.state.user as string, roomId);
-  const membership = request.query.get('membership'),
-    notMembership = request.query.get('not_membership');
+  const { membership, notMembership } = memberFilters(request.query);
   const at = await stateSeqAtToken(roomId, request.query.get('at'), leaveAt);
   const admission = await admitState(room, {
     userId: context.state.user as string,
@@ -23,8 +23,8 @@ export default async function (
   const rows = admission.rows
     .filter((r) =>
       r.type === 'm.room.member' &&
-      (membership === null || r.content.membership === membership) &&
-      (notMembership === null || r.content.membership !== notMembership)
+      (membership === undefined || r.content.membership === membership) &&
+      (notMembership === undefined || r.content.membership !== notMembership)
     );
   return {
     chunk: await clientEventsForRows(

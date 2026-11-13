@@ -72,27 +72,32 @@ Deno.test('federation taxonomy: no DNS address is transport, not local signer/st
   assertEquals(error.context.phase, 'dns');
 });
 
-Deno.test('federation JSON: Matrix error message is optional, errcode alone preserves completed HTTP provenance', async () => {
-  await withPeer(
-    () => Response.json({ errcode: 'M_UNRECOGNIZED' }, { status: 404 }),
-    async (store, fake) => {
-      const server = await store.server(), signer = await testSigner('test');
-      const error = await assertRejects(
-        () =>
-          federationRequest(server, signer, {
-            destination: fake.name,
-            method: 'GET',
-            path: '/reply',
-            body: null,
-          }),
-        FederationHttpError,
-      );
-      assertEquals(error.remoteStatus, 404);
-      assertEquals(error.matrixBody, true);
-      assertEquals(error.status, 404);
-      assertEquals(error.errcode, 'M_UNRECOGNIZED');
-    },
-  );
+Deno.test('federation JSON: Matrix error message is optional, omitted and null preserve completed HTTP provenance', async () => {
+  for (const message of [undefined, null]) {
+    await withPeer(
+      () =>
+        Response.json({ errcode: 'M_UNRECOGNIZED', error: message }, {
+          status: 404,
+        }),
+      async (store, fake) => {
+        const server = await store.server(), signer = await testSigner('test');
+        const error = await assertRejects(
+          () =>
+            federationRequest(server, signer, {
+              destination: fake.name,
+              method: 'GET',
+              path: '/reply',
+              body: null,
+            }),
+          FederationHttpError,
+        );
+        assertEquals(error.remoteStatus, 404);
+        assertEquals(error.matrixBody, true);
+        assertEquals(error.status, 404);
+        assertEquals(error.errcode, 'M_UNRECOGNIZED');
+      },
+    );
+  }
 });
 
 Deno.test('federation JSON: malformed success is protocol, never null or completed HTTP refusal', async (t) => {

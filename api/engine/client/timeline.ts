@@ -5,10 +5,12 @@ import { productionFetcher } from '#engine/federation/fetcher.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { backfill, bridgeForwardAnchor } from '#engine/room/history.ts';
 import {
+  type EventRow,
   formatCursor,
   parseCursor,
   type Room,
   type WalkCursor,
+  type WalkStep,
 } from '#engine/room/index.ts';
 import { membershipOf } from '#engine/server/read.ts';
 import {
@@ -22,6 +24,7 @@ import { requireRoom, type StateRow } from './room.ts';
 import { clientEventsForRows } from './state.ts';
 import { admitState } from './state-admission.ts';
 import { canSeeEvent } from './visibility.ts';
+import { integerParameter } from '#engine/operation.ts';
 
 import { parseStreamToken } from './tokens.ts';
 export { parseStreamToken } from './tokens.ts';
@@ -108,6 +111,7 @@ export type MessagesWindow = {
   limit: number;
   lazyLoadMembers: boolean;
   containsUrl?: boolean;
+  filter?: RoomEventFilter;
   // Room previews never start a history fetch or change participation.
   localOnly?: boolean;
 };
@@ -122,7 +126,12 @@ export async function messages(
   }
 > {
   const room = await requireRoom(w.roomId);
-  const limit = Math.max(0, Math.floor(w.limit));
+  const requested = integerParameter(w.limit, 'limit', 0)!;
+  const filter = {
+    ...w.filter,
+    ...(w.containsUrl === undefined ? {} : { contains_url: w.containsUrl }),
+  };
+  const limit = Math.min(requested, filter.limit ?? requested);
   const leave = w.leaveAt === null
     ? null
     : await cursorForToken(room, 's' + w.leaveAt, 'f');
@@ -150,11 +159,37 @@ export async function messages(
   const to = w.toToken === null
     ? null
     : await cursorForToken(room, w.toToken, w.dir);
-  const raw: { event: string; cursor: WalkCursor }[] = [];
+  // Filtering can cross a long excluded prefix. Retain only the two cut
+  // anchors, never every scanned event merely to fill a small result window.
+  type Scanned = { event: string; cursor: WalkCursor };
+  let firstScanned: Scanned | undefined, lastScanned: Scanned | undefined;
+  const chunk: Record<string, unknown>[] = [];
+  let filtered = false;
   let ended = false, filled = false;
   let frontier: WalkCursor | null = null;
-  while (raw.length < limit) {
-    const step = await room.tx((tx) => tx.segments.step(cursor!, w.dir));
+  let pending: Extract<WalkStep, { kind: 'event' }>[] = [];
+  let storedPage = new Map<string, EventRow>();
+  while (chunk.length < limit) {
+    let step: WalkStep;
+    if (pending.length > 0) step = pending.shift()!;
+    else {
+      const page = await room.tx(async (tx) => {
+        const page = await tx.segments.page(cursor!, w.dir, 32);
+        return page.kind === 'events'
+          ? {
+            ...page,
+            stored: await tx.events.list(
+              page.events.map((entry) => entry.event),
+            ),
+          }
+          : page;
+      });
+      if (page.kind === 'events') {
+        pending = page.events;
+        storedPage = page.stored;
+        step = pending.shift()!;
+      } else step = page;
+    }
     if (step.kind === 'end') {
       ended = true;
       break;
@@ -248,17 +283,27 @@ export async function messages(
       if ((w.dir === 'f' && cmp > 0) || (w.dir === 'b' && cmp <= 0)) break;
     }
     cursor = step.cursor;
-    raw.push(step);
-  }
-  const chunk: Record<string, unknown>[] = [];
-  let filtered = false;
-  for (const row of raw) {
-    const stored = await room.tx((tx) => tx.events.get(row.event));
-    const content = stored === null ? {} : JSON.parse(stored.pdu).content ?? {};
+    firstScanned ??= step;
+    lastScanned = step;
+    const row = step;
+    const stored = storedPage.get(row.event);
+    // Indexed fields suffice for most filters. Only contains_url needs JSON;
+    // excluded prefixes do not deserialize every unrelated stored event.
+    const pdu = stored === undefined ? null : {
+      type: stored.type,
+      sender: stored.sender,
+      room_id: w.roomId,
+      ...(filter.contains_url === undefined ? {} : {
+        content: JSON.parse(stored.pdu).content,
+      }),
+    };
     if (
-      stored === null ||
-      (w.containsUrl !== undefined &&
-        (typeof content.url === 'string') !== w.containsUrl) ||
+      pdu === null ||
+      !eventMatchesRoomEventFilter(
+        stored,
+        { ...pdu, room_id: w.roomId },
+        filter,
+      ) ||
       !await canSeeEvent(w.userId, room, row.event)
     ) {
       filtered = true;
@@ -272,9 +317,9 @@ export async function messages(
     if (ev !== null) chunk.push(ev);
     else filtered = true;
   }
-  const last = raw.length === 0
+  const last = lastScanned === undefined
     ? null
-    : await room.tx((tx) => tx.events.get(raw[raw.length - 1].event));
+    : await room.tx((tx) => tx.events.get(lastScanned!.event));
   const result: {
     chunk: Record<string, unknown>[];
     start: string;
@@ -283,11 +328,13 @@ export async function messages(
   } = { chunk, start: w.fromToken ?? '' };
   if (!((ended || last?.type === 'm.room.create') && !filtered)) {
     if (frontier !== null) result.end = formatCursor(frontier);
-    else if (raw.length > 0 || limit === 0) result.end = formatCursor(cursor);
+    else if (lastScanned !== undefined || limit === 0) {
+      result.end = formatCursor(cursor);
+    }
   }
   if (w.lazyLoadMembers) {
     const senders = new Set(chunk.map((e) => String(e.sender)));
-    const anchor = w.dir === 'f' ? raw[raw.length - 1] : raw[0];
+    const anchor = w.dir === 'f' ? lastScanned : firstScanned;
     const admission = await admitState(room, {
       userId: w.userId,
       ...(anchor === undefined ? {} : { point: { eventId: anchor.event } }),

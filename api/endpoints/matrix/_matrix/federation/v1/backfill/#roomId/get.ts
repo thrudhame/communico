@@ -1,4 +1,5 @@
 import { serveBackfill } from '#engine/federation/serve.ts';
+import { backfillRequest } from '#engine/federation/history-request.ts';
 import { serveDeps } from '#engine/federation/context.ts';
 import { assertFederationEnabled } from '#engine/federation/keydoc.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -17,11 +18,11 @@ export default async function (
       'missing or invalid signature',
     );
   }
-  const limit = request.query.get('limit');
+  const { v, limit } = backfillRequest(request.query);
   return await serveBackfill(
     request.params.roomId as string,
-    request.query.getAll('v'),
-    limit === null ? undefined : Number(limit),
+    v,
+    limit,
     origin,
     serveDeps(),
   );

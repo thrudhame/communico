@@ -10,6 +10,7 @@
 // a retried transaction the same answer — a cache, not an obligation.
 // EDUs ride after PDUs to their registered handlers.
 import { config } from '#engine/config.ts';
+import { transactionRequest } from './transaction-request.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -19,9 +20,7 @@ import { openRoom, type Room } from '#engine/room/index.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import type { Store } from '#engine/store/index.ts';
 import { ReliableEduError } from '#engine/federation/edus.ts';
-import { objectOf, stringOf } from '#engine/net/json.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
-import { transactionEnvelope } from './peer-json.ts';
 
 export type TransactionDeps = {
   store: Store;
@@ -142,18 +141,9 @@ export async function receiveTransaction(
   rawBody: unknown,
   deps: TransactionDeps,
 ): Promise<TxnResult> {
-  let envelope: ReturnType<typeof transactionEnvelope>;
+  let envelope: ReturnType<typeof transactionRequest>;
   try {
-    const body = objectOf(rawBody, 'transaction');
-    // Keep authenticated-origin equality separate from the wire schema.
-    if (stringOf(body.origin, 'transaction') !== origin) {
-      throw new MatrixError(
-        403,
-        'M_FORBIDDEN',
-        'transaction origin does not match the authenticated server',
-      );
-    }
-    envelope = transactionEnvelope(body);
+    envelope = transactionRequest(rawBody, origin);
   } catch (error) {
     if (!(error instanceof UpstreamError)) throw error;
     const failure = new MatrixError(
@@ -183,7 +173,8 @@ export async function receiveTransaction(
   // id — v12.md:18-20, :100-101)
   const byRoom = new Map<string, Pdu[]>();
   for (const raw of pdus) {
-    const pdu = raw as Pdu;
+    // The envelope establishes objects only. The room verifier owns the PDU.
+    const pdu = raw as unknown as Pdu;
     let roomId = typeof pdu.room_id === 'string' ? pdu.room_id : null;
     if (
       roomId === null && pdu.type === 'm.room.create' &&

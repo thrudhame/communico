@@ -5,6 +5,7 @@ import { domainOf, localpartOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { type Json, object, validateUpload } from '#engine/tenant/e2ee.ts';
 import * as wire from '#engine/e2ee-wire.ts';
+import { optionalField } from '#engine/net/json.ts';
 import {
   protocol,
   recoverableUpstream,
@@ -110,20 +111,27 @@ async function remoteKeys(
   }
   if (!claim) {
     const answer = wire.object(value, 'response');
+    const signingMaps: Record<string, Json> = {};
     for (const field of ['master_keys', 'self_signing_keys']) {
-      if (answer[field] === undefined) continue;
-      for (const user of Object.keys(wire.object(answer[field], field))) {
+      const map = optionalField(
+        answer[field],
+        (raw) => wire.object(raw, field),
+      );
+      if (map === undefined) continue;
+      signingMaps[field] = map;
+      for (const [user, key] of Object.entries(map)) {
         if (!wanted.has(user)) {
           wire.identity('origin returned unrequested signing user');
         }
+        // Map values are required objects, not optional schema properties.
+        wire.object(key, field + ' entry');
       }
     }
     for (const [user] of requests) {
       const supplied = publicSigning(
         {
-          master_key: (answer.master_keys as Json | undefined)?.[user],
-          self_signing_key: (answer.self_signing_keys as Json | undefined)
-            ?.[user],
+          master_key: signingMaps.master_keys?.[user],
+          self_signing_key: signingMaps.self_signing_keys?.[user],
         },
         user,
         limits,

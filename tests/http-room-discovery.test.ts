@@ -1,6 +1,7 @@
 import { assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
 import { fedCaller, remoteServer } from '#tests/http-federation.ts';
+import { setConfigForTests } from '#engine/config.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP room discovery');
@@ -109,6 +110,7 @@ suite.test('room summaries share published metadata and enforce user or anonymou
 });
 
 suite.test('client and federation public directories filter room types before count and pagination', async () => {
+  setConfigForTests({ federation: { publicrooms: true } });
   const a = await suite.registerTestUser('discovery-types', 'pw');
   const plain = await create(a.access_token!, {
     name: 'discover plain',

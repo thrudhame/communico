@@ -10,6 +10,7 @@
 // whose typing moved since the token (§3d).
 import type { Database } from '#engine/store/db.ts';
 import { isJoined } from '#engine/server/read.ts';
+import { integerParameter } from '#engine/operation.ts';
 
 const typing = new Map<string, Map<string, number>>();
 const lastChangeT = new Map<string, number>();
@@ -75,6 +76,7 @@ export async function setTyping(
   isTyping: boolean,
   timeoutMs?: number,
 ): Promise<boolean> {
+  integerParameter(timeoutMs, 'timeout', 0);
   // Serialize admission with the projection's membership transaction. The
   // synchronous memory update cannot land behind its departure reconciliation.
   return await server.tx(async (tx) => {

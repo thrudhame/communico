@@ -1,4 +1,4 @@
-import { parseJson } from '@pathfinder/pathfinder/body';
+import { parseJson } from '#engine/operation-body.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 import { backupVersion } from '#engine/client/key-backup.ts';
 

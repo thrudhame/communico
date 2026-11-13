@@ -1,6 +1,7 @@
 // Resident serving on the room core. State uses the event's own before-ref,
 // including imported boundaries; absent provenance never means current state.
 import { config } from '#engine/config.ts';
+import { backfillArguments, missingEventsRequest } from './history-request.ts';
 import { redact } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -274,7 +275,23 @@ async function historySelection(
   stops: string[],
   cap: number,
   includeRoots: boolean,
+  minimumDepth = 0,
 ): Promise<Map<string, Pdu>> {
+  if (!includeRoots) {
+    const walk = await tx.events.missingCandidates(
+      roots,
+      stops,
+      minimumDepth,
+      cap,
+    );
+    if (walk.truncated) {
+      throw new MatrixError(503, 'M_UNKNOWN', 'history walk exceeds bound');
+    }
+    const rows = await tx.events.list(walk.ids);
+    return new Map(
+      walk.ids.map((id) => [id, JSON.parse(rows.get(id)!.pdu) as Pdu]),
+    );
+  }
   const stop = new Set(stops);
   const excluded = new Set(includeRoots ? [] : roots);
   const held = new Map<
@@ -305,7 +322,8 @@ async function historySelection(
       }
       if (entry.pdu === null) continue;
       if (
-        !excluded.has(id) && (entry.standing !== 'soft_failed' || referenced)
+        !excluded.has(id) && (entry.standing !== 'soft_failed' || referenced) &&
+        entry.pdu.depth >= minimumDepth
       ) {
         found.set(id, entry.pdu);
       }
@@ -327,15 +345,15 @@ export async function serveBackfill(
   origin: string,
   deps: ServeDeps,
 ) {
+  const request = backfillArguments(v, limit);
   const room = await heldRoom(deps.store, roomId);
   return await room.tx(async (tx) => {
     const version = await inRoom(tx, origin);
-    if (limit === undefined) {
-      throw new MatrixError(400, 'M_BAD_JSON', 'limit is required');
-    }
-    const cap = Math.min(limit, config().federation.backfillmax);
+    const cap = Math.min(request.limit, config().federation.backfillmax);
     const out: Record<string, unknown>[] = [];
-    for (const [id, pdu] of await historySelection(tx, v, [], cap, true)) {
+    for (
+      const [id, pdu] of await historySelection(tx, request.v, [], cap, true)
+    ) {
       out.push(await wireVisible(tx, id, pdu, version, origin, room));
     }
     return { origin: deps.self, origin_server_ts: Date.now(), pdus: out };
@@ -348,20 +366,19 @@ export async function serveGetMissingEvents(
   origin: string,
   deps: ServeDeps,
 ) {
+  const request = missingEventsRequest(body);
   const room = await heldRoom(deps.store, roomId);
   return await room.tx(async (tx) => {
     const version = await inRoom(tx, origin);
-    const cap = Math.min(
-      typeof body.limit === 'number' ? body.limit : 10,
-      config().federation.missingmax,
+    const cap = Math.min(request.limit, config().federation.missingmax);
+    const found = await historySelection(
+      tx,
+      request.latest,
+      request.earliest,
+      cap,
+      false,
+      request.minDepth,
     );
-    const earliest = Array.isArray(body.earliest_events)
-      ? body.earliest_events.map(String)
-      : [];
-    const latest = Array.isArray(body.latest_events)
-      ? body.latest_events.map(String)
-      : [];
-    const found = await historySelection(tx, latest, earliest, cap, false);
     const events: Record<string, unknown>[] = [];
     // Parent-before-child even when a remote event's declared depth is not
     // topological. Stable ids break ties, eliminating insertion-order output.

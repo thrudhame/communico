@@ -190,7 +190,7 @@ export function isRegistered(
 }
 
 export type RegisterParams = {
-  localpart: string;
+  localpart?: string;
   password: string;
   deviceId?: string;
   displayName?: string;
@@ -207,23 +207,37 @@ export type RegisterResult = {
   home_server: string;
 };
 
+type InhibitedRegisterResult = Omit<RegisterResult, 'device_id'>;
+
 // The real /register path (endpoint + dev seeds share it). Throws
 // MatrixError M_USER_IN_USE (400) for taken localparts.
+export function registerUser(
+  tenant: Tenant,
+  params: RegisterParams & { accessToken: null },
+): Promise<InhibitedRegisterResult>;
+export function registerUser(
+  tenant: Tenant,
+  params: RegisterParams & { accessToken?: string },
+): Promise<RegisterResult>;
+export function registerUser(
+  tenant: Tenant,
+  params: RegisterParams,
+): Promise<RegisterResult | InhibitedRegisterResult>;
 export async function registerUser(
   tenant: Tenant,
   params: RegisterParams,
-): Promise<RegisterResult> {
-  const localpart = checkLocalpart(params.localpart);
+): Promise<RegisterResult | InhibitedRegisterResult> {
+  const generated = params.localpart === undefined;
+  const allocate = () => 'u' + crypto.randomUUID().replaceAll('-', '');
+  const requestedLocalpart = generated
+    ? allocate()
+    : checkLocalpart(params.localpart);
   if (typeof params.password !== 'string' || params.password.length === 0) {
     throw new MatrixError(400, 'M_BAD_REQUEST', 'password required');
   }
   const deviceId = params.deviceId && params.deviceId.length > 0
     ? params.deviceId
     : crypto.randomUUID().replaceAll('-', '').slice(0, 10);
-  const displayName =
-    typeof params.displayName === 'string' && params.displayName.length > 0
-      ? params.displayName
-      : localpart;
   // null = inhibit_login (no token); a non-empty string is taken verbatim
   // (dev seeds); otherwise mint a random one.
   let accessToken: string | undefined;
@@ -237,23 +251,31 @@ export async function registerUser(
     ? null
     : await hashToken(accessToken);
   return await tenant.tx(async (tx) => {
+    let localpart = requestedLocalpart;
+    if (generated) {
+      while (await tx.users.exists(localpart)) localpart = allocate();
+    }
+    const displayName =
+      typeof params.displayName === 'string' && params.displayName.length > 0
+        ? params.displayName
+        : localpart;
     if (await tx.users.exists(localpart)) {
       throw new MatrixError(400, 'M_USER_IN_USE', 'user in use: ' + localpart);
     }
     await tx.users.insert(localpart, displayName);
     await tx.credentials.set(localpart, hashPassword(params.password));
-    await tx.devices.upsert(
-      deviceId,
-      localpart,
-      params.deviceDisplayName ?? displayName,
-    );
     if (accessHash !== null) {
+      await tx.devices.upsert(
+        deviceId,
+        localpart,
+        params.deviceDisplayName ?? displayName,
+      );
       await tx.tokens.insert(accessHash, localpart, deviceId, null);
     }
     return {
       user_id: `@${localpart}:${tenant.serverName}`,
       access_token: accessToken,
-      device_id: deviceId,
+      ...(accessHash === null ? {} : { device_id: deviceId }),
       home_server: tenant.serverName,
     };
   });
@@ -300,7 +322,9 @@ export async function loginUser(
     await tx.devices.upsert(
       params.deviceId,
       params.localpart,
-      params.displayName ?? null,
+      await tx.devices.byId(params.deviceId, params.localpart) === null
+        ? params.displayName ?? null
+        : null,
     );
     await revokeDeviceTokens(tx, params.deviceId, params.localpart);
     await tx.tokens.insert(

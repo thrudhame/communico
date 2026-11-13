@@ -9,12 +9,36 @@ This is a regression checklist, not exhaustive conformance certification.
 
 [`tests/fixtures/versions-endpoints.json`](tests/fixtures/versions-endpoints.json)
 retains all 197 tagged client-server/server-server operation definitions from the
-G10 audit: 167 routed and 30 explicitly excluded. Duplicate definitions remain.
+G10 audit, with ordinary-client empty reads restored: 174 routed and 23 explicitly excluded. Duplicate definitions remain.
 The guard checks every concrete route and its callable handler, not a passing
 test count. Generic federation query maps to directory/profile. Optional 3PID,
 identity servers, appservices, SSO/OAuth, tokens and deprecated global sync APIs
 remain excluded; federation v1 invite is excluded by room-version 1/2 scope.
 The existing versions 3-12 registry is unchanged. Whois records no connections.
+
+## Operation and parameter baseline
+
+`tests/fixtures/spec-contracts-v1.16.json` pins the complete tagged OpenAPI
+request/response schemas, including optional-parent conditions and prose.
+`tools/spec-contracts.py --check` reproduces it from the tagged source.
+`tests/fixtures/spec-consumption-v1.16.json` binds every request node to its
+concrete adapters, decoding boundary, consumer, disposition, normative source
+and named consumer cases. `tools/spec-consumption.py --check` reproduces those
+pinned bindings. `tests/spec-decoder.ts` mechanically follows request values
+through each adapter's called decoding functions, including the tenant binding
+seam. An unrelated field name or import does not count, nor does serializing a
+whole request establish decoding of its named fields. Every routed parameter
+must have a read or an exact, reasoned not-applicable entry; unavailable modules
+retain their explicit refusal reason. There is no manual per-node review gate.
+Exact sets, the manifest digest and the independent reviewed-schema pins retain
+schema/default/enum/prose changes and response obligations for conscious review.
+
+The behavioral runner executes the ledger's named cases as well as the suites
+below, and checks their exact successful JUnit identities. Merely importing an
+endpoint or finding a parameter name in source is not coverage. Successful real
+HTTP responses are also checked against the pinned schemas. State `format`
+selects the documented response branch; profile-capability compatibility and
+search global/group continuations retain explicit conditional consumer proofs.
 
 ## Cumulative behavioral requirements
 

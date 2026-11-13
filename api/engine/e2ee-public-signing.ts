@@ -10,6 +10,7 @@ import {
   object,
 } from '#engine/e2ee-wire.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { optionalField } from '#engine/net/json.ts';
 
 export type PublicSigning = { master_key?: Json; self_signing_key?: Json };
 export class InvalidPublicSigning extends UpstreamError {
@@ -26,8 +27,11 @@ export function publicSigning(
   const value = object(raw, 'public signing keys'), result: PublicSigning = {};
   for (const usage of ['master', 'self_signing'] as const) {
     const field = `${usage}_key` as keyof PublicSigning;
-    if (value[field] === undefined) continue;
-    const key = decodeSigningKey(value[field], user, usage, limits);
+    const key = optionalField(
+      value[field],
+      (raw) => decodeSigningKey(raw, user, usage, limits),
+    );
+    if (key === undefined) continue;
     result[field] = keyView(JSON.parse(key.json), user);
   }
   limitEntries(Object.keys(result).length, limits.maxkeys);

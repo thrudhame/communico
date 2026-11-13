@@ -349,6 +349,56 @@ are not content-filtered. Federation event format crosses the same viewer-aware
 renderer as client format; `event_fields` may receive the spec-permitted superset.
 (`api/engine/tenant/filters.ts`, `api/engine/syncfeed.ts`)
 
+Messages, context and search use that same validated room-event filter rather
+than independently dropping malformed fields. Messages applies the complete
+type/sender/room/URL predicate before its result limit, retaining only scan-cut
+anchors across excluded prefixes. Filter limits can further reduce a page.
+Contiguous history is read and hydrated in 32-event segment pages; the shared
+walk still stops at imported or isolated boundaries before crossing their DAG.
+Indexed event fields reject unrelated events without deserializing their PDUs.
+Ordinary sync normalizes omitted presence to online, rejects malformed booleans
+and numeric parameters, and returns full-state requests immediately even with
+a since token and positive timeout.
+(`api/engine/client/{timeline-request,sync-request,timeline}.ts`)
+
+Search has one normalized operation contract and one keyset pagination owner for
+rank and recent ordering, including room and sender scopes. Equal ranks retain a
+deterministic sequence/event tie-break. Global and per-group continuations name
+the last real result in their scope, including on a terminal nonempty page as in
+Synapse. Following a terminal cursor yields an empty page with no further token.
+Search rejects an explicit zero result limit. Using a group token keeps subsequent global
+continuations in the same group. Multiple matching indexed keys
+still produce one event result. Known search keys, context, grouping and boolean
+fields are validated before selection rather than silently discarded.
+Group order is assigned once on insertion, without rescanning existing groups.
+(`api/engine/client/{search-request,search-page,search}.ts`)
+
+Joined-member summaries retain Synapse's explicit null display/avatar strings
+when absent and preserve empty strings when present. The OpenAPI response guard
+is test-only: its explicit compatibility table documents this nullable-profile
+exception and the terminal-search-page contract without changing pinned schemas
+or rewriting runtime responses. Other field types remain checked.
+(`tests/spec-contract.ts:responseCompatibility`)
+
+Matrix JSON middleware and adapters share one body decoder. Its generated
+operation metadata preserves the tagged requestBody.required flags. Absent bytes
+are an empty object for optional bodies and, as in Synapse/Complement, for required
+body schemas that accept an empty object (including join). Required fields still
+reject before dispatch; malformed nonempty JSON, whitespace, UTF-8 and non-object
+roots never gain omission semantics. The all-operation native guard compares
+every generated flag and empty-object decision with the pinned schemas, and
+prevents adapters from bypassing the shared decoder. Binary media retains its
+streaming owner. Response-schema compatibility remains exclusively test-time.
+(`api/engine/operation-body.ts`, `tools/spec-contracts.py`, `tests/operation-body.test.ts`)
+
+Membership and redaction adapters validate the common optional string reason
+before dispatch, including idempotent joins. State format and member filters
+validate their enumerations without turning malformed intent into a different
+projection. Federation profile fields follow their own explicit enum. Signed
+one-time/fallback key objects require signature maps before any pool publication;
+this is structural validation, not a new cryptographic verification requirement.
+(`client/{membership-request,state-request}.ts`, `tenant/e2ee.ts`)
+
 All client timeline rendering crosses one viewer-aware `renderEvent` boundary.
 Its shared visibility policy requires accepted, grounded events; the viewer's
 own membership events are visible without a qualifying join. Other events need
@@ -516,6 +566,16 @@ v12-only creator field. Valid duplicates and the upgrader's own ID are retained.
 
 ## Federation and delivery
 
+Remote response schemas share one optional-field boundary: JSON null for a
+declared optional field is decoded as absence unless that field's specification
+gives null meaning. Required fields and wrong non-null types still fail. Decoded
+projections omit absent fields without rewriting signed key JSON, opaque event
+content or unknown extension values. This includes membership/delivery envelopes,
+directory/profile/hierarchy metadata, key documents, remote E2EE records and
+completed Matrix error responses. It does not relax authenticated client request
+decoding or required transaction/EDU fields.
+(`api/engine/net/json.ts:optionalField`, `tests/peer-response-optionals.test.ts`)
+
 The shared outbound TLS dialer lets CA trust finish normal chain and hostname
 validation in the handshake. Only pinned/key-is-name trust reads certificate
 material afterwards, requesting the leaf alone and checking its key before
@@ -524,9 +584,23 @@ writing HTTP bytes. It does not rebuild a legacy certificate chain per request.
 
 Client and federation public directories use one published-state metadata
 serializer, including room types. Both filter `room_types` (with `null` for
-untyped rooms) before counting and pagination. User-directory candidates include
+untyped rooms) before counting and pagination. One operation decoder validates
+known query/body fields without turning malformed values into defaults. Network
+selection distinguishes native, all and a named bridge instance; with no bridges,
+a named instance has no rooms, not the native list. Conflicting all/instance
+selectors are rejected. Local cursors are validated by their local owner;
+directory pages retain Synapse's 100-room local cap. Omitted publication visibility
+means public. User-directory candidates include
 unlisted world-readable rooms, while retaining the local-account scope.
-(`api/engine/client/{directory,summary}.ts`)
+(`api/engine/client/{directory,directory-request,summary}.ts`)
+
+Ordinary authenticated clients can read third-party discovery independently of
+optional producers: protocols is an empty object, mapping queries are empty lists,
+unknown protocol metadata is not found, and account 3PID discovery has an empty
+`threepids` list. Required mapping query parameters remain required. These reads
+do not implement bridges, application-service writes or identity-server actions.
+Profile capabilities include matching legacy display-name and avatar flags.
+(`api/engine/client/thirdparty.ts`, client v3 discovery adapters)
 
 `/room_summary` reads reuse that metadata and separate discovery
 access: joined/invited users, public or supported knock rules, world-readable
@@ -623,6 +697,21 @@ PDUs according to that server's visibility at the event. This is not the
 client user's boolean timeline-visibility question.
 (`api/engine/federation/serve.ts:32-54`, `api/engine/federation/serve.ts:70-94`,
 `api/engine/federation/serve.ts:174-177`)
+
+Federation request decoders retain required arrays and integer envelopes instead
+of accepting malformed empty requests. Missing-event selection filters declared
+depth before its result limit, without trusting that depth as DAG order or a walk
+boundary. Absent make_join versions negotiate only version 1. The cache-only
+notary signs a held document only when its validity meets every requested floor;
+omitted floors use one current-time cut. Transaction timestamp/array validation
+precedes replay publication, so malformed requests cannot cache empty success.
+Notary POST selects all held hits in one cache query and signs only eligible
+documents, with no network fetch or per-miss transaction. Missing-event reads
+walk lightweight native graph metadata and hydrate only selected results; an
+indexed no-candidate check avoids a walk when no held depth can qualify.
+Low-depth predecessors still expand, and the existing independent 100000-event
+failure boundary never becomes a silently truncated successful answer.
+(`federation/{history-request,notary-request,transaction-request}.ts`)
 
 Joining verifies the returned snapshot and our join. A returned join must
 recompute to our id; only its verified resident signature is merged into our
@@ -755,6 +844,14 @@ identity. The tenant generates its key once and reloads it on reopen, keeping
 its stored native name and key id. A newly generated key has a public-key-derived
 id; existing ids are retained. Passwords use Argon2id PHC strings; access and
 refresh credentials are stored only as SHA-256 digests.
+Registration allocates a unique localpart when omitted. Inhibited registration
+creates the account without a device or session; disabled guest intent is refused,
+never converted to ordinary registration. Login's initial device name applies
+only to a new device, not an existing device rename. Operation-specific session,
+password and ephemeral decoders validate known scalar types before UIA or effects;
+malformed typing cannot become a stop or advance the typing stream. Room creation
+distinguishes missing fields from explicit null values before applying defaults.
+(`tenant/session-request.ts`, `client/ephemeral-request.ts`, `room/create.ts`)
 (`api/engine/tenant/index.ts:337-401`, `api/engine/tenant/index.ts:51-62`,
 `api/engine/tenant/users.ts:1-3`, `api/engine/tenant/users.ts:39-55`,
 `api/engine/tenant/auth.ts:1-6`, `api/engine/tenant/auth.ts:17-48`)
