@@ -173,8 +173,8 @@ Deno.test('sliding streams: receipt cuts and single-event collisions preserve vi
       seq: number,
     ) =>
       f.server.execute(
-        'INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_id,ts_ms,seq) VALUES(?,?,?,?,?,?,?)',
-        [room, user, type, thread, event, seq * 10, seq],
+        'INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_ids,ts_ms,seq) VALUES(?,?,?,?,?,?,?)',
+        [room, user, type, thread, JSON.stringify([event]), seq * 10, seq],
       );
     await add(alice, 'm.read', '', '$same', 1);
     await add(alice, 'm.read', 'main', '$same', 2);
@@ -208,15 +208,20 @@ Deno.test('sliding streams: receipt cuts and single-event collisions preserve vi
       },
     );
     assertEquals(
-      (await receiptRows(f.server, room, 4, alice, 6)).map((r) => r.eventId),
+      (await receiptRows(f.server, room, 4, alice, 6)).flatMap((r) =>
+        r.eventIds
+      ),
       ['$later'],
     );
-    assertEquals((await receiptRows(f.server, room, 0)).map((r) => r.eventId), [
-      '$same',
-      '$same',
-      '$reply',
-      '$later',
-    ]);
+    assertEquals(
+      (await receiptRows(f.server, room, 0)).flatMap((r) => r.eventIds),
+      [
+        '$same',
+        '$same',
+        '$reply',
+        '$later',
+      ],
+    );
     // Ordinary sync still has separate thread maps and loses no durable slot.
     const ordinary = await receiptsSince(f.server, room, alice, 0);
     assertEquals(ordinary.length, 3);

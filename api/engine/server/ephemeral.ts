@@ -31,7 +31,7 @@ export type ReceiptRow = {
   userId: string;
   receiptType: 'm.read' | 'm.read.private';
   threadId: string | null;
-  eventId: string;
+  eventIds: readonly string[];
   ts: number;
   seq: number;
 };
@@ -187,6 +187,35 @@ export async function setReceipt(
   opts: { ts?: number; threadId?: string | null; requireRelated?: boolean } =
     {},
 ): Promise<boolean> {
+  return await setReceiptMark(
+    server,
+    roomId,
+    userId,
+    receiptType,
+    [eventId],
+    opts,
+  );
+}
+
+/** One graph mark, one durable slot and one stream position. Client writes are
+ * singleton marks; federation can retain several incomparable extremities. */
+export async function setReceiptMark(
+  server: Db,
+  roomId: string,
+  userId: string,
+  receiptType: 'm.read' | 'm.read.private',
+  targets: readonly string[],
+  opts: { ts?: number; threadId?: string | null; requireRelated?: boolean } =
+    {},
+): Promise<boolean> {
+  if (!targets.length || targets.some((id) => typeof id !== 'string')) {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'invalid receipt extremities',
+    );
+  }
+  const eventIds = [...new Set(targets)];
   const ts = opts.ts ?? Date.now();
   const threadId = receiptThreadId(opts.threadId);
   const row = await eventStreamTx(server, async (tx) => {
@@ -219,38 +248,51 @@ export async function setReceipt(
     }
     // Local API admission and read effects share the same relation snapshot.
     // Inbound EDUs may reference targets not held yet and retain their identity.
-    if (
-      opts.requireRelated && threadId !== null &&
-      !await receiptTargetInThread(tx, roomId, eventId, threadId)
-    ) {
-      throw new MatrixError(
-        400,
-        'M_INVALID_PARAM',
-        'event_id is not related to the given thread',
-      );
+    for (const eventId of eventIds) {
+      if (
+        opts.requireRelated && threadId !== null &&
+        !await receiptTargetInThread(tx, roomId, eventId, threadId)
+      ) {
+        throw new MatrixError(
+          400,
+          'M_INVALID_PARAM',
+          'event_id is not related to the given thread',
+        );
+      }
     }
     const seq = await next(tx, 'receipts');
     await tx.execute(
-      `INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_id,ts_ms,seq) VALUES(?,?,?,?,?,?,?)
-      ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_id=excluded.event_id,ts_ms=excluded.ts_ms,seq=excluded.seq`,
-      [roomId, userId, receiptType, threadId ?? '', eventId, ts, seq],
+      `INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_ids,ts_ms,seq) VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_ids=excluded.event_ids,ts_ms=excluded.ts_ms,seq=excluded.seq`,
+      [
+        roomId,
+        userId,
+        receiptType,
+        threadId ?? '',
+        JSON.stringify(eventIds),
+        ts,
+        seq,
+      ],
     );
-    const admitted = await advanceNotificationRead(
-      tx,
-      userId,
-      roomId,
-      threadId ?? '',
-      eventId,
-      Date.now(),
-    );
-    if (!admitted) {
-      throw new MatrixError(
-        429,
-        'M_LIMIT_EXCEEDED',
-        'pending receipt capacity reached',
+    const now = Date.now();
+    for (const eventId of eventIds) {
+      const admitted = await advanceNotificationRead(
+        tx,
+        userId,
+        roomId,
+        threadId ?? '',
+        eventId,
+        now,
       );
+      if (!admitted) {
+        throw new MatrixError(
+          429,
+          'M_LIMIT_EXCEEDED',
+          'pending receipt capacity reached',
+        );
+      }
     }
-    return { userId, receiptType, threadId, eventId, ts, seq };
+    return { userId, receiptType, threadId, eventIds, ts, seq };
   });
   if (row === null) return false;
   // Private rows wake their owner, but federation only consumes public rows.
@@ -288,7 +330,7 @@ export async function receiptRows(
     userId: String(r.user_id),
     receiptType: String(r.receipt_type) as ReceiptRow['receiptType'],
     threadId: r.thread_id === '' ? null : String(r.thread_id),
-    eventId: String(r.event_id),
+    eventIds: JSON.parse(String(r.event_ids)) as string[],
     ts: Number(r.ts_ms),
     seq: Number(r.seq),
   }));
@@ -323,7 +365,7 @@ export async function receiptSnapshot(
       userId: String(r.user_id),
       receiptType: String(r.receipt_type) as ReceiptRow['receiptType'],
       threadId: r.thread_id === '' ? null : String(r.thread_id),
-      eventId: String(r.event_id),
+      eventIds: JSON.parse(String(r.event_ids)) as string[],
       ts: Number(r.ts_ms),
       seq: Number(r.seq),
     });
@@ -333,10 +375,14 @@ export async function receiptSnapshot(
 
 type ReceiptContent = Record<string, Record<string, Record<string, unknown>>>;
 
-function putReceipt(content: ReceiptContent, row: ReceiptRow): void {
-  content[row.eventId] ??= {};
-  content[row.eventId][row.receiptType] ??= {};
-  content[row.eventId][row.receiptType][row.userId] = {
+function putReceipt(
+  content: ReceiptContent,
+  row: ReceiptRow,
+  eventId: string,
+): void {
+  content[eventId] ??= {};
+  content[eventId][row.receiptType] ??= {};
+  content[eventId][row.receiptType][row.userId] = {
     ts: row.ts,
     ...(row.threadId === null ? {} : { thread_id: row.threadId }),
   };
@@ -348,13 +394,17 @@ function putReceipt(content: ReceiptContent, row: ReceiptRow): void {
 export function receiptContent(rows: ReceiptRow[]): ReceiptContent {
   const content: ReceiptContent = {};
   for (const row of rows) {
-    const previous = content[row.eventId]?.[row.receiptType]?.[row.userId] as {
-      thread_id?: string;
-    } | undefined;
-    if (row.threadId !== null && previous && previous.thread_id === undefined) {
-      continue;
+    for (const eventId of row.eventIds) {
+      const previous = content[eventId]?.[row.receiptType]?.[row.userId] as {
+        thread_id?: string;
+      } | undefined;
+      if (
+        row.threadId !== null && previous && previous.thread_id === undefined
+      ) {
+        continue;
+      }
+      putReceipt(content, row, eventId);
     }
-    putReceipt(content, row);
   }
   return content;
 }
@@ -369,7 +419,7 @@ function receiptContents(rows: ReceiptRow[]): Record<string, unknown>[] {
       content = {};
       threads.set(row.threadId, content);
     }
-    putReceipt(content, row);
+    for (const eventId of row.eventIds) putReceipt(content, row, eventId);
   }
   return [...threads.values()];
 }

@@ -381,18 +381,20 @@ async function applyDecisions(
     // Current receipts seed upgrades too; the independent horizons retain the
     // farther position even after a lagging public/private wire update.
     const receipts = await tx.query(
-      'SELECT event_id,thread_id FROM receipts WHERE user_id=? AND room_id=?',
+      'SELECT event_ids,thread_id FROM receipts WHERE user_id=? AND room_id=?',
       [input.user, room],
     );
     for (const receipt of receipts) {
-      await advanceNotificationRead(
-        tx,
-        input.user,
-        room,
-        String(receipt.thread_id),
-        String(receipt.event_id),
-        now,
-      );
+      for (const eventId of JSON.parse(String(receipt.event_ids)) as string[]) {
+        await advanceNotificationRead(
+          tx,
+          input.user,
+          room,
+          String(receipt.thread_id),
+          eventId,
+          now,
+        );
+      }
     }
     const horizons = await tx.query(
       "SELECT MAX(event_seq) AS m FROM notification_horizons WHERE user=? AND room=? AND scope IN ('',?)",

@@ -124,8 +124,8 @@ Deno.test('push publication: v13 migration preserves old feed and receipts witho
       (await db.query('SELECT event,event_seq FROM notifications'))[0],
       { event: fresh.eventId, event_seq: 42 },
     );
-    assertEquals((await db.query('SELECT event_id,ts_ms FROM receipts'))[0], {
-      event_id: old.eventId,
+    assertEquals((await db.query('SELECT event_ids,ts_ms FROM receipts'))[0], {
+      event_ids: JSON.stringify([old.eventId]),
       ts_ms: 123,
     });
     // A failed transaction must roll back both the ledger's read flag and totals.

@@ -376,8 +376,13 @@ CREATE INDEX reports_status ON reports(resolved_ms,id);
 CREATE INDEX reports_kind ON reports(kind,id);
 `;
 
+const RECEIPT_EXTREMITIES_SQL = `
+ALTER TABLE receipts RENAME COLUMN event_id TO event_ids;
+UPDATE receipts SET event_ids=json_array(event_ids);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 23,
+  version: 24,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -402,6 +407,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(
       'ALTER TABLE prejoin_memberships ADD COLUMN local_leave_json TEXT',
     );
+    await db.exec(RECEIPT_EXTREMITIES_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -427,5 +433,6 @@ export const serverSchema: SchemaProvider = {
       conn.exec(
         'ALTER TABLE prejoin_memberships ADD COLUMN local_leave_json TEXT',
       ),
+    23: (conn) => conn.exec(RECEIPT_EXTREMITIES_SQL),
   },
 };

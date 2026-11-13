@@ -48,7 +48,7 @@ export function wireEphemeral(
           queues.queueReceipt(d, {
             roomId: change.roomId,
             userId: change.row.userId,
-            eventId: change.row.eventId,
+            eventIds: change.row.eventIds,
             ts: change.row.ts,
             threadId: change.row.threadId,
           }, change.row.seq);
