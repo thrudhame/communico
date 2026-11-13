@@ -12,6 +12,10 @@ export default async function (request: PathfinderRequest) {
   assertFederationEnabled();
   assertFederationDirectoryAllowed();
   return await listLocalPublishedRooms(
-    decodeDirectoryRequest(request.query, await parseJson(request)),
+    decodeDirectoryRequest(
+      request.query,
+      await parseJson(request),
+      'federation',
+    ),
   );
 }

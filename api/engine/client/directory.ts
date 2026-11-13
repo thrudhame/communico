@@ -256,7 +256,7 @@ export function assertFederationDirectoryAllowed() {
 export async function listLocalPublishedRooms(
   opts: DirectoryRequest,
 ) {
-  const limit = opts.limit !== undefined && opts.limit > 0
+  const limit = opts.limit != null && opts.limit > 0
       ? Math.min(opts.limit, 100)
       : 100,
     offset = localDirectoryOffset(opts.since);
