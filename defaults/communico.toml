@@ -185,6 +185,10 @@ maxbytes = 0
 allowunencryptedcreation = false
 allowunencryptedjoining = true
 allowunencryptedmessages = false
+# Accept only standard relation-only m.reaction annotations in encrypted rooms.
+# Reaction keys/targets remain clear in Matrix, even with an encrypted envelope.
+# COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDREACTIONS
+allowunencryptedreactions = true
 
 [e2ee]
 # Maximum serialized key request or response bytes. COMMUNICO_E2EE_MAXREQUESTBYTES

@@ -86,6 +86,7 @@ export const SCHEMA = {
     allowunencryptedcreation: 'bool',
     allowunencryptedjoining: 'bool',
     allowunencryptedmessages: 'bool',
+    allowunencryptedreactions: 'bool',
   },
   e2ee: {
     maxrequestbytes: 'int',
