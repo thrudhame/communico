@@ -1,8 +1,78 @@
-import { assertEquals, assertRejects, assertThrows } from '@std/assert';
+import {
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+  assertThrows,
+} from '@std/assert';
+import tls from 'node:tls';
 import { dialNodeTls } from '#engine/federation/dial-node-tls.ts';
 import { decodeJson } from '#engine/net/json.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { http1Request } from '#engine/net/http1.ts';
+
+Deno.test('discovery alternates: a plain connect timeout retains connect-phase failover eligibility', async () => {
+  const original = Deno.connect;
+  Deno.connect =
+    ((options: { signal: AbortSignal }) =>
+      new Promise<Deno.TcpConn>((_, reject) => {
+        options.signal.addEventListener(
+          'abort',
+          () => reject(options.signal.reason),
+          { once: true },
+        );
+      })) as unknown as typeof Deno.connect;
+  try {
+    const error = await assertRejects(() =>
+      http1Request({
+        connectIp: '127.0.0.1',
+        port: 1,
+        tls: null,
+        hostHeader: 'localhost',
+        method: 'GET',
+        path: '/',
+        headers: {},
+        body: null,
+        connectMs: 10,
+        timeoutMs: 1000,
+        maxBytes: 100,
+      })
+    );
+    assertEquals((error as UpstreamError).context.phase, 'connect');
+  } finally {
+    Deno.connect = original;
+  }
+});
+
+Deno.test('discovery trust: local CA snapshot faults never become peer transport failures', async () => {
+  const original = tls.getCACertificates;
+  const fault = new Error('local system CA read failed');
+  tls.getCACertificates = () => {
+    throw fault;
+  };
+  try {
+    assertStrictEquals(
+      await assertRejects(() =>
+        dialNodeTls({
+          connectIp: '127.0.0.1',
+          port: 1,
+          sni: 'localhost',
+          hostHeader: 'localhost',
+          trust: { kind: 'ca', caCerts: [] },
+          method: 'GET',
+          path: '/',
+          headers: {},
+          body: null,
+          connectMs: 100,
+          timeoutMs: 500,
+          maxBytes: 100,
+        })
+      ),
+      fault,
+    );
+  } finally {
+    tls.getCACertificates = original;
+  }
+});
 
 Deno.test('discovery alternates: plain redirect transport preserves caller cancellation', async () => {
   let entered!: () => void, release!: () => void;
@@ -68,10 +138,16 @@ Deno.test('discovery alternates: connect failure may fail over before bytes; con
     await request.arrayBuffer();
     return Response.json({ one_time_keys: {} });
   });
+  let alternatives = 0;
   const opts = {
     connectIp: '127.0.0.2',
     port: b.addr.port,
-    alternatives: [{ connectIp: '127.0.0.1', port: b.addr.port }],
+    alternatives: {
+      async *[Symbol.asyncIterator]() {
+        alternatives++;
+        yield { connectIp: '127.0.0.1', port: b.addr.port };
+      },
+    },
     sni: 'localhost',
     hostHeader: 'localhost',
     trust: {
@@ -92,6 +168,7 @@ Deno.test('discovery alternates: connect failure may fail over before bytes; con
       one_time_keys: {},
     });
     assertEquals([first, second], [0, 1]);
+    assertEquals(alternatives, 1);
     const malformed = await dialNodeTls({
       ...opts,
       connectIp: '127.0.0.1',
@@ -120,6 +197,11 @@ Deno.test('discovery alternates: connect failure may fail over before bytes; con
       disk,
     );
     assertEquals([first, second], [2, 1]);
+    assertEquals(
+      alternatives,
+      1,
+      'response/sink failures must not resolve backup addresses',
+    );
     // The peer receives the complete consuming request and closes without a
     // response. Even this ambiguous outcome must not visit the second address.
     const dropped = Deno.listenTls(tls);

@@ -2,6 +2,7 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { http1Wire } from '#engine/net/http1.ts';
 import { mediaMultipart } from '#engine/media/multipart.ts';
+import { mediaType } from '#engine/net/fields.ts';
 
 const enc = new TextEncoder();
 function connection(bytes: Uint8Array, split: number) {
@@ -28,6 +29,36 @@ const opts = {
   body: null,
   maxBytes: 100000,
 };
+
+Deno.test('external field grammar: empty parameter entries are legal', () => {
+  assertEquals(
+    [...mediaType('application/json; ; charset=utf-8;').parameters],
+    [['charset', ['utf-8']]],
+  );
+});
+
+Deno.test('external HTTP: empty encoding-list entries do not change representation or framing', async () => {
+  const raw =
+    'HTTP/1.1 200 OK\r\nTransfer-Encoding: , chunked ,,\r\nContent-Encoding: , identity ,,\r\n\r\n3\r\nabc\r\n0\r\n\r\n';
+  assertEquals(
+    (await http1Wire(connection(enc.encode(raw), 1), opts)).body,
+    enc.encode('abc'),
+  );
+  await assertRejects(() =>
+    http1Wire(
+      connection(
+        enc.encode(
+          raw.replace(
+            'Content-Encoding:',
+            'Content-Length: 3\r\nContent-Encoding:',
+          ),
+        ),
+        1,
+      ),
+      opts,
+    )
+  );
+});
 
 Deno.test('external HTTP: informational heads precede final response, valid chunk extensions/trailers', async () => {
   const wire = 'HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n' +
@@ -211,6 +242,28 @@ Deno.test('external MIME: CTE is explicit and invalid unquoted boundary tokens r
     parse(enc.encode(raw), 'multipart/mixed; boundary=test', 1)
   );
   await assertRejects(() =>
-    parse(enc.encode(raw), 'multipart/mixed; boundary=te/st', 1)
+    parse(
+      enc.encode(
+        raw.replace('Content-Transfer-Encoding: base64\r\n', '').replace(
+          'YWJj',
+          'abc',
+        ),
+      ),
+      'multipart/mixed; boundary=te/st',
+      1,
+    )
+  );
+  assertEquals(
+    (await parse(
+      enc.encode(
+        raw.replace('Content-Transfer-Encoding: base64\r\n', '').replace(
+          'YWJj',
+          'abc',
+        ),
+      ),
+      'multipart/mixed; boundary=test',
+      1,
+    )).bytes,
+    enc.encode('abc'),
   );
 });

@@ -4,9 +4,12 @@ import { protocol } from './upstream-error.ts';
 export function decodeJson(
   bytes: Uint8Array,
   contentType: string | null,
+  mediaPolicy: 'require-json' | 'discovery' = 'require-json',
 ): unknown {
   if (
-    contentType === null || mediaType(contentType).value !== 'application/json'
+    mediaPolicy === 'require-json' &&
+    (contentType === null ||
+      mediaType(contentType).value !== 'application/json')
   ) {
     protocol('json', 'expected application/json response');
   }

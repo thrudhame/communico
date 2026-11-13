@@ -78,6 +78,7 @@ suite.test('remote reliable acceptance reaches sync, dedups across transactions 
   const receive = (txn: string, value: unknown = content) =>
     receiveTransaction('remote.test', txn, {
       origin: 'remote.test',
+      origin_server_ts: Date.now(),
       pdus: [],
       edus: [{ edu_type: 'm.direct_to_device', content: value }],
     }, deps);
@@ -157,6 +158,7 @@ suite.test('inbound wildcard expands local devices beyond the wire key cap witho
     setConfigForTests({ e2ee: { maxkeys: 1 } });
     const result = await receiveTransaction('wild.test', 'all-local-devices', {
       origin: 'wild.test',
+      origin_server_ts: Date.now(),
       pdus: [],
       edus: [{
         edu_type: 'm.direct_to_device',
@@ -222,7 +224,12 @@ suite.test('permanent EDU refusal is visible and lets later work through; storag
   const before = await app.server.query(
     "SELECT value FROM counters WHERE name='federation-edu-refused:m.direct_to_device'",
   );
-  const body = { origin, pdus: [], edus: [invalid, valid] };
+  const body = {
+    origin,
+    origin_server_ts: Date.now(),
+    pdus: [],
+    edus: [invalid, valid],
+  };
   assertEquals(
     (await receiveTransaction(origin, 'refusal-then-valid', body, deps)).status,
     200,
@@ -273,6 +280,7 @@ suite.test('permanent EDU refusal is visible and lets later work through; storag
         );
       await assertRejects(() =>
         receiveTransaction(origin, 'storage-retry', {
+          origin_server_ts: Date.now(),
           origin,
           pdus: [],
           edus: [{
@@ -292,6 +300,7 @@ suite.test('permanent EDU refusal is visible and lets later work through; storag
     app.tenant.tx = original;
   }
   await receiveTransaction(origin, 'storage-retry', {
+    origin_server_ts: Date.now(),
     origin,
     pdus: [],
     edus: [{

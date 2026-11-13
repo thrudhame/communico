@@ -149,6 +149,10 @@ export function keyStore(
     : productionDeps(server, opts.signer!);
   const inFlight = new Map<string, Promise<KeyDoc>>();
   const failureMemory = new Map<string, { until: number; error: unknown }>();
+  const refusalMemory = new Map<
+    string,
+    { until: number; error: KeyChangeRefused }
+  >();
   const warnedOnce = new Set<string>(); // name|fingerprint, per instance
 
   // ---------------------------------------------------------------- DB ----
@@ -318,9 +322,10 @@ export function keyStore(
         signatures: {},
       };
     }
-    const failed = failureMemory.get(name);
-    if (failed !== undefined && Date.now() < failed.until) {
-      throw failed.error;
+    for (const memory of [refusalMemory, failureMemory]) {
+      const failed = memory.get(name);
+      if (failed !== undefined && Date.now() < failed.until) throw failed.error;
+      memory.delete(name);
     }
     // Check each caller's demand before coalescing. Only actual refreshes
     // enter inFlight: a generic cached answer cannot satisfy a rotated-key
@@ -472,6 +477,12 @@ export function keyStore(
       await persistDoc(name, candidate.doc, candidate.via);
       return candidate.doc;
     } catch (e) {
+      if (e instanceof KeyChangeRefused) {
+        refusalMemory.set(name, {
+          until: Date.now() + config().federation.keyfailminutes * 60_000,
+          error: e,
+        });
+      }
       if (
         ['transport', 'protocol', 'validation', 'http'].includes(
           upstreamCategory(e),
@@ -614,6 +625,8 @@ export function keyStore(
     });
     if (found === null) return false;
     await persistDoc(name, found.doc, 'accepted');
+    failureMemory.delete(name);
+    refusalMemory.delete(name);
     return true;
   }
 
@@ -630,6 +643,8 @@ export function keyStore(
         [name],
       );
     });
+    failureMemory.delete(name);
+    refusalMemory.delete(name);
   }
 
   return {

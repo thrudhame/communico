@@ -248,12 +248,15 @@ Deno.test('C1 recovery charges only peer failures, not local storage or revision
     assertEquals(row, { failures: 0, retry_at: 0, stale: 1 });
     mode = 'race';
     await http.app.deviceLists.recover(remote);
-    assertEquals(
-      (await db.query(
-        'SELECT failures,retry_at,stale FROM remote_device_users WHERE user_id=?',
-        [remote],
-      ))[0],
-      row,
+    const fenced = (await db.query(
+      'SELECT failures,retry_at,stale FROM remote_device_users WHERE user_id=?',
+      [remote],
+    ))[0];
+    assertEquals(fenced.failures, 0);
+    assertEquals(fenced.stale, 1);
+    assert(
+      Number(fenced.retry_at) > 0,
+      'local revision fences retain scheduled recovery',
     );
     mode = 'malformed';
     await http.app.deviceLists.recover(remote);

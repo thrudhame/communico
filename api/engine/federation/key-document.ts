@@ -46,7 +46,15 @@ export function keyDocument(raw: unknown): KeyDocShape {
   stringOf(doc.server_name, 'key-doc');
   integer(doc.valid_until_ts);
   keyMap(doc.verify_keys);
-  if (doc.old_verify_keys !== undefined) keyMap(doc.old_verify_keys, true);
+  if (doc.old_verify_keys !== undefined) {
+    const oldKeys = objectOf(doc.old_verify_keys, 'key-doc');
+    keyMap(oldKeys, true);
+    for (const id of Object.keys(oldKeys)) {
+      if (Object.hasOwn(doc.verify_keys as object, id)) {
+        protocol('key-doc', 'key identifier is both current and retired');
+      }
+    }
+  }
   for (const signatures of Object.values(objectOf(doc.signatures, 'key-doc'))) {
     for (const signature of Object.values(objectOf(signatures, 'key-doc'))) {
       stringOf(signature, 'key-doc');

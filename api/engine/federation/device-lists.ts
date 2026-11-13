@@ -98,6 +98,7 @@ export function deviceListService(
       ]),
       config().federation.timeoutms,
     );
+    let peerFailure = false;
     try {
       try {
         await abortable(
@@ -135,12 +136,12 @@ export function deviceListService(
         user,
         config().e2ee,
       );
-      await installDeviceSnapshot(db, cut, snapshot, config().e2ee);
+      if (await installDeviceSnapshot(db, cut, snapshot, config().e2ee)) return;
       // A false installation is a local revision fence, not a peer failure.
-      return;
     } catch (error) {
       if (!recoverableUpstream(error, signal)) throw error;
       if (upstreamCategory(error, signal) === 'cancellation') return;
+      peerFailure = true;
     }
     if (shutdown.signal.aborted || demand.aborted) return;
     const now = Date.now(), fed = config().federation;
@@ -150,11 +151,16 @@ export function deviceListService(
         [user],
       ))[0];
       if (!row) return;
-      const failures = Math.min(20, Number(row.failures) + 1);
-      const delay = Math.min(
-        fed.backoffmaxmillihours,
-        fed.backoffstartmillihours * 2 ** (failures - 1),
-      ) * 3600;
+      const failures = Math.min(
+        20,
+        Number(row.failures) + (peerFailure ? 1 : 0),
+      );
+      const delay = peerFailure
+        ? Math.min(
+          fed.backoffmaxmillihours,
+          fed.backoffstartmillihours * 2 ** (failures - 1),
+        ) * 3600
+        : 1000; // Local fences retry on the service's ordinary scan cadence.
       await tx.execute(
         'UPDATE remote_device_users SET failures=?,retry_at=? WHERE user_id=? AND stale=1',
         [failures, now + delay, user],

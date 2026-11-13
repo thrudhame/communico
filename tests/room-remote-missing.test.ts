@@ -4,7 +4,12 @@
 // the resume driver, the /state_ids + /event pack with the imported
 // boundary, the chase naming the gap tip BEHIND a held event, the
 // terminal format drop (no fallthrough) and the corrupted auth chain.
-import { assert, assertEquals } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { type Room, roomSchema } from '#engine/room/index.ts';
@@ -113,6 +118,43 @@ async function frontierOf(room: Room): Promise<string[]> {
     const stay = await tx.segments.openStay();
     return stay === null ? [] : await tx.extremities.frontier(stay.id);
   });
+}
+
+for (const source of ['fetch', 'verify']) {
+  Deno.test(
+    'missing: local ' + source +
+      ' faults propagate without publishing pending evidence',
+    async () => {
+      await withStore(async (store) => {
+        const s = await setup(store);
+        const parent = await msg(s, 'missing-parent', [s.joinId], 50);
+        const pushed = await msg(s, 'pushed', [String(parent.event_id)], 51);
+        const fault = new Error('local missing ' + source);
+        s.deps.fetcher.missingEvents = () => {
+          if (source === 'fetch') throw fault;
+          return Promise.resolve([parent]);
+        };
+        const keys = s.deps.keys;
+        s.deps.keys = {
+          verifyEventSignature: (args) => {
+            if (args.pdu.content.body === 'missing-parent') throw fault;
+            return keys.verifyEventSignature(args);
+          },
+        };
+        assertStrictEquals(
+          await assertRejects(() =>
+            ingestRemote(s.g.room, [pushed], s.server.name, s.deps)
+          ),
+          fault,
+        );
+        assertEquals(await frontierOf(s.g.room), [s.joinId]);
+        assertEquals(
+          await s.g.room.tx((tx) => tx.events.get(String(pushed.event_id))),
+          null,
+        );
+      });
+    },
+  );
 }
 
 Deno.test('missing: complete pushed batches need no recovery, including rejected and redaction parents', async (t) => {

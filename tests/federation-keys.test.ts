@@ -30,6 +30,7 @@ import {
   notaryFromCache,
 } from '#engine/federation/keydoc.ts';
 import {
+  KeyChangeRefused,
   type KeysDeps,
   keyStore,
   ourKeyDocument,
@@ -436,6 +437,74 @@ Deno.test('one in-flight acquisition per name', async () => {
     ]);
     assertEquals(calls, 1);
     assertEquals(a.server_name, b.server_name);
+  });
+});
+
+Deno.test('key policy refusal is remembered separately and admin decisions clear acquisition memory', async () => {
+  setConfigForTests({ federation: { keychange: 'block' } });
+  try {
+    for (const decision of ['accept', 'forget']) {
+      await withStore(async (store) => {
+        const db = await store.server();
+        const old = await makeServer('refusal-' + decision + '.test');
+        await seedServer(db, old, await makeDoc(old, { validUntilMs: 1 }));
+        const next = await makeServer(old.name, 'ed25519:next');
+        const candidate = await makeDoc(next);
+        let calls = 0;
+        const ks = keyStore(db, {
+          deps: stubDeps({
+            directGet: () => {
+              calls++;
+              return Promise.resolve(candidate);
+            },
+          }),
+        });
+        const refused = await assertRejects(
+          () => ks.acquireKeyDoc(old.name, Date.now()),
+          KeyChangeRefused,
+        );
+        assertStrictEquals(
+          await assertRejects(() => ks.acquireKeyDoc(old.name, Date.now())),
+          refused,
+        );
+        assertEquals(calls, 1, 'policy refusal must not redial');
+        assertEquals(
+          (await ks.listKeyChanges(old.name)).length,
+          1,
+          'one pending admin decision',
+        );
+        if (decision === 'accept') assert(await ks.acceptKeyChange(old.name));
+        else await ks.forgetServerKeys(old.name);
+        assertEquals(await ks.acquireKeyDoc(old.name, Date.now()), candidate);
+        assertEquals(calls, decision === 'accept' ? 1 : 2);
+      });
+    }
+  } finally {
+    setConfigForTests({});
+  }
+});
+
+Deno.test('forget clears peer failure memory as well as persisted keys', async () => {
+  await withStore(async (store) => {
+    const doc = await makeDoc(await makeServer('forget-failure.test'));
+    let failing = true;
+    const ks = keyStore(await store.server(), {
+      deps: stubDeps({
+        directGet: () => {
+          if (failing) {
+            throw new UpstreamError('transport', {
+              phase: 'test',
+              reason: 'offline',
+            });
+          }
+          return Promise.resolve(doc);
+        },
+      }),
+    });
+    await assertRejects(() => ks.acquireKeyDoc(doc.server_name, 0));
+    failing = false;
+    await ks.forgetServerKeys(doc.server_name);
+    assertEquals(await ks.acquireKeyDoc(doc.server_name, 0), doc);
   });
 });
 
