@@ -176,7 +176,8 @@ async function fetchMissing(
         deps.limits.limit,
         origin,
       );
-    } catch {
+    } catch (error) {
+      if (!recoverableUpstream(error)) throw error;
       // the fetch failed outright — fall through to the chase
     }
     let dropped = 0;
@@ -191,7 +192,8 @@ async function fetchMissing(
             oversized: v.oversized,
           });
         }
-      } catch {
+      } catch (error) {
+        if (!recoverableUpstream(error)) throw error;
         dropped++;
       }
     }

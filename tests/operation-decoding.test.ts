@@ -15,6 +15,8 @@ import {
   localDirectoryOffset,
 } from '#engine/client/directory-request.ts';
 import { searchRequest } from '#engine/client/search-request.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { roomEventFilterOf } from '#engine/tenant/filters.ts';
 import { membershipContent } from '#engine/client/membership-request.ts';
 import { memberFilters, stateFormat } from '#engine/client/state-request.ts';
 
@@ -117,7 +119,7 @@ Deno.test('search normalization distinguishes absence, explicit empty values and
     searchRequest({
       search_term: 'needle',
       keys: [],
-      filter: { limit: 0 },
+      filter: { limit: 1 },
       order_by: 'recent',
       event_context: {},
       include_state: true,
@@ -126,7 +128,7 @@ Deno.test('search normalization distinguishes absence, explicit empty values and
     {
       term: 'needle',
       keys: [],
-      filter: { limit: 0 },
+      filter: { limit: 1 },
       order: 'recent',
       context: { before: 5, after: 5, profile: false },
       state: true,
@@ -140,6 +142,12 @@ Deno.test('search normalization distinguishes absence, explicit empty values and
     }).context,
     { before: 0, after: 1, profile: true },
   );
+  const zeroSearch = assertThrows(
+    () => searchRequest({ search_term: 'needle', filter: { limit: 0 } }),
+    MatrixError,
+  );
+  assertEquals(zeroSearch.errcode, 'M_INVALID_PARAM');
+  assertEquals(roomEventFilterOf({ limit: 0 }).limit, 0);
 });
 
 Deno.test('membership and state operation decoders retain valid values and distinguish malformed fields', () => {

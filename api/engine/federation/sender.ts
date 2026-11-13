@@ -357,7 +357,15 @@ export function startSender(deps: SenderDeps): Sender {
       rerun.delete(destination);
       running.add(destination);
       const loop = loopDestination(destination)
-        .catch((e) => console.error(`sender[${destination}] error:`, e))
+        .catch(async (e) => {
+          console.error(`sender[${destination}] error:`, e);
+          if (upstreamCategory(e) === 'local' && !stopped) {
+            // Durable work remains owned after local signer/store faults. Retry
+            // separately from the peer ladder, retaining the frozen envelope.
+            await sleep(1000, destination);
+            rerun.add(destination);
+          }
+        })
         .finally(() => {
           running.delete(destination);
           loops.delete(loop);
@@ -404,6 +412,7 @@ export function startSender(deps: SenderDeps): Sender {
     try {
       await job.run();
     } catch (e) {
+      if (['local', 'cancellation'].includes(upstreamCategory(e))) throw e;
       const status = await peerStatus(server, destination);
       await recordFailure(
         server,

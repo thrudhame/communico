@@ -115,6 +115,9 @@ export function claimedKey(
       material(raw, 32);
     }
   } else {
+    if (algorithm === 'curve25519' || algorithm === 'ed25519') {
+      protocol(phase, 'unsigned key must be a string');
+    }
     const key = object(raw, 'claimed signed key');
     if (typeof key.key !== 'string') {
       protocol(phase, 'invalid signed key');

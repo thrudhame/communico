@@ -60,6 +60,7 @@ export function parameterized(raw: string, phase = 'media-type'): {
   while (at < raw.length) {
     if (raw[at++] !== ';') protocol(phase, 'invalid field parameter');
     ows();
+    if (at === raw.length || raw[at] === ';') continue;
     const name = token().toLowerCase();
     ows();
     if (raw[at++] !== '=') protocol(phase, 'invalid field parameter');

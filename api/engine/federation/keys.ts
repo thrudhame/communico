@@ -4,10 +4,10 @@
 // happens only when no witness answered (open mode) or for a roster peer
 // (closed mode — the gate stops strangers first). Key changes are decided
 // by (id, bytes) MATERIAL before anything is persisted; `block` keeps the
-// candidate only inside the change row. One KeyStore per server file: the
-// in-flight dedup, the failure memory and the warn-once set live in the
-// instance (the old module-level maps served the one global database;
-// the Turso core keeps them per store so nothing leaks across stores).
+// candidate only inside the change row. Acquisition state belongs to the
+// store's stable server database capability, shared by admin and resolver
+// views. Weak ownership keeps separate/reopened stores isolated without
+// retaining a closed store's acquisition memory by its filesystem path.
 // The cache tables are shared across tenants of the same server file
 // (a fetched key serves every tenant). Ported from doltgres.
 import { config } from '#engine/config.ts';
@@ -137,6 +137,19 @@ function productionDeps(server: Db, signer: Signer): KeysDeps {
   };
 }
 
+type AcquisitionEpoch = { current: boolean; users: number };
+
+type AcquisitionState = {
+  inFlight: Map<string, Promise<KeyDoc>>;
+  failureMemory: Map<string, { until: number; error: unknown }>;
+  refusalMemory: Map<string, { until: number; error: KeyChangeRefused }>;
+  warnedOnce: Set<string>;
+  epochs: Map<string, AcquisitionEpoch>;
+  mutations: Map<string, Promise<void>>;
+};
+
+const acquisitionStates = new WeakMap<Db, AcquisitionState>();
+
 export function keyStore(
   server: Db,
   opts: { signer?: Signer; deps?: KeysDeps } = {},
@@ -147,9 +160,80 @@ export function keyStore(
   const deps = opts.deps !== undefined
     ? opts.deps
     : productionDeps(server, opts.signer!);
-  const inFlight = new Map<string, Promise<KeyDoc>>();
-  const failureMemory = new Map<string, { until: number; error: unknown }>();
-  const warnedOnce = new Set<string>(); // name|fingerprint, per instance
+  let state = acquisitionStates.get(server);
+  if (state === undefined) {
+    state = {
+      inFlight: new Map(),
+      failureMemory: new Map(),
+      refusalMemory: new Map(),
+      warnedOnce: new Set(),
+      epochs: new Map(),
+      mutations: new Map(),
+    };
+    acquisitionStates.set(server, state);
+  }
+  const {
+    inFlight,
+    failureMemory,
+    refusalMemory,
+    warnedOnce,
+    epochs,
+    mutations,
+  } = state;
+
+  // A generation is retained only while a lookup uses it. Admin decisions
+  // invalidate that generation; old work can finish without publishing it.
+  async function withEpoch<T>(
+    name: string,
+    fn: (epoch: AcquisitionEpoch) => Promise<T>,
+  ): Promise<T> {
+    let epoch = epochs.get(name);
+    if (epoch === undefined) {
+      epoch = { current: true, users: 0 };
+      epochs.set(name, epoch);
+    }
+    epoch.users++;
+    try {
+      return await fn(epoch);
+    } finally {
+      if (--epoch.users === 0 && epochs.get(name) === epoch) {
+        epochs.delete(name);
+      }
+    }
+  }
+
+  function requireCurrent(epoch: AcquisitionEpoch): void {
+    if (!epoch.current) {
+      throw new Error('key acquisition superseded by admin decision');
+    }
+  }
+
+  function invalidate(name: string): void {
+    const epoch = epochs.get(name);
+    if (epoch !== undefined) epoch.current = false;
+    epochs.delete(name);
+    inFlight.delete(name);
+    failureMemory.delete(name);
+    refusalMemory.delete(name);
+  }
+
+  // Match the room mutation owner: network outside, lifecycle check and all
+  // publication inside one non-reentrant name lock above file transactions.
+  async function mutate<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    const previous = mutations.get(name);
+    const before = previous === undefined ? Promise.resolve() : previous;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => release = resolve);
+    const tail = before.then(() => held);
+    mutations.set(name, tail);
+    await before;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (mutations.get(name) === tail) mutations.delete(name);
+    }
+  }
 
   // ---------------------------------------------------------------- DB ----
 
@@ -307,54 +391,62 @@ export function keyStore(
     ctx?: { roomId?: string },
     wantKeyId?: string,
   ): Promise<KeyDoc> {
-    // rung 4: a key-is-name server IS its ed25519 key — nothing to fetch
-    if (isKeyName(name)) {
-      const raw = b32decode(name);
-      return {
-        server_name: name,
-        verify_keys: { 'ed25519:0': { key: b64encodeStd(raw!) } },
-        old_verify_keys: {},
-        valid_until_ts: Number.MAX_SAFE_INTEGER,
-        signatures: {},
-      };
-    }
-    const failed = failureMemory.get(name);
-    if (failed !== undefined && Date.now() < failed.until) {
-      throw failed.error;
-    }
-    // Check each caller's demand before coalescing. Only actual refreshes
-    // enter inFlight: a generic cached answer cannot satisfy a rotated-key
-    // caller merely because both requests concern the same server.
-    const row = await readDocRow(name);
-    if (row !== null) {
-      const cached = JSON.parse(row.key_json) as KeyDoc;
-      const hasKey = wantKeyId === undefined ||
-        Object.hasOwn(cached.verify_keys, wantKeyId) ||
-        Object.hasOwn(oldKeysOf(cached), wantKeyId);
-      const effectiveUntil = Math.min(
-        cached.valid_until_ts,
-        row.fetched_ms + 7 * 86400_000,
-      );
-      if (hasKey && effectiveUntil >= minimumValidUntilTs) return cached;
-    }
-    const existing = inFlight.get(name);
-    if (existing !== undefined) return await existing;
-    const p = doAcquire(name, minimumValidUntilTs, ctx);
-    inFlight.set(name, p);
-    try {
-      return await p;
-    } finally {
-      inFlight.delete(name);
-    }
+    return await withEpoch(name, async (epoch) => {
+      // rung 4: a key-is-name server IS its ed25519 key — nothing to fetch
+      if (isKeyName(name)) {
+        const raw = b32decode(name);
+        return {
+          server_name: name,
+          verify_keys: { 'ed25519:0': { key: b64encodeStd(raw!) } },
+          old_verify_keys: {},
+          valid_until_ts: Number.MAX_SAFE_INTEGER,
+          signatures: {},
+        };
+      }
+      for (const memory of [refusalMemory, failureMemory]) {
+        const failed = memory.get(name);
+        if (failed !== undefined && Date.now() < failed.until) {
+          throw failed.error;
+        }
+        memory.delete(name);
+      }
+      // Check each caller's demand before coalescing. Only actual refreshes
+      // enter inFlight: a generic cached answer cannot satisfy a rotated-key
+      // caller merely because both requests concern the same server.
+      const row = await readDocRow(name);
+      requireCurrent(epoch);
+      if (row !== null) {
+        const cached = JSON.parse(row.key_json) as KeyDoc;
+        const hasKey = wantKeyId === undefined ||
+          Object.hasOwn(cached.verify_keys, wantKeyId) ||
+          Object.hasOwn(oldKeysOf(cached), wantKeyId);
+        const effectiveUntil = Math.min(
+          cached.valid_until_ts,
+          row.fetched_ms + 7 * 86400_000,
+        );
+        if (hasKey && effectiveUntil >= minimumValidUntilTs) return cached;
+      }
+      const existing = inFlight.get(name);
+      if (existing !== undefined) return await existing;
+      const p = doAcquire(name, minimumValidUntilTs, epoch, ctx);
+      inFlight.set(name, p);
+      try {
+        return await p;
+      } finally {
+        if (inFlight.get(name) === p) inFlight.delete(name);
+      }
+    });
   }
 
   async function doAcquire(
     name: string,
     minimumValidUntilTs: number,
+    epoch: AcquisitionEpoch,
     ctx?: { roomId?: string },
   ): Promise<KeyDoc> {
     try {
       let candidate: { doc: KeyDoc; via: string } | null = null;
+      const disagreements: WitnessDisagreement[] = [];
 
       // witnesses first — a single usable answer is single-source trust
       const peers = (await deps.listWitnesses({
@@ -389,9 +481,7 @@ export function keyStore(
             doc: result.winner.doc,
             via: 'witness:' + result.winner.peer,
           };
-          for (const d of result.disagreements) {
-            await recordDisagreement(name, d);
-          }
+          disagreements.push(...result.disagreements);
         }
       }
 
@@ -403,76 +493,90 @@ export function keyStore(
         candidate = { doc, via: 'direct' };
       }
 
-      // key-change decision, BEFORE persisting (rung 2, by material)
-      const seenRows = await readKeyRows(name);
-      const seen = materialFingerprint({
-        server_name: name,
-        verify_keys: Object.fromEntries(
-          seenRows.filter((r) => r.expired_ts === null).map(
-            (r) => [r.key_id, { key: r.pubkey_b64 }],
+      const selected = candidate;
+      return await mutate(name, async () => {
+        requireCurrent(epoch);
+        for (const disagreement of disagreements) {
+          await recordDisagreement(name, disagreement);
+        }
+        // key-change decision, BEFORE persisting (rung 2, by material)
+        const seenRows = await readKeyRows(name);
+        const seen = materialFingerprint({
+          server_name: name,
+          verify_keys: Object.fromEntries(
+            seenRows.filter((r) => r.expired_ts === null).map(
+              (r) => [r.key_id, { key: r.pubkey_b64 }],
+            ),
           ),
-        ),
-        old_verify_keys: Object.fromEntries(
-          seenRows.filter((r) => r.expired_ts !== null).map(
-            (r) => [r.key_id, {
-              key: r.pubkey_b64,
-              expired_ts: r.expired_ts as number,
-            }],
+          old_verify_keys: Object.fromEntries(
+            seenRows.filter((r) => r.expired_ts !== null).map(
+              (r) => [r.key_id, {
+                key: r.pubkey_b64,
+                expired_ts: r.expired_ts as number,
+              }],
+            ),
           ),
-        ),
-        valid_until_ts: 0,
-        signatures: {},
-      });
-      const docMaterial = materialFingerprint(candidate.doc);
-      const seenPairs = new Set(seen.split('\n'));
-      const docPairs = docMaterial.split('\n');
-      // any pair we have not seen is a change — whether or not the
-      // document also repeats a remembered pair (repeating it is
-      // information for the admin, not a pass; it is public and
-      // copyable). A pure drop (the doc is a strict subset) is not a
-      // change.
-      const hasUnseen = docPairs.some((p) => !seenPairs.has(p));
-      if (seenRows.length > 0 && hasUnseen) {
-        const acknowledgedOld = docPairs.some((p) => seenPairs.has(p));
-        const oldKeys = materialMapOf(seenRows);
-        const newKeys = keyMapOf(candidate.doc);
-        const policy = config().federation.keychange;
-        if (policy === 'block') {
+          valid_until_ts: 0,
+          signatures: {},
+        });
+        const docMaterial = materialFingerprint(selected.doc);
+        const seenPairs = new Set(seen.split('\n'));
+        const docPairs = docMaterial.split('\n');
+        // any pair we have not seen is a change — whether or not the
+        // document also repeats a remembered pair (repeating it is
+        // information for the admin, not a pass; it is public and
+        // copyable). A pure drop (the doc is a strict subset) is not a
+        // change.
+        const hasUnseen = docPairs.some((p) => !seenPairs.has(p));
+        if (seenRows.length > 0 && hasUnseen) {
+          const acknowledgedOld = docPairs.some((p) => seenPairs.has(p));
+          const oldKeys = materialMapOf(seenRows);
+          const newKeys = keyMapOf(selected.doc);
+          const policy = config().federation.keychange;
+          if (policy === 'block') {
+            await recordChange({
+              name,
+              oldKeys,
+              newKeys,
+              status: 'blocking',
+              acknowledgedOld,
+              candidate: { via: selected.via, doc: selected.doc },
+            });
+            throw new KeyChangeRefused(name);
+          }
           await recordChange({
             name,
             oldKeys,
             newKeys,
-            status: 'blocking',
+            status: 'noted',
             acknowledgedOld,
-            candidate: { via: candidate.via, doc: candidate.doc },
+            candidate: null,
           });
-          throw new KeyChangeRefused(name);
-        }
-        await recordChange({
-          name,
-          oldKeys,
-          newKeys,
-          status: 'noted',
-          acknowledgedOld,
-          candidate: null,
-        });
-        if (policy === 'warn') {
-          const tag = name + '|' + docMaterial;
-          if (!warnedOnce.has(tag)) {
-            warnedOnce.add(tag);
-            console.warn(
-              `federation: signing key material changed for ${name} (recorded in server_key_changes; policy warn)`,
-            );
+          if (policy === 'warn') {
+            const tag = name + '|' + docMaterial;
+            if (!warnedOnce.has(tag)) {
+              warnedOnce.add(tag);
+              console.warn(
+                `federation: signing key material changed for ${name} (recorded in server_key_changes; policy warn)`,
+              );
+            }
           }
+          // honest note: this rung buys detection and a record, not proof;
+          // rung 6 (signed cert fingerprint) is the proof
         }
-        // honest note: this rung buys detection and a record, not proof;
-        // rung 6 (signed cert fingerprint) is the proof
-      }
 
-      await persistDoc(name, candidate.doc, candidate.via);
-      return candidate.doc;
+        await persistDoc(name, selected.doc, selected.via);
+        return selected.doc;
+      });
     } catch (e) {
+      if (epoch.current && e instanceof KeyChangeRefused) {
+        refusalMemory.set(name, {
+          until: Date.now() + config().federation.keyfailminutes * 60_000,
+          error: e,
+        });
+      }
       if (
+        epoch.current &&
         ['transport', 'protocol', 'validation', 'http'].includes(
           upstreamCategory(e),
         )
@@ -535,33 +639,37 @@ export function keyStore(
       }
       return await importPublicKeyFromRaw(b32decode(name)!);
     }
-    const hit = await cachedVerifyKey(
-      name,
-      keyId,
-      minimumValidUntilTs,
-      purpose,
-    );
-    if (hit !== null) return hit;
-    await acquireKeyDoc(name, minimumValidUntilTs, ctx, keyId);
-    const again = await cachedVerifyKey(
-      name,
-      keyId,
-      minimumValidUntilTs,
-      purpose,
-    );
-    if (again !== null) return again;
-    // A valid answer without the demanded key is still a failed lookup.
-    // Remember it per server so varying random key ids cannot force dials.
-    // Known cached keys above remain usable during this negative window.
-    const error = new UpstreamError('validation', {
-      phase: 'key-lookup',
-      reason: 'key unavailable for required purpose and validity',
+    return await withEpoch(name, async (epoch) => {
+      const hit = await cachedVerifyKey(
+        name,
+        keyId,
+        minimumValidUntilTs,
+        purpose,
+      );
+      requireCurrent(epoch);
+      if (hit !== null) return hit;
+      await acquireKeyDoc(name, minimumValidUntilTs, ctx, keyId);
+      const again = await cachedVerifyKey(
+        name,
+        keyId,
+        minimumValidUntilTs,
+        purpose,
+      );
+      requireCurrent(epoch);
+      if (again !== null) return again;
+      // A valid answer without the demanded key is still a failed lookup.
+      // Remember it per server so varying random key ids cannot force dials.
+      // Known cached keys above remain usable during this negative window.
+      const error = new UpstreamError('validation', {
+        phase: 'key-lookup',
+        reason: 'key unavailable for required purpose and validity',
+      });
+      failureMemory.set(name, {
+        until: Date.now() + config().federation.keyfailminutes * 60_000,
+        error,
+      });
+      throw error;
     });
-    failureMemory.set(name, {
-      until: Date.now() + config().federation.keyfailminutes * 60_000,
-      error,
-    });
-    throw error;
   }
 
   // ------------------------------------------------------- review tools --
@@ -597,38 +705,46 @@ export function keyStore(
   /** federation-key accept: install the reviewed candidate document
    *  atomically (server_key_docs + server_keys), mark the change accepted. */
   async function acceptKeyChange(name: string): Promise<boolean> {
-    const found = await server.tx(async (tx) => {
-      const rows = await tx.query(
-        "SELECT seen_ms, candidate_json FROM server_key_changes WHERE server_name = ? AND status = 'blocking' ORDER BY seen_ms DESC LIMIT 1",
-        [name],
-      );
-      if (rows.length === 0) return null;
-      await tx.execute(
-        "UPDATE server_key_changes SET status = 'accepted' WHERE server_name = ? AND seen_ms = ?",
-        [name, Number(rows[0].seen_ms)],
-      );
-      return JSON.parse(String(rows[0].candidate_json)) as {
-        via: string;
-        doc: KeyDoc;
-      };
+    return await mutate(name, async () => {
+      const found = await server.tx(async (tx) => {
+        const rows = await tx.query(
+          "SELECT seen_ms, candidate_json FROM server_key_changes WHERE server_name = ? AND status = 'blocking' ORDER BY seen_ms DESC LIMIT 1",
+          [name],
+        );
+        if (rows.length === 0) return null;
+        await tx.execute(
+          "UPDATE server_key_changes SET status = 'accepted' WHERE server_name = ? AND seen_ms = ?",
+          [name, Number(rows[0].seen_ms)],
+        );
+        return JSON.parse(String(rows[0].candidate_json)) as {
+          via: string;
+          doc: KeyDoc;
+        };
+      });
+      if (found === null) return false;
+      await persistDoc(name, found.doc, 'accepted');
+      invalidate(name);
+      return true;
     });
-    if (found === null) return false;
-    await persistDoc(name, found.doc, 'accepted');
-    return true;
   }
 
   /** federation-key forget: delete the server's remembered keys and
    *  documents — the next contact is first contact again. */
   async function forgetServerKeys(name: string): Promise<void> {
-    await server.tx(async (tx) => {
-      await tx.execute('DELETE FROM server_keys WHERE server_name = ?', [name]);
-      await tx.execute('DELETE FROM server_key_docs WHERE server_name = ?', [
-        name,
-      ]);
-      await tx.execute(
-        "UPDATE server_key_changes SET status = 'forgotten' WHERE server_name = ? AND status IN ('noted', 'blocking')",
-        [name],
-      );
+    await mutate(name, async () => {
+      await server.tx(async (tx) => {
+        await tx.execute('DELETE FROM server_keys WHERE server_name = ?', [
+          name,
+        ]);
+        await tx.execute('DELETE FROM server_key_docs WHERE server_name = ?', [
+          name,
+        ]);
+        await tx.execute(
+          "UPDATE server_key_changes SET status = 'forgotten' WHERE server_name = ? AND status IN ('noted', 'blocking')",
+          [name],
+        );
+      });
+      invalidate(name);
     });
   }
 

@@ -14,6 +14,7 @@
 import tls from 'node:tls';
 import { createHash, X509Certificate } from 'node:crypto';
 import { Buffer } from 'node:buffer';
+import { abortable } from '#engine/net/abort.ts';
 import { networkOperation, UpstreamError } from '#engine/net/upstream-error.ts';
 import {
   type Http1Response,
@@ -25,7 +26,9 @@ import {
 export type DialOpts = {
   connectIp: string;
   port: number;
-  alternatives?: { connectIp: string; port: number }[];
+  alternatives?:
+    | Iterable<{ connectIp: string; port: number }>
+    | AsyncIterable<{ connectIp: string; port: number }>;
   sni: string | null;
   hostHeader: string;
   trust:
@@ -135,22 +138,15 @@ function connectWithDeadline(opts: {
   sni: string | null;
   connectMs: number;
   signal: AbortSignal;
-  trust: DialOpts['trust'];
+  trust: { rejectUnauthorized: boolean; ca?: string[] };
 }): Promise<tls.TLSSocket> {
   opts.signal.throwIfAborted();
   return new Promise((resolve, reject) => {
-    // Explicit CA roots extend normal bundled/system trust; they never replace it.
-    const trust = opts.trust.kind === 'ca'
-      ? {
-        rejectUnauthorized: true,
-        ca: caRoots(opts.trust.caCerts),
-      }
-      : { rejectUnauthorized: false }; // Identity is checked below against the roster pin/key.
     const sock = tls.connect({
       host: opts.connectIp,
       port: opts.port,
       servername: opts.sni !== null ? opts.sni : undefined,
-      ...trust,
+      ...opts.trust,
     });
     const cleanup = () => {
       clearTimeout(timer);
@@ -241,6 +237,12 @@ function verifyIdentity(sock: tls.TLSSocket, trust: DialOpts['trust']): void {
 
 export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
   opts.signal?.throwIfAborted();
+  // Local trust preparation is outside networkOperation's peer classification.
+  // Explicit CA roots extend bundled/system trust; pin/keyname identity is
+  // checked separately before any HTTP bytes leave the verified connection.
+  const trust = opts.trust.kind === 'ca'
+    ? { rejectUnauthorized: true, ca: caRoots(opts.trust.caCerts) }
+    : { rejectUnauthorized: false };
   let conn: NodeTlsConn | null = null;
   const ac = new AbortController();
   const cancel = () => {
@@ -264,14 +266,23 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
   try {
     let sock: tls.TLSSocket | null = null;
     let failure: unknown;
-    const addresses = [
-      { connectIp: opts.connectIp, port: opts.port },
-      ...(opts.alternatives === undefined ? [] : opts.alternatives),
-    ];
+    const addresses = async function* () {
+      yield { connectIp: opts.connectIp, port: opts.port };
+      if (opts.alternatives !== undefined) {
+        const rest = (async function* () {
+          yield* opts.alternatives!;
+        })();
+        for (;;) {
+          const next = await abortable(ac.signal, () => rest.next());
+          if (next.done) break;
+          yield next.value;
+        }
+      }
+    };
     // Alternate addresses are eligible ONLY until a verified connection is
     // selected. HTTP writes/reads, decoding and sinks are deliberately outside
     // this loop: an uncertain or consuming request can never be replayed here.
-    for (const address of addresses) {
+    for await (const address of addresses()) {
       ac.signal.throwIfAborted();
       try {
         sock = await networkOperation(
@@ -283,7 +294,7 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
               sni: opts.sni,
               connectMs: opts.connectMs,
               signal: ac.signal,
-              trust: opts.trust,
+              trust,
             }),
         );
         verifyIdentity(sock, opts.trust);

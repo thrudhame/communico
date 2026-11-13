@@ -121,77 +121,87 @@ Deno.test('discovery grammar: production well-known follows only real redirects,
   resetCaCertsForTests();
   let mode = 'redirect', calls = 0;
   const requests: string[] = [];
-  const plain = Deno.serve(
-    { hostname: '127.0.0.1', port: 0, onListen() {} },
-    (request) => {
-      calls++;
-      assertEquals(
-        new URL(request.url).pathname + new URL(request.url).search,
-        '/delegate?keep=yes',
-      );
-      assertEquals(request.headers.get('authorization'), null);
-      return Response.json({ 'm.server': 'delegate.test:8452' });
-    },
-  );
-  const server = Deno.serve({
-    hostname: '127.0.0.1',
-    port: 443,
-    cert: await Deno.readTextFile('tests/fixtures/tls/localhost.crt'),
-    key: await Deno.readTextFile('tests/fixtures/tls/localhost.key'),
-    onListen() {},
-  }, (request) => {
-    calls++;
-    const url = new URL(request.url);
-    requests.push(url.pathname + url.search);
-    if (mode === 'http-redirect') {
-      return new Response(null, {
-        status: 307,
-        headers: {
-          Location: 'http://localhost:' + plain.addr.port +
-            '/delegate?keep=yes',
-        },
-      });
-    }
-    if (mode === 'redirect' && url.pathname.startsWith('/.well-known')) {
-      return new Response(null, {
-        status: 302,
-        headers: { Location: '/delegate?keep=yes' },
-      });
-    }
-    if (mode === 'redirect' && url.search !== '?keep=yes') {
-      return new Response(null, { status: 404 });
-    }
-    if (mode === 'not-redirect') {
-      return new Response(null, {
-        status: 304,
-        headers: { Location: '/delegate?keep=yes' },
-      });
-    }
-    if (mode === 'scheme') {
-      return new Response(null, {
-        status: 302,
-        headers: { Location: 'ftp://localhost/delegate' },
-      });
-    }
-    if (mode === 'invalid') {
-      return Response.json({ 'm.server': 'delegate.test/path' });
-    }
-    if (mode === 'root') return Response.json([]);
-    if (mode === 'utf8') {
-      return new Response(new Uint8Array([123, 255, 125]), {
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-    const headers: Record<string, string> = mode === 'no-store'
-      ? { 'Cache-Control': 'no-store' }
-      : mode === 'no-cache'
-      ? { 'Cache-Control': 'public, no-cache' }
-      : mode === 'age'
-      ? { 'Cache-Control': 'MAX-AGE="60"', Age: '61' }
-      : { 'Cache-Control': 'public, MAX-AGE="60"' };
-    return Response.json({ 'm.server': 'delegate.test:8451' }, { headers });
-  });
+  const cleanup = new AsyncDisposableStack();
   try {
+    const plain = Deno.serve(
+      { hostname: '127.0.0.1', port: 0, onListen() {} },
+      (request) => {
+        calls++;
+        assertEquals(
+          new URL(request.url).pathname + new URL(request.url).search,
+          '/delegate?keep=yes',
+        );
+        assertEquals(request.headers.get('authorization'), null);
+        return Response.json({ 'm.server': 'delegate.test:8452' });
+      },
+    );
+    cleanup.defer(() => plain.shutdown());
+    const server = Deno.serve({
+      hostname: '127.0.0.1',
+      port: 443,
+      cert: await Deno.readTextFile('tests/fixtures/tls/localhost.crt'),
+      key: await Deno.readTextFile('tests/fixtures/tls/localhost.key'),
+      onListen() {},
+    }, (request) => {
+      calls++;
+      const url = new URL(request.url);
+      requests.push(url.pathname + url.search);
+      if (mode === 'http-redirect') {
+        return new Response(null, {
+          status: 307,
+          headers: {
+            Location: 'http://localhost:' + plain.addr.port +
+              '/delegate?keep=yes',
+          },
+        });
+      }
+      if (mode === 'redirect' && url.pathname.startsWith('/.well-known')) {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: '/delegate?keep=yes' },
+        });
+      }
+      if (mode === 'redirect' && url.search !== '?keep=yes') {
+        return new Response(null, { status: 404 });
+      }
+      if (mode === 'not-redirect') {
+        return new Response(null, {
+          status: 304,
+          headers: { Location: '/delegate?keep=yes' },
+        });
+      }
+      if (mode === 'scheme') {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: 'ftp://localhost/delegate' },
+        });
+      }
+      if (mode === 'invalid') {
+        return Response.json({ 'm.server': 'delegate.test/path' });
+      }
+      if (mode === 'root') return Response.json([]);
+      if (mode === 'text-json' || mode === 'no-type') {
+        const response = new Response(
+          JSON.stringify({ 'm.server': 'delegate.test:8451' }),
+        );
+        if (mode === 'no-type') response.headers.delete('content-type');
+        return response;
+      }
+      if (mode === 'utf8') {
+        return new Response(new Uint8Array([123, 255, 125]), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      const headers: Record<string, string> = mode === 'no-store'
+        ? { 'Cache-Control': 'no-store' }
+        : mode === 'no-cache'
+        ? { 'Cache-Control': 'public, no-cache' }
+        : mode === 'age'
+        ? { 'Cache-Control': 'MAX-AGE="60"', Age: '61' }
+        : { 'Cache-Control': 'public, MAX-AGE="60"' };
+      return Response.json({ 'm.server': 'delegate.test:8451' }, { headers });
+    });
+    cleanup.defer(() => server.shutdown());
     await withStore(async (store) => {
       const db = await store.server();
       const read = () => resolve(db, 'localhost');
@@ -204,6 +214,10 @@ Deno.test('discovery grammar: production well-known follows only real redirects,
       mode = 'http-redirect';
       resetWellKnownCache();
       assertEquals((await read()).port, 8452);
+      for (mode of ['text-json', 'no-type']) {
+        resetWellKnownCache();
+        assertEquals((await read()).port, 8451, mode);
+      }
       for (mode of ['not-redirect', 'scheme', 'invalid', 'root', 'utf8']) {
         resetWellKnownCache();
         const before = calls;
@@ -235,8 +249,7 @@ Deno.test('discovery grammar: production well-known follows only real redirects,
     resetWellKnownCache();
     setConfigForTests({});
     resetCaCertsForTests();
-    await server.shutdown();
-    await plain.shutdown();
+    await cleanup.disposeAsync();
   }
   assertEquals(config().federation.enabled, true);
 });
@@ -264,6 +277,51 @@ function deps(over: Partial<ResolveDeps>): ResolveDeps {
       : () => Promise.resolve(null),
     random: over.random,
   };
+}
+
+for (const slow of ['AAAA', 'backup']) {
+  Deno.test(
+    'discovery latency: a usable primary does not await ' + slow,
+    async () => {
+      const signal = AbortSignal.timeout(100);
+      const visited: string[] = [];
+      const answer = await resolveWith(
+        'primary.test:8448',
+        deps({
+          dnsA: () => Promise.resolve(['127.0.0.1']),
+          dnsAAAA: () =>
+            slow === 'AAAA' ? new Promise(() => {}) : Promise.resolve([]),
+        }),
+        slow === 'AAAA' ? signal : undefined,
+      );
+      assertEquals(answer.connectIp, '127.0.0.1');
+      if (slow === 'backup') {
+        const resolved = await resolveWith(
+          'srv.test',
+          deps({
+            dnsSrv: () =>
+              Promise.resolve([
+                { target: 'primary.test', port: 8449, priority: 0, weight: 1 },
+                { target: 'slow.test', port: 8450, priority: 1, weight: 1 },
+              ]),
+            dnsA: (host) => {
+              visited.push(host);
+              return host === 'slow.test'
+                ? new Promise(() => {})
+                : Promise.resolve(['127.0.0.1']);
+            },
+          }),
+          signal,
+        );
+        assertEquals(resolved.port, 8449);
+        assertEquals(
+          visited,
+          ['primary.test'],
+          'backup DNS is eligible only after the primary fails',
+        );
+      }
+    },
+  );
 }
 
 async function withStore(

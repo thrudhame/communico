@@ -176,7 +176,10 @@ async function readHttp(
   if (te !== null && clRaw !== null) {
     protocol('http-framing', 'ambiguous upstream framing');
   }
-  if (te !== null && te.toLowerCase() !== 'chunked') {
+  const transfers = te === null
+    ? []
+    : te.split(',').map((c) => trimOws(c).toLowerCase()).filter(Boolean);
+  if (te !== null && (transfers.length !== 1 || transfers[0] !== 'chunked')) {
     protocol('http-framing', 'unsupported transfer-encoding');
   }
   let length: number | null = null;
@@ -193,7 +196,7 @@ async function readHttp(
   const encoding = headers.get('content-encoding');
   const codings = encoding === null
     ? []
-    : encoding.split(',').map((c) => trimOws(c).toLowerCase());
+    : encoding.split(',').map((c) => trimOws(c).toLowerCase()).filter(Boolean);
   for (const coding of codings) {
     if (!['identity', 'gzip', 'deflate', 'br'].includes(coding)) {
       protocol('http-representation', 'unsupported content-encoding');
@@ -414,10 +417,10 @@ export async function http1Request(
 ): Promise<Http1Response> {
   req.signal?.throwIfAborted();
   const ac = new AbortController();
-  const timeout = () =>
+  const timeout = (phase: 'connect' | 'deadline' = 'deadline') =>
     ac.abort(
       new UpstreamError('transport', {
-        phase: 'deadline',
+        phase,
         reason: 'upstream timeout',
       }),
     );
@@ -442,7 +445,7 @@ export async function http1Request(
   );
   try {
     const connectTimer = setTimeout(
-      timeout,
+      () => timeout('connect'),
       Math.min(req.connectMs, req.timeoutMs),
     );
     let tcp: Deno.TcpConn;

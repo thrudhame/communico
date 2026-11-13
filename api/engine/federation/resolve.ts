@@ -41,7 +41,7 @@ export type Endpoint = {
   hostHeader: string;
   sni: string | null;
   trust: Trust;
-  alternatives?: { connectIp: string; port: number }[];
+  alternatives?: AsyncIterable<{ connectIp: string; port: number }>;
 };
 
 export type ResolveDeps = {
@@ -191,18 +191,16 @@ export async function resolveWith(
         `key-is-name peer ${name} has no address`,
       );
     }
-    const ips = await resolveHost(row.host, deps, signal);
     return endpoint(
-      ips.map((ip) => ({ ip, port: row.port! })),
+      hostAddresses(row.host, row.port, deps, signal),
       name,
       sniOf,
       trust,
     );
   }
   if (row !== null && row.host !== null && row.port !== null) {
-    const ips = await resolveHost(row.host, deps, signal);
     return endpoint(
-      ips.map((ip) => ({ ip, port: row.port! })),
+      hostAddresses(row.host, row.port, deps, signal),
       name,
       sniOf,
       trust,
@@ -220,8 +218,7 @@ export async function resolveWith(
   }
   // (2) explicit port
   if (port !== null) {
-    const ips = await resolveHost(host, deps, signal);
-    return endpoint(ips.map((ip) => ({ ip, port })), name, host, trust);
+    return endpoint(hostAddresses(host, port, deps, signal), name, host, trust);
   }
   // (3) .well-known
   let delegation: string | null = null;
@@ -249,10 +246,7 @@ export async function resolveWith(
   if (target.port !== null) {
     const targetPort = target.port;
     return endpoint(
-      (await resolveHost(target.host, deps, signal)).map((ip) => ({
-        ip,
-        port: targetPort,
-      })),
+      hostAddresses(target.host, targetPort, deps, signal),
       identity,
       target.host,
       trust,
@@ -264,32 +258,41 @@ export async function resolveWith(
     return endpoint(bySrv, identity, target.host, trust);
   }
   return endpoint(
-    (await resolveHost(target.host, deps, signal)).map((ip) => ({
-      ip,
-      port: 8448,
-    })),
+    hostAddresses(target.host, 8448, deps, signal),
     identity,
     target.host,
     trust,
   );
 }
 
-function endpoint(
-  addresses: { ip: string; port: number }[],
+async function endpoint(
+  addresses:
+    | Iterable<{ ip: string; port: number }>
+    | AsyncIterable<{ ip: string; port: number }>,
   hostHeader: string,
   sni: string | null,
   trust: Trust,
-): Endpoint {
-  const [first, ...rest] = addresses;
+): Promise<Endpoint> {
+  const remaining = (async function* () {
+    yield* addresses;
+  })();
+  const next = await remaining.next();
+  if (next.done) {
+    throw new UpstreamError('transport', {
+      phase: 'dns',
+      reason: 'no eligible server address',
+    });
+  }
+  const first = next.value;
   return {
     connectIp: first.ip,
     port: first.port,
     hostHeader,
     sni,
     trust,
-    ...(rest.length
-      ? { alternatives: rest.map(({ ip, port }) => ({ connectIp: ip, port })) }
-      : {}),
+    alternatives: (async function* () {
+      for await (const { ip, port } of remaining) yield { connectIp: ip, port };
+    })(),
   };
 }
 
@@ -301,30 +304,67 @@ function discoveryFallback(error: unknown, signal?: AbortSignal): void {
   ) throw error;
 }
 
-async function resolveHost(
+async function* resolveHost(
   host: string,
   deps: Pick<ResolveDeps, 'dnsA' | 'dnsAAAA'>,
   signal?: AbortSignal,
-): Promise<string[]> {
-  if (isIpLiteral(host)) return [host];
-  const addresses: string[] = [];
-  for (const query of [deps.dnsA, deps.dnsAAAA]) {
+): AsyncGenerator<string> {
+  if (isIpLiteral(host)) {
+    yield host;
+    return;
+  }
+  // Neither address family waits for the other. Keep the unconsumed answer
+  // available for connection failover, with every rejection observed immediately.
+  const queries = new Map(
+    [deps.dnsA, deps.dnsAAAA].map((
+      query,
+      index,
+    ) => [
+      index,
+      Promise.resolve().then(() => query(host)).then(
+        (addresses) => ({ index, addresses, error: undefined }),
+        (error: unknown) => ({ index, addresses: [] as string[], error }),
+      ),
+    ]),
+  );
+  const seen = new Set<string>();
+  while (queries.size) {
+    const result = await abortable(
+      signal,
+      () => Promise.race(queries.values()),
+    );
+    queries.delete(result.index);
     try {
-      for (const address of await query(host)) {
+      if (result.error !== undefined) throw result.error;
+      for (const address of result.addresses) {
         if (typeof address !== 'string' || !isIpLiteral(address)) {
           protocol('dns', 'invalid address answer');
         }
-        if (!addresses.includes(address)) addresses.push(address);
+      }
+      for (const address of result.addresses) {
+        if (!seen.has(address)) {
+          seen.add(address);
+          yield address;
+        }
       }
     } catch (error) {
       discoveryFallback(error, signal);
     }
   }
-  if (addresses.length) return addresses;
+  if (seen.size) return;
   throw new UpstreamError('transport', {
     phase: 'dns',
     reason: 'could not resolve server hostname',
   });
+}
+
+async function* hostAddresses(
+  host: string,
+  port: number,
+  deps: Pick<ResolveDeps, 'dnsA' | 'dnsAAAA'>,
+  signal?: AbortSignal,
+) {
+  for await (const ip of resolveHost(host, deps, signal)) yield { ip, port };
 }
 
 // RFC2782: increasing priority, weighted draws without replacement within each
@@ -362,7 +402,7 @@ async function resolveSrv(
   host: string,
   deps: ResolveDeps,
   signal?: AbortSignal,
-): Promise<{ ip: string; port: number }[] | null> {
+): Promise<AsyncIterable<{ ip: string; port: number }> | null> {
   for (const label of ['_matrix-fed._tcp.', '_matrix._tcp.']) {
     let rows: Awaited<ReturnType<ResolveDeps['dnsSrv']>>;
     try {
@@ -389,29 +429,63 @@ async function resolveSrv(
         protocol('dns', 'invalid SRV target');
       }
     }
-    const addresses: { ip: string; port: number }[] = [];
-    for (
-      const row of srvOrder(
-        rows,
-        deps.random === undefined ? Math.random : deps.random,
-      )
-    ) {
-      try {
-        const ips = await resolveHost(
-          row.target.replace(/\.$/, ''),
-          deps,
-          signal,
+    const ordered = srvOrder(
+      rows,
+      deps.random === undefined ? Math.random : deps.random,
+    );
+    return (async function* () {
+      let yielded = false;
+      const sources = ordered.map((row) =>
+        hostAddresses(row.target.replace(/\.$/, ''), row.port, deps, signal)
+      );
+      type Answer = {
+        index: number;
+        result?: IteratorResult<{ ip: string; port: number }>;
+        error?: unknown;
+      };
+      const pending = new Map<number, Promise<Answer>>();
+      const advance = (index: number) => {
+        pending.set(
+          index,
+          sources[index].next().then(
+            (result) => ({ index, result }),
+            (error: unknown) => ({ index, error }),
+          ),
         );
-        addresses.push(...ips.map((ip) => ({ ip, port: row.port })));
-      } catch (error) {
-        discoveryFallback(error, signal);
+      };
+      let started = 0;
+      advance(started++);
+      while (pending.size) {
+        const answer = await abortable(
+          signal,
+          () => Promise.race(pending.values()),
+        );
+        pending.delete(answer.index);
+        try {
+          if (answer.result === undefined) throw answer.error;
+          if (!answer.result.done) {
+            yielded = true;
+            yield answer.result.value;
+            // Resumption means the dialer could not connect. Retain this
+            // target's pending family, but race it with later targets so no
+            // stalled DNS answer can consume the whole failover deadline.
+            advance(answer.index);
+            while (started < sources.length) advance(started++);
+          }
+        } catch (error) {
+          discoveryFallback(error, signal);
+        }
+        if (!yielded && pending.size === 0 && started < sources.length) {
+          advance(started++);
+        }
       }
-    }
-    if (addresses.length) return addresses;
-    throw new UpstreamError('transport', {
-      phase: 'dns',
-      reason: 'no federation service target could be resolved',
-    });
+      if (!yielded) {
+        throw new UpstreamError('transport', {
+          phase: 'dns',
+          reason: 'no federation service target could be resolved',
+        });
+      }
+    })();
   }
   return null;
 }

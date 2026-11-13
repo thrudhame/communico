@@ -7,7 +7,12 @@
 // key-is-name peers the raw 32-byte key equality, mismatches a 502
 // before any request bytes are written (doltgres
 // tests/federation-dial.test.ts, restored).
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import { createHash, X509Certificate } from 'node:crypto';
 import tls from 'node:tls';
 import { config, setConfigForTests } from '#engine/config.ts';
@@ -327,7 +332,7 @@ Deno.test('client: valid TLS cannot rename protocol or local sink failures to tr
               },
             }),
         }).catch((e) => e);
-        assertEquals(result, fault);
+        assertStrictEquals(result, fault);
       }
     }, (req) => req.path === '/bytes' ? new Response('bytes') : null);
   });

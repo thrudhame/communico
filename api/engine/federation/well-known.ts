@@ -96,7 +96,7 @@ function cacheLifetime(
 
 export async function wellKnownGet(
   host: string,
-  addresses: (host: string) => Promise<string[]>,
+  addresses: (host: string) => AsyncIterable<string>,
   caCerts: () => string[],
   signal?: AbortSignal,
 ): Promise<Answer> {
@@ -117,7 +117,9 @@ export async function wellKnownGet(
       // Never turn URL user-info into Authorization on a redirected request.
       headers = null;
       const name = splitServerName(url.host);
-      const ips = await addresses(name.host);
+      const ips = addresses(name.host)[Symbol.asyncIterator]();
+      const first = await ips.next();
+      if (first.done) protocol('well-known', 'no discovery address');
       started = Date.now();
       const request = {
         port: name.port === null
@@ -137,20 +139,25 @@ export async function wellKnownGet(
       if (url.protocol === 'https:') {
         res = await dialNodeTls({
           ...request,
-          connectIp: ips[0],
-          alternatives: ips.slice(1).map((connectIp) => ({
-            connectIp,
-            port: request.port,
-          })),
+          connectIp: first.value,
+          alternatives: (async function* () {
+            for (;;) {
+              const next = await ips.next();
+              if (next.done) break;
+              yield { connectIp: next.value, port: request.port };
+            }
+          })(),
           sni: isIpLiteral(name.host) ? null : name.host,
           trust: { kind: 'ca', caCerts: caCerts() },
         });
       } else {
-        for (let i = 0; i < ips.length; i++) {
+        let next: IteratorResult<string> = first;
+        let failure: unknown;
+        while (!next.done) {
           try {
             res = await http1Request({
               ...request,
-              connectIp: ips[i],
+              connectIp: next.value,
               tls: null,
             });
             break;
@@ -159,10 +166,13 @@ export async function wellKnownGet(
             if (
               !(error instanceof UpstreamError) ||
               error.category !== 'transport' ||
-              error.context.phase !== 'connect' || i === ips.length - 1
+              error.context.phase !== 'connect'
             ) throw error;
+            failure = error;
+            next = await ips.next();
           }
         }
+        if (res === undefined && failure !== undefined) throw failure;
       }
       if (res === undefined) protocol('well-known', 'no discovery address');
       headers = res.headers;
@@ -192,7 +202,7 @@ export async function wellKnownGet(
         throw new UpstreamHttpError(res.status, 'well-known');
       }
       const body = objectOf(
-        decodeJson(res.body, headers.get('content-type')),
+        decodeJson(res.body, headers.get('content-type'), 'discovery'),
         'well-known',
       );
       const mServer = stringOf(body['m.server'], 'well-known');

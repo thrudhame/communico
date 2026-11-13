@@ -916,7 +916,9 @@ tags and preserve quoted spaces before the existing filename sanitization.
 `api/engine/media/{multipart,service}.ts`)
 
 Federation JSON successes require the JSON media type and fatal UTF-8 decoding;
-empty or malformed replies cannot become null success. Endpoint consumers still
+well-known discovery explicitly ignores the media type as required by its schema,
+while retaining the same fatal UTF-8, JSON and endpoint validation.
+Empty or malformed replies cannot become null success. Endpoint consumers still
 own the decoded root/schema. Outgoing transactions validate the required PDU
 verdict map before acknowledging their frozen durable batch or recording peer
 success. Malformed 2xx keeps delivery pending and retries the same transaction;
@@ -939,6 +941,13 @@ adding optional fields or rewriting signed validity. The seven-day effective
 expiry is stored beside the intact signed document and remains tied to its
 acquisition time on cache reads. Only typed peer failures enter negative key
 memory; local storage/signing faults and cancellation retain their identity.
+Policy-refused key changes have separate acquisition backoff. The store's stable
+server database capability owns acquisition memory shared by every key-store
+view; accepting or forgetting a server clears both memories immediately.
+Admin decisions also invalidate active lookup generations. Network acquisition
+runs outside the per-name mutation lock; publication rechecks its generation
+inside that lock, so obsolete work cannot restore forgotten keys, decisions or
+negative memory. A later contact never joins the superseded acquisition.
 Event, prejoin, history and join consumers distinguish peer verification refusal
 from a local resolver fault, which never becomes missing evidence or resident
 failover. Matrix wire Base64 uses the standard alphabet and accepts the optional
@@ -976,6 +985,11 @@ matching transport, and caches according to Cache-Control and response age.
 Only classified peer failures fall back; local CA faults and cancellation
 propagate. SRV selection uses priority and RFC2782 weighted ordering, recognizes
 an unavailable service, and retains alternate targets and A/AAAA answers.
+Address families resolve concurrently; a usable answer is dialable immediately.
+Later SRV targets remain unresolved until connection failover begins, then race
+the failed target's remaining families so a stalled answer cannot block a healthy
+backup. Deferred address reads share caller cancellation and the dialer's total
+deadline.
 Dial failover stops before the first HTTP write: completed or uncertain requests,
 decoder failures and sink failures cannot replay on another address. Delegated
 Host and TLS identities never acquire the SRV target's port.
