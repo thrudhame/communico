@@ -1,7 +1,7 @@
 // Room-first semantic export and recoverable cross-file application. Journal
 // bytes pin the bootstrap/closure before its source watermark can advance.
 import type { KeyResolver } from '#engine/room/deps.ts';
-import type { Room } from '#engine/room/index.ts';
+import { openRoom, type Room } from '#engine/room/index.ts';
 import {
   exportReplicaRoom,
   importReplicaRoom,
@@ -90,6 +90,64 @@ export async function exportRoomReplica(
   }
 }
 
+/** Each retained local participation has an independent export owner. A failed
+ * or busy room cannot stop enumeration or hold another room's source watermark.
+ * Existing changes are the durable intent, so restart needs no volatile queue. */
+export function startRoomExports(options: {
+  store: Store;
+  self: string;
+  peer: string;
+  pairing: string;
+  changed(): void;
+  failed(error: unknown, roomId?: string): void;
+}) {
+  let stopped = false;
+  let scanning: Promise<void> | undefined;
+  const running = new Map<string, Promise<void>>();
+  const wake = () => {
+    if (stopped) return;
+    scanning ??= (async () => {
+      try {
+        for (const id of await options.store.rooms()) {
+          if (stopped || running.has(id)) continue;
+          const job = (async () => {
+            const room = await openRoom(options.store, id);
+            // Evidence-only/prejoin files carry no authentic participation.
+            if (!await room.tx((tx) => tx.segments.latestStay())) return;
+            if (
+              await exportRoomReplica(
+                options.store,
+                room,
+                options.self,
+                options.peer,
+                options.pairing,
+              )
+            ) {
+              options.changed();
+            }
+          })().catch((error) => options.failed(error, id));
+          running.set(id, job);
+          void job.finally(() => running.delete(id));
+        }
+      } catch (error) {
+        options.failed(error);
+      } finally {
+        scanning = undefined;
+      }
+    })();
+  };
+  let closed: Promise<void> | undefined;
+  return {
+    wake,
+    close: () =>
+      closed ??= (async () => {
+        stopped = true;
+        await scanning;
+        await Promise.all(running.values());
+      })(),
+  };
+}
+
 export class RoomReplicas {
   constructor(
     private readonly store: Store,
@@ -97,6 +155,21 @@ export class RoomReplicas {
     private readonly self: string,
     private readonly keys: KeyResolver,
   ) {}
+
+  async scopes(incarnation?: string) {
+    const binding = incarnation ??
+      (await this.pairings.active()).body.transcript.body.context.id;
+    const rows = await (await this.store.server()).query(
+      "SELECT scope,source_cut,ready,pending_hash FROM facade_scopes WHERE incarnation=? AND scope LIKE 'room:%' ORDER BY scope",
+      [binding],
+    );
+    return rows.map((row) => ({
+      scope: String(row.scope),
+      cut: Number(row.source_cut),
+      ready: Number(row.ready) === 1,
+      pending: row.pending_hash === null ? null : String(row.pending_hash),
+    }));
+  }
 
   async status(roomId: string) {
     const grant = await this.pairings.active();

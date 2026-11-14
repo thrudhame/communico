@@ -3,8 +3,14 @@
 // and signature verification happen outside that transaction.
 import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
-import { type KeyDoc, signWithSigner } from '#engine/federation/keys.ts';
+import {
+  type KeyDoc,
+  type KeyStore,
+  keyStore,
+  signWithSigner,
+} from '#engine/federation/keys.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import {
   b64encodeStd,
@@ -130,6 +136,47 @@ export class FacadeKeys {
     private readonly publicKey: string,
     private readonly pairings: Pairings,
   ) {}
+
+  /** Local signatures use the home-approved roster, never a dial to the logical
+   * server (which may resolve back here). Remote keys retain ordinary acquisition.
+   * This feeds the shared event verifier and request authentication unchanged. */
+  verificationKeys(): KeyStore {
+    const remote = keyStore(this.db, { signer: this.signer });
+    return {
+      ...remote,
+      getVerifyKey: async (name, keyId, floor, purpose, context) => {
+        if (name !== this.signer.serverName) {
+          return await remote.getVerifyKey(
+            name,
+            keyId,
+            floor,
+            purpose,
+            context,
+          );
+        }
+        const grant = await this.pairings.active();
+        const [held] = await this.db.query(
+          'SELECT revision,roster_json FROM facade_key_roster WHERE singleton=1',
+        );
+        const roster = held.roster_json === null
+          ? null
+          : rosterOf(JSON.parse(String(held.roster_json)));
+        const key = roster?.keys.find((key) => key.keyId === keyId);
+        if (
+          !roster || roster.server !== name ||
+          Number(held.revision) < grant.body.revision || !key ||
+          (key.retiredAt !== null &&
+            (purpose === 'request' || floor > key.retiredAt))
+        ) {
+          throw new UpstreamError('validation', {
+            phase: 'key-lookup',
+            reason: 'local key unavailable for required purpose and validity',
+          });
+        }
+        return await importPublicKeyFromRaw(matrixBase64(key.publicKey, 32));
+      },
+    };
+  }
 
   async contact(now = Date.now()): Promise<void> {
     integer(now);

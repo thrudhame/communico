@@ -7,6 +7,7 @@ import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES, LinkError } from '#engine/facade/protocol.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -121,6 +122,27 @@ Deno.test('approved roster is journaled once, durably applied, and renewed offli
     const record = await f.receive();
     assertEquals(await f.exportRoster(), record);
     assertEquals(await f.keys().apply(f.journal(), record), true);
+    const verification = f.keys().verificationKeys();
+    assertEquals(
+      (await verification.getVerifyKey(
+        'logical.test',
+        f.tenant.keyId,
+        Date.now(),
+        'event',
+      )).algorithm.name,
+      'Ed25519',
+    );
+    await assertRejects(
+      () =>
+        verification.getVerifyKey(
+          'logical.test',
+          'ed25519:unknown',
+          0,
+          'event',
+        ),
+      UpstreamError,
+      'local key unavailable',
+    );
     const before = await f.keys().document();
     assertEquals(
       Object.keys(before.verify_keys).sort(),
@@ -229,6 +251,36 @@ Deno.test('roster retirement is preserved, and changed or forged control cannot 
         expired_ts: retiredAt,
       });
       assertEquals(doc.verify_keys[node.keyId], undefined);
+      const verification = f.keys().verificationKeys();
+      assertEquals(
+        (await verification.getVerifyKey(
+          'logical.test',
+          node.keyId,
+          retiredAt,
+          'event',
+        )).algorithm.name,
+        'Ed25519',
+      );
+      await assertRejects(
+        () =>
+          verification.getVerifyKey(
+            'logical.test',
+            node.keyId,
+            retiredAt + 1,
+            'event',
+          ),
+        UpstreamError,
+      );
+      await assertRejects(
+        () =>
+          verification.getVerifyKey(
+            'logical.test',
+            node.keyId,
+            retiredAt - 1,
+            'request',
+          ),
+        UpstreamError,
+      );
     } finally {
       await otherStore.close();
       await Deno.remove(otherDir, { recursive: true });

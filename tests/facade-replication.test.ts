@@ -3,7 +3,12 @@ import { initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
-import { exportRoomReplica, RoomReplicas } from '#engine/facade/replication.ts';
+import {
+  exportRoomReplica,
+  RoomReplicas,
+  startRoomExports,
+} from '#engine/facade/replication.ts';
+import { bounded } from './helpers/server-process.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { importReplicaGenesis } from '#engine/room/replica.ts';
@@ -108,6 +113,15 @@ async function fixture() {
     exports,
     journal,
     replicas,
+    node,
+    bundle,
+    signing,
+    async retire() {
+      await (await edge.server()).execute(
+        "UPDATE facade_pairings SET state='revoked' WHERE id=?",
+        [bundle.id],
+      );
+    },
     replica: () => openRoom(edge, source.roomId),
     async downgrade() {
       await (await edge.server()).tx(async (conn) => {
@@ -187,6 +201,56 @@ Deno.test('room replication pins bootstrap, applies only durable semantic suffix
   }
 });
 
+Deno.test('home room export progresses past a busy or broken room, skips evidence-only files, and drains admitted work', async () => {
+  const f = await fixture();
+  const blocked = await openRoom(f.home, '!busy:logical.test', {
+    create: true,
+  });
+  await blocked.tx((tx) => tx.segments.create({ kind: 'stay' }));
+  await openRoom(f.home, '!evidence:logical.test', { create: true });
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const held = blocked.tx(async () => {
+    entered.resolve();
+    await release.promise;
+  });
+  await entered.promise;
+  const exported = Promise.withResolvers<void>();
+  const failed = Promise.withResolvers<unknown>();
+  const worker = startRoomExports({
+    store: f.home,
+    self: f.signing.name,
+    peer: f.node.node,
+    pairing: f.bundle.id,
+    changed: () => exported.resolve(),
+    failed: (error) => failed.resolve(error),
+  });
+  try {
+    worker.wake();
+    await bounded(exported.promise);
+    const streams = await new Journal(await f.home.server(), LINK_CAPABILITIES)
+      .streams(f.node.node, 'out');
+    assertEquals(streams.map((stream) => stream.stream), [
+      'room:' + f.source.roomId,
+    ]);
+    let closed = false;
+    const closing = worker.close().then(() => {
+      closed = true;
+    });
+    await Promise.resolve();
+    assertEquals(closed, false);
+    release.resolve();
+    await held;
+    await bounded(failed.promise);
+    await bounded(closing);
+  } finally {
+    release.resolve();
+    await held;
+    await worker.close();
+    await f.close();
+  }
+});
+
 Deno.test('room commit before completion survives reopen without readiness or duplicate publication', async () => {
   const f = await fixture();
   try {
@@ -237,6 +301,23 @@ Deno.test('v29 server files append scope ownership before room replication', asy
       (await (await f.replicas()).status(f.source.roomId))?.ready,
       true,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('scope introspection uses its captured pairing cut even after live authority is revoked', async () => {
+  const f = await fixture();
+  try {
+    const record = await f.exports();
+    assert(record);
+    await (await f.journal()).receive('home', [record]);
+    const owner = await f.replicas();
+    await owner.apply(await f.journal(), record);
+    const captured = await owner.scopes();
+    await f.retire();
+    await assertRejects(() => owner.scopes());
+    assertEquals(await owner.scopes(f.bundle.id), captured);
   } finally {
     await f.close();
   }

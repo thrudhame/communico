@@ -9,6 +9,7 @@ import { certificatePin, readProtectedFile } from './identity.ts';
 import { Journal } from './journal.ts';
 import { enrollLink } from './link.ts';
 import { Pairings } from './pairing.ts';
+import { startRoomExports } from './replication.ts';
 import {
   LINK_CAPABILITIES,
   LinkError,
@@ -43,6 +44,7 @@ export async function startHomeLinks(
   const journal = new Journal(app.server, LINK_CAPABILITIES);
   const controller = new AbortController();
   const workers = new Map<string, ReturnType<typeof startHomeLinkWorker>>();
+  const exports = new Map<string, ReturnType<typeof startRoomExports>>();
   const jobs = new Map<string, Promise<void>>();
   const failed = (node: string, error: unknown) => {
     if (!controller.signal.aborted) {
@@ -57,8 +59,11 @@ export async function startHomeLinks(
     const peer = await pairings.connection(id);
     if (peer.state === 'paired' && workers.has(id)) {
       await exportKeyRoster(app.store, app.tenant, node, id);
+      exports.get(id)?.wake();
       return;
     }
+    await exports.get(id)?.close();
+    exports.delete(id);
     await workers.get(id)?.close();
     workers.delete(id);
     let secret: string | undefined;
@@ -104,6 +109,16 @@ export async function startHomeLinks(
         failed: (error) => failed(node, error),
       }),
     );
+    const rooms = startRoomExports({
+      store: app.store,
+      self: app.tenant.serverName,
+      peer: node,
+      pairing: id,
+      changed: () => workers.get(id)?.wake(),
+      failed: (error) => failed(node, error),
+    });
+    exports.set(id, rooms);
+    rooms.wake();
   }
   let scanning: Promise<void> | undefined;
   const scan = () =>
@@ -135,10 +150,11 @@ export async function startHomeLinks(
         clearInterval(timer);
         controller.abort();
         await scanning;
+        await Promise.all(jobs.values());
+        await Promise.all([...exports.values()].map((rooms) => rooms.close()));
         await Promise.all(
           [...workers.values()].map((worker) => worker.close()),
         );
-        await Promise.all(jobs.values());
       })();
     },
   };

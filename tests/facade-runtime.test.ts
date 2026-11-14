@@ -6,6 +6,7 @@ import { facadeTls } from './support/facade-tls.ts';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
+import { openRoom, roomSchema } from '#engine/room/index.ts';
 
 Deno.test('cold roles enroll through local admin without facade tenant genesis, Matrix or home workers', async () => {
   const tls = await facadeTls();
@@ -61,6 +62,54 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
       null,
     );
     home = await process(homeConfig, 'federation: disabled');
+    await until(async () => {
+      try {
+        const connection = await Deno.connect({
+          hostname: '127.0.0.1',
+          port: homePort,
+        });
+        connection.close();
+        return true;
+      } catch (error) {
+        if (!(error instanceof Deno.errors.ConnectionRefused)) throw error;
+        return false;
+      }
+    });
+    const api = async (
+      path: string,
+      body: unknown,
+      token?: string,
+      method = 'POST',
+    ) => {
+      const response = await fetch(
+        `http://127.0.0.1:${homePort}/_matrix/client/v3/${path}`,
+        {
+          method,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify(body),
+        },
+      );
+      const result = await response.json();
+      return { status: response.status, body: result };
+    };
+    const registration = { username: 'replica', password: 'replica-password' };
+    const challenge = await api('register', registration);
+    const registered = await api('register', {
+      ...registration,
+      auth: { type: 'm.login.dummy', session: challenge.body.session },
+    });
+    assertEquals(registered.status, 200);
+    const token = registered.body.access_token;
+    const created = await api(
+      'createRoom',
+      { name: 'Home-owned replica' },
+      token,
+    );
+    assertEquals(created.status, 200);
+    const roomId = created.body.room_id;
     const paired = await adminCall(tls.dir + '/home.sock', 'facade/pair', {
       node: 'edge_a',
       url: `https://127.0.0.1:${linkPort}`,
@@ -83,7 +132,24 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
     assert(roster.revision > 0);
     assert(roster.lastHome > 0);
     assertEquals((await status()).body.result.matrix, false);
-    assertEquals((await status()).body.result.scopes, []);
+    const roomScope = async () =>
+      (await status()).body.result.scopes.find((scope: { scope: string }) =>
+        scope.scope === 'room:' + roomId
+      );
+    await until(async () => (await roomScope())?.ready === true);
+    const initialCut = (await roomScope()).cut;
+    const sent = await api(
+      `rooms/${encodeURIComponent(roomId)}/send/m.room.message/replica-suffix`,
+      { body: 'Delivered through the production link', msgtype: 'm.text' },
+      token,
+      'PUT',
+    );
+    assertEquals(sent.status, 200);
+    await until(async () =>
+      (await roomScope())?.cut > initialCut &&
+      (await roomScope())?.ready === true
+    );
+    const replicatedCut = (await roomScope()).cut;
     await assertRejects(() =>
       Deno.connect({ hostname: '127.0.0.1', port: facadePort })
     );
@@ -102,6 +168,8 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
     facade = await process(facadeConfig, 'facade: link/local admin ready');
     assertEquals((await status()).body.result.keyId, initialized.keyId);
     assertEquals((await status()).body.result.enrolled, true);
+    assertEquals((await roomScope()).cut, replicatedCut);
+    assertEquals((await roomScope()).ready, true);
     assertEquals(
       (await status()).body.result.keyRoster.revision,
       roster.revision,
@@ -123,7 +191,9 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
       checkpointlogbytes: 65536,
       maxopenfiles: 8,
       idleseconds: 300,
-    }, { schemas: { server: serverSchema, tenant: tenantSchema } });
+    }, {
+      schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+    });
     try {
       assertEquals(
         (await openTenant(store, 'logical.test')).keyId,
@@ -149,6 +219,22 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
         "SELECT applied FROM facade_streams WHERE direction='in' AND stream='control'",
       );
       assertEquals(Number(applied.applied), 1);
+      const replica = await openRoom(store, roomId);
+      assertEquals(
+        await replica.tx(async (tx) =>
+          (await tx.events.getStatus(sent.body.event_id))?.standing
+        ),
+        'accepted',
+      );
+      assert(
+        await replica.tx((tx) => tx.segments.positionOf(sent.body.event_id)),
+      );
+      assertEquals(
+        JSON.parse(
+          (await replica.tx((tx) => tx.events.get(sent.body.event_id)))!.pdu,
+        ).content.body,
+        'Delivered through the production link',
+      );
     } finally {
       await store.close();
     }
