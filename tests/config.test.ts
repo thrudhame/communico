@@ -50,6 +50,7 @@ maxrooms = 10000
 
 [server]
 name = "localhost"
+role = "home"
 port = 8008
 shutdowngraceseconds = 10
 maxrequestbytes = 13107200
@@ -64,6 +65,27 @@ cacerts = []
 [admin]
 socket = ""
 users = []
+
+[facade]
+phase = "f1"
+nodes = []
+url = ""
+nodeid = ""
+pairfile = ""
+linkport = 8449
+linkcert = ""
+linkkey = ""
+linkcacerts = []
+notify = "websocket"
+pollseconds = 5
+reconnectmaxseconds = 10
+outbound = "direct"
+replicaterooms = "local"
+mailboxmaxbytes = 0
+mailboxmaxagedays = 0
+maxofflinedays = 0
+batchmaxbytes = 12500000
+batchmaxitems = 1000
 
 [wellknown]
 client = ""
@@ -937,7 +959,7 @@ Deno.test('public directory settings use complete defaults and strict leaf-wise 
   }
 });
 
-Deno.test('121 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('141 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -956,8 +978,9 @@ Deno.test('121 leaves total across the sections (the surface tripwire)', async (
     [name, leaves],
   ): [string, number] => [name, countLeaves(leaves)]);
   assertEquals(counts, [
-    ['server', 4],
+    ['server', 5],
     ['admin', 2],
+    ['facade', 19],
     ['wellknown', 7],
     ['turn', 5],
     ['matrixrtc', 1],
@@ -978,8 +1001,8 @@ Deno.test('121 leaves total across the sections (the surface tripwire)', async (
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    121,
-    'the whole config surface includes discovery, TURN and HTTP administrators',
+    141,
+    'the whole config surface includes discovery, TURN, HTTP administrators and facade role',
   );
 });
 

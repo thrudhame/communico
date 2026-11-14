@@ -79,6 +79,11 @@ export function theApp(): App {
  * per process — a second openApp before closeApp throws. */
 export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   if (current !== null) throw new Error('openApp: an app is already open');
+  // A facade must enter through explicit enrolled-node composition. Never let
+  // selecting the role fall through to home identity genesis or home workers.
+  if (config().server.role === 'facade') {
+    throw new Error('facade requires enrolled node composition');
+  }
   if (!hooksInstalled) {
     hooksInstalled = true;
     installServerHooks();

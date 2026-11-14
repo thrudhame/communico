@@ -11,6 +11,7 @@ export type Schema = {
 export const SCHEMA = {
   server: {
     name: 'string',
+    role: 'string',
     port: 'int',
     shutdowngraceseconds: 'int',
     maxrequestbytes: 'int',
@@ -18,6 +19,27 @@ export const SCHEMA = {
   admin: {
     socket: 'string',
     users: 'list',
+  },
+  facade: {
+    phase: 'string',
+    nodes: 'list',
+    url: 'string',
+    nodeid: 'string',
+    pairfile: 'string',
+    linkport: 'int',
+    linkcert: 'string',
+    linkkey: 'string',
+    linkcacerts: 'list',
+    notify: 'string',
+    pollseconds: 'int',
+    reconnectmaxseconds: 'int',
+    outbound: 'string',
+    replicaterooms: 'string',
+    mailboxmaxbytes: 'int',
+    mailboxmaxagedays: 'int',
+    maxofflinedays: 'int',
+    batchmaxbytes: 'int',
+    batchmaxitems: 'int',
   },
   wellknown: {
     client: 'string',
