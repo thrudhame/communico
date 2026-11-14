@@ -3,6 +3,7 @@
 import { splitId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 
 export type DirectoryFacts = {
   aliases: { alias: string; roomId: string; creator: string | null }[];
@@ -141,30 +142,59 @@ export async function installDirectoryFacts(
   self: string,
 ): Promise<void> {
   const facts = directoryFactsOf(raw, self);
-  await conn.execute('DELETE FROM aliases');
+  const aliases = new Set(facts.aliases.map((entry) => entry.alias));
+  for (const row of await conn.query('SELECT alias FROM aliases')) {
+    if (!aliases.has(String(row.alias))) {
+      await conn.execute('DELETE FROM aliases WHERE alias=?', [row.alias]);
+    }
+  }
   for (const entry of facts.aliases) {
     await conn.execute(
-      'INSERT INTO aliases(alias,room_id,creator) VALUES(?,?,?)',
+      'INSERT INTO aliases(alias,room_id,creator) VALUES(?,?,?) ON CONFLICT(alias) DO UPDATE SET room_id=excluded.room_id,creator=excluded.creator WHERE ' +
+        changedColumns('aliases', 'room_id', 'creator'),
       [entry.alias, entry.roomId, entry.creator],
     );
   }
-  await conn.execute('DELETE FROM visibility');
-  await conn.execute('DELETE FROM directory');
+  const rooms = new Set(facts.publication.map((entry) => entry.roomId));
+  for (const table of ['visibility', 'directory']) {
+    for (const row of await conn.query('SELECT room_id FROM ' + table)) {
+      if (!rooms.has(String(row.room_id))) {
+        await conn.execute('DELETE FROM ' + table + ' WHERE room_id=?', [
+          row.room_id,
+        ]);
+      }
+    }
+  }
   for (const entry of facts.publication) {
     await conn.execute(
-      'INSERT INTO visibility(room_id,visibility) VALUES(?,?)',
+      'INSERT INTO visibility(room_id,visibility) VALUES(?,?) ON CONFLICT(room_id) DO UPDATE SET visibility=excluded.visibility WHERE ' +
+        changedColumns('visibility', 'visibility'),
       [entry.roomId, entry.visibility],
     );
     await conn.execute(
-      'INSERT INTO directory(room_id,purgeable_ms) VALUES(?,?)',
+      'INSERT INTO directory(room_id,purgeable_ms) VALUES(?,?) ON CONFLICT(room_id) DO UPDATE SET purgeable_ms=excluded.purgeable_ms WHERE ' +
+        changedColumns('directory', 'purgeable_ms'),
       [entry.roomId, entry.purgeable],
     );
   }
-  await conn.execute('DELETE FROM forgotten');
+  const forgotten = new Set(
+    facts.forgotten.map((entry) => JSON.stringify([entry.user, entry.roomId])),
+  );
+  for (const row of await conn.query('SELECT user,room FROM forgotten')) {
+    if (!forgotten.has(JSON.stringify([row.user, row.room]))) {
+      await conn.execute('DELETE FROM forgotten WHERE user=? AND room=?', [
+        row.user,
+        row.room,
+      ]);
+    }
+  }
   for (const entry of facts.forgotten) {
-    await conn.execute('INSERT INTO forgotten(user,room) VALUES(?,?)', [
-      entry.user,
-      entry.roomId,
-    ]);
+    await conn.execute(
+      'INSERT INTO forgotten(user,room) VALUES(?,?) ON CONFLICT(user,room) DO NOTHING',
+      [
+        entry.user,
+        entry.roomId,
+      ],
+    );
   }
 }
