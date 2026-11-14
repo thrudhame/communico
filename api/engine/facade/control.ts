@@ -187,7 +187,12 @@ export async function publishKeyDocument(
       // A refresh attempt is not authority revocation. The public owner rechecks
       // the current control cut and expiry before any retained publication can
       // keep replication running; a changed roster or expired document refuses.
-      const retained = await publishedKeyDocument(db, signer, publicKey, now);
+      const retained = await publishedKeyDocument(
+        db,
+        signer,
+        publicKey,
+        Math.max(now, Date.now()),
+      );
       if (!retained) throw error;
       refreshFailed(error);
       return retained;

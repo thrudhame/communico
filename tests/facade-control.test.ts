@@ -707,3 +707,43 @@ Deno.test('a failed connected refresh preserves valid publication and export pro
     setConfigForTests({});
   }
 });
+
+Deno.test('a slow failed refresh cannot retain a publication that expired during collection', async () => {
+  setConfigForTests({ facade: { maxofflinedays: 1 } });
+  const f = await fixture();
+  const clock = Date.now;
+  try {
+    const first = await f.receive();
+    await f.keys().apply(f.journal(), first);
+    const before = await f.keys().document();
+    const started = before.valid_until_ts - 1;
+    const db = await f.home.server();
+    const errors: unknown[] = [];
+    Date.now = () => started;
+    await assertRejects(
+      () =>
+        publishKeyDocument(
+          db,
+          f.tenant.signer(),
+          f.tenant.publicB64,
+          () => {
+            Date.now = () => before.valid_until_ts;
+            return Promise.reject(new Error('slow collection failed'));
+          },
+          started,
+          (error) => errors.push(error),
+        ),
+      MatrixError,
+      'expired',
+    );
+    assertEquals(
+      errors,
+      [],
+      'expired authority cannot report retained success',
+    );
+  } finally {
+    Date.now = clock;
+    await f.close();
+    setConfigForTests({});
+  }
+});

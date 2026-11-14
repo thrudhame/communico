@@ -21,10 +21,15 @@ import {
 } from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
-import { exportPublicReplica, PublicReplicas } from '#engine/facade/public.ts';
+import {
+  exportPublicReplica,
+  PublicReplicas,
+  startPublicExports,
+} from '#engine/facade/public.ts';
 import {
   DirectoryReplicas,
   exportDirectoryReplica,
+  startDirectoryExports,
 } from '#engine/facade/directory.ts';
 import {
   addBlock,
@@ -57,6 +62,7 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { roomOf } from '#engine/server/read.ts';
 import { recoverServer } from '#engine/server/startup.ts';
+import { project } from '#engine/server/project.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
@@ -320,6 +326,57 @@ Deno.test('home room export progresses past a busy or broken room, skips evidenc
     await f.close();
   }
 });
+
+for (const domain of ['room', 'public', 'directory'] as const) {
+  Deno.test(`${domain} exports wake at the committed source without a periodic coordinator tick`, async () => {
+    const f = await fixture();
+    const initial = Promise.withResolvers<void>();
+    const suffix = Promise.withResolvers<void>();
+    const failures: unknown[] = [];
+    let changes = 0;
+    const common = {
+      store: f.home,
+      tenant: f.tenant,
+      self: f.signing.name,
+      peer: f.node.node,
+      pairing: f.bundle.id,
+      changed: () => {
+        if (++changes === 1) initial.resolve();
+        else suffix.resolve();
+      },
+      failed: (error: unknown) => failures.push(error),
+    };
+    await f.tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+    await recoverServer(f.home);
+    const worker = domain === 'room'
+      ? startRoomExports(common)
+      : domain === 'public'
+      ? startPublicExports(common)
+      : startDirectoryExports(common);
+    try {
+      worker.wake();
+      await bounded(initial.promise, 3000);
+      if (domain === 'room') {
+        const message = await f.source.addEvent({
+          type: 'm.room.message',
+          content: { body: 'source wake' },
+        });
+        await f.ingest([message]);
+        await project(f.home, f.room.id);
+      } else {
+        await f.tenant.tx((tx) =>
+          tx.profiles.set('alice', 'displayname', 'Source wake')
+        );
+      }
+      await bounded(suffix.promise, 3000);
+      assertEquals(failures, []);
+      assert(changes >= 2);
+    } finally {
+      await worker.close();
+      await f.close();
+    }
+  });
+}
 
 Deno.test('room commit before completion survives reopen without readiness or duplicate publication', async () => {
   const f = await fixture();

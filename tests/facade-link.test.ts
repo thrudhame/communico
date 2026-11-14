@@ -1010,6 +1010,140 @@ Deno.test('a blocked domain cannot starve another stream or periodic hello with 
   }
 });
 
+Deno.test('reconciliation preserves an outgoing wake received during an in-flight push', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const base = {
+      source: 'home',
+      incarnation: bundle.id,
+      stream: 'egress:wake.test',
+      type: 'control',
+      version: 1,
+    };
+    const first = await f.hj.append('edge_a', {
+      ...base,
+      operationId: 'first',
+      payload: 1,
+    });
+    const push = client.push.bind(client);
+    let blocked = false;
+    client.push = async (...args) => {
+      const result = await push(...args);
+      if (!blocked) {
+        blocked = true;
+        entered.resolve();
+        await release.promise;
+      }
+      return result;
+    };
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      apply: () => Promise.resolve(false),
+      failed: (error) => failures.push(error),
+    });
+    await reconciler.reconcile();
+    await testDeadline(entered.promise);
+    const second = await f.hj.append('edge_a', {
+      ...base,
+      operationId: 'second',
+      payload: 2,
+    });
+    await reconciler.reconcile();
+    release.resolve();
+    await reconciler.drain();
+    assertEquals(
+      (await f.fj.heads('home', 'in', first)).received.sequence,
+      second.sequence,
+    );
+    assertEquals(
+      failures,
+      [],
+      'a fresh reconciliation must not compare ACKs to stale hello cuts',
+    );
+  } finally {
+    release.resolve();
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
+Deno.test('reconciliation preserves an incoming notice while its domain is finishing a pass', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const base = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      stream: 'ingress:wake.test',
+      type: 'control',
+      version: 1,
+    };
+    const first = await f.fj.append('home', {
+      ...base,
+      operationId: 'first',
+      payload: 1,
+    });
+    let blocked = false;
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      failed: (error) => failures.push(error),
+      apply: async (stream) => {
+        const record = await f.hj.next('edge_a', stream);
+        if (record) {
+          await f.hj.complete('edge_a', stream, record, {
+            exact: record.payload,
+          });
+          return true;
+        }
+        if (!blocked) {
+          blocked = true;
+          entered.resolve();
+          await release.promise;
+        }
+        return false;
+      },
+    });
+    await reconciler.reconcile();
+    await testDeadline(entered.promise);
+    const second = await f.fj.append('home', {
+      ...base,
+      operationId: 'second',
+      payload: 2,
+    });
+    await reconciler.reconcile();
+    release.resolve();
+    await reconciler.drain();
+    assertEquals(
+      (await f.hj.heads('edge_a', 'in', first)).applied.sequence,
+      second.sequence,
+    );
+    assertEquals(failures, []);
+  } finally {
+    release.resolve();
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
 async function testDeadline<T>(work: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -1084,6 +1218,76 @@ Deno.test('facade inbox application is independent per stream and drains without
       result: { applied: 1 },
     });
     assertEquals(failed, []);
+  } finally {
+    release.resolve();
+    await worker?.close();
+    await f.close();
+  }
+});
+
+Deno.test('facade inbox retains a wake during its final empty domain check', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const rescanned = Promise.withResolvers<void>();
+  const delivered = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let worker: ReturnType<typeof startInboxWorker> | undefined;
+  try {
+    const base = {
+      source: 'home',
+      incarnation: 'inbox-wake',
+      stream: 'room:inbox',
+      type: 'control',
+      version: 1,
+    };
+    const first = await f.hj.append('edge_a', {
+      ...base,
+      operationId: 'first',
+      payload: 1,
+    });
+    await f.fj.receive('home', [first]);
+    const streams = f.fj.streams.bind(f.fj);
+    let blocked = false;
+    f.fj.streams = async (...args) => {
+      const result = await streams(...args);
+      if (blocked) rescanned.resolve();
+      return result;
+    };
+    worker = startInboxWorker({
+      journal: f.fj,
+      peer: 'home',
+      pollseconds: 60,
+      changed() {},
+      failed: (error) => failures.push(error),
+      apply: async (stream) => {
+        const next = await f.fj.next('home', stream);
+        if (next) {
+          await f.fj.complete('home', stream, next, { exact: next.payload });
+          if (next.payload === 2) delivered.resolve();
+          return true;
+        }
+        if (!blocked) {
+          blocked = true;
+          entered.resolve();
+          await release.promise;
+        }
+        return false;
+      },
+    });
+    await testDeadline(entered.promise);
+    const second = await f.hj.append('edge_a', {
+      ...base,
+      operationId: 'second',
+      payload: 2,
+    });
+    await f.fj.receive('home', [second]);
+    worker.wake();
+    await testDeadline(rescanned.promise);
+    release.resolve();
+    await testDeadline(delivered.promise);
+    assertEquals((await f.fj.heads('home', 'in', second)).applied.sequence, 2);
+    assertEquals(failures, []);
   } finally {
     release.resolve();
     await worker?.close();
