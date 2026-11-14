@@ -23,6 +23,7 @@ export type ReplicaBoundary = {
   roomId: string;
   roomVersion: string;
   cut: number;
+  resident: string;
   join: Pdu;
   state: Pdu[];
   authChain: Pdu[];
@@ -97,6 +98,7 @@ export function exportReplicaBoundary(
       roomId: room.id,
       roomVersion: create.content.room_version,
       cut: await tx.changes.head(),
+      resident: status.origin ?? self,
       join,
       state: stateIds.map((id) => pack.get(id)!),
       authChain: [...pack].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map((

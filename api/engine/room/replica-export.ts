@@ -24,7 +24,13 @@ export type ReplicaRoom = {
     origin: string;
   }[];
   events: Pdu[];
-  boundaries: { eventId: string; state: string[]; authChain: string[] }[];
+  residents: Record<string, string>;
+  boundaries: {
+    eventId: string;
+    resident: string;
+    state: string[];
+    authChain: string[];
+  }[];
 };
 
 function unavailable(message: string): never {
@@ -52,6 +58,7 @@ export function exportReplicaRoom(
     const segments = await tx.segments.list();
     const bySegment = new Map(segments.map((segment) => [segment.id, segment]));
     const pack = new Map<string, Pdu>();
+    const residents: Record<string, string> = {};
     const read = async (id: string): Promise<Pdu> => {
       const held = pack.get(id);
       if (held) return held;
@@ -59,6 +66,7 @@ export function exportReplicaRoom(
       if (!row) unavailable('required replica event is not retained');
       const pdu = JSON.parse(row.pdu) as Pdu;
       pack.set(id, pdu);
+      residents[id] = (await tx.events.getStatus(id))?.origin ?? self;
       return pdu;
     };
     for (const change of changes) {
@@ -182,7 +190,12 @@ export function exportReplicaRoom(
         closure.add(auth);
         queue.push(...((await read(auth)).auth_events ?? []));
       }
-      boundaries.push({ eventId: id, state, authChain: [...closure].sort() });
+      boundaries.push({
+        eventId: id,
+        resident: residents[id],
+        state,
+        authChain: [...closure].sort(),
+      });
     }
     // Include complete retained auth closure, even for unpositioned evidence.
     const queue = [...pack.keys()];
@@ -205,6 +218,7 @@ export function exportReplicaRoom(
       events: [...pack].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map((
         [, pdu],
       ) => pdu),
+      residents,
       boundaries,
     };
   });

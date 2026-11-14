@@ -39,6 +39,17 @@ type Roster = {
 };
 type Control = { kind: 'key-roster'; body: Roster; signature: string };
 
+// A retained roster belongs to a home control cut, not merely this node's key.
+// Re-enrollment must not revive authority from an older grant at any consumer.
+function rosterAt(
+  held: Record<string, unknown>,
+  revision: number,
+): Roster | null {
+  return held.roster_json === null || Number(held.revision) < revision
+    ? null
+    : rosterOf(JSON.parse(String(held.roster_json)));
+}
+
 function rosterOf(raw: unknown): Roster {
   const value = object(raw);
   if (!Array.isArray(value.keys)) {
@@ -170,13 +181,11 @@ export class FacadeKeys {
         const [held] = await this.db.query(
           'SELECT revision,roster_json FROM facade_key_roster WHERE singleton=1',
         );
-        const roster = held.roster_json === null
-          ? null
-          : rosterOf(JSON.parse(String(held.roster_json)));
+        const roster = rosterAt(held, grant.body.revision);
         const key = roster?.keys.find((key) => key.keyId === keyId);
         if (
           !roster || roster.server !== name ||
-          Number(held.revision) < grant.body.revision || !key ||
+          !key ||
           (key.retiredAt !== null &&
             (purpose === 'request' || floor > key.retiredAt))
         ) {
@@ -204,9 +213,14 @@ export class FacadeKeys {
     const [held] = await this.db.query(
       'SELECT revision,roster_json,last_home_ms FROM facade_key_roster WHERE singleton=1',
     );
-    const roster = held.roster_json === null
-      ? null
-      : rosterOf(JSON.parse(String(held.roster_json)));
+    let roster: Roster | null = null;
+    try {
+      roster = rosterAt(held, (await this.pairings.active()).body.revision);
+    } catch (error) {
+      if (!(error instanceof LinkError) || error.code !== 'LINK_UNPAIRED') {
+        throw error;
+      }
+    }
     const own = roster?.keys.find((key) => key.keyId === this.signer.keyId);
     return {
       revision: Number(held.revision),
@@ -337,10 +351,10 @@ export class FacadeKeys {
           'SELECT * FROM facade_key_roster WHERE singleton=1',
         ))[0];
       });
-      if (held.roster_json === null) {
+      const roster = rosterAt(held, grant.body.revision);
+      if (roster === null) {
         throw new MatrixError(503, 'M_UNAVAILABLE', 'key roster not ready');
       }
-      const roster = rosterOf(JSON.parse(String(held.roster_json)));
       const own = roster.keys.find((key) => key.keyId === this.signer.keyId);
       if (own?.publicKey !== this.publicKey || own.retiredAt !== null) {
         throw new MatrixError(

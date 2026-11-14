@@ -78,6 +78,26 @@ async function fixture() {
     keys,
     journal,
     exportRoster,
+    async reenroll() {
+      await fp.retire(await hp.revoke(bundle.id), 'a'.repeat(64));
+      const next = await hp.create({
+        node: 'edge_a',
+        url: 'https://facade.test',
+        facadePin: 'b'.repeat(64),
+        expires: Date.now() + 60000,
+        required: [...LINK_CAPABILITIES],
+      });
+      await fp.accept(next);
+      const granted = await hp.grant(
+        next.id,
+        await fp.challenge(next.id, next.secret, 'a'.repeat(64)),
+      );
+      await hp.confirm(
+        next.id,
+        await fp.complete(next.id, granted, 'a'.repeat(64)),
+      );
+      return await exportKeyRoster(home, tenant, 'edge_a', next.id);
+    },
     async downgrade() {
       await edgeServer.tx(async (conn) => {
         await conn.exec(
@@ -199,6 +219,41 @@ Deno.test('offline renewal cap preserves old validity, and authenticated contact
   } finally {
     await f.close();
     setConfigForTests({});
+  }
+});
+
+Deno.test('re-enrollment makes every roster consumer unavailable until its new control cut arrives', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.receive();
+    await f.keys().apply(f.journal(), first);
+    const prior = await f.keys().document();
+    const next = await f.reenroll();
+    await assertRejects(() => f.keys().document(), MatrixError, 'not ready');
+    assertEquals((await f.keys().status()).ready, false);
+    await assertRejects(
+      () => f.keys().requestSigner().sign('not yet authorized'),
+      MatrixError,
+      'not ready',
+    );
+    await assertRejects(
+      () =>
+        f.keys().verificationKeys().getVerifyKey(
+          'logical.test',
+          f.tenant.keyId,
+          0,
+          'event',
+        ),
+      UpstreamError,
+    );
+    await f.reopen();
+    await assertRejects(() => f.keys().document(), MatrixError, 'not ready');
+    await f.journal().receive('home', [next]);
+    await f.keys().apply(f.journal(), next);
+    assertEquals((await f.keys().status()).ready, true);
+    assertEquals((await f.keys().document()).verify_keys, prior.verify_keys);
+  } finally {
+    await f.close();
   }
 });
 

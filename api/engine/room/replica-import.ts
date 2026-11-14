@@ -31,12 +31,16 @@ export async function importReplicaRoom(
     throw new MatrixError(400, 'M_BAD_JSON', 'replica manifest version');
   }
   if (manifest.after > 0) await openRoom(store, manifest.roomId);
+  const residents = new Map(Object.entries(manifest.residents));
   const pack = new Map<string, Pdu>();
   for (const raw of manifest.events) {
     input.signal?.throwIfAborted();
     const verified = await verify(raw, manifest.roomVersion, input.keys, {
       roomId: manifest.roomId,
       exemptPrevAuthLimits: true,
+      localSnapshotFallback: residents.has(String(raw.event_id))
+        ? { self: input.self, resident: residents.get(String(raw.event_id))! }
+        : undefined,
     });
     if (raw.event_id !== verified.eventId || pack.has(verified.eventId)) {
       throw new MatrixError(
@@ -56,6 +60,7 @@ export async function importReplicaRoom(
     const boundary = boundaries.get(id);
     if (!boundary) unavailable('replica before-state is unavailable');
     return {
+      resident: boundary.resident,
       state: boundary.state.map(event),
       authChain: boundary.authChain.map(event),
     };
@@ -95,7 +100,7 @@ export async function importReplicaRoom(
     manifest.stays.map((stay) => [stay.opening.eventId, stay]),
   );
   const initialized = new Set<string>();
-  const ensure = async (id: string, origin: string) => {
+  const ensure = async (id: string) => {
     if (initialized.has(id)) return;
     const stay = stays.get(id);
     if (!stay) unavailable('replica stay is unavailable');
@@ -113,7 +118,6 @@ export async function importReplicaRoom(
         ...input,
         roomId: manifest.roomId,
         roomVersion: manifest.roomVersion,
-        resident: origin,
         join: event(id),
         ...snapshot(id),
       });
@@ -123,7 +127,7 @@ export async function importReplicaRoom(
   for (let i = 0; i < manifest.steps.length;) {
     input.signal?.throwIfAborted();
     const step = manifest.steps[i];
-    await ensure(step.stay, step.origin);
+    await ensure(step.stay);
     const room = await openRoom(store, manifest.roomId);
     if (step.kind === 'history') {
       const chunk = [];
@@ -183,7 +187,6 @@ export async function importReplicaRoom(
         ...input,
         roomId: manifest.roomId,
         roomVersion: manifest.roomVersion,
-        resident: step.origin,
         ...snapshot(step.eventId),
       })
       : undefined;
@@ -216,7 +219,7 @@ export async function importReplicaRoom(
               'replica replaces room create',
             );
           }
-          await stageSnapshotEvidence(tx, boundary, step.eventId, step.origin);
+          await stageSnapshotEvidence(tx, boundary, step.eventId);
         }
         const result = await ingestInTx(tx, room.id, verified.pdu, {
           remote: {
@@ -224,6 +227,7 @@ export async function importReplicaRoom(
             self: input.self,
             oversized: verified.oversized,
             ungroundedMs: 0,
+            promoteEvidence: true,
             boundary: boundary?.snapshot,
           },
         });
@@ -235,7 +239,7 @@ export async function importReplicaRoom(
   }
   for (const [id, expected] of stays) {
     if (!initialized.has(id)) {
-      await ensure(id, input.self);
+      await ensure(id);
     }
     const room = await openRoom(store, manifest.roomId);
     const closed = await room.tx(async (tx) => {
@@ -261,6 +265,7 @@ export async function importReplicaRoom(
     roomId: manifest.roomId,
     roomVersion: manifest.roomVersion,
     resident: input.self,
+    residents,
     state: [event(first.opening.createId)],
     authChain: [...pack.values()],
   });
@@ -275,7 +280,7 @@ export async function importReplicaRoom(
           'replica replaces retained room create',
         );
       }
-      await stageSnapshotEvidence(tx, evidence, evidence.createId, input.self);
+      await stageSnapshotEvidence(tx, evidence, evidence.createId);
     }));
   await projectAfterWrite(store, room.id);
 }

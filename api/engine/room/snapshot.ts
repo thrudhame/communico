@@ -17,6 +17,7 @@ import { verify } from './verify.ts';
 
 export type VerifiedSnapshot = {
   pack: Map<string, Pdu>;
+  residents: Map<string, string>;
   rejected: Map<string, string>;
   ordered: (readonly [string, Pdu])[];
   snapshot: StateMap;
@@ -35,9 +36,13 @@ export async function verifySnapshot(input: {
   keys: KeyResolver;
   state: readonly Pdu[];
   authChain: readonly Pdu[];
+  // A semantic replica retains the original resident for each evidence PDU.
+  // This selects the ordinary local-sender fallback, never an auth verdict.
+  residents?: ReadonlyMap<string, string>;
 }): Promise<VerifiedSnapshot> {
   const rulebook = getRulebook(input.roomVersion);
   const pack = new Map<string, Pdu>();
+  const residents = new Map<string, string>();
   const stateEventIds: string[] = [];
   for (
     const [events, state] of [[input.state, true], [
@@ -47,19 +52,24 @@ export async function verifySnapshot(input: {
   ) {
     for (const raw of events) {
       let admitted;
+      const resident = input.residents?.get(String(raw.event_id)) ??
+        input.resident;
       try {
         // The resident can vouch for our own events riding a snapshot back.
         // All other receipt checks still use the ordinary verifier.
         admitted = await verify(raw, input.roomVersion, input.keys, {
           roomId: input.roomId,
-          localSnapshotFallback: { self: input.self, resident: input.resident },
+          localSnapshotFallback: { self: input.self, resident },
         });
       } catch (error) {
         if (!recoverableUpstream(error)) throw error;
         continue;
       }
       if (admitted === null) continue;
-      if (!pack.has(admitted.eventId)) pack.set(admitted.eventId, admitted.pdu);
+      if (!pack.has(admitted.eventId)) {
+        pack.set(admitted.eventId, admitted.pdu);
+        residents.set(admitted.eventId, resident);
+      }
       if (state) stateEventIds.push(admitted.eventId);
     }
   }
@@ -112,6 +122,7 @@ export async function verifySnapshot(input: {
   }
   return {
     pack,
+    residents,
     rejected,
     ordered,
     snapshot,
