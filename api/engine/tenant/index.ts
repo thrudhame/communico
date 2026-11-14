@@ -56,6 +56,7 @@ import {
   generateSigningKeypair,
   importPrivateKeyFromPkcs8,
   importPublicKeyFromRaw,
+  matrixBase64,
   sha256bytes,
 } from '#engine/signing-primitives.js';
 
@@ -681,6 +682,66 @@ function bind(
 
 export type TenantTx = ReturnType<typeof bind>;
 
+/** Explicit provisioning uses an already-authorized local signer. It neither
+ * generates nor replaces identity, and never accepts a key from a remote row
+ * replication API. The facade enrollment owner is the production caller. */
+export async function provisionTenant(
+  store: Store,
+  serverName: string,
+  identity: { keyId: string; publicB64: string; privateB64: string },
+): Promise<Tenant> {
+  if (!/^ed25519:[A-Za-z0-9_]+$/.test(identity.keyId)) {
+    throw new Error('invalid provisioned tenant identity key ID');
+  }
+  const raw = matrixBase64(identity.publicB64, 32);
+  const publicKey = await importPublicKeyFromRaw(raw);
+  const privateKey = await importPrivateKeyFromPkcs8(
+    b64decode(identity.privateB64),
+  );
+  const proof = crypto.getRandomValues(new Uint8Array(32));
+  const signed = await crypto.subtle.sign('Ed25519', privateKey, proof);
+  if (!await crypto.subtle.verify('Ed25519', publicKey, signed, proof)) {
+    throw new Error('provisioned tenant identity keys do not match');
+  }
+  const row: IdentityRow = {
+    server_name: serverName,
+    native_name: nativeNameFor(raw),
+    pubkey_b64: b64encodeStd(raw),
+    privkey_enc: identity.privateB64,
+    key_id: identity.keyId.slice('ed25519:'.length),
+  };
+  const db = await store.tenant(serverName, { create: true });
+  const created = Date.now();
+  await db.tx(async (conn) => {
+    const existing = await conn.query(
+      'SELECT * FROM tenant WHERE server_name=?',
+      [serverName],
+    );
+    if (existing.length) {
+      for (const key of Object.keys(row) as (keyof IdentityRow)[]) {
+        if (existing[0][key] !== row[key]) {
+          throw new Error(
+            'existing tenant identity does not match enrolled node',
+          );
+        }
+      }
+      return;
+    }
+    await conn.execute(
+      'INSERT INTO tenant(server_name,native_name,pubkey_b64,privkey_enc,key_id,created_ms) VALUES(?,?,?,?,?,?)',
+      [
+        row.server_name,
+        row.native_name,
+        row.pubkey_b64,
+        row.privkey_enc,
+        row.key_id,
+        created,
+      ],
+    );
+  });
+  return await openTenant(store, serverName);
+}
+
 export async function openTenant(
   store: Store,
   serverName: string,
@@ -700,6 +761,11 @@ export async function openTenant(
           b64decode(String(row.privkey_enc)),
         ),
       };
+    }
+    if (options.create !== true) {
+      throw new Error(
+        'tenant identity missing; explicit creation or provisioning required',
+      );
     }
     const pair = (await generateSigningKeypair()) as CryptoKeyPair;
     const pubRaw = await exportPublicKeyRaw(pair.publicKey);

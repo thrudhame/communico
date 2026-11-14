@@ -1,6 +1,85 @@
 // Durable publication of caller-owned private staging, never operator data.
 import { dirname, join } from '@std/path';
 import type { Turso } from './ffi.ts';
+import { type FileHandle, open } from 'node:fs/promises';
+import { constants } from 'node:fs';
+
+export type InputFile = Pick<Deno.FileInfo, 'dev' | 'ino' | 'uid' | 'mode'>;
+
+// The caller owns the returned descriptor. Metadata, policy and reads can all
+// refer to this one pinned file, including under scoped Deno permissions.
+export async function openRegularFile(source: string) {
+  let file: FileHandle | undefined;
+  try {
+    file = await open(
+      source,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const entry = await Deno.lstat(source);
+    const stat = await file.stat();
+    if (!entry.isFile || !stat.isFile()) {
+      throw new Error('backup source must be a regular file');
+    }
+    if (entry.dev !== stat.dev || entry.ino !== stat.ino) {
+      throw new Error('backup source changed while opening');
+    }
+    return { file, stat };
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error
+      ? error.code
+      : undefined;
+    const failure = code === 'ELOOP'
+      ? new Error('backup source must be a regular file', { cause: error })
+      : code === 'ENOENT'
+      ? new Deno.errors.NotFound(
+        error instanceof Error ? error.message : 'backup source not found',
+      )
+      : error;
+    try {
+      await file?.close();
+    } catch (close) {
+      throw new AggregateError(
+        [failure, close],
+        'backup source validation and close failed',
+      );
+    }
+    throw failure;
+  }
+}
+
+export async function copyPrivateFile(
+  source: string,
+  target: string,
+  validate?: (file: InputFile) => void,
+): Promise<void> {
+  const { file: input, stat } = await openRegularFile(source);
+  try {
+    validate?.(stat);
+    const output = await Deno.open(target, {
+      write: true,
+      createNew: true,
+      mode: 0o600,
+    });
+    try {
+      const chunk = new Uint8Array(65536);
+      for (;;) {
+        const { bytesRead } = await input.read(chunk, 0, chunk.length, null);
+        if (bytesRead === 0) break;
+        let written = 0;
+        while (written < bytesRead) {
+          const count = await output.write(chunk.subarray(written, bytesRead));
+          if (count <= 0) throw new Error('short backup copy write');
+          written += count;
+        }
+      }
+      await output.sync();
+    } finally {
+      output.close();
+    }
+  } finally {
+    await input.close();
+  }
+}
 
 export async function syncPath(path: string): Promise<void> {
   const file = await Deno.open(path, { read: true });
@@ -47,30 +126,7 @@ export async function copyPrivate(
   if (!stat.isFile) {
     throw new Error('backup contains a non-regular filesystem entry');
   }
-  const input = await Deno.open(source, { read: true });
-  try {
-    const output = await Deno.open(target, {
-      write: true,
-      createNew: true,
-      mode: 0o600,
-    });
-    try {
-      const chunk = new Uint8Array(65536);
-      for (;;) {
-        const count = await input.read(chunk);
-        if (count === null) break;
-        let written = 0;
-        while (written < count) {
-          written += await output.write(chunk.subarray(written, count));
-        }
-      }
-      await output.sync();
-    } finally {
-      output.close();
-    }
-  } finally {
-    input.close();
-  }
+  await copyPrivateFile(source, target);
 }
 
 export async function publish(

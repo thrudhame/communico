@@ -445,7 +445,8 @@ same layered configuration as the server:
 # Equivalent: deno task backup -- /srv/backups/communico-2026-11-14
 ```
 
-Backup requires a running server. The CLI uses only its private admin socket,
+Backup requires a running home server, not an independently enrolled facade.
+The CLI uses only its private admin socket,
 never opens live databases, and resolves relative destinations in the caller's
 working directory. The destination's parent must exist; the destination must
 not exist or overlap live data. The response is JSON with the published path,
@@ -454,6 +455,13 @@ Writes pause for the consistent whole-store cut, then resume while the bundle is
 assembled. There is no configured backup duration deadline. Use the completed
 bundle, not a copy of live database files or an unfinished private staging tree.
 
+The current baseline keeps storage admission closed through every database
+export. The pause grows with file count and data size: live-traffic measurements
+observed 14.5 seconds for 12 database files and 30-41 seconds for 21 files
+(19 rooms). Sends and sync reads can stall for that pause. This is an online
+backup, not a pause-free one; `pauseMs` reports the actual cut rather than a
+configured deadline.
+
 The format-1 bundle includes database files, signing private keys, password
 hashes, uploaded local media, effective configuration, the original operator
 overlay and referenced TLS/CA files. Payloads and manifest are mode 0600 in
@@ -461,6 +469,14 @@ private directories; the manifest is published last and records exact hashes
 and sizes. Remote media cache, thumbnails, unfinished uploads, runtime sockets
 and the backup passphrase source are excluded. Environment TURN credentials
 remain external and must be supplied on the restored installation.
+
+Configured facade link certificate/key/CA files and a present pairing bootstrap
+are portable too. Deployment inputs are captured before the database cut, so a
+bootstrap consumed by later durable enrollment is retained. An already-consumed
+or missing pairing file is valid; durable enrollment no longer needs it.
+Protected link keys, pairing inputs and passphrase inputs must retain the
+existing server-user/private-mode ownership policy. Replacing a paired link's
+TLS identity requires its normal re-enrollment flow.
 
 `backup.encrypt` defaults to false. To use standard OpenPGP AES256 encryption,
 install GnuPG (`gpg` and `gpgconf`) for the server and set:
@@ -488,7 +504,8 @@ COMMUNICO_CONFIG=/srv/communico/config/restore.toml \
 # Equivalent: deno task restore -- <bundle> [--replace]
 ```
 
-Both target parents must exist. Restore verifies the exact bundle, supported
+Target parents must be writable by the server user; missing parents are created
+where permitted. Restore verifies the exact bundle, supported
 native/schema versions and application references, then migrates private copies,
 audits media and signing identity, sanitizes consuming keys and sync delivery
 boundaries, and writes a durable operator report before promotion. The archive

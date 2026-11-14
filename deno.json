@@ -21,6 +21,7 @@
     "debug-proxy": "deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
   },
   "imports": {
+    "ws": "npm:ws@8.23.0",
     "imagescript": "npm:imagescript@3.20.2",
     "parse5": "npm:parse5@8.0.0",
     "html-encoding-sniffer": "npm:html-encoding-sniffer@4.0.0",

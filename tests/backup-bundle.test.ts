@@ -6,6 +6,7 @@ import { loadConfig, loadedConfig, setConfigForTests } from '#engine/config.ts';
 import { openTenant } from '#engine/tenant/index.ts';
 import { createBackup } from '#engine/backup/bundle.ts';
 import { readManifest } from '#engine/backup/manifest.ts';
+import { openCipher } from '#engine/backup/encryption.ts';
 
 async function fixture() {
   const root = await Deno.makeTempDir({ prefix: 'bundle-' });
@@ -191,6 +192,10 @@ Deno.test('backup bundle: TLS and CA references have portable mappings; excluded
     await Deno.writeTextFile(cert, 'certificate');
     await Deno.writeTextFile(key, 'private deployment key', { mode: 0o600 });
     await Deno.writeTextFile(ca, 'authority');
+    const pairing = join(f.root, 'pairing.json');
+    await Deno.writeTextFile(pairing, '{"fixture":"protected bootstrap"}', {
+      mode: 0o600,
+    });
     f.settings.config.federation = {
       ...f.settings.config.federation,
       enabled: true,
@@ -199,6 +204,13 @@ Deno.test('backup bundle: TLS and CA references have portable mappings; excluded
       cacerts: [ca],
     };
     f.settings.config.push = { ...f.settings.config.push, cacerts: [ca] };
+    f.settings.config.facade = {
+      ...f.settings.config.facade,
+      linkcert: cert,
+      linkkey: key,
+      linkcacerts: [ca],
+      pairfile: pairing,
+    };
     const result = await createBackup(
       f.app.store,
       join(f.root, 'deployment-backup'),
@@ -210,6 +222,10 @@ Deno.test('backup bundle: TLS and CA references have portable mappings; excluded
         'federation.key',
         'federation.cacerts.0',
         'push.cacerts.0',
+        'facade.linkcert',
+        'facade.linkkey',
+        'facade.linkcacerts.0',
+        'facade.pairfile',
       ]
     ) {
       const file = result.manifest.deployment.find((d) => d.node === node)!;
@@ -218,6 +234,38 @@ Deno.test('backup bundle: TLS and CA references have portable mappings; excluded
         await Deno.readTextFile(join(result.path, file.path)),
         await Deno.readTextFile(file.source),
       );
+    }
+    f.settings.config.facade = {
+      ...f.settings.config.facade,
+      pairfile: join(f.root, 'already-consumed-pairing.json'),
+    };
+    const consumed = await createBackup(
+      f.app.store,
+      join(f.root, 'consumed-bootstrap'),
+      f.settings,
+    );
+    assert(
+      !consumed.manifest.deployment.some((file) =>
+        file.node === 'facade.pairfile'
+      ),
+    );
+    for (const leaf of ['linkkey', 'pairfile'] as const) {
+      f.settings.config.facade = {
+        ...f.settings.config.facade,
+        [leaf]: leaf === 'linkkey' ? key : pairing,
+      };
+      await Deno.chmod(leaf === 'linkkey' ? key : pairing, 0o644);
+      await assertRejects(
+        () =>
+          createBackup(
+            f.app.store,
+            join(f.root, 'unprotected-' + leaf),
+            f.settings,
+          ),
+        Error,
+        'private and owned',
+      );
+      await Deno.chmod(leaf === 'linkkey' ? key : pairing, 0o600);
     }
     f.settings.config.backup = { encrypt: false, passphrasefile: key };
     await assertRejects(
@@ -271,6 +319,68 @@ Deno.test('backup bundle: passphrase exclusion retains the captured identity aft
     assert(replaced, 'the source pathname replacement must actually occur');
   } finally {
     Deno.makeTempDir = makeTempDir;
+    await f.close();
+  }
+});
+
+Deno.test('backup bundle: a deployment-path replacement cannot copy the actual passphrase source', async () => {
+  const f = await fixture();
+  const lstat = Deno.lstat;
+  let reader: Awaited<ReturnType<typeof openCipher>> = null;
+  try {
+    const passphrase = join(f.root, 'input-passphrase');
+    const expectedPassphrase = join(f.root, 'expected-passphrase');
+    const key = join(f.root, 'deployment-key');
+    await Deno.writeTextFile(passphrase, 'test-private-passphrase\n', {
+      mode: 0o600,
+    });
+    await Deno.writeTextFile(expectedPassphrase, 'test-private-passphrase\n', {
+      mode: 0o600,
+    });
+    await Deno.writeTextFile(key, 'deployment key, not a passphrase', {
+      mode: 0o600,
+    });
+    f.settings.config.backup = { encrypt: true, passphrasefile: passphrase };
+    f.settings.config.federation = { ...f.settings.config.federation, key };
+    f.settings.sources['federation.key'] = 'config';
+    let replaced = false;
+    Deno.lstat = async (path) => {
+      const stat = await lstat(path);
+      if (!replaced && path === key) {
+        replaced = true;
+        await Deno.rename(key, join(f.root, 'original-deployment-key'));
+        await Deno.rename(passphrase, key);
+      }
+      return stat;
+    };
+    const backup = await createBackup(
+      f.app.store,
+      join(f.root, 'deployment-race'),
+      f.settings,
+    );
+    Deno.lstat = lstat;
+    assert(replaced, 'the deployment entry replacement must actually occur');
+    const file = backup.manifest.deployment.find((file) =>
+      file.node === 'federation.key'
+    )!;
+    const payload = backup.manifest.payloads.find((payload) =>
+      payload.path === file.path
+    )!;
+    const candidate = join(f.root, 'decrypted');
+    await Deno.mkdir(join(candidate, 'deployment'), { recursive: true });
+    reader = await openCipher({
+      encrypt: true,
+      passphrasefile: expectedPassphrase,
+    }, f.root);
+    assert(reader);
+    await reader.decrypt(backup.path, payload, candidate);
+    assertEquals(
+      await Deno.readTextFile(join(candidate, file.path)),
+      'deployment key, not a passphrase',
+    );
+  } finally {
+    Deno.lstat = lstat;
+    await reader?.close();
     await f.close();
   }
 });

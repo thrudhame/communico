@@ -1121,7 +1121,8 @@ The offline coordinator composes these owners with the recovery epoch/report
 boundary before promotion, without opening the app.
 (`api/engine/store/candidate.ts`, `api/engine/tenant/restore.ts`)
 
-Server schema v25 adds a persistent restore recovery identity and report marker.
+Server schema v28 adds a persistent restore recovery identity and report marker
+after the facade journal, pairing and runtime-identity migrations.
 Ordinary sync tokens retain their legacy wire form until the first restore, then
 carry that identity. A different identity resets the entire sync baseline before
 inbox acknowledgment or long-polling, even after numeric streams catch up. Both
@@ -1205,9 +1206,13 @@ without a row-count ceiling. Both backup and offline restore compose these audit
 (`api/engine/store/inspect.ts`, `api/engine/backup/{audit,checks}.ts`,
 `api/engine/{room,tenant,server}/backup-audit.ts`)
 
-The internal bundle producer takes that running-store cut, audits private copies,
-copies only uploaded local media, and preserves the original operator overlay,
-effective non-secret environment settings and explicitly referenced TLS/CA files.
+The internal bundle producer captures deployment inputs before the running-store
+cut, audits private database copies, copies only uploaded local media, and
+preserves the original operator overlay, effective non-secret environment settings
+and explicitly referenced Matrix/facade TLS/CA files. A present protected pairing
+bootstrap is retained; a missing consumed bootstrap is valid. Private-file policy
+and passphrase exclusion inspect the descriptor actually copied, through the same
+pinned regular-file owner used by passphrase capture.
 Portable deployment mappings record each original config node and bundled file.
 Environment-sourced TURN credentials remain external; the encryption passphrase
 source is never bundled. Optional encryption removes only owned plaintext staging

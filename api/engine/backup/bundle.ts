@@ -4,7 +4,11 @@ import { basename, dirname, join, relative, resolve } from '@std/path';
 import { stringify } from '@std/toml';
 import { envNameOf, type LoadedConfig, loadedConfig } from '#engine/config.ts';
 import type { Store } from '#engine/store/index.ts';
-import { copyPrivate, removeOwned } from '#engine/store/files.ts';
+import {
+  copyPrivate,
+  copyPrivateFile,
+  removeOwned,
+} from '#engine/store/files.ts';
 import { auditSnapshot } from './audit.ts';
 import { openCipher, type PayloadCipher } from './encryption.ts';
 import {
@@ -67,6 +71,9 @@ export async function createBackup(
   let cipher: PayloadCipher | null = null;
   try {
     cipher = await openCipher(settings.config.backup, stage);
+    // Enrollment input can be consumed after its durable grant commits. Capture
+    // deployment inputs before the database cut, not after that consumption.
+    const deployment = await captureDeployment(stage, settings, cipher);
     const startedAt = new Date().toISOString();
     const cut = await store.snapshot(join(stage, 'store'));
     const endedAt = new Date().toISOString();
@@ -97,7 +104,6 @@ export async function createBackup(
     }
     // No empty directories survive the exact manifest inventory.
     if (!media.length) await Deno.remove(join(stage, 'media'));
-    const deployment = await captureDeployment(stage, settings, cipher);
     const manifest: Manifest = {
       format: 1,
       backupId: crypto.randomUUID(),
@@ -193,18 +199,25 @@ async function captureDeployment(
   ): Promise<string> {
     source = resolve(source);
     await rootDirectory(dirname(source));
-    const stat = await Deno.lstat(source);
-    if (
-      !stat.isFile || cipher?.isPassphraseSource(stat) ||
-      (passphrase !== null && stat.dev === passphrase.dev &&
-        stat.ino === passphrase.ino)
-    ) {
-      throw new Error(
-        'backup deployment source is unsupported or is the excluded passphrase',
-      );
-    }
     const path = 'deployment/' + basename(name);
-    await copyPrivate(source, join(root, path));
+    await copyPrivateFile(source, join(root, path), (stat) => {
+      if (
+        (node === 'facade.linkkey' || node === 'facade.pairfile') &&
+        (stat.uid !== Deno.uid() || stat.mode === null ||
+          (stat.mode & 0o077) !== 0)
+      ) {
+        throw new Error(
+          'backup protected deployment source must be private and owned by this user',
+        );
+      }
+      if (
+        cipher?.isPassphraseSource(stat) ||
+        (passphrase !== null && stat.dev === passphrase.dev &&
+          stat.ino === passphrase.ino)
+      ) {
+        throw new Error('backup deployment source is the excluded passphrase');
+      }
+    });
     files.push({ node, source, path });
     return path;
   }
@@ -230,6 +243,25 @@ async function captureDeployment(
         path,
         section + '-ca-' + index + '.pem',
       );
+    }
+  }
+  const facade = settings.config.facade;
+  for (const leaf of ['linkcert', 'linkkey'] as const) {
+    if (facade[leaf] === '') continue;
+    await copy('facade.' + leaf, facade[leaf], 'facade-' + leaf + '.pem');
+  }
+  for (const [index, path] of facade.linkcacerts.entries()) {
+    await copy(
+      'facade.linkcacerts.' + index,
+      path,
+      'facade-ca-' + index + '.pem',
+    );
+  }
+  if (facade.pairfile !== '') {
+    try {
+      await copy('facade.pairfile', facade.pairfile, 'facade-pairing.json');
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
   }
   const path = 'deployment/effective.toml';

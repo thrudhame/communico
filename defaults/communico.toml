@@ -6,6 +6,8 @@
 [server]
 # Homeserver DNS name. COMMUNICO_SERVER_NAME (formerly SERVER_NAME)
 name = "localhost"
+# Process authority, not a different Matrix server name. COMMUNICO_SERVER_ROLE
+role = "home"
 # The one listener's port. COMMUNICO_SERVER_PORT (formerly APP_PORT)
 port = 8008
 # Admission stops immediately on SIGTERM/SIGINT; admitted work gets this long.
@@ -35,6 +37,44 @@ encrypt = false
 # passphrase, as with GnuPG. Never archived or placed in command arguments.
 # COMMUNICO_BACKUP_PASSPHRASEFILE
 passphrasefile = ""
+
+[facade]
+# Delivered role capability. F2/F3 are not implemented. COMMUNICO_FACADE_PHASE
+phase = "f1"
+# Enabled peer IDs from the durable home pairing registry. Empty is standalone.
+# COMMUNICO_FACADE_NODES
+nodes = []
+# Public HTTPS link base URL and immutable node ID. COMMUNICO_FACADE_URL / NODEID
+url = ""
+nodeid = ""
+# Protected out-of-band enrollment bundle. Facade uses it for its first accepted
+# binding; subsequent enrollment uses local accept. Home needs it only until its
+# durable transcript/grant exists. COMMUNICO_FACADE_PAIRFILE
+pairfile = ""
+# Dedicated mTLS listener/client identity, independent of Matrix signing/TLS.
+# COMMUNICO_FACADE_LINKPORT / LINKCERT / LINKKEY / LINKCACERTS
+linkport = 8449
+linkcert = ""
+linkkey = ""
+linkcacerts = []
+# Notices are hints; periodic durable head checks always run.
+# COMMUNICO_FACADE_NOTIFY / POLLSECONDS / RECONNECTMAXSECONDS
+notify = "websocket"
+pollseconds = 5
+reconnectmaxseconds = 10
+# Direct home egress still coordinates its frozen batch with the facade owner.
+# COMMUNICO_FACADE_OUTBOUND / REPLICATEROOMS
+outbound = "direct"
+replicaterooms = "local"
+# Zero is unlimited. Age flags work, never evicts acknowledged undrained work.
+# COMMUNICO_FACADE_MAILBOXMAXBYTES / MAILBOXMAXAGEDAYS / MAXOFFLINEDAYS
+mailboxmaxbytes = 0
+mailboxmaxagedays = 0
+maxofflinedays = 0
+# Whole-record page targets, independent of Matrix transaction envelope limits.
+# Oversized singleton records remain whole. COMMUNICO_FACADE_BATCHMAXBYTES / BATCHMAXITEMS
+batchmaxbytes = 12500000
+batchmaxitems = 1000
 
 [wellknown]
 # Public client API base URL; empty disables /.well-known/matrix/client (404).
@@ -319,6 +359,8 @@ wellknownmaxage = 86400
 # Outbound: TCP connect budget and whole-request budget, ms. Discovery
 # hops (.well-known, SRV, key fetch) must fail fast — Complement's
 # two-server tests resolve `hs1` with no .well-known and no SRV.
+# The whole-request budget also covers finite facade-link exchanges and notice
+# handshakes, not an admitted long-lived SSE/WebSocket notice connection.
 # COMMUNICO_FEDERATION_CONNECTMS / COMMUNICO_FEDERATION_TIMEOUTMS
 connectms = 5000
 timeoutms = 30000

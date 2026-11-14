@@ -281,7 +281,10 @@ export class Store implements StartupStore {
 
 export async function openStore(
   config: StoreConfig,
-  options: { schemas?: StoreSchemas } = {},
+  options: {
+    schemas?: StoreSchemas;
+    beforeStartup?(store: Store): Promise<unknown>;
+  } = {},
 ): Promise<Store> {
   const ffi = new Turso(config.library);
   let serverDb: Db | undefined;
@@ -331,6 +334,9 @@ export async function openStore(
       tenants: options.schemas?.tenant,
     });
     const store = new Store(ffi, serverDb, pool, ownership);
+    // The composition root binds runtime authority before a recovery hook may
+    // project data or schedule owner-specific intents. Failure unwinds the pool.
+    await options.beforeStartup?.(store);
     for (const hook of startupHooks()) await hook(store);
     return store;
   } catch (error) {

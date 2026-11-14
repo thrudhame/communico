@@ -3,7 +3,7 @@
 // bytes stay private and unusable until both GnuPG and the plaintext digest pass.
 import { dirname, join } from '@std/path';
 import { type FileHandle, open } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { openRegularFile } from '#engine/store/files.ts';
 import type { Config } from '#engine/config.ts';
 import {
   describePayload,
@@ -27,38 +27,9 @@ async function agent(
 }
 
 async function readPassphrase(path: string) {
-  let file: FileHandle;
-  try {
-    // O_NONBLOCK lets fstat reject a substituted FIFO without waiting for a
-    // writer. A regular file's read behavior is unchanged by that flag.
-    file = await open(
-      path,
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ELOOP') {
-      throw new Error('backup passphrase source must be a regular file', {
-        cause: error,
-      });
-    }
-    throw error;
-  }
+  const { file, stat } = await openRegularFile(path);
   let bytes: Uint8Array | undefined;
   try {
-    // Scoped Deno permissions can resolve a final symlink before Node's open
-    // flags reach the kernel. Check the entry with the descriptor already
-    // pinned, then require that both observations name the same file.
-    const entry = await Deno.lstat(path);
-    if (!entry.isFile) {
-      throw new Error('backup passphrase source must be a regular file');
-    }
-    const stat = await file.stat();
-    if (!stat.isFile()) {
-      throw new Error('backup passphrase source must be a regular file');
-    }
-    if (entry.dev !== stat.dev || entry.ino !== stat.ino) {
-      throw new Error('backup passphrase source changed while opening');
-    }
     if (stat.uid !== Deno.uid() || (stat.mode & 0o077) !== 0) {
       throw new Error(
         'backup passphrase source must be private and owned by this user',

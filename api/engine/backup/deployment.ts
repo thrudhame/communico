@@ -23,6 +23,10 @@ function writeNode(
 ): void {
   let node = root;
   for (const part of path.slice(0, -1)) {
+    // New schema sections may not exist in an older effective configuration.
+    // Add only the structure needed by an explicitly supplied current leaf;
+    // shipped defaults still own every unspecified value.
+    if (node[part] === undefined) node[part] = {};
     if (node[part] === null || typeof node[part] !== 'object') {
       throw new Error('invalid archived configuration structure');
     }
@@ -100,7 +104,7 @@ export async function restoreDeployment(
       continue;
     }
     if (
-      !/^(?:federation\.(?:cert|key)|(?:federation|push)\.cacerts\.[0-9]+)$/
+      !/^(?:federation\.(?:cert|key)|(?:federation|push)\.cacerts\.[0-9]+|facade\.(?:linkcert|linkkey|pairfile|linkcacerts\.[0-9]+))$/
         .test(file.node)
     ) throw new Error('unsupported deployment config node');
     const parts = file.node.split('.');

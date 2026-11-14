@@ -14,6 +14,8 @@ import { roomSchema } from '#engine/room/schema.ts';
 import { tenantSchema } from '#engine/tenant/schema.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
+import { loadLinkTls } from '#engine/facade/transport.ts';
+import { certificatePin } from '#engine/facade/identity.ts';
 
 async function fixture(encrypted = false) {
   const root = await Deno.makeTempDir({ prefix: "restore's-control-" });
@@ -320,6 +322,73 @@ Deno.test('offline restore: target overrides preserve the Matrix name and never 
       await Deno.readTextFile(result.reportPath),
       JSON.stringify(result.report, null, 2) + '\n',
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('offline restore: portable facade TLS and protected bootstrap reach the real link TLS loader', async () => {
+  const f = await fixture();
+  try {
+    const cert = join(f.root, 'home-link.crt'),
+      key = join(f.root, 'home-link.key');
+    const ca = join(f.root, 'home-link-ca.crt'),
+      pair = join(f.root, 'home-pairing.json');
+    await Deno.copyFile('tests/fixtures/tls/localhost.crt', cert);
+    await Deno.copyFile('tests/fixtures/tls/localhost.key', key);
+    await Deno.copyFile('tests/fixtures/tls/ca.crt', ca);
+    await Deno.chmod(key, 0o600);
+    await Deno.writeTextFile(pair, '{"fixture":"retained enrollment input"}', {
+      mode: 0o600,
+    });
+    const settings = {
+      ...f.targetSettings,
+      config: {
+        ...f.cfg,
+        facade: {
+          ...f.cfg.facade,
+          linkcert: cert,
+          linkkey: key,
+          linkcacerts: [ca],
+          pairfile: pair,
+        },
+      },
+    };
+    const source = await openStore(f.cfg.store, {
+      schemas: { room: roomSchema, tenant: tenantSchema, server: serverSchema },
+    });
+    const bundle = join(f.root, 'facade-deployment');
+    try {
+      await createBackup(source, bundle, settings);
+    } finally {
+      await source.close();
+    }
+    const result = await restoreBackup(bundle, {}, f.targetSettings);
+    const loaded = loadConfig({
+      defaultsPath: f.targetSettings.defaultsPath,
+      configPath: result.configPath,
+      env: {},
+    });
+    const tls = await loadLinkTls(loaded.config.facade);
+    assertEquals(
+      certificatePin(tls.cert),
+      certificatePin(await Deno.readTextFile(cert)),
+    );
+    assertEquals(tls.key, await Deno.readTextFile(key));
+    assertEquals(tls.ca, [await Deno.readTextFile(ca)]);
+    assertEquals(
+      await Deno.readTextFile(loaded.config.facade.pairfile),
+      await Deno.readTextFile(pair),
+    );
+    assertEquals(
+      (await Deno.stat(loaded.config.facade.linkkey)).mode! & 0o777,
+      0o600,
+    );
+    assertEquals(
+      (await Deno.stat(loaded.config.facade.pairfile)).mode! & 0o777,
+      0o600,
+    );
+    assertEquals(loaded.config.server.role, 'home');
   } finally {
     await f.close();
   }
