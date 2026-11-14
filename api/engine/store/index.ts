@@ -226,7 +226,6 @@ export class Store implements StartupStore {
         ...[...sources.values()].map((source) => source.release()),
         ...(server ? [server.release()] : []),
       ]);
-      await removeOwned(staging);
       const errors = released.flatMap((result) =>
         result.status === 'rejected' ? [result.reason] : []
       );
@@ -282,20 +281,46 @@ export class Store implements StartupStore {
           const path = join(staging, file.path);
           await Deno.mkdir(dirname(path), { recursive: true, mode: 0o700 });
           await reader.export(path);
-        } finally {
-          // Each completed file releases its reader immediately, so catch-up
-          // maintenance need not wait for the remaining database/media exports.
-          await release();
+        } catch (error) {
+          try {
+            await release();
+          } catch (cleanup) {
+            throw new AggregateError(
+              [error, cleanup],
+              'snapshot export and release failed',
+              { cause: error },
+            );
+          }
+          throw error;
         }
+        // Each completed file releases its reader immediately, so catch-up
+        // maintenance need not wait for the remaining database/media exports.
+        await release();
       }
+      // Complete fallible source cleanup and metadata before publication. A
+      // release failure must not turn an already-published cut into a rejection.
+      await releaseSources();
+      const native = await this.ffi.buildInfo();
       await publish(this.ffi, staging, destination);
       return {
         files: readers.map(({ file }) => file),
         pauseMs,
-        native: await this.ffi.buildInfo(),
+        native,
       };
-    } finally {
-      await releaseSources();
+    } catch (error) {
+      const cleanup = await Promise.allSettled([releaseSources()]);
+      cleanup.push(...await Promise.allSettled([removeOwned(staging)]));
+      const errors = cleanup.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : []
+      );
+      if (errors.length) {
+        throw new AggregateError(
+          [error, ...errors],
+          'snapshot and cleanup failed',
+          { cause: error },
+        );
+      }
+      throw error;
     }
   }
 

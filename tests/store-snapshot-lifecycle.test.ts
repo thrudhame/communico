@@ -213,3 +213,58 @@ Deno.test('store snapshot: pin and export failures release all native and lifecy
     });
   }
 });
+
+for (const phase of ['pin', 'export', 'release']) {
+  Deno.test(`store snapshot: ${phase} failure preserves the primary cause through cleanup`, async () => {
+    const { root, store } = await fixture();
+    await store.room('!cleanup:test', { create: true });
+    const prepare = Db.prototype.prepareReadSnapshot;
+    const primary = new Error('original ' + phase + ' failure');
+    const cleanup = new Error('independent source release failure');
+    Db.prototype.prepareReadSnapshot = async function () {
+      const prepared = await prepare.call(this);
+      if (!this.path.includes('/rooms/')) return prepared;
+      return {
+        pin: async () => {
+          if (phase === 'pin') throw primary;
+          const reader = await prepared.pin();
+          return {
+            ...reader,
+            export: phase === 'export'
+              ? () => Promise.reject(primary)
+              : (path) => reader.export(path),
+          };
+        },
+        release: async () => {
+          await prepared.release();
+          throw cleanup;
+        },
+      };
+    };
+    const causes = (error: unknown): unknown[] => [
+      error,
+      ...(error instanceof AggregateError ? error.errors.flatMap(causes) : []),
+      ...(error instanceof Error && error.cause ? causes(error.cause) : []),
+    ];
+    try {
+      const error = await assertRejects(() => store.snapshot(root + '/failed'));
+      assert(causes(error).includes(cleanup));
+      if (phase !== 'release') assert(causes(error).includes(primary));
+      await assertRejects(
+        () => Deno.stat(root + '/failed'),
+        Deno.errors.NotFound,
+      );
+      assertEquals(
+        (await Array.fromAsync(Deno.readDir(root + '/live')))
+          .filter((entry) => entry.name.startsWith('.backup-')),
+        [],
+      );
+      Db.prototype.prepareReadSnapshot = prepare;
+      await store.snapshot(root + '/after');
+    } finally {
+      Db.prototype.prepareReadSnapshot = prepare;
+      await store.close();
+      await Deno.remove(root, { recursive: true });
+    }
+  });
+}
