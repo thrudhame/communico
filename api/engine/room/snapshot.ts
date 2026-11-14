@@ -118,3 +118,33 @@ export async function verifySnapshot(input: {
     createId: String(creates[0].event_id),
   };
 }
+
+/** The boundary event must be authorized against the imported before-state,
+ * not just have valid bytes or an accepted declared auth chain. */
+export async function authorizeSnapshotEvent(
+  event: Pdu,
+  roomVersion: string,
+  verified: VerifiedSnapshot,
+): Promise<void> {
+  const rulebook = getRulebook(roomVersion);
+  const id = String(event.event_id);
+  if ([...verified.snapshot.values()].includes(id)) {
+    badResponse('boundary event appears in its own before-state');
+  }
+  const store: EventStore = await withAuthProofs({
+    get: (key) => key === id ? event : verified.pack.get(key),
+    isRejected: (key) => verified.rejected.has(key),
+  }, [...verified.pack.values(), event]);
+  const chain = checkDeclaredAuth(event, rulebook, store, verified.createId);
+  if (!chain.ok) {
+    badResponse(
+      `the join is not authorized by its auth events (${chain.rule})`,
+    );
+  }
+  const state = rulebook.checkAuthAgainstState(event, verified.snapshot, store);
+  if (!state.ok) {
+    badResponse(
+      `the join is not authorized against the snapshot state (${state.rule})`,
+    );
+  }
+}
