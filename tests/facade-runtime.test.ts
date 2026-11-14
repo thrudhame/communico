@@ -10,15 +10,15 @@ import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { lookupAlias } from '#engine/server/aliases.ts';
 import { listedRooms } from '#engine/server/directory.ts';
 
-Deno.test('cold roles enroll through local admin without facade tenant genesis, Matrix or home workers', async () => {
+Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   const tls = await facadeTls();
   const ports = [];
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 4; i++) {
     const probe = Deno.listen({ hostname: '127.0.0.1', port: 0 });
     ports.push(probe.addr.port);
     probe.close();
   }
-  const [facadePort, homePort, linkPort] = ports;
+  const [facadePort, homePort, linkPort, federationPort] = ports;
   const facadeConfig = `${tls.dir}/facade.toml`;
   const homeConfig = `${tls.dir}/home.toml`;
   const bundlefile = `${tls.dir}/bundle.json`;
@@ -26,9 +26,11 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
     `[server]\nname="logical.test"\nrole="${role}"\nport=${port}\n[store]\ndir="${tls.dir}/${side}-store"\n[media]\nroot="${tls.dir}/${side}-media"\n[admin]\nsocket="${tls.dir}/${side}.sock"\n`;
   const link = (side: string) =>
     `[facade]\nnodeid="edge_a"\nurl="https://127.0.0.1:${linkPort}"\nlinkport=${linkPort}\nlinkcert="${tls.dir}/${side}.crt"\nlinkkey="${tls.dir}/${side}.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\nreconnectmaxseconds=1\n`;
+  const facadeFederation =
+    `[federation]\nenabled=true\nport=${federationPort}\ncert="${tls.dir}/facade.crt"\nkey="${tls.dir}/facade.key"\n`;
   await Deno.writeTextFile(
     facadeConfig,
-    common('facade', facadePort, 'facade') + '[federation]\nenabled=true\n' +
+    common('facade', facadePort, 'facade') + facadeFederation +
       link('facade'),
   );
   await Deno.writeTextFile(
@@ -137,7 +139,7 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
     const roster = (await status()).body.result.keyRoster;
     assert(roster.revision > 0);
     assert(roster.lastHome > 0);
-    assertEquals((await status()).body.result.matrix, false);
+    await until(async () => (await status()).body.result.matrix === true);
     const roomScope = async () =>
       (await status()).body.result.scopes.find((scope: { scope: string }) =>
         scope.scope === 'room:' + roomId
@@ -153,6 +155,46 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
         scope: { scope: string; ready: boolean },
       ) => scope.scope === 'directory' && scope.ready)
     );
+    const publicGet = (path: string) =>
+      fetch(`http://127.0.0.1:${facadePort}${path}`);
+    const versions = await publicGet('/_matrix/client/versions');
+    assertEquals(versions.status, 200);
+    assertEquals(await versions.json(), {
+      versions: [],
+      unstable_features: {},
+    });
+    const tlsClient = Deno.createHttpClient({ caCerts: tls.facade.ca });
+    try {
+      const secure = await fetch(
+        `https://127.0.0.1:${federationPort}/_matrix/client/versions`,
+        { client: tlsClient },
+      );
+      assertEquals(secure.status, 200);
+      assertEquals(await secure.json(), {
+        versions: [],
+        unstable_features: {},
+      });
+    } finally {
+      tlsClient.close();
+    }
+    const keyResponse = await publicGet('/_matrix/key/v2/server');
+    assertEquals(keyResponse.status, 200);
+    const document = await keyResponse.json();
+    assertEquals(document.server_name, 'logical.test');
+    assertEquals(Object.keys(document.verify_keys).length, 2);
+    assert(Object.hasOwn(document.verify_keys, initialized.keyId));
+    assert(
+      Object.hasOwn(document.signatures['logical.test'], initialized.keyId),
+    );
+    const hidden = await publicGet('/_matrix/client/v3/login');
+    assertEquals(hidden.status, 404);
+    assertEquals((await hidden.json()).errcode, 'M_UNRECOGNIZED');
+    const ingress = await fetch(
+      `http://127.0.0.1:${facadePort}/_matrix/federation/v1/send/not-yet`,
+      { method: 'PUT', body: '{}' },
+    );
+    assertEquals(ingress.status, 503);
+    await ingress.body?.cancel();
     const publicCut = (await publicScope()).cut;
     const beforeProfileRoomCut = (await roomScope()).cut;
     assertEquals(
@@ -187,9 +229,11 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
       (await roomScope())?.ready === true
     );
     const replicatedCut = (await roomScope()).cut;
-    await assertRejects(() =>
-      Deno.connect({ hostname: '127.0.0.1', port: facadePort })
-    );
+    const connection = await Deno.connect({
+      hostname: '127.0.0.1',
+      port: facadePort,
+    });
+    connection.close();
     assertEquals(
       await Deno.stat(tls.dir + '/facade-media').catch(() => null),
       null,
@@ -198,7 +242,7 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
     await Deno.remove(bundlefile);
     await Deno.writeTextFile(
       facadeConfig,
-      common('facade', facadePort, 'facade') + '[federation]\nenabled=true\n' +
+      common('facade', facadePort, 'facade') + facadeFederation +
         link('facade') + `pairfile="${bundlefile}"\n`,
     );
     await facade.stop();
@@ -218,6 +262,9 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
       id: paired.body.result.id,
     });
     await until(async () => (await status()).body.result.enrolled === false);
+    const revoked = await publicGet('/_matrix/key/v2/server');
+    assertEquals(revoked.status, 503);
+    await revoked.body?.cancel();
     await home.stop();
     home = undefined;
     await facade.stop();

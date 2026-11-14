@@ -46,6 +46,7 @@ import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks, recoverServer } from '#engine/server/startup.ts';
 import type { Database as Db } from '#engine/store/db.ts';
+import type { Signer } from '#engine/room/signer.ts';
 import {
   openStore,
   type Store,
@@ -74,9 +75,11 @@ export type App = {
 /** Granted read dependencies are supplied by the node composition root. The
  * endpoint tree never reconstructs a home identity or reaches into a link owner. */
 export type ReplicaAccess = {
-  requireScope(scope: string): Promise<void>;
+  requireScope(scope: string, allowAbsent?: boolean): Promise<void>;
   keyDocument(): Promise<KeyDoc>;
   publicRooms(): Promise<boolean>;
+  keys: KeyStore;
+  signer: Signer;
 };
 
 let hooksInstalled = false;
@@ -210,7 +213,7 @@ export async function openReplicaApp(
     store,
     server,
     tenant,
-    federationKeys: keyStore(server, { signer: tenant.signer() }),
+    federationKeys: replica.keys,
     federationEdus: eduState(server, tenant.serverName, store),
     sender: null,
     replica,

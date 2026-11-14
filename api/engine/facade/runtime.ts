@@ -1,6 +1,7 @@
 // Independent node composition: no application singleton, home tenant genesis,
 // public Matrix listener, or home-only worker is needed for local enrollment.
 import { config, serverName } from '#engine/config.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -172,6 +173,43 @@ export async function openFacadeRuntime(
     notices,
     capabilities: caps,
     pairings,
+    verificationKeys: async () => (await keyOwner()).verificationKeys(),
+    requestSigner: async () => (await keyOwner()).requestSigner(),
+    async grantedTenant() {
+      if (!node) return null;
+      try {
+        await (await pairings()).active();
+        return tenant ?? null;
+      } catch (error) {
+        if (error instanceof LinkError && error.code === 'LINK_UNPAIRED') {
+          return null;
+        }
+        throw error;
+      }
+    },
+    async requireScope(scope: string, allowAbsent?: boolean) {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+      ).requireScope(scope, allowAbsent);
+    },
+    async publicRooms() {
+      const owner = new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+      );
+      const view = await owner.snapshot();
+      if (!view) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'directory replica not ready',
+        );
+      }
+      return view.publicRooms;
+    },
     async initialize() {
       const pending = initializing ??= initializeNode(
         server,

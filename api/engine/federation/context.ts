@@ -8,17 +8,22 @@ import type { ServeDeps } from './serve.ts';
 
 export function serveDeps(): ServeDeps {
   const app = theApp();
-  return { store: app.store, server: app.server, self: app.tenant.serverName };
+  return {
+    store: app.store,
+    server: app.server,
+    self: app.tenant.serverName,
+    requireScope: app.replica?.requireScope,
+  };
 }
 
 export function inviteDeps(): InviteDeps {
   const app = theApp();
-  const signer = app.tenant.signer();
+  const signer = app.replica ? app.replica.signer : app.tenant.signer();
   return {
     store: app.store,
     server: app.server,
     signer,
-    keys: productionKeyResolver(app.server, signer),
+    keys: productionKeyResolver(app.server, signer, app.federationKeys),
     self: app.tenant.serverName,
     wake: (destination) => app.sender?.wake(destination),
   };

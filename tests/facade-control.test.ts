@@ -202,6 +202,29 @@ Deno.test('offline renewal cap preserves old validity, and authenticated contact
   }
 });
 
+Deno.test('facade request signing refuses an expired offline authority before creating a signature', async () => {
+  setConfigForTests({
+    federation: { keyvalidityhours: 1 },
+    facade: { maxofflinedays: 1 },
+  });
+  const f = await fixture();
+  try {
+    const record = await f.receive();
+    await f.keys().apply(f.journal(), record);
+    const past = Date.now() - 2 * 86400000;
+    await f.keys().contact(past);
+    await f.keys().document(past);
+    await assertRejects(
+      () => f.keys().requestSigner().sign('not signed'),
+      MatrixError,
+      'expired',
+    );
+  } finally {
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
 Deno.test('roster retirement is preserved, and changed or forged control cannot advance the apply cut', async () => {
   const f = await fixture();
   try {

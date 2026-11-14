@@ -11,6 +11,7 @@ import { admitState } from './state-admission.ts';
 
 export async function lookupRoom(roomId: string): Promise<Room | null> {
   try {
+    await theApp().replica?.requireScope('room:' + roomId, true);
     return await openRoom(theApp().store, roomId);
   } catch (e) {
     if (e instanceof Deno.errors.NotFound) return null;

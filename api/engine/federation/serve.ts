@@ -23,7 +23,17 @@ import {
   serverInState,
 } from './room.ts';
 
-export type ServeDeps = { store: Store; server: Db; self: string };
+export type ServeDeps = {
+  store: Store;
+  server: Db;
+  self: string;
+  requireScope?(scope: string): Promise<void>;
+};
+
+async function readyRoom(deps: ServeDeps, roomId: string) {
+  await deps.requireScope?.('room:' + roomId);
+  return await heldRoom(deps.store, roomId);
+}
 
 async function inRoom(tx: RoomTx, origin: string) {
   await assertAcl(tx, origin);
@@ -123,7 +133,7 @@ export async function serveTimestamp(
   origin: string,
   deps: ServeDeps,
 ) {
-  const room = await heldRoom(deps.store, roomId);
+  const room = await readyRoom(deps, roomId);
   return await room.tx(async (tx) => {
     await inRoom(tx, origin);
     const hit = await findTimestamp(
@@ -148,7 +158,7 @@ export async function serveStateIds(
   origin: string,
   deps: ServeDeps,
 ) {
-  const room = await heldRoom(deps.store, roomId);
+  const room = await readyRoom(deps, roomId);
   return await room.tx(async (tx) => {
     await inRoom(tx, origin);
     const ids = [...(await stateBefore(tx, eventId)).values()];
@@ -165,7 +175,7 @@ export async function serveState(
   origin: string,
   deps: ServeDeps,
 ) {
-  const room = await heldRoom(deps.store, roomId);
+  const room = await readyRoom(deps, roomId);
   return await room.tx(async (tx) => {
     const version = await inRoom(tx, origin);
     const ids = [...(await stateBefore(tx, eventId)).values()];
@@ -218,8 +228,11 @@ export async function serveEvent(
   deps: ServeDeps,
 ) {
   const roomId = await roomOf(deps.server, eventId);
-  if (roomId === null) throw new MatrixError(404, 'M_NOT_FOUND', eventId);
-  const room = await heldRoom(deps.store, roomId);
+  if (roomId === null) {
+    await deps.requireScope?.('rooms');
+    throw new MatrixError(404, 'M_NOT_FOUND', eventId);
+  }
+  const room = await readyRoom(deps, roomId);
   return await room.tx(async (tx) => {
     const version = await inRoom(tx, origin);
     const pdu = await pduAt(tx, eventId);
@@ -238,7 +251,7 @@ export async function serveEventAuth(
   origin: string,
   deps: ServeDeps,
 ) {
-  const room = await heldRoom(deps.store, roomId);
+  const room = await readyRoom(deps, roomId);
   return await room.tx(async (tx) => {
     const version = await inRoom(tx, origin);
     if (await pduAt(tx, eventId) === null) {
@@ -346,7 +359,7 @@ export async function serveBackfill(
   deps: ServeDeps,
 ) {
   const request = backfillArguments(v, limit);
-  const room = await heldRoom(deps.store, roomId);
+  const room = await readyRoom(deps, roomId);
   return await room.tx(async (tx) => {
     const version = await inRoom(tx, origin);
     const cap = Math.min(request.limit, config().federation.backfillmax);
@@ -367,7 +380,7 @@ export async function serveGetMissingEvents(
   deps: ServeDeps,
 ) {
   const request = missingEventsRequest(body);
-  const room = await heldRoom(deps.store, roomId);
+  const room = await readyRoom(deps, roomId);
   return await room.tx(async (tx) => {
     const version = await inRoom(tx, origin);
     const cap = Math.min(request.limit, config().federation.missingmax);

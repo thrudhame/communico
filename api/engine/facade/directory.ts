@@ -211,13 +211,27 @@ export class DirectoryReplicas {
       : null;
   }
 
-  async requireScope(scope: string): Promise<void> {
+  async requireScope(scope: string, allowAbsent = false): Promise<void> {
     const view = await this.snapshot();
     const unavailable = () => {
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
     };
     if (!view) unavailable();
     if (scope === 'directory') return;
+    if (scope === 'rooms') {
+      const grant = await this.pairings.active();
+      const incoming = await this.db.query(
+        "SELECT DISTINCT stream FROM facade_streams WHERE peer='home' AND direction='in' AND source='home' AND incarnation=? AND stream LIKE 'room:%'",
+        [grant.body.transcript.body.context.id],
+      );
+      for (
+        const room of new Set([
+          ...view!.rooms.map((id) => 'room:' + id),
+          ...incoming.map((row) => String(row.stream)),
+        ])
+      ) await this.requireScope(room);
+      return;
+    }
     const grant = await this.pairings.active();
     const [held] = await this.db.query(
       "SELECT s.received,s.applied,v.source_cut,v.ready FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
@@ -231,6 +245,7 @@ export class DirectoryReplicas {
       Number(held.source_cut) >= (required ?? 0)
     ) return;
     if (required !== undefined || held) unavailable();
+    if (allowAbsent) return;
     throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
   }
 

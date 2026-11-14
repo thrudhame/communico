@@ -10,6 +10,11 @@ import { serveDeps } from '#engine/federation/context.ts';
 import { serveEvent } from '#engine/federation/serve.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
+import { keyStore } from '#engine/federation/keys.ts';
+import * as serving from '#engine/federation/serve.ts';
+import { pathfinder } from '@pathfinder/pathfinder';
+import { seedServer } from './federation/doc-helper.ts';
+import { fedCaller } from './http-federation.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { exportPublicReplica, PublicReplicas } from '#engine/facade/public.ts';
 import {
@@ -863,6 +868,10 @@ Deno.test('enrolled replica app composes ordinary reads and recovery without cre
     const journal = await f.journal();
     await journal.receive('home', [record]);
     assert(await (await f.replicas()).apply(journal, record));
+    const inventory = await f.directoryExport();
+    assert(inventory);
+    await journal.receive('home', [inventory]);
+    assert(await (await f.directoryOwner()).apply(journal, inventory));
     const tenant = await f.edgeTenant();
     setConfigForTests({
       server: { name: 'logical.test', role: 'facade' },
@@ -870,7 +879,10 @@ Deno.test('enrolled replica app composes ordinary reads and recovery without cre
     });
     const directory = await f.directoryOwner();
     const app = await openReplicaApp(f.edgeStore(), tenant, {
-      requireScope: (scope) => directory.requireScope(scope),
+      requireScope: (scope, allowAbsent) =>
+        directory.requireScope(scope, allowAbsent),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
       keyDocument: () =>
         Promise.reject(
           new Error('key document is supplied by the enrolled owner'),
@@ -897,6 +909,73 @@ Deno.test('enrolled replica app composes ordinary reads and recovery without cre
     const served = await serveEvent(eventId, f.signing.name, serveDeps());
     assertEquals(served.origin, f.tenant.serverName);
     assertEquals(served.pdus[0].content, f.source.events.get(eventId)!.content);
+    const homeDeps = {
+      store: f.home,
+      server: await f.home.server(),
+      self: f.tenant.serverName,
+    };
+    const origin = f.signing.name, roomId = f.source.roomId;
+    const readers = [
+      (deps: serving.ServeDeps) =>
+        serving.serveState(roomId, eventId, origin, deps),
+      (deps: serving.ServeDeps) =>
+        serving.serveStateIds(roomId, eventId, origin, deps),
+      (deps: serving.ServeDeps) =>
+        serving.serveEventAuth(roomId, eventId, origin, deps),
+      (deps: serving.ServeDeps) =>
+        serving.serveBackfill(roomId, [eventId], 10, origin, deps),
+      (deps: serving.ServeDeps) =>
+        serving.serveGetMissingEvents(
+          roomId,
+          { earliest_events: [], latest_events: [eventId], limit: 10 },
+          origin,
+          deps,
+        ),
+      (deps: serving.ServeDeps) =>
+        serving.serveTimestamp(roomId, { ts: 0, dir: 'f' }, origin, deps),
+    ];
+    const semantic = (value: unknown) => {
+      const out = { ...value as Record<string, unknown> };
+      delete out.origin_server_ts;
+      return out;
+    };
+    for (const read of readers) {
+      assertEquals(
+        semantic(await read(serveDeps())),
+        semantic(await read(homeDeps)),
+      );
+    }
+    const next = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'not applied yet' },
+    });
+    await f.ingest([next]);
+    const suffix = await f.exports();
+    assert(suffix);
+    await journal.receive('home', [suffix]);
+    for (const read of readers) {
+      const unavailable = await assertRejects(
+        () => read(serveDeps()),
+        MatrixError,
+      );
+      assertEquals(unavailable.status, 503);
+    }
+    const unknown = await assertRejects(
+      () => serveEvent('$unknown', origin, serveDeps()),
+      MatrixError,
+    );
+    assertEquals(unknown.status, 503);
+    assert(await (await f.replicas()).apply(journal, suffix));
+    assertEquals(
+      (await serveEvent(String(next.event_id), origin, serveDeps())).pdus[0]
+        .content,
+      next.content,
+    );
+    const absent = await assertRejects(
+      () => serveEvent('$unknown', origin, serveDeps()),
+      MatrixError,
+    );
+    assertEquals(absent.status, 404);
     await assertRejects(
       () => openReplicaApp(f.edgeStore(), tenant, app.replica!),
       Error,
@@ -957,6 +1036,131 @@ Deno.test('directory and peer policy exports use the published server cut withou
     await held;
     f.home.room = room;
     await exporting?.catch(() => undefined);
+    await f.close();
+  }
+});
+
+Deno.test('real replica HTTP reads distinguish required cuts from absence and bind home directory policy', async () => {
+  const f = await fixture();
+  let http: Deno.HttpServer<Deno.NetAddr> | undefined;
+  setConfigForTests({
+    server: { name: 'logical.test' },
+    federation: { enabled: true, mode: 'open', publicrooms: false },
+  });
+  try {
+    await f.tenant.tx(async (tx) => {
+      await tx.users.insert('alice', 'Alice');
+      await tx.profiles.set('alice', 'displayname', 'Linked Alice');
+    });
+    await registerAlias(
+      await f.home.server(),
+      '#linked:logical.test',
+      f.source.roomId,
+      '@alice:logical.test',
+    );
+    await setVisibility(await f.home.server(), f.source.roomId, 'public');
+    const inventory = await f.directoryExport();
+    assert(inventory);
+    const journal = await f.journal(), directory = await f.directoryOwner();
+    await journal.receive('home', [inventory]);
+    assert(await directory.apply(journal, inventory));
+    await seedServer(await f.edgeServer(), f.signing);
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      federation: { enabled: true, mode: 'closed', publicrooms: true },
+    });
+    await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: (scope, allowAbsent) =>
+        directory.requireScope(scope, allowAbsent),
+      keyDocument: () =>
+        Promise.reject(new Error('unused key-document callback')),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      publicRooms: async () => (await directory.snapshot())!.publicRooms,
+    });
+    http = Deno.serve(
+      { hostname: '127.0.0.1', port: 0, onListen: () => {} },
+      await pathfinder({ roots: ['api/endpoints/matrix/'] }),
+    );
+    const base = `http://127.0.0.1:${http.addr.port}`;
+    const call = fedCaller((request) => {
+      const url = new URL(request.url);
+      return fetch(new Request(base + url.pathname + url.search, request));
+    }, f.signing);
+    const p = '/_matrix/federation/v1/';
+    const alias = p + 'query/directory?room_alias=' +
+      encodeURIComponent('#linked:logical.test');
+    const profile = p + 'query/profile?user_id=' +
+      encodeURIComponent('@alice:logical.test');
+    const devices = p + 'user/devices/' +
+      encodeURIComponent('@alice:logical.test');
+    const query = { device_keys: { '@alice:logical.test': [] } };
+    for (const path of [alias, profile, devices]) {
+      assertEquals((await call('GET', path)).status, 503);
+    }
+    assertEquals(
+      (await call('POST', p + 'user/keys/query', query)).status,
+      503,
+    );
+    assertEquals((await call('GET', p + 'publicRooms')).status, 403);
+    assertEquals(
+      (await call('POST', p + 'user/keys/query', {
+        device_keys: { '@absent:logical.test': [] },
+      })).status,
+      200,
+    );
+    assertEquals(
+      (await call(
+        'GET',
+        p + 'query/profile?user_id=' +
+          encodeURIComponent('@absent:logical.test'),
+      )).status,
+      404,
+    );
+    const room = await f.exports(), user = await f.publicExport();
+    assert(room && user);
+    await journal.receive('home', [room]);
+    await journal.receive('home', [user]);
+    assert(await (await f.replicas()).apply(journal, room));
+    assert(await (await f.publicOwner()).apply(journal, user));
+    assertEquals(await call('GET', alias), {
+      status: 200,
+      body: { room_id: f.source.roomId, servers: ['logical.test'] },
+    });
+    assertEquals(await call('GET', profile), {
+      status: 200,
+      body: { displayname: 'Linked Alice' },
+    });
+    assertEquals((await call('GET', devices)).status, 200);
+    assertEquals(
+      (await call('POST', p + 'user/keys/query', query)).status,
+      200,
+    );
+    setConfigForTests({
+      server: { name: 'logical.test' },
+      federation: { enabled: true, mode: 'open', publicrooms: true },
+    });
+    const next = await f.directoryExport();
+    assert(next);
+    await journal.receive('home', [next]);
+    assertEquals((await call('GET', profile)).status, 503);
+    assert(await directory.apply(journal, next));
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      federation: { enabled: true, publicrooms: false },
+    });
+    const published = await call('GET', p + 'publicRooms');
+    assertEquals(published.status, 200);
+    assertEquals(
+      (published.body.chunk as { room_id: string }[]).map((room) =>
+        room.room_id
+      ),
+      [f.source.roomId],
+    );
+  } finally {
+    await http?.shutdown();
+    await closeApp();
+    setConfigForTests({});
     await f.close();
   }
 });

@@ -7,8 +7,10 @@ import {
 
 export default async function () {
   assertFederationEnabled();
-  const { tenant, server } = theApp();
+  const { tenant, server, replica } = theApp();
   return keyDocResponse(
-    await homeKeyDocument(server, tenant.signer(), tenant.publicB64),
+    replica
+      ? await replica.keyDocument()
+      : await homeKeyDocument(server, tenant.signer(), tenant.publicB64),
   );
 }

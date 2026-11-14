@@ -10,6 +10,7 @@ import {
   signWithSigner,
 } from '#engine/federation/keys.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { federationPolicy } from '#engine/federation/policy.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import {
@@ -137,11 +138,22 @@ export class FacadeKeys {
     private readonly pairings: Pairings,
   ) {}
 
+  requestSigner(): Signer {
+    return {
+      serverName: this.signer.serverName,
+      keyId: this.signer.keyId,
+      sign: async (canonical) => {
+        await this.document();
+        return await this.signer.sign(canonical);
+      },
+    };
+  }
+
   /** Local signatures use the home-approved roster, never a dial to the logical
    * server (which may resolve back here). Remote keys retain ordinary acquisition.
    * This feeds the shared event verifier and request authentication unchanged. */
   verificationKeys(): KeyStore {
-    const remote = keyStore(this.db, { signer: this.signer });
+    const remote = keyStore(this.db, { signer: this.requestSigner() });
     return {
       ...remote,
       getVerifyKey: async (name, keyId, floor, purpose, context) => {
@@ -360,7 +372,8 @@ export class FacadeKeys {
         verify_keys: {},
         old_verify_keys: {},
         valid_until_ts: now +
-          Math.min(config().federation.keyvalidityhours, 168) * 3600000,
+          Math.min((await federationPolicy(this.db)).keyvalidityhours, 168) *
+            3600000,
         signatures: {},
       };
       for (const key of roster.keys) {
