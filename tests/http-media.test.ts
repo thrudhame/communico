@@ -347,6 +347,25 @@ test('local upload fsyncs bytes before close and rename, then parent before meta
 
 for (const failure of ['file-sync', 'directory-sync'] as const) {
   test(
+    'direct upload cleans all unpublished bytes after ' + failure,
+    async (root) => {
+      const user = await suite.registerTestUser(
+        'direct-fsync-' + failure,
+        'pw',
+      );
+      await observePublication(root, async () => {
+        const response = await upload(
+          user.access_token!,
+          new Uint8Array([7, 8]),
+          'text/plain',
+        );
+        await response.arrayBuffer();
+        assertEquals(response.status, 500);
+        assertEquals([...Deno.readDirSync(root)], []);
+      }, failure);
+    },
+  );
+  test(
     'failed ' + failure + ' leaves reserved metadata pending and permits retry',
     async (root) => {
       const user = await suite.registerTestUser('media-fsync-' + failure, 'pw');

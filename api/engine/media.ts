@@ -161,6 +161,7 @@ async function storeUploadBody(
     mode: 0o600,
   });
   let size = 0;
+  let renamed = false;
   try {
     if (stream !== null) {
       for await (const chunk of stream) {
@@ -184,6 +185,7 @@ async function storeUploadBody(
     file.close();
     file = null;
     await Deno.rename(partPath, finalPath);
+    renamed = true;
     const directory = await Deno.open(root, { read: true });
     try {
       await directory.sync();
@@ -192,7 +194,7 @@ async function storeUploadBody(
     }
   } catch (error) {
     file?.close();
-    await Deno.remove(partPath).catch((cleanup) => {
+    await Deno.remove(renamed ? finalPath : partPath).catch((cleanup) => {
       if (!(cleanup instanceof Deno.errors.NotFound)) throw cleanup;
     });
     throw error;

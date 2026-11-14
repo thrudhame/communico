@@ -234,3 +234,43 @@ Deno.test('backup bundle: TLS and CA references have portable mappings; excluded
     await f.close();
   }
 });
+
+Deno.test('backup bundle: passphrase exclusion retains the captured identity after its pathname is replaced', async () => {
+  const f = await fixture();
+  const makeTempDir = Deno.makeTempDir;
+  try {
+    const passphrase = join(f.root, 'captured-passphrase');
+    const alias = join(f.root, 'deployment-alias');
+    await Deno.writeTextFile(passphrase, 'original private passphrase\n', {
+      mode: 0o600,
+    });
+    await Deno.link(passphrase, alias);
+    f.settings.config.backup = { encrypt: true, passphrasefile: passphrase };
+    f.settings.config.federation = {
+      ...f.settings.config.federation,
+      key: alias,
+    };
+    f.settings.sources['federation.key'] = 'config';
+    let replaced = false;
+    Deno.makeTempDir = async (options) => {
+      const path = await makeTempDir(options);
+      if (!replaced && options?.prefix === '.gpg-') {
+        replaced = true;
+        await Deno.rename(passphrase, join(f.root, 'retained-passphrase'));
+        await Deno.writeTextFile(passphrase, 'replacement source\n', {
+          mode: 0o600,
+        });
+      }
+      return path;
+    };
+    await assertRejects(
+      () => createBackup(f.app.store, join(f.root, 'race-bundle'), f.settings),
+      Error,
+      'excluded passphrase',
+    );
+    assert(replaced, 'the source pathname replacement must actually occur');
+  } finally {
+    Deno.makeTempDir = makeTempDir;
+    await f.close();
+  }
+});

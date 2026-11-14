@@ -4,8 +4,13 @@ import metadata from '#root/deno.json' with { type: 'json' };
 
 // Real task permissions, separate server processes and public consumers. The
 // backup client receives an unusable native path to prove the live owner does it.
-for (const encrypted of [false, true]) {
-  Deno.test(`backup CLI: ${encrypted ? 'OpenPGP' : 'plaintext'} running-server control round trip`, async () => {
+for (
+  const [encrypted, defaultSocket] of [[false, false], [true, false], [
+    false,
+    true,
+  ]]
+) {
+  Deno.test(`backup CLI: ${encrypted ? 'OpenPGP' : 'plaintext'}${defaultSocket ? ' default admin socket' : ''} running-server control round trip`, async () => {
     const dir = await Deno.makeTempDir({ prefix: "cli's-backup-" });
     const socket = join(dir, 'admin.sock');
     const config = join(dir, 'source.toml');
@@ -21,8 +26,9 @@ for (const encrypted of [false, true]) {
     await Deno.writeTextFile(passphrase, 'control passphrase\n', {
       mode: 0o600,
     });
-    const common =
-      `[server]\nname="control.test"\nport=${port}\n[admin]\nsocket="${socket}"\n[federation]\nenabled=true\nport=${tlsPort}\ncert="tests/fixtures/tls/localhost.crt"\nkey="tests/fixtures/tls/localhost.key"\n[backup]\nencrypt=${encrypted}\npassphrasefile="${passphrase}"\n`;
+    const common = `[server]\nname="control.test"\nport=${port}\n` +
+      (defaultSocket ? '' : `[admin]\nsocket="${socket}"\n`) +
+      `[federation]\nenabled=true\nport=${tlsPort}\ncert="tests/fixtures/tls/localhost.crt"\nkey="tests/fixtures/tls/localhost.key"\n[backup]\nencrypt=${encrypted}\npassphrasefile="${passphrase}"\n`;
     await Deno.writeTextFile(
       config,
       common +

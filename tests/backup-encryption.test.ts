@@ -209,10 +209,68 @@ Deno.test('backup encryption: private passphrase source is required only when en
     await Deno.chmod(passphrasefile, 0o600);
     await Deno.symlink(passphrasefile, root + '/linked');
     await assertRejects(
-      () =>
-        openCipher({ encrypt: true, passphrasefile: root + '/linked' }, root),
+      async () => {
+        const unexpected = await openCipher({
+          encrypt: true,
+          passphrasefile: root + '/linked',
+        }, root);
+        await unexpected?.close();
+      },
       Error,
       'regular',
     );
+  });
+});
+
+Deno.test('backup encryption: replacement after metadata validation cannot change the captured passphrase', async () => {
+  await fixture(async (root, passphrasefile) => {
+    const expectedFile = root + '/expected-passphrase';
+    await Deno.writeTextFile(expectedFile, 'not-an-argv-secret\n', {
+      mode: 0o600,
+    });
+    await Deno.mkdir(root + '/bundle/media', { recursive: true });
+    await Deno.mkdir(root + '/restored/media', { recursive: true });
+    await Deno.writeTextFile(
+      root + '/bundle/media/test',
+      'stable descriptor payload',
+    );
+    const payload = await describePayload(root + '/bundle', 'media/test');
+    const lstat = Deno.lstat;
+    let replaced = false;
+    const replace = async () => {
+      if (replaced) return;
+      replaced = true;
+      await Deno.rename(passphrasefile, root + '/captured-original');
+      await Deno.writeTextFile(passphrasefile, 'attacker-known-replacement\n');
+      await Deno.chmod(passphrasefile, 0o644);
+    };
+    let cipher: Awaited<ReturnType<typeof openCipher>> = null;
+    let expected: Awaited<ReturnType<typeof openCipher>> = null;
+    try {
+      Deno.lstat = async (path) => {
+        const result = await lstat(path);
+        if (path === passphrasefile) await replace();
+        return result;
+      };
+      cipher = await openCipher({ encrypt: true, passphrasefile }, root);
+      assert(replaced, 'the replacement race must actually fire');
+      Deno.lstat = lstat;
+      assert(cipher);
+      const encrypted = await cipher.encrypt(root + '/bundle', payload);
+      expected = await openCipher({
+        encrypt: true,
+        passphrasefile: expectedFile,
+      }, root);
+      assert(expected);
+      await expected.decrypt(root + '/bundle', encrypted, root + '/restored');
+      assertEquals(
+        await Deno.readTextFile(root + '/restored/media/test'),
+        'stable descriptor payload',
+      );
+    } finally {
+      Deno.lstat = lstat;
+      await cipher?.close();
+      await expected?.close();
+    }
   });
 });

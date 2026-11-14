@@ -3,6 +3,7 @@
 // bytes stay private and unusable until both GnuPG and the plaintext digest pass.
 import { dirname, join } from '@std/path';
 import { type FileHandle, open } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import type { Config } from '#engine/config.ts';
 import {
   describePayload,
@@ -25,6 +26,60 @@ async function agent(
   }
 }
 
+async function readPassphrase(path: string) {
+  let file: FileHandle;
+  try {
+    // O_NONBLOCK lets fstat reject a substituted FIFO without waiting for a
+    // writer. A regular file's read behavior is unchanged by that flag.
+    file = await open(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ELOOP') {
+      throw new Error('backup passphrase source must be a regular file', {
+        cause: error,
+      });
+    }
+    throw error;
+  }
+  let bytes: Uint8Array | undefined;
+  try {
+    // Scoped Deno permissions can resolve a final symlink before Node's open
+    // flags reach the kernel. Check the entry with the descriptor already
+    // pinned, then require that both observations name the same file.
+    const entry = await Deno.lstat(path);
+    if (!entry.isFile) {
+      throw new Error('backup passphrase source must be a regular file');
+    }
+    const stat = await file.stat();
+    if (!stat.isFile()) {
+      throw new Error('backup passphrase source must be a regular file');
+    }
+    if (entry.dev !== stat.dev || entry.ino !== stat.ino) {
+      throw new Error('backup passphrase source changed while opening');
+    }
+    if (stat.uid !== Deno.uid() || (stat.mode & 0o077) !== 0) {
+      throw new Error(
+        'backup passphrase source must be private and owned by this user',
+      );
+    }
+    bytes = await file.readFile();
+    return { bytes, file, identity: { dev: stat.dev, ino: stat.ino } };
+  } catch (error) {
+    bytes?.fill(0);
+    try {
+      await file.close();
+    } catch (close) {
+      throw new AggregateError(
+        [error, close],
+        'passphrase validation and close failed',
+      );
+    }
+    throw error;
+  }
+}
+
 export async function openCipher(
   options: Config['backup'],
   workspace: string,
@@ -33,20 +88,11 @@ export async function openCipher(
   if (options.passphrasefile === '') {
     throw new Error('backup encryption requires a passphrase file');
   }
-  const stat = await Deno.lstat(options.passphrasefile);
-  if (!stat.isFile) {
-    throw new Error('backup passphrase source must be a regular file');
-  }
-  if (
-    stat.uid !== Deno.uid() || stat.mode === null || (stat.mode & 0o077) !== 0
-  ) {
-    throw new Error(
-      'backup passphrase source must be private and owned by this user',
-    );
-  }
-  const passphrase = await Deno.readFile(options.passphrasefile);
+  const captured = await readPassphrase(options.passphrasefile);
+  const passphrase = captured.bytes;
   if (passphrase.length === 0 || passphrase[0] === 10 || passphrase[0] === 13) {
     passphrase.fill(0);
+    await captured.file.close();
     throw new Error('backup passphrase first line must not be empty');
   }
   let home: string | undefined;
@@ -70,7 +116,14 @@ export async function openCipher(
     // GnuPG requests its private agent even with loopback and caching disabled
     // (e.g. S2K calibration). Launch and reap only the agent for our own home.
     await agent(agentHome, '--launch');
-    return new PayloadCipher(home, agentHome, directory, passphrase);
+    return new PayloadCipher(
+      home,
+      agentHome,
+      directory,
+      passphrase,
+      captured.identity,
+      captured.file,
+    );
   } catch (error) {
     passphrase.fill(0);
     try {
@@ -79,7 +132,11 @@ export async function openCipher(
       try {
         await directory?.close();
       } finally {
-        if (home !== undefined) await Deno.remove(home, { recursive: true });
+        try {
+          if (home !== undefined) await Deno.remove(home, { recursive: true });
+        } finally {
+          await captured.file.close();
+        }
       }
     }
     throw error;
@@ -93,7 +150,15 @@ export class PayloadCipher {
     private agentHome: string,
     private directory: FileHandle,
     private passphrase: Uint8Array,
+    private source: { dev: number; ino: number },
+    private passphraseFile: FileHandle,
   ) {}
+
+  isPassphraseSource(file: Pick<Deno.FileInfo, 'dev' | 'ino'>): boolean {
+    // The source descriptor remains owned until close(), so a pathname change
+    // cannot turn this exclusion into a check of another file or reused inode.
+    return file.dev === this.source.dev && file.ino === this.source.ino;
+  }
 
   private async run(
     source: string,
@@ -263,7 +328,11 @@ export class PayloadCipher {
       try {
         await this.directory.close();
       } finally {
-        await Deno.remove(this.home, { recursive: true });
+        try {
+          await this.passphraseFile.close();
+        } finally {
+          await Deno.remove(this.home, { recursive: true });
+        }
       }
     }
   }

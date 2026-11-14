@@ -190,12 +190,19 @@ Deno.test('backup audit: retired-room orphan watermark and historical completed 
       1,
     ]);
     const server = await f.app.store.server();
-    await server.execute('INSERT INTO watermarks VALUES(?,?)', [
-      'room:!removed:test',
-      17,
-    ]);
+    for (const prefix of ['room:', 'push-context:', 'client-room-rules:']) {
+      await server.execute('INSERT INTO watermarks VALUES(?,?)', [
+        prefix + '!removed:test',
+        17,
+      ]);
+    }
     const result = await f.audit();
     assertEquals(result.historicalUnheldReceipts, 1);
+    await server.execute('INSERT INTO watermarks VALUES(?,?)', [
+      'unknown-room-owner:!removed:test',
+      17,
+    ]);
+    await assertRejects(f.audit, Error, 'watermark has no captured source');
   } finally {
     await f.close();
   }

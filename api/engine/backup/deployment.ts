@@ -2,6 +2,7 @@
 import { basename, join, resolve } from '@std/path';
 import { parse, stringify } from '@std/toml';
 import {
+  adminSocket,
   envNameOf,
   leaves,
   loadConfig,
@@ -65,7 +66,14 @@ export async function restoreDeployment(
     resolve(settings.config.store.library),
   );
   writeNode(config, ['media', 'root'], finalMedia);
-  writeNode(config, ['admin', 'socket'], resolve(settings.config.admin.socket));
+  writeNode(
+    config,
+    ['admin', 'socket'],
+    adminSocket({
+      ...settings.config,
+      store: { ...settings.config.store, dir: finalRoot },
+    }),
+  );
   writeNode(
     config,
     ['backup', 'passphrasefile'],
@@ -74,7 +82,9 @@ export async function restoreDeployment(
   const externalSecrets = new Set(manifest.configuration.externalSecrets);
   for (const leaf of ['secret', 'password']) {
     const name = envNameOf(['turn', leaf]);
-    if (settings.sources['turn.' + leaf] === 'env') externalSecrets.add(name);
+    const source = settings.sources['turn.' + leaf];
+    if (source === 'env') externalSecrets.add(name);
+    else if (source === 'config') externalSecrets.delete(name);
     if (externalSecrets.has(name)) {
       delete (config.turn as Record<string, unknown>)[leaf];
     }

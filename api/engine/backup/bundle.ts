@@ -79,23 +79,25 @@ export async function createBackup(
     );
     await Deno.mkdir(join(stage, 'media'), { mode: 0o700 });
     const media: Manifest['media'] = [];
+    const copiedMedia = new Map<string, number>();
     for (const item of inventory.media) {
       const target = join(stage, item.path);
-      const existing = media.find((m) => m.path === item.path);
+      const existing = copiedMedia.get(item.path);
       if (existing === undefined) {
         await rootDirectory(mediaRoot);
         await copyPrivate(join(mediaRoot, item.id), target);
         if ((await Deno.stat(target)).size !== item.size) {
           throw new Error('backup local media size mismatch');
         }
-      } else if ((await Deno.stat(target)).size !== item.size) {
+        copiedMedia.set(item.path, item.size);
+      } else if (existing !== item.size) {
         throw new Error('backup local media identity collision');
       }
       media.push({ tenant: item.tenant, id: item.id, path: item.path });
     }
     // No empty directories survive the exact manifest inventory.
     if (!media.length) await Deno.remove(join(stage, 'media'));
-    const deployment = await captureDeployment(stage, settings);
+    const deployment = await captureDeployment(stage, settings, cipher);
     const manifest: Manifest = {
       format: 1,
       backupId: crypto.randomUUID(),
@@ -152,7 +154,11 @@ export async function createBackup(
   }
 }
 
-async function captureDeployment(root: string, settings: LoadedConfig) {
+async function captureDeployment(
+  root: string,
+  settings: LoadedConfig,
+  cipher: PayloadCipher | null,
+) {
   await Deno.mkdir(join(root, 'deployment'), { mode: 0o700 });
   const files: Manifest['deployment'] = [];
   const externalSecrets: string[] = [];
@@ -189,7 +195,7 @@ async function captureDeployment(root: string, settings: LoadedConfig) {
     await rootDirectory(dirname(source));
     const stat = await Deno.lstat(source);
     if (
-      !stat.isFile ||
+      !stat.isFile || cipher?.isPassphraseSource(stat) ||
       (passphrase !== null && stat.dev === passphrase.dev &&
         stat.ino === passphrase.ino)
     ) {

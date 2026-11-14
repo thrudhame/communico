@@ -9,6 +9,8 @@ import {
 } from '#engine/backup/checks.ts';
 import type { Manifest } from '#engine/backup/manifest.ts';
 
+const roomWatermarks = ['room:', 'push-context:', 'client-room-rules:'];
+
 export async function auditServer(
   snapshot: CapturedStore,
   server: CapturedFile,
@@ -35,7 +37,7 @@ export async function auditServer(
     const sourceHeads = new Map<string, number>();
     for (const file of databases) {
       if (file.kind === 'rooms') {
-        for (const prefix of ['room:', 'push-context:', 'client-room-rules:']) {
+        for (const prefix of roomWatermarks) {
           sourceHeads.set(prefix + file.id, file.heads.changes);
         }
       } else if (file.kind === 'tenants') {
@@ -72,9 +74,10 @@ export async function auditServer(
       if (head === undefined) {
         // Completed room unlink precedes removal of these orphan watermarks.
         if (
-          (source.startsWith('room:') && !registered.has(source.slice(5))) ||
-          (source.startsWith('push-context:') &&
-            !registered.has(source.slice(13)))
+          roomWatermarks.some((prefix) =>
+            source.startsWith(prefix) &&
+            !registered.has(source.slice(prefix.length))
+          )
         ) continue;
         auditFailure('watermark has no captured source');
       }
