@@ -896,8 +896,13 @@ accepted without normalization, with the 255-byte identifier bound. Power
 levels, additional creators and restricted authorizers use this contract;
 new local account naming and non-event device-list policy remain separate.
 Local upload metadata remains tenant-owned; bytes live under
-`media.root`. Uploads enforce the size bound while streaming to `.part`, then
-rename the completed file. Generated media ids use the shared URL-safe encoder.
+`media.root`. The shared local-media publisher owns admission, bytes and metadata
+for direct uploads, reserved PUTs and preview images. It serializes each media ID,
+rechecks ownership/pending status, streams within the size bound to a private
+0600 `.part`, fsyncs the open file, closes and renames it, then fsyncs the parent
+before publishing uploaded metadata. Competing reserved PUTs cannot replace
+acknowledged bytes; failed publication leaves the reservation retryable.
+Generated media ids use the shared URL-safe encoder.
 (`api/engine/ids.ts`, `api/engine/media.ts`, `api/engine/tenant/media.ts`)
 
 `media/service.ts` owns authenticated remote demand and current origin admission,
