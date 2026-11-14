@@ -38,6 +38,9 @@ export const LINK_CAPABILITIES: readonly Capability[] = [{
 }, {
   type: 'room-replica',
   version: 1,
+}, {
+  type: 'public-replica',
+  version: 1,
 }];
 export const EMPTY_CUT: Cut = { sequence: 0, hash: '' };
 

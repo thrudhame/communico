@@ -5,7 +5,7 @@ import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type StoreConfig } from '#engine/store/index.ts';
-import { tenantSchema } from '#engine/tenant/index.ts';
+import { type Tenant, tenantSchema } from '#engine/tenant/index.ts';
 import { capabilities } from './capabilities.ts';
 import { FacadeKeys } from './control.ts';
 import {
@@ -21,6 +21,7 @@ import { linkHandler } from './link.ts';
 import { NoticeHub } from './notices.ts';
 import { Pairings, pairingStatus } from './pairing.ts';
 import { RoomReplicas } from './replication.ts';
+import { PublicReplicas } from './public.ts';
 import { LINK_CAPABILITIES, LinkError } from './protocol.ts';
 import { bindRole } from './role.ts';
 import { loadLinkTls } from './transport.ts';
@@ -56,6 +57,7 @@ export async function openFacadeRuntime(
   const journal = new Journal(server, LINK_CAPABILITIES);
   const notices = new NoticeHub();
   let node: NodeIdentity | undefined;
+  let tenant: Tenant | undefined;
   let initializing: Promise<NodeIdentity> | undefined;
   let inbox: ReturnType<typeof startInboxWorker> | undefined;
   const pairings = () => {
@@ -106,7 +108,7 @@ export async function openFacadeRuntime(
         403,
       );
     }
-    await enrolledTenant(store, owner, identity.server, identity.node);
+    tenant = await enrolledTenant(store, owner, identity.server, identity.node);
   };
   const acceptConfigured = async () => {
     // A file bootstraps a binding, not a second live registry. Restart never
@@ -140,6 +142,11 @@ export async function openFacadeRuntime(
           ? await (await keyOwner()).apply(journal, stream)
           : stream.stream.startsWith('room:')
           ? await (await roomOwner()).apply(journal, stream)
+          : stream.stream.startsWith('public:')
+          ? await new PublicReplicas(store, tenant!, await pairings()).apply(
+            journal,
+            stream,
+          )
           : await apply(journal, stream),
       changed: () => notices.changed(),
       failed: (error) =>

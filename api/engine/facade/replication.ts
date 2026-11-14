@@ -10,6 +10,7 @@ import {
 import type { Store } from '#engine/store/index.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { Pairings } from './pairing.ts';
+import { applyReplicaScope } from './scopes.ts';
 import {
   integer,
   LinkError,
@@ -160,7 +161,7 @@ export class RoomReplicas {
     const binding = incarnation ??
       (await this.pairings.active()).body.transcript.body.context.id;
     const rows = await (await this.store.server()).query(
-      "SELECT scope,source_cut,ready,pending_hash FROM facade_scopes WHERE incarnation=? AND scope LIKE 'room:%' ORDER BY scope",
+      'SELECT scope,source_cut,ready,pending_hash FROM facade_scopes WHERE incarnation=? ORDER BY scope',
       [binding],
     );
     return rows.map((row) => ({
@@ -193,82 +194,29 @@ export class RoomReplicas {
     if (record.type !== 'room-replica' || record.version !== 1) {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not a room replica');
     }
-    const grant = await this.pairings.active();
-    const context = grant.body.transcript.body.context;
-    if (
-      record.source !== 'home' || record.incarnation !== context.id ||
-      context.server !== this.self
-    ) {
-      throw new LinkError(
-        'LINK_IDENTITY_MISMATCH',
-        'room source does not match home grant',
-        403,
-      );
-    }
     const payload = object(record.payload);
     if (payload.kind !== 'room-replica') {
       throw new LinkError('LINK_BAD_RECORD', 'unknown room operation', 400);
     }
     const manifest = manifestOf(payload.manifest);
     const scope = 'room:' + manifest.roomId;
-    if (scope !== stream.stream) {
-      throw new LinkError(
-        'LINK_IDENTITY_MISMATCH',
-        'room scope substitution',
-        403,
-      );
-    }
-    const db = await this.store.server();
-    const checkGrant = async (conn: import('#engine/store/db.ts').Conn) => {
-      const [binding] = await conn.query(
-        "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
-        [context.id],
-      );
-      if (
-        binding?.state !== 'paired' ||
-        Number(binding.revision) !== grant.body.revision
-      ) throw new LinkError('LINK_UNPAIRED', 'room grant changed', 403);
-    };
-    await db.tx(async (conn) => {
-      await checkGrant(conn);
-      const [prior] = await conn.query(
-        'SELECT source_cut,pending_hash FROM facade_scopes WHERE incarnation=? AND scope=?',
-        [context.id, scope],
-      );
-      if (
-        (prior ? Number(prior.source_cut) : 0) !== manifest.after ||
-        (prior?.pending_hash && prior.pending_hash !== record.hash)
-      ) {
-        throw new LinkError(
-          'LINK_DIVERGED',
-          'room suffix does not follow applied source cut',
-        );
-      }
-      await conn.execute(
-        'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,0,?) ON CONFLICT(incarnation,scope) DO UPDATE SET ready=0,pending_hash=excluded.pending_hash',
-        [context.id, scope, manifest.after, record.hash],
-      );
-    });
-    await importReplicaRoom(this.store, manifest, {
+    return await applyReplicaScope({
+      db: await this.store.server(),
+      pairings: this.pairings,
       self: this.self,
-      keys: this.keys,
-    });
-    return await journal.apply('home', stream, async (conn, current) => {
-      await checkGrant(conn);
-      if (current.hash !== record.hash) {
-        throw new LinkError('LINK_DIVERGED', 'room application raced');
-      }
-      const changed = await conn.execute(
-        'UPDATE facade_scopes SET source_cut=?,ready=1,pending_hash=NULL WHERE incarnation=? AND scope=? AND source_cut=? AND pending_hash=?',
-        [manifest.cut, context.id, scope, manifest.after, record.hash],
-      );
-      if (changed !== 1) {
-        throw new LinkError(
-          'LINK_DIVERGED',
-          'room completion lost its pending identity',
-        );
-      }
-      return { roomId: manifest.roomId, cut: manifest.cut };
+      journal,
+      stream,
+      record,
+      scope,
+      after: manifest.after,
+      cut: manifest.cut,
+      apply: async () => {
+        await importReplicaRoom(this.store, manifest, {
+          self: this.self,
+          keys: this.keys,
+        });
+        return { roomId: manifest.roomId, cut: manifest.cut };
+      },
     });
   }
 }

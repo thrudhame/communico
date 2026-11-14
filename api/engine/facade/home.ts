@@ -10,6 +10,7 @@ import { Journal } from './journal.ts';
 import { enrollLink } from './link.ts';
 import { Pairings } from './pairing.ts';
 import { startRoomExports } from './replication.ts';
+import { startPublicExports } from './public.ts';
 import {
   LINK_CAPABILITIES,
   LinkError,
@@ -45,6 +46,10 @@ export async function startHomeLinks(
   const controller = new AbortController();
   const workers = new Map<string, ReturnType<typeof startHomeLinkWorker>>();
   const exports = new Map<string, ReturnType<typeof startRoomExports>>();
+  const publicExports = new Map<
+    string,
+    ReturnType<typeof startPublicExports>
+  >();
   const jobs = new Map<string, Promise<void>>();
   const failed = (node: string, error: unknown) => {
     if (!controller.signal.aborted) {
@@ -60,10 +65,13 @@ export async function startHomeLinks(
     if (peer.state === 'paired' && workers.has(id)) {
       await exportKeyRoster(app.store, app.tenant, node, id);
       exports.get(id)?.wake();
+      publicExports.get(id)?.wake();
       return;
     }
     await exports.get(id)?.close();
     exports.delete(id);
+    await publicExports.get(id)?.close();
+    publicExports.delete(id);
     await workers.get(id)?.close();
     workers.delete(id);
     let secret: string | undefined;
@@ -119,6 +127,16 @@ export async function startHomeLinks(
     });
     exports.set(id, rooms);
     rooms.wake();
+    const users = startPublicExports({
+      store: app.store,
+      tenant: app.tenant,
+      peer: node,
+      pairing: id,
+      changed: () => workers.get(id)?.wake(),
+      failed: (error) => failed(node, error),
+    });
+    publicExports.set(id, users);
+    users.wake();
   }
   let scanning: Promise<void> | undefined;
   const scan = () =>
@@ -152,6 +170,9 @@ export async function startHomeLinks(
         await scanning;
         await Promise.all(jobs.values());
         await Promise.all([...exports.values()].map((rooms) => rooms.close()));
+        await Promise.all(
+          [...publicExports.values()].map((users) => users.close()),
+        );
         await Promise.all(
           [...workers.values()].map((worker) => worker.close()),
         );

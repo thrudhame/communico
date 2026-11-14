@@ -137,6 +137,32 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
         scope.scope === 'room:' + roomId
       );
     await until(async () => (await roomScope())?.ready === true);
+    const publicScope = async () =>
+      (await status()).body.result.scopes.find((scope: { scope: string }) =>
+        scope.scope === 'public:@replica:logical.test'
+      );
+    await until(async () => (await publicScope())?.ready === true);
+    const publicCut = (await publicScope()).cut;
+    const beforeProfileRoomCut = (await roomScope()).cut;
+    assertEquals(
+      (await api(
+        'profile/%40replica%3Alogical.test/displayname',
+        { displayname: 'Linked profile' },
+        token,
+        'PUT',
+      )).status,
+      200,
+    );
+    await until(async () =>
+      (await publicScope())?.cut > publicCut &&
+      (await publicScope())?.ready === true
+    );
+    // A profile change also authors a real room membership event. Observe that
+    // separate room suffix before using its next cut to wait for the message.
+    await until(async () =>
+      (await roomScope())?.cut > beforeProfileRoomCut &&
+      (await roomScope())?.ready === true
+    );
     const initialCut = (await roomScope()).cut;
     const sent = await api(
       `rooms/${encodeURIComponent(roomId)}/send/m.room.message/replica-suffix`,
@@ -219,6 +245,16 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
         "SELECT applied FROM facade_streams WHERE direction='in' AND stream='control'",
       );
       assertEquals(Number(applied.applied), 1);
+      const replicaTenant = await openTenant(store, 'logical.test');
+      assertEquals(
+        (await replicaTenant.tx((tx) => tx.profiles.get('replica')))
+          ?.displayname,
+        'Linked profile',
+      );
+      assertEquals(
+        await replicaTenant.tx((tx) => tx.credentials.hash('replica')),
+        null,
+      );
       const replica = await openRoom(store, roomId);
       assertEquals(
         await replica.tx(async (tx) =>

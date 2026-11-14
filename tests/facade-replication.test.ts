@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
-import { initializeNode } from '#engine/facade/identity.ts';
+import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
+import { exportPublicReplica, PublicReplicas } from '#engine/facade/public.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
@@ -116,6 +117,17 @@ async function fixture() {
     node,
     bundle,
     signing,
+    tenant,
+    async publicOwner() {
+      const pairings = await edgePairings();
+      return new PublicReplicas(
+        edge,
+        await enrolledTenant(edge, pairings, tenant.serverName, node.node),
+        pairings,
+      );
+    },
+    publicExport: () =>
+      exportPublicReplica(home, tenant, 'alice', node.node, bundle.id),
     async retire() {
       await (await edge.server()).execute(
         "UPDATE facade_pairings SET state='revoked' WHERE id=?",
@@ -318,6 +330,65 @@ Deno.test('scope introspection uses its captured pairing cut even after live aut
     await f.retire();
     await assertRejects(() => owner.scopes());
     assertEquals(await owner.scopes(f.bundle.id), captured);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('public journal completion survives a tenant commit crash without advancing readiness or losing a profile suffix', async () => {
+  const f = await fixture();
+  try {
+    await f.tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+    const initial = await f.publicExport();
+    assert(initial);
+    assertEquals(await f.publicExport(), null);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    journal.apply = () =>
+      Promise.reject(new Error('crash after public tenant commit'));
+    await assertRejects(
+      async () => (await f.publicOwner()).apply(journal, initial),
+      Error,
+      'crash after public tenant commit',
+    );
+    assertEquals(
+      (await (await f.replicas()).scopes()).find((scope) =>
+        scope.scope === initial.stream
+      )?.ready,
+      false,
+    );
+    await f.reopen();
+    const owner = await f.publicOwner();
+    assert(await owner.apply(await f.journal(), initial));
+    assertEquals(
+      (await (await f.replicas()).scopes()).find((scope) =>
+        scope.scope === initial.stream
+      )?.ready,
+      true,
+    );
+    await f.tenant.tx((tx) =>
+      tx.profiles.set('alice', 'displayname', 'Updated Alice')
+    );
+    const suffix = await f.publicExport();
+    assert(suffix);
+    assert(suffix.sequence > initial.sequence);
+    await (await f.journal()).receive('home', [suffix]);
+    assert(await owner.apply(await f.journal(), suffix));
+    assertEquals(await owner.apply(await f.journal(), suffix), false);
+    const bad = await new Journal(await f.home.server(), LINK_CAPABILITIES)
+      .append(f.node.node, {
+        ...suffix,
+        operationId: 'skipped-source-cut',
+        payload: { ...(suffix.payload as object), after: 999999 },
+      });
+    await (await f.journal()).receive('home', [bad]);
+    await assertRejects(async () =>
+      (await f.publicOwner()).apply(await f.journal(), bad)
+    );
+    assertEquals(
+      (await (await f.journal()).heads('home', 'in', bad)).applied.sequence,
+      suffix.sequence,
+    );
   } finally {
     await f.close();
   }
