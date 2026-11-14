@@ -6,6 +6,7 @@ import { loadConfig, loadedConfig, setConfigForTests } from '#engine/config.ts';
 import { createBackup } from '#engine/backup/bundle.ts';
 import { restoreBackup } from '#engine/backup/restore.ts';
 import { describePayload, readManifest } from '#engine/backup/manifest.ts';
+import { parseStreamToken } from '#engine/client/tokens.ts';
 import { assertSpecHttpResponse } from '#tests/spec-contract.ts';
 
 type Json = Record<string, unknown>;
@@ -300,7 +301,19 @@ Deno.test('older archive over HTTP: consumed keys never reappear and newer ordin
           );
         }
         const again = await sync(String(ordinaryB.next_batch));
-        assert(object(object(again.rooms).join)[room]);
+        const before = parseStreamToken(String(ordinaryB.next_batch))!;
+        const after = parseStreamToken(String(again.next_batch))!;
+        assert(after.eSeq > before.eSeq && after.aSeq > before.aSeq);
+        const againRoom = object(object(object(again.rooms).join)[room]);
+        const againState = [
+          ...object(againRoom.state).events as Json[],
+          ...object(againRoom.timeline).events as Json[],
+        ];
+        assertEquals(
+          againState.find((event) => event.type === 'm.room.name')?.content,
+          { name: 'Snapshot A name' },
+          'numeric catch-up must not turn the old epoch into an incremental baseline',
+        );
         assertEquals(
           (object(again.account_data).events as Json[]).find((event) =>
             event.type === 'restore.older'
