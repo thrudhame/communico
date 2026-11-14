@@ -204,7 +204,7 @@ export async function notifyPeerAlive(
       [destination, now],
     );
     await tx.execute(
-      "UPDATE outbox SET next_attempt_ms = 0 WHERE destination = ? AND state = 'pending'",
+      "UPDATE outbox SET next_attempt_ms = 0 WHERE destination = ? AND state = 'pending' AND next_attempt_ms != 0",
       [destination],
     );
   });
