@@ -7,6 +7,51 @@ import { config } from '#engine/config.ts';
 import { bounded } from '#engine/tenant/e2ee.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 
+/** Private restore candidate only; immutable reset intents project before serving. */
+export async function rebaseRestoredDeviceStreams(
+  conn: Conn,
+): Promise<{ users: number; floor: number }> {
+  const [{ head }] = await conn.query(
+    'SELECT COALESCE(MAX(value),0) AS head FROM user_device_stream',
+  );
+  // A microsecond wall-clock anchor moves a restored counter out of its old
+  // incremental range. Numeric ordering alone cannot prove unseen peer state:
+  // the empty predecessor reset below is the authoritative recovery boundary.
+  const floor = Math.max(
+    Math.floor((performance.timeOrigin + performance.now()) * 1000),
+    Number(head) + 1,
+  );
+  if (!Number.isSafeInteger(floor) || floor >= Number.MAX_SAFE_INTEGER) {
+    throw new Error('restored device stream exceeds supported integer range');
+  }
+  let cursor: string | null = null, users = 0;
+  for (;;) {
+    const rows = await conn.query(
+      'SELECT localpart FROM (SELECT localpart FROM users UNION SELECT localpart FROM user_device_stream) WHERE (? IS NULL OR localpart>?) ORDER BY localpart LIMIT 256',
+      [cursor, cursor],
+    );
+    if (!rows.length) break;
+    for (const row of rows) {
+      const localpart = String(row.localpart);
+      await conn.execute(
+        'INSERT INTO user_device_stream VALUES(?,?) ON CONFLICT(localpart) DO UPDATE SET value=excluded.value',
+        [localpart, floor],
+      );
+      await conn.execute('INSERT INTO e2ee_changes VALUES(?,?,?,?,?,?)', [
+        await nextCounter(conn, 'e2ee_changes'),
+        localpart,
+        '',
+        0,
+        floor,
+        '{"kind":"restore_reset","device_id":"","deleted":true}',
+      ]);
+      users++;
+    }
+    cursor = String(rows.at(-1)!.localpart);
+  }
+  return { users, floor };
+}
+
 /** Immutable public snapshot/tombstone, committed with its owning mutation. */
 export async function appendDeviceChange(
   conn: Conn,

@@ -1131,9 +1131,21 @@ does not apply sync recovery semantics. A private candidate's report is written
 0600 and fsynced before its digest completes the server marker. App startup checks
 the marker, file digest and report identity before creating any app worker or
 serving; missing, incomplete or modified reports refuse startup. Full restore
-assembly, peer-device stream rebasing and job/report inventory remain unwired.
+assembly and job/report inventory remain unwired.
 (`api/engine/server/recovery.ts`, `api/engine/backup/report.ts`,
 `api/engine/client/{tokens,device-lists}.ts`, `api/engine/{app,syncfeed}.ts`)
+
+Private tenant recovery rebases user-device allocators above both their archived
+maximum and a fresh microsecond-clock anchor, then appends immutable reset intents.
+Normal tenant roll-forward projects those behind retained reliable work using the
+same full-resnapshot owner as subscription activation. Frozen envelope bytes, UUIDs
+and old source identities stay unchanged. Subsequent updates chain from the new
+anchor; new subscriptions, including empty accounts, use it too. Numeric rebasing
+does not establish what an unseen peer once observed: `prev_id:[]` is the actual
+resnapshot contract. Private server recovery invalidates learned remote-device
+completeness/causal memory and retries without deleting keys or trust decisions.
+The offline coordinator still needs to compose these owners.
+(`api/engine/tenant/changes.ts`, `api/engine/server/{device-federation,remote-devices}.ts`)
 
 The internal store snapshot primitive pauses common storage admission, drains
 transactions and lifecycle changes, then exports every final server/tenant/room
