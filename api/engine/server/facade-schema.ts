@@ -6,3 +6,10 @@ CREATE TABLE facade_records(peer TEXT NOT NULL,direction TEXT NOT NULL,source TE
 CREATE INDEX facade_records_pending ON facade_records(peer,direction,source,incarnation,stream,sequence);
 CREATE TABLE facade_export_acks(peer TEXT NOT NULL,source TEXT NOT NULL,incarnation TEXT NOT NULL,stream TEXT NOT NULL,received INTEGER NOT NULL,received_hash TEXT NOT NULL,applied INTEGER NOT NULL,applied_hash TEXT NOT NULL,PRIMARY KEY(peer,source,incarnation,stream));
 `;
+
+export const FACADE_PAIRING_SQL = `
+CREATE TABLE facade_control(singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),revision INTEGER NOT NULL);
+INSERT INTO facade_control(singleton,revision) VALUES(1,0);
+CREATE TABLE facade_pairings(id TEXT PRIMARY KEY NOT NULL,side TEXT NOT NULL CHECK(side IN ('home','facade')),node TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','granting','paired','revoked')),context_json TEXT NOT NULL,transcript_json TEXT,grant_json TEXT,receipt_json TEXT,revocation_json TEXT,revision INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX facade_pairings_node ON facade_pairings(node,state);
+`;

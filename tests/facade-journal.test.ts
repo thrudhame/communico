@@ -344,14 +344,14 @@ Deno.test('reopen preserves received/unapplied tail, completed results and expor
 
 Deno.test('v24 migration adds journal without changing existing room/transaction truth', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'facade-migration-' });
-  // Reconstruct the previous provider from the current provider's pre-journal
-  // schema. Dropping only the new empty tables models the exact v24 boundary.
+  // Reconstruct v24 by removing every table added since that boundary. The
+  // journal and enrollment migrations must both run against genuine old state.
   let store = await openStore(cfg(dir), { schemas: { server: serverSchema } });
   try {
     const server = await store.server();
     await server.tx(async (conn) => {
       await conn.exec(
-        'DROP TABLE facade_export_acks; DROP TABLE facade_records; DROP TABLE facade_streams; DROP TABLE facade_node;',
+        'DROP TABLE facade_pairings; DROP TABLE facade_control; DROP TABLE facade_export_acks; DROP TABLE facade_records; DROP TABLE facade_streams; DROP TABLE facade_node;',
       );
       await conn.execute('UPDATE meta SET v=? WHERE k=?', [
         '24',
