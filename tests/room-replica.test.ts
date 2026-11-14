@@ -72,9 +72,26 @@ async function roundTrip(
   }
 }
 
-async function fixture() {
+async function fixture(
+  options: { priorLocal?: boolean; deny?: string[] } = {},
+) {
   const source = await makeFakeRoom({ roomId: '!replica:remote.test' });
   const home = await makeRemoteServer('logical.test');
+  if (options.priorLocal) {
+    await source.addEvent({
+      type: 'm.room.member',
+      sender: '@prior:logical.test',
+      state_key: '@prior:logical.test',
+      content: { membership: 'join' },
+    });
+  }
+  if (options.deny) {
+    await source.addEvent({
+      type: 'm.room.server_acl',
+      state_key: '',
+      content: { allow: ['*'], deny: options.deny, allow_ip_literals: true },
+    });
+  }
   const template = source.makeJoinAnswer('@alice:logical.test').event;
   const join = await remoteEvent(source.roomId, home, source.version, {
     ...template,
@@ -637,6 +654,83 @@ Deno.test('whole-room replay refuses tampering and missing before-state rather t
       tx.state.eventStateBefore(String(f.join.event_id))
     );
     assert(before);
+  } finally {
+    await destination.close();
+    await Deno.remove(dir, { recursive: true });
+    await f.close();
+  }
+});
+
+Deno.test('whole-room replay preserves resident-vouched local snapshot evidence without accepting a resident-only participation join', async () => {
+  const f = await fixture({ priorLocal: true });
+  try {
+    await importReplicaBoundary(f.store, f.input);
+    const room = await openRoom(f.store, f.source.roomId);
+    const manifest = await exportReplicaRoom(room, f.input.self);
+    const prior = manifest.events.find((pdu) =>
+      pdu.sender === '@prior:logical.test'
+    )!;
+    assert(prior);
+    assertEquals(prior.signatures[f.input.self], undefined);
+    await roundTrip(f, manifest);
+    const tampered = structuredClone(manifest);
+    const opening = tampered.events.find((pdu) =>
+      pdu.event_id === f.join.event_id
+    )!;
+    delete opening.signatures[f.input.self];
+    await assertRejects(() => roundTrip(f, tampered));
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('whole-room suffix keeps the opening resident when a later ACL admits a different relayer', async () => {
+  const f = await fixture({ deny: ['later.test'] });
+  const dir = await Deno.makeTempDir({ prefix: 'replica-opening-resident-' });
+  const destination = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { room: roomSchema } });
+  try {
+    await importReplicaBoundary(f.store, f.input);
+    const room = await openRoom(f.store, f.source.roomId);
+    const initial = await exportReplicaRoom(room, f.input.self);
+    await importReplicaRoom(destination, initial, f.input);
+    const deps = {
+      keys: f.input.keys,
+      fetcher: fakeFetcher({}).fetcher,
+      self: f.input.self,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    };
+    const allow = await f.source.addEvent({
+      type: 'm.room.server_acl',
+      state_key: '',
+      content: { allow: ['*'], deny: [], allow_ip_literals: true },
+    });
+    await ingestRemote(room, [allow], f.input.resident, deps);
+    const first = await exportReplicaRoom(room, f.input.self, initial.cut);
+    await importReplicaRoom(destination, first, f.input);
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'valid new relayer', msgtype: 'm.text' },
+    });
+    const result = await ingestRemote(room, [message], 'later.test', deps);
+    assertEquals(result[0].outcome, 'accepted');
+    const second = await exportReplicaRoom(room, f.input.self, first.cut);
+    await importReplicaRoom(destination, second, f.input);
+    const replica = await openRoom(destination, room.id);
+    assertEquals(
+      (await replica.tx((tx) => tx.events.getStatus(String(message.event_id))))
+        ?.grounding,
+      'grounded',
+    );
+    const head = await replica.tx((tx) => tx.changes.head());
+    await importReplicaRoom(destination, second, f.input);
+    assertEquals(await replica.tx((tx) => tx.changes.head()), head);
   } finally {
     await destination.close();
     await Deno.remove(dir, { recursive: true });

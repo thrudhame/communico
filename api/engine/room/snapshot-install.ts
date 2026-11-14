@@ -21,7 +21,7 @@ export async function installSnapshotBoundary(
   },
 ): Promise<void> {
   const eventId = String(input.event.event_id);
-  await stageSnapshotEvidence(tx, input.verified, eventId, input.resident);
+  await stageSnapshotEvidence(tx, input.verified, eventId);
   const group = await tx.materialize.newGroup(
     null,
     mapEntries(input.verified.snapshot),
@@ -55,10 +55,10 @@ export async function stageSnapshotEvidence(
   tx: RoomTx,
   verified: VerifiedSnapshot,
   eventId: string,
-  resident: string,
 ): Promise<void> {
   for (const [id, pdu] of verified.ordered) {
     if (id === eventId || await tx.events.get(id) !== null) continue;
+    const resident = verified.residents.get(id)!;
     const rule = verified.rejected.get(id) ?? null;
     await tx.events.insert(
       id,
