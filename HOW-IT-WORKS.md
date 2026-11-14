@@ -119,10 +119,14 @@ JSON. Remaining ungrounded events become pending with waits; later arrivals
 re-run the shared pipeline. A zero
 ungrounded lifetime drops them instead. Delayed redaction targets use waits
 too, without rewriting the stored target PDU.
-Committed local and remote arrivals dispatch only their indexed dependency
-waits. Newly grounded children continue that worklist; unrelated unresolved
-history is not rescanned on a foreground arrival. Each candidate keeps its
-locked ingest/effect revalidation and eligible work remains oldest-first.
+The room transaction marks indexed dependency waits ready with each stored
+arrival or grounding transition. Ready rows form one durable retry queue:
+local/remote arrivals, idempotent replay and app startup drain it. Newly
+grounded children mark their dependents before removing their own waits, so
+a later failure cannot lose the retry obligation. Recovery errors propagate;
+unrelated unresolved history is never rescanned on a foreground arrival.
+Prev recovery requires grounded parents; delayed redaction needs only stored
+target bytes. Each candidate retains locked revalidation and oldest-first order.
 (`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,
 `api/engine/room/ingest.ts:654-681`)
 

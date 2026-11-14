@@ -93,6 +93,9 @@ export type RemoteIngest = {
   oversized: boolean;
   ungroundedMs: number;
   boundary?: StateMap;
+  // A verified live recovery can promote an auth-only snapshot outlier. It
+  // still needs genuine prevs or an admitted boundary and all ordinary auth.
+  promoteEvidence?: boolean;
   // Resident-side send_join/send_leave: forward to the other room servers.
   // The only closed-stay write is an invited remote user's self-rejection.
   residentMembership?: boolean;
@@ -289,10 +292,7 @@ export async function afterLocalCommit(
   eventId: string,
   self: string,
 ): Promise<void> {
-  const hasWaiters = await room.tx(async (tx) =>
-    (await tx.waits.for(eventId)).length > 0
-  );
-  if (hasWaiters) await resumeWaits(room, { self }, [eventId]);
+  await resumeWaits(room, { self }, [eventId]);
   await projectAfterWrite(room.store, room.id);
 }
 
@@ -360,18 +360,22 @@ export async function ingestInTx(
   }
 
   // Idempotent redelivery (requirements §4.3 I2): the original receipt,
-  // no re-verification. A remote redelivery of a PENDING event falls
-  // through to a real re-ingest (ruling B — the first-writer bytes are
-  // kept, the record is re-evaluated).
+  // no re-verification. Pending redelivery and explicit live recovery of
+  // snapshot evidence re-evaluate first-writer bytes, never the new copy.
   const existing = await tx.events.get(eventId);
-  let pendingRedelivery = false;
+  let redelivery: { standing: Standing; grounding: Grounding } | null = null;
   if (existing !== null) {
     const status = await tx.events.getStatus(eventId);
     if (status === null) {
       throw new Error('E_STATUS_MISSING: ' + eventId);
     }
-    if (remote !== null && status.grounding === 'pending') {
-      pendingRedelivery = true;
+    if (
+      remote !== null &&
+      (status.grounding === 'pending' ||
+        (status.grounding === 'evidence' && remote.promoteEvidence === true))
+    ) {
+      redelivery = { standing: status.standing, grounding: status.grounding };
+      pdu = JSON.parse(existing.pdu) as Pdu;
     } else {
       return {
         eventId,
@@ -450,7 +454,7 @@ export async function ingestInTx(
         eventId,
         missing,
         remote,
-        pendingRedelivery,
+        redelivery,
       );
     }
   } else {
@@ -599,7 +603,7 @@ export async function ingestInTx(
     afterGroup,
     boundary !== undefined ? 'imported' : 'dag',
   );
-  if (pendingRedelivery) {
+  if (redelivery !== null) {
     // grounded now — the prev waits are spent (the redaction waits this
     // event may own are the resume driver's, not ours)
     for (const wait of await tx.waits.of(eventId)) {
@@ -635,7 +639,7 @@ export async function ingestInTx(
 
   // Positions: accepted events land on the stay's timeline in arrival
   // order; rejected/soft-failed events are change-log entries only. A
-  // pending event that now grounds is a standing/grounding TRANSITION
+  // retained event that now grounds is a standing/grounding TRANSITION
   // (R11) carrying the full payload, not a new event.
   const offset = standing === 'accepted'
     ? await tx.segments.appendPosition(stay.id, eventId)
@@ -654,9 +658,9 @@ export async function ingestInTx(
     grounding: 'grounded',
     origin: remote?.origin ?? null,
   };
-  const changePos = pendingRedelivery
+  const changePos = redelivery !== null
     ? await tx.changes.append('transition', eventId, {
-      from: { standing: 'rejected', grounding: 'pending' },
+      from: redelivery,
       ...payload,
     })
     : await tx.changes.append('event', eventId, payload);
@@ -851,8 +855,22 @@ async function storePending(
   eventId: string,
   missing: string[],
   remote: RemoteIngest,
-  redelivery: boolean,
+  redelivery: { standing: Standing; grounding: Grounding } | null,
 ): Promise<IngestLocalResult> {
+  // Recovery without a usable before-state leaves retained evidence intact.
+  // It cannot discard those bytes or manufacture a live pending transition.
+  if (redelivery?.grounding === 'evidence') {
+    return {
+      eventId,
+      standing: redelivery.standing,
+      reason: null,
+      rule: null,
+      grounding: 'evidence',
+      stored: true,
+      receipt: true,
+      event: (await tx.events.get(eventId))!,
+    };
+  }
   const canonical = canonicalJson(pdu as unknown as Record<string, unknown>);
   const row: EventRow = {
     id: eventId,
@@ -875,7 +893,7 @@ async function storePending(
       event: row,
     };
   }
-  if (redelivery) {
+  if (redelivery !== null) {
     // still ungrounded on a redelivery — refresh the waiting set
     await tx.waits.removeOf(eventId);
   } else {
@@ -924,8 +942,8 @@ async function storePending(
   };
 }
 
-// Follow only dependency edges from committed arrivals, never the room's
-// unrelated unresolved history. Newly grounded children feed the same owner.
+// Drain durable ready/retry work plus dependency edges from committed arrivals,
+// never unrelated unresolved history. Newly grounded children feed this owner.
 // Each candidate is revalidated in its own transaction, oldest first; ingest
 // and redaction effects retain the room lock. No network work happens here.
 export async function resumeWaits(
@@ -935,13 +953,20 @@ export async function resumeWaits(
 ): Promise<number> {
   const processed = new Set<string>();
   const expanded = new Set<string>();
-  const pending: Awaited<ReturnType<RoomTx['waits']['for']>> = [];
+  const pending = await room.tx(async (tx) => {
+    for (const id of new Set(arrived)) await tx.waits.arrive(id);
+    return await tx.waits.ready();
+  });
   const enqueue = async (ids: readonly string[]) => {
     const fresh = [...new Set(ids)].filter((id) => !expanded.has(id));
     if (fresh.length === 0) return;
     const waits = await room.tx(async (tx) => {
       const result: typeof pending = [];
-      for (const id of fresh) result.push(...await tx.waits.for(id));
+      for (const id of fresh) {
+        result.push(
+          ...(await tx.waits.for(id)).filter((wait) => wait.state === 'ready'),
+        );
+      }
       return result;
     });
     for (const id of fresh) expanded.add(id);
@@ -972,7 +997,10 @@ export async function resumeWaits(
           return null;
         }
         const prevIds = (JSON.parse(row.pdu) as Pdu).prev_events ?? [];
-        if ((await ungroundedPrevs(tx, prevIds)).length > 0) return null;
+        if ((await ungroundedPrevs(tx, prevIds)).length > 0) {
+          await tx.waits.defer(wait);
+          return null;
+        }
         return { kind: 'prev' as const, eventId: wait.waiting };
       }
       if (wait.kind === 'redaction') {
@@ -987,70 +1015,67 @@ export async function resumeWaits(
     });
     if (job === null) continue;
     processed.add(job.eventId + '|' + job.kind);
-    try {
-      if (job.kind === 'prev') {
-        const grounded = await withRoomLock(
-          room.id,
-          () =>
-            room.tx(async (tx) => {
-              const row = await tx.events.get(job.eventId);
-              const status = await tx.events.getStatus(job.eventId);
-              const stay = await tx.segments.openStay();
-              if (row === null || status === null || stay === null) return;
-              const version = await roomVersionOf(tx, stay.id);
-              const pdu = JSON.parse(row.pdu) as Pdu;
-              const result = await ingestInTx(tx, room.id, pdu, {
-                remote: {
-                  origin: status.origin ?? '',
-                  self: deps.self,
-                  // recomputed — the flag is a deterministic function of
-                  // the verified bytes and the version, never persisted
-                  oversized: oversizedOf(pdu, version),
-                  ungroundedMs: 0,
-                },
-              });
-              return result.grounding === 'grounded';
-            }),
-        );
-        if (grounded) await enqueue([job.eventId]);
-      } else {
-        await withRoomLock(room.id, () =>
+    // Failure leaves the committed ready row for another arrival or startup.
+    if (job.kind === 'prev') {
+      const grounded = await withRoomLock(
+        room.id,
+        () =>
           room.tx(async (tx) => {
-            const waiting = await tx.waits.of(job.eventId);
-            if (
-              !waiting.some((wait) =>
-                wait.kind === 'redaction' && wait.missing === job.target
-              )
-            ) return;
             const row = await tx.events.get(job.eventId);
-            const target = await tx.events.get(job.target);
-            if (row === null || target === null) return;
-            const before = await tx.state.eventStateBefore(job.eventId);
-            if (before === null) return;
+            const status = await tx.events.getStatus(job.eventId);
             const stay = await tx.segments.openStay();
-            if (stay === null) return;
+            if (row === null || status === null || stay === null) return;
             const version = await roomVersionOf(tx, stay.id);
             const pdu = JSON.parse(row.pdu) as Pdu;
-            if (
-              await redactionEffectAllowed(
-                tx,
-                getRulebook(version).spec,
-                pdu,
-                target,
-                before.group,
-              )
-            ) {
-              await tx.changes.append('redaction', job.eventId, {
-                target: job.target,
-              });
-            }
-            await tx.waits.remove(job.target, job.eventId, 'redaction');
-          }));
-      }
-      resumed++;
-    } catch (e) {
-      console.error(`resumeWaits: ${job.kind} ${job.eventId} failed:`, e);
+            const result = await ingestInTx(tx, room.id, pdu, {
+              remote: {
+                origin: status.origin ?? '',
+                self: deps.self,
+                // recomputed — the flag is a deterministic function of
+                // the verified bytes and the version, never persisted
+                oversized: oversizedOf(pdu, version),
+                ungroundedMs: 0,
+              },
+            });
+            return result.grounding === 'grounded';
+          }),
+      );
+      if (grounded) await enqueue([job.eventId]);
+    } else {
+      await withRoomLock(room.id, () =>
+        room.tx(async (tx) => {
+          const waiting = await tx.waits.of(job.eventId);
+          if (
+            !waiting.some((wait) =>
+              wait.kind === 'redaction' && wait.missing === job.target
+            )
+          ) return;
+          const row = await tx.events.get(job.eventId);
+          const target = await tx.events.get(job.target);
+          if (row === null || target === null) return;
+          const before = await tx.state.eventStateBefore(job.eventId);
+          if (before === null) return;
+          const stay = await tx.segments.openStay();
+          if (stay === null) return;
+          const version = await roomVersionOf(tx, stay.id);
+          const pdu = JSON.parse(row.pdu) as Pdu;
+          if (
+            await redactionEffectAllowed(
+              tx,
+              getRulebook(version).spec,
+              pdu,
+              target,
+              before.group,
+            )
+          ) {
+            await tx.changes.append('redaction', job.eventId, {
+              target: job.target,
+            });
+          }
+          await tx.waits.remove(job.target, job.eventId, 'redaction');
+        }));
     }
+    resumed++;
   }
   return resumed;
 }

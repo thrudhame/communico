@@ -3,11 +3,19 @@
 import type { App } from '#engine/app.ts';
 import { config } from '#engine/config.ts';
 import { capabilities } from './capabilities.ts';
+import { exportKeyRoster } from './control.ts';
 import { openJournalClient } from './client.ts';
 import { certificatePin, readProtectedFile } from './identity.ts';
 import { Journal } from './journal.ts';
 import { enrollLink } from './link.ts';
 import { Pairings } from './pairing.ts';
+import { startRoomExports } from './replication.ts';
+import { startPublicExports } from './public.ts';
+import { startDirectoryExports } from './directory.ts';
+import { HomeIngress } from './drain.ts';
+import { HomeEgress } from './home-egress.ts';
+import { dispatchBatch } from '#engine/federation/sender.ts';
+import { transactionDependencies } from '#engine/federation/dependencies.ts';
 import {
   LINK_CAPABILITIES,
   LinkError,
@@ -31,7 +39,19 @@ export async function startHomeLinks(
       403,
     );
   }
-  if (!settings.nodes.length) return { close: () => Promise.resolve() };
+  if (!settings.nodes.length) {
+    if (
+      (await app.server.query('SELECT 1 FROM facade_egress_routes LIMIT 1'))
+        .length
+    ) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'retained destination egress ownership requires its configured link',
+        503,
+      );
+    }
+    return { dispatch: undefined, close: () => Promise.resolve() };
+  }
   const tls = await loadLinkTls(settings);
   const pairings = new Pairings(
     app.server,
@@ -42,7 +62,27 @@ export async function startHomeLinks(
   const journal = new Journal(app.server, LINK_CAPABILITIES);
   const controller = new AbortController();
   const workers = new Map<string, ReturnType<typeof startHomeLinkWorker>>();
+  const exports = new Map<string, ReturnType<typeof startRoomExports>>();
+  const publicExports = new Map<
+    string,
+    ReturnType<typeof startPublicExports>
+  >();
   const jobs = new Map<string, Promise<void>>();
+  const directoryExports = new Map<
+    string,
+    ReturnType<typeof startDirectoryExports>
+  >();
+  const egress = new HomeEgress(
+    app.server,
+    pairings,
+    journal,
+    settings.nodes,
+    settings.outbound as 'direct' | 'facade',
+    (envelope) => dispatchBatch(app.server, app.tenant.signer(), envelope),
+    () => {
+      for (const worker of workers.values()) worker.wake();
+    },
+  );
   const failed = (node: string, error: unknown) => {
     if (!controller.signal.aborted) {
       console.error(
@@ -54,7 +94,19 @@ export async function startHomeLinks(
   };
   async function reconcile(id: string, node: string) {
     const peer = await pairings.connection(id);
-    if (peer.state === 'paired' && workers.has(id)) return;
+    if (peer.state === 'paired' && workers.has(id)) {
+      await exportKeyRoster(app.store, app.tenant, node, id);
+      exports.get(id)?.wake();
+      publicExports.get(id)?.wake();
+      directoryExports.get(id)?.wake();
+      return;
+    }
+    await exports.get(id)?.close();
+    exports.delete(id);
+    await publicExports.get(id)?.close();
+    publicExports.delete(id);
+    await directoryExports.get(id)?.close();
+    directoryExports.delete(id);
     await workers.get(id)?.close();
     workers.delete(id);
     let secret: string | undefined;
@@ -80,8 +132,15 @@ export async function startHomeLinks(
     }
     await enrollLink(pairings, id, tls, secret, controller.signal);
     if (peer.state === 'revoked' || controller.signal.aborted) return;
+    await exportKeyRoster(app.store, app.tenant, node, id);
     const client = await openJournalClient(pairings, id, tls);
     if (controller.signal.aborted) return;
+    const ingress = new HomeIngress(app.server, {
+      peer: node,
+      pairing: id,
+      pairings,
+      transaction: transactionDependencies(app),
+    });
     workers.set(
       id,
       startHomeLinkWorker({
@@ -95,10 +154,43 @@ export async function startHomeLinks(
         notify: settings.notify as 'websocket' | 'sse' | 'poll',
         pollseconds: settings.pollseconds,
         reconnectmaxseconds: settings.reconnectmaxseconds,
-        apply: (stream) => apply(node, stream),
+        apply: (stream) =>
+          stream.stream.startsWith('ingress:')
+            ? ingress.apply(journal, stream)
+            : apply(node, stream),
         failed: (error) => failed(node, error),
       }),
     );
+    const rooms = startRoomExports({
+      store: app.store,
+      self: app.tenant.serverName,
+      peer: node,
+      pairing: id,
+      changed: () => workers.get(id)?.wake(),
+      failed: (error) => failed(node, error),
+    });
+    exports.set(id, rooms);
+    rooms.wake();
+    const users = startPublicExports({
+      store: app.store,
+      tenant: app.tenant,
+      peer: node,
+      pairing: id,
+      changed: () => workers.get(id)?.wake(),
+      failed: (error) => failed(node, error),
+    });
+    publicExports.set(id, users);
+    users.wake();
+    const directory = startDirectoryExports({
+      store: app.store,
+      tenant: app.tenant,
+      peer: node,
+      pairing: id,
+      changed: () => workers.get(id)?.wake(),
+      failed: (error) => failed(node, error),
+    });
+    directoryExports.set(id, directory);
+    directory.wake();
   }
   let scanning: Promise<void> | undefined;
   const scan = () =>
@@ -125,15 +217,23 @@ export async function startHomeLinks(
   await scan();
   let closed: Promise<void> | undefined;
   return {
+    dispatch: egress.dispatch.bind(egress),
     close() {
       return closed ??= (async () => {
         clearInterval(timer);
         controller.abort();
         await scanning;
+        await Promise.all(jobs.values());
+        await Promise.all([...exports.values()].map((rooms) => rooms.close()));
+        await Promise.all(
+          [...publicExports.values()].map((users) => users.close()),
+        );
+        await Promise.all(
+          [...directoryExports.values()].map((directory) => directory.close()),
+        );
         await Promise.all(
           [...workers.values()].map((worker) => worker.close()),
         );
-        await Promise.all(jobs.values());
       })();
     },
   };

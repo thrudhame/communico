@@ -9,7 +9,7 @@ import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 export default async function (request: PathfinderRequest) {
   assertFederationEnabled();
-  assertFederationDirectoryAllowed();
+  await assertFederationDirectoryAllowed();
   return await listLocalPublishedRooms(
     decodeDirectoryRequest(request.query, undefined, 'federation'),
   );

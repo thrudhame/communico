@@ -13,14 +13,28 @@ import { reconcileDeviceSubscriptions } from '#engine/server/device-federation.t
 import type { Store } from '#engine/store/index.ts';
 import { onStartup, type StartupStore } from '#engine/store/watermark.ts';
 import { installJoinAdmission } from '#engine/server/join-attempts.ts';
+import { openRoom } from '#engine/room/index.ts';
+import { resumeWaits } from '#engine/room/ingest.ts';
+
+// App composition calls this after the restore-report gate and before workers.
+// Failed dependency work is durable room truth, not a process-local task.
+export async function recoverRoomWaits(
+  store: Store,
+  self: string,
+): Promise<void> {
+  for (const roomId of await listRooms(store)) {
+    await resumeWaits(await openRoom(store, roomId), { self }, []);
+    await project(store, roomId);
+  }
+}
 
 export function installServerHooks(): void {
   setRoomHooks({ project, register: registerRoom });
   setTenantProjector(projectTenant);
-  onStartup(rollForward);
+  onStartup(recoverServer);
 }
 
-async function rollForward(store: StartupStore): Promise<void> {
+export async function recoverServer(store: StartupStore): Promise<void> {
   const concrete = store as Store;
   const server = await concrete.server();
   // A store opened without the server schema (engine tests) has nothing

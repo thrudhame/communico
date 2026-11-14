@@ -13,6 +13,10 @@ export type FrozenBatch = {
   rows: OutboxDueRow[];
   sources: string[];
 };
+export type DispatchEnvelope = Pick<FrozenBatch, 'txnId' | 'body'> & {
+  destination: string;
+};
+export type Dispatch = (envelope: DispatchEnvelope) => Promise<unknown>;
 
 export async function enqueueEdu(
   tx: Conn,
@@ -81,6 +85,7 @@ async function current(
 export async function frozenBatch(
   server: Database,
   destination: string,
+  retain = false,
 ): Promise<FrozenBatch | null> {
   return await server.tx(async (tx) => {
     const row =
@@ -94,7 +99,9 @@ export async function frozenBatch(
       rows: JSON.parse(String(row.pdu_rows)),
       sources: JSON.parse(String(row.edu_sources)),
     };
-    if (await current(tx, destination, batch)) return batch;
+    // A distributed owner may already have dispatched these bytes. Local
+    // pruning/expiry/retry cannot retire that unresolved logical-pair ID.
+    if (retain || await current(tx, destination, batch)) return batch;
     // Expiry/prune/retry can retire PDU work. Re-form a new envelope with a
     // fresh id, leaving accepted reliable EDUs pending rather than expiring them.
     await tx.execute('DELETE FROM federation_batches WHERE destination=?', [
@@ -143,8 +150,8 @@ export async function completeBatch(
 ): Promise<void> {
   for (const row of batch.rows) {
     await tx.execute(
-      "UPDATE outbox SET state='sent' WHERE room=? AND pos=? AND destination=?",
-      [row.room, row.pos, destination],
+      "UPDATE outbox SET state='sent' WHERE room=? AND pos=? AND destination=? AND added_ms=?",
+      [row.room, row.pos, destination, row.addedMs],
     );
   }
   for (const source of batch.sources) {

@@ -95,12 +95,18 @@ if (config().server.role === 'facade') {
   const facade = await startFacade(lifetime);
   admin = facade.admin;
   stopRuntime = facade.close;
-  console.log('facade: link/local admin ready; Matrix scopes not yet ready');
+  console.log(
+    'facade: link/local admin ready; Matrix exposure follows enrollment and replica cuts',
+  );
 } else {
   await Deno.mkdir(mediaRoot(), { recursive: true });
   const app = await openApp();
+  let federationDispatch: Awaited<
+    ReturnType<typeof startHomeLinks>
+  >['dispatch'];
   try {
     const links = await startHomeLinks(app);
+    federationDispatch = links.dispatch;
     stopRuntime = async () => {
       await links.close();
       await closeApp();
@@ -123,7 +129,7 @@ if (config().server.role === 'facade') {
     console.log(
       `federation: enabled port=${fed.port} mode=${fed.mode} cert=${absCert} cacerts=${fed.cacerts.length} peers=${peers} blocks=${blocks} pending=${pending}`,
     );
-    startFederationServices(app);
+    startFederationServices(app, federationDispatch);
   } else {
     console.log('federation: disabled');
   }

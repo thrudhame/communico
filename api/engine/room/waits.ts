@@ -38,6 +38,33 @@ export async function addWait(conn: Conn, wait: Wait): Promise<void> {
       wait.state,
     ],
   );
+  await readyFor(conn, wait.missing);
+}
+
+// Eligibility belongs to the durable dependency owner. The arrival and its
+// ready edges commit together, including arrivals stored only as evidence.
+// Prev recovery needs grounding; a redaction needs only the target's bytes.
+export async function readyFor(conn: Conn, missing: string): Promise<void> {
+  await conn.execute(
+    `UPDATE waits SET state='ready' WHERE missing=? AND state!='ready' AND (
+      (kind='redaction' AND EXISTS(SELECT 1 FROM events WHERE id=?)) OR
+      (kind='prev' AND EXISTS(SELECT 1 FROM event_status WHERE event=? AND grounding='grounded'))
+    )`,
+    [missing, missing, missing],
+  );
+}
+
+export async function readyWaits(conn: Conn): Promise<Wait[]> {
+  return (await conn.query(
+    "SELECT * FROM waits WHERE state='ready' ORDER BY since, waiting, missing, kind",
+  )).map(waitOf);
+}
+
+export async function deferWait(conn: Conn, wait: Wait): Promise<void> {
+  await conn.execute(
+    "UPDATE waits SET state='pending' WHERE missing=? AND waiting=? AND kind=?",
+    [wait.missing, wait.waiting, wait.kind],
+  );
 }
 
 export async function waitsFor(conn: Conn, missing: string): Promise<Wait[]> {
@@ -56,7 +83,7 @@ export async function waitsOf(conn: Conn, waiting: string): Promise<Wait[]> {
   return rows.map(waitOf);
 }
 
-// Every wait of the room, oldest first — the recheck driver's scan.
+// Inventory only; foreground recovery uses the indexed ready queue.
 export async function allWaits(conn: Conn): Promise<Wait[]> {
   const rows = await conn.query(
     'SELECT * FROM waits ORDER BY since, waiting, missing, kind',

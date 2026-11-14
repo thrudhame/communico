@@ -547,6 +547,7 @@ export function loadedConfig(): LoadedConfig {
 }
 
 export type ConfigPatch = {
+  facade?: Partial<Config['facade']>;
   wellknown?: Partial<Omit<Config['wellknown'], 'support'>> & {
     support?: {
       page?: string;
@@ -571,6 +572,7 @@ export type ConfigPatch = {
     cacerts?: string[];
   };
   server?: {
+    role?: string;
     name?: string;
     port?: number;
     shutdowngraceseconds?: number;

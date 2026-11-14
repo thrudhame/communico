@@ -17,10 +17,15 @@ import type { Pdu } from '#engine/pdu.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import type { Fetcher, KeyResolver, RemoteDeps } from '#engine/room/deps.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
-import { ingestRemote } from '#engine/room/remote.ts';
+import {
+  ingestRemote,
+  type RemoteOutcome,
+  replayRemoteBatch,
+} from '#engine/room/remote.ts';
 import type { Store } from '#engine/store/index.ts';
 import { ReliableEduError } from '#engine/federation/edus.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
+import type { RequestEvidence } from './request-evidence.ts';
 
 export type TransactionDeps = {
   store: Store;
@@ -35,6 +40,129 @@ export type TransactionDeps = {
 };
 
 export type TxnResult = { status: number; body: Record<string, unknown> };
+export type TransactionIngress = {
+  stage(txnId: string, evidence: RequestEvidence): Promise<void>;
+  receive(origin: string, txnId: string): Promise<TxnResult>;
+};
+export type PduResults = Record<
+  string,
+  Record<string, never> | { error: string }
+>;
+
+async function identifyRoomInputs(pdus: Pdu[], version: string) {
+  const identified: { pdu: Pdu; eventId: string }[] = [];
+  for (const pdu of pdus) {
+    let eventId: string;
+    try {
+      eventId = await eventIdFor(
+        pdu as unknown as Record<string, unknown>,
+        version,
+      );
+    } catch {
+      continue;
+    }
+    pdu.event_id = eventId;
+    identified.push({ pdu, eventId });
+  }
+  return identified;
+}
+
+/** No room/DAG authority is implied by an out-of-band invite. The local invite
+ * owner may still process its ordinary rescind without creating a room. */
+export async function absentTransactionRoom(
+  pdus: Pdu[],
+  rescind?: (pdu: Pdu) => Promise<boolean>,
+): Promise<PduResults> {
+  const results: PduResults = {};
+  for (const { pdu, eventId } of await identifyRoomInputs(pdus, '11')) {
+    results[eventId] = rescind && await rescind(pdu)
+      ? {}
+      : { error: 'unknown room' };
+  }
+  return results;
+}
+
+/** Shared envelope admission for standalone processing and durable ingress. */
+export function decodeTransaction(rawBody: unknown, origin: string) {
+  try {
+    return transactionRequest(rawBody, origin);
+  } catch (error) {
+    if (!(error instanceof UpstreamError)) throw error;
+    const failure = new MatrixError(
+      400,
+      error.context.resourceLimit ? 'M_TOO_LARGE' : 'M_BAD_JSON',
+      error.context.reason,
+    );
+    failure.cause = error;
+    throw failure;
+  }
+}
+
+export function transactionRooms(pdus: readonly Pdu[]) {
+  const byRoom = new Map<string, Pdu[]>();
+  for (const raw of pdus) {
+    const pdu = raw as unknown as Pdu;
+    let roomId = typeof pdu.room_id === 'string' ? pdu.room_id : null;
+    if (
+      roomId === null && pdu.type === 'm.room.create' &&
+      typeof pdu.event_id === 'string'
+    ) roomId = '!' + String(pdu.event_id).slice(1);
+    if (roomId === null) continue;
+    const held = byRoom.get(roomId);
+    const list = held == null ? [] : held;
+    list.push(pdu);
+    byRoom.set(roomId, list);
+  }
+  return byRoom;
+}
+
+export async function dispatchTransactionEdu(
+  origin: string,
+  raw: unknown,
+  edus: TransactionDeps['edus'],
+): Promise<void> {
+  try {
+    await edus.dispatch(origin, raw);
+  } catch (error) {
+    if (error instanceof ReliableEduError) throw error;
+    if (
+      !(error instanceof UpstreamError) ||
+      !['protocol', 'validation'].includes(error.category)
+    ) throw error;
+    console.error(`transactions[${origin}]: EDU dropped:`, error);
+  }
+}
+
+export async function receiveTransactionRoom(
+  roomId: string,
+  pdus: Pdu[],
+  origin: string,
+  deps: TransactionDeps,
+  operationId?: string,
+): Promise<PduResults> {
+  const fed = config().federation;
+  const results: PduResults = {};
+  await receiveRoom(
+    roomId,
+    pdus,
+    origin,
+    deps,
+    {
+      keys: deps.keys,
+      fetcher: deps.fetcher,
+      self: deps.self,
+      limits: {
+        waitMs: fed.missingwaitms,
+        limit: fed.missinglimit,
+        budgetMs: fed.missingbudgetms,
+      },
+      ungroundedMs: fed.ungroundedmillihours * 3_600,
+    },
+    results,
+    operationId,
+  );
+  return results;
+}
 
 // One room's PDUs through the remote pipeline, mapping outcomes to the
 // spec's per-PDU result entries ({} for handled — accepted, rejected,
@@ -48,7 +176,8 @@ async function receiveRoom(
   origin: string,
   deps: TransactionDeps,
   remoteDeps: RemoteDeps,
-  results: Record<string, Record<string, never> | { error: string }>,
+  results: PduResults,
+  operationId?: string,
 ): Promise<void> {
   let room: Room | null = null;
   try {
@@ -61,46 +190,42 @@ async function receiveRoom(
   let participating = false;
   if (room !== null) {
     const read = await room.tx(async (tx) => {
-      const stay = await tx.segments.openStay();
+      const stay = await tx.segments.latestStay();
       if (stay === null) return { version: null, participating: false };
       return {
         version: await roomVersionOf(tx, stay.id),
-        participating: true,
+        participating: stay.status === 'open',
       };
     });
     version = read.version == null ? '11' : read.version;
     participating = read.participating;
   }
+  if (room === null) {
+    Object.assign(
+      results,
+      await absentTransactionRoom(
+        pdus,
+        deps.rescind ? (pdu) => deps.rescind!(roomId, pdu) : undefined,
+      ),
+    );
+    return;
+  }
   // the result key is the event's COMPUTED id (uncomputable → no entry —
   // Complement counts them, federation_room_get_missing_events_test.go:292-294)
-  const identified: { pdu: Pdu; eventId: string }[] = [];
-  for (const pdu of pdus) {
-    let eventId: string;
-    try {
-      eventId = await eventIdFor(
-        pdu as unknown as Record<string, unknown>,
-        version,
-      );
-    } catch {
-      continue;
+  // Restore derived event IDs on the wire form before shared remote admission.
+  const identified = await identifyRoomInputs(pdus, version);
+  if (operationId !== undefined) {
+    const prior = await replayRemoteBatch(
+      room,
+      identified.map((item) => item.pdu),
+      origin,
+      deps.self,
+      operationId,
+    );
+    if (prior) {
+      assignOutcomes(results, prior);
+      return;
     }
-    // the wire form has no event_id (v3+, transported out-of-band) —
-    // restore it: the signature covers the redacted form WITH it
-    (pdu as unknown as Record<string, unknown>).event_id = eventId;
-    identified.push({ pdu, eventId });
-  }
-  if (room === null) {
-    // no room file — except an m.room.member leave/ban for a user with
-    // an out-of-band invite (§3.8 step 7's rescind): a remote rejection,
-    // not an error
-    for (const { pdu, eventId } of identified) {
-      if (deps.rescind !== undefined && (await deps.rescind(roomId, pdu))) {
-        results[eventId] = {};
-      } else {
-        results[eventId] = { error: 'unknown room' };
-      }
-    }
-    return;
   }
   if (!participating) {
     for (const { eventId } of identified) {
@@ -113,7 +238,13 @@ async function receiveRoom(
     identified.map((item) => item.pdu),
     origin,
     remoteDeps,
+    'pushed',
+    operationId,
   );
+  assignOutcomes(results, outcomes);
+}
+
+function assignOutcomes(results: PduResults, outcomes: RemoteOutcome[]) {
   for (const outcome of outcomes) {
     if (outcome.eventId === null) continue;
     switch (outcome.outcome) {
@@ -145,20 +276,7 @@ export async function receiveTransaction(
   rawBody: unknown,
   deps: TransactionDeps,
 ): Promise<TxnResult> {
-  let envelope: ReturnType<typeof transactionRequest>;
-  try {
-    envelope = transactionRequest(rawBody, origin);
-  } catch (error) {
-    if (!(error instanceof UpstreamError)) throw error;
-    const failure = new MatrixError(
-      400,
-      error.context.resourceLimit ? 'M_TOO_LARGE' : 'M_BAD_JSON',
-      error.context.reason,
-    );
-    failure.cause = error;
-    throw failure;
-  }
-  const { pdus, edus } = envelope;
+  const { pdus, edus } = decodeTransaction(rawBody, origin);
 
   const server = await deps.store.server();
   // replay: a retried transaction gets the stored answer
@@ -173,57 +291,20 @@ export async function receiveTransaction(
     };
   }
 
-  // group PDUs by room (v12 create: the room id derives from the event
-  // id — v12.md:18-20, :100-101)
-  const byRoom = new Map<string, Pdu[]>();
-  for (const raw of pdus) {
-    // The envelope establishes objects only. The room verifier owns the PDU.
-    const pdu = raw as unknown as Pdu;
-    let roomId = typeof pdu.room_id === 'string' ? pdu.room_id : null;
-    if (
-      roomId === null && pdu.type === 'm.room.create' &&
-      typeof pdu.event_id === 'string'
-    ) {
-      roomId = '!' + String(pdu.event_id).slice(1);
-    }
-    if (roomId === null) continue; // no computable room — no result entry
-    const held = byRoom.get(roomId);
-    const list = held == null ? [] : held;
-    list.push(pdu);
-    byRoom.set(roomId, list);
-  }
-
   const fed = config().federation;
-  const remoteDeps: RemoteDeps = {
-    keys: deps.keys,
-    fetcher: deps.fetcher,
-    self: deps.self,
-    limits: {
-      waitMs: fed.missingwaitms,
-      limit: fed.missinglimit,
-      budgetMs: fed.missingbudgetms,
-    },
-    ungroundedMs: fed.ungroundedmillihours * 3_600, // millihours → ms
-  };
-  const results: Record<string, Record<string, never> | { error: string }> = {};
+  const results: PduResults = {};
   // one room at a time, in first-seen order (the room's own sequencing
   // lives inside ingestRemote's locked batch)
-  for (const [roomId, roomPdus] of byRoom) {
-    await receiveRoom(roomId, roomPdus, origin, deps, remoteDeps, results);
+  for (const [roomId, roomPdus] of transactionRooms(pdus)) {
+    Object.assign(
+      results,
+      await receiveTransactionRoom(roomId, roomPdus, origin, deps),
+    );
   }
 
   // Reliable acceptance must finish before the transport success is cached.
   for (const raw of edus) {
-    try {
-      await deps.edus.dispatch(origin, raw);
-    } catch (e) {
-      if (e instanceof ReliableEduError) throw e;
-      if (
-        !(e instanceof UpstreamError) ||
-        !['protocol', 'validation'].includes(e.category)
-      ) throw e;
-      console.error(`transactions[${origin}]: EDU dropped:`, e);
-    }
+    await dispatchTransactionEdu(origin, raw, deps.edus);
   }
 
   const response = { pdus: results };

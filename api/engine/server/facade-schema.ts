@@ -17,3 +17,23 @@ CREATE INDEX facade_pairings_node ON facade_pairings(node,state);
 export const RUNTIME_IDENTITY_SQL = `
 CREATE TABLE runtime_identity(singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),role TEXT NOT NULL CHECK(role IN ('home','facade')),server_name TEXT NOT NULL,node_id TEXT NOT NULL,initialized INTEGER NOT NULL CHECK(initialized IN (0,1)));
 `;
+
+export const FACADE_KEY_RETIREMENT_SQL = `
+ALTER TABLE facade_pairings ADD COLUMN retired_ms INTEGER;
+`;
+
+export const FACADE_KEY_ROSTER_SQL = `
+CREATE TABLE facade_key_roster(singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),revision INTEGER NOT NULL,roster_json TEXT,last_home_ms INTEGER,document_json TEXT,issued_ms INTEGER);
+INSERT INTO facade_key_roster(singleton,revision) VALUES(1,0);
+`;
+
+export const FACADE_SCOPES_SQL = `
+CREATE TABLE facade_exports(peer TEXT NOT NULL,incarnation TEXT NOT NULL,scope TEXT NOT NULL,source_cut INTEGER NOT NULL,PRIMARY KEY(peer,incarnation,scope));
+CREATE TABLE facade_scopes(incarnation TEXT NOT NULL,scope TEXT NOT NULL,source_cut INTEGER NOT NULL,ready INTEGER NOT NULL CHECK(ready IN (0,1)),pending_hash TEXT,PRIMARY KEY(incarnation,scope));
+`;
+
+export const FACADE_INGRESS_SQL = `
+CREATE TABLE facade_ingress(origin TEXT NOT NULL,txn_id TEXT NOT NULL,input_hash TEXT NOT NULL,evidence_json TEXT NOT NULL,bytes INTEGER NOT NULL,pairing TEXT NOT NULL,revision INTEGER NOT NULL,source TEXT NOT NULL,incarnation TEXT NOT NULL,response_json TEXT,record_sequence INTEGER,record_hash TEXT,PRIMARY KEY(origin,txn_id));
+CREATE TABLE facade_ingress_children(origin TEXT NOT NULL,txn_id TEXT NOT NULL,kind TEXT NOT NULL,child_key TEXT NOT NULL,result_json TEXT NOT NULL,PRIMARY KEY(origin,txn_id,kind,child_key));
+CREATE TABLE facade_ingress_collisions(origin TEXT NOT NULL,txn_id TEXT NOT NULL,input_hash TEXT NOT NULL,evidence_json TEXT NOT NULL,PRIMARY KEY(origin,txn_id,input_hash));
+`;

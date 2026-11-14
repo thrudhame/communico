@@ -15,22 +15,15 @@
 // 5xx, 404 M_NOT_FOUND and M_UNABLE_TO_(AUTHORISE|GRANT)_JOIN fail
 // over; other 4xx abort (the old classification). Network never runs
 // under the lock (R13).
-import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
-import { withAuthProofs } from '#engine/auth-proofs.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import {
-  type EventStore,
   getRulebook,
   type Rulebook,
   supportedRoomVersions,
 } from '#engine/rulebook/index.ts';
-import {
-  checkDeclaredAuth,
-  finalizeBuilt,
-  roomCreateId,
-} from '#engine/room/build.ts';
+import { finalizeBuilt, roomCreateId } from '#engine/room/build.ts';
 import {
   type Fetcher,
   type KeyResolver,
@@ -41,14 +34,16 @@ import {
   projectAfterWrite,
   registerCreatedRoom,
 } from '#engine/room/hooks.ts';
-import { ingestInTx } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { AclDenied, assertServerAllowed } from '#engine/room/acl.ts';
 import type { Signer } from '#engine/room/signer.ts';
-import { orderEvents } from '#engine/room/order.ts';
-import { mapEntries, type StateMap } from '#engine/room/state.ts';
-import { identify, oversizedOf, verify } from '#engine/room/verify.ts';
+import {
+  authorizeSnapshotEvent,
+  verifySnapshot,
+} from '#engine/room/snapshot.ts';
+import { installSnapshotBoundary } from '#engine/room/snapshot-install.ts';
+import { identify } from '#engine/room/verify.ts';
 import { authorizerServer } from '#engine/room/verify.ts';
 import {
   recoverableUpstream,
@@ -78,32 +73,6 @@ export type JoinDeps = {
 };
 
 export type JoinResult = { roomId: string; eventId: string };
-
-// Verify one snapshot event through the ONE verification path (G9).
-// Our own events ride the snapshot back to us (a re-join's snapshot
-// carries our first join): their sender-domain key is not resolvable
-// through the injected resolver, so — as in the old snapshot semantics
-// — the RESIDENT's signature also proves the event (it vouches for the
-// snapshot it serves). Both failing drops only this event; the usable
-// snapshot and join authorization decide whether the response suffices.
-async function verifySnapshotEvent(
-  raw: Pdu,
-  roomVersion: string,
-  candidate: string,
-  roomId: string,
-  keys: KeyResolver,
-  self: string,
-): Promise<{ eventId: string; pdu: Pdu } | null> {
-  try {
-    return await verify(raw, roomVersion, keys, {
-      roomId,
-      localSnapshotFallback: { self, resident: candidate },
-    });
-  } catch (error) {
-    if (!recoverableUpstream(error)) throw error;
-    return null;
-  }
-}
 
 // Fail over to the next candidate on network failure, 5xx,
 // 404 M_NOT_FOUND and the M_UNABLE_TO_* join errcodes; abort on other
@@ -265,92 +234,16 @@ async function joinVia(
     // 4. validate BEFORE anything is written: individual receipt failures
     //    drop events, auth failures reject them. Only accepted state enters
     //    the boundary; the join must still be authorized by that snapshot.
-    const pack = new Map<string, Pdu>();
-    const stateEventIds: string[] = [];
-    for (const raw of resp.state ?? []) {
-      const v = await verifySnapshotEvent(
-        raw,
-        mk.roomVersion,
-        candidate,
-        args.roomId,
-        deps.keys,
-        deps.self,
-      );
-      if (v === null) continue;
-      if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
-      stateEventIds.push(v.eventId);
-    }
-    for (const raw of resp.authChain ?? []) {
-      const v = await verifySnapshotEvent(
-        raw,
-        mk.roomVersion,
-        candidate,
-        args.roomId,
-        deps.keys,
-        deps.self,
-      );
-      if (v === null) continue;
-      if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
-    }
-    // Per-event auth checks in dependency order, regardless of the source
-    // array: rejected evidence is stored but never imported as state.
-    const rejected = new Map([...pack.keys()].map((id) => [id, 'unchecked']));
-    const packStore: EventStore = await withAuthProofs({
-      get: (id) => pack.get(id),
-      isRejected: (id) => rejected.has(id),
-    }, pack.values());
-    const stateIdSet = new Set(stateEventIds);
-    const snapshotCreates = [...stateIdSet].filter((id) =>
-      pack.get(id)?.type === 'm.room.create' &&
-      checkDeclaredAuth(pack.get(id)!, rulebook, packStore, null).ok
-    );
-    if (snapshotCreates.length !== 1) {
-      throw badResponse('snapshot has no single create');
-    }
-    const ordered = orderEvents(
-      [...pack].map(([eventId, pdu]) => ({ eventId, pdu })),
-      ['auth_events'],
-    ).map(({ eventId, pdu }) => [eventId, pdu] as const);
-    for (const [id, eventPdu] of ordered) {
-      rejected.delete(id);
-      const chain = checkDeclaredAuth(
-        eventPdu,
-        rulebook,
-        packStore,
-        snapshotCreates[0],
-      );
-      if (!chain.ok) {
-        rejected.set(id, chain.rule);
-      }
-    }
-    // exactly one create among the accepted state events, for the
-    // template's version
-    const creates = stateEventIds
-      .filter((id) => !rejected.has(id))
-      .map((id) => pack.get(id)!)
-      .filter((eventPdu) => eventPdu.type === 'm.room.create');
-    if (creates.length !== 1) {
-      throw badResponse('snapshot has no single create');
-    }
-    if (String(creates[0].content?.room_version ?? '') !== mk.roomVersion) {
-      throw badResponse(
-        `snapshot create says room_version ${
-          String(creates[0].content?.room_version)
-        }, expected ${mk.roomVersion}`,
-      );
-    }
-    // the snapshot: the accepted state events (the imported boundary —
-    // the state PRIOR to the join, joins-v2.yaml)
-    const snapshot: StateMap = new Map();
-    for (const id of stateEventIds) {
-      if (rejected.has(id)) continue;
-      const eventPdu = pack.get(id)!;
-      if (eventPdu.state_key === undefined) continue;
-      snapshot.set(
-        String(eventPdu.type) + '\0' + String(eventPdu.state_key),
-        id,
-      );
-    }
+    const verified = await verifySnapshot({
+      roomId: args.roomId,
+      roomVersion: mk.roomVersion,
+      resident: candidate,
+      self: deps.self,
+      keys: deps.keys,
+      state: resp.state ?? [],
+      authChain: resp.authChain ?? [],
+    });
+    const { pack, snapshot, createId } = verified;
     // The returned join must match ours. Merge only its verified resident
     // signature into our authored event. The countersigned
     // copy is required only for restricted authorisation (joins-v2.yaml).
@@ -415,27 +308,7 @@ async function joinVia(
       throw badResponse('the returned join is not vouched by the resident');
     }
     // the join against the snapshot: its auth events and the state before
-    const joinStore: EventStore = await withAuthProofs({
-      get: (id) => id === eventId ? join : pack.get(id),
-      isRejected: (id) => rejected.has(id),
-    }, [...pack.values(), join]);
-    const joinChain = checkDeclaredAuth(
-      join,
-      rulebook,
-      joinStore,
-      String(creates[0].event_id),
-    );
-    if (!joinChain.ok) {
-      throw badResponse(
-        `the join is not authorized by its auth events (${joinChain.rule})`,
-      );
-    }
-    const joinState = rulebook.checkAuthAgainstState(join, snapshot, joinStore);
-    if (!joinState.ok) {
-      throw badResponse(
-        `the join is not authorized against the snapshot state (${joinState.rule})`,
-      );
-    }
+    await authorizeSnapshotEvent(join, mk.roomVersion, verified);
 
     const aclId = snapshot.get('m.room.server_acl\0');
     const acl = aclId === undefined ? null : pack.get(aclId)?.content ?? {};
@@ -511,72 +384,20 @@ async function joinVia(
           .pop() ?? null;
         if (
           prevStay !== null &&
-          await roomCreateId(tx, prevStay.id) !== String(creates[0].event_id)
+          await roomCreateId(tx, prevStay.id) !== createId
         ) {
           throw badResponse('snapshot replaces the room create');
         }
 
-        // the auth chain and state events as EVIDENCE (R2 — first writer
-        // wins; bytes, never state-at, never positioned)
-        for (const [id, eventPdu] of ordered) {
-          if ((await tx.events.get(id)) !== null) continue;
-          const rule = rejected.get(id) ?? null;
-          await tx.events.insert(
-            id,
-            canonicalJson(eventPdu as unknown as Record<string, unknown>),
-          );
-          await tx.events.setStatus(id, {
-            standing: rule === null ? 'accepted' : 'rejected',
-            grounding: 'evidence',
-            origin: candidate,
-            received_ts: Date.now(),
-          });
-          await tx.changes.append('event', id, {
-            standing: rule === null ? 'accepted' : 'rejected',
-            reason: rule === null ? null : 'auth',
-            rule,
-            type: String(eventPdu.type),
-            state_key: eventPdu.state_key ?? null,
-            sender: String(eventPdu.sender),
-            depth: eventPdu.depth,
-            origin_server_ts: eventPdu.origin_server_ts,
-            stay: null,
-            offset: null,
-            grounding: 'evidence',
-            origin: candidate,
-          });
-        }
-
-        // the imported snapshot group (R5/G1) opens the new stay; the
-        // join is ingested with before = the snapshot — the pipeline
-        // positions it, sets the frontier, publishes and logs the
-        // membership change
-        const snapshotGroup = await tx.materialize.newGroup(
-          null,
-          mapEntries(snapshot),
-        );
-        const stayId = await tx.segments.create({
-          kind: 'stay',
-          prev: prevStay?.id ?? null,
-          opening_group: snapshotGroup,
+        await installSnapshotBoundary(tx, {
+          roomId: args.roomId,
+          roomVersion: mk.roomVersion,
+          event: join,
+          verified,
+          resident: candidate,
+          self: deps.self,
+          previousStay: prevStay?.id ?? null,
         });
-        const result = await ingestInTx(tx, args.roomId, join, {
-          remote: {
-            origin: candidate,
-            self: deps.self,
-            oversized: oversizedOf(join, mk.roomVersion),
-            ungroundedMs: 0,
-            boundary: snapshot,
-          },
-        });
-        if (result.standing !== 'accepted') {
-          throw new Error(
-            `E_JOIN_NOT_ACCEPTED: ${result.standing} (${result.reason ?? ''}${
-              result.rule === null ? '' : ', rule ' + result.rule
-            })`,
-          );
-        }
-        await tx.segments.setOpenedBy(stayId, eventId);
       }));
     await projectAfterWrite(store, args.roomId);
     return { roomId: args.roomId, eventId };

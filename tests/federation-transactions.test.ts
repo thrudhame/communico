@@ -12,11 +12,14 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { eduQueues, type EduState, eduState } from '#engine/federation/edus.ts';
-import { receiveTransaction } from '#engine/federation/transactions.ts';
+import {
+  receiveTransaction,
+  receiveTransactionRoom,
+} from '#engine/federation/transactions.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
-import { roomSchema } from '#engine/room/index.ts';
+import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
@@ -294,6 +297,149 @@ async function msg(
     }, s.tip),
   });
 }
+
+Deno.test('transaction room retry recovers exact pending result after grounding and archive', async () => {
+  await withStore(async (store) => {
+    setConfigForTests({ federation: { missingwaitms: 0, missingbudgetms: 0 } });
+    try {
+      const s = await remoteSetup(store);
+      const parent = await msg(s, 'late parent', [s.tip]);
+      const child = await msg(s, 'original pending result', [
+        String(parent.event_id),
+      ]);
+      const deps = { ...s.deps, store, edus: s.edus };
+      const receive = () =>
+        receiveTransactionRoom(
+          s.g.roomId,
+          [structuredClone(child)],
+          s.srv.name,
+          deps,
+          'ingress:room-retry',
+        );
+      const first = await receive();
+      assert('error' in first[String(child.event_id)]);
+      await receiveTransactionRoom(s.g.roomId, [parent], s.srv.name, deps);
+      assertEquals(await receive(), first);
+      await s.g.room.tx(async (tx) => {
+        const stay = await tx.segments.openStay();
+        assert(stay);
+        await tx.segments.close(stay.id);
+      });
+      assertEquals(await receive(), first);
+    } finally {
+      setConfigForTests({});
+    }
+  });
+});
+
+Deno.test('remote batch receipt survives later grounding and rejects changed retry content', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store);
+    const parent = await msg(s, 'not yet disclosed', [s.tip]);
+    const child = await msg(s, 'pending at original admission', [
+      String(parent.event_id),
+    ]);
+    const deps: RemoteDeps = {
+      ...s.deps,
+      limits: { waitMs: 0, limit: 10, budgetMs: 8000 },
+      ungroundedMs: 3_600_000,
+    };
+    const input = [child];
+    const first = await ingestRemote(
+      s.g.room,
+      structuredClone(input),
+      s.srv.name,
+      deps,
+      'pushed',
+      'ingress:one',
+    );
+    assertEquals(first[0].outcome, 'pending');
+    assert(first[0].error?.includes('not divulging'));
+    await ingestRemote(s.g.room, [parent], s.srv.name, deps);
+    assertEquals(
+      (await s.g.room.tx((tx) => tx.events.getStatus(String(child.event_id))))
+        ?.grounding,
+      'grounded',
+    );
+    assertEquals(
+      await ingestRemote(
+        s.g.room,
+        structuredClone(input),
+        s.srv.name,
+        deps,
+        'pushed',
+        'ingress:one',
+      ),
+      first,
+      'a room commit followed by a lost server receipt must not change the original negative result',
+    );
+    await assertRejects(
+      () =>
+        ingestRemote(
+          s.g.room,
+          [parent],
+          s.srv.name,
+          deps,
+          'pushed',
+          'ingress:one',
+        ),
+      Error,
+      'E_REMOTE_BATCH_COLLISION',
+    );
+  });
+});
+
+Deno.test('remote batch commit reopens with its exact receipt even after participation ends', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: { room: roomSchema, server: serverSchema },
+  });
+  try {
+    const s = await remoteSetup(store);
+    const event = await msg(s, 'committed before receipt delivery', [s.tip]);
+    const deps: RemoteDeps = {
+      ...s.deps,
+      limits: { waitMs: 0, limit: 10, budgetMs: 8000 },
+      ungroundedMs: 3_600_000,
+    };
+    const first = await ingestRemote(
+      s.g.room,
+      [structuredClone(event)],
+      s.srv.name,
+      deps,
+      'pushed',
+      'ingress:restart',
+    );
+    assertEquals(first[0].outcome, 'accepted');
+    await s.g.room.tx(async (tx) => {
+      await tx.segments.close((await tx.segments.openStay())!.id);
+    });
+    await store.close();
+    store = await openStore(config(dir), {
+      schemas: { room: roomSchema, server: serverSchema },
+    });
+    const room = await openRoom(store, s.g.roomId);
+    assertEquals(
+      await ingestRemote(
+        room,
+        [structuredClone(event)],
+        s.srv.name,
+        deps,
+        'pushed',
+        'ingress:restart',
+      ),
+      first,
+    );
+    const rows = await (await store.room(s.g.roomId)).query(
+      'SELECT * FROM remote_batches',
+    );
+    assertEquals(rows.length, 1);
+    assertEquals(JSON.parse(String(rows[0].response)), first);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('send: origin mismatch 403, >50 PDUs 400, replay returns the stored answer', async () => {
   await withStore(async (store) => {

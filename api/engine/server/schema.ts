@@ -9,10 +9,17 @@
 // the transaction they stamp (no sequences). The store owns the id row,
 // the meta table and the watermarks; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
+import { FEDERATION_POLICY_SQL } from '#engine/federation/policy.ts';
+import { KEY_DECISIONS_SQL } from '#engine/federation/key-decisions.ts';
+import { FACADE_EGRESS_SQL } from '#engine/facade/egress.ts';
 import { RECOVERY_SQL } from '#engine/server/recovery.ts';
 import {
+  FACADE_INGRESS_SQL,
   FACADE_JOURNAL_SQL,
+  FACADE_KEY_RETIREMENT_SQL,
+  FACADE_KEY_ROSTER_SQL,
   FACADE_PAIRING_SQL,
+  FACADE_SCOPES_SQL,
   RUNTIME_IDENTITY_SQL,
 } from './facade-schema.ts';
 
@@ -388,7 +395,7 @@ UPDATE receipts SET event_ids=json_array(event_ids);
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 28,
+  version: 35,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -418,6 +425,13 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FACADE_PAIRING_SQL);
     await db.exec(RUNTIME_IDENTITY_SQL);
     await db.exec(RECOVERY_SQL);
+    await db.exec(FACADE_KEY_RETIREMENT_SQL);
+    await db.exec(FACADE_KEY_ROSTER_SQL);
+    await db.exec(FACADE_SCOPES_SQL);
+    await db.exec(FEDERATION_POLICY_SQL);
+    await db.exec(KEY_DECISIONS_SQL);
+    await db.exec(FACADE_INGRESS_SQL);
+    await db.exec(FACADE_EGRESS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -448,5 +462,12 @@ export const serverSchema: SchemaProvider = {
     25: (conn) => conn.exec(FACADE_PAIRING_SQL),
     26: (conn) => conn.exec(RUNTIME_IDENTITY_SQL),
     27: (conn) => conn.exec(RECOVERY_SQL),
+    28: (conn) => conn.exec(FACADE_KEY_RETIREMENT_SQL),
+    29: (conn) => conn.exec(FACADE_KEY_ROSTER_SQL),
+    30: (conn) => conn.exec(FACADE_SCOPES_SQL),
+    31: (conn) => conn.exec(FEDERATION_POLICY_SQL),
+    32: (conn) => conn.exec(KEY_DECISIONS_SQL),
+    33: (conn) => conn.exec(FACADE_INGRESS_SQL),
+    34: (conn) => conn.exec(FACADE_EGRESS_SQL),
   },
 };

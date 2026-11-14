@@ -13,9 +13,9 @@ import {
 import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { type Room, roomSchema } from '#engine/room/index.ts';
-import { ingestRemote } from '#engine/room/remote.ts';
+import { ingestRemote, replayRemoteBatch } from '#engine/room/remote.ts';
 import { backfill } from '#engine/room/history.ts';
-import { sendLocal } from '#engine/room/ingest.ts';
+import { redactEvent, sendLocal } from '#engine/room/ingest.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { genesis } from './fixtures/genesis.ts';
 import { authAt } from './fixtures/auth.ts';
@@ -145,6 +145,88 @@ async function frontierOf(room: Room): Promise<string[]> {
     return stay === null ? [] : await tx.extremities.frontier(stay.id);
   });
 }
+
+Deno.test('remote: a stored pending target dispatches its delayed redaction', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store);
+    const target = await remoteMsg(s, 'pending target', ['$still-missing'], {});
+    const redaction = await redactEvent(
+      s.room,
+      s.creator,
+      target.event_id!,
+      s.signer,
+    );
+    assertEquals(
+      (await s.room.tx((tx) => tx.waits.of(redaction.eventId))).length,
+      1,
+    );
+    const result = await ingestRemote(s.room, [target], s.server.name, s.deps);
+    assertEquals(result[0].outcome, 'pending');
+    assertEquals(
+      (await s.room.tx((tx) => tx.events.getStatus(target.event_id!)))
+        ?.grounding,
+      'pending',
+    );
+    assertEquals(await s.room.tx((tx) => tx.waits.of(redaction.eventId)), []);
+    const changes = await s.room.tx((tx) => tx.changes.after(0, 200));
+    assertEquals(
+      changes.filter((c) =>
+        c.kind === 'redaction' && c.event === redaction.eventId
+      ).length,
+      1,
+    );
+  });
+});
+
+Deno.test('remote: durable batch identity excludes unsigned data across ingest and replay', async () => {
+  await withStore(async (store) => {
+    const s = await remoteSetup(store);
+    const message = await remoteMsg(s, 'unsigned receipt', [s.joinId], {});
+    const sibling = await remoteMsg(s, 'unblocked sibling', [s.joinId], {});
+    const input = { ...message, unsigned: { extra: 1.5 } };
+    const ordinary = await ingestRemote(
+      s.room,
+      [structuredClone(input)],
+      s.server.name,
+      s.deps,
+    );
+    const result = await ingestRemote(
+      s.room,
+      [input, structuredClone(sibling)],
+      s.server.name,
+      s.deps,
+      'pushed',
+      'unsigned-batch',
+    );
+    assertEquals(result[0], ordinary[0]);
+    assertEquals(result[1].outcome, 'accepted');
+    const changed = { ...message, unsigned: { extra: 2.5 } };
+    assertEquals(
+      await replayRemoteBatch(
+        s.room,
+        [changed, structuredClone(sibling)],
+        s.server.name,
+        s.deps.self,
+        'unsigned-batch',
+      ),
+      result,
+    );
+    assertEquals(
+      await ingestRemote(
+        s.room,
+        [changed, structuredClone(sibling)],
+        s.server.name,
+        s.deps,
+        'pushed',
+        'unsigned-batch',
+      ),
+      result,
+    );
+    const saved = await s.room.tx((tx) => tx.events.get(sibling.event_id!));
+    assert(saved);
+    assertEquals(JSON.parse(saved.pdu).unsigned, undefined);
+  });
+});
 
 Deno.test('key fault ownership: live and historical consumers propagate local faults without publication', async () => {
   await withStore(async (store) => {

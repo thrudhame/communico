@@ -574,4 +574,34 @@ export class Journal {
       return held.result === null ? null : { result: JSON.parse(held.result) };
     });
   }
+
+  /** Resume an immutable outgoing operation without reconstructing a lost
+   * response or choosing different dispatch parameters after restart. */
+  async outgoing(
+    peer: string,
+    stream: Stream,
+    operationId: string,
+  ): Promise<{ record: LinkRecord; result: unknown | null } | null> {
+    return await this.db.tx(async (conn) => {
+      const row = (await conn.query(
+        "SELECT sequence FROM facade_records WHERE peer=? AND direction='out' AND source=? AND incarnation=? AND operation_id=?",
+        [peer, stream.source, stream.incarnation, operationId],
+      ))[0];
+      if (!row) return null;
+      const value = await recordInTx(
+        conn,
+        peer,
+        'out',
+        stream,
+        Number(row.sequence),
+      );
+      if (!value || value.record.operationId !== operationId) {
+        diverged('outgoing operation belongs to another stream');
+      }
+      return {
+        record: value.record,
+        result: value.result === null ? null : JSON.parse(value.result),
+      };
+    });
+  }
 }

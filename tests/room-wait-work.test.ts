@@ -1,12 +1,13 @@
-import { assertEquals } from '@std/assert';
+import { assertEquals, assertRejects } from '@std/assert';
 import { canonicalJson } from '#engine/canonical.ts';
 import { buildInTx, finalizeBuilt } from '#engine/room/build.ts';
-import { roomSchema } from '#engine/room/index.ts';
+import { openRoom, roomSchema } from '#engine/room/index.ts';
 import {
   afterLocalCommit,
   ingestInTx,
   ingestLocal,
   redactEvent,
+  resumeWaits,
 } from '#engine/room/ingest.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { Conn } from '#engine/store/db.ts';
@@ -111,90 +112,145 @@ Deno.test('wait recovery reads only dependencies affected by the arriving event'
   }
 });
 
-Deno.test('wait recovery follows grounded descendants and rechecks multi-parent joins', async () => {
-  const dir = await Deno.makeTempDir();
-  const store = await openStore({
-    dir,
-    library: './.native/libturso_ffi.so',
-    checkpointlogbytes: 65536,
-    maxopenfiles: 8,
-    idleseconds: 300,
-  }, { schemas: { room: roomSchema } });
-  try {
-    const g = await genesis(store, { roomId: '!wait-chain:test' });
-    const first = await g.room.tx((tx) =>
-      buildInTx(tx, g.room.id, {
-        type: 'm.room.message',
-        sender: g.creator,
-        content: { body: 'first parent' },
-      }, g.signer)
-    );
-    const other = await g.room.tx((tx) =>
-      buildInTx(tx, g.room.id, {
-        type: 'm.room.message',
-        sender: g.creator,
-        content: { body: 'other parent' },
-      }, g.signer)
-    );
-    const { event_id: _, ...template } = first;
-    void _;
-    const child = await finalizeBuilt(
-      {
-        ...template,
-        content: { body: 'both parents required' },
-        prev_events: [first.event_id!, other.event_id!],
-        depth: Number(first.depth) + 1,
-      },
-      getRulebook('11'),
-      g.signer,
-    );
-    const descendant = await finalizeBuilt(
-      {
-        ...template,
-        content: { body: 'descendant' },
-        prev_events: [child.event_id!],
-        depth: Number(child.depth) + 1,
-      },
-      getRulebook('11'),
-      g.signer,
-    );
-    for (const pdu of [descendant, child]) {
-      const result = await g.room.tx((tx) =>
-        ingestInTx(tx, g.room.id, pdu, {
-          remote: {
-            origin: g.signer.serverName,
-            self: g.signer.serverName,
-            oversized: false,
-            ungroundedMs: 3600000,
-          },
-        })
+for (const recovery of ['arrival', 'startup']) {
+  Deno.test(`wait recovery follows grounded descendants after failure via ${recovery}`, async () => {
+    const dir = await Deno.makeTempDir();
+    let store = await openStore({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, { schemas: { room: roomSchema } });
+    try {
+      const g = await genesis(store, { roomId: '!wait-chain:test' });
+      const first = await g.room.tx((tx) =>
+        buildInTx(tx, g.room.id, {
+          type: 'm.room.message',
+          sender: g.creator,
+          content: { body: 'first parent' },
+        }, g.signer)
       );
-      assertEquals(result.grounding, 'pending');
-    }
-    await ingestLocal(g.room, first, g.signer.serverName);
-    assertEquals(
-      (await g.room.tx((tx) => tx.events.getStatus(child.event_id!)))
-        ?.grounding,
-      'pending',
-    );
-    await ingestLocal(g.room, other, g.signer.serverName);
-    for (const pdu of [child, descendant]) {
+      const other = await g.room.tx((tx) =>
+        buildInTx(tx, g.room.id, {
+          type: 'm.room.message',
+          sender: g.creator,
+          content: { body: 'other parent' },
+        }, g.signer)
+      );
+      const { event_id: _, ...template } = first;
+      void _;
+      const child = await finalizeBuilt(
+        {
+          ...template,
+          content: { body: 'both parents required' },
+          prev_events: [first.event_id!, other.event_id!],
+          depth: Number(first.depth) + 1,
+        },
+        getRulebook('11'),
+        g.signer,
+      );
+      const descendant = await finalizeBuilt(
+        {
+          ...template,
+          content: { body: 'descendant' },
+          prev_events: [child.event_id!],
+          depth: Number(child.depth) + 1,
+        },
+        getRulebook('11'),
+        g.signer,
+      );
+      for (const pdu of [descendant, child]) {
+        const result = await g.room.tx((tx) =>
+          ingestInTx(tx, g.room.id, pdu, {
+            remote: {
+              origin: g.signer.serverName,
+              self: g.signer.serverName,
+              oversized: false,
+              ungroundedMs: 3600000,
+            },
+          })
+        );
+        assertEquals(result.grounding, 'pending');
+      }
+      await ingestLocal(g.room, first, g.signer.serverName);
       assertEquals(
-        (await g.room.tx((tx) => tx.events.getStatus(pdu.event_id!)))
+        (await g.room.tx((tx) => tx.events.getStatus(child.event_id!)))
+          ?.grounding,
+        'pending',
+      );
+      const transaction = g.room.tx;
+      let failNext = false, injected = false;
+      g.room.tx = async (fn) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error('injected recovery failure');
+        }
+        const result = await transaction(fn);
+        if (
+          !injected && result && typeof result === 'object' &&
+          'kind' in result && result.kind === 'prev' && 'eventId' in result &&
+          result.eventId === descendant.event_id
+        ) {
+          injected = true;
+          failNext = true;
+        }
+        return result;
+      };
+      try {
+        await assertRejects(
+          () => ingestLocal(g.room, other, g.signer.serverName),
+          Error,
+          'injected recovery failure',
+        );
+      } finally {
+        g.room.tx = transaction;
+      }
+      assertEquals(
+        (await g.room.tx((tx) => tx.events.getStatus(child.event_id!)))
           ?.grounding,
         'grounded',
       );
-      assertEquals(await g.room.tx((tx) => tx.waits.of(pdu.event_id!)), []);
-      const changes = await g.room.tx((tx) => tx.changes.after(0, 200));
-      assertEquals(
-        changes.filter((change) =>
-          change.event === pdu.event_id && change.kind === 'transition'
-        ).length,
-        1,
-      );
+      assertEquals(await g.room.tx((tx) => tx.waits.of(child.event_id!)), []);
+      if (recovery === 'startup') {
+        // No arriving ancestor, and a complete native database lifetime later.
+        await store.close();
+        store = await openStore({
+          dir,
+          library: './.native/libturso_ffi.so',
+          checkpointlogbytes: 65536,
+          maxopenfiles: 8,
+          idleseconds: 300,
+        }, { schemas: { room: roomSchema } });
+        g.room = await openRoom(store, g.room.id);
+        await resumeWaits(g.room, { self: g.signer.serverName }, []);
+        assertEquals(
+          (await g.room.tx((tx) => tx.events.getStatus(descendant.event_id!)))
+            ?.grounding,
+          'grounded',
+        );
+      }
+      // The original parent is already committed. Its ordinary idempotent retry
+      // must revisit retained dependency work instead of falsely acknowledging it.
+      await ingestLocal(g.room, other, g.signer.serverName);
+      for (const pdu of [child, descendant]) {
+        assertEquals(
+          (await g.room.tx((tx) => tx.events.getStatus(pdu.event_id!)))
+            ?.grounding,
+          'grounded',
+        );
+        assertEquals(await g.room.tx((tx) => tx.waits.of(pdu.event_id!)), []);
+        const changes = await g.room.tx((tx) => tx.changes.after(0, 200));
+        assertEquals(
+          changes.filter((change) =>
+            change.event === pdu.event_id && change.kind === 'transition'
+          ).length,
+          1,
+        );
+      }
+    } finally {
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
     }
-  } finally {
-    await store.close();
-    await Deno.remove(dir, { recursive: true });
-  }
-});
+  });
+}

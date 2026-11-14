@@ -44,6 +44,7 @@ import * as users from '#engine/tenant/users.ts';
 import * as openid from '#engine/tenant/openid.ts';
 import * as profiles from '#engine/tenant/profiles.ts';
 import * as erasure from '#engine/tenant/erasure.ts';
+import * as publicReplica from '#engine/tenant/public-replica.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
 import { tenantStreamCommitted } from '#engine/tenant/streams.ts';
 import { writeCertificate } from '#engine/tenant/certificate.ts';
@@ -125,6 +126,14 @@ function bind(
     return value;
   };
   return {
+    publicReplica: {
+      users: () => publicReplica.publicUsers(conn),
+      inventory: () => publicReplica.publicInventory(conn),
+      export: (localpart: string, server: string) =>
+        publicReplica.exportPublicUser(conn, localpart, server),
+      install: (raw: unknown, server: string) =>
+        publicReplica.installPublicUser(conn, raw, server),
+    },
     streams: { heads: () => syncStreamHeads(conn) },
     keyBackup: {
       clear: (localpart: string) => keyBackup.clearBackup(conn, localpart),
@@ -352,26 +361,27 @@ function bind(
     },
     erasure: {
       mark: (localpart: string, cuts: Record<string, ErasureCut>) =>
-        erasure.markErased(conn, localpart, cuts),
+        mutation(erasure.markErased(conn, localpart, cuts)),
       get: (localpart: string, roomId: string) =>
         erasure.erasureRow(conn, localpart, roomId),
     },
     profiles: {
       get: (localpart: string) => profiles.profileRow(conn, localpart),
       set: (localpart: string, key: string, value: unknown) =>
-        profiles.setProfileRow(conn, localpart, key, value),
-      clear: (localpart: string) => profiles.clearProfileRows(conn, localpart),
+        mutation(profiles.setProfileRow(conn, localpart, key, value)),
+      clear: (localpart: string) =>
+        mutation(profiles.clearProfileRows(conn, localpart)),
     },
     users: {
       exists: (localpart: string) => users.userExists(conn, localpart),
       insert: (localpart: string, displayName: string) =>
-        users.insertUser(conn, localpart, displayName),
+        mutation(users.insertUser(conn, localpart, displayName)),
       byLocalpart: (localpart: string) =>
         users.userByLocalpart(conn, localpart),
       setDisplayName: (localpart: string, name: string | null) =>
-        users.setUserDisplayName(conn, localpart, name),
+        mutation(users.setUserDisplayName(conn, localpart, name)),
       setAvatarUrl: (localpart: string, url: string | null) =>
-        users.setUserAvatarUrl(conn, localpart, url),
+        mutation(users.setUserAvatarUrl(conn, localpart, url)),
       markDeactivated: (localpart: string) =>
         mutation(users.markDeactivated(conn, localpart)),
     },

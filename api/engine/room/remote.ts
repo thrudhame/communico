@@ -16,6 +16,7 @@
 // the budget lands pending + waits (R10); a later arrival re-runs it
 // (resumeWaits in ingest.ts).
 import { canonicalJson } from '#engine/canonical.ts';
+import { createHash } from 'node:crypto';
 import { eventIdFor } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { StateMap } from '#engine/rulebook/index.ts';
@@ -429,13 +430,78 @@ async function fetchGapTip(
 // stay) throw. One room transaction for the whole batch (G11).
 // The only pulled-input caller is the verified resident send_join response;
 // transaction receipt uses the default pushed source.
+function batchInputHash(
+  room: Room,
+  pdus: Pdu[],
+  origin: string,
+  source: VerifiedItem['source'],
+) {
+  return createHash('sha256')
+    .update(canonicalJson({
+      room: room.id,
+      origin,
+      pdus: pdus.map((pdu) => {
+        const retained = { ...pdu };
+        delete retained.unsigned;
+        return retained;
+      }),
+      source,
+    }))
+    .digest('hex');
+}
+
+/** Recall before a transport's participation guard. A room may have archived
+ * after committing the batch but before its caller saved the child result. */
+export async function replayRemoteBatch(
+  room: Room,
+  pdus: Pdu[],
+  origin: string,
+  self: string,
+  operationId: string,
+  source: VerifiedItem['source'] = 'pushed',
+): Promise<RemoteOutcome[] | null> {
+  if (!operationId) throw new Error('E_REMOTE_BATCH_IDENTITY');
+  const prior = await room.tx((tx) =>
+    tx.remoteBatches.get(
+      operationId,
+      batchInputHash(room, pdus, origin, source),
+    )
+  );
+  if (prior) {
+    await resumeWaits(
+      room,
+      { self },
+      prior.flatMap((outcome) =>
+        outcome.eventId === null ? [] : [outcome.eventId]
+      ),
+    );
+    await projectAfterWrite(room.store, room.id);
+  }
+  return prior;
+}
+
 export async function ingestRemote(
   room: Room,
   pdus: Pdu[],
   origin: string,
   deps: RemoteDeps,
   source: VerifiedItem['source'] = 'pushed',
+  operationId?: string,
 ): Promise<RemoteOutcome[]> {
+  const inputHash = operationId === undefined
+    ? ''
+    : batchInputHash(room, pdus, origin, source);
+  if (operationId !== undefined) {
+    const prior = await replayRemoteBatch(
+      room,
+      pdus,
+      origin,
+      deps.self,
+      operationId,
+      source,
+    );
+    if (prior) return prior;
+  }
   const version = await room.tx(async (tx) => {
     const stay = await tx.segments.openStay();
     if (stay === null) {
@@ -447,7 +513,7 @@ export async function ingestRemote(
 
   // Denied traffic must not trigger key discovery or missing-event fetches.
   if (!await room.tx((tx) => aclAllows(tx, origin))) {
-    return await Promise.all(pdus.map(async (pdu) => {
+    const denied = await Promise.all(pdus.map(async (pdu) => {
       let id: string | null = null;
       try {
         id = await eventIdFor(
@@ -457,6 +523,11 @@ export async function ingestRemote(
       } catch { /* uncomputable */ }
       return outcomeOf(id, 'refused', 'server denied by room ACL');
     }));
+    return operationId === undefined
+      ? denied
+      : await room.tx((tx) =>
+        tx.remoteBatches.save(operationId, inputHash, denied)
+      );
   }
 
   // identify every PDU (format guards, unsigned strip, recomputed id) —
@@ -575,6 +646,10 @@ export async function ingestRemote(
       await admitLocalJoin(room.store, room.id, deps.localJoin.userId);
     }
     return await room.tx(async (tx) => {
+      if (operationId !== undefined) {
+        const prior = await tx.remoteBatches.get(operationId, inputHash);
+        if (prior) return { grounded: [], outcomes: prior };
+      }
       const grounded: string[] = [];
       const results = new Map<number, RemoteOutcome>();
       // Revalidation (G8): the fetch phase ran unlocked — the stay, the
@@ -737,25 +812,28 @@ export async function ingestRemote(
           results.set(index, result);
         }
       }
-      return { grounded, results };
+      const completed = outcomes.map((outcome, index) =>
+        results.get(index) ?? outcome ??
+          outcomeOf(null, 'refused', 'E_OUTCOME_MISSING')
+      );
+      return {
+        grounded,
+        outcomes: operationId === undefined
+          ? completed
+          : await tx.remoteBatches.save(operationId, inputHash, completed),
+      };
     });
   });
-  for (const [index, result] of committed.results) outcomes[index] = result;
 
   // A later arrival re-runs what waited for it (R10 — each recheck is a
   // locked ingest of its own, after this lock released)
-  const hasWaiters = await room.tx(async (tx) => {
-    for (const id of committed.grounded) {
-      if ((await tx.waits.for(id)).length > 0) return true;
-    }
-    return false;
-  });
-  if (hasWaiters) {
-    await resumeWaits(room, { self: deps.self }, committed.grounded);
-  }
+  await resumeWaits(room, { self: deps.self }, [
+    ...identified.map((item) => item.eventId),
+    ...acc.evidence.keys(),
+    ...acc.corrupted.keys(),
+    ...committed.grounded,
+  ]);
   await projectAfterWrite(room.store, room.id);
 
-  return outcomes.map((outcome) =>
-    outcome ?? outcomeOf(null, 'refused', 'E_OUTCOME_MISSING')
-  );
+  return committed.outcomes;
 }

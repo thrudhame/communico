@@ -14,6 +14,8 @@ import * as segments from '#engine/room/segments.ts';
 import { roomSchema } from '#engine/room/schema.ts';
 import * as state from '#engine/room/state.ts';
 import * as waits from '#engine/room/waits.ts';
+import * as remoteBatches from '#engine/room/remote-batches.ts';
+import type { RemoteOutcome } from '#engine/room/remote.ts';
 import { orderKeys } from '#engine/room/topology.ts';
 
 export { roomSchema };
@@ -31,9 +33,21 @@ export const resolutionProbe = { resolutions: 0 };
 function bind(conn: Conn, edges: EdgeOverlay) {
   return {
     diagnostics: { resolutions: 0 },
+    remoteBatches: {
+      get: (operationId: string, inputHash: string) =>
+        remoteBatches.remoteBatch(conn, operationId, inputHash),
+      save: (
+        operationId: string,
+        inputHash: string,
+        outcomes: RemoteOutcome[],
+      ) =>
+        remoteBatches.saveRemoteBatch(conn, operationId, inputHash, outcomes),
+    },
     events: {
-      insert: (id: string, pdu: string) =>
-        events.insertEvent(conn, id, pdu, edges),
+      insert: async (id: string, pdu: string) => {
+        await events.insertEvent(conn, id, pdu, edges);
+        await waits.readyFor(conn, id);
+      },
       get: (id: string) => events.getEvent(conn, id, edges),
       list: (ids: readonly string[]) => events.getEvents(conn, ids, edges),
       prevsOf: (event: string) => events.prevsOf(conn, event, edges),
@@ -49,8 +63,10 @@ function bind(conn: Conn, edges: EdgeOverlay) {
         limit: number,
       ) => events.ancestors(conn, seeds, stopAt, limit, edges),
       getStatus: (event: string) => events.getStatus(conn, event),
-      setStatus: (event: string, status: events.Status) =>
-        events.setStatus(conn, event, status),
+      setStatus: async (event: string, status: events.Status) => {
+        await events.setStatus(conn, event, status);
+        await waits.readyFor(conn, event);
+      },
       statuses: (ids: readonly string[]) => events.statuses(conn, ids),
       missingCandidates: (
         latest: readonly string[],
@@ -156,6 +172,9 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       for: (missing: string) => waits.waitsFor(conn, missing),
       of: (waiting: string) => waits.waitsOf(conn, waiting),
       all: () => waits.allWaits(conn),
+      ready: () => waits.readyWaits(conn),
+      arrive: (missing: string) => waits.readyFor(conn, missing),
+      defer: (wait: waits.Wait) => waits.deferWait(conn, wait),
       expired: (now: number) => waits.expiredWaits(conn, now),
       remove: (missing: string, waiting: string, kind: string) =>
         waits.removeWait(conn, missing, waiting, kind),

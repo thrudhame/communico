@@ -15,13 +15,15 @@ import type { Store } from '#engine/store/index.ts';
 import {
   completeBatch,
   deliveryTurn,
+  type Dispatch,
+  type DispatchEnvelope,
   freezeBatch,
   frozenBatch,
   pendingEdus,
 } from '#engine/server/delivery.ts';
 import { FederationHttpError, federationRequest } from './client.ts';
 import { sendVerdicts } from './responses.ts';
-import { upstreamCategory } from '#engine/net/upstream-error.ts';
+import { protocol, upstreamCategory } from '#engine/net/upstream-error.ts';
 import { isBlocked, recordPending } from './peers.ts';
 
 export type Edu = { edu_type: string; content: Record<string, unknown> };
@@ -302,7 +304,26 @@ export type SenderDeps = {
   // module and the frozen-batch cache lives here regardless)
   drainEdus?: (destination: string, limit: number) => Edu[];
   onDelivered?: () => Promise<void>;
+  // Enrolled homes must coordinate the same frozen owner, not run a second
+  // sender. The callback returns only after durable destination completion.
+  dispatch?: Dispatch;
 };
+
+export async function dispatchBatch(
+  server: Db,
+  signer: Signer,
+  envelope: DispatchEnvelope,
+): Promise<unknown> {
+  const res = await federationRequest(server, signer, {
+    destination: envelope.destination,
+    method: 'PUT',
+    path: `/_matrix/federation/v1/send/${encodeURIComponent(envelope.txnId)}`,
+    body: new TextEncoder().encode(envelope.body),
+    maxBytes: config().federation.bulkmaxbytes,
+  });
+  if (res.status !== 200) protocol('send-verdict', 'expected HTTP 200');
+  return { pdus: sendVerdicts(res.json) };
+}
 
 export type Sender = {
   wake(destination: string): void;
@@ -477,7 +498,11 @@ export function startSender(deps: SenderDeps): Sender {
       if (await isBlocked(server, destination)) return;
       // Resume exact persisted bytes first. New work cannot change an in-flight
       // transaction, even when it arrives between a failure and a restart.
-      let frozen = await frozenBatch(server, destination);
+      let frozen = await frozenBatch(
+        server,
+        destination,
+        deps.dispatch !== undefined,
+      );
       if (frozen === null) {
         const candidates = await outboxDue(server, destination, Date.now(), 50);
         const pending = await pendingEdus(server, destination, 100);
@@ -560,14 +585,11 @@ export function startSender(deps: SenderDeps): Sender {
           txnId,
           rows: batch.map((row) => `${row.room}:${row.pos}`),
         });
-        const res = await federationRequest(server, deps.signer, {
-          destination,
-          method: 'PUT',
-          path: `/_matrix/federation/v1/send/${encodeURIComponent(txnId)}`,
-          body: new TextEncoder().encode(delivered.body),
-          maxBytes: config().federation.bulkmaxbytes,
-        });
-        verdicts = sendVerdicts(res.json);
+        const envelope = { destination, txnId, body: delivered.body };
+        const response = deps.dispatch
+          ? await deps.dispatch(envelope)
+          : await dispatchBatch(server, deps.signer, envelope);
+        verdicts = sendVerdicts(response);
       } catch (e) {
         const category = upstreamCategory(e);
         // A local signer/store/programming fault is not a peer outage. Abort is

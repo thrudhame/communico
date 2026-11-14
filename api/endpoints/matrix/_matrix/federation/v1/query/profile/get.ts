@@ -23,6 +23,7 @@ export default async function (request: PathfinderRequest) {
   ) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid user id');
   }
+  await theApp().replica?.requireScope('public:' + userId);
   const profile = await getPublicProfile(theApp().tenant, parts.localpart);
   if (profile === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'no such user');

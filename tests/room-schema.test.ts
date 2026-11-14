@@ -28,6 +28,7 @@ const TABLES = [
   'extremities',
   'waits',
   'changes',
+  'remote_batches',
 ];
 
 const INDEXES = [
@@ -41,6 +42,7 @@ const INDEXES = [
   'positions_event',
   'waits_waiting',
   'waits_expires',
+  'waits_ready',
   'changes_event',
   'changes_redaction_target',
   'publications_change',
@@ -114,7 +116,7 @@ Deno.test('room schema: v3 upgrade preserves old data and starts the future publ
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE publication_keys; DROP INDEX events_annotation_target',
+            'DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
           );
         },
       },
@@ -149,7 +151,9 @@ Deno.test('room schema: v4 annotation index upgrade preserves events and uses ta
         version: 4,
         apply: async (db) => {
           await roomSchema.apply(db);
-          await db.exec('DROP INDEX events_annotation_target');
+          await db.exec(
+            'DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
+          );
         },
       },
     },
@@ -187,6 +191,104 @@ Deno.test('room schema: v4 annotation index upgrade preserves events and uses ta
       plan.some((row) =>
         String(row.detail).includes('events_annotation_target')
       ),
+      true,
+      JSON.stringify(plan),
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('room schema: v5 adds durable remote batch receipts without changing events', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: {
+      room: {
+        version: 5,
+        apply: async (db) => {
+          await roomSchema.apply(db);
+          await db.exec('DROP TABLE remote_batches; DROP INDEX waits_ready');
+        },
+      },
+    },
+  });
+  try {
+    const room = await store.room('!receipt-upgrade:test', { create: true });
+    await room.execute(
+      "INSERT INTO events(id,pdu,type,sender,depth,origin_ts) VALUES('$old','{}','test','@a:test',1,1)",
+    );
+    await store.close();
+    store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    const upgraded = await store.room('!receipt-upgrade:test');
+    assertEquals(await upgraded.query('SELECT id FROM events'), [{
+      id: '$old',
+    }]);
+    assertEquals(await upgraded.query('SELECT * FROM remote_batches'), []);
+    assertEquals(await upgraded.query('SELECT v FROM meta'), [{
+      v: String(roomSchema.version),
+    }]);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('room schema: v6 admits eligible retained dependencies into the indexed retry queue', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: {
+      room: {
+        version: 6,
+        apply: async (db) => {
+          await roomSchema.apply(db);
+          await db.exec('DROP INDEX waits_ready');
+        },
+      },
+    },
+  });
+  try {
+    const room = await store.room('!wait-upgrade:test', { create: true });
+    await room.tx(async (conn) => {
+      for (const id of ['$grounded', '$pending']) {
+        await conn.execute(
+          "INSERT INTO events(id,pdu,type,sender,depth,origin_ts) VALUES(?,'{}','test','@a:test',1,1)",
+          [id],
+        );
+        await conn.execute(
+          "INSERT INTO event_status VALUES(?,'accepted',?,NULL,1)",
+          [id, id === '$grounded' ? 'grounded' : 'pending'],
+        );
+      }
+      for (
+        const [missing, waiting, kind] of [
+          ['$grounded', '$child', 'prev'],
+          ['$pending', '$held', 'prev'],
+          ['$pending', '$redaction', 'redaction'],
+          ['$absent', '$unrelated', 'prev'],
+        ]
+      ) {
+        await conn.execute("INSERT INTO waits VALUES(?,?,?,1,NULL,'pending')", [
+          missing,
+          waiting,
+          kind,
+        ]);
+      }
+    });
+    await store.close();
+    store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    const upgraded = await store.room('!wait-upgrade:test');
+    assertEquals(
+      await upgraded.query(
+        "SELECT waiting FROM waits WHERE state='ready' ORDER BY waiting",
+      ),
+      [{ waiting: '$child' }, { waiting: '$redaction' }],
+    );
+    const plan = await upgraded.query(
+      "EXPLAIN QUERY PLAN SELECT * FROM waits WHERE state='ready' ORDER BY since,waiting,missing,kind",
+    );
+    assertEquals(
+      plan.some((row) => String(row.detail).includes('waits_ready')),
       true,
       JSON.stringify(plan),
     );

@@ -23,7 +23,7 @@ import {
   type Version,
 } from './protocol.ts';
 
-type PublicKey = { keyId: string; publicKey: string };
+export type PublicKey = { keyId: string; publicKey: string };
 export type PairingContext = {
   id: string;
   server: string;
@@ -548,7 +548,7 @@ export class Pairings {
     return grant;
   }
 
-  async revoke(id: string): Promise<Revocation> {
+  async revoke(id: string, now = Date.now()): Promise<Revocation> {
     if (this.node) refused('facade cannot revoke home authority');
     const reserved = await this.db.tx(async (conn) => {
       const current = await entry(conn, id);
@@ -556,8 +556,8 @@ export class Pairings {
       if (current.state === 'revoked') return current;
       const revision = await nextRevision(conn);
       await conn.execute(
-        "UPDATE facade_pairings SET state='revoked',revision=? WHERE id=?",
-        [revision, id],
+        "UPDATE facade_pairings SET state='revoked',revision=?,retired_ms=? WHERE id=?",
+        [revision, integer(now), id],
       );
       return { ...current, revision };
     });
@@ -701,4 +701,44 @@ export async function pairingStatus(db: Database): Promise<{
     state: String(row.state),
     revision: Number(row.revision),
   }));
+}
+
+/** Public authority is read at one control cut, never from an endpoint's
+ * configuration or a replica's independently chosen signing identity. A later
+ * grant of the same node key supersedes its earlier prospective retirement. */
+export async function homePublicKeys(
+  db: Database,
+  home: PublicKey & { server: string },
+): Promise<
+  { revision: number; keys: (PublicKey & { retiredAt: number | null })[] }
+> {
+  return await db.tx(async (conn) => {
+    const [control] = await conn.query(
+      'SELECT revision FROM facade_control WHERE singleton=1',
+    );
+    const rows = await conn.query(
+      "SELECT context_json,transcript_json,state,retired_ms FROM facade_pairings WHERE side='home' AND transcript_json IS NOT NULL ORDER BY revision",
+    );
+    const keys = new Map<string, PublicKey & { retiredAt: number | null }>();
+    for (const row of rows) {
+      const context = JSON.parse(String(row.context_json)) as PairingContext;
+      if (context.server !== home.server || !equal(context.home, keyOf(home))) {
+        continue;
+      }
+      const transcript = JSON.parse(String(row.transcript_json)) as Transcript;
+      const key = keyOf(transcript.body.key);
+      if (row.state === 'granting' || row.state === 'paired') {
+        keys.set(key.keyId, { ...key, retiredAt: null });
+      } else if (row.state === 'revoked' && row.retired_ms !== null) {
+        keys.set(key.keyId, {
+          ...key,
+          retiredAt: integer(Number(row.retired_ms)),
+        });
+      }
+    }
+    return {
+      revision: integer(Number(control.revision)),
+      keys: [...keys.values()],
+    };
+  });
 }

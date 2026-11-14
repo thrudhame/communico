@@ -9,7 +9,31 @@ import { config } from '#engine/config.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Signer } from '#engine/room/signer.ts';
-import { type KeyDoc, signWithSigner } from './keys.ts';
+import { homePublicKeys } from '#engine/facade/pairing.ts';
+import { b64encodeStd, matrixBase64 } from '#engine/signing-primitives.js';
+import { type KeyDoc, ourKeyDocument, signWithSigner } from './keys.ts';
+
+/** Home authors the roster approved by its durable enrollment owner. Pending
+ * keys are absent; retirement retains the original public key and cutoff. */
+export async function homeKeyDocument(
+  server: Db,
+  signer: Signer,
+  publicKey: string,
+): Promise<KeyDoc> {
+  const roster = await homePublicKeys(server, {
+    server: signer.serverName,
+    keyId: signer.keyId,
+    publicKey,
+  });
+  const active: KeyDoc['verify_keys'] = {};
+  const retired: NonNullable<KeyDoc['old_verify_keys']> = {};
+  for (const entry of roster.keys) {
+    const key = b64encodeStd(matrixBase64(entry.publicKey, 32));
+    if (entry.retiredAt === null) active[entry.keyId] = { key };
+    else retired[entry.keyId] = { key, expired_ts: entry.retiredAt };
+  }
+  return await ourKeyDocument(signer, publicKey, { active, retired });
+}
 
 /** Every handler under /_matrix/federation/, /_matrix/key/ and — with a
  *  plain 404 in the .well-known handler — checks this first. Not a guard:
