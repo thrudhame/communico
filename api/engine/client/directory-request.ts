@@ -16,7 +16,9 @@ export type DirectoryNetwork = { kind: 'native' } | { kind: 'all' } | {
   id: string;
 };
 export type DirectoryRequest = {
-  limit?: number;
+  // null is federation GET's explicit "no caller limit" intent. The serving
+  // owner still applies its response cap, as Synapse does for all four routes.
+  limit?: number | null;
   since?: string;
   filter?: Record<string, unknown> & {
     generic_search_term?: string;
@@ -30,6 +32,7 @@ export type DirectoryRequest = {
 export function decodeDirectoryRequest(
   query: URLSearchParams,
   body?: unknown,
+  source: 'client' | 'federation' = 'client',
 ): DirectoryRequest {
   const post = body !== undefined;
   const raw = post ? objectParameter(body, 'body') : {};
@@ -65,7 +68,11 @@ export function decodeDirectoryRequest(
     };
   }
   return {
-    ...(limit === undefined ? {} : { limit }),
+    ...(source === 'federation' && !post && (limit === undefined || limit === 0)
+      ? { limit: null }
+      : limit === undefined
+      ? {}
+      : { limit }),
     ...(since === undefined ? {} : { since }),
     ...(filter === undefined ? {} : { filter }),
     network: all
@@ -112,7 +119,7 @@ export function directoryWireRequest(
   request: DirectoryRequest,
 ): Record<string, unknown> {
   return {
-    ...(request.limit === undefined ? {} : { limit: request.limit }),
+    ...(request.limit === undefined ? {} : { limit: request.limit ?? 0 }),
     ...(request.since === undefined ? {} : { since: request.since }),
     ...(request.filter === undefined ? {} : { filter: request.filter }),
     ...(request.network.kind === 'all' ? { include_all_networks: true } : {}),

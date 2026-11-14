@@ -589,7 +589,10 @@ known query/body fields without turning malformed values into defaults. Network
 selection distinguishes native, all and a named bridge instance; with no bridges,
 a named instance has no rooms, not the native list. Conflicting all/instance
 selectors are rejected. Local cursors are validated by their local owner;
-directory pages retain Synapse's 100-room local cap. Omitted publication visibility
+directory pages retain Synapse's 100-room local cap. Federation GET normalizes
+omitted/zero limits as no caller limit, distinct from client and POST defaults;
+the serving cap still applies and continuation tokens retain the remaining rooms.
+Omitted publication visibility
 means public. User-directory candidates include
 unlisted world-readable rooms, while retaining the local-account scope.
 (`api/engine/client/{directory,directory-request,summary}.ts`)

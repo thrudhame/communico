@@ -403,3 +403,101 @@ Deno.test('directory decoder preserves meaningful defaults and hands complete no
     assertEquals(encoded.filter, { room_types: [null], 'org.example': 7 });
   }
 });
+
+Deno.test('federation GET normalizes no caller limit separately from client and POST defaults', () => {
+  const decode = decodeDirectoryRequest;
+  for (const query of ['', 'limit=0']) {
+    assertEquals<unknown>(
+      decode(new URLSearchParams(query), undefined, 'federation'),
+      {
+        limit: null,
+        network: { kind: 'native' },
+      },
+    );
+  }
+  assertEquals(decode(new URLSearchParams(), {}, 'federation'), {
+    network: { kind: 'native' },
+  });
+  assertEquals(decode(new URLSearchParams()), {
+    network: { kind: 'native' },
+  });
+  assertEquals(
+    directoryWireRequest(
+      decode(new URLSearchParams(), undefined, 'federation'),
+    ),
+    { limit: 0 },
+  );
+});
+
+suite.test('105 published rooms retain the shared Synapse cap and reachable tail on every directory route', async () => {
+  const user = await suite.registerTestUser('directory-pagination', 'pw');
+  for (let i = 0; i < 105; i++) {
+    const response = await suite.matrix(
+      new Request('http://x/_matrix/client/v3/createRoom', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + user.access_token },
+        body: JSON.stringify({ visibility: 'public', name: 'Published ' + i }),
+      }),
+    );
+    await response.arrayBuffer();
+    assertEquals(response.status, 200);
+  }
+  const fed = await federationCaller();
+  setConfigForTests({ federation: { publicrooms: true } });
+  try {
+    for (const federation of [false, true]) {
+      for (const post of [false, true]) {
+        for (const limit of [undefined, 0, 3, 500]) {
+          const read = async (since?: string) => {
+            const params = new URLSearchParams();
+            const body = {
+              ...(limit === undefined ? {} : { limit }),
+              ...(since === undefined ? {} : { since }),
+            };
+            if (!post) {
+              for (const [key, value] of Object.entries(body)) {
+                params.set(key, String(value));
+              }
+            }
+            if (federation) {
+              const response = await fed(
+                post ? 'POST' : 'GET',
+                '/_matrix/federation/v1/publicRooms' +
+                  (params.size ? '?' + params : ''),
+                post ? body : undefined,
+              );
+              assertEquals(response.status, 200);
+              return response.body;
+            }
+            const response = await call(
+              '',
+              user.access_token,
+              post ? body : undefined,
+              '&' + params,
+            );
+            assertEquals(response.status, 200);
+            return response.body;
+          };
+          const page = await read();
+          const size = limit === 3 ? 3 : 100;
+          assertEquals((page.chunk as Json[]).length, size);
+          assertEquals(page.total_room_count_estimate, 105);
+          const next = await read(String(page.next_batch));
+          assertEquals(
+            (next.chunk as Json[]).length,
+            Math.min(size, 105 - size),
+          );
+          assertEquals(next.prev_batch, '0');
+          if (size === 100) {
+            assertEquals(next.next_batch, undefined);
+            const ids = [...page.chunk as Json[], ...next.chunk as Json[]]
+              .map((room) => room.room_id);
+            assertEquals(new Set(ids).size, 105);
+          }
+        }
+      }
+    }
+  } finally {
+    setConfigForTests({});
+  }
+});
