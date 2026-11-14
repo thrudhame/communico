@@ -1114,6 +1114,14 @@ encrypted payload digests are separate. This metadata primitive alone is not
 the whole-server backup/restore command.
 (`api/engine/backup/manifest.ts`)
 
+The optional bundle cipher uses standard GnuPG AES256 OpenPGP, disabled in the
+shipped `backup` settings. It checks the private passphrase file and executable
+before the cut, streams secrets through stdin and bytes through private 0600
+files, verifies GnuPG's integrity status and the manifest's plaintext digest,
+and cleans up only its own temporary GnuPG home/agent. Plaintext staging is not
+secure erasure, and this cipher primitive does not yet expose a backup command.
+(`api/engine/backup/encryption.ts`, `defaults/communico.toml`)
+
 Configuration layers shipped TOML, an optional overlay and environment leaves;
 unknown nodes and wrong types are errors. Signals stop admission, drain all
 listeners within the configured grace and close storage last. Unhandled

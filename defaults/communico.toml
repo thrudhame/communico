@@ -26,6 +26,16 @@ socket = ""
 # COMMUNICO_ADMIN_USERS
 users = []
 
+[backup]
+# Optional standard OpenPGP AES256 payload encryption; requires GnuPG when on.
+# Plaintext staging stays private, but secure erasure on SSDs is not promised.
+# COMMUNICO_BACKUP_ENCRYPT
+encrypt = false
+# Private file owned by the server user (0600 or stricter); first line is the
+# passphrase, as with GnuPG. Never archived or placed in command arguments.
+# COMMUNICO_BACKUP_PASSPHRASEFILE
+passphrasefile = ""
+
 [wellknown]
 # Public client API base URL; empty disables /.well-known/matrix/client (404).
 # Explicit URL, independent of federation.enabled. COMMUNICO_WELLKNOWN_CLIENT

@@ -19,6 +19,7 @@ export const SCHEMA = {
     socket: 'string',
     users: 'list',
   },
+  backup: { encrypt: 'bool', passphrasefile: 'string' },
   wellknown: {
     client: 'string',
     identity: 'string',

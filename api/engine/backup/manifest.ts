@@ -96,7 +96,7 @@ function relative(value: unknown): string {
   ) fail('invalid relative path');
   return path;
 }
-function payloadPath(value: unknown, encrypted = false): string {
+export function payloadPath(value: unknown, encrypted = false): string {
   const path = relative(value);
   const plain = encrypted && path.endsWith('.gpg') ? path.slice(0, -4) : path;
   if (
@@ -327,7 +327,7 @@ export function assertCompatible(
   }
 }
 
-async function rootDirectory(root: string): Promise<string> {
+export async function rootDirectory(root: string): Promise<string> {
   const full = resolve(root);
   let path = parse(full).root;
   for (const part of full.slice(path.length).split('/').filter(Boolean)) {
