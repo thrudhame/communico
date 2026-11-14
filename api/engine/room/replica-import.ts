@@ -61,6 +61,7 @@ export async function importReplicaRoom(
     if (!boundary) unavailable('replica before-state is unavailable');
     return {
       resident: boundary.resident,
+      residents,
       state: boundary.state.map(event),
       authChain: boundary.authChain.map(event),
     };

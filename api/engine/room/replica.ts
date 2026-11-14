@@ -12,7 +12,11 @@ import { projectAfterWrite, registerCreatedRoom } from './hooks.ts';
 import { initializeRoom, openRoom, type Room } from './index.ts';
 import { ingestInTx } from './ingest.ts';
 import { withRoomLock } from './lock.ts';
-import { authorizeSnapshotEvent, verifySnapshot } from './snapshot.ts';
+import {
+  authorizeSnapshotEvent,
+  type SnapshotInput,
+  verifySnapshot,
+} from './snapshot.ts';
 import { installSnapshotBoundary } from './snapshot-install.ts';
 import { oversizedOf, verify } from './verify.ts';
 
@@ -108,16 +112,12 @@ export function exportReplicaBoundary(
   });
 }
 
-export async function importReplicaBoundary(store: Store, input: {
-  roomId: string;
-  roomVersion: string;
-  self: string;
-  resident: string;
-  keys: KeyResolver;
-  join: Pdu;
-  state: readonly Pdu[];
-  authChain: readonly Pdu[];
-}): Promise<{ roomId: string; eventId: string }> {
+export async function importReplicaBoundary(
+  store: Store,
+  input: SnapshotInput & {
+    join: Pdu;
+  },
+): Promise<{ roomId: string; eventId: string }> {
   const verified = await verifySnapshot(input);
   const admitted = await verify(input.join, input.roomVersion, input.keys, {
     roomId: input.roomId,

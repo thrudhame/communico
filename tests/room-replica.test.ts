@@ -685,6 +685,33 @@ Deno.test('whole-room replay preserves resident-vouched local snapshot evidence 
   }
 });
 
+Deno.test('whole-room boundary preserves independently vouched state through a different opening resident', async () => {
+  const f = await fixture({ priorLocal: true });
+  try {
+    const residents = new Map(
+      [...f.input.state, ...f.input.authChain].map((
+        pdu,
+      ) => [String(pdu.event_id), f.input.resident]),
+    );
+    const input = { ...f.input, resident: 'different-relayer.test', residents };
+    await importReplicaBoundary(f.store, input);
+    const room = await openRoom(f.store, f.source.roomId);
+    const manifest = await exportReplicaRoom(room, f.input.self);
+    const prior = manifest.events.find((pdu) =>
+      pdu.sender === '@prior:logical.test'
+    )!;
+    assert(prior);
+    assertEquals(manifest.residents[String(prior.event_id)], f.input.resident);
+    assertEquals(
+      manifest.boundaries.find((b) => b.eventId === f.join.event_id)?.resident,
+      input.resident,
+    );
+    await roundTrip(f, manifest);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('whole-room suffix keeps the opening resident when a later ACL admits a different relayer', async () => {
   const f = await fixture({ deny: ['later.test'] });
   const dir = await Deno.makeTempDir({ prefix: 'replica-opening-resident-' });

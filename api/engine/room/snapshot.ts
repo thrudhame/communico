@@ -28,7 +28,7 @@ function badResponse(message: string): never {
   throw new MatrixError(502, 'M_UNKNOWN', message);
 }
 
-export async function verifySnapshot(input: {
+export type SnapshotInput = {
   roomId: string;
   roomVersion: string;
   resident: string;
@@ -39,7 +39,11 @@ export async function verifySnapshot(input: {
   // A semantic replica retains the original resident for each evidence PDU.
   // This selects the ordinary local-sender fallback, never an auth verdict.
   residents?: ReadonlyMap<string, string>;
-}): Promise<VerifiedSnapshot> {
+};
+
+export async function verifySnapshot(
+  input: SnapshotInput,
+): Promise<VerifiedSnapshot> {
   const rulebook = getRulebook(input.roomVersion);
   const pack = new Map<string, Pdu>();
   const residents = new Map<string, string>();
