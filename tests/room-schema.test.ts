@@ -28,6 +28,7 @@ const TABLES = [
   'extremities',
   'waits',
   'changes',
+  'remote_batches',
 ];
 
 const INDEXES = [
@@ -114,7 +115,7 @@ Deno.test('room schema: v3 upgrade preserves old data and starts the future publ
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE publication_keys; DROP INDEX events_annotation_target',
+            'DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches',
           );
         },
       },
@@ -149,7 +150,9 @@ Deno.test('room schema: v4 annotation index upgrade preserves events and uses ta
         version: 4,
         apply: async (db) => {
           await roomSchema.apply(db);
-          await db.exec('DROP INDEX events_annotation_target');
+          await db.exec(
+            'DROP INDEX events_annotation_target; DROP TABLE remote_batches',
+          );
         },
       },
     },
@@ -190,6 +193,40 @@ Deno.test('room schema: v4 annotation index upgrade preserves events and uses ta
       true,
       JSON.stringify(plan),
     );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('room schema: v5 adds durable remote batch receipts without changing events', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: {
+      room: {
+        version: 5,
+        apply: async (db) => {
+          await roomSchema.apply(db);
+          await db.exec('DROP TABLE remote_batches');
+        },
+      },
+    },
+  });
+  try {
+    const room = await store.room('!receipt-upgrade:test', { create: true });
+    await room.execute(
+      "INSERT INTO events(id,pdu,type,sender,depth,origin_ts) VALUES('$old','{}','test','@a:test',1,1)",
+    );
+    await store.close();
+    store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    const upgraded = await store.room('!receipt-upgrade:test');
+    assertEquals(await upgraded.query('SELECT id FROM events'), [{
+      id: '$old',
+    }]);
+    assertEquals(await upgraded.query('SELECT * FROM remote_batches'), []);
+    assertEquals(await upgraded.query('SELECT v FROM meta'), [{
+      v: String(roomSchema.version),
+    }]);
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });

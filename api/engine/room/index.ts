@@ -14,6 +14,8 @@ import * as segments from '#engine/room/segments.ts';
 import { roomSchema } from '#engine/room/schema.ts';
 import * as state from '#engine/room/state.ts';
 import * as waits from '#engine/room/waits.ts';
+import * as remoteBatches from '#engine/room/remote-batches.ts';
+import type { RemoteOutcome } from '#engine/room/remote.ts';
 import { orderKeys } from '#engine/room/topology.ts';
 
 export { roomSchema };
@@ -31,6 +33,16 @@ export const resolutionProbe = { resolutions: 0 };
 function bind(conn: Conn, edges: EdgeOverlay) {
   return {
     diagnostics: { resolutions: 0 },
+    remoteBatches: {
+      get: (operationId: string, inputHash: string) =>
+        remoteBatches.remoteBatch(conn, operationId, inputHash),
+      save: (
+        operationId: string,
+        inputHash: string,
+        outcomes: RemoteOutcome[],
+      ) =>
+        remoteBatches.saveRemoteBatch(conn, operationId, inputHash, outcomes),
+    },
     events: {
       insert: (id: string, pdu: string) =>
         events.insertEvent(conn, id, pdu, edges),
