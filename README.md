@@ -457,10 +457,12 @@ bundle, not a copy of live database files or an unfinished private staging tree.
 
 The current baseline keeps storage admission closed through every database
 export. The pause grows with file count and data size: live-traffic measurements
-observed 14.5 seconds for 12 database files and 30-41 seconds for 21 files
-(19 rooms). Sends and sync reads can stall for that pause. This is an online
-backup, not a pause-free one; `pauseMs` reports the actual cut rather than a
-configured deadline.
+observed a 15.75-second median at 12 database files, 36.23 seconds at 21 files
+(19 rooms), and 94.49 seconds at 45 files (43 rooms), with a maximum of
+116.20 seconds. The heavy live workload also exposed sync and typing HTTP500
+responses. Sends and sync reads can stall or fail during this baseline operation.
+This is an online backup, not a pause-free one; `pauseMs` reports the actual cut
+rather than a configured deadline.
 
 The format-1 bundle includes database files, signing private keys, password
 hashes, uploaded local media, effective configuration, the original operator
