@@ -1122,6 +1122,18 @@ and cleans up only its own temporary GnuPG home/agent. Plaintext staging is not
 secure erasure, and this cipher primitive does not yet expose a backup command.
 (`api/engine/backup/encryption.ts`, `defaults/communico.toml`)
 
+Captured-database inspection opens and upgrades only store-owned private scratch
+copies, checks integrity and full file identities, and never invokes app startup
+or workers. Domain audits check room DAG/state references, signing-key pairs,
+allocator/source heads, projection references and watermarks, prepared/completed
+send receipts and projected reliable delivery. Projection lag and the completed
+room-removal crash window remain valid. The uploaded-media inventory includes
+inactive tenants and excludes pending reservations. Full scans use keyset batches
+without a row-count ceiling. These internal audits do not yet expose a backup or
+restore command.
+(`api/engine/store/inspect.ts`, `api/engine/backup/{audit,checks}.ts`,
+`api/engine/{room,tenant,server}/backup-audit.ts`)
+
 Configuration layers shipped TOML, an optional overlay and environment leaves;
 unknown nodes and wrong types are errors. Signals stop admission, drain all
 listeners within the configured grace and close storage last. Unhandled
