@@ -1103,9 +1103,9 @@ renames; replacement keeps both old roots. Startup refuses an unfinished journal
 before creating or opening a root. An explicit offline retry checks the recorded
 directory identities and rolls back the entire original pair before preparing a
 new candidate; unknown/tampered identities refuse without moving either root.
-Candidate failure before publication removes only owned staging. This storage
-lifecycle does not yet expose the restore command or perform its required
-sanitation and operator report.
+Candidate failure before publication removes only owned staging. The engine
+coordinator composes this lifecycle with validation, sanitation and the report;
+the public CLI is not yet connected.
 (`api/engine/store/{restore,ownership,index}.ts`)
 
 Private restore candidates have a separate store-owned database lifecycle:
@@ -1117,8 +1117,8 @@ inbox-receipt and sliding-position owners in one transaction: purge every restor
 OTK/fallback pool, publish each affected pool status, clear old inbox deletion
 receipts and expire both sliding connections and positions. Public signing keys,
 credentials, encrypted session backups and retained inbox messages are unchanged.
-These internal owners are not yet the complete restore command or its recovery
-epoch/report boundary.
+The offline coordinator composes these owners with the recovery epoch/report
+boundary before promotion, without opening the app.
 (`api/engine/store/candidate.ts`, `api/engine/tenant/restore.ts`)
 
 Server schema v25 adds a persistent restore recovery identity and report marker.
@@ -1130,8 +1130,7 @@ on that boundary. Room pagination can still read the token's event cursor; it
 does not apply sync recovery semantics. A private candidate's report is written
 0600 and fsynced before its digest completes the server marker. App startup checks
 the marker, file digest and report identity before creating any app worker or
-serving; missing, incomplete or modified reports refuse startup. Full restore
-assembly and job/report inventory remain unwired.
+serving; missing, incomplete or modified reports refuse startup.
 (`api/engine/server/recovery.ts`, `api/engine/backup/report.ts`,
 `api/engine/client/{tokens,device-lists}.ts`, `api/engine/{app,syncfeed}.ts`)
 
@@ -1144,7 +1143,7 @@ anchor; new subscriptions, including empty accounts, use it too. Numeric rebasin
 does not establish what an unseen peer once observed: `prev_id:[]` is the actual
 resnapshot contract. Private server recovery invalidates learned remote-device
 completeness/causal memory and retries without deleting keys or trust decisions.
-The offline coordinator still needs to compose these owners.
+The offline coordinator composes these owners before completing the report.
 (`api/engine/tenant/changes.ts`, `api/engine/server/{device-federation,remote-devices}.ts`)
 
 Restore work inspection uses query-only captured/candidate capabilities, never
@@ -1207,8 +1206,24 @@ source is never bundled. Optional encryption removes only owned plaintext stagin
 after encryption succeeds. The manifest-last seal and storage-owned no-replace
 publication expose only the complete bundle. GnuPG uses a live directory-fd alias
 for its private home/agent, so long bundle paths do not become socket paths. This
-engine producer is not yet wired to the admin socket/CLI or an offline restore.
+engine producer is paired with offline restore; admin socket/CLI wiring remains.
 (`api/engine/backup/bundle.ts`, `api/engine/store/index.ts`)
+
+The offline engine restore reads and verifies the complete manifest/inventory,
+checks native/schema compatibility and copies/decrypts only private candidates.
+It migrates and audits DB identities/source references, checks the uploaded-media
+inventory, sanitizes consuming keys and delivery boundaries, rebases device streams
+and invalidates learned device completeness. Real job inventories and RPO warnings
+are fsynced into the report and bound into the candidate marker before closing
+candidate DB lifetimes and promoting both roots. The immutable bundle is never
+opened as a running store or migrated in place. Replacement preserves prior roots.
+Portable generated configuration uses the same Matrix name and signing identity,
+new storage/media paths and bundled TLS/CA mappings; explicit target overrides
+win, but environment credentials remain external. The original effective/overlay
+files are retained for provenance. Operators must fence the old installation
+before serving the same identity on another machine; a local ownership lock cannot
+fence another host. This engine flow is not yet a public command.
+(`api/engine/backup/{restore,deployment}.ts`)
 
 Configuration layers shipped TOML, an optional overlay and environment leaves;
 unknown nodes and wrong types are errors. Signals stop admission, drain all
