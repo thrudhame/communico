@@ -6,6 +6,8 @@ import {
   exportReplicaRoom,
   importReplicaBoundary,
   importReplicaGenesis,
+  importReplicaRoom,
+  type ReplicaRoom,
 } from '#engine/room/replica.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { backfill } from '#engine/room/history.ts';
@@ -18,6 +20,57 @@ import {
   remoteEvent,
 } from './fixtures/remote.ts';
 import { makeFakeRoom } from './fixtures/remote-room.ts';
+
+async function roundTrip(
+  f: Awaited<ReturnType<typeof fixture>>,
+  manifest: ReplicaRoom,
+) {
+  const dir = await Deno.makeTempDir({ prefix: 'whole-room-replica-' });
+  const destination = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { room: roomSchema } });
+  try {
+    await importReplicaRoom(destination, manifest, {
+      self: f.input.self,
+      keys: f.input.keys,
+    });
+    const replica = await openRoom(destination, manifest.roomId);
+    const actual = await exportReplicaRoom(replica, f.input.self);
+    assertEquals(actual.stays, manifest.stays);
+    assertEquals(
+      new Set(actual.events.map((pdu) => String(pdu.event_id))),
+      new Set(manifest.events.map((pdu) => String(pdu.event_id))),
+    );
+    const source = await openRoom(f.store, manifest.roomId);
+    for (const step of manifest.steps) {
+      const state = (room: typeof replica) =>
+        room.tx(async (tx) => {
+          const before = await tx.state.eventStateBefore(step.eventId);
+          return {
+            status: (await tx.events.getStatus(step.eventId))?.standing,
+            before: before === null
+              ? null
+              : await tx.state.groupMap(before.group),
+            positioned: await tx.segments.positionOf(step.eventId) !== null,
+          };
+        });
+      assertEquals(await state(replica), await state(source));
+    }
+    const head = await replica.tx((tx) => tx.changes.head());
+    await importReplicaRoom(destination, manifest, {
+      self: f.input.self,
+      keys: f.input.keys,
+    });
+    assertEquals(await replica.tx((tx) => tx.changes.head()), head);
+  } finally {
+    await destination.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+}
 
 async function fixture() {
   const source = await makeFakeRoom({ roomId: '!replica:remote.test' });
@@ -361,6 +414,7 @@ Deno.test('whole-room export retains participation, authorized history and exact
     ) {
       assert(!serialized.includes('"' + field + '"'));
     }
+    await roundTrip(f, manifest);
     const oldCut = manifest.cut;
     const suffix = await f.source.addEvent({
       type: 'm.room.topic',
@@ -466,7 +520,126 @@ Deno.test('whole-room export includes older departed stays and isolated historic
     assert(
       manifest.boundaries.some((entry) => entry.eventId === rejoin.event_id),
     );
+    await roundTrip(f, manifest);
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('whole-room replay rebuilds home genesis and live recovery gaps through ordinary ingest', async () => {
+  const f = await fixture();
+  try {
+    const source = await makeFakeRoom({
+      roomId: '!genesis:logical.test',
+      server: f.home,
+    });
+    const pdus = [...source.events.values()];
+    await importReplicaGenesis(f.store, {
+      ...f.input,
+      roomId: source.roomId,
+      create: pdus[0],
+      join: pdus[1],
+    });
+    const room = await openRoom(f.store, source.roomId);
+    await ingestRemote(room, pdus.slice(2), f.home.name, {
+      keys: f.input.keys,
+      fetcher: fakeFetcher({}).fetcher,
+      self: f.input.self,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    await source.addEvent({
+      type: 'm.room.topic',
+      state_key: '',
+      content: { topic: 'retained evidence only' },
+    });
+    const parent = await source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'gap parent' },
+    });
+    const tip = await source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'gap tip' },
+    });
+    const latest = await source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'live' },
+    });
+    await ingestRemote(room, [latest], f.home.name, {
+      keys: f.input.keys,
+      self: f.input.self,
+      fetcher: fakeFetcher({
+        missingEvents: [tip],
+        event: source.events,
+        stateIds: new Map([[
+          String(parent.event_id),
+          source.stateIdsAt(String(parent.event_id))!,
+        ]]),
+      }).fetcher,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    assertEquals(
+      (await room.tx((tx) =>
+        tx.state.eventStateBefore(String(parent.event_id))
+      ))?.provenance,
+      'imported',
+    );
+    const manifest = await exportReplicaRoom(room, f.input.self);
+    assertEquals(manifest.stays[0].opening.kind, 'genesis');
+    await roundTrip(f, manifest);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('whole-room replay refuses tampering and missing before-state rather than completing a partial replica', async () => {
+  const f = await fixture();
+  const dir = await Deno.makeTempDir({ prefix: 'replica-refusal-' });
+  const destination = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { room: roomSchema } });
+  try {
+    await importReplicaBoundary(f.store, f.input);
+    const source = await openRoom(f.store, f.source.roomId);
+    const manifest = await exportReplicaRoom(source, f.input.self);
+    const tampered = structuredClone(manifest);
+    tampered.events.find((pdu) => pdu.event_id === f.join.event_id)!
+      .signatures = {};
+    await assertRejects(() =>
+      importReplicaRoom(destination, tampered, f.input)
+    );
+    await assertRejects(
+      () => openRoom(destination, f.source.roomId),
+      Deno.errors.NotFound,
+    );
+    await assertRejects(
+      () =>
+        importReplicaRoom(
+          destination,
+          { ...manifest, boundaries: [] },
+          f.input,
+        ),
+      MatrixError,
+      'before-state',
+    );
+    await assertRejects(
+      () => openRoom(destination, f.source.roomId),
+      Deno.errors.NotFound,
+    );
+    await importReplicaRoom(destination, manifest, f.input);
+    const replica = await openRoom(destination, f.source.roomId);
+    const before = await replica.tx((tx) =>
+      tx.state.eventStateBefore(String(f.join.event_id))
+    );
+    assert(before);
+  } finally {
+    await destination.close();
+    await Deno.remove(dir, { recursive: true });
     await f.close();
   }
 });

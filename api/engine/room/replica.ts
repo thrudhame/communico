@@ -17,6 +17,7 @@ import { installSnapshotBoundary } from './snapshot-install.ts';
 import { oversizedOf, verify } from './verify.ts';
 
 export { exportReplicaRoom, type ReplicaRoom } from './replica-export.ts';
+export { importReplicaRoom } from './replica-import.ts';
 
 export type ReplicaBoundary = {
   roomId: string;

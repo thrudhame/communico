@@ -21,34 +21,7 @@ export async function installSnapshotBoundary(
   },
 ): Promise<void> {
   const eventId = String(input.event.event_id);
-  for (const [id, pdu] of input.verified.ordered) {
-    if (id === eventId || await tx.events.get(id) !== null) continue;
-    const rule = input.verified.rejected.get(id) ?? null;
-    await tx.events.insert(
-      id,
-      canonicalJson(pdu as unknown as Record<string, unknown>),
-    );
-    await tx.events.setStatus(id, {
-      standing: rule === null ? 'accepted' : 'rejected',
-      grounding: 'evidence',
-      origin: input.resident,
-      received_ts: Date.now(),
-    });
-    await tx.changes.append('event', id, {
-      standing: rule === null ? 'accepted' : 'rejected',
-      reason: rule === null ? null : 'auth',
-      rule,
-      type: String(pdu.type),
-      state_key: pdu.state_key ?? null,
-      sender: String(pdu.sender),
-      depth: pdu.depth,
-      origin_server_ts: pdu.origin_server_ts,
-      stay: null,
-      offset: null,
-      grounding: 'evidence',
-      origin: input.resident,
-    });
-  }
+  await stageSnapshotEvidence(tx, input.verified, eventId, input.resident);
   const group = await tx.materialize.newGroup(
     null,
     mapEntries(input.verified.snapshot),
@@ -75,4 +48,41 @@ export async function installSnapshotBoundary(
     );
   }
   await tx.segments.setOpenedBy(stay, eventId);
+}
+
+/** Join and in-stay replica recovery use one verified outlier staging owner. */
+export async function stageSnapshotEvidence(
+  tx: RoomTx,
+  verified: VerifiedSnapshot,
+  eventId: string,
+  resident: string,
+): Promise<void> {
+  for (const [id, pdu] of verified.ordered) {
+    if (id === eventId || await tx.events.get(id) !== null) continue;
+    const rule = verified.rejected.get(id) ?? null;
+    await tx.events.insert(
+      id,
+      canonicalJson(pdu as unknown as Record<string, unknown>),
+    );
+    await tx.events.setStatus(id, {
+      standing: rule === null ? 'accepted' : 'rejected',
+      grounding: 'evidence',
+      origin: resident,
+      received_ts: Date.now(),
+    });
+    await tx.changes.append('event', id, {
+      standing: rule === null ? 'accepted' : 'rejected',
+      reason: rule === null ? null : 'auth',
+      rule,
+      type: String(pdu.type),
+      state_key: pdu.state_key ?? null,
+      sender: String(pdu.sender),
+      depth: pdu.depth,
+      origin_server_ts: pdu.origin_server_ts,
+      stay: null,
+      offset: null,
+      grounding: 'evidence',
+      origin: resident,
+    });
+  }
 }
