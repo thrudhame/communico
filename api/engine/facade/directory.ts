@@ -3,6 +3,7 @@
 // room/user streams need not be ready before this manifest can describe them.
 import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
+import { reconcileKeyDecisions } from '#engine/federation/keys.ts';
 import {
   exportPeerPolicy,
   installPeerPolicy,
@@ -283,30 +284,47 @@ export class DirectoryReplicas {
         403,
       );
     }
-    return await journal.apply('home', stream, async (conn, current) => {
-      const [binding] = await conn.query(
-        "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
-        [context.id],
-      );
-      if (
-        binding?.state !== 'paired' ||
-        Number(binding.revision) !== grant.body.revision
-      ) throw new LinkError('LINK_UNPAIRED', 'directory grant changed', 403);
-      const [prior] = await conn.query(
-        "SELECT source_cut FROM facade_scopes WHERE incarnation=? AND scope='directory'",
-        [context.id],
-      );
-      if (
-        (prior ? Number(prior.source_cut) : 0) !== after ||
-        current.hash !== record.hash
-      ) throw new LinkError('LINK_DIVERGED', 'directory source cut diverged');
-      await installDirectoryFacts(conn, view.directory, this.self);
-      await installPeerPolicy(conn, view.policy);
-      await conn.execute(
-        "INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,'directory',?,1,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=1,pending_hash=NULL",
-        [context.id, cut],
-      );
-      return { cut };
-    });
+    return await reconcileKeyDecisions(
+      this.db,
+      view.policy.keyDecisions,
+      (installKeys) =>
+        journal.apply('home', stream, async (conn, current) => {
+          const [binding] = await conn.query(
+            "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
+            [context.id],
+          );
+          if (
+            binding?.state !== 'paired' ||
+            Number(binding.revision) !== grant.body.revision
+          ) {
+            throw new LinkError(
+              'LINK_UNPAIRED',
+              'directory grant changed',
+              403,
+            );
+          }
+          const [prior] = await conn.query(
+            "SELECT source_cut FROM facade_scopes WHERE incarnation=? AND scope='directory'",
+            [context.id],
+          );
+          if (
+            (prior ? Number(prior.source_cut) : 0) !== after ||
+            current.hash !== record.hash
+          ) {
+            throw new LinkError(
+              'LINK_DIVERGED',
+              'directory source cut diverged',
+            );
+          }
+          await installDirectoryFacts(conn, view.directory, this.self);
+          await installPeerPolicy(conn, view.policy);
+          await installKeys(conn);
+          await conn.execute(
+            "INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,'directory',?,1,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=1,pending_hash=NULL",
+            [context.id, cut],
+          );
+          return { cut };
+        }),
+    );
   }
 }

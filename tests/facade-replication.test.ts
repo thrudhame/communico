@@ -13,7 +13,12 @@ import { federationPolicy } from '#engine/federation/policy.ts';
 import { keyStore } from '#engine/federation/keys.ts';
 import * as serving from '#engine/federation/serve.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { seedServer } from './federation/doc-helper.ts';
+import {
+  directOnly,
+  makeDoc,
+  makeServer,
+  seedServer,
+} from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { exportPublicReplica, PublicReplicas } from '#engine/facade/public.ts';
@@ -189,7 +194,7 @@ async function fixture() {
     async downgrade() {
       await (await edge.server()).tx(async (conn) => {
         await conn.exec(
-          'DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports',
+          'DROP TABLE server_key_decisions; DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports',
         );
         await conn.execute("UPDATE meta SET v='29' WHERE k='schema_version'");
       }, { mode: 'deferred' });
@@ -669,6 +674,80 @@ Deno.test('replica admission consumes home federation mode and blocking key deci
       'ok',
     );
     assertEquals((await federationPolicy(reopened)).keychange, 'warn');
+  } finally {
+    setConfigForTests({});
+    await f.close();
+  }
+});
+
+Deno.test('home reviewed remote keys reconcile facade blocks and refusal memory without clearing unrelated decisions', async () => {
+  const f = await fixture();
+  try {
+    setConfigForTests({ federation: { keychange: 'block' } });
+    const home = await f.home.server(), edge = await f.edgeServer();
+    const remote = await makeServer('reviewed.test');
+    const unrelated = await makeServer('unreviewed.test');
+    const rotated = await makeDoc(remote, {
+      kp: (await makeServer('rotation.test')).kp,
+      keyId: 'ed25519:rotated',
+    });
+    const other = await makeDoc(unrelated, {
+      kp: (await makeServer('other-rotation.test')).kp,
+      keyId: 'ed25519:rotated',
+    });
+    for (const db of [home, edge]) {
+      await seedServer(db, remote);
+      await seedServer(db, unrelated);
+    }
+    const horizon = Date.now() + 25 * 3600000;
+    const source = keyStore(home, { deps: directOnly(rotated) });
+    const counter = { calls: 0 };
+    const replica = keyStore(edge, { deps: directOnly(rotated, counter) });
+    await assertRejects(() => source.acquireKeyDoc(remote.name, horizon));
+    await assertRejects(() => replica.acquireKeyDoc(remote.name, horizon));
+    await assertRejects(() =>
+      keyStore(edge, { deps: directOnly(other) })
+        .acquireKeyDoc(unrelated.name, horizon)
+    );
+    assert(await source.acceptKeyChange(remote.name));
+    const record = await f.directoryExport();
+    assert(record);
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    assert(await (await f.directoryOwner()).apply(journal, record));
+    assertEquals(
+      await admit(edge, remote.name, { kind: 'lookup', what: 'review' }),
+      'ok',
+    );
+    await replica.getVerifyKey(
+      remote.name,
+      'ed25519:rotated',
+      Date.now(),
+      'request',
+    );
+    assertEquals(await replica.acquireKeyDoc(remote.name, Date.now()), rotated);
+    assertEquals(
+      counter.calls,
+      1,
+      'reviewed material is available without another origin dial',
+    );
+    await assertRejects(
+      () => admit(edge, unrelated.name, { kind: 'lookup', what: 'review' }),
+      MatrixError,
+    );
+    assert(
+      (await replica.listKeyChanges(unrelated.name)).some((row) =>
+        row.status === 'blocking'
+      ),
+    );
+    await f.reopen();
+    assertEquals(
+      await admit(await f.edgeServer(), remote.name, {
+        kind: 'lookup',
+        what: 'review',
+      }),
+      'ok',
+    );
   } finally {
     setConfigForTests({});
     await f.close();

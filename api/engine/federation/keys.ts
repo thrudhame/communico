@@ -11,7 +11,7 @@
 // The cache tables are shared across tenants of the same server file
 // (a fetched key serves every tenant). Ported from doltgres.
 import { config } from '#engine/config.ts';
-import type { Database as Db } from '#engine/store/db.ts';
+import type { Conn, Database as Db } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Signer } from '#engine/room/signer.ts';
@@ -35,6 +35,12 @@ import { federationRequest } from './client.ts';
 import { upstreamCategory, UpstreamError } from '#engine/net/upstream-error.ts';
 import { keyDocument, oldKeysOf } from './key-document.ts';
 import { federationPolicy } from './policy.ts';
+import {
+  keyDecisionsOf,
+  persistKeyDocument,
+  recordKeyDecision,
+  saveKeyDecision,
+} from './key-decisions.ts';
 
 export type KeyDoc = KeyDocShape;
 
@@ -151,16 +157,7 @@ type AcquisitionState = {
 
 const acquisitionStates = new WeakMap<Db, AcquisitionState>();
 
-export function keyStore(
-  server: Db,
-  opts: { signer?: Signer; deps?: KeysDeps } = {},
-): KeyStore {
-  if (opts.deps === undefined && opts.signer === undefined) {
-    throw new Error('keyStore: production transport needs the tenant signer');
-  }
-  const deps = opts.deps !== undefined
-    ? opts.deps
-    : productionDeps(server, opts.signer!);
+function stateOf(server: Db): AcquisitionState {
   let state = acquisitionStates.get(server);
   if (state === undefined) {
     state = {
@@ -173,13 +170,162 @@ export function keyStore(
     };
     acquisitionStates.set(server, state);
   }
+  return state;
+}
+
+function invalidateAcquisition(server: Db, name: string): void {
+  const state = stateOf(server), epoch = state.epochs.get(name);
+  if (epoch !== undefined) epoch.current = false;
+  state.epochs.delete(name);
+  state.inFlight.delete(name);
+  state.failureMemory.delete(name);
+  state.refusalMemory.delete(name);
+}
+
+async function mutateKeys<T>(
+  server: Db,
+  name: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const mutations = stateOf(server).mutations;
+  const previous = mutations.get(name);
+  const before = previous === undefined ? Promise.resolve() : previous;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => release = resolve);
+  const tail = before.then(() => held);
+  mutations.set(name, tail);
+  await before;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (mutations.get(name) === tail) mutations.delete(name);
+  }
+}
+
+// The domain owner holds the same name locks as acquisition/admin decisions
+// across the caller's atomic projection+journal commit. Invalidations happen
+// only after that commit, before a superseded network result can publish.
+export async function reconcileKeyDecisions<T>(
+  server: Db,
+  raw: unknown,
+  commit: (install: (conn: Conn) => Promise<void>) => Promise<T>,
+): Promise<T> {
+  const decisions = keyDecisionsOf(raw).sort((a, b) =>
+    a.name.localeCompare(b.name)
+  );
+  for (const decision of decisions) {
+    if (decision.action === 'accept') {
+      await validateCandidate(decision.name, decision.doc);
+    }
+  }
+  const lock = async (index: number): Promise<T> => {
+    if (index < decisions.length) {
+      return await mutateKeys(
+        server,
+        decisions[index].name,
+        () => lock(index + 1),
+      );
+    }
+    const changed: string[] = [];
+    for (const decision of decisions) {
+      const [prior] = await server.query(
+        'SELECT revision FROM server_key_decisions WHERE server_name=?',
+        [decision.name],
+      );
+      if (!prior || Number(prior.revision) !== decision.revision) {
+        changed.push(decision.name);
+      }
+    }
+    const result = await commit(async (conn) => {
+      for (const decision of decisions) {
+        if (!await saveKeyDecision(conn, decision)) continue;
+        if (decision.action === 'accept') {
+          await persistKeyDocument(
+            conn,
+            decision.name,
+            decision.doc,
+            'home-accepted',
+            decision.acquired,
+          );
+          const material = canonicalJson(keyMapOf(decision.doc));
+          const rows = await conn.query(
+            "SELECT seen_ms,new_keys FROM server_key_changes WHERE server_name=? AND status='blocking'",
+            [decision.name],
+          );
+          for (const row of rows) {
+            if (canonicalJson(JSON.parse(String(row.new_keys))) !== material) {
+              continue;
+            }
+            await conn.execute(
+              "UPDATE server_key_changes SET status='accepted' WHERE server_name=? AND seen_ms=? AND status='blocking'",
+              [decision.name, Number(row.seen_ms)],
+            );
+          }
+        } else {
+          await forgetKeys(conn, decision.name);
+        }
+      }
+    });
+    for (const name of changed) invalidateAcquisition(server, name);
+    return result;
+  };
+  return await lock(0);
+}
+
+async function forgetKeys(conn: Conn, name: string): Promise<void> {
+  await conn.execute('DELETE FROM server_keys WHERE server_name=?', [name]);
+  await conn.execute('DELETE FROM server_key_docs WHERE server_name=?', [name]);
+  await conn.execute(
+    "UPDATE server_key_changes SET status='forgotten' WHERE server_name=? AND status IN ('noted','blocking')",
+    [name],
+  );
+}
+
+// Shared by origin acquisition and home-approved replica decisions. The original
+// signed document is always checked outside any storage transaction.
+async function validateCandidate(name: string, raw: unknown): Promise<KeyDoc> {
+  const doc = keyDocument(raw);
+  if (doc.server_name !== name) {
+    throw new UpstreamError('validation', {
+      phase: 'key-doc',
+      reason: 'server identity mismatch',
+    });
+  }
+  for (const [id, entry] of Object.entries(doc.verify_keys)) {
+    if (!id.startsWith('ed25519:')) continue;
+    if (
+      await verifyJson(
+        doc,
+        name,
+        id,
+        await importPublicKeyFromRaw(b64decode(entry.key)),
+      )
+    ) return doc;
+  }
+  throw new UpstreamError('validation', {
+    phase: 'key-doc',
+    reason: 'invalid self signature',
+  });
+}
+
+export function keyStore(
+  server: Db,
+  opts: { signer?: Signer; deps?: KeysDeps } = {},
+): KeyStore {
+  if (opts.deps === undefined && opts.signer === undefined) {
+    throw new Error('keyStore: production transport needs the tenant signer');
+  }
+  const deps = opts.deps !== undefined
+    ? opts.deps
+    : productionDeps(server, opts.signer!);
+  const state = stateOf(server);
   const {
     inFlight,
     failureMemory,
     refusalMemory,
     warnedOnce,
     epochs,
-    mutations,
   } = state;
 
   // A generation is retained only while a lookup uses it. Admin decisions
@@ -210,30 +356,13 @@ export function keyStore(
   }
 
   function invalidate(name: string): void {
-    const epoch = epochs.get(name);
-    if (epoch !== undefined) epoch.current = false;
-    epochs.delete(name);
-    inFlight.delete(name);
-    failureMemory.delete(name);
-    refusalMemory.delete(name);
+    invalidateAcquisition(server, name);
   }
 
   // Match the room mutation owner: network outside, lifecycle check and all
   // publication inside one non-reentrant name lock above file transactions.
   async function mutate<T>(name: string, fn: () => Promise<T>): Promise<T> {
-    const previous = mutations.get(name);
-    const before = previous === undefined ? Promise.resolve() : previous;
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => release = resolve);
-    const tail = before.then(() => held);
-    mutations.set(name, tail);
-    await before;
-    try {
-      return await fn();
-    } finally {
-      release();
-      if (mutations.get(name) === tail) mutations.delete(name);
-    }
+    return await mutateKeys(server, name, fn);
   }
 
   // ---------------------------------------------------------------- DB ----
@@ -269,73 +398,13 @@ export function keyStore(
     doc: KeyDoc,
     via: string,
   ): Promise<void> {
-    const fetchedMs = Date.now();
-    const effectiveUntil = Math.min(
-      doc.valid_until_ts,
-      fetchedMs + 7 * 86400_000,
-    );
-    await server.tx(async (tx) => {
-      await tx.execute(
-        'INSERT INTO server_key_docs(server_name, key_json, fetched_ms, via) VALUES(?,?,?,?) ON CONFLICT(server_name) DO UPDATE SET key_json = excluded.key_json, fetched_ms = excluded.fetched_ms, via = excluded.via',
-        [name, JSON.stringify(doc), fetchedMs, via],
-      );
-      // the document fully re-states the server's keys — replace the cache
-      await tx.execute('DELETE FROM server_keys WHERE server_name = ?', [name]);
-      for (const [keyId, entry] of Object.entries(doc.verify_keys)) {
-        await tx.execute(
-          'INSERT INTO server_keys(server_name, key_id, pubkey_b64, valid_until_ts, fetched_ms, expired_ts) VALUES(?,?,?,?,?,NULL)',
-          [name, keyId, entry.key, effectiveUntil, fetchedMs],
-        );
-      }
-      for (const [keyId, entry] of Object.entries(oldKeysOf(doc))) {
-        await tx.execute(
-          'INSERT INTO server_keys(server_name, key_id, pubkey_b64, valid_until_ts, fetched_ms, expired_ts) VALUES(?,?,?,?,?,?)',
-          [
-            name,
-            keyId,
-            entry.key,
-            effectiveUntil,
-            fetchedMs,
-            entry.expired_ts,
-          ],
-        );
-      }
-    });
+    await server.tx((tx) => persistKeyDocument(tx, name, doc, via, Date.now()));
   }
 
   // ------------------------------------------------------- validation ----
 
   // Decode before signature admission. The signed document stays intact;
   // effective capped validity is persisted separately in server_keys.
-  async function validateCandidate(
-    name: string,
-    raw: unknown,
-  ): Promise<KeyDoc> {
-    const doc = keyDocument(raw);
-    if (doc.server_name !== name) {
-      throw new UpstreamError('validation', {
-        phase: 'key-doc',
-        reason: 'server identity mismatch',
-      });
-    }
-    let selfSigned = false;
-    for (const [keyId, entry] of Object.entries(doc.verify_keys)) {
-      if (!keyId.startsWith('ed25519:')) continue;
-      const pub = await importPublicKeyFromRaw(b64decode(entry.key));
-      if (await verifyJson(doc, name, keyId, pub)) {
-        selfSigned = true;
-        break;
-      }
-    }
-    if (!selfSigned) {
-      throw new UpstreamError('validation', {
-        phase: 'key-doc',
-        reason: 'invalid self signature',
-      });
-    }
-    return doc;
-  }
-
   // --------------------------------------------------- key change --------
 
   function materialMapOf(rows: KeyRow[]): Record<string, string> {
@@ -710,6 +779,7 @@ export function keyStore(
    *  atomically (server_key_docs + server_keys), mark the change accepted. */
   async function acceptKeyChange(name: string): Promise<boolean> {
     return await mutate(name, async () => {
+      const acquired = Date.now();
       const found = await server.tx(async (tx) => {
         const rows = await tx.query(
           "SELECT seen_ms, candidate_json FROM server_key_changes WHERE server_name = ? AND status = 'blocking' ORDER BY seen_ms DESC LIMIT 1",
@@ -720,13 +790,19 @@ export function keyStore(
           "UPDATE server_key_changes SET status = 'accepted' WHERE server_name = ? AND seen_ms = ?",
           [name, Number(rows[0].seen_ms)],
         );
-        return JSON.parse(String(rows[0].candidate_json)) as {
+        const candidate = JSON.parse(String(rows[0].candidate_json)) as {
           via: string;
           doc: KeyDoc;
         };
+        await persistKeyDocument(tx, name, candidate.doc, 'accepted', acquired);
+        await recordKeyDecision(tx, name, {
+          action: 'accept',
+          doc: candidate.doc,
+          acquired,
+        });
+        return candidate;
       });
       if (found === null) return false;
-      await persistDoc(name, found.doc, 'accepted');
       invalidate(name);
       return true;
     });
@@ -737,16 +813,8 @@ export function keyStore(
   async function forgetServerKeys(name: string): Promise<void> {
     await mutate(name, async () => {
       await server.tx(async (tx) => {
-        await tx.execute('DELETE FROM server_keys WHERE server_name = ?', [
-          name,
-        ]);
-        await tx.execute('DELETE FROM server_key_docs WHERE server_name = ?', [
-          name,
-        ]);
-        await tx.execute(
-          "UPDATE server_key_changes SET status = 'forgotten' WHERE server_name = ? AND status IN ('noted', 'blocking')",
-          [name],
-        );
+        await forgetKeys(tx, name);
+        await recordKeyDecision(tx, name, { action: 'forget' });
       });
       invalidate(name);
     });

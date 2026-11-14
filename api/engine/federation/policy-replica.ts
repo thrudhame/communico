@@ -3,6 +3,11 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import {
+  exportKeyDecisions,
+  type KeyDecision,
+  keyDecisionsOf,
+} from './key-decisions.ts';
+import {
   exportFederationPolicy,
   type FederationPolicy,
   policyOf,
@@ -10,6 +15,7 @@ import {
 
 export type PeerPolicy = {
   federation: FederationPolicy;
+  keyDecisions: KeyDecision[];
   peers: {
     name: string;
     host: string | null;
@@ -67,11 +73,17 @@ export function peerPolicyOf(raw: unknown): PeerPolicy {
     new Set(peers.map((p) => p.name)).size !== peers.length ||
     new Set(blocks.map((b) => b.pattern)).size !== blocks.length
   ) bad();
-  return { peers, blocks, federation: policyOf(value.federation) };
+  return {
+    peers,
+    blocks,
+    federation: policyOf(value.federation),
+    keyDecisions: keyDecisionsOf(value.keyDecisions),
+  };
 }
 export async function exportPeerPolicy(conn: Conn): Promise<PeerPolicy> {
   return peerPolicyOf({
     federation: await exportFederationPolicy(conn),
+    keyDecisions: await exportKeyDecisions(conn),
     peers: (await conn.query(
       'SELECT name,host,port,trust,pin_spki_sha256,added_ms,added_by FROM federation_peers ORDER BY added_ms,name',
     )).map((p) => ({
