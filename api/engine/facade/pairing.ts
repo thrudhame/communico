@@ -14,6 +14,7 @@ import { nodeId, type NodeIdentity } from './identity.ts';
 import {
   type Capability,
   integer,
+  LINK_CAPABILITIES,
   LINK_VERSION,
   LinkError,
   negotiate,
@@ -77,10 +78,6 @@ type Entry = {
   revision: number;
 };
 
-const controlCapabilities: readonly Capability[] = [{
-  type: 'control',
-  version: 1,
-}];
 function refused(message: string, status = 403): never {
   throw new LinkError('LINK_ENROLLMENT_REFUSED', message, status);
 }
@@ -124,7 +121,12 @@ function contextOf(
   const row = object(value);
   const server = text(row.server);
   const version = negotiate(row, server, supported);
-  const url = new URL(text(row.url));
+  let url: URL;
+  try {
+    url = new URL(text(row.url));
+  } catch {
+    refused('pairing requires an HTTPS origin', 400);
+  }
   if (
     url.protocol !== 'https:' || url.username || url.password || url.search ||
     url.hash || url.pathname !== '/'
@@ -260,7 +262,7 @@ export class Pairings {
     publicKey: string,
     private readonly pin: string,
     private readonly node?: NodeIdentity,
-    private readonly supported: readonly Capability[] = controlCapabilities,
+    private readonly supported: readonly Capability[] = LINK_CAPABILITIES,
   ) {
     this.key = keyOf({ keyId: signer.keyId, publicKey });
     pinOf(pin);
@@ -621,14 +623,24 @@ export class Pairings {
   async status(): Promise<
     { id: string; node: string; state: string; revision: number }[]
   > {
-    const rows = await this.db.query(
-      'SELECT id,node,state,revision FROM facade_pairings ORDER BY id',
-    );
-    return rows.map((row) => ({
-      id: String(row.id),
-      node: String(row.node),
-      state: String(row.state),
-      revision: Number(row.revision),
-    }));
+    return await pairingStatus(this.db);
   }
+}
+
+/** Registry inspection does not require any signing or TLS credential. */
+export async function pairingStatus(db: Database): Promise<{
+  id: string;
+  node: string;
+  state: string;
+  revision: number;
+}[]> {
+  const rows = await db.query(
+    'SELECT id,node,state,revision FROM facade_pairings ORDER BY id',
+  );
+  return rows.map((row) => ({
+    id: String(row.id),
+    node: String(row.node),
+    state: String(row.state),
+    revision: Number(row.revision),
+  }));
 }

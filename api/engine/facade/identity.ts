@@ -1,6 +1,6 @@
 // Explicit facade initialization, never the home tenant's implicit genesis.
 // Neither this owner nor its status view exports private material.
-import { createHash } from 'node:crypto';
+import { createHash, X509Certificate } from 'node:crypto';
 import type { Database } from '#engine/store/db.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import {
@@ -229,4 +229,38 @@ export async function readProtectedFile(path: string): Promise<string> {
     offset += chunk.length;
   }
   return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+}
+
+export function certificatePin(pem: string | Uint8Array): string {
+  return createHash('sha256').update(
+    new X509Certificate(pem).publicKey.export({ type: 'spki', format: 'der' }),
+  ).digest('hex');
+}
+
+/** Never overwrite an operator's existing file, including a symlink. */
+export async function writeProtectedFile(
+  path: string,
+  value: string,
+): Promise<void> {
+  using file = await Deno.open(path, {
+    write: true,
+    createNew: true,
+    mode: 0o600,
+  });
+  const info = await file.stat();
+  if (
+    !info.isFile || info.uid !== Deno.uid() || (info.mode! & 0o7777) !== 0o600
+  ) {
+    throw new LinkError(
+      'LINK_UNSAFE_FILE',
+      'pairing export must be runtime-owned with mode 0600',
+      403,
+    );
+  }
+  const bytes = new TextEncoder().encode(value);
+  let offset = 0;
+  while (offset < bytes.length) {
+    offset += await file.write(bytes.subarray(offset));
+  }
+  await file.sync();
 }

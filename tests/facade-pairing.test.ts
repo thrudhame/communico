@@ -279,6 +279,7 @@ Deno.test('enrollment refuses wrong credentials, pins, node identity, expiry and
         { server: 'other.test' },
         { facadePin: homePin },
         { expires: Date.now() - 1 },
+        { url: 'not-an-https-origin' },
         { protocol: { major: 2, minor: 0 } },
       ]
     ) {

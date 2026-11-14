@@ -71,6 +71,14 @@ Deno.test('admin status, private socket, stale/live ownership and public isolati
       assertEquals((await Deno.lstat(path)).mode! & 0o7777, 0o600);
       assertEquals((await Deno.lstat(path)).uid, Deno.uid());
     });
+    await t.step(
+      'facade registry status needs no enrollment TLS configuration',
+      async () => {
+        const result = await call(path, '/v1/facade/status');
+        assertEquals(result.ok, true);
+        assertEquals(result.result, []);
+      },
+    );
     await t.step('live socket refuses second start', async () => {
       await assertRejects(
         () => startAdmin(http.app, path),
