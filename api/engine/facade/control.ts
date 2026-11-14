@@ -141,6 +141,21 @@ export class FacadeKeys {
     });
   }
 
+  async status() {
+    const [held] = await this.db.query(
+      'SELECT revision,roster_json,last_home_ms FROM facade_key_roster WHERE singleton=1',
+    );
+    const roster = held.roster_json === null
+      ? null
+      : rosterOf(JSON.parse(String(held.roster_json)));
+    const own = roster?.keys.find((key) => key.keyId === this.signer.keyId);
+    return {
+      revision: Number(held.revision),
+      ready: own?.publicKey === this.publicKey && own?.retiredAt === null,
+      lastHome: held.last_home_ms === null ? null : Number(held.last_home_ms),
+    };
+  }
+
   async apply(journal: Journal, stream: Stream): Promise<boolean> {
     const record = await journal.next('home', stream);
     if (!record) return false;

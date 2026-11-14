@@ -199,6 +199,7 @@ export function linkHandler(options: {
   limits: PageLimits;
   notices?: NoticeHub;
   changed?(): Promise<void>;
+  contacted?(): Promise<void>;
 }): (request: Request, peerPin: string) => Promise<Response> {
   const enroll = enrollmentHandler(options);
   const json = (raw: string | null) => {
@@ -244,6 +245,7 @@ export function linkHandler(options: {
         403,
       );
     }
+    await options.contacted?.();
     const response = (value: Record<string, unknown>) =>
       Response.json({
         protocol: LINK_VERSION,

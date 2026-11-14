@@ -76,6 +76,12 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
       200,
     );
     await until(async () => (await status()).body.result.enrolled === true);
+    await until(async () =>
+      (await status()).body.result.keyRoster?.ready === true
+    );
+    const roster = (await status()).body.result.keyRoster;
+    assert(roster.revision > 0);
+    assert(roster.lastHome > 0);
     assertEquals((await status()).body.result.matrix, false);
     assertEquals((await status()).body.result.scopes, []);
     await assertRejects(() =>
@@ -96,6 +102,11 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
     facade = await process(facadeConfig, 'facade: link/local admin ready');
     assertEquals((await status()).body.result.keyId, initialized.keyId);
     assertEquals((await status()).body.result.enrolled, true);
+    assertEquals(
+      (await status()).body.result.keyRoster.revision,
+      roster.revision,
+    );
+    assert((await status()).body.result.keyRoster.lastHome >= roster.lastHome);
     await home.stop();
     home = await process(homeConfig, 'federation: disabled');
     await adminCall(tls.dir + '/home.sock', 'facade/revoke', {
@@ -124,6 +135,20 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
         ))[0].role,
         'facade',
       );
+      const server = await store.server();
+      const [control] = await server.query(
+        'SELECT roster_json,revision FROM facade_key_roster',
+      );
+      assertEquals(Number(control.revision), roster.revision);
+      const keys = JSON.parse(String(control.roster_json)).keys;
+      assertEquals(keys.length, 2);
+      assert(
+        keys.some((key: { keyId: string }) => key.keyId === initialized.keyId),
+      );
+      const [applied] = await server.query(
+        "SELECT applied FROM facade_streams WHERE direction='in' AND stream='control'",
+      );
+      assertEquals(Number(applied.applied), 1);
     } finally {
       await store.close();
     }

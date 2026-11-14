@@ -6,6 +6,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type StoreConfig } from '#engine/store/index.ts';
 import { tenantSchema } from '#engine/tenant/index.ts';
 import { capabilities } from './capabilities.ts';
+import { FacadeKeys } from './control.ts';
 import {
   certificatePin,
   enrolledTenant,
@@ -68,6 +69,10 @@ export async function openFacadeRuntime(
       new Pairings(server, node.signer(), node.publicKey, pin, node),
     );
   };
+  const keyOwner = async () => {
+    const owner = await pairings();
+    return new FacadeKeys(server, node!.signer(), node!.publicKey, owner);
+  };
   const refresh = async () => {
     notices.changed();
     inbox?.wake();
@@ -120,7 +125,10 @@ export async function openFacadeRuntime(
       journal,
       peer: 'home',
       pollseconds: settings.pollseconds,
-      apply: (stream) => apply(journal, stream),
+      apply: async (stream) =>
+        stream.stream === 'control'
+          ? await (await keyOwner()).apply(journal, stream)
+          : await apply(journal, stream),
       changed: () => notices.changed(),
       failed: (error) =>
         console.error(
@@ -172,6 +180,9 @@ export async function openFacadeRuntime(
         keyId: node?.keyId ?? null,
         matrix: false,
         scopes: [],
+        keyRoster: node && paired
+          ? await (await keyOwner()).status()
+          : { ready: false, revision: 0, lastHome: null },
         pairings: await pairingStatus(server),
       };
     },
@@ -197,9 +208,11 @@ export async function openFacadeRuntime(
         },
         notices,
         changed: refresh,
+        contacted: async () => await (await keyOwner()).contact(),
       })(request, peerPin);
     },
     changed: refresh,
+    keyDocument: async () => await (await keyOwner()).document(),
     close: () =>
       closed ??= (async () => {
         await inbox?.close();

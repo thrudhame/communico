@@ -3,6 +3,7 @@
 import type { App } from '#engine/app.ts';
 import { config } from '#engine/config.ts';
 import { capabilities } from './capabilities.ts';
+import { exportKeyRoster } from './control.ts';
 import { openJournalClient } from './client.ts';
 import { certificatePin, readProtectedFile } from './identity.ts';
 import { Journal } from './journal.ts';
@@ -54,7 +55,10 @@ export async function startHomeLinks(
   };
   async function reconcile(id: string, node: string) {
     const peer = await pairings.connection(id);
-    if (peer.state === 'paired' && workers.has(id)) return;
+    if (peer.state === 'paired' && workers.has(id)) {
+      await exportKeyRoster(app.store, app.tenant, node, id);
+      return;
+    }
     await workers.get(id)?.close();
     workers.delete(id);
     let secret: string | undefined;
@@ -80,6 +84,7 @@ export async function startHomeLinks(
     }
     await enrollLink(pairings, id, tls, secret, controller.signal);
     if (peer.state === 'revoked' || controller.signal.aborted) return;
+    await exportKeyRoster(app.store, app.tenant, node, id);
     const client = await openJournalClient(pairings, id, tls);
     if (controller.signal.aborted) return;
     workers.set(
