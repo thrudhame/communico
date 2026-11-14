@@ -254,6 +254,26 @@ test('send: body memoization, origin/caps and empty replay', async () => {
   const result = await call('PUT', target, body);
   assertEquals(result, { status: 200, body: { pdus: {} } });
   assertEquals(await call('PUT', target, body), result);
+  const [before] = await theApp().server.query(
+    'SELECT received_ms,response FROM federation_txns WHERE origin=? AND txn_id=?',
+    [remote.name, 'txn-test'],
+  );
+  assertEquals(
+    await call('PUT', target, {
+      ...body,
+      origin_server_ts: body.origin_server_ts + 1,
+    }),
+    result,
+    'ordinary home replay accepts a freshly signed envelope timestamp',
+  );
+  assertEquals(
+    await theApp().server.query(
+      'SELECT received_ms,response FROM federation_txns WHERE origin=? AND txn_id=?',
+      [remote.name, 'txn-test'],
+    ),
+    [before],
+    'a home retry neither processes again nor replaces its saved result',
+  );
 });
 
 test('invite v2: validate, countersign and persist an out-of-band invite', async () => {
