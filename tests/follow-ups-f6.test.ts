@@ -186,7 +186,7 @@ Deno.test('F6 receipt capacity cannot block notification projection of legacy re
       }
       // Supported upgrades can have a retained wire receipt without a pending ref.
       await tx.execute(
-        "INSERT INTO receipts VALUES(?,?,'m.read','','$legacy',1,1)",
+        `INSERT INTO receipts VALUES(?,?,'m.read','','["$legacy"]',1,1)`,
         [room, a.user_id],
       );
     });
@@ -215,10 +215,10 @@ Deno.test('F6 receipt capacity cannot block notification projection of legacy re
     );
     assertEquals(
       (await db.query(
-        'SELECT event_id FROM receipts WHERE user_id=? AND room_id=?',
+        'SELECT event_ids FROM receipts WHERE user_id=? AND room_id=?',
         [a.user_id, room],
-      ))[0].event_id,
-      '$legacy',
+      ))[0].event_ids,
+      '["$legacy"]',
     );
   } finally {
     await http.close();
@@ -260,12 +260,12 @@ Deno.test('F6 receipt ingress preserves unthreaded state and bounds unknown dura
       });
     }
     const rows = await db.query(
-      'SELECT thread_id,event_id FROM receipts WHERE room_id=? ORDER BY seq',
+      'SELECT thread_id,event_ids FROM receipts WHERE room_id=? ORDER BY seq',
       [room],
     );
     assertEquals(rows.length, 101);
-    assertEquals(rows[0], { thread_id: '', event_id: '$first' });
-    assertEquals(rows[1], { thread_id: '$unknown0', event_id: '$event0' });
+    assertEquals(rows[0], { thread_id: '', event_ids: '["$first"]' });
+    assertEquals(rows[1], { thread_id: '$unknown0', event_ids: '["$event0"]' });
     const capSeq = await streamMax(db, 'receipts');
     const overflow = await assertRejects(
       () =>
@@ -445,10 +445,10 @@ Deno.test('F6 HTTP departure clears typing and notification listing filters with
     });
     assertEquals(
       await http.app.server.query(
-        'SELECT user_id,thread_id,event_id FROM receipts WHERE room_id=?',
+        'SELECT user_id,thread_id,event_ids FROM receipts WHERE room_id=?',
         [room],
       ),
-      [{ user_id: b.user_id, thread_id: 'main', event_id: '$valid' }],
+      [{ user_id: b.user_id, thread_id: 'main', event_ids: '["$valid"]' }],
     );
     await inbound.dispatch('localhost', {
       edu_type: 'm.receipt',
@@ -469,10 +469,10 @@ Deno.test('F6 HTTP departure clears typing and notification listing filters with
     });
     assertEquals(
       (await http.app.server.query(
-        'SELECT event_id FROM receipts WHERE room_id=? ORDER BY seq',
+        'SELECT event_ids FROM receipts WHERE room_id=? ORDER BY seq',
         [room],
-      )).map((r) => r.event_id),
-      ['$valid', '$later'],
+      )).map((r) => JSON.parse(String(r.event_ids))),
+      [['$valid'], ['$later']],
     );
     await setTyping(http.app.server, room, b.user_id, true);
     await call(base + '/leave', b.access_token!, {});

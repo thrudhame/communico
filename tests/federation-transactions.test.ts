@@ -107,7 +107,7 @@ Deno.test('peer JSON: invalid receipt metadata cannot publish fabricated data', 
       const mark of [
         { event_ids: [event.event_id], data: {} },
         { event_ids: [event.event_id], data: { ts: '1' } },
-        { event_ids: [event.event_id, '$other'], data: { ts: 1 } },
+        { event_ids: [event.event_id, 5], data: { ts: 1 } },
       ]
     ) {
       await s.edus.dispatch('remote.test', {
@@ -482,7 +482,7 @@ Deno.test('send: EDUs — typing, receipt, presence for the origin’s users; wr
     const receipts = await s.edus.receiptsIn(s.g.roomId);
     assertEquals(receipts.length, 1);
     assertEquals(receipts[0].userId, s.user);
-    assertEquals(receipts[0].eventId, String(event.event_id));
+    assertEquals(receipts[0].eventIds, [String(event.event_id)]);
     assertEquals(receipts[0].ts, 1234567890);
     // presence
     const presence = await s.edus.presenceOf(s.user);
@@ -506,7 +506,7 @@ Deno.test('edus: queueing coalesces per key, merges on drain, and never queues r
   queues.queueReceipt('remote.test', {
     roomId: '!r:test',
     userId: '@dev:test',
-    eventId: '$e1',
+    eventIds: ['$e1'],
     ts: 7,
     threadId: null,
   }, 4);

@@ -530,6 +530,12 @@ Receipts are keyed by room, user, public/private type and thread. Sync exposes
 public receipts plus the viewer's private receipts; federation consumes only
 public receipts. Thread identity survives both sync and federation, with
 unthreaded receipts kept distinct from `main` and named threads.
+Each durable slot retains a whole set of event extremities, never an arbitrary
+representative. One mark commits one stream position and all notification-read
+effects atomically; ordinary/sliding sync expand its extremities without losing
+the shared thread/type identity. Outbound EDU coalescing replaces whole marks.
+Server schema v24 upgrades existing scalar targets to singleton arrays while
+preserving their stream positions and timestamps.
 
 Sync captures member and visible-receipt sets with two set-based queries inside
 the existing server transaction for maxima, memberships and notification counts.

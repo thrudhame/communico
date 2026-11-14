@@ -266,7 +266,7 @@ test('send: typing, receipt and presence EDUs update producer state only for the
   assertEquals(edus.typingOf(s.id).userIds, [user()]);
   assertEquals(await edus.receiptsIn(s.id), [{
     userId: user(),
-    eventId: String(target.event_id),
+    eventIds: [String(target.event_id)],
     ts: 1234567890,
     threadId: null,
   }]);

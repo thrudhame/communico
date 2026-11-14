@@ -152,7 +152,7 @@ export function receiptsExtension(
       row.seq <= through &&
       (row.receiptType === 'm.read' || row.userId === viewer) &&
       (initial
-        ? row.userId === viewer || eventIds.has(row.eventId)
+        ? row.userId === viewer || row.eventIds.some((id) => eventIds.has(id))
         : row.seq > previous[room])
     );
     if (rows.length) {

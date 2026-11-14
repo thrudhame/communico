@@ -145,9 +145,9 @@ suite.test('unknown-thread capacity is a 429 rather than a not-joined error, wit
   const f = await setup('thread-capacity');
   await theApp().server.execute(
     `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100)
-    INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_id,ts_ms,seq)
+    INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_ids,ts_ms,seq)
     SELECT ?,?,'m.read','$unknown-' || i,?,0,0 FROM n`,
-    [f.room, f.a.user_id, f.root],
+    [f.room, f.a.user_id, JSON.stringify([f.root])],
   );
   const result = await call(f.receipt(f.root), f.a.access_token!, {
     thread_id: '$overflow',
@@ -242,7 +242,7 @@ Deno.test('receipt EDU coalescing and bounded drain preserve each thread for one
     queues.queueReceipt('remote', {
       roomId: '!r:test',
       userId: '@local:test',
-      eventId: '$event' + index,
+      eventIds: ['$event' + index],
       ts: index,
       threadId,
     }, index + 1);
@@ -250,7 +250,7 @@ Deno.test('receipt EDU coalescing and bounded drain preserve each thread for one
   queues.queueReceipt('remote', {
     roomId: '!r:test',
     userId: '@local:test',
-    eventId: '$stale',
+    eventIds: ['$stale'],
     ts: 0,
     threadId: '$root1',
   }, 0);

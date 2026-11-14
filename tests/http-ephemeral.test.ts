@@ -186,10 +186,10 @@ suite.test('receipts and read markers round-trip; private receipts stay stored a
   const after = await sync(b.access_token!, '&since=' + before.next_batch);
   assertEquals(eventOf(after, roomId, 'm.receipt'), undefined);
   const rows = await theApp().server.query(
-    "SELECT event_id FROM receipts WHERE room_id=? AND user_id=? AND receipt_type='m.read.private'",
+    "SELECT event_ids FROM receipts WHERE room_id=? AND user_id=? AND receipt_type='m.read.private'",
     [roomId, a.user_id],
   );
-  assertEquals(rows[0].event_id, e4);
+  assertEquals(JSON.parse(String(rows[0].event_ids)), [e4]);
   const bad = await call(
     receipt('m.fully_read', e4),
     a.access_token!,

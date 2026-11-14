@@ -20,7 +20,7 @@ import {
   getPresence,
   receiptRows,
   setPresence,
-  setReceipt,
+  setReceiptMark,
 } from '#engine/server/ephemeral.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import { setTyping, typingIn } from '#engine/typing.ts';
@@ -68,7 +68,7 @@ function presenceWire(push: PresencePush): PresenceWire {
 export type ReceiptMark = {
   roomId: string;
   userId: string;
-  eventId: string;
+  eventIds: readonly string[];
   ts: number;
   threadId: string | null;
 };
@@ -148,7 +148,7 @@ export function eduQueues(
     const key = JSON.stringify([mark.roomId, mark.userId, mark.threadId]);
     const seen = q.get(key);
     if (seen !== undefined && seen.seq > seq) return;
-    q.set(key, { seq, mark });
+    q.set(key, { seq, mark: { ...mark, eventIds: [...mark.eventIds] } });
     if (wake !== undefined) wake(destination);
   }
 
@@ -205,7 +205,7 @@ export function eduQueues(
           byRoom.set(mark.roomId, room);
         }
         room.set(mark.userId, {
-          event_ids: [mark.eventId],
+          event_ids: [...mark.eventIds],
           data: mark.threadId === null
             ? { ts: mark.ts }
             : { ts: mark.ts, thread_id: mark.threadId },
@@ -262,7 +262,12 @@ export type EduState = {
   receiptsIn(
     roomId: string,
   ): Promise<
-    { userId: string; eventId: string; ts: number; threadId: string | null }[]
+    {
+      userId: string;
+      eventIds: readonly string[];
+      ts: number;
+      threadId: string | null;
+    }[]
   >;
 };
 
@@ -323,12 +328,12 @@ export function eduState(server: Db, self: string, store: Store): EduState {
           if (domainOf(userId) !== origin) continue;
           try {
             const receipt = receiptContent(mark);
-            await setReceipt(
+            await setReceiptMark(
               server,
               roomId,
               userId,
               'm.read',
-              receipt.eventId,
+              receipt.eventIds,
               {
                 ts: receipt.ts,
                 threadId: receipt.threadId,
@@ -443,7 +448,7 @@ export function eduState(server: Db, self: string, store: Store): EduState {
     receiptsIn: async (roomId) => {
       return (await receiptRows(server, roomId)).map((row) => ({
         userId: row.userId,
-        eventId: row.eventId,
+        eventIds: row.eventIds,
         ts: row.ts,
         threadId: row.threadId,
       }));

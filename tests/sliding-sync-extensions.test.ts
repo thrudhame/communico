@@ -104,7 +104,14 @@ Deno.test('sliding extensions: initial/expanded receipts include timeline target
     seq: number,
     receiptType: ReceiptRow['receiptType'] = 'm.read',
     threadId: string | null = null,
-  ): ReceiptRow => ({ userId, eventId, seq, receiptType, threadId, ts: seq });
+  ): ReceiptRow => ({
+    userId,
+    eventIds: [eventId],
+    seq,
+    receiptType,
+    threadId,
+    ts: seq,
+  });
   const snapshot = new Map([
     ['!a:test', [
       mark('@bob:test', '$timeline', 1),

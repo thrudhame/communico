@@ -45,14 +45,14 @@ export function receiptContent(raw: unknown) {
     (id) => stringOf(id, 'receipt'),
     'receipt',
   );
-  if (eventIds.length !== 1) {
-    protocol('receipt', 'expected one receipt extremity');
+  if (!eventIds.length) {
+    protocol('receipt', 'expected receipt extremities');
   }
   const ts = integer(data.ts, 'receipt');
   const threadId = data.thread_id === undefined
     ? undefined
     : stringOf(data.thread_id, 'receipt');
-  return { eventId: eventIds[0], ts, threadId };
+  return { eventIds, ts, threadId };
 }
 export function presenceContent(raw: unknown) {
   const p = objectOf(raw, 'presence'), userId = stringOf(p.user_id, 'presence');
