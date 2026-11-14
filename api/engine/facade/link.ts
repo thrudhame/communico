@@ -3,6 +3,7 @@
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Pairings } from './pairing.ts';
 import type { Journal, PageLimits } from './journal.ts';
+import { NoticeHub } from './notices.ts';
 import {
   cutOf,
   integer,
@@ -194,6 +195,7 @@ export function linkHandler(options: {
   pairings(): Promise<Pairings>;
   journal: Journal;
   limits: PageLimits;
+  notices?: NoticeHub;
   changed?(): Promise<void>;
 }): (request: Request, peerPin: string) => Promise<Response> {
   const enroll = enrollmentHandler(options);
@@ -215,7 +217,8 @@ export function linkHandler(options: {
       return await enroll(request, pin);
     }
     if (
-      !((request.method === 'GET' && ['hello', 'records'].includes(route)) ||
+      !((request.method === 'GET' &&
+        ['hello', 'records', 'notices'].includes(route)) ||
         (request.method === 'POST' && ['records', 'ack'].includes(route)))
     ) {
       return new Response(null, { status: 404 });
@@ -265,6 +268,36 @@ export function linkHandler(options: {
       return stream;
     };
     const journal = options.journal;
+    if (route === 'notices') {
+      const read = async () => {
+        await (await options.pairings()).authorizedHome(id, pin);
+        const streams = [
+          ...await journal.streams('home', 'out'),
+          ...await journal.streams('home', 'in'),
+        ];
+        return {
+          protocol: LINK_VERSION,
+          server: options.server,
+          required: LINK_CAPABILITIES,
+          source: options.node,
+          incarnation: options.incarnation,
+          pairing: id,
+          heads: streams.map((stream) => ({
+            ...streamOf(stream),
+            head: stream.received,
+          })),
+        };
+      };
+      const websocket =
+        request.headers.get('upgrade')?.toLowerCase() === 'websocket';
+      if (websocket || request.headers.get('accept') === 'text/event-stream') {
+        if (!options.notices) {
+          throw new LinkError('LINK_UNAVAILABLE', 'notices not composed', 503);
+        }
+        return options.notices.response(read, request.signal, websocket);
+      }
+      return Response.json(await read());
+    }
     if (route === 'hello') {
       const outgoing = await journal.streams('home', 'out');
       return response({
