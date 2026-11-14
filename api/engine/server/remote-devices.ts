@@ -15,6 +15,7 @@ import {
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { keyView } from '#engine/e2ee-key-view.ts';
 import { canonicalJson } from '#engine/canonical.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import {
   type PublicSigning,
   signingViews,
@@ -181,6 +182,26 @@ async function writeState(tx: Conn, user: string, s: State): Promise<void> {
 async function notify(tx: Conn, user: string): Promise<void> {
   await publishDeviceChange(tx, await nextDeviceSeq(tx), user);
 }
+
+// Delta and authoritative-list publication share semantic key comparison. Old
+// JSON may use another property order; completeness/causal progress is separate.
+async function writeDeviceKey(
+  tx: Conn,
+  user: string,
+  id: string,
+  key: Json,
+  previous: Json | undefined,
+): Promise<void> {
+  const encoded = canonicalJson(key);
+  if (previous !== undefined && canonicalJson(previous) === encoded) return;
+  await tx.execute(
+    `INSERT INTO remote_device_keys VALUES(?,?,?)
+     ON CONFLICT(user_id,device_id) DO UPDATE SET key_json=excluded.key_json
+     WHERE ${changedColumns('remote_device_keys', 'key_json')}`,
+    [user, id, encoded],
+  );
+}
+
 async function apply(tx: Conn, d: DeviceDelta): Promise<void> {
   if (d.deleted || d.key === null) {
     await tx.execute(
@@ -188,9 +209,16 @@ async function apply(tx: Conn, d: DeviceDelta): Promise<void> {
       [d.user, d.id],
     );
   } else {
-    await tx.execute(
-      'INSERT INTO remote_device_keys VALUES(?,?,?) ON CONFLICT(user_id,device_id) DO UPDATE SET key_json=excluded.key_json',
-      [d.user, d.id, JSON.stringify(d.key)],
+    const previous = (await tx.query(
+      'SELECT key_json FROM remote_device_keys WHERE user_id=? AND device_id=?',
+      [d.user, d.id],
+    ))[0];
+    await writeDeviceKey(
+      tx,
+      d.user,
+      d.id,
+      d.key,
+      previous ? JSON.parse(String(previous.key_json)) : undefined,
     );
   }
 }
@@ -374,22 +402,23 @@ export async function installDeviceSnapshot(
           { devices: Object.fromEntries(keys), signing },
           limits.maxrequestbytes,
         );
-        const previous = Object.fromEntries((await tx.query(
+        const previous = new Map<string, Json>((await tx.query(
           'SELECT device_id,key_json FROM remote_device_keys WHERE user_id=?',
           [cut.user],
         )).map((r) => [String(r.device_id), JSON.parse(String(r.key_json))]));
         const signingChanged = await writeSigning(tx, cut.user, signing);
         const changed = signingChanged ||
-          canonicalJson(previous) !== canonicalJson(Object.fromEntries(keys));
-        await tx.execute('DELETE FROM remote_device_keys WHERE user_id=?', [
-          cut.user,
-        ]);
+          canonicalJson(Object.fromEntries(previous)) !==
+            canonicalJson(Object.fromEntries(keys));
+        for (const id of previous.keys()) {
+          if (keys.has(id)) continue;
+          await tx.execute(
+            'DELETE FROM remote_device_keys WHERE user_id=? AND device_id=?',
+            [cut.user, id],
+          );
+        }
         for (const [id, key] of keys) {
-          await tx.execute('INSERT INTO remote_device_keys VALUES(?,?,?)', [
-            cut.user,
-            id,
-            JSON.stringify(key),
-          ]);
+          await writeDeviceKey(tx, cut.user, id, key, previous.get(id));
         }
         s.anchor = seen.at(-1)!;
         s.stale = false;
@@ -403,7 +432,7 @@ export async function installDeviceSnapshot(
           ],
         );
         await tx.execute(
-          'UPDATE remote_device_users SET retry_at=0,failures=0 WHERE user_id=?',
+          'UPDATE remote_device_users SET retry_at=0,failures=0 WHERE user_id=? AND (retry_at!=0 OR failures!=0)',
           [cut.user],
         );
         if (changed) await notify(tx, cut.user);

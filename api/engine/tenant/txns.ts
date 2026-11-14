@@ -184,7 +184,7 @@ export async function finishSubmission(
   const key = [...scope(device), endpointKey(endpoint), txnId, eventId];
   if (accepted) {
     await conn.execute(
-      'UPDATE transactions SET completed = 1, pending_pdu = NULL WHERE localpart = ? AND device_id = ? AND generation = ? AND endpoint = ? AND txn_id = ? AND event_id = ?',
+      'UPDATE transactions SET completed = 1, pending_pdu = NULL WHERE localpart = ? AND device_id = ? AND generation = ? AND endpoint = ? AND txn_id = ? AND event_id = ? AND (completed != 1 OR pending_pdu IS NOT NULL)',
       key,
     );
   } else {
