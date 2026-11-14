@@ -1,7 +1,11 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { setConfigForTests } from '#engine/config.ts';
 import { canonicalJson } from '#engine/canonical.ts';
-import { type IngressObligation, Mailbox } from '#engine/facade/mailbox.ts';
+import {
+  type IngressObligation,
+  Mailbox,
+  verifyIngressRequest,
+} from '#engine/facade/mailbox.ts';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { Journal } from '#engine/facade/journal.ts';
@@ -163,6 +167,7 @@ async function fixture() {
       edu_type: 'm.direct_to_device',
       content: { test: true },
     }],
+    timestamp = 1,
   ) => {
     const req = {
       method: 'PUT',
@@ -171,7 +176,7 @@ async function fixture() {
       authorization: '',
       body: new TextEncoder().encode(
         JSON.stringify(
-          { origin: remote.name, origin_server_ts: 1, pdus, edus },
+          { origin: remote.name, origin_server_ts: timestamp, pdus, edus },
           null,
           1,
         ),
@@ -321,6 +326,143 @@ Deno.test('mailbox commits the exact complete answer and home obligation atomica
       ))[0].n,
       1,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('mailbox retimestamped retries keep original evidence and exact results before and after cold completion', async () => {
+  const f = await fixture();
+  try {
+    let box = await f.mailbox();
+    const original = await f.evidence('retimestamp');
+    await box.stage('retimestamp', original);
+    // A legitimately re-signed envelope is the same operation even while its
+    // result is pending. Timestamp changes without a new signature still fail.
+    await box.stage(
+      'retimestamp',
+      await f.evidence('retimestamp', [], undefined, 2),
+    );
+    const first = await box.receive(f.remote.name, 'retimestamp');
+    assertEquals(f.accepted(), 1);
+    await f.reopen();
+    box = await f.mailbox();
+    setConfigForTests({ facade: { mailboxmaxbytes: 1 } });
+    await box.stage(
+      'retimestamp',
+      await f.evidence('retimestamp', [], undefined, 3),
+    );
+    assertEquals(await box.receive(f.remote.name, 'retimestamp'), first);
+    assertEquals(f.accepted(), 1);
+    const db = await f.edge().server();
+    const [held] = await db.query('SELECT * FROM facade_ingress');
+    assertEquals(JSON.parse(String(held.evidence_json)), original);
+    assertEquals(
+      JSON.parse(String(held.response_json)),
+      first,
+    );
+    assertEquals(
+      await db.query('SELECT * FROM facade_ingress_collisions'),
+      [],
+    );
+    setConfigForTests({});
+    const forged = structuredClone(original);
+    const body = JSON.parse(atob(forged.request.body));
+    body.origin_server_ts = 4;
+    forged.request.body = btoa(JSON.stringify(body));
+    assertEquals(
+      (await assertRejects(() => box.stage('retimestamp', forged), MatrixError))
+        .status,
+      400,
+    );
+    const changed = await f.evidence('retimestamp', [], [{
+      edu_type: 'm.direct_to_device',
+      content: { test: false },
+    }], 5);
+    assertEquals(
+      (await assertRejects(
+        () => box.stage('retimestamp', changed),
+        MatrixError,
+      ))
+        .status,
+      400,
+    );
+    assertEquals(f.accepted(), 1);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('home drain retimestamped original admission retains its evidence and applies a reliable tail once', async () => {
+  const f = await fixture();
+  try {
+    const txnId = 'home-retimestamp';
+    const first = await f.evidence(txnId, [], undefined, 1);
+    const retained = await f.evidence(txnId, [], undefined, 2);
+    const box = await f.mailbox();
+    await box.stage(txnId, first);
+    assertEquals(await box.receive(f.remote.name, txnId), {
+      status: 200,
+      body: { pdus: {} },
+    });
+    const verified = await verifyIngressRequest(txnId, retained, f.self);
+    const db = await f.home().server();
+    const encoded = canonicalJson(retained);
+    // This is the already persisted full-evidence digest, not a replacement
+    // digest or a new schema. A cold reader must preserve that admission.
+    await db.execute(
+      'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation) VALUES(?,?,?,?,?,?,?,?,?)',
+      [
+        f.remote.name,
+        txnId,
+        verified.inputHash,
+        encoded,
+        new TextEncoder().encode(encoded).byteLength,
+        f.bundle.id,
+        1,
+        f.node.node,
+        f.node.incarnation,
+      ],
+    );
+    const [out] = await (await f.edge().server()).query(
+      "SELECT record_json FROM facade_records WHERE stream='ingress:remote.test'",
+    );
+    const record = JSON.parse(String(out.record_json));
+    await f.reopenHome();
+    const home = await f.home().server();
+    const journal = new Journal(home, LINK_CAPABILITIES);
+    let delivered = 0;
+    const drain = new HomeIngress(home, {
+      peer: f.node.node,
+      pairing: f.bundle.id,
+      pairings: await f.homePairings(),
+      transaction: {
+        self: f.self,
+        store: f.home(),
+        keys: fakeKeyResolver(f.remote),
+        fetcher: fakeFetcher({}).fetcher,
+        edus: {
+          dispatch: () => {
+            delivered++;
+            return Promise.resolve();
+          },
+        },
+      },
+    });
+    await journal.receive(f.node.node, [record]);
+    assertEquals(await drain.apply(journal, record), true);
+    assertEquals(await drain.apply(journal, record), false);
+    assertEquals(delivered, 1);
+    const [held] = await home.query('SELECT * FROM facade_ingress');
+    assertEquals(JSON.parse(String(held.evidence_json)), retained);
+    assertEquals(held.input_hash, verified.inputHash);
+    assertEquals(JSON.parse(String(held.response_json)), {
+      kind: 'ingress',
+      origin: f.remote.name,
+      txnId,
+      rooms: [],
+      edus: [{ index: 0, kind: 'processed', type: 'm.direct_to_device' }],
+    });
   } finally {
     await f.close();
   }
