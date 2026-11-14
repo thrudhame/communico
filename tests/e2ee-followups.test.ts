@@ -263,9 +263,13 @@ Deno.test('E2EE follow-ups: device replacement and deletion publish removed publ
     });
     try {
       const user = '@a:local.test';
+      const deviceSignature = (key: unknown) =>
+        (key as { signatures?: Record<string, Record<string, string>> })
+          .signatures?.[user]?.['ed25519:D'];
       await tenant.tx((tx) => tx.users.insert('a', 'A'));
-      const masterPair = await generateSigningKeypair() as CryptoKeyPair;
-      const pub = b64encodeStd(await exportPublicKeyRaw(masterPair.publicKey));
+      // A real master key whose ID begins with the device ID. Signature
+      // assertions must distinguish the exact device slot from this prefix.
+      const pub = 'DzoyLmflatdJeaV+oykbKwrC+S1EPFWnVp0mp+gQCjs';
       const master = {
         user_id: user,
         usage: ['master'],
@@ -281,6 +285,13 @@ Deno.test('E2EE follow-ups: device replacement and deletion publish removed publ
         )
       );
       const db = await store.server();
+      const publishedMaster = async () =>
+        JSON.parse(String(
+          (await db.query(
+            'SELECT payload FROM public_signing_keys WHERE subject=?',
+            [user],
+          ))[0].payload,
+        )).master_key;
       await db.tx((tx) =>
         reconcileDeviceRoom(
           tx,
@@ -333,11 +344,7 @@ Deno.test('E2EE follow-ups: device replacement and deletion publish removed publ
           { failures: {} },
         );
         await projectTenant(store, 'local.test');
-        assert(
-          JSON.stringify(
-            await db.query('SELECT payload FROM public_signing_keys'),
-          ).includes('ed25519:D'),
-        );
+        assert(typeof deviceSignature(await publishedMaster()) === 'string');
         if (action === 'delete') {
           await tenant.tx((tx) => tx.devices.delete('D', 'a'));
         } else {
@@ -352,12 +359,15 @@ Deno.test('E2EE follow-ups: device replacement and deletion publish removed publ
         const local = await tenant.tx((tx) =>
           tx.crossSigning.views('a', user, '')
         );
-        assert(!JSON.stringify(local).includes('ed25519:D'));
+        assertEquals(deviceSignature(local.master_keys), undefined);
+        assertEquals(
+          (local.master_keys as { keys: Record<string, string> }).keys,
+          master.keys,
+        );
         await projectTenant(store, 'local.test');
-        assert(
-          !JSON.stringify(
-            await db.query('SELECT payload FROM public_signing_keys'),
-          ).includes('ed25519:D'),
+        assertEquals(
+          deviceSignature(await publishedMaster()),
+          undefined,
           action + ' must publish the changed public view',
         );
         const queued = await db.query(
@@ -380,7 +390,7 @@ Deno.test('E2EE follow-ups: device replacement and deletion publish removed publ
         await sender.stop();
         sender = undefined;
         assert(
-          JSON.stringify(received.at(-2)!.master_key).includes('ed25519:D'),
+          typeof deviceSignature(received.at(-2)!.master_key) === 'string',
         );
         assertEquals(
           received.at(-1)!.master_key,
