@@ -9,6 +9,7 @@
 // the transaction they stamp (no sequences). The store owns the id row,
 // the meta table and the watermarks; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
+import { RECOVERY_SQL } from '#engine/server/recovery.ts';
 import {
   FACADE_JOURNAL_SQL,
   FACADE_PAIRING_SQL,
@@ -387,7 +388,7 @@ UPDATE receipts SET event_ids=json_array(event_ids);
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 27,
+  version: 28,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -416,6 +417,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FACADE_JOURNAL_SQL);
     await db.exec(FACADE_PAIRING_SQL);
     await db.exec(RUNTIME_IDENTITY_SQL);
+    await db.exec(RECOVERY_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -445,5 +447,6 @@ export const serverSchema: SchemaProvider = {
     24: (conn) => conn.exec(FACADE_JOURNAL_SQL),
     25: (conn) => conn.exec(FACADE_PAIRING_SQL),
     26: (conn) => conn.exec(RUNTIME_IDENTITY_SQL),
+    27: (conn) => conn.exec(RECOVERY_SQL),
   },
 };

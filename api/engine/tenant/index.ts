@@ -6,6 +6,7 @@
 // store must have been opened with the tenant schema provider (R14).
 import type { Store } from '#engine/store/index.ts';
 import type { Conn } from '#engine/store/db.ts';
+import { syncStreamHeads } from '#engine/tenant/streams.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { tenantSchema } from '#engine/tenant/schema.ts';
@@ -124,6 +125,7 @@ function bind(
     return value;
   };
   return {
+    streams: { heads: () => syncStreamHeads(conn) },
     keyBackup: {
       clear: (localpart: string) => keyBackup.clearBackup(conn, localpart),
       version: (

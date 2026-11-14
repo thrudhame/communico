@@ -192,6 +192,222 @@ test('over-limit upload is 413 M_TOO_LARGE and removes partial bytes', async (ro
   assertEquals(files, []);
 });
 
+test('reserved upload publishes exactly once under concurrent PUTs', async (root) => {
+  const user = await suite.registerTestUser('media-concurrent', 'pw');
+  const created = await request(
+    '/_matrix/media/v1/create',
+    user.access_token!,
+    'POST',
+  );
+  const id = idOf(String((await created.json() as Json).content_uri));
+  const path = '/_matrix/media/v3/upload/' + serverName() + '/' + id;
+  const bodies = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6, 7])];
+  // Hold the first publisher after admission but before writing. Without the
+  // shared owner, the second PUT passes its pending check and publishes first.
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => entered = resolve);
+  const held = new Promise<void>((resolve) => release = resolve);
+  const open = Deno.open;
+  const create = Deno.create;
+  let first = true;
+  async function hold(file: Deno.FsFile, name: string | URL) {
+    if (
+      first && typeof name === 'string' && name.startsWith(root + '/') &&
+      name.endsWith('.part')
+    ) {
+      first = false;
+      entered();
+      await held;
+    }
+    return file;
+  }
+  Deno.open = async (name, options) => hold(await open(name, options), name);
+  Deno.create = async (name) => hold(await create(name), name);
+  let responses: Response[];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const one = request(
+      path,
+      user.access_token!,
+      'PUT',
+      bodies[0],
+      'application/octet-stream',
+    );
+    await started;
+    const two = request(
+      path,
+      user.access_token!,
+      'PUT',
+      bodies[1],
+      'application/octet-stream',
+    );
+    await Promise.race([
+      two,
+      new Promise<void>((resolve) => timer = setTimeout(resolve, 100)),
+    ]);
+    release();
+    responses = await Promise.all([one, two]);
+  } finally {
+    release();
+    clearTimeout(timer);
+    Deno.open = open;
+    Deno.create = create;
+  }
+  const statuses = responses.map((response) => response.status);
+  const results = await Promise.all(
+    responses.map((response) => response.json()),
+  );
+  assertEquals([...statuses].sort(), [200, 409]);
+  assertEquals(
+    results[statuses.indexOf(409)].errcode,
+    'M_CANNOT_OVERWRITE_MEDIA',
+  );
+  const download = await request(
+    '/_matrix/media/v3/download/' + serverName() + '/' + id,
+  );
+  const winner = bodies[statuses.indexOf(200)];
+  assertEquals(new Uint8Array(await download.arrayBuffer()), winner);
+  assertEquals(
+    (await getMedia(theApp().tenant, id))?.size_bytes,
+    winner.length,
+  );
+});
+
+// Observe real file handles, including failures, rather than treating rename
+// or a successful HTTP response as evidence that the bytes reached disk.
+async function observePublication<T>(
+  root: string,
+  fn: (events: string[]) => Promise<T>,
+  fail?: 'file-sync' | 'directory-sync',
+): Promise<T> {
+  const events: string[] = [];
+  const open = Deno.open;
+  const create = Deno.create;
+  const rename = Deno.rename;
+  function observe(file: Deno.FsFile, path: string | URL): Deno.FsFile {
+    if (
+      typeof path !== 'string' ||
+      !(path === root || path.startsWith(root + '/'))
+    ) return file;
+    const kind = path === root ? 'directory' : 'file';
+    const sync = file.sync.bind(file);
+    const close = file.close.bind(file);
+    file.sync = async () => {
+      events.push(kind + '-sync');
+      if (fail === kind + '-sync') {
+        throw new Error('injected media fsync failure');
+      }
+      await sync();
+    };
+    file.close = () => {
+      events.push(kind + '-close');
+      close();
+    };
+    return file;
+  }
+  Deno.open = async (path, options) => observe(await open(path, options), path);
+  Deno.create = async (path) => observe(await create(path), path);
+  Deno.rename = async (source, destination) => {
+    if (typeof destination === 'string' && destination.startsWith(root + '/')) {
+      events.push('rename');
+    }
+    await rename(source, destination);
+  };
+  try {
+    return await fn(events);
+  } finally {
+    Deno.open = open;
+    Deno.create = create;
+    Deno.rename = rename;
+  }
+}
+
+test('local upload fsyncs bytes before close and rename, then parent before metadata acknowledgment', async (root) => {
+  const user = await suite.registerTestUser('media-durable', 'pw');
+  await observePublication(root, async (events) => {
+    const response = await upload(
+      user.access_token!,
+      new Uint8Array([1, 2]),
+      'text/plain',
+    );
+    assertEquals(response.status, 200);
+    const id = idOf(String((await response.json() as Json).content_uri));
+    assertEquals(events, [
+      'file-sync',
+      'file-close',
+      'rename',
+      'directory-sync',
+      'directory-close',
+    ]);
+    assertEquals((await getMedia(theApp().tenant, id))?.state, 'uploaded');
+    assertEquals((await Deno.stat(root + '/' + id)).mode! & 0o777, 0o600);
+  });
+});
+
+for (const failure of ['file-sync', 'directory-sync'] as const) {
+  test(
+    'direct upload cleans all unpublished bytes after ' + failure,
+    async (root) => {
+      const user = await suite.registerTestUser(
+        'direct-fsync-' + failure,
+        'pw',
+      );
+      await observePublication(root, async () => {
+        const response = await upload(
+          user.access_token!,
+          new Uint8Array([7, 8]),
+          'text/plain',
+        );
+        await response.arrayBuffer();
+        assertEquals(response.status, 500);
+        assertEquals([...Deno.readDirSync(root)], []);
+      }, failure);
+    },
+  );
+  test(
+    'failed ' + failure + ' leaves reserved metadata pending and permits retry',
+    async (root) => {
+      const user = await suite.registerTestUser('media-fsync-' + failure, 'pw');
+      const created = await request(
+        '/_matrix/media/v1/create',
+        user.access_token!,
+        'POST',
+      );
+      const id = idOf(String((await created.json() as Json).content_uri));
+      const path = '/_matrix/media/v3/upload/' + serverName() + '/' + id;
+      await observePublication(root, async () => {
+        const response = await request(
+          path,
+          user.access_token!,
+          'PUT',
+          new Uint8Array([1]),
+          'text/plain',
+        );
+        await response.arrayBuffer();
+        assertEquals(response.status, 500);
+        assertEquals((await getMedia(theApp().tenant, id))?.state, 'pending');
+      }, failure);
+      const retried = await request(
+        path,
+        user.access_token!,
+        'PUT',
+        new Uint8Array([2, 3]),
+        'text/plain',
+      );
+      assertEquals(retried.status, 200);
+      await retried.arrayBuffer();
+      const download = await request(
+        '/_matrix/media/v3/download/' + serverName() + '/' + id,
+      );
+      assertEquals(
+        new Uint8Array(await download.arrayBuffer()),
+        new Uint8Array([2, 3]),
+      );
+    },
+  );
+}
+
 test('foreign, unknown and unsanitized MXC values are 404', async () => {
   const user = await suite.registerTestUser('media-unknown', 'pw');
   const up = await upload(

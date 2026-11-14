@@ -6,7 +6,48 @@ import { enqueueEdu } from '#engine/server/delivery.ts';
 function wirePayload(raw: string): Record<string, unknown> {
   const payload = JSON.parse(raw);
   delete payload.generation;
+  delete payload.kind;
   return payload;
+}
+
+/** Subscription activation and restore use the same durable full-reset owner. */
+async function queueDeviceReset(
+  tx: Conn,
+  subject: string,
+  destination: string,
+  epoch: number,
+  stream: number,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  await enqueueEdu(
+    tx,
+    'device-reset:' + JSON.stringify([subject, destination, epoch]),
+    destination,
+    'm.device_list_update',
+    {
+      ...payload,
+      user_id: subject,
+      stream_id: stream,
+      prev_id: [],
+    },
+  );
+  const signing =
+    (await tx.query('SELECT payload FROM public_signing_keys WHERE subject=?', [
+      subject,
+    ]))[0];
+  if (signing) {
+    await enqueueEdu(
+      tx,
+      'signing-reset:' + JSON.stringify([subject, destination, epoch]),
+      destination,
+      'm.signing_key_update',
+      { ...JSON.parse(String(signing.payload)), user_id: subject },
+    );
+  }
+  await tx.execute(
+    'INSERT INTO device_subscriptions VALUES(?,?,1,?,?,NULL) ON CONFLICT(subject,destination) DO UPDATE SET active=1,epoch=excluded.epoch,queued_stream=excluded.queued_stream',
+    [subject, destination, epoch, stream],
+  );
 }
 
 /** Called in the same server transaction as all-room relationship changes. */
@@ -79,34 +120,13 @@ export async function reconcileDeviceSubscriptions(
         const payload = latest
           ? wirePayload(String(latest.payload))
           : { device_id: '', deleted: true };
-        await enqueueEdu(
+        await queueDeviceReset(
           tx,
-          'device-reset:' + JSON.stringify([subject, destination, epoch]),
+          subject,
           destination,
-          'm.device_list_update',
-          {
-            ...payload,
-            user_id: subject,
-            stream_id: stream,
-            prev_id: [],
-          },
-        );
-        const signing = (await tx.query(
-          'SELECT payload FROM public_signing_keys WHERE subject=?',
-          [subject],
-        ))[0];
-        if (signing) {
-          await enqueueEdu(
-            tx,
-            'signing-reset:' + JSON.stringify([subject, destination, epoch]),
-            destination,
-            'm.signing_key_update',
-            { ...JSON.parse(String(signing.payload)), user_id: subject },
-          );
-        }
-        await tx.execute(
-          'INSERT INTO device_subscriptions VALUES(?,?,1,?,?,NULL) ON CONFLICT(subject,destination) DO UPDATE SET active=1,epoch=excluded.epoch,queued_stream=excluded.queued_stream',
-          [subject, destination, epoch, stream],
+          epoch,
+          stream,
+          payload,
         );
       }
     }
@@ -120,12 +140,24 @@ export async function fanoutDeviceChange(
   stream: number,
   raw: string,
 ): Promise<void> {
+  const reset = JSON.parse(raw).kind === 'restore_reset';
   const subscriptions = await tx.query(
-    'SELECT destination,queued_stream FROM device_subscriptions WHERE subject=? AND active=1',
+    'SELECT destination,queued_stream,epoch FROM device_subscriptions WHERE subject=? AND active=1',
     [subject],
   );
   for (const row of subscriptions) {
     if (stream <= Number(row.queued_stream)) continue;
+    if (reset) {
+      await queueDeviceReset(
+        tx,
+        subject,
+        String(row.destination),
+        Number(row.epoch) + 1,
+        stream,
+        wirePayload(raw),
+      );
+      continue;
+    }
     await enqueueEdu(
       tx,
       'device-change:' + JSON.stringify([subject, stream]),

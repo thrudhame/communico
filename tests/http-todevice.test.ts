@@ -205,7 +205,7 @@ suite.test('250 messages drain 100/100/50, forged known-head cut replays, older 
       encodeURIComponent(third.next_batch.replace(/_m\d+/, '_m999999')),
     undefined,
     'GET',
-    400,
+    200,
   );
 });
 

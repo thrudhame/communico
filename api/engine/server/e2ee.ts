@@ -11,6 +11,29 @@ export {
 export type TrackingScope = 'sync' | 'keys';
 export type DeviceLists = { changed: string[]; left: string[] };
 
+// Restore recovery is a full audience invalidation, not a numeric history delta.
+export async function deviceListSnapshot(
+  server: Database,
+  observer: string,
+  scope: TrackingScope,
+  to: number,
+): Promise<DeviceLists> {
+  return await server.tx(async (tx) => {
+    const rows = await tx.query(
+      'SELECT subject,MAX(CASE WHEN end_seq IS NULL OR end_seq>? THEN 1 ELSE 0 END) AS active FROM device_tracking WHERE observer=? AND scope=? AND start_seq<=? GROUP BY subject ORDER BY subject',
+      [to, observer, scope, to],
+    );
+    const changed = new Set([observer]);
+    const left: string[] = [];
+    for (const row of rows) {
+      const subject = String(row.subject);
+      if (Number(row.active) === 1) changed.add(subject);
+      else if (subject !== observer) left.push(subject);
+    }
+    return { changed: [...changed].sort(), left };
+  });
+}
+
 /** Both client surfaces deliberately track the all-room superset at published cuts. */
 export async function reconcileDeviceRoom(
   tx: Conn,

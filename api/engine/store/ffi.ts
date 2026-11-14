@@ -39,6 +39,21 @@ const definitions = {
     result: 'pointer',
     nonblocking: true,
   },
+  ffi_vacuum_into: {
+    parameters: ['u32', 'buffer'],
+    result: 'pointer',
+    nonblocking: true,
+  },
+  ffi_rename_noreplace: {
+    parameters: ['buffer', 'buffer'],
+    result: 'pointer',
+    nonblocking: true,
+  },
+  ffi_lock_store: {
+    parameters: ['buffer'],
+    result: 'pointer',
+    nonblocking: true,
+  },
   ffi_execute: {
     parameters: ['u32', 'buffer', 'buffer'],
     result: 'pointer',
@@ -146,6 +161,40 @@ export class Turso {
     return this.value(() =>
       this.library.symbols.ffi_exec(connection, bytes(sql))
     );
+  }
+
+  vacuumInto(
+    connection: number,
+    staging: string,
+  ): Promise<void> {
+    return this.value(() =>
+      this.library.symbols.ffi_vacuum_into(
+        connection,
+        bytes(staging),
+      )
+    );
+  }
+
+  renameNoReplace(source: string, destination: string): Promise<boolean> {
+    return this.value(() =>
+      this.library.symbols.ffi_rename_noreplace(
+        bytes(source),
+        bytes(destination),
+      )
+    );
+  }
+
+  async lockStore(path: string): Promise<number> {
+    const handle = await this.value<number>(() =>
+      this.library.symbols.ffi_lock_store(bytes(path))
+    );
+    this.files++;
+    return handle;
+  }
+
+  async unlockStore(handle: number): Promise<void> {
+    await this.value(() => this.library.symbols.ffi_close(handle, 2));
+    this.files--;
   }
 
   execute(
