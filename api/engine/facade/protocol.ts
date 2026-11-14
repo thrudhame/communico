@@ -44,6 +44,9 @@ export const LINK_CAPABILITIES: readonly Capability[] = [{
 }, {
   type: 'directory-replica',
   version: 1,
+}, {
+  type: 'ingress',
+  version: 1,
 }];
 export const EMPTY_CUT: Cut = { sequence: 0, hash: '' };
 
