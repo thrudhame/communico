@@ -12,6 +12,8 @@ import { Pairings } from './pairing.ts';
 import { startRoomExports } from './replication.ts';
 import { startPublicExports } from './public.ts';
 import { startDirectoryExports } from './directory.ts';
+import { HomeIngress } from './drain.ts';
+import { transactionDependencies } from '#engine/federation/dependencies.ts';
 import {
   LINK_CAPABILITIES,
   LinkError,
@@ -108,6 +110,12 @@ export async function startHomeLinks(
     await exportKeyRoster(app.store, app.tenant, node, id);
     const client = await openJournalClient(pairings, id, tls);
     if (controller.signal.aborted) return;
+    const ingress = new HomeIngress(app.server, {
+      peer: node,
+      pairing: id,
+      pairings,
+      transaction: transactionDependencies(app),
+    });
     workers.set(
       id,
       startHomeLinkWorker({
@@ -121,7 +129,10 @@ export async function startHomeLinks(
         notify: settings.notify as 'websocket' | 'sse' | 'poll',
         pollseconds: settings.pollseconds,
         reconnectmaxseconds: settings.reconnectmaxseconds,
-        apply: (stream) => apply(node, stream),
+        apply: (stream) =>
+          stream.stream.startsWith('ingress:')
+            ? ingress.apply(journal, stream)
+            : apply(node, stream),
         failed: (error) => failed(node, error),
       }),
     );

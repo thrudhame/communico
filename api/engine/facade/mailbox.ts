@@ -69,9 +69,36 @@ function collision(): never {
     'transaction identity reused with changed signed content',
   );
 }
-function operation(origin: string, txnId: string) {
+export function ingressOperation(origin: string, txnId: string) {
   return 'ingress:' +
     createHash('sha256').update(canonicalJson([origin, txnId])).digest('hex');
+}
+export async function verifyIngressRequest(
+  txnId: string,
+  raw: unknown,
+  self: string,
+) {
+  const { evidence, request } = await verifyRequestEvidence(raw, self);
+  const prefix = '/_matrix/federation/v1/send/';
+  const path = request.uri.split('?')[0];
+  if (
+    request.method !== 'PUT' || !path.startsWith(prefix) ||
+    decodeURIComponent(path.slice(prefix.length)) !== txnId || !txnId
+  ) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'retained request is not this transaction',
+    );
+  }
+  const transaction = decodeTransaction(
+    JSON.parse(new TextDecoder().decode(request.body)),
+    evidence.origin,
+  );
+  const inputHash = createHash('sha256').update(
+    requestCanonical(self, request, evidence.origin),
+  ).digest('hex');
+  return { evidence, request, transaction, inputHash };
 }
 async function checkBinding(conn: Conn, binding: Binding) {
   const [row] = await conn.query(
@@ -116,29 +143,11 @@ export class Mailbox {
   }
 
   private async prepare(txnId: string, raw: RequestEvidence): Promise<void> {
-    const { evidence, request } = await verifyRequestEvidence(
+    const { evidence, inputHash } = await verifyIngressRequest(
+      txnId,
       raw,
       this.options.self,
     );
-    const prefix = '/_matrix/federation/v1/send/';
-    const path = request.uri.split('?')[0];
-    if (
-      request.method !== 'PUT' || !path.startsWith(prefix) ||
-      decodeURIComponent(path.slice(prefix.length)) !== txnId || !txnId
-    ) {
-      throw new MatrixError(
-        400,
-        'M_BAD_JSON',
-        'retained request is not this transaction',
-      );
-    }
-    decodeTransaction(
-      JSON.parse(new TextDecoder().decode(request.body)),
-      evidence.origin,
-    );
-    const inputHash = createHash('sha256').update(
-      requestCanonical(this.options.self, request, evidence.origin),
-    ).digest('hex');
     const grant = await this.options.pairings.active();
     const context = grant.body.transcript.body.context;
     const binding = {
@@ -196,7 +205,7 @@ export class Mailbox {
   }
 
   async receive(origin: string, txnId: string): Promise<TxnResult> {
-    const key = operation(origin, txnId);
+    const key = ingressOperation(origin, txnId);
     const previous = this.locks.get(key) ?? Promise.resolve();
     let release!: () => void;
     const mine = new Promise<void>((resolve) => {
@@ -284,7 +293,7 @@ export class Mailbox {
               inputs,
               origin,
               this.options.transaction,
-              operation(origin, txnId) + ':room:' + roomId,
+              ingressOperation(origin, txnId) + ':room:' + roomId,
             );
             const room = await openRoom(this.options.transaction.store, roomId);
             return {
@@ -338,7 +347,7 @@ export class Mailbox {
         stream: 'ingress:' + origin,
         type: 'ingress',
         version: 1,
-        operationId: operation(origin, txnId),
+        operationId: ingressOperation(origin, txnId),
         payload,
       });
       await conn.execute(

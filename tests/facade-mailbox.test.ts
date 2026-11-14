@@ -19,6 +19,14 @@ import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { signJson } from '#engine/signing-primitives.js';
 import { directOnly, makeDoc } from './federation/doc-helper.ts';
+import { HomeIngress } from '#engine/facade/drain.ts';
+import { exportRoomReplica } from '#engine/facade/replication.ts';
+import { eduState } from '#engine/federation/edus.ts';
+import { registerToDevice } from '#engine/federation/todevice.ts';
+import { registerUser } from '#engine/tenant/users.ts';
+import { testRemoteServer } from './fixtures/signer.ts';
+import { receiveTransactionRoom } from '#engine/federation/transactions.ts';
+import { sendLocal } from '#engine/room/ingest.ts';
 import { genesis } from './fixtures/genesis.ts';
 import { authAt } from './fixtures/auth.ts';
 import {
@@ -42,7 +50,7 @@ async function fixture() {
     }, {
       schemas: { server: serverSchema, room: roomSchema, tenant: tenantSchema },
     });
-  const home = await open('home');
+  let home = await open('home');
   let edge = await open('edge');
   const g = await genesis(edge, {
     roomId: '!mailbox:test',
@@ -180,6 +188,21 @@ async function fixture() {
     });
   };
   return {
+    home: () => home,
+    bundle,
+    tenant,
+    async homePairings() {
+      return new Pairings(
+        await home.server(),
+        tenant.signer(),
+        tenant.publicB64,
+        'a'.repeat(64),
+      );
+    },
+    async reopenHome() {
+      await home.close();
+      home = await open('home');
+    },
     self,
     remote,
     g,
@@ -466,5 +489,203 @@ Deno.test('mailbox schema upgrades the previous server version without recreatin
     );
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('home drain reconciles room and reliable EDU commits across child and final-result crash cuts before ACK', async () => {
+  for (const cut of ['room', 'edu', 'final']) {
+    const f = await fixture();
+    try {
+      const local = await genesis(f.home(), {
+        roomId: f.g.roomId,
+        joinRule: 'public',
+      });
+      assertEquals(local.tipId, f.g.tipId);
+      await exportRoomReplica(
+        f.home(),
+        local.room,
+        f.self,
+        f.node.node,
+        f.bundle.id,
+      );
+      await registerUser(f.tenant, {
+        localpart: 'target',
+        password: 'pw',
+        deviceId: 'PHONE',
+      });
+      const join = await f.join();
+      await receiveTransactionRoom(f.g.roomId, [join], f.remote.name, {
+        store: f.edge(),
+        self: f.self,
+        keys: fakeKeyResolver(f.remote),
+        fetcher: fakeFetcher({}).fetcher,
+        edus: { dispatch: () => Promise.resolve() },
+      });
+      const fields = {
+        type: 'm.room.message',
+        sender: '@remote:remote.test',
+        content: { body: 'retained branch' },
+      };
+      const message = await remoteEvent(f.g.roomId, f.remote, '11', {
+        ...fields,
+        prev_events: [String(join.event_id)],
+        auth_events: await authAt(f.g.room, fields, String(join.event_id)),
+        depth: 100,
+      });
+      const lan = await sendLocal(local.room, {
+        type: 'm.room.message',
+        sender: local.creator,
+        content: { body: 'concurrent LAN branch' },
+        origin_server_ts: Date.now(),
+      }, local.signer);
+      const edus = [{
+        edu_type: 'm.direct_to_device',
+        content: {
+          sender: '@remote:remote.test',
+          type: 'm.test',
+          message_id: 'home-' + cut,
+          messages: { ['@target:' + f.self]: { '*': { cut } } },
+        },
+      }, { edu_type: 'm.typing', content: {} }];
+      const box = await f.mailbox();
+      await box.stage(
+        'home-' + cut,
+        await f.evidence('home-' + cut, [message], edus),
+      );
+      await box.receive(f.remote.name, 'home-' + cut);
+      const [out] = await (await f.edge().server()).query(
+        "SELECT record_json FROM facade_records WHERE stream='ingress:remote.test'",
+      );
+      const record = JSON.parse(String(out.record_json));
+      let fail = true;
+      const setup = async () => {
+        const real = await f.home().server();
+        const db: Database = {
+          ...real,
+          tx: (fn, options) =>
+            real.tx((conn) =>
+              fn(
+                new Proxy(conn, {
+                  get(target, prop) {
+                    if (prop === 'execute') {
+                      return (sql: string, args: readonly unknown[] = []) => {
+                        if (
+                          fail &&
+                          ((cut === 'final' &&
+                            sql.startsWith(
+                              'UPDATE facade_ingress SET response_json=',
+                            )) ||
+                            (sql.startsWith(
+                              'INSERT INTO facade_ingress_children',
+                            ) && args[2] === cut))
+                        ) {
+                          fail = false;
+                          throw new Error(
+                            'injected home ' + cut + ' checkpoint interruption',
+                          );
+                        }
+                        return conn.execute(
+                          sql,
+                          args as Parameters<Conn['execute']>[1],
+                        );
+                      };
+                    }
+                    const value = Reflect.get(target, prop);
+                    return typeof value === 'function'
+                      ? value.bind(target)
+                      : value;
+                  },
+                }),
+              ), options),
+        };
+        const tenant = await openTenant(f.home(), f.self);
+        const edus = eduState(real, f.self, f.home());
+        registerToDevice(edus, tenant);
+        const journal = new Journal(db, LINK_CAPABILITIES);
+        const drain = new HomeIngress(db, {
+          peer: f.node.node,
+          pairing: f.bundle.id,
+          pairings: await f.homePairings(),
+          transaction: {
+            self: f.self,
+            store: f.home(),
+            keys: fakeKeyResolver(f.remote, await testRemoteServer()),
+            fetcher: fakeFetcher({}).fetcher,
+            edus,
+          },
+        });
+        return { journal, drain };
+      };
+      let { journal, drain } = await setup();
+      await journal.receive(f.node.node, [record]);
+      await assertRejects(
+        () => drain.apply(journal, record),
+        Error,
+        'injected home',
+      );
+      assertEquals(
+        (await journal.heads(f.node.node, 'in', record)).applied.sequence,
+        0,
+      );
+      const room = await openRoom(f.home(), f.g.roomId);
+      const head = await room.tx((tx) => tx.changes.head());
+      assertEquals(
+        (await room.tx((tx) => tx.events.getStatus(String(message.event_id))))
+          ?.standing,
+        'accepted',
+      );
+      const rows = await (await f.home().tenant(f.self)).query(
+        'SELECT event_json FROM to_device_inbox',
+      );
+      assertEquals(rows.length, 1);
+      await f.reopenHome();
+      ({ journal, drain } = await setup());
+      assert(await drain.apply(journal, record));
+      assertEquals(await drain.apply(journal, record), false);
+      const reopened = await openRoom(f.home(), f.g.roomId);
+      assertEquals(await reopened.tx((tx) => tx.changes.head()), head);
+      for (
+        const id of [
+          String(join.event_id),
+          String(message.event_id),
+          lan.eventId,
+        ]
+      ) {
+        assertEquals(
+          (await reopened.tx((tx) => tx.events.getStatus(id)))?.standing,
+          'accepted',
+        );
+        assert(await reopened.tx((tx) => tx.segments.positionOf(id)));
+      }
+      assertEquals(
+        await (await f.home().tenant(f.self)).query(
+          'SELECT event_json FROM to_device_inbox',
+        ),
+        rows,
+      );
+      assertEquals(
+        (await journal.heads(f.node.node, 'in', record)).applied.sequence,
+        1,
+      );
+      const ack = await journal.acknowledgement(f.node.node, record, {
+        sequence: 0,
+        hash: '',
+      }, { maxItems: 100, maxBytes: 100000 });
+      await new Journal(await f.edge().server(), LINK_CAPABILITIES).ack(
+        'home',
+        record,
+        ack.received,
+        ack.applied,
+        ack.results,
+      );
+      assertEquals(
+        (await (await f.edge().server()).query(
+          "SELECT result_json FROM facade_records WHERE stream='ingress:remote.test'",
+        ))[0].result_json !== null,
+        true,
+      );
+    } finally {
+      await f.close();
+    }
   }
 });

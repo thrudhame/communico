@@ -60,7 +60,14 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
   await seed.close();
   try {
     facade = await process(facadeConfig, 'facade: link/local admin ready');
-    const status = () => adminCall(tls.dir + '/facade.sock', 'facade/status');
+    const status = async () => {
+      const response = await adminCall(
+        tls.dir + '/facade.sock',
+        'facade/status',
+      );
+      assertEquals(response.status, 200, JSON.stringify(response));
+      return response;
+    };
     assertEquals((await status()).body.result.initialized, false);
     assertEquals((await status()).body.result.matrix, false);
     await assertRejects(() =>
@@ -246,6 +253,15 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     const changed = await call('PUT', sendPath, { ...sendBody, edus: [] });
     assertEquals(changed.status, 400);
     assertEquals(changed.body.errcode, 'M_BAD_JSON');
+    const inbox = async () =>
+      (await api('sync?timeout=0', undefined, token, 'GET')).body.to_device
+        ?.events ?? [];
+    await until(async () => (await inbox()).length === 1);
+    assertEquals(await inbox(), [{
+      sender: '@sender:remote.test',
+      type: 'm.room.encrypted',
+      content: { ciphertext: 'opaque' },
+    }]);
     const publicCut = (await publicScope()).cut;
     const beforeProfileRoomCut = (await roomScope()).cut;
     assertEquals(
@@ -299,6 +315,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     await facade.stop();
     facade = await process(facadeConfig, 'facade: link/local admin ready');
     assertEquals(await call('PUT', sendPath, sendBody), saved);
+    assertEquals((await inbox()).length, 1);
     assertEquals((await status()).body.result.keyId, initialized.keyId);
     assertEquals((await status()).body.result.enrolled, true);
     assertEquals((await roomScope()).cut, replicatedCut);
@@ -364,6 +381,13 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       assertEquals(
         (await server.query('SELECT * FROM federation_txns')).length,
         0,
+      );
+      const [drained] = await server.query(
+        "SELECT result_json FROM facade_records WHERE stream='ingress:remote.test'",
+      );
+      assert(
+        drained.result_json !== null,
+        'home completion must reach facade ACK',
       );
       assertEquals(await lookupAlias(server, '#replica:logical.test'), roomId);
       assertEquals(await listedRooms(server), [roomId]);
