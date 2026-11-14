@@ -453,7 +453,10 @@ Paginated relation/thread order uses a room-owned derived causal height, then
 first-owner positions and event ID as tie-breakers. Heights come only from held
 prev edges, never remote PDU depth. Event insertion repairs indexed descendants
 when a missing parent arrives; the room transaction commits graph and keys
-together. Room schema v1 upgrades seed the index once without changing PDUs.
+together. Repair settles affected held nodes by their prior topological height,
+combining parent increases before writing each changed key once. Converging
+paths do not repeatedly rewrite the same descendants at intermediate heights.
+Room schema v1 upgrades seed the index once without changing PDUs.
 Subsequent reads fetch only candidate/anchor keys in bounded batches, independent
 of the old room prefix, and filtering or adding an anchor cannot reorder the
 remaining IDs. The shared room ordering module retains the nearby bidirectional
