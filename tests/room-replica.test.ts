@@ -3,12 +3,16 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   exportReplicaBoundary,
+  exportReplicaRoom,
   importReplicaBoundary,
   importReplicaGenesis,
 } from '#engine/room/replica.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { backfill } from '#engine/room/history.ts';
+import { ingestRemote } from '#engine/room/remote.ts';
 import { openStore } from '#engine/store/index.ts';
 import {
+  fakeFetcher,
   fakeKeyResolver,
   makeRemoteServer,
   remoteEvent,
@@ -36,6 +40,7 @@ async function fixture() {
   return {
     store,
     source,
+    home,
     join,
     input: {
       roomId: source.roomId,
@@ -283,6 +288,184 @@ Deno.test('replica boundary export pins original before-state and complete auth 
       await destination.close();
       await Deno.remove(dir, { recursive: true });
     }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('whole-room export retains participation, authorized history and exact imported before-state without local row IDs', async () => {
+  const f = await fixture();
+  try {
+    await importReplicaBoundary(f.store, f.input);
+    const room = await openRoom(f.store, f.source.roomId);
+    const fetch = fakeFetcher({
+      backfill: f.source.backfillPdus(
+        f.join.prev_events!,
+        f.source.events.size,
+      ),
+    });
+    const history = await backfill(room, {
+      from: f.join.prev_events!,
+      limit: f.source.events.size,
+      via: f.source.server.name,
+    }, { keys: f.input.keys, fetcher: fetch.fetcher });
+    assert(history.positioned.length > 0);
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'retained live', msgtype: 'm.text' },
+    });
+    await ingestRemote(room, [message], f.source.server.name, {
+      keys: f.input.keys,
+      fetcher: fakeFetcher({}).fetcher,
+      self: f.input.self,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    const manifest = await exportReplicaRoom(room, f.input.self);
+    assertEquals(manifest.cut, await room.tx((tx) => tx.changes.head()));
+    assertEquals(manifest.stays.map((stay) => stay.opening.eventId), [
+      f.join.event_id,
+    ]);
+    assertEquals(manifest.stays[0].opening.kind, 'join');
+    assert(manifest.steps.some((step) => step.kind === 'history'));
+    assert(
+      manifest.steps.some((step) =>
+        step.kind === 'live' && step.eventId === message.event_id
+      ),
+    );
+    const boundary = manifest.boundaries.find((boundary) =>
+      boundary.eventId === f.join.event_id
+    );
+    assert(boundary);
+    assertEquals(
+      new Set(boundary.state),
+      new Set(f.input.state.map((pdu) => String(pdu.event_id))),
+    );
+    const events = new Map(
+      manifest.events.map((pdu) => [String(pdu.event_id), pdu]),
+    );
+    assertEquals(events.get(String(message.event_id)), message);
+    for (const pdu of events.values()) {
+      for (const id of pdu.auth_events ?? []) assert(events.has(id));
+    }
+    const serialized = JSON.stringify(manifest);
+    for (
+      const field of [
+        'opening_group',
+        'current_group',
+        'before_group',
+        'after_group',
+        'offset',
+        'change_pos',
+      ]
+    ) {
+      assert(!serialized.includes('"' + field + '"'));
+    }
+    const oldCut = manifest.cut;
+    const suffix = await f.source.addEvent({
+      type: 'm.room.topic',
+      state_key: '',
+      content: { topic: 'suffix' },
+    });
+    await ingestRemote(room, [suffix], f.source.server.name, {
+      keys: f.input.keys,
+      fetcher: fakeFetcher({}).fetcher,
+      self: f.input.self,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    const next = await exportReplicaRoom(room, f.input.self);
+    assert(next.cut > oldCut);
+    assert(!manifest.events.some((pdu) => pdu.event_id === suffix.event_id));
+    assertEquals(JSON.stringify(manifest), serialized);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('whole-room export includes older departed stays and isolated historical gap boundaries', async () => {
+  const f = await fixture();
+  try {
+    await importReplicaBoundary(f.store, f.input);
+    const room = await openRoom(f.store, f.source.roomId);
+    const hidden = await f.source.addEvent({
+      type: 'm.room.topic',
+      state_key: '',
+      content: { topic: 'history only' },
+    });
+    const anchor = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'isolated history', msgtype: 'm.text' },
+    });
+    const ids = f.source.stateIdsAt(String(anchor.event_id))!;
+    await backfill(room, {
+      from: [String(anchor.event_id)],
+      limit: 1,
+      via: f.source.server.name,
+      anchor,
+    }, {
+      keys: f.input.keys,
+      fetcher: fakeFetcher({
+        stateIds: new Map([[String(anchor.event_id), ids]]),
+        event: f.source.events,
+      }).fetcher,
+    });
+    const kicked = await f.source.addEvent({
+      type: 'm.room.member',
+      state_key: '@alice:logical.test',
+      content: { membership: 'leave' },
+    });
+    const missing = fakeFetcher({
+      missingEvents: [hidden, anchor],
+      event: f.source.events,
+    });
+    await ingestRemote(room, [kicked], f.source.server.name, {
+      keys: f.input.keys,
+      fetcher: missing.fetcher,
+      self: f.input.self,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    assertEquals(await room.tx((tx) => tx.segments.openStay()), null);
+    const template = f.source.makeJoinAnswer('@alice:logical.test').event;
+    const rejoin = await remoteEvent(
+      f.source.roomId,
+      f.home,
+      f.source.version,
+      {
+        ...template,
+        prev_events: template.prev_events!,
+      },
+    );
+    const answer = await f.source.acceptSendJoin(rejoin);
+    await importReplicaBoundary(f.store, {
+      ...f.input,
+      join: answer.event,
+      state: answer.state,
+      authChain: answer.authChain,
+    });
+    const manifest = await exportReplicaRoom(room, f.input.self);
+    assertEquals(
+      manifest.stays.map((stay) => [stay.opening.eventId, stay.closed]),
+      [
+        [f.join.event_id, true],
+        [rejoin.event_id, false],
+      ],
+    );
+    assert(
+      manifest.steps.some((step) =>
+        step.kind === 'history' && step.anchor === anchor.event_id &&
+        step.stay === f.join.event_id
+      ),
+    );
+    const boundary = manifest.boundaries.find((entry) =>
+      entry.eventId === anchor.event_id
+    );
+    assert(boundary);
+    assertEquals(boundary.state, ids.pduIds);
+    assert(
+      manifest.boundaries.some((entry) => entry.eventId === rejoin.event_id),
+    );
   } finally {
     await f.close();
   }
