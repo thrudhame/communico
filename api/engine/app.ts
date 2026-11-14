@@ -9,6 +9,7 @@
 // app store (4b), engine tests keep opening schema-less stores without
 // it.
 import { config, serverName } from '#engine/config.ts';
+import { bindRole } from '#engine/facade/role.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { MediaService } from '#engine/media/service.ts';
@@ -79,12 +80,19 @@ export function theApp(): App {
  * per process — a second openApp before closeApp throws. */
 export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   if (current !== null) throw new Error('openApp: an app is already open');
+  // A facade must enter through explicit enrolled-node composition. Never let
+  // selecting the role fall through to home identity genesis or home workers.
+  if (config().server.role === 'facade') {
+    throw new Error('facade requires enrolled node composition');
+  }
   if (!hooksInstalled) {
     hooksInstalled = true;
     installServerHooks();
   }
   const store = await openStore(storeConfig ?? config().store, {
     schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
+    beforeStartup: (store) =>
+      bindRole(store, { role: 'home', server: serverName(), node: '' }),
   });
   const services: (() => void | Promise<void>)[] = [];
   const stopServices = () => drainResources(services.splice(0).reverse());

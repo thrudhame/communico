@@ -9,6 +9,11 @@
 // the transaction they stamp (no sequences). The store owns the id row,
 // the meta table and the watermarks; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
+import {
+  FACADE_JOURNAL_SQL,
+  FACADE_PAIRING_SQL,
+  RUNTIME_IDENTITY_SQL,
+} from './facade-schema.ts';
 
 const DEVICE_CHANGES_SQL = `
 CREATE TABLE device_changes(seq INTEGER PRIMARY KEY NOT NULL, source TEXT NOT NULL, source_pos INTEGER NOT NULL, subject TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, stream_id INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(source,source_pos));
@@ -382,7 +387,7 @@ UPDATE receipts SET event_ids=json_array(event_ids);
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 24,
+  version: 27,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -408,6 +413,9 @@ export const serverSchema: SchemaProvider = {
       'ALTER TABLE prejoin_memberships ADD COLUMN local_leave_json TEXT',
     );
     await db.exec(RECEIPT_EXTREMITIES_SQL);
+    await db.exec(FACADE_JOURNAL_SQL);
+    await db.exec(FACADE_PAIRING_SQL);
+    await db.exec(RUNTIME_IDENTITY_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -434,5 +442,8 @@ export const serverSchema: SchemaProvider = {
         'ALTER TABLE prejoin_memberships ADD COLUMN local_leave_json TEXT',
       ),
     23: (conn) => conn.exec(RECEIPT_EXTREMITIES_SQL),
+    24: (conn) => conn.exec(FACADE_JOURNAL_SQL),
+    25: (conn) => conn.exec(FACADE_PAIRING_SQL),
+    26: (conn) => conn.exec(RUNTIME_IDENTITY_SQL),
   },
 };

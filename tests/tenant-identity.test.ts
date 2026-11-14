@@ -114,6 +114,14 @@ Deno.test('tenant: open without create on a missing file refuses', async () => {
   });
 });
 
+Deno.test('tenant: existing file without authority never triggers implicit identity generation', async () => {
+  await withStore(async (store) => {
+    const db = await store.tenant('a.test', { create: true });
+    await assertRejects(() => openTenant(store, 'a.test'), Error, 'identity');
+    assertEquals(await db.query('SELECT server_name FROM tenant'), []);
+  });
+});
+
 Deno.test('tenant: fresh stores for the same server name get distinct signing key ids', async () => {
   await withStore(async (first) => {
     await withStore(async (second) => {

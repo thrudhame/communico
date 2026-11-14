@@ -304,6 +304,29 @@ export function loadConfig(opts: {
   }
 
   problems.push(...validateNumbers(built as Partial<Config>));
+  for (
+    const [node, allowed] of [
+      ['server.role', ['home', 'facade']],
+      ['facade.phase', ['f1']],
+      ['facade.notify', ['websocket', 'sse', 'poll']],
+      ['facade.outbound', ['direct', 'facade']],
+      ['facade.replicaterooms', ['local']],
+    ] as const
+  ) {
+    const [section, leaf] = node.split('.');
+    const value = (built[section] as Record<string, unknown> | undefined)
+      ?.[leaf];
+    if (
+      typeof value === 'string' &&
+      !(allowed as readonly string[]).includes(value)
+    ) {
+      problems.push(
+        `config: ${node} (${envNameOf([section, leaf])}): expected one of ${
+          allowed.join(', ')
+        }`,
+      );
+    }
+  }
   const rtcUrl = (built.matrixrtc as Record<string, unknown> | undefined)
     ?.livekitserviceurl;
   if (typeof rtcUrl === 'string' && rtcUrl !== '') {
