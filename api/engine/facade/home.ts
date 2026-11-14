@@ -118,6 +118,8 @@ export async function startHomeLinks(
         node,
         id,
         collectKeySignature,
+        undefined,
+        (error) => failed(node, error),
       );
       exports.get(id)?.wake();
       publicExports.get(id)?.wake();
@@ -155,7 +157,15 @@ export async function startHomeLinks(
     }
     await enrollLink(pairings, id, tls, secret, controller.signal);
     if (peer.state === 'revoked' || controller.signal.aborted) return;
-    await exportKeyRoster(app.store, app.tenant, node, id, collectKeySignature);
+    await exportKeyRoster(
+      app.store,
+      app.tenant,
+      node,
+      id,
+      collectKeySignature,
+      undefined,
+      (error) => failed(node, error),
+    );
     const client = await openJournalClient(pairings, id, tls);
     if (controller.signal.aborted) return;
     const ingress = new HomeIngress(app.server, {

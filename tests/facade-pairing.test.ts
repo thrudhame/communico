@@ -14,6 +14,7 @@ import { LinkError } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
+import type { Database } from '#engine/store/db.ts';
 
 const homePin = 'a'.repeat(64);
 const facadePin = 'b'.repeat(64);
@@ -263,6 +264,41 @@ Deno.test('v28 upgrade retains enrolled authority while adding prospective key r
       ))[0].retired_ms,
       null,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('home-only publication cannot pick up an unsigned facade key from a later roster read', async () => {
+  const f = await fixture();
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    const transcript = await f.fp.challenge(bundle.id, bundle.secret, homePin);
+    const db = await f.home().server();
+    const tenant = await openTenant(f.home(), 'logical.test');
+    let granted = false;
+    const racing: Database = {
+      ...db,
+      async tx(fn, options) {
+        const result = await db.tx(fn, options);
+        if (!granted) {
+          granted = true;
+          await f.hp.grant(bundle.id, transcript);
+        }
+        return result;
+      },
+    };
+    const doc = await homeKeyDocument(
+      racing,
+      tenant.signer(),
+      tenant.publicB64,
+    );
+    assertEquals(
+      Object.keys(doc.verify_keys).sort(),
+      Object.keys(doc.signatures['logical.test']).sort(),
+    );
+    assertEquals(doc.verify_keys[f.node.keyId], undefined);
   } finally {
     await f.close();
   }

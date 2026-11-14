@@ -9,9 +9,7 @@ import { config } from '#engine/config.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Signer } from '#engine/room/signer.ts';
-import { homePublicKeys } from '#engine/facade/pairing.ts';
 import { publishedKeyDocument } from '#engine/facade/control.ts';
-import { b64encodeStd, matrixBase64 } from '#engine/signing-primitives.js';
 import { type KeyDoc, ourKeyDocument, signWithSigner } from './keys.ts';
 
 /** Home authors the roster approved by its durable enrollment owner. Pending
@@ -23,19 +21,9 @@ export async function homeKeyDocument(
 ): Promise<KeyDoc> {
   const published = await publishedKeyDocument(server, signer, publicKey);
   if (published) return published;
-  const roster = await homePublicKeys(server, {
-    server: signer.serverName,
-    keyId: signer.keyId,
-    publicKey,
-  });
-  const active: KeyDoc['verify_keys'] = {};
-  const retired: NonNullable<KeyDoc['old_verify_keys']> = {};
-  for (const entry of roster.keys) {
-    const key = b64encodeStd(matrixBase64(entry.publicKey, 32));
-    if (entry.retiredAt === null) active[entry.keyId] = { key };
-    else retired[entry.keyId] = { key, expired_ts: entry.retiredAt };
-  }
-  return await ourKeyDocument(signer, publicKey, { active, retired });
+  // The publication owner observed a home-only roster. Do not read a newer
+  // roster here and accidentally attach keys whose signatures are not held.
+  return await ourKeyDocument(signer, publicKey);
 }
 
 /** Every handler under /_matrix/federation/, /_matrix/key/ and — with a

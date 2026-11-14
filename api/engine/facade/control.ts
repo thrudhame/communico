@@ -125,6 +125,7 @@ export async function publishKeyDocument(
   publicKey: string,
   collect: CollectKeySignature,
   now = Date.now(),
+  refreshFailed?: (error: unknown) => void,
 ): Promise<KeyDoc> {
   integer(now);
   for (;;) {
@@ -170,16 +171,27 @@ export async function publishKeyDocument(
         };}
     }
     await signWithSigner(doc as unknown as Record<string, unknown>, signer);
-    for (const key of roster.keys) {
-      if (key.retiredAt === null && key.keyId !== signer.keyId) {
-        // A collector cannot mutate the shared candidate or other signatures.
-        doc.signatures[signer.serverName][key.keyId] = await collect(
-          key.keyId,
-          structuredClone(doc),
-        );
+    try {
+      for (const key of roster.keys) {
+        if (key.retiredAt === null && key.keyId !== signer.keyId) {
+          // A collector cannot mutate the shared candidate or other signatures.
+          doc.signatures[signer.serverName][key.keyId] = await collect(
+            key.keyId,
+            structuredClone(doc),
+          );
+        }
       }
+      await completeDocument(doc, roster);
+    } catch (error) {
+      if (!refreshFailed) throw error;
+      // A refresh attempt is not authority revocation. The public owner rechecks
+      // the current control cut and expiry before any retained publication can
+      // keep replication running; a changed roster or expired document refuses.
+      const retained = await publishedKeyDocument(db, signer, publicKey, now);
+      if (!retained) throw error;
+      refreshFailed(error);
+      return retained;
     }
-    await completeDocument(doc, roster);
     const saved = await writeRoster(db, () =>
       db.tx(async (conn) => {
         const [control] = await conn.query(
@@ -208,6 +220,7 @@ export async function publishedKeyDocument(
   db: Database,
   signer: Signer,
   publicKey: string,
+  now = Date.now(),
 ): Promise<KeyDoc | null> {
   const roster = await homeRoster(db, signer, publicKey);
   if (roster.keys.length === 1) return null;
@@ -236,7 +249,7 @@ export async function publishedKeyDocument(
     JSON.parse(String(held.document_json)),
     roster,
   );
-  if (Date.now() >= doc.valid_until_ts) {
+  if (now >= doc.valid_until_ts) {
     throw new MatrixError(503, 'M_UNAVAILABLE', 'key document expired');
   }
   return doc;
@@ -313,6 +326,7 @@ export async function exportKeyRoster(
   pairing: string,
   collect?: CollectKeySignature,
   now = Date.now(),
+  refreshFailed?: (error: unknown) => void,
 ): Promise<LinkRecord> {
   const db = await store.server();
   for (;;) {
@@ -328,6 +342,7 @@ export async function exportKeyRoster(
         );
       }),
       now,
+      refreshFailed,
     );
     const body = await homeRoster(db, tenant.signer(), tenant.publicB64);
     await completeDocument(document, body);

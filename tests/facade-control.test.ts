@@ -657,3 +657,53 @@ Deno.test('legacy facade-only cached documents confer no authority and a complet
     setConfigForTests({});
   }
 });
+
+Deno.test('a failed connected refresh preserves valid publication and export progress while reporting its failure', async () => {
+  setConfigForTests({
+    federation: { keyvalidityhours: 1 },
+    facade: { maxofflinedays: 1 },
+  });
+  const f = await fixture();
+  try {
+    const first = await f.receive();
+    await f.keys().apply(f.journal(), first);
+    const before = await f.keys().document();
+    const errors: unknown[] = [];
+    const failed = new Error('refresh signing link disconnected');
+    const now = Date.now() + 3600000;
+    const exported = await exportKeyRoster(
+      f.home,
+      f.tenant,
+      'edge_a',
+      f.bundle.id,
+      () => Promise.reject(failed),
+      now,
+      (error) => errors.push(error),
+    );
+    assertEquals(exported, first);
+    assertEquals(errors, [failed]);
+    assertEquals(await f.keys().document(now), before);
+    await assertRejects(
+      () =>
+        exportKeyRoster(
+          f.home,
+          f.tenant,
+          'edge_a',
+          f.bundle.id,
+          () => Promise.reject(failed),
+          before.valid_until_ts,
+          (error) => errors.push(error),
+        ),
+      MatrixError,
+      'expired',
+    );
+    assertEquals(
+      errors,
+      [failed],
+      'expired authority cannot be disguised as a recoverable refresh',
+    );
+  } finally {
+    await f.close();
+    setConfigForTests({});
+  }
+});
