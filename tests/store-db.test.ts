@@ -152,6 +152,39 @@ Deno.test('store Db: transaction commit, rollback, released Conn and canonical o
   }
 });
 
+Deno.test('store Db: only the file gate owns checkpoint admission above the native default', async () => {
+  const dir = await Deno.makeTempDir();
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const db = await Db.open(ffi, dir + '/data.db', 64 * 1024 * 1024);
+  try {
+    await db.exec('CREATE TABLE data(id INTEGER PRIMARY KEY, body TEXT)');
+    await db.tx(async (tx) => {
+      for (let id = 0; id < 128; id++) {
+        await tx.execute('INSERT INTO data VALUES(?,?)', [
+          id,
+          'x'.repeat(65536),
+        ]);
+      }
+    });
+    assert(
+      (await Deno.stat(dir + '/data.db-log')).size > 4120000,
+      'native checkpoint must not bypass the configured file gate',
+    );
+    assertEquals(
+      Object.values((await db.query('PRAGMA mvcc_checkpoint_threshold'))[0]),
+      [-1],
+    );
+    assertEquals(db.gate.stats().barriers, 0);
+    assertEquals(await db.query('SELECT count(*) AS n FROM data'), [{
+      n: 128,
+    }]);
+  } finally {
+    await db.close();
+    ffi.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('store Db: reopen waits for the closing canonical owner', async () => {
   const dir = await Deno.makeTempDir();
   const ffi = new Turso('./.native/libturso_ffi.so');

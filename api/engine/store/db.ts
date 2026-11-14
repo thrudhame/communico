@@ -158,9 +158,24 @@ export class Db {
       db.references++;
       return db;
     }
-    const opened = ffi.open(path).then((handle) =>
-      new Db(ffi, path, handle, checkpointlogbytes)
-    );
+    const opened = ffi.open(path).then(async (handle) => {
+      const db = new Db(ffi, path, handle, checkpointlogbytes);
+      try {
+        const connection = await db.acquire();
+        try {
+          // File admission owns checkpoints. Native auto-checkpoint runs inside
+          // COMMIT, before the gate can drain peers, and makes unrelated begins
+          // exhaust their conflict retries while maintenance holds its lock.
+          await ffi.query(connection, 'PRAGMA mvcc_checkpoint_threshold=-1');
+        } finally {
+          db.idle.push(connection);
+        }
+        return db;
+      } catch (error) {
+        await db.shutdown();
+        throw error;
+      }
+    });
     this.openFiles.set(path, opened);
     try {
       return await opened;
