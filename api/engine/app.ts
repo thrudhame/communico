@@ -51,7 +51,11 @@ import { type Sender, startSender } from '#engine/federation/sender.ts';
 import type { Dispatch } from '#engine/server/delivery.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
-import { installServerHooks, recoverServer } from '#engine/server/startup.ts';
+import {
+  installServerHooks,
+  recoverRoomWaits,
+  recoverServer,
+} from '#engine/server/startup.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import {
@@ -128,6 +132,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   try {
     await assertRestoreReport(store);
     const tenant = await openTenant(store, serverName(), { create: true });
+    await recoverRoomWaits(store, tenant.serverName);
     await tenant.tx((tx) => tx.slidingSync.prune());
     const server = await store.server();
     const media = new MediaService(server, tenant);

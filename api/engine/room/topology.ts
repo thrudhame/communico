@@ -52,8 +52,54 @@ export async function rebuildTopology(conn: Conn): Promise<void> {
   }
 }
 
-/** Insert the new key and propagate only actual increases through the reverse
- * edge index. A normal parent-first insert touches no old room prefix. */
+type Repair = { event: string; before: number; height: number };
+
+// Old heights already topologically order all held nodes. Settle a node only
+// after its affected held parents, combining their proposed increases first.
+// A FIFO instead revisits converging descendants at each intermediate height.
+class Repairs {
+  private heap: Repair[] = [];
+
+  private before(a: Repair, b: Repair): boolean {
+    return a.before < b.before ||
+      (a.before === b.before && a.event < b.event);
+  }
+
+  add(repair: Repair): void {
+    let i = this.heap.length;
+    this.heap.push(repair);
+    while (i > 0) {
+      const parent = Math.floor((i - 1) / 2);
+      if (!this.before(repair, this.heap[parent])) break;
+      this.heap[i] = this.heap[parent];
+      i = parent;
+    }
+    this.heap[i] = repair;
+  }
+
+  take(): Repair | undefined {
+    const first = this.heap[0];
+    const last = this.heap.pop();
+    if (this.heap.length === 0) return first;
+    let i = 0;
+    while (i * 2 + 1 < this.heap.length) {
+      let child = i * 2 + 1;
+      if (
+        child + 1 < this.heap.length &&
+        this.before(this.heap[child + 1], this.heap[child])
+      ) child++;
+      if (!this.before(this.heap[child], last!)) break;
+      this.heap[i] = this.heap[child];
+      i = child;
+    }
+    this.heap[i] = last!;
+    return first;
+  }
+}
+
+/** Insert the new key and settle each genuinely affected descendant once.
+ * Native work follows changed nodes/edges, not every path through their DAG.
+ * A normal parent-first insert touches no old room prefix. */
 export async function indexTopology(conn: Conn, event: string): Promise<void> {
   const rows = await conn.query(
     'SELECT coalesce(max(t.height),0)+1 AS height FROM prev_edges p LEFT JOIN event_topology t ON t.event=p.prev WHERE p.event=?',
@@ -64,26 +110,39 @@ export async function indexTopology(conn: Conn, event: string): Promise<void> {
     event,
     height,
   ]);
-  const queue: [string, number][] = [[event, height]];
-  const latest = new Map(queue);
-  for (let i = 0; i < queue.length; i++) {
-    const [parent, rank] = queue[i];
-    if (latest.get(parent)! > rank) continue;
+  const queue = new Repairs();
+  const pending = new Map<string, Repair>();
+  const children = async (parent: string, rank: number) => {
     for (
       const row of await conn.query(
-        'SELECT t.event FROM prev_edges p JOIN event_topology t ON t.event=p.event WHERE p.prev=? AND t.height<=?',
+        'SELECT t.event,t.height FROM prev_edges p JOIN event_topology t ON t.event=p.event WHERE p.prev=? AND t.height<=?',
         [parent, rank],
       )
     ) {
       const child = String(row.event);
       if (child === event) throw new Error('stored prev DAG has a cycle');
-      await conn.execute('UPDATE event_topology SET height=? WHERE event=?', [
-        rank + 1,
-        child,
-      ]);
-      latest.set(child, rank + 1);
-      queue.push([child, rank + 1]);
+      const known = pending.get(child);
+      if (known !== undefined) {
+        known.height = Math.max(known.height, rank + 1);
+      } else {
+        const repair = {
+          event: child,
+          before: Number(row.height),
+          height: rank + 1,
+        };
+        pending.set(child, repair);
+        queue.add(repair);
+      }
     }
+  };
+  await children(event, height);
+  for (let repair = queue.take(); repair !== undefined; repair = queue.take()) {
+    pending.delete(repair.event);
+    await conn.execute('UPDATE event_topology SET height=? WHERE event=?', [
+      repair.height,
+      repair.event,
+    ]);
+    await children(repair.event, repair.height);
   }
 }
 

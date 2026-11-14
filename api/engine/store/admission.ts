@@ -1,5 +1,6 @@
-// Common storage admission. Higher-level operations may stop between commits,
-// exactly as at a crash; no transaction or file lifecycle can cross the cut.
+// Common commit/publication admission. Transaction bodies, connection waits and
+// maintenance keep running; no native commit or final file publication crosses
+// the cut. Accepted operation lifetime is owned separately by the Store.
 export class Admission {
   private paused = false;
   private active = 0;

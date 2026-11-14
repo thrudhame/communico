@@ -199,7 +199,7 @@ for (const route of ['remote', 'history'] as const) {
             from: [gap.event_id!, good.event_id!],
             via: fr.server.name,
             limit: 100,
-          }, { keys, fetcher: scripted.fetcher });
+          }, { self: 'test', keys, fetcher: scripted.fetcher });
           assertEquals(result.positioned, [good.event_id!]);
           assertEquals(
             await room.tx((tx) => tx.state.eventStateAfter(gap.event_id!)),

@@ -119,15 +119,21 @@ Deno.test('store snapshot: lifecycle, held lease and ordinary transactions canno
   const room = await store.room('!existing:test', { create: true });
   const lease = await store.leaseRoom('!existing:test');
   const paused = latch(), resume = latch();
-  const vacuum = Db.prototype.vacuumInto;
+  const prepare = Db.prototype.prepareReadSnapshot;
   let cutting = false;
-  Db.prototype.vacuumInto = async function (path) {
-    if (!cutting && this.path.startsWith(root + '/live/')) {
-      cutting = true;
-      paused.release();
-      await resume.wait;
-    }
-    return await vacuum.call(this, path);
+  Db.prototype.prepareReadSnapshot = async function () {
+    const prepared = await prepare.call(this);
+    return {
+      ...prepared,
+      pin: async () => {
+        if (!cutting && this.path.startsWith(root + '/live/')) {
+          cutting = true;
+          paused.release();
+          await resume.wait;
+        }
+        return await prepared.pin();
+      },
+    };
   };
   const actions: Promise<unknown>[] = [];
   let snapshot: ReturnType<SnapshotStore['snapshot']> | undefined;
@@ -177,7 +183,7 @@ Deno.test('store snapshot: lifecycle, held lease and ordinary transactions canno
     resume.release();
     await snapshot;
     await Promise.allSettled(actions);
-    Db.prototype.vacuumInto = vacuum;
+    Db.prototype.prepareReadSnapshot = prepare;
     await lease.release();
     await store.close();
     await Deno.remove(root, { recursive: true });

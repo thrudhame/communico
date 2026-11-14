@@ -147,14 +147,27 @@ export async function advanceNotificationRead(
       [user, room, scope],
     ))[0].event_seq,
   );
+  // Counts, retained listing and durable facts consume the same unread set.
+  // Recopying the whole room's history rewrites old read entries and all their
+  // indexes on every receipt/own send, amplifying one transition with retention.
+  const unread =
+    "WHERE user=? AND room=? AND read_ms IS NULL AND event_seq<=? AND (?='' OR thread=?)";
+  const values = [user, room, horizon, scope, scope];
   const affected = await tx.query(
-    `SELECT thread,COUNT(*) AS n,SUM(highlight) AS h FROM notifications
-    WHERE user=? AND room=? AND read_ms IS NULL AND withdrawn=0 AND event_seq<=? AND (?='' OR thread=?) GROUP BY thread`,
-    [user, room, horizon, scope, scope],
+    `SELECT thread,COUNT(*) AS n,SUM(highlight) AS h FROM notifications ${unread} AND withdrawn=0 GROUP BY thread`,
+    values,
   );
+  if (affected.length) {
+    // Select the identities before marking the facts read. Both changes share
+    // this transaction; already-read timestamps and other buckets stay intact.
+    await tx.execute(
+      `UPDATE notification_history SET read_ms=? WHERE seq IN (SELECT seq FROM notifications ${unread})`,
+      [now, ...values],
+    );
+  }
   await tx.execute(
-    `UPDATE notifications SET read_ms=? WHERE user=? AND room=? AND read_ms IS NULL AND event_seq<=? AND (?='' OR thread=?)`,
-    [now, user, room, horizon, scope, scope],
+    `UPDATE notifications SET read_ms=? ${unread}`,
+    [now, ...values],
   );
   for (const row of affected) {
     await delta(
@@ -167,10 +180,6 @@ export async function advanceNotificationRead(
     );
   }
   if (affected.length) {
-    await tx.execute(
-      'UPDATE notification_history SET read_ms=(SELECT read_ms FROM notifications WHERE seq=notification_history.seq) WHERE user=? AND room=?',
-      [user, room],
-    );
     await pruneNotificationHistory(tx, now);
   }
   return true;

@@ -119,6 +119,18 @@ JSON. Remaining ungrounded events become pending with waits; later arrivals
 re-run the shared pipeline. A zero
 ungrounded lifetime drops them instead. Delayed redaction targets use waits
 too, without rewriting the stored target PDU.
+The room transaction marks indexed dependency waits ready with each stored
+arrival or grounding transition. Ready rows form one durable retry queue:
+local/remote arrivals, historical imports, snapshot/rejoin/replica evidence,
+idempotent replay and app startup drain it. Arrival-capable room compositions
+share one post-commit completion boundary, outside the room lock and before
+projection. History receives the local identity through its injected deps;
+recovering a delayed effect does not turn its historical target into live news. Newly
+grounded children mark their dependents before removing their own waits, so
+a later failure cannot lose the retry obligation. Recovery errors propagate;
+unrelated unresolved history is never rescanned on a foreground arrival.
+Prev recovery requires grounded parents; delayed redaction needs only stored
+target bytes. Each candidate retains locked revalidation and oldest-first order.
 (`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,
 `api/engine/room/ingest.ts:654-681`)
 
@@ -445,7 +457,10 @@ Paginated relation/thread order uses a room-owned derived causal height, then
 first-owner positions and event ID as tie-breakers. Heights come only from held
 prev edges, never remote PDU depth. Event insertion repairs indexed descendants
 when a missing parent arrives; the room transaction commits graph and keys
-together. Room schema v1 upgrades seed the index once without changing PDUs.
+together. Repair settles affected held nodes by their prior topological height,
+combining parent increases before writing each changed key once. Converging
+paths do not repeatedly rewrite the same descendants at intermediate heights.
+Room schema v1 upgrades seed the index once without changing PDUs.
 Subsequent reads fetch only candidate/anchor keys in bounded batches, independent
 of the old room prefix, and filtering or adding an anchor cannot reorder the
 remaining IDs. The shared room ordering module retains the nearby bidirectional
@@ -1063,7 +1078,12 @@ Legacy v3 receipts remain archived when their ownership cannot be proved.
 `api/engine/store/create.ts:18-21`, `api/engine/store/create.ts:104-165`)
 
 Room/tenant handles acquire a pool lease per operation and release it in
-`finally`; idle eviction cannot close leased files. At the configured log
+`finally`; idle eviction cannot close leased files. The shared pool queue owns
+only synchronous metadata changes. Per-file reservations serialize opening,
+initialization and detached closing without holding that queue; identity listing
+retains physical incarnations while reading outside it. Shutdown drains accepted
+listings, reservations, leases and retention before native lifetime ends.
+At the configured log
 threshold (default 4,120,000 bytes), the file gate pauses admission, drains
 active transactions and checkpoints before reopening admission.
 (`api/engine/store/index.ts:88-105`, `api/engine/store/pool.ts:118-154`,
@@ -1168,15 +1188,26 @@ external effects. This inventory is not an extra operator approval gate; workers
 resume normal semantics only after the completed durable report boundary.
 (`api/engine/backup/work.ts`, `api/engine/{room,tenant,server}/restore-work.ts`)
 
-The internal store snapshot primitive pauses common storage admission, drains
-transactions and lifecycle changes, then exports every final server/tenant/room
-file with store-owned autocommit VACUUM connections. Retired but not yet unlinked
-files remain part of that crash-consistent cut. The pause is measured, not
-deadline-limited. Quote-free directory-fd staging keeps legal operator paths
-out of SQL. After admission resumes, publication fsyncs and uses no-replace
-rename, staging a private copy first across filesystems. This primitive exports
-database files, not local media or deployment configuration by itself.
-(`api/engine/store/{admission,db,index,pool,files}.ts`)
+The internal store snapshot owner retains physical file incarnations, opens and
+normalizes inactive/over-cache sources and acquires checkpoint retention outside
+common admission and the pool metadata queue. The common fence drains only native
+commits and final file publication/unlink, revalidates the final inventory and pins
+native MVCC reads together. In-flight transaction bodies, connection waits and
+checkpoint completion stay outside it; uncommitted data/schema remain outside the
+cut. New database initialization is private until its fenced final rename. Retired
+but not yet unlinked files remain in the cut. SQL
+export then copies schema, explicit rowids and bounded keyset pages into private
+standalone targets while ordinary writes continue. Engine-private MVCC metadata
+is regenerated, not copied as application truth. Each completed export releases
+its source immediately; checkpoint retention defers initiation rather than
+blocking committing writers. The file gate is the sole checkpoint owner; native
+automatic checkpointing is disabled. Removal waits outside common admission,
+and the Store drains all accepted operations before shutdown, with commit and
+publication admission still open so those operations can finish. The common pause
+is measured, not deadline-limited. Completed targets use fsync and no-replace
+publication, with private destination-side copying across filesystems. This
+primitive exports databases, not media or deployment configuration by itself.
+(`api/engine/store/{admission,db,export,index,pool,gate,files}.ts`)
 
 The internal format-1 bundle manifest records logical identities, native/schema
 provenance, the measured cut, secret disclosures and exact payload inventories.

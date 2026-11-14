@@ -208,6 +208,7 @@ export async function messages(
           (await serversInRoom(room.id)).filter((s) => s !== serverName()),
           config().federation.backfillbatch,
           {
+            self: signer.serverName,
             keys: productionKeyResolver(theApp().server, signer),
             fetcher: productionFetcher(theApp().server, signer, theApp().store),
           },
@@ -261,6 +262,7 @@ export async function messages(
           isolated: segment?.kind === 'stay' &&
             first[0]?.offset !== step.cursor.offset,
         }, {
+          self: signer.serverName,
           keys: productionKeyResolver(theApp().server, signer),
           fetcher: productionFetcher(theApp().server, signer, theApp().store),
         });

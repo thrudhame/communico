@@ -148,15 +148,23 @@ CREATE INDEX events_annotation_target ON events(
 ) WHERE json_extract(pdu, '$.content."m.relates_to".rel_type')='m.annotation';
 `;
 
+const WAIT_READY_SQL = `
+CREATE INDEX waits_ready ON waits(state, since, waiting, missing, kind);
+UPDATE waits SET state='ready' WHERE
+  (kind='redaction' AND EXISTS(SELECT 1 FROM events WHERE id=waits.missing)) OR
+  (kind='prev' AND EXISTS(SELECT 1 FROM event_status WHERE event=waits.missing AND grounding='grounded'));
+`;
+
 export const roomSchema: SchemaProvider = {
-  version: 6,
+  version: 7,
   apply: async (db) => {
     await db.exec(
       ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL +
-        ANNOTATION_INDEX_SQL + REMOTE_BATCHES_SQL,
+        ANNOTATION_INDEX_SQL + REMOTE_BATCHES_SQL + WAIT_READY_SQL,
     );
   },
   migrations: {
+    6: (conn) => conn.exec(WAIT_READY_SQL),
     5: (conn) => conn.exec(REMOTE_BATCHES_SQL),
     4: async (conn) => {
       await conn.exec(ANNOTATION_INDEX_SQL);

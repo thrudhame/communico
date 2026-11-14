@@ -9,8 +9,14 @@ import {
   type Value,
 } from '#engine/store/ffi.ts';
 import { Gate } from '#engine/store/gate.ts';
+import type { Admission } from '#engine/store/admission.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import { publish } from '#engine/store/files.ts';
+import {
+  exportSnapshot,
+  type PreparedSnapshot,
+  type ReadSnapshot,
+} from '#engine/store/export.ts';
 
 export class StoreConflictError extends StoreError {
   constructor(
@@ -114,6 +120,7 @@ export class Db {
     readonly path: string,
     private readonly handle: number,
     checkpointlogbytes: number,
+    private readonly admission?: Admission,
   ) {
     this.gate = new Gate(path, checkpointlogbytes, async (started) => {
       const connection = await this.acquire();
@@ -132,6 +139,7 @@ export class Db {
     ffi: Turso,
     path: string,
     checkpointlogbytes: number,
+    admission?: Admission,
   ): Promise<Db> {
     path = resolve(path);
     if (path !== databaseFiles(dirname(path)).database) {
@@ -148,19 +156,35 @@ export class Db {
       const db = await existing;
       if (db.closingTask !== undefined) {
         await db.closingTask;
-        return await this.open(ffi, path, checkpointlogbytes);
+        return await this.open(ffi, path, checkpointlogbytes, admission);
       }
       if (
-        db.ffi !== ffi || db.gate.threshold !== checkpointlogbytes
+        db.ffi !== ffi || db.gate.threshold !== checkpointlogbytes ||
+        (admission !== undefined && db.admission !== admission)
       ) {
         throw new Error('database already owned by another library');
       }
       db.references++;
       return db;
     }
-    const opened = ffi.open(path).then((handle) =>
-      new Db(ffi, path, handle, checkpointlogbytes)
-    );
+    const opened = ffi.open(path).then(async (handle) => {
+      const db = new Db(ffi, path, handle, checkpointlogbytes, admission);
+      try {
+        const connection = await db.acquire();
+        try {
+          // File admission owns checkpoints. Native auto-checkpoint runs inside
+          // COMMIT, before the gate can drain peers, and makes unrelated begins
+          // exhaust their conflict retries while maintenance holds its lock.
+          await ffi.query(connection, 'PRAGMA mvcc_checkpoint_threshold=-1');
+        } finally {
+          db.idle.push(connection);
+        }
+        return db;
+      } catch (error) {
+        await db.shutdown();
+        throw error;
+      }
+    });
     this.openFiles.set(path, opened);
     try {
       return await opened;
@@ -253,7 +277,11 @@ export class Db {
       try {
         await this.ffi.begin(handle, mode);
         const result = await fn(connection);
-        await this.ffi.commit(handle);
+        if (this.admission) {
+          await this.admission.run(() => this.ffi.commit(handle!));
+        } else {
+          await this.ffi.commit(handle);
+        }
         committed = true;
         return { committed: true, value: result };
       } catch (error) {
@@ -302,6 +330,106 @@ export class Db {
 
   exec(sql: string): Promise<void> {
     return this.tx((connection) => connection.exec(sql), { mode: 'deferred' });
+  }
+
+  // Separate maintenance capability: owns one native read transaction without
+  // consuming an ordinary transaction slot or blocking threshold writers.
+  async readSnapshot(): Promise<ReadSnapshot> {
+    const prepared = await this.prepareReadSnapshot();
+    return await prepared.pin();
+  }
+
+  // Connect and drain existing checkpoints before the whole-store fence. Only
+  // BEGIN and its first metadata read belong inside the common cut.
+  async prepareReadSnapshot(): Promise<PreparedSnapshot> {
+    if (this.closing || this.closed) {
+      throw new Error('database is closing or closed');
+    }
+    this.users++;
+    let releaseGate: (() => void) | undefined;
+    let handle: number | undefined;
+    let released = false;
+    let exporting: Promise<void> | undefined;
+    let releasing: Promise<void> | undefined;
+    let pinned = false;
+    const release = () =>
+      releasing ??= (async () => {
+        released = true;
+        try {
+          await exporting?.catch(() => undefined);
+          if (handle !== undefined) {
+            try {
+              await this.ffi.rollback(handle);
+            } finally {
+              await this.ffi.closeConnection(handle);
+            }
+          }
+        } finally {
+          releaseGate?.();
+          this.users--;
+          this.notify();
+        }
+      })();
+    try {
+      releaseGate = await this.gate.retain();
+      handle = await this.ffi.connect(this.handle);
+      return {
+        pin: async () => {
+          if (released || pinned) {
+            throw new Error('snapshot is released or already pinned');
+          }
+          pinned = true;
+          try {
+            await this.ffi.begin(handle!, 'deferred');
+            // BEGIN alone is lazy; this read establishes the actual MVCC cut.
+            const schema = await this.ffi.query(
+              handle!,
+              'SELECT type,name,sql FROM sqlite_schema ORDER BY rowid',
+            );
+            return {
+              export: (destination) => {
+                if (released) {
+                  return Promise.reject(
+                    new Error('snapshot has been released'),
+                  );
+                }
+                if (exporting) {
+                  return Promise.reject(
+                    new Error('snapshot export already started'),
+                  );
+                }
+                if (resolve(destination) === this.path) {
+                  return Promise.reject(
+                    new TypeError('backup destination is the source database'),
+                  );
+                }
+                return exporting = exportSnapshot(
+                  this.ffi,
+                  handle!,
+                  schema,
+                  destination,
+                );
+              },
+              release,
+            };
+          } catch (error) {
+            await release();
+            throw error;
+          }
+        },
+        release,
+      };
+    } catch (error) {
+      try {
+        await release();
+      } catch (cleanup) {
+        throw new AggregateError(
+          [error, cleanup],
+          'snapshot pin and release failed',
+        );
+      }
+      throw error;
+    }
   }
 
   // Store-owned maintenance, deliberately absent from the logical Database/Conn

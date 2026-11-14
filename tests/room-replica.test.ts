@@ -379,7 +379,7 @@ Deno.test('whole-room export retains participation, authorized history and exact
       from: f.join.prev_events!,
       limit: f.source.events.size,
       via: f.source.server.name,
-    }, { keys: f.input.keys, fetcher: fetch.fetcher });
+    }, { self: f.input.self, keys: f.input.keys, fetcher: fetch.fetcher });
     assert(history.positioned.length > 0);
     const message = await f.source.addEvent({
       type: 'm.room.message',
@@ -476,6 +476,7 @@ Deno.test('whole-room export includes older departed stays and isolated historic
       via: f.source.server.name,
       anchor,
     }, {
+      self: f.input.self,
       keys: f.input.keys,
       fetcher: fakeFetcher({
         stateIds: new Map([[String(anchor.event_id), ids]]),
