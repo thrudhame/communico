@@ -1105,6 +1105,15 @@ rename, staging a private copy first across filesystems. This primitive exports
 database files, not local media or deployment configuration by itself.
 (`api/engine/store/{admission,db,index,pool,files}.ts`)
 
+The internal format-1 bundle manifest records logical identities, native/schema
+provenance, the measured cut, secret disclosures and exact payload inventories.
+Its sealer hashes and syncs payloads before creating a private completion file;
+the reader refuses missing/extra entries, symlinks, invalid paths and mismatched
+sizes/hashes without opening or migrating archived databases. Plaintext and
+encrypted payload digests are separate. This metadata primitive alone is not
+the whole-server backup/restore command.
+(`api/engine/backup/manifest.ts`)
+
 Configuration layers shipped TOML, an optional overlay and environment leaves;
 unknown nodes and wrong types are errors. Signals stop admission, drain all
 listeners within the configured grace and close storage last. Unhandled
