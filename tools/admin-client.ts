@@ -51,10 +51,14 @@ async function send<T>(operation: string, body: unknown): Promise<T> {
           ),
         ),
     );
-    req.setTimeout(
-      30000,
-      () => req.destroy(new Error(`admin request timed out: ${socket}`)),
-    );
+    // A whole-server backup has no arbitrary duration limit. Its completion
+    // response follows publication; the measured write pause is reported there.
+    if (operation !== 'backup') {
+      req.setTimeout(
+        30000,
+        () => req.destroy(new Error(`admin request timed out: ${socket}`)),
+      );
+    }
     req.end(payload);
   });
 }

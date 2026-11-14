@@ -1105,7 +1105,7 @@ directory identities and rolls back the entire original pair before preparing a
 new candidate; unknown/tampered identities refuse without moving either root.
 Candidate failure before publication removes only owned staging. The engine
 coordinator composes this lifecycle with validation, sanitation and the report;
-the public CLI is not yet connected.
+the explicit offline CLI invokes it without opening the app.
 (`api/engine/store/{restore,ownership,index}.ts`)
 
 Private restore candidates have a separate store-owned database lifecycle:
@@ -1182,7 +1182,7 @@ shipped `backup` settings. It checks the private passphrase file and executable
 before the cut, streams secrets through stdin and bytes through private 0600
 files, verifies GnuPG's integrity status and the manifest's plaintext digest,
 and cleans up only its own temporary GnuPG home/agent. Plaintext staging is not
-secure erasure, and this cipher primitive does not yet expose a backup command.
+secure erasure; the running backup and offline restore commands compose it.
 (`api/engine/backup/encryption.ts`, `defaults/communico.toml`)
 
 Captured-database inspection opens and upgrades only store-owned private scratch
@@ -1192,8 +1192,7 @@ allocator/source heads, projection references and watermarks, prepared/completed
 send receipts and projected reliable delivery. Projection lag and the completed
 room-removal crash window remain valid. The uploaded-media inventory includes
 inactive tenants and excludes pending reservations. Full scans use keyset batches
-without a row-count ceiling. These internal audits do not yet expose a backup or
-restore command.
+without a row-count ceiling. Both backup and offline restore compose these audits.
 (`api/engine/store/inspect.ts`, `api/engine/backup/{audit,checks}.ts`,
 `api/engine/{room,tenant,server}/backup-audit.ts`)
 
@@ -1206,7 +1205,7 @@ source is never bundled. Optional encryption removes only owned plaintext stagin
 after encryption succeeds. The manifest-last seal and storage-owned no-replace
 publication expose only the complete bundle. GnuPG uses a live directory-fd alias
 for its private home/agent, so long bundle paths do not become socket paths. This
-engine producer is paired with offline restore; admin socket/CLI wiring remains.
+engine producer is paired with offline restore through the operator commands.
 (`api/engine/backup/bundle.ts`, `api/engine/store/index.ts`)
 
 The offline engine restore reads and verifies the complete manifest/inventory,
@@ -1222,8 +1221,19 @@ new storage/media paths and bundled TLS/CA mappings; explicit target overrides
 win, but environment credentials remain external. The original effective/overlay
 files are retained for provenance. Operators must fence the old installation
 before serving the same identity on another machine; a local ownership lock cannot
-fence another host. This engine flow is not yet a public command.
+fence another host. The offline CLI calls this owner, never app startup.
 (`api/engine/backup/{restore,deployment}.ts`)
+
+`./communico backup` / `deno task backup` resolve the destination at the caller
+and invoke `/v1/backup` over the existing versioned private socket. That adapter
+calls the running store's bundle owner. The client has no FFI or TCP permission
+and no backup duration deadline. `./communico restore` / `deno task restore`
+invoke the offline owner with native/file access and optional GnuPG subprocesses,
+but no network permission. Their JSON results name the bundle or generated
+configuration/report and retained replacement roots; detailed restore inventory
+stays in the durable report. The normal start task permits `gpg`/`gpgconf` for
+encrypted backup. Public Matrix listeners never mount either admin operation.
+(`api/admin/backup.ts`, `tools/{backup,restore,admin-client}.ts`, `deno.json`)
 
 Configuration layers shipped TOML, an optional overlay and environment leaves;
 unknown nodes and wrong types are errors. Signals stop admission, drain all

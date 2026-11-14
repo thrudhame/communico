@@ -435,6 +435,92 @@ retained until DELETE. Only display names and avatars enter room membership.
 Avatar and timezone values must be strings but are otherwise accepted verbatim,
 matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
+## Backup and restore
+
+Run these commands from the installation directory as the server user, with the
+same layered configuration as the server:
+
+```sh
+./communico backup /srv/backups/communico-2026-11-14
+# Equivalent: deno task backup -- /srv/backups/communico-2026-11-14
+```
+
+Backup requires a running server. The CLI uses only its private admin socket,
+never opens live databases, and resolves relative destinations in the caller's
+working directory. The destination's parent must exist; the destination must
+not exist or overlap live data. The response is JSON with the published path,
+backup ID, measured storage-admission pause in milliseconds and encryption mode.
+Writes pause for the consistent whole-store cut, then resume while the bundle is
+assembled. There is no configured backup duration deadline. Use the completed
+bundle, not a copy of live database files or an unfinished private staging tree.
+
+The format-1 bundle includes database files, signing private keys, password
+hashes, uploaded local media, effective configuration, the original operator
+overlay and referenced TLS/CA files. Payloads and manifest are mode 0600 in
+private directories; the manifest is published last and records exact hashes
+and sizes. Remote media cache, thumbnails, unfinished uploads, runtime sockets
+and the backup passphrase source are excluded. Environment TURN credentials
+remain external and must be supplied on the restored installation.
+
+`backup.encrypt` defaults to false. To use standard OpenPGP AES256 encryption,
+install GnuPG (`gpg` and `gpgconf`) for the server and set:
+
+```toml
+[backup]
+encrypt = true
+passphrasefile = "/srv/secrets/communico-backup-passphrase"
+```
+
+The passphrase file must be owned by the server user and inaccessible to group
+and others. Keep it separately from the archive; restore needs the same
+passphrase through its own configuration. The manifest remains readable and
+contains identifiers and operational metadata. Encryption does not securely
+erase plaintext staging from the filesystem. Protect and copy the complete
+bundle off-machine with your own scheduling/storage tools.
+
+Restore is explicit and offline. Stop and fence the original installation
+before serving another copy of the same Matrix identity, including on another
+machine. Configure the desired `store.dir` and `media.root` on the target, then:
+
+```sh
+COMMUNICO_CONFIG=/srv/communico/config/restore.toml \
+  ./communico restore /srv/backups/communico-2026-11-14
+# Equivalent: deno task restore -- <bundle> [--replace]
+```
+
+Both target parents must exist. Restore verifies the exact bundle, supported
+native/schema versions and application references, then migrates private copies,
+audits media and signing identity, sanitizes consuming keys and sync delivery
+boundaries, and writes a durable operator report before promotion. The archive
+is never modified. Nonempty targets refuse unless `--replace` is explicit;
+replacement preserves prior store and media roots and prints their paths.
+Neither replacement nor a stale socket bypasses a running owner's store lock.
+An interrupted two-root promotion fences startup; rerun the offline command to
+recover the original pair before retrying. Do not manually combine roots.
+
+The JSON result names `configPath`, `reportPath` and retained replacement paths.
+Read the report, supply any external secrets, and start with the generated config:
+
+```sh
+COMMUNICO_CONFIG=<configPath> ./communico start
+```
+
+The generated configuration retains the Matrix server name/signing identity,
+uses the target storage/native/admin paths and portable bundled TLS/CA paths,
+and respects explicit target config/environment overrides. Normal startup is
+never an automatic restore and refuses a missing or modified required report.
+After that durable report boundary, retained delayed, push and federation work
+resumes with normal semantics; there is no additional approval flag.
+
+An older archive cannot recover post-cut messages, credentials/revocations,
+cancellations, peer acknowledgments or client private keys. Old credentials and
+jobs may revive; external side effects may repeat. Restored OTK/fallback pools
+are cleared so clients can refill them. Ordinary sync receives a fresh recovery
+identity, sliding positions expire, and peers receive device-list resnapshot
+resets. Keep clients' crypto stores. These mechanisms do not reconstruct lost
+private keys or guarantee that every newer client cache will converge. The
+report records sanitation, pending work and these security/RPO implications.
+
 ## Operator tools
 
 The tools require the server to be running with the same configuration. They
@@ -455,6 +541,7 @@ shutdown. Run tools as that same user.
 | 4 | `deno task federation-outbox -- ...` | `list [<destination>]`, `retry <destination>`, `prune <destination>`                                         |
 | 5 | `deno task federation-cert`          | Write the configured certificate/key from the tenant identity; refuse existing outputs                       |
 | 6 | `deno task rooms -- ...`             | `list [--purgeable]`, `purge [--older-than <ms>]`, `drop <roomId>`                                           |
+| 7 | `deno task backup -- <destination>`  | Publish a whole-server bundle through the running owner; see Backup and restore                              |
 
 The shared launcher grants read/env access, write access to the socket, and
 `--allow-net=unix:<config-resolved-absolute-socket-path>`, which Deno requires
