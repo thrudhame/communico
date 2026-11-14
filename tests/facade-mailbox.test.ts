@@ -465,17 +465,15 @@ Deno.test('mailbox configured capacity refuses only new work and journal ACK rel
   }
 });
 
-Deno.test('mailbox schema upgrades the previous server version without recreating identity or pairing', async () => {
+Deno.test('mailbox schema upgrades v32 without recreating identity or pairing', async () => {
   const f = await fixture();
   try {
     const server = await f.edge().server();
     await server.tx(async (conn) => {
       await conn.exec(
-        'DROP TABLE facade_ingress_collisions; DROP TABLE facade_ingress_children; DROP TABLE facade_ingress',
+        'DROP TABLE facade_egress_routes; DROP TABLE facade_egress; DROP TABLE facade_ingress_collisions; DROP TABLE facade_ingress_children; DROP TABLE facade_ingress',
       );
-      await conn.execute("UPDATE meta SET v=? WHERE k='schema_version'", [
-        String(serverSchema.version - 1),
-      ]);
+      await conn.execute("UPDATE meta SET v='32' WHERE k='schema_version'");
     }, { mode: 'deferred' });
     await f.reopen();
     const box = await f.mailbox();
