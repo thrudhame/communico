@@ -67,6 +67,10 @@ export class Pool {
   private readonly retiring = new Set<string>();
   private readonly incarnations = new Map<string, symbol>();
   private readonly retained = new Map<string, number>();
+  private readonly fileWork = new Map<string, Promise<unknown>>();
+  private readonly closeFailures = new Map<string, unknown>();
+  private readonly unlinking = new Set<string>();
+  private listings = 0;
 
   private retireKey(key: string): void {
     if (this.retiring.has(key)) return;
@@ -89,12 +93,64 @@ export class Pool {
     return await this.locked(() => this.retiring.has(key));
   }
 
-  // Opening, leasing and eviction share one metadata critical section.
-  // File operations run OUTSIDE it, protected by their lease count.
-  private locked<T>(fn: () => T | Promise<T>): Promise<T> {
+  // This queue owns metadata only. Native opens, schema work, reads and closes
+  // run outside it, reserved by key, lease or physical-incarnation retention.
+  private locked<T>(
+    fn: () => T & (T extends PromiseLike<unknown> ? never : unknown),
+  ): Promise<T> {
     const result = this.queue.then(fn);
     this.queue = result.catch(() => undefined);
     return result;
+  }
+
+  private notify(): void {
+    for (const wake of this.released.splice(0)) wake();
+  }
+
+  private changed(): Promise<void> {
+    return new Promise<void>((resolve) => this.released.push(resolve));
+  }
+
+  // Called only under locked(). A pending file operation never holds the queue
+  // needed by unrelated leases, its own completion, or shutdown.
+  private startWork<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const task = Promise.resolve().then(fn).finally(() =>
+      this.locked(() => {
+        this.fileWork.delete(key);
+        this.notify();
+      })
+    );
+    this.fileWork.set(key, task);
+    return task;
+  }
+
+  private async hold(
+    key: string,
+    accepted = false,
+  ): Promise<() => Promise<void>> {
+    for (;;) {
+      const result = await this.locked(() => {
+        if (this.closed && !accepted) {
+          throw new Error('open-file pool is closed');
+        }
+        if (this.unlinking.has(key)) return { wait: this.changed() };
+        this.retained.set(key, (this.retained.get(key) ?? 0) + 1);
+        let released = false;
+        return {
+          release: () =>
+            this.locked(() => {
+              if (released) return;
+              released = true;
+              const count = this.retained.get(key)! - 1;
+              if (count) this.retained.set(key, count);
+              else this.retained.delete(key);
+              this.notify();
+            }),
+        };
+      });
+      if (result.release) return result.release;
+      await result.wait;
+    }
   }
 
   constructor(
@@ -165,10 +221,7 @@ export class Pool {
     fileKey: string,
   ): Promise<SnapshotSource | undefined> {
     const key = kind + ':' + fileKey;
-    await this.locked(() => {
-      if (this.closed) throw new Error('open-file pool is closed');
-      this.retained.set(key, (this.retained.get(key) ?? 0) + 1);
-    });
+    const releaseHold = await this.hold(key);
     let db: Db | undefined;
     let prepared: PreparedSnapshot | undefined;
     let releasing: Promise<void> | undefined;
@@ -181,12 +234,7 @@ export class Pool {
             await db?.close();
           }
         } finally {
-          await this.locked(() => {
-            const count = this.retained.get(key)! - 1;
-            if (count) this.retained.set(key, count);
-            else this.retained.delete(key);
-            for (const wake of this.released.splice(0)) wake();
-          });
+          await releaseHold();
         }
       })();
     try {
@@ -218,24 +266,33 @@ export class Pool {
       !entry.db.gate.stats().closed;
   }
 
-  private async drop(key: string, entry: Entry): Promise<void> {
+  private drop(key: string, entry: Entry): Promise<void> {
     this.entries.delete(key);
-    try {
-      await entry.db.close();
-    } catch (error) {
+    const task = this.startWork(key, async () => {
+      try {
+        await entry.db.close();
+      } catch (error) {
+        // A failed close does not prove native lifetime ended. Keep its path
+        // fenced against reopen/unlink, including when eviction started it.
+        this.closeFailures.set(key, error);
+        throw error;
+      }
+    });
+    void task.catch((error) => {
       this.errors.push(
         error instanceof Error ? error : new Error(String(error)),
       );
-    }
+    });
+    return task;
   }
 
   private idleSweep(): void {
-    void this.locked(async () => {
+    void this.locked(() => {
       if (this.closed) return;
       const cutoff = Date.now() - this.options.idleseconds * 1000;
       for (const [key, entry] of this.entries) {
         if (entry.lastUsed < cutoff && this.evictable(entry)) {
-          await this.drop(key, entry);
+          this.drop(key, entry);
         }
       }
     }).catch((error) =>
@@ -245,10 +302,12 @@ export class Pool {
     );
   }
 
-  private async evictToLimit(): Promise<void> {
+  private evictToLimit(): void {
     for (const [key, entry] of this.entries) {
       if (this.entries.size <= this.options.maxopenfiles) return;
-      if (this.evictable(entry)) await this.drop(key, entry);
+      if (this.evictable(entry) && !this.fileWork.has(key)) {
+        this.drop(key, entry);
+      }
     }
   }
 
@@ -256,11 +315,19 @@ export class Pool {
   // discovery): every directory's file is opened, its id row read, then
   // released. Files already pooled stay pooled (the open dedups by path).
   async list(kind: FileKind): Promise<string[]> {
-    return await this.locked(() => this.listLocked(kind));
+    if (this.closed) throw new Error('open-file pool is closed');
+    this.listings++;
+    try {
+      return await this.listFiles(kind);
+    } finally {
+      await this.locked(() => {
+        this.listings--;
+        this.notify();
+      });
+    }
   }
 
-  private async listLocked(kind: FileKind): Promise<string[]> {
-    if (this.closed) throw new Error('open-file pool is closed');
+  private async listFiles(kind: FileKind): Promise<string[]> {
     const parent = join(this.root, kind);
     const entries: Deno.DirEntry[] = [];
     try {
@@ -272,33 +339,38 @@ export class Pool {
     const ids: string[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory || entry.name.endsWith('.new')) continue;
-      const files = databaseFiles(directory(this.root, kind, entry.name));
+      const releaseHold = await this.hold(kind + ':' + entry.name, true);
       try {
-        if (!(await Deno.stat(files.database)).isFile) {
-          throw new Error(`not a database file: ${files.database}`);
+        const files = databaseFiles(directory(this.root, kind, entry.name));
+        try {
+          if (!(await Deno.stat(files.database)).isFile) {
+            throw new Error(`not a database file: ${files.database}`);
+          }
+        } catch (error) {
+          if (error instanceof Deno.errors.NotFound) continue;
+          throw error;
         }
-      } catch (error) {
-        if (error instanceof Deno.errors.NotFound) continue;
-        throw error;
-      }
-      let db: Db;
-      try {
-        db = await Db.open(
-          this.ffi,
-          files.database,
-          this.options.checkpointlogbytes,
-        );
-      } catch (error) {
-        if (error instanceof Deno.errors.NotFound) continue;
-        throw error;
-      }
-      try {
-        const rows = await db.query('SELECT value FROM id');
-        if (rows.length === 1 && typeof rows[0].value === 'string') {
-          ids.push(rows[0].value);
+        let db: Db;
+        try {
+          db = await Db.open(
+            this.ffi,
+            files.database,
+            this.options.checkpointlogbytes,
+          );
+        } catch (error) {
+          if (error instanceof Deno.errors.NotFound) continue;
+          throw error;
+        }
+        try {
+          const rows = await db.query('SELECT value FROM id');
+          if (rows.length === 1 && typeof rows[0].value === 'string') {
+            ids.push(rows[0].value);
+          }
+        } finally {
+          await db.close();
         }
       } finally {
-        await db.close();
+        await releaseHold();
       }
     }
     return ids;
@@ -311,10 +383,26 @@ export class Pool {
     id: string,
     fn: (db: Database) => Promise<T>,
   ): Promise<T> {
-    return await this.locked(() => this.initializeLocked(kind, id, fn));
+    const key = kind + ':' + await keyFor(id);
+    for (;;) {
+      const result = await this.locked(() => {
+        if (this.closed) throw new Error('open-file pool is closed');
+        if (this.removing.has(key) || this.retiring.has(key)) {
+          throw new Deno.errors.NotFound(`removed ${kind} database: ${id}`);
+        }
+        const waiting = this.fileWork.get(key);
+        if (waiting) return { wait: waiting };
+        return {
+          work: this.startWork(key, () => this.initializeFile(kind, id, fn)),
+        };
+      });
+      if (result.work) return await result.work;
+      // Another operation's failure does not determine this caller's result.
+      await result.wait?.catch(() => undefined);
+    }
   }
 
-  private async initializeLocked<T>(
+  private async initializeFile<T>(
     kind: FileKind,
     id: string,
     fn: (db: Database) => Promise<T>,
@@ -350,57 +438,90 @@ export class Pool {
     id: string,
     options: { create?: boolean; incarnation?: symbol } = {},
   ): Promise<Lease> {
-    return await this.locked(async () => {
-      if (this.closed) throw new Error('open-file pool is closed');
-      const fileKey = await keyFor(id);
-      const key = kind + ':' + fileKey;
-      const previous = this.incarnations.get(key);
-      if (
-        this.removing.has(key) || this.retiring.has(key) ||
-        (options.incarnation !== undefined &&
-          options.incarnation !== previous)
-      ) {
-        throw new Deno.errors.NotFound(`removed ${kind} database: ${id}`);
-      }
-      let entry = this.entries.get(key);
-      if (entry === undefined) {
-        entry = {
-          db: await this.open(kind, id, fileKey, options),
-          leases: 0,
-          lastUsed: Date.now(),
+    const fileKey = await keyFor(id);
+    const key = kind + ':' + fileKey;
+    for (;;) {
+      const result = await this.locked(() => {
+        if (this.closed) throw new Error('open-file pool is closed');
+        const previous = this.incarnations.get(key);
+        if (this.closeFailures.has(key)) throw this.closeFailures.get(key);
+        if (
+          this.removing.has(key) || this.retiring.has(key) ||
+          (options.incarnation !== undefined &&
+            options.incarnation !== previous)
+        ) {
+          throw new Deno.errors.NotFound(`removed ${kind} database: ${id}`);
+        }
+        const entry = this.entries.get(key);
+        if (entry) return { lease: this.lease(key, entry) };
+        const waiting = this.fileWork.get(key);
+        if (waiting) return { wait: waiting };
+        return {
+          opening: this.startWork(key, async () => {
+            const db = await this.open(kind, id, fileKey, options);
+            let accepted = false;
+            try {
+              return await this.locked(() => {
+                if (this.closed) throw new Error('open-file pool is closed');
+                if (
+                  this.removing.has(key) || this.retiring.has(key) ||
+                  this.incarnations.get(key) !== previous
+                ) {
+                  throw new Deno.errors.NotFound(
+                    `removed ${kind} database: ${id}`,
+                  );
+                }
+                const lease = this.lease(key, {
+                  db,
+                  leases: 0,
+                  lastUsed: Date.now(),
+                });
+                accepted = true;
+                return lease;
+              });
+            } finally {
+              if (!accepted) await db.close();
+            }
+          }),
         };
-      }
-      // Failed opens must not retain attacker-selected identities. Existing
-      // tokens survive eviction and every failure so held handles keep their
-      // retirement fence; publish a first token only after open succeeds.
-      const incarnation = previous ?? Symbol();
-      this.incarnations.set(key, incarnation);
-      entry.leases++;
-      entry.lastUsed = Date.now();
-      this.entries.delete(key);
-      this.entries.set(key, entry);
-      await this.evictToLimit();
-      let released = false;
-      const leased = entry;
-      return {
-        incarnation,
-        events: leased.db.gate,
-        db: operations((fn, txOptions) => {
-          if (released) throw new Error('database lease has been released');
-          return leased.db.tx(fn, txOptions);
-        }, leased.db.path),
-        release: async () => {
-          if (released) return;
-          released = true;
-          await this.locked(async () => {
-            leased.leases--;
-            leased.lastUsed = Date.now();
-            await this.evictToLimit();
-            for (const wake of this.released.splice(0)) wake();
-          });
-        },
-      };
-    });
+      });
+      if (result.lease) return result.lease;
+      if (result.opening) return await result.opening;
+      await result.wait?.catch(() => undefined);
+    }
+  }
+
+  private lease(key: string, entry: Entry): Lease {
+    // Failed opens must not retain attacker-selected identities. Existing
+    // tokens survive eviction and every failure so held handles keep their
+    // retirement fence; publish a first token only after open succeeds.
+    const incarnation = this.incarnations.get(key) ?? Symbol();
+    this.incarnations.set(key, incarnation);
+    entry.leases++;
+    entry.lastUsed = Date.now();
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    this.evictToLimit();
+    let released = false;
+    const leased = entry;
+    return {
+      incarnation,
+      events: leased.db.gate,
+      db: operations((fn, txOptions) => {
+        if (released) throw new Error('database lease has been released');
+        return leased.db.tx(fn, txOptions);
+      }, leased.db.path),
+      release: async () => {
+        if (released) return;
+        released = true;
+        await this.locked(() => {
+          leased.leases--;
+          leased.lastUsed = Date.now();
+          this.evictToLimit();
+          this.notify();
+        });
+      },
+    };
   }
 
   /** Retire this file incarnation, drain leases, close, then unlink its directory.
@@ -424,23 +545,29 @@ export class Pool {
     );
     try {
       for (;;) {
-        const waiting = await admit(() =>
-          this.locked(async () => {
-            const entry = this.entries.get(key);
-            if (
-              (entry !== undefined && entry.leases > 0) ||
-              this.retained.has(key)
-            ) {
-              return {
-                wait: new Promise<void>((resolve) =>
-                  this.released.push(resolve)
-                ),
-              };
-            }
-            if (entry !== undefined) {
-              await entry.db.close();
-              this.entries.delete(key);
-            }
+        const waiting = await this.locked(() => {
+          if (this.closeFailures.has(key)) throw this.closeFailures.get(key);
+          const entry = this.entries.get(key);
+          if (
+            (entry !== undefined && entry.leases > 0) ||
+            this.retained.has(key) || this.fileWork.has(key)
+          ) {
+            return {
+              wait: this.changed(),
+            };
+          }
+          if (entry !== undefined) {
+            return { wait: this.drop(key, entry) };
+          }
+          this.unlinking.add(key);
+          return null;
+        });
+        if (waiting) {
+          await waiting.wait;
+          continue;
+        }
+        await admit(async () => {
+          try {
             const dir = directory(this.root, kind, fileKey);
             try {
               const info = await Deno.lstat(dir);
@@ -451,17 +578,21 @@ export class Pool {
             } catch (error) {
               if (!(error instanceof Deno.errors.NotFound)) throw error;
             }
-            this.retiring.delete(key);
-            return null;
-          })
-        );
-        if (waiting === null) return;
-        await waiting.wait;
+            await this.locked(() => this.retiring.delete(key));
+          } finally {
+            await this.locked(() => {
+              this.unlinking.delete(key);
+              this.notify();
+            });
+          }
+        });
+        return;
       }
     } finally {
       await admit(() =>
         this.locked(() => {
           this.removing.delete(key);
+          this.notify();
         })
       );
     }
@@ -527,19 +658,26 @@ export class Pool {
 
   private async finishClose(): Promise<void> {
     for (;;) {
-      const waiting = await this.locked(async () => {
+      const waiting = await this.locked(() => {
         if (
-          this.retained.size ||
+          this.retained.size || this.fileWork.size || this.removing.size ||
+          this.listings ||
           [...this.entries.values()].some((entry) => entry.leases > 0)
         ) {
           return {
-            wait: new Promise<void>((resolve) => this.released.push(resolve)),
+            wait: this.changed(),
           };
         }
         for (const [key, entry] of [...this.entries].reverse()) {
-          await this.drop(key, entry);
+          this.drop(key, entry);
         }
-        return null;
+        if (!this.fileWork.size && this.closeFailures.size) {
+          throw new AggregateError(
+            [...this.closeFailures.values()],
+            'file close failed',
+          );
+        }
+        return this.fileWork.size ? { wait: this.changed() } : null;
       });
       if (waiting === null) return;
       await waiting.wait;

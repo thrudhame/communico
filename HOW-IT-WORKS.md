@@ -1063,7 +1063,12 @@ Legacy v3 receipts remain archived when their ownership cannot be proved.
 `api/engine/store/create.ts:18-21`, `api/engine/store/create.ts:104-165`)
 
 Room/tenant handles acquire a pool lease per operation and release it in
-`finally`; idle eviction cannot close leased files. At the configured log
+`finally`; idle eviction cannot close leased files. The shared pool queue owns
+only synchronous metadata changes. Per-file reservations serialize opening,
+initialization and detached closing without holding that queue; identity listing
+retains physical incarnations while reading outside it. Shutdown drains accepted
+listings, reservations, leases and retention before native lifetime ends.
+At the configured log
 threshold (default 4,120,000 bytes), the file gate pauses admission, drains
 active transactions and checkpoints before reopening admission.
 (`api/engine/store/index.ts:88-105`, `api/engine/store/pool.ts:118-154`,
