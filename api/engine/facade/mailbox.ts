@@ -20,6 +20,7 @@ import {
   verifyRequestEvidence,
 } from '#engine/federation/request-evidence.ts';
 import { requestCanonical } from '#engine/federation/request-signature.ts';
+import { transactionReplayCanonical } from '#engine/federation/transaction-request.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { exportReplicaRoom, type ReplicaRoom } from '#engine/room/replica.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
@@ -96,10 +97,39 @@ export async function verifyIngressRequest(
     JSON.parse(new TextDecoder().decode(request.body)),
     evidence.origin,
   );
-  const inputHash = createHash('sha256').update(
-    requestCanonical(self, request, evidence.origin),
+  const canonical = requestCanonical(self, request, evidence.origin);
+  const inputHash = createHash('sha256').update(canonical).digest('hex');
+  const operationHash = createHash('sha256').update(
+    transactionReplayCanonical(canonical),
   ).digest('hex');
-  return { evidence, request, transaction, inputHash };
+  return { evidence, request, transaction, inputHash, operationHash };
+}
+
+/** Stored input_hash remains the immutable full original evidence digest.
+ * Derive the replay comparison from that authenticated evidence, so old pending
+ * and completed receipts need neither replacement nor a digest migration. Both
+ * facade admission and home reconciliation use this same comparison. */
+export async function sameIngressRequest(
+  txnId: string,
+  self: string,
+  held: Record<string, unknown>,
+  incoming: Awaited<ReturnType<typeof verifyIngressRequest>>,
+): Promise<boolean> {
+  if (held.input_hash === incoming.inputHash) return true;
+  let original: Awaited<ReturnType<typeof verifyIngressRequest>>;
+  try {
+    original = await verifyIngressRequest(
+      txnId,
+      JSON.parse(String(held.evidence_json)),
+      self,
+    );
+    if (original.inputHash !== held.input_hash) {
+      throw new Error('retained evidence digest differs');
+    }
+  } catch (cause) {
+    throw new Error('retained ingress evidence is invalid', { cause });
+  }
+  return original.operationHash === incoming.operationHash;
 }
 async function checkBinding(conn: Conn, binding: Binding) {
   const [row] = await conn.query(
@@ -144,11 +174,12 @@ export class Mailbox {
   }
 
   private async prepare(txnId: string, raw: RequestEvidence): Promise<void> {
-    const { evidence, inputHash } = await verifyIngressRequest(
+    const verified = await verifyIngressRequest(
       txnId,
       raw,
       this.options.self,
     );
+    const { evidence, inputHash } = verified;
     const grant = await this.options.pairings.active();
     const context = grant.body.transcript.body.context;
     const binding = {
@@ -162,10 +193,17 @@ export class Mailbox {
     const changed = await this.db.tx(async (conn) => {
       await checkBinding(conn, binding);
       const [held] = await conn.query(
-        'SELECT input_hash FROM facade_ingress WHERE origin=? AND txn_id=?',
+        'SELECT input_hash,evidence_json FROM facade_ingress WHERE origin=? AND txn_id=?',
         [evidence.origin, txnId],
       );
-      if (held?.input_hash === inputHash) return false;
+      if (
+        held && await sameIngressRequest(
+          txnId,
+          this.options.self,
+          held,
+          verified,
+        )
+      ) return false;
       if (
         held && (await conn.query(
           'SELECT 1 FROM facade_ingress_collisions WHERE origin=? AND txn_id=? AND input_hash=?',
