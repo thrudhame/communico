@@ -1084,6 +1084,22 @@ past/future direction, including retained expired work.
 (`main.ts:90-135`, `api/admin/index.ts:16-66`, `api/admin/index.ts:72-148`,
 `tools/admin.sh:1-12`, `api/engine/room/operator.ts:55-134`)
 
+Store startup takes an exclusive nonblocking ownership lock before sweeping or
+opening data. Its stable sibling file, `.<store-basename>.communico.lock`, is
+retained after shutdown; another owner refuses before it can modify a live
+store. Store shutdown also drains admitted snapshots before releasing ownership.
+(`api/engine/store/{index,ownership}.ts`, `native/turso-ffi/src/lib.rs`)
+
+The internal store snapshot primitive pauses common storage admission, drains
+transactions and lifecycle changes, then exports every final server/tenant/room
+file with store-owned autocommit VACUUM connections. Retired but not yet unlinked
+files remain part of that crash-consistent cut. The pause is measured, not
+deadline-limited. Quote-free directory-fd staging keeps legal operator paths
+out of SQL. After admission resumes, publication fsyncs and uses no-replace
+rename, staging a private copy first across filesystems. This primitive exports
+database files, not local media or deployment configuration by itself.
+(`api/engine/store/{admission,db,index,pool,files}.ts`)
+
 Configuration layers shipped TOML, an optional overlay and environment leaves;
 unknown nodes and wrong types are errors. Signals stop admission, drain all
 listeners within the configured grace and close storage last. Unhandled

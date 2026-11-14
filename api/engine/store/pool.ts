@@ -116,6 +116,50 @@ export class Pool {
     return this.entries.size;
   }
 
+  // Only the Store's exclusive snapshot path calls this physical capability.
+  // A normal logical Database lease never exposes nontransactional SQL.
+  async vacuumInto(
+    kind: FileKind,
+    id: string,
+    destination: string,
+  ): Promise<void> {
+    await this.snapshotFile(kind, id, (db) => db.vacuumInto(destination));
+  }
+
+  prepareSnapshot(kind: FileKind, id: string): Promise<void> {
+    return this.snapshotFile(
+      kind,
+      id,
+      (db) => ensureSchema(db, this.providers[kind]),
+    );
+  }
+
+  // Exclusive Store admission fences creation/removal. Capture retired-but-not-
+  // unlinked files too: their durable removal intent belongs to the same cut.
+  private snapshotFile<T>(
+    kind: FileKind,
+    id: string,
+    fn: (db: Db) => Promise<T>,
+  ): Promise<T> {
+    return this.locked(async () => {
+      if (this.closed) throw new Error('open-file pool is closed');
+      const fileKey = await keyFor(id);
+      const path = databaseFiles(directory(this.root, kind, fileKey)).database;
+      if (!(await Deno.lstat(path)).isFile) {
+        throw new Error('backup source must be a regular database file');
+      }
+      const entry = this.entries.get(kind + ':' + fileKey);
+      const db = entry?.db ??
+        await Db.open(this.ffi, path, this.options.checkpointlogbytes);
+      try {
+        await checkId(db, id);
+        return await fn(db);
+      } finally {
+        if (entry === undefined) await db.close();
+      }
+    });
+  }
+
   private evictable(entry: Entry): boolean {
     return entry.leases === 0 && !entry.db.inUse &&
       !entry.db.gate.stats().closed;

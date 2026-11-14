@@ -3,6 +3,8 @@
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use turso::{Connection, Database, Value};
@@ -103,6 +105,7 @@ struct Handles {
     paths: HashMap<PathBuf, u32>,
     opening: HashMap<PathBuf, Arc<Opening>>,
     connections: HashMap<u32, (u32, SharedConnection)>,
+    locks: HashMap<u32, std::fs::File>,
 }
 
 impl Handles {
@@ -492,6 +495,108 @@ pub unsafe extern "C" fn ffi_exec(handle: u32, sql: *const c_char) -> *mut c_cha
     })
 }
 
+// The pin does not decode SQL-escaped path literals. Keep every SQL path
+// controlled, even when the real store/staging ancestors contain quote marks.
+#[no_mangle]
+pub unsafe extern "C" fn ffi_vacuum_into(handle: u32, staging: *const c_char) -> *mut c_char {
+    reply(|| {
+        let staging = PathBuf::from(text(staging)?);
+        if !std::fs::symlink_metadata(&staging)
+            .map_err(|error| Failure::binding(error.to_string()))?
+            .is_dir()
+        {
+            return Err(Failure::binding("backup staging must be a real directory"));
+        }
+        let directory =
+            std::fs::File::open(&staging).map_err(|error| Failure::binding(error.to_string()))?;
+        let sql = format!(
+            "VACUUM INTO '/proc/self/fd/{}/data.db'",
+            directory.as_raw_fd()
+        );
+        let connection = connection(handle)?;
+        run(async move {
+            let connection = connection.lock().await;
+            if !connection.is_autocommit()? {
+                return Err(Failure::binding("backup snapshot requires autocommit"));
+            }
+            connection.execute_batch(sql).await?;
+            drop(directory);
+            Ok(Json::Null)
+        })
+    })
+}
+
+// Atomic no-replace publication; false means the caller must stage a copy on
+// the destination filesystem. Never emulate no-replace with stat + rename.
+#[no_mangle]
+pub unsafe extern "C" fn ffi_rename_noreplace(
+    source: *const c_char,
+    destination: *const c_char,
+) -> *mut c_char {
+    unsafe extern "C" {
+        fn renameat2(
+            olddirfd: i32,
+            oldpath: *const c_char,
+            newdirfd: i32,
+            newpath: *const c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    reply(|| {
+        let source =
+            CString::new(text(source)?).map_err(|error| Failure::binding(error.to_string()))?;
+        let destination = CString::new(text(destination)?)
+            .map_err(|error| Failure::binding(error.to_string()))?;
+        if renameat2(-100, source.as_ptr(), -100, destination.as_ptr(), 1) == 0 {
+            return Ok(json!(true));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(18) {
+            return Ok(json!(false));
+        }
+        Err(Failure::binding(format!(
+            "no-replace publication failed: {error}"
+        )))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ffi_lock_store(path: *const c_char) -> *mut c_char {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    reply(|| {
+        let path = text(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(0o400000)
+            .open(path)
+            .map_err(|error| Failure::binding(format!("store ownership lock: {error}")))?;
+        if !file
+            .metadata()
+            .map_err(|error| Failure::binding(error.to_string()))?
+            .is_file()
+        {
+            return Err(Failure::binding(
+                "store ownership lock must be a regular file",
+            ));
+        }
+        if flock(file.as_raw_fd(), 2 | 4) != 0 {
+            return Err(Failure::binding(format!(
+                "store is already owned: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut handles = handles()?;
+        let id = handles.id()?;
+        handles.locks.insert(id, file);
+        Ok(json!(id))
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ffi_execute(
     handle: u32,
@@ -587,6 +692,12 @@ pub extern "C" fn ffi_close(handle: u32, kind: u32) -> *mut c_char {
     reply(|| {
         let mut handles = handles()?;
         match kind {
+            2 => {
+                handles
+                    .locks
+                    .remove(&handle)
+                    .ok_or_else(|| Failure::binding("invalid store lock"))?;
+            }
             1 => {
                 handles
                     .connections
