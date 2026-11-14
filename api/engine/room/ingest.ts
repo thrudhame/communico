@@ -292,7 +292,18 @@ export async function afterLocalCommit(
   eventId: string,
   self: string,
 ): Promise<void> {
-  await resumeWaits(room, { self }, [eventId]);
+  await afterRoomCommit(room, self, [eventId]);
+}
+
+// Every arrival-capable composition completes the same durable dependency
+// queue before projection, including history and snapshot evidence. Call only
+// after releasing the room lock; recovery acquires it for each eligible job.
+export async function afterRoomCommit(
+  room: Room,
+  self: string,
+  arrived: readonly string[] = [],
+): Promise<void> {
+  await resumeWaits(room, { self }, arrived);
   await projectAfterWrite(room.store, room.id);
 }
 

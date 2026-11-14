@@ -121,7 +121,11 @@ ungrounded lifetime drops them instead. Delayed redaction targets use waits
 too, without rewriting the stored target PDU.
 The room transaction marks indexed dependency waits ready with each stored
 arrival or grounding transition. Ready rows form one durable retry queue:
-local/remote arrivals, idempotent replay and app startup drain it. Newly
+local/remote arrivals, historical imports, snapshot/rejoin/replica evidence,
+idempotent replay and app startup drain it. Arrival-capable room compositions
+share one post-commit completion boundary, outside the room lock and before
+projection. History receives the local identity through its injected deps;
+recovering a delayed effect does not turn its historical target into live news. Newly
 grounded children mark their dependents before removing their own waits, so
 a later failure cannot lose the retry obligation. Recovery errors propagate;
 unrelated unresolved history is never rescanned on a foreground arrival.

@@ -196,6 +196,7 @@ Deno.test('stays: join → leave closes → rejoin opens a new stay; the old sta
       room,
       { from: join2Pdu.prev_events ?? [], limit: 10, via: fr.server.name },
       {
+        self: 'test',
         keys: fakeKeyResolver(fr.server, await testRemoteServer()),
         fetcher: fetchGap.fetcher,
       },
@@ -249,6 +250,7 @@ Deno.test('stays: join → leave closes → rejoin opens a new stay; the old sta
         stay: ids.stayId,
       },
       {
+        self: 'test',
         keys: fakeKeyResolver(fr.server, await testRemoteServer()),
         fetcher: fetchGap.fetcher,
       },
@@ -345,6 +347,7 @@ Deno.test('stays: a read of an event uses its own state refs, never the current 
       room,
       { from: joinPdu.prev_events ?? [], limit: 10, via: fr.server.name },
       {
+        self: 'test',
         keys: fakeKeyResolver(fr.server, await testRemoteServer()),
         fetcher: fetchGap.fetcher,
       },

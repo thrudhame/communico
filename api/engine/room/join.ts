@@ -29,11 +29,8 @@ import {
   type KeyResolver,
   SendJoinRefused,
 } from '#engine/room/deps.ts';
-import {
-  admitLocalJoin,
-  projectAfterWrite,
-  registerCreatedRoom,
-} from '#engine/room/hooks.ts';
+import { admitLocalJoin, registerCreatedRoom } from '#engine/room/hooks.ts';
+import { afterRoomCommit } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { AclDenied, assertServerAllowed } from '#engine/room/acl.ts';
@@ -399,7 +396,7 @@ async function joinVia(
           previousStay: prevStay?.id ?? null,
         });
       }));
-    await projectAfterWrite(store, args.roomId);
+    await afterRoomCommit(room, deps.self);
     return { roomId: args.roomId, eventId };
   } finally {
     if (attempt !== null) {

@@ -782,6 +782,7 @@ suite.test('backfilled history never appears as new in HTTP sync', async () => {
     limit: 20,
     via: fr.server.name,
   }, {
+    self: 'localhost',
     keys,
     fetcher: transport.fetcher,
   });

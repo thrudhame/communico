@@ -29,9 +29,9 @@ import {
   ungroundedPrevs,
 } from '#engine/room/build.ts';
 import { fetchOrNull, type RemoteDeps } from '#engine/room/deps.ts';
-import { admitLocalJoin, projectAfterWrite } from '#engine/room/hooks.ts';
+import { admitLocalJoin } from '#engine/room/hooks.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
-import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
+import { afterRoomCommit, ingestInTx } from '#engine/room/ingest.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { aclAllows, assertAcl } from '#engine/room/acl.ts';
@@ -468,14 +468,13 @@ export async function replayRemoteBatch(
     )
   );
   if (prior) {
-    await resumeWaits(
+    await afterRoomCommit(
       room,
-      { self },
+      self,
       prior.flatMap((outcome) =>
         outcome.eventId === null ? [] : [outcome.eventId]
       ),
     );
-    await projectAfterWrite(room.store, room.id);
   }
   return prior;
 }
@@ -827,13 +826,12 @@ export async function ingestRemote(
 
   // A later arrival re-runs what waited for it (R10 — each recheck is a
   // locked ingest of its own, after this lock released)
-  await resumeWaits(room, { self: deps.self }, [
+  await afterRoomCommit(room, deps.self, [
     ...identified.map((item) => item.eventId),
     ...acc.evidence.keys(),
     ...acc.corrupted.keys(),
     ...committed.grounded,
   ]);
-  await projectAfterWrite(room.store, room.id);
 
   return committed.outcomes;
 }

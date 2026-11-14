@@ -354,7 +354,7 @@ test('G6 HTTP: grounded history visibility and context use the event state, neve
     from: joinPdu.prev_events,
     limit: 100,
     via: fr.server.name,
-  }, { keys, fetcher });
+  }, { self: a.home_server, keys, fetcher });
   assertEquals(fill.outcome, 'complete');
   const position = await room.tx((tx) =>
     tx.segments.positionOf(String(secret.event_id))
@@ -436,7 +436,7 @@ test('shared HTTP history remains readable after departure, including imported u
       from: joinPdu.prev_events,
       limit: 100,
       via: fr.server.name,
-    }, { keys, fetcher })).outcome,
+    }, { self: a.home_server, keys, fetcher })).outcome,
     'complete',
   );
   const index = await theApp().server.query(

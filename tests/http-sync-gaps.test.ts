@@ -432,7 +432,7 @@ suite.test('remote imported gap limits sync and its cursor resumes through missi
     limit: 1,
     via: fr.server.name,
     isolated: true,
-  }, { keys, fetcher: recovery.fetcher });
+  }, { self: 'localhost', keys, fetcher: recovery.fetcher });
   const repaired = await messages(window);
   assertEquals(repaired.chunk.map((e) => e.event_id), [hidden.event_id]);
 });
@@ -475,7 +475,7 @@ suite.test('isolated backfill does not allocate empty anchors for evidence or ov
       limit: 1,
       via: fr.server.name,
       isolated: true,
-    }, { keys, fetcher });
+    }, { self: 'localhost', keys, fetcher });
     assertEquals(result.outcome, 'open');
     assertEquals(result.segment, null);
     assertEquals(await room.tx((tx) => tx.segments.list()), initial);
@@ -485,7 +485,11 @@ suite.test('isolated backfill does not allocate empty anchors for evidence or ov
     limit: 1,
     via: fr.server.name,
     isolated: true,
-  }, { keys, fetcher: fakeFetcher({ backfill: [live] }).fetcher });
+  }, {
+    self: 'localhost',
+    keys,
+    fetcher: fakeFetcher({ backfill: [live] }).fetcher,
+  });
   assertEquals(overlap, { outcome: 'complete', segment: null, positioned: [] });
   assertEquals(await room.tx((tx) => tx.segments.list()), initial);
 });

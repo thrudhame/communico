@@ -8,9 +8,9 @@ import type { Store } from '#engine/store/index.ts';
 import { assertServerAllowed } from './acl.ts';
 import { roomCreateId } from './build.ts';
 import type { KeyResolver } from './deps.ts';
-import { projectAfterWrite, registerCreatedRoom } from './hooks.ts';
+import { registerCreatedRoom } from './hooks.ts';
 import { initializeRoom, openRoom, type Room } from './index.ts';
-import { ingestInTx } from './ingest.ts';
+import { afterRoomCommit, ingestInTx } from './ingest.ts';
 import { withRoomLock } from './lock.ts';
 import {
   authorizeSnapshotEvent,
@@ -180,7 +180,7 @@ export async function importReplicaBoundary(
         previousStay: previous?.id ?? null,
       });
     }));
-  await projectAfterWrite(store, input.roomId);
+  await afterRoomCommit(room, input.self);
   return { roomId: input.roomId, eventId: admitted.eventId };
 }
 
@@ -269,6 +269,6 @@ export async function importReplicaGenesis(store: Store, input: {
     });
   });
   await registerCreatedRoom(store, input.roomId);
-  await projectAfterWrite(store, input.roomId);
+  await afterRoomCommit(await openRoom(store, input.roomId), input.self);
   return { roomId: input.roomId, eventId: admitted.eventId };
 }
