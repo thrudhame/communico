@@ -227,6 +227,7 @@ export async function importReplicaRoom(
             self: input.self,
             oversized: verified.oversized,
             ungroundedMs: 0,
+            promoteEvidence: true,
             boundary: boundary?.snapshot,
           },
         });
