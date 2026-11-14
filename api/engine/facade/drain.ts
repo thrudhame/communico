@@ -163,7 +163,18 @@ export class HomeIngress {
                   400,
                 );
               }
-              return { roomId, result };
+              // The facade has no F1 invite authority. Its saved negative is
+              // still truthful, while home must apply its own retained invite
+              // transition through the same absent-room owner as direct S2S.
+              return {
+                roomId,
+                result: await absentTransactionRoom(
+                  inputs,
+                  transaction.rescind
+                    ? (pdu) => transaction.rescind!(roomId, pdu)
+                    : undefined,
+                ),
+              };
             }
             const [scope] = await this.db.query(
               'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',

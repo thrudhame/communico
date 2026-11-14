@@ -26,6 +26,11 @@ import { registerToDevice } from '#engine/federation/todevice.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { testRemoteServer } from './fixtures/signer.ts';
 import { receiveTransactionRoom } from '#engine/federation/transactions.ts';
+import {
+  acceptRescind,
+  inviteFor,
+  receiveInvite,
+} from '#engine/federation/invites.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { genesis } from './fixtures/genesis.ts';
 import { authAt } from './fixtures/auth.ts';
@@ -34,6 +39,7 @@ import {
   fakeKeyResolver,
   makeRemoteServer,
   remoteEvent,
+  wireOf,
 } from './fixtures/remote.ts';
 
 installServerHooks();
@@ -489,6 +495,147 @@ Deno.test('mailbox confirmed absence completes independently of accepted rooms a
     assertEquals(
       (await journal.heads(f.node.node, 'in', record)).applied.sequence,
       1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('absent-room home drain preserves home-only invite rescinds without facade invite authority', async () => {
+  const f = await fixture();
+  try {
+    const target = '@target:' + f.self;
+    await registerUser(f.tenant, {
+      localpart: 'target',
+      password: 'pw',
+      deviceId: 'PHONE',
+    });
+    const db = await f.home().server();
+    const invites = {
+      store: f.home(),
+      server: db,
+      signer: f.tenant.signer(),
+      keys: fakeKeyResolver(f.remote),
+      self: f.self,
+      wake() {},
+    };
+    const withdrawals = [];
+    for (const membership of ['leave', 'ban', 'third-party']) {
+      const roomId = `!home-only-${membership}:remote.test`;
+      f.absent(roomId);
+      const invite = await remoteEvent(roomId, f.remote, '11', {
+        type: 'm.room.member',
+        sender: '@remote:remote.test',
+        state_key: target,
+        content: { membership: 'invite' },
+        prev_events: [],
+        auth_events: [],
+      });
+      await receiveInvite(
+        roomId,
+        String(invite.event_id),
+        {
+          room_version: '11',
+          event: wireOf(invite),
+          invite_room_state: [],
+        },
+        f.remote.name,
+        invites,
+      );
+      const pdu = await remoteEvent(roomId, f.remote, '11', {
+        type: 'm.room.member',
+        sender: membership === 'third-party'
+          ? '@third-party:remote.test'
+          : '@remote:remote.test',
+        state_key: target,
+        content: { membership: membership === 'ban' ? 'ban' : 'leave' },
+        prev_events: [String(invite.event_id)],
+        auth_events: [],
+      });
+      withdrawals.push({ roomId, membership, pdu });
+    }
+    const box = await f.mailbox();
+    await box.stage(
+      'home-only-invites',
+      await f.evidence(
+        'home-only-invites',
+        withdrawals.map(({ pdu }) => pdu),
+      ),
+    );
+    const response = await box.receive(f.remote.name, 'home-only-invites');
+    assertEquals(response, {
+      status: 200,
+      body: {
+        pdus: Object.fromEntries(withdrawals.map(({ pdu }) => [
+          String(pdu.event_id),
+          { error: 'unknown room' },
+        ])),
+      },
+    });
+    const [out] = await (await f.edge().server()).query(
+      "SELECT record_json FROM facade_records WHERE stream='ingress:remote.test'",
+    );
+    const record = JSON.parse(String(out.record_json));
+    let delivered = 0;
+    const journal = new Journal(db, LINK_CAPABILITIES);
+    const drain = new HomeIngress(db, {
+      peer: f.node.node,
+      pairing: f.bundle.id,
+      pairings: await f.homePairings(),
+      transaction: {
+        self: f.self,
+        store: f.home(),
+        keys: fakeKeyResolver(f.remote),
+        fetcher: fakeFetcher({}).fetcher,
+        rescind: (roomId, pdu) => acceptRescind(roomId, pdu, invites),
+        edus: {
+          dispatch: () => {
+            delivered++;
+            return Promise.resolve();
+          },
+        },
+      },
+    });
+    await journal.receive(f.node.node, [record]);
+    assertEquals(await drain.apply(journal, record), true);
+    const revisions = [];
+    for (const { roomId, membership, pdu } of withdrawals) {
+      const held = await inviteFor(roomId, target, invites);
+      assertEquals(
+        held?.status,
+        membership === 'third-party' ? 'pending' : 'rejected',
+      );
+      if (membership !== 'third-party') {
+        assertEquals(JSON.parse(held!.eventJson).event_id, pdu.event_id);
+      }
+      revisions.push(held?.revision);
+      await assertRejects(
+        () => openRoom(f.home(), roomId),
+        Deno.errors.NotFound,
+      );
+      const [child] = await db.query(
+        "SELECT result_json FROM facade_ingress_children WHERE kind='room' AND child_key=?",
+        [roomId],
+      );
+      assertEquals(JSON.parse(String(child.result_json)).result, {
+        [String(pdu.event_id)]: membership === 'third-party'
+          ? { error: 'unknown room' }
+          : {},
+      });
+    }
+    assertEquals(await drain.apply(journal, record), false);
+    assertEquals(delivered, 1);
+    assertEquals(
+      await box.receive(f.remote.name, 'home-only-invites'),
+      response,
+    );
+    assertEquals(
+      await Promise.all(
+        withdrawals.map(async ({ roomId }) =>
+          (await inviteFor(roomId, target, invites))?.revision
+        ),
+      ),
+      revisions,
     );
   } finally {
     await f.close();

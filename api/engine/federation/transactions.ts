@@ -67,12 +67,19 @@ async function identifyRoomInputs(pdus: Pdu[], version: string) {
   return identified;
 }
 
-/** A confirmed absent room has the ordinary per-PDU negative result, not a
- * replica miss or permission to create/ingest an unsolicited room. */
-export async function absentTransactionRoom(pdus: Pdu[]): Promise<PduResults> {
-  return Object.fromEntries((await identifyRoomInputs(pdus, '11')).map(
-    ({ eventId }) => [eventId, { error: 'unknown room' }],
-  ));
+/** No room/DAG authority is implied by an out-of-band invite. The local invite
+ * owner may still process its ordinary rescind without creating a room. */
+export async function absentTransactionRoom(
+  pdus: Pdu[],
+  rescind?: (pdu: Pdu) => Promise<boolean>,
+): Promise<PduResults> {
+  const results: PduResults = {};
+  for (const { pdu, eventId } of await identifyRoomInputs(pdus, '11')) {
+    results[eventId] = rescind && await rescind(pdu)
+      ? {}
+      : { error: 'unknown room' };
+  }
+  return results;
 }
 
 /** Shared envelope admission for standalone processing and durable ingress. */
@@ -193,23 +200,20 @@ async function receiveRoom(
     version = read.version == null ? '11' : read.version;
     participating = read.participating;
   }
+  if (room === null) {
+    Object.assign(
+      results,
+      await absentTransactionRoom(
+        pdus,
+        deps.rescind ? (pdu) => deps.rescind!(roomId, pdu) : undefined,
+      ),
+    );
+    return;
+  }
   // the result key is the event's COMPUTED id (uncomputable → no entry —
   // Complement counts them, federation_room_get_missing_events_test.go:292-294)
   // Restore derived event IDs on the wire form before shared remote admission.
   const identified = await identifyRoomInputs(pdus, version);
-  if (room === null) {
-    // no room file — except an m.room.member leave/ban for a user with
-    // an out-of-band invite (§3.8 step 7's rescind): a remote rejection,
-    // not an error
-    for (const { pdu, eventId } of identified) {
-      if (deps.rescind !== undefined && (await deps.rescind(roomId, pdu))) {
-        results[eventId] = {};
-      } else {
-        results[eventId] = { error: 'unknown room' };
-      }
-    }
-    return;
-  }
   if (operationId !== undefined) {
     const prior = await replayRemoteBatch(
       room,
