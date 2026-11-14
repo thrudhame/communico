@@ -349,6 +349,8 @@ wellknownmaxage = 86400
 # Outbound: TCP connect budget and whole-request budget, ms. Discovery
 # hops (.well-known, SRV, key fetch) must fail fast — Complement's
 # two-server tests resolve `hs1` with no .well-known and no SRV.
+# The whole-request budget also covers finite facade-link exchanges and notice
+# handshakes, not an admitted long-lived SSE/WebSocket notice connection.
 # COMMUNICO_FEDERATION_CONNECTMS / COMMUNICO_FEDERATION_TIMEOUTMS
 connectms = 5000
 timeoutms = 30000

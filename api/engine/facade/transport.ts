@@ -9,6 +9,7 @@ import { type Duplex, Readable } from 'node:stream';
 import { checkServerIdentity, type TLSSocket } from 'node:tls';
 // @deno-types="npm:@types/ws@8.18.2"
 import WebSocket, { WebSocketServer } from 'ws';
+import { config } from '#engine/config.ts';
 import { certificatePin, readProtectedFile } from './identity.ts';
 import { LinkError } from './protocol.ts';
 import { lines } from './notices.ts';
@@ -44,7 +45,7 @@ function headersOf(message: IncomingMessage): Headers {
   return headers;
 }
 
-async function writeResponse(
+export async function writeResponse(
   target: ServerResponse,
   response: Response,
   signal: AbortSignal,
@@ -61,7 +62,7 @@ async function writeResponse(
       for (;;) {
         const { done, value } = await reader.read();
         if (done || signal.aborted) break;
-        if (!target.write(value)) await once(target, 'drain');
+        if (!target.write(value)) await once(target, 'drain', { signal });
       }
     } finally {
       signal.removeEventListener('abort', abort);
@@ -346,6 +347,7 @@ export class LinkClient {
       const ws = new WebSocket(url, {
         ...this.tlsOptions(),
         headers: Object.fromEntries(new Headers(init.headers)),
+        handshakeTimeout: config().federation.timeoutms,
         perMessageDeflate: false,
         maxPayload: 0,
       });
@@ -422,13 +424,48 @@ export class LinkClient {
       : undefined;
     input.signal.throwIfAborted();
     return await new Promise<Response>((resolve, reject) => {
+      // Reuse the operator's outbound federation deadline for finite link
+      // exchanges. Clearing an admitted notice deadline never clears shutdown.
+      const deadline = new AbortController();
+      const signal = AbortSignal.any([input.signal, deadline.signal]);
+      const timer = setTimeout(() =>
+        deadline.abort(
+          new LinkError(
+            'LINK_UNAVAILABLE',
+            'link exchange deadline exceeded',
+            503,
+          ),
+        ), config().federation.timeoutms);
+      let response: IncomingMessage | undefined;
+      const stop = () => {
+        const error = signal.reason instanceof Error
+          ? signal.reason
+          : new Error('link exchange aborted');
+        req.destroy(error);
+        response?.destroy(error);
+      };
+      const finished = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', stop);
+      };
       const req = httpsRequest(url, {
         ...this.tlsOptions(),
         method: input.method,
         headers: Object.fromEntries(input.headers),
-        signal: input.signal,
+        signal,
       }, (res) => {
+        response = res;
+        res.once('close', finished);
         const status = res.statusCode ?? 500;
+        if (
+          input.method === 'GET' && url.pathname === LINK_PREFIX + 'notices' &&
+          input.headers.get('accept') === 'text/event-stream' &&
+          status === 200 &&
+          headersOf(res).get('content-type')?.split(';')[0].trim() ===
+            'text/event-stream'
+        ) {
+          clearTimeout(timer);
+        }
         const empty = input.method === 'HEAD' || status === 204 ||
           status === 205 || status === 304;
         if (empty) res.resume();
@@ -442,7 +479,12 @@ export class LinkClient {
           ),
         );
       });
-      req.once('error', reject);
+      signal.addEventListener('abort', stop, { once: true });
+      req.once('error', (error) => {
+        if (!response) finished();
+        reject(error);
+      });
+      if (signal.aborted) stop();
       req.end(body);
     });
   }

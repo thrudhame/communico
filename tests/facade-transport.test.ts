@@ -1,12 +1,222 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { request } from 'node:https';
+import type { ServerResponse } from 'node:http';
+import { EventEmitter } from 'node:events';
+import { setConfigForTests } from '#engine/config.ts';
 import { LinkError } from '#engine/facade/protocol.ts';
 import {
   LinkClient,
   loadLinkTls,
   startLinkTransport,
+  writeResponse,
 } from '#engine/facade/transport.ts';
 import { facadeTls } from './support/facade-tls.ts';
+
+async function deadline<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('test progress deadline')),
+          1500,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+Deno.test('finite link deadlines abort the request before headers and during body reads', async (t) => {
+  const f = await facadeTls();
+  setConfigForTests({ federation: { timeoutms: 50 } });
+  try {
+    for (const phase of ['headers', 'body']) {
+      await t.step(phase, async () => {
+        const release = Promise.withResolvers<void>();
+        const entered = Promise.withResolvers<AbortSignal>();
+        const aborted = Promise.withResolvers<void>();
+        const stop = new AbortController();
+        const server = await startLinkTransport({
+          hostname: '127.0.0.1',
+          port: 0,
+          tls: f.facade,
+          authorize: () => Promise.resolve(true),
+          handle: async (req) => {
+            req.signal.addEventListener('abort', () => aborted.resolve(), {
+              once: true,
+            });
+            entered.resolve(req.signal);
+            if (phase === 'headers') await release.promise;
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.enqueue(
+                    new TextEncoder().encode('{"unfinished":'),
+                  );
+                },
+              }),
+            );
+          },
+        });
+        const client = new LinkClient(f.home, {
+          url: server.url,
+          pin: f.facadePin,
+        });
+        const work = (async () => {
+          const response = await client.fetch('/_communico/link/v1/hello', {
+            signal: stop.signal,
+          });
+          return await response.text();
+        })();
+        void work.catch(() => {});
+        try {
+          const signal = await deadline(entered.promise);
+          await deadline(assertRejects(() => work));
+          await deadline(aborted.promise);
+          assert(
+            signal.aborted,
+            'the transport must actually close the stalled exchange',
+          );
+        } finally {
+          stop.abort();
+          release.resolve();
+          await work.catch(() => {});
+          await server.close();
+        }
+      });
+    }
+  } finally {
+    setConfigForTests({});
+    await f.close();
+  }
+});
+
+Deno.test('admitted SSE outlives a finite exchange deadline and still obeys shutdown abort', async () => {
+  const f = await facadeTls();
+  setConfigForTests({ federation: { timeoutms: 50 } });
+  const stop = new AbortController();
+  let signal: AbortSignal | undefined;
+  const server = await startLinkTransport({
+    hostname: '127.0.0.1',
+    port: 0,
+    tls: f.facade,
+    authorize: () => Promise.resolve(true),
+    handle: (req) => {
+      signal = req.signal;
+      return Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('data: {}\n\n'));
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        ),
+      );
+    },
+  });
+  try {
+    const client = new LinkClient(f.home, {
+      url: server.url,
+      pin: f.facadePin,
+    });
+    const response = await client.fetch('/_communico/link/v1/notices', {
+      headers: { accept: 'text/event-stream' },
+      signal: stop.signal,
+    });
+    const reader = response.body!.getReader();
+    assertEquals(
+      new TextDecoder().decode((await reader.read()).value),
+      'data: {}\n\n',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assertEquals(signal?.aborted, false);
+    const reading = reader.read();
+    stop.abort();
+    await deadline(assertRejects(() => reading));
+    reader.releaseLock();
+  } finally {
+    stop.abort();
+    await server.close();
+    setConfigForTests({});
+    await f.close();
+  }
+});
+
+Deno.test('link shutdown cancels a response blocked on socket backpressure', async () => {
+  const f = await facadeTls();
+  const received = Promise.withResolvers<void>();
+  const cancelled = Promise.withResolvers<void>();
+  const server = await startLinkTransport({
+    hostname: '127.0.0.1',
+    port: 0,
+    tls: f.facade,
+    authorize: () => Promise.resolve(true),
+    handle: () =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new Uint8Array(16 * 1024 * 1024));
+            },
+            cancel() {
+              cancelled.resolve();
+            },
+          }),
+        ),
+      ),
+  });
+  const req = request(server.url + '/_communico/link/v1/records', {
+    ...f.home,
+    agent: false,
+  }, (res) => {
+    res.pause();
+    received.resolve();
+  });
+  req.on('error', () => {});
+  req.end();
+  try {
+    await deadline(received.promise);
+    await deadline(server.close());
+    await deadline(cancelled.promise);
+  } finally {
+    req.destroy();
+    // On the failing implementation its drain promise never settles, even
+    // after disconnect. Do not make test cleanup wait on that same defect.
+    void server.close();
+    await f.close();
+  }
+});
+
+Deno.test('an aborted response cancels the exact drain wait before the socket drains', async () => {
+  const entered = Promise.withResolvers<void>();
+  const abort = new AbortController();
+  const target = Object.assign(new EventEmitter(), {
+    writeHead() {},
+    write() {
+      entered.resolve();
+      return false;
+    },
+    end() {},
+  });
+  const work = writeResponse(
+    target as unknown as ServerResponse,
+    new Response('pending'),
+    abort.signal,
+  );
+  try {
+    await entered.promise;
+    abort.abort();
+    await deadline(assertRejects(() => work));
+    assertEquals(target.listenerCount('drain'), 0);
+  } finally {
+    target.emit('drain');
+    await work.catch(() => {});
+  }
+});
 
 Deno.test('production mTLS authenticates both pins before application admission', async (t) => {
   const f = await facadeTls();
