@@ -22,7 +22,12 @@ import {
   savedPrejoinDisplay,
 } from '#engine/federation/prejoin.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
-import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
+import {
+  deviceListsBetween,
+  deviceListSnapshot,
+  deviceStreamMax,
+} from '#engine/server/e2ee.ts';
+import { recoveryState } from '#engine/server/recovery.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
@@ -166,6 +171,7 @@ async function roomTimeline(
           now.mSeq,
           now.kSeq,
           now.nSeq,
+          now.epoch,
         )
         : formatCursor(paginationCursor),
     },
@@ -296,6 +302,11 @@ async function waitForRelevant(
 
 export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const app = theApp();
+  const epoch = (await recoveryState(app.server))?.epoch;
+  const recoveryReset = i.since !== null && i.since.epoch !== epoch;
+  // Resolve the entire delivery baseline BEFORE old inbox proofs or wait logic.
+  // Equal numeric counters from another restore era never reestablish authority.
+  if (recoveryReset) i = { ...i, since: null, fullState: true };
   const lp = localpartOf(i.userId);
   const device: DeviceIdentity | null =
     i.deviceId === null || i.deviceGeneration === undefined
@@ -377,6 +388,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     mSeq: 0,
     kSeq: 0,
     nSeq: snapshot.counters.get('notifications') ?? 0,
+    ...(epoch === undefined ? {} : { epoch }),
   };
   const delivery = device === null
     ? { events: [], token: now, pools: { counts: {}, unused: [] } }
@@ -572,7 +584,9 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       await includePresence(u);
     }
   }
-  const deviceLists = i.since === null
+  const deviceLists = recoveryReset
+    ? await deviceListSnapshot(app.server, i.userId, 'sync', now.dSeq)
+    : i.since === null
     ? { changed: [], left: [] }
     : await deviceListsBetween(
       app.server,

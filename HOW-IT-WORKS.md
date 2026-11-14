@@ -1121,6 +1121,20 @@ These internal owners are not yet the complete restore command or its recovery
 epoch/report boundary.
 (`api/engine/store/candidate.ts`, `api/engine/tenant/restore.ts`)
 
+Server schema v25 adds a persistent restore recovery identity and report marker.
+Ordinary sync tokens retain their legacy wire form until the first restore, then
+carry that identity. A different identity resets the entire sync baseline before
+inbox acknowledgment or long-polling, even after numeric streams catch up. Both
+ordinary sync and `/keys/changes` invalidate the current complete device audience
+on that boundary. Room pagination can still read the token's event cursor; it
+does not apply sync recovery semantics. A private candidate's report is written
+0600 and fsynced before its digest completes the server marker. App startup checks
+the marker, file digest and report identity before creating any app worker or
+serving; missing, incomplete or modified reports refuse startup. Full restore
+assembly, peer-device stream rebasing and job/report inventory remain unwired.
+(`api/engine/server/recovery.ts`, `api/engine/backup/report.ts`,
+`api/engine/client/{tokens,device-lists}.ts`, `api/engine/{app,syncfeed}.ts`)
+
 The internal store snapshot primitive pauses common storage admission, drains
 transactions and lifecycle changes, then exports every final server/tenant/room
 file with store-owned autocommit VACUUM connections. Retired but not yet unlinked
