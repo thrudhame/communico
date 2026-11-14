@@ -80,6 +80,7 @@ async function roomTimeline(
   now: StreamToken,
   end: number,
   summary: boolean,
+  recoveryReset: boolean,
   snapshot: {
     receipts: Record<string, unknown>[];
     members: Row[];
@@ -90,17 +91,24 @@ async function roomTimeline(
 ) {
   const app = theApp();
   const limit = i.filter.timeline.limit ?? 10;
-  const { rows: returned, events, gap, trimmed } = await syncWindow(room, {
-    userId: i.userId,
-    deviceId: i.deviceId,
-    tenant: app.tenant,
-  }, {
-    since: i.since?.eSeq ?? 0,
-    end,
-    limit,
-    filter: i.filter.timeline,
-    eventFormat: i.filter.eventFormat,
-  });
+  // A restored era cannot join a retained newer timeline, even if archived IDs
+  // overlap it. Establish the admitted end state with an empty gap boundary;
+  // prev_batch below leaves all archived history available to back-pagination.
+  // Replaying held timeline IDs instead would let clients deduplicate away their
+  // state effects and suppress a limited reset, retaining newer state forever.
+  const { rows: returned, events, gap, trimmed } = recoveryReset
+    ? { rows: [], events: [], gap: false, trimmed: false }
+    : await syncWindow(room, {
+      userId: i.userId,
+      deviceId: i.deviceId,
+      tenant: app.tenant,
+    }, {
+      since: i.since?.eSeq ?? 0,
+      end,
+      limit,
+      filter: i.filter.timeline,
+      eventFormat: i.filter.eventFormat,
+    });
   let joinGap = false;
   const since = i.since?.eSeq;
   const delivery = await StateDelivery.capture(room, i.userId, {
@@ -121,7 +129,7 @@ async function roomTimeline(
         .length > 0;
     }
   }
-  const limited = gap || trimmed || joinGap;
+  const limited = recoveryReset || gap || trimmed || joinGap;
   const start = returned[0];
   const admission = await admitState(room, {
     userId: i.userId,
@@ -462,7 +470,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     if (row.status !== 'pending') {
       if (
         i.since === null
-          ? i.filter.includeLeave
+          ? i.filter.includeLeave || recoveryReset
           : Number(row.seq) > i.since.eSeq
       ) {
         const pdu = await prejoinDeparture(inviteOf(row), {
@@ -545,7 +553,11 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       if (
         (m.forgotten || purgeable.length) && (i.since === null || i.fullState)
       ) continue;
-      if (!(i.since === null ? i.filter.includeLeave : m.seq > i.since.eSeq)) {
+      if (
+        !(i.since === null
+          ? i.filter.includeLeave || recoveryReset
+          : m.seq > i.since.eSeq)
+      ) {
         continue;
       }
     } else if (i.since !== null && !i.fullState) {
@@ -569,6 +581,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       delivery.token,
       left ? m.seq : now.eSeq,
       !left,
+      recoveryReset,
       {
         ...snapshot.rooms.get(m.roomId)!,
         accountData: roomAccountData.get(m.roomId) ?? [],

@@ -1145,8 +1145,12 @@ Server schema v28 adds a persistent restore recovery identity and report marker
 after the facade journal, pairing and runtime-identity migrations.
 Ordinary sync tokens retain their legacy wire form until the first restore, then
 carry that identity. A different identity resets the entire sync baseline before
-inbox acknowledgment or long-polling, even after numeric streams catch up. Both
-ordinary sync and `/keys/changes` invalidate the current complete device audience
+inbox acknowledgment or long-polling, even after numeric streams catch up.
+Ordinary state dialects admit the restored end state at an empty, limited timeline
+boundary, with a backward cursor retaining archived history. Replayed held event
+IDs cannot suppress that real era gap or hide restored state effects. Known
+archived departures are included without requiring an initial-sync leave filter.
+Both ordinary sync and `/keys/changes` invalidate the current complete device audience
 on that boundary. Room pagination can still read the token's event cursor; it
 does not apply sync recovery semantics. A private candidate's report is written
 0600 and fsynced before its digest completes the server marker. App startup checks

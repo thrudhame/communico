@@ -195,6 +195,11 @@ Deno.test('restore report warnings: lost revocations, cancellations, peer effect
       'revocation',
       'old credentials',
       'private crypto stores',
+      'rooms created after the cut',
+      'account-data types first written after the cut',
+      'device/token revocation',
+      'next login',
+      'never automatic',
       'Frozen federation',
       'COMMUNICO_TURN_SECRET',
     ]
