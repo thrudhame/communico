@@ -1,5 +1,10 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { initializeNode } from '#engine/facade/identity.ts';
+import { openJournalClient } from '#engine/facade/client.ts';
+import {
+  JournalReconciler,
+  startHomeLinkWorker,
+} from '#engine/facade/worker.ts';
 import { enrollLink, linkHandler } from '#engine/facade/link.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { NoticeHub, sseMessages } from '#engine/facade/notices.ts';
@@ -510,3 +515,231 @@ Deno.test('enrollment HTTP rejects wrong secrets and protocol skew without grant
     await f.close();
   }
 });
+
+Deno.test('typed reconciliation delivers fair pages and exact results across reopen without notices', async () => {
+  const f = await fixture();
+  const failures: unknown[] = [];
+  const make = async (id: string) =>
+    new JournalReconciler({
+      client: await openJournalClient(f.hp, id, f.tls.home),
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1 },
+      apply: (stream) =>
+        f.hj.apply('edge_a', stream, (_conn, record) =>
+          Promise.resolve({ accepted: record.payload })),
+      failed: (error) =>
+        failures.push(error),
+    });
+  try {
+    const bundle = await f.create();
+    await assertRejects(
+      () => openJournalClient(f.hp, bundle.id, f.tls.home),
+      LinkError,
+    );
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const homeStream = {
+      source: 'home',
+      incarnation: bundle.id,
+      stream: 'room:one',
+    };
+    const facadeStream = {
+      source: 'edge_a',
+      incarnation: (await f.fp.active()).body.transcript.body.incarnation,
+      stream: 'ingress:remote.test',
+    };
+    const forward = [];
+    const reverse = [];
+    for (let i = 0; i < 3; i++) {
+      forward.push(
+        await f.hj.append('edge_a', {
+          ...homeStream,
+          type: 'control',
+          version: 1,
+          operationId: 'home-' + i,
+          payload: { i },
+        }),
+      );
+      reverse.push(
+        await f.fj.append('home', {
+          ...facadeStream,
+          type: 'control',
+          version: 1,
+          operationId: 'facade-' + i,
+          payload: { i },
+        }),
+      );
+    }
+    let reconciler = await make(bundle.id);
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(failures, []);
+    assertEquals(
+      (await f.fj.heads('home', 'in', homeStream)).received.sequence,
+      3,
+    );
+    assertEquals(
+      (await f.hj.acknowledged('edge_a', homeStream)).applied,
+      EMPTY_CUT,
+    );
+    for (const record of reverse) {
+      assertEquals(await f.fj.result('home', 'out', facadeStream, record), {
+        result: { accepted: record.payload },
+      });
+    }
+    while (
+      await f.fj.apply(
+        'home',
+        homeStream,
+        (_conn, record) => Promise.resolve({ received: record.payload }),
+      )
+    ) { /* drain owner work */ }
+    await f.reopen();
+    reconciler = await make(bundle.id);
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(failures, []);
+    assertEquals(
+      (await f.hj.acknowledged('edge_a', homeStream)).applied.sequence,
+      3,
+    );
+    for (const record of forward) {
+      assertEquals(await f.hj.result('edge_a', 'out', homeStream, record), {
+        result: { received: record.payload },
+      });
+    }
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    assertEquals((await client.poll()).length, 2);
+    await f.hp.revoke(bundle.id);
+    await assertRejects(() => client.hello(), LinkError);
+    await assertRejects(
+      () => openJournalClient(f.hp, bundle.id, f.tls.home),
+      LinkError,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('a blocked domain cannot starve another stream or periodic hello with a live WS connection', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const delivered = Promise.withResolvers<void>();
+  const lateDelivered = Promise.withResolvers<void>();
+  const periodicHello = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let worker: ReturnType<typeof startHomeLinkWorker> | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const blocked = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      stream: 'room:a-blocked',
+    };
+    const free = { ...blocked, stream: 'room:z-free' };
+    const one = await f.fj.append('home', {
+      ...blocked,
+      type: 'control',
+      version: 1,
+      operationId: 'blocked',
+      payload: 1,
+    });
+    const two = await f.fj.append('home', {
+      ...free,
+      type: 'control',
+      version: 1,
+      operationId: 'free',
+      payload: 2,
+    });
+    let hellos = 0;
+    const original = client.hello.bind(client);
+    client.hello = (signal) => {
+      if (++hellos >= 4) periodicHello.resolve();
+      return original(signal);
+    };
+    worker = startHomeLinkWorker({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      notify: 'websocket',
+      pollseconds: 0.02,
+      reconnectmaxseconds: 0.04,
+      failed: (error) => failures.push(error),
+      apply: async (stream) => {
+        const next = await f.hj.next('edge_a', stream);
+        if (!next) return false;
+        if (stream.stream === blocked.stream) {
+          entered.resolve();
+          await release.promise;
+        }
+        await f.hj.complete('edge_a', stream, next, { exact: next.payload });
+        if (stream.stream === free.stream) delivered.resolve();
+        if (next.payload === 3) lateDelivered.resolve();
+        return true;
+      },
+    });
+    // Test deadline only: distinguishes progress from an accidental global wait.
+    await testDeadline(
+      Promise.all([entered.promise, delivered.promise, periodicHello.promise]),
+    );
+    assertEquals(await f.hj.result('edge_a', 'in', blocked, one), null);
+    assertEquals(await f.hj.result('edge_a', 'in', free, two), {
+      result: { exact: 2 },
+    });
+    // Deliberately omit the hub wakeup while the WS connection stays open.
+    const late = await f.fj.append('home', {
+      ...free,
+      type: 'control',
+      version: 1,
+      operationId: 'missed-notice',
+      payload: 3,
+    });
+    await testDeadline(lateDelivered.promise);
+    assertEquals(await f.hj.result('edge_a', 'in', free, late), {
+      result: { exact: 3 },
+    });
+    const closing = worker.close();
+    let closed = false;
+    void closing.then(() => {
+      closed = true;
+    });
+    await Promise.resolve();
+    assertEquals(closed, false);
+    release.resolve();
+    await testDeadline(closing);
+    assertEquals(await f.hj.result('edge_a', 'in', blocked, one), {
+      result: { exact: 1 },
+    });
+    assertEquals(
+      failures.filter((error) =>
+        !(error instanceof DOMException && error.name === 'AbortError')
+      ),
+      [],
+    );
+  } finally {
+    release.resolve();
+    await worker?.close();
+    await f.close();
+  }
+});
+
+async function testDeadline<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('stream progress deadline')),
+          3000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
