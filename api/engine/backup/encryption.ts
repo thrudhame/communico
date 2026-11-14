@@ -2,6 +2,7 @@
 // GnuPG 2.4: MDC is always used (force-mdc is obsolete since 2.2.8). Decrypted
 // bytes stay private and unusable until both GnuPG and the plaintext digest pass.
 import { dirname, join } from '@std/path';
+import { type FileHandle, open } from 'node:fs/promises';
 import type { Config } from '#engine/config.ts';
 import {
   describePayload,
@@ -49,6 +50,8 @@ export async function openCipher(
     throw new Error('backup passphrase first line must not be empty');
   }
   let home: string | undefined;
+  let directory: FileHandle | undefined;
+  let agentHome: string | undefined;
   try {
     // Check the optional dependency before a backup starts pausing admission.
     const version = await new Deno.Command('gpg', {
@@ -58,15 +61,26 @@ export async function openCipher(
     }).output();
     if (!version.success) throw new Error('backup encryption requires GnuPG');
     home = await Deno.makeTempDir({ dir: workspace, prefix: '.gpg-' });
+    // Standard Unix sockets cannot contain a long operator/workspace path.
+    // Keep the real home private on disk and address it through our live
+    // directory descriptor for every GnuPG subprocess, including its agent.
+    // The descriptor stays open until that one private agent is reaped.
+    directory = await open(home, 'r');
+    agentHome = '/proc/' + Deno.pid + '/fd/' + directory.fd;
     // GnuPG requests its private agent even with loopback and caching disabled
     // (e.g. S2K calibration). Launch and reap only the agent for our own home.
-    await agent(home, '--launch');
-    return new PayloadCipher(home, passphrase);
+    await agent(agentHome, '--launch');
+    return new PayloadCipher(home, agentHome, directory, passphrase);
   } catch (error) {
     passphrase.fill(0);
-    if (home !== undefined) {
-      await agent(home, '--kill');
-      await Deno.remove(home, { recursive: true });
+    try {
+      if (agentHome !== undefined) await agent(agentHome, '--kill');
+    } finally {
+      try {
+        await directory?.close();
+      } finally {
+        if (home !== undefined) await Deno.remove(home, { recursive: true });
+      }
     }
     throw error;
   }
@@ -74,7 +88,12 @@ export async function openCipher(
 
 export class PayloadCipher {
   private closed = false;
-  constructor(private home: string, private passphrase: Uint8Array) {}
+  constructor(
+    private home: string,
+    private agentHome: string,
+    private directory: FileHandle,
+    private passphrase: Uint8Array,
+  ) {}
 
   private async run(
     source: string,
@@ -93,7 +112,7 @@ export class PayloadCipher {
         args: [
           '--no-options',
           '--homedir',
-          this.home,
+          this.agentHome,
           '--batch',
           '--no-tty',
           '--no-autostart',
@@ -238,7 +257,14 @@ export class PayloadCipher {
     if (this.closed) return;
     this.closed = true;
     this.passphrase.fill(0);
-    await agent(this.home, '--kill');
-    await Deno.remove(this.home, { recursive: true });
+    try {
+      await agent(this.agentHome, '--kill');
+    } finally {
+      try {
+        await this.directory.close();
+      } finally {
+        await Deno.remove(this.home, { recursive: true });
+      }
+    }
   }
 }

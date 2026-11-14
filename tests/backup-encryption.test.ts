@@ -88,6 +88,33 @@ Deno.test('backup encryption: standard AES256 OpenPGP round trip with private ou
   });
 });
 
+Deno.test('backup encryption: long private workspaces do not impose a Unix-socket path limit on operator destinations', async () => {
+  await fixture(async (root, passphrasefile) => {
+    const workspace = root + '/' + 'long-private-workspace-'.repeat(6);
+    await Deno.mkdir(workspace);
+    await Deno.mkdir(root + '/bundle/media', { recursive: true });
+    await Deno.mkdir(root + '/restored/media', { recursive: true });
+    await Deno.writeTextFile(root + '/bundle/media/test', 'long-path payload');
+    const payload = await describePayload(root + '/bundle', 'media/test');
+    const cipher = await openCipher(
+      { encrypt: true, passphrasefile },
+      workspace,
+    );
+    assert(cipher);
+    try {
+      const encrypted = await cipher.encrypt(root + '/bundle', payload);
+      await cipher.decrypt(root + '/bundle', encrypted, root + '/restored');
+      assertEquals(
+        await Deno.readTextFile(root + '/restored/media/test'),
+        'long-path payload',
+      );
+    } finally {
+      await cipher.close();
+    }
+    assertEquals([...Deno.readDirSync(workspace)], []);
+  });
+});
+
 Deno.test('backup encryption: wrong passphrase, corrupted ciphertext and wrong plaintext digest never publish a candidate', async () => {
   await fixture(async (root, passphrasefile) => {
     await Deno.mkdir(root + '/bundle/media', { recursive: true });

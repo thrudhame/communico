@@ -6,7 +6,7 @@
 import { dirname, join } from '@std/path';
 import { publish, removeOwned } from '#engine/store/files.ts';
 import { ownershipPath } from '#engine/store/ownership.ts';
-import { checkBuildInfo } from '#engine/store/build.ts';
+import { type BuildInfo, checkBuildInfo } from '#engine/store/build.ts';
 import { Admission } from '#engine/store/admission.ts';
 import {
   applySchema,
@@ -88,6 +88,19 @@ export class Store implements StartupStore {
 
   server(): Promise<Database> {
     return Promise.resolve(this.serverOperations);
+  }
+
+  get directory(): string {
+    return dirname(dirname(this.serverDb.path));
+  }
+
+  // Bundle bytes are prepared by the engine; only storage owns native durable
+  // no-replace publication. Shutdown drains this maintenance operation too.
+  publishSnapshot(source: string, destination: string): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error('store is closed'));
+    const task = publish(this.ffi, source, destination);
+    this.snapshots.add(task);
+    return task.finally(() => this.snapshots.delete(task));
   }
 
   async room(
@@ -181,7 +194,7 @@ export class Store implements StartupStore {
   // The caller owns a private, unpublished bundle and later audits/fsyncs it.
   snapshot(
     destination: string,
-  ): Promise<{ files: SnapshotFile[]; pauseMs: number }> {
+  ): Promise<{ files: SnapshotFile[]; pauseMs: number; native: BuildInfo }> {
     if (this.stopped) return Promise.reject(new Error('store is closed'));
     const task = this.captureSnapshot(destination);
     this.snapshots.add(task);
@@ -190,7 +203,7 @@ export class Store implements StartupStore {
 
   private async captureSnapshot(
     destination: string,
-  ): Promise<{ files: SnapshotFile[]; pauseMs: number }> {
+  ): Promise<{ files: SnapshotFile[]; pauseMs: number; native: BuildInfo }> {
     const staging = await Deno.makeTempDir({
       dir: dirname(dirname(this.serverDb.path)),
       prefix: '.backup-',
@@ -227,7 +240,11 @@ export class Store implements StartupStore {
         return files;
       });
       await publish(this.ffi, staging, destination);
-      return { files: result.value, pauseMs: result.pauseMs };
+      return {
+        files: result.value,
+        pauseMs: result.pauseMs,
+        native: await this.ffi.buildInfo(),
+      };
     } finally {
       await removeOwned(staging);
     }

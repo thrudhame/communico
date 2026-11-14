@@ -1134,6 +1134,18 @@ restore command.
 (`api/engine/store/inspect.ts`, `api/engine/backup/{audit,checks}.ts`,
 `api/engine/{room,tenant,server}/backup-audit.ts`)
 
+The internal bundle producer takes that running-store cut, audits private copies,
+copies only uploaded local media, and preserves the original operator overlay,
+effective non-secret environment settings and explicitly referenced TLS/CA files.
+Portable deployment mappings record each original config node and bundled file.
+Environment-sourced TURN credentials remain external; the encryption passphrase
+source is never bundled. Optional encryption removes only owned plaintext staging
+after encryption succeeds. The manifest-last seal and storage-owned no-replace
+publication expose only the complete bundle. GnuPG uses a live directory-fd alias
+for its private home/agent, so long bundle paths do not become socket paths. This
+engine producer is not yet wired to the admin socket/CLI or an offline restore.
+(`api/engine/backup/bundle.ts`, `api/engine/store/index.ts`)
+
 Configuration layers shipped TOML, an optional overlay and environment leaves;
 unknown nodes and wrong types are errors. Signals stop admission, drain all
 listeners within the configured grace and close storage last. Unhandled
