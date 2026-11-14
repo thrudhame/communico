@@ -30,6 +30,27 @@ export function auditFailure(what: string): never {
   throw new Error('backup audit: ' + what);
 }
 
+/** Collect selected metadata only, in keyset pages without a row-count ceiling. */
+export async function inventoryRows(
+  db: CapturedQuery,
+  table: string,
+  columns: string,
+  where = '1',
+  values: readonly Value[] = [],
+): Promise<Row[]> {
+  const rows: Row[] = [];
+  for await (
+    const { audit_rowid: _rowid, ...row } of scan(
+      db,
+      table,
+      columns,
+      where,
+      values,
+    )
+  ) rows.push(row);
+  return rows;
+}
+
 export function nonnegative(value: unknown, what: string): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
     auditFailure(what);

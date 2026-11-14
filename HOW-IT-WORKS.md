@@ -1147,6 +1147,18 @@ completeness/causal memory and retries without deleting keys or trust decisions.
 The offline coordinator still needs to compose these owners.
 (`api/engine/tenant/changes.ts`, `api/engine/server/{device-federation,remote-devices}.ts`)
 
+Restore work inspection uses query-only captured/candidate capabilities, never
+sender or scheduler APIs. Domain owners inventory every retained delayed command
+(including overdue, prepared and completed reconciliation state), outstanding
+send receipts, tenant reliable intents/projection lag, server PDU/EDU and frozen
+transaction identities/digests, join/knock/retraction work, queued pushes/badges
+and unprojected room delivery intent. Keyset reads have no row-count ceiling;
+reports omit message/key/PDU bodies. The report disclosure owner describes the
+post-cut RPO, reviving old credentials, missing private keys and possible repeated
+external effects. This inventory is not an extra operator approval gate; workers
+resume normal semantics only after the completed durable report boundary.
+(`api/engine/backup/work.ts`, `api/engine/{room,tenant,server}/restore-work.ts`)
+
 The internal store snapshot primitive pauses common storage admission, drains
 transactions and lifecycle changes, then exports every final server/tenant/room
 file with store-owned autocommit VACUUM connections. Retired but not yet unlinked
