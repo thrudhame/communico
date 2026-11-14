@@ -9,7 +9,9 @@ import { LINK_CAPABILITIES, LinkError } from '#engine/facade/protocol.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { openStore } from '#engine/store/index.ts';
+import type { Database } from '#engine/store/db.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
   importPublicKeyFromRaw,
@@ -17,18 +19,18 @@ import {
   verifyJson,
 } from '#engine/signing-primitives.js';
 
-async function fixture() {
+async function fixture(seedServer = serverSchema) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-control-' });
-  const open = (name: string) =>
+  const open = (name: string, schema = serverSchema) =>
     openStore({
       dir: dir + '/' + name,
       library: './.native/libturso_ffi.so',
       checkpointlogbytes: 65536,
       maxopenfiles: 8,
       idleseconds: 300,
-    }, { schemas: { server: serverSchema, tenant: tenantSchema } });
-  const home = await open('home');
-  let edge = await open('edge');
+    }, { schemas: { server: schema, tenant: tenantSchema } });
+  const home = await open('home', seedServer);
+  let edge = await open('edge', seedServer);
   const tenant = await openTenant(home, 'logical.test', { create: true });
   const node = await initializeNode(
     await edge.server(),
@@ -66,8 +68,8 @@ async function fixture() {
   );
   const journal = () => new Journal(edgeServer, LINK_CAPABILITIES);
   let edgeServer = await edge.server();
-  const keys = () =>
-    new FacadeKeys(edgeServer, node.signer(), node.publicKey, fp);
+  const keys = (database = edgeServer) =>
+    new FacadeKeys(database, node.signer(), node.publicKey, fp);
   const exportRoster = () => exportKeyRoster(home, tenant, 'edge_a', bundle.id);
   return {
     home,
@@ -76,6 +78,7 @@ async function fixture() {
     hp,
     bundle,
     keys,
+    server: () => edgeServer,
     journal,
     exportRoster,
     async reenroll() {
@@ -219,6 +222,93 @@ Deno.test('offline renewal cap preserves old validity, and authenticated contact
   } finally {
     await f.close();
     setConfigForTests({});
+  }
+});
+
+Deno.test('roster contacts serialize across owner instances and preserve the latest durable time', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const server = f.server();
+  let active = 0;
+  let peak = 0;
+  let calls = 0;
+  const database: Database = {
+    ...server,
+    async tx(fn, options) {
+      active++;
+      peak = Math.max(peak, active);
+      try {
+        if (++calls === 1) {
+          entered.resolve();
+          await release.promise;
+        }
+        return await server.tx(fn, options);
+      } finally {
+        active--;
+      }
+    },
+  };
+  const latest = Date.now();
+  const first = f.keys(database).contact(latest);
+  try {
+    await entered.promise;
+    const second = f.keys(database).contact(latest - 1);
+    release.resolve();
+    await Promise.all([first, second]);
+    assertEquals(
+      peak,
+      1,
+      'one roster writer per canonical file, not per instance',
+    );
+    assertEquals(
+      calls,
+      2,
+      'each authenticated contact commits its observation',
+    );
+    await f.reopen();
+    assertEquals((await f.keys().status()).lastHome, latest);
+  } finally {
+    release.resolve();
+    await first;
+    await f.close();
+  }
+});
+
+Deno.test('a failed roster contact releases its queued successor without hiding the failure', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const server = f.server();
+  let calls = 0;
+  const database: Database = {
+    ...server,
+    async tx(fn, options) {
+      if (++calls === 1) {
+        entered.resolve();
+        await release.promise;
+        throw new Error('injected contact commit failure');
+      }
+      return await server.tx(fn, options);
+    },
+  };
+  const now = Date.now();
+  const failure = assertRejects(
+    () => f.keys(database).contact(now),
+    Error,
+    'injected contact commit failure',
+  );
+  try {
+    await entered.promise;
+    const successor = f.keys(database).contact(now + 1);
+    release.resolve();
+    await Promise.all([failure, successor]);
+    await f.reopen();
+    assertEquals((await f.keys().status()).lastHome, now + 1);
+  } finally {
+    release.resolve();
+    await failure;
+    await f.close();
   }
 });
 
@@ -389,7 +479,7 @@ Deno.test('roster retirement is preserved, and changed or forged control cannot 
 });
 
 Deno.test('v28 upgrade preserves the received roster and rejects home-signed same-revision substitution', async () => {
-  const f = await fixture();
+  const f = await fixture(historicalServerSchema(35));
   try {
     const first = await f.receive();
     await f.downgrade();

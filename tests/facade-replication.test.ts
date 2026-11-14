@@ -55,6 +55,7 @@ import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { importReplicaGenesis } from '#engine/room/replica.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { roomOf } from '#engine/server/read.ts';
 import { recoverServer } from '#engine/server/startup.ts';
 import { openStore } from '#engine/store/index.ts';
@@ -66,9 +67,9 @@ import {
 } from './fixtures/remote.ts';
 import { makeFakeRoom } from './fixtures/remote-room.ts';
 
-async function fixture() {
+async function fixture(seedServer = serverSchema) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-replication-' });
-  const open = (name: string) =>
+  const open = (name: string, schema = serverSchema) =>
     openStore({
       dir: dir + '/' + name,
       library: './.native/libturso_ffi.so',
@@ -76,10 +77,10 @@ async function fixture() {
       maxopenfiles: 8,
       idleseconds: 300,
     }, {
-      schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+      schemas: { server: schema, tenant: tenantSchema, room: roomSchema },
     });
-  const home = await open('home');
-  let edge = await open('edge');
+  const home = await open('home', seedServer);
+  let edge = await open('edge', seedServer);
   const tenant = await openTenant(home, 'logical.test', { create: true });
   const node = await initializeNode(
     await edge.server(),
@@ -359,7 +360,7 @@ Deno.test('room commit before completion survives reopen without readiness or du
 });
 
 Deno.test('v29 server files append scope ownership before room replication', async () => {
-  const f = await fixture();
+  const f = await fixture(historicalServerSchema(35));
   try {
     await f.downgrade();
     await f.reopen();

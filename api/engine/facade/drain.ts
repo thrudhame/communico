@@ -15,7 +15,11 @@ import {
 import { openRoom } from '#engine/room/index.ts';
 import { recoveryPack } from '#engine/room/recovery-pack.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
-import { ingressOperation, verifyIngressRequest } from './mailbox.ts';
+import {
+  ingressOperation,
+  sameIngressRequest,
+  verifyIngressRequest,
+} from './mailbox.ts';
 import type { Journal } from './journal.ts';
 import type { Pairings } from './pairing.ts';
 import { LinkError, object, type Stream, text } from './protocol.ts';
@@ -98,10 +102,17 @@ export class HomeIngress {
     await this.db.tx(async (conn) => {
       await checkBinding(conn);
       const [held] = await conn.query(
-        'SELECT input_hash FROM facade_ingress WHERE origin=? AND txn_id=?',
+        'SELECT input_hash,evidence_json FROM facade_ingress WHERE origin=? AND txn_id=?',
         [origin, txnId],
       );
-      if (held && held.input_hash !== verified.inputHash) {
+      if (
+        held && !await sameIngressRequest(
+          txnId,
+          transaction.self,
+          held,
+          verified,
+        )
+      ) {
         throw new LinkError(
           'LINK_DIVERGED',
           'changed original ingress request',

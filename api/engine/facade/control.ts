@@ -39,6 +39,26 @@ type Roster = {
 };
 type Control = { kind: 'key-roster'; body: Roster; signature: string };
 
+// HTTP, notices and control workers share one row even when their FacadeKeys
+// instances differ. Queue its mutations at the file owner rather than making
+// authenticated link progress compete for the store's bounded conflict retries.
+const rosterWriters = new Map<string, Promise<void>>();
+
+async function writeRoster<T>(
+  db: Database,
+  write: () => Promise<T>,
+): Promise<T> {
+  const previous = rosterWriters.get(db.path) ?? Promise.resolve();
+  const run = previous.then(write);
+  const settled = run.then(() => undefined, () => undefined);
+  rosterWriters.set(db.path, settled);
+  try {
+    return await run;
+  } finally {
+    if (rosterWriters.get(db.path) === settled) rosterWriters.delete(db.path);
+  }
+}
+
 // A retained roster belongs to a home control cut, not merely this node's key.
 // Re-enrollment must not revive authority from an older grant at any consumer.
 function rosterAt(
@@ -201,12 +221,13 @@ export class FacadeKeys {
 
   async contact(now = Date.now()): Promise<void> {
     integer(now);
-    await this.db.tx(async (conn) => {
-      await conn.execute(
-        'UPDATE facade_key_roster SET last_home_ms=MAX(COALESCE(last_home_ms,0),?) WHERE singleton=1',
-        [now],
-      );
-    });
+    await writeRoster(this.db, () =>
+      this.db.tx(async (conn) => {
+        await conn.execute(
+          'UPDATE facade_key_roster SET last_home_ms=MAX(COALESCE(last_home_ms,0),?) WHERE singleton=1',
+          [now],
+        );
+      }));
   }
 
   async status() {
@@ -287,41 +308,45 @@ export class FacadeKeys {
       );
     }
     const encoded = canonicalJson(body);
-    return await journal.apply('home', stream, async (conn, current) => {
-      if (current.hash !== record.hash) {
-        throw new LinkError('LINK_DIVERGED', 'control apply raced');
-      }
-      const [binding] = await conn.query(
-        "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
-        [context.id],
-      );
-      if (
-        binding?.state !== 'paired' ||
-        Number(binding.revision) !== grant.body.revision
-      ) {
-        throw new LinkError('LINK_UNPAIRED', 'control grant changed', 403);
-      }
-      const [held] = await conn.query(
-        'SELECT revision,roster_json FROM facade_key_roster WHERE singleton=1',
-      );
-      if (
-        Number(held.revision) > body.revision ||
-        (Number(held.revision) === body.revision &&
-          held.roster_json !== encoded)
-      ) {
-        throw new LinkError(
-          'LINK_DIVERGED',
-          'regressing or changed control revision',
-        );
-      }
-      if (Number(held.revision) !== body.revision) {
-        await conn.execute(
-          'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=NULL,issued_ms=NULL WHERE singleton=1',
-          [body.revision, encoded],
-        );
-      }
-      return { revision: body.revision };
-    });
+    return await writeRoster(
+      this.db,
+      () =>
+        journal.apply('home', stream, async (conn, current) => {
+          if (current.hash !== record.hash) {
+            throw new LinkError('LINK_DIVERGED', 'control apply raced');
+          }
+          const [binding] = await conn.query(
+            "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
+            [context.id],
+          );
+          if (
+            binding?.state !== 'paired' ||
+            Number(binding.revision) !== grant.body.revision
+          ) {
+            throw new LinkError('LINK_UNPAIRED', 'control grant changed', 403);
+          }
+          const [held] = await conn.query(
+            'SELECT revision,roster_json FROM facade_key_roster WHERE singleton=1',
+          );
+          if (
+            Number(held.revision) > body.revision ||
+            (Number(held.revision) === body.revision &&
+              held.roster_json !== encoded)
+          ) {
+            throw new LinkError(
+              'LINK_DIVERGED',
+              'regressing or changed control revision',
+            );
+          }
+          if (Number(held.revision) !== body.revision) {
+            await conn.execute(
+              'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=NULL,issued_ms=NULL WHERE singleton=1',
+              [body.revision, encoded],
+            );
+          }
+          return { revision: body.revision };
+        }),
+    );
   }
 
   async document(now = Date.now()): Promise<KeyDoc> {
@@ -404,22 +429,26 @@ export class FacadeKeys {
         doc as unknown as Record<string, unknown>,
         this.signer,
       );
-      const saved = await this.db.tx(async (conn) => {
-        await requireGrant(conn);
-        const [current] = await conn.query(
-          'SELECT roster_json,last_home_ms,document_json FROM facade_key_roster WHERE singleton=1',
-        );
-        if (
-          current.roster_json !== held.roster_json ||
-          current.last_home_ms !== held.last_home_ms ||
-          current.document_json !== held.document_json
-        ) return false;
-        await conn.execute(
-          'UPDATE facade_key_roster SET document_json=?,issued_ms=? WHERE singleton=1',
-          [canonicalJson(doc), now],
-        );
-        return true;
-      });
+      const saved = await writeRoster(
+        this.db,
+        () =>
+          this.db.tx(async (conn) => {
+            await requireGrant(conn);
+            const [current] = await conn.query(
+              'SELECT roster_json,last_home_ms,document_json FROM facade_key_roster WHERE singleton=1',
+            );
+            if (
+              current.roster_json !== held.roster_json ||
+              current.last_home_ms !== held.last_home_ms ||
+              current.document_json !== held.document_json
+            ) return false;
+            await conn.execute(
+              'UPDATE facade_key_roster SET document_json=?,issued_ms=? WHERE singleton=1',
+              [canonicalJson(doc), now],
+            );
+            return true;
+          }),
+      );
       if (saved) return doc;
     }
   }

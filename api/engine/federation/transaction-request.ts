@@ -1,7 +1,17 @@
 import { MatrixError } from '#engine/matrix-error.ts';
+import { canonicalJson } from '#engine/canonical.ts';
 import { objectOf, stringOf } from '#engine/net/json.ts';
 import { protocol } from '#engine/net/upstream-error.ts';
 import { transactionEnvelope } from './peer-json.ts';
+
+// Full request authentication still covers the timestamp. After authentication
+// and envelope validation, only that compose-time metadata is absent from the
+// replay comparison: stock senders may restamp an otherwise identical retry.
+export function transactionReplayCanonical(canonicalRequest: string): string {
+  const request = JSON.parse(canonicalRequest);
+  delete request.content.origin_server_ts;
+  return canonicalJson(request);
+}
 
 export function transactionRequest(value: unknown, origin: string) {
   const raw = objectOf(value, 'transaction');
