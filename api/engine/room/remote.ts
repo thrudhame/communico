@@ -130,11 +130,9 @@ async function parentsSupplied(
   });
 }
 
-// The bounded fetch ladder for one PDU with ungrounded prevs (old §3.4),
-// all with the room lock RELEASED: the brief wait, ONE
-// get_missing_events, then /state_ids + /event for the gap tips — never
-// for an id we hold or one this chain proved terminal. State recovery is
-// permitted by a pulled event, never by a pushed event withholding its parents.
+// Collect the brief wait and ONE missing-events response per input, with the
+// room lock RELEASED. Pushed batches complete this verified union before any
+// ancestry recovery, so later replies cannot leave earlier inputs deferred.
 async function fetchMissing(
   room: Room,
   item: VerifiedItem,
@@ -230,7 +228,20 @@ async function fetchMissing(
       acc.terminal.add(missing[0]);
     }
   }
+}
 
+// Chase the final supplied union, inside the original whole-batch budget.
+// Only pulled events permit state recovery behind their unresolved parents.
+async function recoverMissing(
+  room: Room,
+  item: VerifiedItem,
+  origin: string,
+  deps: RemoteDeps,
+  version: string,
+  budget: { until: number },
+  acc: FetchAcc,
+): Promise<void> {
+  const budgetLeft = () => budget.until - Date.now();
   // 3. /state_ids + /event for the GAP TIPS (at most missinglimit state
   //    fetches, the whole chain inside the batch budget): a prev we HOLD
   //    (pending or evidence) is never /state_ids'd — the gap behind it is
@@ -511,8 +522,19 @@ export async function ingestRemote(
     terminal: new Set(),
   };
   const budget = { until: Date.now() + deps.limits.budgetMs };
+  if (source === 'pushed') {
+    for (const item of items) {
+      await fetchMissing(room, item, origin, deps, version, budget, acc);
+    }
+  }
   for (const item of items) {
-    await fetchMissing(room, item, origin, deps, version, budget, acc);
+    // Pulled inputs have no parent-disclosure gate. Preserve their existing
+    // incremental recovery, including not refetching gaps already recovered by
+    // an earlier pulled input; only pushed admission needs every reply first.
+    if (source === 'pulled') {
+      await fetchMissing(room, item, origin, deps, version, budget, acc);
+    }
+    await recoverMissing(room, item, origin, deps, version, budget, acc);
   }
   // A later input's missing-events answer can supply an earlier input's parent.
   // Decide unavailability once from the final verified union, before subsequent

@@ -419,6 +419,70 @@ Deno.test('missing: later batch replies replace stale parent-unavailability verd
   });
 });
 
+Deno.test('missing: batch-wide supplied ancestry recovery is independent of input order', async (t) => {
+  for (const reversed of [false, true]) {
+    await t.step(reversed ? 'supplier first' : 'supplier last', async () => {
+      await withStore(async (store) => {
+        const s = await setup(store);
+        const far = await msg(s, 'recoverable ancestor', [s.joinId], 50);
+        const parent = await msg(
+          s,
+          'later supplied parent',
+          [far.event_id!],
+          51,
+        );
+        const first = await msg(s, 'first pushed', [parent.event_id!], 52);
+        const otherParent = await msg(s, 'other parent', [s.joinId], 53);
+        const second = await msg(
+          s,
+          'supplier pushed',
+          [otherParent.event_id!],
+          54,
+        );
+        const recording = fakeFetcher({
+          stateIds: new Map([[far.event_id!, {
+            pduIds: [s.g.createId, s.joinId],
+            authChainIds: [],
+          }]]),
+          event: new Map([[far.event_id!, far]]),
+        });
+        const latestCalls: string[][] = [];
+        recording.fetcher.missingEvents = (_room, _earliest, latest) => {
+          latestCalls.push([...latest]);
+          return Promise.resolve(
+            latest.includes(second.event_id!) ? [parent, otherParent] : [],
+          );
+        };
+        s.deps.fetcher = recording.fetcher;
+        const batch = reversed ? [second, first] : [first, second];
+        const out = await ingestRemote(s.g.room, batch, s.server.name, s.deps);
+        assertEquals(out.map((result) => result.outcome), [
+          'accepted',
+          'accepted',
+        ]);
+        assertEquals(out.map((result) => result.error), [null, null]);
+        assertEquals(latestCalls, batch.map((pdu) => [pdu.event_id!]));
+        assertEquals(recording.calls.stateIds, [far.event_id!]);
+        assertEquals(recording.calls.event, [far.event_id!]);
+        await s.g.room.tx(async (tx) => {
+          for (const pdu of [far, parent, first, otherParent, second]) {
+            assertEquals(
+              (await tx.events.getStatus(pdu.event_id!))?.grounding,
+              'grounded',
+            );
+            assert(await tx.state.eventStateAfter(pdu.event_id!) !== null);
+            assert(await tx.segments.positionOf(pdu.event_id!) !== null);
+          }
+        });
+        assertEquals(
+          await frontierOf(s.g.room),
+          [first.event_id!, second.event_id!].sort(),
+        );
+      });
+    });
+  }
+});
+
 Deno.test('missing: budget exhausted → pending + wait; the later arrival resumes it', async () => {
   await withStore(async (store) => {
     const s = await setup(store, {
