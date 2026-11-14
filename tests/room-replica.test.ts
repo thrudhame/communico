@@ -2,6 +2,7 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
+  exportReplicaBoundary,
   importReplicaBoundary,
   importReplicaGenesis,
 } from '#engine/room/replica.ts';
@@ -216,6 +217,72 @@ Deno.test('home-created replica genesis replays the original create and creator 
     const before = await read();
     await importReplicaGenesis(f.store, input);
     assertEquals(await read(), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica boundary export pins original before-state and complete auth closure at one room cut', async () => {
+  const f = await fixture();
+  try {
+    await importReplicaBoundary(f.store, f.input);
+    const room = await openRoom(f.store, f.source.roomId);
+    const exported = await exportReplicaBoundary(
+      room,
+      String(f.join.event_id),
+      f.input.self,
+    );
+    assertEquals(exported.roomId, f.source.roomId);
+    assertEquals(exported.roomVersion, f.source.version);
+    assertEquals(
+      new Set(exported.state.map((pdu) => String(pdu.event_id))),
+      new Set(f.input.state.map((pdu) => String(pdu.event_id))),
+    );
+    assert(
+      !exported.state.some((pdu) => pdu.state_key === '@alice:logical.test'),
+    );
+    assertEquals(exported.cut, await room.tx((tx) => tx.changes.head()));
+    assert(!('opening_group' in exported));
+    const closure = new Map(
+      exported.authChain.map((pdu) => [String(pdu.event_id), pdu]),
+    );
+    for (
+      const pdu of [...exported.state, exported.join, ...exported.authChain]
+    ) {
+      for (const id of pdu.auth_events ?? []) assert(closure.has(id));
+    }
+    const dir = await Deno.makeTempDir({ prefix: 'room-replica-destination-' });
+    const destination = await openStore({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, { schemas: { room: roomSchema } });
+    try {
+      await importReplicaBoundary(destination, {
+        ...exported,
+        keys: f.input.keys,
+        self: f.input.self,
+        resident: f.input.resident,
+      });
+      const replica = await openRoom(destination, f.source.roomId);
+      const before = await replica.tx((tx) =>
+        tx.state.eventStateBefore(String(f.join.event_id))
+      );
+      assert(before);
+      assertEquals(
+        await replica.tx((tx) => tx.state.groupMap(before.group)),
+        new Map(
+          exported.state.map((
+            pdu,
+          ) => [pdu.type + '\0' + pdu.state_key, String(pdu.event_id)]),
+        ),
+      );
+    } finally {
+      await destination.close();
+      await Deno.remove(dir, { recursive: true });
+    }
   } finally {
     await f.close();
   }

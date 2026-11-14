@@ -9,12 +9,99 @@ import { assertServerAllowed } from './acl.ts';
 import { roomCreateId } from './build.ts';
 import type { KeyResolver } from './deps.ts';
 import { projectAfterWrite, registerCreatedRoom } from './hooks.ts';
-import { initializeRoom, openRoom } from './index.ts';
+import { initializeRoom, openRoom, type Room } from './index.ts';
 import { ingestInTx } from './ingest.ts';
 import { withRoomLock } from './lock.ts';
 import { authorizeSnapshotEvent, verifySnapshot } from './snapshot.ts';
 import { installSnapshotBoundary } from './snapshot-install.ts';
 import { oversizedOf, verify } from './verify.ts';
+
+export type ReplicaBoundary = {
+  roomId: string;
+  roomVersion: string;
+  cut: number;
+  join: Pdu;
+  state: Pdu[];
+  authChain: Pdu[];
+};
+
+/** Read the authentic opening event, its before-state and all required auth
+ * bytes in one source snapshot. The cut is an export watermark only; receiver
+ * positions/groups are allocated by its own domain owners. Missing retained
+ * evidence is unavailable, never a current-state substitute or a partial pack. */
+export function exportReplicaBoundary(
+  room: Room,
+  eventId: string,
+  self: string,
+): Promise<ReplicaBoundary> {
+  return room.tx(async (tx) => {
+    const stay = (await tx.segments.list()).find((segment) =>
+      segment.kind === 'stay' && segment.opened_by === eventId
+    );
+    const status = await tx.events.getStatus(eventId);
+    const row = await tx.events.get(eventId);
+    const before = await tx.state.eventStateBefore(eventId);
+    if (
+      !stay || !row || !before || status?.standing !== 'accepted' ||
+      status.grounding !== 'grounded'
+    ) {
+      throw new MatrixError(
+        503,
+        'M_UNAVAILABLE',
+        'replica participation boundary is not retained',
+      );
+    }
+    const join = JSON.parse(row.pdu) as Pdu;
+    if (
+      join.type !== 'm.room.member' || join.state_key !== join.sender ||
+      domainOf(join.sender) !== self || join.content?.membership !== 'join'
+    ) {
+      throw new MatrixError(
+        400,
+        'M_BAD_JSON',
+        'replica requires authentic local participation',
+      );
+    }
+    const map = await tx.state.groupMap(before.group);
+    const stateIds = [...new Set(map.values())].sort();
+    const queue = [...stateIds, ...(join.auth_events ?? [])];
+    const pack = new Map<string, Pdu>();
+    for (let index = 0; index < queue.length; index++) {
+      const id = queue[index];
+      if (pack.has(id)) continue;
+      const event = await tx.events.get(id);
+      if (event === null) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'required replica auth/state evidence is unavailable',
+        );
+      }
+      const pdu = JSON.parse(event.pdu) as Pdu;
+      pack.set(id, pdu);
+      queue.push(...(pdu.auth_events ?? []));
+    }
+    const createId = map.get('m.room.create\0');
+    const create = createId === undefined ? undefined : pack.get(createId);
+    if (typeof create?.content?.room_version !== 'string') {
+      throw new MatrixError(
+        503,
+        'M_UNAVAILABLE',
+        'replica room version is unavailable',
+      );
+    }
+    return {
+      roomId: room.id,
+      roomVersion: create.content.room_version,
+      cut: await tx.changes.head(),
+      join,
+      state: stateIds.map((id) => pack.get(id)!),
+      authChain: [...pack].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map((
+        [, pdu],
+      ) => pdu),
+    };
+  });
+}
 
 export async function importReplicaBoundary(store: Store, input: {
   roomId: string;
