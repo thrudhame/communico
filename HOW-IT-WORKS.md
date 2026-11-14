@@ -1175,16 +1175,20 @@ resume normal semantics only after the completed durable report boundary.
 
 The internal store snapshot owner retains physical file incarnations, opens and
 normalizes inactive/over-cache sources and acquires checkpoint retention outside
-common admission and the pool metadata queue. At the admission fence it drains
-transactions/lifecycle changes, revalidates the final inventory and pins native
-MVCC reads together. Retired but not yet unlinked files remain in the cut. SQL
+common admission and the pool metadata queue. The common fence drains only native
+commits and final file publication/unlink, revalidates the final inventory and pins
+native MVCC reads together. In-flight transaction bodies, connection waits and
+checkpoint completion stay outside it; uncommitted data/schema remain outside the
+cut. New database initialization is private until its fenced final rename. Retired
+but not yet unlinked files remain in the cut. SQL
 export then copies schema, explicit rowids and bounded keyset pages into private
 standalone targets while ordinary writes continue. Engine-private MVCC metadata
 is regenerated, not copied as application truth. Each completed export releases
 its source immediately; checkpoint retention defers initiation rather than
 blocking committing writers. The file gate is the sole checkpoint owner; native
 automatic checkpointing is disabled. Removal waits outside common admission,
-and the Store drains all accepted maintenance before shutdown. The common pause
+and the Store drains all accepted operations before shutdown, with commit and
+publication admission still open so those operations can finish. The common pause
 is measured, not deadline-limited. Completed targets use fsync and no-replace
 publication, with private destination-side copying across filesystems. This
 primitive exports databases, not media or deployment configuration by itself.

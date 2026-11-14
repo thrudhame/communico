@@ -9,6 +9,7 @@ import {
   type Value,
 } from '#engine/store/ffi.ts';
 import { Gate } from '#engine/store/gate.ts';
+import type { Admission } from '#engine/store/admission.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import { publish } from '#engine/store/files.ts';
 import {
@@ -119,6 +120,7 @@ export class Db {
     readonly path: string,
     private readonly handle: number,
     checkpointlogbytes: number,
+    private readonly admission?: Admission,
   ) {
     this.gate = new Gate(path, checkpointlogbytes, async (started) => {
       const connection = await this.acquire();
@@ -137,6 +139,7 @@ export class Db {
     ffi: Turso,
     path: string,
     checkpointlogbytes: number,
+    admission?: Admission,
   ): Promise<Db> {
     path = resolve(path);
     if (path !== databaseFiles(dirname(path)).database) {
@@ -153,10 +156,11 @@ export class Db {
       const db = await existing;
       if (db.closingTask !== undefined) {
         await db.closingTask;
-        return await this.open(ffi, path, checkpointlogbytes);
+        return await this.open(ffi, path, checkpointlogbytes, admission);
       }
       if (
-        db.ffi !== ffi || db.gate.threshold !== checkpointlogbytes
+        db.ffi !== ffi || db.gate.threshold !== checkpointlogbytes ||
+        (admission !== undefined && db.admission !== admission)
       ) {
         throw new Error('database already owned by another library');
       }
@@ -164,7 +168,7 @@ export class Db {
       return db;
     }
     const opened = ffi.open(path).then(async (handle) => {
-      const db = new Db(ffi, path, handle, checkpointlogbytes);
+      const db = new Db(ffi, path, handle, checkpointlogbytes, admission);
       try {
         const connection = await db.acquire();
         try {
@@ -273,7 +277,11 @@ export class Db {
       try {
         await this.ffi.begin(handle, mode);
         const result = await fn(connection);
-        await this.ffi.commit(handle);
+        if (this.admission) {
+          await this.admission.run(() => this.ffi.commit(handle!));
+        } else {
+          await this.ffi.commit(handle);
+        }
         committed = true;
         return { committed: true, value: result };
       } catch (error) {

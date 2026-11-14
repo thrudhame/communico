@@ -68,7 +68,6 @@ export type SnapshotFile = {
 export class Store implements StartupStore {
   private stopped = false;
   private closing?: Promise<void>;
-  private readonly admission = new Admission();
   private readonly maintenance = new Set<Promise<unknown>>();
   private readonly serverOperations: Database;
   constructor(
@@ -76,13 +75,10 @@ export class Store implements StartupStore {
     private readonly serverDb: Db,
     private readonly pool: Pool,
     private readonly ownership: number,
+    private readonly admission: Admission,
   ) {
     this.serverOperations = operations(
-      (fn, options) =>
-        this.admission.run(() => {
-          if (this.stopped) throw new Error('store is closed');
-          return this.serverDb.tx(fn, options);
-        }),
+      (fn, options) => this.run(() => this.serverDb.tx(fn, options)),
       this.serverDb.path,
     );
   }
@@ -102,11 +98,16 @@ export class Store implements StartupStore {
     return this.maintain(publish(this.ffi, source, destination));
   }
 
-  // Work can wait outside transaction admission without escaping the Store's
-  // shutdown lifetime. Every such operation belongs to this one drain owner.
+  // Accepted work owns a lifetime independently of the short commit/publication
+  // fence. Shutdown must drain it without blocking its final commit.
   private maintain<T>(task: Promise<T>): Promise<T> {
     this.maintenance.add(task);
     return task.finally(() => this.maintenance.delete(task));
+  }
+
+  private run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.stopped) return Promise.reject(new Error('store is closed'));
+    return this.maintain(Promise.resolve().then(fn));
   }
 
   async room(
@@ -129,17 +130,13 @@ export class Store implements StartupStore {
     id: string,
     options: { create?: boolean } = {},
   ): Promise<Lease> {
-    const lease = await this.admission.run(() => {
-      if (this.stopped) throw new Error('store is closed');
-      return this.pool.acquire('rooms', id, options);
-    });
+    const lease = await this.run(() => this.pool.acquire('rooms', id, options));
     return {
       ...lease,
-      db: operations((fn, txOptions) =>
-        this.admission.run(() => {
-          if (this.stopped) throw new Error('store is closed');
-          return lease.db.tx(fn, txOptions);
-        }), lease.db.path),
+      db: operations(
+        (fn, txOptions) => this.run(() => lease.db.tx(fn, txOptions)),
+        lease.db.path,
+      ),
     };
   }
 
@@ -149,42 +146,39 @@ export class Store implements StartupStore {
     options: { create?: boolean },
   ): Promise<Database> {
     // Preserve open/create validation without retaining the opening lease.
-    const initial = await this.admission.run(() => {
-      if (this.stopped) throw new Error('store is closed');
-      return this.pool.acquire(kind, id, options);
+    return await this.run(async () => {
+      const initial = await this.pool.acquire(kind, id, options);
+      const path = initial.db.path;
+      const incarnation = initial.incarnation;
+      await initial.release();
+      return operations((fn, txOptions) =>
+        this.run(async () => {
+          const lease = await this.pool.acquire(kind, id, { incarnation });
+          try {
+            return await lease.db.tx(fn, txOptions);
+          } finally {
+            await lease.release();
+          }
+        }), path);
     });
-    const path = initial.db.path;
-    const incarnation = initial.incarnation;
-    await initial.release();
-    return operations((fn, txOptions) =>
-      this.admission.run(async () => {
-        if (this.stopped) throw new Error('store is closed');
-        const lease = await this.pool.acquire(kind, id, { incarnation });
-        try {
-          return await lease.db.tx(fn, txOptions);
-        } finally {
-          await lease.release();
-        }
-      }), path);
   }
 
   // The room ids recorded on disk (the server stage's startup discovery).
   rooms(): Promise<string[]> {
-    return this.admission.run(() => this.pool.list('rooms'));
+    return this.run(() => this.pool.list('rooms'));
   }
 
   tenants(): Promise<string[]> {
-    return this.admission.run(() => this.pool.list('tenants'));
+    return this.run(() => this.pool.list('tenants'));
   }
 
   /** The engine owns deletion intent/projection; storage owns file retirement. */
   retireRoom(id: string): Promise<void> {
-    if (this.stopped) throw new Error('store is closed');
-    return this.admission.run(() => this.pool.retire('rooms', id));
+    return this.run(() => this.pool.retire('rooms', id));
   }
 
   roomRetired(id: string): Promise<boolean> {
-    return this.admission.run(() => this.pool.isRetired('rooms', id));
+    return this.run(() => this.pool.isRetired('rooms', id));
   }
 
   removeRoom(id: string): Promise<void> {
@@ -197,7 +191,7 @@ export class Store implements StartupStore {
   }
 
   initializeRoom<T>(id: string, fn: (db: Database) => Promise<T>): Promise<T> {
-    return this.admission.run(() => this.pool.initialize('rooms', id, fn));
+    return this.run(() => this.pool.initialize('rooms', id, fn));
   }
 
   // One crash-consistent cut for every file, including inactive rooms/tenants.
@@ -244,7 +238,7 @@ export class Store implements StartupStore {
       server = await this.serverDb.prepareReadSnapshot();
       for (;;) {
         if (this.stopped) throw new Error('store is closed');
-        // Replay/open/migrate and connect before pausing common admission. The
+        // Replay/open/migrate and connect before pausing commits/publications. The
         // physical holds prevent unlink/recreation while this set is prepared.
         for (const { kind, key } of await this.pool.snapshotInventory()) {
           const identity = kind + '/' + key;
@@ -320,12 +314,12 @@ export class Store implements StartupStore {
     this.stopped = true;
     await (this.closing ??= (async () => {
       await Promise.allSettled(this.maintenance);
-      await this.admission.exclusive(async () => {
-        await this.pool.close();
-        await this.serverDb.close();
-        await this.ffi.unlockStore(this.ownership);
-        this.ffi.close();
-      });
+      // Accepted operations can still need their native commit/publication.
+      // Never close that admission while draining the owners that use it.
+      await this.pool.close();
+      await this.serverDb.close();
+      await this.ffi.unlockStore(this.ownership);
+      this.ffi.close();
     })());
   }
 }
@@ -341,6 +335,7 @@ export async function openStore(
   let serverDb: Db | undefined;
   let pool: Pool | undefined;
   let ownership: number | undefined;
+  const admission = new Admission();
   try {
     checkBuildInfo(await ffi.buildInfo());
     config = { ...config, dir: await canonicalRoot(config.dir) };
@@ -374,7 +369,12 @@ export async function openStore(
         verify: (db) => checkSchema(db, serverProvider),
       });
     }
-    serverDb = await Db.open(ffi, serverPath, config.checkpointlogbytes);
+    serverDb = await Db.open(
+      ffi,
+      serverPath,
+      config.checkpointlogbytes,
+      admission,
+    );
     await ensureSchema(serverDb, serverProvider);
     pool = new Pool(ffi, config.dir, {
       checkpointlogbytes: config.checkpointlogbytes,
@@ -383,8 +383,8 @@ export async function openStore(
     }, {
       rooms: options.schemas?.room,
       tenants: options.schemas?.tenant,
-    });
-    const store = new Store(ffi, serverDb, pool, ownership);
+    }, admission);
+    const store = new Store(ffi, serverDb, pool, ownership, admission);
     // The composition root binds runtime authority before a recovery hook may
     // project data or schedule owner-specific intents. Failure unwinds the pool.
     await options.beforeStartup?.(store);

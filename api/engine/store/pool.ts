@@ -14,6 +14,7 @@ import {
 import { type Database, Db, operations } from '#engine/store/db.ts';
 import type { Turso } from '#engine/store/ffi.ts';
 import type { PreparedSnapshot } from '#engine/store/export.ts';
+import type { Admission } from '#engine/store/admission.ts';
 import {
   checkId,
   databaseFiles,
@@ -158,6 +159,7 @@ export class Pool {
     private readonly root: string,
     private readonly options: PoolOptions,
     providers: Partial<Record<FileKind, SchemaProvider>> = {},
+    private readonly admission?: Admission,
   ) {
     this.providers = {
       rooms: providers.rooms ?? EMPTY_SCHEMA,
@@ -242,7 +244,12 @@ export class Pool {
       if (!(await Deno.lstat(path)).isFile) {
         throw new Error('backup source must be a regular database file');
       }
-      db = await Db.open(this.ffi, path, this.options.checkpointlogbytes);
+      db = await Db.open(
+        this.ffi,
+        path,
+        this.options.checkpointlogbytes,
+        this.admission,
+      );
       const rows = await db.query('SELECT value FROM id');
       if (
         rows.length !== 1 || typeof rows[0].value !== 'string' ||
@@ -356,6 +363,7 @@ export class Pool {
             this.ffi,
             files.database,
             this.options.checkpointlogbytes,
+            this.admission,
           );
         } catch (error) {
           if (error instanceof Deno.errors.NotFound) continue;
@@ -420,6 +428,7 @@ export class Pool {
     await createDatabase(this.ffi, parent, key, {
       checkpointlogbytes: this.options.checkpointlogbytes,
       discardOnFailure: true,
+      publication: this.admission,
       schema: async (db) => {
         await recordId(db, id);
         await applySchema(db, provider);
@@ -623,6 +632,7 @@ export class Pool {
       const provider = this.providers[kind];
       await createDatabase(this.ffi, parent, key, {
         checkpointlogbytes: this.options.checkpointlogbytes,
+        publication: this.admission,
         schema: async (db) => {
           await recordId(db, id);
           await applySchema(db, provider);
@@ -637,6 +647,7 @@ export class Pool {
       this.ffi,
       files.database,
       this.options.checkpointlogbytes,
+      this.admission,
     );
     try {
       await checkId(db, id);
