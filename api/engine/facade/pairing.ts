@@ -625,6 +625,51 @@ export class Pairings {
   > {
     return await pairingStatus(this.db);
   }
+
+  /** TLS admission trusts only an authority explicitly accepted by local admin.
+   * Retired bindings still admit their own signed revocation retry; each route
+   * separately checks its required pending/active authority before mutation. */
+  async allowsHome(peerPin: string): Promise<boolean> {
+    if (!this.node) return false;
+    const rows = await this.db.query(
+      "SELECT context_json FROM facade_pairings WHERE side='facade'",
+    );
+    return rows.some((row) => {
+      const context = contextOf(
+        JSON.parse(String(row.context_json)),
+        this.supported,
+      );
+      return context.server === this.node!.server &&
+        context.node === this.node!.node &&
+        sameDigest(context.facadePin, this.pin) &&
+        sameDigest(context.homePin, peerPin);
+    });
+  }
+
+  /** Narrow, credential-free home connection contract. The transport never
+   * reads registry tables or chooses a peer from public request data. */
+  async connection(id: string): Promise<{
+    context: PairingContext;
+    state: string;
+    grant: Grant | null;
+    transcript: Transcript | null;
+  }> {
+    if (this.node) refused('facade cannot initiate a link');
+    const row = await entry(this.db, id);
+    const context = contextOf(row.context, this.supported);
+    if (
+      row.side !== 'home' || !equal(context.home, this.key) ||
+      !sameDigest(context.homePin, this.pin)
+    ) {
+      refused('link configuration does not match home authority');
+    }
+    return {
+      context,
+      state: row.state,
+      grant: row.grant,
+      transcript: row.transcript,
+    };
+  }
 }
 
 /** Registry inspection does not require any signing or TLS credential. */
