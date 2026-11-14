@@ -50,3 +50,19 @@ export async function eventStreamMax(db: Db): Promise<number> {
   );
   return rows.length === 0 ? 0 : Number(rows[0].value);
 }
+
+/** Durable allocator ceilings, read together before a sync consumer waits. */
+export async function syncStreamHeads(db: Db) {
+  const counters = new Map(
+    (await db.query('SELECT name,value FROM counters')).map((
+      row,
+    ) => [String(row.name), Number(row.value)]),
+  );
+  return {
+    events: counters.get('events') ?? 0,
+    presence: counters.get('presence') ?? 0,
+    receipts: counters.get('receipts') ?? 0,
+    devices: counters.get('devices') ?? 0,
+    notifications: counters.get('notifications') ?? 0,
+  };
+}

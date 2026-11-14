@@ -361,7 +361,7 @@ Deno.test('v24 migration adds journal without changing existing room/transaction
     const server = await store.server();
     await server.tx(async (conn) => {
       await conn.exec(
-        'DROP TABLE server_key_decisions; DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports; DROP TABLE facade_key_roster; DROP TABLE runtime_identity; DROP TABLE facade_pairings; DROP TABLE facade_control; DROP TABLE facade_export_acks; DROP TABLE facade_records; DROP TABLE facade_streams; DROP TABLE facade_node;',
+        'DROP TABLE server_key_decisions; DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports; DROP TABLE facade_key_roster; DROP TABLE restore_state; DROP TABLE runtime_identity; DROP TABLE facade_pairings; DROP TABLE facade_control; DROP TABLE facade_export_acks; DROP TABLE facade_records; DROP TABLE facade_streams; DROP TABLE facade_node;',
       );
       await conn.execute('UPDATE meta SET v=? WHERE k=?', [
         '24',

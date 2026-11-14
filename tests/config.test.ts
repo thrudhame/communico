@@ -11,7 +11,11 @@ import {
   resolvePaths,
 } from '#engine/config.ts';
 
-const FULL = `[matrixrtc]
+const FULL = `[backup]
+encrypt = false
+passphrasefile = ""
+
+[matrixrtc]
 livekitserviceurl = ""
 
 [directory]
@@ -959,7 +963,7 @@ Deno.test('public directory settings use complete defaults and strict leaf-wise 
   }
 });
 
-Deno.test('141 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('143 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -980,6 +984,7 @@ Deno.test('141 leaves total across the sections (the surface tripwire)', async (
   assertEquals(counts, [
     ['server', 5],
     ['admin', 2],
+    ['backup', 2],
     ['facade', 19],
     ['wellknown', 7],
     ['turn', 5],
@@ -1001,8 +1006,8 @@ Deno.test('141 leaves total across the sections (the surface tripwire)', async (
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    141,
-    'the whole config surface includes discovery, TURN, HTTP administrators and facade role',
+    143,
+    'the whole config surface includes discovery, TURN, HTTP administrators, backup and facade role',
   );
 });
 

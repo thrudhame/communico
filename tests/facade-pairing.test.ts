@@ -194,7 +194,7 @@ Deno.test('home key document publishes approved node keys and durable prospectiv
   }
 });
 
-Deno.test('v27 upgrade retains enrolled authority while adding prospective key retirement', async () => {
+Deno.test('v28 upgrade retains enrolled authority while adding prospective key retirement', async () => {
   const f = await fixture();
   try {
     const bundle = await f.create();
@@ -211,7 +211,7 @@ Deno.test('v27 upgrade retains enrolled authority while adding prospective key r
         'DROP TABLE server_key_decisions; DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports; DROP TABLE facade_key_roster',
       );
       await conn.exec('ALTER TABLE facade_pairings DROP COLUMN retired_ms');
-      await conn.execute("UPDATE meta SET v='27' WHERE k='schema_version'");
+      await conn.execute("UPDATE meta SET v='28' WHERE k='schema_version'");
     }, { mode: 'deferred' });
     await f.reopen();
     const tenant = await openTenant(f.home(), 'logical.test');

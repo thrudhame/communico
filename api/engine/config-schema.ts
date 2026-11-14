@@ -20,6 +20,7 @@ export const SCHEMA = {
     socket: 'string',
     users: 'list',
   },
+  backup: { encrypt: 'bool', passphrasefile: 'string' },
   facade: {
     phase: 'string',
     nodes: 'list',

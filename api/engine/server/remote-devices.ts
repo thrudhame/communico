@@ -111,6 +111,25 @@ export async function acceptSigningUpdate(
 }
 
 type Pending = { revision: number; delta: DeviceDelta };
+
+/** Invalidate learned device completeness in a private restore candidate. */
+export async function invalidateRestoredDeviceCaches(
+  tx: Conn,
+): Promise<number> {
+  const [{ count }] = await tx.query(
+    'SELECT COUNT(*) AS count FROM remote_device_users',
+  );
+  // Learned keys remain for comparison/trust continuity but cannot answer a
+  // query until a fresh authoritative snapshot establishes completeness.
+  await tx.execute(
+    "UPDATE remote_device_users SET anchor=NULL,stale=1,revision=revision+1,pending='[]',seen='[]',retry_at=0,failures=0",
+  );
+  await tx.execute(
+    'INSERT INTO device_recovery_requests SELECT user_id FROM remote_device_users WHERE 1 ON CONFLICT DO NOTHING',
+  );
+  return Number(count);
+}
+
 type State = {
   anchor: string | null;
   stale: boolean;

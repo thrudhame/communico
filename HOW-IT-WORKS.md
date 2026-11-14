@@ -896,8 +896,13 @@ accepted without normalization, with the 255-byte identifier bound. Power
 levels, additional creators and restricted authorizers use this contract;
 new local account naming and non-event device-list policy remain separate.
 Local upload metadata remains tenant-owned; bytes live under
-`media.root`. Uploads enforce the size bound while streaming to `.part`, then
-rename the completed file. Generated media ids use the shared URL-safe encoder.
+`media.root`. The shared local-media publisher owns admission, bytes and metadata
+for direct uploads, reserved PUTs and preview images. It serializes each media ID,
+rechecks ownership/pending status, streams within the size bound to a private
+0600 `.part`, fsyncs the open file, closes and renames it, then fsyncs the parent
+before publishing uploaded metadata. Competing reserved PUTs cannot replace
+acknowledged bytes; failed publication leaves the reservation retryable.
+Generated media ids use the shared URL-safe encoder.
 (`api/engine/ids.ts`, `api/engine/media.ts`, `api/engine/tenant/media.ts`)
 
 `media/service.ts` owns authenticated remote demand and current origin admission,
@@ -1083,6 +1088,166 @@ omitting it lists all destinations. CLI retry and expiry times retain their real
 past/future direction, including retained expired work.
 (`main.ts:90-135`, `api/admin/index.ts:16-66`, `api/admin/index.ts:72-148`,
 `tools/admin.sh:1-12`, `api/engine/room/operator.ts:55-134`)
+
+Store startup takes an exclusive nonblocking ownership lock before creating,
+sweeping or opening its root. Its stable sibling file, `.<store-basename>.communico.lock`, is
+retained after shutdown; another owner refuses before it can modify a live
+store. Store shutdown also drains admitted snapshots before releasing ownership.
+(`api/engine/store/{index,ownership}.ts`, `native/turso-ffi/src/lib.rs`)
+
+The internal offline restore lifecycle shares that lock, rejects symlink or
+overlapping roots and refuses nonempty store or media targets without explicit
+replacement. Private candidates live beside each target, even when the two roots
+use different filesystems. A fully synced undo journal precedes no-replace
+renames; replacement keeps both old roots. Startup refuses an unfinished journal
+before creating or opening a root. An explicit offline retry checks the recorded
+directory identities and rolls back the entire original pair before preparing a
+new candidate; unknown/tampered identities refuse without moving either root.
+Candidate failure before publication removes only owned staging. The engine
+coordinator composes this lifecycle with validation, sanitation and the report;
+the explicit offline CLI invokes it without opening the app.
+(`api/engine/store/{restore,ownership,index}.ts`)
+
+Private restore candidates have a separate store-owned database lifecycle:
+preflight all file paths, check full identities/integrity, apply only supported
+migrations, then expose transaction-scoped capabilities without startup hooks or
+workers. It records original and migrated schema versions and closes/drains
+capabilities before promotion. Tenant sanitation composes the consuming-key,
+inbox-receipt and sliding-position owners in one transaction: purge every restored
+OTK/fallback pool, publish each affected pool status, clear old inbox deletion
+receipts and expire both sliding connections and positions. Public signing keys,
+credentials, encrypted session backups and retained inbox messages are unchanged.
+The offline coordinator composes these owners with the recovery epoch/report
+boundary before promotion, without opening the app.
+(`api/engine/store/candidate.ts`, `api/engine/tenant/restore.ts`)
+
+Server schema v28 adds a persistent restore recovery identity and report marker
+after the facade journal, pairing and runtime-identity migrations.
+Ordinary sync tokens retain their legacy wire form until the first restore, then
+carry that identity. A different identity resets the entire sync baseline before
+inbox acknowledgment or long-polling, even after numeric streams catch up. Both
+ordinary sync and `/keys/changes` invalidate the current complete device audience
+on that boundary. Room pagination can still read the token's event cursor; it
+does not apply sync recovery semantics. A private candidate's report is written
+0600 and fsynced before its digest completes the server marker. App startup checks
+the marker, file digest and report identity before creating any app worker or
+serving; missing, incomplete or modified reports refuse startup.
+(`api/engine/server/recovery.ts`, `api/engine/backup/report.ts`,
+`api/engine/client/{tokens,device-lists}.ts`, `api/engine/{app,syncfeed}.ts`)
+
+Within one recovery epoch, ordinary sync bounds future durable stream numbers to
+their owning server/tenant allocator ceilings before polling, as Synapse does.
+Typing remains process-local and is not numerically clamped. A repaired baseline
+never becomes an issued inbox acknowledgment: changing any numeric field cannot
+manufacture deletion authority by matching an older real receipt. Parsing tokens
+for room pagination remains storage-neutral and does not apply these repairs.
+(`api/engine/client/tokens.ts`, `api/engine/server/stream.ts`, `api/engine/tenant/streams.ts`,
+`api/engine/syncfeed.ts`)
+
+Private tenant recovery rebases user-device allocators above both their archived
+maximum and a fresh microsecond-clock anchor, then appends immutable reset intents.
+Normal tenant roll-forward projects those behind retained reliable work using the
+same full-resnapshot owner as subscription activation. Frozen envelope bytes, UUIDs
+and old source identities stay unchanged. Subsequent updates chain from the new
+anchor; new subscriptions, including empty accounts, use it too. Numeric rebasing
+does not establish what an unseen peer once observed: `prev_id:[]` is the actual
+resnapshot contract. Private server recovery invalidates learned remote-device
+completeness/causal memory and retries without deleting keys or trust decisions.
+The offline coordinator composes these owners before completing the report.
+(`api/engine/tenant/changes.ts`, `api/engine/server/{device-federation,remote-devices}.ts`)
+
+Restore work inspection uses query-only captured/candidate capabilities, never
+sender or scheduler APIs. Domain owners inventory every retained delayed command
+(including overdue, prepared and completed reconciliation state), outstanding
+send receipts, tenant reliable intents/projection lag, server PDU/EDU and frozen
+transaction identities/digests, join/knock/retraction work, queued pushes/badges
+and unprojected room delivery intent. Keyset reads have no row-count ceiling;
+reports omit message/key/PDU bodies. The report disclosure owner describes the
+post-cut RPO, reviving old credentials, missing private keys and possible repeated
+external effects. This inventory is not an extra operator approval gate; workers
+resume normal semantics only after the completed durable report boundary.
+(`api/engine/backup/work.ts`, `api/engine/{room,tenant,server}/restore-work.ts`)
+
+The internal store snapshot primitive pauses common storage admission, drains
+transactions and lifecycle changes, then exports every final server/tenant/room
+file with store-owned autocommit VACUUM connections. Retired but not yet unlinked
+files remain part of that crash-consistent cut. The pause is measured, not
+deadline-limited. Quote-free directory-fd staging keeps legal operator paths
+out of SQL. After admission resumes, publication fsyncs and uses no-replace
+rename, staging a private copy first across filesystems. This primitive exports
+database files, not local media or deployment configuration by itself.
+(`api/engine/store/{admission,db,index,pool,files}.ts`)
+
+The internal format-1 bundle manifest records logical identities, native/schema
+provenance, the measured cut, secret disclosures and exact payload inventories.
+Its sealer hashes and syncs payloads before creating a private completion file;
+the reader refuses missing/extra entries, symlinks, invalid paths and mismatched
+sizes/hashes without opening or migrating archived databases. Plaintext and
+encrypted payload digests are separate. This metadata primitive alone is not
+the whole-server backup/restore command.
+(`api/engine/backup/manifest.ts`)
+
+The optional bundle cipher uses standard GnuPG AES256 OpenPGP, disabled in the
+shipped `backup` settings. It checks the private passphrase file and executable
+before the cut, streams secrets through stdin and bytes through private 0600
+files, verifies GnuPG's integrity status and the manifest's plaintext digest,
+and cleans up only its own temporary GnuPG home/agent. Plaintext staging is not
+secure erasure; the running backup and offline restore commands compose it.
+(`api/engine/backup/encryption.ts`, `defaults/communico.toml`)
+
+Captured-database inspection opens and upgrades only store-owned private scratch
+copies, checks integrity and full file identities, and never invokes app startup
+or workers. Domain audits check room DAG/state references, signing-key pairs,
+allocator/source heads, projection references and watermarks, prepared/completed
+send receipts and projected reliable delivery. Projection lag and the completed
+room-removal crash window remain valid. The uploaded-media inventory includes
+inactive tenants and excludes pending reservations. Full scans use keyset batches
+without a row-count ceiling. Both backup and offline restore compose these audits.
+(`api/engine/store/inspect.ts`, `api/engine/backup/{audit,checks}.ts`,
+`api/engine/{room,tenant,server}/backup-audit.ts`)
+
+The internal bundle producer captures deployment inputs before the running-store
+cut, audits private database copies, copies only uploaded local media, and
+preserves the original operator overlay, effective non-secret environment settings
+and explicitly referenced Matrix/facade TLS/CA files. A present protected pairing
+bootstrap is retained; a missing consumed bootstrap is valid. Private-file policy
+and passphrase exclusion inspect the descriptor actually copied, through the same
+pinned regular-file owner used by passphrase capture.
+Portable deployment mappings record each original config node and bundled file.
+Environment-sourced TURN credentials remain external; the encryption passphrase
+source is never bundled. Optional encryption removes only owned plaintext staging
+after encryption succeeds. The manifest-last seal and storage-owned no-replace
+publication expose only the complete bundle. GnuPG uses a live directory-fd alias
+for its private home/agent, so long bundle paths do not become socket paths. This
+engine producer is paired with offline restore through the operator commands.
+(`api/engine/backup/bundle.ts`, `api/engine/store/index.ts`)
+
+The offline engine restore reads and verifies the complete manifest/inventory,
+checks native/schema compatibility and copies/decrypts only private candidates.
+It migrates and audits DB identities/source references, checks the uploaded-media
+inventory, sanitizes consuming keys and delivery boundaries, rebases device streams
+and invalidates learned device completeness. Real job inventories and RPO warnings
+are fsynced into the report and bound into the candidate marker before closing
+candidate DB lifetimes and promoting both roots. The immutable bundle is never
+opened as a running store or migrated in place. Replacement preserves prior roots.
+Portable generated configuration uses the same Matrix name and signing identity,
+new storage/media paths and bundled TLS/CA mappings; explicit target overrides
+win, but environment credentials remain external. The original effective/overlay
+files are retained for provenance. Operators must fence the old installation
+before serving the same identity on another machine; a local ownership lock cannot
+fence another host. The offline CLI calls this owner, never app startup.
+(`api/engine/backup/{restore,deployment}.ts`)
+
+`./communico backup` / `deno task backup` resolve the destination at the caller
+and invoke `/v1/backup` over the existing versioned private socket. That adapter
+calls the running store's bundle owner. The client has no FFI or TCP permission
+and no backup duration deadline. `./communico restore` / `deno task restore`
+invoke the offline owner with native/file access and optional GnuPG subprocesses,
+but no network permission. Their JSON results name the bundle or generated
+configuration/report and retained replacement roots; detailed restore inventory
+stays in the durable report. The normal start task permits `gpg`/`gpgconf` for
+encrypted backup. Public Matrix listeners never mount either admin operation.
+(`api/admin/backup.ts`, `tools/{backup,restore,admin-client}.ts`, `deno.json`)
 
 Configuration layers shipped TOML, an optional overlay and environment leaves;
 unknown nodes and wrong types are errors. Signals stop admission, drain all

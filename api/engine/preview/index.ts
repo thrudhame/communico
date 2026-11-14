@@ -2,8 +2,7 @@ import { theApp } from '#engine/app.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { mediaMaxBytes, newMediaId, storeUploadBody } from '#engine/media.ts';
-import { createMedia } from '#engine/tenant/media.ts';
+import { mediaMaxBytes, uploadMedia } from '#engine/media.ts';
 import { imageDimensions } from './dimensions.ts';
 import { guardedGet } from './guard.ts';
 import { openGraphFor } from './og.ts';
@@ -99,21 +98,23 @@ export async function previewUrl(
     delete og['og:image'];
     return og;
   }
-  const mediaId = newMediaId();
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       controller.enqueue(img.body);
       controller.close();
     },
   });
-  const sizeBytes = await storeUploadBody(stream, mediaId);
   const filename = filenameOf(absolute);
   const contentType = img.contentType.split(';')[0].trim();
-  await createMedia(theApp().tenant, localpartOf(userId), mediaId, 'uploaded', {
-    content_type: contentType,
-    filename: filename.length > 0 ? filename : undefined,
-    size_bytes: sizeBytes,
-  });
+  const { mediaId, sizeBytes } = await uploadMedia(
+    theApp().tenant,
+    localpartOf(userId),
+    stream,
+    {
+      content_type: contentType,
+      filename: filename.length > 0 ? filename : undefined,
+    },
+  );
   og['og:image'] = 'mxc://' + serverName() + '/' + mediaId;
   og['og:image:type'] = contentType;
   og['matrix:image:size'] = sizeBytes;

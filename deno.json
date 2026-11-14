@@ -6,7 +6,7 @@
   "tasks": {
     "native": "sh tools/native-build.sh",
     "check": "deno fmt --check && deno lint && deno check main.ts api/ tests/ tools/",
-    "start": "deno --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys=uid,umask,ca --allow-run=openssl main.ts",
+    "start": "deno --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys=uid,umask,ca --allow-run=openssl,gpg,gpgconf main.ts",
     "fmt": "deno fmt",
     "test": "COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDCREATION=true COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDJOINING=true COMMUNICO_ENCRYPTION_ALLOWUNENCRYPTEDMESSAGES=true deno test --allow-net --allow-env --allow-read --allow-write --allow-run --allow-ffi --allow-sys=uid,umask,ca tests/*.test.ts tests/rulebook/*.test.ts",
     "config": "deno run --allow-env --allow-read tools/config.ts",
@@ -16,6 +16,8 @@
     "federation-outbox": "sh tools/admin.sh federation-outbox",
     "federation-cert": "sh tools/admin.sh federation-cert",
     "rooms": "sh tools/admin.sh rooms",
+    "backup": "sh tools/admin.sh backup",
+    "restore": "deno run --env --allow-env --allow-read --allow-write --allow-ffi --allow-sys=uid --allow-run=gpg,gpgconf tools/restore.ts",
     "debug-proxy": "deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
   },
   "imports": {

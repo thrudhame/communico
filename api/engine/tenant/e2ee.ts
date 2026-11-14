@@ -257,6 +257,40 @@ export async function keyStatus(
   return { counts, unused, seq: seq.length ? Number(seq[0].seq) : 0 };
 }
 
+// A backup may predate a claim or fallback rotation. No restored consuming key
+// is safe to republish; long-lived device/signing keys and backups are not pools.
+export async function purgeRestoredKeyPools(conn: Conn): Promise<{
+  oneTimeKeys: number;
+  fallbackKeys: number;
+  poolDevices: number;
+}> {
+  let oneTimeKeys = 0, fallbackKeys = 0, poolDevices = 0;
+  for (;;) {
+    const devices = await conn.query(
+      'SELECT localpart,device_id,generation FROM one_time_keys UNION SELECT localpart,device_id,generation FROM fallback_keys LIMIT 256',
+    );
+    if (!devices.length) break;
+    for (const row of devices) {
+      const owner = [row.localpart, row.device_id, row.generation];
+      oneTimeKeys += await conn.execute(
+        'DELETE FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=?',
+        owner,
+      );
+      fallbackKeys += await conn.execute(
+        'DELETE FROM fallback_keys WHERE localpart=? AND device_id=? AND generation=?',
+        owner,
+      );
+      await poolChanged(conn, {
+        localpart: String(row.localpart),
+        deviceId: String(row.device_id),
+        generation: Number(row.generation),
+      });
+      poolDevices++;
+    }
+  }
+  return { oneTimeKeys, fallbackKeys, poolDevices };
+}
+
 export async function queryKeys(
   conn: Conn,
   localpart: string,

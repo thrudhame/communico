@@ -11,6 +11,7 @@
 import type { SchemaProvider } from '#engine/store/create.ts';
 import { FEDERATION_POLICY_SQL } from '#engine/federation/policy.ts';
 import { KEY_DECISIONS_SQL } from '#engine/federation/key-decisions.ts';
+import { RECOVERY_SQL } from '#engine/server/recovery.ts';
 import {
   FACADE_JOURNAL_SQL,
   FACADE_KEY_RETIREMENT_SQL,
@@ -392,7 +393,7 @@ UPDATE receipts SET event_ids=json_array(event_ids);
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 32,
+  version: 33,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -421,6 +422,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FACADE_JOURNAL_SQL);
     await db.exec(FACADE_PAIRING_SQL);
     await db.exec(RUNTIME_IDENTITY_SQL);
+    await db.exec(RECOVERY_SQL);
     await db.exec(FACADE_KEY_RETIREMENT_SQL);
     await db.exec(FACADE_KEY_ROSTER_SQL);
     await db.exec(FACADE_SCOPES_SQL);
@@ -455,10 +457,11 @@ export const serverSchema: SchemaProvider = {
     24: (conn) => conn.exec(FACADE_JOURNAL_SQL),
     25: (conn) => conn.exec(FACADE_PAIRING_SQL),
     26: (conn) => conn.exec(RUNTIME_IDENTITY_SQL),
-    27: (conn) => conn.exec(FACADE_KEY_RETIREMENT_SQL),
-    28: (conn) => conn.exec(FACADE_KEY_ROSTER_SQL),
-    29: (conn) => conn.exec(FACADE_SCOPES_SQL),
-    30: (conn) => conn.exec(FEDERATION_POLICY_SQL),
-    31: (conn) => conn.exec(KEY_DECISIONS_SQL),
+    27: (conn) => conn.exec(RECOVERY_SQL),
+    28: (conn) => conn.exec(FACADE_KEY_RETIREMENT_SQL),
+    29: (conn) => conn.exec(FACADE_KEY_ROSTER_SQL),
+    30: (conn) => conn.exec(FACADE_SCOPES_SQL),
+    31: (conn) => conn.exec(FEDERATION_POLICY_SQL),
+    32: (conn) => conn.exec(KEY_DECISIONS_SQL),
   },
 };

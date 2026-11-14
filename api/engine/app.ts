@@ -9,6 +9,7 @@
 // app store (4b), engine tests keep opening schema-less stores without
 // it.
 import { config, serverName } from '#engine/config.ts';
+import { assertRestoreReport } from '#engine/backup/report.ts';
 import { bindRole } from '#engine/facade/role.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
@@ -117,6 +118,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   const services: (() => void | Promise<void>)[] = [];
   const stopServices = () => drainResources(services.splice(0).reverse());
   try {
+    await assertRestoreReport(store);
     const tenant = await openTenant(store, serverName(), { create: true });
     await tenant.tx((tx) => tx.slidingSync.prune());
     const server = await store.server();
