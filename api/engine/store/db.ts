@@ -11,6 +11,7 @@ import {
 import { Gate } from '#engine/store/gate.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import { publish } from '#engine/store/files.ts';
+import { exportSnapshot, type ReadSnapshot } from '#engine/store/export.ts';
 
 export class StoreConflictError extends StoreError {
   constructor(
@@ -317,6 +318,80 @@ export class Db {
 
   exec(sql: string): Promise<void> {
     return this.tx((connection) => connection.exec(sql), { mode: 'deferred' });
+  }
+
+  // Separate maintenance capability: owns one native read transaction without
+  // consuming an ordinary transaction slot or blocking threshold writers.
+  async readSnapshot(): Promise<ReadSnapshot> {
+    if (this.closing || this.closed) {
+      throw new Error('database is closing or closed');
+    }
+    this.users++;
+    let releaseGate: (() => void) | undefined;
+    let handle: number | undefined;
+    let released = false;
+    let exporting: Promise<void> | undefined;
+    let releasing: Promise<void> | undefined;
+    const release = () =>
+      releasing ??= (async () => {
+        released = true;
+        try {
+          await exporting?.catch(() => undefined);
+          if (handle !== undefined) {
+            try {
+              await this.ffi.rollback(handle);
+            } finally {
+              await this.ffi.closeConnection(handle);
+            }
+          }
+        } finally {
+          releaseGate?.();
+          this.users--;
+          this.notify();
+        }
+      })();
+    try {
+      releaseGate = await this.gate.retain();
+      handle = await this.ffi.connect(this.handle);
+      await this.ffi.begin(handle, 'deferred');
+      // BEGIN alone is lazy; this read establishes the actual MVCC cut.
+      const schema = await this.ffi.query(
+        handle,
+        'SELECT type,name,sql FROM sqlite_schema ORDER BY rowid',
+      );
+      return {
+        export: (destination) => {
+          if (released) {
+            return Promise.reject(new Error('snapshot has been released'));
+          }
+          if (exporting) {
+            return Promise.reject(new Error('snapshot export already started'));
+          }
+          if (resolve(destination) === this.path) {
+            return Promise.reject(
+              new TypeError('backup destination is the source database'),
+            );
+          }
+          return exporting = exportSnapshot(
+            this.ffi,
+            handle!,
+            schema,
+            destination,
+          );
+        },
+        release,
+      };
+    } catch (error) {
+      try {
+        await release();
+      } catch (cleanup) {
+        throw new AggregateError(
+          [error, cleanup],
+          'snapshot pin and release failed',
+        );
+      }
+      throw error;
+    }
   }
 
   // Store-owned maintenance, deliberately absent from the logical Database/Conn

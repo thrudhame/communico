@@ -22,6 +22,7 @@ export class Gate extends EventTarget {
   private active = 0;
   private paused = false;
   private checkpointing = false;
+  private retained = 0;
   private waiters: (() => void)[] = [];
   private drained?: () => void;
   private barrier?: Promise<void>;
@@ -64,6 +65,22 @@ export class Gate extends EventTarget {
     this.counters.transactions++;
   }
 
+  // A backup snapshot prevents checkpoint initiation, not transaction admission.
+  // Unlike an ordinary reader it must never make a committing writer wait for
+  // the complete export. Native auto-checkpoint is disabled by the Db owner.
+  async retain(): Promise<() => void> {
+    while (this.paused) {
+      await new Promise<void>((wake) => this.waiters.push(wake));
+    }
+    this.retained++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.retained--;
+    };
+  }
+
   async leave(committed: boolean): Promise<void> {
     if (this.active < 1) throw new Error('unbalanced file gate');
     this.active--;
@@ -75,8 +92,11 @@ export class Gate extends EventTarget {
     this.counters.commits++;
     // Check every commit, including read-only ones: query SQL can return rows
     // while writing (RETURNING). No SQL-text guesses can bypass maintenance.
+    if (this.retained) return;
     if (this.barrier) return await this.barrier;
     if (await this.logBytes() < this.threshold) return;
+    // retain() can have acquired ownership while stat was in flight.
+    if (this.retained) return;
     if (this.barrier) return await this.barrier;
     this.paused = true;
     this.barrier = this.maintain();
