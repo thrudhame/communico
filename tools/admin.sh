@@ -4,7 +4,7 @@ set -eu
 tool=$1
 shift
 case "$tool" in
-  federation-block|federation-peer|federation-key|federation-outbox|federation-cert|rooms) ;;
+  federation-block|federation-peer|federation-key|federation-outbox|federation-cert|rooms|backup) ;;
   *) exit 2 ;;
 esac
 socket=$(deno run --env --allow-env --allow-read tools/admin-client.ts --socket)

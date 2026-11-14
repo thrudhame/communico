@@ -1,0 +1,9 @@
+#!/bin/sh
+# Run from the installation directory, with the normal layered configuration.
+set -eu
+command=${1-}
+test "$#" -eq 0 || shift
+case "$command" in
+  start|backup|restore) exec deno task "$command" -- "$@" ;;
+  *) echo 'usage: ./communico start | backup <destination> | restore <bundle> [--replace]' >&2; exit 2 ;;
+esac

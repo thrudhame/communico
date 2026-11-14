@@ -10,6 +10,7 @@ import {
 } from '#engine/store/ffi.ts';
 import { Gate } from '#engine/store/gate.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
+import { publish } from '#engine/store/files.ts';
 
 export class StoreConflictError extends StoreError {
   constructor(
@@ -301,6 +302,62 @@ export class Db {
 
   exec(sql: string): Promise<void> {
     return this.tx((connection) => connection.exec(sql), { mode: 'deferred' });
+  }
+
+  // Store-owned maintenance, deliberately absent from the logical Database/Conn
+  // capability. The gate retains this reader against checkpoint and shutdown.
+  async vacuumInto(destination: string): Promise<void> {
+    if (this.closing || this.closed) {
+      throw new Error('database is closing or closed');
+    }
+    if (resolve(destination) === this.path) {
+      throw new TypeError('backup destination is the source database');
+    }
+    this.users++;
+    let entered = false;
+    let handle: number | undefined;
+    let staging: string | undefined;
+    try {
+      await this.gate.enter();
+      entered = true;
+      handle = await this.acquire();
+      staging = await Deno.makeTempDir({
+        dir: dirname(dirname(this.path)),
+        prefix: '.backup-',
+        suffix: '.new',
+      });
+      await this.ffi.vacuumInto(handle, staging);
+      const output = join(staging, 'data.db');
+      await Deno.chmod(output, 0o600);
+      await publish(this.ffi, output, destination);
+    } finally {
+      try {
+        if (handle !== undefined) {
+          try {
+            await this.ffi.rollback(handle);
+          } finally {
+            try {
+              await this.ffi.closeConnection(handle);
+            } finally {
+              this.connections--;
+            }
+          }
+        }
+      } finally {
+        try {
+          try {
+            if (staging !== undefined) {
+              await Deno.remove(staging, { recursive: true });
+            }
+          } finally {
+            if (entered) await this.gate.leave(false);
+          }
+        } finally {
+          this.users--;
+          this.notify();
+        }
+      }
+    }
   }
 
   close(): Promise<void> {

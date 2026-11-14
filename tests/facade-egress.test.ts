@@ -284,14 +284,14 @@ Deno.test('facade dispatch loss retries the identical owner envelope after resta
   }
 });
 
-Deno.test('egress migration upgrades v33 without losing frozen bytes', async () => {
+Deno.test('egress migration upgrades v34 without losing frozen bytes', async () => {
   const f = await fixture();
   try {
     await (await f.db()).tx(async (tx) => {
       await tx.exec(
         'DROP TABLE facade_egress; DROP TABLE facade_egress_routes',
       );
-      await tx.execute("UPDATE meta SET v='33' WHERE k='schema_version'");
+      await tx.execute("UPDATE meta SET v='34' WHERE k='schema_version'");
     }, { mode: 'deferred' });
     await f.reopen();
     const record = await f.append({ kind: 'propose', ...f.envelope });

@@ -18,6 +18,12 @@ import { encodeStreamToken, type StreamToken } from '#engine/client/tokens.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 
 const args = (d: DeviceIdentity) => [d.localpart, d.deviceId, d.generation];
+
+// Old issued tokens lose deletion authority after restore. Retained messages and
+// genuinely committed acknowledgments are not discarded or inferred anew.
+export function forgetRestoredDeliveries(conn: Conn): Promise<number> {
+  return conn.execute('DELETE FROM sync_deliveries');
+}
 export type Message = { user: string; id: string; content: Json };
 /** Queue pressure is temporary, unlike a permanently oversized wire object. */
 export class InboxFullError extends MatrixError {

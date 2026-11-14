@@ -12,6 +12,7 @@ import {
 } from '#engine/client/render.ts';
 import { inviteOf, prejoinDeparture } from '#engine/federation/invites.ts';
 import {
+  boundFutureToken,
   encodeStreamToken,
   formatStreamToken,
   type StreamToken,
@@ -22,8 +23,13 @@ import {
   savedPrejoinDisplay,
 } from '#engine/federation/prejoin.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
-import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
-import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  deviceListsBetween,
+  deviceListSnapshot,
+  deviceStreamMax,
+} from '#engine/server/e2ee.ts';
+import { recoveryState } from '#engine/server/recovery.ts';
+import { syncStreamHeads } from '#engine/server/stream.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import { formatCursor } from '#engine/room/segments.ts';
@@ -166,6 +172,7 @@ async function roomTimeline(
           now.mSeq,
           now.kSeq,
           now.nSeq,
+          now.epoch,
         )
         : formatCursor(paginationCursor),
     },
@@ -296,17 +303,43 @@ async function waitForRelevant(
 
 export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
   const app = theApp();
+  const epoch = (await recoveryState(app.server))?.epoch;
+  const recoveryReset = i.since !== null && i.since.epoch !== epoch;
+  // Resolve the entire delivery baseline BEFORE old inbox proofs or wait logic.
+  // Equal numeric counters from another restore era never reestablish authority.
+  if (recoveryReset) i = { ...i, since: null, fullState: true };
   const lp = localpartOf(i.userId);
   const device: DeviceIdentity | null =
     i.deviceId === null || i.deviceGeneration === undefined
       ? null
       : { localpart: lp, deviceId: i.deviceId, generation: i.deviceGeneration };
-  if (device !== null) {
-    await app.tenant.tx((tx) => tx.toDevice.acknowledge(device, i.since));
+  const issuedSince = i.since;
+  if (i.since !== null) {
+    const serverHeads = await syncStreamHeads(app.server);
+    const tenantHeads = await app.tenant.tx((tx) => tx.streams.heads());
+    i = {
+      ...i,
+      since: boundFutureToken(i.since, {
+        eSeq: serverHeads.events,
+        pSeq: serverHeads.presence,
+        rSeq: serverHeads.receipts,
+        dSeq: serverHeads.devices,
+        nSeq: serverHeads.notifications,
+        aSeq: tenantHeads.accountData,
+        mSeq: tenantHeads.inbox,
+        kSeq: tenantHeads.keyPools,
+      }),
+    };
   }
-  const deviceHead = await deviceStreamMax(app.server);
-  if (i.since !== null && i.since.dSeq > deviceHead) {
-    throw new MatrixError(400, 'M_INVALID_PARAM', 'future device token');
+  if (device !== null) {
+    // A repaired numeric baseline is not the exact receipt issued to a client.
+    // Never hash it into deletion authority, even if it equals an older receipt.
+    await app.tenant.tx((tx) =>
+      tx.toDevice.acknowledge(
+        device,
+        i.since === issuedSince ? issuedSince : null,
+      )
+    );
   }
   if (i.setPresence !== undefined) {
     await setPresenceValue(app.server, i.userId, i.setPresence);
@@ -377,6 +410,7 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     mSeq: 0,
     kSeq: 0,
     nSeq: snapshot.counters.get('notifications') ?? 0,
+    ...(epoch === undefined ? {} : { epoch }),
   };
   const delivery = device === null
     ? { events: [], token: now, pools: { counts: {}, unused: [] } }
@@ -572,7 +606,9 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       await includePresence(u);
     }
   }
-  const deviceLists = i.since === null
+  const deviceLists = recoveryReset
+    ? await deviceListSnapshot(app.server, i.userId, 'sync', now.dSeq)
+    : i.since === null
     ? { changed: [], left: [] }
     : await deviceListsBetween(
       app.server,

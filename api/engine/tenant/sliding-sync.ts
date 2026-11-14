@@ -17,6 +17,19 @@ const scope = (d: DeviceIdentity) => [d.localpart, d.deviceId, d.generation];
 function unknown(): never {
   throw new MatrixError(400, 'M_UNKNOWN_POS', 'unknown sliding sync position');
 }
+
+export async function resetRestoredPositions(conn: Conn): Promise<{
+  slidingPositions: number;
+  slidingConnections: number;
+}> {
+  const slidingPositions = await conn.execute(
+    'DELETE FROM sliding_sync_positions',
+  );
+  const slidingConnections = await conn.execute(
+    'DELETE FROM sliding_sync_connections',
+  );
+  return { slidingPositions, slidingConnections };
+}
 export async function prunePositions(conn: Conn, now: number): Promise<void> {
   await conn.execute(
     'DELETE FROM sliding_sync_positions WHERE connection_id IN (SELECT id FROM sliding_sync_connections WHERE expires_ms<=?)',

@@ -1,4 +1,5 @@
-// Storage-neutral doltgres stream grammar; shared with room pagination.
+// Storage-neutral wire grammar. Sync recovery is applied by its consumer, never
+// by room pagination, which reads only its own event/room cursor boundary.
 export type StreamToken = {
   eSeq: number;
   pSeq: number;
@@ -9,18 +10,42 @@ export type StreamToken = {
   mSeq: number;
   kSeq: number;
   nSeq?: number;
+  epoch?: string;
 };
+
+export type DurableStreamHeads = Omit<Required<StreamToken>, 'epoch' | 'tSeq'>;
+
+/** Synapse's future-token recovery: clamp durable streams to allocated maxima.
+ * Typing is intentionally excluded because its process-local stream may reset.
+ * Return identity when unchanged so callers never synthesize receipt authority.
+ * This is a sync-consumer operation, not part of the pagination wire parser. */
+export function boundFutureToken(
+  token: StreamToken,
+  heads: DurableStreamHeads,
+): StreamToken {
+  const bounded = { ...token };
+  let changed = false;
+  for (const key of Object.keys(heads) as (keyof DurableStreamHeads)[]) {
+    if ((token[key] ?? 0) > heads[key]) {
+      bounded[key] = heads[key];
+      changed = true;
+    }
+  }
+  return changed ? bounded : token;
+}
 
 export function parseStreamToken(raw: string | null): StreamToken | null {
   if (raw === null) return null;
   const m =
-    /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?(?:_a(\d+))?(?:_d(\d+))?(?:_m(\d+))?(?:_k(\d+))?(?:_n(\d+))?$/
+    /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?(?:_a(\d+))?(?:_d(\d+))?(?:_m(\d+))?(?:_k(\d+))?(?:_n(\d+))?(?:_z([a-f0-9]{32}))?$/
       .exec(
         raw,
       );
   if (!m) return null;
   if (
-    m.slice(1).some((n) => n !== undefined && !Number.isSafeInteger(Number(n)))
+    m.slice(1, 10).some((n) =>
+      n !== undefined && !Number.isSafeInteger(Number(n))
+    )
   ) return null;
   return {
     eSeq: Number(m[1]),
@@ -32,6 +57,7 @@ export function parseStreamToken(raw: string | null): StreamToken | null {
     mSeq: m[7] ? Number(m[7]) : 0,
     kSeq: m[8] ? Number(m[8]) : 0,
     ...(m[9] === undefined ? {} : { nSeq: Number(m[9]) }),
+    ...(m[10] === undefined ? {} : { epoch: m[10] }),
   };
 }
 
@@ -45,9 +71,11 @@ export function formatStreamToken(
   mSeq = 0,
   kSeq = 0,
   nSeq?: number,
+  epoch?: string,
 ): string {
   return `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}_a${aSeq}_d${dSeq}_m${mSeq}_k${kSeq}` +
-    (nSeq === undefined ? '' : `_n${nSeq}`);
+    (nSeq === undefined ? '' : `_n${nSeq}`) +
+    (epoch === undefined ? '' : `_z${epoch}`);
 }
 
 export function encodeStreamToken(t: StreamToken): string {
@@ -61,5 +89,6 @@ export function encodeStreamToken(t: StreamToken): string {
     t.mSeq,
     t.kSeq,
     t.nSeq,
+    t.epoch,
   );
 }

@@ -6,6 +6,7 @@ import metadata from '#root/deno.json' with { type: 'json' };
 import { federationOperations } from './federation.ts';
 import { roomOperations } from './rooms.ts';
 import { reportOperations } from './reports.ts';
+import { backupOperations } from './backup.ts';
 import { homeFacadeOperations } from './facade.ts';
 import { operationHandler } from './handler.ts';
 import { startAdminHandler } from './socket.ts';
@@ -19,6 +20,7 @@ export function adminHandler(
     ...federationOperations(app),
     ...roomOperations(app),
     ...reportOperations(app),
+    ...backupOperations(app),
     ...homeFacadeOperations(app),
     '/v1/status': () => ({
       server: serverName(),

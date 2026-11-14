@@ -103,7 +103,7 @@ async function fixture() {
         await conn.exec(
           'DROP TABLE facade_egress_routes; DROP TABLE facade_egress; DROP TABLE facade_ingress_collisions; DROP TABLE facade_ingress_children; DROP TABLE facade_ingress; DROP TABLE server_key_decisions; DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports; DROP TABLE facade_key_roster',
         );
-        await conn.execute("UPDATE meta SET v='28' WHERE k='schema_version'");
+        await conn.execute("UPDATE meta SET v='29' WHERE k='schema_version'");
       }, { mode: 'deferred' });
     },
     async receive() {

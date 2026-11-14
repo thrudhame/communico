@@ -28,6 +28,16 @@ socket = ""
 # COMMUNICO_ADMIN_USERS
 users = []
 
+[backup]
+# Optional standard OpenPGP AES256 payload encryption; requires GnuPG when on.
+# Plaintext staging stays private, but secure erasure on SSDs is not promised.
+# COMMUNICO_BACKUP_ENCRYPT
+encrypt = false
+# Private file owned by the server user (0600 or stricter); first line is the
+# passphrase, as with GnuPG. Never archived or placed in command arguments.
+# COMMUNICO_BACKUP_PASSPHRASEFILE
+passphrasefile = ""
+
 [facade]
 # Delivered role capability. F2/F3 are not implemented. COMMUNICO_FACADE_PHASE
 phase = "f1"
