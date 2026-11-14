@@ -35,6 +35,9 @@ export const LINK_VERSION: Version = { major: 1, minor: 0 };
 export const LINK_CAPABILITIES: readonly Capability[] = [{
   type: 'control',
   version: 1,
+}, {
+  type: 'room-replica',
+  version: 1,
 }];
 export const EMPTY_CUT: Cut = { sequence: 0, hash: '' };
 

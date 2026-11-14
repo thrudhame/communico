@@ -9,6 +9,7 @@ export type ReplicaRoom = {
   version: 1;
   roomId: string;
   roomVersion: string;
+  after: number;
   cut: number;
   stays: {
     opening: { kind: 'genesis' | 'join'; eventId: string; createId: string };
@@ -38,10 +39,16 @@ function unavailable(message: string): never {
 export function exportReplicaRoom(
   room: Room,
   self: string,
+  after = 0,
 ): Promise<ReplicaRoom> {
   return room.tx(async (tx) => {
     const cut = await tx.changes.head();
-    const changes = cut === 0 ? [] : await tx.changes.after(0, cut);
+    if (!Number.isSafeInteger(after) || after < 0 || after > cut) {
+      unavailable('replica source cut is unavailable');
+    }
+    const changes = cut === after
+      ? []
+      : await tx.changes.after(after, cut - after);
     const segments = await tx.segments.list();
     const bySegment = new Map(segments.map((segment) => [segment.id, segment]));
     const pack = new Map<string, Pdu>();
@@ -191,6 +198,7 @@ export function exportReplicaRoom(
       version: 1,
       roomId: room.id,
       roomVersion,
+      after,
       cut,
       stays,
       steps,

@@ -79,7 +79,9 @@ async function fixture() {
     exportRoster,
     async downgrade() {
       await edgeServer.tx(async (conn) => {
-        await conn.exec('DROP TABLE facade_key_roster');
+        await conn.exec(
+          'DROP TABLE facade_scopes; DROP TABLE facade_exports; DROP TABLE facade_key_roster',
+        );
         await conn.execute("UPDATE meta SET v='28' WHERE k='schema_version'");
       }, { mode: 'deferred' });
     },

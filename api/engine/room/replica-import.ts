@@ -30,6 +30,7 @@ export async function importReplicaRoom(
   if (manifest.version !== 1) {
     throw new MatrixError(400, 'M_BAD_JSON', 'replica manifest version');
   }
+  if (manifest.after > 0) await openRoom(store, manifest.roomId);
   const pack = new Map<string, Pdu>();
   for (const raw of manifest.events) {
     input.signal?.throwIfAborted();
@@ -234,7 +235,7 @@ export async function importReplicaRoom(
   }
   for (const [id, expected] of stays) {
     if (!initialized.has(id)) {
-      unavailable('replica participation was not applied');
+      await ensure(id, input.self);
     }
     const room = await openRoom(store, manifest.roomId);
     const closed = await room.tx(async (tx) => {

@@ -26,3 +26,8 @@ export const FACADE_KEY_ROSTER_SQL = `
 CREATE TABLE facade_key_roster(singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),revision INTEGER NOT NULL,roster_json TEXT,last_home_ms INTEGER,document_json TEXT,issued_ms INTEGER);
 INSERT INTO facade_key_roster(singleton,revision) VALUES(1,0);
 `;
+
+export const FACADE_SCOPES_SQL = `
+CREATE TABLE facade_exports(peer TEXT NOT NULL,incarnation TEXT NOT NULL,scope TEXT NOT NULL,source_cut INTEGER NOT NULL,PRIMARY KEY(peer,incarnation,scope));
+CREATE TABLE facade_scopes(incarnation TEXT NOT NULL,scope TEXT NOT NULL,source_cut INTEGER NOT NULL,ready INTEGER NOT NULL CHECK(ready IN (0,1)),pending_hash TEXT,PRIMARY KEY(incarnation,scope));
+`;
