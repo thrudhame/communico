@@ -270,12 +270,20 @@ export function linkHandler(options: {
       return stream;
     };
     const journal = options.journal;
+    // Retention spans enrollment lifetimes; the active wire view does not.
+    const activeStreams = async (direction: 'in' | 'out') =>
+      (await journal.streams('home', direction)).filter((stream) =>
+        direction === 'in'
+          ? stream.source === 'home' && stream.incarnation === id
+          : stream.source === options.node &&
+            stream.incarnation === options.incarnation
+      );
     if (route === 'notices') {
       const read = async () => {
         await (await options.pairings()).authorizedHome(id, pin);
         const streams = [
-          ...await journal.streams('home', 'out'),
-          ...await journal.streams('home', 'in'),
+          ...await activeStreams('out'),
+          ...await activeStreams('in'),
         ];
         return {
           protocol: LINK_VERSION,
@@ -301,12 +309,12 @@ export function linkHandler(options: {
       return Response.json(await read());
     }
     if (route === 'hello') {
-      const outgoing = await journal.streams('home', 'out');
+      const outgoing = await activeStreams('out');
       return response({
         revision: grant.body.revision,
         scopes: [],
         outgoing,
-        incoming: await journal.streams('home', 'in'),
+        incoming: await activeStreams('in'),
         exportAcks: await Promise.all(outgoing.map(async (stream) => ({
           ...streamOf(stream),
           ...await journal.acknowledged('home', stream),

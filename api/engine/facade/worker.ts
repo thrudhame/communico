@@ -50,8 +50,17 @@ export class JournalReconciler {
   async reconcile(signal?: AbortSignal): Promise<Hello> {
     const hello = await this.options.client.hello(signal);
     const { client, journal } = this.options;
-    const outgoing = await journal.streams(client.peer.node, 'out');
-    const incoming = await journal.streams(client.peer.node, 'in');
+    const outgoing = (await journal.streams(client.peer.node, 'out')).filter((
+      stream,
+    ) =>
+      stream.source === 'home' && stream.incarnation === client.peer.pairing
+    );
+    const incoming = (await journal.streams(client.peer.node, 'in')).filter((
+      stream,
+    ) =>
+      stream.source === client.peer.node &&
+      stream.incarnation === client.peer.incarnation
+    );
     const remoteOut = new Map(
       hello.outgoing.map((stream) => [key(stream), stream]),
     );
@@ -187,6 +196,7 @@ export class JournalReconciler {
         );
       }
       held = next;
+      await acknowledge();
     }
     signal?.throwIfAborted();
     await acknowledge();

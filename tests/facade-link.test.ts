@@ -357,6 +357,143 @@ async function fixture() {
   };
 }
 
+Deno.test('re-enrollment exposes only active home streams while retaining retired records', async () => {
+  const f = await fixture();
+  const failures: unknown[] = [];
+  try {
+    const first = await f.create();
+    await f.fp.accept(first);
+    await enrollLink(f.hp, first.id, f.tls.home, first.secret);
+    const old = await f.hj.append('edge_a', {
+      source: 'home',
+      incarnation: first.id,
+      stream: 'control',
+      type: 'control',
+      version: 1,
+      operationId: 'retired',
+      payload: 1,
+    });
+    await f.fj.receive('home', [old]);
+    await f.hp.revoke(first.id);
+    await enrollLink(f.hp, first.id, f.tls.home);
+    const second = await f.create();
+    await f.fp.accept(second);
+    await enrollLink(f.hp, second.id, f.tls.home, second.secret);
+    const client = await openJournalClient(f.hp, second.id, f.tls.home);
+    assertEquals((await client.hello()).incoming, []);
+    assertEquals(await client.poll(), []);
+    for (const mode of ['websocket', 'sse'] as const) {
+      const abort = new AbortController();
+      const notices = client.notices(mode, abort.signal);
+      try {
+        assertEquals((await notices.next()).value, []);
+      } finally {
+        abort.abort();
+        await notices.return(undefined).catch(() => {});
+      }
+    }
+    const current = await f.hj.append('edge_a', {
+      source: 'home',
+      incarnation: second.id,
+      stream: 'control',
+      type: 'control',
+      version: 1,
+      operationId: 'current',
+      payload: 2,
+    });
+    const reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 100, maxBytes: 10000 },
+      apply: () => Promise.resolve(false),
+      failed: (error) => failures.push(error),
+    });
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(failures, []);
+    assertEquals(
+      (await f.fj.heads('home', 'in', current)).received.sequence,
+      1,
+    );
+    assertEquals(
+      (await f.fj.page('home', 'in', old, 0, {
+        maxItems: 100,
+        maxBytes: 10000,
+      })).records,
+      [old],
+    );
+    assertEquals(
+      (await client.hello()).incoming.map((stream) => stream.incarnation),
+      [second.id],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('durable result is ACKed before a later operation blocks in the same stream', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const stream = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      stream: 'ingress:remote.test',
+    };
+    const records = [];
+    for (const i of [1, 2]) {
+      records.push(
+        await f.fj.append('home', {
+          ...stream,
+          type: 'control',
+          version: 1,
+          operationId: 'progress-' + i,
+          payload: i,
+        }),
+      );
+    }
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      failed: (error) => failures.push(error),
+      apply: async (source) => {
+        const next = await f.hj.next('edge_a', source);
+        if (!next) return false;
+        if (next.payload === 2) {
+          entered.resolve();
+          await release.promise;
+        }
+        await f.hj.complete('edge_a', source, next, { exact: next.payload });
+        return true;
+      },
+    });
+    await reconciler.reconcile();
+    await testDeadline(entered.promise);
+    assertEquals(await f.fj.result('home', 'out', stream, records[0]), {
+      result: { exact: 1 },
+    });
+    assertEquals(await f.fj.result('home', 'out', stream, records[1]), null);
+    release.resolve();
+    await reconciler.drain();
+    assertEquals(failures, []);
+    assertEquals(await f.fj.result('home', 'out', stream, records[1]), {
+      result: { exact: 2 },
+    });
+  } finally {
+    release.resolve();
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
 Deno.test('home initiates enrollment over pinned mTLS and retries a lost receipt without plaintext credentials', async () => {
   const f = await fixture();
   try {
