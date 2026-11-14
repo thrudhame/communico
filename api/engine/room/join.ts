@@ -46,9 +46,9 @@ import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { AclDenied, assertServerAllowed } from '#engine/room/acl.ts';
 import type { Signer } from '#engine/room/signer.ts';
-import { orderEvents } from '#engine/room/order.ts';
-import { mapEntries, type StateMap } from '#engine/room/state.ts';
-import { identify, oversizedOf, verify } from '#engine/room/verify.ts';
+import { mapEntries } from '#engine/room/state.ts';
+import { verifySnapshot } from '#engine/room/snapshot.ts';
+import { identify, oversizedOf } from '#engine/room/verify.ts';
 import { authorizerServer } from '#engine/room/verify.ts';
 import {
   recoverableUpstream,
@@ -78,32 +78,6 @@ export type JoinDeps = {
 };
 
 export type JoinResult = { roomId: string; eventId: string };
-
-// Verify one snapshot event through the ONE verification path (G9).
-// Our own events ride the snapshot back to us (a re-join's snapshot
-// carries our first join): their sender-domain key is not resolvable
-// through the injected resolver, so — as in the old snapshot semantics
-// — the RESIDENT's signature also proves the event (it vouches for the
-// snapshot it serves). Both failing drops only this event; the usable
-// snapshot and join authorization decide whether the response suffices.
-async function verifySnapshotEvent(
-  raw: Pdu,
-  roomVersion: string,
-  candidate: string,
-  roomId: string,
-  keys: KeyResolver,
-  self: string,
-): Promise<{ eventId: string; pdu: Pdu } | null> {
-  try {
-    return await verify(raw, roomVersion, keys, {
-      roomId,
-      localSnapshotFallback: { self, resident: candidate },
-    });
-  } catch (error) {
-    if (!recoverableUpstream(error)) throw error;
-    return null;
-  }
-}
 
 // Fail over to the next candidate on network failure, 5xx,
 // 404 M_NOT_FOUND and the M_UNABLE_TO_* join errcodes; abort on other
@@ -265,92 +239,16 @@ async function joinVia(
     // 4. validate BEFORE anything is written: individual receipt failures
     //    drop events, auth failures reject them. Only accepted state enters
     //    the boundary; the join must still be authorized by that snapshot.
-    const pack = new Map<string, Pdu>();
-    const stateEventIds: string[] = [];
-    for (const raw of resp.state ?? []) {
-      const v = await verifySnapshotEvent(
-        raw,
-        mk.roomVersion,
-        candidate,
-        args.roomId,
-        deps.keys,
-        deps.self,
-      );
-      if (v === null) continue;
-      if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
-      stateEventIds.push(v.eventId);
-    }
-    for (const raw of resp.authChain ?? []) {
-      const v = await verifySnapshotEvent(
-        raw,
-        mk.roomVersion,
-        candidate,
-        args.roomId,
-        deps.keys,
-        deps.self,
-      );
-      if (v === null) continue;
-      if (!pack.has(v.eventId)) pack.set(v.eventId, v.pdu);
-    }
-    // Per-event auth checks in dependency order, regardless of the source
-    // array: rejected evidence is stored but never imported as state.
-    const rejected = new Map([...pack.keys()].map((id) => [id, 'unchecked']));
-    const packStore: EventStore = await withAuthProofs({
-      get: (id) => pack.get(id),
-      isRejected: (id) => rejected.has(id),
-    }, pack.values());
-    const stateIdSet = new Set(stateEventIds);
-    const snapshotCreates = [...stateIdSet].filter((id) =>
-      pack.get(id)?.type === 'm.room.create' &&
-      checkDeclaredAuth(pack.get(id)!, rulebook, packStore, null).ok
-    );
-    if (snapshotCreates.length !== 1) {
-      throw badResponse('snapshot has no single create');
-    }
-    const ordered = orderEvents(
-      [...pack].map(([eventId, pdu]) => ({ eventId, pdu })),
-      ['auth_events'],
-    ).map(({ eventId, pdu }) => [eventId, pdu] as const);
-    for (const [id, eventPdu] of ordered) {
-      rejected.delete(id);
-      const chain = checkDeclaredAuth(
-        eventPdu,
-        rulebook,
-        packStore,
-        snapshotCreates[0],
-      );
-      if (!chain.ok) {
-        rejected.set(id, chain.rule);
-      }
-    }
-    // exactly one create among the accepted state events, for the
-    // template's version
-    const creates = stateEventIds
-      .filter((id) => !rejected.has(id))
-      .map((id) => pack.get(id)!)
-      .filter((eventPdu) => eventPdu.type === 'm.room.create');
-    if (creates.length !== 1) {
-      throw badResponse('snapshot has no single create');
-    }
-    if (String(creates[0].content?.room_version ?? '') !== mk.roomVersion) {
-      throw badResponse(
-        `snapshot create says room_version ${
-          String(creates[0].content?.room_version)
-        }, expected ${mk.roomVersion}`,
-      );
-    }
-    // the snapshot: the accepted state events (the imported boundary —
-    // the state PRIOR to the join, joins-v2.yaml)
-    const snapshot: StateMap = new Map();
-    for (const id of stateEventIds) {
-      if (rejected.has(id)) continue;
-      const eventPdu = pack.get(id)!;
-      if (eventPdu.state_key === undefined) continue;
-      snapshot.set(
-        String(eventPdu.type) + '\0' + String(eventPdu.state_key),
-        id,
-      );
-    }
+    const { pack, rejected, ordered, snapshot, createId } =
+      await verifySnapshot({
+        roomId: args.roomId,
+        roomVersion: mk.roomVersion,
+        resident: candidate,
+        self: deps.self,
+        keys: deps.keys,
+        state: resp.state ?? [],
+        authChain: resp.authChain ?? [],
+      });
     // The returned join must match ours. Merge only its verified resident
     // signature into our authored event. The countersigned
     // copy is required only for restricted authorisation (joins-v2.yaml).
@@ -423,7 +321,7 @@ async function joinVia(
       join,
       rulebook,
       joinStore,
-      String(creates[0].event_id),
+      createId,
     );
     if (!joinChain.ok) {
       throw badResponse(
@@ -511,7 +409,7 @@ async function joinVia(
           .pop() ?? null;
         if (
           prevStay !== null &&
-          await roomCreateId(tx, prevStay.id) !== String(creates[0].event_id)
+          await roomCreateId(tx, prevStay.id) !== createId
         ) {
           throw badResponse('snapshot replaces the room create');
         }
