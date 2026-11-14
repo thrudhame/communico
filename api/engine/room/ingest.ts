@@ -963,13 +963,12 @@ export async function resumeWaits(
   arrived: readonly string[],
 ): Promise<number> {
   const processed = new Set<string>();
-  const expanded = new Set<string>();
   const pending = await room.tx(async (tx) => {
     for (const id of new Set(arrived)) await tx.waits.arrive(id);
     return await tx.waits.ready();
   });
   const enqueue = async (ids: readonly string[]) => {
-    const fresh = [...new Set(ids)].filter((id) => !expanded.has(id));
+    const fresh = [...new Set(ids)];
     if (fresh.length === 0) return;
     const waits = await room.tx(async (tx) => {
       const result: typeof pending = [];
@@ -980,7 +979,6 @@ export async function resumeWaits(
       }
       return result;
     });
-    for (const id of fresh) expanded.add(id);
     pending.push(...waits);
     pending.sort((a, b) => {
       if (a.since !== b.since) return a.since - b.since;
@@ -991,7 +989,10 @@ export async function resumeWaits(
     });
   };
   let resumed = 0;
-  await enqueue(arrived);
+  // The initial ready query already includes every committed arrival. A
+  // subsequent grounding transition must reread its newly ready dependents,
+  // even when that identity was also an input. Only attempted jobs, not
+  // prerequisite identities, are deduplicated for this drain.
   while (pending.length > 0) {
     const wait = pending.shift()!;
     if (processed.has(wait.waiting + '|' + wait.kind)) continue;

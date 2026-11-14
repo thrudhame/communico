@@ -10,9 +10,12 @@ import {
   resumeWaits,
 } from '#engine/room/ingest.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
+import { ingestRemote, replayRemoteBatch } from '#engine/room/remote.ts';
 import { Conn } from '#engine/store/db.ts';
 import { openStore } from '#engine/store/index.ts';
 import { genesis } from './fixtures/genesis.ts';
+import { fakeFetcher, fakeKeyResolver } from './fixtures/remote.ts';
+import { testRemoteServer } from './fixtures/signer.ts';
 
 Deno.test('wait recovery reads only dependencies affected by the arriving event', async () => {
   const dir = await Deno.makeTempDir();
@@ -106,6 +109,88 @@ Deno.test('wait recovery reads only dependencies affected by the arriving event'
       (await g.room.tx((tx) => tx.waits.for('$missing-0'))).length,
       1,
     );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('remote replay expands dependencies after a retained pending arrival becomes grounded', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { room: roomSchema } });
+  try {
+    const g = await genesis(store, { roomId: '!wait-replay:test' });
+    const parent = await g.room.tx((tx) =>
+      buildInTx(tx, g.room.id, {
+        type: 'm.room.message',
+        sender: g.creator,
+        content: { body: 'retained parent' },
+      }, g.signer)
+    );
+    const { event_id: _, ...template } = parent;
+    void _;
+    const child = await finalizeBuilt(
+      {
+        ...template,
+        content: { body: 'retained child' },
+        prev_events: [parent.event_id!],
+        depth: parent.depth + 1,
+      },
+      getRulebook('11'),
+      g.signer,
+    );
+    const descendant = await finalizeBuilt(
+      {
+        ...template,
+        content: { body: 'retained descendant' },
+        prev_events: [child.event_id!],
+        depth: child.depth + 1,
+      },
+      getRulebook('11'),
+      g.signer,
+    );
+    const deps = {
+      self: 'test',
+      keys: fakeKeyResolver(await testRemoteServer()),
+      fetcher: fakeFetcher({}).fetcher,
+      limits: { waitMs: 0, limit: 10, budgetMs: 8000 },
+      ungroundedMs: 3600000,
+    };
+    const original = await ingestRemote(
+      g.room,
+      [child],
+      'test',
+      deps,
+      'pushed',
+      'child-batch',
+    );
+    await ingestRemote(g.room, [descendant], 'test', deps);
+    // Model interruption after the parent commit, before its queue drain.
+    await g.room.tx((tx) =>
+      ingestInTx(tx, g.room.id, parent, { self: g.signer.serverName })
+    );
+    assertEquals(
+      (await g.room.tx((tx) => tx.waits.ready())).map((wait) => wait.waiting),
+      [child.event_id],
+    );
+    assertEquals(
+      await replayRemoteBatch(g.room, [child], 'test', 'test', 'child-batch'),
+      original,
+    );
+    for (const pdu of [child, descendant]) {
+      assertEquals(
+        (await g.room.tx((tx) => tx.events.getStatus(pdu.event_id!)))
+          ?.grounding,
+        'grounded',
+      );
+      assertEquals(await g.room.tx((tx) => tx.waits.of(pdu.event_id!)), []);
+    }
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
