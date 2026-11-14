@@ -8,7 +8,8 @@ import { join as joinRoom } from '#engine/client/membership.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { setPusher } from '#engine/tenant/pushers.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
-import { startPushSender } from '#engine/push/sender.ts';
+import { type PushSender, startPushSender } from '#engine/push/sender.ts';
+import type { Database } from '#engine/store/db.ts';
 import { copyPrivate } from '#engine/store/files.ts';
 import { withCandidateStore } from '#engine/store/candidate.ts';
 import { roomSchema } from '#engine/room/schema.ts';
@@ -21,6 +22,21 @@ import { readManifest } from '#engine/backup/manifest.ts';
 import { inventoryRestoredWork } from '#engine/backup/work.ts';
 
 type Json = Record<string, unknown>;
+
+async function drainPush(db: Database, sender: PushSender, phase: string) {
+  const pending = () =>
+    db.query("SELECT * FROM push_delivery WHERE state='pending'");
+  let before = await pending();
+  while (before.length) {
+    await sender.tick();
+    const after = await pending();
+    assert(
+      after.length < before.length,
+      phase + ' push made no progress: ' + JSON.stringify(after),
+    );
+    before = after;
+  }
+}
 
 Deno.test('restored work: failed/incomplete report holds overdue commands and real gateway pushes; a durable report resumes retained jobs and discloses lost B effects', async () => {
   const root = await Deno.makeTempDir({ prefix: 'restore-worker-boundary-' });
@@ -174,12 +190,7 @@ Deno.test('restored work: failed/incomplete report holds overdue commands and re
       tenant: app.tenant,
       automatic: false,
     });
-    while (
-      (await app.server.query(
-        "SELECT 1 FROM push_delivery WHERE state='pending'",
-      ))
-        .length
-    ) await sourcePush.tick();
+    await drainPush(app.server, sourcePush, 'source');
     await sourcePush.stop();
     const acknowledgedAtB = requests.map((r) =>
       String((r.body.notification as Json).event_id)
@@ -296,12 +307,7 @@ Deno.test('restored work: failed/incomplete report holds overdue commands and re
     phase = 'restored';
     const running = await openApp(restored);
     await running.delayedEvents.drain();
-    while (
-      (await running.server.query(
-        "SELECT 1 FROM push_delivery WHERE state='pending'",
-      ))
-        .length
-    ) await running.pushSender.tick();
+    await drainPush(running.server, running.pushSender, 'restored');
     const restoredRequests = requests.slice(sourceRequests);
     assert(restoredRequests.length > 0);
     assert(
@@ -317,9 +323,11 @@ Deno.test('restored work: failed/incomplete report holds overdue commands and re
     assert(replayed.includes(preparedEvent));
     const roomDb = await running.store.room(room);
     assertEquals(
-      (await roomDb.query('SELECT id FROM events WHERE id=?', [preparedEvent]))
-        .length,
-      1,
+      await roomDb.query(
+        "SELECT id FROM events WHERE json_extract(pdu,'$.content.body')=? ORDER BY id",
+        ['exact prepared A'],
+      ),
+      [{ id: preparedEvent }],
       'prepared room commit is reconciled, never authored twice',
     );
     assertEquals(
