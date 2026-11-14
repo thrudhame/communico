@@ -1,7 +1,10 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { importReplicaBoundary } from '#engine/room/replica.ts';
+import {
+  importReplicaBoundary,
+  importReplicaGenesis,
+} from '#engine/room/replica.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { openStore } from '#engine/store/index.ts';
 import {
@@ -166,6 +169,53 @@ Deno.test('a signed participation event still needs authorization against its im
       () => openRoom(f.store, f.source.roomId),
       Deno.errors.NotFound,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('home-created replica genesis replays the original create and creator join through normal DAG state', async () => {
+  const f = await fixture();
+  try {
+    const home = await makeRemoteServer('logical.test');
+    const source = await makeFakeRoom({
+      roomId: '!local:logical.test',
+      server: home,
+    });
+    const create = source.events.get(source.createId)!;
+    const join = [...source.events.values()].find((pdu) =>
+      pdu.type === 'm.room.member'
+    )!;
+    const input = {
+      roomId: source.roomId,
+      roomVersion: source.version,
+      self: home.name,
+      keys: fakeKeyResolver(home),
+      create,
+      join,
+    };
+    await importReplicaGenesis(f.store, input);
+    const room = await openRoom(f.store, source.roomId);
+    const read = () =>
+      room.tx(async (tx) => {
+        assertEquals(
+          (await tx.state.eventStateBefore(source.createId))?.provenance,
+          'dag',
+        );
+        const before = await tx.state.eventStateBefore(String(join.event_id));
+        assert(before);
+        assertEquals(before.provenance, 'dag');
+        assertEquals(
+          await tx.state.groupMap(before.group),
+          new Map([['m.room.create\0', source.createId]]),
+        );
+        assert(await tx.segments.positionOf(source.createId));
+        assert(await tx.segments.positionOf(String(join.event_id)));
+        return await tx.changes.head();
+      });
+    const before = await read();
+    await importReplicaGenesis(f.store, input);
+    assertEquals(await read(), before);
   } finally {
     await f.close();
   }
