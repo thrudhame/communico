@@ -13,6 +13,7 @@ import {
 } from '#engine/store/create.ts';
 import { type Database, Db, operations } from '#engine/store/db.ts';
 import type { Turso } from '#engine/store/ffi.ts';
+import type { PreparedSnapshot } from '#engine/store/export.ts';
 import {
   checkId,
   databaseFiles,
@@ -41,6 +42,16 @@ export type Lease = {
   release(): Promise<void>;
 };
 
+export type SnapshotSource = {
+  kind: FileKind;
+  key: string;
+  id: string;
+  prepared: PreparedSnapshot;
+  release(): Promise<void>;
+};
+
+type Admit = <T>(fn: () => Promise<T>) => Promise<T>;
+
 export class Pool {
   private readonly entries = new Map<string, Entry>();
   readonly errors: Error[] = [];
@@ -55,6 +66,7 @@ export class Pool {
   // clears this fence; a restart replays the durable room drop before serving.
   private readonly retiring = new Set<string>();
   private readonly incarnations = new Map<string, symbol>();
+  private readonly retained = new Map<string, number>();
 
   private retireKey(key: string): void {
     if (this.retiring.has(key)) return;
@@ -116,48 +128,89 @@ export class Pool {
     return this.entries.size;
   }
 
-  // Only the Store's exclusive snapshot path calls this physical capability.
-  // A normal logical Database lease never exposes nontransactional SQL.
-  async vacuumInto(
-    kind: FileKind,
-    id: string,
-    destination: string,
-  ): Promise<void> {
-    await this.snapshotFile(kind, id, (db) => db.vacuumInto(destination));
-  }
-
-  prepareSnapshot(kind: FileKind, id: string): Promise<void> {
-    return this.snapshotFile(
-      kind,
-      id,
-      (db) => ensureSchema(db, this.providers[kind]),
+  // Filesystem metadata only: no native open, replay, migration or checkpoint.
+  // Store revalidates this inventory at the common admission fence.
+  async snapshotInventory(): Promise<{ kind: FileKind; key: string }[]> {
+    const result: { kind: FileKind; key: string }[] = [];
+    for (const kind of ['tenants', 'rooms'] as const) {
+      try {
+        for await (const entry of Deno.readDir(join(this.root, kind))) {
+          if (!entry.isDirectory || entry.name.endsWith('.new')) continue;
+          const path =
+            databaseFiles(directory(this.root, kind, entry.name)).database;
+          try {
+            if (!(await Deno.lstat(path)).isFile) {
+              throw new Error('backup source must be a regular database file');
+            }
+            result.push({ kind, key: entry.name });
+          } catch (error) {
+            if (!(error instanceof Deno.errors.NotFound)) throw error;
+          }
+        }
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+    }
+    return result.sort((a, b) =>
+      (a.kind + a.key).localeCompare(b.kind + b.key)
     );
   }
 
-  // Exclusive Store admission fences creation/removal. Capture retired-but-not-
-  // unlinked files too: their durable removal intent belongs to the same cut.
-  private snapshotFile<T>(
+  // Retain a physical incarnation before opening it. Every native operation is
+  // outside metadata admission, so inactive and over-cache sources cannot stall
+  // unrelated active writers behind the pool queue. Retirement does not exclude
+  // final files: their durable removal intent belongs to the same cut.
+  async retainSnapshot(
     kind: FileKind,
-    id: string,
-    fn: (db: Db) => Promise<T>,
-  ): Promise<T> {
-    return this.locked(async () => {
+    fileKey: string,
+  ): Promise<SnapshotSource | undefined> {
+    const key = kind + ':' + fileKey;
+    await this.locked(() => {
       if (this.closed) throw new Error('open-file pool is closed');
-      const fileKey = await keyFor(id);
+      this.retained.set(key, (this.retained.get(key) ?? 0) + 1);
+    });
+    let db: Db | undefined;
+    let prepared: PreparedSnapshot | undefined;
+    let releasing: Promise<void> | undefined;
+    const release = () =>
+      releasing ??= (async () => {
+        try {
+          try {
+            await prepared?.release();
+          } finally {
+            await db?.close();
+          }
+        } finally {
+          await this.locked(() => {
+            const count = this.retained.get(key)! - 1;
+            if (count) this.retained.set(key, count);
+            else this.retained.delete(key);
+            for (const wake of this.released.splice(0)) wake();
+          });
+        }
+      })();
+    try {
       const path = databaseFiles(directory(this.root, kind, fileKey)).database;
       if (!(await Deno.lstat(path)).isFile) {
         throw new Error('backup source must be a regular database file');
       }
-      const entry = this.entries.get(kind + ':' + fileKey);
-      const db = entry?.db ??
-        await Db.open(this.ffi, path, this.options.checkpointlogbytes);
-      try {
-        await checkId(db, id);
-        return await fn(db);
-      } finally {
-        if (entry === undefined) await db.close();
-      }
-    });
+      db = await Db.open(this.ffi, path, this.options.checkpointlogbytes);
+      const rows = await db.query('SELECT value FROM id');
+      if (
+        rows.length !== 1 || typeof rows[0].value !== 'string' ||
+        await keyFor(rows[0].value) !== fileKey
+      ) throw new Error('backup source id/path mismatch');
+      const id = rows[0].value;
+      await ensureSchema(db, this.providers[kind]);
+      prepared = await db.prepareReadSnapshot();
+      return { kind, key: fileKey, id, prepared, release };
+    } catch (error) {
+      await release();
+      // A deletion can finish between enumeration and retention. The Store
+      // enumerates again before pinning; never create a replacement source.
+      if (error instanceof Deno.errors.NotFound) return undefined;
+      throw error;
+    }
   }
 
   private evictable(entry: Entry): boolean {
@@ -352,50 +405,65 @@ export class Pool {
 
   /** Retire this file incarnation, drain leases, close, then unlink its directory.
    * Metadata waits never hold the queue needed by lease.release(). */
-  async remove(kind: FileKind, id: string): Promise<void> {
+  async remove(
+    kind: FileKind,
+    id: string,
+    admit: Admit = (fn) => fn(),
+  ): Promise<void> {
     const fileKey = await keyFor(id);
     const key = kind + ':' + fileKey;
-    await this.locked(() => {
-      if (this.closed) throw new Error('open-file pool is closed');
-      if (this.removing.has(key)) {
-        throw new Error(`removal already in progress: ${id}`);
-      }
-      this.removing.add(key);
-      this.retireKey(key);
-    });
+    await admit(() =>
+      this.locked(() => {
+        if (this.closed) throw new Error('open-file pool is closed');
+        if (this.removing.has(key)) {
+          throw new Error(`removal already in progress: ${id}`);
+        }
+        this.removing.add(key);
+        this.retireKey(key);
+      })
+    );
     try {
       for (;;) {
-        const waiting = await this.locked(async () => {
-          const entry = this.entries.get(key);
-          if (entry !== undefined && entry.leases > 0) {
-            return {
-              wait: new Promise<void>((resolve) => this.released.push(resolve)),
-            };
-          }
-          if (entry !== undefined) {
-            await entry.db.close();
-            this.entries.delete(key);
-          }
-          const dir = directory(this.root, kind, fileKey);
-          try {
-            const info = await Deno.lstat(dir);
-            if (!info.isDirectory) {
-              throw new Error(`not a database directory: ${dir}`);
+        const waiting = await admit(() =>
+          this.locked(async () => {
+            const entry = this.entries.get(key);
+            if (
+              (entry !== undefined && entry.leases > 0) ||
+              this.retained.has(key)
+            ) {
+              return {
+                wait: new Promise<void>((resolve) =>
+                  this.released.push(resolve)
+                ),
+              };
             }
-            await Deno.remove(dir, { recursive: true });
-          } catch (error) {
-            if (!(error instanceof Deno.errors.NotFound)) throw error;
-          }
-          this.retiring.delete(key);
-          return null;
-        });
+            if (entry !== undefined) {
+              await entry.db.close();
+              this.entries.delete(key);
+            }
+            const dir = directory(this.root, kind, fileKey);
+            try {
+              const info = await Deno.lstat(dir);
+              if (!info.isDirectory) {
+                throw new Error(`not a database directory: ${dir}`);
+              }
+              await Deno.remove(dir, { recursive: true });
+            } catch (error) {
+              if (!(error instanceof Deno.errors.NotFound)) throw error;
+            }
+            this.retiring.delete(key);
+            return null;
+          })
+        );
         if (waiting === null) return;
         await waiting.wait;
       }
     } finally {
-      await this.locked(() => {
-        this.removing.delete(key);
-      });
+      await admit(() =>
+        this.locked(() => {
+          this.removing.delete(key);
+        })
+      );
     }
   }
 
@@ -460,7 +528,10 @@ export class Pool {
   private async finishClose(): Promise<void> {
     for (;;) {
       const waiting = await this.locked(async () => {
-        if ([...this.entries.values()].some((entry) => entry.leases > 0)) {
+        if (
+          this.retained.size ||
+          [...this.entries.values()].some((entry) => entry.leases > 0)
+        ) {
           return {
             wait: new Promise<void>((resolve) => this.released.push(resolve)),
           };

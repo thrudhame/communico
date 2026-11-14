@@ -12,6 +12,7 @@ import {
 } from '#engine/store/ownership.ts';
 import { type BuildInfo, checkBuildInfo } from '#engine/store/build.ts';
 import { Admission } from '#engine/store/admission.ts';
+import type { ReadSnapshot } from '#engine/store/export.ts';
 import {
   applySchema,
   checkSchema,
@@ -30,12 +31,8 @@ import {
 import type { FileKind } from '#engine/store/layout.ts';
 import { type GateStats } from '#engine/store/gate.ts';
 import { Turso } from '#engine/store/ffi.ts';
-import {
-  databaseFiles,
-  keyFor,
-  serverDirectory,
-} from '#engine/store/layout.ts';
-import { type Lease, Pool } from '#engine/store/pool.ts';
+import { databaseFiles, serverDirectory } from '#engine/store/layout.ts';
+import { type Lease, Pool, type SnapshotSource } from '#engine/store/pool.ts';
 import {
   ensureWatermarks,
   startupHooks,
@@ -72,7 +69,7 @@ export class Store implements StartupStore {
   private stopped = false;
   private closing?: Promise<void>;
   private readonly admission = new Admission();
-  private readonly snapshots = new Set<Promise<unknown>>();
+  private readonly maintenance = new Set<Promise<unknown>>();
   private readonly serverOperations: Database;
   constructor(
     private readonly ffi: Turso,
@@ -102,9 +99,14 @@ export class Store implements StartupStore {
   // no-replace publication. Shutdown drains this maintenance operation too.
   publishSnapshot(source: string, destination: string): Promise<void> {
     if (this.stopped) return Promise.reject(new Error('store is closed'));
-    const task = publish(this.ffi, source, destination);
-    this.snapshots.add(task);
-    return task.finally(() => this.snapshots.delete(task));
+    return this.maintain(publish(this.ffi, source, destination));
+  }
+
+  // Work can wait outside transaction admission without escaping the Store's
+  // shutdown lifetime. Every such operation belongs to this one drain owner.
+  private maintain<T>(task: Promise<T>): Promise<T> {
+    this.maintenance.add(task);
+    return task.finally(() => this.maintenance.delete(task));
   }
 
   async room(
@@ -187,7 +189,11 @@ export class Store implements StartupStore {
 
   removeRoom(id: string): Promise<void> {
     if (this.stopped) throw new Error('store is closed');
-    return this.admission.run(() => this.pool.remove('rooms', id));
+    // Lease/backup retention waits must not remain admitted: the next common
+    // cut needs to drain admission before its readers can finish and release.
+    return this.maintain(
+      this.pool.remove('rooms', id, (fn) => this.admission.run(fn)),
+    );
   }
 
   initializeRoom<T>(id: string, fn: (db: Database) => Promise<T>): Promise<T> {
@@ -200,9 +206,7 @@ export class Store implements StartupStore {
     destination: string,
   ): Promise<{ files: SnapshotFile[]; pauseMs: number; native: BuildInfo }> {
     if (this.stopped) return Promise.reject(new Error('store is closed'));
-    const task = this.captureSnapshot(destination);
-    this.snapshots.add(task);
-    return task.finally(() => this.snapshots.delete(task));
+    return this.maintain(this.captureSnapshot(destination));
   }
 
   private async captureSnapshot(
@@ -213,44 +217,91 @@ export class Store implements StartupStore {
       prefix: '.backup-',
       suffix: '.new',
     });
+    const sources = new Map<string, SnapshotSource>();
+    const readers: {
+      file: SnapshotFile;
+      reader: ReadSnapshot;
+      release(): Promise<void>;
+    }[] = [];
+    let server: Awaited<ReturnType<Db['prepareReadSnapshot']>> | undefined;
+    let pauseMs = 0;
+    const releaseSources = async () => {
+      // Settle every owner even if one release fails; never leak a later native
+      // reader or lifecycle hold after an earlier export/pin/cleanup error.
+      const released = await Promise.allSettled([
+        ...[...sources.values()].map((source) => source.release()),
+        ...(server ? [server.release()] : []),
+      ]);
+      await removeOwned(staging);
+      const errors = released.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : []
+      );
+      if (errors.length) {
+        throw new AggregateError(errors, 'snapshot release failed');
+      }
+    };
     try {
-      const result = await this.admission.exclusive(async () => {
+      server = await this.serverDb.prepareReadSnapshot();
+      for (;;) {
         if (this.stopped) throw new Error('store is closed');
-        const files: SnapshotFile[] = [{
-          kind: 'server',
-          id: null,
-          path: 'server/data.db',
-        }];
-        for (const kind of ['tenants', 'rooms'] as const) {
-          for (const id of await this.pool.list(kind)) {
-            // Normalize any supported schema before any snapshot is taken.
-            await this.pool.prepareSnapshot(kind, id);
-            files.push({
-              kind,
-              id,
-              path: kind + '/' + await keyFor(id) + '/data.db',
+        // Replay/open/migrate and connect before pausing common admission. The
+        // physical holds prevent unlink/recreation while this set is prepared.
+        for (const { kind, key } of await this.pool.snapshotInventory()) {
+          const identity = kind + '/' + key;
+          if (sources.has(identity)) continue;
+          const source = await this.pool.retainSnapshot(kind, key);
+          if (source) sources.set(identity, source);
+        }
+        const result = await this.admission.exclusive(async () => {
+          if (this.stopped) throw new Error('store is closed');
+          const inventory = await this.pool.snapshotInventory();
+          if (
+            inventory.length !== sources.size ||
+            inventory.some(({ kind, key }) => !sources.has(kind + '/' + key))
+          ) {
+            return false;
+          }
+          readers.push({
+            file: { kind: 'server', id: null, path: 'server/data.db' },
+            reader: await server!.pin(),
+            release: () => server!.release(),
+          });
+          for (const { kind, key } of inventory) {
+            const source = sources.get(kind + '/' + key)!;
+            readers.push({
+              file: {
+                kind,
+                id: source.id,
+                path: kind + '/' + key + '/data.db',
+              },
+              reader: await source.prepared.pin(),
+              release: () => source.release(),
             });
           }
-        }
-        for (const file of files) {
+          return true;
+        });
+        pauseMs += result.pauseMs;
+        if (result.value) break;
+      }
+      for (const { file, reader, release } of readers) {
+        try {
           const path = join(staging, file.path);
-          await Deno.mkdir(join(path, '..'), { recursive: true, mode: 0o700 });
-          if (file.kind === 'server') {
-            await this.serverDb.vacuumInto(path);
-          } else {
-            await this.pool.vacuumInto(file.kind, file.id!, path);
-          }
+          await Deno.mkdir(dirname(path), { recursive: true, mode: 0o700 });
+          await reader.export(path);
+        } finally {
+          // Each completed file releases its reader immediately, so catch-up
+          // maintenance need not wait for the remaining database/media exports.
+          await release();
         }
-        return files;
-      });
+      }
       await publish(this.ffi, staging, destination);
       return {
-        files: result.value,
-        pauseMs: result.pauseMs,
+        files: readers.map(({ file }) => file),
+        pauseMs,
         native: await this.ffi.buildInfo(),
       };
     } finally {
-      await removeOwned(staging);
+      await releaseSources();
     }
   }
 
@@ -268,7 +319,7 @@ export class Store implements StartupStore {
   async close(): Promise<void> {
     this.stopped = true;
     await (this.closing ??= (async () => {
-      await Promise.allSettled(this.snapshots);
+      await Promise.allSettled(this.maintenance);
       await this.admission.exclusive(async () => {
         await this.pool.close();
         await this.serverDb.close();

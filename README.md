@@ -455,14 +455,16 @@ Writes pause for the consistent whole-store cut, then resume while the bundle is
 assembled. There is no configured backup duration deadline. Use the completed
 bundle, not a copy of live database files or an unfinished private staging tree.
 
-The current baseline keeps storage admission closed through every database
-export. The pause grows with file count and data size: live-traffic measurements
-observed a 15.75-second median at 12 database files, 36.23 seconds at 21 files
-(19 rooms), and 94.49 seconds at 45 files (43 rooms), with a maximum of
-116.20 seconds. The heavy live workload also exposed sync and typing HTTP500
-responses. Sends and sync reads can stall or fail during this baseline operation.
-This is an online backup, not a pause-free one; `pauseMs` reports the actual cut
-rather than a configured deadline.
+The store prepares and retains every source before the common admission fence,
+then pins logical MVCC read snapshots together. SQL export runs after admission
+reopens, including for inactive databases and stores larger than the open-file
+cache. Each source snapshot defers file checkpoints without blocking ordinary
+writers and releases as soon as its export finishes; normal catch-up checkpoints
+then resume. This is an online backup, not a pause-free one; `pauseMs` reports
+the common cut rather than a configured deadline. It does not include later
+file-checkpoint pauses. Full live-client measurements for this exporter are
+still pending; the earlier VACUUM baseline had write pauses up to 116.20 seconds
+and exposed sync and typing HTTP500 responses, not a passing workload.
 
 The format-1 bundle includes database files, signing private keys, password
 hashes, uploaded local media, effective configuration, the original operator

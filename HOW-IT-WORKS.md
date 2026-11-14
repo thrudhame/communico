@@ -1168,15 +1168,22 @@ external effects. This inventory is not an extra operator approval gate; workers
 resume normal semantics only after the completed durable report boundary.
 (`api/engine/backup/work.ts`, `api/engine/{room,tenant,server}/restore-work.ts`)
 
-The internal store snapshot primitive pauses common storage admission, drains
-transactions and lifecycle changes, then exports every final server/tenant/room
-file with store-owned autocommit VACUUM connections. Retired but not yet unlinked
-files remain part of that crash-consistent cut. The pause is measured, not
-deadline-limited. Quote-free directory-fd staging keeps legal operator paths
-out of SQL. After admission resumes, publication fsyncs and uses no-replace
-rename, staging a private copy first across filesystems. This primitive exports
-database files, not local media or deployment configuration by itself.
-(`api/engine/store/{admission,db,index,pool,files}.ts`)
+The internal store snapshot owner retains physical file incarnations, opens and
+normalizes inactive/over-cache sources and acquires checkpoint retention outside
+common admission and the pool metadata queue. At the admission fence it drains
+transactions/lifecycle changes, revalidates the final inventory and pins native
+MVCC reads together. Retired but not yet unlinked files remain in the cut. SQL
+export then copies schema, explicit rowids and bounded keyset pages into private
+standalone targets while ordinary writes continue. Engine-private MVCC metadata
+is regenerated, not copied as application truth. Each completed export releases
+its source immediately; checkpoint retention defers initiation rather than
+blocking committing writers. The file gate is the sole checkpoint owner; native
+automatic checkpointing is disabled. Removal waits outside common admission,
+and the Store drains all accepted maintenance before shutdown. The common pause
+is measured, not deadline-limited. Completed targets use fsync and no-replace
+publication, with private destination-side copying across filesystems. This
+primitive exports databases, not media or deployment configuration by itself.
+(`api/engine/store/{admission,db,export,index,pool,gate,files}.ts`)
 
 The internal format-1 bundle manifest records logical identities, native/schema
 provenance, the measured cut, secret disclosures and exact payload inventories.

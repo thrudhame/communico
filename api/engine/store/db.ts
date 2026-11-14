@@ -11,7 +11,11 @@ import {
 import { Gate } from '#engine/store/gate.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import { publish } from '#engine/store/files.ts';
-import { exportSnapshot, type ReadSnapshot } from '#engine/store/export.ts';
+import {
+  exportSnapshot,
+  type PreparedSnapshot,
+  type ReadSnapshot,
+} from '#engine/store/export.ts';
 
 export class StoreConflictError extends StoreError {
   constructor(
@@ -323,6 +327,13 @@ export class Db {
   // Separate maintenance capability: owns one native read transaction without
   // consuming an ordinary transaction slot or blocking threshold writers.
   async readSnapshot(): Promise<ReadSnapshot> {
+    const prepared = await this.prepareReadSnapshot();
+    return await prepared.pin();
+  }
+
+  // Connect and drain existing checkpoints before the whole-store fence. Only
+  // BEGIN and its first metadata read belong inside the common cut.
+  async prepareReadSnapshot(): Promise<PreparedSnapshot> {
     if (this.closing || this.closed) {
       throw new Error('database is closing or closed');
     }
@@ -332,6 +343,7 @@ export class Db {
     let released = false;
     let exporting: Promise<void> | undefined;
     let releasing: Promise<void> | undefined;
+    let pinned = false;
     const release = () =>
       releasing ??= (async () => {
         released = true;
@@ -353,31 +365,49 @@ export class Db {
     try {
       releaseGate = await this.gate.retain();
       handle = await this.ffi.connect(this.handle);
-      await this.ffi.begin(handle, 'deferred');
-      // BEGIN alone is lazy; this read establishes the actual MVCC cut.
-      const schema = await this.ffi.query(
-        handle,
-        'SELECT type,name,sql FROM sqlite_schema ORDER BY rowid',
-      );
       return {
-        export: (destination) => {
-          if (released) {
-            return Promise.reject(new Error('snapshot has been released'));
+        pin: async () => {
+          if (released || pinned) {
+            throw new Error('snapshot is released or already pinned');
           }
-          if (exporting) {
-            return Promise.reject(new Error('snapshot export already started'));
-          }
-          if (resolve(destination) === this.path) {
-            return Promise.reject(
-              new TypeError('backup destination is the source database'),
+          pinned = true;
+          try {
+            await this.ffi.begin(handle!, 'deferred');
+            // BEGIN alone is lazy; this read establishes the actual MVCC cut.
+            const schema = await this.ffi.query(
+              handle!,
+              'SELECT type,name,sql FROM sqlite_schema ORDER BY rowid',
             );
+            return {
+              export: (destination) => {
+                if (released) {
+                  return Promise.reject(
+                    new Error('snapshot has been released'),
+                  );
+                }
+                if (exporting) {
+                  return Promise.reject(
+                    new Error('snapshot export already started'),
+                  );
+                }
+                if (resolve(destination) === this.path) {
+                  return Promise.reject(
+                    new TypeError('backup destination is the source database'),
+                  );
+                }
+                return exporting = exportSnapshot(
+                  this.ffi,
+                  handle!,
+                  schema,
+                  destination,
+                );
+              },
+              release,
+            };
+          } catch (error) {
+            await release();
+            throw error;
           }
-          return exporting = exportSnapshot(
-            this.ffi,
-            handle!,
-            schema,
-            destination,
-          );
         },
         release,
       };

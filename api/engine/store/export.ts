@@ -9,6 +9,11 @@ export type ReadSnapshot = {
   release(): Promise<void>;
 };
 
+export type PreparedSnapshot = {
+  pin(): Promise<ReadSnapshot>;
+  release(): Promise<void>;
+};
+
 const identifier = (name: string) => '"' + name.replaceAll('"', '""') + '"';
 
 export async function exportSnapshot(
