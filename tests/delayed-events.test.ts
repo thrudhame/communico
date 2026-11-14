@@ -272,7 +272,7 @@ Deno.test('delayed: v19 upgrade keeps credentials and adds empty scheduling owne
         apply: async (db) => {
           await tenantSchema.apply(db);
           await db.exec(
-            'DROP TABLE delayed_events;DROP TABLE delayed_event_receipts',
+            'DROP TABLE public_user_replicas;DROP TABLE delayed_events;DROP TABLE delayed_event_receipts',
           );
         },
       },

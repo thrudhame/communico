@@ -257,8 +257,12 @@ CREATE INDEX delayed_events_user ON delayed_events(localpart);
 CREATE TABLE delayed_event_receipts(localpart TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL,endpoint TEXT NOT NULL,txn_id TEXT NOT NULL,delay_id TEXT NOT NULL,PRIMARY KEY(localpart,device_id,generation,endpoint,txn_id));
 `;
 
+const PUBLIC_REPLICAS_SQL = `
+CREATE TABLE public_user_replicas(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart),source_cut INTEGER NOT NULL,snapshot_json TEXT NOT NULL);
+`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 20,
+  version: 21,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -277,8 +281,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(BACKUP_ACCOUNTING_SQL);
     await db.exec(SLIDING_SYNC_SQL);
     await db.exec(DELAYED_EVENTS_SQL);
+    await db.exec(PUBLIC_REPLICAS_SQL);
   },
   migrations: {
+    20: (conn) => conn.exec(PUBLIC_REPLICAS_SQL),
     19: (conn) => conn.exec(DELAYED_EVENTS_SQL),
     18: (conn) => conn.exec(SLIDING_SYNC_SQL),
     17: migrateBackupAccounting,

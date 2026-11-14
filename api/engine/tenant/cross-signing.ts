@@ -12,6 +12,7 @@ import type { Json } from '#engine/tenant/e2ee.ts';
 import { bounded } from '#engine/tenant/e2ee.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { domainOf, localpartOf } from '#engine/ids.ts';
+import { readPublicReplica } from './public-replica.ts';
 import {
   forgetKeySignatures,
   signatureView,
@@ -72,6 +73,13 @@ export async function signingViews(
   user: string,
   requester: string,
 ): Promise<Json> {
+  const replica = await readPublicReplica(conn, localpart);
+  if (replica) {
+    if (replica.userId !== user) {
+      throw new Error('public replica owner mismatch');
+    }
+    return replica.signing;
+  }
   const state = await signingState(conn, localpart), result: Json = {};
   for (const usage of signingUsages) {
     if (usage === 'user_signing' && requester !== user) continue;
