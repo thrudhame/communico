@@ -1,5 +1,11 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { canonicalJson } from '#engine/canonical.ts';
+import { homeKeyDocument } from '#engine/federation/keydoc.ts';
+import {
+  importPublicKeyFromRaw,
+  matrixBase64,
+  verifyJson,
+} from '#engine/signing-primitives.js';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LinkError } from '#engine/facade/protocol.ts';
@@ -125,6 +131,104 @@ Deno.test('enrollment consumes once and replays exact challenge, grant and recei
     const status = canonicalJson(await f.fp.status());
     assert(!status.includes(bundle.secret));
     assert(!status.includes('private'));
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('home key document publishes approved node keys and durable prospective retirement', async () => {
+  const f = await fixture();
+  const document = async () => {
+    const tenant = await openTenant(f.home(), 'logical.test');
+    return await homeKeyDocument(
+      await f.home().server(),
+      tenant.signer(),
+      tenant.publicB64,
+    );
+  };
+  try {
+    const home = await openTenant(f.home(), 'logical.test');
+    const publicKey = await importPublicKeyFromRaw(
+      matrixBase64(home.publicB64, 32),
+    );
+    const initial = await document();
+    assertEquals(Object.keys(initial.verify_keys), [home.keyId]);
+    const bundle = await f.create();
+    assertEquals(Object.keys((await document()).verify_keys), [home.keyId]);
+    await f.fp.accept(bundle);
+    const transcript = await f.fp.challenge(bundle.id, bundle.secret, homePin);
+    const grant = await f.hp.grant(bundle.id, transcript);
+    const approved = await document();
+    assertEquals(approved.verify_keys[f.node.keyId], { key: f.node.publicKey });
+    assert(await verifyJson(approved, home.serverName, home.keyId, publicKey));
+    assert(!canonicalJson(approved).includes(bundle.secret));
+    const receipt = await f.fp.complete(bundle.id, grant, homePin);
+    await f.hp.confirm(bundle.id, receipt);
+    const retiredAt = Date.now();
+    const revocation = await f.hp.revoke(bundle.id, retiredAt);
+    await f.reopen();
+    assertEquals(await f.hp.revoke(bundle.id, retiredAt + 1000), revocation);
+    const retired = await document();
+    assertEquals(retired.verify_keys[f.node.keyId], undefined);
+    assert(retired.old_verify_keys);
+    assertEquals(retired.old_verify_keys[f.node.keyId], {
+      key: f.node.publicKey,
+      expired_ts: retiredAt,
+    });
+    assert(await verifyJson(retired, home.serverName, home.keyId, publicKey));
+    await f.fp.retire(revocation, homePin);
+    const next = await f.create();
+    await f.fp.accept(next);
+    await f.hp.grant(
+      next.id,
+      await f.fp.challenge(next.id, next.secret, homePin),
+    );
+    const reauthorized = await document();
+    assert(reauthorized.old_verify_keys);
+    assertEquals(reauthorized.verify_keys[f.node.keyId], {
+      key: f.node.publicKey,
+    });
+    assertEquals(reauthorized.old_verify_keys[f.node.keyId], undefined);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('v28 upgrade retains enrolled authority while adding prospective key retirement', async () => {
+  const f = await fixture();
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    const transcript = await f.fp.challenge(bundle.id, bundle.secret, homePin);
+    const grant = await f.hp.grant(bundle.id, transcript);
+    await f.hp.confirm(
+      bundle.id,
+      await f.fp.complete(bundle.id, grant, homePin),
+    );
+    const server = await f.home().server();
+    await server.tx(async (conn) => {
+      await conn.exec(
+        'DROP TABLE server_key_decisions; DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports; DROP TABLE facade_key_roster',
+      );
+      await conn.exec('ALTER TABLE facade_pairings DROP COLUMN retired_ms');
+      await conn.execute("UPDATE meta SET v='28' WHERE k='schema_version'");
+    }, { mode: 'deferred' });
+    await f.reopen();
+    const tenant = await openTenant(f.home(), 'logical.test');
+    const doc = await homeKeyDocument(
+      await f.home().server(),
+      tenant.signer(),
+      tenant.publicB64,
+    );
+    assertEquals(doc.verify_keys[f.node.keyId], { key: f.node.publicKey });
+    assertEquals((await f.hp.connection(bundle.id)).grant, grant);
+    assertEquals(await f.fp.active(), grant);
+    assertEquals(
+      (await (await f.home().server()).query(
+        'SELECT retired_ms FROM facade_pairings',
+      ))[0].retired_ms,
+      null,
+    );
   } finally {
     await f.close();
   }

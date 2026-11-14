@@ -95,7 +95,9 @@ if (config().server.role === 'facade') {
   const facade = await startFacade(lifetime);
   admin = facade.admin;
   stopRuntime = facade.close;
-  console.log('facade: link/local admin ready; Matrix scopes not yet ready');
+  console.log(
+    'facade: link/local admin ready; Matrix exposure follows enrollment and replica cuts',
+  );
 } else {
   await Deno.mkdir(mediaRoot(), { recursive: true });
   const app = await openApp();

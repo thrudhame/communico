@@ -10,6 +10,7 @@ import type { Config } from '#engine/config-schema.ts';
 import { config } from '#engine/config.ts';
 import { forgetDeviceSignatures } from '#engine/tenant/cross-signing.ts';
 import { signatureView } from '#engine/tenant/signature-view.ts';
+import { readPublicReplica } from './public-replica.ts';
 
 export type Json = Record<string, unknown>;
 export type KeyLimits = Config['e2ee'];
@@ -299,6 +300,18 @@ export async function queryKeys(
   maxKeys: number,
 ): Promise<Json> {
   const result: Json = Object.create(null);
+  const replica = await readPublicReplica(conn, localpart);
+  if (replica) {
+    if (replica.userId !== owner) {
+      throw new Error('public replica owner mismatch');
+    }
+    for (const raw of replica.devices.devices as Json[]) {
+      const id = String(raw.device_id);
+      if (!deviceIds.length || deviceIds.includes(id)) result[id] = raw.keys;
+    }
+    limitEntries(Object.keys(result).length, maxKeys);
+    return result;
+  }
   const rows = await conn.query(
     'SELECT d.device_id,d.display_name,k.key_json FROM devices d JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation WHERE d.localpart=?' +
       (deviceIds.length
@@ -340,6 +353,15 @@ export async function deviceSnapshot(
   owner: string,
   limits: KeyLimits,
 ): Promise<Json> {
+  const replica = await readPublicReplica(conn, localpart);
+  if (replica) {
+    if (replica.userId !== owner) {
+      throw new Error('public replica owner mismatch');
+    }
+    limitEntries((replica.devices.devices as unknown[]).length, limits.maxkeys);
+    bounded(replica.devices, limits.maxrequestbytes);
+    return replica.devices;
+  }
   const keys = await queryKeys(conn, localpart, [], '', owner, limits.maxkeys);
   const rows = await conn.query(
     'SELECT value FROM user_device_stream WHERE localpart=?',

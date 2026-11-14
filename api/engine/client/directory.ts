@@ -51,6 +51,7 @@ export async function createAlias(
   await registerAlias(theApp().server, alias, roomId, creator);
 }
 export async function resolveAlias(alias: string) {
+  await theApp().replica?.requireScope('directory');
   const parts = splitId(alias), fed = config().federation;
   if (!aliasIsLocal(alias)) {
     if (!fed.enabled || fed.lookups === 'none') {
@@ -77,6 +78,7 @@ export async function resolveAlias(alias: string) {
   if (roomId === null || await directory.purgeable(theApp().server, roomId)) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
   }
+  await theApp().replica?.requireScope('room:' + roomId);
   const servers = await serversInRoom(roomId);
   if (servers.length === 0) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
@@ -243,8 +245,12 @@ export async function queryDirectory(
   return remoteDirectoryResponse(answer);
 }
 
-export function assertFederationDirectoryAllowed() {
-  if (!config().federation.publicrooms) {
+export async function assertFederationDirectoryAllowed() {
+  if (
+    !(theApp().replica
+      ? await theApp().replica!.publicRooms()
+      : config().federation.publicrooms)
+  ) {
     throw new MatrixError(
       403,
       'M_FORBIDDEN',
@@ -256,6 +262,7 @@ export function assertFederationDirectoryAllowed() {
 export async function listLocalPublishedRooms(
   opts: DirectoryRequest,
 ) {
+  await theApp().replica?.requireScope('directory');
   const limit = opts.limit != null && opts.limit > 0
       ? Math.min(opts.limit, 100)
       : 100,

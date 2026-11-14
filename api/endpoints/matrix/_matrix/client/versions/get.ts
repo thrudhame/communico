@@ -7,6 +7,9 @@ import { rtcTransports } from '#engine/matrixrtc.ts';
 import { delayedEventsEnabled } from '#engine/delayed-events.ts';
 // deno-lint-ignore require-await
 export default async function () {
+  if (config().server.role === 'facade') {
+    return { versions: [], unstable_features: {} };
+  }
   return {
     versions: [
       'v1.1',

@@ -15,9 +15,14 @@ import { bounded } from '#engine/tenant/e2ee.ts';
 
 export async function queryUserKeys(body: unknown) {
   assertFederationEnabled();
+  const entries = queryRequest(body, config().e2ee);
+  ownUsers(theApp().tenant, entries);
+  for (const [user] of entries) {
+    await theApp().replica?.requireScope('public:' + user, true);
+  }
   return await localQuery(
     theApp().tenant,
-    queryRequest(body, config().e2ee),
+    entries,
     '',
     config().e2ee,
   );
@@ -37,6 +42,7 @@ export async function userDevices(user: string) {
   }
   const tenant = theApp().tenant;
   ownUsers(tenant, [[user, []]]);
+  await theApp().replica?.requireScope('public:' + user);
   return await tenant.tx(async (tx) => {
     const lp = localpartOf(user);
     if (!await tx.users.exists(lp)) {

@@ -1,10 +1,14 @@
 // doltgres http-contract + federation-disabled: real HTTP key/version doors.
 import { assert, assertEquals } from '@std/assert';
 import { theApp } from '#engine/app.ts';
-import { serverName, setConfigForTests } from '#engine/config.ts';
+import { config, serverName, setConfigForTests } from '#engine/config.ts';
 import { federationRequest } from '#engine/federation/client.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { keyStore } from '#engine/federation/keys.ts';
+import { initializeNode } from '#engine/facade/identity.ts';
+import { Pairings } from '#engine/facade/pairing.ts';
+import { serverSchema } from '#engine/server/schema.ts';
+import { openStore } from '#engine/store/index.ts';
 import { httpSuite } from './http-app.ts';
 import { directOnly, makeDoc, makeServer } from './federation/doc-helper.ts';
 import {
@@ -41,6 +45,78 @@ test('our key document and deprecated key-id path are signed and public', async 
         await importPublicKeyFromRaw(b64decode(doc.verify_keys[ids[0]].key)),
       ),
     );
+  }
+});
+
+test('both public key-document paths publish the approved roster and exact retirement cut', async () => {
+  const app = theApp();
+  const dir = await Deno.makeTempDir({ prefix: 'http-key-roster-' });
+  const facade = await openStore({
+    ...config().store,
+    dir,
+  }, { schemas: { server: serverSchema } });
+  try {
+    const node = await initializeNode(
+      await facade.server(),
+      serverName(),
+      'key_edge',
+    );
+    const homePin = 'a'.repeat(64);
+    const facadePin = 'b'.repeat(64);
+    const home = new Pairings(
+      app.server,
+      app.tenant.signer(),
+      app.tenant.publicB64,
+      homePin,
+    );
+    const edge = new Pairings(
+      await facade.server(),
+      node.signer(),
+      node.publicKey,
+      facadePin,
+      node,
+    );
+    const bundle = await home.create({
+      node: node.node,
+      url: 'https://edge.test',
+      facadePin,
+      expires: Date.now() + 60000,
+      required: [{ type: 'control', version: 1 }],
+    });
+    await edge.accept(bundle);
+    await home.grant(
+      bundle.id,
+      await edge.challenge(bundle.id, bundle.secret, homePin),
+    );
+    const cut = Date.now();
+    for (const retired of [false, true]) {
+      if (retired) await home.revoke(bundle.id, cut);
+      for (const suffix of ['', '/' + node.keyId]) {
+        const res = await get('/_matrix/key/v2/server' + suffix);
+        assertEquals(res.status, 200);
+        const doc = await res.json();
+        if (retired) {
+          assertEquals(doc.verify_keys[node.keyId], undefined);
+          assertEquals(doc.old_verify_keys[node.keyId], {
+            key: node.publicKey,
+            expired_ts: cut,
+          });
+        } else {
+          assertEquals(doc.verify_keys[node.keyId], { key: node.publicKey });
+        }
+        assert(
+          await verifyJson(
+            doc,
+            serverName(),
+            app.tenant.keyId,
+            await importPublicKeyFromRaw(b64decode(app.tenant.publicB64)),
+          ),
+        );
+      }
+    }
+  } finally {
+    await facade.close();
+    await Deno.remove(dir, { recursive: true });
   }
 });
 
