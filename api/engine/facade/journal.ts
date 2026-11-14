@@ -11,6 +11,7 @@ import {
   integer,
   LinkError,
   type LinkRecord,
+  object,
   recordHash,
   recordOf,
   type Stream,
@@ -22,6 +23,12 @@ type Direction = 'in' | 'out';
 export type Heads = Stream & { received: Cut; applied: Cut };
 export type Page = { records: LinkRecord[]; head: Cut };
 export type PageLimits = { maxBytes: number; maxItems: number };
+export type TerminalResult = Cut & { result: unknown };
+export type Acknowledgement = {
+  received: Cut;
+  applied: Cut;
+  results: TerminalResult[];
+};
 type Append = Stream & {
   type: string;
   version: number;
@@ -377,11 +384,28 @@ export class Journal {
     stream: Stream,
     rawReceived: Cut,
     rawApplied: Cut,
+    rawResults: readonly unknown[] = [],
   ): Promise<{ received: Cut; applied: Cut }> {
     const received = cutOf(rawReceived);
     const applied = cutOf(rawApplied);
     if (applied.sequence > received.sequence) {
       diverged('applied ACK exceeds received ACK');
+    }
+    const results = rawResults.map((raw) => {
+      const value = object(raw);
+      const cut = cutOf(value);
+      if (
+        cut.sequence === 0 || cut.sequence > applied.sequence ||
+        !Object.hasOwn(value, 'result')
+      ) {
+        diverged('terminal result is outside applied ACK');
+      }
+      return { ...cut, encoded: canonicalJson(value.result) };
+    });
+    if (
+      new Set(results.map((result) => result.sequence)).size !== results.length
+    ) {
+      diverged('duplicate terminal result');
     }
     return await this.db.tx(async (conn) => {
       for (const cut of [received, applied]) {
@@ -408,6 +432,33 @@ export class Journal {
       ) {
         diverged('ACK regression');
       }
+      for (const result of results) {
+        const held = await recordInTx(
+          conn,
+          peer,
+          'out',
+          stream,
+          result.sequence,
+        );
+        if (!held || held.record.hash !== result.hash) {
+          diverged('terminal result does not name outgoing record');
+        }
+        if (held.result !== null && held.result !== result.encoded) {
+          diverged('changed remote terminal result');
+        }
+        await conn.execute(
+          'UPDATE facade_records SET result_json=? WHERE peer=? AND direction=? AND source=? AND incarnation=? AND stream=? AND sequence=?',
+          [result.encoded, ...key(peer, 'out', stream), result.sequence],
+        );
+      }
+      const previous = rows.length ? Number(rows[0].applied) : 0;
+      const [completed] = await conn.query(
+        'SELECT count(*) AS n FROM facade_records WHERE peer=? AND direction=? AND source=? AND incarnation=? AND stream=? AND sequence>? AND sequence<=? AND result_json IS NOT NULL',
+        [...key(peer, 'out', stream), previous, applied.sequence],
+      );
+      if (Number(completed.n) !== applied.sequence - previous) {
+        diverged('applied ACK is missing terminal results');
+      }
       await conn.execute(
         'INSERT INTO facade_export_acks(peer,source,incarnation,stream,received,received_hash,applied,applied_hash) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(peer,source,incarnation,stream) DO UPDATE SET received=excluded.received,received_hash=excluded.received_hash,applied=excluded.applied,applied_hash=excluded.applied_hash',
         [
@@ -422,6 +473,105 @@ export class Journal {
         ],
       );
       return { received, applied };
+    });
+  }
+
+  async acknowledgement(
+    peer: string,
+    stream: Stream,
+    rawAfter: Cut,
+    limits: PageLimits,
+  ): Promise<Acknowledgement> {
+    const after = cutOf(rawAfter);
+    integer(limits.maxBytes, 1);
+    integer(limits.maxItems, 1);
+    return await this.db.tx(async (conn) => {
+      const heads = await headsInTx(conn, peer, 'in', stream);
+      if (after.sequence > heads.applied.sequence) {
+        diverged('result cursor exceeds applied cut');
+      }
+      if (after.sequence) {
+        const held = await recordInTx(conn, peer, 'in', stream, after.sequence);
+        if (!held || held.record.hash !== after.hash) {
+          diverged('result cursor digest mismatch');
+        }
+      }
+      const candidates = await conn.query(
+        'SELECT sequence,hash,length(CAST(result_json AS BLOB)) AS bytes FROM facade_records WHERE peer=? AND direction=? AND source=? AND incarnation=? AND stream=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT ?',
+        [
+          ...key(peer, 'in', stream),
+          after.sequence,
+          heads.applied.sequence,
+          limits.maxItems,
+        ],
+      );
+      const results: TerminalResult[] = [];
+      let applied = after;
+      let bytes = 0;
+      for (const row of candidates) {
+        // The terminal envelope has a fixed numeric/hash overhead; include it in
+        // the byte target without hydrating all candidate result bodies first.
+        const cut = { sequence: Number(row.sequence), hash: String(row.hash) };
+        const size = Number(row.bytes) +
+          new TextEncoder().encode(canonicalJson({ ...cut, result: null }))
+            .byteLength -
+          4;
+        if (results.length && bytes + size > limits.maxBytes) break;
+        const held = await recordInTx(conn, peer, 'in', stream, cut.sequence);
+        if (
+          !held || held.result === null || cut.sequence !== applied.sequence + 1
+        ) {
+          diverged('missing retained terminal result');
+        }
+        results.push({ ...cut, result: JSON.parse(held.result) });
+        applied = cut;
+        bytes += size;
+      }
+      return { received: heads.received, applied, results };
+    });
+  }
+
+  async acknowledged(
+    peer: string,
+    stream: Stream,
+  ): Promise<{ received: Cut; applied: Cut }> {
+    const rows = await this.db.query(
+      'SELECT received,received_hash,applied,applied_hash FROM facade_export_acks WHERE peer=? AND source=? AND incarnation=? AND stream=?',
+      [peer, stream.source, stream.incarnation, stream.stream],
+    );
+    return rows.length
+      ? {
+        received: {
+          sequence: Number(rows[0].received),
+          hash: String(rows[0].received_hash),
+        },
+        applied: {
+          sequence: Number(rows[0].applied),
+          hash: String(rows[0].applied_hash),
+        },
+      }
+      : { received: { ...EMPTY_CUT }, applied: { ...EMPTY_CUT } };
+  }
+
+  async result(
+    peer: string,
+    direction: Direction,
+    stream: Stream,
+    rawCut: Cut,
+  ): Promise<{ result: unknown } | null> {
+    const cut = cutOf(rawCut);
+    return await this.db.tx(async (conn) => {
+      const held = await recordInTx(
+        conn,
+        peer,
+        direction,
+        stream,
+        cut.sequence,
+      );
+      if (!held || held.record.hash !== cut.hash) {
+        diverged('result does not name retained record');
+      }
+      return held.result === null ? null : { result: JSON.parse(held.result) };
     });
   }
 }

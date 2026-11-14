@@ -234,10 +234,14 @@ Deno.test('journal ACK names exact received/applied digests and never deletes un
         journal.ack('edge', stream, { sequence: 2, hash: one.hash }, EMPTY_CUT),
       LinkError,
     );
-    assertEquals(await journal.ack('edge', stream, cut(two), cut(one)), {
-      received: cut(two),
-      applied: cut(one),
-    });
+    const result = { ...cut(one), result: { done: true } };
+    assertEquals(
+      await journal.ack('edge', stream, cut(two), cut(one), [result]),
+      {
+        received: cut(two),
+        applied: cut(one),
+      },
+    );
     assertEquals(await journal.ack('edge', stream, cut(two), cut(one)), {
       received: cut(two),
       applied: cut(one),
@@ -246,7 +250,10 @@ Deno.test('journal ACK names exact received/applied digests and never deletes un
       () => journal.ack('edge', stream, cut(one), cut(one)),
       LinkError,
     );
-    await journal.ack('edge', stream, cut(two), cut(two));
+    await journal.ack('edge', stream, cut(two), cut(two), [{
+      ...cut(two),
+      result: { done: true },
+    }]);
     assertEquals(
       (await journal.page('edge', 'out', stream, 0, limits)).records,
       [one, two],
@@ -313,7 +320,10 @@ Deno.test('reopen preserves received/unapplied tail, completed results and expor
     const two = await journal.append('edge', input('two'));
     await journal.receive('home', [one, two]);
     await journal.complete('home', stream, cut(one), { done: true });
-    await journal.ack('edge', stream, cut(two), cut(one));
+    await journal.ack('edge', stream, cut(two), cut(one), [{
+      ...cut(one),
+      result: { done: true },
+    }]);
     await store.close();
     store = await openStore(cfg(dir), { schemas: { server: serverSchema } });
     journal = new Journal(await store.server(), capabilities);
