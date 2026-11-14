@@ -202,7 +202,7 @@ export async function openFacadeRuntime(
         node: node!,
         pairings: owner,
         transaction,
-        requireScope: (scope) => directory.requireScope(scope),
+        scopeState: (scope) => directory.scopeState(scope),
         acceptEdu: (origin, raw) =>
           acceptIngressEdu(origin, identity.server, raw, transaction.edus),
         changed: () => notices.changed(),

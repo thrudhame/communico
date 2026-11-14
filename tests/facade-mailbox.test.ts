@@ -95,6 +95,7 @@ async function fixture() {
   let accepted = 0;
   let fail: ((sql: string, args: readonly unknown[]) => boolean) | undefined;
   let blocked = false;
+  const absent = new Set<string>();
   const db = async (): Promise<Database> => {
     const real = await edge.server();
     return {
@@ -135,12 +136,14 @@ async function fixture() {
         fetcher: fakeFetcher({}).fetcher,
         edus: { dispatch: () => Promise.resolve() },
       },
-      requireScope: () =>
+      scopeState: (scope) =>
         blocked
           ? Promise.reject(
             new MatrixError(503, 'M_UNAVAILABLE', 'scope not ready'),
           )
-          : Promise.resolve(),
+          : absent.has(scope)
+          ? Promise.resolve('absent')
+          : Promise.resolve('ready'),
       acceptEdu: () => {
         accepted++;
         return Promise.resolve({ kind: 'retained' });
@@ -213,6 +216,9 @@ async function fixture() {
     accepted: () => accepted,
     block(value: boolean) {
       blocked = value;
+    },
+    absent(roomId: string) {
+      absent.add('room:' + roomId);
     },
     fail(match: NonNullable<typeof fail>) {
       fail = match;
@@ -352,7 +358,7 @@ Deno.test('mailbox recovers a room commit before its child checkpoint without lo
     const payload = JSON.parse(String(record.record_json))
       .payload as IngressObligation;
     assert(
-      payload.rooms[0].recovery.events.some((event) =>
+      payload.rooms[0].recovery!.events.some((event) =>
         event.event_id === join.event_id
       ),
     );
@@ -387,6 +393,103 @@ Deno.test('mailbox scope misses retain the independent EDU tail and never cache 
       pdus: { [String(join.event_id)]: {} },
     });
     assertEquals(f.accepted(), 1);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('mailbox confirmed absence completes independently of accepted rooms and reliable EDUs through cold home drain', async () => {
+  const f = await fixture();
+  try {
+    const local = await genesis(f.home(), {
+      roomId: f.g.roomId,
+      joinRule: 'public',
+    });
+    await exportRoomReplica(
+      f.home(),
+      local.room,
+      f.self,
+      f.node.node,
+      f.bundle.id,
+    );
+    const join = await f.join();
+    const absentId = '!permanently-absent:test';
+    f.absent(absentId);
+    const unknown = await remoteEvent(absentId, f.remote, '11', {
+      type: 'm.room.message',
+      sender: '@remote:remote.test',
+      content: { body: 'not our room' },
+      prev_events: [],
+      auth_events: [],
+    });
+    let box = await f.mailbox();
+    await box.stage(
+      'known-absence',
+      await f.evidence('known-absence', [unknown, join]),
+    );
+    const response = await box.receive(f.remote.name, 'known-absence');
+    assertEquals(response, {
+      status: 200,
+      body: {
+        pdus: {
+          [String(join.event_id)]: {},
+          [String(unknown.event_id)]: { error: 'unknown room' },
+        },
+      },
+    });
+    assertEquals(f.accepted(), 1);
+    await f.reopen();
+    box = await f.mailbox();
+    assertEquals(await box.receive(f.remote.name, 'known-absence'), response);
+    const [out] = await (await f.edge().server()).query(
+      "SELECT record_json FROM facade_records WHERE stream='ingress:remote.test'",
+    );
+    const record = JSON.parse(String(out.record_json));
+    let delivered = 0;
+    const db = await f.home().server();
+    const journal = new Journal(db, LINK_CAPABILITIES);
+    const drain = new HomeIngress(db, {
+      peer: f.node.node,
+      pairing: f.bundle.id,
+      pairings: await f.homePairings(),
+      transaction: {
+        self: f.self,
+        store: f.home(),
+        keys: fakeKeyResolver(f.remote),
+        fetcher: fakeFetcher({}).fetcher,
+        edus: {
+          dispatch() {
+            delivered++;
+            return Promise.resolve();
+          },
+        },
+      },
+    });
+    await journal.receive(f.node.node, [record]);
+    assertEquals(await drain.apply(journal, record), true);
+    assertEquals(await drain.apply(journal, record), false);
+    assertEquals(delivered, 1);
+    assertEquals(
+      (await local.room.tx((tx) => tx.events.getStatus(String(join.event_id))))
+        ?.standing,
+      'accepted',
+    );
+    await assertRejects(
+      () => openRoom(f.home(), absentId),
+      Deno.errors.NotFound,
+    );
+    const [child] = await db.query(
+      "SELECT result_json FROM facade_ingress_children WHERE kind='room' AND child_key=?",
+      [absentId],
+    );
+    assertEquals(JSON.parse(String(child.result_json)), {
+      roomId: absentId,
+      result: { [String(unknown.event_id)]: { error: 'unknown room' } },
+    });
+    assertEquals(
+      (await journal.heads(f.node.node, 'in', record)).applied.sequence,
+      1,
+    );
   } finally {
     await f.close();
   }
@@ -459,6 +562,76 @@ Deno.test('mailbox configured capacity refuses only new work and journal ACK rel
     assertEquals(
       (await server.query('SELECT count(*) AS n FROM facade_records'))[0].n,
       1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('mailbox capacity accounts for distinct collision evidence without charging duplicate retries', async () => {
+  const f = await fixture();
+  try {
+    const box = await f.mailbox();
+    const original = await f.evidence('collision-limit');
+    await box.stage('collision-limit', original);
+    const variant = (value: string) =>
+      f.evidence('collision-limit', [], [{
+        edu_type: 'm.test',
+        content: { value },
+      }]);
+    const one = await variant('one');
+    const bytes = (value: unknown) =>
+      new TextEncoder().encode(canonicalJson(value)).byteLength;
+    setConfigForTests({
+      facade: { mailboxmaxbytes: bytes(original) + bytes(one) },
+    });
+    assertEquals(
+      (await assertRejects(
+        () => box.stage('collision-limit', one),
+        MatrixError,
+      )).status,
+      400,
+    );
+    assertEquals(
+      (await assertRejects(
+        () => box.stage('collision-limit', one),
+        MatrixError,
+      )).status,
+      400,
+    );
+    const two = await variant('two');
+    assertEquals(
+      (await assertRejects(
+        () => box.stage('collision-limit', two),
+        MatrixError,
+      )).status,
+      429,
+    );
+    const fresh = await f.evidence('new-after-collision');
+    setConfigForTests({
+      facade: { mailboxmaxbytes: bytes(original) + bytes(fresh) },
+    });
+    assertEquals(
+      (await assertRejects(
+        () => box.stage('new-after-collision', fresh),
+        MatrixError,
+      )).status,
+      429,
+    );
+    assertEquals(
+      (await (await f.edge().server()).query(
+        'SELECT count(*) AS n FROM facade_ingress_collisions',
+      ))[0].n,
+      1,
+    );
+    setConfigForTests({ facade: { mailboxmaxbytes: 1 } });
+    await box.stage('collision-limit', original);
+    assertEquals(
+      (await assertRejects(
+        () => box.stage('collision-limit', one),
+        MatrixError,
+      )).status,
+      400,
     );
   } finally {
     await f.close();

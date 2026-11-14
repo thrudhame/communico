@@ -213,12 +213,18 @@ export class DirectoryReplicas {
   }
 
   async requireScope(scope: string, allowAbsent = false): Promise<void> {
+    if (await this.scopeState(scope) === 'absent' && !allowAbsent) {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
+    }
+  }
+
+  async scopeState(scope: string): Promise<'ready' | 'absent'> {
     const view = await this.snapshot();
     const unavailable = () => {
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
     };
     if (!view) unavailable();
-    if (scope === 'directory') return;
+    if (scope === 'directory') return 'ready';
     if (scope === 'rooms') {
       const grant = await this.pairings.active();
       const incoming = await this.db.query(
@@ -231,7 +237,7 @@ export class DirectoryReplicas {
           ...incoming.map((row) => String(row.stream)),
         ])
       ) await this.requireScope(room);
-      return;
+      return 'ready';
     }
     const grant = await this.pairings.active();
     const [held] = await this.db.query(
@@ -244,10 +250,9 @@ export class DirectoryReplicas {
       held && Number(held.ready) === 1 &&
       Number(held.received) === Number(held.applied) &&
       Number(held.source_cut) >= (required ?? 0)
-    ) return;
+    ) return 'ready';
     if (required !== undefined || held) unavailable();
-    if (allowAbsent) return;
-    throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
+    return 'absent';
   }
 
   async apply(journal: Journal, stream: Stream): Promise<boolean> {

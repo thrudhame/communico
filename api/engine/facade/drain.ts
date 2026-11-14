@@ -6,6 +6,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { eduEnvelope } from '#engine/federation/peer-json.ts';
 import {
+  absentTransactionRoom,
   dispatchTransactionEdu,
   receiveTransactionRoom,
   type TransactionDeps,
@@ -72,7 +73,7 @@ export class HomeIngress {
     const rooms = transactionRooms(verified.transaction.pdus);
     const recovery = new Map(payload.rooms.map((raw) => {
       const room = object(raw);
-      return [text(room.roomId), room.recovery] as const;
+      return [text(room.roomId), room] as const;
     }));
     if (
       recovery.size !== payload.rooms.length || recovery.size !== rooms.size ||
@@ -152,6 +153,18 @@ export class HomeIngress {
       try {
         roomResults.push(
           await child('room', roomId, async () => {
+            const retained = recovery.get(roomId)!;
+            if (retained.recovery === null) {
+              const result = await absentTransactionRoom(inputs);
+              if (canonicalJson(result) !== canonicalJson(retained.result)) {
+                throw new LinkError(
+                  'LINK_BAD_RECORD',
+                  'invalid absent-room disposition',
+                  400,
+                );
+              }
+              return { roomId, result };
+            }
             const [scope] = await this.db.query(
               'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
               [peer, pairing, 'room:' + roomId],
@@ -171,7 +184,7 @@ export class HomeIngress {
               {
                 ...transaction,
                 fetcher: recoveryPack(
-                  recovery.get(roomId),
+                  retained.recovery,
                   roomId,
                   transaction.fetcher,
                 ),

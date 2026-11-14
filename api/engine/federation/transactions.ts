@@ -49,6 +49,32 @@ export type PduResults = Record<
   Record<string, never> | { error: string }
 >;
 
+async function identifyRoomInputs(pdus: Pdu[], version: string) {
+  const identified: { pdu: Pdu; eventId: string }[] = [];
+  for (const pdu of pdus) {
+    let eventId: string;
+    try {
+      eventId = await eventIdFor(
+        pdu as unknown as Record<string, unknown>,
+        version,
+      );
+    } catch {
+      continue;
+    }
+    pdu.event_id = eventId;
+    identified.push({ pdu, eventId });
+  }
+  return identified;
+}
+
+/** A confirmed absent room has the ordinary per-PDU negative result, not a
+ * replica miss or permission to create/ingest an unsolicited room. */
+export async function absentTransactionRoom(pdus: Pdu[]): Promise<PduResults> {
+  return Object.fromEntries((await identifyRoomInputs(pdus, '11')).map(
+    ({ eventId }) => [eventId, { error: 'unknown room' }],
+  ));
+}
+
 /** Shared envelope admission for standalone processing and durable ingress. */
 export function decodeTransaction(rawBody: unknown, origin: string) {
   try {
@@ -169,22 +195,8 @@ async function receiveRoom(
   }
   // the result key is the event's COMPUTED id (uncomputable → no entry —
   // Complement counts them, federation_room_get_missing_events_test.go:292-294)
-  const identified: { pdu: Pdu; eventId: string }[] = [];
-  for (const pdu of pdus) {
-    let eventId: string;
-    try {
-      eventId = await eventIdFor(
-        pdu as unknown as Record<string, unknown>,
-        version,
-      );
-    } catch {
-      continue;
-    }
-    // the wire form has no event_id (v3+, transported out-of-band) —
-    // restore it: the signature covers the redacted form WITH it
-    (pdu as unknown as Record<string, unknown>).event_id = eventId;
-    identified.push({ pdu, eventId });
-  }
+  // Restore derived event IDs on the wire form before shared remote admission.
+  const identified = await identifyRoomInputs(pdus, version);
   if (room === null) {
     // no room file — except an m.room.member leave/ban for a user with
     // an out-of-band invite (§3.8 step 7's rescind): a remote rejection,

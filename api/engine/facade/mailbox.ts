@@ -7,6 +7,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
+  absentTransactionRoom,
   decodeTransaction,
   type PduResults,
   receiveTransactionRoom,
@@ -29,7 +30,7 @@ import type { Pairings } from './pairing.ts';
 export type IngressRoom = {
   roomId: string;
   result: PduResults;
-  recovery: ReplicaRoom;
+  recovery: ReplicaRoom | null;
 };
 export type IngressEdu = { index: number; disposition: unknown };
 export type IngressObligation = {
@@ -119,7 +120,7 @@ export class Mailbox {
       node: NodeIdentity;
       pairings: Pairings;
       transaction: TransactionDeps;
-      requireScope(scope: string): Promise<void>;
+      scopeState(scope: string): Promise<'ready' | 'absent'>;
       acceptEdu(origin: string, raw: unknown): Promise<unknown>;
       changed(): void;
     },
@@ -164,18 +165,19 @@ export class Mailbox {
         'SELECT input_hash FROM facade_ingress WHERE origin=? AND txn_id=?',
         [evidence.origin, txnId],
       );
-      if (held) {
-        if (held.input_hash === inputHash) return false;
-        await conn.execute(
-          'INSERT INTO facade_ingress_collisions(origin,txn_id,input_hash,evidence_json) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
-          [evidence.origin, txnId, inputHash, encoded],
-        );
+      if (held?.input_hash === inputHash) return false;
+      if (
+        held && (await conn.query(
+          'SELECT 1 FROM facade_ingress_collisions WHERE origin=? AND txn_id=? AND input_hash=?',
+          [evidence.origin, txnId, inputHash],
+        )).length
+      ) {
         return true;
       }
       const max = config().facade.mailboxmaxbytes;
       if (max) {
         const [usage] = await conn.query(
-          "SELECT COALESCE(SUM(i.bytes),0) AS bytes FROM facade_ingress i WHERE i.record_hash IS NULL OR NOT EXISTS (SELECT 1 FROM facade_records r WHERE r.peer='home' AND r.direction='out' AND r.source=i.source AND r.incarnation=i.incarnation AND r.hash=i.record_hash AND r.result_json IS NOT NULL)",
+          "SELECT (SELECT COALESCE(SUM(i.bytes),0) FROM facade_ingress i WHERE i.record_hash IS NULL OR NOT EXISTS (SELECT 1 FROM facade_records r WHERE r.peer='home' AND r.direction='out' AND r.source=i.source AND r.incarnation=i.incarnation AND r.hash=i.record_hash AND r.result_json IS NOT NULL)) + (SELECT COALESCE(SUM(length(CAST(evidence_json AS BLOB))),0) FROM facade_ingress_collisions) AS bytes",
         );
         if (Number(usage.bytes) + bytes > max) {
           throw new MatrixError(
@@ -184,6 +186,13 @@ export class Mailbox {
             'configured mailbox capacity reached',
           );
         }
+      }
+      if (held) {
+        await conn.execute(
+          'INSERT INTO facade_ingress_collisions(origin,txn_id,input_hash,evidence_json) VALUES(?,?,?,?)',
+          [evidence.origin, txnId, inputHash, encoded],
+        );
+        return true;
       }
       await conn.execute(
         'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -287,7 +296,13 @@ export class Mailbox {
       async ([roomId, inputs]) => {
         try {
           const result = await this.child(entry, 'room', roomId, async () => {
-            await this.options.requireScope('room:' + roomId);
+            if (await this.options.scopeState('room:' + roomId) === 'absent') {
+              return {
+                roomId,
+                result: await absentTransactionRoom(inputs),
+                recovery: null,
+              };
+            }
             const result = await receiveTransactionRoom(
               roomId,
               inputs,

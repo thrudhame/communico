@@ -816,6 +816,8 @@ Deno.test('directory readiness requires the advertised room cut, not just an old
     await journal.receive('home', [initial]);
     assert(await owner.apply(journal, initial));
     await owner.requireScope('room:' + f.source.roomId);
+    assertEquals(await owner.scopeState('room:' + f.source.roomId), 'ready');
+    assertEquals(await owner.scopeState('room:!absent:logical.test'), 'absent');
     const message = await f.source.addEvent({
       type: 'm.room.message',
       content: { body: 'new inventory cut' },
@@ -826,6 +828,11 @@ Deno.test('directory readiness requires the advertised room cut, not just an old
     await journal.receive('home', [inventory]);
     assertEquals(await owner.snapshot(), null);
     assert(await owner.apply(journal, inventory));
+    await assertRejects(
+      () => owner.scopeState('room:' + f.source.roomId),
+      MatrixError,
+      'replica unavailable',
+    );
     await assertRejects(
       () => owner.requireScope('room:' + f.source.roomId),
       MatrixError,
