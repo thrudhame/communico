@@ -137,39 +137,43 @@ export function startPublicExports(
       try {
         do {
           dirty = false;
-          const users = await options.tenant.tx((tx) =>
-            tx.publicReplica.users()
-          );
-          for (const user of users) {
-            if (stopped) break;
-            if (running.has(user)) {
-              rerun.add(user);
-              continue;
-            }
-            const work = (async () => {
-              try {
-                do {
-                  rerun.delete(user);
-                  const record = await exportPublicReplica(
-                    options.store,
-                    options.tenant,
-                    user,
-                    options.peer,
-                    options.pairing,
-                  );
-                  if (record) options.changed();
-                } while (!stopped && rerun.delete(user));
-              } catch (error) {
-                options.failed(error, user);
-              } finally {
-                running.delete(user);
+          try {
+            const users = await options.tenant.tx((tx) =>
+              tx.publicReplica.users()
+            );
+            for (const user of users) {
+              if (stopped) break;
+              if (running.has(user)) {
+                rerun.add(user);
+                continue;
               }
-            })();
-            running.set(user, work);
+              const work = (async () => {
+                try {
+                  do {
+                    rerun.delete(user);
+                    try {
+                      const record = await exportPublicReplica(
+                        options.store,
+                        options.tenant,
+                        user,
+                        options.peer,
+                        options.pairing,
+                      );
+                      if (record) options.changed();
+                    } catch (error) {
+                      options.failed(error, user);
+                    }
+                  } while (!stopped && rerun.delete(user));
+                } finally {
+                  running.delete(user);
+                }
+              })();
+              running.set(user, work);
+            }
+          } catch (error) {
+            options.failed(error);
           }
         } while (!stopped && dirty);
-      } catch (error) {
-        options.failed(error);
       } finally {
         scanning = undefined;
       }

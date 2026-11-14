@@ -329,49 +329,56 @@ export function startInboxWorker(options: {
       try {
         do {
           dirty = false;
-          for (
-            const stream of await options.journal.streams(options.peer, 'in')
-          ) {
-            const id = key(stream);
-            if (stopped) break;
-            if (running.has(id)) {
-              rerun.add(id);
-              continue;
-            }
-            const work = (async () => {
-              try {
-                do {
-                  rerun.delete(id);
-                  let applied =
-                    (await options.journal.heads(options.peer, 'in', stream))
-                      .applied.sequence;
-                  while (!stopped && await options.apply(stream)) {
-                    const next = await options.journal.heads(
-                      options.peer,
-                      'in',
-                      stream,
-                    );
-                    if (next.applied.sequence <= applied) {
-                      throw new LinkError(
-                        'LINK_DIVERGED',
-                        'domain reported application without durable completion',
-                      );
-                    }
-                    applied = next.applied.sequence;
-                    options.changed();
-                  }
-                } while (!stopped && rerun.delete(id));
-              } catch (error) {
-                options.failed(error, stream);
-              } finally {
-                running.delete(id);
+          try {
+            for (
+              const stream of await options.journal.streams(options.peer, 'in')
+            ) {
+              const id = key(stream);
+              if (stopped) break;
+              if (running.has(id)) {
+                rerun.add(id);
+                continue;
               }
-            })();
-            running.set(id, work);
+              const work = (async () => {
+                try {
+                  do {
+                    rerun.delete(id);
+                    try {
+                      let applied = (await options.journal.heads(
+                        options.peer,
+                        'in',
+                        stream,
+                      ))
+                        .applied.sequence;
+                      while (!stopped && await options.apply(stream)) {
+                        const next = await options.journal.heads(
+                          options.peer,
+                          'in',
+                          stream,
+                        );
+                        if (next.applied.sequence <= applied) {
+                          throw new LinkError(
+                            'LINK_DIVERGED',
+                            'domain reported application without durable completion',
+                          );
+                        }
+                        applied = next.applied.sequence;
+                        options.changed();
+                      }
+                    } catch (error) {
+                      options.failed(error, stream);
+                    }
+                  } while (!stopped && rerun.delete(id));
+                } finally {
+                  running.delete(id);
+                }
+              })();
+              running.set(id, work);
+            }
+          } catch (error) {
+            options.failed(error);
           }
         } while (!stopped && dirty);
-      } catch (error) {
-        options.failed(error);
       } finally {
         scanning = undefined;
       }

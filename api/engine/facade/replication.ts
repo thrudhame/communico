@@ -115,42 +115,48 @@ export function startRoomExports(options: {
       try {
         do {
           dirty = false;
-          for (const id of await options.store.rooms()) {
-            if (stopped) break;
-            if (running.has(id)) {
-              rerun.add(id);
-              continue;
-            }
-            const job = (async () => {
-              try {
-                do {
-                  rerun.delete(id);
-                  const room = await openRoom(options.store, id);
-                  // Evidence-only/prejoin files carry no authentic participation.
-                  if (!await room.tx((tx) => tx.segments.latestStay())) return;
-                  if (
-                    await exportRoomReplica(
-                      options.store,
-                      room,
-                      options.self,
-                      options.peer,
-                      options.pairing,
-                    )
-                  ) {
-                    options.changed();
-                  }
-                } while (!stopped && rerun.delete(id));
-              } catch (error) {
-                options.failed(error, id);
-              } finally {
-                running.delete(id);
+          try {
+            for (const id of await options.store.rooms()) {
+              if (stopped) break;
+              if (running.has(id)) {
+                rerun.add(id);
+                continue;
               }
-            })();
-            running.set(id, job);
+              const job = (async () => {
+                try {
+                  do {
+                    rerun.delete(id);
+                    try {
+                      const room = await openRoom(options.store, id);
+                      // Evidence-only/prejoin files carry no authentic participation.
+                      if (!await room.tx((tx) => tx.segments.latestStay())) {
+                        continue;
+                      }
+                      if (
+                        await exportRoomReplica(
+                          options.store,
+                          room,
+                          options.self,
+                          options.peer,
+                          options.pairing,
+                        )
+                      ) {
+                        options.changed();
+                      }
+                    } catch (error) {
+                      options.failed(error, id);
+                    }
+                  } while (!stopped && rerun.delete(id));
+                } finally {
+                  running.delete(id);
+                }
+              })();
+              running.set(id, job);
+            }
+          } catch (error) {
+            options.failed(error);
           }
         } while (!stopped && dirty);
-      } catch (error) {
-        options.failed(error);
       } finally {
         scanning = undefined;
       }

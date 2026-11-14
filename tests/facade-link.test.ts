@@ -1294,3 +1294,73 @@ Deno.test('facade inbox retains a wake during its final empty domain check', asy
     await f.close();
   }
 });
+
+for (const fault of ['apply', 'enumeration'] as const) {
+  Deno.test(`facade inbox retains a wake across a failed ${fault} pass`, async () => {
+    const f = await fixture();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const rescanned = Promise.withResolvers<void>();
+    const delivered = Promise.withResolvers<void>();
+    const failures: unknown[] = [];
+    const failure = new Error('injected inbox pass failure');
+    let injected = false;
+    let worker: ReturnType<typeof startInboxWorker> | undefined;
+    try {
+      const record = await f.hj.append('edge_a', {
+        source: 'home',
+        incarnation: 'inbox-error-wake',
+        stream: 'room:retry',
+        type: 'control',
+        version: 1,
+        operationId: 'retry',
+        payload: 1,
+      });
+      await f.fj.receive('home', [record]);
+      const streams = f.fj.streams.bind(f.fj);
+      let scans = 0;
+      f.fj.streams = async (...args) => {
+        scans++;
+        if (fault === 'enumeration' && !injected) {
+          injected = true;
+          entered.resolve();
+          await release.promise;
+          throw failure;
+        }
+        const result = await streams(...args);
+        if (scans > 1) setTimeout(() => rescanned.resolve(), 0);
+        return result;
+      };
+      worker = startInboxWorker({
+        journal: f.fj,
+        peer: 'home',
+        pollseconds: 60,
+        changed() {},
+        failed: (error) => failures.push(error),
+        apply: async (stream) => {
+          if (fault === 'apply' && !injected) {
+            injected = true;
+            entered.resolve();
+            await release.promise;
+            throw failure;
+          }
+          const next = await f.fj.next('home', stream);
+          if (!next) return false;
+          await f.fj.complete('home', stream, next, { applied: true });
+          delivered.resolve();
+          return true;
+        },
+      });
+      await testDeadline(entered.promise);
+      worker.wake();
+      if (fault === 'apply') await testDeadline(rescanned.promise);
+      release.resolve();
+      await testDeadline(delivered.promise);
+      assertEquals(failures, [failure]);
+    } finally {
+      release.resolve();
+      await worker?.close();
+      await f.close();
+    }
+  });
+}
