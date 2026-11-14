@@ -1,4 +1,13 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
+import {
+  closeApp,
+  openReplicaApp,
+  startFederationServices,
+  theApp,
+} from '#engine/app.ts';
+import { setConfigForTests } from '#engine/config.ts';
+import { serveDeps } from '#engine/federation/context.ts';
+import { serveEvent } from '#engine/federation/serve.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { exportPublicReplica, PublicReplicas } from '#engine/facade/public.ts';
 import {
@@ -34,6 +43,8 @@ import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { importReplicaGenesis } from '#engine/room/replica.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { roomOf } from '#engine/server/read.ts';
+import { recoverServer } from '#engine/server/startup.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
@@ -147,8 +158,10 @@ async function fixture() {
     },
     publicExport: () =>
       exportPublicReplica(home, tenant, 'alice', node.node, bundle.id),
-    directoryExport: () =>
-      exportDirectoryReplica(home, tenant, node.node, bundle.id),
+    directoryExport: async () => {
+      await recoverServer(home);
+      return await exportDirectoryReplica(home, tenant, node.node, bundle.id);
+    },
     directoryOwner: async () =>
       new DirectoryReplicas(
         await edge.server(),
@@ -156,6 +169,9 @@ async function fixture() {
         tenant.serverName,
       ),
     edgeServer: () => edge.server(),
+    edgeStore: () => edge,
+    edgeTenant: async () =>
+      enrolledTenant(edge, await edgePairings(), tenant.serverName, node.node),
     async retire() {
       await (await edge.server()).execute(
         "UPDATE facade_pairings SET state='revoked' WHERE id=?",
@@ -751,6 +767,112 @@ Deno.test('a received newer user scope is unavailable rather than absent before 
     assert(await (await f.publicOwner()).apply(journal, user));
     await owner.requireScope('public:@alice:logical.test');
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('enrolled replica app composes ordinary reads and recovery without creating home-only workers or a home identity', async () => {
+  const f = await fixture();
+  try {
+    const record = await f.exports();
+    assert(record);
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    assert(await (await f.replicas()).apply(journal, record));
+    const tenant = await f.edgeTenant();
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { nodeid: 'edge_a' },
+    });
+    const directory = await f.directoryOwner();
+    const app = await openReplicaApp(f.edgeStore(), tenant, {
+      requireScope: (scope) => directory.requireScope(scope),
+      keyDocument: () =>
+        Promise.reject(
+          new Error('key document is supplied by the enrolled owner'),
+        ),
+      publicRooms: async () => (await directory.snapshot())!.publicRooms,
+    });
+    assertEquals(theApp(), app);
+    assertEquals(app.tenant.keyId, f.node.keyId);
+    assertEquals(app.sender, null);
+    for (
+      const service of [
+        'pushSender',
+        'delayedEvents',
+        'media',
+        'deviceLists',
+      ] as const
+    ) {
+      const error = assertThrows(() => app[service], MatrixError);
+      assertEquals(error.status, 503);
+    }
+    assertThrows(() => startFederationServices(app), MatrixError);
+    const eventId = String([...f.source.events.values()].at(-1)!.event_id);
+    assertEquals(await roomOf(app.server, eventId), f.source.roomId);
+    const served = await serveEvent(eventId, f.signing.name, serveDeps());
+    assertEquals(served.origin, f.tenant.serverName);
+    assertEquals(served.pdus[0].content, f.source.events.get(eventId)!.content);
+    await assertRejects(
+      () => openReplicaApp(f.edgeStore(), tenant, app.replica!),
+      Error,
+      'already open',
+    );
+    await closeApp();
+    assertThrows(() => theApp(), Error, 'no app open');
+  } finally {
+    await closeApp();
+    setConfigForTests({});
+    await f.close();
+  }
+});
+
+Deno.test('directory and peer policy exports use the published server cut without reopening busy or unavailable room files', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let held: Promise<void> | undefined;
+  let exporting: ReturnType<typeof exportDirectoryReplica> | undefined;
+  const room = f.home.room.bind(f.home);
+  try {
+    const initial = await f.directoryExport();
+    assert(initial);
+    held = f.room.tx(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    f.home.room = () =>
+      Promise.reject(new Error('room metadata temporarily unavailable'));
+    await registerAlias(
+      await f.home.server(),
+      '#fair:logical.test',
+      f.source.roomId,
+      '@alice:logical.test',
+    );
+    exporting = exportDirectoryReplica(
+      f.home,
+      f.tenant,
+      f.node.node,
+      f.bundle.id,
+    );
+    const record = await bounded(exporting);
+    assert(record);
+    const journal = await f.journal();
+    // Deliver the first manifest before its successor, exactly as the link does.
+    await journal.receive('home', [initial, record]);
+    const owner = await f.directoryOwner();
+    assert(await owner.apply(journal, initial));
+    assert(await owner.apply(journal, record));
+    assertEquals(
+      await lookupAlias(await f.edgeServer(), '#fair:logical.test'),
+      f.source.roomId,
+    );
+  } finally {
+    release.resolve();
+    await held;
+    f.home.room = room;
+    await exporting?.catch(() => undefined);
     await f.close();
   }
 });

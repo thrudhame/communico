@@ -11,12 +11,12 @@ import {
 } from '#engine/federation/policy-replica.ts';
 import { splitId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { openRoom } from '#engine/room/index.ts';
 import {
   type DirectoryFacts,
   directoryFactsOf,
   exportDirectoryFacts,
   installDirectoryFacts,
+  publishedRoomScopes,
 } from '#engine/server/public-replica.ts';
 import type { Database } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
@@ -97,21 +97,12 @@ export async function exportDirectoryReplica(
   pairing: string,
 ): Promise<LinkRecord | null> {
   const users = await tenant.tx((tx) => tx.publicReplica.inventory());
-  const rooms = (await Promise.all(
-    (await store.rooms()).sort().map(async (id) => {
-      const room = await openRoom(store, id);
-      return await room.tx(async (tx) =>
-        await tx.segments.latestStay()
-          ? { id, cut: await tx.changes.head() }
-          : null
-      );
-    }),
-  )).filter((entry) => entry !== null);
   const userIds = users.users.map((user) =>
     '@' + user + ':' + tenant.serverName
   );
   const db = await store.server();
   return await db.tx(async (conn) => {
+    const rooms = await publishedRoomScopes(conn);
     const [binding] = await conn.query(
       "SELECT node,state FROM facade_pairings WHERE id=? AND side='home'",
       [pairing],

@@ -14,6 +14,16 @@ export type DirectoryFacts = {
   forgotten: { user: string; roomId: string }[];
 };
 
+/** The publication owner already records authentic retained stays and their
+ * projected source cut. Inventory never opens unrelated room files, so a room
+ * failure cannot hold directory or policy replication behind its own stream. */
+export async function publishedRoomScopes(conn: Conn) {
+  return (await conn.query(
+    "SELECT DISTINCT f.room,w.position FROM feed f JOIN watermarks w ON w.source='room:' || f.room ORDER BY f.room",
+  ))
+    .map((row) => ({ id: String(row.room), cut: Number(row.position) }));
+}
+
 function bad(): never {
   throw new MatrixError(400, 'M_BAD_JSON', 'invalid public directory facts');
 }
