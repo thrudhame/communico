@@ -1,4 +1,12 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
+import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
+import { homeKeyDocument } from '#engine/federation/keydoc.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  importPublicKeyFromRaw,
+  matrixBase64,
+  verifyJson,
+} from '#engine/signing-primitives.js';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { openJournalClient } from '#engine/facade/client.ts';
 import {
@@ -270,6 +278,13 @@ async function fixture() {
       limits: { maxItems: 100, maxBytes: 10000 },
       notices,
       pairings: () => Promise.resolve(fp),
+      signKeyDocument: async (raw) =>
+        await new FacadeKeys(
+          await facade.server(),
+          node.signer(),
+          node.publicKey,
+          fp,
+        ).cosign(raw),
       changed: () => {
         changes++;
         notices.changed();
@@ -293,6 +308,10 @@ async function fixture() {
   return {
     tls,
     notices,
+    home: () => home,
+    tenant: () => tenant,
+    keys: async () =>
+      new FacadeKeys(await facade.server(), node.signer(), node.publicKey, fp),
     get hj() {
       return hj;
     },
@@ -356,6 +375,80 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('co-signed key publication collects over the authenticated link before either public role serves it', async () => {
+  const f = await fixture();
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const tenant = f.tenant();
+    const homeDoc = async () =>
+      await homeKeyDocument(
+        await f.home().server(),
+        tenant.signer(),
+        tenant.publicB64,
+      );
+    await assertRejects(homeDoc, MatrixError, 'not ready');
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    let calls = 0;
+    const record = await exportKeyRoster(
+      f.home(),
+      tenant,
+      'edge_a',
+      bundle.id,
+      async (_id, doc) => {
+        calls++;
+        await assertRejects(homeDoc, MatrixError, 'not ready');
+        return await client.signKeyDocument(doc);
+      },
+    );
+    assertEquals(calls, 1);
+    const document = await homeDoc();
+    assertEquals(
+      Object.keys(document.signatures[tenant.serverName]).sort(),
+      Object.keys(document.verify_keys).sort(),
+    );
+    for (const [id, key] of Object.entries(document.verify_keys)) {
+      assert(
+        await verifyJson(
+          document,
+          tenant.serverName,
+          id,
+          await importPublicKeyFromRaw(matrixBase64(key.key, 32)),
+        ),
+      );
+    }
+    await client.push(record, [record], EMPTY_CUT);
+    await (await f.keys()).apply(f.fj, record);
+    assertEquals(await (await f.keys()).document(), document);
+    const changed = structuredClone(document);
+    changed.valid_until_ts--;
+    await assertRejects(
+      () => client.signKeyDocument(changed),
+      LinkError,
+      'refused',
+    );
+    const unsigned = structuredClone(document);
+    delete unsigned.signatures[tenant.serverName][tenant.keyId];
+    await assertRejects(
+      () => client.signKeyDocument(unsigned),
+      LinkError,
+      'refused',
+    );
+    await f.reopen();
+    assertEquals(await (await f.keys()).document(), document);
+    const reopened = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    await f.hp.revoke(bundle.id);
+    await assertRejects(
+      () => reopened.signKeyDocument(document),
+      LinkError,
+      'no longer active',
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('re-enrollment exposes only active home streams while retaining retired records', async () => {
   const f = await fixture();
@@ -489,6 +582,58 @@ Deno.test('durable result is ACKed before a later operation blocks in the same s
     });
   } finally {
     release.resolve();
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
+Deno.test('durable outgoing ACK progress wakes its consumer without waiting for a fault retry timer', async () => {
+  const f = await fixture();
+  const notifications: string[] = [];
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const record = await f.hj.append('edge_a', {
+      source: 'home',
+      incarnation: bundle.id,
+      stream: 'egress:remote.test',
+      type: 'control',
+      version: 1,
+      operationId: 'ack-wake',
+      payload: {},
+    });
+    await client.push(record, [record], EMPTY_CUT);
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 100, maxBytes: 10000 },
+      apply: () => Promise.resolve(false),
+      failed: (error) => failures.push(error),
+      acknowledged: (stream) => notifications.push(stream.stream),
+    });
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(notifications, [], 'receipt alone is not an applied result');
+    await f.fj.complete('home', record, record, { fence: 'ready' });
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(await f.hj.result('edge_a', 'out', record, record), {
+      result: { fence: 'ready' },
+    });
+    assertEquals(notifications, ['egress:remote.test']);
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(
+      notifications,
+      ['egress:remote.test'],
+      'an unchanged ACK is not progress',
+    );
+    assertEquals(failures, []);
+  } finally {
     await reconciler?.drain();
     await f.close();
   }

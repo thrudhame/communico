@@ -200,6 +200,7 @@ export function linkHandler(options: {
   notices?: NoticeHub;
   changed?(): Promise<void>;
   contacted?(): Promise<void>;
+  signKeyDocument?(raw: unknown): Promise<string>;
 }): (request: Request, peerPin: string) => Promise<Response> {
   const enroll = enrollmentHandler(options);
   const json = (raw: string | null) => {
@@ -222,7 +223,8 @@ export function linkHandler(options: {
     if (
       !((request.method === 'GET' &&
         ['hello', 'records', 'notices'].includes(route)) ||
-        (request.method === 'POST' && ['records', 'ack'].includes(route)))
+        (request.method === 'POST' &&
+          ['records', 'ack', 'key-signature'].includes(route)))
     ) {
       return new Response(null, { status: 404 });
     }
@@ -256,6 +258,17 @@ export function linkHandler(options: {
         pairing: id,
         ...value,
       });
+    if (route === 'key-signature') {
+      if (!options.signKeyDocument) {
+        throw new LinkError(
+          'LINK_CAPABILITY_MISMATCH',
+          'key signing unavailable',
+        );
+      }
+      return response({
+        signature: await options.signKeyDocument(body.document),
+      });
+    }
     const checkedStream = (
       raw: unknown,
       source: string,
