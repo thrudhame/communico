@@ -13,6 +13,10 @@ export type FrozenBatch = {
   rows: OutboxDueRow[];
   sources: string[];
 };
+export type DispatchEnvelope = Pick<FrozenBatch, 'txnId' | 'body'> & {
+  destination: string;
+};
+export type Dispatch = (envelope: DispatchEnvelope) => Promise<unknown>;
 
 export async function enqueueEdu(
   tx: Conn,

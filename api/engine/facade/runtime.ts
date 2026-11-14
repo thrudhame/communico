@@ -32,6 +32,8 @@ import { Mailbox } from './mailbox.ts';
 import { acceptIngressEdu } from './ingress-edus.ts';
 import type { TransactionDeps } from '#engine/federation/transactions.ts';
 import type { Stream } from './protocol.ts';
+import { EgressOwner } from './egress.ts';
+import { dispatchBatch } from '#engine/federation/sender.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -159,6 +161,17 @@ export async function openFacadeRuntime(
             journal,
             stream,
           )
+          : stream.stream.startsWith('egress:')
+          ? await new EgressOwner(
+            server,
+            await pairings(),
+            async (envelope) =>
+              dispatchBatch(
+                server,
+                await (await keyOwner()).requestSigner(),
+                envelope,
+              ),
+          ).apply(journal, stream)
           : await apply(journal, stream),
       changed: () => notices.changed(),
       failed: (error) =>

@@ -47,6 +47,7 @@ import {
   keyStore,
 } from '#engine/federation/keys.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
+import type { Dispatch } from '#engine/server/delivery.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks, recoverServer } from '#engine/server/startup.ts';
@@ -250,12 +251,17 @@ export async function openReplicaApp(
  * the per-destination delivery worker on the outbox, fed by the EDU
  * queues and the reject-invite intent provider. Endpoints (5b) are not
  * part of this — no federation routes exist yet. */
-export function startFederationServices(app: App): void {
+export function startFederationServices(app: App, dispatch?: Dispatch): void {
   if (app.replica) {
     throw new MatrixError(
       503,
       'M_UNAVAILABLE',
       'home federation producers unavailable at this ingress',
+    );
+  }
+  if (config().facade.nodes.length && !dispatch) {
+    throw new Error(
+      'enrolled federation requires its destination egress coordinator',
     );
   }
   app.deviceLists.start();
@@ -271,6 +277,7 @@ export function startFederationServices(app: App): void {
     signer,
     drainEdus: queues.drain,
     onDelivered: () => projectTenant(app.store, app.tenant.serverName),
+    dispatch,
   });
   senderRef = sender;
   const inviteDeps: InviteDeps = {

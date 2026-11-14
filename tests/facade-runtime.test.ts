@@ -16,6 +16,21 @@ import { setConfigForTests } from '#engine/config.ts';
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   setConfigForTests({ server: { name: 'logical.test' } });
   const tls = await facadeTls();
+  const outbound: { path: string; body: string; authorization: string }[] = [];
+  const receiver = Deno.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    cert: tls.facade.cert,
+    key: tls.facade.key,
+  }, async (request) => {
+    outbound.push({
+      path: new URL(request.url).pathname,
+      body: await request.text(),
+      authorization: request.headers.get('authorization') ?? '',
+    });
+    return Response.json({ pdus: {} });
+  });
+  const destination = `127.0.0.1:${receiver.addr.port}`;
   const ports = [];
   for (let i = 0; i < 5; i++) {
     const probe = Deno.listen({ hostname: '127.0.0.1', port: 0 });
@@ -32,7 +47,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
   const link = (side: string) =>
     `[facade]\nnodeid="edge_a"\nurl="https://127.0.0.1:${linkPort}"\nlinkport=${linkPort}\nlinkcert="${tls.dir}/${side}.crt"\nlinkkey="${tls.dir}/${side}.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\nreconnectmaxseconds=1\n`;
   const facadeFederation =
-    `[federation]\nenabled=true\nport=${federationPort}\ncert="${tls.dir}/facade.crt"\nkey="${tls.dir}/facade.key"\n`;
+    `[federation]\nenabled=true\nport=${federationPort}\ncert="${tls.dir}/facade.crt"\nkey="${tls.dir}/facade.key"\ncacerts=["${tls.dir}/ca.crt"]\n`;
   await Deno.writeTextFile(
     facadeConfig,
     common('facade', facadePort, 'facade') + facadeFederation +
@@ -41,7 +56,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
   await Deno.writeTextFile(
     homeConfig,
     common('home', homePort, 'home') +
-      `[federation]\nenabled=true\nport=${homeFederationPort}\ncert="${tls.dir}/home.crt"\nkey="${tls.dir}/home.key"\n` +
+      `[federation]\nenabled=true\nport=${homeFederationPort}\ncert="${tls.dir}/home.crt"\nkey="${tls.dir}/home.key"\ncacerts=["${tls.dir}/ca.crt"]\n` +
       link('home') + `nodes=["edge_a"]\npairfile="${bundlefile}"\n`,
   );
   let facade: Awaited<ReturnType<typeof process>> | undefined;
@@ -165,6 +180,19 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     assert(roster.revision > 0);
     assert(roster.lastHome > 0);
     await until(async () => (await status()).body.result.matrix === true);
+    const sendOutbound = async (marker: string) => {
+      const result = await api(
+        `sendToDevice/m.egress.test/${marker}`,
+        { messages: { [`@peer:${destination}`]: { '*': { marker } } } },
+        token,
+        'PUT',
+      );
+      assertEquals(result.status, 200, JSON.stringify(result));
+    };
+    const observedOutbound = (marker: string) =>
+      outbound.filter((entry) => entry.body.includes(`"marker":"${marker}"`));
+    await sendOutbound('direct');
+    await until(() => Promise.resolve(observedOutbound('direct').length === 1));
     const roomScope = async () =>
       (await status()).body.result.scopes.find((scope: { scope: string }) =>
         scope.scope === 'room:' + roomId
@@ -313,7 +341,32 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
         link('facade') + `pairfile="${bundlefile}"\n`,
     );
     await facade.stop();
+    facade = undefined;
+    const beforeOfflineSend = outbound.length;
+    await sendOutbound('offline');
+    // Drain the actual home process before asserting that no ungranted
+    // standalone send escaped while the owner link was unavailable.
+    await home.stop();
+    home = undefined;
+    assertEquals(outbound.length, beforeOfflineSend);
     facade = await process(facadeConfig, 'facade: link/local admin ready');
+    home = await process(homeConfig, 'federation: enabled');
+    await until(() =>
+      Promise.resolve(observedOutbound('offline').length === 1)
+    );
+    await until(async () => {
+      try {
+        const connection = await Deno.connect({
+          hostname: '127.0.0.1',
+          port: homePort,
+        });
+        connection.close();
+        return true;
+      } catch (error) {
+        if (error instanceof Deno.errors.ConnectionRefused) return false;
+        throw error;
+      }
+    });
     assertEquals(await call('PUT', sendPath, sendBody), saved);
     assertEquals((await inbox()).length, 1);
     assertEquals((await status()).body.result.keyId, initialized.keyId);
@@ -326,7 +379,30 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     );
     assert((await status()).body.result.keyRoster.lastHome >= roster.lastHome);
     await home.stop();
+    await Deno.writeTextFile(
+      homeConfig,
+      await Deno.readTextFile(homeConfig) + '\noutbound="facade"\n',
+    );
     home = await process(homeConfig, 'federation: enabled');
+    await until(async () => {
+      try {
+        const connection = await Deno.connect({
+          hostname: '127.0.0.1',
+          port: homePort,
+        });
+        connection.close();
+        return true;
+      } catch (error) {
+        if (error instanceof Deno.errors.ConnectionRefused) return false;
+        throw error;
+      }
+    });
+    await sendOutbound('facade');
+    await until(() => Promise.resolve(observedOutbound('facade').length === 1));
+    await sendOutbound('barrier');
+    await until(() =>
+      Promise.resolve(observedOutbound('barrier').length === 1)
+    );
     await adminCall(tls.dir + '/home.sock', 'facade/revoke', {
       id: paired.body.result.id,
     });
@@ -338,6 +414,26 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     home = undefined;
     await facade.stop();
     facade = undefined;
+    const disabledOwner = tls.dir + '/disabled-owner.toml';
+    await Deno.writeTextFile(
+      disabledOwner,
+      (await Deno.readTextFile(homeConfig)).replace(
+        'nodes=["edge_a"]',
+        'nodes=[]',
+      ),
+    );
+    const refusedOwner = await new Deno.Command(Deno.execPath(), {
+      args: metadata.tasks.start.split(' ').slice(1),
+      env: { COMMUNICO_CONFIG: disabledOwner, DENO_NO_PROMPT: '1' },
+      stdout: 'piped',
+      stderr: 'piped',
+    }).output();
+    assert(!refusedOwner.success);
+    assert(
+      new TextDecoder().decode(refusedOwner.stderr).includes(
+        'retained destination egress ownership requires its configured link',
+      ),
+    );
     const store = await openStore({
       dir: tls.dir + '/facade-store',
       library: './.native/libturso_ffi.so',
@@ -359,6 +455,36 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
         'facade',
       );
       const server = await store.server();
+      const egress = await server.query(
+        'SELECT mode,body,result_json FROM facade_egress ORDER BY txn_id',
+      );
+      for (const marker of ['direct', 'offline', 'facade']) {
+        const matching = egress.filter((row) =>
+          String(row.body).includes(`"marker":"${marker}"`)
+        );
+        assertEquals(
+          matching.length,
+          1,
+          `durable destination owner for ${marker}`,
+        );
+        assertEquals(
+          matching[0].mode,
+          marker === 'facade' ? 'facade' : 'direct',
+        );
+        assertEquals(JSON.parse(String(matching[0].result_json)), { pdus: {} });
+        assertEquals(observedOutbound(marker).length, 1);
+        assert(
+          observedOutbound(marker)[0].authorization.includes(
+            `key="${
+              marker === 'facade'
+                ? initialized.keyId
+                : Object.keys(document.verify_keys).find((id) =>
+                  id !== initialized.keyId
+                )
+            }"`,
+          ),
+        );
+      }
       const [admission] = await server.query(
         'SELECT txn_id,evidence_json,response_json FROM facade_ingress',
       );
@@ -453,6 +579,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
   } finally {
     await home?.dispose();
     await facade?.dispose();
+    await receiver.shutdown();
     await tls.close();
     setConfigForTests({});
   }

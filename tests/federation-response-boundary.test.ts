@@ -161,6 +161,7 @@ Deno.test('sender: malformed 2xx cannot acknowledge durable delivery and restart
       ['array-map', () => Response.json({ pdus: [] })],
       ['null-verdict', () => Response.json({ pdus: { $e: null } })],
       ['wrong-error', () => Response.json({ pdus: { $e: { error: 2 } } })],
+      ['not-completed', () => Response.json({ pdus: {} }, { status: 202 })],
     ] as const
   ) {
     await t.step(name, async () => {

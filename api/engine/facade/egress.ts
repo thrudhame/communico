@@ -3,6 +3,7 @@
 import { canonicalJson } from '#engine/canonical.ts';
 import { sendVerdicts } from '#engine/federation/responses.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
+import type { Dispatch } from '#engine/server/delivery.ts';
 import { type Journal } from './journal.ts';
 import type { Pairings } from './pairing.ts';
 import {
@@ -25,10 +26,6 @@ export type EgressEnvelope = {
   body: string;
   mode: 'direct' | 'facade';
 };
-export type Dispatch = (
-  envelope: Pick<EgressEnvelope, 'destination' | 'txnId' | 'body'>,
-) => Promise<unknown>;
-
 function diverged(message: string): never {
   throw new LinkError('LINK_DIVERGED', message);
 }

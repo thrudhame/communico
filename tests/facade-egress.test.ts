@@ -13,6 +13,7 @@ import { Journal } from '#engine/facade/journal.ts';
 import { type EgressEnvelope, EgressOwner } from '#engine/facade/egress.ts';
 import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
 import type { Database } from '#engine/store/db.ts';
+import { HomeEgress } from '#engine/facade/home-egress.ts';
 
 const settings = (dir: string) => ({
   dir,
@@ -400,5 +401,92 @@ Deno.test('distributed frozen batch survives local selection retirement and cold
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('home egress persists completion before ACK, resumes original mode, and never promotes a replacement owner', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.home.server();
+    const journal = new Journal(db, LINK_CAPABILITIES);
+    let calls = 0;
+    const home = (
+      mode: 'direct' | 'facade' = 'direct',
+      nodes = [f.node.node],
+    ) =>
+      new HomeEgress(db, f.hp, journal, nodes, mode, () => {
+        calls++;
+        return Promise.resolve({ pdus: {} });
+      }, () => {});
+    const pump = async () => {
+      for (const stream of await journal.streams(f.node.node, 'out')) {
+        const edge = await f.journal();
+        const head = await edge.heads('home', 'in', stream);
+        const page = await journal.page(
+          f.node.node,
+          'out',
+          stream,
+          head.received.sequence,
+          { maxItems: 100, maxBytes: 1000000 },
+        );
+        if (page.records.length) await edge.receive('home', page.records);
+        while (
+          await (await f.owner()).apply(edge, stream)
+        ) { /* drain this stream */ }
+        const after = await journal.acknowledged(f.node.node, stream);
+        const ack = await edge.acknowledgement('home', stream, after.applied, {
+          maxItems: 100,
+          maxBytes: 1000000,
+        });
+        await journal.ack(
+          f.node.node,
+          stream,
+          ack.received,
+          ack.applied,
+          ack.results,
+        );
+      }
+    };
+    await assertRejects(() => home().dispatch(f.envelope), Error, 'awaits');
+    assertEquals(calls, 0);
+    await pump();
+    await assertRejects(() => home().dispatch(f.envelope), Error, 'awaits');
+    assertEquals(calls, 1);
+    // Reconstructed coordinator with changed config must use the immutable
+    // proposal's dispatcher and its already retained completion, not redial.
+    await assertRejects(
+      () => home('facade').dispatch(f.envelope),
+      Error,
+      'awaits',
+    );
+    assertEquals(calls, 1);
+    await f.reopen();
+    await pump();
+    assertEquals(await home('facade').dispatch(f.envelope), { pdus: {} });
+    assertEquals(calls, 1);
+    await assertRejects(
+      () =>
+        home('direct', ['replacement']).dispatch({
+          ...f.envelope,
+          txnId: 'two',
+        }),
+      Error,
+      'awaits',
+    );
+    await assertRejects(
+      () => home('direct', []).dispatch({ ...f.envelope, txnId: 'two' }),
+      Error,
+      'awaits',
+    );
+    assertEquals(
+      await db.query('SELECT peer,pairing FROM facade_egress_routes'),
+      [{ peer: f.node.node, pairing: f.bundle.id }],
+    );
+    assertEquals(
+      (await journal.streams(f.node.node, 'out'))[0].received.sequence,
+      2,
+    );
+  } finally {
+    await f.close();
   }
 });
