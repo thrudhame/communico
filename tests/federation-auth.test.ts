@@ -7,11 +7,20 @@
 // the open-mode knock is recorded only after verification, the contact
 // hook fires. (doltgres tests/federation-auth.test.ts, restored at the
 // function — HTTP routing is stage 5.)
-import { assertEquals, assertRejects, assertStrictEquals } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { authenticateRequest } from '#engine/federation/auth.ts';
+import {
+  type RequestEvidence,
+  verifyRequestEvidence,
+} from '#engine/federation/request-evidence.ts';
 import { keyStore } from '#engine/federation/keys.ts';
 import {
   addBlock,
@@ -20,12 +29,227 @@ import {
   removeBlock,
 } from '#engine/federation/peers.ts';
 import { serverSchema } from '#engine/server/schema.ts';
-import { signJson } from '#engine/signing-primitives.js';
+import {
+  b32encode,
+  exportPublicKeyRaw,
+  signJson,
+} from '#engine/signing-primitives.js';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { directOnly, makeDoc, makeServer } from './federation/doc-helper.ts';
 
 const OURS = 'our.test';
 const TARGET = '/_matrix/federation/v1/send/txn-1?x=1';
+
+Deno.test('authenticated admission can retain the exact request and verifying key evidence before contact side effects', async () => {
+  await withStore(async (store) => {
+    const origin = await makeServer('proof-origin.test');
+    const server = await store.server();
+    const keys = keyStore(server, { deps: directOnly(await makeDoc(origin)) });
+    const bodyText = '{ "pdus": [], "edus": [] }';
+    const authorization = await headerFor(origin, 'PUT', TARGET, { bodyText });
+    let evidence!: RequestEvidence;
+    const order: string[] = [];
+    const deps = {
+      server,
+      keys,
+      onVerified: (value: RequestEvidence) => {
+        evidence = value;
+        order.push('verified');
+        return Promise.resolve();
+      },
+      onContact: () => order.push('contact'),
+    };
+    assertEquals(
+      await authenticateRequest(deps, OURS, {
+        method: 'PUT',
+        uri: TARGET,
+        authorization,
+        body: new TextEncoder().encode(bodyText),
+      }),
+      origin.name,
+    );
+    assert(
+      evidence !== undefined,
+      'the durable ingress owner needs original signature evidence, not an asserted origin',
+    );
+    assertEquals(order, ['verified', 'contact']);
+    const retained = await verifyRequestEvidence(
+      JSON.parse(JSON.stringify(evidence)),
+      OURS,
+    );
+    assertEquals(retained.request.uri, TARGET);
+    assertEquals(retained.request.authorization, authorization);
+    assertEquals(new TextDecoder().decode(retained.request.body), bodyText);
+    assert(evidence.acquisition !== null);
+    assert(evidence.acquisition.fetched <= evidence.admitted);
+    assert(evidence.acquisition.until >= evidence.admitted);
+    const clock = Date.now;
+    try {
+      Date.now = () => evidence.acquisition!.until + 86400000;
+      assertEquals(
+        (await verifyRequestEvidence(evidence, OURS)).evidence.admitted,
+        evidence.admitted,
+      );
+    } finally {
+      Date.now = clock;
+    }
+    const changes: ((copy: RequestEvidence) => void)[] = [
+      (p) => {
+        p.origin = 'forged.test';
+      },
+      (p) => {
+        p.destination = 'elsewhere.test';
+      },
+      (p) => {
+        p.admitted = p.acquisition!.until + 1;
+      },
+      (p) => {
+        p.acquisition!.until = p.acquisition!.fetched + 8 * 86400000;
+      },
+      (p) => {
+        p.request.uri = TARGET + '&tampered=true';
+      },
+      (p) => {
+        p.request.method = 'POST';
+      },
+      (p) => {
+        p.request.body = 'e30=';
+      },
+      (p) => {
+        p.request.authorization = 'X-Matrix origin="forged.test"';
+      },
+      (p) => {
+        p.acquisition!.doc.signatures = {};
+      },
+    ];
+    for (const change of changes) {
+      const copy = structuredClone(evidence);
+      change(copy);
+      await assertRejects(() => verifyRequestEvidence(copy, OURS));
+    }
+  });
+});
+
+Deno.test('admission evidence staging failure prevents contact side effects', async () => {
+  await withStore(async (store) => {
+    const origin = await makeServer('failed-proof.test');
+    const server = await store.server();
+    const keys = keyStore(server, { deps: directOnly(await makeDoc(origin)) });
+    const fault = new Error('durable admission unavailable');
+    let contacts = 0;
+    assertStrictEquals(
+      await assertRejects(async () =>
+        authenticateRequest(
+          {
+            server,
+            keys,
+            onVerified: () => Promise.reject(fault),
+            onContact: () => {
+              contacts++;
+            },
+          },
+          OURS,
+          {
+            method: 'PUT',
+            uri: TARGET,
+            authorization: await headerFor(origin, 'PUT', TARGET),
+            body: new Uint8Array(),
+          },
+        )
+      ),
+      fault,
+    );
+    assertEquals(contacts, 0);
+  });
+});
+
+Deno.test('admission evidence preserves valid padded key documents and large original bodies', async () => {
+  await withStore(async (store) => {
+    const origin = await makeServer('padded-proof.test');
+    const doc = await makeDoc(origin);
+    doc.verify_keys[origin.keyId].key += '=';
+    await signJson(doc, origin.name, origin.keyId, origin.kp.privateKey);
+    const server = await store.server();
+    const keys = keyStore(server, { deps: directOnly(doc) });
+    const bodyText = JSON.stringify({
+      pdus: [],
+      edus: [],
+      extension: 'x'.repeat(1024 * 1024),
+    });
+    let proof!: RequestEvidence;
+    await authenticateRequest(
+      {
+        server,
+        keys,
+        onVerified: (value) => {
+          proof = value;
+          return Promise.resolve();
+        },
+      },
+      OURS,
+      {
+        method: 'PUT',
+        uri: TARGET,
+        authorization: await headerFor(origin, 'PUT', TARGET, { bodyText }),
+        body: new TextEncoder().encode(bodyText),
+      },
+    );
+    assertEquals(
+      new TextDecoder().decode(
+        (await verifyRequestEvidence(proof, OURS)).request.body,
+      ),
+      bodyText,
+    );
+    assertEquals(
+      proof.acquisition!.doc,
+      doc,
+      'retain the signed origin document, do not normalize its signed fields',
+    );
+  });
+});
+
+Deno.test('key-is-name admission evidence is verified from the name with no invented origin document', async () => {
+  await withStore(async (store) => {
+    const origin = await makeServer('unused.test', 'ed25519:0');
+    origin.name = b32encode(await exportPublicKeyRaw(origin.kp.publicKey))
+      .toLowerCase().replace(/=+$/, '');
+    const server = await store.server();
+    const keys = keyStore(server, {
+      deps: {
+        directGet: () => {
+          throw new Error('must not fetch a key name');
+        },
+        witnessQuery: () => {
+          throw new Error('must not ask a witness');
+        },
+        listWitnesses: () => Promise.resolve([]),
+      },
+    });
+    let proof!: RequestEvidence;
+    await authenticateRequest(
+      {
+        server,
+        keys,
+        onVerified: (value) => {
+          proof = value;
+          return Promise.resolve();
+        },
+      },
+      OURS,
+      {
+        method: 'PUT',
+        uri: TARGET,
+        authorization: await headerFor(origin, 'PUT', TARGET),
+        body: new Uint8Array(),
+      },
+    );
+    assertEquals(proof.acquisition, null);
+    assertEquals(
+      (await verifyRequestEvidence(proof, OURS)).evidence.origin,
+      origin.name,
+    );
+  });
+});
 
 Deno.test('key fault ownership: request authentication preserves local key lookup faults', async () => {
   await withStore(async (store) => {

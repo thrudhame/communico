@@ -11,8 +11,10 @@
 import type { SchemaProvider } from '#engine/store/create.ts';
 import { FEDERATION_POLICY_SQL } from '#engine/federation/policy.ts';
 import { KEY_DECISIONS_SQL } from '#engine/federation/key-decisions.ts';
+import { FACADE_EGRESS_SQL } from '#engine/facade/egress.ts';
 import { RECOVERY_SQL } from '#engine/server/recovery.ts';
 import {
+  FACADE_INGRESS_SQL,
   FACADE_JOURNAL_SQL,
   FACADE_KEY_RETIREMENT_SQL,
   FACADE_KEY_ROSTER_SQL,
@@ -393,7 +395,7 @@ UPDATE receipts SET event_ids=json_array(event_ids);
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 33,
+  version: 35,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -428,6 +430,8 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FACADE_SCOPES_SQL);
     await db.exec(FEDERATION_POLICY_SQL);
     await db.exec(KEY_DECISIONS_SQL);
+    await db.exec(FACADE_INGRESS_SQL);
+    await db.exec(FACADE_EGRESS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -463,5 +467,7 @@ export const serverSchema: SchemaProvider = {
     30: (conn) => conn.exec(FACADE_SCOPES_SQL),
     31: (conn) => conn.exec(FEDERATION_POLICY_SQL),
     32: (conn) => conn.exec(KEY_DECISIONS_SQL),
+    33: (conn) => conn.exec(FACADE_INGRESS_SQL),
+    34: (conn) => conn.exec(FACADE_EGRESS_SQL),
   },
 };

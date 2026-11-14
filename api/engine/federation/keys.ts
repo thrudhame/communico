@@ -216,7 +216,7 @@ export async function reconcileKeyDecisions<T>(
   );
   for (const decision of decisions) {
     if (decision.action === 'accept') {
-      await validateCandidate(decision.name, decision.doc);
+      await validatedKeyDocument(decision.name, decision.doc);
     }
   }
   const lock = async (index: number): Promise<T> => {
@@ -284,7 +284,10 @@ async function forgetKeys(conn: Conn, name: string): Promise<void> {
 
 // Shared by origin acquisition and home-approved replica decisions. The original
 // signed document is always checked outside any storage transaction.
-async function validateCandidate(name: string, raw: unknown): Promise<KeyDoc> {
+export async function validatedKeyDocument(
+  name: string,
+  raw: unknown,
+): Promise<KeyDoc> {
   const doc = keyDocument(raw);
   if (doc.server_name !== name) {
     throw new UpstreamError('validation', {
@@ -532,7 +535,7 @@ export function keyStore(
           minimumValidUntilTs,
           peers,
           query: deps.witnessQuery,
-          selfCheck: (doc) => validateCandidate(name, doc),
+          selfCheck: (doc) => validatedKeyDocument(name, doc),
           witnessCheck: async (peer, doc) => {
             const witnessRows = await readKeyRows(peer);
             for (const w of witnessRows) {
@@ -559,7 +562,7 @@ export function keyStore(
       // closed mode only roster peers reach here — a consented address)
       if (candidate === null) {
         const raw = await deps.directGet(name, minimumValidUntilTs);
-        const doc = await validateCandidate(name, raw);
+        const doc = await validatedKeyDocument(name, raw);
         candidate = { doc, via: 'direct' };
       }
 

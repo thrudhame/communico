@@ -12,6 +12,10 @@ import { Pairings } from './pairing.ts';
 import { startRoomExports } from './replication.ts';
 import { startPublicExports } from './public.ts';
 import { startDirectoryExports } from './directory.ts';
+import { HomeIngress } from './drain.ts';
+import { HomeEgress } from './home-egress.ts';
+import { dispatchBatch } from '#engine/federation/sender.ts';
+import { transactionDependencies } from '#engine/federation/dependencies.ts';
 import {
   LINK_CAPABILITIES,
   LinkError,
@@ -35,7 +39,19 @@ export async function startHomeLinks(
       403,
     );
   }
-  if (!settings.nodes.length) return { close: () => Promise.resolve() };
+  if (!settings.nodes.length) {
+    if (
+      (await app.server.query('SELECT 1 FROM facade_egress_routes LIMIT 1'))
+        .length
+    ) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'retained destination egress ownership requires its configured link',
+        503,
+      );
+    }
+    return { dispatch: undefined, close: () => Promise.resolve() };
+  }
   const tls = await loadLinkTls(settings);
   const pairings = new Pairings(
     app.server,
@@ -56,6 +72,17 @@ export async function startHomeLinks(
     string,
     ReturnType<typeof startDirectoryExports>
   >();
+  const egress = new HomeEgress(
+    app.server,
+    pairings,
+    journal,
+    settings.nodes,
+    settings.outbound as 'direct' | 'facade',
+    (envelope) => dispatchBatch(app.server, app.tenant.signer(), envelope),
+    () => {
+      for (const worker of workers.values()) worker.wake();
+    },
+  );
   const failed = (node: string, error: unknown) => {
     if (!controller.signal.aborted) {
       console.error(
@@ -108,6 +135,12 @@ export async function startHomeLinks(
     await exportKeyRoster(app.store, app.tenant, node, id);
     const client = await openJournalClient(pairings, id, tls);
     if (controller.signal.aborted) return;
+    const ingress = new HomeIngress(app.server, {
+      peer: node,
+      pairing: id,
+      pairings,
+      transaction: transactionDependencies(app),
+    });
     workers.set(
       id,
       startHomeLinkWorker({
@@ -121,7 +154,10 @@ export async function startHomeLinks(
         notify: settings.notify as 'websocket' | 'sse' | 'poll',
         pollseconds: settings.pollseconds,
         reconnectmaxseconds: settings.reconnectmaxseconds,
-        apply: (stream) => apply(node, stream),
+        apply: (stream) =>
+          stream.stream.startsWith('ingress:')
+            ? ingress.apply(journal, stream)
+            : apply(node, stream),
         failed: (error) => failed(node, error),
       }),
     );
@@ -181,6 +217,7 @@ export async function startHomeLinks(
   await scan();
   let closed: Promise<void> | undefined;
   return {
+    dispatch: egress.dispatch.bind(egress),
     close() {
       return closed ??= (async () => {
         clearInterval(timer);

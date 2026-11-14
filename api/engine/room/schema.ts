@@ -6,6 +6,7 @@
 // is the only writer of the state-group/publication/pointer tables (R7).
 import type { SchemaProvider } from '#engine/store/create.ts';
 import { rebuildTopology, TOPOLOGY_SQL } from './topology.ts';
+import { REMOTE_BATCHES_SQL } from './remote-batches.ts';
 
 export const ROOM_SCHEMA_SQL = `
 CREATE TABLE events(
@@ -148,14 +149,15 @@ CREATE INDEX events_annotation_target ON events(
 `;
 
 export const roomSchema: SchemaProvider = {
-  version: 5,
+  version: 6,
   apply: async (db) => {
     await db.exec(
       ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL +
-        ANNOTATION_INDEX_SQL,
+        ANNOTATION_INDEX_SQL + REMOTE_BATCHES_SQL,
     );
   },
   migrations: {
+    5: (conn) => conn.exec(REMOTE_BATCHES_SQL),
     4: async (conn) => {
       await conn.exec(ANNOTATION_INDEX_SQL);
     },

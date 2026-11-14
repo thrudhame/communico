@@ -28,7 +28,12 @@ import { LINK_CAPABILITIES, LinkError } from './protocol.ts';
 import { bindRole } from './role.ts';
 import { loadLinkTls } from './transport.ts';
 import { startInboxWorker } from './worker.ts';
+import { Mailbox } from './mailbox.ts';
+import { acceptIngressEdu } from './ingress-edus.ts';
+import type { TransactionDeps } from '#engine/federation/transactions.ts';
 import type { Stream } from './protocol.ts';
+import { EgressOwner } from './egress.ts';
+import { dispatchBatch } from '#engine/federation/sender.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -62,6 +67,7 @@ export async function openFacadeRuntime(
   let tenant: Tenant | undefined;
   let initializing: Promise<NodeIdentity> | undefined;
   let inbox: ReturnType<typeof startInboxWorker> | undefined;
+  let mailbox: Mailbox | undefined;
   const pairings = () => {
     if (!node) {
       throw new LinkError(
@@ -155,6 +161,17 @@ export async function openFacadeRuntime(
             journal,
             stream,
           )
+          : stream.stream.startsWith('egress:')
+          ? await new EgressOwner(
+            server,
+            await pairings(),
+            async (envelope) =>
+              dispatchBatch(
+                server,
+                await (await keyOwner()).requestSigner(),
+                envelope,
+              ),
+          ).apply(journal, stream)
           : await apply(journal, stream),
       changed: () => notices.changed(),
       failed: (error) =>
@@ -175,6 +192,23 @@ export async function openFacadeRuntime(
     pairings,
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),
+    async ingress(transaction: TransactionDeps) {
+      if (mailbox) return mailbox;
+      const owner = await pairings();
+      await owner.active();
+      const directory = new DirectoryReplicas(server, owner, identity.server);
+      mailbox = new Mailbox(server, {
+        self: identity.server,
+        node: node!,
+        pairings: owner,
+        transaction,
+        scopeState: (scope) => directory.scopeState(scope),
+        acceptEdu: (origin, raw) =>
+          acceptIngressEdu(origin, identity.server, raw, transaction.edus),
+        changed: () => notices.changed(),
+      });
+      return mailbox;
+    },
     async grantedTenant() {
       if (!node) return null;
       try {

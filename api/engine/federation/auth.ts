@@ -11,7 +11,6 @@
 // (delivery-backoff reset + sender wake — the old D2, injected) and the
 // open-mode knock is recorded, nowhere before the verification.
 import { MatrixError } from '#engine/matrix-error.ts';
-import { canonicalJson } from '#engine/canonical.ts';
 import { matrixBase64 } from '#engine/signing-primitives.js';
 import type { Database as Db } from '#engine/store/db.ts';
 import { admit } from './gate.ts';
@@ -20,6 +19,11 @@ import { KeyChangeRefused, type KeyStore } from './keys.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import { lookupPeer, recordPending } from './peers.ts';
 import { parseXMatrixHeaders } from './xmatrix.ts';
+import { requestCanonical } from './request-signature.ts';
+import {
+  captureRequestEvidence,
+  type RequestEvidence,
+} from './request-evidence.ts';
 
 export type FederationRequest_ = {
   method: string;
@@ -38,6 +42,9 @@ export type AuthDeps = {
   // reset + queue wake). Injected so auth stands alone (commit 1) and
   // every authenticated endpoint wires the same hook (old D2).
   onContact?: (origin: string) => void;
+  // Protected durable-ingress composition opts in. Standalone/read requests do
+  // not materialize evidence or change their authentication behavior.
+  onVerified?: (evidence: RequestEvidence) => Promise<void>;
 };
 
 function unauthorized(): never {
@@ -74,20 +81,9 @@ export async function authenticateRequest(
       endpoint: req.uri,
     });
     // 5. rebuild the signed object — destination always OURS
-    const obj: Record<string, unknown> = {
-      method: req.method,
-      uri: req.uri,
-      origin: candidate.origin,
-      destination,
-    };
     let canonical: string;
     try {
-      if (req.body.length > 0) {
-        obj.content = JSON.parse(
-          new TextDecoder('utf-8', { fatal: true }).decode(req.body),
-        );
-      }
-      canonical = canonicalJson(obj);
+      canonical = requestCanonical(destination, req, candidate.origin);
     } catch {
       unauthorized();
     }
@@ -120,6 +116,15 @@ export async function authenticateRequest(
       new TextEncoder().encode(canonical),
     );
     if (!ok) continue;
+    if (deps.onVerified !== undefined) {
+      await deps.onVerified(
+        await captureRequestEvidence(deps.keys, destination, req, {
+          origin: candidate.origin,
+          keyId: candidate.key,
+          publicKey: pub,
+        }),
+      );
+    }
     // 7. authenticated — and only NOW the first contact is recorded (open
     //    mode, no roster row: nothing durable on a stranger's word before
     //    this point). The contact hook resets the destination's delivery
