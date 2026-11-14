@@ -463,14 +463,15 @@ Deno.test('fetcher: /state_ids + /event packs the gap tip over TLS (imported bou
           const group = await tx.state.current(stay!.id);
           return [...(await tx.state.groupMap(group!)).values()];
         });
-        b.scripted.missingAnswers = []; // nothing from get_missing_events
+        const pulled = await msg(b, 'pulled', [String(zoe.event_id)], 51);
+        b.scripted.missingAnswers = [pulled];
         b.scripted.stateIds.set(String(zoe.event_id), {
           pdu_ids: [...stateIds, String(topic.event_id)],
           auth_chain_ids: [b.g.createId],
         });
         b.scripted.events.set(String(zoe.event_id), zoe);
         b.scripted.events.set(String(topic.event_id), topic);
-        const pushed = await msg(b, 'pushed', [String(zoe.event_id)], 51);
+        const pushed = await msg(b, 'pushed', [String(pulled.event_id)], 52);
         const outcomes = await ingestRemote(
           b.g.room,
           [pushed],

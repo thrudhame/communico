@@ -1,12 +1,30 @@
-# Complement baseline - 2026-11-10 07:34:03 PST
+# Complement baseline - 2026-11-13 11:42:10 PST
 
 - checkout: ~/Sources/matrix-org-complement @ 0116400
-- image: communico-complement:local (commit 5a4b9d4983e573c6e7124a417dcb5b7b5955b10b)
+- image: communico-complement:local (commit c51c7f87b72a6a9da51304d08e77c1b5505e62b9)
 - go test exit: 1 (red tests are the baseline, not a harness error)
 - packages: pass=13 fail=2 skip=0
-- failing tests: 15
+- failing tests: 14
 
 ## Change from the previous baseline
+
+Overnight F4 reduces the tracked baseline from 15 failures to 14, with no new
+failures. The unchanged full corpus produced 677 terminal test results across
+15 packages; the no-new-failure comparator and unchanged settings pass exit 0.
+
+| # | Explicitly observed passing under full load | Elapsed |
+|---|---|---|
+| 1 | `TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6` | 9.08 s |
+| 2 | `TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph` | 12.86 s |
+| 3 | `TestMSC4297StateResolutionV2_1_starts_from_empty_set` | 12.19 s |
+| 4 | `TestCorruptedAuthChain` | 18.87 s |
+
+These are actual pass events, not inferred absence or skips. Native full
+coverage is 1281 tests and 949 steps with zero failures. No Complement fixture,
+test, deadline, settings or recovery concurrency changed. This baseline-only
+amendment does not change the tested runtime inputs.
+
+### Historical G7 baseline
 
 G7 reduces the tracked baseline from 18 failures to 15, with no new failures.
 `TestSyncTimelineGap`, `/full` and `/incremental` were explicitly observed passing
@@ -97,7 +115,6 @@ Package totals above count each package once, failing if any pass fails.
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate/Parallel
 - github.com/matrix-org/complement/tests/csapi TestRoomCreate
-- github.com/matrix-org/complement/tests TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
 - github.com/matrix-org/complement/tests TestJoinFederatedRoomFromApplicationServiceBridgeUser
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_over_federation
 - github.com/matrix-org/complement/tests TestMediaFilenames/Parallel/Unicode

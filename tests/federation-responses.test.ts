@@ -128,7 +128,9 @@ Deno.test('peer envelopes: required lists and transaction metadata reject malfor
   const h = await setup();
   try {
     for (
-      const bad of [null, [], {}, { events: {} }, { events: [null] }, {
+      const bad of [null, [], { events: null }, { events: {} }, {
+        events: [null],
+      }, {
         events: [1],
       }]
     ) {
@@ -139,6 +141,11 @@ Deno.test('peer envelopes: required lists and transaction metadata reject malfor
       );
     }
     h.answer({ events: [] });
+    assertEquals(
+      await h.fetcher.missingEvents(roomId, [], [], 10, h.fake.name),
+      [],
+    );
+    h.answer({});
     assertEquals(
       await h.fetcher.missingEvents(roomId, [], [], 10, h.fake.name),
       [],

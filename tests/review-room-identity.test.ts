@@ -150,13 +150,14 @@ for (
           : [tip],
       });
       if (route === 'remote-evidence') {
+        // Pulled recovery still must reject a foreign room root.
         const result = await ingestRemote(room, [child], fr.server.name, {
           keys,
           fetcher: scripted.fetcher,
           self: 'test',
           limits: { waitMs: 0, budgetMs: 10000, limit: 100 },
           ungroundedMs: 0,
-        });
+        }, 'pulled');
         assertEquals(result[0].outcome, 'dropped');
       } else {
         const result = await backfill(room, {

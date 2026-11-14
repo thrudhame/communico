@@ -107,13 +107,14 @@ for (const route of ['remote', 'history'] as const) {
           },
         });
         if (route === 'remote') {
+          // Exercise pulled-event recovery; pushed missing parents must refuse.
           const result = await ingestRemote(room, [child], fr.server.name, {
             keys,
             self: 'test',
             fetcher,
             limits: { waitMs: 0, budgetMs: 8000, limit: 100 },
             ungroundedMs: 0,
-          });
+          }, 'pulled');
           if (invalid) assertNotEquals(result[0].outcome, 'accepted');
           else assertEquals(result[0].outcome, 'accepted');
         } else {

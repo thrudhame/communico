@@ -231,7 +231,7 @@ Deno.test('wiring: remote ingest and backfill project before returning', async (
       [room.id],
     );
     assertEquals(Number(liveFeed[0].n), 5);
-    // the chase for the tip, then the backfill — both wired
+    // The pulled tip's chase, then backfill, both project before returning.
     const gapTip = String(tip.prev_events![0]);
     deps.fetcher = fakeFetcher({
       missingEvents: [],
@@ -241,7 +241,8 @@ Deno.test('wiring: remote ingest and backfill project before returning', async (
       ),
     }).fetcher;
     assertEquals(
-      (await ingestRemote(room, [tip], fr.server.name, deps))[0].outcome,
+      (await ingestRemote(room, [tip], fr.server.name, deps, 'pulled'))[0]
+        .outcome,
       'accepted',
     );
     deps.fetcher = fakeFetcher({

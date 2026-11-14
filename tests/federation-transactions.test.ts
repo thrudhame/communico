@@ -4,7 +4,7 @@
 // error, rejected {}); in-order processing of a fork; EDUs — typing,
 // receipt, presence for the origin's users (a wrong-domain user is
 // ignored; an unknown type is ignored); unknown prev → stored ungrounded
-// ({}) and the ungroundedmillihours = 0 drop ({ error }). (doltgres
+// (per-PDU error) and the ungroundedmillihours = 0 drop ({ error }). (doltgres
 // tests/federation-send.test.ts, restored at the engine functions; the
 // middleware's backoff reset is the sender's contact hook, covered in
 // federation-sender.test.ts.)
@@ -558,7 +558,7 @@ Deno.test('edus: queueing coalesces per key, merges on drain, and never queues r
   assertEquals(queues.drain('remote.test', 100), []);
 });
 
-Deno.test('send: unknown prev → stored ungrounded ({}); ungroundedmillihours = 0 drops ({ error })', async () => {
+Deno.test('send: unknown prev returns a per-PDU error while retaining pending waits; zero lifetime drops it', async () => {
   await withStore(async (store) => {
     const s = await remoteSetup(store);
     const orphaned = await msg(s, 'no parents', [
@@ -571,7 +571,8 @@ Deno.test('send: unknown prev → stored ungrounded ({}); ungroundedmillihours =
       pdus: [orphaned],
     });
     assertEquals(res.status, 200);
-    assertEquals(res.body.pdus, { [String(orphaned.event_id)]: {} });
+    const outcomes = res.body.pdus as Record<string, { error?: string }>;
+    assert(outcomes[String(orphaned.event_id)]?.error?.includes('prev_events'));
     // the placeholder: stored pending, waits on the made-up prevs
     const status = await s.g.room.tx(async (tx) => {
       const row = await tx.events.getStatus(String(orphaned.event_id));

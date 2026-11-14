@@ -677,8 +677,8 @@ Deno.test('project: history is indexed without a seq and never feeds news', asyn
       deps,
     );
     for (const outcome of rest) assertEquals(outcome.outcome, 'accepted');
-    // the latest event's chase pulls the gap tip (imported boundary) —
-    // the state_ids answer names the MISSING PREV, not the pushed event
+    // A pulled latest event's chase imports the gap tip boundary;
+    // the state_ids answer names the missing prev, not the pulled child.
     const gapTip = String(tip.prev_events![0]);
     const fetcher = fakeFetcher({
       missingEvents: [],
@@ -688,7 +688,7 @@ Deno.test('project: history is indexed without a seq and never feeds news', asyn
       ),
     });
     deps.fetcher = fetcher.fetcher;
-    const gap = await ingestRemote(room, [tip], fr.server.name, deps);
+    const gap = await ingestRemote(room, [tip], fr.server.name, deps, 'pulled');
     assertEquals(gap[0].outcome, 'accepted');
     // now backfill the oldest message into the history segment (the gap
     // tip's prev is the walk's frontier)
