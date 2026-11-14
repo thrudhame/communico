@@ -1,6 +1,6 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { canonicalJson } from '#engine/canonical.ts';
-import { initializeNode } from '#engine/facade/identity.ts';
+import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LinkError } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -224,6 +224,46 @@ Deno.test('restart validates the complete grant against the existing local signe
       [canonicalJson(grant), bundle.id],
     );
     await assertRejects(() => f.fp.active(), LinkError);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('only completed enrollment explicitly provisions the same logical name and node signer', async () => {
+  const f = await fixture();
+  try {
+    await assertRejects(
+      () => enrolledTenant(f.edge(), f.fp, 'logical.test', 'edge_a'),
+      LinkError,
+    );
+    assertEquals(await f.edge().tenants(), []);
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    const transcript = await f.fp.challenge(bundle.id, bundle.secret, homePin);
+    const grant = await f.hp.grant(bundle.id, transcript);
+    await f.fp.complete(bundle.id, grant, homePin);
+    let tenant = await enrolledTenant(f.edge(), f.fp, 'logical.test', 'edge_a');
+    assertEquals(tenant.serverName, 'logical.test');
+    assertEquals(tenant.keyId, f.node.keyId);
+    assertEquals(tenant.publicB64, f.node.publicKey);
+    assertEquals(
+      await tenant.signer().sign('proof'),
+      await f.node.signer().sign('proof'),
+    );
+    await f.reopen();
+    tenant = await enrolledTenant(f.edge(), f.fp, 'logical.test', 'edge_a');
+    assertEquals(tenant.publicB64, f.node.publicKey);
+    const db = await f.edge().tenant('logical.test');
+    await db.execute("UPDATE tenant SET key_id='wrong'");
+    await assertRejects(
+      () => enrolledTenant(f.edge(), f.fp, 'logical.test', 'edge_a'),
+      Error,
+      'identity',
+    );
+    assertEquals(
+      (await db.query('SELECT key_id FROM tenant'))[0].key_id,
+      'wrong',
+    );
   } finally {
     await f.close();
   }

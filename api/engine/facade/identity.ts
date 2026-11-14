@@ -14,6 +14,43 @@ import {
   matrixBase64,
 } from '#engine/signing-primitives.js';
 import { LinkError, text } from './protocol.ts';
+import type { Pairings } from './pairing.ts';
+import type { Store } from '#engine/store/index.ts';
+import { provisionTenant, type Tenant } from '#engine/tenant/index.ts';
+
+/** Cross-file provisioning is recoverable: replay installs the same granted
+ * local key through the tenant owner, never home identity genesis or row clone. */
+export async function enrolledTenant(
+  store: Store,
+  pairings: Pairings,
+  server: string,
+  node: string,
+): Promise<Tenant> {
+  const grant = await pairings.active();
+  const db = await store.server();
+  const identity = await loadNode(db, server, node);
+  const transcript = grant.body.transcript.body;
+  if (
+    transcript.context.server !== server || transcript.context.node !== node ||
+    transcript.incarnation !== identity.incarnation ||
+    transcript.key.keyId !== identity.keyId ||
+    transcript.key.publicKey !== identity.publicKey
+  ) {
+    throw new LinkError(
+      'LINK_IDENTITY_MISMATCH',
+      'grant belongs to another local node',
+      403,
+    );
+  }
+  const [row] = await db.query(
+    'SELECT private_key FROM facade_node WHERE singleton=1',
+  );
+  return await provisionTenant(store, server, {
+    keyId: identity.keyId,
+    publicB64: identity.publicKey,
+    privateB64: String(row.private_key),
+  });
+}
 
 export type NodeIdentity = {
   readonly server: string;
