@@ -25,6 +25,7 @@ import {
 import type { Store } from '#engine/store/index.ts';
 import { ReliableEduError } from '#engine/federation/edus.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
+import type { RequestEvidence } from './request-evidence.ts';
 
 export type TransactionDeps = {
   store: Store;
@@ -39,6 +40,10 @@ export type TransactionDeps = {
 };
 
 export type TxnResult = { status: number; body: Record<string, unknown> };
+export type TransactionIngress = {
+  stage(txnId: string, evidence: RequestEvidence): Promise<void>;
+  receive(origin: string, txnId: string): Promise<TxnResult>;
+};
 export type PduResults = Record<
   string,
   Record<string, never> | { error: string }

@@ -39,6 +39,7 @@ export async function startFacade(lifetime: ServerLifetime) {
           publicRooms: runtime.publicRooms,
           keys: await runtime.verificationKeys(),
           signer: await runtime.requestSigner(),
+          ingress: runtime.ingress,
         });
       }
       appBound = true;
@@ -47,7 +48,7 @@ export async function startFacade(lifetime: ServerLifetime) {
         let required: Scope | undefined;
         const blocked = runtime.capabilities.gate(request, (scope) => {
           required = scope;
-          return scope !== 'ingress';
+          return true;
         });
         if (blocked) {
           return blocked;

@@ -22,6 +22,11 @@ import {
   eduState,
 } from '#engine/federation/edus.ts';
 import { wireEphemeral } from '#engine/federation/ephemeral.ts';
+import { transactionDependencies } from '#engine/federation/dependencies.ts';
+import type {
+  TransactionDeps,
+  TransactionIngress,
+} from '#engine/federation/transactions.ts';
 import { registerToDevice } from '#engine/federation/todevice.ts';
 import {
   type DeviceListService,
@@ -61,6 +66,7 @@ export type App = {
   readonly tenant: Tenant;
   readonly federationKeys: KeyStore;
   readonly federationEdus: EduState;
+  readonly federationIngress?: TransactionIngress;
   readonly deviceLists: DeviceListService;
   // The delivery worker — null until startFederationServices (federation
   // disabled, or an endpoint-test app).
@@ -80,6 +86,7 @@ export type ReplicaAccess = {
   publicRooms(): Promise<boolean>;
   keys: KeyStore;
   signer: Signer;
+  ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
 };
 
 let hooksInstalled = false;
@@ -215,6 +222,9 @@ export async function openReplicaApp(
     tenant,
     federationKeys: replica.keys,
     federationEdus: eduState(server, tenant.serverName, store),
+    get federationIngress() {
+      return ingress;
+    },
     sender: null,
     replica,
     get deviceLists() {
@@ -231,6 +241,7 @@ export async function openReplicaApp(
     },
     close: () => store.close(),
   };
+  const ingress = await replica.ingress?.(transactionDependencies(app));
   current = app;
   return app;
 }

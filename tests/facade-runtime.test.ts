@@ -9,16 +9,21 @@ import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { lookupAlias } from '#engine/server/aliases.ts';
 import { listedRooms } from '#engine/server/directory.ts';
+import { makeServer, seedServer } from './federation/doc-helper.ts';
+import { fedCaller } from './http-federation.ts';
+import { setConfigForTests } from '#engine/config.ts';
 
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
+  setConfigForTests({ server: { name: 'logical.test' } });
   const tls = await facadeTls();
   const ports = [];
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     const probe = Deno.listen({ hostname: '127.0.0.1', port: 0 });
     ports.push(probe.addr.port);
     probe.close();
   }
-  const [facadePort, homePort, linkPort, federationPort] = ports;
+  const [facadePort, homePort, linkPort, federationPort, homeFederationPort] =
+    ports;
   const facadeConfig = `${tls.dir}/facade.toml`;
   const homeConfig = `${tls.dir}/home.toml`;
   const bundlefile = `${tls.dir}/bundle.json`;
@@ -35,11 +40,24 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
   );
   await Deno.writeTextFile(
     homeConfig,
-    common('home', homePort, 'home') + '[federation]\nenabled=false\n' +
+    common('home', homePort, 'home') +
+      `[federation]\nenabled=true\nport=${homeFederationPort}\ncert="${tls.dir}/home.crt"\nkey="${tls.dir}/home.key"\n` +
       link('home') + `nodes=["edge_a"]\npairfile="${bundlefile}"\n`,
   );
   let facade: Awaited<ReturnType<typeof process>> | undefined;
   let home: Awaited<ReturnType<typeof process>> | undefined;
+  const remote = await makeServer('remote.test');
+  const seed = await openStore({
+    dir: tls.dir + '/facade-store',
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, {
+    schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+  });
+  await seedServer(await seed.server(), remote);
+  await seed.close();
   try {
     facade = await process(facadeConfig, 'facade: link/local admin ready');
     const status = () => adminCall(tls.dir + '/facade.sock', 'facade/status');
@@ -65,7 +83,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       await Deno.stat(tls.dir + '/facade-media').catch(() => null),
       null,
     );
-    home = await process(homeConfig, 'federation: disabled');
+    home = await process(homeConfig, 'federation: enabled');
     await until(async () => {
       try {
         const connection = await Deno.connect({
@@ -193,8 +211,41 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       `http://127.0.0.1:${facadePort}/_matrix/federation/v1/send/not-yet`,
       { method: 'PUT', body: '{}' },
     );
-    assertEquals(ingress.status, 503);
+    assertEquals(ingress.status, 401);
     await ingress.body?.cancel();
+    const sendPath =
+      '/_matrix/federation/v1/send/retained%20transaction?cut=original';
+    const sendBody = {
+      origin: remote.name,
+      origin_server_ts: 1,
+      pdus: [],
+      edus: [{
+        edu_type: 'm.direct_to_device',
+        content: {
+          sender: '@sender:remote.test',
+          type: 'm.room.encrypted',
+          message_id: 'retained-message',
+          messages: {
+            '@replica:logical.test': { '*': { ciphertext: 'opaque' } },
+          },
+        },
+      }, { edu_type: 'm.typing', content: {} }],
+    };
+    const call = fedCaller((request) => {
+      const url = new URL(request.url);
+      return fetch(
+        new Request(
+          `http://127.0.0.1:${facadePort}${url.pathname}${url.search}`,
+          request,
+        ),
+      );
+    }, remote);
+    const saved = await call('PUT', sendPath, sendBody);
+    assertEquals(saved, { status: 200, body: { pdus: {} } });
+    assertEquals(await call('PUT', sendPath, sendBody), saved);
+    const changed = await call('PUT', sendPath, { ...sendBody, edus: [] });
+    assertEquals(changed.status, 400);
+    assertEquals(changed.body.errcode, 'M_BAD_JSON');
     const publicCut = (await publicScope()).cut;
     const beforeProfileRoomCut = (await roomScope()).cut;
     assertEquals(
@@ -247,6 +298,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     );
     await facade.stop();
     facade = await process(facadeConfig, 'facade: link/local admin ready');
+    assertEquals(await call('PUT', sendPath, sendBody), saved);
     assertEquals((await status()).body.result.keyId, initialized.keyId);
     assertEquals((await status()).body.result.enrolled, true);
     assertEquals((await roomScope()).cut, replicatedCut);
@@ -257,7 +309,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     );
     assert((await status()).body.result.keyRoster.lastHome >= roster.lastHome);
     await home.stop();
-    home = await process(homeConfig, 'federation: disabled');
+    home = await process(homeConfig, 'federation: enabled');
     await adminCall(tls.dir + '/home.sock', 'facade/revoke', {
       id: paired.body.result.id,
     });
@@ -290,6 +342,29 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
         'facade',
       );
       const server = await store.server();
+      const [admission] = await server.query(
+        'SELECT txn_id,evidence_json,response_json FROM facade_ingress',
+      );
+      assertEquals(admission.txn_id, 'retained transaction');
+      assertEquals(JSON.parse(String(admission.response_json)), saved);
+      const proof = JSON.parse(String(admission.evidence_json));
+      assertEquals(proof.origin, remote.name);
+      assertEquals(proof.request.uri, sendPath);
+      const [obligation] = await server.query(
+        "SELECT record_json FROM facade_records WHERE stream='ingress:remote.test'",
+      );
+      const retained = JSON.parse(String(obligation.record_json)).payload;
+      assertEquals(retained.evidence, proof);
+      assertEquals(
+        retained.edus.map((edu: { disposition: { kind: string } }) =>
+          edu.disposition.kind
+        ),
+        ['retained', 'expired'],
+      );
+      assertEquals(
+        (await server.query('SELECT * FROM federation_txns')).length,
+        0,
+      );
       assertEquals(await lookupAlias(server, '#replica:logical.test'), roomId);
       assertEquals(await listedRooms(server), [roomId]);
       const [control] = await server.query(
@@ -355,6 +430,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     await home?.dispose();
     await facade?.dispose();
     await tls.close();
+    setConfigForTests({});
   }
 });
 
