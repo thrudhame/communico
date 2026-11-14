@@ -3,6 +3,7 @@
 // NULL for the never-expiring (unverifiable) records.
 import type { Conn } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 
 export type Wait = {
   missing: string;
@@ -24,17 +25,28 @@ function waitOf(row: Row): Wait {
   };
 }
 
+// The inserted row and already-retained siblings use the same eligibility.
+const eligible = (kind: string, missing: string) =>
+  `((${kind}='redaction' AND EXISTS(SELECT 1 FROM events WHERE id=${missing})) OR
+    (${kind}='prev' AND EXISTS(SELECT 1 FROM event_status WHERE event=${missing} AND grounding='grounded')))`;
+
 export async function addWait(conn: Conn, wait: Wait): Promise<void> {
   await conn.execute(
-    `INSERT INTO waits(missing, waiting, kind, since, expires, state) VALUES(?,?,?,?,?,?)
+    `INSERT INTO waits(missing, waiting, kind, since, expires, state)
+     VALUES(?,?,?,?,?,CASE WHEN ${eligible('?', '?')} THEN 'ready' ELSE ? END)
      ON CONFLICT(missing, waiting, kind) DO UPDATE SET since = excluded.since,
-       expires = excluded.expires, state = excluded.state`,
+       expires = excluded.expires, state = excluded.state
+     WHERE ${changedColumns('waits', 'since', 'expires', 'state')}`,
     [
       wait.missing,
       wait.waiting,
       wait.kind,
       wait.since,
       wait.expires,
+      wait.kind,
+      wait.missing,
+      wait.kind,
+      wait.missing,
       wait.state,
     ],
   );
@@ -46,10 +58,9 @@ export async function addWait(conn: Conn, wait: Wait): Promise<void> {
 // Prev recovery needs grounding; a redaction needs only the target's bytes.
 export async function readyFor(conn: Conn, missing: string): Promise<void> {
   await conn.execute(
-    `UPDATE waits SET state='ready' WHERE missing=? AND state!='ready' AND (
-      (kind='redaction' AND EXISTS(SELECT 1 FROM events WHERE id=?)) OR
-      (kind='prev' AND EXISTS(SELECT 1 FROM event_status WHERE event=? AND grounding='grounded'))
-    )`,
+    `UPDATE waits SET state='ready' WHERE missing=? AND state!='ready' AND ${
+      eligible('kind', '?')
+    }`,
     [missing, missing, missing],
   );
 }
@@ -62,7 +73,7 @@ export async function readyWaits(conn: Conn): Promise<Wait[]> {
 
 export async function deferWait(conn: Conn, wait: Wait): Promise<void> {
   await conn.execute(
-    "UPDATE waits SET state='pending' WHERE missing=? AND waiting=? AND kind=?",
+    "UPDATE waits SET state='pending' WHERE missing=? AND waiting=? AND kind=? AND state!='pending'",
     [wait.missing, wait.waiting, wait.kind],
   );
 }
