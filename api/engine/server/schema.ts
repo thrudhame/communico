@@ -9,6 +9,7 @@
 // the transaction they stamp (no sequences). The store owns the id row,
 // the meta table and the watermarks; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
+import { FEDERATION_POLICY_SQL } from '#engine/federation/policy.ts';
 import {
   FACADE_JOURNAL_SQL,
   FACADE_KEY_RETIREMENT_SQL,
@@ -390,7 +391,7 @@ UPDATE receipts SET event_ids=json_array(event_ids);
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 30,
+  version: 31,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -422,6 +423,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FACADE_KEY_RETIREMENT_SQL);
     await db.exec(FACADE_KEY_ROSTER_SQL);
     await db.exec(FACADE_SCOPES_SQL);
+    await db.exec(FEDERATION_POLICY_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -454,5 +456,6 @@ export const serverSchema: SchemaProvider = {
     27: (conn) => conn.exec(FACADE_KEY_RETIREMENT_SQL),
     28: (conn) => conn.exec(FACADE_KEY_ROSTER_SQL),
     29: (conn) => conn.exec(FACADE_SCOPES_SQL),
+    30: (conn) => conn.exec(FEDERATION_POLICY_SQL),
   },
 };

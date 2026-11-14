@@ -9,6 +9,7 @@
 // participation intent or adds a roster row. approve/reject are the operator's doors on the door
 // log (a 'refused' row is a delivery record, not a knock). Ported from
 // doltgres; the server file's Db is explicit (no global database).
+import { federationPolicy } from './policy.ts';
 import { config } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Database as Db } from '#engine/store/db.ts';
@@ -47,7 +48,15 @@ export async function admit(
     );
   }
   const peer = await lookupPeer(server, name);
-  const mode = config().federation.mode;
+  const policy = await federationPolicy(server);
+  const mode = policy.mode;
+  if (config().server.role === 'facade' && !policy.enabled) {
+    throw new MatrixError(
+      403,
+      'M_FORBIDDEN',
+      'federation disabled by home policy',
+    );
+  }
   // (2) closed mode: the unverified claim is bucketed, then refused
   if (peer === null && mode === 'closed') {
     if (ctx.kind === 'lookup') {
@@ -84,7 +93,7 @@ export async function admit(
     });
   }
   // (4) a blocking key change pauses the server until the admin accepts
-  if (await hasBlockingChange(server, name)) {
+  if (policy.paused.includes(name) || await hasBlockingChange(server, name)) {
     throw new MatrixError(
       403,
       'M_FORBIDDEN',

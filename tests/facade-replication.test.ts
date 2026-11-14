@@ -8,6 +8,8 @@ import {
 import { setConfigForTests } from '#engine/config.ts';
 import { serveDeps } from '#engine/federation/context.ts';
 import { serveEvent } from '#engine/federation/serve.ts';
+import { admit } from '#engine/federation/gate.ts';
+import { federationPolicy } from '#engine/federation/policy.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { exportPublicReplica, PublicReplicas } from '#engine/facade/public.ts';
 import {
@@ -181,7 +183,9 @@ async function fixture() {
     replica: () => openRoom(edge, source.roomId),
     async downgrade() {
       await (await edge.server()).tx(async (conn) => {
-        await conn.exec('DROP TABLE facade_scopes; DROP TABLE facade_exports');
+        await conn.exec(
+          'DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports',
+        );
         await conn.execute("UPDATE meta SET v='29' WHERE k='schema_version'");
       }, { mode: 'deferred' });
     },
@@ -582,6 +586,86 @@ Deno.test('directory replicas preserve home alias/publication/policy intent and 
       2,
     );
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica admission consumes home federation mode and blocking key decisions rather than node-local defaults', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.home.server();
+    await addPeer(db, {
+      name: 'paused.test',
+      host: null,
+      port: null,
+      trust: 'ca',
+      addedBy: 'operator',
+    });
+    await db.execute(
+      "INSERT INTO server_key_changes(server_name,seen_ms,old_keys,new_keys,status,acknowledged_old) VALUES('paused.test',1,'{}','{}','blocking',0)",
+    );
+    setConfigForTests({
+      federation: {
+        enabled: true,
+        mode: 'closed',
+        keychange: 'block',
+        witnesses: 2,
+      },
+    });
+    const record = await f.directoryExport();
+    assert(record);
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    assert(await (await f.directoryOwner()).apply(journal, record));
+    setConfigForTests({
+      server: { role: 'facade' },
+      federation: { mode: 'open', keychange: 'accept', witnesses: 0 },
+    });
+    const edge = await f.edgeServer();
+    assertEquals((await federationPolicy(edge)).keychange, 'block');
+    assertEquals((await federationPolicy(edge)).witnesses, 2);
+    const stranger = await assertRejects(
+      () => admit(edge, 'stranger.test', { kind: 'lookup', what: 'test' }),
+      MatrixError,
+    );
+    assertEquals(stranger.status, 403);
+    const blocked = await assertRejects(
+      () => admit(edge, 'paused.test', { kind: 'lookup', what: 'test' }),
+      MatrixError,
+    );
+    assertEquals(blocked.status, 403);
+    setConfigForTests({
+      federation: {
+        enabled: true,
+        mode: 'open',
+        keychange: 'warn',
+        witnesses: 3,
+      },
+    });
+    await db.execute(
+      "UPDATE server_key_changes SET status='noted' WHERE server_name='paused.test'",
+    );
+    const updated = await f.directoryExport();
+    assert(updated);
+    await journal.receive('home', [updated]);
+    assert(await (await f.directoryOwner()).apply(journal, updated));
+    await f.reopen();
+    setConfigForTests({
+      server: { role: 'facade' },
+      federation: { mode: 'closed', keychange: 'block', witnesses: 0 },
+    });
+    const reopened = await f.edgeServer();
+    assertEquals(
+      await admit(reopened, 'stranger.test', { kind: 'lookup', what: 'test' }),
+      'ok',
+    );
+    assertEquals(
+      await admit(reopened, 'paused.test', { kind: 'lookup', what: 'test' }),
+      'ok',
+    );
+    assertEquals((await federationPolicy(reopened)).keychange, 'warn');
+  } finally {
+    setConfigForTests({});
     await f.close();
   }
 });

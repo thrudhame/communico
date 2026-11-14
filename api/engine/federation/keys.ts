@@ -34,6 +34,7 @@ import { listWitnesses } from './peers.ts';
 import { federationRequest } from './client.ts';
 import { upstreamCategory, UpstreamError } from '#engine/net/upstream-error.ts';
 import { keyDocument, oldKeysOf } from './key-document.ts';
+import { federationPolicy } from './policy.ts';
 
 export type KeyDoc = KeyDocShape;
 
@@ -454,7 +455,7 @@ export function keyStore(
         excludeName: name,
       })).slice(
         0,
-        config().federation.witnesses,
+        (await federationPolicy(server)).witnesses,
       );
       if (peers.length > 0) {
         const result = await askWitnesses({
@@ -532,7 +533,7 @@ export function keyStore(
           const acknowledgedOld = docPairs.some((p) => seenPairs.has(p));
           const oldKeys = materialMapOf(seenRows);
           const newKeys = keyMapOf(selected.doc);
-          const policy = config().federation.keychange;
+          const policy = (await federationPolicy(server)).keychange;
           if (policy === 'block') {
             await recordChange({
               name,
@@ -571,7 +572,8 @@ export function keyStore(
     } catch (e) {
       if (epoch.current && e instanceof KeyChangeRefused) {
         refusalMemory.set(name, {
-          until: Date.now() + config().federation.keyfailminutes * 60_000,
+          until: Date.now() +
+            (await federationPolicy(server)).keyfailminutes * 60_000,
           error: e,
         });
       }
@@ -582,7 +584,8 @@ export function keyStore(
         )
       ) {
         failureMemory.set(name, {
-          until: Date.now() + config().federation.keyfailminutes * 60_000,
+          until: Date.now() +
+            (await federationPolicy(server)).keyfailminutes * 60_000,
           error: e,
         });
       }
@@ -665,7 +668,8 @@ export function keyStore(
         reason: 'key unavailable for required purpose and validity',
       });
       failureMemory.set(name, {
-        until: Date.now() + config().federation.keyfailminutes * 60_000,
+        until: Date.now() +
+          (await federationPolicy(server)).keyfailminutes * 60_000,
         error,
       });
       throw error;

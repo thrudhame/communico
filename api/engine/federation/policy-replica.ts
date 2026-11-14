@@ -2,8 +2,14 @@
 // pending admission claims, cached key evidence or operator annotations.
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
+import {
+  exportFederationPolicy,
+  type FederationPolicy,
+  policyOf,
+} from './policy.ts';
 
 export type PeerPolicy = {
+  federation: FederationPolicy;
   peers: {
     name: string;
     host: string | null;
@@ -61,10 +67,11 @@ export function peerPolicyOf(raw: unknown): PeerPolicy {
     new Set(peers.map((p) => p.name)).size !== peers.length ||
     new Set(blocks.map((b) => b.pattern)).size !== blocks.length
   ) bad();
-  return { peers, blocks };
+  return { peers, blocks, federation: policyOf(value.federation) };
 }
 export async function exportPeerPolicy(conn: Conn): Promise<PeerPolicy> {
   return peerPolicyOf({
+    federation: await exportFederationPolicy(conn),
     peers: (await conn.query(
       'SELECT name,host,port,trust,pin_spki_sha256,added_ms,added_by FROM federation_peers ORDER BY added_ms,name',
     )).map((p) => ({
@@ -89,6 +96,10 @@ export async function installPeerPolicy(
   raw: unknown,
 ): Promise<void> {
   const policy = peerPolicyOf(raw);
+  await conn.execute(
+    'INSERT INTO federation_policy(singleton,policy_json) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET policy_json=excluded.policy_json',
+    [JSON.stringify(policy.federation)],
+  );
   await conn.execute('DELETE FROM federation_peers');
   for (const p of policy.peers) {
     await conn.execute(
