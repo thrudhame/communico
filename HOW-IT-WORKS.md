@@ -1108,6 +1108,19 @@ lifecycle does not yet expose the restore command or perform its required
 sanitation and operator report.
 (`api/engine/store/{restore,ownership,index}.ts`)
 
+Private restore candidates have a separate store-owned database lifecycle:
+preflight all file paths, check full identities/integrity, apply only supported
+migrations, then expose transaction-scoped capabilities without startup hooks or
+workers. It records original and migrated schema versions and closes/drains
+capabilities before promotion. Tenant sanitation composes the consuming-key,
+inbox-receipt and sliding-position owners in one transaction: purge every restored
+OTK/fallback pool, publish each affected pool status, clear old inbox deletion
+receipts and expire both sliding connections and positions. Public signing keys,
+credentials, encrypted session backups and retained inbox messages are unchanged.
+These internal owners are not yet the complete restore command or its recovery
+epoch/report boundary.
+(`api/engine/store/candidate.ts`, `api/engine/tenant/restore.ts`)
+
 The internal store snapshot primitive pauses common storage admission, drains
 transactions and lifecycle changes, then exports every final server/tenant/room
 file with store-owned autocommit VACUUM connections. Retired but not yet unlinked
