@@ -789,13 +789,18 @@ export async function signWithSigner(
 export async function ourKeyDocument(
   signer: Signer,
   publicB64: string,
+  roster?: {
+    active: KeyDoc['verify_keys'];
+    retired: NonNullable<KeyDoc['old_verify_keys']>;
+  },
 ): Promise<KeyDoc> {
   const doc: KeyDoc = {
     server_name: signer.serverName,
     verify_keys: {
+      ...(roster === undefined ? {} : roster.active),
       [signer.keyId]: { key: b64encodeStd(b64decode(publicB64)) },
     },
-    old_verify_keys: {},
+    old_verify_keys: roster === undefined ? {} : roster.retired,
     valid_until_ts: Date.now() +
       config().federation.keyvalidityhours * 3_600_000,
     signatures: {},

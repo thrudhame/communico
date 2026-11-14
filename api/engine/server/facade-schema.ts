@@ -17,3 +17,7 @@ CREATE INDEX facade_pairings_node ON facade_pairings(node,state);
 export const RUNTIME_IDENTITY_SQL = `
 CREATE TABLE runtime_identity(singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),role TEXT NOT NULL CHECK(role IN ('home','facade')),server_name TEXT NOT NULL,node_id TEXT NOT NULL,initialized INTEGER NOT NULL CHECK(initialized IN (0,1)));
 `;
+
+export const FACADE_KEY_RETIREMENT_SQL = `
+ALTER TABLE facade_pairings ADD COLUMN retired_ms INTEGER;
+`;

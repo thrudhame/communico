@@ -1,14 +1,14 @@
 import { theApp } from '#engine/app.ts';
 import {
   assertFederationEnabled,
+  homeKeyDocument,
   keyDocResponse,
 } from '#engine/federation/keydoc.ts';
-import { ourKeyDocument } from '#engine/federation/keys.ts';
 
 export default async function () {
   assertFederationEnabled();
-  const { tenant } = theApp();
+  const { tenant, server } = theApp();
   return keyDocResponse(
-    await ourKeyDocument(tenant.signer(), tenant.publicB64),
+    await homeKeyDocument(server, tenant.signer(), tenant.publicB64),
   );
 }
