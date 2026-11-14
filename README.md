@@ -554,9 +554,11 @@ private keys. Ordinary recovery sends admitted restored state at an empty,
 limited timeline boundary; archived history remains available by pagination.
 Clients can still display rooms created after the cut and account-data types
 first written after it: the archive cannot name those objects to remove them
-from newer caches. An operator can optionally use existing device/token
+from newer caches. Before optional signout, have clients securely preserve their
+private crypto stores and recovery secrets; the server cannot export those stores.
+An operator can then optionally use existing device/token
 revocation to sign users out so clients drop these caches on next login. This
-is never automatic; preserve private crypto stores and recovery secrets.
+is never automatic.
 The report records sanitation, pending work and these security/RPO implications.
 
 ## Operator tools
