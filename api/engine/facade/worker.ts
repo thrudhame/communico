@@ -265,3 +265,69 @@ export function startHomeLinkWorker(
     },
   };
 }
+
+/** Facade application is local and independent of the home socket. The same
+ * explicit domain completion contract is used by both runtime roles. */
+export function startInboxWorker(options: {
+  journal: Journal;
+  peer: string;
+  pollseconds: number;
+  apply(stream: Stream): Promise<boolean>;
+  changed(): void;
+  failed(error: unknown, stream?: Stream): void;
+}) {
+  let stopped = false;
+  let scanning: Promise<void> | undefined;
+  const running = new Map<string, Promise<void>>();
+  const scan = () =>
+    scanning ??= (async () => {
+      try {
+        for (
+          const stream of await options.journal.streams(options.peer, 'in')
+        ) {
+          const id = key(stream);
+          if (stopped || running.has(id)) continue;
+          const work = (async () => {
+            let applied = stream.applied.sequence;
+            while (!stopped && await options.apply(stream)) {
+              const next = await options.journal.heads(
+                options.peer,
+                'in',
+                stream,
+              );
+              if (next.applied.sequence <= applied) {
+                throw new LinkError(
+                  'LINK_DIVERGED',
+                  'domain reported application without durable completion',
+                );
+              }
+              applied = next.applied.sequence;
+              options.changed();
+            }
+          })().catch((error) => options.failed(error, stream));
+          running.set(id, work);
+          void work.finally(() => running.delete(id));
+        }
+      } catch (error) {
+        options.failed(error);
+      } finally {
+        scanning = undefined;
+      }
+    })();
+  const timer = setInterval(() => void scan(), options.pollseconds * 1000);
+  void scan();
+  let closed: Promise<void> | undefined;
+  return {
+    wake: () => {
+      if (!stopped) void scan();
+    },
+    close() {
+      return closed ??= (async () => {
+        stopped = true;
+        clearInterval(timer);
+        await scanning;
+        await Promise.all(running.values());
+      })();
+    },
+  };
+}

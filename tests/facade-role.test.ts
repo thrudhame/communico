@@ -1,5 +1,6 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { bindRole } from '#engine/facade/role.ts';
+import { capabilities } from '#engine/facade/capabilities.ts';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { LinkError } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -101,4 +102,67 @@ Deno.test('an existing home tenant cannot be adopted as an independent facade st
     await store.close();
     await Deno.remove(dir, { recursive: true });
   }
+});
+
+Deno.test('one F1 capability manifest gates public requests before auth and excludes home workers', async () => {
+  const home = capabilities('home');
+  const facade = capabilities('facade');
+  for (
+    const name of [
+      'push',
+      'delayed',
+      'media',
+      'device-lists',
+      'link-client',
+      'federation-sender',
+    ]
+  ) {
+    assertEquals(facade.service(name), false);
+    assertEquals(home.service(name), true);
+  }
+  assertEquals(facade.service('link-server'), true);
+  assertEquals(facade.service('link-inbox'), true);
+  const request = (path: string, method = 'GET') =>
+    new Request('https://logical.test' + path, { method });
+  const ready = () => true;
+  const missing = () => false;
+  for (
+    const path of [
+      '/_matrix/federation/v1/event/%24event',
+      '/_matrix/key/v2/server',
+      '/.well-known/matrix/server',
+      '/_matrix/client/versions',
+    ]
+  ) {
+    assertEquals(facade.gate(request(path), missing)?.status, 503);
+    assertEquals(facade.gate(request(path), ready), null);
+  }
+  assertEquals(
+    facade.gate(request('/_matrix/federation/v1/event/x', 'POST'), ready)
+      ?.status,
+    405,
+  );
+  for (
+    const [path, method] of [
+      ['/_matrix/client/v3/sync', 'GET'],
+      ['/_matrix/client/v3/register', 'POST'],
+      ['/_matrix/federation/v1/make_join/room/user', 'GET'],
+      ['/_matrix/federation/v1/user/keys/claim', 'POST'],
+      ['/_matrix/federation/v1/query/arbitrary', 'GET'],
+      ['/_matrix/media/v3/upload', 'POST'],
+      ['/v1/facade/initialize', 'POST'],
+    ]
+  ) {
+    assertEquals(facade.gate(request(path, method), ready)?.status, 404);
+    assertEquals(home.gate(request(path, method), missing), null);
+  }
+  const refusal = facade.gate(
+    request('/_matrix/client/v3/directory/room/%23alias', 'DELETE'),
+    ready,
+  )!;
+  assertEquals(refusal.status, 503);
+  assertEquals(await refusal.json(), {
+    errcode: 'M_UNAVAILABLE',
+    error: 'operation requires home ingress',
+  });
 });

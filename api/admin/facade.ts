@@ -15,6 +15,7 @@ type Dependencies = {
   pairings(): Promise<Pairings>;
   initialize?(): Promise<unknown>;
   status?(): Promise<unknown>;
+  changed?(): Promise<void>;
 };
 export function facadeOperations(
   deps: Dependencies,
@@ -78,6 +79,7 @@ export function facadeOperations(
         throw error;
       }
       await (await deps.pairings()).accept(bundle);
+      await deps.changed?.();
       return { accepted: true };
     };
   }

@@ -9,12 +9,15 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { mediaRoot } from '#engine/media.ts';
 import { startAdmin } from '#root/api/admin/index.ts';
 import { ServerLifetime } from '#root/api/server-lifetime.ts';
+import { startFacade } from '#root/api/facade.ts';
+import { startHomeLinks } from '#engine/facade/home.ts';
 
 const lifetime = new ServerLifetime();
 let fatal = false;
 let closing: Promise<void> | undefined;
+let stopRuntime: () => Promise<void> = closeApp;
 function closeStore(): Promise<void> {
-  return closing ??= closeApp();
+  return closing ??= stopRuntime();
 }
 
 globalThis.addEventListener('unhandledrejection', (event) => {
@@ -65,7 +68,7 @@ try {
     );
   }
   const fed = loaded.config.federation;
-  if (fed.enabled) {
+  if (fed.enabled && loaded.config.server.role === 'home') {
     // existence checked here, not at config load (tests and the demo load
     // config without a certificate)
     try {
@@ -86,54 +89,67 @@ try {
   throw e;
 }
 
-await Deno.mkdir(mediaRoot(), { recursive: true });
-const app = await openApp();
-let admin: Awaited<ReturnType<typeof startAdmin>>;
-try {
-  admin = await startAdmin(app, undefined, lifetime);
-} catch (error) {
-  await closeStore();
-  throw error;
-}
-
-if (config().federation.enabled) {
-  const fed = config().federation;
-  const absCert = Deno.realPathSync(fed.cert);
-  // the store is provisioned synchronously at openApp, so the runtime
-  // counts always read (the old '?' fallback answered the app's
-  // first-boot-before-db-init dance, which no longer exists)
-  const peers = (await listPeers(app.server)).length;
-  const blocks = (await listBlocks(app.server)).length;
-  const pending = (await listPending(app.server)).length;
-  console.log(
-    `federation: enabled port=${fed.port} mode=${fed.mode} cert=${absCert} cacerts=${fed.cacerts.length} peers=${peers} blocks=${blocks} pending=${pending}`,
-  );
-  startFederationServices(app);
+let admin: { shutdown(): Promise<void> };
+const servers: Deno.HttpServer[] = [];
+if (config().server.role === 'facade') {
+  const facade = await startFacade(lifetime);
+  admin = facade.admin;
+  stopRuntime = facade.close;
+  console.log('facade: link/local admin ready; Matrix scopes not yet ready');
 } else {
-  console.log('federation: disabled');
-}
+  await Deno.mkdir(mediaRoot(), { recursive: true });
+  const app = await openApp();
+  try {
+    const links = await startHomeLinks(app);
+    stopRuntime = async () => {
+      await links.close();
+      await closeApp();
+    };
+    admin = await startAdmin(app, undefined, lifetime);
+  } catch (error) {
+    await closeStore();
+    throw error;
+  }
 
-const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
+  if (config().federation.enabled) {
+    const fed = config().federation;
+    const absCert = Deno.realPathSync(fed.cert);
+    // the store is provisioned synchronously at openApp, so the runtime
+    // counts always read (the old '?' fallback answered the app's
+    // first-boot-before-db-init dance, which no longer exists)
+    const peers = (await listPeers(app.server)).length;
+    const blocks = (await listBlocks(app.server)).length;
+    const pending = (await listPending(app.server)).length;
+    console.log(
+      `federation: enabled port=${fed.port} mode=${fed.mode} cert=${absCert} cacerts=${fed.cacerts.length} peers=${peers} blocks=${blocks} pending=${pending}`,
+    );
+    startFederationServices(app);
+  } else {
+    console.log('federation: disabled');
+  }
 
-const servers = [
-  Deno.serve(
-    { port: appPort(), signal: lifetime.controller.signal },
-    lifetime.wrap('cs', matrix),
-  ),
-];
+  const matrix = await pathfinder({ roots: ['api/endpoints/matrix/'] });
 
-if (config().federation.enabled) {
-  const { cert, key, port } = config().federation;
-  // the same app on both listeners (Synapse's single-listener shape;
-  // Complement probes /_matrix/federation/* and /_matrix/key/* on 8008)
   servers.push(
-    Deno.serve({
-      port,
-      cert: await Deno.readTextFile(cert),
-      key: await Deno.readTextFile(key),
-      signal: lifetime.controller.signal,
-    }, lifetime.wrap('federation', matrix)),
+    Deno.serve(
+      { port: appPort(), signal: lifetime.controller.signal },
+      lifetime.wrap('cs', matrix),
+    ),
   );
+
+  if (config().federation.enabled) {
+    const { cert, key, port } = config().federation;
+    // the same app on both listeners (Synapse's single-listener shape;
+    // Complement probes /_matrix/federation/* and /_matrix/key/* on 8008)
+    servers.push(
+      Deno.serve({
+        port,
+        cert: await Deno.readTextFile(cert),
+        key: await Deno.readTextFile(key),
+        signal: lifetime.controller.signal,
+      }, lifetime.wrap('federation', matrix)),
+    );
+  }
 }
 
 // Stop admission first; keep transports readable until admitted work drains.

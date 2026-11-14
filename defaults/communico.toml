@@ -37,7 +37,9 @@ nodes = []
 # Public HTTPS link base URL and immutable node ID. COMMUNICO_FACADE_URL / NODEID
 url = ""
 nodeid = ""
-# Protected out-of-band enrollment bundle. COMMUNICO_FACADE_PAIRFILE
+# Protected out-of-band enrollment bundle. Facade uses it for its first accepted
+# binding; subsequent enrollment uses local accept. Home needs it only until its
+# durable transcript/grant exists. COMMUNICO_FACADE_PAIRFILE
 pairfile = ""
 # Dedicated mTLS listener/client identity, independent of Matrix signing/TLS.
 # COMMUNICO_FACADE_LINKPORT / LINKCERT / LINKKEY / LINKCACERTS

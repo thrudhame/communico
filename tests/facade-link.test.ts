@@ -4,6 +4,7 @@ import { openJournalClient } from '#engine/facade/client.ts';
 import {
   JournalReconciler,
   startHomeLinkWorker,
+  startInboxWorker,
 } from '#engine/facade/worker.ts';
 import { enrollLink, linkHandler } from '#engine/facade/link.ts';
 import { Journal } from '#engine/facade/journal.ts';
@@ -743,3 +744,67 @@ async function testDeadline<T>(work: Promise<T>): Promise<T> {
     clearTimeout(timer);
   }
 }
+
+Deno.test('facade inbox application is independent per stream and drains without a home socket', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const delivered = Promise.withResolvers<void>();
+  const failed: unknown[] = [];
+  let worker: ReturnType<typeof startInboxWorker> | undefined;
+  try {
+    const base = { source: 'home', incarnation: 'pair-inbox' };
+    const one = await f.hj.append('edge_a', {
+      ...base,
+      stream: 'room:a-blocked',
+      type: 'control',
+      version: 1,
+      operationId: 'a',
+      payload: 1,
+    });
+    const two = await f.hj.append('edge_a', {
+      ...base,
+      stream: 'room:z-free',
+      type: 'control',
+      version: 1,
+      operationId: 'z',
+      payload: 2,
+    });
+    await f.fj.receive('home', [one]);
+    await f.fj.receive('home', [two]);
+    worker = startInboxWorker({
+      journal: f.fj,
+      peer: 'home',
+      pollseconds: 0.02,
+      changed() {},
+      failed: (error) => failed.push(error),
+      apply: async (stream) => {
+        const next = await f.fj.next('home', stream);
+        if (!next) return false;
+        if (next.operationId === 'a') {
+          entered.resolve();
+          await release.promise;
+        }
+        await f.fj.complete('home', stream, next, { applied: next.payload });
+        if (next.operationId === 'z') delivered.resolve();
+        return true;
+      },
+    });
+    await testDeadline(Promise.all([entered.promise, delivered.promise]));
+    assertEquals(await f.fj.result('home', 'in', one, one), null);
+    assertEquals(await f.fj.result('home', 'in', two, two), {
+      result: { applied: 2 },
+    });
+    const close = worker.close();
+    release.resolve();
+    await testDeadline(close);
+    assertEquals(await f.fj.result('home', 'in', one, one), {
+      result: { applied: 1 },
+    });
+    assertEquals(failed, []);
+  } finally {
+    release.resolve();
+    await worker?.close();
+    await f.close();
+  }
+});

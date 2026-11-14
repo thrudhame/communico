@@ -99,6 +99,7 @@ export async function enrollLink(
   id: string,
   tls: LinkTls,
   secret?: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const peer = await pairings.connection(id);
   const context = peer.context;
@@ -109,6 +110,7 @@ export async function enrollLink(
   async function call(route: string, fields: Record<string, unknown>) {
     const response = await client.fetch(LINK_PREFIX + route, {
       method: 'POST',
+      signal,
       body: canonicalJson({
         protocol: LINK_VERSION,
         server: context.server,
