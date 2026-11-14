@@ -13,3 +13,7 @@ INSERT INTO facade_control(singleton,revision) VALUES(1,0);
 CREATE TABLE facade_pairings(id TEXT PRIMARY KEY NOT NULL,side TEXT NOT NULL CHECK(side IN ('home','facade')),node TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','granting','paired','revoked')),context_json TEXT NOT NULL,transcript_json TEXT,grant_json TEXT,receipt_json TEXT,revocation_json TEXT,revision INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX facade_pairings_node ON facade_pairings(node,state);
 `;
+
+export const RUNTIME_IDENTITY_SQL = `
+CREATE TABLE runtime_identity(singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),role TEXT NOT NULL CHECK(role IN ('home','facade')),server_name TEXT NOT NULL,node_id TEXT NOT NULL,initialized INTEGER NOT NULL CHECK(initialized IN (0,1)));
+`;

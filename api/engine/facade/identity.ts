@@ -160,6 +160,20 @@ export async function initializeNode(
   text(server);
   const present = await db.query('SELECT singleton FROM facade_node');
   if (present.length) return await loadNode(db, server, node);
+  const [binding] = await db.query(
+    'SELECT role,server_name,node_id,initialized FROM runtime_identity WHERE singleton=1',
+  );
+  if (
+    binding &&
+    (binding.role !== 'facade' || binding.server_name !== server ||
+      binding.node_id !== node || binding.initialized === 1)
+  ) {
+    throw new LinkError(
+      'LINK_IDENTITY_MISMATCH',
+      'runtime binding refuses node genesis or missing signer replacement',
+      403,
+    );
+  }
   // Crypto generation is outside the retryable transaction. Concurrent explicit
   // initialization is fenced by the singleton; the loser reloads the winner.
   const pair = await generateSigningKeypair() as CryptoKeyPair;
@@ -180,6 +194,9 @@ export async function initializeNode(
         b64encodeStd(privateRaw),
         created,
       ],
+    );
+    await conn.execute(
+      'UPDATE runtime_identity SET initialized=1 WHERE singleton=1',
     );
   });
   return await loadNode(db, server, node);
