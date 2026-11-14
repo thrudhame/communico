@@ -127,6 +127,7 @@ function bind(
   return {
     publicReplica: {
       users: () => publicReplica.publicUsers(conn),
+      inventory: () => publicReplica.publicInventory(conn),
       export: (localpart: string, server: string) =>
         publicReplica.exportPublicUser(conn, localpart, server),
       install: (raw: unknown, server: string) =>

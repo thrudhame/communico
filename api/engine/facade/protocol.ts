@@ -41,6 +41,9 @@ export const LINK_CAPABILITIES: readonly Capability[] = [{
 }, {
   type: 'public-replica',
   version: 1,
+}, {
+  type: 'directory-replica',
+  version: 1,
 }];
 export const EMPTY_CUT: Cut = { sequence: 0, hash: '' };
 

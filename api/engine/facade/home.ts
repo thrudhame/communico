@@ -11,6 +11,7 @@ import { enrollLink } from './link.ts';
 import { Pairings } from './pairing.ts';
 import { startRoomExports } from './replication.ts';
 import { startPublicExports } from './public.ts';
+import { startDirectoryExports } from './directory.ts';
 import {
   LINK_CAPABILITIES,
   LinkError,
@@ -51,6 +52,10 @@ export async function startHomeLinks(
     ReturnType<typeof startPublicExports>
   >();
   const jobs = new Map<string, Promise<void>>();
+  const directoryExports = new Map<
+    string,
+    ReturnType<typeof startDirectoryExports>
+  >();
   const failed = (node: string, error: unknown) => {
     if (!controller.signal.aborted) {
       console.error(
@@ -66,12 +71,15 @@ export async function startHomeLinks(
       await exportKeyRoster(app.store, app.tenant, node, id);
       exports.get(id)?.wake();
       publicExports.get(id)?.wake();
+      directoryExports.get(id)?.wake();
       return;
     }
     await exports.get(id)?.close();
     exports.delete(id);
     await publicExports.get(id)?.close();
     publicExports.delete(id);
+    await directoryExports.get(id)?.close();
+    directoryExports.delete(id);
     await workers.get(id)?.close();
     workers.delete(id);
     let secret: string | undefined;
@@ -137,6 +145,16 @@ export async function startHomeLinks(
     });
     publicExports.set(id, users);
     users.wake();
+    const directory = startDirectoryExports({
+      store: app.store,
+      tenant: app.tenant,
+      peer: node,
+      pairing: id,
+      changed: () => workers.get(id)?.wake(),
+      failed: (error) => failed(node, error),
+    });
+    directoryExports.set(id, directory);
+    directory.wake();
   }
   let scanning: Promise<void> | undefined;
   const scan = () =>
@@ -172,6 +190,9 @@ export async function startHomeLinks(
         await Promise.all([...exports.values()].map((rooms) => rooms.close()));
         await Promise.all(
           [...publicExports.values()].map((users) => users.close()),
+        );
+        await Promise.all(
+          [...directoryExports.values()].map((directory) => directory.close()),
         );
         await Promise.all(
           [...workers.values()].map((worker) => worker.close()),

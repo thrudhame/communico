@@ -22,6 +22,7 @@ import { NoticeHub } from './notices.ts';
 import { Pairings, pairingStatus } from './pairing.ts';
 import { RoomReplicas } from './replication.ts';
 import { PublicReplicas } from './public.ts';
+import { DirectoryReplicas } from './directory.ts';
 import { LINK_CAPABILITIES, LinkError } from './protocol.ts';
 import { bindRole } from './role.ts';
 import { loadLinkTls } from './transport.ts';
@@ -140,6 +141,12 @@ export async function openFacadeRuntime(
       apply: async (stream) =>
         stream.stream === 'control'
           ? await (await keyOwner()).apply(journal, stream)
+          : stream.stream === 'directory'
+          ? await new DirectoryReplicas(
+            server,
+            await pairings(),
+            identity.server,
+          ).apply(journal, stream)
           : stream.stream.startsWith('room:')
           ? await (await roomOwner()).apply(journal, stream)
           : stream.stream.startsWith('public:')

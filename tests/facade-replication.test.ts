@@ -1,6 +1,25 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { exportPublicReplica, PublicReplicas } from '#engine/facade/public.ts';
+import {
+  DirectoryReplicas,
+  exportDirectoryReplica,
+} from '#engine/facade/directory.ts';
+import {
+  addBlock,
+  addPeer,
+  isBlocked,
+  listPeers,
+  removeBlock,
+  removePeer,
+} from '#engine/federation/peers.ts';
+import {
+  lookupAlias,
+  registerAlias,
+  removeAlias,
+} from '#engine/server/aliases.ts';
+import { listedRooms, setVisibility } from '#engine/server/directory.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
@@ -128,6 +147,15 @@ async function fixture() {
     },
     publicExport: () =>
       exportPublicReplica(home, tenant, 'alice', node.node, bundle.id),
+    directoryExport: () =>
+      exportDirectoryReplica(home, tenant, node.node, bundle.id),
+    directoryOwner: async () =>
+      new DirectoryReplicas(
+        await edge.server(),
+        await edgePairings(),
+        tenant.serverName,
+      ),
+    edgeServer: () => edge.server(),
     async retire() {
       await (await edge.server()).execute(
         "UPDATE facade_pairings SET state='revoked' WHERE id=?",
@@ -424,6 +452,304 @@ Deno.test('a missing required room pack remains unready and cannot advance its a
       (await (await f.replicas()).status(f.source.roomId))?.ready,
       false,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('directory replicas preserve home alias/publication/policy intent and complete known scope inventory independently of room readiness', async () => {
+  const f = await fixture();
+  try {
+    await f.tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+    const db = await f.home.server();
+    const alias = '#replicated:logical.test';
+    await registerAlias(db, alias, f.source.roomId, '@alice:logical.test');
+    await setVisibility(db, f.source.roomId, 'public');
+    await addPeer(db, {
+      name: 'remote.test',
+      host: 'peer.example',
+      port: 8449,
+      trust: 'pinned',
+      pin: 'f'.repeat(64),
+      addedBy: 'operator',
+      note: 'not a public policy fact',
+    });
+    await addBlock(db, '*.blocked.test', 'private operator annotation');
+    const owner = await f.directoryOwner();
+    await assertRejects(
+      () => owner.requireScope('room:' + f.source.roomId),
+      MatrixError,
+      'replica unavailable',
+    );
+    const initial = await f.directoryExport();
+    assert(initial);
+    assertEquals(await f.directoryExport(), null);
+    const j = await f.journal();
+    await j.receive('home', [initial]);
+    assert(await owner.apply(j, initial));
+    assertEquals(await owner.apply(j, initial), false);
+    const replica = await f.edgeServer();
+    assertEquals(await lookupAlias(replica, alias), f.source.roomId);
+    assertEquals(await listedRooms(replica), [f.source.roomId]);
+    assertEquals(
+      (await listPeers(replica)).map((
+        p,
+      ) => [
+        p.name,
+        p.host,
+        p.port,
+        p.trust,
+        p.pin_spki_sha256,
+        p.added_by,
+        p.note,
+      ]),
+      [[
+        'remote.test',
+        'peer.example',
+        8449,
+        'pinned',
+        'f'.repeat(64),
+        'operator',
+        null,
+      ]],
+    );
+    assert(await isBlocked(replica, 'a.blocked.test'));
+    assert(
+      !JSON.stringify(initial.payload).includes('private operator annotation'),
+    );
+    assert(
+      !JSON.stringify(initial.payload).includes('not a public policy fact'),
+    );
+    assertEquals((await owner.snapshot())?.users, ['@alice:logical.test']);
+    assertEquals((await owner.snapshot())?.rooms, [f.source.roomId]);
+    await assertRejects(
+      () => owner.requireScope('room:' + f.source.roomId),
+      MatrixError,
+      'replica unavailable',
+    );
+    await assertRejects(
+      () => owner.requireScope('public:@alice:logical.test'),
+      MatrixError,
+      'replica unavailable',
+    );
+    const missing = await assertRejects(
+      () => owner.requireScope('room:!absent:logical.test'),
+      MatrixError,
+    );
+    assertEquals(missing.status, 404);
+    const room = await f.exports();
+    assert(room);
+    await j.receive('home', [room]);
+    assert(await (await f.replicas()).apply(j, room));
+    await owner.requireScope('room:' + f.source.roomId);
+    const user = await f.publicExport();
+    assert(user);
+    await j.receive('home', [user]);
+    assert(await (await f.publicOwner()).apply(j, user));
+    await owner.requireScope('public:@alice:logical.test');
+    await removeAlias(db, alias);
+    await setVisibility(db, f.source.roomId, 'private');
+    await removePeer(db, 'remote.test');
+    await removeBlock(db, '*.blocked.test');
+    const suffix = await f.directoryExport();
+    assert(suffix);
+    await j.receive('home', [suffix]);
+    await f.reopen();
+    assert(await (await f.directoryOwner()).apply(await f.journal(), suffix));
+    const reopened = await f.edgeServer();
+    assertEquals(await lookupAlias(reopened, alias), null);
+    assertEquals(await listedRooms(reopened), []);
+    assertEquals(await listPeers(reopened), []);
+    assertEquals(await isBlocked(reopened, 'a.blocked.test'), false);
+    assertEquals(
+      (await (await f.journal()).heads('home', 'in', suffix)).applied.sequence,
+      2,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('directory application rolls back domain facts, readiness and journal result together on a failed server commit', async () => {
+  const f = await fixture();
+  try {
+    await registerAlias(
+      await f.home.server(),
+      '#atomic:logical.test',
+      f.source.roomId,
+      '@alice:logical.test',
+    );
+    const record = await f.directoryExport();
+    assert(record);
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    const apply = journal.apply.bind(journal);
+    journal.apply = (peer, stream, callback) =>
+      apply(peer, stream, async (conn, current) => {
+        await callback(conn, current);
+        throw new Error('crash before directory commit');
+      });
+    await assertRejects(
+      async () => (await f.directoryOwner()).apply(journal, record),
+      Error,
+      'crash before directory commit',
+    );
+    assertEquals(
+      await lookupAlias(await f.edgeServer(), '#atomic:logical.test'),
+      null,
+    );
+    assertEquals(await (await f.directoryOwner()).snapshot(), null);
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      0,
+    );
+    await f.reopen();
+    assert(await (await f.directoryOwner()).apply(await f.journal(), record));
+    assertEquals(
+      await lookupAlias(await f.edgeServer(), '#atomic:logical.test'),
+      f.source.roomId,
+    );
+    await f.retire();
+    await assertRejects(async () =>
+      (await f.directoryOwner()).requireScope('room:' + f.source.roomId)
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('directory readiness requires the advertised room cut, not just an older ready bootstrap', async () => {
+  const f = await fixture();
+  try {
+    const firstRoom = await f.exports();
+    assert(firstRoom);
+    const journal = await f.journal();
+    await journal.receive('home', [firstRoom]);
+    assert(await (await f.replicas()).apply(journal, firstRoom));
+    const owner = await f.directoryOwner();
+    const initial = await f.directoryExport();
+    assert(initial);
+    await journal.receive('home', [initial]);
+    assert(await owner.apply(journal, initial));
+    await owner.requireScope('room:' + f.source.roomId);
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'new inventory cut' },
+    });
+    await f.ingest([message]);
+    const inventory = await f.directoryExport();
+    assert(inventory);
+    await journal.receive('home', [inventory]);
+    assertEquals(await owner.snapshot(), null);
+    assert(await owner.apply(journal, inventory));
+    await assertRejects(
+      () => owner.requireScope('room:' + f.source.roomId),
+      MatrixError,
+      'replica unavailable',
+    );
+    const suffix = await f.exports();
+    assert(suffix);
+    await journal.receive('home', [suffix]);
+    assert(await (await f.replicas()).apply(journal, suffix));
+    await owner.requireScope('room:' + f.source.roomId);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('directory rejects foreign alias authority before changing held public facts', async () => {
+  const f = await fixture();
+  try {
+    const initial = await f.directoryExport();
+    assert(initial);
+    const source = new Journal(await f.home.server(), LINK_CAPABILITIES);
+    const view =
+      (initial.payload as { view: { directory: { aliases: unknown[] } } }).view;
+    const badAlias = await source.append('other', {
+      ...initial,
+      operationId: 'foreign-alias',
+      payload: {
+        kind: 'directory-replica',
+        after: 0,
+        cut: 1,
+        view: {
+          ...view,
+          directory: {
+            ...view.directory,
+            aliases: [{
+              alias: '#stolen:foreign.test',
+              roomId: f.source.roomId,
+              creator: null,
+            }],
+          },
+        },
+      },
+    });
+    const journal = await f.journal();
+    await journal.receive('home', [badAlias]);
+    await assertRejects(
+      async () => (await f.directoryOwner()).apply(journal, badAlias),
+      MatrixError,
+      'invalid public directory facts',
+    );
+    assertEquals(
+      (await journal.heads('home', 'in', badAlias)).applied.sequence,
+      0,
+    );
+    assertEquals(await (await f.directoryOwner()).snapshot(), null);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('directory rejects a skipped source cut despite its valid link hash', async () => {
+  const f = await fixture();
+  try {
+    const initial = await f.directoryExport();
+    assert(initial);
+    const skipped = await new Journal(await f.home.server(), LINK_CAPABILITIES)
+      .append('other', {
+        ...initial,
+        operationId: 'skipped-directory-cut',
+        payload: { ...(initial.payload as object), after: 2, cut: 3 },
+      });
+    const journal = await f.journal();
+    await journal.receive('home', [skipped]);
+    await assertRejects(
+      async () => (await f.directoryOwner()).apply(journal, skipped),
+      Error,
+      'directory source cut diverged',
+    );
+    assertEquals(
+      (await journal.heads('home', 'in', skipped)).applied.sequence,
+      0,
+    );
+    assertEquals(await (await f.directoryOwner()).snapshot(), null);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('a received newer user scope is unavailable rather than absent before its inventory or public view applies', async () => {
+  const f = await fixture();
+  try {
+    const initial = await f.directoryExport();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    const owner = await f.directoryOwner();
+    assert(await owner.apply(journal, initial));
+    await f.tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+    const user = await f.publicExport();
+    assert(user);
+    await journal.receive('home', [user]);
+    const error = await assertRejects(
+      () => owner.requireScope('public:@alice:logical.test'),
+      MatrixError,
+    );
+    assertEquals(error.status, 503);
+    assert(await (await f.publicOwner()).apply(journal, user));
+    await owner.requireScope('public:@alice:logical.test');
   } finally {
     await f.close();
   }

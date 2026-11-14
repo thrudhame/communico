@@ -26,6 +26,14 @@ export async function publicUsers(conn: Conn): Promise<string[]> {
     .map((row) => String(row.localpart));
 }
 
+export async function publicInventory(conn: Conn) {
+  const users = await publicUsers(conn);
+  const [row] = await conn.query(
+    "SELECT value FROM counters WHERE name='projection_revision'",
+  );
+  return { users, cut: row ? Number(row.value) : 0 };
+}
+
 export async function readPublicReplica(
   conn: Conn,
   localpart: string,

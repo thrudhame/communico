@@ -7,6 +7,8 @@ import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { lookupAlias } from '#engine/server/aliases.ts';
+import { listedRooms } from '#engine/server/directory.ts';
 
 Deno.test('cold roles enroll through local admin without facade tenant genesis, Matrix or home workers', async () => {
   const tls = await facadeTls();
@@ -105,7 +107,11 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
     const token = registered.body.access_token;
     const created = await api(
       'createRoom',
-      { name: 'Home-owned replica' },
+      {
+        name: 'Home-owned replica',
+        room_alias_name: 'replica',
+        visibility: 'public',
+      },
       token,
     );
     assertEquals(created.status, 200);
@@ -142,6 +148,11 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
         scope.scope === 'public:@replica:logical.test'
       );
     await until(async () => (await publicScope())?.ready === true);
+    await until(async () =>
+      (await status()).body.result.scopes.some((
+        scope: { scope: string; ready: boolean },
+      ) => scope.scope === 'directory' && scope.ready)
+    );
     const publicCut = (await publicScope()).cut;
     const beforeProfileRoomCut = (await roomScope()).cut;
     assertEquals(
@@ -232,6 +243,8 @@ Deno.test('cold roles enroll through local admin without facade tenant genesis, 
         'facade',
       );
       const server = await store.server();
+      assertEquals(await lookupAlias(server, '#replica:logical.test'), roomId);
+      assertEquals(await listedRooms(server), [roomId]);
       const [control] = await server.query(
         'SELECT roster_json,revision FROM facade_key_roster',
       );
