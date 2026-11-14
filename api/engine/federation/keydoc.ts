@@ -10,6 +10,7 @@ import type { Database as Db } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { homePublicKeys } from '#engine/facade/pairing.ts';
+import { publishedKeyDocument } from '#engine/facade/control.ts';
 import { b64encodeStd, matrixBase64 } from '#engine/signing-primitives.js';
 import { type KeyDoc, ourKeyDocument, signWithSigner } from './keys.ts';
 
@@ -20,6 +21,8 @@ export async function homeKeyDocument(
   signer: Signer,
   publicKey: string,
 ): Promise<KeyDoc> {
+  const published = await publishedKeyDocument(server, signer, publicKey);
+  if (published) return published;
   const roster = await homePublicKeys(server, {
     server: signer.serverName,
     keyId: signer.keyId,

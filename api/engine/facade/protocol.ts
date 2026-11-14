@@ -36,6 +36,9 @@ export const LINK_CAPABILITIES: readonly Capability[] = [{
   type: 'control',
   version: 1,
 }, {
+  type: 'control',
+  version: 2,
+}, {
   type: 'room-replica',
   version: 1,
 }, {

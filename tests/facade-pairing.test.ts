@@ -1,6 +1,8 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { canonicalJson } from '#engine/canonical.ts';
 import { homeKeyDocument } from '#engine/federation/keydoc.ts';
+import { FacadeKeys, publishKeyDocument } from '#engine/facade/control.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   importPublicKeyFromRaw,
   matrixBase64,
@@ -158,12 +160,27 @@ Deno.test('home key document publishes approved node keys and durable prospectiv
     await f.fp.accept(bundle);
     const transcript = await f.fp.challenge(bundle.id, bundle.secret, homePin);
     const grant = await f.hp.grant(bundle.id, transcript);
+    await assertRejects(document, MatrixError, 'not ready');
+    const receipt = await f.fp.complete(bundle.id, grant, homePin);
+    await f.hp.confirm(bundle.id, receipt);
+    const publish = async () =>
+      await publishKeyDocument(
+        await f.home().server(),
+        home.signer(),
+        home.publicB64,
+        async (_id, doc) =>
+          await new FacadeKeys(
+            await f.edge().server(),
+            f.node.signer(),
+            f.node.publicKey,
+            f.fp,
+          ).cosign(doc),
+      );
+    await publish();
     const approved = await document();
     assertEquals(approved.verify_keys[f.node.keyId], { key: f.node.publicKey });
     assert(await verifyJson(approved, home.serverName, home.keyId, publicKey));
     assert(!canonicalJson(approved).includes(bundle.secret));
-    const receipt = await f.fp.complete(bundle.id, grant, homePin);
-    await f.hp.confirm(bundle.id, receipt);
     const retiredAt = Date.now();
     const revocation = await f.hp.revoke(bundle.id, retiredAt);
     await f.reopen();
@@ -179,10 +196,15 @@ Deno.test('home key document publishes approved node keys and durable prospectiv
     await f.fp.retire(revocation, homePin);
     const next = await f.create();
     await f.fp.accept(next);
-    await f.hp.grant(
+    const nextGrant = await f.hp.grant(
       next.id,
       await f.fp.challenge(next.id, next.secret, homePin),
     );
+    await f.hp.confirm(
+      next.id,
+      await f.fp.complete(next.id, nextGrant, homePin),
+    );
+    await publish();
     const reauthorized = await document();
     assert(reauthorized.old_verify_keys);
     assertEquals(reauthorized.verify_keys[f.node.keyId], {
@@ -215,6 +237,18 @@ Deno.test('v28 upgrade retains enrolled authority while adding prospective key r
     }, { mode: 'deferred' });
     await f.reopen();
     const tenant = await openTenant(f.home(), 'logical.test');
+    await publishKeyDocument(
+      await f.home().server(),
+      tenant.signer(),
+      tenant.publicB64,
+      async (_id, raw) =>
+        await new FacadeKeys(
+          await f.edge().server(),
+          f.node.signer(),
+          f.node.publicKey,
+          f.fp,
+        ).cosign(raw),
+    );
     const doc = await homeKeyDocument(
       await f.home().server(),
       tenant.signer(),

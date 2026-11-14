@@ -68,6 +68,23 @@ export async function startHomeLinks(
     ReturnType<typeof startPublicExports>
   >();
   const jobs = new Map<string, Promise<void>>();
+  const collectKeySignature = async (
+    keyId: string,
+    document: import('#engine/federation/keys.ts').KeyDoc,
+  ) => {
+    for (const binding of await pairings.status()) {
+      if (binding.state !== 'paired') continue;
+      const connection = await pairings.connection(binding.id);
+      if (connection.grant?.body.transcript.body.key.keyId !== keyId) continue;
+      const client = await openJournalClient(pairings, binding.id, tls);
+      return await client.signKeyDocument(document, controller.signal);
+    }
+    throw new LinkError(
+      'LINK_UNAVAILABLE',
+      'approved facade signing link unavailable',
+      503,
+    );
+  };
   const directoryExports = new Map<
     string,
     ReturnType<typeof startDirectoryExports>
@@ -95,7 +112,13 @@ export async function startHomeLinks(
   async function reconcile(id: string, node: string) {
     const peer = await pairings.connection(id);
     if (peer.state === 'paired' && workers.has(id)) {
-      await exportKeyRoster(app.store, app.tenant, node, id);
+      await exportKeyRoster(
+        app.store,
+        app.tenant,
+        node,
+        id,
+        collectKeySignature,
+      );
       exports.get(id)?.wake();
       publicExports.get(id)?.wake();
       directoryExports.get(id)?.wake();
@@ -132,7 +155,7 @@ export async function startHomeLinks(
     }
     await enrollLink(pairings, id, tls, secret, controller.signal);
     if (peer.state === 'revoked' || controller.signal.aborted) return;
-    await exportKeyRoster(app.store, app.tenant, node, id);
+    await exportKeyRoster(app.store, app.tenant, node, id, collectKeySignature);
     const client = await openJournalClient(pairings, id, tls);
     if (controller.signal.aborted) return;
     const ingress = new HomeIngress(app.server, {

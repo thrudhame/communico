@@ -1,7 +1,12 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { setConfigForTests } from '#engine/config.ts';
 import { canonicalJson } from '#engine/canonical.ts';
-import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
+import {
+  exportKeyRoster,
+  FacadeKeys,
+  publishKeyDocument,
+} from '#engine/facade/control.ts';
+import { homeKeyDocument } from '#engine/federation/keydoc.ts';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
@@ -69,7 +74,15 @@ async function fixture() {
   let edgeServer = await edge.server();
   const keys = (database = edgeServer) =>
     new FacadeKeys(database, node.signer(), node.publicKey, fp);
-  const exportRoster = () => exportKeyRoster(home, tenant, 'edge_a', bundle.id);
+  const exportRoster = (now?: number) =>
+    exportKeyRoster(
+      home,
+      tenant,
+      'edge_a',
+      bundle.id,
+      (_id, doc) => keys().cosign(doc),
+      now,
+    );
   return {
     home,
     tenant,
@@ -98,7 +111,13 @@ async function fixture() {
         next.id,
         await fp.complete(next.id, granted, 'a'.repeat(64)),
       );
-      return await exportKeyRoster(home, tenant, 'edge_a', next.id);
+      return await exportKeyRoster(
+        home,
+        tenant,
+        'edge_a',
+        next.id,
+        (_id, doc) => keys().cosign(doc),
+      );
     },
     async downgrade() {
       await edgeServer.tx(async (conn) => {
@@ -108,8 +127,8 @@ async function fixture() {
         await conn.execute("UPDATE meta SET v='29' WHERE k='schema_version'");
       }, { mode: 'deferred' });
     },
-    async receive() {
-      const record = await exportRoster();
+    async receive(now?: number) {
+      const record = await exportRoster(now);
       await journal().receive('home', [record]);
       return record;
     },
@@ -133,7 +152,7 @@ async function fixture() {
   };
 }
 
-Deno.test('approved roster is journaled once, durably applied, and renewed offline with only the facade signature', async () => {
+Deno.test('co-signed publication includes every current key and is served unchanged offline', async () => {
   setConfigForTests({
     federation: { keyvalidityhours: 1 },
     facade: { maxofflinedays: 0 },
@@ -170,9 +189,10 @@ Deno.test('approved roster is journaled once, durably applied, and renewed offli
       Object.keys(before.verify_keys).sort(),
       [f.tenant.keyId, f.node.keyId].sort(),
     );
-    assertEquals(Object.keys(before.signatures['logical.test']), [
-      f.node.keyId,
-    ]);
+    assertEquals(
+      Object.keys(before.signatures['logical.test']).sort(),
+      [f.tenant.keyId, f.node.keyId].sort(),
+    );
     const publicKey = await importPublicKeyFromRaw(
       matrixBase64(f.node.publicKey, 32),
     );
@@ -181,7 +201,7 @@ Deno.test('approved roster is journaled once, durably applied, and renewed offli
     assertEquals(await f.keys().apply(f.journal(), record), false);
     assertEquals(await f.keys().document(), before);
     const after = await f.keys().document(before.valid_until_ts - 1000);
-    assert(after.valid_until_ts > before.valid_until_ts);
+    assertEquals(after, before);
     assertEquals(after.verify_keys, before.verify_keys);
     assert(await verifyJson(after, 'logical.test', f.node.keyId, publicKey));
     assertEquals(
@@ -194,7 +214,7 @@ Deno.test('approved roster is journaled once, durably applied, and renewed offli
   }
 });
 
-Deno.test('offline renewal cap preserves old validity, and authenticated contact survives reopen', async () => {
+Deno.test('co-signed offline horizon expires without renewal and only home can refresh it', async () => {
   setConfigForTests({
     federation: { keyvalidityhours: 168 },
     facade: { maxofflinedays: 1 },
@@ -206,7 +226,7 @@ Deno.test('offline renewal cap preserves old validity, and authenticated contact
     const now = Date.now();
     await f.keys().contact(now);
     const doc = await f.keys().document(now);
-    assertEquals(await f.keys().document(now + 5 * 86400000), doc);
+    assertEquals(await f.keys().document(doc.valid_until_ts - 1), doc);
     await assertRejects(
       () => f.keys().document(doc.valid_until_ts),
       MatrixError,
@@ -214,6 +234,13 @@ Deno.test('offline renewal cap preserves old validity, and authenticated contact
     );
     await f.keys().contact(doc.valid_until_ts);
     await f.reopen();
+    await assertRejects(
+      () => f.keys().document(doc.valid_until_ts),
+      MatrixError,
+      'expired',
+    );
+    const refreshed = await f.receive(doc.valid_until_ts - 1000);
+    await f.keys().apply(f.journal(), refreshed);
     assert(
       (await f.keys().document(doc.valid_until_ts)).valid_until_ts >
         doc.valid_until_ts,
@@ -355,14 +382,18 @@ Deno.test('facade request signing refuses an expired offline authority before cr
   try {
     const record = await f.receive();
     await f.keys().apply(f.journal(), record);
-    const past = Date.now() - 2 * 86400000;
-    await f.keys().contact(past);
-    await f.keys().document(past);
-    await assertRejects(
-      () => f.keys().requestSigner().sign('not signed'),
-      MatrixError,
-      'expired',
-    );
+    const doc = await f.keys().document();
+    const clock = Date.now;
+    try {
+      Date.now = () => doc.valid_until_ts;
+      await assertRejects(
+        () => f.keys().requestSigner().sign('not signed'),
+        MatrixError,
+        'expired',
+      );
+    } finally {
+      Date.now = clock;
+    }
   } finally {
     await f.close();
     setConfigForTests({});
@@ -521,5 +552,108 @@ Deno.test('v28 upgrade preserves the received roster and rejects home-signed sam
     assertEquals(await f.keys().document(), before);
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('co-signed publication never exposes a failed or invalid signature collection', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.home.server();
+    const read = () =>
+      homeKeyDocument(db, f.tenant.signer(), f.tenant.publicB64);
+    const publish = (
+      collect: (
+        _id: string,
+        doc: import('#engine/federation/keys.ts').KeyDoc,
+      ) => Promise<string>,
+      now?: number,
+    ) =>
+      publishKeyDocument(
+        db,
+        f.tenant.signer(),
+        f.tenant.publicB64,
+        collect,
+        now,
+      );
+    await assertRejects(
+      () => publish(() => Promise.reject(new Error('link disconnected'))),
+      Error,
+      'disconnected',
+    );
+    await assertRejects(read, MatrixError, 'not ready');
+    await assertRejects(
+      () => publish(() => Promise.resolve('invalid')),
+      LinkError,
+      'signature',
+    );
+    await assertRejects(read, MatrixError, 'not ready');
+    const first = await f.receive();
+    await f.keys().apply(f.journal(), first);
+    const before = await read();
+    setConfigForTests({ facade: { maxofflinedays: 1 } });
+    await assertRejects(
+      () => publish(() => Promise.reject(new Error('refresh disconnected'))),
+      Error,
+      'disconnected',
+    );
+    assertEquals(await read(), before);
+    assertEquals(await f.keys().document(), before);
+    const next = await f.receive();
+    assert(next.operationId !== first.operationId);
+    await f.keys().apply(f.journal(), next);
+    const refreshed = await read();
+    assert(refreshed.valid_until_ts < before.valid_until_ts);
+    assertEquals(await f.keys().document(), refreshed);
+    assertEquals(
+      Object.keys(refreshed.signatures['logical.test']).sort(),
+      Object.keys(refreshed.verify_keys).sort(),
+    );
+  } finally {
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('legacy facade-only cached documents confer no authority and a complete same-roster publication repairs them', async () => {
+  const f = await fixture();
+  try {
+    const record = await f.receive();
+    await f.keys().apply(f.journal(), record);
+    const complete = await f.keys().document();
+    const partial = structuredClone(complete);
+    delete partial.signatures['logical.test'][f.tenant.keyId];
+    await f.server().tx(async (conn) => {
+      await conn.execute(
+        'UPDATE facade_key_roster SET document_json=? WHERE singleton=1',
+        [canonicalJson(partial)],
+      );
+    });
+    await f.reopen();
+    await assertRejects(() => f.keys().document(), MatrixError, 'not ready');
+    assertEquals((await f.keys().status()).ready, false);
+    await assertRejects(
+      () => f.keys().requestSigner().sign('not authorized'),
+      MatrixError,
+      'not ready',
+    );
+    await assertRejects(
+      () =>
+        f.keys().verificationKeys().getVerifyKey(
+          'logical.test',
+          f.tenant.keyId,
+          0,
+          'event',
+        ),
+      UpstreamError,
+    );
+    // Re-apply a new complete publication at the same roster revision.
+    setConfigForTests({ facade: { maxofflinedays: 2 } });
+    const next = await f.receive();
+    await f.keys().apply(f.journal(), next);
+    assertEquals((await f.keys().status()).ready, true);
+    assertEquals((await f.keys().document()).verify_keys, complete.verify_keys);
+  } finally {
+    await f.close();
+    setConfigForTests({});
   }
 });
