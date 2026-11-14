@@ -1,17 +1,196 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { initializeNode } from '#engine/facade/identity.ts';
-import { enrollLink, enrollmentHandler } from '#engine/facade/link.ts';
+import { enrollLink, linkHandler } from '#engine/facade/link.ts';
+import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import {
+  EMPTY_CUT,
   LINK_CAPABILITIES,
   LINK_VERSION,
   LinkError,
+  recordHash,
 } from '#engine/facade/protocol.ts';
 import { LinkClient, startLinkTransport } from '#engine/facade/transport.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { facadeTls } from './support/facade-tls.ts';
+
+Deno.test('authenticated HTTP journal exchanges durable records and exact results in both directions', async () => {
+  const f = await fixture();
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const facadeIncarnation =
+      (await f.fp.active()).body.transcript.body.incarnation;
+    const envelope = {
+      protocol: LINK_VERSION,
+      server: bundle.server,
+      required: LINK_CAPABILITIES,
+      source: 'home',
+      incarnation: bundle.id,
+      pairing: bundle.id,
+    };
+    const call = async (route: string, fields?: Record<string, unknown>) => {
+      const response = await f.client().fetch(
+        '/_communico/link/v1/' + route,
+        fields
+          ? {
+            method: 'POST',
+            body: JSON.stringify({ ...envelope, ...fields }),
+          }
+          : { headers: { 'x-communico-link': JSON.stringify(envelope) } },
+      );
+      const body = await response.json();
+      assertEquals(response.status, 200, JSON.stringify(body));
+      assertEquals(body.source, 'edge_a');
+      assertEquals(body.incarnation, facadeIncarnation);
+      return body;
+    };
+    const stream = {
+      source: 'home',
+      incarnation: bundle.id,
+      stream: 'control',
+    };
+    const one = await f.hj.append('edge_a', {
+      ...stream,
+      type: 'control',
+      version: 1,
+      operationId: 'one',
+      payload: { roster: [] },
+    });
+    const oneCut = { sequence: one.sequence, hash: one.hash };
+    assertEquals((await call('hello')).incoming, []);
+    for (
+      const patch of [
+        { protocol: { major: 2, minor: 0 } },
+        { source: 'edge_a' },
+        { incarnation: 'different-enrollment' },
+      ]
+    ) {
+      const rejected = await f.client().fetch('/_communico/link/v1/records', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...envelope,
+          ...patch,
+          stream,
+          records: [one],
+          after: EMPTY_CUT,
+        }),
+      });
+      assertEquals(rejected.status, 'protocol' in patch ? 409 : 403);
+      await rejected.body?.cancel();
+      assertEquals(
+        (await f.fj.heads('home', 'in', stream)).received,
+        EMPTY_CUT,
+      );
+    }
+    const { hash: _hash, ...unsigned } = one;
+    const substituted = { ...unsigned, incarnation: 'another-store' };
+    const forged = await f.client().fetch('/_communico/link/v1/records', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...envelope,
+        stream,
+        records: [{ ...substituted, hash: recordHash(substituted) }],
+        after: EMPTY_CUT,
+      }),
+    });
+    assertEquals(forged.status, 403);
+    await forged.body?.cancel();
+    assertEquals((await f.fj.heads('home', 'in', stream)).received, EMPTY_CUT);
+    const invalid = await f.client().fetch('/_communico/link/v1/records', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...envelope,
+        stream,
+        records: [one],
+        after: oneCut,
+      }),
+    });
+    assertEquals(invalid.status, 409);
+    await invalid.body?.cancel();
+    assertEquals((await f.fj.heads('home', 'in', stream)).received, EMPTY_CUT);
+    const received = await call('records', {
+      stream,
+      records: [one],
+      after: EMPTY_CUT,
+    });
+    assertEquals(received.ack, {
+      received: oneCut,
+      applied: EMPTY_CUT,
+      results: [],
+    });
+    await f.fj.complete('home', stream, oneCut, {
+      exact: 'home operation terminal result',
+    });
+    await f.reopen();
+    const completed = await call('records', {
+      stream,
+      records: [],
+      after: EMPTY_CUT,
+    });
+    await f.hj.ack(
+      'edge_a',
+      stream,
+      completed.ack.received,
+      completed.ack.applied,
+      completed.ack.results,
+    );
+    assertEquals(await f.hj.result('edge_a', 'out', stream, oneCut), {
+      result: { exact: 'home operation terminal result' },
+    });
+
+    const reverse = {
+      source: 'edge_a',
+      incarnation: facadeIncarnation,
+      stream: 'ingress:remote.test',
+    };
+    const two = await f.fj.append('home', {
+      ...reverse,
+      type: 'control',
+      version: 1,
+      operationId: 'two',
+      payload: { durable: true },
+    });
+    const twoCut = { sequence: two.sequence, hash: two.hash };
+    assertEquals((await call('hello')).outgoing, [{
+      ...reverse,
+      received: twoCut,
+      applied: EMPTY_CUT,
+    }]);
+    const pulled = await call(
+      'records?stream=' + encodeURIComponent(JSON.stringify(reverse)) +
+        '&after=0',
+    );
+    assertEquals(pulled.page.records, [two]);
+    await f.hj.receive('edge_a', pulled.page.records);
+    await f.hj.complete('edge_a', reverse, twoCut, { pdus: {} });
+    const ack = await f.hj.acknowledgement('edge_a', reverse, EMPTY_CUT, {
+      maxItems: 100,
+      maxBytes: 10000,
+    });
+    await call('ack', { stream: reverse, ...ack });
+    await f.reopen();
+    assertEquals(await f.fj.result('home', 'out', reverse, twoCut), {
+      result: { pdus: {} },
+    });
+    assertEquals(await f.fj.acknowledged('home', reverse), {
+      received: twoCut,
+      applied: twoCut,
+    });
+    await f.hp.revoke(bundle.id);
+    await enrollLink(f.hp, bundle.id, f.tls.home);
+    const denied = await f.client().fetch('/_communico/link/v1/hello', {
+      headers: { 'x-communico-link': JSON.stringify(envelope) },
+    });
+    assertEquals(denied.status, 403);
+    await denied.body?.cancel();
+  } finally {
+    await f.close();
+  }
+});
 
 async function fixture() {
   const tls = await facadeTls();
@@ -45,24 +224,29 @@ async function fixture() {
     node,
   );
   let dropReceipt = false;
+  let hj = new Journal(await home.server(), LINK_CAPABILITIES);
+  let fj = new Journal(await facade.server(), LINK_CAPABILITIES);
   let changes = 0;
-  const handler = enrollmentHandler({
-    server: 'logical.test',
-    node: node.node,
-    incarnation: node.incarnation,
-    pairings: () => Promise.resolve(fp),
-    changed: () => {
-      changes++;
-      return Promise.resolve();
-    },
-  });
+  const handler = () =>
+    linkHandler({
+      server: 'logical.test',
+      node: node.node,
+      incarnation: node.incarnation,
+      journal: fj,
+      limits: { maxItems: 100, maxBytes: 10000 },
+      pairings: () => Promise.resolve(fp),
+      changed: () => {
+        changes++;
+        return Promise.resolve();
+      },
+    });
   const transport = await startLinkTransport({
     hostname: '127.0.0.1',
     port: 0,
     tls: tls.facade,
     authorize: (pin) => fp.allowsHome(pin),
     handle: async (request, pin) => {
-      const response = await handler(request, pin);
+      const response = await handler()(request, pin);
       if (dropReceipt && request.url.endsWith('/complete')) {
         dropReceipt = false;
         throw new Error('receipt response lost after durable completion');
@@ -72,6 +256,12 @@ async function fixture() {
   });
   return {
     tls,
+    get hj() {
+      return hj;
+    },
+    get fj() {
+      return fj;
+    },
     get hp() {
       return hp;
     },
@@ -118,6 +308,8 @@ async function fixture() {
         tls.facadePin,
         node,
       );
+      hj = new Journal(await home.server(), LINK_CAPABILITIES);
+      fj = new Journal(await facade.server(), LINK_CAPABILITIES);
     },
     async close() {
       await transport.close();

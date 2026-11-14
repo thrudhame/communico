@@ -2,12 +2,18 @@
 // signatures to their owner, never reads registry tables or provisions a tenant.
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Pairings } from './pairing.ts';
+import type { Journal, PageLimits } from './journal.ts';
 import {
+  cutOf,
+  integer,
   LINK_CAPABILITIES,
   LINK_VERSION,
   LinkError,
   negotiate,
   object,
+  recordOf,
+  type Stream,
+  streamOf,
   text,
 } from './protocol.ts';
 import { LINK_PREFIX, LinkClient, type LinkTls } from './transport.ts';
@@ -179,4 +185,157 @@ export async function enrollLink(
     );
   }
   await pairings.confirm(id, response.receipt);
+}
+
+export function linkHandler(options: {
+  server: string;
+  node: string;
+  incarnation: string;
+  pairings(): Promise<Pairings>;
+  journal: Journal;
+  limits: PageLimits;
+  changed?(): Promise<void>;
+}): (request: Request, peerPin: string) => Promise<Response> {
+  const enroll = enrollmentHandler(options);
+  const json = (raw: string | null) => {
+    try {
+      return JSON.parse(raw ?? '');
+    } catch {
+      throw new LinkError(
+        'LINK_BAD_RECORD',
+        'invalid link query or envelope',
+        400,
+      );
+    }
+  };
+  return async (request, pin) => {
+    const url = new URL(request.url);
+    const route = url.pathname.slice(LINK_PREFIX.length);
+    if (['enroll', 'complete', 'revoke'].includes(route)) {
+      return await enroll(request, pin);
+    }
+    if (
+      !((request.method === 'GET' && ['hello', 'records'].includes(route)) ||
+        (request.method === 'POST' && ['records', 'ack'].includes(route)))
+    ) {
+      return new Response(null, { status: 404 });
+    }
+    const body = request.method === 'GET'
+      ? object(json(request.headers.get('x-communico-link')))
+      : await message(request);
+    negotiate(body, options.server, LINK_CAPABILITIES);
+    const id = text(body.pairing);
+    if (body.source !== 'home' || body.incarnation !== id) {
+      throw new LinkError('LINK_IDENTITY_MISMATCH', 'wrong link source', 403);
+    }
+    const grant = await (await options.pairings()).authorizedHome(id, pin);
+    if (
+      grant.body.transcript.body.context.node !== options.node ||
+      grant.body.transcript.body.incarnation !== options.incarnation
+    ) {
+      throw new LinkError(
+        'LINK_IDENTITY_MISMATCH',
+        'listener does not match enrolled node',
+        403,
+      );
+    }
+    const response = (value: Record<string, unknown>) =>
+      Response.json({
+        protocol: LINK_VERSION,
+        server: options.server,
+        required: LINK_CAPABILITIES,
+        source: options.node,
+        incarnation: options.incarnation,
+        pairing: id,
+        ...value,
+      });
+    const checkedStream = (
+      raw: unknown,
+      source: string,
+      incarnation: string,
+    ): Stream => {
+      const stream = streamOf(raw);
+      if (stream.source !== source || stream.incarnation !== incarnation) {
+        throw new LinkError(
+          'LINK_IDENTITY_MISMATCH',
+          'wrong journal source or incarnation',
+          403,
+        );
+      }
+      return stream;
+    };
+    const journal = options.journal;
+    if (route === 'hello') {
+      const outgoing = await journal.streams('home', 'out');
+      return response({
+        revision: grant.body.revision,
+        scopes: [],
+        outgoing,
+        incoming: await journal.streams('home', 'in'),
+        exportAcks: await Promise.all(outgoing.map(async (stream) => ({
+          ...streamOf(stream),
+          ...await journal.acknowledged('home', stream),
+        }))),
+      });
+    }
+    if (request.method === 'GET') {
+      const stream = checkedStream(
+        json(url.searchParams.get('stream')),
+        options.node,
+        options.incarnation,
+      );
+      const after = integer(Number(text(url.searchParams.get('after'))));
+      return response({
+        page: await journal.page('home', 'out', stream, after, options.limits),
+      });
+    }
+    if (route === 'ack') {
+      const stream = checkedStream(
+        body.stream,
+        options.node,
+        options.incarnation,
+      );
+      if (!Array.isArray(body.results)) {
+        throw new LinkError(
+          'LINK_BAD_RECORD',
+          'terminal results must be an array',
+          400,
+        );
+      }
+      return response({
+        ack: await journal.ack(
+          'home',
+          stream,
+          cutOf(body.received),
+          cutOf(body.applied),
+          body.results,
+        ),
+      });
+    }
+    const stream = checkedStream(body.stream, 'home', id);
+    if (!Array.isArray(body.records)) {
+      throw new LinkError('LINK_BAD_RECORD', 'records must be an array', 400);
+    }
+    const records = body.records.map((raw) => {
+      const record = recordOf(raw);
+      const source = checkedStream(record, 'home', id);
+      if (source.stream !== stream.stream) {
+        throw new LinkError(
+          'LINK_BAD_RECORD',
+          'record belongs to another stream',
+          400,
+        );
+      }
+      return record;
+    });
+    const after = cutOf(body.after);
+    // Validate the result cursor before any page receipt. A malformed request
+    // must not partially advance received state and then fail while forming ACK.
+    await journal.acknowledgement('home', stream, after, options.limits);
+    await journal.receive('home', records);
+    await options.changed?.();
+    return response({
+      ack: await journal.acknowledgement('home', stream, after, options.limits),
+    });
+  };
 }

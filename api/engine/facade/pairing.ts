@@ -670,6 +670,19 @@ export class Pairings {
       transcript: row.transcript,
     };
   }
+
+  async authorizedHome(id: string, peerPin: string): Promise<Grant> {
+    const row = await entry(this.db, id);
+    live(row, 'facade');
+    if (row.state !== 'paired' || !sameDigest(row.context.homePin, peerPin)) {
+      refused('link requires completed enrollment');
+    }
+    const grant = await this.active();
+    if (grant.body.transcript.body.context.id !== id) {
+      refused('wrong active pairing');
+    }
+    return grant;
+  }
 }
 
 /** Registry inspection does not require any signing or TLS credential. */
