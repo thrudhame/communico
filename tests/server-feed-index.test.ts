@@ -3,6 +3,7 @@ import { outboxDue } from '#engine/server/read.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { roomSchema } from '#engine/room/schema.ts';
 import { openStore } from '#engine/store/index.ts';
+import { historicalServerSchema } from '#tests/fixtures/server-schema-history.ts';
 
 for (const mode of ['fresh', 'upgrade']) {
   Deno.test(
@@ -21,13 +22,7 @@ for (const mode of ['fresh', 'upgrade']) {
         const old = await openStore(settings, {
           schemas: {
             room: roomSchema,
-            server: {
-              version: 35,
-              apply: async (db) => {
-                await serverSchema.apply(db);
-                await db.exec('DROP INDEX IF EXISTS feed_event');
-              },
-            },
+            server: historicalServerSchema(35),
           },
         });
         await old.close();
