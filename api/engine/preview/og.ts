@@ -75,6 +75,22 @@ export function parseOpenGraph(html: string): Record<string, string> {
   return out.result();
 }
 
+function xmlDeclarationEncoding(body: Uint8Array): string | undefined {
+  if (
+    body[0] !== 60 || body[1] !== 63 || body[2] !== 120 ||
+    body[3] !== 109 || body[4] !== 108 ||
+    ![9, 10, 13, 32].includes(body[5])
+  ) return undefined;
+  // Only the declaration prefix uses ASCII-compatible byte text. The document
+  // is decoded once below in its selected encoding. The existing input budget
+  // also bounds a long declaration; there is no independent declaration quota.
+  let end = 6;
+  while (end < body.length && body[end] !== 63) end++;
+  return /^<\?xml\s[^?]*\bencoding\s*=\s*['"]([^'"]+)['"]/.exec(
+    fieldText(body.subarray(0, end)),
+  )?.[1];
+}
+
 function xhtmlGraph(
   body: Uint8Array,
   contentType: string,
@@ -87,9 +103,9 @@ function xhtmlGraph(
     : body[0] === 60 && body[1] === 0
     ? 'UTF-16LE'
     : null;
-  const declaration = /^<\?xml\s[^?]*\bencoding\s*=\s*['"]([^'"]+)['"]/.exec(
-    fieldText(body),
-  )?.[1];
+  const declaration = bom || label !== undefined || wide
+    ? undefined
+    : xmlDeclarationEncoding(body);
   const selected = bom ?? (label === undefined ? null : labelToName(label)) ??
     wide ?? (declaration === undefined ? 'UTF-8' : labelToName(declaration));
   if (
