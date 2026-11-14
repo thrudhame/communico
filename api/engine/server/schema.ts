@@ -12,6 +12,7 @@ import type { SchemaProvider } from '#engine/store/create.ts';
 import {
   FACADE_JOURNAL_SQL,
   FACADE_KEY_RETIREMENT_SQL,
+  FACADE_KEY_ROSTER_SQL,
   FACADE_PAIRING_SQL,
   RUNTIME_IDENTITY_SQL,
 } from './facade-schema.ts';
@@ -388,7 +389,7 @@ UPDATE receipts SET event_ids=json_array(event_ids);
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 28,
+  version: 29,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -418,6 +419,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FACADE_PAIRING_SQL);
     await db.exec(RUNTIME_IDENTITY_SQL);
     await db.exec(FACADE_KEY_RETIREMENT_SQL);
+    await db.exec(FACADE_KEY_ROSTER_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -448,5 +450,6 @@ export const serverSchema: SchemaProvider = {
     25: (conn) => conn.exec(FACADE_PAIRING_SQL),
     26: (conn) => conn.exec(RUNTIME_IDENTITY_SQL),
     27: (conn) => conn.exec(FACADE_KEY_RETIREMENT_SQL),
+    28: (conn) => conn.exec(FACADE_KEY_ROSTER_SQL),
   },
 };

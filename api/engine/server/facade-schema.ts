@@ -21,3 +21,8 @@ CREATE TABLE runtime_identity(singleton INTEGER PRIMARY KEY NOT NULL CHECK(singl
 export const FACADE_KEY_RETIREMENT_SQL = `
 ALTER TABLE facade_pairings ADD COLUMN retired_ms INTEGER;
 `;
+
+export const FACADE_KEY_ROSTER_SQL = `
+CREATE TABLE facade_key_roster(singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),revision INTEGER NOT NULL,roster_json TEXT,last_home_ms INTEGER,document_json TEXT,issued_ms INTEGER);
+INSERT INTO facade_key_roster(singleton,revision) VALUES(1,0);
+`;

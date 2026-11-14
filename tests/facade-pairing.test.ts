@@ -207,6 +207,7 @@ Deno.test('v27 upgrade retains enrolled authority while adding prospective key r
     );
     const server = await f.home().server();
     await server.tx(async (conn) => {
+      await conn.exec('DROP TABLE facade_key_roster');
       await conn.exec('ALTER TABLE facade_pairings DROP COLUMN retired_ms');
       await conn.execute("UPDATE meta SET v='27' WHERE k='schema_version'");
     }, { mode: 'deferred' });
