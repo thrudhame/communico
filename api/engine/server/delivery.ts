@@ -150,8 +150,8 @@ export async function completeBatch(
 ): Promise<void> {
   for (const row of batch.rows) {
     await tx.execute(
-      "UPDATE outbox SET state='sent' WHERE room=? AND pos=? AND destination=?",
-      [row.room, row.pos, destination],
+      "UPDATE outbox SET state='sent' WHERE room=? AND pos=? AND destination=? AND added_ms=?",
+      [row.room, row.pos, destination, row.addedMs],
     );
   }
   for (const source of batch.sources) {

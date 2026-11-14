@@ -2,6 +2,7 @@ import { assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
+import { retryDestination } from '#engine/federation/sender.ts';
 import {
   completeBatch,
   enqueueEdu,
@@ -92,6 +93,67 @@ Deno.test('E3: server v5 upgrade preserves pending work, frozen envelopes surviv
     assertEquals(
       (await server.query('SELECT state FROM outbox'))[0].state,
       'failed',
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('retained completion cannot consume an operator-refreshed PDU generation', async () => {
+  const dir = await Deno.makeTempDir();
+  const settings = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(settings, { schemas: { server: serverSchema } });
+  try {
+    let server = await store.server();
+    await server.execute(
+      "INSERT INTO outbox(room,pos,destination,event,state,added_ms) VALUES('!r:test',1,'remote.test','$e','pending',123)",
+    );
+    const envelope = {
+      txnId: 'retained-one',
+      body: 'exact bytes',
+      sources: [],
+      rows: [{
+        room: '!r:test',
+        pos: 1,
+        destination: 'remote.test',
+        event: '$e',
+        seq: 1,
+        attempts: 0,
+        addedMs: 123,
+      }],
+    };
+    assertEquals(await freezeBatch(server, 'remote.test', envelope), true);
+    await retryDestination(server, 'remote.test');
+    await store.close();
+    store = await openStore(settings, { schemas: { server: serverSchema } });
+    server = await store.server();
+    assertEquals(await frozenBatch(server, 'remote.test', true), envelope);
+    await server.tx((tx) => completeBatch(tx, 'remote.test', envelope));
+    assertEquals(
+      (await server.query('SELECT state FROM outbox'))[0].state,
+      'pending',
+    );
+    assertEquals(await frozenBatch(server, 'remote.test', true), null);
+    const generation = Number(
+      (await server.query('SELECT added_ms FROM outbox'))[0].added_ms,
+    );
+    const refreshed = {
+      ...envelope,
+      txnId: 'retained-two',
+      rows: [{ ...envelope.rows[0], addedMs: generation }],
+    };
+    assertEquals(await freezeBatch(server, 'remote.test', refreshed), true);
+    await server.tx((tx) => completeBatch(tx, 'remote.test', refreshed));
+    assertEquals(
+      (await server.query('SELECT state FROM outbox'))[0].state,
+      'sent',
     );
   } finally {
     await store.close();

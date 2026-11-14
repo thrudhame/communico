@@ -437,7 +437,16 @@ function batchInputHash(
   source: VerifiedItem['source'],
 ) {
   return createHash('sha256')
-    .update(canonicalJson({ room: room.id, origin, pdus, source }))
+    .update(canonicalJson({
+      room: room.id,
+      origin,
+      pdus: pdus.map((pdu) => {
+        const retained = { ...pdu };
+        delete retained.unsigned;
+        return retained;
+      }),
+      source,
+    }))
     .digest('hex');
 }
 
