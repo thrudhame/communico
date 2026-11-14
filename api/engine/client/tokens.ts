@@ -13,6 +13,27 @@ export type StreamToken = {
   epoch?: string;
 };
 
+export type DurableStreamHeads = Omit<Required<StreamToken>, 'epoch' | 'tSeq'>;
+
+/** Synapse's future-token recovery: clamp durable streams to allocated maxima.
+ * Typing is intentionally excluded because its process-local stream may reset.
+ * Return identity when unchanged so callers never synthesize receipt authority.
+ * This is a sync-consumer operation, not part of the pagination wire parser. */
+export function boundFutureToken(
+  token: StreamToken,
+  heads: DurableStreamHeads,
+): StreamToken {
+  const bounded = { ...token };
+  let changed = false;
+  for (const key of Object.keys(heads) as (keyof DurableStreamHeads)[]) {
+    if ((token[key] ?? 0) > heads[key]) {
+      bounded[key] = heads[key];
+      changed = true;
+    }
+  }
+  return changed ? bounded : token;
+}
+
 export function parseStreamToken(raw: string | null): StreamToken | null {
   if (raw === null) return null;
   const m =

@@ -12,6 +12,7 @@ import {
 } from '#engine/client/render.ts';
 import { inviteOf, prejoinDeparture } from '#engine/federation/invites.ts';
 import {
+  boundFutureToken,
   encodeStreamToken,
   formatStreamToken,
   type StreamToken,
@@ -28,7 +29,7 @@ import {
   deviceStreamMax,
 } from '#engine/server/e2ee.ts';
 import { recoveryState } from '#engine/server/recovery.ts';
-import { MatrixError } from '#engine/matrix-error.ts';
+import { syncStreamHeads } from '#engine/server/stream.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import { formatCursor } from '#engine/room/segments.ts';
@@ -312,12 +313,33 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
     i.deviceId === null || i.deviceGeneration === undefined
       ? null
       : { localpart: lp, deviceId: i.deviceId, generation: i.deviceGeneration };
-  if (device !== null) {
-    await app.tenant.tx((tx) => tx.toDevice.acknowledge(device, i.since));
+  const issuedSince = i.since;
+  if (i.since !== null) {
+    const serverHeads = await syncStreamHeads(app.server);
+    const tenantHeads = await app.tenant.tx((tx) => tx.streams.heads());
+    i = {
+      ...i,
+      since: boundFutureToken(i.since, {
+        eSeq: serverHeads.events,
+        pSeq: serverHeads.presence,
+        rSeq: serverHeads.receipts,
+        dSeq: serverHeads.devices,
+        nSeq: serverHeads.notifications,
+        aSeq: tenantHeads.accountData,
+        mSeq: tenantHeads.inbox,
+        kSeq: tenantHeads.keyPools,
+      }),
+    };
   }
-  const deviceHead = await deviceStreamMax(app.server);
-  if (i.since !== null && i.since.dSeq > deviceHead) {
-    throw new MatrixError(400, 'M_INVALID_PARAM', 'future device token');
+  if (device !== null) {
+    // A repaired numeric baseline is not the exact receipt issued to a client.
+    // Never hash it into deletion authority, even if it equals an older receipt.
+    await app.tenant.tx((tx) =>
+      tx.toDevice.acknowledge(
+        device,
+        i.since === issuedSince ? issuedSince : null,
+      )
+    );
   }
   if (i.setPresence !== undefined) {
     await setPresenceValue(app.server, i.userId, i.setPresence);

@@ -10,7 +10,11 @@ import { putAccountData } from '#engine/tenant/accountdata.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { insertMessage } from '#engine/tenant/todevice.ts';
 import { beginRecovery, recoveryState } from '#engine/server/recovery.ts';
-import { encodeStreamToken, parseStreamToken } from '#engine/client/tokens.ts';
+import {
+  boundFutureToken,
+  encodeStreamToken,
+  parseStreamToken,
+} from '#engine/client/tokens.ts';
 import { openStore } from '#engine/store/index.ts';
 import { withCandidateStore } from '#engine/store/candidate.ts';
 import { copyPrivate } from '#engine/store/files.ts';
@@ -114,12 +118,134 @@ suite.test('an older delivery epoch resets every sync baseline, survives numeric
   assertEquals(incremental.rooms.join[room.roomId], undefined);
 });
 
+suite.test('matching-era future stream numbers are bounded before polling without turning a forged cut into inbox deletion authority', async () => {
+  const app = theApp();
+  const alice = await suite.registerTestUser('future-alice', 'pw');
+  const bob = await suite.registerTestUser('future-bob', 'pw');
+  await app.server.tx(beginRecovery);
+  const room = await createRoom(app.store, {
+    creator: alice.user_id,
+    preset: 'public_chat',
+  }, app.tenant.signer());
+  await joinRoom(
+    await openRoom(app.store, room.roomId),
+    bob.user_id,
+    app.tenant.signer(),
+  );
+  const device = await deviceIdentity(
+    app.tenant,
+    'future-alice',
+    alice.device_id!,
+  );
+  await (await app.store.tenant(app.tenant.serverName)).tx((tx) =>
+    insertMessage(tx, device, 'retained', {
+      type: 'm.room_key',
+      content: { retained: true },
+    }, config().e2ee)
+  );
+  const sync = async (since?: string, timeout = 0) => {
+    const response = await suite.matrix(
+      new Request(
+        'http://x/_matrix/client/v3/sync?timeout=' + timeout +
+          (since ? '&since=' + encodeURIComponent(since) : ''),
+        { headers: { Authorization: 'Bearer ' + alice.access_token } },
+      ),
+    );
+    assertEquals(response.status, 200, await response.clone().text());
+    return await response.json() as SyncBody & {
+      rooms: { join: Record<string, { timeline: { events: Json[] } }> };
+    };
+  };
+  const initial = await sync();
+  assertEquals(initial.to_device.events.length, 1);
+  const actual = parseStreamToken(initial.next_batch)!;
+  const future = encodeStreamToken({
+    ...actual,
+    eSeq: 999999,
+    pSeq: 999999,
+    rSeq: 999999,
+    aSeq: 999999,
+    dSeq: 999999,
+    mSeq: 999999,
+    kSeq: 999999,
+    nSeq: 999999,
+  });
+  const bounded = await sync(future);
+  assertEquals(
+    bounded.to_device.events,
+    initial.to_device.events,
+    'bounding must not manufacture an issued inbox receipt',
+  );
+  assertEquals(parseStreamToken(bounded.next_batch)!.epoch, actual.epoch);
+  const acknowledged = await sync(bounded.next_batch);
+  assertEquals(acknowledged.to_device.events, []);
+  const waitToken = encodeStreamToken({
+    ...parseStreamToken(acknowledged.next_batch)!,
+    eSeq: 999999,
+  });
+  const pending = sync(waitToken, 3000);
+  // Allow the request to reach its ordinary wait owner before the new commit.
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const response = await suite.matrix(
+    new Request(
+      'http://x/_matrix/client/v3/rooms/' + encodeURIComponent(room.roomId) +
+        '/send/m.room.message/new',
+      {
+        method: 'PUT',
+        headers: { Authorization: 'Bearer ' + bob.access_token },
+        body: JSON.stringify({ msgtype: 'm.text', body: 'after bounded cut' }),
+      },
+    ),
+  );
+  assertEquals(response.status, 200, await response.clone().text());
+  const sent = await response.json() as { event_id: string };
+  const result = await pending;
+  assert(
+    result.rooms.join[room.roomId]?.timeline.events.some((event) =>
+      event.event_id === sent.event_id
+    ),
+    'a new lower-numbered event must wake and reach the future-token consumer',
+  );
+});
+
 Deno.test('restore epoch: legacy tokens retain their grammar and invalid epochs are not accepted', () => {
   assertEquals(parseStreamToken('s1_p2')?.eSeq, 1);
   assertEquals(parseStreamToken('s1_z' + 'x'.repeat(32)), null);
   assertEquals(parseStreamToken('s1_z' + 'a'.repeat(31)), null);
   const valid = 's1_p2_t0_r0_a0_d0_m0_k0_z' + 'a'.repeat(32);
   assertEquals(encodeStreamToken(parseStreamToken(valid)!), valid);
+});
+
+Deno.test('future numeric bounding covers every durable component but retains typing, epoch and historical cuts', () => {
+  const heads = {
+    eSeq: 11,
+    pSeq: 12,
+    rSeq: 13,
+    aSeq: 14,
+    dSeq: 15,
+    mSeq: 16,
+    kSeq: 17,
+    nSeq: 18,
+  };
+  const token = { ...heads, tSeq: 999999, epoch: 'a'.repeat(32) };
+  assertEquals(boundFutureToken(token, heads), token);
+  assert(boundFutureToken(token, heads) === token);
+  for (const key of Object.keys(heads) as (keyof typeof heads)[]) {
+    const forged = { ...token, [key]: 999999 };
+    assertEquals(boundFutureToken(forged, heads), token);
+    assertEquals(
+      forged[key],
+      999999,
+      'the caller/receipt token must remain immutable',
+    );
+    const historical = { ...token, [key]: 0 };
+    assert(boundFutureToken(historical, heads) === historical);
+    assertEquals(
+      parseStreamToken(encodeStreamToken(forged))![key],
+      999999,
+      'pagination parser is not a sync baseline repair',
+    );
+  }
 });
 
 function storage(dir: string) {

@@ -1134,6 +1134,15 @@ serving; missing, incomplete or modified reports refuse startup.
 (`api/engine/server/recovery.ts`, `api/engine/backup/report.ts`,
 `api/engine/client/{tokens,device-lists}.ts`, `api/engine/{app,syncfeed}.ts`)
 
+Within one recovery epoch, ordinary sync bounds future durable stream numbers to
+their owning server/tenant allocator ceilings before polling, as Synapse does.
+Typing remains process-local and is not numerically clamped. A repaired baseline
+never becomes an issued inbox acknowledgment: changing any numeric field cannot
+manufacture deletion authority by matching an older real receipt. Parsing tokens
+for room pagination remains storage-neutral and does not apply these repairs.
+(`api/engine/client/tokens.ts`, `api/engine/server/stream.ts`, `api/engine/tenant/streams.ts`,
+`api/engine/syncfeed.ts`)
+
 Private tenant recovery rebases user-device allocators above both their archived
 maximum and a fresh microsecond-clock anchor, then appends immutable reset intents.
 Normal tenant roll-forward projects those behind retained reliable work using the
