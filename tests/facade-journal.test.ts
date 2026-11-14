@@ -10,6 +10,7 @@ import {
 } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 
 const capabilities = [{ type: 'control', version: 1 }];
 const stream = { source: 'home', incarnation: 'home-1', stream: 'control' };
@@ -354,19 +355,12 @@ Deno.test('reopen preserves received/unapplied tail, completed results and expor
 
 Deno.test('v24 migration adds journal without changing existing room/transaction truth', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'facade-migration-' });
-  // Reconstruct v24 by removing every table added since that boundary. The
-  // journal and enrollment migrations must both run against genuine old state.
-  let store = await openStore(cfg(dir), { schemas: { server: serverSchema } });
+  let store = await openStore(cfg(dir), {
+    schemas: { server: historicalServerSchema(24) },
+  });
   try {
     const server = await store.server();
     await server.tx(async (conn) => {
-      await conn.exec(
-        'DROP TABLE facade_egress_routes; DROP TABLE facade_egress; DROP TABLE facade_ingress_collisions; DROP TABLE facade_ingress_children; DROP TABLE facade_ingress; DROP TABLE server_key_decisions; DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports; DROP TABLE facade_key_roster; DROP TABLE restore_state; DROP TABLE runtime_identity; DROP TABLE facade_pairings; DROP TABLE facade_control; DROP TABLE facade_export_acks; DROP TABLE facade_records; DROP TABLE facade_streams; DROP TABLE facade_node;',
-      );
-      await conn.execute('UPDATE meta SET v=? WHERE k=?', [
-        '24',
-        'schema_version',
-      ]);
       await conn.execute(
         'INSERT INTO federation_txns(origin,txn_id,received_ms,response) VALUES(?,?,?,?)',
         ['remote.test', 'retained', 1, '{"pdus":{}}'],
