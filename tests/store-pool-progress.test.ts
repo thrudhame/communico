@@ -224,3 +224,155 @@ Deno.test('store pool progress: failed detached close cannot authorize physical 
     await Deno.remove(root, { recursive: true });
   }
 });
+
+Deno.test('store pool progress: idle eviction cannot replace a reserved file operation', async () => {
+  const { root, ffi, pool } = await fixture();
+  const path = root + '/rooms/' + await keyFor('!slow:test');
+  const key = 'rooms:' + await keyFor('!slow:test');
+  const state = pool as unknown as {
+    entries: Map<string, { lastUsed: number }>;
+    fileWork: Map<string, Promise<unknown>>;
+    idleSweep(): void;
+  };
+  const original = Deno.lstat;
+  const entered = latch(), resume = latch();
+  Deno.lstat = async (target) => {
+    if (target === path) {
+      entered.release();
+      await resume.wait;
+    }
+    return await original(target);
+  };
+  let initializing: Promise<unknown> | undefined;
+  try {
+    initializing = pool.initialize('rooms', '!slow:test', async () => {});
+    // Attach the rejection handler before releasing the existing-file check.
+    const rejected = assertRejects(
+      () => initializing!,
+      Deno.errors.AlreadyExists,
+    );
+    await entered.wait;
+    const reservation = state.fileWork.get(key);
+    assert(reservation);
+    state.entries.get(key)!.lastUsed = 0;
+    state.idleSweep();
+    // Queue a metadata operation behind the sweep, not a wall-clock sleep.
+    await pool.isRetired('rooms', '!slow:test');
+    assert(state.fileWork.get(key) === reservation);
+    assert(state.entries.has(key), 'idle sweep evicted a reserved incarnation');
+    resume.release();
+    await rejected;
+    assertEquals(state.fileWork.has(key), false);
+  } finally {
+    resume.release();
+    await initializing?.catch(() => undefined);
+    Deno.lstat = original;
+    await pool.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+for (const owner of ['snapshot', 'listing', 'validation', 'rejected-open']) {
+  Deno.test(`store pool progress: ${owner} close uncertainty fences every subsequent lifetime`, async () => {
+    const { root, ffi, pool: seed } = await fixture();
+    const id = '!slow:test';
+    const key = await keyFor(id);
+    const path = root + '/rooms/' + key + '/data.db';
+    if (owner === 'validation') {
+      const lease = await seed.acquire('rooms', id);
+      await lease.db.execute(
+        "UPDATE meta SET v = '1' WHERE k = 'schema_version'",
+      );
+      await lease.release();
+    }
+    await seed.close();
+    const pool = new Pool(ffi, root, {
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 3600,
+    });
+    const originalClose = Db.prototype.close, originalOpen = Db.open;
+    const entered = latch(), resume = latch();
+    const failure = new Error('injected ' + owner + ' uncertain close');
+    let injected = false;
+    Db.prototype.close = async function () {
+      await originalClose.call(this);
+      if (!injected && this.path === path) {
+        injected = true;
+        throw failure;
+      }
+    };
+    let opening: Promise<unknown> | undefined;
+    try {
+      if (owner === 'snapshot') {
+        const snapshot = await pool.retainSnapshot('rooms', key);
+        assert(snapshot);
+        await assertRejects(() => snapshot.release(), Error, failure.message);
+      } else if (owner === 'listing') {
+        await assertRejects(() => pool.list('rooms'), Error, failure.message);
+      } else if (owner === 'validation') {
+        await assertRejects(
+          () => pool.acquire('rooms', id),
+          Error,
+          failure.message,
+        );
+      } else {
+        Db.open = async (...args) => {
+          const db = await originalOpen.apply(Db, args);
+          if (args[1] === path) {
+            entered.release();
+            await resume.wait;
+          }
+          return db;
+        };
+        opening = pool.acquire('rooms', id);
+        const rejected = assertRejects(() => opening!, Error, failure.message);
+        await entered.wait;
+        await pool.retire('rooms', id);
+        resume.release();
+        await rejected;
+      }
+      assert(injected, 'the failed close path must actually execute');
+      await assertRejects(
+        async () => {
+          const lease = await pool.acquire('rooms', id);
+          await lease.release();
+        },
+        Error,
+        failure.message,
+      );
+      await assertRejects(
+        async () => {
+          const snapshot = await pool.retainSnapshot('rooms', key);
+          await snapshot?.release();
+        },
+        Error,
+        failure.message,
+      );
+      await assertRejects(() => pool.list('rooms'), Error, failure.message);
+      await assertRejects(
+        () => pool.remove('rooms', id),
+        Error,
+        failure.message,
+      );
+      assert(
+        (await Deno.stat(path)).isFile,
+        'uncertain native lifetime must retain bytes',
+      );
+      await assertRejects(
+        () => pool.close(),
+        AggregateError,
+        'file close failed',
+      );
+    } finally {
+      resume.release();
+      await opening?.catch(() => undefined);
+      Db.open = originalOpen;
+      Db.prototype.close = originalClose;
+      await pool.close().catch(() => undefined);
+      ffi.close();
+      await Deno.remove(root, { recursive: true });
+    }
+  });
+}

@@ -115,6 +115,10 @@ export class Pool {
   // Called only under locked(). A pending file operation never holds the queue
   // needed by unrelated leases, its own completion, or shutdown.
   private startWork<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    if (this.closeFailures.has(key)) throw this.closeFailures.get(key);
+    if (this.fileWork.has(key)) {
+      throw new Error('file operation already reserved: ' + key);
+    }
     const task = Promise.resolve().then(fn).finally(() =>
       this.locked(() => {
         this.fileWork.delete(key);
@@ -134,6 +138,7 @@ export class Pool {
         if (this.closed && !accepted) {
           throw new Error('open-file pool is closed');
         }
+        if (this.closeFailures.has(key)) throw this.closeFailures.get(key);
         if (this.unlinking.has(key)) return { wait: this.changed() };
         this.retained.set(key, (this.retained.get(key) ?? 0) + 1);
         let released = false;
@@ -233,7 +238,7 @@ export class Pool {
           try {
             await prepared?.release();
           } finally {
-            await db?.close();
+            if (db) await this.closeFile(key, db);
           }
         } finally {
           await releaseHold();
@@ -268,23 +273,26 @@ export class Pool {
     }
   }
 
-  private evictable(entry: Entry): boolean {
+  private evictable(key: string, entry: Entry): boolean {
     return entry.leases === 0 && !entry.db.inUse &&
-      !entry.db.gate.stats().closed;
+      !entry.db.gate.stats().closed && !this.fileWork.has(key) &&
+      !this.closeFailures.has(key);
+  }
+
+  private async closeFile(key: string, db: Db): Promise<void> {
+    try {
+      await db.close();
+    } catch (error) {
+      // Every pool-owned reference shares the same uncertainty fence, not only
+      // cached eviction. A failed release never authorizes another lifetime.
+      await this.locked(() => this.closeFailures.set(key, error));
+      throw error;
+    }
   }
 
   private drop(key: string, entry: Entry): Promise<void> {
     this.entries.delete(key);
-    const task = this.startWork(key, async () => {
-      try {
-        await entry.db.close();
-      } catch (error) {
-        // A failed close does not prove native lifetime ended. Keep its path
-        // fenced against reopen/unlink, including when eviction started it.
-        this.closeFailures.set(key, error);
-        throw error;
-      }
-    });
+    const task = this.startWork(key, () => this.closeFile(key, entry.db));
     void task.catch((error) => {
       this.errors.push(
         error instanceof Error ? error : new Error(String(error)),
@@ -298,7 +306,7 @@ export class Pool {
       if (this.closed) return;
       const cutoff = Date.now() - this.options.idleseconds * 1000;
       for (const [key, entry] of this.entries) {
-        if (entry.lastUsed < cutoff && this.evictable(entry)) {
+        if (entry.lastUsed < cutoff && this.evictable(key, entry)) {
           this.drop(key, entry);
         }
       }
@@ -312,7 +320,7 @@ export class Pool {
   private evictToLimit(): void {
     for (const [key, entry] of this.entries) {
       if (this.entries.size <= this.options.maxopenfiles) return;
-      if (this.evictable(entry) && !this.fileWork.has(key)) {
+      if (this.evictable(key, entry)) {
         this.drop(key, entry);
       }
     }
@@ -375,7 +383,7 @@ export class Pool {
             ids.push(rows[0].value);
           }
         } finally {
-          await db.close();
+          await this.closeFile(kind + ':' + entry.name, db);
         }
       } finally {
         await releaseHold();
@@ -489,7 +497,7 @@ export class Pool {
                 return lease;
               });
             } finally {
-              if (!accepted) await db.close();
+              if (!accepted) await this.closeFile(key, db);
             }
           }),
         };
@@ -653,7 +661,7 @@ export class Pool {
       await checkId(db, id);
       await ensureSchema(db, this.providers[kind]);
     } catch (error) {
-      await db.close();
+      await this.closeFile(kind + ':' + key, db);
       throw error;
     }
     return db;
@@ -680,7 +688,7 @@ export class Pool {
           };
         }
         for (const [key, entry] of [...this.entries].reverse()) {
-          this.drop(key, entry);
+          if (!this.closeFailures.has(key)) this.drop(key, entry);
         }
         if (!this.fileWork.size && this.closeFailures.size) {
           throw new AggregateError(

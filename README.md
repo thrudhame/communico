@@ -466,6 +466,17 @@ file-checkpoint pauses. Full live-client measurements for this exporter are
 still pending; the earlier VACUUM baseline had write pauses up to 116.20 seconds
 and exposed sync and typing HTTP500 responses, not a passing workload.
 
+Size the service's file-descriptor limit for the complete backup inventory, not
+`store.maxopenfiles`: a common cut must retain every room, tenant and the server
+file simultaneously, including retired files not yet removed. On the qualified
+Linux/Turso build, each newly opened source uses five descriptors (1/10/43 sources
+used 5/50/215 additional descriptors). Budget at least `5 * (rooms + tenants + 1)`
+for sources alone, plus export targets, HTTP connections, logs and runtime files;
+already-open sources share their native owner. Inspect the running process's
+`/proc/<pid>/limits` and peak `/proc/<pid>/fd` count under normal traffic and a
+backup, and set the supervisor's `LimitNOFILE` or launch-shell `ulimit -n`
+accordingly. `maxopenfiles` only sizes the ordinary idle cache, not this cut.
+
 The format-1 bundle includes database files, signing private keys, password
 hashes, uploaded local media, effective configuration, the original operator
 overlay and referenced TLS/CA files. Payloads and manifest are mode 0600 in
