@@ -750,7 +750,9 @@ export async function ingestRemote(
     }
     return false;
   });
-  if (hasWaiters) await resumeWaits(room, { self: deps.self });
+  if (hasWaiters) {
+    await resumeWaits(room, { self: deps.self }, committed.grounded);
+  }
   await projectAfterWrite(room.store, room.id);
 
   return outcomes.map((outcome) =>

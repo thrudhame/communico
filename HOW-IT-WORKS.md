@@ -119,6 +119,10 @@ JSON. Remaining ungrounded events become pending with waits; later arrivals
 re-run the shared pipeline. A zero
 ungrounded lifetime drops them instead. Delayed redaction targets use waits
 too, without rewriting the stored target PDU.
+Committed local and remote arrivals dispatch only their indexed dependency
+waits. Newly grounded children continue that worklist; unrelated unresolved
+history is not rescanned on a foreground arrival. Each candidate keeps its
+locked ingest/effect revalidation and eligible work remains oldest-first.
 (`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,
 `api/engine/room/ingest.ts:654-681`)
 

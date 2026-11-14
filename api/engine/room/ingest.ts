@@ -292,7 +292,7 @@ export async function afterLocalCommit(
   const hasWaiters = await room.tx(async (tx) =>
     (await tx.waits.for(eventId)).length > 0
   );
-  if (hasWaiters) await resumeWaits(room, { self });
+  if (hasWaiters) await resumeWaits(room, { self }, [eventId]);
   await projectAfterWrite(room.store, room.id);
 }
 
@@ -924,73 +924,95 @@ async function storePending(
   };
 }
 
-// The recheck driver (R10, old ruling B): waiting work is re-run when
-// what it missed arrives — a pending event whose prevs all ground now is
-// re-ingested (each in its own locked transaction, oldest first; an
-// accepted one re-runs ITS waiters in turn) and a waiting redaction
-// whose target is now held gets its effect evaluated. No fetching here
-// (the network is the caller's layer); a still-ungrounded event keeps
-// waiting, and a failure leaves the wait in place (logged, not fatal).
+// Follow only dependency edges from committed arrivals, never the room's
+// unrelated unresolved history. Newly grounded children feed the same owner.
+// Each candidate is revalidated in its own transaction, oldest first; ingest
+// and redaction effects retain the room lock. No network work happens here.
 export async function resumeWaits(
   room: Room,
   deps: { self: string },
+  arrived: readonly string[],
 ): Promise<number> {
   const processed = new Set<string>();
+  const expanded = new Set<string>();
+  const pending: Awaited<ReturnType<RoomTx['waits']['for']>> = [];
+  const enqueue = async (ids: readonly string[]) => {
+    const fresh = [...new Set(ids)].filter((id) => !expanded.has(id));
+    if (fresh.length === 0) return;
+    const waits = await room.tx(async (tx) => {
+      const result: typeof pending = [];
+      for (const id of fresh) result.push(...await tx.waits.for(id));
+      return result;
+    });
+    for (const id of fresh) expanded.add(id);
+    pending.push(...waits);
+    pending.sort((a, b) => {
+      if (a.since !== b.since) return a.since - b.since;
+      for (const key of ['waiting', 'missing', 'kind'] as const) {
+        if (a[key] !== b[key]) return a[key] < b[key] ? -1 : 1;
+      }
+      return 0;
+    });
+  };
   let resumed = 0;
-  for (;;) {
+  await enqueue(arrived);
+  while (pending.length > 0) {
+    const wait = pending.shift()!;
+    if (processed.has(wait.waiting + '|' + wait.kind)) continue;
     const job = await room.tx(async (tx) => {
-      for (const wait of await tx.waits.all()) {
-        if (processed.has(wait.waiting + '|' + wait.kind)) continue;
-        if (wait.kind === 'prev') {
-          const status = await tx.events.getStatus(wait.waiting);
-          if (status === null || status.grounding !== 'pending') {
-            await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
-            continue;
-          }
-          const row = await tx.events.get(wait.waiting);
-          if (row === null) {
-            await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
-            continue;
-          }
-          const prevIds = (JSON.parse(row.pdu) as Pdu).prev_events ?? [];
-          const missing = await ungroundedPrevs(tx, prevIds);
-          if (missing.length > 0) continue;
-          return { kind: 'prev' as const, eventId: wait.waiting };
+      if (wait.kind === 'prev') {
+        const status = await tx.events.getStatus(wait.waiting);
+        if (status === null || status.grounding !== 'pending') {
+          await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
+          return null;
         }
-        if (wait.kind === 'redaction') {
-          if ((await tx.events.get(wait.missing)) === null) continue;
-          return {
-            kind: 'redaction' as const,
-            eventId: wait.waiting,
-            target: wait.missing,
-          };
+        const row = await tx.events.get(wait.waiting);
+        if (row === null) {
+          await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
+          return null;
         }
+        const prevIds = (JSON.parse(row.pdu) as Pdu).prev_events ?? [];
+        if ((await ungroundedPrevs(tx, prevIds)).length > 0) return null;
+        return { kind: 'prev' as const, eventId: wait.waiting };
+      }
+      if (wait.kind === 'redaction') {
+        if ((await tx.events.get(wait.missing)) === null) return null;
+        return {
+          kind: 'redaction' as const,
+          eventId: wait.waiting,
+          target: wait.missing,
+        };
       }
       return null;
     });
-    if (job === null) return resumed;
+    if (job === null) continue;
     processed.add(job.eventId + '|' + job.kind);
     try {
       if (job.kind === 'prev') {
-        await withRoomLock(room.id, () =>
-          room.tx(async (tx) => {
-            const row = await tx.events.get(job.eventId);
-            const status = await tx.events.getStatus(job.eventId);
-            const stay = await tx.segments.openStay();
-            if (row === null || status === null || stay === null) return;
-            const version = await roomVersionOf(tx, stay.id);
-            const pdu = JSON.parse(row.pdu) as Pdu;
-            await ingestInTx(tx, room.id, pdu, {
-              remote: {
-                origin: status.origin ?? '',
-                self: deps.self,
-                // recomputed — the flag is a deterministic function of
-                // the verified bytes and the version, never persisted
-                oversized: oversizedOf(pdu, version),
-                ungroundedMs: 0,
-              },
-            });
-          }));
+        const grounded = await withRoomLock(
+          room.id,
+          () =>
+            room.tx(async (tx) => {
+              const row = await tx.events.get(job.eventId);
+              const status = await tx.events.getStatus(job.eventId);
+              const stay = await tx.segments.openStay();
+              if (row === null || status === null || stay === null) return;
+              const version = await roomVersionOf(tx, stay.id);
+              const pdu = JSON.parse(row.pdu) as Pdu;
+              const result = await ingestInTx(tx, room.id, pdu, {
+                remote: {
+                  origin: status.origin ?? '',
+                  self: deps.self,
+                  // recomputed — the flag is a deterministic function of
+                  // the verified bytes and the version, never persisted
+                  oversized: oversizedOf(pdu, version),
+                  ungroundedMs: 0,
+                },
+              });
+              return result.grounding === 'grounded';
+            }),
+        );
+        if (grounded) await enqueue([job.eventId]);
       } else {
         await withRoomLock(room.id, () =>
           room.tx(async (tx) => {
@@ -1030,6 +1052,7 @@ export async function resumeWaits(
       console.error(`resumeWaits: ${job.kind} ${job.eventId} failed:`, e);
     }
   }
+  return resumed;
 }
 
 async function statePduOf(
