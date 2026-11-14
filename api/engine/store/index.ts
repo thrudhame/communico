@@ -5,7 +5,11 @@
 // carries the store's watermark tables under the provider's own tables.
 import { dirname, join } from '@std/path';
 import { publish, removeOwned } from '#engine/store/files.ts';
-import { ownershipPath } from '#engine/store/ownership.ts';
+import {
+  assertNoPromotion,
+  canonicalRoot,
+  ownershipPath,
+} from '#engine/store/ownership.ts';
 import { type BuildInfo, checkBuildInfo } from '#engine/store/build.ts';
 import { Admission } from '#engine/store/admission.ts';
 import {
@@ -285,9 +289,11 @@ export async function openStore(
   let ownership: number | undefined;
   try {
     checkBuildInfo(await ffi.buildInfo());
-    await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
-    config = { ...config, dir: await Deno.realPath(config.dir) };
+    config = { ...config, dir: await canonicalRoot(config.dir) };
+    await Deno.mkdir(dirname(config.dir), { recursive: true, mode: 0o700 });
     ownership = await ffi.lockStore(await ownershipPath(config.dir));
+    await assertNoPromotion(config.dir);
+    await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
     await sweep(config.dir);
     await sweep(join(config.dir, 'rooms'));
     await sweep(join(config.dir, 'tenants'));

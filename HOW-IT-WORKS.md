@@ -1089,11 +1089,24 @@ past/future direction, including retained expired work.
 (`main.ts:90-135`, `api/admin/index.ts:16-66`, `api/admin/index.ts:72-148`,
 `tools/admin.sh:1-12`, `api/engine/room/operator.ts:55-134`)
 
-Store startup takes an exclusive nonblocking ownership lock before sweeping or
-opening data. Its stable sibling file, `.<store-basename>.communico.lock`, is
+Store startup takes an exclusive nonblocking ownership lock before creating,
+sweeping or opening its root. Its stable sibling file, `.<store-basename>.communico.lock`, is
 retained after shutdown; another owner refuses before it can modify a live
 store. Store shutdown also drains admitted snapshots before releasing ownership.
 (`api/engine/store/{index,ownership}.ts`, `native/turso-ffi/src/lib.rs`)
+
+The internal offline restore lifecycle shares that lock, rejects symlink or
+overlapping roots and refuses nonempty store or media targets without explicit
+replacement. Private candidates live beside each target, even when the two roots
+use different filesystems. A fully synced undo journal precedes no-replace
+renames; replacement keeps both old roots. Startup refuses an unfinished journal
+before creating or opening a root. An explicit offline retry checks the recorded
+directory identities and rolls back the entire original pair before preparing a
+new candidate; unknown/tampered identities refuse without moving either root.
+Candidate failure before publication removes only owned staging. This storage
+lifecycle does not yet expose the restore command or perform its required
+sanitation and operator report.
+(`api/engine/store/{restore,ownership,index}.ts`)
 
 The internal store snapshot primitive pauses common storage admission, drains
 transactions and lifecycle changes, then exports every final server/tenant/room
