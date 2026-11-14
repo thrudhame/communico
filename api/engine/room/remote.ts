@@ -111,6 +111,25 @@ async function groundingOf(
   });
 }
 
+// Supply is a batch-wide fact, separate from whether supplied bytes can ground.
+// Use the same complete-parent admission at every pushed traversal entry and
+// when rendering final receipts after all missing-events replies have arrived.
+async function parentsSupplied(
+  room: Room,
+  ids: readonly string[],
+  acc: FetchAcc,
+): Promise<boolean> {
+  return await room.tx(async (tx) => {
+    for (const id of ids) {
+      if (
+        !acc.live.has(id) &&
+        (await tx.state.eventStateAfter(id)) === null
+      ) return false;
+    }
+    return true;
+  });
+}
+
 // The bounded fetch ladder for one PDU with ungrounded prevs (old §3.4),
 // all with the room lock RELEASED: the brief wait, ONE
 // get_missing_events, then /state_ids + /event for the gap tips — never
@@ -221,6 +240,9 @@ async function fetchMissing(
     ids: readonly string[],
     source: VerifiedItem['source'],
   ): Promise<void> => {
+    // Gate every pushed ancestor's whole parent set before following any
+    // sibling, not only the original input's parents at the outer call.
+    if (source === 'pushed' && !await parentsSupplied(room, ids, acc)) return;
     for (const id of ids) {
       if (
         chased.has(id) || acc.terminal.has(id) || acc.boundaries.has(id) ||
@@ -251,20 +273,7 @@ async function fetchMissing(
       await chase(prevs, source);
     }
   };
-  // Check the whole direct-parent set before chasing any branch. Otherwise a
-  // fetched sibling can route state recovery back to a withheld direct parent.
-  const parentsPresent = item.source === 'pulled' ||
-    await room.tx(async (tx) => {
-      for (const id of item.pdu.prev_events ?? []) {
-        if (
-          !acc.live.has(id) &&
-          (await tx.state.eventStateAfter(id)) === null
-        ) return false;
-      }
-      return true;
-    });
-  if (parentsPresent) await chase(item.pdu.prev_events ?? [], item.source);
-  else acc.unavailablePrevs.add(item.eventId);
+  await chase(item.pdu.prev_events ?? [], item.source);
   for (const tip of gapTips) {
     if (budgetLeft() <= 0) return;
     await fetchGapTip(room, tip, origin, deps, version, budget, acc);
@@ -504,6 +513,15 @@ export async function ingestRemote(
   const budget = { until: Date.now() + deps.limits.budgetMs };
   for (const item of items) {
     await fetchMissing(room, item, origin, deps, version, budget, acc);
+  }
+  // A later input's missing-events answer can supply an earlier input's parent.
+  // Decide unavailability once from the final verified union, before subsequent
+  // auth/state staging can discard supplied bytes that fail to ground.
+  for (const item of items) {
+    if (
+      item.source === 'pushed' &&
+      !await parentsSupplied(room, item.pdu.prev_events ?? [], acc)
+    ) acc.unavailablePrevs.add(item.eventId);
   }
 
   if (

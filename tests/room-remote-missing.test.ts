@@ -302,7 +302,16 @@ Deno.test('missing: request shape (earliest = our extremities); answers land liv
   });
 });
 
-for (const answer of ['empty', 'partial', 'unavailable', 'shared-gap']) {
+for (
+  const answer of [
+    'empty',
+    'partial',
+    'unavailable',
+    'shared-gap',
+    'nested-shared-gap',
+    'parent-first-shared-gap',
+  ]
+) {
   Deno.test(
     'missing: pushed own prevs must be supplied before state recovery: ' +
       answer,
@@ -311,14 +320,14 @@ for (const answer of ['empty', 'partial', 'unavailable', 'shared-gap']) {
         const s = await setup(store);
         const withheld = await msg(s, 'withheld', [s.joinId], 50);
         const returned = await msg(s, 'returned', [
-          answer === 'shared-gap' ? withheld.event_id! : s.joinId,
+          answer.endsWith('shared-gap') ? withheld.event_id! : s.joinId,
         ], 51);
         const pushed = await msg(s, 'pushed', [
           withheld.event_id!,
           returned.event_id!,
         ], 52);
         const recording = fakeFetcher({
-          missingEvents: answer === 'partial' || answer === 'shared-gap'
+          missingEvents: answer === 'partial' || answer.endsWith('shared-gap')
             ? [returned]
             : [],
           stateIds: new Map([[withheld.event_id!, {
@@ -333,16 +342,32 @@ for (const answer of ['empty', 'partial', 'unavailable', 'shared-gap']) {
           };
         }
         s.deps.fetcher = recording.fetcher;
-        const [out] = await ingestRemote(
+        const child = await msg(s, 'nested child', [pushed.event_id!], 53);
+        const batch = answer === 'nested-shared-gap'
+          ? [child, pushed]
+          : answer === 'parent-first-shared-gap'
+          ? [pushed, child]
+          : [pushed];
+        const outcomes = await ingestRemote(
           s.g.room,
-          [pushed],
+          batch,
           s.server.name,
           s.deps,
         );
+        const out = outcomes.find((result) =>
+          result.eventId === pushed.event_id
+        )!;
         assertEquals(recording.calls.stateIds, []);
         assertEquals(recording.calls.event, []);
         assertEquals(out.outcome, 'pending');
         assert(out.error?.includes('prev_events'));
+        if (batch.length === 2) {
+          const childOut = outcomes.find((result) =>
+            result.eventId === child.event_id
+          )!;
+          assertEquals(childOut.outcome, 'pending');
+          assertEquals(childOut.error, null);
+        }
         await s.g.room.tx(async (tx) => {
           assertEquals(await tx.events.get(withheld.event_id!), null);
           assertEquals(await tx.state.eventStateAfter(pushed.event_id!), null);
@@ -352,6 +377,47 @@ for (const answer of ['empty', 'partial', 'unavailable', 'shared-gap']) {
     },
   );
 }
+
+Deno.test('missing: later batch replies replace stale parent-unavailability verdicts', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const far = await msg(s, 'unresolved ancestor', [s.joinId], 50);
+    const parent = await msg(s, 'later supplied parent', [far.event_id!], 51);
+    const first = await msg(s, 'first pushed', [parent.event_id!], 52);
+    const otherParent = await msg(s, 'other parent', [s.joinId], 53);
+    const second = await msg(s, 'second pushed', [otherParent.event_id!], 54);
+    const latestCalls: string[][] = [];
+    s.deps.fetcher.missingEvents = (_room, _earliest, latest) => {
+      latestCalls.push([...latest]);
+      return Promise.resolve(
+        latest.includes(second.event_id!) ? [parent, otherParent] : [],
+      );
+    };
+    const out = await ingestRemote(
+      s.g.room,
+      [first, second],
+      s.server.name,
+      s.deps,
+    );
+    assertEquals(latestCalls, [[first.event_id!], [second.event_id!]]);
+    assertEquals(out.map((result) => result.outcome), ['pending', 'accepted']);
+    assertEquals(out[0].error, null);
+    await s.g.room.tx(async (tx) => {
+      assertEquals(
+        (await tx.events.getStatus(parent.event_id!))?.grounding,
+        'pending',
+      );
+      assertEquals(
+        (await tx.events.getStatus(first.event_id!))?.grounding,
+        'pending',
+      );
+      assertEquals(await tx.state.eventStateAfter(first.event_id!), null);
+      assertEquals(await tx.segments.positionOf(first.event_id!), null);
+      assertEquals(await tx.events.get(far.event_id!), null);
+    });
+    assertEquals(await frontierOf(s.g.room), [second.event_id!]);
+  });
+});
 
 Deno.test('missing: budget exhausted → pending + wait; the later arrival resumes it', async () => {
   await withStore(async (store) => {
