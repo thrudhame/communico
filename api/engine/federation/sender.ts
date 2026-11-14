@@ -383,7 +383,7 @@ export function startSender(deps: SenderDeps): Sender {
           if (upstreamCategory(e) === 'local' && !stopped) {
             // Durable work remains owned after local signer/store faults. Retry
             // separately from the peer ladder, retaining the frozen envelope.
-            await sleep(1000, destination);
+            if (!rerun.has(destination)) await sleep(1000, destination);
             rerun.add(destination);
           }
         })

@@ -192,6 +192,11 @@ export async function startHomeLinks(
             ? ingress.apply(journal, stream)
             : apply(node, stream),
         failed: (error) => failed(node, error),
+        acknowledged: (stream) => {
+          if (stream.stream.startsWith('egress:')) {
+            app.sender?.wake(stream.stream.slice('egress:'.length));
+          }
+        },
       }),
     );
     const rooms = startRoomExports({

@@ -24,6 +24,7 @@ type Options = {
   // domain commit then Journal.complete for cross-file effects. No network in tx.
   apply(stream: Stream): Promise<boolean>;
   failed(error: unknown, stream?: Stream): void;
+  acknowledged?(stream: Stream): void;
 };
 function key(stream: Stream) {
   return canonicalJson(streamOf(stream));
@@ -131,6 +132,9 @@ export class JournalReconciler {
         next.applied,
         next.results,
       );
+      if (next.applied.sequence > ack.applied.sequence) {
+        this.options.acknowledged?.(stream);
+      }
       const progressed = !sameCut(ack.received, next.received) ||
         !sameCut(ack.applied, next.applied);
       ack = next;

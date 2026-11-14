@@ -587,6 +587,58 @@ Deno.test('durable result is ACKed before a later operation blocks in the same s
   }
 });
 
+Deno.test('durable outgoing ACK progress wakes its consumer without waiting for a fault retry timer', async () => {
+  const f = await fixture();
+  const notifications: string[] = [];
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const record = await f.hj.append('edge_a', {
+      source: 'home',
+      incarnation: bundle.id,
+      stream: 'egress:remote.test',
+      type: 'control',
+      version: 1,
+      operationId: 'ack-wake',
+      payload: {},
+    });
+    await client.push(record, [record], EMPTY_CUT);
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 100, maxBytes: 10000 },
+      apply: () => Promise.resolve(false),
+      failed: (error) => failures.push(error),
+      acknowledged: (stream) => notifications.push(stream.stream),
+    });
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(notifications, [], 'receipt alone is not an applied result');
+    await f.fj.complete('home', record, record, { fence: 'ready' });
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(await f.hj.result('edge_a', 'out', record, record), {
+      result: { fence: 'ready' },
+    });
+    assertEquals(notifications, ['egress:remote.test']);
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(
+      notifications,
+      ['egress:remote.test'],
+      'an unchanged ACK is not progress',
+    );
+    assertEquals(failures, []);
+  } finally {
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
 Deno.test('home initiates enrollment over pinned mTLS and retries a lost receipt without plaintext credentials', async () => {
   const f = await fixture();
   try {
