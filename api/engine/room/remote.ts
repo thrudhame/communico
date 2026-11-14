@@ -430,6 +430,41 @@ async function fetchGapTip(
 // stay) throw. One room transaction for the whole batch (G11).
 // The only pulled-input caller is the verified resident send_join response;
 // transaction receipt uses the default pushed source.
+function batchInputHash(
+  room: Room,
+  pdus: Pdu[],
+  origin: string,
+  source: VerifiedItem['source'],
+) {
+  return createHash('sha256')
+    .update(canonicalJson({ room: room.id, origin, pdus, source }))
+    .digest('hex');
+}
+
+/** Recall before a transport's participation guard. A room may have archived
+ * after committing the batch but before its caller saved the child result. */
+export async function replayRemoteBatch(
+  room: Room,
+  pdus: Pdu[],
+  origin: string,
+  self: string,
+  operationId: string,
+  source: VerifiedItem['source'] = 'pushed',
+): Promise<RemoteOutcome[] | null> {
+  if (!operationId) throw new Error('E_REMOTE_BATCH_IDENTITY');
+  const prior = await room.tx((tx) =>
+    tx.remoteBatches.get(
+      operationId,
+      batchInputHash(room, pdus, origin, source),
+    )
+  );
+  if (prior) {
+    await resumeWaits(room, { self });
+    await projectAfterWrite(room.store, room.id);
+  }
+  return prior;
+}
+
 export async function ingestRemote(
   room: Room,
   pdus: Pdu[],
@@ -438,20 +473,19 @@ export async function ingestRemote(
   source: VerifiedItem['source'] = 'pushed',
   operationId?: string,
 ): Promise<RemoteOutcome[]> {
-  const inputHash = operationId === undefined ? '' : createHash('sha256')
-    .update(canonicalJson({ room: room.id, origin, pdus, source }))
-    .digest('hex');
+  const inputHash = operationId === undefined
+    ? ''
+    : batchInputHash(room, pdus, origin, source);
   if (operationId !== undefined) {
-    if (!operationId) throw new Error('E_REMOTE_BATCH_IDENTITY');
-    const prior = await room.tx((tx) =>
-      tx.remoteBatches.get(operationId, inputHash)
+    const prior = await replayRemoteBatch(
+      room,
+      pdus,
+      origin,
+      deps.self,
+      operationId,
+      source,
     );
-    if (prior) {
-      // The previous attempt may have died between room commit and projection.
-      await resumeWaits(room, { self: deps.self });
-      await projectAfterWrite(room.store, room.id);
-      return prior;
-    }
+    if (prior) return prior;
   }
   const version = await room.tx(async (tx) => {
     const stay = await tx.segments.openStay();

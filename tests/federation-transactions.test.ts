@@ -12,7 +12,10 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { eduQueues, type EduState, eduState } from '#engine/federation/edus.ts';
-import { receiveTransaction } from '#engine/federation/transactions.ts';
+import {
+  receiveTransaction,
+  receiveTransactionRoom,
+} from '#engine/federation/transactions.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
@@ -294,6 +297,40 @@ async function msg(
     }, s.tip),
   });
 }
+
+Deno.test('transaction room retry recovers exact pending result after grounding and archive', async () => {
+  await withStore(async (store) => {
+    setConfigForTests({ federation: { missingwaitms: 0, missingbudgetms: 0 } });
+    try {
+      const s = await remoteSetup(store);
+      const parent = await msg(s, 'late parent', [s.tip]);
+      const child = await msg(s, 'original pending result', [
+        String(parent.event_id),
+      ]);
+      const deps = { ...s.deps, store, edus: s.edus };
+      const receive = () =>
+        receiveTransactionRoom(
+          s.g.roomId,
+          [structuredClone(child)],
+          s.srv.name,
+          deps,
+          'ingress:room-retry',
+        );
+      const first = await receive();
+      assert('error' in first[String(child.event_id)]);
+      await receiveTransactionRoom(s.g.roomId, [parent], s.srv.name, deps);
+      assertEquals(await receive(), first);
+      await s.g.room.tx(async (tx) => {
+        const stay = await tx.segments.openStay();
+        assert(stay);
+        await tx.segments.close(stay.id);
+      });
+      assertEquals(await receive(), first);
+    } finally {
+      setConfigForTests({});
+    }
+  });
+});
 
 Deno.test('remote batch receipt survives later grounding and rejects changed retry content', async () => {
   await withStore(async (store) => {
