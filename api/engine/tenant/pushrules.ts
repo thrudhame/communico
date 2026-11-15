@@ -442,6 +442,10 @@ function validatedRuleset(
     rules[kind] = values.map((rule) => {
       if (
         !object(rule) || typeof rule.rule_id !== 'string' ||
+        Object.keys(rule).some((key) =>
+          !['rule_id', 'default', 'enabled', 'actions', 'conditions', 'pattern']
+            .includes(key)
+        ) ||
         typeof rule.enabled !== 'boolean' ||
         typeof rule.default !== 'boolean' ||
         seen.has(rule.rule_id) ||

@@ -2,7 +2,8 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
-import { registerOperations } from '#engine/facade/registers.ts';
+import { registerJson, registerOperations } from '#engine/facade/registers.ts';
+import { createHash } from 'node:crypto';
 import {
   deleteRule,
   migrateRoomRules,
@@ -76,6 +77,51 @@ Deno.test('facade push rules: ordinary validated mutation retains a complete ord
       JSON.parse(rows.at(-1)!.payload),
       await rulesetFor(f.home, 'alice'),
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade push rules: imports reject rule fields that cannot round-trip through the owning projection', async () => {
+  const f = await fixture();
+  try {
+    await putRule(f.home, 'alice', 'override', 'custom', {
+      actions: ['notify'],
+      conditions: [],
+    }, {});
+    const operations = await f.home.tx((tx) =>
+      tx.pushRules.operations('alice')
+    );
+    const original = operations.at(-1)!;
+    const before = await rulesetFor(f.edge, 'alice');
+    const cut = await f.edge.tx((tx) => tx.pushRules.streamSeq('alice'));
+    for (const custom of [false, true]) {
+      const rules = JSON.parse(original.payload);
+      const rule = rules.override.find((value: { default: boolean }) =>
+        value.default !== custom
+      );
+      rule['org.example.meta'] = 1;
+      const payload = registerJson(JSON.stringify(rules));
+      const invalid = {
+        ...original,
+        payload,
+        payloadHash: createHash('sha256').update(payload).digest('hex'),
+      };
+      await assertRejects(
+        () => f.edge.tx((tx) => tx.pushRules.import(invalid)),
+        Error,
+        'invalid push-rules',
+      );
+      assertEquals(await rulesetFor(f.edge, 'alice'), before);
+      assertEquals(
+        await f.edge.tx((tx) => tx.pushRules.operations('alice')),
+        [],
+      );
+      assertEquals(
+        await f.edge.tx((tx) => tx.pushRules.streamSeq('alice')),
+        cut,
+      );
+    }
   } finally {
     await f.close();
   }
