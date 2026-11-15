@@ -35,6 +35,11 @@ import type { TransactionDeps } from '#engine/federation/transactions.ts';
 import type { Stream } from './protocol.ts';
 import { EgressOwner } from './egress.ts';
 import { dispatchBatch } from '#engine/federation/sender.ts';
+import {
+  AccountSnapshots,
+  exportSessionAuthority,
+  startAccountExports,
+} from './accounts.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -69,6 +74,7 @@ export async function openFacadeRuntime(
   let initializing: Promise<NodeIdentity> | undefined;
   let inbox: ReturnType<typeof startInboxWorker> | undefined;
   let mailbox: Mailbox | undefined;
+  let authExports: ReturnType<typeof startAccountExports> | undefined;
   const pairings = () => {
     if (!node) {
       throw new LinkError(
@@ -96,6 +102,13 @@ export async function openFacadeRuntime(
         (await keyOwner()).verificationKeys(),
       ),
     );
+  const ownerControls = async () =>
+    new OwnerControls(
+      server,
+      await store.tenant(identity.server),
+      await pairings(),
+      node!,
+    );
   const refresh = async () => {
     notices.changed();
     inbox?.wake();
@@ -118,6 +131,32 @@ export async function openFacadeRuntime(
       );
     }
     tenant = await enrolledTenant(store, owner, identity.server, identity.node);
+    if (settings.phase === 'f2' && !authExports) {
+      authExports = startAccountExports({
+        store,
+        tenant,
+        pollseconds: settings.pollseconds,
+        users: async () =>
+          (await (await store.tenant(identity.server)).query(
+            'SELECT localpart FROM account_auth_snapshots ORDER BY localpart',
+          )).map((row) => String(row.localpart)),
+        emit: async (localpart) =>
+          exportSessionAuthority(
+            store,
+            tenant!,
+            await pairings(),
+            await ownerControls(),
+            node!,
+            localpart,
+          ),
+        changed: () => notices.changed(),
+        failed: (error) =>
+          console.error(
+            'facade auth export:',
+            error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
+          ),
+      });
+    }
   };
   const acceptConfigured = async () => {
     // A file bootstraps a binding, not a second live registry. Restart never
@@ -150,11 +189,13 @@ export async function openFacadeRuntime(
         stream.stream === 'control'
           ? await (await keyOwner()).apply(journal, stream)
           : stream.stream === 'owner-control'
-          ? await new OwnerControls(
-            server,
-            await store.tenant(identity.server),
+          ? await (await ownerControls()).apply(journal, stream)
+          : settings.phase === 'f2' && stream.stream.startsWith('auth:')
+          ? await new AccountSnapshots(
+            store,
+            tenant!,
             await pairings(),
-            node!,
+            await ownerControls(),
           ).apply(journal, stream)
           : stream.stream === 'directory'
           ? await new DirectoryReplicas(
@@ -328,6 +369,7 @@ export async function openFacadeRuntime(
     keyDocument: async () => await (await keyOwner()).document(),
     close: () =>
       closed ??= (async () => {
+        await authExports?.close();
         await inbox?.close();
         await store.close();
       })(),

@@ -27,6 +27,7 @@ import type { Grant, Pairings } from './pairing.ts';
 import type { NodeIdentity } from './identity.ts';
 import { integer, LinkError, object, type Stream, text } from './protocol.ts';
 import { applyReplicaScope } from './scopes.ts';
+import { onTenantStream } from '#engine/tenant/streams.ts';
 
 type AuthorityCut = AccountAuth['authority'];
 type SessionAuthority = {
@@ -368,7 +369,7 @@ export class AccountSnapshots {
     private readonly store: Store,
     private readonly tenant: Tenant,
     private readonly pairings: Pairings,
-    private readonly owners: Pick<OwnerControls, 'ready'>,
+    private readonly owners?: Pick<OwnerControls, 'ready'>,
   ) {}
 
   async applyFromFacade(
@@ -462,6 +463,7 @@ export class AccountSnapshots {
     const payload = object(record.payload), signed = object(payload.signed);
     const view = accountAuthOf(signed.body);
     const grant = await this.pairings.active();
+    if (!this.owners) mismatch('account snapshots require facade ownership');
     const owner = await this.owners.ready();
     const context = grant.body.transcript.body.context;
     if (
@@ -540,4 +542,76 @@ export class AccountSnapshots {
       },
     });
   }
+}
+
+/** Per-account fair exporter. Mutations wake it promptly; periodic scans also
+ * recover a missed notification/restart and publish fresh home auth cuts. */
+export function startAccountExports(options: {
+  store: Store;
+  tenant: Tenant;
+  pollseconds: number;
+  users(): Promise<string[]>;
+  emit(localpart: string): Promise<unknown>;
+  changed(): void;
+  failed(error: unknown): void;
+}) {
+  let stopped = false, dirty = false;
+  let scanning: Promise<void> | undefined;
+  const running = new Map<string, Promise<void>>();
+  const rerun = new Set<string>();
+  const wake = () => {
+    if (stopped) return;
+    dirty = true;
+    scanning ??= (async () => {
+      try {
+        do {
+          dirty = false;
+          for (const user of await options.users()) {
+            if (stopped) break;
+            if (running.has(user)) {
+              rerun.add(user);
+              continue;
+            }
+            const work = (async () => {
+              try {
+                do {
+                  rerun.delete(user);
+                  try {
+                    await options.emit(user);
+                    options.changed();
+                  } catch (error) {
+                    options.failed(error);
+                  }
+                } while (!stopped && rerun.delete(user));
+              } finally {
+                running.delete(user);
+              }
+            })();
+            running.set(user, work);
+          }
+        } while (!stopped && dirty);
+      } catch (error) {
+        options.failed(error);
+      } finally {
+        scanning = undefined;
+      }
+    })();
+  };
+  const untenant = onTenantStream((store, name) => {
+    if (store === options.store && name === options.tenant.serverName) wake();
+  });
+  const timer = setInterval(wake, options.pollseconds * 1000);
+  let closed: Promise<void> | undefined;
+  wake();
+  return {
+    wake,
+    close: () =>
+      closed ??= (async () => {
+        stopped = true;
+        clearInterval(timer);
+        untenant();
+        await scanning;
+        await Promise.all(running.values());
+      })(),
+  };
 }

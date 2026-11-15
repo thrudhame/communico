@@ -4,6 +4,7 @@ import {
   AccountSnapshots,
   exportAccountAuth,
   exportSessionAuthority,
+  startAccountExports,
 } from '#engine/facade/accounts.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
@@ -28,6 +29,7 @@ import {
 import { lookupToken, revokeAllTokens } from '#engine/tenant/auth.ts';
 import { captureSessionAuthority } from '#engine/tenant/session-authority.ts';
 import { deleteDevices } from '#engine/tenant/devices.ts';
+import { bounded } from './helpers/server-process.ts';
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-account-auth-' });
@@ -748,6 +750,42 @@ Deno.test('reverse authority retries a committed tenant cut after cold reopen wi
     assertEquals(facts.length, 1);
   } finally {
     await cold?.close();
+    await f.close();
+  }
+});
+
+Deno.test('account export drains independent users fairly and shutdown waits for admitted work', async () => {
+  const f = await fixture();
+  const hold = Promise.withResolvers<void>(),
+    other = Promise.withResolvers<void>();
+  const emitted: string[] = [];
+  const errors: unknown[] = [];
+  const worker = startAccountExports({
+    store: f.home,
+    tenant: f.ht,
+    pollseconds: 60,
+    users: () => Promise.resolve(['alice', 'bob']),
+    emit: async (user) => {
+      emitted.push(user);
+      if (user === 'alice') await hold.promise;
+      else other.resolve();
+    },
+    changed: () => {},
+    failed: (error) => errors.push(error),
+  });
+  try {
+    await bounded(other.promise);
+    assertEquals(emitted, ['alice', 'bob']);
+    let closed = false;
+    const closing = worker.close().then(() => closed = true);
+    await Promise.resolve();
+    assertEquals(closed, false);
+    hold.resolve();
+    await bounded(closing);
+    assertEquals(errors, []);
+  } finally {
+    hold.resolve();
+    await worker.close();
     await f.close();
   }
 });

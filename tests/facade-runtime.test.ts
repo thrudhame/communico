@@ -12,6 +12,9 @@ import { listedRooms } from '#engine/server/directory.ts';
 import { makeServer, seedServer } from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
 import { setConfigForTests } from '#engine/config.ts';
+import { loginUser, verifyUserPassword } from '#engine/tenant/users.ts';
+import { lookupToken } from '#engine/tenant/auth.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   setConfigForTests({ server: { name: 'logical.test' } });
@@ -582,6 +585,175 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     await receiver.shutdown();
     await tls.close();
     setConfigForTests({});
+  }
+});
+
+Deno.test('cold F2 link workers export account cuts and recover facade authority before home ACK', async () => {
+  const tls = await facadeTls();
+  const ports: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
+    ports.push(listener.addr.port);
+    listener.close();
+  }
+  const [homePort, facadePort, linkPort] = ports;
+  const bundlefile = tls.dir + '/auth-bundle.json';
+  const file = (side: string) => tls.dir + '/' + side + '-auth.toml';
+  for (const side of ['home', 'facade']) {
+    await Deno.writeTextFile(
+      file(side),
+      `[server]\nname="logical.test"\nrole="${side}"\nport=${
+        side === 'home' ? homePort : facadePort
+      }\n` +
+        `[store]\ndir="${tls.dir}/${side}-auth-store"\n[media]\nroot="${tls.dir}/${side}-auth-media"\n[admin]\nsocket="${tls.dir}/${side}-auth.sock"\n[federation]\nenabled=false\n` +
+        `[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://127.0.0.1:${linkPort}"\nlinkport=${linkPort}\nlinkcert="${tls.dir}/${side}.crt"\nlinkkey="${tls.dir}/${side}.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\nreconnectmaxseconds=1\n` +
+        (side === 'home' ? `nodes=["edge_a"]\npairfile="${bundlefile}"\n` : ''),
+    );
+  }
+  let home: Awaited<ReturnType<typeof process>> | undefined;
+  let edge: Awaited<ReturnType<typeof process>> | undefined;
+  const api = async (path: string, body?: unknown, token?: string) => {
+    const response = await fetch(
+      `http://127.0.0.1:${homePort}/_matrix/client/v3/${path}`,
+      {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: token ? { authorization: 'Bearer ' + token } : {},
+        body: body === undefined ? undefined : JSON.stringify(body),
+      },
+    );
+    return { status: response.status, body: await response.json() };
+  };
+  const open = (side: string) =>
+    openStore({
+      dir: `${tls.dir}/${side}-auth-store`,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, {
+      schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+    });
+  try {
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await adminCall(tls.dir + '/facade-auth.sock', 'facade/initialize');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    const registration = { username: 'outside', password: 'offline-password' };
+    const challenge = await api('register', registration);
+    const registered = await api('register', {
+      ...registration,
+      auth: { type: 'm.login.dummy', session: challenge.body.session },
+    });
+    assertEquals(registered.status, 200);
+    const paired = await adminCall(tls.dir + '/home-auth.sock', 'facade/pair', {
+      node: 'edge_a',
+      url: `https://127.0.0.1:${linkPort}`,
+      facadePin: tls.facadePin,
+      expires: Date.now() + 60000,
+      bundlefile,
+    });
+    assertEquals(paired.status, 200);
+    assertEquals(
+      (await adminCall(tls.dir + '/facade-auth.sock', 'facade/accept', {
+        bundlefile,
+      })).status,
+      200,
+    );
+    await until(async () => {
+      const response = await adminCall(
+        tls.dir + '/facade-auth.sock',
+        'facade/status',
+      );
+      return response.body.result.scopes.some((
+        scope: { scope: string; ready: boolean },
+      ) => scope.scope === 'auth:@outside:logical.test' && scope.ready);
+    });
+    await home.stop();
+    await edge.stop();
+    const offline = await open('facade');
+    let token: string;
+    try {
+      const tenant = await openTenant(offline, 'logical.test');
+      assertEquals(
+        await verifyUserPassword(tenant, 'outside', 'offline-password'),
+        true,
+      );
+      const session = await loginUser(tenant, {
+        localpart: 'outside',
+        password: 'offline-password',
+        deviceId: 'outside-device',
+        refresh: true,
+      });
+      token = session.accessToken;
+    } finally {
+      await offline.close();
+    }
+    // The mutation happened while both processes were absent. Restart scans
+    // durable owner state; an in-memory notification cannot supply this proof.
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('account/whoami', undefined, token)).status === 503;
+      } catch {
+        return false;
+      }
+    });
+    const before =
+      (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
+        .result.scopes.find((scope: { scope: string }) =>
+          scope.scope === 'auth:@outside:logical.test'
+        ).cut;
+    assertEquals(
+      (await api('logout/all', {}, registered.body.access_token)).status,
+      200,
+    );
+    await until(async () => {
+      const response = await adminCall(
+        tls.dir + '/facade-auth.sock',
+        'facade/status',
+      );
+      // One capture may already be in flight at logout; its successor is taken
+      // after that mutation by the account's serialized export owner.
+      return response.body.result.scopes.some((
+        scope: { scope: string; ready: boolean; cut: number },
+      ) =>
+        scope.scope === 'auth:@outside:logical.test' && scope.ready &&
+        scope.cut > before + 1
+      );
+    });
+    await home.stop();
+    await edge.stop();
+    const closedHome = await open('home'), closedEdge = await open('facade');
+    try {
+      const [received] = await (await closedHome.server()).query(
+        "SELECT received,applied FROM facade_streams WHERE direction='in' AND stream='authority:@outside:logical.test'",
+      );
+      assert(Number(received.applied) > 0);
+      const [ack] = await (await closedEdge.server()).query(
+        "SELECT result_json FROM facade_records WHERE direction='out' AND stream='authority:@outside:logical.test' AND result_json IS NOT NULL LIMIT 1",
+      );
+      assert(ack);
+      const tenant = await openTenant(closedEdge, 'logical.test');
+      await assertRejects(
+        () => lookupToken(tenant, token),
+        MatrixError,
+        'session authority revoked',
+      );
+    } finally {
+      await closedHome.close();
+      await closedEdge.close();
+    }
+  } finally {
+    await home?.dispose();
+    await edge?.dispose();
+    await tls.close();
   }
 });
 
