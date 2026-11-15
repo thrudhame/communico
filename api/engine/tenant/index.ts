@@ -55,6 +55,11 @@ import type { ErasureCut } from '#engine/room/state.ts';
 import { tenantStreamCommitted } from '#engine/tenant/streams.ts';
 import { writeCertificate } from '#engine/tenant/certificate.ts';
 import {
+  type DomainBinding,
+  requireDomainControl,
+} from '#engine/facade/domain-control.ts';
+import { LinkError } from '#engine/facade/protocol.ts';
+import {
   b32encode,
   b64decode,
   b64encodeStd,
@@ -142,6 +147,29 @@ function bind(
   };
   return {
     ingress: { check: authorize },
+    domains: {
+      authorize: async (
+        view: DomainBinding,
+        selected?: { pairing: string; revision: number },
+      ) => {
+        await requireDomainControl(conn, view);
+        if (!selected) return;
+        const [row] = await conn.query(
+          'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
+          [view.localpart],
+        );
+        if (
+          row?.pairing !== selected.pairing ||
+          Number(row.grant_revision) !== selected.revision
+        ) {
+          throw new LinkError(
+            'LINK_IDENTITY_MISMATCH',
+            'domain account not selected',
+            403,
+          );
+        }
+      },
+    },
     publicReplica: {
       users: () => publicReplica.publicUsers(conn),
       inventory: () => publicReplica.publicInventory(conn),

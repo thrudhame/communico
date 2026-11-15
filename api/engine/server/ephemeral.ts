@@ -376,12 +376,14 @@ export async function importReceiptOperation(
   server: Db,
   operation: ReceiptOperation,
   authenticated: { source: string; incarnation: string; userId: string },
+  authorize?: (conn: Conn) => Promise<void>,
 ): Promise<void> {
   const mark = receiptOperationMark(operation);
   if (mark.userId !== authenticated.userId) {
     throw new Error('receipt account not selected');
   }
   const rows = await eventStreamTx(server, async (tx) => {
+    await authorize?.(tx);
     await acceptReceiptOperation(tx, operation, authenticated);
     return await projectPendingReceipts(tx, mark.roomId);
   });
