@@ -719,6 +719,187 @@ Deno.test('missing: a pulled event with its own missing prev — the chase names
   });
 });
 
+for (const supplied of ['answer', 'held', 'pulled-input'] as const) {
+  Deno.test(
+    'missing: pulled boundary fallback survives unavailable older ancestry: ' +
+      supplied,
+    async () => {
+      await withStore(async (store) => {
+        const s = await setup(store);
+        const far = await msg(s, 'far pulled', ['$unavailable-older'], 50);
+        const near = await msg(s, 'near pulled', [far.event_id!], 51);
+        const pushed = await msg(s, 'pushed child', [near.event_id!], 52);
+        if (supplied === 'held') {
+          await ingestRemote(s.g.room, [far], s.server.name, {
+            ...s.deps,
+            limits: { ...s.deps.limits, budgetMs: 0 },
+          });
+        }
+        const stateIds = await s.g.room.tx(async (tx) => {
+          const stay = await tx.segments.openStay();
+          return [
+            ...(await tx.state.groupMap((await tx.state.current(stay!.id))!))
+              .values(),
+          ];
+        });
+        const recording = fakeFetcher({
+          missingEvents: supplied === 'answer' ? [near, far] : [near],
+          stateIds: new Map([[far.event_id!, {
+            pduIds: stateIds,
+            authChainIds: [],
+          }]]),
+          event: new Map([[far.event_id!, far]]),
+        });
+        s.deps.fetcher = recording.fetcher;
+        const out = await ingestRemote(
+          s.g.room,
+          supplied === 'pulled-input' ? [far] : [pushed],
+          s.server.name,
+          s.deps,
+          supplied === 'pulled-input' ? 'pulled' : 'pushed',
+        );
+        assertEquals(out[0].outcome, 'accepted');
+        assertEquals(out[0].error, null);
+        assertEquals(recording.calls.stateIds, [
+          '$unavailable-older',
+          far.event_id!,
+        ]);
+        await s.g.room.tx(async (tx) => {
+          assertEquals(
+            (await tx.events.getStatus(far.event_id!))?.grounding,
+            'grounded',
+          );
+          assertEquals(
+            (await tx.state.eventStateBefore(far.event_id!))?.provenance,
+            'imported',
+          );
+          assertEquals(await tx.events.get('$unavailable-older'), null);
+          if (supplied !== 'pulled-input') {
+            assertEquals(
+              (await tx.events.getStatus(pushed.event_id!))?.grounding,
+              'grounded',
+            );
+            assertEquals(
+              (await tx.state.eventStateBefore(near.event_id!))?.provenance,
+              'dag',
+            );
+          }
+        });
+      });
+    },
+  );
+}
+
+for (
+  const boundary of [
+    'unavailable',
+    'incomplete',
+    'unauthorized',
+    'local-fault',
+  ] as const
+) {
+  Deno.test(
+    'missing: pulled boundary fallback does not invent state: ' + boundary,
+    async () => {
+      await withStore(async (store) => {
+        const s = await setup(store);
+        const far = await msg(s, 'far pulled', ['$unavailable-older'], 50);
+        const near = await msg(s, 'near pulled', [far.event_id!], 51);
+        const pushed = await msg(s, 'pushed child', [near.event_id!], 52);
+        const stateIds = await s.g.room.tx(async (tx) => {
+          const stay = await tx.segments.openStay();
+          return [
+            ...(await tx.state.groupMap((await tx.state.current(stay!.id))!))
+              .values(),
+          ];
+        });
+        const recording = fakeFetcher({
+          missingEvents: [far, near],
+          stateIds: new Map(
+            boundary === 'unavailable' ? [] : [[far.event_id!, {
+              pduIds: boundary === 'incomplete'
+                ? [...stateIds, '$missing-state']
+                : boundary === 'unauthorized'
+                ? stateIds.filter((id) => id !== s.g.createId)
+                : stateIds,
+              authChainIds: [],
+            }]],
+          ),
+          event: new Map([[far.event_id!, far]]),
+        });
+        const fault = new Error('local boundary read fault');
+        const state = recording.fetcher.stateIds;
+        const attempts: string[] = [];
+        recording.fetcher.stateIds = (room, id, via) => {
+          attempts.push(id);
+          if (boundary === 'local-fault' && id === far.event_id) throw fault;
+          return state(room, id, via);
+        };
+        s.deps.fetcher = recording.fetcher;
+        if (boundary === 'local-fault') {
+          assertStrictEquals(
+            await assertRejects(() =>
+              ingestRemote(s.g.room, [pushed], s.server.name, s.deps)
+            ),
+            fault,
+          );
+        } else {
+          const out = await ingestRemote(
+            s.g.room,
+            [pushed],
+            s.server.name,
+            s.deps,
+          );
+          assertEquals(out[0].outcome, 'pending');
+          assertEquals(out[0].error, null);
+        }
+        assert(attempts.includes(far.event_id!));
+        assert(!attempts.includes(pushed.event_id!));
+        assertEquals(await frontierOf(s.g.room), [s.joinId]);
+        await s.g.room.tx(async (tx) => {
+          assertEquals(await tx.state.eventStateAfter(pushed.event_id!), null);
+          assertEquals(await tx.segments.positionOf(pushed.event_id!), null);
+        });
+      });
+    },
+  );
+}
+
+Deno.test('missing: pulled boundary fallback prefers deeper available ancestry', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const deep = await msg(s, 'deep available', [s.joinId], 49);
+    const far = await msg(s, 'far pulled', [deep.event_id!], 50);
+    const near = await msg(s, 'near pulled', [far.event_id!], 51);
+    const pushed = await msg(s, 'pushed child', [near.event_id!], 52);
+    const recording = fakeFetcher({
+      missingEvents: [far, near],
+      stateIds: new Map([[deep.event_id!, {
+        pduIds: [s.g.createId, s.joinId],
+        authChainIds: [],
+      }]]),
+      event: new Map([[deep.event_id!, deep]]),
+    });
+    s.deps.fetcher = recording.fetcher;
+    assertEquals(
+      (await ingestRemote(s.g.room, [pushed], s.server.name, s.deps))[0]
+        .outcome,
+      'accepted',
+    );
+    assertEquals(recording.calls.stateIds, [deep.event_id!]);
+    await s.g.room.tx(async (tx) => {
+      assertEquals(
+        (await tx.state.eventStateBefore(far.event_id!))?.provenance,
+        'dag',
+      );
+      assertEquals(
+        (await tx.events.getStatus(deep.event_id!))?.grounding,
+        'grounded',
+      );
+    });
+  });
+});
+
 Deno.test('missing: a format-dropped answer event is terminal — no /state_ids fallthrough (the BadJSON case)', async () => {
   await withStore(async (store) => {
     const s = await setup(store, { roomId: '!m6:test' });
