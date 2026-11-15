@@ -13,6 +13,8 @@ import {
   writeRegister,
 } from '#engine/facade/registers.ts';
 import { tenantAuthority } from './session-authority.ts';
+import { requireTenantDomainSource } from './domain-source.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
 import { recordProfileFanout } from './profile-fanout.ts';
 
 export type Profile = Record<string, unknown> & {
@@ -138,6 +140,7 @@ export async function materializeProfile(
 export async function importProfile(
   conn: Conn,
   operation: RegisterOperation,
+  history?: DomainHistoryProof,
 ): Promise<boolean> {
   let address: unknown, profile: unknown;
   try {
@@ -156,18 +159,13 @@ export async function importProfile(
     throw new Error('invalid profile operation');
   }
   validateProfile(profile);
-  const localpart = address[1], authority = await tenantAuthority(conn);
-  const allowed = (dot: { source: string; incarnation: string }) =>
-    authority &&
-    ((dot.source === 'home' && dot.incarnation === authority.homeIncarnation) ||
-      (dot.source === authority.edgeNode &&
-        dot.incarnation === authority.edgeIncarnation));
-  if (
-    !allowed(operation) || !Array.isArray(operation.context) ||
-    !operation.context.every(allowed)
-  ) {
-    throw new Error('profile source unavailable');
-  }
+  const localpart = address[1],
+    authority = await requireTenantDomainSource(
+      conn,
+      operation,
+      localpart,
+      history,
+    );
   const [user] = await conn.query(
     'SELECT deactivated FROM users WHERE localpart=?',
     [localpart],

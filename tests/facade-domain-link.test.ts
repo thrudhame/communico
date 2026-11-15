@@ -34,7 +34,14 @@ import {
   captureProfileOperations,
   setProfileField,
 } from '#engine/tenant/profiles.ts';
-import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
+import {
+  capturePushRuleOperations,
+  putRule,
+} from '#engine/tenant/pushrules.ts';
+import {
+  importRegisterOperation,
+  writeRegister,
+} from '#engine/facade/registers.ts';
 import {
   receiptOperations,
   recordReceiptOperation,
@@ -499,5 +506,319 @@ Deno.test('domain bootstrap: missing owner facts prevent readiness and ACK until
     );
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('domain bootstrap review: home restores an authenticated facade-origin fact before declaring completeness', async () => {
+  const f = await fixture();
+  try {
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await putAccountData(f.et, 'alice', '', 'm.secret_storage.key', {
+      ciphertext: 'facade-retained-by-home',
+    });
+    const reverse = await f.es.export('alice');
+    for (const record of reverse) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(
+      await getAccountData(f.ht, 'alice', '', 'm.secret_storage.key'),
+      { ciphertext: 'facade-retained-by-home' },
+    );
+    const operation = (reverse.find((record) =>
+      (record.payload as { body: DomainOperation }).body.operation.kind ===
+        'account-data'
+    )!.payload as { body: DomainOperation }).body.operation;
+    // Same missing-owner-fact boundary as the existing authentic-replay test,
+    // but this fact was authored here and durably admitted at home.
+    await (await f.edge.tenant('logical.test')).execute(
+      'DELETE FROM domain_operations WHERE operation_id=?',
+      [operation.operationId],
+    );
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(bootstrap);
+    assertEquals(
+      (await f.et.tx((tx) =>
+        tx.accountData.operations('alice')
+      )).some((held) => held.operationId === operation.operationId),
+      true,
+    );
+    assertEquals(
+      await f.hs.export('alice', f.bundle.id),
+      bootstrap.filter((record) =>
+        (record.payload as { body: { kind: string } }).body.kind ===
+          'domain-operation'
+      ),
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain history: every owner restores original facts without new news or export echoes', async () => {
+  const f = await fixture();
+  try {
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await putAccountData(f.et, 'alice', '', 'm.secret_storage.key', {
+      ciphertext: 'retained',
+    });
+    await putAccountData(f.et, 'alice', '!r:logical.test', 'm.tag', {
+      tags: { edge: { order: 0.25 } },
+    });
+    await setProfileField(f.et, 'alice', 'displayname', 'Retained edge');
+    await putRule(f.et, 'alice', 'override', 'edge', {
+      actions: ['dont_notify'],
+      conditions: [],
+    }, {});
+    await (await f.edge.server()).tx((conn) =>
+      recordReceiptOperation(conn, {
+        roomId: '!r:logical.test',
+        userId: '@alice:logical.test',
+        receiptType: 'm.read.private',
+        threadId: null,
+        eventIds: ['$pending-target'],
+        ts: 1,
+        admission: { membershipEvent: '$original-join' },
+      })
+    );
+    const reverse = await f.es.export('alice');
+    for (const record of reverse) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    const operations = reverse.map((record) =>
+      (record.payload as { body: DomainOperation }).body.operation
+    );
+    assertEquals([...new Set(operations.map((op) => op.kind))].sort(), [
+      'account-data',
+      'profile',
+      'push-rules',
+      'receipt',
+      'tags',
+    ]);
+    const before = await f.et.tx((tx) => tx.streams.heads());
+    for (const operation of operations) {
+      await (await (operation.kind === 'receipt'
+        ? f.edge.server()
+        : f.edge.tenant('logical.test'))).execute(
+          'DELETE FROM domain_operations WHERE operation_id=?',
+          [operation.operationId],
+        );
+    }
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    const restored = [
+      ...await f.et.tx(async (tx) => [
+        ...await tx.accountData.operations('alice'),
+        ...await tx.profiles.operations('alice'),
+        ...await tx.pushRules.operations('alice'),
+      ]),
+      ...await (await f.edge.server()).tx((conn) =>
+        receiptOperations(conn, '@alice:logical.test')
+      ),
+    ];
+    for (const operation of operations) {
+      assertEquals(
+        restored.find((op) => op.operationId === operation.operationId),
+        operation,
+      );
+    }
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+    assertEquals(await f.es.export('alice'), reverse);
+    assertEquals(
+      await (await f.edge.server()).query(
+        "SELECT applied FROM domain_operations WHERE kind='receipt'",
+      ),
+      [{ applied: 0 }],
+    );
+    await f.toEdge(records);
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain history: retained prior-incarnation context permits current successors but not fresh historical authorship', async () => {
+  const f = await fixture();
+  try {
+    // A home-retained owner fact from an earlier enrollment. No current source
+    // can author it; bootstrap must preserve that original identity and closure.
+    const conn = await f.home.tenant('logical.test');
+    const { operation: prior } = await conn.tx((tx) =>
+      writeRegister(
+        tx,
+        { source: 'edge_a', incarnation: 'prior-authenticated-incarnation' },
+        JSON.stringify(['account-data', 'alice', '', 'm.secret_storage.key']),
+        'account-data',
+        JSON.stringify({ ciphertext: 'old-retained' }),
+      )
+    );
+    await putAccountData(f.ht, 'alice', '', 'm.secret_storage.key', {
+      ciphertext: 'home-successor',
+    });
+    // Ordinary export can precede the historical predecessor. Its signed
+    // successor stays pending rather than blocking the journal before history.
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals(
+      await getAccountData(f.et, 'alice', '', 'm.secret_storage.key'),
+      { ciphertext: 'home-successor' },
+    );
+    await putAccountData(f.et, 'alice', '', 'm.secret_storage.key', {
+      ciphertext: 'current-successor',
+    });
+    const reverse = await f.es.export('alice');
+    for (const record of reverse) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(
+      await getAccountData(f.ht, 'alice', '', 'm.secret_storage.key'),
+      { ciphertext: 'current-successor' },
+    );
+    const retained = (await f.et.tx((tx) => tx.accountData.operations('alice')))
+      .find((op) => op.operationId === prior.operationId)!;
+    await assertRejects(
+      () => f.et.tx((tx) => tx.accountData.import(retained)),
+      Error,
+      'domain source unavailable',
+    );
+    // A structurally valid but unknown historical context is not authority.
+    const { operation: forged } = await conn.tx((tx) =>
+      writeRegister(
+        tx,
+        { source: 'edge_a', incarnation: 'never-admitted' },
+        JSON.stringify(['account-data', 'alice', '', 'm.other']),
+        'account-data',
+        '{}',
+      )
+    );
+    const { operation: next } = await conn.tx((tx) =>
+      writeRegister(
+        tx,
+        { source: f.node.node, incarnation: f.node.incarnation },
+        forged.semanticKey,
+        'account-data',
+        '{"next":true}',
+      )
+    );
+    const before = await f.et.tx((tx) => tx.streams.heads());
+    await f.et.tx((tx) => tx.accountData.import(next));
+    assertEquals(await getAccountData(f.et, 'alice', '', 'm.other'), null);
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+    // Persisting an unrelated stream's dot cannot authenticate this predecessor.
+    await (await f.edge.tenant('logical.test')).tx((tx) =>
+      importRegisterOperation(tx, {
+        ...forged,
+        semanticKey: JSON.stringify([
+          'account-data',
+          'alice',
+          '',
+          'm.unrelated',
+        ]),
+        stream: 'register:' +
+          JSON.stringify(['account-data', 'alice', '', 'm.unrelated']),
+        operationId: JSON.stringify([
+          forged.source,
+          forged.incarnation,
+          'register:' +
+          JSON.stringify(['account-data', 'alice', '', 'm.unrelated']),
+          forged.sequence,
+        ]),
+      })
+    );
+    await f.et.tx((tx) => tx.accountData.import(next));
+    assertEquals(await getAccountData(f.et, 'alice', '', 'm.other'), null);
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain history: authenticated current home, account and control bindings precede owner import and ACK', async (t) => {
+  for (
+    const fault of [
+      'signature',
+      'payload',
+      'account',
+      'grant',
+      'future-control',
+      'source',
+      'ordinary-echo',
+    ]
+  ) {
+    await t.step(fault, async () => {
+      const f = await fixture();
+      try {
+        await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+        await putAccountData(f.et, 'alice', '', 'm.secret_storage.key', {
+          ciphertext: 'retained',
+        });
+        for (const record of await f.es.export('alice')) {
+          await f.hj.receive(f.node.node, [record]);
+          await f.hs.apply(f.hj, record, f.bundle.id);
+        }
+        const records = await f.hs.bootstrap('alice', f.bundle.id);
+        const original = records.find((r) =>
+          (r.payload as { body: { kind: string } }).body.kind ===
+            'domain-history'
+        )!;
+        const record = structuredClone(original);
+        const payload = record.payload as {
+          body:
+            | DomainOperation
+            | import('#engine/facade/domain-control.ts').DomainHistory;
+          signature: string;
+        };
+        if (fault === 'account') payload.body.localpart = 'bob';
+        if (fault === 'grant') payload.body.grantRevision++;
+        if (fault === 'future-control') payload.body.ownerRevision = 99;
+        if (fault === 'source') payload.body.source = 'edge_a';
+        if (fault === 'ordinary-echo') payload.body.kind = 'domain-operation';
+        if (fault !== 'signature') {
+          payload.signature = await f.ht.signer().sign(
+            canonicalJson(payload.body),
+          );
+        } else payload.signature = 'A'.repeat(86);
+        if (fault === 'payload') {
+          payload.body.operation.payload = '{"ciphertext":"substituted"}';
+        }
+        record.operationId = (payload.body.kind === 'domain-history'
+          ? 'domain-history:'
+          : 'domain:') +
+          createHash('sha256').update(
+            canonicalJson([
+              payload.body.pairing,
+              payload.body.grantRevision,
+              payload.body.ownerRevision,
+              payload.body.operation.operationId,
+            ]),
+          ).digest('hex');
+        record.hash = recordHash({
+          source: record.source,
+          incarnation: record.incarnation,
+          stream: record.stream,
+          sequence: record.sequence,
+          type: record.type,
+          version: record.version,
+          operationId: record.operationId,
+          previous: record.previous,
+          payload: record.payload,
+        });
+        await f.ej.receive('home', [record]);
+        const before = await f.ej.heads('home', 'in', record);
+        await assertRejects(() =>
+          f.es.apply(f.ej, record), LinkError);
+        assertEquals(
+          (await f.ej.heads('home', 'in', record)).applied,
+          before.applied,
+        );
+        assertEquals(
+          await getAccountData(f.et, 'alice', '', 'm.secret_storage.key'),
+          { ciphertext: 'retained' },
+        );
+      } finally {
+        await f.close();
+      }
+    });
   }
 });

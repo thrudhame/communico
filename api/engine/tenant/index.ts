@@ -452,8 +452,11 @@ function bind(
         profiles.profileOperations(conn, localpart),
       import: async (
         operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
       ) => {
-        if (await profiles.importProfile(conn, operation)) projectionChanged();
+        if (await profiles.importProfile(conn, operation, history)) {
+          projectionChanged();
+        }
       },
       set: (localpart: string, key: string, value: unknown) =>
         mutation(profiles.setProfileRow(conn, localpart, key, value)),
@@ -639,8 +642,11 @@ function bind(
         accountdata.accountDataOperations(conn, localpart),
       import: async (
         operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
       ) => {
-        if (await accountdata.importAccountData(conn, operation)) changed();
+        if (await accountdata.importAccountData(conn, operation, history)) {
+          changed();
+        }
       },
       tag: async (
         localpart: string,
@@ -718,8 +724,11 @@ function bind(
         pushrules.pushRuleOperations(conn, localpart),
       import: async (
         operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
       ) => {
-        if (await pushrules.importPushRules(conn, operation, serverName)) {
+        if (
+          await pushrules.importPushRules(conn, operation, serverName, history)
+        ) {
           changed();
         }
       },

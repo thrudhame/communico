@@ -19,6 +19,8 @@ import {
   writeRegister,
 } from '#engine/facade/registers.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
+import { requireTenantDomainSource } from './domain-source.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 export async function clearAccountData(
   conn: Conn,
@@ -303,18 +305,15 @@ export async function captureAccountDataOperations(
 export async function importAccountData(
   conn: Conn,
   operation: RegisterOperation,
+  history?: DomainHistoryProof,
 ): Promise<boolean> {
   const [localpart, room, type] = address(operation),
-    authority = await tenantAuthority(conn);
-  const allowed = (dot: { source: string; incarnation: string }) =>
-    authority &&
-    ((dot.source === 'home' && dot.incarnation === authority.homeIncarnation) ||
-      (dot.source === authority.edgeNode &&
-        dot.incarnation === authority.edgeIncarnation));
-  if (
-    !allowed(operation) || !Array.isArray(operation.context) ||
-    !operation.context.every(allowed)
-  ) throw new Error('account-data source unavailable');
+    authority = await requireTenantDomainSource(
+      conn,
+      operation,
+      localpart,
+      history,
+    );
   const [user] = await conn.query(
     'SELECT deactivated FROM users WHERE localpart=?',
     [localpart],

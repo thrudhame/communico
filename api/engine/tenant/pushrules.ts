@@ -16,6 +16,8 @@ import {
   writeRegister,
 } from '#engine/facade/registers.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
+import { requireTenantDomainSource } from './domain-source.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
 import { nextStreamSeq } from '#engine/tenant/accountdata.ts';
 export async function clearPushRules(
   conn: Conn,
@@ -474,6 +476,7 @@ export async function importPushRules(
   conn: Conn,
   operation: RegisterOperation,
   server: string,
+  history?: DomainHistoryProof,
 ): Promise<boolean> {
   let address: unknown, payload: unknown;
   try {
@@ -491,19 +494,14 @@ export async function importPushRules(
   ) {
     throw new Error('invalid push-rules operation');
   }
-  const localpart = address[1], authority = await tenantAuthority(conn);
+  const localpart = address[1],
+    authority = await requireTenantDomainSource(
+      conn,
+      operation,
+      localpart,
+      history,
+    );
   validatedRuleset(payload, localpart, server);
-  const allowed = (dot: { source: string; incarnation: string }) =>
-    authority &&
-    ((dot.source === 'home' && dot.incarnation === authority.homeIncarnation) ||
-      (dot.source === authority.edgeNode &&
-        dot.incarnation === authority.edgeIncarnation));
-  if (
-    !allowed(operation) || !Array.isArray(operation.context) ||
-    !operation.context.every(allowed)
-  ) {
-    throw new Error('push-rules source unavailable');
-  }
   const [user] = await conn.query(
     'SELECT deactivated FROM users WHERE localpart=?',
     [localpart],

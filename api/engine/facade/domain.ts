@@ -26,7 +26,12 @@ import type { OwnerControl } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
 import { integer, LinkError, object, type Stream, text } from './protocol.ts';
 import { readRegister, type RegisterOperation } from './registers.ts';
-import { type DomainBinding, requireDomainControl } from './domain-control.ts';
+import {
+  type DomainBinding,
+  type DomainHistory,
+  DomainHistoryProof,
+  requireDomainControl,
+} from './domain-control.ts';
 
 export type DomainOperation = DomainBinding & {
   kind: 'domain-operation';
@@ -152,29 +157,31 @@ function mismatch(message: string): never {
 function streamName(localpart: string, server: string) {
   return 'domain:@' + localpart + ':' + server;
 }
-function operationId(view: DomainOperation | DomainBootstrap) {
+function operationId(view: DomainOperation | DomainHistory | DomainBootstrap) {
   if (view.kind === 'domain-bootstrap') {
     return 'domain-bootstrap:' +
       createHash('sha256').update(canonicalJson(view)).digest('hex');
   }
-  return 'domain:' + createHash('sha256').update(canonicalJson([
-    view.pairing,
-    view.grantRevision,
-    view.ownerRevision,
-    view.operation.operationId,
-  ])).digest('hex');
+  return (view.kind === 'domain-history' ? 'domain-history:' : 'domain:') +
+    createHash('sha256').update(canonicalJson([
+      view.pairing,
+      view.grantRevision,
+      view.ownerRevision,
+      view.operation.operationId,
+    ])).digest('hex');
 }
 
-function viewOf(raw: unknown): DomainOperation {
+function viewOf(raw: unknown): DomainOperation | DomainHistory {
   const row = object(raw), operation = object(row.operation);
   const localpart = text(row.localpart);
   if (
-    row.kind !== 'domain-operation' || checkLocalpart(localpart) !== localpart
+    !['domain-operation', 'domain-history'].includes(String(row.kind)) ||
+    checkLocalpart(localpart) !== localpart
   ) {
     mismatch('invalid domain account');
   }
-  const view: DomainOperation = {
-    kind: 'domain-operation',
+  const view: DomainOperation | DomainHistory = {
+    kind: row.kind as 'domain-operation' | 'domain-history',
     server: text(row.server),
     pairing: text(row.pairing),
     grantRevision: integer(row.grantRevision, 1),
@@ -186,8 +193,10 @@ function viewOf(raw: unknown): DomainOperation {
   };
   if (
     canonicalJson(view) !== canonicalJson(raw) ||
-    operation.source !== view.source ||
-    operation.incarnation !== view.incarnation
+    (view.kind === 'domain-history'
+      ? view.source !== 'home'
+      : operation.source !== view.source ||
+        operation.incarnation !== view.incarnation)
   ) {
     mismatch('domain operation differs from signed source');
   }
@@ -289,6 +298,32 @@ export class DomainOperations {
     }
   }
 
+  private async publish(
+    view: DomainOperation | DomainHistory | DomainBootstrap,
+    grant: Grant,
+  ) {
+    const context = grant.body.transcript.body.context;
+    const signed = {
+      body: view,
+      signature: await (this.node?.signer() ?? this.tenant.signer()).sign(
+        canonicalJson(view),
+      ),
+    };
+    return await (await this.store.server()).tx(async (conn) => {
+      await this.selected(conn, grant, view.localpart);
+      await requireDomainControl(conn, view);
+      return await appendRecord(conn, this.node ? 'home' : context.node, {
+        source: view.source,
+        incarnation: this.node ? view.incarnation : context.id,
+        stream: streamName(view.localpart, context.server),
+        type: 'domain-operation',
+        version: 1,
+        operationId: operationId(view),
+        payload: signed,
+      });
+    });
+  }
+
   async export(localpart: string, pairing?: string) {
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
@@ -357,27 +392,7 @@ export class DomainOperations {
         incarnation: source.incarnation,
         operation,
       });
-      const signed = {
-        body: view,
-        signature: await (this.node?.signer() ?? this.tenant.signer()).sign(
-          canonicalJson(view),
-        ),
-      };
-      records.push(
-        await db.tx(async (conn) => {
-          await this.selected(conn, grant, localpart);
-          await requireDomainControl(conn, view);
-          return await appendRecord(conn, this.node ? 'home' : context.node, {
-            source: source.node,
-            incarnation: this.node ? source.incarnation : context.id,
-            stream: streamName(localpart, context.server),
-            type: 'domain-operation',
-            version: 1,
-            operationId: operationId(view),
-            payload: signed,
-          });
-        }),
-      );
+      records.push(await this.publish(view, grant));
     }
     return records;
   }
@@ -426,49 +441,48 @@ export class DomainOperations {
         );
         if (!user) mismatch('domain account unavailable');
         if (user.deactivated === 1) return [];
-        return facts([
+        return [
           ...await captureAccountDataOperations(conn, localpart),
           ...await captureProfileOperations(conn, localpart),
           ...await capturePushRuleOperations(conn, localpart, context.server),
-        ]);
+        ];
       },
     );
     const receiptFacts = await server.tx(async (conn) => {
       await this.selected(conn, grant, localpart);
       await requireDomainControl(conn, binding);
-      return facts(
-        await captureReceiptOperations(
-          conn,
-          '@' + localpart + ':' + context.server,
-        ),
+      return await captureReceiptOperations(
+        conn,
+        '@' + localpart + ':' + context.server,
       );
     });
     const records = await this.export(localpart, pairing);
+    // Ordinary export never echoes replica intent. Bootstrap separately attests
+    // exactly the authentic history home retained, including a receiver's own
+    // prior dots and prior incarnations. No dot, payload or context is rebased.
+    for (const operation of [...tenantFacts, ...receiptFacts]) {
+      if (
+        operation.source === source.node &&
+        operation.incarnation === source.incarnation
+      ) continue;
+      records.push(
+        await this.publish(
+          viewOf({
+            ...binding,
+            kind: 'domain-history',
+            operation,
+          }),
+          grant,
+        ),
+      );
+    }
     const body = bootstrapOf({
       ...binding,
       kind: 'domain-bootstrap',
-      tenant: tenantFacts,
-      receipts: receiptFacts,
+      tenant: facts(tenantFacts),
+      receipts: facts(receiptFacts),
     });
-    const signed = {
-      body,
-      signature: await this.tenant.signer().sign(canonicalJson(body)),
-    };
-    records.push(
-      await server.tx(async (conn) => {
-        await this.selected(conn, grant, localpart);
-        await requireDomainControl(conn, body);
-        return await appendRecord(conn, context.node, {
-          source: 'home',
-          incarnation: context.id,
-          stream: streamName(localpart, context.server),
-          type: 'domain-operation',
-          version: 1,
-          operationId: operationId(body),
-          payload: signed,
-        });
-      }),
-    );
+    records.push(await this.publish(body, grant));
     return records;
   }
 
@@ -516,6 +530,9 @@ export class DomainOperations {
       );
     } catch { /* A malformed signature grants no semantic authority. */ }
     if (!valid) mismatch('invalid domain operation signature');
+    if (view.kind === 'domain-history' && !this.node) {
+      mismatch('only home may attest domain history');
+    }
     await this.tenantSelected(view.localpart, grant);
     const check = async (conn: Conn) => {
       await this.selected(conn, grant, view.localpart);
@@ -552,16 +569,24 @@ export class DomainOperations {
         return { kind: 'domain-bootstrap', localpart: view.localpart };
       });
     }
+    const history = view.kind === 'domain-history'
+      ? await DomainHistoryProof.verify(
+        view,
+        text(signed.signature),
+        context.home.publicKey,
+      )
+      : undefined;
     if (view.operation.kind === 'receipt') {
       await importReceiptOperation(
         await this.store.server(),
         view.operation as RegisterOperation & { kind: 'receipt' },
         {
-          source: view.source,
-          incarnation: view.incarnation,
+          source: history ? view.operation.source : view.source,
+          incarnation: history ? view.operation.incarnation : view.incarnation,
           userId: '@' + view.localpart + ':' + view.server,
         },
         check,
+        history,
       );
     } else {
       await this.tenant.tx(async (tx) => {
@@ -572,10 +597,10 @@ export class DomainOperations {
             : undefined,
         );
         if (view.operation.kind === 'profile') {
-          await tx.profiles.import(view.operation);
+          await tx.profiles.import(view.operation, history);
         } else if (view.operation.kind === 'push-rules') {
-          await tx.pushRules.import(view.operation);
-        } else await tx.accountData.import(view.operation);
+          await tx.pushRules.import(view.operation, history);
+        } else await tx.accountData.import(view.operation, history);
       });
     }
     // Cross-file crash replay is safe: the semantic owner deduplicates before

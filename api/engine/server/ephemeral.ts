@@ -376,6 +376,7 @@ export async function importReceiptOperation(
   operation: ReceiptOperation,
   authenticated: { source: string; incarnation: string; userId: string },
   authorize?: (conn: Conn) => Promise<void>,
+  history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
 ): Promise<void> {
   const mark = receiptOperationMark(operation);
   if (mark.userId !== authenticated.userId) {
@@ -383,7 +384,7 @@ export async function importReceiptOperation(
   }
   const rows = await eventStreamTx(server, async (tx) => {
     await authorize?.(tx);
-    await acceptReceiptOperation(tx, operation, authenticated);
+    await acceptReceiptOperation(tx, operation, authenticated, history);
     return await projectPendingReceipts(tx, mark.roomId);
   });
   for (const row of rows) {

@@ -5,6 +5,10 @@ import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { domainOf } from '#engine/ids.ts';
 import type { Conn } from '#engine/store/db.ts';
+import {
+  type DomainHistoryProof,
+  requireDomainSources,
+} from '#engine/facade/domain-control.ts';
 
 type Source = { source: string; incarnation: string };
 type Dot = Source & { sequence: number };
@@ -172,19 +176,29 @@ export async function acceptReceiptOperation(
   conn: Conn,
   operation: ReceiptOperation,
   authenticated: Source,
+  history?: DomainHistoryProof,
 ): Promise<boolean> {
   const mark = receiptOperationMark(operation), held = await control(conn);
-  const allowed = (dot: Source) =>
-    held?.nodes.some((node) =>
-      node.node === dot.source && node.incarnation === dot.incarnation
-    );
   if (
     !held || domainOf(mark.userId) !== held.server ||
-    !allowed(operation) || !operation.context.every(allowed) ||
     (mark.admission.baseline === true && operation.source !== 'home') ||
     operation.source !== authenticated.source ||
     operation.incarnation !== authenticated.incarnation
   ) throw new Error('receipt source unavailable');
+  try {
+    await requireDomainSources(
+      conn,
+      operation,
+      held.nodes.map((node) => ({
+        source: node.node,
+        incarnation: node.incarnation,
+      })),
+      mark.userId.slice(1, mark.userId.indexOf(':')),
+      history,
+    );
+  } catch {
+    throw new Error('receipt source unavailable');
+  }
   const [prior] = await conn.query(
     'SELECT * FROM domain_operations WHERE operation_id=? OR (source=? AND incarnation=? AND stream=? AND sequence=?)',
     [
