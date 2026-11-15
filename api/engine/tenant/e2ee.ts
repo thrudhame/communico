@@ -240,6 +240,9 @@ export async function keyStatus(
 ): Promise<{ counts: Record<string, number>; unused: string[]; seq: number }> {
   const args = identity(device);
   const counts: Record<string, number> = Object.create(null);
+  // MSC4186 treats an omitted algorithm as unchanged, unlike ordinary sync.
+  // Follow Synapse: an exhausted signed pool must explicitly request refill.
+  counts.signed_curve25519 = 0;
   for (
     const row of await conn.query(
       'SELECT algorithm,COUNT(*) AS n FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=? GROUP BY algorithm',

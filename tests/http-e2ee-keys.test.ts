@@ -22,6 +22,82 @@ async function post(
 }
 const otk = (key: string) => ({ key, signatures: {} });
 
+suite.test('empty key counts and fallback status are explicit on initial and incremental sync in both protocols', async () => {
+  const user = await suite.registerTestUser('empty-key-status', 'pw');
+  let since = '';
+  let pos = '';
+  for (const stage of ['fresh', 'uploaded', 'claimed']) {
+    if (stage === 'uploaded') {
+      await post(user.access_token!, 'upload', {
+        one_time_keys: {
+          'signed_curve25519:once': otk('once'),
+          'curve25519:other': 'other',
+        },
+        fallback_keys: {
+          'signed_curve25519:fallback': { ...otk('fallback'), fallback: true },
+        },
+      });
+    }
+    if (stage === 'claimed') {
+      for (let claim = 0; claim < 2; claim++) {
+        await post(user.access_token!, 'claim', {
+          one_time_keys: {
+            [user.user_id]: { [user.device_id]: 'signed_curve25519' },
+          },
+        });
+      }
+    }
+    const expected = stage === 'uploaded'
+      ? { signed_curve25519: 1, curve25519: 1 }
+      : stage === 'claimed'
+      ? { signed_curve25519: 0, curve25519: 1 }
+      : { signed_curve25519: 0 };
+    assertEquals(
+      (await post(user.access_token!, 'upload', {})).one_time_key_counts,
+      expected,
+    );
+    const response = await suite.matrix(
+      new Request(
+        'http://x/_matrix/client/v3/sync?timeout=0' +
+          (since ? '&since=' + encodeURIComponent(since) : ''),
+        {
+          headers: { Authorization: 'Bearer ' + user.access_token! },
+        },
+      ),
+    );
+    assertEquals(response.status, 200);
+    const sync = await response.json();
+    assertEquals(sync.device_one_time_keys_count, expected);
+    assertEquals(
+      sync.device_unused_fallback_key_types,
+      stage === 'uploaded' ? ['signed_curve25519'] : [],
+    );
+    since = sync.next_batch;
+    const sliding = await suite.matrix(
+      new Request(
+        'http://x/_matrix/client/unstable/org.matrix.simplified_msc3575/sync?timeout=0' +
+          (pos ? '&pos=' + encodeURIComponent(pos) : ''),
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + user.access_token! },
+          body: JSON.stringify({
+            conn_id: 'key-status',
+            extensions: { e2ee: { enabled: true } },
+          }),
+        },
+      ),
+    );
+    assertEquals(sliding.status, 200);
+    const next = await sliding.json();
+    assertEquals(next.extensions.e2ee.device_one_time_keys_count, expected);
+    assertEquals(
+      next.extensions.e2ee.device_unused_fallback_key_types,
+      stage === 'uploaded' ? ['signed_curve25519'] : [],
+    );
+    pos = next.pos;
+  }
+});
+
 suite.test('signed one-time and fallback key envelopes require signature maps before publishing any pool changes', async () => {
   const a = await suite.registerTestUser('key-shapes', 'pw');
   const token = a.access_token!;
@@ -35,7 +111,9 @@ suite.test('signed one-time and fallback key envelopes require signature maps be
         one_time_keys: { 'curve25519:atomic': 'must-not-publish' },
         [field]: { 'signed_curve25519:bad': { key: 'public', signatures } },
       }, 400);
-      assertEquals((await post(token, 'upload', {})).one_time_key_counts, {});
+      assertEquals((await post(token, 'upload', {})).one_time_key_counts, {
+        signed_curve25519: 0,
+      });
     }
   }
   const key = {
@@ -79,7 +157,7 @@ suite.test('response budget failure rolls back every consuming key claim', async
   for (const user of [a, b]) {
     assertEquals(
       (await post(user.access_token!, 'upload', {})).one_time_key_counts,
-      { curve25519: 1 },
+      { signed_curve25519: 0, curve25519: 1 },
     );
   }
 });
@@ -112,7 +190,7 @@ suite.test('string-valued one-time and fallback variants retain exact material a
   }
   assertEquals(
     (await post(user.access_token!, 'upload', {})).one_time_key_counts,
-    {},
+    { signed_curve25519: 0 },
   );
 });
 
@@ -224,7 +302,7 @@ suite.test('overlap/conflict atomicity, FIFO, concurrent consuming claims and fa
   );
   assertEquals(response.status, 200);
   const sync = await response.json();
-  assertEquals(sync.device_one_time_keys_count, {});
+  assertEquals(sync.device_one_time_keys_count, { signed_curve25519: 0 });
   assertEquals(sync.device_unused_fallback_key_types, []);
   await post(token, 'upload', {
     fallback_keys: {

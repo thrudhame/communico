@@ -403,7 +403,9 @@ export function linkHandler(options: {
       reconciling?.(id, [{ ...stream, head }]);
     }
     await journal.receive('home', records);
-    await options.changed?.();
+    // An empty page polls durable results, not a source mutation. Echoing it as
+    // a notice makes every reconciler pass schedule another identical pass.
+    if (records.length) await options.changed?.();
     return response({
       ack: await journal.acknowledgement('home', stream, after, options.limits),
     });
