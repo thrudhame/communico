@@ -69,6 +69,26 @@ export function withRemoteSigningState<T>(
     async () => fn(await db.tx((tx) => signingState(tx, user))),
   );
 }
+/** Pin several learned signing cuts in deterministic mutex order. The callback
+ * runs above storage: no server transaction is held over another file's work. */
+export function withRemoteSigningStates<T>(
+  db: Database,
+  users: string[],
+  fn: (
+    states: ReadonlyMap<string, { revision: number; keys: PublicSigning }>,
+  ) => Promise<T>,
+): Promise<T> {
+  const ordered = [...new Set(users)].sort();
+  const states = new Map<string, { revision: number; keys: PublicSigning }>();
+  const next = (index: number): Promise<T> =>
+    index === ordered.length
+      ? fn(states)
+      : withRemoteSigningState(db, ordered[index], (state) => {
+        states.set(ordered[index], state);
+        return next(index + 1);
+      });
+  return next(0);
+}
 async function writeSigning(
   tx: Conn,
   user: string,

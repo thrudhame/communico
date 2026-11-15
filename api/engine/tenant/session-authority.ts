@@ -11,6 +11,7 @@ import type { ErasureCut } from '#engine/room/state.ts';
 import { authUnavailable } from '#engine/tenant/account-auth.ts';
 import {
   legacySignatures,
+  type RemoteSignatureCuts,
   retainLegacySignatures,
 } from '#engine/tenant/signature-bootstrap.ts';
 
@@ -88,6 +89,7 @@ export async function tenantAuthority(
 export async function activateTenantAuthority(
   conn: Conn,
   identity: AuthorityIdentity,
+  remoteSignatureCuts?: RemoteSignatureCuts,
 ): Promise<void> {
   const held = await tenantAuthority(conn);
   if (held && canonicalJson(held) !== canonicalJson(identity)) {
@@ -95,7 +97,7 @@ export async function activateTenantAuthority(
   }
   if (!held) {
     const signatures = identity.node === 'home'
-      ? await legacySignatures(conn)
+      ? await legacySignatures(conn, remoteSignatureCuts)
       : [];
     await conn.execute('INSERT INTO tenant_authority VALUES(1,?,?,?,?,?)', [
       identity.node,

@@ -4,6 +4,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { domainOf, localpartOf } from '#engine/ids.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Json } from '#engine/tenant/e2ee.ts';
+import type { PublicSigning } from '#engine/e2ee-public-signing.ts';
 import {
   appendSignatureOperation,
   captureEmbeddedSignatures,
@@ -30,9 +31,19 @@ type LegacySignature = {
   signature: string;
 };
 
+export type RemoteSignatureCuts = ReadonlyMap<
+  string,
+  { revision: number; keys: PublicSigning }
+>;
+/** Composition retries with the newly observed subject, outside this file gate. */
+export class RemoteSignatureCutMissing extends Error {}
+
 /** Read BEFORE tenant_authority installation, while the old owner can still
  * prove exact target material and the original local generation/revision. */
-export async function legacySignatures(conn: Conn): Promise<LegacySignature[]> {
+export async function legacySignatures(
+  conn: Conn,
+  remotes: RemoteSignatureCuts = new Map(),
+): Promise<LegacySignature[]> {
   const [tenant] = await conn.query('SELECT server_name FROM tenant');
   const result: LegacySignature[] = [];
   for (
@@ -60,20 +71,15 @@ export async function legacySignatures(conn: Conn): Promise<LegacySignature[]> {
         if (keyMaterial(parsed) === row.target_material) json = parsed;
       }
     } else {
-      // Legacy remote targets retain canonical material + their original cache
-      // revision. Parse that evidence, never read/advance another cache counter.
-      try {
-        const material = JSON.parse(String(row.target_material));
-        if (
-          Array.isArray(material) && material.length === 2 &&
-          typeof material[0] === 'string' && Number.isSafeInteger(material[1])
-        ) {
-          const parsed = JSON.parse(material[0]) as Json;
-          if (
-            remoteTargetMaterial(parsed, material[1]) === row.target_material
-          ) json = parsed;
-        }
-      } catch { /* Unprovable historical material cannot become an overlay. */ }
+      // A stored tuple proves the original admission, not current visibility.
+      // Composition pins this current cache cut above both file transactions.
+      const state = remotes.get(owner);
+      if (!state) throw new RemoteSignatureCutMissing(owner);
+      const target = state.keys.master_key;
+      if (
+        target && Object.hasOwn(target.keys as Json, 'ed25519:' + id) &&
+        remoteTargetMaterial(target, state.revision) === row.target_material
+      ) json = target;
     }
     if (!json) continue;
     const signature = String(row.signature);
