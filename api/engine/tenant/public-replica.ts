@@ -8,7 +8,11 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import { signingViews } from './cross-signing.ts';
 import { deviceSnapshot, type Json, object } from './e2ee.ts';
-import { profileRow, setProfileRow } from './profiles.ts';
+import {
+  materializeProfile,
+  profileOperations,
+  profileRow,
+} from './profiles.ts';
 
 export type PublicUserReplica = {
   version: 1;
@@ -199,7 +203,7 @@ export async function installPublicUser(
   );
   if (user?.deactivated !== 1) {
     await conn.execute(
-      'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET display_name=NULL,avatar_url=NULL,deactivated=excluded.deactivated',
+      'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET deactivated=excluded.deactivated',
       [localpart, view.deactivated ? 1 : 0],
     );
   }
@@ -210,13 +214,14 @@ export async function installPublicUser(
   // Retain and acknowledge the authenticated source record while refusing its
   // obsolete materialization. In particular, never delete a local erasure cut.
   if (user?.deactivated === 1) return;
-  await conn.execute('DELETE FROM profile_fields WHERE localpart=?', [
-    localpart,
-  ]);
-  if (!view.deactivated) {
-    for (const [key, value] of Object.entries(view.profile)) {
-      await setProfileRow(conn, localpart, key, value);
-    }
+  // An F1 public snapshot is still evidence, not authority to overwrite an F2
+  // complete-profile register or generate a local semantic export echo.
+  if (view.deactivated || !(await profileOperations(conn, localpart)).length) {
+    await materializeProfile(
+      conn,
+      localpart,
+      view.deactivated ? {} : view.profile,
+    );
   }
   await conn.execute('DELETE FROM erased_users WHERE localpart=?', [localpart]);
   if (view.erased !== null) {

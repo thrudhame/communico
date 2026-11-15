@@ -157,6 +157,51 @@ Deno.test('facade account data: pre-F2 home values are retained before mutation;
   }
 });
 
+Deno.test('facade account data: sparse future facts do not hide a complete held cut while waiting for closure', async () => {
+  const f = await fixture();
+  try {
+    const type = 'm.secret_storage.key';
+    await putAccountData(f.home, 'alice', '', type, { ciphertext: 'A' });
+    const a = (await f.home.tx((tx) => tx.accountData.operations('alice')))[0];
+    await f.edge.tx((tx) => tx.accountData.import(a));
+    await putAccountData(f.edge, 'alice', '', type, { ciphertext: 'B' });
+    const b = (await f.edge.tx((tx) => tx.accountData.operations('alice')))
+      .find((op) => op.source === 'edge')!;
+    await putAccountData(f.edge, 'alice', '', type, { ciphertext: 'C' });
+    const full = (await f.edge.tx((tx) => tx.accountData.operations('alice')))
+      .find((op) => op.source === 'edge' && op.sequence === 2)!;
+    const c = {
+      ...full,
+      context: [{
+        source: b.source,
+        incarnation: b.incarnation,
+        sequence: b.sequence,
+      }],
+    };
+    const target = await openTenant(f.store, 'sparse.test', { create: true });
+    await registerUser(target, { localpart: 'alice', password: 'pw' });
+    await (await f.store.tenant(target.serverName)).tx((conn) =>
+      activateTenantAuthority(conn, {
+        node: 'edge',
+        incarnation: 'edge-store',
+        homeIncarnation: 'home-store',
+        edgeNode: 'edge',
+        edgeIncarnation: 'edge-store',
+      })
+    );
+    for (
+      const [op, expected] of [[c, null], [a, { ciphertext: 'A' }], [b, {
+        ciphertext: 'C',
+      }]] as const
+    ) {
+      await target.tx((tx) => tx.accountData.import(op));
+      assertEquals(await getAccountData(target, 'alice', '', type), expected);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('facade account data: an incoming operation cannot erase an uncaptured home baseline', async () => {
   const f = await fixture(true);
   try {
@@ -174,6 +219,66 @@ Deno.test('facade account data: an incoming operation cannot erase an uncaptured
       (await f.home.tx((tx) => tx.accountData.operations('alice'))).length,
       2,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade tags: sparse cross-tag causality retains the complete reset ancestry for each tag winner', async () => {
+  const f = await fixture();
+  try {
+    const room = '!sparse:logical.test';
+    await putAccountData(f.home, 'alice', room, 'm.tag', {
+      tags: { original: {} },
+    });
+    const h1 = (await f.home.tx((tx) => tx.accountData.operations('alice')))[0];
+    await f.edge.tx((tx) => tx.accountData.import(h1));
+    await updateRoomTag(f.edge, 'alice', room, 'b', {});
+    const e1 = (await f.edge.tx((tx) => tx.accountData.operations('alice')))
+      .find((op) => op.source === 'edge')!;
+    await updateRoomTag(f.edge, 'alice', room, 'a', {});
+    const full = (await f.edge.tx((tx) => tx.accountData.operations('alice')))
+      .find((op) => op.source === 'edge' && op.sequence === 2)!;
+    const e2 = {
+      ...full,
+      context: [{
+        source: e1.source,
+        incarnation: e1.incarnation,
+        sequence: e1.sequence,
+      }],
+    };
+    await f.home.tx((tx) => tx.accountData.import(e1));
+    await f.home.tx((tx) => tx.accountData.import(e2));
+    assertEquals(await getAccountData(f.home, 'alice', room, 'm.tag'), {
+      tags: { original: {}, b: {}, a: {} },
+    });
+    const orders = [[h1, e1, e2], [h1, e2, e1], [e1, h1, e2], [e1, e2, h1], [
+      e2,
+      h1,
+      e1,
+    ], [e2, e1, h1]];
+    for (const [n, order] of orders.entries()) {
+      const target = await openTenant(f.store, 'sparse-tag' + n + '.test', {
+        create: true,
+      });
+      await registerUser(target, { localpart: 'alice', password: 'pw' });
+      await (await f.store.tenant(target.serverName)).tx((conn) =>
+        activateTenantAuthority(conn, {
+          node: 'edge',
+          incarnation: 'edge-store',
+          homeIncarnation: 'home-store',
+          edgeNode: 'edge',
+          edgeIncarnation: 'edge-store',
+        })
+      );
+      for (const operation of order) {
+        await target.tx((tx) => tx.accountData.import(operation));
+        await target.tx((tx) => tx.accountData.import(operation));
+      }
+      assertEquals(await getAccountData(target, 'alice', room, 'm.tag'), {
+        tags: { original: {}, b: {}, a: {} },
+      });
+    }
   } finally {
     await f.close();
   }

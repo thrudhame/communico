@@ -169,10 +169,24 @@ function join(vector: Map<string, RegisterDot>, dot: RegisterDot): void {
   }
 }
 
-function maxima(rows: RegisterOperation[]): RegisterOperation[] {
+function maxima(
+  rows: RegisterOperation[],
+  history: RegisterOperation[] = rows,
+): RegisterOperation[] {
   const observed = new Map<string, RegisterDot>();
+  const retained = new Map(history.map((row) => [row.operationId, row]));
+  const visited = new Set<string>();
   for (const row of rows) {
-    for (const dot of row.context) join(observed, dot);
+    const pending = [...row.context];
+    while (pending.length) {
+      const dot = pending.pop()!;
+      join(observed, dot);
+      const id = identity(dot, row.stream);
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const predecessor = retained.get(id);
+      if (predecessor) pending.push(...predecessor.context);
+    }
   }
   return rows.filter((row) =>
     row.sequence > (observed.get(domain(row))?.sequence ?? 0)
@@ -183,8 +197,9 @@ function maxima(rows: RegisterOperation[]): RegisterOperation[] {
  * operations affecting one tag). The same ordering and dominance still apply. */
 export function registerWinner(
   rows: RegisterOperation[],
+  history: RegisterOperation[] = rows,
 ): RegisterOperation | null {
-  return maxima([...rows].sort(compare)).at(-1) ?? null;
+  return maxima([...rows].sort(compare), history).at(-1) ?? null;
 }
 
 /** Context entries name predecessor dots in this semantic key's counter domain.
@@ -227,7 +242,9 @@ export async function readRegister(
 /** Import has no local authorship or export echo. Missing predecessor closure is
  * durably pending, not a winner. A later predecessor can release successors in
  * this same owning transaction; materialize the returned winner, not raw input.
- * Sparse contexts resolve transitively, so every delivery permutation converges. */
+ * Sparse contexts resolve transitively, so every delivery permutation converges.
+ * Complete held operations remain publishable while other facts are pending;
+ * receiving a future fact does not make its unavailable ancestors known. */
 export async function importRegisterOperation(
   conn: Conn,
   raw: RegisterOperation,
@@ -333,11 +350,15 @@ export async function writeRegister(
   const ready = new Set(rows.map((row) => row.operationId));
   if (
     all.some((row) =>
-      domain(row) === domain(source) && !ready.has(row.operationId)
+      (domain(row) === domain(source) && !ready.has(row.operationId)) ||
+      row.context.some((dot) =>
+        domain(dot) === domain(source) && !ready.has(identity(dot, row.stream))
+      )
     )
   ) {
     // A restored writer cannot skip its own previously authored causal cut.
-    // Foreign pending operations may remain concurrent; its own cannot.
+    // Foreign pending operations may remain concurrent unless they expose a
+    // missing dot authored by this writer. Referenced absence is not recovery.
     throw new Error('local register predecessor unavailable');
   }
   const vector = new Map<string, RegisterDot>();

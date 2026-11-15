@@ -183,7 +183,7 @@ async function projection(
   const rows = [...view.conflicts, view.winner];
   const decoded = new Map(rows.map((row) => [row, tagOperation(row)]));
   const resets = rows.filter((row) => decoded.get(row)!.action === 'reset');
-  const reset = registerWinner(resets);
+  const reset = registerWinner(resets, rows);
   const base = reset
     ? (decoded.get(reset)! as { action: 'reset'; content: unknown }).content
     : {};
@@ -199,10 +199,13 @@ async function projection(
   }
   const values = new Map<string, unknown>();
   for (const name of names) {
-    const winner = registerWinner(rows.filter((row) => {
-      const value = decoded.get(row)!;
-      return value.action === 'reset' || value.tag === name;
-    }))!;
+    const winner = registerWinner(
+      rows.filter((row) => {
+        const value = decoded.get(row)!;
+        return value.action === 'reset' || value.tag === name;
+      }),
+      rows,
+    )!;
     const value = decoded.get(winner)!;
     if (value.action === 'tag') {
       if (!value.removed) values.set(name, value.value);

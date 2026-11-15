@@ -381,6 +381,13 @@ function bind(
     },
     profiles: {
       get: (localpart: string) => profiles.profileRow(conn, localpart),
+      operations: (localpart: string) =>
+        profiles.profileOperations(conn, localpart),
+      import: async (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+      ) => {
+        if (await profiles.importProfile(conn, operation)) projectionChanged();
+      },
       set: (localpart: string, key: string, value: unknown) =>
         mutation(profiles.setProfileRow(conn, localpart, key, value)),
       clear: (localpart: string) =>

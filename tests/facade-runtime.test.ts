@@ -834,20 +834,26 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     refresh_token: true,
   });
   const authTail = async (localparts: string[]) => {
-    // FacadeIngress checks ready/pending AND received=applied (including their
-    // digests) before password verification. Wrong-password M_FORBIDDEN is a
-    // read-only consumer proof of that account's applied tail, not merely scope
-    // readiness. Never open a second store while the child owns its lock.
-    for (const localpart of localparts) {
-      await until(async () => {
-        const response = await api('facade', 'login', {
-          ...login('tail-probe', 'not-the-password'),
-          identifier: { type: 'm.id.user', user: localpart },
-        });
-        return response.status === 403 &&
-          response.body.errcode === 'M_FORBIDDEN';
+    // Permissive auth may use a complete older cut. Observe the journal through
+    // its owning process instead; home is stopped so its received tail is finite.
+    // Never open a second store while the child owns its lock.
+    await until(async () => {
+      const status =
+        (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
+          .body.result;
+      return localparts.every((localpart) => {
+        const scope = 'auth:@' + localpart + ':logical.test';
+        const held = status.scopes.find((row: { scope: string }) =>
+          row.scope === scope
+        );
+        const stream = status.streams.find((row: { stream: string }) =>
+          row.stream === scope
+        );
+        return held?.ready && held.pending === null && stream &&
+          stream.received.sequence === stream.applied.sequence &&
+          stream.received.hash === stream.applied.hash;
       });
-    }
+    });
   };
   try {
     edge = await process(file('facade'), 'facade: link/local admin ready');

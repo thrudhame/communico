@@ -3,6 +3,15 @@
 import type { Conn } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  importRegisterOperation,
+  readRegister,
+  registerJson,
+  type RegisterOperation,
+  registerOperations,
+  writeRegister,
+} from '#engine/facade/registers.ts';
+import { tenantAuthority } from './session-authority.ts';
 
 export type Profile = Record<string, unknown> & {
   displayname?: string;
@@ -11,6 +20,157 @@ export type Profile = Record<string, unknown> & {
 const KEY =
   /^(avatar_url|displayname|m\.tz|[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+)$/;
 const encoder = new TextEncoder();
+
+function semanticKey(localpart: string): string {
+  return JSON.stringify(['profile', localpart]);
+}
+
+function validateProfile(profile: unknown): asserts profile is Profile {
+  if (
+    profile === null || typeof profile !== 'object' || Array.isArray(profile)
+  ) {
+    throw new MatrixError(400, 'M_BAD_JSON', 'profile must be an object');
+  }
+  for (const [key, value] of Object.entries(profile)) {
+    checkProfileKey(key);
+    if (
+      ['displayname', 'avatar_url', 'm.tz'].includes(key) &&
+      typeof value !== 'string'
+    ) {
+      throw new MatrixError(
+        400,
+        'M_INVALID_PARAM',
+        'invalid profile field type',
+      );
+    }
+  }
+  if (encoder.encode(JSON.stringify(profile)).length >= 65536) {
+    throw new MatrixError(
+      400,
+      'M_PROFILE_TOO_LARGE',
+      'profile must be under 64 KiB',
+    );
+  }
+}
+
+async function activeAccount(conn: Conn, localpart: string): Promise<void> {
+  const [row] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!row) throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
+  if (row.deactivated === 1) {
+    throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account is deactivated');
+  }
+}
+
+export function profileOperations(conn: Conn, localpart: string) {
+  return registerOperations(conn, semanticKey(localpart));
+}
+
+async function baseline(
+  conn: Conn,
+  localpart: string,
+  held: Profile,
+): Promise<void> {
+  if ((await profileOperations(conn, localpart)).length) return;
+  const authority = (await tenantAuthority(conn))!;
+  if (authority.node !== 'home') {
+    throw new MatrixError(503, 'M_UNAVAILABLE', 'profile baseline unavailable');
+  }
+  validateProfile(held);
+  await writeRegister(
+    conn,
+    { source: authority.node, incarnation: authority.incarnation },
+    semanticKey(localpart),
+    'profile',
+    JSON.stringify(held),
+  );
+}
+
+/** Complete validated public value; F1 snapshot installation uses this passive
+ * materializer, never a locally authored field mutation. */
+export async function materializeProfile(
+  conn: Conn,
+  localpart: string,
+  profile: Profile,
+): Promise<void> {
+  validateProfile(profile);
+  await conn.execute(
+    'UPDATE users SET display_name=?,avatar_url=? WHERE localpart=?',
+    [
+      profile.displayname ?? null,
+      profile.avatar_url ?? null,
+      localpart,
+    ],
+  );
+  await conn.execute('DELETE FROM profile_fields WHERE localpart=?', [
+    localpart,
+  ]);
+  for (const [key, value] of Object.entries(profile)) {
+    if (key === 'displayname' || key === 'avatar_url') continue;
+    await conn.execute(
+      'INSERT INTO profile_fields(localpart,key,value) VALUES(?,?,?)',
+      [
+        localpart,
+        key,
+        JSON.stringify(value),
+      ],
+    );
+  }
+}
+
+export async function importProfile(
+  conn: Conn,
+  operation: RegisterOperation,
+): Promise<boolean> {
+  let address: unknown, profile: unknown;
+  try {
+    address = JSON.parse(operation.semanticKey);
+    profile = JSON.parse(operation.payload);
+  } catch {
+    throw new Error('invalid profile operation');
+  }
+  if (
+    !Array.isArray(address) || address.length !== 2 ||
+    address[0] !== 'profile' ||
+    typeof address[1] !== 'string' || !address[1] ||
+    operation.semanticKey !== semanticKey(address[1]) ||
+    operation.kind !== 'profile'
+  ) {
+    throw new Error('invalid profile operation');
+  }
+  validateProfile(profile);
+  const localpart = address[1], authority = await tenantAuthority(conn);
+  const allowed = (dot: { source: string; incarnation: string }) =>
+    authority &&
+    ((dot.source === 'home' && dot.incarnation === authority.homeIncarnation) ||
+      (dot.source === authority.edgeNode &&
+        dot.incarnation === authority.edgeIncarnation));
+  if (
+    !allowed(operation) || !Array.isArray(operation.context) ||
+    !operation.context.every(allowed)
+  ) {
+    throw new Error('profile source unavailable');
+  }
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!user) throw new Error('profile account unavailable');
+  const held = (await profileRow(conn, localpart))!;
+  if (user.deactivated !== 1 && authority!.node === 'home') {
+    await baseline(conn, localpart, held);
+  }
+  await importRegisterOperation(conn, operation);
+  if (user.deactivated === 1) return false;
+  const winner = (await readRegister(conn, operation.semanticKey)).winner;
+  if (!winner || registerJson(JSON.stringify(held)) === winner.payload) {
+    return false;
+  }
+  await materializeProfile(conn, localpart, JSON.parse(winner.payload));
+  return true;
+}
 
 export function checkProfileKey(key: string): void {
   if (encoder.encode(key).length > 255) {
@@ -83,6 +243,7 @@ export async function setProfileRow(
   if (profile === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
   }
+  const previous = { ...profile };
   if (value === undefined || (legacy && value === null)) delete profile[key];
   else profile[key] = value;
   if (encoder.encode(JSON.stringify(profile)).length >= 65536) {
@@ -91,6 +252,22 @@ export async function setProfileRow(
       'M_PROFILE_TOO_LARGE',
       'profile must be under 64 KiB',
     );
+  }
+  const authority = await tenantAuthority(conn);
+  if (authority) {
+    await activeAccount(conn, localpart);
+    await baseline(conn, localpart, previous);
+    const { winner } = await writeRegister(
+      conn,
+      { source: authority.node, incarnation: authority.incarnation },
+      semanticKey(localpart),
+      'profile',
+      JSON.stringify(profile),
+    );
+    if (winner) {
+      await materializeProfile(conn, localpart, JSON.parse(winner.payload));
+    }
+    return;
   }
   if (legacy) {
     const column = key === 'displayname' ? 'display_name' : 'avatar_url';

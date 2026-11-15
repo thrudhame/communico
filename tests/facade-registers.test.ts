@@ -193,12 +193,18 @@ Deno.test('registers: missing causal predecessors stay pending through cold reop
     for (const [n, order] of permutations([first, second, third]).entries()) {
       const target = await f.db('dependency-target' + n + '.test');
       for (const operation of order) {
-        await target.tx((c) => importRegisterOperation(c, operation));
+        const result = await target.tx((c) =>
+          importRegisterOperation(c, operation)
+        );
         const view = await target.tx((c) => readRegister(c, key));
+        assertEquals(result.winner, view.winner);
         const received = order.slice(0, order.indexOf(operation) + 1);
         const complete = received.includes(first) && received.includes(second);
         if (view.winner?.source === 'third') assertEquals(complete, true);
         if (!received.includes(first)) assertEquals(view.winner, null);
+        if (received.includes(first) && !received.includes(second)) {
+          assertEquals(view.winner, first);
+        }
       }
       assertEquals(
         (await target.tx((c) => readRegister(c, key))).frontier.map((r) =>
@@ -282,6 +288,43 @@ Deno.test('registers: operation identity, immutable content and causal domains r
       target.tx((c) => importRegisterOperation(c, substitute.operation))
     );
     assertEquals(await target.tx((c) => readRegister(c, key)), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('registers: foreign pending references fence a restored writer before its missing dot can be reused', async () => {
+  const f = await fixture();
+  try {
+    const a = await f.db('writer-home.test'),
+      b = await f.db('writer-edge.test');
+    const h1 = (await a.tx((c) =>
+      writeRegister(c, home, key, 'account-data', '"H1"')
+    )).operation;
+    await b.tx((c) => importRegisterOperation(c, h1));
+    const e1 = (await b.tx((c) =>
+      writeRegister(c, edge, key, 'account-data', '"E1"')
+    )).operation;
+    const restored = await f.db('writer-restored.test');
+    await restored.tx((c) => importRegisterOperation(c, e1));
+    await assertRejects(
+      () =>
+        restored.tx((c) =>
+          writeRegister(c, home, key, 'account-data', '"reused-H1"')
+        ),
+      Error,
+      'local register predecessor unavailable',
+    );
+    await restored.tx((c) => importRegisterOperation(c, h1));
+    const next = await restored.tx((c) =>
+      writeRegister(c, home, key, 'account-data', '"H2"')
+    );
+    assertEquals(next.operation.sequence, 2);
+    assertEquals(
+      next.operation.context.find((dot) => dot.source === home.source)
+        ?.sequence,
+      1,
+    );
   } finally {
     await f.close();
   }
