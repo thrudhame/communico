@@ -350,6 +350,16 @@ Deno.test('strict facade ingress requires live authenticated link and its full c
       MatrixError,
       'authentication snapshot unavailable',
     );
+    const replacement = new AbortController();
+    guarded.health.connected(f.bundle.id, replacement.signal);
+    await assertRejects(
+      () => verifyUserPassword(guarded.tenant, 'alice', 'pw'),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    guarded.health.observe(f.bundle.id, declaration(second));
+    assertEquals(await verifyUserPassword(guarded.tenant, 'alice', 'pw'), true);
+    replacement.abort();
   } finally {
     await f.close();
   }
@@ -424,6 +434,44 @@ Deno.test('permissive auth retains the prior complete snapshot while a successor
     );
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('auth health binds asynchronous reconciliation evidence to its original live connection generation', () => {
+  for (const notify of ['websocket', 'sse']) {
+    const health = new AuthLinkHealth({ notify, pollseconds: 2 });
+    const first = new AbortController(), second = new AbortController();
+    const scope = 'auth:@a:logical.test';
+    const head = { sequence: 1, hash: 'a'.repeat(64) };
+    const declaration = [{
+      source: 'home',
+      incarnation: 'pair',
+      stream: scope,
+      head,
+    }];
+    const beforeAnyConnection = health.reconciliation();
+    health.connected('pair', first.signal);
+    beforeAnyConnection('pair', declaration);
+    assertEquals(health.ready('pair', scope, head), false);
+    health.observe('pair', declaration);
+    assertEquals(health.ready('pair', scope, head), true);
+    const delayed = health.reconciliation();
+    first.abort();
+    health.connected('pair', second.signal);
+    delayed('pair', declaration);
+    assertEquals(health.ready('pair', scope, head), false);
+    // A delayed older-generation page still raises the monotone required head.
+    const next = { sequence: 2, hash: 'b'.repeat(64) };
+    delayed('pair', [{ ...declaration[0], head: next }]);
+    health.observe('pair', declaration);
+    assertEquals(health.ready('pair', scope, next), false);
+    health.observe('pair', [{ ...declaration[0], head: next }]);
+    assertEquals(health.ready('pair', scope, next), true);
+    // Duplicate connection notification cannot erase or reset this generation.
+    health.connected('pair', second.signal);
+    assertEquals(health.ready('pair', scope, next), true);
+    second.abort();
+    assertEquals(health.ready('pair', scope, next), false);
   }
 });
 

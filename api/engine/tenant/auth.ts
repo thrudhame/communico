@@ -9,10 +9,12 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Tenant, TenantTx } from '#engine/tenant/index.ts';
 import { deviceById } from '#engine/tenant/devices.ts';
 import {
+  recordOtherSessionRevocations,
   recordRefreshReplacement,
   recordRevocation,
   recordSession,
 } from '#engine/tenant/session-authority.ts';
+import { deletePushersForToken } from '#engine/tenant/pushers.ts';
 
 // The informational access-token lifetime advertised at refresh (band C
 // D8: expires_in_ms is advertised, never enforced — spec: optional).
@@ -120,6 +122,26 @@ export async function deleteAccessToken(
 ): Promise<void> {
   await recordRevocation(conn, hash);
   await conn.execute('DELETE FROM access_tokens WHERE token = ?', [hash]);
+}
+
+export async function deleteOtherTokens(
+  conn: Conn,
+  localpart: string,
+  keepHash: string | null,
+): Promise<string | null> {
+  const keep = keepHash === null
+    ? null
+    : await accessTokenByHash(conn, keepHash);
+  if (!keep || keep.localpart !== localpart) keepHash = null;
+  const keepDevice = keepHash === null ? null : keep!.device_id;
+  await recordOtherSessionRevocations(conn, localpart, keepHash, keepDevice);
+  for (const token of await accessTokensOfUser(conn, localpart)) {
+    if (token.token === keepHash) continue;
+    await deletePushersForToken(conn, token.token);
+    await deleteRefreshForAccessToken(conn, token.token);
+    await deleteAccessToken(conn, token.token);
+  }
+  return keepDevice;
 }
 
 export async function deleteAccessTokensOfUser(

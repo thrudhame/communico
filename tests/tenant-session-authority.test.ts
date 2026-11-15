@@ -1,7 +1,11 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
-import { loginUser, registerUser } from '#engine/tenant/users.ts';
+import {
+  changePassword,
+  loginUser,
+  registerUser,
+} from '#engine/tenant/users.ts';
 import {
   consumeRefreshToken,
   hashToken,
@@ -107,6 +111,71 @@ Deno.test('session authority: first ingress owns supplied IDs and foreign recove
     assertEquals(
       (await lookupToken(f.home.tenant, session.accessToken))?.device_id,
       'supplied-byte-for-byte',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('password logout revokes imported sessions and devices but preserves the caller refresh window', async () => {
+  const f = await fixture();
+  try {
+    const caller = await f.home.login('caller');
+    const other = await f.home.login('other-home');
+    const foreign = await f.edge.login('foreign');
+    const foreignView = await f.edge.capture();
+    await f.home.install(foreignView);
+    await changePassword(f.home.tenant, 'alice', 'new-pw', {
+      keepToken: caller.accessToken,
+      logoutDevices: true,
+    });
+    await f.edge.install(await f.home.capture());
+    for (
+      const [node, session] of [[f.home, other], [f.edge, foreign]] as const
+    ) {
+      await assertRejects(
+        () => lookupToken(node.tenant, session.accessToken),
+        MatrixError,
+        'session authority revoked',
+      );
+      await assertRejects(
+        () => consumeRefreshToken(node.tenant, session.refreshToken!),
+        MatrixError,
+        'session authority revoked',
+      );
+    }
+    assertEquals(
+      await f.edge.tenant.tx((tx) => tx.devices.ofUser('alice')),
+      [],
+    );
+    await f.edge.install(foreignView);
+    await assertRejects(
+      () => lookupToken(f.edge.tenant, foreign.accessToken),
+      MatrixError,
+      'session authority revoked',
+    );
+    assertEquals(
+      (await lookupToken(f.home.tenant, caller.accessToken))?.device_id,
+      'caller',
+    );
+    const next = await consumeRefreshToken(f.home.tenant, caller.refreshToken!);
+    // Changing the password does not destroy the pending issuer retry window.
+    await changePassword(f.home.tenant, 'alice', 'newer-pw', {
+      keepToken: next.accessToken,
+      logoutDevices: true,
+    });
+    const retry = await consumeRefreshToken(
+      f.home.tenant,
+      caller.refreshToken!,
+    );
+    assertEquals(
+      (await lookupToken(f.home.tenant, retry.accessToken))?.device_id,
+      'caller',
+    );
+    const after = await consumeRefreshToken(f.home.tenant, retry.refreshToken);
+    assertEquals(
+      (await lookupToken(f.home.tenant, after.accessToken))?.device_id,
+      'caller',
     );
   } finally {
     await f.close();

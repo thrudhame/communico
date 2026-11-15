@@ -16,6 +16,13 @@ import { loginUser, verifyUserPassword } from '#engine/tenant/users.ts';
 import { lookupToken } from '#engine/tenant/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { membershipOf } from '#engine/room/membership.ts';
+import { loadNode } from '#engine/facade/identity.ts';
+import { redact } from '#engine/eventid.ts';
+import {
+  b64decode,
+  importPublicKeyFromRaw,
+  verifyJson,
+} from '#engine/signing-primitives.js';
 
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   setConfigForTests({ server: { name: 'logical.test' } });
@@ -865,6 +872,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     assertEquals(departure.status, 200);
     const departureRoom = await api('home', 'createRoom', {
       preset: 'public_chat',
+      room_version: '11',
     }, departure.body.access_token);
     assertEquals(departureRoom.status, 200);
     assertEquals(
@@ -1290,6 +1298,34 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
         Object.keys(pdu.signatures['logical.test']).some((id) =>
           id.startsWith('ed25519:edge_a_')
         ),
+      );
+      const identity = await loadNode(
+        await closed.server(),
+        'logical.test',
+        'edge_a',
+      );
+      const signed = redact(pdu, '11');
+      delete signed.event_id;
+      assert(
+        await verifyJson(
+          signed,
+          'logical.test',
+          identity.keyId,
+          await importPublicKeyFromRaw(b64decode(identity.publicKey)),
+        ),
+      );
+      const forged = {
+        ...signed,
+        signatures: { 'logical.test': { [identity.keyId]: 'A'.repeat(86) } },
+      };
+      assertEquals(
+        await verifyJson(
+          forged,
+          'logical.test',
+          identity.keyId,
+          await importPublicKeyFromRaw(b64decode(identity.publicKey)),
+        ),
+        false,
       );
       assertEquals(await room.tx((tx) => tx.segments.openStay()), null);
     } finally {

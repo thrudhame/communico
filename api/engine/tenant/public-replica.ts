@@ -213,8 +213,10 @@ export async function installPublicUser(
   await conn.execute('DELETE FROM profile_fields WHERE localpart=?', [
     localpart,
   ]);
-  for (const [key, value] of Object.entries(view.profile)) {
-    await setProfileRow(conn, localpart, key, value);
+  if (!view.deactivated) {
+    for (const [key, value] of Object.entries(view.profile)) {
+      await setProfileRow(conn, localpart, key, value);
+    }
   }
   await conn.execute('DELETE FROM erased_users WHERE localpart=?', [localpart]);
   if (view.erased !== null) {

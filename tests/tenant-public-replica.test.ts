@@ -159,6 +159,47 @@ Deno.test('a later public replica cannot resurrect local deactivation, erasure o
   }
 });
 
+Deno.test('incoming deactivated public snapshots clear profile material for absent and active accounts while retaining source evidence', async () => {
+  for (const existing of [false, true]) {
+    const f = await fixture();
+    try {
+      const active = await f.export();
+      if (existing) await f.install(active);
+      const erased = {
+        '!room:logical.test': { changePos: 4, segment: 1, group: 2 },
+      };
+      const terminal = {
+        ...active,
+        cut: active.cut + 1,
+        deactivated: true,
+        erased,
+      };
+      await f.install(terminal);
+      await f.install(terminal);
+      await f.reopen();
+      assertEquals(await f.edge().tx((tx) => tx.profiles.get('alice')), {});
+      assertEquals(
+        (await (await f.db()).query(
+          'SELECT snapshot_json FROM public_user_replicas',
+        ))[0].snapshot_json,
+        canonicalJson(terminal),
+      );
+      assertEquals(
+        await (await f.db()).query('SELECT room_cuts FROM erased_users'),
+        [{ room_cuts: canonicalJson(erased) }],
+      );
+      await f.install({ ...active, cut: terminal.cut + 1 });
+      assertEquals(await f.edge().tx((tx) => tx.profiles.get('alice')), {});
+      assertEquals(
+        await (await f.db()).query('SELECT room_cuts FROM erased_users'),
+        [{ room_cuts: canonicalJson(erased) }],
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
+
 Deno.test('public user replica preserves coherent ordinary profile/device/signing reads without credentials, pools or private signing', async () => {
   const f = await fixture();
   try {
