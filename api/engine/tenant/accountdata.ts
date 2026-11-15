@@ -278,6 +278,28 @@ export async function accountDataOperations(
   return result;
 }
 
+/** Explicit F1 -> F2 capture at the existing value owner. Reads and immutable
+ * baseline intents share one tenant cut; bootstrap never restamps account news. */
+export async function captureAccountDataOperations(
+  conn: Conn,
+  localpart: string,
+): Promise<RegisterOperation[]> {
+  const authority = await tenantAuthority(conn);
+  if (authority?.node !== 'home') {
+    throw new Error('account-data bootstrap requires home authority');
+  }
+  await activeAccount(conn, localpart);
+  for (
+    const row of await conn.query(
+      'SELECT room_id,type FROM account_data WHERE localpart=? ORDER BY room_id,type',
+      [localpart],
+    )
+  ) {
+    await baseline(conn, localpart, String(row.room_id), String(row.type));
+  }
+  return await accountDataOperations(conn, localpart);
+}
+
 export async function importAccountData(
   conn: Conn,
   operation: RegisterOperation,

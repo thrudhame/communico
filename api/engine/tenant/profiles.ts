@@ -69,6 +69,17 @@ export function profileOperations(conn: Conn, localpart: string) {
   return registerOperations(conn, semanticKey(localpart));
 }
 
+/** Capture the whole validated held profile without inventing a field write or
+ * member PDU. The same baseline remains immutable across later source exports. */
+export async function captureProfileOperations(conn: Conn, localpart: string) {
+  if ((await tenantAuthority(conn))?.node !== 'home') {
+    throw new Error('profile bootstrap requires home authority');
+  }
+  await activeAccount(conn, localpart);
+  await baseline(conn, localpart, (await profileRow(conn, localpart))!);
+  return await profileOperations(conn, localpart);
+}
+
 async function baseline(
   conn: Conn,
   localpart: string,

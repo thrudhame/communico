@@ -344,6 +344,21 @@ export function pushRuleOperations(conn: Conn, localpart: string) {
   return registerOperations(conn, semanticKey(localpart));
 }
 
+/** The initial semantic value includes the complete effective default catalog
+ * and ordering, not merely the operator-overridden SQL rows. */
+export async function capturePushRuleOperations(
+  conn: Conn,
+  localpart: string,
+  server: string,
+) {
+  if ((await tenantAuthority(conn))?.node !== 'home') {
+    throw new Error('push-rules bootstrap requires home authority');
+  }
+  await activeAccount(conn, localpart);
+  await baseline(conn, localpart, server);
+  return await pushRuleOperations(conn, localpart);
+}
+
 async function baseline(
   conn: Conn,
   localpart: string,
