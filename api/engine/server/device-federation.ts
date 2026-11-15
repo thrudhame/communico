@@ -7,6 +7,7 @@ function wirePayload(raw: string): Record<string, unknown> {
   const payload = JSON.parse(raw);
   delete payload.generation;
   delete payload.kind;
+  delete payload.operation;
   return payload;
 }
 

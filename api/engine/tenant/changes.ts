@@ -6,6 +6,8 @@ import { signatureView } from '#engine/tenant/signature-view.ts';
 import { config } from '#engine/config.ts';
 import { bounded } from '#engine/tenant/e2ee.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
+import { deviceChangeOperation } from '#engine/tenant/device-source.ts';
+import type { Json } from '#engine/tenant/e2ee.ts';
 
 /** Private restore candidate only; immutable reset intents project before serving. */
 export async function rebaseRestoredDeviceStreams(
@@ -92,6 +94,17 @@ export async function appendDeviceChange(
       );
     }
   }
+  const operation = await deviceChangeOperation(
+    conn,
+    device,
+    pos,
+    deleted ? null : {
+      displayName: rows[0].display_name === null
+        ? null
+        : String(rows[0].display_name),
+      keys: (payload.keys as Json | undefined) ?? null,
+    },
+  );
   const [tenant] = await conn.query('SELECT server_name FROM tenant');
   const server = String(tenant.server_name);
   const { generation: _generation, ...wire } = payload;
@@ -117,7 +130,7 @@ export async function appendDeviceChange(
     device.deviceId,
     device.generation,
     Number(stream[0].value),
-    canonicalJson(payload),
+    canonicalJson(operation ? { ...payload, operation } : payload),
   ]);
 }
 
