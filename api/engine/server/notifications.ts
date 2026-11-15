@@ -2,6 +2,11 @@
 // connection, committing with live publication or the receipt that caused them.
 import type { Conn, Database } from '#engine/store/db.ts';
 import type { PushPublication } from '#engine/server/push-project.ts';
+import {
+  graphNotificationRead,
+  graphReceiptsEnabled,
+  rememberGraphRead,
+} from '#engine/server/receipt-frontier.ts';
 import { enqueuePush, queueBadge, removePushWork } from './push-queue.ts';
 import {
   pruneNotificationHistory,
@@ -34,6 +39,7 @@ export async function removeNotificationFacts(
       'notification_receipt_refs',
       'notification_changes',
       'notification_own_events',
+      'notification_graph_reads',
       'notification_history',
     ]
   ) {
@@ -94,11 +100,12 @@ export async function advanceNotificationRead(
     [event],
   );
   const target = rows[0];
+  const graph = await graphReceiptsEnabled(tx);
   const pending = target === undefined ||
     (target.room === room && target.standing === 'accepted' &&
       target.grounding !== 'grounded');
   const invalidScope = target !== undefined && target.room === room &&
-    target.seq !== null && scope !== '' &&
+    (graph || target.seq !== null) && scope !== '' &&
     !await receiptTargetInThread(tx, room, event, scope);
   if (
     pending || (invalidScope && await receiptRelationPending(tx, room, event))
@@ -131,10 +138,17 @@ export async function advanceNotificationRead(
   // Known history has no live-order position. A wrong-room, rejected or
   // unrelated target cannot borrow another event's cut or leave a pending ref.
   if (
-    target.room !== room || target.seq === null ||
+    target.room !== room || (!graph && target.seq === null) ||
     target.standing !== 'accepted' || target.grounding !== 'grounded' ||
     invalidScope
   ) return true;
+  // Preserve exact admitted target identity even before F2 activation, so a
+  // later transition never has to reinterpret a local numeric read horizon.
+  await rememberGraphRead(tx, user, room, scope, event);
+  if (graph) {
+    await clearGraphNotifications(tx, user, room, now);
+    return true;
+  }
   const seq = Number(target.seq);
   await tx.execute(
     `INSERT INTO notification_horizons(user,room,scope,event_seq) VALUES(?,?,?,?)
@@ -174,6 +188,67 @@ export async function advanceNotificationRead(
     await pruneNotificationHistory(tx, now);
   }
   return true;
+}
+
+async function notificationIsRead(
+  tx: Conn,
+  user: string,
+  room: string,
+  thread: string,
+  event: string,
+  seq: number,
+): Promise<boolean> {
+  if (await graphReceiptsEnabled(tx)) {
+    return await graphNotificationRead(tx, user, room, thread, event);
+  }
+  const [horizon] = await tx.query(
+    "SELECT MAX(event_seq) AS m FROM notification_horizons WHERE user=? AND room=? AND scope IN ('',?)",
+    [user, room, thread],
+  );
+  return Number(horizon.m ?? 0) >= seq;
+}
+
+/** Work on unread facts only. A local seq remains an index key, not evidence of
+ * ancestry. Unknown edges leave the fact unread until projection supplies them. */
+async function clearGraphNotifications(
+  tx: Conn,
+  user: string,
+  room: string,
+  now: number,
+): Promise<void> {
+  const rows = await tx.query(
+    'SELECT seq,event,thread,highlight,withdrawn FROM notifications WHERE user=? AND room=? AND read_ms IS NULL',
+    [user, room],
+  );
+  let changed = false;
+  for (const row of rows) {
+    if (
+      !await graphNotificationRead(
+        tx,
+        user,
+        room,
+        String(row.thread),
+        String(row.event),
+      )
+    ) continue;
+    await tx.execute(
+      'UPDATE notifications SET read_ms=? WHERE seq=? AND read_ms IS NULL',
+      [now, Number(row.seq)],
+    );
+    await syncNotificationHistory(tx, Number(row.seq), now);
+    if (!Number(row.withdrawn)) {
+      await delta(
+        tx,
+        user,
+        room,
+        String(row.thread),
+        -1,
+        -Number(row.highlight),
+      );
+    }
+    changed = true;
+  }
+  if (changed) await pruneNotificationHistory(tx, now);
 }
 
 export async function applyPushPublication(
@@ -288,11 +363,14 @@ export async function reconcileNotificationEvent(
       if (!redacted && row.thread === thread) continue;
       const user = String(row.user);
       const priorUnread = row.read_ms === null;
-      const horizon = (await tx.query(
-        "SELECT MAX(event_seq) AS m FROM notification_horizons WHERE user=? AND room=? AND scope IN ('',?)",
-        [user, room, thread],
-      ))[0].m;
-      const read = Number(horizon ?? 0) >= Number(row.event_seq);
+      const read = await notificationIsRead(
+        tx,
+        user,
+        room,
+        thread,
+        target,
+        Number(row.event_seq),
+      );
       await tx.execute(
         'UPDATE notifications SET thread=?,withdrawn=?,read_ms=? WHERE seq=?',
         [
@@ -321,6 +399,15 @@ export async function reconcileNotificationEvent(
           read ? 0 : Number(row.highlight),
         );
       }
+    }
+  }
+  if (await graphReceiptsEnabled(tx)) {
+    const users = await tx.query(
+      'SELECT DISTINCT user FROM notification_graph_reads WHERE room=?',
+      [room],
+    );
+    for (const row of users) {
+      await clearGraphNotifications(tx, String(row.user), room, now);
     }
   }
 }
@@ -396,11 +483,14 @@ async function applyDecisions(
         );
       }
     }
-    const horizons = await tx.query(
-      "SELECT MAX(event_seq) AS m FROM notification_horizons WHERE user=? AND room=? AND scope IN ('',?)",
-      [input.user, room, thread],
+    const read = await notificationIsRead(
+      tx,
+      input.user,
+      room,
+      thread,
+      event,
+      eventSeq,
     );
-    const read = Number(horizons[0].m ?? 0) >= eventSeq;
     const withdrawn = (await tx.query(
       'SELECT 1 FROM redactions WHERE room=? AND target=?',
       [room, event],

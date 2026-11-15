@@ -23,6 +23,8 @@ import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { reconcileTyping } from '#engine/typing.ts';
+import { projectReceiptGraph } from '#engine/server/receipt-frontier.ts';
+import { reconcileReceiptMarks } from '#engine/server/ephemeral.ts';
 import {
   preparePush,
   type PushPublication,
@@ -102,6 +104,7 @@ async function projectNow(store: Store, roomId: string): Promise<boolean> {
   // Never advance the normal room/context watermark past an incomplete seed:
   // live decisions must see the complete already-published relation context.
   if (!await seedHistoricalRelations(store, room)) return false;
+  if (!await seedReceiptGraph(store, room)) return false;
   for (;;) {
     const mark = await get(server, source);
     // A supported schema upgrade seeds at the already projected publication,
@@ -157,6 +160,7 @@ async function projectNow(store: Store, roomId: string): Promise<boolean> {
       }
       await advance(tx, source, batch[batch.length - 1].pos);
       await advance(tx, 'push-context:' + roomId, batch[batch.length - 1].pos);
+      await advance(tx, 'receipt-graph:' + roomId, batch[batch.length - 1].pos);
     });
   }
 }
@@ -219,6 +223,44 @@ async function seedHistoricalRelations(
   return cursor === mark;
 }
 
+/** Populate the new graph index from immutable held room evidence at the
+ * already-projected cut. Each page commits with its own durable seed cursor;
+ * no room reads, nested transactions or new publication inside the server tx. */
+async function seedReceiptGraph(store: Store, room: Room): Promise<boolean> {
+  const server = await store.server();
+  const source = 'receipt-graph:' + room.id;
+  const mark = await get(server, sourceOf(room.id));
+  const prior = await get(server, source);
+  if (mark === 0 || prior >= mark) return true;
+  const page = await server.query(
+    "SELECT event,pos FROM event_index WHERE room=? AND pos>? AND pos<=? AND standing='accepted' AND grounding='grounded' ORDER BY pos LIMIT ?",
+    [room.id, prior, mark, BATCH],
+  );
+  const facts = await room.tx(async (tx) => {
+    const out = [];
+    for (const row of page) {
+      const event = String(row.event);
+      if (await tx.events.get(event) === null) {
+        throw new Error('projected receipt event missing: ' + event);
+      }
+      out.push({ event, prevs: await tx.events.prevsOf(event) });
+    }
+    return out;
+  });
+  const cursor = page.length < BATCH ? mark : Number(page.at(-1)!.pos);
+  await eventStreamTx(server, async (tx) => {
+    for (const fact of facts) {
+      await projectReceiptGraph(tx, room.id, fact.event, fact.prevs);
+    }
+    await reconcileReceiptMarks(tx, room.id);
+    for (const fact of facts) {
+      await reconcileNotificationEvent(tx, room.id, fact.event, Date.now());
+    }
+    await advance(tx, source, cursor);
+  });
+  return cursor === mark;
+}
+
 // The 'event'/'transition'/'history' payloads share one shape (the room's
 // change log writes it verbatim; a 'transition' adds `from`, a 'history'
 // names its segment instead of the stay).
@@ -244,6 +286,7 @@ type Prepared =
     | {
       kind: 'event' | 'transition' | 'history';
       payload: EventPayload;
+      prevs: string[] | null;
       relation: { relatesTo: string; relType: string | null } | null;
       search: { key: string; text: string } | null;
       // A live cut's complete published membership. Reconciliation uses
@@ -393,19 +436,22 @@ async function prepare(
         let relation: { relatesTo: string; relType: string | null } | null =
           null;
         let search: { key: string; text: string } | null = null;
+        let prevs: string[] | null = null;
         if (
           payload.standing === 'accepted' && payload.grounding === 'grounded'
         ) {
-          const pdu = await room.tx(async (tx) => {
+          const facts = await room.tx(async (tx) => {
             const row = await tx.events.get(change.event!);
-            return row === null
-              ? null
-              : (JSON.parse(row.pdu) as Record<string, unknown>);
+            return row === null ? null : {
+              pdu: JSON.parse(row.pdu) as Record<string, unknown>,
+              prevs: await tx.events.prevsOf(change.event!),
+            };
           });
-          if (pdu !== null) {
-            relation = relationOf(pdu, change.event);
+          if (facts !== null) {
+            prevs = facts.prevs;
+            relation = relationOf(facts.pdu, change.event);
             if (change.kind !== 'history' && isLive(payload)) {
-              search = searchTextOf(payload, pdu);
+              search = searchTextOf(payload, facts.pdu);
             }
           }
         }
@@ -443,6 +489,7 @@ async function prepare(
           change,
           kind: change.kind,
           payload,
+          prevs,
           relation,
           search,
           publication,
@@ -650,6 +697,7 @@ async function apply(
           item.payload.origin,
         ],
       );
+      await applyReceiptGraph(tx, roomId, item);
       if (isLive(item.payload)) await applyLive(tx, roomId, item, addedMs);
       else await reconcileNotificationEvent(tx, roomId, change.event!, addedMs);
       await applyPublication(
@@ -682,6 +730,7 @@ async function apply(
           item.payload.origin,
         ],
       );
+      await applyReceiptGraph(tx, roomId, item);
       if (isLive(item.payload)) await applyLive(tx, roomId, item, addedMs);
       else await reconcileNotificationEvent(tx, roomId, change.event!, addedMs);
       await applyPublication(
@@ -716,6 +765,7 @@ async function apply(
         ],
       );
       await applyRelation(tx, roomId, item);
+      await applyReceiptGraph(tx, roomId, item);
       await reconcileNotificationEvent(tx, roomId, change.event!, addedMs);
       return;
     }
@@ -783,6 +833,16 @@ async function apply(
       return;
     }
   }
+}
+
+async function applyReceiptGraph(
+  tx: Conn,
+  roomId: string,
+  item: Extract<Prepared, { payload: EventPayload }>,
+): Promise<void> {
+  if (item.prevs === null) return;
+  await projectReceiptGraph(tx, roomId, item.change.event!, item.prevs);
+  await reconcileReceiptMarks(tx, roomId);
 }
 
 // Reconcile against what the server has actually projected, in the same

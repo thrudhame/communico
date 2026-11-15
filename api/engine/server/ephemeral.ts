@@ -5,6 +5,10 @@ import type { Conn, Database as Db } from '#engine/store/db.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { isJoined, receiptTargetInThread } from '#engine/server/read.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
+import {
+  graphReceiptsEnabled,
+  receiptFrontier,
+} from '#engine/server/receipt-frontier.ts';
 
 const MAX_UNKNOWN_THREADS = 100;
 /** Protocol identifiers, not arbitrary durable keys. Adapters must not coerce
@@ -215,7 +219,7 @@ export async function setReceiptMark(
       'invalid receipt extremities',
     );
   }
-  const eventIds = [...new Set(targets)];
+  const incoming = [...new Set(targets)];
   const ts = opts.ts ?? Date.now();
   const threadId = receiptThreadId(opts.threadId);
   const row = await eventStreamTx(server, async (tx) => {
@@ -248,7 +252,7 @@ export async function setReceiptMark(
     }
     // Local API admission and read effects share the same relation snapshot.
     // Inbound EDUs may reference targets not held yet and retain their identity.
-    for (const eventId of eventIds) {
+    for (const eventId of incoming) {
       if (
         opts.requireRelated && threadId !== null &&
         !await receiptTargetInThread(tx, roomId, eventId, threadId)
@@ -260,6 +264,19 @@ export async function setReceiptMark(
         );
       }
     }
+    const [prior] = await tx.query(
+      'SELECT event_ids FROM receipts WHERE room_id=? AND user_id=? AND receipt_type=? AND thread_id=?',
+      [roomId, userId, receiptType, threadId ?? ''],
+    );
+    const graph = await graphReceiptsEnabled(tx);
+    const oldIds: string[] = prior ? JSON.parse(String(prior.event_ids)) : [];
+    const eventIds = graph
+      ? await receiptFrontier(tx, roomId, [...oldIds, ...incoming])
+      : incoming;
+    if (
+      graph && prior &&
+      JSON.stringify(oldIds.toSorted()) === JSON.stringify(eventIds)
+    ) return null;
     const seq = await next(tx, 'receipts');
     await tx.execute(
       `INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_ids,ts_ms,seq) VALUES(?,?,?,?,?,?,?)
@@ -298,6 +315,37 @@ export async function setReceiptMark(
   // Private rows wake their owner, but federation only consumes public rows.
   notify(server, { kind: 'receipt', roomId, receiptType, row });
   return true;
+}
+
+/** Projection has learned new accepted ancestry. Reduce every retained slot in
+ * the same server transaction without changing admission or privacy scope. */
+export async function reconcileReceiptMarks(
+  tx: Conn,
+  roomId: string,
+): Promise<void> {
+  if (!await graphReceiptsEnabled(tx)) return;
+  const rows = await tx.query(
+    'SELECT user_id,receipt_type,thread_id,event_ids FROM receipts WHERE room_id=?',
+    [roomId],
+  );
+  for (const row of rows) {
+    const oldIds: string[] = JSON.parse(String(row.event_ids));
+    const eventIds = await receiptFrontier(tx, roomId, oldIds);
+    if (JSON.stringify(oldIds.toSorted()) === JSON.stringify(eventIds)) {
+      continue;
+    }
+    await tx.execute(
+      'UPDATE receipts SET event_ids=?,seq=? WHERE room_id=? AND user_id=? AND receipt_type=? AND thread_id=?',
+      [
+        JSON.stringify(eventIds),
+        await next(tx, 'receipts'),
+        roomId,
+        String(row.user_id),
+        String(row.receipt_type),
+        String(row.thread_id),
+      ],
+    );
+  }
 }
 // Relevance is a publication read too: use the same public-or-own contract for
 // long-poll wakeups and incremental room selection as for receipt content.

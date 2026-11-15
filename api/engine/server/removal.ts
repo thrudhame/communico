@@ -37,6 +37,9 @@ export async function finishRoomRemoval(
     await tx.execute('DELETE FROM watermarks WHERE source=?', [
       'push-context:' + roomId,
     ]);
+    await tx.execute('DELETE FROM watermarks WHERE source=?', [
+      'receipt-graph:' + roomId,
+    ]);
     const rows = await tx.query(
       "SELECT destination, count(*) AS n FROM outbox WHERE room = ? AND state = 'pending' GROUP BY destination",
       [roomId],
@@ -79,6 +82,8 @@ export async function finishRoomRemoval(
     for (
       const table of [
         'event_index',
+        'receipt_dag_edges',
+        'receipt_dag_nodes',
         'feed',
         'memberships',
         'redactions',
