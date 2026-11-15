@@ -198,6 +198,10 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
               count++;
               if (waitingWriters > 0) break;
             }
+            // Relations, feed positions and graph evidence must all exist at
+            // this committed cut before pending threaded marks are projected.
+            // One sweep per prefix also avoids a whole-room scan per event.
+            await reconcileReceiptMarks(tx, roomId);
             const pos = ready[count - 1].change.pos;
             await advance(tx, sourceOf(roomId), pos);
             await advance(tx, 'push-context:' + roomId, pos);
@@ -343,7 +347,6 @@ async function applyHistoricalRelations(
         .slice(start)
     ) {
       await projectReceiptGraph(tx, roomId, event, prevs, membership);
-      await reconcileReceiptMarks(tx, roomId);
       if (relation !== null) {
         await tx.execute(
           'INSERT INTO relations(event,relates_to,rel_type,room,seq) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
@@ -360,6 +363,7 @@ async function applyHistoricalRelations(
       end++;
       if (waitingWriters > 0) break;
     }
+    await reconcileReceiptMarks(tx, roomId);
     const cursor = end === seed.edges.length
       ? seed.cursor
       : seed.edges[end - 1].pos;
@@ -961,7 +965,6 @@ async function applyReceiptGraph(
     item.prevs,
     item.receiptMembership,
   );
-  await reconcileReceiptMarks(tx, roomId);
 }
 
 // Reconcile against what the server has actually projected, in the same

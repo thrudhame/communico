@@ -783,6 +783,160 @@ Deno.test('facade receipts: missing receiver evidence stays pending and late pro
   }
 });
 
+Deno.test('facade receipts: final reply relation resolves a pending threaded mark in its publication prefix', async (t) => {
+  for (const historical of [false, true]) {
+    await t.step(historical ? 'historical seed' : 'live reply', async () => {
+      const f = await fixture();
+      try {
+        await activateReceiptSource(f);
+        const reply = (await sendLocal(f.g.room, {
+          type: 'm.room.message',
+          sender: f.g.creator,
+          content: {
+            body: 'final reply',
+            'm.relates_to': { rel_type: 'm.thread', event_id: f.left },
+          },
+        }, f.g.signer)).eventId;
+        if (historical) {
+          await project(f.store, f.g.roomId);
+          // Simulate an upgrade whose graph cursor owes already published
+          // relation evidence. No event follows this final reply.
+          await f.db.execute('DELETE FROM relations WHERE event=?', [reply]);
+          await f.db.execute('DELETE FROM watermarks WHERE source=?', [
+            'receipt-graph:' + f.g.roomId,
+          ]);
+        }
+        // Capture source intent without applying the source's read effects to
+        // this receiver fixture. Only the pending import may clear its unread.
+        await f.db.tx((tx) =>
+          recordReceiptOperation(tx, {
+            roomId: f.g.roomId,
+            userId: '@bob:test',
+            receiptType: 'm.read.private',
+            threadId: f.left,
+            eventIds: [reply],
+            ts: 1,
+            admission: { membershipEvent: f.base },
+          })
+        );
+        const [operation] = await f.db.tx((tx) =>
+          receiptOperations(tx, '@bob:test')
+        );
+        await f.db.execute('DELETE FROM domain_operations');
+        await f.db.execute('DELETE FROM receipts');
+        await f.db.execute('DELETE FROM notification_graph_reads');
+        await f.db.execute("UPDATE publication_domain SET node='edge'");
+        await importReceiptOperation(f.db, operation, {
+          source: 'home',
+          incarnation: 'home-store',
+          userId: '@bob:test',
+        });
+        assertEquals(
+          (await f.db.query('SELECT applied FROM domain_operations'))[0]
+            .applied,
+          0,
+        );
+        if (historical) {
+          assertEquals(
+            (await f.db.query(
+              'SELECT read_ms FROM notifications WHERE user=? AND event=?',
+              ['@bob:test', reply],
+            ))[0].read_ms,
+            null,
+          );
+        }
+        const feed = (await f.db.query('SELECT COUNT(*) AS n FROM feed'))[0].n;
+        const publishedReads: Promise<boolean>[] = [];
+        const stop = onEventStream((path) => {
+          if (path !== f.db.path) return;
+          publishedReads.push(
+            f.db.query('SELECT applied FROM domain_operations').then((rows) =>
+              rows[0].applied === 1
+            ),
+          );
+        });
+        try {
+          await project(f.store, f.g.roomId);
+        } finally {
+          stop();
+        }
+        const appliedAtPublication = await Promise.all(publishedReads);
+        assertEquals(
+          (await f.db.query('SELECT applied FROM domain_operations'))[0]
+            .applied,
+          1,
+        );
+        assertEquals(
+          appliedAtPublication.includes(true),
+          true,
+          'the ordinary stream must publish the applied receipt',
+        );
+        const rows = await receiptRows(f.db, f.g.roomId, 0, '@bob:test');
+        assertEquals(rows.map((row) => [row.threadId, row.eventIds]), [[
+          f.left,
+          [reply],
+        ]]);
+        assertEquals(await receiptRows(f.db, f.g.roomId), []);
+        assertEquals(
+          (await f.db.query(
+            'SELECT read_ms FROM notifications WHERE user=? AND event=?',
+            ['@bob:test', reply],
+          ))[0].read_ms !== null,
+          true,
+        );
+        if (historical) {
+          assertEquals(
+            (await f.db.query('SELECT COUNT(*) AS n FROM feed'))[0].n,
+            feed,
+          );
+        }
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('facade receipts: whole-room reconciliation scans once per committed live or historical prefix', async (t) => {
+  for (const historical of [false, true]) {
+    await t.step(historical ? 'historical prefix' : 'live prefix', async () => {
+      const f = await fixture();
+      const original = f.db.tx.bind(f.db);
+      try {
+        for (const body of ['first', 'second', 'last']) await f.message(body);
+        if (historical) {
+          await project(f.store, f.g.roomId);
+          await f.db.execute('DELETE FROM watermarks WHERE source=?', [
+            'receipt-graph:' + f.g.roomId,
+          ]);
+        }
+        let scans = 0;
+        f.db.tx = (fn, options) =>
+          original((conn) => {
+            const query = conn.query.bind(conn);
+            conn.query = (sql, values = []) => {
+              if (
+                sql ===
+                  'SELECT user_id,receipt_type,thread_id,event_ids FROM receipts WHERE room_id=?'
+              ) scans++;
+              return query(sql, values);
+            };
+            return fn(conn);
+          }, options);
+        await project(f.store, f.g.roomId);
+        assertEquals(
+          scans,
+          1,
+          'one retained-slot sweep for the complete committed prefix',
+        );
+      } finally {
+        f.db.tx = original;
+        await f.close();
+      }
+    });
+  }
+});
+
 Deno.test('facade receipts: a later local arrival is not proof its concurrent sibling was read', async () => {
   const f = await fixture();
   try {
