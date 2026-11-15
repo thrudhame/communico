@@ -98,6 +98,19 @@ const RULE_COLUMNS =
 
 // --- conn-level rows (bound on TenantTx) -----------------------------------
 
+export async function rulesetRows(
+  conn: Conn,
+  localpart: string,
+): Promise<(RuleRow & { kind: string })[]> {
+  const rows = await conn.query(
+    `SELECT kind, ${RULE_COLUMNS} FROM push_rules
+     WHERE localpart = ? AND scope = 'global'
+     ORDER BY kind ASC, priority ASC`,
+    [localpart],
+  );
+  return rows.map((row) => ({ ...ruleRow(row), kind: String(row.kind) }));
+}
+
 export async function kindRows(
   conn: Conn,
   localpart: string,
@@ -327,10 +340,11 @@ export async function rulesetAt(
   serverName: string,
 ): Promise<Ruleset> {
   const stored = {} as Ruleset;
-  for (const kind of PUSH_KINDS) {
-    stored[kind] = (await tx.pushRules.kindRows(localpart, kind)).map(
-      rowToRule,
-    );
+  for (const kind of PUSH_KINDS) stored[kind] = [];
+  for (const row of await tx.pushRules.rulesetRows(localpart)) {
+    if ((PUSH_KINDS as readonly string[]).includes(row.kind)) {
+      stored[row.kind as PushKind].push(rowToRule(row));
+    }
   }
   return effectiveRules(`@${localpart}:${serverName}`, stored);
 }
