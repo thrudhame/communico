@@ -221,3 +221,66 @@ Deno.test('facade profiles: passive F1 snapshots cannot overwrite a mutable F2 p
     await f.close();
   }
 });
+
+Deno.test('facade profiles: restored home imports never fabricate authentic or referenced home history', async (t) => {
+  const f = await fixture();
+  try {
+    await setProfileField(f.home, 'alice', 'displayname', 'Home edit');
+    const h1 = (await f.home.tx((tx) => tx.profiles.operations('alice')))[0];
+    await f.edge.tx((tx) => tx.profiles.import(h1));
+    await setProfileField(f.edge, 'alice', 'displayname', 'Edge successor');
+    const e1 = (await f.edge.tx((tx) => tx.profiles.operations('alice')))
+      .find((op) => op.source === 'edge')!;
+    for (const [n, incoming] of [h1, e1].entries()) {
+      await t.step(
+        n === 0 ? 'authentic home history' : 'referenced missing home history',
+        async () => {
+          const target = await openTenant(
+            f.store,
+            'restored-profile' + n + '.test',
+            { create: true },
+          );
+          await registerUser(target, { localpart: 'alice', password: 'pw' });
+          await setProfileField(
+            target,
+            'alice',
+            'displayname',
+            'Older restored value',
+          );
+          await (await f.store.tenant(target.serverName)).tx((conn) =>
+            activateTenantAuthority(conn, {
+              node: 'home',
+              incarnation: 'home-store',
+              homeIncarnation: 'home-store',
+              edgeNode: 'edge',
+              edgeIncarnation: 'edge-store',
+            })
+          );
+          await target.tx((tx) => tx.profiles.import(incoming));
+          assertEquals(
+            await target.tx((tx) => tx.profiles.operations('alice')),
+            [incoming],
+          );
+          assertEquals(
+            (await getPublicProfile(target, 'alice'))?.displayname,
+            n === 0
+              ? JSON.parse(h1.payload).displayname
+              : 'Older restored value',
+          );
+          await target.tx((tx) => tx.profiles.import(h1));
+          await target.tx((tx) => tx.profiles.import(incoming));
+          assertEquals(
+            (await getPublicProfile(target, 'alice'))?.displayname,
+            n === 0 ? JSON.parse(h1.payload).displayname : 'Edge successor',
+          );
+          const retained = await target.tx((tx) =>
+            tx.profiles.operations('alice')
+          );
+          assertEquals(retained.filter((op) => op.source === 'home'), [h1]);
+        },
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});

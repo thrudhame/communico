@@ -1037,6 +1037,9 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     await edge.stop();
     await configure('facade');
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    // The online strict login may have left another finite auth suffix. As at
+    // the first cold restart, listener readiness is not owner apply completion.
+    await authTail(['outside', 'departure']);
     // Refused GETs and refreshes above must not close the original retry window.
     const retried = await api('facade', 'refresh', {
       refresh_token: session.body.refresh_token,

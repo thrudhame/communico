@@ -224,6 +224,68 @@ Deno.test('facade account data: an incoming operation cannot erase an uncaptured
   }
 });
 
+Deno.test('facade account data: restored home imports never fabricate authentic or referenced home history', async (t) => {
+  const f = await fixture();
+  try {
+    const type = 'm.secret_storage.key';
+    await putAccountData(f.home, 'alice', '', type, {
+      ciphertext: 'authentic home',
+    });
+    const h1 = (await f.home.tx((tx) => tx.accountData.operations('alice')))[0];
+    await f.edge.tx((tx) => tx.accountData.import(h1));
+    await putAccountData(f.edge, 'alice', '', type, {
+      ciphertext: 'edge successor',
+    });
+    const e1 = (await f.edge.tx((tx) => tx.accountData.operations('alice')))
+      .find((op) => op.source === 'edge')!;
+    for (const [n, incoming] of [h1, e1].entries()) {
+      await t.step(
+        n === 0 ? 'authentic home history' : 'referenced missing home history',
+        async () => {
+          const target = await openTenant(
+            f.store,
+            'restored-account' + n + '.test',
+            { create: true },
+          );
+          await registerUser(target, { localpart: 'alice', password: 'pw' });
+          await putAccountData(target, 'alice', '', type, {
+            ciphertext: 'older restored value',
+          });
+          await (await f.store.tenant(target.serverName)).tx((conn) =>
+            activateTenantAuthority(conn, {
+              node: 'home',
+              incarnation: 'home-store',
+              homeIncarnation: 'home-store',
+              edgeNode: 'edge',
+              edgeIncarnation: 'edge-store',
+            })
+          );
+          await target.tx((tx) => tx.accountData.import(incoming));
+          assertEquals(
+            await target.tx((tx) => tx.accountData.operations('alice')),
+            [incoming],
+          );
+          assertEquals(await getAccountData(target, 'alice', '', type), {
+            ciphertext: n === 0 ? 'authentic home' : 'older restored value',
+          });
+          await target.tx((tx) => tx.accountData.import(h1));
+          await target.tx((tx) => tx.accountData.import(incoming));
+          assertEquals(await getAccountData(target, 'alice', '', type), {
+            ciphertext: n === 0 ? 'authentic home' : 'edge successor',
+          });
+          assertEquals(
+            (await target.tx((tx) => tx.accountData.operations('alice')))
+              .filter((op) => op.source === 'home'),
+            [h1],
+          );
+        },
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('facade tags: sparse cross-tag causality retains the complete reset ancestry for each tag winner', async () => {
   const f = await fixture();
   try {

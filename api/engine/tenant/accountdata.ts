@@ -9,6 +9,7 @@ import type { Conn } from '#engine/store/db.ts';
 import type { Tenant, TenantTx } from '#engine/tenant/index.ts';
 import { rulesetAt } from '#engine/tenant/pushrules.ts';
 import {
+  captureRegisterBaseline,
   importRegisterOperation,
   readRegister,
   registerJson,
@@ -148,9 +149,10 @@ async function baseline(
   localpart: string,
   room: string,
   type: string,
+  incoming?: RegisterOperation,
 ): Promise<void> {
   const key = semanticKey(localpart, room, type);
-  if ((await readRegister(conn, key)).winner) return;
+  if ((await registerOperations(conn, key)).length) return;
   const held = await accountDataRow(conn, localpart, room, type);
   if (held === null) return;
   const authority = (await tenantAuthority(conn))!;
@@ -161,7 +163,7 @@ async function baseline(
       'account-data baseline unavailable',
     );
   }
-  await writeRegister(
+  await captureRegisterBaseline(
     conn,
     { source: authority.node, incarnation: authority.incarnation },
     key,
@@ -169,6 +171,7 @@ async function baseline(
     type === 'm.tag'
       ? JSON.stringify({ action: 'reset', content: JSON.parse(held) })
       : held,
+    incoming,
   );
 }
 
@@ -296,7 +299,7 @@ export async function importAccountData(
   );
   if (!user) throw new Error('account-data account unavailable');
   if (user.deactivated !== 1 && authority?.node === 'home') {
-    await baseline(conn, localpart, room, type);
+    await baseline(conn, localpart, room, type, operation);
   }
   if (type === 'm.tag') tagOperation(operation);
   await importRegisterOperation(conn, operation);

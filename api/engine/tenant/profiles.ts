@@ -4,6 +4,7 @@ import type { Conn } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
+  captureRegisterBaseline,
   importRegisterOperation,
   readRegister,
   registerJson,
@@ -72,6 +73,7 @@ async function baseline(
   conn: Conn,
   localpart: string,
   held: Profile,
+  incoming?: RegisterOperation,
 ): Promise<void> {
   if ((await profileOperations(conn, localpart)).length) return;
   const authority = (await tenantAuthority(conn))!;
@@ -79,12 +81,13 @@ async function baseline(
     throw new MatrixError(503, 'M_UNAVAILABLE', 'profile baseline unavailable');
   }
   validateProfile(held);
-  await writeRegister(
+  await captureRegisterBaseline(
     conn,
     { source: authority.node, incarnation: authority.incarnation },
     semanticKey(localpart),
     'profile',
     JSON.stringify(held),
+    incoming,
   );
 }
 
@@ -160,7 +163,7 @@ export async function importProfile(
   if (!user) throw new Error('profile account unavailable');
   const held = (await profileRow(conn, localpart))!;
   if (user.deactivated !== 1 && authority!.node === 'home') {
-    await baseline(conn, localpart, held);
+    await baseline(conn, localpart, held, operation);
   }
   await importRegisterOperation(conn, operation);
   if (user.deactivated === 1) return false;

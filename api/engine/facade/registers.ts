@@ -158,6 +158,32 @@ export async function registerOperations(
   )).map(fromRow).sort(compare);
 }
 
+/** Capture a pre-semantic local value only before authentic history exists.
+ * An incoming local dot, or a foreign dot with incomplete history, may be
+ * restoring this writer's original baseline. Never manufacture that identity
+ * from a stale materialization. Only a foreign root is provably concurrent;
+ * otherwise import the original history and retain the held value meanwhile. */
+export async function captureRegisterBaseline(
+  conn: Conn,
+  source: RegisterSource,
+  semanticKey: string,
+  kind: string,
+  payload: string,
+  incoming?: RegisterOperation,
+): Promise<void> {
+  if (incoming) {
+    const operation = checked(incoming);
+    if (operation.semanticKey !== semanticKey || operation.kind !== kind) {
+      throw new Error('register baseline semantic mismatch');
+    }
+    if (domain(operation) === domain(source) || operation.context.length) {
+      return;
+    }
+  }
+  if ((await registerOperations(conn, semanticKey)).length) return;
+  await writeRegister(conn, source, semanticKey, kind, payload);
+}
+
 function join(vector: Map<string, RegisterDot>, dot: RegisterDot): void {
   const key = domain(dot), old = vector.get(key);
   if (!old || old.sequence < dot.sequence) {
