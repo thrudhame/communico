@@ -123,6 +123,7 @@ type IdentityRow = {
 
 function bind(
   conn: Conn,
+  serverName: string,
   changed: () => void = () => {},
   projectionChanged: () => void = () => {},
   ingress?: import('./ingress.ts').PreparedIngressAuthority,
@@ -645,6 +646,17 @@ function bind(
       expire: (now: number) => openid.expireOpenId(conn, now),
     },
     pushRules: {
+      prepare: (localpart: string) =>
+        pushrules.preparePushRules(conn, localpart, serverName),
+      operations: (localpart: string) =>
+        pushrules.pushRuleOperations(conn, localpart),
+      import: async (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+      ) => {
+        if (await pushrules.importPushRules(conn, operation, serverName)) {
+          changed();
+        }
+      },
       clear: (localpart: string) => pushrules.clearPushRules(conn, localpart),
       putDefault: (localpart: string, kind: string, rule: pushrules.PushRule) =>
         pushrules.putDefaultOverride(conn, localpart, kind, rule),
@@ -700,8 +712,12 @@ function bind(
         newRoomId: string,
         row: pushrules.RuleRow,
       ) => pushrules.copyRoomRule(conn, localpart, newRoomId, row),
-      stampStream: (localpart: string, seq: number) =>
-        pushrules.stampPushStream(conn, localpart, seq),
+      stampStream: async (localpart: string, seq: number) => {
+        if (await pushrules.recordPushRules(conn, localpart, serverName, seq)) {
+          projectionChanged();
+        }
+        changed();
+      },
       streamSeq: (localpart: string) =>
         pushrules.pushStreamSeqRow(conn, localpart),
     },
@@ -945,7 +961,7 @@ export async function openTenant(
         async (conn) => {
           let changed = false;
           let projectionChanged = false;
-          const result = await fn(bind(conn, () => {
+          const result = await fn(bind(conn, serverName, () => {
             changed = true;
           }, () => {
             projectionChanged = true;
