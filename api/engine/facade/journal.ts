@@ -21,6 +21,37 @@ import {
 
 type Direction = 'in' | 'out';
 export type Heads = Stream & { received: Cut; applied: Cut };
+type ReceiveFence = Map<string, { revision: number; writing: number }>;
+const receiveFences = new Map<string, WeakRef<ReceiveFence>>();
+const collectedFences = new FinalizationRegistry<string>((path) => {
+  if (!receiveFences.get(path)?.deref()) receiveFences.delete(path);
+});
+
+function receiveFenceFor(db: Database): ReceiveFence {
+  let fence = receiveFences.get(db.path)?.deref();
+  if (!fence) {
+    fence = new Map();
+    receiveFences.set(db.path, new WeakRef(fence));
+    collectedFences.register(fence, db.path);
+  }
+  return fence;
+}
+
+/** Capture before reading durable heads. Like signing permits, cross-file
+ * admission must detect intervening owner writes without opening a nested tx.
+ * Each stream is independent; unrelated accounts cannot invalidate the cut. */
+export function receivedFence(db: Database) {
+  const fence = receiveFenceFor(db);
+  const revisions = new Map(
+    [...fence].map(([key, state]) => [key, state.revision]),
+  );
+  return (peer: string, stream: Stream): boolean => {
+    const id = JSON.stringify(key(peer, 'in', stream)), state = fence.get(id);
+    return !state?.writing &&
+      (state?.revision ?? 0) === (revisions.get(id) ?? 0);
+  };
+}
+
 export type Page = { records: LinkRecord[]; head: Cut };
 export type PageLimits = { maxBytes: number; maxItems: number };
 export type TerminalResult = Cut & { result: unknown };
@@ -222,42 +253,56 @@ export class Journal {
         400,
       );
     }
-    return await this.db.tx(async (conn) => {
-      let head = (await headsInTx(conn, peer, 'in', stream)).received;
-      await ensureStream(conn, peer, 'in', stream);
-      for (const record of records) {
-        const prior = await recordInTx(
-          conn,
-          peer,
-          'in',
-          stream,
-          record.sequence,
-        );
-        if (prior) {
-          if (canonicalJson(prior.record) !== canonicalJson(record)) {
-            diverged('changed record replay');
+    const fence = receiveFenceFor(this.db);
+    const id = JSON.stringify(key(peer, 'in', stream));
+    const state = fence.get(id) ?? { revision: 0, writing: 0 };
+    fence.set(id, state);
+    // Fence the whole asynchronous write, including retries. Preparations made
+    // while receive is pending must not become valid when it commits or fails.
+    state.writing++;
+    state.revision++;
+    try {
+      return await this.db.tx(async (conn) => {
+        let head = (await headsInTx(conn, peer, 'in', stream)).received;
+        await ensureStream(conn, peer, 'in', stream);
+        for (const record of records) {
+          const prior = await recordInTx(
+            conn,
+            peer,
+            'in',
+            stream,
+            record.sequence,
+          );
+          if (prior) {
+            if (canonicalJson(prior.record) !== canonicalJson(record)) {
+              diverged('changed record replay');
+            }
+            continue;
           }
-          continue;
+          if (
+            record.sequence !== head.sequence + 1 ||
+            record.previous !== head.hash
+          ) diverged('record hole or predecessor mismatch');
+          const duplicate = await conn.query(
+            "SELECT 1 FROM facade_records WHERE peer=? AND direction='in' AND source=? AND incarnation=? AND operation_id=?",
+            [peer, stream.source, stream.incarnation, record.operationId],
+          );
+          if (duplicate.length) {
+            diverged('operation identity repeated at another sequence');
+          }
+          await insert(conn, peer, 'in', record, canonicalJson(record));
+          head = { sequence: record.sequence, hash: record.hash };
         }
-        if (
-          record.sequence !== head.sequence + 1 || record.previous !== head.hash
-        ) diverged('record hole or predecessor mismatch');
-        const duplicate = await conn.query(
-          "SELECT 1 FROM facade_records WHERE peer=? AND direction='in' AND source=? AND incarnation=? AND operation_id=?",
-          [peer, stream.source, stream.incarnation, record.operationId],
+        await conn.execute(
+          'UPDATE facade_streams SET received=?,received_hash=? WHERE peer=? AND direction=? AND source=? AND incarnation=? AND stream=?',
+          [head.sequence, head.hash, ...key(peer, 'in', stream)],
         );
-        if (duplicate.length) {
-          diverged('operation identity repeated at another sequence');
-        }
-        await insert(conn, peer, 'in', record, canonicalJson(record));
-        head = { sequence: record.sequence, hash: record.hash };
-      }
-      await conn.execute(
-        'UPDATE facade_streams SET received=?,received_hash=? WHERE peer=? AND direction=? AND source=? AND incarnation=? AND stream=?',
-        [head.sequence, head.hash, ...key(peer, 'in', stream)],
-      );
-      return headsInTx(conn, peer, 'in', stream);
-    });
+        return headsInTx(conn, peer, 'in', stream);
+      });
+    } finally {
+      state.revision++;
+      state.writing--;
+    }
   }
 
   async page(

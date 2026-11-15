@@ -10,6 +10,7 @@ import {
 import type { PreparedIngressAuthority } from '#engine/tenant/ingress.ts';
 import { requireSessionAuthority } from '#engine/tenant/session-authority.ts';
 import type { NodeIdentity } from './identity.ts';
+import { receivedFence } from './journal.ts';
 import { noticeHeads } from './notices.ts';
 import type { Pairings } from './pairing.ts';
 import { type Cut, LinkError } from './protocol.ts';
@@ -150,6 +151,7 @@ export class FacadeAuth {
   async prepare(): Promise<PreparedIngressAuthority> {
     // Passive replication reads still work before activation. Explicit auth or
     // user-domain intents consume admission; unknown tokens keep their normal401.
+    const received = receivedFence(this.server);
     const admission = await this.capture().catch(() => null);
     return {
       check: async (conn, intent) => {
@@ -187,13 +189,19 @@ export class FacadeAuth {
         const scope = (intent.kind === 'domain' ? 'domain:@' : 'auth:@') +
           localpart + ':' + this.node.server;
         const cut = admission.scopes.find((row) => row.scope === scope);
+        const current = () =>
+          received('home', {
+            source: 'home',
+            incarnation: admission.pairing,
+            stream: scope,
+          });
         // Auth may use a complete older cut in permissive mode. Domain reads
         // require complete bootstrap and applied received facts, not a partial
         // value that masquerades as absence or a completed whole register.
         if (
           !cut ||
           (intent.kind === 'domain'
-            ? cut.ready !== 1 || cut.pending_hash !== null ||
+            ? !current() || cut.ready !== 1 || cut.pending_hash !== null ||
               Number(cut.source_cut) < 1 ||
               Number(cut.received) !== Number(cut.applied) ||
               cut.received_hash !== cut.applied_hash
@@ -219,7 +227,8 @@ export class FacadeAuth {
           if (
             selected?.pairing !== admission.pairing ||
             Number(selected.grant_revision) !== admission.grantRevision ||
-            Number(selected.owner_revision) !== Number(activation.revision)
+            Number(selected.owner_revision) !== Number(activation.revision) ||
+            !current()
           ) unavailable();
           return;
         }

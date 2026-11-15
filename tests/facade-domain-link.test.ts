@@ -270,6 +270,72 @@ Deno.test('domain link: user-facing register owners require complete domain boot
   }
 });
 
+Deno.test('domain admission: retained preparations refuse a newly received suffix at every register owner', async () => {
+  const f = await fixture();
+  try {
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(bootstrap);
+    const authority = new FacadeAuth(
+      await f.edge.server(),
+      f.fp,
+      f.node,
+      new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+      {
+        replicatecredentials: false,
+        allowstaleauth: false,
+        authmaxstalehours: 1,
+      },
+    );
+    const prepared = await authority.prepare();
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      prepared,
+    );
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), null);
+    await putAccountData(f.ht, 'alice', '', 'm.direct', { pending: true });
+    const cut = Math.max(...bootstrap.map((record) => record.sequence));
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > cut
+    );
+    assertEquals(suffix.length > 0, true);
+    await f.ej.receive('home', suffix);
+    const intents = [
+      () => getAccountData(tenant, 'alice', '', 'm.direct'),
+      () => getPublicProfile(tenant, 'alice'),
+      () => rulesetFor(tenant, 'alice'),
+      () => putAccountData(tenant, 'alice', '', 'm.direct', { stale: true }),
+      () => updateRoomTag(tenant, 'alice', '!r:logical.test', 'work', {}),
+      () => setProfileField(tenant, 'alice', 'org.example.field', 'stale'),
+      () => setDisplayName(tenant, 'alice', 'stale name'),
+      () => setAvatarUrl(tenant, 'alice', 'mxc://logical.test/stale'),
+      () => setRuleEnabled(tenant, 'alice', 'override', '.m.rule.master', true),
+    ];
+    const before = await f.et.tx((tx) => tx.streams.heads());
+    for (const intent of intents) {
+      await assertRejects(intent, MatrixError, 'domain snapshot unavailable');
+    }
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+    for (const record of suffix) await f.es.apply(f.ej, record);
+    // Application restores fresh admission, never the earlier retained cut.
+    await assertRejects(intents[0], MatrixError, 'domain snapshot unavailable');
+    const current = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      authority,
+    );
+    assertEquals(await getAccountData(current, 'alice', '', 'm.direct'), {
+      pending: true,
+    });
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('domain link: signed owner operations reconcile both directions without export echoes or duplicate news', async () => {
   const f = await fixture();
   try {
