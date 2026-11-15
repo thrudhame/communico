@@ -443,6 +443,8 @@ function bind(
         mutation(devices.deleteDevicesOfUser(conn, localpart)),
     },
     tokens: {
+      deleteOthers: (localpart: string, keepHash: string | null) =>
+        auth.deleteOtherTokens(conn, localpart, keepHash),
       barrier: (localpart: string) => recordLogoutBarrier(conn, localpart),
       insert: (
         hash: string,

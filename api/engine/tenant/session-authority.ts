@@ -281,6 +281,36 @@ export async function recordRevocation(
   }
 }
 
+/** Revoke observed sessions and device incarnations, not the account: a
+ * blanket barrier would also revoke the caller whose password change survives. */
+export async function recordOtherSessionRevocations(
+  conn: Conn,
+  localpart: string,
+  keepHash: string | null,
+  keepDevice: string | null,
+): Promise<void> {
+  const view = await captureSessionAuthority(conn, localpart);
+  for (const session of view.sessions) {
+    if (
+      keepHash !== null &&
+      (session.hash === keepHash ||
+        (session.refresh && session.accessHash === keepHash))
+    ) continue;
+    await recordRevocation(conn, session.hash);
+  }
+  for (
+    const deviceId of new Set(
+      view.facts.filter((fact) => fact.kind === 'device').map((fact) =>
+        fact.deviceId!
+      ),
+    )
+  ) {
+    if (deviceId !== keepDevice) {
+      await recordDeviceDeletion(conn, localpart, deviceId);
+    }
+  }
+}
+
 export async function recordLogoutBarrier(
   conn: Conn,
   localpart: string,

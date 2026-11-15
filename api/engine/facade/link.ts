@@ -201,7 +201,7 @@ export function linkHandler(options: {
   notices?: NoticeHub;
   changed?(): Promise<void>;
   contacted?(): Promise<void>;
-  reconciling?(pairing: string, heads: unknown): void;
+  reconciling?(): (pairing: string, heads: unknown) => void;
   connected?(pairing: string, signal: AbortSignal): void;
   signKeyDocument?(raw: unknown): Promise<string>;
 }): (request: Request, peerPin: string) => Promise<Response> {
@@ -218,6 +218,7 @@ export function linkHandler(options: {
     }
   };
   return async (request, pin) => {
+    const reconciling = options.reconciling?.();
     const url = new URL(request.url);
     const route = url.pathname.slice(LINK_PREFIX.length);
     if (['enroll', 'complete', 'revoke'].includes(route)) {
@@ -399,7 +400,7 @@ export function linkHandler(options: {
       if (records.some((record) => record.sequence > head.sequence)) {
         throw new LinkError('LINK_DIVERGED', 'page exceeds declared home head');
       }
-      options.reconciling?.(id, [{ ...stream, head }]);
+      reconciling?.(id, [{ ...stream, head }]);
     }
     await journal.receive('home', records);
     await options.changed?.();

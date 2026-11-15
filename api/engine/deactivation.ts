@@ -83,7 +83,8 @@ export function startDeactivationWork(
           } catch (error) {
             options.failed(error);
           }
-        } while (!stopped && dirty);
+          // close stops accepting wakes, not work already accepted by this pass.
+        } while (dirty);
       } finally {
         running = undefined;
       }

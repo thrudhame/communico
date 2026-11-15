@@ -1,5 +1,8 @@
 import { assert, assertEquals } from '@std/assert';
-import { runDeactivationWork } from '#engine/deactivation.ts';
+import {
+  runDeactivationWork,
+  startDeactivationWork,
+} from '#engine/deactivation.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { deactivateUser, registerUser } from '#engine/tenant/users.ts';
@@ -151,6 +154,76 @@ for (const kind of ['invite', 'knock']) {
     }
   });
 }
+
+Deno.test('deactivation close drains a wake accepted during an admitted pass', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'deactivation-close-' });
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, {
+    schemas: { room: roomSchema, tenant: tenantSchema, server: serverSchema },
+  });
+  let worker: ReturnType<typeof startDeactivationWork> | undefined;
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  try {
+    const tenant = await openTenant(store, 'logical.test', { create: true });
+    for (const localpart of ['alice', 'bob']) {
+      await registerUser(tenant, { localpart, password: 'pw' });
+    }
+    const signer = tenant.signer();
+    await createRoom(store, { creator: '@alice:logical.test' }, signer);
+    const bob = await createRoom(
+      store,
+      { creator: '@bob:logical.test' },
+      signer,
+    );
+    await deactivateUser(tenant, 'alice');
+    const failures: unknown[] = [];
+    worker = startDeactivationWork({
+      store,
+      tenant,
+      pollseconds: 60,
+      wake() {},
+      failed(error) {
+        failures.push(error);
+      },
+      async prepareSigner() {
+        entered.resolve();
+        await release.promise;
+        return signer;
+      },
+    });
+    await entered.promise;
+    await deactivateUser(tenant, 'bob');
+    worker.wake();
+    const closing = worker.close();
+    release.resolve();
+    await closing;
+    assertEquals(failures, []);
+    assertEquals(
+      (await membershipOf(
+        await openRoom(store, bob.roomId),
+        '@bob:logical.test',
+      ))?.membership,
+      'leave',
+    );
+    assertEquals(
+      await (await store.tenant('logical.test')).query(
+        'SELECT localpart FROM deactivation_work ORDER BY localpart',
+      ),
+      [{ localpart: 'alice' }, { localpart: 'bob' }],
+    );
+  } finally {
+    release.resolve();
+    await worker?.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('deactivation work leaves all local memberships fairly, retries after restart and retains roots for late rooms', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'deactivation-worker-' });

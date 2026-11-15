@@ -460,19 +460,7 @@ export async function changePassword(
     }
     await tx.credentials.set(localpart, hashPassword(newPassword));
     if (!opts.logoutDevices) return;
-    let keepDevice: string | null = null;
-    if (keepHash !== null) {
-      const keep = await tx.tokens.byHash(keepHash);
-      if (keep !== null && keep.localpart === localpart) {
-        keepDevice = keep.device_id;
-      }
-    }
-    for (const token of await tx.tokens.ofUser(localpart)) {
-      if (keepHash !== null && token.token === keepHash) continue;
-      await tx.pushers.deleteForToken(token.token);
-      await tx.refresh.deleteForAccessToken(token.token);
-      await tx.tokens.delete(token.token);
-    }
+    const keepDevice = await tx.tokens.deleteOthers(localpart, keepHash);
     for (const device of await tx.devices.ofUser(localpart)) {
       if (keepDevice !== null && device.device_id === keepDevice) continue;
       await tx.devices.delete(device.device_id, localpart);

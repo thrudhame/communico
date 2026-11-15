@@ -401,7 +401,7 @@ export async function openFacadeRuntime(
         notices,
         changed: refresh,
         contacted: async () => await (await keyOwner()).contact(),
-        reconciling: (pairing, heads) => authHealth.observe(pairing, heads),
+        reconciling: () => authHealth.reconciliation(),
         connected: (pairing, signal) => authHealth.connected(pairing, signal),
         signKeyDocument: async (raw) => await (await keyOwner()).cosign(raw),
       })(request, peerPin);

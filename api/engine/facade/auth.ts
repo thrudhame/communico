@@ -14,7 +14,10 @@ import type { Pairings } from './pairing.ts';
 import { type Cut, LinkError } from './protocol.ts';
 
 export class AuthLinkHealth {
-  private readonly connections = new Map<AbortSignal, string>();
+  private readonly connections = new Map<
+    AbortSignal,
+    { pairing: string; heads: Map<string, Cut> }
+  >();
   private readonly declarations = new Map<
     string,
     Map<string, { at: number; head: Cut }>
@@ -25,14 +28,35 @@ export class AuthLinkHealth {
   ) {}
 
   connected(pairing: string, signal: AbortSignal): void {
-    if (signal.aborted) return;
-    this.connections.set(signal, pairing);
+    if (signal.aborted || this.connections.has(signal)) return;
+    this.connections.set(signal, { pairing, heads: new Map() });
     signal.addEventListener('abort', () => this.connections.delete(signal), {
       once: true,
     });
   }
 
   observe(pairing: string, raw: unknown, now = Date.now()): void {
+    this.reconciliation()(pairing, raw, now);
+  }
+
+  /** Capture before the request's first await. Delayed pages may raise the
+   * required cut, but cannot certify a connection opened after they arrived. */
+  reconciliation(): (pairing: string, raw: unknown, now?: number) => void {
+    const connections = [...this.connections];
+    return (pairing, raw, now = Date.now()) => {
+      this.observeHeads(pairing, raw, now, connections);
+    };
+  }
+
+  private observeHeads(
+    pairing: string,
+    raw: unknown,
+    now: number,
+    connections: Array<[
+      AbortSignal,
+      { pairing: string; heads: Map<string, Cut> },
+    ]>,
+  ): void {
     const heads = new Map<string, Cut>();
     for (const entry of noticeHeads(raw)) {
       if (
@@ -68,6 +92,18 @@ export class AuthLinkHealth {
       }
     }
     this.declarations.set(pairing, prior);
+    for (const [signal, connection] of connections) {
+      if (
+        signal.aborted || connection.pairing !== pairing ||
+        this.connections.get(signal) !== connection
+      ) continue;
+      for (const [scope, head] of heads) {
+        const held = connection.heads.get(scope);
+        if (!held || head.sequence >= held.sequence) {
+          connection.heads.set(scope, head);
+        }
+      }
+    }
   }
 
   ready(
@@ -88,9 +124,12 @@ export class AuthLinkHealth {
     return this.settings.notify === 'poll'
       ? now >= declaration.at &&
         now - declaration.at <= this.settings.pollseconds * 1000
-      : [...this.connections].some(([signal, id]) =>
-        id === pairing && !signal.aborted
-      );
+      : [...this.connections].some(([signal, connection]) => {
+        const observed = connection.heads.get(scope);
+        return connection.pairing === pairing && !signal.aborted &&
+          observed?.sequence === target.sequence &&
+          observed.hash === target.hash;
+      });
   }
 }
 
