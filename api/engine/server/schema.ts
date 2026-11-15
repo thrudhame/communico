@@ -17,7 +17,10 @@ import {
   PUBLICATION_DOMAIN_SQL,
 } from '#engine/facade/schema.ts';
 import { RECOVERY_SQL } from '#engine/server/recovery.ts';
-import { RECEIPT_GRAPH_SQL } from '#engine/server/receipt-frontier.ts';
+import {
+  RECEIPT_ADMISSION_SQL,
+  RECEIPT_GRAPH_SQL,
+} from '#engine/server/receipt-frontier.ts';
 import {
   FACADE_INGRESS_SQL,
   FACADE_JOURNAL_SQL,
@@ -405,7 +408,7 @@ const NOTIFICATIONS_UNREAD_SQL =
   'CREATE INDEX notifications_unread ON notifications(user,room,thread,event_seq,withdrawn,highlight) WHERE read_ms IS NULL';
 
 export const serverSchema: SchemaProvider = {
-  version: 38,
+  version: 39,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -446,6 +449,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(OWNER_CONTROL_SQL);
     await db.exec(PUBLICATION_DOMAIN_SQL);
     await db.exec(RECEIPT_GRAPH_SQL);
+    await db.exec(RECEIPT_ADMISSION_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -489,5 +493,13 @@ export const serverSchema: SchemaProvider = {
       await conn.exec(PUBLICATION_DOMAIN_SQL);
     },
     37: (conn) => conn.exec(RECEIPT_GRAPH_SQL),
+    38: async (conn) => {
+      await conn.exec(RECEIPT_ADMISSION_SQL);
+      // This is a derived evidence index. Re-read held immutable events at
+      // the existing cut, without replaying feed positions or local news.
+      await conn.execute(
+        "DELETE FROM watermarks WHERE source LIKE 'receipt-graph:%'",
+      );
+    },
   },
 };

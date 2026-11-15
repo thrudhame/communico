@@ -13,6 +13,24 @@ INSERT INTO notification_graph_reads(user,room,scope,event)
   WHERE i.standing='accepted' AND i.grounding='grounded';
 `;
 
+export const RECEIPT_ADMISSION_SQL = `
+CREATE TABLE receipt_membership_events(room TEXT NOT NULL,event TEXT NOT NULL,user TEXT NOT NULL,membership TEXT NOT NULL,PRIMARY KEY(room,event));
+CREATE INDEX receipt_membership_user ON receipt_membership_events(room,user,membership,event);
+`;
+
+export type ReceiptMembership = { user: string; membership: string };
+
+/** Immutable accepted event meaning, not today's resolved membership. */
+export function receiptMembership(
+  pdu: Record<string, unknown>,
+): ReceiptMembership | null {
+  const content = pdu.content as Record<string, unknown> | null;
+  return pdu.type === 'm.room.member' && typeof pdu.state_key === 'string' &&
+      typeof content?.membership === 'string'
+    ? { user: pdu.state_key, membership: content.membership }
+    : null;
+}
+
 /** A negotiated F2 activation changes the read contract. F1/standalone keeps
  * its existing stream contract; merely installing this schema does not opt in. */
 export async function graphReceiptsEnabled(tx: Conn): Promise<boolean> {
@@ -25,6 +43,7 @@ export async function projectReceiptGraph(
   room: string,
   event: string,
   prevs: readonly string[],
+  membership: ReceiptMembership | null = null,
 ): Promise<void> {
   await tx.execute(
     'INSERT INTO receipt_dag_nodes(room,event) VALUES(?,?) ON CONFLICT DO NOTHING',
@@ -34,6 +53,12 @@ export async function projectReceiptGraph(
     await tx.execute(
       'INSERT INTO receipt_dag_edges(room,event,parent) VALUES(?,?,?) ON CONFLICT DO NOTHING',
       [room, event, parent],
+    );
+  }
+  if (membership) {
+    await tx.execute(
+      'INSERT INTO receipt_membership_events(room,event,user,membership) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
+      [room, event, membership.user, membership.membership],
     );
   }
 }

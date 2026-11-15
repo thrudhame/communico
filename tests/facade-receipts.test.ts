@@ -1,4 +1,6 @@
 import { assertEquals, assertRejects } from '@std/assert';
+import { createHash } from 'node:crypto';
+import { canonicalJson } from '#engine/canonical.ts';
 import { openStore } from '#engine/store/index.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -354,6 +356,50 @@ Deno.test('facade receipts: one ancestry closure serves every unread notificatio
   }
 });
 
+Deno.test('facade receipts: source admission names an authentic join for the same user, never another accepted event', async (t) => {
+  const f = await fixture();
+  try {
+    await activateReceiptSource(f);
+    await f.read(f.left, 'm.read.private');
+    const [operation] = await f.db.tx((tx) =>
+      receiptOperations(tx, '@bob:test')
+    );
+    const [creatorJoin] = await f.db.query(
+      'SELECT event FROM memberships WHERE user=? AND room=?',
+      [f.g.creator, f.g.roomId],
+    );
+    const leave = await sendLocal(f.g.room, {
+      type: 'm.room.member',
+      sender: '@bob:test',
+      state_key: '@bob:test',
+      content: { membership: 'leave' },
+    }, f.g.signer);
+    await project(f.store, f.g.roomId);
+    for (
+      const [name, event] of [['message', f.left], [
+        'other user join',
+        String(creatorJoin.event),
+      ], ['own leave', leave.eventId]]
+    ) {
+      await t.step(name, async () => {
+        await f.db.execute('DELETE FROM domain_operations');
+        await f.db.execute('DELETE FROM receipts');
+        const mark = JSON.parse(operation.payload);
+        mark.admission.membershipEvent = event;
+        const payload = canonicalJson(mark);
+        await importReceiptOperation(f.db, {
+          ...operation,
+          payload,
+          payloadHash: createHash('sha256').update(payload).digest('hex'),
+        }, { source: 'home', incarnation: 'home-store', userId: '@bob:test' });
+        assertEquals(await receiptRows(f.db, f.g.roomId, 0, '@bob:test'), []);
+      });
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('facade receipts: authenticated import retains original admission after departure without an export echo', async () => {
   const f = await fixture();
   try {
@@ -677,6 +723,80 @@ Deno.test('facade receipts: v37 horizons retain exact graph target identity on u
         scope: 'main',
         event: '$read',
       }],
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('facade receipts: actual v38 upgrade re-seeds authentic membership evidence without new feed publication', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'receipt-admission-upgrade-' });
+  const options = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(options, {
+    schemas: { room: roomSchema, server: historicalServerSchema(38) },
+  });
+  try {
+    const g = await genesis(store, {
+      roomId: '!receipt-admission-upgrade:test',
+    });
+    const joined = await bobJoins(g);
+    const changes = await g.room.tx((tx) => tx.changes.after(0, 500));
+    const mark = changes.at(-1)!.pos, db = await store.server();
+    await db.tx(async (tx) => {
+      for (const change of changes) {
+        if (change.kind !== 'event' || change.event === null) continue;
+        const payload = JSON.parse(change.data);
+        await tx.execute(
+          'INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES(?,?,?,?,?,NULL)',
+          [
+            change.event,
+            g.roomId,
+            change.pos,
+            payload.standing,
+            payload.grounding,
+          ],
+        );
+        await tx.execute('INSERT INTO receipt_dag_nodes VALUES(?,?)', [
+          g.roomId,
+          change.event,
+        ]);
+      }
+      await advance(tx, 'room:' + g.roomId, mark);
+      await advance(tx, 'push-context:' + g.roomId, mark);
+      await advance(tx, 'receipt-graph:' + g.roomId, mark);
+    });
+    await store.close();
+    store = await openStore(options, {
+      schemas: { room: roomSchema, server: serverSchema },
+    });
+    const upgraded = await store.server();
+    assertEquals(await get(upgraded, 'receipt-graph:' + g.roomId), 0);
+    await project(store, g.roomId);
+    assertEquals(
+      await upgraded.query(
+        'SELECT user,membership FROM receipt_membership_events WHERE room=? AND event=?',
+        [g.roomId, joined],
+      ),
+      [{ user: '@bob:test', membership: 'join' }],
+    );
+    assertEquals(await upgraded.query('SELECT * FROM feed'), []);
+    assertEquals(await get(upgraded, 'receipt-graph:' + g.roomId), mark);
+    const facts = await upgraded.query(
+      'SELECT * FROM receipt_membership_events ORDER BY event',
+    );
+    await project(store, g.roomId);
+    assertEquals(
+      await upgraded.query(
+        'SELECT * FROM receipt_membership_events ORDER BY event',
+      ),
+      facts,
     );
   } finally {
     await store.close();

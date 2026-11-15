@@ -406,8 +406,8 @@ async function projectPendingReceipts(tx: Conn, roomId: string) {
     // mark out of storage or discloses an unknown event ID to local consumers.
     if (
       !(await tx.query(
-        "SELECT 1 FROM event_index WHERE event=? AND room=? AND standing='accepted' AND grounding='grounded'",
-        [mark.admission.membershipEvent, roomId],
+        "SELECT 1 FROM receipt_membership_events m JOIN event_index i ON i.event=m.event AND i.room=m.room WHERE m.event=? AND m.room=? AND m.user=? AND m.membership='join' AND i.standing='accepted' AND i.grounding='grounded'",
+        [mark.admission.membershipEvent, roomId, mark.userId],
       )).length
     ) continue;
     for (const event of mark.eventIds) {

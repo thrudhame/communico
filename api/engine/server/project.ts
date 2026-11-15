@@ -23,7 +23,11 @@ import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { reconcileTyping } from '#engine/typing.ts';
-import { projectReceiptGraph } from '#engine/server/receipt-frontier.ts';
+import {
+  projectReceiptGraph,
+  type ReceiptMembership,
+  receiptMembership,
+} from '#engine/server/receipt-frontier.ts';
 import { reconcileReceiptMarks } from '#engine/server/ephemeral.ts';
 import {
   preparePush,
@@ -240,17 +244,28 @@ async function seedReceiptGraph(store: Store, room: Room): Promise<boolean> {
     const out = [];
     for (const row of page) {
       const event = String(row.event);
-      if (await tx.events.get(event) === null) {
+      const held = await tx.events.get(event);
+      if (held === null) {
         throw new Error('projected receipt event missing: ' + event);
       }
-      out.push({ event, prevs: await tx.events.prevsOf(event) });
+      out.push({
+        event,
+        prevs: await tx.events.prevsOf(event),
+        membership: receiptMembership(JSON.parse(held.pdu)),
+      });
     }
     return out;
   });
   const cursor = page.length < BATCH ? mark : Number(page.at(-1)!.pos);
   await eventStreamTx(server, async (tx) => {
     for (const fact of facts) {
-      await projectReceiptGraph(tx, room.id, fact.event, fact.prevs);
+      await projectReceiptGraph(
+        tx,
+        room.id,
+        fact.event,
+        fact.prevs,
+        fact.membership,
+      );
     }
     await reconcileReceiptMarks(tx, room.id);
     for (const fact of facts) {
@@ -287,6 +302,7 @@ type Prepared =
       kind: 'event' | 'transition' | 'history';
       payload: EventPayload;
       prevs: string[] | null;
+      receiptMembership: ReceiptMembership | null;
       relation: { relatesTo: string; relType: string | null } | null;
       search: { key: string; text: string } | null;
       // A live cut's complete published membership. Reconciliation uses
@@ -437,6 +453,7 @@ async function prepare(
           null;
         let search: { key: string; text: string } | null = null;
         let prevs: string[] | null = null;
+        let member: ReceiptMembership | null = null;
         if (
           payload.standing === 'accepted' && payload.grounding === 'grounded'
         ) {
@@ -449,6 +466,7 @@ async function prepare(
           });
           if (facts !== null) {
             prevs = facts.prevs;
+            member = receiptMembership(facts.pdu);
             relation = relationOf(facts.pdu, change.event);
             if (change.kind !== 'history' && isLive(payload)) {
               search = searchTextOf(payload, facts.pdu);
@@ -490,6 +508,7 @@ async function prepare(
           kind: change.kind,
           payload,
           prevs,
+          receiptMembership: member,
           relation,
           search,
           publication,
@@ -841,7 +860,13 @@ async function applyReceiptGraph(
   item: Extract<Prepared, { payload: EventPayload }>,
 ): Promise<void> {
   if (item.prevs === null) return;
-  await projectReceiptGraph(tx, roomId, item.change.event!, item.prevs);
+  await projectReceiptGraph(
+    tx,
+    roomId,
+    item.change.event!,
+    item.prevs,
+    item.receiptMembership,
+  );
   await reconcileReceiptMarks(tx, roomId);
 }
 
