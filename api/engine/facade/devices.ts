@@ -14,6 +14,10 @@ import {
   type DeviceOperation,
 } from '#engine/tenant/device-source.ts';
 import { importDeviceOperation } from '#engine/tenant/device-operations.ts';
+import {
+  linkApplication,
+  retainLinkApplication,
+} from '#engine/tenant/link-applications.ts';
 import { checkLocalpart } from '#engine/tenant/users.ts';
 import { type DomainBinding, requireDomainControl } from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
@@ -21,6 +25,7 @@ import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
 import { integer, LinkError, object, type Stream, text } from './protocol.ts';
+import { signingFence } from './signing-authority.ts';
 
 export type DeviceView = DomainBinding & {
   kind: 'device-operation';
@@ -210,9 +215,10 @@ export class DeviceOperations {
     stream: Stream,
     pairing?: string,
   ): Promise<boolean> {
-    const grant = await this.binding(pairing),
-      context = grant.body.transcript.body.context;
-    const peer = this.node ? 'home' : context.node;
+    if (!this.node && !pairing) {
+      mismatch('home device exchange requires pairing');
+    }
+    const peer = this.node ? 'home' : stream.source;
     const record = await journal.next(peer, stream);
     if (!record) return false;
     if (record.type !== 'device-operation' || record.version !== 1) {
@@ -220,8 +226,27 @@ export class DeviceOperations {
     }
     const signed = object(record.payload), view = viewOf(signed.body);
     if (
+      view.server !== this.tenant.serverName ||
+      (!this.node && view.pairing !== pairing)
+    ) {
+      mismatch('device completion differs from local scope');
+    }
+    const tenant = await this.store.tenant(this.tenant.serverName);
+    const prior = await tenant.tx((conn) =>
+      linkApplication(conn, peer, record)
+    );
+    if (prior) {
+      await journal.complete(peer, stream, record, prior.result);
+      return true;
+    }
+    const server = await this.store.server();
+    const unchanged = signingFence(server);
+    const grant = await this.binding(pairing),
+      context = grant.body.transcript.body.context;
+    if (
       view.server !== context.server || view.pairing !== context.id ||
       view.grantRevision !== grant.body.revision || view.source !== peer ||
+      peer !== (this.node ? 'home' : context.node) ||
       record.source !== peer ||
       record.incarnation !==
         (this.node ? context.id : grant.body.transcript.body.incarnation) ||
@@ -247,19 +272,22 @@ export class DeviceOperations {
       await this.selected(conn, grant, view.localpart);
       await requireDomainControl(conn, view);
     };
-    await (await this.store.server()).tx(check);
-    await (await this.store.tenant(context.server)).tx(async (conn) => {
+    await server.tx(check);
+    const result = await tenant.tx(async (conn) => {
+      unchanged();
       await this.tenantSelected(conn, view);
       await importDeviceOperation(conn, view.operation, view);
+      const result = { operationId: view.operation.operationId };
+      await retainLinkApplication(conn, peer, record, result);
+      // This synchronous fence is the admission cut. A retirement begun before
+      // it rolls back fact + receipt. Once it passes, a successful owner commit
+      // is admitted immutable work, even if revocation overlaps native COMMIT.
+      unchanged();
+      return result;
     });
-    // A crash before this ACK replays only the immutable tenant fact. It cannot
-    // reauthor the operation, mint sessions or allocate a consuming key pool.
-    return await journal.apply(peer, stream, async (conn, current) => {
-      await check(conn);
-      if (current.hash !== record.hash) {
-        throw new LinkError('LINK_DIVERGED', 'device application raced');
-      }
-      return { operationId: view.operation.operationId };
-    });
+    // Completion cannot retroactively revoke admitted work. After ACK loss,
+    // only the exact durable receipt can take this path, including cold replay.
+    await journal.complete(peer, stream, record, result);
+    return true;
   }
 }

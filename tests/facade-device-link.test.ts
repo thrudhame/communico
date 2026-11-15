@@ -24,6 +24,70 @@ import { updateDeviceName, upsertDevice } from '#engine/tenant/devices.ts';
 import { publicDeviceValues } from '#engine/tenant/device-operations.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
+import type { Conn } from '#engine/store/db.ts';
+import type { Store } from '#engine/store/index.ts';
+
+// Pause the real owner at deterministic cross-file boundaries. Revocation runs
+// in the test task, never as a nested server transaction in the owner callback.
+function pauseImport(store: Store, cut: 'before' | 'during' | 'after') {
+  const reached = Promise.withResolvers<void>();
+  const proceed = Promise.withResolvers<void>();
+  const tenant = store.tenant.bind(store);
+  let paused = false;
+  const pause = async () => {
+    if (paused) return;
+    paused = true;
+    reached.resolve();
+    await proceed.promise;
+  };
+  store.tenant = async (...args) => {
+    const db = await tenant(...args);
+    return {
+      ...db,
+      tx: async (fn, options) => {
+        let imported = false;
+        const result = await db.tx((conn) =>
+          fn(
+            new Proxy(conn, {
+              get(target, key) {
+                if (key === 'query') {
+                  return async (...args: Parameters<Conn['query']>) => {
+                    const [sql] = args;
+                    if (
+                      cut === 'before' &&
+                      sql.includes('facade_owner_activation')
+                    ) await pause();
+                    return await target.query(...args);
+                  };
+                }
+                if (key === 'execute') {
+                  return async (...args: Parameters<Conn['execute']>) => {
+                    const value = await target.execute(...args);
+                    if (args[0].startsWith('INSERT INTO device_operations ')) {
+                      imported = true;
+                      if (cut === 'during') await pause();
+                    }
+                    return value;
+                  };
+                }
+                const value = Reflect.get(target, key);
+                return typeof value === 'function' ? value.bind(target) : value;
+              },
+            }),
+          ), options);
+        if (imported && cut === 'after') await pause();
+        return result;
+      },
+    };
+  };
+  return {
+    reached: reached.promise,
+    resume: () => proceed.resolve(),
+    restore: () => {
+      store.tenant = tenant;
+    },
+  };
+}
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-device-link-' });
@@ -276,14 +340,14 @@ Deno.test('device link: committed owner fact survives ACK loss and cold reopen w
     const records = await f.hs.export('alice', f.bundle.id);
     assert(records.length > 0);
     await f.ej.receive('home', records);
-    const apply = f.ej.apply.bind(f.ej);
-    f.ej.apply = () => Promise.reject(new Error('injected ACK loss'));
+    const complete = f.ej.complete.bind(f.ej);
+    f.ej.complete = () => Promise.reject(new Error('injected ACK loss'));
     await assertRejects(
       () => f.es.apply(f.ej, records[0]),
       Error,
       'injected ACK loss',
     );
-    f.ej.apply = apply;
+    f.ej.complete = complete;
     assertEquals(
       (await (await f.edge.tenant('logical.test')).query(
         'SELECT * FROM device_operations',
@@ -343,6 +407,175 @@ Deno.test('device link: unselected accounts are refused before any export intent
     }
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('device link: revocation before or during tenant admission rolls back at both receiving owners', async () => {
+  for (const side of ['home', 'edge'] as const) {
+    for (const cut of ['before', 'during'] as const) {
+      const f = await fixture();
+      try {
+        if (side === 'home') {
+          await upsertDevice(f.et, 'alice', 'PHONE', 'outside');
+          const auth = await exportSessionAuthority(
+            f.edge,
+            f.et,
+            f.fp,
+            f.owners,
+            f.node,
+            'alice',
+          );
+          await f.hj.receive('edge_a', [auth]);
+          await f.accounts.applyFromFacade(f.hj, f.bundle.id, auth);
+        }
+        const store = side === 'home' ? f.home : f.edge;
+        const owner = side === 'home' ? f.hs : f.es;
+        const journal = side === 'home' ? f.hj : f.ej;
+        const peer = side === 'home' ? 'edge_a' : 'home';
+        const records = side === 'home'
+          ? await f.es.export('alice')
+          : await f.hs.export('alice', f.bundle.id);
+        await journal.receive(peer, records);
+        const paused = pauseImport(store, cut);
+        const outcome = owner.apply(
+          journal,
+          records[0],
+          side === 'home' ? f.bundle.id : undefined,
+        )
+          .then(() => null, (error) => error);
+        try {
+          await paused.reached;
+          const revoked = await f.hp.revoke(f.bundle.id);
+          if (side === 'edge') await f.fp.retire(revoked, 'a'.repeat(64));
+        } finally {
+          paused.resume();
+          paused.restore();
+        }
+        assert(await outcome instanceof Error, 'revoked admission must refuse');
+        assertEquals(
+          await (await store.tenant('logical.test')).query(
+            'SELECT * FROM device_operations',
+          ),
+          [],
+          cut,
+        );
+        assertEquals(
+          (await journal.next(peer, records[0]))?.hash,
+          records[0].hash,
+        );
+      } finally {
+        await f.close();
+      }
+    }
+  }
+});
+
+Deno.test('device link: revocation after tenant admission completes its exact ACK after cold reopen only', async () => {
+  for (const side of ['edge', 'home'] as const) {
+    const f = await fixture();
+    try {
+      if (side === 'home') {
+        await upsertDevice(f.et, 'alice', 'PHONE', 'outside');
+        const auth = await exportSessionAuthority(
+          f.edge,
+          f.et,
+          f.fp,
+          f.owners,
+          f.node,
+          'alice',
+        );
+        await f.hj.receive('edge_a', [auth]);
+        await f.accounts.applyFromFacade(f.hj, f.bundle.id, auth);
+        await f.es.export('alice');
+        await updateDeviceName(f.et, 'alice', 'PHONE', 'second edge fact');
+      } else {
+        await f.hs.export('alice', f.bundle.id);
+        await updateDeviceName(f.ht, 'alice', 'LAN', 'second home fact');
+      }
+      const store = side === 'home' ? f.home : f.edge;
+      const receiver = side === 'home' ? f.hs : f.es;
+      const currentJournal = side === 'home' ? f.hj : f.ej;
+      const peer = side === 'home' ? 'edge_a' : 'home';
+      const pairing = side === 'home' ? f.bundle.id : undefined;
+      const records = side === 'home'
+        ? await f.es.export('alice')
+        : await f.hs.export('alice', f.bundle.id);
+      assert(records.length >= 2);
+      await currentJournal.receive(peer, records);
+      const paused = pauseImport(store, 'after');
+      const complete = currentJournal.complete.bind(currentJournal);
+      currentJournal.complete = () =>
+        Promise.reject(new Error('injected ACK loss'));
+      const outcome = receiver.apply(currentJournal, records[0], pairing).then(
+        () => null,
+        (error) => error,
+      );
+      try {
+        await paused.reached;
+        const revoked = await f.hp.revoke(f.bundle.id);
+        if (side === 'edge') await f.fp.retire(revoked, 'a'.repeat(64));
+      } finally {
+        paused.resume();
+        paused.restore();
+      }
+      const error = await outcome;
+      assert(
+        error instanceof Error && error.message === 'injected ACK loss',
+        'already admitted fact must reach durable completion, not a new live-grant check',
+      );
+      currentJournal.complete = complete;
+      assertEquals(
+        (await (await store.tenant('logical.test')).query(
+          'SELECT * FROM device_operations',
+        )).length,
+        1,
+      );
+      await store.close();
+      const reopened = await f.open(side);
+      try {
+        const pairings = side === 'edge'
+          ? new Pairings(
+            await reopened.server(),
+            f.node.signer(),
+            f.node.publicKey,
+            'b'.repeat(64),
+            f.node,
+          )
+          : new Pairings(
+            await reopened.server(),
+            f.ht.signer(),
+            f.ht.publicB64,
+            'a'.repeat(64),
+          );
+        const journal = new Journal(await reopened.server(), LINK_SUPPORTED);
+        const owner = new DeviceOperations(
+          reopened,
+          side === 'edge' ? f.et : f.ht,
+          pairings,
+          side === 'edge' ? f.node : undefined,
+        );
+        assertEquals(await owner.apply(journal, records[0], pairing), true);
+        assertEquals((await journal.heads(peer, 'in', records[0])).applied, {
+          sequence: records[0].sequence,
+          hash: records[0].hash,
+        });
+        assertEquals(
+          (await (await reopened.tenant('logical.test')).query(
+            'SELECT * FROM device_operations',
+          )).length,
+          1,
+        );
+        // A retained receipt is not permission to admit a second signed record.
+        await assertRejects(
+          () => owner.apply(journal, records[1], pairing),
+          Error,
+        );
+      } finally {
+        await reopened.close();
+      }
+    } finally {
+      await f.close();
+    }
   }
 });
 

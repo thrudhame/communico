@@ -564,17 +564,21 @@ export class Pairings {
 
   async revoke(id: string, now = Date.now()): Promise<Revocation> {
     if (this.node) refused('facade cannot revoke home authority');
-    const reserved = await this.db.tx(async (conn) => {
-      const current = await entry(conn, id);
-      if (current.side !== 'home') refused('wrong enrollment role');
-      if (current.state === 'revoked') return current;
-      const revision = await nextRevision(conn);
-      await conn.execute(
-        "UPDATE facade_pairings SET state='revoked',revision=?,retired_ms=? WHERE id=?",
-        [revision, integer(now), id],
-      );
-      return { ...current, revision };
-    });
+    const reserved = await changeSigningAuthority(
+      this.db,
+      () =>
+        this.db.tx(async (conn) => {
+          const current = await entry(conn, id);
+          if (current.side !== 'home') refused('wrong enrollment role');
+          if (current.state === 'revoked') return current;
+          const revision = await nextRevision(conn);
+          await conn.execute(
+            "UPDATE facade_pairings SET state='revoked',revision=?,retired_ms=? WHERE id=?",
+            [revision, integer(now), id],
+          );
+          return { ...current, revision };
+        }),
+    );
     const revocation = await sign(this.signer, {
       kind: 'facade-enrollment-revocation' as const,
       server: this.signer.serverName,
