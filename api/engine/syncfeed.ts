@@ -8,7 +8,7 @@ import { StateDelivery } from '#engine/client/state-delivery.ts';
 import { syncWindow } from '#engine/client/sync-window.ts';
 import {
   renderPrejoinDeparture,
-  renderStateEvent,
+  renderStateEvents,
 } from '#engine/client/render.ts';
 import { inviteOf, prejoinDeparture } from '#engine/federation/invites.ts';
 import {
@@ -147,15 +147,14 @@ async function roomTimeline(
     incremental: i.since !== null,
     fullState: i.fullState,
   });
-  const stateEvents: Record<string, unknown>[] = [];
-  for (const row of prepared.rows) {
-    const ev = await renderStateEvent(room, row.eventId, {
+  const stateEvents = [
+    ...(await renderStateEvents(room, prepared.rows.map((row) => row.eventId), {
       userId: i.userId,
       deviceId: i.deviceId,
       tenant: app.tenant,
-    }, { omitRoomId: true, eventFormat: i.filter.eventFormat, admission });
-    if (ev !== null) stateEvents.push(ev);
-  }
+    }, { omitRoomId: true, eventFormat: i.filter.eventFormat, admission }))
+      .values(),
+  ];
   const prevE = trimmed && returned.length ? returned[0].seq - 1 : end;
   // Like Synapse, an untrimmed window retains its captured end cut. Only a
   // limited window needs a before-event cursor for the missing older history.

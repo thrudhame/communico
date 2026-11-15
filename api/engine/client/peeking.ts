@@ -11,7 +11,7 @@ import { visibility } from '#engine/server/directory.ts';
 import { listRoomAccountData } from '#engine/tenant/accountdata.ts';
 import { requireRoom, stateAtSeq } from './room.ts';
 import { admitState } from './state-admission.ts';
-import { renderEvent } from './render.ts';
+import { renderEvents } from './render.ts';
 import { clientEventsForRows } from './state.ts';
 import { messages } from './timeline.ts';
 import { parseStreamToken } from './tokens.ts';
@@ -165,15 +165,13 @@ export async function roomEvents(
           config().peeking.maxevents,
           snapshot.cut,
         );
-        const chunk: Record<string, unknown>[] = [];
-        for (const row of rows) {
-          const event = await renderEvent(snapshot.room, row.event, {
+        const chunk = [
+          ...(await renderEvents(snapshot.room, rows.map((row) => row.event), {
             userId: user,
             deviceId: device,
             tenant: app.tenant,
-          });
-          if (event !== null) chunk.push(event);
-        }
+          })).values(),
+        ];
         const end = rows.length === config().peeking.maxevents
           ? rows.at(-1)!.seq
           : Math.max(from, snapshot.cut);

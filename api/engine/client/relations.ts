@@ -5,7 +5,7 @@ import { type Room } from '#engine/room/index.ts';
 import { stableCausalOrder } from '#engine/room/order.ts';
 import { requireRoom } from './room.ts';
 import { cursorForToken } from './timeline.ts';
-import { renderEvent } from './render.ts';
+import { renderEvents } from './render.ts';
 import { canSeeEvent } from './visibility.ts';
 import { relationView } from './relation-view.ts';
 
@@ -156,15 +156,11 @@ export async function relationsPage(
     query.to,
   );
   const slice = window.slice(0, limit);
-  const chunk: Record<string, unknown>[] = [];
-  for (const row of slice) {
-    const event = await renderEvent(room, row.event, {
-      userId: viewer,
-      deviceId: null,
-      tenant: theApp().tenant,
-    });
-    if (event !== null) chunk.push(event);
-  }
+  const chunk = [...(await renderEvents(room, slice.map((row) => row.event), {
+    userId: viewer,
+    deviceId: null,
+    tenant: theApp().tenant,
+  })).values()];
   const out: {
     chunk: Record<string, unknown>[];
     next_batch?: string;
@@ -187,13 +183,15 @@ export async function threads(
 ) {
   const room = await requireRoom(roomId);
   const rendered: { event: string; ev: Record<string, unknown> }[] = [];
-  for (const root of await threadRootsOf(theApp().server, roomId)) {
-    const ev = await renderEvent(room, root.eventId, {
-      userId: viewer,
-      deviceId: null,
-      tenant: theApp().tenant,
-    });
-    if (ev === null) continue;
+  const roots = await threadRootsOf(theApp().server, roomId);
+  const events = await renderEvents(room, roots.map((root) => root.eventId), {
+    userId: viewer,
+    deviceId: null,
+    tenant: theApp().tenant,
+  });
+  for (const root of roots) {
+    const ev = events.get(root.eventId);
+    if (ev === undefined) continue;
     const summary = ((ev.unsigned as Record<string, unknown>)['m.relations'] as
       | Record<string, Record<string, unknown>>
       | undefined)?.['m.thread'];

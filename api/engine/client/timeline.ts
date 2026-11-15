@@ -19,7 +19,7 @@ import {
   roomEventFilterOf,
 } from '#engine/tenant/filters.ts';
 import { serversInRoom } from './membership.ts';
-import { renderEvent } from './render.ts';
+import { renderEvent, renderEvents } from './render.ts';
 import { requireRoom, type StateRow } from './room.ts';
 import { clientEventsForRows } from './state.ts';
 import { admitState } from './state-admission.ts';
@@ -169,6 +169,7 @@ export async function messages(
   let frontier: WalkCursor | null = null;
   let pending: Extract<WalkStep, { kind: 'event' }>[] = [];
   let storedPage = new Map<string, EventRow>();
+  let renderedPage = new Map<string, Record<string, unknown>>();
   while (chunk.length < limit) {
     let step: WalkStep;
     if (pending.length > 0) step = pending.shift()!;
@@ -187,6 +188,35 @@ export async function messages(
       if (page.kind === 'events') {
         pending = page.events;
         storedPage = page.stored;
+        const selected: string[] = [];
+        for (const entry of pending) {
+          if (leave !== null && await compare(room, entry.cursor, leave) > 0) {
+            if (w.dir === 'f') break;
+            continue;
+          }
+          if (to !== null) {
+            const cmp = await compare(room, entry.cursor, to);
+            if ((w.dir === 'f' && cmp > 0) || (w.dir === 'b' && cmp <= 0)) {
+              break;
+            }
+          }
+          const row = storedPage.get(entry.event);
+          if (
+            row !== undefined && eventMatchesRoomEventFilter(row, {
+              type: row.type,
+              sender: row.sender,
+              room_id: w.roomId,
+              ...(filter.contains_url === undefined
+                ? {}
+                : { content: JSON.parse(row.pdu).content }),
+            }, filter)
+          ) selected.push(entry.event);
+        }
+        renderedPage = await renderEvents(room, selected, {
+          userId: w.userId,
+          deviceId: w.deviceId,
+          tenant: theApp().tenant,
+        }, { take: limit - chunk.length });
         step = pending.shift()!;
       } else step = page;
     }
@@ -305,18 +335,13 @@ export async function messages(
         stored,
         { ...pdu, room_id: w.roomId },
         filter,
-      ) ||
-      !await canSeeEvent(w.userId, room, row.event)
+      )
     ) {
       filtered = true;
       continue;
     }
-    const ev = await renderEvent(room, row.event, {
-      userId: w.userId,
-      deviceId: w.deviceId,
-      tenant: theApp().tenant,
-    });
-    if (ev !== null) chunk.push(ev);
+    const ev = renderedPage.get(row.event);
+    if (ev !== undefined) chunk.push(ev);
     else filtered = true;
   }
   const last = lastScanned === undefined

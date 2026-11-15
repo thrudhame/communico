@@ -14,7 +14,7 @@ import {
 import { joinedRooms } from './membership.ts';
 import { lookupRoom, requireRoom, stateAtSeq } from './room.ts';
 import { admitState } from './state-admission.ts';
-import { renderEvent } from './render.ts';
+import { renderEvents } from './render.ts';
 import { messages } from './timeline.ts';
 import { searchRequest } from './search-request.ts';
 import { searchPage } from './search-page.ts';
@@ -106,14 +106,26 @@ export async function search(
     nextBatch,
   );
   const results: Record<string, unknown>[] = [];
+  const selected = new Map<string, string[]>();
   for (const hit of page) {
-    const room = (await lookupRoom(hit.roomId))!;
-    const ev = await renderEvent(room, hit.eventId, {
-      userId,
-      deviceId,
-      tenant: theApp().tenant,
-    });
-    if (ev === null) continue;
+    const ids = selected.get(hit.roomId) ?? [];
+    ids.push(hit.eventId);
+    selected.set(hit.roomId, ids);
+  }
+  const rendered = new Map<string, Record<string, unknown>>();
+  for (const [roomId, ids] of selected) {
+    const room = (await lookupRoom(roomId))!;
+    for (
+      const [id, event] of await renderEvents(room, ids, {
+        userId,
+        deviceId,
+        tenant: theApp().tenant,
+      })
+    ) rendered.set(id, event);
+  }
+  for (const hit of page) {
+    const ev = rendered.get(hit.eventId);
+    if (ev === undefined) continue;
     let context: Record<string, unknown> = {};
     if (request.context !== undefined) {
       const ctx = request.context;
