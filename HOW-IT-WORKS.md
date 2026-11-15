@@ -546,6 +546,12 @@ Long-poll relevance checks notification-change existence, not the full count map
 Notification listing filters the shared retention cutoff without owning deletion.
 Push-rule bodies and action updates are validated by their shared tenant writer.
 
+Notification read advancement selects unread facts through a covering partial
+index, shared by grouped counts and fact mutations. Retained read history is not
+part of that access path. Withdrawn unread facts remain indexed because reading
+them is independent of whether they contribute to visible counts. Fresh server
+schema v36 and supported upgrades install the same index.
+
 Typing admission is serialized with server membership writes; completed room
 projection reconciles retained typing before notifying consumers. Leave, ban,
 imported resets and outsider stops clear retained entries and publish a stop.

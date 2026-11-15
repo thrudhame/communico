@@ -398,8 +398,13 @@ ALTER TABLE receipts RENAME COLUMN event_id TO event_ids;
 UPDATE receipts SET event_ids=json_array(event_ids);
 `;
 
+// Read advancement consumes only unread facts, including withdrawn ones. The
+// covering thread order also serves grouped summaries without retained history.
+const NOTIFICATIONS_UNREAD_SQL =
+  'CREATE INDEX notifications_unread ON notifications(user,room,thread,event_seq,withdrawn,highlight) WHERE read_ms IS NULL';
+
 export const serverSchema: SchemaProvider = {
-  version: 36,
+  version: 37,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -436,6 +441,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(KEY_DECISIONS_SQL);
     await db.exec(FACADE_INGRESS_SQL);
     await db.exec(FACADE_EGRESS_SQL);
+    await db.exec(NOTIFICATIONS_UNREAD_SQL);
     await db.exec(OWNER_CONTROL_SQL);
     await db.exec(PUBLICATION_DOMAIN_SQL);
   },
@@ -475,7 +481,8 @@ export const serverSchema: SchemaProvider = {
     32: (conn) => conn.exec(KEY_DECISIONS_SQL),
     33: (conn) => conn.exec(FACADE_INGRESS_SQL),
     34: (conn) => conn.exec(FACADE_EGRESS_SQL),
-    35: async (conn) => {
+    35: (conn) => conn.exec(NOTIFICATIONS_UNREAD_SQL),
+    36: async (conn) => {
       await conn.exec(OWNER_CONTROL_SQL);
       await conn.exec(PUBLICATION_DOMAIN_SQL);
     },

@@ -5,6 +5,7 @@ import {
   frozenBatch,
 } from '#engine/server/delivery.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { initializeNode } from '#engine/facade/identity.ts';
@@ -23,14 +24,14 @@ const settings = (dir: string) => ({
   idleseconds: 300,
 });
 
-async function fixture() {
+async function fixture(seedServer = serverSchema) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-egress-owner-' });
-  const open = (name: string) =>
+  const open = (name: string, schema = serverSchema) =>
     openStore(settings(dir + '/' + name), {
-      schemas: { server: serverSchema, tenant: tenantSchema },
+      schemas: { server: schema, tenant: tenantSchema },
     });
-  const home = await open('home');
-  let edge = await open('edge');
+  const home = await open('home', seedServer);
+  let edge = await open('edge', seedServer);
   const tenant = await openTenant(home, 'logical.test', { create: true });
   const node = await initializeNode(
     await edge.server(),
@@ -285,11 +286,11 @@ Deno.test('facade dispatch loss retries the identical owner envelope after resta
 });
 
 Deno.test('egress migration upgrades v34 without losing frozen bytes', async () => {
-  const f = await fixture();
+  const f = await fixture(historicalServerSchema(35));
   try {
     await (await f.db()).tx(async (tx) => {
       await tx.exec(
-        'DROP TABLE domain_conflicts; DROP TABLE domain_frontiers; DROP TABLE domain_operations; DROP TABLE facade_owner_activation; DROP TABLE facade_owner_controls; DROP TABLE publication_domain; DROP TABLE facade_egress; DROP TABLE facade_egress_routes',
+        'DROP TABLE facade_egress; DROP TABLE facade_egress_routes',
       );
       await tx.execute("UPDATE meta SET v='34' WHERE k='schema_version'");
     }, { mode: 'deferred' });
