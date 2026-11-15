@@ -116,6 +116,32 @@ export async function transactionForEvent(
   return await tenant.tx((tx) => tx.txns.forEvent(device, roomId, eventId));
 }
 
+/** Resolve one sending-device generation for the renderer's whole event batch.
+ * A deleted/replaced device never discloses the old generation's receipts. */
+export async function transactionsForDeviceEvents(
+  tenant: Tenant,
+  localpart: string,
+  deviceId: string,
+  roomId: string,
+  eventIds: readonly string[],
+): Promise<Map<string, string>> {
+  if (!eventIds.length) return new Map();
+  return await tenant.tx(async (tx) => {
+    const device = await tx.devices.byId(deviceId, localpart);
+    const result = new Map<string, string>();
+    if (device === null) return result;
+    for (const eventId of new Set(eventIds)) {
+      const txn = await tx.txns.forEvent(
+        { localpart, deviceId, generation: device.generation },
+        roomId,
+        eventId,
+      );
+      if (txn !== null) result.set(eventId, txn);
+    }
+    return result;
+  });
+}
+
 export async function transactionIdForEvent(
   conn: Conn,
   device: DeviceIdentity,

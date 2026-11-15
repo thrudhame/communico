@@ -1,8 +1,12 @@
 import type { Room } from '#engine/room/index.ts';
 import { stableCausalOrder } from '#engine/room/order.ts';
-import { type RelationRow, relationsOf } from '#engine/server/read.ts';
+import {
+  type RelationRow,
+  relationsForEvents,
+  relationsOf,
+} from '#engine/server/read.ts';
 import { ignoredSenders } from './ignored.ts';
-import { canSeeEvent } from './visibility.ts';
+import { canSeeEvent, canSeeEventAt } from './visibility.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Viewer } from './render.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -22,67 +26,117 @@ export async function relationBundles(
   viewer: Viewer,
   opts: { threads: boolean; redacted: boolean },
 ): Promise<BundleSelection> {
-  const result: BundleSelection = {
-    references: [],
-    replacement: null,
-    thread: null,
-  };
-  const relation = parent.content?.['m.relates_to'] as
-    | { rel_type?: unknown }
-    | null;
-  if (
-    parent.state_key != null || relation?.rel_type === 'm.replace' ||
-    relation?.rel_type === 'm.annotation'
-  ) return result;
-  result.references =
-    (await relationView(room, eventId, viewer, { relType: 'm.reference' })).map(
-      (r) => r.eventId,
-    );
-  if (!opts.redacted) {
-    let latest: { id: string; ts: number } | null = null;
-    for (
-      const child of await relationView(room, eventId, viewer, {
-        relType: 'm.replace',
-      })
-    ) {
-      const row = await room.tx((tx) => tx.events.get(child.eventId));
-      if (
-        row === null || row.state_key !== null ||
-        row.sender !== parent.sender || row.type !== parent.type
-      ) continue;
-      const content = (JSON.parse(row.pdu) as Pdu).content;
-      const replacement = content?.['m.new_content'];
-      // Encrypted new content exists only inside the ciphertext, not the envelope.
-      if (
-        row.type !== 'm.room.encrypted' &&
-        (replacement === null || typeof replacement !== 'object' ||
-          Array.isArray(replacement))
-      ) continue;
-      if (
-        latest === null || row.origin_ts > latest.ts ||
-        (row.origin_ts === latest.ts && row.id > latest.id)
-      ) latest = { id: row.id, ts: row.origin_ts };
-    }
-    result.replacement = latest?.id ?? null;
+  return (await relationBundlesFor(room, new Map([[eventId, parent]]), viewer, {
+    threads: opts.threads,
+    redacted: new Set(opts.redacted ? [eventId] : []),
+  }, await ignoredSenders(viewer))).get(eventId)!;
+}
+
+/** Direct bundles have one server candidate capture and one room admission
+ * attempt for every parent. Nested rendering remains the renderer's job. */
+export async function relationBundlesFor(
+  room: Room,
+  parents: ReadonlyMap<string, Pdu>,
+  viewer: Viewer,
+  opts: { threads: boolean; redacted: ReadonlySet<string> },
+  ignored: ReadonlySet<string>,
+): Promise<Map<string, BundleSelection>> {
+  const selected = new Map([...parents].filter(([, parent]) => {
+    const relation = parent.content?.['m.relates_to'] as
+      | { rel_type?: unknown }
+      | null;
+    return parent.state_key == null && relation?.rel_type !== 'm.replace' &&
+      relation?.rel_type !== 'm.annotation';
+  }));
+  const candidates = await relationsForEvents(
+    await room.store.server(),
+    room.id,
+    [...selected.keys()],
+    ['m.reference', 'm.replace', ...(opts.threads ? ['m.thread'] : [])],
+  );
+  const result = new Map<string, BundleSelection>();
+  for (const id of parents.keys()) {
+    result.set(id, { references: [], replacement: null, thread: null });
   }
-  if (opts.threads) {
-    const children = await relationView(room, eventId, viewer, {
-      relType: 'm.thread',
-    });
-    if (children.length > 0) {
-      let participated = parent.sender === viewer.userId;
-      for (const child of children) {
-        const row = await room.tx((tx) => tx.events.get(child.eventId));
-        if (row?.sender === viewer.userId) participated = true;
-      }
-      result.thread = {
-        latest: children.at(-1)!.eventId,
-        count: children.length,
-        participated,
+  if (!candidates.size) return result;
+  return await room.tx(async (tx) => {
+    const result = new Map<string, BundleSelection>();
+    const rows = await tx.events.list([
+      ...new Set(
+        [...candidates.values()].flatMap((items) =>
+          items.map((row) => row.eventId)
+        ),
+      ),
+    ]);
+    const visible = new Map<string, boolean>();
+    for (const [id, row] of rows) {
+      visible.set(
+        id,
+        !ignored.has(row.sender) && await canSeeEventAt(viewer.userId, tx, id),
+      );
+    }
+    for (const [id, parent] of parents) {
+      const bundle: BundleSelection = {
+        references: [],
+        replacement: null,
+        thread: null,
       };
+      result.set(id, bundle);
+      const children = (candidates.get(id) ?? []).filter((row) =>
+        visible.get(row.eventId)
+      );
+      const ordered = async (kind: string) => {
+        const matching = new Map(
+          children.filter((row) => row.relType === kind).map((
+            row,
+          ) => [row.eventId, row]),
+        );
+        const order = await stableCausalOrder(tx, [...matching.keys()]);
+        return order.map((key) => matching.get(key)!);
+      };
+      bundle.references = (await ordered('m.reference')).map((row) =>
+        row.eventId
+      );
+      if (!opts.redacted.has(id)) {
+        let latest: { id: string; ts: number } | null = null;
+        for (
+          const child of children.filter((row) => row.relType === 'm.replace')
+        ) {
+          const row = rows.get(child.eventId)!;
+          if (
+            row.state_key !== null || row.sender !== parent.sender ||
+            row.type !== parent.type
+          ) continue;
+          const replacement = (JSON.parse(row.pdu) as Pdu).content
+            ?.['m.new_content'];
+          if (
+            row.type !== 'm.room.encrypted' &&
+            (replacement === null || typeof replacement !== 'object' ||
+              Array.isArray(replacement))
+          ) continue;
+          if (
+            latest === null || row.origin_ts > latest.ts ||
+            (row.origin_ts === latest.ts && row.id > latest.id)
+          ) latest = { id: row.id, ts: row.origin_ts };
+        }
+        bundle.replacement = latest?.id ?? null;
+      }
+      if (opts.threads) {
+        const threads = await ordered('m.thread');
+        if (threads.length) {
+          bundle.thread = {
+            latest: threads.at(-1)!.eventId,
+            count: threads.length,
+            participated: parent.sender === viewer.userId ||
+              threads.some((row) =>
+                rows.get(row.eventId)?.sender === viewer.userId
+              ),
+          };
+        }
+      }
     }
-  }
-  return result;
+    return result;
+  });
 }
 
 // Walk structurally valid edges first, then apply the viewer's presentation

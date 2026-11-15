@@ -410,7 +410,19 @@ one-time/fallback key objects require signature maps before any pool publication
 this is structural validation, not a new cryptographic verification requirement.
 (`client/{membership-request,state-request}.ts`, `tenant/e2ee.ts`)
 
-All client timeline rendering crosses one viewer-aware `renderEvent` boundary.
+All client timeline rendering crosses one viewer-aware batch boundary;
+`renderEvent` delegates to its singleton form. State batches retain their own
+exact snapshot admission grants and share only the private formatter. Ordinary
+and sliding sync, messages, relations, search results, state and discovery pages
+pass their existing selected IDs to this owner. Each batch captures its room
+facts in a transaction attempt, without tenant/server reads inside that callback.
+Ignored senders, sending-device receipts, redactions, erasure intent and relation
+candidates are captured through their domain owners, rather than reopened for
+each event. Room state maps never cross attempts. Live-window membership uses
+the selected feed row's actual publication position; nested replies inherit that
+membership and serialization format, not another event's cut. Later render
+operations recapture mutable viewer policy.
+
 Its shared visibility policy requires accepted, grounded events; the viewer's
 own membership events are visible without a qualifying join. Other events need
 genuine event-state refs: after-state, plus before-state for history-visibility
