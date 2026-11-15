@@ -12,6 +12,7 @@ import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LinkError } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import type { Database } from '#engine/store/db.ts';
@@ -25,14 +26,14 @@ const cfg = (dir: string) => ({
   maxopenfiles: 8,
   idleseconds: 300,
 });
-async function fixture() {
+async function fixture(seedServer = serverSchema) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-pairing-' });
-  const open = (name: string) =>
+  const open = (name: string, schema = serverSchema) =>
     openStore(cfg(dir + '/' + name), {
-      schemas: { server: serverSchema, tenant: tenantSchema },
+      schemas: { server: schema, tenant: tenantSchema },
     });
-  let home: Store = await open('home');
-  let edge: Store = await open('edge');
+  let home: Store = await open('home', seedServer);
+  let edge: Store = await open('edge', seedServer);
   const tenant = await openTenant(home, 'logical.test', { create: true });
   let node = await initializeNode(
     await edge.server(),
@@ -218,7 +219,7 @@ Deno.test('home key document publishes approved node keys and durable prospectiv
 });
 
 Deno.test('v28 upgrade retains enrolled authority while adding prospective key retirement', async () => {
-  const f = await fixture();
+  const f = await fixture(historicalServerSchema(35));
   try {
     const bundle = await f.create();
     await f.fp.accept(bundle);

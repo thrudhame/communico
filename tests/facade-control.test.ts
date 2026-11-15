@@ -14,6 +14,7 @@ import { LINK_CAPABILITIES, LinkError } from '#engine/facade/protocol.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { openStore } from '#engine/store/index.ts';
 import type { Database } from '#engine/store/db.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -23,18 +24,18 @@ import {
   verifyJson,
 } from '#engine/signing-primitives.js';
 
-async function fixture() {
+async function fixture(seedServer = serverSchema) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-control-' });
-  const open = (name: string) =>
+  const open = (name: string, schema = serverSchema) =>
     openStore({
       dir: dir + '/' + name,
       library: './.native/libturso_ffi.so',
       checkpointlogbytes: 65536,
       maxopenfiles: 8,
       idleseconds: 300,
-    }, { schemas: { server: serverSchema, tenant: tenantSchema } });
-  const home = await open('home');
-  let edge = await open('edge');
+    }, { schemas: { server: schema, tenant: tenantSchema } });
+  const home = await open('home', seedServer);
+  let edge = await open('edge', seedServer);
   const tenant = await openTenant(home, 'logical.test', { create: true });
   const node = await initializeNode(
     await edge.server(),
@@ -509,7 +510,7 @@ Deno.test('roster retirement is preserved, and changed or forged control cannot 
 });
 
 Deno.test('v28 upgrade preserves the received roster and rejects home-signed same-revision substitution', async () => {
-  const f = await fixture();
+  const f = await fixture(historicalServerSchema(35));
   try {
     const first = await f.receive();
     await f.downgrade();
