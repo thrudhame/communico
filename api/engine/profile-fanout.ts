@@ -3,7 +3,7 @@
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import type { Signer } from '#engine/room/signer.ts';
-import { openRoom, type Room } from '#engine/room/index.ts';
+import { openRoom, type Room, type RoomTx } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { roomsFor } from '#engine/server/read.ts';
 import { onProjected } from '#engine/server/project.ts';
@@ -21,6 +21,20 @@ type Dependencies = {
   prepareSigner(work: ProfileFanout, room: string): Promise<Signer>;
   room?(id: string): Promise<Room>;
 };
+
+class DepartedProfileMember extends Error {}
+
+async function currentMembership(tx: RoomTx, user: string) {
+  const stay = await tx.segments.openStay();
+  const group = stay === null ? null : await tx.state.current(stay.id);
+  const id = group === null
+    ? null
+    : await tx.state.groupKey(group, 'm.room.member', user);
+  const event = id === null ? null : await tx.events.get(id);
+  return event === null
+    ? null
+    : JSON.parse(event.pdu).content as Record<string, unknown>;
+}
 
 export class ProfileFanoutWork {
   #tail: Promise<unknown> = Promise.resolve();
@@ -100,19 +114,11 @@ export class ProfileFanoutWork {
       tx.profiles.fanout.submission(work, roomId)
     );
     const { membership, receipt } = await room.tx(async (tx) => {
-      const stay = await tx.segments.openStay();
-      const group = stay === null ? null : await tx.state.current(stay.id);
-      const id = group === null
-        ? null
-        : await tx.state.groupKey(group, 'm.room.member', user);
-      const event = id === null ? null : await tx.events.get(id);
       const held = prepared === null
         ? null
         : await tx.events.get(prepared.eventId);
       return {
-        membership: event === null
-          ? null
-          : JSON.parse(event.pdu).content as Record<string, unknown>,
+        membership: await currentMembership(tx, user),
         receipt: held === null
           ? null
           : await tx.events.getStatus(prepared!.eventId),
@@ -151,29 +157,47 @@ export class ProfileFanoutWork {
       else content[field] = work.profile[field];
     }
     const signer = await this.options.prepareSigner(work, roomId);
-    const result = await sendLocal(
-      room,
-      {
-        type: 'm.room.member',
-        state_key: user,
-        sender: user,
-        content,
-        origin_server_ts: Date.now(),
-      },
-      signer,
-      {
-        lookup: () =>
-          tenant.tx((tx) => tx.profiles.fanout.submission(work, roomId)),
-        prepare: (pdu) =>
-          tenant.tx((tx) => tx.profiles.fanout.prepare(work, roomId, pdu)),
-        finish: (eventId, accepted) =>
-          tenant.tx((tx) =>
-            tx.profiles.fanout.finish(work, roomId, eventId, accepted)
-          ),
-      },
-    );
-    if (result.standing === 'rejected') {
-      throw new MatrixError(403, 'M_FORBIDDEN', 'profile membership rejected');
+    try {
+      const result = await sendLocal(
+        room,
+        {
+          type: 'm.room.member',
+          state_key: user,
+          sender: user,
+          content,
+          origin_server_ts: Date.now(),
+        },
+        signer,
+        {
+          admit: async (tx) => {
+            if ((await currentMembership(tx, user))?.membership !== 'join') {
+              throw new DepartedProfileMember();
+            }
+          },
+          lookup: () =>
+            tenant.tx((tx) => tx.profiles.fanout.submission(work, roomId)),
+          prepare: (pdu) =>
+            tenant.tx((tx) => tx.profiles.fanout.prepare(work, roomId, pdu)),
+          finish: (eventId, accepted) =>
+            tenant.tx((tx) =>
+              tx.profiles.fanout.finish(work, roomId, eventId, accepted)
+            ),
+        },
+      );
+      if (result.standing === 'rejected') {
+        throw new MatrixError(
+          403,
+          'M_FORBIDDEN',
+          'profile membership rejected',
+        );
+      }
+    } catch (error) {
+      if (!(error instanceof DepartedProfileMember)) throw error;
+      // No room event was written. A retained preparation is not an accepted
+      // join, and must never become a fresh join after the user has left.
+      await tenant.tx((tx) =>
+        tx.profiles.fanout.finish(work, roomId, null, null)
+      );
     }
   }
 }
