@@ -7,7 +7,8 @@ import {
   matrixBase64,
   verifyJson,
 } from '#engine/signing-primitives.js';
-import { initializeNode } from '#engine/facade/identity.ts';
+import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
+import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { openJournalClient } from '#engine/facade/client.ts';
 import {
   JournalReconciler,
@@ -21,6 +22,7 @@ import { Pairings } from '#engine/facade/pairing.ts';
 import {
   EMPTY_CUT,
   LINK_CAPABILITIES,
+  LINK_SUPPORTED,
   LINK_VERSION,
   LinkError,
   recordHash,
@@ -233,7 +235,7 @@ Deno.test('authenticated HTTP journal exchanges durable records and exact result
   }
 });
 
-async function fixture() {
+async function fixture(supported = LINK_CAPABILITIES) {
   const tls = await facadeTls();
   const open = (side: string) =>
     openStore({
@@ -265,8 +267,8 @@ async function fixture() {
     node,
   );
   let dropReceipt = false;
-  let hj = new Journal(await home.server(), LINK_CAPABILITIES);
-  let fj = new Journal(await facade.server(), LINK_CAPABILITIES);
+  let hj = new Journal(await home.server(), supported);
+  let fj = new Journal(await facade.server(), supported);
   let changes = 0;
   const notices = new NoticeHub();
   const handler = () =>
@@ -310,6 +312,15 @@ async function fixture() {
     notices,
     home: () => home,
     tenant: () => tenant,
+    ownership: async () => {
+      await enrolledTenant(facade, fp, 'logical.test', 'edge_a');
+      return new OwnerControls(
+        await facade.server(),
+        await facade.tenant('logical.test'),
+        fp,
+        node,
+      );
+    },
     keys: async () =>
       new FacadeKeys(await facade.server(), node.signer(), node.publicKey, fp),
     get hj() {
@@ -364,8 +375,8 @@ async function fixture() {
         tls.facadePin,
         node,
       );
-      hj = new Journal(await home.server(), LINK_CAPABILITIES);
-      fj = new Journal(await facade.server(), LINK_CAPABILITIES);
+      hj = new Journal(await home.server(), supported);
+      fj = new Journal(await facade.server(), supported);
     },
     async close() {
       await transport.close();
@@ -375,6 +386,36 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('F1 enrollment upgrades ownership over the same authenticated link, with apply ACK after both files', async () => {
+  const f = await fixture(LINK_SUPPORTED);
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const record = await exportOwnerControl(
+      f.home(),
+      f.tenant(),
+      f.hp,
+      bundle.id,
+    );
+    const response = await client.push(record, [record], EMPTY_CUT);
+    assertEquals(response.received.sequence, 1);
+    assertEquals(response.applied.sequence, 0);
+    const owner = await f.ownership();
+    await owner.apply(f.fj, record);
+    const ready = await owner.ready();
+    assertEquals(ready.policy, 'first-ingress');
+    const next = await client.push(record, [record], EMPTY_CUT);
+    assertEquals(next.applied.sequence, 1);
+    assertEquals(next.results.length, 1);
+    await f.reopen();
+    assertEquals(await (await f.ownership()).ready(), ready);
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('co-signed key publication collects over the authenticated link before either public role serves it', async () => {
   const f = await fixture();
