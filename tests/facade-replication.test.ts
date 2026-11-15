@@ -1225,6 +1225,7 @@ Deno.test('receipt scope: a suffix after preparation refuses all client receipt 
       const f = await fixture();
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
+      let holdPrepared = false;
       let writing: Promise<void> | undefined;
       try {
         const initial = await f.exports();
@@ -1251,8 +1252,10 @@ Deno.test('receipt scope: a suffix after preparation refuses all client receipt 
               roomId,
               allowAbsent,
             );
-            entered.resolve();
-            await release.promise;
+            if (holdPrepared) {
+              entered.resolve();
+              await release.promise;
+            }
             return admission;
           },
           keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
@@ -1261,7 +1264,23 @@ Deno.test('receipt scope: a suffix after preparation refuses all client receipt 
           publicRooms: async () => (await directory.snapshot())!.publicRooms,
         });
         const eventId = String([...f.source.events.values()].at(-1)!.event_id);
+        if (kind !== 'm.fully_read') {
+          await app.server.execute(
+            "INSERT INTO facade_owner_activation VALUES('receipt-noop',1,'verified-test')",
+          );
+          // The production client adapter must acknowledge an admitted graph
+          // no-op, not convert the unchanged projection into M_FORBIDDEN.
+          for (let n = 0; n < 2; n++) {
+            await writeClientReceipt(
+              f.source.roomId,
+              f.source.creator,
+              kind,
+              eventId,
+            );
+          }
+        }
         const before = await app.server.query('SELECT * FROM receipts');
+        holdPrepared = true;
         writing = writeClientReceipt(
           f.source.roomId,
           f.source.creator,

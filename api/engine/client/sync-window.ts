@@ -1,8 +1,7 @@
 // Both sync protocols select visible live rows before applying the limit.
 // Pagination/token policy stays with the caller; these are actual returned cuts.
 import { theApp } from '#engine/app.ts';
-import { stateAtSeq } from './read.ts';
-import { renderEvent, type Viewer } from './render.ts';
+import { renderEvents, type Viewer } from './render.ts';
 import type { Room } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { feedBefore, type FeedRow } from '#engine/server/read.ts';
@@ -49,6 +48,35 @@ export async function syncWindow(
       }
       return { stored, boundaries };
     });
+    const candidates: FeedRow[] = [];
+    const pageStay = newestStay ?? page[0].stay;
+    for (const row of page) {
+      if (row.stay !== pageStay) break;
+      const record = stored.get(row.event);
+      if (
+        record !== undefined && eventMatchesRoomEventFilter(
+          null,
+          { ...JSON.parse(record.pdu) as Pdu, room_id: room.id },
+          input.filter ?? {},
+        )
+      ) candidates.push(row);
+      if (boundaries.has(row.event)) break;
+    }
+    const rendered = await renderEvents(
+      room,
+      candidates.map((row) => row.event),
+      viewer,
+      {
+        omitRoomId: true,
+        eventFormat: input.eventFormat,
+        take: input.limit + 1 - eligible.length,
+        publications: new Map(
+          candidates.map((
+            row,
+          ) => [row.event, { pos: row.pos, stay: row.stay }]),
+        ),
+      },
+    );
     for (const row of page) {
       newestStay ??= row.stay;
       if (row.stay !== newestStay) {
@@ -74,18 +102,8 @@ export async function syncWindow(
         if (gap) break;
         continue;
       }
-      const at = await stateAtSeq(room, row.seq, row.stay, [[
-        'm.room.member',
-        viewer.userId,
-      ]]);
-      const membership = at.find((s) =>
-        s.type === 'm.room.member' && s.stateKey === viewer.userId
-      )?.content.membership ?? 'leave';
-      const event = await renderEvent(room, row.event, {
-        ...viewer,
-        membership: String(membership),
-      }, { omitRoomId: true, eventFormat: input.eventFormat });
-      if (event !== null) {
+      const event = rendered.get(row.event);
+      if (event !== undefined) {
         eligible.unshift({ row, event });
       }
       if (gap || eligible.length > input.limit) {

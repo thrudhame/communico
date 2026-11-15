@@ -189,6 +189,10 @@ export async function uploadKeys(
     }
   }
   let changed = false;
+  // upload_pos identifies the accepted upload call, not iteration order within
+  // its key map. Retries retain existing cohorts; only new inventory joins this
+  // call's cohort, allocated on the same retrying owner transaction.
+  let cohort: number | undefined;
   for (const key of input.otks) {
     // A lost claim response does not make its key available again. Upload is
     // not a new identity for a consumed key in the same device incarnation.
@@ -220,12 +224,12 @@ export async function uploadKeys(
       }
       continue;
     }
-    const pos = await nextCounter(conn, 'key_upload');
+    cohort ??= await nextCounter(conn, 'key_upload');
     await conn.execute('INSERT INTO one_time_keys VALUES(?,?,?,?,?,?,?)', [
       ...args,
       key.algorithm,
       key.id,
-      pos,
+      cohort,
       key.json,
     ]);
     changed = true;

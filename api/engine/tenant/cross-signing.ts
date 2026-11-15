@@ -17,6 +17,10 @@ import {
   forgetKeySignatures,
   signatureView,
 } from '#engine/tenant/signature-view.ts';
+import {
+  ownerUnavailable,
+  tenantAuthority,
+} from '#engine/tenant/session-authority.ts';
 
 export async function signingState(
   conn: Conn,
@@ -104,6 +108,11 @@ export async function uploadSigningKeys(
   authenticated: boolean,
   maxEnvelopeBytes: number,
 ): Promise<void> {
+  // An authenticated facade session can append signatures, never replace the
+  // account's cross-signing identity. Enforce at the owning write, including a
+  // first upload that does not require UIA and direct TenantTx consumers.
+  const authority = await tenantAuthority(conn);
+  if (authority && authority.node !== 'home') ownerUnavailable();
   const old = await signingState(conn, localpart);
   if (
     needsSigningAuth(old, input) &&

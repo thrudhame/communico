@@ -278,6 +278,77 @@ Deno.test('E1: simultaneous claims consume each accepted key once; upload orderi
   }
 });
 
+Deno.test('F2: one upload call owns one durable OTK cohort across algorithms and retries', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: { tenant: tenantSchema },
+  });
+  try {
+    let tenant = await openTenant(store, 'a.test', { create: true });
+    const user = await registerUser(tenant, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'PHONE',
+    });
+    const device = await deviceIdentity(tenant, 'alice', 'PHONE');
+    const upload = (keys: Record<string, string>) =>
+      tenant.tx((tx) =>
+        tx.e2ee.upload(
+          device,
+          validateUpload(
+            { one_time_keys: keys },
+            user.user_id,
+            'PHONE',
+            limits,
+          ),
+        )
+      );
+    const cohorts = async () =>
+      (await store.tenant('a.test')).query(
+        'SELECT algorithm,key_id,upload_pos FROM one_time_keys ORDER BY algorithm,key_id',
+      );
+    const first = { 'curve25519:z': 'z', 'curve25519:a': 'a', 'other:x': 'x' };
+    await upload(first);
+    const rows = await cohorts();
+    assertEquals(rows.length, 3);
+    assertEquals(new Set(rows.map((row) => Number(row.upload_pos))).size, 1);
+    const firstPos = Number(rows[0].upload_pos);
+    await upload(first);
+    assertEquals(await cohorts(), rows);
+    await upload({ ...first, 'curve25519:0': 'later' });
+    const later = (await cohorts()).find((row) => row.key_id === '0')!;
+    assert(Number(later.upload_pos) > firstPos);
+    await assertRejects(() =>
+      upload({ 'curve25519:new': 'new', 'curve25519:a': 'conflict' })
+    );
+    assertEquals((await cohorts()).length, 4);
+    await store.close();
+    store = await openStore(config(dir), { schemas: { tenant: tenantSchema } });
+    tenant = await openTenant(store, 'a.test');
+    const claimed = [];
+    for (let n = 0; n < 2; n++) {
+      claimed.push(
+        await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
+      );
+    }
+    assertEquals(
+      new Set(claimed.flatMap((value) => Object.keys(value!))),
+      new Set(['curve25519:a', 'curve25519:z']),
+    );
+    assertEquals(
+      await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
+      { 'curve25519:0': 'later' },
+    );
+    assertEquals(
+      await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'other')),
+      { 'other:x': 'x' },
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('F2: consumed OTK identities remain burned across reupload and cold restart, not fallback reuse or recreation', async () => {
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
