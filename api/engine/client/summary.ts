@@ -4,7 +4,7 @@ import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { joinedUsers } from '#engine/server/directory.ts';
-import { renderStateEvent } from './render.ts';
+import { renderStateEvents } from './render.ts';
 import { requireRoom } from './room.ts';
 import { admitState } from './state-admission.ts';
 
@@ -23,13 +23,21 @@ export async function heldRoomSummary(roomId: string) {
   const room = await requireRoom(roomId);
   const content = new Map<string, Record<string, unknown>>();
   const admission = await admitState(room, { userId: null, discovery: true });
-  for (const row of admission.rows) {
-    if (row.stateKey !== '' || !SUMMARY_TYPES.includes(row.type)) continue;
-    const event = await renderStateEvent(room, row.eventId, undefined, {
+  const rows = admission.rows.filter((row) =>
+    row.stateKey === '' && SUMMARY_TYPES.includes(row.type)
+  );
+  const rendered = await renderStateEvents(
+    room,
+    rows.map((row) => row.eventId),
+    undefined,
+    {
       bundleThreads: false,
       admission,
-    });
-    if (event !== null) {
+    },
+  );
+  for (const row of rows) {
+    const event = rendered.get(row.eventId);
+    if (event !== undefined) {
       content.set(row.type, event.content as Record<string, unknown>);
     }
   }

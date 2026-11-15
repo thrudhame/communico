@@ -2,7 +2,7 @@
 // by the room payload owner only after this module chooses the windows.
 import { theApp } from '#engine/app.ts';
 import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
-import { renderStateEvent } from '#engine/client/render.ts';
+import { renderStateEvents } from '#engine/client/render.ts';
 import { admitState } from '#engine/client/state-admission.ts';
 import {
   prejoinDisplay,
@@ -243,15 +243,17 @@ export async function selectLists(
             keys: [[type, key]],
           });
           const rows = admission.rows;
-          const out: Json[] = [];
-          for (const row of rows) {
-            const shown = await renderStateEvent(room, row.eventId, viewer, {
-              bundleThreads: false,
-              admission,
-            });
-            if (shown !== null) out.push(shown);
-          }
-          return out;
+          return [
+            ...(await renderStateEvents(
+              room,
+              rows.map((row) => row.eventId),
+              viewer,
+              {
+                bundleThreads: false,
+                admission,
+              },
+            )).values(),
+          ];
         })(),
       );
     }

@@ -93,10 +93,58 @@ export async function erasedView(
   tenant?: Tenant,
   tx?: RoomTx,
 ): Promise<Pdu> {
+  if (tx === undefined) {
+    return (await erasedViews(
+      room,
+      new Map([[eventId, pdu]]),
+      version,
+      principal,
+      tenant,
+    )).get(eventId)!;
+  }
   return await erasurePrunes(room, eventId, pdu, principal, tenant, tx)
     ? redact(
       pdu as unknown as Record<string, unknown>,
       version,
     ) as unknown as Pdu
     : pdu;
+}
+
+/** Cross-file intent is captured before the retryable room callback. Immutable
+ * event inputs may cross phases; reconstructed room state never does. */
+export async function erasedViews(
+  room: Room,
+  events: ReadonlyMap<string, Pdu>,
+  version: string,
+  principal?: ErasurePrincipal,
+  tenant?: Tenant,
+): Promise<Map<string, Pdu>> {
+  const cuts = new Map<string, ErasureCut | null | false>();
+  for (const pdu of events.values()) {
+    if (!cuts.has(pdu.sender)) {
+      cuts.set(
+        pdu.sender,
+        await erasureFor(room.store, pdu.sender, room.id, tenant),
+      );
+    }
+  }
+  const result = new Map(events);
+  if ([...cuts.values()].every((cut) => cut === false)) return result;
+  return await room.tx(async (tx) => {
+    const shown = new Map(events);
+    for (const [eventId, pdu] of events) {
+      const cut = cuts.get(pdu.sender)!;
+      if (cut === false) continue;
+      if (cut === null || !await priorVisibility(tx, eventId, cut, principal)) {
+        shown.set(
+          eventId,
+          redact(
+            pdu as unknown as Record<string, unknown>,
+            version,
+          ) as unknown as Pdu,
+        );
+      }
+    }
+    return shown;
+  });
 }

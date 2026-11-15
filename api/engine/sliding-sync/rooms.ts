@@ -6,7 +6,7 @@ import {
 } from '#engine/client/state-admission.ts';
 import {
   renderPrejoinDeparture,
-  renderStateEvent,
+  renderStateEvents,
   type Viewer,
 } from '#engine/client/render.ts';
 import { syncWindow } from '#engine/client/sync-window.ts';
@@ -54,18 +54,20 @@ async function metadata(
 ) {
   const rows = admission.rows;
   // Render before deriving display values: raw state is not erasure/redaction safe.
-  const shown: Json[] = [];
-  for (const row of rows) {
-    if (!['m.room.member', 'm.room.name', 'm.room.avatar'].includes(row.type)) {
-      continue;
-    }
-    const event = await renderStateEvent(room, row.eventId, viewer, {
-      omitRoomId: true,
-      bundleThreads: false,
-      admission,
-    });
-    if (event !== null) shown.push(event);
-  }
+  const shown = [
+    ...(await renderStateEvents(
+      room,
+      rows.filter((row) =>
+        ['m.room.member', 'm.room.name', 'm.room.avatar'].includes(row.type)
+      ).map((row) => row.eventId),
+      viewer,
+      {
+        omitRoomId: true,
+        bundleThreads: false,
+        admission,
+      },
+    )).values(),
+  ];
   const value = (type: string, key: string) => {
     const v = object(
       shown.find((e) => e.type === type && e.state_key === '')?.content,
@@ -257,14 +259,17 @@ export async function roomPayloads(
         timeline: window.events,
         limited,
       });
-      const state: Json[] = [];
-      for (const row of required.rows) {
-        const event = await renderStateEvent(room, row.eventId, viewer, {
-          omitRoomId: true,
-          admission,
-        });
-        if (event !== null) state.push(event);
-      }
+      const state = [
+        ...(await renderStateEvents(
+          room,
+          required.rows.map((row) => row.eventId),
+          viewer,
+          {
+            omitRoomId: true,
+            admission,
+          },
+        )).values(),
+      ];
       if (state.length) entry.required_state = state;
       ({ members, required: requiredCoverage } = required.rendered(state));
       const bump = c.membership === 'join'
