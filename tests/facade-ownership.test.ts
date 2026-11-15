@@ -206,6 +206,44 @@ Deno.test('F2 ownership control is signed, durable, first-ingress and isolated f
   }
 });
 
+Deno.test('owner readiness revalidates authority after asynchronous activation reads', async () => {
+  const f = await fixture();
+  try {
+    const record = await f.receive();
+    await (await f.owner()).apply(await f.journal(), record);
+    const server = await f.edge().server();
+    const grant = await f.pairings().active();
+    let revoked = false;
+    const owner = new OwnerControls(
+      {
+        ...server,
+        query: async (...args: Parameters<typeof server.query>) => {
+          const rows = await server.query(...args);
+          if (!revoked && args[0].includes('facade_owner_activation')) {
+            revoked = true;
+            await f.pairings().retire(
+              await f.hp.revoke(grant.body.transcript.body.context.id),
+              'a'.repeat(64),
+            );
+          }
+          return rows;
+        },
+      },
+      await f.edge().tenant('logical.test'),
+      f.pairings(),
+      f.node,
+    );
+    await assertRejects(
+      () => owner.ready(),
+      LinkError,
+      'ownership grant changed',
+    );
+    assert(revoked);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('control rejects forged authority, same-revision substitution and revision regression without apply ACK', async () => {
   const f = await fixture();
   try {

@@ -363,6 +363,7 @@ export class OwnerControls {
       grant,
     );
     if (hash(signed.body) !== left.body_hash) unavailable();
+    await this.server.tx((conn) => assertGrant(conn, grant, 'facade'));
     return signed.body;
   }
 }
