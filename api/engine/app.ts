@@ -14,6 +14,10 @@ import { bindRole } from '#engine/facade/role.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
 import { startDeactivationWork } from '#engine/deactivation.ts';
+import {
+  type ProfileFanoutFailure,
+  startProfileFanout,
+} from '#engine/profile-fanout.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { MediaService } from '#engine/media/service.ts';
 import { installRuleMigration } from '#engine/client/rule-migration.ts';
@@ -77,6 +81,9 @@ export type App = {
   readonly pushSender: PushSender;
   readonly media: MediaService;
   delayedEvents: DelayedEvents;
+  readonly profileFanout?: {
+    drain(localpart?: string): Promise<ProfileFanoutFailure[]>;
+  };
   readonly replica?: ReplicaAccess;
   close(): Promise<void>;
 };
@@ -91,6 +98,7 @@ export type ReplicaAccess = {
   keys: KeyStore;
   signer: Signer;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
+  profileFanout?(localpart?: string): Promise<ProfileFanoutFailure[]>;
 };
 
 let hooksInstalled = false;
@@ -145,6 +153,14 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
     services.push(() => pushSender.stop());
     const delayedEvents = new DelayedEvents({ store, tenant });
     services.push(() => delayedEvents.stop());
+    const profileFanout = startProfileFanout({
+      store,
+      tenant,
+      pollseconds: config().facade.pollseconds,
+      prepareSigner: () => Promise.resolve(tenant.signer()),
+      failed: (error) => console.error('profile fanout pending:', error),
+    });
+    services.push(() => profileFanout.close());
     const app: App = {
       store,
       server,
@@ -156,6 +172,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       pushSender,
       media,
       delayedEvents,
+      profileFanout,
       close: async () => {
         const sender = app.sender;
         app.sender = null;
@@ -241,6 +258,9 @@ export async function openReplicaApp(
     },
     sender: null,
     replica,
+    profileFanout: replica.profileFanout
+      ? { drain: replica.profileFanout }
+      : undefined,
     get deviceLists() {
       return unavailable('device-lists');
     },

@@ -48,6 +48,7 @@ import * as slidingSync from '#engine/tenant/sliding-sync.ts';
 import * as users from '#engine/tenant/users.ts';
 import * as openid from '#engine/tenant/openid.ts';
 import * as profiles from '#engine/tenant/profiles.ts';
+import * as profileFanout from '#engine/tenant/profile-fanout.ts';
 import * as conflicts from '#engine/tenant/conflicts.ts';
 import * as erasure from '#engine/tenant/erasure.ts';
 import * as publicReplica from '#engine/tenant/public-replica.ts';
@@ -416,6 +417,36 @@ function bind(
         erasure.erasureRow(conn, localpart, roomId),
     },
     profiles: {
+      fanout: {
+        list: (localpart?: string) =>
+          profileFanout.profileFanouts(conn, localpart),
+        discover: (
+          work: profileFanout.ProfileFanout,
+          rooms: readonly string[],
+        ) => profileFanout.discoverProfileRooms(conn, work, rooms),
+        rooms: (work: profileFanout.ProfileFanout) =>
+          profileFanout.profileRoomResults(conn, work),
+        submission: (work: profileFanout.ProfileFanout, room: string) =>
+          profileFanout.profileSubmission(conn, work, room),
+        prepare: (
+          work: profileFanout.ProfileFanout,
+          room: string,
+          pdu: import('#engine/pdu.ts').Pdu,
+        ) => profileFanout.prepareProfileSubmission(conn, work, room, pdu),
+        finish: (
+          work: profileFanout.ProfileFanout,
+          room: string,
+          eventId: string | null,
+          accepted: boolean | null,
+        ) =>
+          profileFanout.finishProfileSubmission(
+            conn,
+            work,
+            room,
+            eventId,
+            accepted,
+          ),
+      },
       get: (localpart: string) => profiles.profileRow(conn, localpart),
       operations: (localpart: string) =>
         profiles.profileOperations(conn, localpart),

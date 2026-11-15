@@ -13,6 +13,7 @@ import {
   writeRegister,
 } from '#engine/facade/registers.ts';
 import { tenantAuthority } from './session-authority.ts';
+import { recordProfileFanout } from './profile-fanout.ts';
 
 export type Profile = Record<string, unknown> & {
   displayname?: string;
@@ -182,7 +183,9 @@ export async function importProfile(
   if (!winner || registerJson(JSON.stringify(held)) === winner.payload) {
     return false;
   }
-  await materializeProfile(conn, localpart, JSON.parse(winner.payload));
+  const selected = JSON.parse(winner.payload);
+  await recordProfileFanout(conn, localpart, held, selected);
+  await materializeProfile(conn, localpart, selected);
   return true;
 }
 
@@ -279,10 +282,13 @@ export async function setProfileRow(
       JSON.stringify(profile),
     );
     if (winner) {
-      await materializeProfile(conn, localpart, JSON.parse(winner.payload));
+      const selected = JSON.parse(winner.payload);
+      await recordProfileFanout(conn, localpart, previous, selected);
+      await materializeProfile(conn, localpart, selected);
     }
     return;
   }
+  await recordProfileFanout(conn, localpart, previous, profile);
   if (legacy) {
     const column = key === 'displayname' ? 'display_name' : 'avatar_url';
     await conn.execute('UPDATE users SET ' + column + '=? WHERE localpart=?', [
