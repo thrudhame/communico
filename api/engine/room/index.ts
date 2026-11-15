@@ -50,6 +50,7 @@ function bind(conn: Conn, edges: EdgeOverlay, groups: state.StateGroups) {
       },
       get: (id: string) => events.getEvent(conn, id, edges),
       list: (ids: readonly string[]) => events.getEvents(conn, ids, edges),
+      ancestry: (ids: readonly string[]) => events.ancestryNodes(conn, ids),
       prevsOf: (event: string) => events.prevsOf(conn, event, edges),
       authsOf: (event: string) => events.authsOf(conn, event, edges),
       childrenOf: (prev: string) => events.childrenOf(conn, prev),

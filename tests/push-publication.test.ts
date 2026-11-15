@@ -243,10 +243,16 @@ Deno.test('push upgrade: durable chunks release projection lock, interleaved liv
     const originalServer = store.server.bind(store);
     store.server = () => Promise.resolve(db);
     let visited = 0;
-    db.query = (...args: Parameters<typeof db.query>) => {
+    const secondSeed = Promise.withResolvers<void>();
+    const releaseSeed = Promise.withResolvers<void>();
+    db.query = async (...args: Parameters<typeof db.query>) => {
       if (args[0].includes('SELECT event,pos,seq FROM event_index')) {
         visited++;
-        if (visited === 2) throw new Error('interrupt next upgrade chunk');
+        if (visited === 2) {
+          secondSeed.resolve();
+          await releaseSeed.promise;
+          throw new Error('interrupt next upgrade chunk');
+        }
       }
       return originalQuery(...args);
     };
@@ -256,12 +262,17 @@ Deno.test('push upgrade: durable chunks release projection lock, interleaved liv
         Error,
         'interrupt next upgrade chunk',
       );
+      // Preparation no longer occupies the writer queue. Observe the first
+      // durable page by holding the next capture, not by assuming project()
+      // synchronously enqueues its whole read phase ahead of a lock marker.
+      await secondSeed.promise;
       const live = project(store, other.roomId);
+      await live;
       const between = withProjectionLock(async () => {
         assertEquals(
           visited,
-          1,
-          'another projection gets the lock before the second upgrade page',
+          2,
+          'another projection gets the lock while the second page is captured',
         );
         assertEquals(
           await get(db, 'push-context:' + old.roomId),
@@ -286,11 +297,14 @@ Deno.test('push upgrade: durable chunks release projection lock, interleaved liv
           highlight_count: 0,
         });
       });
+      await between;
+      releaseSeed.resolve();
       const results = await Promise.allSettled([recovery, live, between]);
       for (const result of results) {
         if (result.status === 'rejected') throw result.reason;
       }
     } finally {
+      releaseSeed.resolve();
       db.query = originalQuery;
       store.server = originalServer;
     }
@@ -331,19 +345,45 @@ Deno.test('push upgrade: durable chunks release projection lock, interleaved liv
       sender: old.creator,
       content: { body: 'same-room live', msgtype: 'm.text' },
     }, old.signer);
+    const nextSeed = Promise.withResolvers<void>();
+    const allowNextSeed = Promise.withResolvers<void>();
+    const finalQuery = db.query.bind(db);
+    const finalServer = store.server.bind(store);
+    let seedPages = 0;
+    db.query = async (...args: Parameters<typeof db.query>) => {
+      if (
+        args[0].includes('SELECT event,pos,seq FROM event_index') &&
+        ++seedPages === 2
+      ) {
+        nextSeed.resolve();
+        await allowNextSeed.promise;
+      }
+      return finalQuery(...args);
+    };
+    store.server = () => Promise.resolve(db);
     const seeding = project(store, old.roomId);
-    const sameRoomBoundary = withProjectionLock(async () => {
-      assertEquals(await get(db, 'push-context:' + old.roomId), firstCut);
-      assertEquals(
-        (await db.query('SELECT COUNT(*) AS n FROM feed WHERE event=?', [
-          ownRoomLive.eventId,
-        ]))[0].n,
-        0,
-        'same-room live publication waits for its complete context',
-      );
-    });
-    const sameRoomLive = project(store, old.roomId);
-    await Promise.all([seeding, sameRoomBoundary, sameRoomLive]);
+    try {
+      await nextSeed.promise;
+      const sameRoomBoundary = withProjectionLock(async () => {
+        assertEquals(await get(db, 'push-context:' + old.roomId), firstCut);
+        assertEquals(
+          (await db.query('SELECT COUNT(*) AS n FROM feed WHERE event=?', [
+            ownRoomLive.eventId,
+          ]))[0].n,
+          0,
+          'same-room live publication waits for its complete context',
+        );
+      });
+      const sameRoomLive = project(store, old.roomId);
+      await sameRoomBoundary;
+      allowNextSeed.resolve();
+      await Promise.all([seeding, sameRoomBoundary, sameRoomLive]);
+    } finally {
+      allowNextSeed.resolve();
+      await seeding;
+      db.query = finalQuery;
+      store.server = finalServer;
+    }
     assertEquals(
       await get(db, 'push-context:' + old.roomId),
       await get(db, sourceOf(old.roomId)),

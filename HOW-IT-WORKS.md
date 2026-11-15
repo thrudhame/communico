@@ -148,6 +148,16 @@ target bytes. Each candidate retains locked revalidation and oldest-first order.
 (`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,
 `api/engine/room/ingest.ts:654-681`)
 
+The verified batch owns direct-parent supply and recovery ancestry separately.
+A supplied parent does not repeat the brief missing-events wait through its
+held prefix. Shared lightweight graph captures use 32-node room read pages and
+one room change cut; changed cuts or supplied unions invalidate missing/readiness
+facts. Failed boundary attempts are remembered only for that batch. Deeper
+ancestry still precedes a nearer usable pulled boundary, and pushed events never
+borrow state-recovery permission. Final locked ingest retains fresh lifecycle,
+ACL and authorization checks within the original whole-batch budget.
+(`api/engine/room/{remote,recovery-ancestry,events}.ts`)
+
 Inbound and history boundaries share one event retrieval strategy: after
 `/state_ids` and held-event deduplication, missing at least 10% of the required
 events selects bulk `/state`. Sparse sets and incomplete/unavailable snapshots
@@ -161,7 +171,10 @@ unavailable, it can instead import complete verified state at a nearer pulled
 event, including a held event reached through pulled ancestry. Pushed provenance
 never gains that permission: its direct parents must still be supplied. The
 existing batch budget bounds all attempts, and locked boundary/event authorization
-and current-state checks still decide what can ground or publish.
+and current-state checks still decide what can ground or publish. Known corrupt
+auth ancestry stops that fallback instead of being treated as unavailable history.
+Verified parent supply remains independent of later auth rejection, so invalid
+supplied bytes are not reported as withheld parents.
 (`api/engine/room/remote.ts`)
 
 Recovery authorizes complete evidence graphs outside the mutation lock, reading
@@ -231,7 +244,19 @@ the next projection or startup rolls forward from its watermark.
 (`api/engine/room/schema.ts:109-120`, `api/engine/room/ingest.ts:685-714`,
 `api/engine/room/hooks.ts:21-48`, `api/engine/server/startup.ts:13-38`)
 
-Projection writes a batch and advances its watermark in one server
+Each room has one store-lifetime projection capture owner. Independent rooms
+prepare immutable room facts outside the global mutation queue. The existing
+500-change page bounds capture, not writer ownership: uncontended changes batch,
+but queued writer demand ends the turn at the next complete change. A caller owes its admitted room
+head, not later writes to a continuously busy room. Application rechecks both
+watermarks and the original room capability's incarnation before writing.
+Historical-context seed edges similarly commit the completed prefix cursor;
+same-room live publication waits for complete context. Tenant push decisions
+are recaptured inside each publication turn, so preparation cannot
+resurrect a deactivated account's notification facts.
+(`api/engine/server/{project,push-project}.ts`)
+
+Projection writes a complete change prefix and advances its watermark in one server
 transaction. Rows are idempotent on `(room, pos)`; outbox rows also include
 destination. The server assigns global live-feed sequence numbers here.
 It is durable truth for those numbers, delivery progress and user intent,
@@ -350,6 +375,10 @@ tenant OTK/fallback status. No-pos requests have empty device-list deltas;
 disabled extensions do not read or advance their independent cuts. Later enable
 reads from the connection's retained baseline, not an unrelated room-list cut.
 Unchanged status envelopes are not poll updates, while key-pool changes are.
+The tenant's shared key-status owner always includes `signed_curve25519: 0`
+for an exhausted pool, alongside actual counts for other uploaded algorithms,
+as Synapse does. Ordinary sync, sliding sync and key uploads use that same
+status; empty unused-fallback status is an explicit list, never absence.
 (`api/engine/sliding-sync/extensions.ts`)
 
 Final sliding publication runs only after rendering: one tenant transaction
