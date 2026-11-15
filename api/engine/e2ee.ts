@@ -135,9 +135,25 @@ export async function localClaim(
   ownUsers(tenant, entries); // Reject the entire foreign request before consumption.
   return await tenant.tx(async (tx) => {
     const one_time_keys: Record<string, Json> = Object.create(null);
+    // Attempt-local response state: a C-S partial failure must not escape a
+    // rolled-back/retried transaction or turn a known foreign pool into empty.
+    const unavailable = failures === undefined ? undefined : { ...failures };
     for (const [user, devices] of entries) {
       for (const [id, algorithm] of Object.entries(devices)) {
-        const key = await tx.e2ee.claim(localpartOf(user), id, algorithm);
+        let key: Json | null;
+        try {
+          key = await tx.e2ee.claim(localpartOf(user), id, algorithm);
+        } catch (error) {
+          if (
+            unavailable === undefined || !(error instanceof MatrixError) ||
+            error.status !== 503 || error.errcode !== 'M_UNAVAILABLE'
+          ) throw error;
+          unavailable[tenant.serverName] = {
+            errcode: 'M_UNAVAILABLE',
+            error: 'keys unavailable',
+          };
+          continue;
+        }
         if (key !== null) {
           if (!Object.hasOwn(one_time_keys, user)) {
             one_time_keys[user] = Object.create(null);
@@ -148,7 +164,7 @@ export async function localClaim(
     }
     const response = {
       one_time_keys,
-      ...(failures === undefined ? {} : { failures }),
+      ...(unavailable === undefined ? {} : { failures: unavailable }),
     };
     bounded(response, limits.maxrequestbytes); // Roll back all local claims together.
     return response;

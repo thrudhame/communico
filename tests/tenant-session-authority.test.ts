@@ -17,6 +17,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { config } from '#engine/config.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
+import { localClaim } from '#engine/e2ee.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import {
   activateTenantAuthority,
@@ -160,6 +161,58 @@ Deno.test('F2: whole-device pools refuse a live foreign owner before exhaustion 
         tx.e2ee.claim('alice', 'HOME', 'curve25519')
       ),
       null,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('F2: C-S returns available keys with a truthful owner failure while S2S rolls back incomplete claims', async () => {
+  const f = await fixture();
+  try {
+    await f.home.login('HOME');
+    await f.edge.install(await f.home.capture());
+    await f.edge.login('EDGE');
+    const device = await deviceIdentity(f.edge.tenant, 'alice', 'EDGE');
+    await f.edge.tenant.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload(
+          {
+            one_time_keys: {
+              'curve25519:first': 'first',
+              'curve25519:second': 'second',
+            },
+          },
+          '@alice:edge.test',
+          'EDGE',
+          config().e2ee,
+        ),
+      )
+    );
+    const request: import('#engine/e2ee.ts').Claim = [[
+      '@alice:edge.test',
+      { EDGE: 'curve25519', HOME: 'curve25519' },
+    ]];
+    assertEquals(await localClaim(f.edge.tenant, request, config().e2ee, {}), {
+      one_time_keys: {
+        '@alice:edge.test': { EDGE: { 'curve25519:first': 'first' } },
+      },
+      failures: {
+        'edge.test': { errcode: 'M_UNAVAILABLE', error: 'keys unavailable' },
+      },
+    });
+    await assertRejects(
+      () => localClaim(f.edge.tenant, request, config().e2ee),
+      MatrixError,
+      'operation owner unavailable',
+    );
+    assertEquals(
+      await f.edge.tenant.tx((tx) =>
+        tx.e2ee.claim('alice', 'EDGE', 'curve25519')
+      ),
+      { 'curve25519:second': 'second' },
+      'the rejected S2S answer must not consume its available prefix',
     );
   } finally {
     await f.close();

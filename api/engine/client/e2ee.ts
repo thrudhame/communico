@@ -183,7 +183,7 @@ async function composed(
   }
   // Reserve every possible failure before consuming local keys. Later merges
   // can only replace this reservation when the complete response still fits.
-  const failures: Json = Object.create(null);
+  let failures: Json = Object.create(null);
   for (const origin of groups.keys()) failures[origin] = unavailable();
   const field = claim ? 'one_time_keys' : 'device_keys';
   const response = claim
@@ -200,6 +200,9 @@ async function composed(
       limits,
       failures,
     );
+  // localClaim may have an owner-specific partial failure. Continue remote
+  // composition on that committed response map, not its pre-transaction input.
+  failures = response.failures as Json;
   let count = Object.values(response[field] as Json).reduce<number>(
     (n, keys) => n + Object.keys(keys as Json).length,
     0,
