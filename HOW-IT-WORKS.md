@@ -346,6 +346,10 @@ tenant OTK/fallback status. No-pos requests have empty device-list deltas;
 disabled extensions do not read or advance their independent cuts. Later enable
 reads from the connection's retained baseline, not an unrelated room-list cut.
 Unchanged status envelopes are not poll updates, while key-pool changes are.
+The tenant's shared key-status owner always includes `signed_curve25519: 0`
+for an exhausted pool, alongside actual counts for other uploaded algorithms,
+as Synapse does. Ordinary sync, sliding sync and key uploads use that same
+status; empty unused-fallback status is an explicit list, never absence.
 (`api/engine/sliding-sync/extensions.ts`)
 
 Final sliding publication runs only after rendering: one tenant transaction

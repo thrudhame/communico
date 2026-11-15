@@ -199,6 +199,7 @@ Deno.test('E1: tenant commit survives projection interruption; replay cannot res
       changes,
     );
     assertEquals((await reopened.tx((tx) => tx.e2ee.status(device))).counts, {
+      signed_curve25519: 0,
       curve25519: 1,
     });
     assertEquals(
@@ -266,7 +267,9 @@ Deno.test('E1: simultaneous claims consume each accepted key once; upload orderi
       ),
     );
     assertEquals(new Set(claims.map((key) => Object.keys(key!)[0])).size, 12);
-    assertEquals((await tenant.tx((tx) => tx.e2ee.status(device))).counts, {});
+    assertEquals((await tenant.tx((tx) => tx.e2ee.status(device))).counts, {
+      signed_curve25519: 0,
+    });
     assertEquals(
       await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
       null,
@@ -306,7 +309,7 @@ Deno.test('E1: pool overflow rejects the entire mutation and leaves accepted key
       })
     );
     const status = await tenant.tx((tx) => tx.e2ee.status(device));
-    assertEquals(status.counts, { curve25519: 1 });
+    assertEquals(status.counts, { signed_curve25519: 0, curve25519: 1 });
     assertEquals(status.unused, []);
     assertEquals(
       await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
