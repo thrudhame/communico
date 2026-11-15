@@ -122,6 +122,16 @@ too, without rewriting the stored target PDU.
 (`api/engine/room/remote.ts:1-17`, `api/engine/room/ingest.ts:758-848`,
 `api/engine/room/ingest.ts:654-681`)
 
+The verified batch owns direct-parent supply and recovery ancestry separately.
+A supplied parent does not repeat the brief missing-events wait through its
+held prefix. Shared lightweight graph captures use 32-node room read pages and
+one room change cut; changed cuts or supplied unions invalidate missing/readiness
+facts. Failed boundary attempts are remembered only for that batch. Deeper
+ancestry still precedes a nearer usable pulled boundary, and pushed events never
+borrow state-recovery permission. Final locked ingest retains fresh lifecycle,
+ACL and authorization checks within the original whole-batch budget.
+(`api/engine/room/{remote,recovery-ancestry,events}.ts`)
+
 Inbound and history boundaries share one event retrieval strategy: after
 `/state_ids` and held-event deduplication, missing at least 10% of the required
 events selects bulk `/state`. Sparse sets and incomplete/unavailable snapshots
