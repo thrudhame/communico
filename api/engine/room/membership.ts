@@ -13,7 +13,6 @@ import type { Signer } from '#engine/room/signer.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
-import { projectAfterWrite } from '#engine/room/hooks.ts';
 import { admitLocalJoin } from '#engine/room/hooks.ts';
 import { withRestrictedAdmission } from './restricted.ts';
 
@@ -94,15 +93,36 @@ export async function join(
   signer: Signer,
   extraContent?: Record<string, unknown>,
 ): Promise<MembershipOpResult> {
-  const current = await membershipOf(room, userId);
-  if (current?.membership === 'join') {
-    return { roomId: room.id, eventId: current.eventId, created: false };
-  }
+  return (await admitJoin(room, userId, signer, extraContent))!;
+}
+
+// A nonresident result is a locked routing decision, not a public 404 caused
+// by racing the last local departure. The caller can discover remote peers.
+export async function joinResident(
+  room: Room,
+  userId: string,
+  signer: Signer,
+  extraContent?: Record<string, unknown>,
+): Promise<MembershipOpResult | null> {
+  return await admitJoin(room, userId, signer, extraContent, () => null);
+}
+
+async function admitJoin(
+  room: Room,
+  userId: string,
+  signer: Signer,
+  extraContent?: Record<string, unknown>,
+  absent?: (tx: RoomTx) => Promise<MembershipOpResult | null> | null,
+): Promise<MembershipOpResult | null> {
   const result = await withRestrictedAdmission(
     room,
     userId,
     signer.serverName,
     async (tx, authorizer) => {
+      const current = await membershipInTx(tx, userId);
+      if (current?.membership === 'join') {
+        return { roomId: room.id, eventId: current.eventId, created: false };
+      }
       const content = { ...extraContent, membership: 'join' } as Record<
         string,
         unknown
@@ -131,8 +151,11 @@ export async function join(
     },
     undefined,
     () => admitLocalJoin(room.store, room.id, userId),
+    absent,
   );
-  await afterLocalCommit(room, result.eventId, signer.serverName);
+  if (result !== null) {
+    await afterLocalCommit(room, result.eventId, signer.serverName);
+  }
   return result;
 }
 
@@ -306,53 +329,41 @@ export async function reopen(
   signer: Signer,
   content: Record<string, unknown>,
 ): Promise<MembershipOpResult> {
-  const result = await withRoomLock(room.id, async () => {
-    await admitLocalJoin(room.store, room.id, userId);
-    return await room.tx(async (tx) => {
-      if (await tx.segments.openStay() !== null) {
-        throw new MatrixError(
-          400,
-          'M_BAD_STATE',
-          'already joined to ' + room.id,
-        );
-      }
-      const last = await tx.segments.latestStay();
-      const group = last === null ? null : await tx.state.current(last.id);
-      if (last === null || group === null) {
-        throw new MatrixError(403, 'M_FORBIDDEN', 'no snapshot to reopen');
-      }
-      const prevs = await tx.extremities.frontier(last.id);
-      const stay = await tx.segments.create({
-        kind: 'stay',
-        prev: last.id,
-        opening_group: group,
-      });
-      await tx.segments.create({
-        kind: 'history',
-        prev: stay,
-        status: 'complete',
-      });
-      const pdu = await buildInTx(tx, room.id, {
-        type: 'm.room.member',
-        sender: userId,
-        state_key: userId,
-        content: { ...content, membership: 'join' },
-        prev_events: prevs,
-      }, signer);
-      const res = await ingestInTx(tx, room.id, pdu, {
-        self: signer.serverName,
-      });
-      if (res.standing !== 'accepted') {
-        throw new MatrixError(
-          403,
-          'M_FORBIDDEN',
-          `membership rejected (${res.reason}, rule ${res.rule})`,
-        );
-      }
-      await tx.segments.setOpenedBy(stay, res.eventId);
-      return { roomId: room.id, eventId: res.eventId, created: true };
+  return (await admitJoin(room, userId, signer, content, async (tx) => {
+    const last = await tx.segments.latestStay();
+    const group = last === null ? null : await tx.state.current(last.id);
+    if (last === null || group === null) {
+      throw new MatrixError(403, 'M_FORBIDDEN', 'no snapshot to reopen');
+    }
+    const prevs = await tx.extremities.frontier(last.id);
+    const stay = await tx.segments.create({
+      kind: 'stay',
+      prev: last.id,
+      opening_group: group,
     });
-  });
-  await projectAfterWrite(room.store, room.id);
-  return result;
+    await tx.segments.create({
+      kind: 'history',
+      prev: stay,
+      status: 'complete',
+    });
+    const pdu = await buildInTx(tx, room.id, {
+      type: 'm.room.member',
+      sender: userId,
+      state_key: userId,
+      content: { ...content, membership: 'join' },
+      prev_events: prevs,
+    }, signer);
+    const res = await ingestInTx(tx, room.id, pdu, {
+      self: signer.serverName,
+    });
+    if (res.standing !== 'accepted') {
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        `membership rejected (${res.reason}, rule ${res.rule})`,
+      );
+    }
+    await tx.segments.setOpenedBy(stay, res.eventId);
+    return { roomId: room.id, eventId: res.eventId, created: true };
+  }))!;
 }

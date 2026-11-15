@@ -34,7 +34,7 @@ export async function publicInventory(conn: Conn) {
   return { users, cut: row ? Number(row.value) : 0 };
 }
 
-export async function readPublicReplica(
+async function storedPublicReplica(
   conn: Conn,
   localpart: string,
 ): Promise<PublicUserReplica | null> {
@@ -43,6 +43,21 @@ export async function readPublicReplica(
     [localpart],
   );
   return row ? JSON.parse(String(row.snapshot_json)) : null;
+}
+
+export async function readPublicReplica(
+  conn: Conn,
+  localpart: string,
+): Promise<PublicUserReplica | null> {
+  // A read-only snapshot is not authority to undo a locally committed lifecycle
+  // tombstone. Fall through to the cleared owning rows, not stale keys/profiles.
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  return user?.deactivated === 1
+    ? null
+    : await storedPublicReplica(conn, localpart);
 }
 
 export async function exportPublicUser(
@@ -55,7 +70,7 @@ export async function exportPublicUser(
     [localpart],
   );
   if (!user) throw new MatrixError(404, 'M_NOT_FOUND', 'no such user');
-  if (await readPublicReplica(conn, localpart)) {
+  if (await storedPublicReplica(conn, localpart)) {
     throw new MatrixError(
       403,
       'M_FORBIDDEN',
@@ -152,7 +167,7 @@ export async function installPublicUser(
 ): Promise<void> {
   const view = publicUserOf(raw, server);
   const localpart = splitId(view.userId).localpart;
-  const held = await readPublicReplica(conn, localpart);
+  const held = await storedPublicReplica(conn, localpart);
   const encoded = canonicalJson(view);
   if (
     held &&
@@ -178,10 +193,23 @@ export async function installPublicUser(
       'public replica cannot replace an owned account',
     );
   }
-  await conn.execute(
-    'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET display_name=NULL,avatar_url=NULL,deactivated=excluded.deactivated',
-    [localpart, view.deactivated ? 1 : 0],
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
   );
+  if (user?.deactivated !== 1) {
+    await conn.execute(
+      'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET display_name=NULL,avatar_url=NULL,deactivated=excluded.deactivated',
+      [localpart, view.deactivated ? 1 : 0],
+    );
+  }
+  await conn.execute(
+    'INSERT INTO public_user_replicas(localpart,source_cut,snapshot_json) VALUES(?,?,?) ON CONFLICT(localpart) DO UPDATE SET source_cut=excluded.source_cut,snapshot_json=excluded.snapshot_json',
+    [localpart, view.cut, encoded],
+  );
+  // Retain and acknowledge the authenticated source record while refusing its
+  // obsolete materialization. In particular, never delete a local erasure cut.
+  if (user?.deactivated === 1) return;
   await conn.execute('DELETE FROM profile_fields WHERE localpart=?', [
     localpart,
   ]);
@@ -195,8 +223,4 @@ export async function installPublicUser(
       [localpart, canonicalJson(view.erased)],
     );
   }
-  await conn.execute(
-    'INSERT INTO public_user_replicas(localpart,source_cut,snapshot_json) VALUES(?,?,?) ON CONFLICT(localpart) DO UPDATE SET source_cut=excluded.source_cut,snapshot_json=excluded.snapshot_json',
-    [localpart, view.cut, encoded],
-  );
 }

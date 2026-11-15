@@ -15,6 +15,7 @@ import { setConfigForTests } from '#engine/config.ts';
 import { loginUser, verifyUserPassword } from '#engine/tenant/users.ts';
 import { lookupToken } from '#engine/tenant/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { membershipOf } from '#engine/room/membership.ts';
 
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   setConfigForTests({ server: { name: 'logical.test' } });
@@ -847,6 +848,25 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       auth: { type: 'm.login.dummy', session: challenge.body.session },
     });
     assertEquals(registered.status, 200);
+    const departureRegistration = {
+      username: 'departure',
+      password: 'offline-password',
+      device_id: 'departure-home-device',
+    };
+    const departureChallenge = await api(
+      'home',
+      'register',
+      departureRegistration,
+    );
+    const departure = await api('home', 'register', {
+      ...departureRegistration,
+      auth: { type: 'm.login.dummy', session: departureChallenge.body.session },
+    });
+    assertEquals(departure.status, 200);
+    const departureRoom = await api('home', 'createRoom', {
+      preset: 'public_chat',
+    }, departure.body.access_token);
+    assertEquals(departureRoom.status, 200);
     assertEquals(
       (await adminCall(tls.dir + '/home-public-auth.sock', 'facade/pair', {
         node: 'edge_a',
@@ -863,12 +883,20 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       })).status,
       200,
     );
-    await until(async () =>
-      (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
-        .body.result.scopes.some((scope: { scope: string; ready: boolean }) =>
-          scope.scope === 'auth:@outside:logical.test' && scope.ready
+    await until(async () => {
+      const scopes =
+        (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
+          .body.result.scopes;
+      return [
+        'auth:@outside:logical.test',
+        'auth:@departure:logical.test',
+        'room:' + departureRoom.body.room_id,
+      ].every((required) =>
+        scopes.some((scope: { scope: string; ready: boolean }) =>
+          scope.scope === required && scope.ready
         )
-    );
+      );
+    });
     await home.stop();
     assertEquals((await api('facade', 'login')).body, {
       flows: [{ type: 'm.login.password' }],
@@ -1188,6 +1216,99 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       (await api('facade', 'login', login('offline-deactivated'))).body.errcode,
       'M_USER_DEACTIVATED',
     );
+    // A different served account deactivates at the facade with home absent.
+    // Its worker must sign the actual replicated-room leave, not only revoke
+    // tokens or retain a tenant root. UIA is exercised over public HTTP.
+    const departureLogin = {
+      ...login('departure-edge-device'),
+      identifier: { type: 'm.id.user', user: 'departure' },
+    };
+    // Drain the finite local inbox after the home's final shutdown, then prove
+    // this independent account from a cold facade, not during an apply window.
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    // The preceding verifier-withdrawal/restoration exercise covers every
+    // served account asynchronously. Observe this account's restored verifier
+    // without minting a new session while its last received cut drains.
+    await until(async () =>
+      (await api('facade', 'login', {
+        ...departureLogin,
+        password: 'not-the-password',
+      })).status === 403
+    );
+    const departureSession = await api('facade', 'login', departureLogin);
+    assertEquals(
+      departureSession.status,
+      200,
+      JSON.stringify(departureSession),
+    );
+    const departureUia = await api('facade', 'account/deactivate', {
+      erase: true,
+    }, departureSession.body.access_token);
+    assertEquals(departureUia.status, 401, JSON.stringify(departureUia));
+    assertEquals(
+      (await api('facade', 'account/deactivate', {
+        erase: true,
+        auth: {
+          type: 'm.login.password',
+          session: departureUia.body.session,
+          password: 'offline-password',
+        },
+      }, departureSession.body.access_token)).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        departureSession.body.access_token,
+      )).status,
+      401,
+    );
+    await edge.stop();
+    const closed = await openStore({
+      dir: tls.dir + '/facade-public-auth-store',
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, {
+      schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
+    });
+    let leaveId: string;
+    try {
+      const room = await openRoom(closed, departureRoom.body.room_id);
+      const member = await membershipOf(room, '@departure:logical.test');
+      assertEquals(member?.membership, 'leave');
+      leaveId = member!.eventId;
+      const event = await room.tx((tx) => tx.events.get(leaveId));
+      assert(event);
+      const pdu = JSON.parse(event.pdu);
+      assertEquals(pdu.content, { membership: 'leave' });
+      assert(
+        Object.keys(pdu.signatures['logical.test']).some((id) =>
+          id.startsWith('ed25519:edge_a_')
+        ),
+      );
+      assertEquals(await room.tx((tx) => tx.segments.openStay()), null);
+    } finally {
+      await closed.close();
+    }
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    assertEquals(
+      (await api('facade', 'login', departureLogin)).body.errcode,
+      'M_USER_DEACTIVATED',
+    );
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login', departureLogin)).body.errcode ===
+          'M_USER_DEACTIVATED';
+      } catch {
+        return false;
+      }
+    });
   } finally {
     await home?.dispose();
     await edge?.dispose();

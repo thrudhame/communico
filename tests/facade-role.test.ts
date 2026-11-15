@@ -182,6 +182,7 @@ Deno.test('F2 auth manifest enables only delivered account authority and keeps o
       ['v3/logout/all', 'POST'],
       ['v3/account/whoami', 'GET'],
       ['v3/delete_devices', 'POST'],
+      ['v3/account/deactivate', 'POST'],
       ['v3/devices/target', 'DELETE'],
       ['v3/devices/target', 'PUT'],
     ]
@@ -201,9 +202,10 @@ Deno.test('F2 auth manifest enables only delivered account authority and keeps o
       ['v3/devices', 'GET'],
       ['v3/keys/upload', 'POST'],
       ['v3/sendToDevice/m.test/txn', 'PUT'],
-      ['v3/account/deactivate', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true)?.status, 404);
+  assertEquals(facade.service('deactivation'), true);
+  assertEquals(capabilities('facade', 'f1').service('deactivation'), false);
   for (
     const service of [
       'push',

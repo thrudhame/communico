@@ -18,9 +18,15 @@ async function current(tx: RoomTx) {
   return { stay, group };
 }
 
-async function target(tx: RoomTx, user: string, needAuthorizers = false) {
+async function target(
+  tx: RoomTx,
+  user: string,
+  needAuthorizers = false,
+  allowAbsent = false,
+) {
   const { stay, group } = await current(tx);
   if (stay === null || group === null) {
+    if (allowAbsent) return null;
     throw new MatrixError(404, 'M_NOT_FOUND', 'not resident');
   }
   const version = await roomVersionOf(tx, stay.id);
@@ -114,14 +120,15 @@ export async function withRestrictedAdmission<T>(
   operation: (tx: RoomTx, authorizer: string | null) => T | Promise<T>,
   nominated?: string,
   before?: () => Promise<void>,
+  absent?: (tx: RoomTx) => T | Promise<T>,
 ): Promise<T> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const captured = await room.tx((tx) =>
-      target(tx, user, nominated !== undefined)
+      target(tx, user, nominated !== undefined, absent !== undefined)
     );
     let proof: Witness | null = null;
-    let unknown = captured.unknown;
-    if (captured.required) {
+    let unknown = captured?.unknown ?? false;
+    if (captured?.required) {
       for (const id of captured.rooms) {
         let allowed;
         try {
@@ -148,7 +155,16 @@ export async function withRestrictedAdmission<T>(
         ) return changed;
       }
       return await room.tx(async (tx) => {
-        const now = await target(tx, user, nominated !== undefined);
+        const now = await target(
+          tx,
+          user,
+          nominated !== undefined,
+          absent !== undefined,
+        );
+        // Residency can change while cross-room evidence is captured. Only
+        // this locked decision may select the archived path or publish a join.
+        if (now === null) return await absent!(tx);
+        if (captured === null) return changed;
         if (now.group !== captured.group || now.stay !== captured.stay) {
           return changed;
         }
@@ -201,6 +217,6 @@ export async function restrictedResidents(
   return await room.tx(async (tx) => {
     if (await tx.segments.openStay() === null) return [];
     const snapshot = await target(tx, user, true);
-    return [...new Set(snapshot.authorizers.map(domainOf))];
+    return [...new Set(snapshot!.authorizers.map(domainOf))];
   });
 }

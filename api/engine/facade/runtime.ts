@@ -41,6 +41,7 @@ import {
   startAccountExports,
 } from './accounts.ts';
 import { AuthLinkHealth, FacadeAuth } from './auth.ts';
+import { startDeactivationWork } from '#engine/deactivation.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -77,6 +78,7 @@ export async function openFacadeRuntime(
   let inbox: ReturnType<typeof startInboxWorker> | undefined;
   let mailbox: Mailbox | undefined;
   let authExports: ReturnType<typeof startAccountExports> | undefined;
+  let deactivation: ReturnType<typeof startDeactivationWork> | undefined;
   const pairings = () => {
     if (!node) {
       throw new LinkError(
@@ -141,6 +143,22 @@ export async function openFacadeRuntime(
         ? new FacadeAuth(server, owner, node, authHealth, settings)
         : undefined,
     );
+    if (caps.service('deactivation') && !deactivation) {
+      deactivation = startDeactivationWork({
+        store,
+        tenant,
+        pollseconds: settings.pollseconds,
+        prepareSigner: async () => (await keyOwner()).prepareSigner(),
+        // OOB rejection is durable at its existing intent owner. B7 composes
+        // the performing sender; link observers are woken without a home RPC.
+        wake: () => notices.changed(),
+        failed: (error) =>
+          console.error(
+            'facade deactivation pending:',
+            error instanceof LinkError ? error.code : 'M_UNAVAILABLE',
+          ),
+      });
+    }
     if (settings.phase === 'f2' && !authExports) {
       authExports = startAccountExports({
         store,
@@ -251,6 +269,7 @@ export async function openFacadeRuntime(
     pairings,
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),
+    prepareSigner: async () => (await keyOwner()).prepareSigner(),
     async ingress(transaction: TransactionDeps) {
       if (mailbox) return mailbox;
       const owner = await pairings();
@@ -393,6 +412,7 @@ export async function openFacadeRuntime(
       closed ??= (async () => {
         await authExports?.close();
         await inbox?.close();
+        await deactivation?.close();
         await store.close();
       })(),
   };

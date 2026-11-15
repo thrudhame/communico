@@ -5,7 +5,7 @@ import { signingUpload } from '#engine/e2ee-signing.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
-import { registerUser } from '#engine/tenant/users.ts';
+import { deactivateUser, registerUser } from '#engine/tenant/users.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
@@ -114,6 +114,50 @@ async function fixture(seedTenant = tenantSchema) {
     },
   };
 }
+
+Deno.test('a later public replica cannot resurrect local deactivation, erasure or read-through key/profile material', async () => {
+  const f = await fixture();
+  try {
+    await f.install(await f.export());
+    await deactivateUser(f.edge(), 'alice', {});
+    await f.home.tx((tx) =>
+      tx.profiles.set('alice', 'displayname', 'Stale home profile')
+    );
+    const successor = await f.export();
+    await f.install(successor);
+    await f.install(successor);
+    await f.reopen();
+    assertEquals(
+      (await f.edge().tx((tx) => tx.users.byLocalpart('alice')))?.deactivated,
+      true,
+    );
+    assertEquals(await f.edge().tx((tx) => tx.profiles.get('alice')), {});
+    assertEquals(
+      await f.edge().tx((tx) =>
+        tx.e2ee.query('alice', [], '', f.user, config().e2ee.maxkeys)
+      ),
+      {},
+    );
+    assertEquals(
+      await f.edge().tx((tx) => tx.crossSigning.views('alice', f.user, '')),
+      {},
+    );
+    assertEquals(
+      await (await f.db()).query(
+        'SELECT localpart,room_cuts FROM erased_users',
+      ),
+      [{ localpart: 'alice', room_cuts: '{}' }],
+    );
+    assertEquals(
+      await (await f.db()).query(
+        'SELECT localpart,erase FROM deactivation_work',
+      ),
+      [{ localpart: 'alice', erase: 1 }],
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('public user replica preserves coherent ordinary profile/device/signing reads without credentials, pools or private signing', async () => {
   const f = await fixture();

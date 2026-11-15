@@ -10,9 +10,11 @@ import {
   ban,
   invite,
   join,
+  joinResident,
   kick,
   leave,
   membershipOf,
+  reopen,
   unban,
 } from '#engine/room/membership.ts';
 import type { Signer } from '#engine/room/signer.ts';
@@ -266,5 +268,70 @@ Deno.test('membership: an idempotent re-join returns the existing event', async 
     // the creator's own re-join is idempotent too
     const own = await join(room, creator, signer);
     assertEquals(own.created, false);
+  });
+});
+
+Deno.test('membership: concurrent joins share one admitted membership event', async () => {
+  await withStore(async (store) => {
+    const { room, signer } = await fixture(store, { preset: 'public_chat' });
+    const results = await Promise.all([
+      join(room, '@bob:test', signer),
+      join(room, '@bob:test', signer),
+    ]);
+    assertEquals(results.filter((result) => result.created).length, 1);
+    assertEquals(new Set(results.map((result) => result.eventId)).size, 1);
+  });
+});
+
+Deno.test('membership: resident admission observes a last-local departure after capture without authoring or leaking a routing 404', async () => {
+  await withStore(async (store) => {
+    const { room, signer, creator } = await fixture(store, {
+      preset: 'public_chat',
+    });
+    const original = room.tx;
+    let armed = true;
+    room.tx = async (fn) => {
+      const result = await original(fn);
+      if (
+        armed && result !== null && typeof result === 'object' &&
+        'required' in result
+      ) {
+        armed = false;
+        await leave(room, creator, signer);
+      }
+      return result;
+    };
+    try {
+      assertEquals(await joinResident(room, '@bob:test', signer), null);
+      assertEquals(armed, false, 'departure occurred after admission capture');
+      assertEquals(await membershipOf(room, '@bob:test'), null);
+      assertEquals((await reopen(room, '@bob:test', signer, {})).created, true);
+    } finally {
+      room.tx = original;
+    }
+  });
+});
+
+Deno.test('membership: archived reopen admits a concurrent winner without a second stay or join', async () => {
+  await withStore(async (store) => {
+    const { room, signer, creator } = await fixture(store, {
+      preset: 'public_chat',
+    });
+    await leave(room, creator, signer);
+    const results = await Promise.all([
+      reopen(room, '@bob:test', signer, {}),
+      reopen(room, '@bob:test', signer, {}),
+      reopen(room, '@carol:test', signer, {}),
+    ]);
+    assertEquals(results.filter((result) => result.created).length, 2);
+    assertEquals(results[0].eventId, results[1].eventId);
+    assertEquals((await membershipOf(room, '@carol:test'))?.membership, 'join');
+    assertEquals(
+      (await room.tx((tx) => tx.segments.list())).filter((s) =>
+        s.kind === 'stay'
+      )
+        .length,
+      2,
+    );
   });
 });

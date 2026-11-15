@@ -63,9 +63,10 @@ const F2_AUTH: readonly Rule[] = [
       route(method, literal('/_matrix/client/' + version + '/login'), 'auth')
     )
   ),
-  ...['refresh', 'logout', 'logout/all', 'delete_devices'].map((name) =>
-    route('POST', literal('/_matrix/client/v3/' + name), 'auth')
-  ),
+  ...['refresh', 'logout', 'logout/all', 'delete_devices', 'account/deactivate']
+    .map((name) =>
+      route('POST', literal('/_matrix/client/v3/' + name), 'auth')
+    ),
   route('GET', literal('/_matrix/client/v3/account/whoami'), 'auth'),
   ...['PUT', 'DELETE'].map((method) =>
     route(method, /^\/_matrix\/client\/v3\/devices\/[^/]+$/, 'auth')
@@ -89,6 +90,7 @@ const HOME_SERVICES = new Set([
   'media',
   'device-lists',
   'federation-sender',
+  'deactivation',
 ]);
 const FACADE_SERVICES = new Set([
   'recovery',
@@ -106,6 +108,9 @@ export function capabilities(role: string, phase = 'f1') {
   return {
     role,
     service(name: string): boolean {
+      if (role === 'facade' && phase === 'f2' && name === 'deactivation') {
+        return true;
+      }
       return services.has(name);
     },
     gate(request: Request, ready: (scope: Scope) => boolean): Response | null {
