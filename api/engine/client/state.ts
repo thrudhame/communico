@@ -2,7 +2,7 @@ import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { stateFormat } from './state-request.ts';
 import { readPositionFor, requireRoom, type StateRow } from './room.ts';
-import { renderStateEvent } from './render.ts';
+import { renderStateEvents } from './render.ts';
 import {
   admitState,
   type StateAdmission,
@@ -24,19 +24,14 @@ export async function clientEventsForRows(
   const room = await requireRoom(roomId);
   const admission = options.admission ??
     await admitState(room, { userId: userId ?? null, ...options });
-  const out: Record<string, unknown>[] = [];
-  for (const row of rows) {
-    const ev = await renderStateEvent(
-      room,
-      row.eventId,
-      userId === undefined
-        ? undefined
-        : { userId, deviceId: null, tenant: theApp().tenant },
-      { admission },
-    );
-    if (ev !== null) out.push(ev);
-  }
-  return out;
+  return [...(await renderStateEvents(
+    room,
+    rows.map((row) => row.eventId),
+    userId === undefined
+      ? undefined
+      : { userId, deviceId: null, tenant: theApp().tenant },
+    { admission },
+  )).values()];
 }
 
 export async function clientStateFor(roomId: string, userId: string) {
