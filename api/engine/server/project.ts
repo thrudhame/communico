@@ -24,7 +24,9 @@ import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { reconcileTyping } from '#engine/typing.ts';
 import {
-  preparePush,
+  capturePush,
+  prepareCapturedPush,
+  type PushCapture,
   type PushPublication,
 } from '#engine/server/push-project.ts';
 import {
@@ -41,11 +43,11 @@ export function sourceOf(roomId: string): string {
 // The batch cap (plan §2): one server transaction per ≤ 500 changes.
 const BATCH = 500;
 
-// One projection at a time process-wide: the server file has one writer,
-// and a queued call collapses into a cheap no-op once the watermark is
-// caught up. A failed run must not jam the queue — the next write or the
-// startup roll-forward retries.
+// One publication/lifecycle mutation at a time. Immutable room preparation
+// belongs to each room's capture owner, never this shared writer turn. Failed
+// work releases both owners for the next write or startup roll-forward.
 let queue: Promise<void> = Promise.resolve();
+const roomQueues = new WeakMap<Store, Map<string, Promise<void>>>();
 
 // Projection listeners (the federation sender's wake, 4c-2): registered
 // like the room hooks, fired after each completed projection. A listener
@@ -63,14 +65,101 @@ export function onProjected(
   };
 }
 
-export async function project(store: Store, roomId: string): Promise<void> {
-  // Recovery remains synchronous for the caller (including startup), but each
-  // durable upgrade page rejoins the queue so another room can publish between
-  // pages. A same-room caller helps recovery before publishing any new changes.
+export function project(store: Store, roomId: string): Promise<void> {
+  let rooms = roomQueues.get(store);
+  if (rooms === undefined) roomQueues.set(store, rooms = new Map());
+  // This room's baseline has one capture owner; independent rooms prepare
+  // concurrently. A failed page releases its owner for the next roll-forward.
+  const run = (rooms.get(roomId) ?? Promise.resolve()).catch(() => {}).then(
+    () => projectRoom(store, roomId),
+  );
+  rooms.set(roomId, run);
+  const release = () => {
+    if (rooms.get(roomId) === run) rooms.delete(roomId);
+  };
+  void run.then(release, release);
+  return run;
+}
+
+async function projectRoom(store: Store, roomId: string): Promise<void> {
+  const server = await store.server();
+  const room = await openRoom(store, roomId);
+  // Owe this admitted cut, not every later write to a continuously busy room.
+  const head = await room.tx((tx) => tx.changes.head());
   for (;;) {
+    const mark = await get(server, sourceOf(roomId));
+    const contextMark = await get(server, 'push-context:' + roomId);
+    const localServers = await store.tenants();
+    const seed = await captureHistoricalRelations(room, mark, contextMark);
+    const device = seed === null
+      ? await captureDevicePublication(store, room, mark)
+      : null;
+    let batch = seed === null
+      ? await room.tx(async (tx) =>
+        (await tx.changes.after(mark, BATCH)).filter((c) => c.pos <= head)
+      )
+      : [];
+    const drop = batch.findIndex((change) => change.kind === 'drop');
+    if (drop > 0) batch = batch.slice(0, drop);
+    const prepared = drop === 0
+      ? []
+      : await prepare(room, store, roomId, batch, localServers);
     const complete = await withProjectionLock(async () => {
-      if (!await projectNow(store, roomId)) return false;
-      await reconcileTyping(await store.server(), roomId);
+      // This logical handle fences retirement and the storage incarnation.
+      // A drop/recreate cannot publish an earlier incarnation's captured page.
+      await room.tx((tx) => tx.changes.head());
+      if (
+        await get(server, sourceOf(roomId)) !== mark ||
+        await get(server, 'push-context:' + roomId) !== contextMark
+      ) return false;
+      if (seed !== null) {
+        await applyHistoricalRelations(server, roomId, seed);
+        return false;
+      }
+      if (
+        device !== null && !(await server.query(
+          'SELECT 1 FROM e2ee_rooms WHERE room=?',
+          [roomId],
+        )).length
+      ) {
+        await server.tx((tx) =>
+          applyDevicePublication(
+            tx,
+            roomId,
+            device.publication,
+            device.pos,
+            localServers,
+          )
+        );
+      }
+      if (drop === 0) {
+        await finishRoomRemoval(
+          store,
+          roomId,
+          JSON.parse(batch[0].data) as Removal,
+          batch[0].pos,
+        );
+        return true;
+      }
+      if (batch.length) {
+        // Keep tenant deactivation and notification publication ordered. Only
+        // immutable room facts, never tenant policy, escape preparation waits.
+        for (const item of prepared) {
+          if ('pushCapture' in item && item.pushCapture !== null) {
+            item.push = await prepareCapturedPush(store, item.pushCapture);
+          }
+        }
+        const addedMs = Date.now();
+        await eventStreamTx(server, async (tx) => {
+          for (const item of prepared) {
+            await apply(tx, roomId, item, addedMs, localServers);
+          }
+          await advance(tx, sourceOf(roomId), batch.at(-1)!.pos);
+          await advance(tx, 'push-context:' + roomId, batch.at(-1)!.pos);
+        });
+        if (batch.at(-1)!.pos < head) return false;
+      }
+      await reconcileTyping(server, roomId);
       for (const fn of projectedListeners) {
         try {
           await fn(store, roomId);
@@ -94,71 +183,37 @@ export function withProjectionLock<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-async function projectNow(store: Store, roomId: string): Promise<boolean> {
+async function captureDevicePublication(
+  store: Store,
+  room: Room,
+  mark: number,
+): Promise<{ publication: Publication; pos: number } | null> {
   const server = await store.server();
-  const room = await openRoom(store, roomId);
-  const source = sourceOf(roomId);
-  const localServers = await store.tenants();
-  // Never advance the normal room/context watermark past an incomplete seed:
-  // live decisions must see the complete already-published relation context.
-  if (!await seedHistoricalRelations(store, room)) return false;
-  for (;;) {
-    const mark = await get(server, source);
-    // A supported schema upgrade seeds at the already projected publication,
-    // not at a newer room head and not by replaying history as news.
-    if (
-      mark > 0 &&
-      !(await server.query('SELECT 1 FROM e2ee_rooms WHERE room=?', [roomId]))
-        .length
-    ) {
-      const cut = await server.query(
-        'SELECT stay,pos FROM feed WHERE room=? AND pos<=? ORDER BY pos DESC LIMIT 1',
-        [roomId, mark],
+  // A supported schema upgrade seeds at the already projected publication,
+  // not at a newer room head and not by replaying history as news.
+  if (
+    mark > 0 &&
+    !(await server.query('SELECT 1 FROM e2ee_rooms WHERE room=?', [room.id]))
+      .length
+  ) {
+    const cut = await server.query(
+      'SELECT stay,pos FROM feed WHERE room=? AND pos<=? ORDER BY pos DESC LIMIT 1',
+      [room.id, mark],
+    );
+    if (cut.length) {
+      const ids = await memberIdsAt(
+        room,
+        Number(cut[0].stay),
+        Number(cut[0].pos),
+        true,
       );
-      if (cut.length) {
-        const ids = await memberIdsAt(
-          room,
-          Number(cut[0].stay),
-          Number(cut[0].pos),
-          true,
-        );
-        if (ids !== null) {
-          const members = await membersAt(room, ids.members, new Map());
-          await server.tx((tx) =>
-            applyDevicePublication(
-              tx,
-              roomId,
-              { ...ids, members },
-              Number(cut[0].pos),
-              localServers,
-            )
-          );
-        }
+      if (ids !== null) {
+        const members = await membersAt(room, ids.members, new Map());
+        return { publication: { ...ids, members }, pos: Number(cut[0].pos) };
       }
     }
-    let batch = await room.tx((tx) => tx.changes.after(mark, BATCH));
-    if (batch.length === 0) return true;
-    const drop = batch.findIndex((change) => change.kind === 'drop');
-    if (drop === 0) {
-      await finishRoomRemoval(
-        store,
-        roomId,
-        JSON.parse(batch[0].data) as Removal,
-        batch[0].pos,
-      );
-      return true;
-    }
-    if (drop > 0) batch = batch.slice(0, drop);
-    const prepared = await prepare(room, store, roomId, batch, localServers);
-    const addedMs = Date.now();
-    await eventStreamTx(server, async (tx) => {
-      for (const item of prepared) {
-        await apply(tx, roomId, item, addedMs, localServers);
-      }
-      await advance(tx, source, batch[batch.length - 1].pos);
-      await advance(tx, 'push-context:' + roomId, batch[batch.length - 1].pos);
-    });
   }
+  return null;
 }
 
 // --- the change payloads ---------------------------------------------------
@@ -166,19 +221,27 @@ async function projectNow(store: Store, roomId: string): Promise<boolean> {
 // Older schemas lacked history edges and implicit-read event identity. Recover
 // those facts from immutable PDUs, then reconcile saved decisions. This never
 // re-evaluates rules or replays live publication/delivery intent.
-async function seedHistoricalRelations(
-  store: Store,
+type HistoricalSeed = {
+  cursor: number;
+  edges: {
+    event: string;
+    relation: { relatesTo: string; relType: string | null } | null;
+    sender: string;
+    seq: number | null;
+  }[];
+};
+
+async function captureHistoricalRelations(
   room: Room,
-): Promise<boolean> {
-  const server = await store.server();
-  const source = 'push-context:' + room.id;
-  const mark = await get(server, sourceOf(room.id));
-  if (mark === 0 || await get(server, source) >= mark) return true;
-  let cursor = await get(server, source);
+  mark: number,
+  contextMark: number,
+): Promise<HistoricalSeed | null> {
+  if (mark === 0 || contextMark >= mark) return null;
+  const server = await room.store.server();
   const page = await server.query(
     `SELECT event,pos,seq FROM event_index WHERE room=? AND pos>? AND pos<=?
       AND standing='accepted' AND grounding='grounded' ORDER BY pos LIMIT ?`,
-    [room.id, cursor, mark, BATCH],
+    [room.id, contextMark, mark, BATCH],
   );
   const edges = await room.tx(async (tx) => {
     const out = [];
@@ -196,27 +259,36 @@ async function seedHistoricalRelations(
     }
     return out;
   });
-  cursor = page.length < BATCH ? mark : Number(page.at(-1)!.pos);
+  return {
+    edges,
+    cursor: page.length < BATCH ? mark : Number(page.at(-1)!.pos),
+  };
+}
+
+async function applyHistoricalRelations(
+  server: Awaited<ReturnType<Store['server']>>,
+  roomId: string,
+  seed: HistoricalSeed,
+): Promise<void> {
   const now = Date.now();
   await server.tx(async (tx) => {
-    for (const { event, relation, sender, seq } of edges) {
+    for (const { event, relation, sender, seq } of seed.edges) {
       if (relation !== null) {
         await tx.execute(
           'INSERT INTO relations(event,relates_to,rel_type,room,seq) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
-          [event, relation.relatesTo, relation.relType, room.id, seq],
+          [event, relation.relatesTo, relation.relType, roomId, seq],
         );
       }
       if (seq !== null) {
         await tx.execute(
           'INSERT INTO notification_own_events(room,event,user,event_seq) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
-          [room.id, event, sender, seq],
+          [roomId, event, sender, seq],
         );
       }
-      await reconcileNotificationEvent(tx, room.id, event, now);
+      await reconcileNotificationEvent(tx, roomId, event, now);
     }
-    await advance(tx, source, cursor);
+    await advance(tx, 'push-context:' + roomId, seed.cursor);
   });
-  return cursor === mark;
 }
 
 // The 'event'/'transition'/'history' payloads share one shape (the room's
@@ -251,6 +323,7 @@ type Prepared =
       // changes in the same batch. Evidence/history carry no publication.
       publication: Publication | null;
       push: PushPublication | null;
+      pushCapture: PushCapture | null;
     }
     | {
       kind: 'membership';
@@ -446,11 +519,11 @@ async function prepare(
           relation,
           search,
           publication,
-          push: localServers.length > 0 && change.kind !== 'history' &&
+          push: null,
+          pushCapture: localServers.length > 0 && change.kind !== 'history' &&
               isLive(payload)
-            ? await preparePush(
+            ? await capturePush(
               room,
-              store,
               change.event,
               payload.stay!,
               change.pos,
