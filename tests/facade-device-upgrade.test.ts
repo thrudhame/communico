@@ -11,6 +11,51 @@ import {
 import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
 import { historicalTenantSchema } from '#tests/fixtures/tenant-schema-history.ts';
 
+Deno.test('F2 wire frontier upgrades tenant35 without inventing original publication evidence', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'facade-device-wire-upgrade-' });
+  const options = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(options, {
+    schemas: { tenant: historicalTenantSchema(35) },
+  });
+  try {
+    await openTenant(store, 'logical.test', { create: true });
+    const old = await store.tenant('logical.test');
+    await old.execute("INSERT INTO user_device_stream VALUES('alice',10)");
+    await old.execute(
+      'INSERT INTO e2ee_changes VALUES(1,\'alice\',\'OLD\',1,10,\'{"device_id":"OLD","deleted":true}\')',
+    );
+    const retained = await old.query('SELECT * FROM e2ee_changes');
+    await store.close();
+    store = await openStore(options, { schemas: { tenant: tenantSchema } });
+    const db = await store.tenant('logical.test');
+    for (
+      const table of [
+        'device_stream_publications',
+        'device_stream_predecessors',
+        'device_stream_frontier',
+        'device_stream_baselines',
+      ]
+    ) {
+      assertEquals(await db.query('SELECT * FROM ' + table), []);
+    }
+    assertEquals(await db.query('SELECT * FROM e2ee_changes'), retained);
+    const sql =
+      "SELECT name,sql FROM sqlite_master WHERE name LIKE 'device_stream_%' ORDER BY name";
+    const upgraded = await db.query(sql);
+    await openTenant(store, 'fresh.test', { create: true });
+    assertEquals(await (await store.tenant('fresh.test')).query(sql), upgraded);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('F2 public device schema upgrades the prior pool owner and retains imported facts on reopen', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'facade-device-upgrade-' });
   const options = {

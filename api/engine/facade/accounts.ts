@@ -250,6 +250,9 @@ function accountAuthOf(raw: unknown): AccountAuth {
     credentials: row.credentials,
     phc: row.phc as string | null,
     deactivated: row.deactivated,
+    ...(Object.hasOwn(row, 'deviceStreamFloor')
+      ? { deviceStreamFloor: integer(row.deviceStreamFloor) }
+      : {}),
     authority: (() => {
       const authority = object(row.authority);
       if (

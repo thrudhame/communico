@@ -21,6 +21,10 @@ import {
   type SessionFact,
 } from '#engine/tenant/session-authority.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
+import {
+  captureDeviceStreamFloor,
+  installDeviceStreamFloor,
+} from '#engine/tenant/device-stream.ts';
 
 export const ACCOUNT_AUTH_SQL = `
 CREATE TABLE account_auth_sources(localpart TEXT PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,material_hash TEXT NOT NULL,captured_ms INTEGER NOT NULL);
@@ -45,16 +49,23 @@ export type AccountAuth = {
   phc: string | null;
   deactivated: boolean;
   authority: { facts: AuthorityFact[]; sessions: SessionFact[] };
+  deviceStreamFloor?: number;
 };
 
 function material(
-  view: Pick<AccountAuth, 'credentials' | 'phc' | 'deactivated' | 'authority'>,
+  view: Pick<
+    AccountAuth,
+    'credentials' | 'phc' | 'deactivated' | 'authority' | 'deviceStreamFloor'
+  >,
 ) {
   return createHash('sha256').update(canonicalJson({
     credentials: view.credentials,
     phc: view.phc,
     deactivated: view.deactivated,
     authority: view.authority,
+    ...(view.deviceStreamFloor === undefined
+      ? {}
+      : { deviceStreamFloor: view.deviceStreamFloor }),
   })).digest('hex');
 }
 
@@ -81,11 +92,13 @@ export async function captureAccountAuth(
   const phc = credentials && !user.deactivated
     ? await credentialHash(conn, localpart)
     : null;
+  const deviceStreamFloor = await captureDeviceStreamFloor(conn, localpart);
   const view = {
     credentials,
     phc,
     deactivated: user.deactivated,
     authority: await captureSessionAuthority(conn, localpart),
+    ...(deviceStreamFloor === undefined ? {} : { deviceStreamFloor }),
   };
   const hash = createHash('sha256').update(canonicalJson({
     material: material(view),
@@ -155,6 +168,13 @@ export async function installAccountAuth(
     view.authority,
     erasureCuts,
   );
+  if (view.deviceStreamFloor !== undefined) {
+    await installDeviceStreamFloor(
+      conn,
+      view.localpart,
+      view.deviceStreamFloor,
+    );
+  }
   user = await userByLocalpart(conn, view.localpart);
   if (view.deactivated) {
     await deactivateUserRows(

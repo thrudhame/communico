@@ -19,6 +19,7 @@ import { UIA_BINDING_SQL } from '#engine/tenant/uia.ts';
 import { PROFILE_FANOUT_SQL } from '#engine/tenant/profile-fanout.ts';
 import { KEY_CONSUMPTIONS_SQL } from '#engine/tenant/e2ee.ts';
 import { DEVICE_OPERATIONS_SQL } from '#engine/tenant/device-operations.ts';
+import { DEVICE_STREAM_SQL } from '#engine/tenant/device-stream.ts';
 import { SIGNING_OPERATIONS_SQL } from '#engine/tenant/signing-operations.ts';
 import { LINK_APPLICATIONS_SQL } from '#engine/tenant/link-applications.ts';
 import { SIGNATURE_OPERATIONS_SQL } from '#engine/tenant/signature-operations.ts';
@@ -286,7 +287,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 35,
+  version: 36,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -320,8 +321,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(SIGNATURE_OPERATIONS_SQL);
     await db.exec(KEY_BOOTSTRAP_SQL);
     await db.exec(DEVICE_CREATION_HISTORY_SQL);
+    await db.exec(DEVICE_STREAM_SQL);
   },
   migrations: {
+    35: (conn) => conn.exec(DEVICE_STREAM_SQL),
     34: (conn) => conn.exec(DEVICE_CREATION_HISTORY_SQL),
     33: (conn) => conn.exec(KEY_BOOTSTRAP_SQL),
     32: (conn) => conn.exec(SIGNATURE_OPERATIONS_SQL),

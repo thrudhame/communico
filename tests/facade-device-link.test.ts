@@ -25,7 +25,12 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { updateDeviceName, upsertDevice } from '#engine/tenant/devices.ts';
-import { publicDeviceValues } from '#engine/tenant/device-operations.ts';
+import {
+  importDeviceOperation,
+  publicDeviceValues,
+} from '#engine/tenant/device-operations.ts';
+import type { DeviceOperation } from '#engine/tenant/device-source.ts';
+import { rebaseRestoredDeviceStreams } from '#engine/tenant/changes.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deactivateUser } from '#engine/tenant/users.ts';
@@ -110,7 +115,7 @@ function pauseImport(store: Store, cut: 'before' | 'during' | 'after') {
   };
 }
 
-async function fixture(publicFirst = false) {
+async function fixture(publicFirst = false, legacyChanges = 0) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-device-link-' });
   const open = (side: string) =>
     openStore({
@@ -133,6 +138,9 @@ async function fixture(publicFirst = false) {
     await tx.users.insert('bob', 'Bob');
   });
   await upsertDevice(ht, 'alice', 'LAN', 'home name');
+  for (let index = 0; index < legacyChanges; index++) {
+    await updateDeviceName(ht, 'alice', 'LAN', 'legacy home ' + index);
+  }
   const node = await initializeNode(
     await edge.server(),
     'logical.test',
@@ -215,6 +223,337 @@ async function fixture(publicFirst = false) {
     },
   };
 }
+
+Deno.test('device wire lanes: first offline facade creation cannot reuse the legacy home serial namespace', async () => {
+  const f = await fixture(false, 6);
+  try {
+    const homeDb = await f.home.tenant('logical.test');
+    const legacy = await homeDb.query(
+      'SELECT stream_id FROM e2ee_changes ORDER BY pos',
+    );
+    const used = legacy.map((row) => Number(row.stream_id));
+    assert(
+      used.includes(2),
+      'the former serial namespace already used the facade lane',
+    );
+    // No device/public snapshot has crossed the link. Only the signed account
+    // bootstrap grants this first offline login; its allocation floor must be
+    // present before a new device can publish anything.
+    await upsertDevice(f.et, 'alice', 'FIRST', 'first offline device');
+    const edgeDb = await f.edge.tenant('logical.test');
+    const [row] = await edgeDb.query(
+      'SELECT stream_id FROM e2ee_changes ORDER BY pos DESC LIMIT 1',
+    );
+    assert(
+      Number(row.stream_id) > Math.max(...used),
+      'new lane must start beyond every legacy home identity',
+    );
+    assertEquals(Number(row.stream_id) % 2, 0);
+    const [baseline] = await edgeDb.query(
+      'SELECT floor FROM device_stream_baselines WHERE localpart=?',
+      ['alice'],
+    );
+    assertEquals(Number(baseline.floor), Math.max(...used));
+    await updateDeviceName(f.ht, 'alice', 'LAN', 'new signed home publication');
+    const refreshed = await exportAccountAuth(
+      f.home,
+      f.ht,
+      f.hp,
+      f.bundle.id,
+      'alice',
+      false,
+    );
+    const signed =
+      (refreshed.payload as { signed: { body: { deviceStreamFloor: number } } })
+        .signed;
+    assertEquals(
+      signed.body.deviceStreamFloor,
+      Number(baseline.floor),
+      'auth refresh does not manufacture newer checkpoints',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('device wire lanes: missing signed home baseline refuses effects instead of using an old serial snapshot', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.tenant('logical.test');
+    await db.execute('DELETE FROM device_stream_baselines');
+    await assertRejects(
+      () => upsertDevice(f.et, 'alice', 'PHONE'),
+      MatrixError,
+      'home allocation baseline',
+    );
+    assertEquals(await db.query('SELECT * FROM devices'), []);
+    assertEquals(
+      await db.query('SELECT * FROM device_stream_publications'),
+      [],
+    );
+    assertEquals(await db.query('SELECT * FROM user_device_stream'), []);
+    assertEquals(await db.query('SELECT * FROM e2ee_changes'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('device wire lanes: signed source identities survive exchange and the next owner joins observed tips', async () => {
+  const f = await fixture();
+  type Wire = { streamId: number; prevIds: number[] };
+  const wireOf = (op: unknown) => (op as { wire?: Wire }).wire;
+  const viewOf = (record: LinkRecord) =>
+    (record.payload as { body: DeviceView }).body;
+  try {
+    const homeDb = await f.home.tenant('logical.test');
+    const edgeDb = await f.edge.tenant('logical.test');
+    const records = await f.hs.export('alice', f.bundle.id);
+    const homeOps = records.map((r) => viewOf(r).operation);
+    assert(homeOps.length > 0);
+    for (const op of homeOps) {
+      const wire = wireOf(op);
+      assert(
+        wire,
+        'signed owner source must retain its original wire publication',
+      );
+      assertEquals(wire.streamId % 2, 1, 'home uses its signed odd lane');
+    }
+    await f.ej.receive('home', records);
+    for (const record of records) await f.es.apply(f.ej, record);
+    await upsertDevice(f.et, 'alice', 'PHONE', 'outside phone');
+    await updateDeviceName(f.ht, 'alice', 'LAN', 'concurrent home change');
+    const [concurrent] = await homeDb.query(
+      'SELECT payload FROM e2ee_changes ORDER BY pos DESC LIMIT 1',
+    );
+    const homeTip =
+      JSON.parse(String(concurrent.payload)).operation.wire.streamId;
+    const authority = await exportSessionAuthority(
+      f.edge,
+      f.et,
+      f.fp,
+      f.owners,
+      f.node,
+      'alice',
+    );
+    await f.hj.receive('edge_a', [authority]);
+    await f.accounts.applyFromFacade(f.hj, f.bundle.id, authority);
+    const reverse = await f.es.export('alice');
+    assert(reverse.length > 0);
+    for (const record of reverse) {
+      const op = viewOf(record).operation;
+      const wire = wireOf(op);
+      assert(wire);
+      assertEquals(wire.streamId % 2, 0, 'facade uses its signed even lane');
+      assert(wire.prevIds.includes(wireOf(homeOps.at(-1)!)!.streamId));
+      await f.hj.receive('edge_a', [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+      const [retained] = await homeDb.query(
+        'SELECT payload_json FROM device_operations WHERE operation_id=?',
+        [op.operationId],
+      );
+      assertEquals(
+        JSON.parse(String(retained.payload_json)),
+        op,
+        'import does not allocate a replacement wire identity',
+      );
+    }
+    await updateDeviceName(f.ht, 'alice', 'LAN', 'after import');
+    const [last] = await homeDb.query(
+      'SELECT payload FROM e2ee_changes ORDER BY pos DESC LIMIT 1',
+    );
+    const local = JSON.parse(String(last.payload));
+    const lastRemote = wireOf(viewOf(reverse.at(-1)!).operation)!;
+    assertEquals(
+      local.operation.wire.prevIds,
+      [lastRemote.streamId, homeTip].sort((a, b) => a - b),
+    );
+    assertEquals(local.wire, local.operation.wire);
+    assertEquals(
+      await f.es.export('alice'),
+      reverse,
+      'reads and retries reuse exact source publications',
+    );
+    const frontier = await edgeDb.query(
+      'SELECT stream_id FROM device_stream_frontier WHERE localpart=?',
+      ['alice'],
+    );
+    assertEquals(frontier.map((row) => Number(row.stream_id)), [
+      lastRemote.streamId,
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('device wire lanes: wrong lanes, changed identities and cycles roll back; a delayed ancestor stays consumed after cold reopen', async () => {
+  const f = await fixture();
+  let reopened;
+  try {
+    const [record] = await f.hs.export('alice', f.bundle.id);
+    const original = (record.payload as { body: DeviceView }).body.operation;
+    const expected = {
+      source: original.source,
+      incarnation: original.incarnation,
+      localpart: 'alice',
+    };
+    const op = (
+      sequence: number,
+      streamId: number,
+      prevIds: number[],
+    ): DeviceOperation => {
+      const { payloadHash: _hash, ...source } = original;
+      const body = {
+        ...source,
+        sequence,
+        operationId: canonicalJson([
+          source.source,
+          source.incarnation,
+          'device',
+          sequence,
+        ]),
+        wire: { streamId, prevIds },
+      };
+      return {
+        ...body,
+        payloadHash: createHash('sha256').update(canonicalJson(body)).digest(
+          'hex',
+        ),
+      };
+    };
+    const db = await f.edge.tenant('logical.test');
+    const apply = (operation: DeviceOperation) =>
+      db.tx((conn) => importDeviceOperation(conn, operation, expected));
+    await assertRejects(
+      () => apply(op(100, 12, [])),
+      MatrixError,
+      'wire publication collision',
+    );
+    assertEquals(await db.query('SELECT * FROM device_operations'), []);
+    const child = op(101, 11, [13]);
+    await apply(child);
+    await assertRejects(
+      () => apply(op(102, 11, [13])),
+      MatrixError,
+      'wire publication collision',
+    );
+    await assertRejects(
+      () => apply(op(102, 13, [11])),
+      MatrixError,
+      'wire publication collision',
+    );
+    assertEquals(
+      (await db.query('SELECT stream_id FROM device_stream_frontier')).map((
+        r,
+      ) => Number(r.stream_id)),
+      [11],
+    );
+    await apply(op(102, 13, []));
+    await apply(child);
+    assertEquals(
+      (await db.query('SELECT stream_id FROM device_stream_frontier')).map((
+        r,
+      ) => Number(r.stream_id)),
+      [11],
+    );
+    assertEquals(
+      (await db.query('SELECT * FROM device_stream_publications')).length,
+      2,
+    );
+    await f.edge.close();
+    reopened = await f.open('edge');
+    const cold = await reopened.tenant('logical.test');
+    assertEquals(
+      (await cold.query('SELECT stream_id FROM device_stream_frontier')).map((
+        r,
+      ) => Number(r.stream_id)),
+      [11],
+    );
+    const tenant = await openTenant(reopened, 'logical.test');
+    await upsertDevice(tenant, 'alice', 'PHONE', 'after cold import');
+    const [last] = await cold.query(
+      'SELECT payload FROM e2ee_changes ORDER BY pos DESC LIMIT 1',
+    );
+    const wire = JSON.parse(String(last.payload)).wire;
+    assertEquals(
+      wire.streamId,
+      2,
+      'imported positions do not become the local source allocator',
+    );
+    assertEquals(wire.prevIds, [11]);
+  } finally {
+    await reopened?.close();
+    await f.close();
+  }
+});
+
+Deno.test('device wire lanes: rollback, restart and private restore never reuse the signed lane', async () => {
+  const f = await fixture();
+  let reopened;
+  try {
+    await f.hs.export('alice', f.bundle.id);
+    const db = await f.home.tenant('logical.test');
+    const before = await db.query(
+      'SELECT * FROM device_stream_publications ORDER BY stream_id',
+    );
+    await assertRejects(
+      () =>
+        db.tx(async (conn) => {
+          await conn.execute(
+            "UPDATE facade_owner_activation SET body_hash='incomplete-control'",
+          );
+          await rebaseRestoredDeviceStreams(conn);
+        }),
+      MatrixError,
+      'device stream awaits ownership control',
+    );
+    assertEquals(
+      await db.query(
+        'SELECT * FROM device_stream_publications ORDER BY stream_id',
+      ),
+      before,
+    );
+    await assertRejects(
+      () =>
+        db.tx(async (conn) => {
+          await rebaseRestoredDeviceStreams(conn);
+          throw new Error('rollback private restore');
+        }),
+      Error,
+      'rollback private restore',
+    );
+    assertEquals(
+      await db.query(
+        'SELECT * FROM device_stream_publications ORDER BY stream_id',
+      ),
+      before,
+    );
+    await db.tx((conn) => rebaseRestoredDeviceStreams(conn));
+    const [reset] = await db.query(
+      'SELECT stream_id,payload FROM e2ee_changes ORDER BY pos DESC LIMIT 1',
+    );
+    const resetWire = JSON.parse(String(reset.payload)).wire;
+    assertEquals(Number(reset.stream_id) % 2, 1);
+    assertEquals(resetWire.streamId, Number(reset.stream_id));
+    assertEquals(resetWire.prevIds, []);
+    await f.home.close();
+    reopened = await f.open('home');
+    const tenant = await openTenant(reopened, 'logical.test');
+    await updateDeviceName(tenant, 'alice', 'LAN', 'after restore restart');
+    const cold = await reopened.tenant('logical.test');
+    const [last] = await cold.query(
+      'SELECT stream_id,payload FROM e2ee_changes ORDER BY pos DESC LIMIT 1',
+    );
+    assertEquals(Number(last.stream_id), Number(reset.stream_id) + 2);
+    assert(
+      JSON.parse(String(last.payload)).wire.prevIds.includes(
+        Number(reset.stream_id),
+      ),
+    );
+  } finally {
+    await reopened?.close();
+    await f.close();
+  }
+});
 
 Deno.test('F2 public evidence cannot replace semantic account state in either bootstrap order or after cold reopen', async () => {
   for (const publicFirst of [false, true]) {
@@ -587,7 +926,10 @@ Deno.test('semantic key bootstrap: home retained history preserves original iden
   }
 });
 
-async function retainedDevice(f: Awaited<ReturnType<typeof fixture>>) {
+async function retainedDevice(
+  f: Awaited<ReturnType<typeof fixture>>,
+  withWire = false,
+) {
   const db = await f.home.tenant('logical.test');
   const [row] = await db.query(
     "SELECT payload FROM authority_facts WHERE localpart='alice' AND kind='device'",
@@ -604,12 +946,13 @@ async function retainedDevice(f: Awaited<ReturnType<typeof fixture>>) {
   ]);
   const [record] = await f.hs.export('alice', f.bundle.id);
   const original = (record.payload as { body: DeviceView }).body.operation;
-  const { payloadHash: _hash, ...body } = original;
+  const { payloadHash: _hash, wire: _wire, ...body } = original;
   const oldBody = {
     ...body,
     incarnation: creation.incarnation,
     deviceId: creation.deviceId,
     deviceIncarnation: creation.id,
+    ...(withWire ? { wire: { streamId: 101, prevIds: [] } } : {}),
     operationId: canonicalJson([
       creation.node,
       creation.incarnation,
@@ -652,10 +995,11 @@ async function retainedDevice(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 Deno.test('semantic key historical device creation: fresh receiver retains exact passive closure without session authority', async () => {
-  for (const historyFirst of [false, true]) {
+  for (const mode of [0, 1, 2, 3]) {
+    const historyFirst = mode % 2 === 1;
     const f = await fixture();
     try {
-      const { creation, operation } = await retainedDevice(f);
+      const { creation, operation } = await retainedDevice(f, mode >= 2);
       const records = await f.hs.bootstrap('alice', f.bundle.id);
       const historical = records.find((record) =>
         record.type === 'key-history'
@@ -1185,27 +1529,28 @@ Deno.test('semantic key public scope: actual F1-only evidence remains exact and 
       tx.publicReplica.export('bob', f.ht.serverName)
     );
     await f.et.tx((tx) => tx.publicReplica.install(view, f.et.serverName));
-    await upsertDevice(f.et, 'bob', 'RAW');
-    const device = await deviceIdentity(f.et, 'bob', 'RAW');
-    await f.et.tx((tx) =>
-      tx.e2ee.upload(
-        device,
-        validateUpload(
-          {
-            device_keys: {
-              user_id: user,
-              device_id: 'RAW',
-              algorithms: [],
-              keys: { 'ed25519:RAW': 'raw-public' },
-              signatures: {},
-            },
-          },
-          user,
-          'RAW',
-          config().e2ee,
-        ),
-      )
+    await assertRejects(
+      () => upsertDevice(f.et, 'bob', 'NEW'),
+      MatrixError,
+      'home allocation baseline',
     );
+    // Unselected legacy/corrupt raw rows are not an admission capability. Seed
+    // that read-boundary input directly, not through a new owner publication
+    // without a signed account baseline.
+    const db = await f.edge.tenant('logical.test');
+    await db.execute("INSERT INTO devices VALUES('RAW','bob',1,NULL)");
+    await db.execute('INSERT INTO device_keys VALUES(?,?,?,?)', [
+      'bob',
+      'RAW',
+      1,
+      canonicalJson({
+        user_id: user,
+        device_id: 'RAW',
+        algorithms: [],
+        keys: { 'ed25519:RAW': 'raw-public' },
+        signatures: {},
+      }),
+    ]);
     assertEquals(await readers[0](), {});
     assertEquals(await readers[1](), {});
     assertEquals(await readers[2](), view.devices);

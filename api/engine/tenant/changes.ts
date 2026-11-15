@@ -9,11 +9,26 @@ import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { deviceChangeOperation } from '#engine/tenant/device-source.ts';
 import type { Json } from '#engine/tenant/e2ee.ts';
 import type { SignatureOperation } from '#engine/tenant/signature-operations.ts';
+import {
+  allocateDeviceWire,
+  type DeviceWire,
+  retainDeviceWire,
+} from '#engine/tenant/device-stream.ts';
+import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 
 async function reserveDeviceChange(conn: Conn, localpart: string) {
-  await conn.execute(
-    'INSERT INTO user_device_stream(localpart,value) VALUES(?,1) ON CONFLICT(localpart) DO UPDATE SET value=user_device_stream.value+1',
+  const [prior] = await conn.query(
+    'SELECT value FROM user_device_stream WHERE localpart=?',
     [localpart],
+  );
+  const wire = await allocateDeviceWire(
+    conn,
+    localpart,
+    prior ? Number(prior.value) : 0,
+  );
+  await conn.execute(
+    'INSERT INTO user_device_stream(localpart,value) VALUES(?,?) ON CONFLICT(localpart) DO UPDATE SET value=excluded.value',
+    [localpart, wire ? wire.streamId : (prior ? Number(prior.value) : 0) + 1],
   );
   const [stream] = await conn.query(
     'SELECT value FROM user_device_stream WHERE localpart=?',
@@ -22,6 +37,7 @@ async function reserveDeviceChange(conn: Conn, localpart: string) {
   return {
     pos: await nextCounter(conn, 'e2ee_changes'),
     stream: Number(stream.value),
+    wire,
   };
 }
 
@@ -51,18 +67,25 @@ export async function rebaseRestoredDeviceStreams(
     if (!rows.length) break;
     for (const row of rows) {
       const localpart = String(row.localpart);
+      const allocated = await allocateDeviceWire(conn, localpart, floor - 1);
+      const wire = allocated ? { ...allocated, prevIds: [] } : null;
+      const stream = wire?.streamId ?? floor;
       await conn.execute(
         'INSERT INTO user_device_stream VALUES(?,?) ON CONFLICT(localpart) DO UPDATE SET value=excluded.value',
-        [localpart, floor],
+        [localpart, stream],
       );
-      await conn.execute('INSERT INTO e2ee_changes VALUES(?,?,?,?,?,?)', [
+      await retainDeviceChange(
+        conn,
+        { localpart, deviceId: '', generation: 0 },
         await nextCounter(conn, 'e2ee_changes'),
-        localpart,
-        '',
-        0,
-        floor,
-        '{"kind":"restore_reset","device_id":"","deleted":true}',
-      ]);
+        stream,
+        {
+          kind: 'restore_reset',
+          device_id: '',
+          deleted: true,
+          ...(wire ? { wire } : {}),
+        },
+      );
       users++;
     }
     cursor = String(rows.at(-1)!.localpart);
@@ -81,7 +104,10 @@ export async function appendDeviceChange(
     'SELECT d.display_name,k.key_json FROM devices d LEFT JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation WHERE d.localpart=? AND d.device_id=? AND d.generation=?',
     [device.localpart, device.deviceId, device.generation],
   );
-  const { pos, stream } = await reserveDeviceChange(conn, device.localpart);
+  const { pos, stream, wire } = await reserveDeviceChange(
+    conn,
+    device.localpart,
+  );
   const payload: Record<string, unknown> = {
     device_id: device.deviceId,
     generation: device.generation,
@@ -118,9 +144,11 @@ export async function appendDeviceChange(
         ? null
         : JSON.parse(String(rows[0].key_json)) as Json,
     },
+    wire ?? undefined,
   );
   await retainDeviceChange(conn, device, pos, stream, {
     ...payload,
+    ...(wire ? { wire } : {}),
     ...(operation ? { operation } : {}),
     ...(signatureOperation ? { signatureOperation } : {}),
   });
@@ -137,7 +165,7 @@ export async function appendDeviceOverlayChange(
   displayName: string | null,
   signatureOperation: SignatureOperation,
 ) {
-  const { pos, stream } = await reserveDeviceChange(conn, localpart);
+  const { pos, stream, wire } = await reserveDeviceChange(conn, localpart);
   await retainDeviceChange(
     conn,
     { localpart, deviceId, generation: 0 },
@@ -148,6 +176,7 @@ export async function appendDeviceOverlayChange(
       keys,
       ...(displayName === null ? {} : { device_display_name: displayName }),
       signatureOperation,
+      ...(wire ? { wire } : {}),
     },
   );
 }
@@ -160,14 +189,33 @@ async function retainDeviceChange(
   payload: Record<string, unknown>,
 ) {
   const [tenant] = await conn.query('SELECT server_name FROM tenant');
+  if (payload.wire) {
+    const identity = await tenantAuthority(conn);
+    if (!identity) throw new Error('device wire source authority missing');
+    await retainDeviceWire(
+      conn,
+      device.localpart,
+      (payload.operation as { operationId: string } | undefined)?.operationId ??
+        canonicalJson([
+          identity.node,
+          identity.incarnation,
+          'device-publication',
+          pos,
+        ]),
+      identity.node,
+      identity.incarnation,
+      payload.wire as DeviceWire,
+    );
+  }
   const server = String(tenant.server_name);
   const {
     generation: _generation,
     operation: _operation,
     signatureOperation: _signatureOperation,
+    wire: _wire,
     ...wire
   } = payload;
-  void [_generation, _operation, _signatureOperation];
+  void [_generation, _operation, _signatureOperation, _wire];
   // Like to-device and public signing, reject undeliverable snapshots in their
   // owning transaction, before accepting a durable reliable obligation. Reserve
   // the widest timestamps/stream IDs and causal predecessor, including resets.
@@ -178,7 +226,8 @@ async function retainDeviceChange(
         ...wire,
         user_id: '@' + device.localpart + ':' + server,
         stream_id: Number.MAX_SAFE_INTEGER,
-        prev_id: [Number.MAX_SAFE_INTEGER],
+        prev_id: (payload.wire as DeviceWire | undefined)?.prevIds ??
+          [Number.MAX_SAFE_INTEGER],
       },
     }])),
     config().federation.bulkmaxbytes,

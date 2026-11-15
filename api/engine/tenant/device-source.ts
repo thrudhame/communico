@@ -8,6 +8,7 @@ import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Json } from '#engine/tenant/e2ee.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import { appendDeviceChange } from '#engine/tenant/changes.ts';
+import type { DeviceWire } from '#engine/tenant/device-stream.ts';
 
 export type DeviceOperation = {
   version: 1;
@@ -20,6 +21,7 @@ export type DeviceOperation = {
   deviceIncarnation: string;
   value: { displayName: string | null; keys: Json | null } | null;
   payloadHash: string;
+  wire?: DeviceWire;
 };
 
 export async function deviceChangeOperation(
@@ -27,6 +29,7 @@ export async function deviceChangeOperation(
   device: DeviceIdentity,
   sequence: number,
   value: DeviceOperation['value'],
+  wire?: DeviceWire,
 ): Promise<DeviceOperation | null> {
   const identity = await tenantAuthority(conn);
   if (!identity) return null;
@@ -55,6 +58,7 @@ export async function deviceChangeOperation(
     deviceId: device.deviceId,
     deviceIncarnation: String(mapping.incarnation),
     value,
+    ...(wire ? { wire } : {}),
   };
   return {
     ...body,

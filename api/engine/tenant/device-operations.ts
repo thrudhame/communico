@@ -8,6 +8,10 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
 import { KeyHistoryProof } from '#engine/tenant/key-bootstrap.ts';
+import {
+  deviceWireOf,
+  retainDeviceWire,
+} from '#engine/tenant/device-stream.ts';
 import { type Json, object, validateUpload } from '#engine/tenant/e2ee.ts';
 import {
   registryDevice,
@@ -76,6 +80,7 @@ function deviceOperationOf(raw: unknown, server: string): DeviceOperation {
     deviceId: String(row.deviceId),
     deviceIncarnation: String(row.deviceIncarnation),
     value,
+    ...(Object.hasOwn(row, 'wire') ? { wire: deviceWireOf(row.wire) } : {}),
   };
   const operation = {
     ...body,
@@ -158,6 +163,17 @@ export async function importDeviceOperation(
   if (old) {
     if (old.payload_json !== encoded) collision();
     return;
+  }
+  if (operation.wire) {
+    await retainDeviceWire(
+      conn,
+      operation.localpart,
+      operation.operationId,
+      operation.source,
+      operation.incarnation,
+      operation.wire,
+      history ? { proof: history, operation } : undefined,
+    );
   }
   await conn.execute(
     'INSERT INTO device_operations VALUES(?,?,?,?,?,?,?,?,?)',
