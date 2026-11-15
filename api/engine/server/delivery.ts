@@ -163,8 +163,15 @@ export async function completeBatch(
       if (edu.edu_type === 'm.device_list_update') {
         const content = JSON.parse(String(edu.payload));
         await tx.execute(
-          'UPDATE device_subscriptions SET sent_stream=? WHERE subject=? AND destination=? AND (sent_stream IS NULL OR sent_stream<?)',
-          [content.stream_id, content.user_id, destination, content.stream_id],
+          'UPDATE device_publications SET sent=1 WHERE source=? AND destination=?',
+          [source, destination],
+        );
+        // Compatibility/diagnostic scalar only: the ledger above acknowledges
+        // the exact frozen identity, including a concurrent smaller stream ID.
+        // An old epoch's completion must not claim current-epoch progress.
+        await tx.execute(
+          'UPDATE device_subscriptions SET sent_stream=? WHERE subject=? AND destination=? AND EXISTS(SELECT 1 FROM device_publications p WHERE p.source=? AND p.destination=device_subscriptions.destination AND p.subject=device_subscriptions.subject AND p.epoch=device_subscriptions.epoch)',
+          [content.stream_id, content.user_id, destination, source],
         );
       }
       // Publication epochs/tenant watermarks already own replay prevention.
