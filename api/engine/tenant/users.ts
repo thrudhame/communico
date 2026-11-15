@@ -349,10 +349,13 @@ export async function loginUser(
     ? null
     : await hashToken(refreshToken);
   return await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'password', localpart: params.localpart });
+    // A durable remove-wins tombstone is already a complete refusal. A newer
+    // authentication snapshot cannot restore it, so a stale captured cut must
+    // not mask that terminal result as temporary unavailability.
     if ((await tx.users.byLocalpart(params.localpart))?.deactivated) {
       throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account deactivated');
     }
+    await tx.ingress.check({ kind: 'password', localpart: params.localpart });
     const phc = await tx.credentials.hash(params.localpart);
     if (phc === null || !verifyPassword(phc, params.password)) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
@@ -522,11 +525,11 @@ export async function deactivateUserRows(
   );
   await clearBackup(conn, localpart);
   await clearProfileRows(conn, localpart);
-  if (erasureCuts !== undefined) {
-    await clearAccountData(conn, localpart);
-    await clearFilters(conn, localpart);
-    await clearPushRules(conn, localpart);
-  }
+  // Private account state is removed on every deactivation. The erase flag
+  // separately controls viewer-specific pruning of public room history.
+  await clearAccountData(conn, localpart);
+  await clearFilters(conn, localpart);
+  await clearPushRules(conn, localpart);
   // A deactivated account never retains a usable verifier, even without erase.
   await clearCredential(conn, localpart);
   await markDeactivated(conn, localpart);

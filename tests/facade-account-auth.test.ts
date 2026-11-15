@@ -22,6 +22,7 @@ import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { requireAccountAuth } from '#engine/tenant/account-auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
+  deactivateUser,
   loginUser,
   registerUser,
   verifyUserPassword,
@@ -178,6 +179,44 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('irreversible deactivation refuses login even when a captured auth cut is superseded', async () => {
+  const f = await fixture();
+  try {
+    await deactivateUser(f.ht, 'alice');
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    const guarded = await f.guarded({
+      replicatecredentials: true,
+      allowstaleauth: true,
+      authmaxstalehours: 0,
+    });
+    const captured = await guarded.ingress.prepare();
+    const stale = await openTenant(f.edge, 'logical.test', {
+      ingress: captured,
+    });
+    const next = await f.emit();
+    await f.journal.receive('home', [next]);
+    await f.receiver.apply(f.journal, next);
+    const failure = await assertRejects(() =>
+      loginUser(stale, {
+        localpart: 'alice',
+        password: 'pw',
+        deviceId: 'deactivated',
+        refresh: true,
+      }), MatrixError);
+    assertEquals(failure.errcode, 'M_USER_DEACTIVATED');
+    assertEquals(
+      await (await f.edge.tenant('logical.test')).query(
+        'SELECT token FROM access_tokens',
+      ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('facade ingress admits only an applied bound account cut and keeps unknown bearer semantics', async () => {
   const f = await fixture();

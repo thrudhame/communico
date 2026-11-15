@@ -11,6 +11,7 @@ import {
   matrixBase64,
 } from '#engine/signing-primitives.js';
 import { nodeId, type NodeIdentity } from './identity.ts';
+import { changeSigningAuthority } from './signing-authority.ts';
 import {
   type Capability,
   integer,
@@ -456,30 +457,39 @@ export class Pairings {
       pairing: id,
       grantHash: hash(grant),
     });
-    return await this.db.tx(async (conn) => {
-      const current = await entry(conn, id);
-      live(current, 'facade');
-      if (current.grant) {
-        if (!equal(current.grant, grant) || !current.receipt) collision();
-        return current.receipt;
-      }
-      live(current, 'facade', now);
-      const [control] = await conn.query(
-        'SELECT revision FROM facade_control WHERE singleton=1',
-      );
-      if (grant.body.revision <= Number(control.revision)) {
-        refused('regressing control revision');
-      }
-      await conn.execute(
-        'UPDATE facade_control SET revision=? WHERE singleton=1',
-        [grant.body.revision],
-      );
-      await conn.execute(
-        "UPDATE facade_pairings SET state='paired',grant_json=?,receipt_json=?,revision=? WHERE id=?",
-        [canonicalJson(grant), canonicalJson(receipt), grant.body.revision, id],
-      );
-      return receipt;
-    });
+    return await changeSigningAuthority(
+      this.db,
+      () =>
+        this.db.tx(async (conn) => {
+          const current = await entry(conn, id);
+          live(current, 'facade');
+          if (current.grant) {
+            if (!equal(current.grant, grant) || !current.receipt) collision();
+            return current.receipt;
+          }
+          live(current, 'facade', now);
+          const [control] = await conn.query(
+            'SELECT revision FROM facade_control WHERE singleton=1',
+          );
+          if (grant.body.revision <= Number(control.revision)) {
+            refused('regressing control revision');
+          }
+          await conn.execute(
+            'UPDATE facade_control SET revision=? WHERE singleton=1',
+            [grant.body.revision],
+          );
+          await conn.execute(
+            "UPDATE facade_pairings SET state='paired',grant_json=?,receipt_json=?,revision=? WHERE id=?",
+            [
+              canonicalJson(grant),
+              canonicalJson(receipt),
+              grant.body.revision,
+              id,
+            ],
+          );
+          return receipt;
+        }),
+    );
   }
 
   async confirm(id: string, raw: unknown): Promise<void> {
@@ -597,27 +607,28 @@ export class Pairings {
       revocation.body.node !== this.node.node
     ) refused('wrong revocation authority');
     await verify(revocation, row.context.home);
-    await this.db.tx(async (conn) => {
-      const current = await entry(conn, row.id);
-      if (current.revocation) {
-        if (!equal(current.revocation, revocation)) collision();
-        return;
-      }
-      const [control] = await conn.query(
-        'SELECT revision FROM facade_control WHERE singleton=1',
-      );
-      if (revocation.body.revision <= Number(control.revision)) {
-        refused('regressing control revision');
-      }
-      await conn.execute(
-        'UPDATE facade_control SET revision=? WHERE singleton=1',
-        [revocation.body.revision],
-      );
-      await conn.execute(
-        "UPDATE facade_pairings SET state='revoked',revision=?,revocation_json=? WHERE id=?",
-        [revocation.body.revision, canonicalJson(revocation), row.id],
-      );
-    });
+    await changeSigningAuthority(this.db, () =>
+      this.db.tx(async (conn) => {
+        const current = await entry(conn, row.id);
+        if (current.revocation) {
+          if (!equal(current.revocation, revocation)) collision();
+          return;
+        }
+        const [control] = await conn.query(
+          'SELECT revision FROM facade_control WHERE singleton=1',
+        );
+        if (revocation.body.revision <= Number(control.revision)) {
+          refused('regressing control revision');
+        }
+        await conn.execute(
+          'UPDATE facade_control SET revision=? WHERE singleton=1',
+          [revocation.body.revision],
+        );
+        await conn.execute(
+          "UPDATE facade_pairings SET state='revoked',revision=?,revocation_json=? WHERE id=?",
+          [revocation.body.revision, canonicalJson(revocation), row.id],
+        );
+      }));
   }
 
   async status(): Promise<

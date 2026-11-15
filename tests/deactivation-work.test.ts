@@ -16,6 +16,68 @@ const settings = (dir: string) => ({
   idleseconds: 300,
 });
 
+Deno.test('deactivation clears private account state without requiring public-history erasure on either ingress', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'deactivation-private-' });
+  const store = await openStore(settings(dir), {
+    schemas: { tenant: tenantSchema },
+  });
+  try {
+    const tenant = await openTenant(store, 'logical.test', { create: true });
+    for (const localpart of ['local', 'imported', 'active']) {
+      await registerUser(tenant, { localpart, password: 'pw' });
+      await tenant.tx(async (tx) => {
+        await tx.accountData.put(
+          localpart,
+          '',
+          'm.secret_storage.key.key',
+          '{"encrypted":"retained"}',
+          1,
+        );
+        await tx.filters.insert(localpart, 'filter', '{}');
+        await tx.pushRules.put(
+          localpart,
+          'override',
+          'private',
+          1,
+          '["notify"]',
+          '[]',
+          null,
+          1,
+        );
+      });
+    }
+    await deactivateUser(tenant, 'local');
+    await (await store.tenant('logical.test')).tx((conn) =>
+      deactivateUserRows(conn, 'logical.test', 'imported', undefined, true)
+    );
+    for (const localpart of ['local', 'imported']) {
+      assertEquals(
+        await tenant.tx((tx) =>
+          tx.accountData.get(localpart, '', 'm.secret_storage.key.key')
+        ),
+        null,
+      );
+      assertEquals(await tenant.tx((tx) => tx.filters.count(localpart)), 0);
+      assertEquals(
+        await tenant.tx((tx) =>
+          tx.pushRules.byId(localpart, 'override', 'private')
+        ),
+        null,
+      );
+    }
+    assertEquals(await tenant.tx((tx) => tx.filters.count('active')), 1);
+    assertEquals(
+      await (await store.tenant('logical.test')).query(
+        'SELECT localpart FROM erased_users',
+      ),
+      [],
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('deactivation work is atomic, remove-wins and durable for local and imported cleanup', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'deactivation-work-' });
   let store = await openStore(settings(dir), {
