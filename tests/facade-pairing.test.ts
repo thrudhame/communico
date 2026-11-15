@@ -140,6 +140,73 @@ Deno.test('enrollment consumes once and replays exact challenge, grant and recei
   }
 });
 
+Deno.test('active authority and home admission use one pairing snapshot across retirement', async () => {
+  for (const admission of ['active', 'authorizedHome'] as const) {
+    const f = await fixture();
+    try {
+      const bundle = await f.create();
+      await f.fp.accept(bundle);
+      const transcript = await f.fp.challenge(
+        bundle.id,
+        bundle.secret,
+        homePin,
+      );
+      const grant = await f.hp.grant(bundle.id, transcript);
+      const receipt = await f.fp.complete(bundle.id, grant, homePin);
+      await f.hp.confirm(bundle.id, receipt);
+      const revocation = await f.hp.revoke(bundle.id);
+      const db = await f.edge().server();
+      let captured = false;
+      const observed = new Proxy(db, {
+        get(target, property) {
+          if (property === 'query') {
+            return async (...args: Parameters<Database['query']>) => {
+              const rows = await target.query(...args);
+              if (
+                !captured &&
+                args[0].includes("WHERE side='facade' AND state='paired'")
+              ) {
+                captured = true;
+                await f.fp.retire(revocation, homePin);
+              }
+              return rows;
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const owner = new Pairings(
+        observed,
+        f.node.signer(),
+        f.node.publicKey,
+        facadePin,
+        f.node,
+      );
+      // A read concurrent with retirement may observe the complete earlier cut,
+      // never a paired selector combined with a retired row's later revision.
+      assertEquals(
+        await (admission === 'active'
+          ? owner.active()
+          : owner.authorizedHome(bundle.id, homePin)),
+        grant,
+      );
+      assert(captured);
+      assertEquals((await f.fp.status())[0].state, 'revoked');
+      const error = await assertRejects(() => owner.active(), LinkError);
+      assertEquals((error as LinkError).code, 'LINK_UNPAIRED');
+      await assertRejects(
+        () => owner.authorizedHome(bundle.id, homePin),
+        LinkError,
+      );
+      await f.reopen();
+      await assertRejects(() => f.fp.active(), LinkError, 'not enrolled');
+    } finally {
+      await f.close();
+    }
+  }
+});
+
 Deno.test('home key document publishes approved node keys and durable prospective retirement', async () => {
   const f = await fixture();
   const document = async () => {

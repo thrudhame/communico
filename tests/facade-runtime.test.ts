@@ -833,6 +833,28 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     device_id: device,
     refresh_token: true,
   });
+  const authTail = async (localparts: string[]) => {
+    // Permissive auth may use a complete older cut. Observe the journal through
+    // its owning process instead; home is stopped so its received tail is finite.
+    // Never open a second store while the child owns its lock.
+    await until(async () => {
+      const status =
+        (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
+          .body.result;
+      return localparts.every((localpart) => {
+        const scope = 'auth:@' + localpart + ':logical.test';
+        const held = status.scopes.find((row: { scope: string }) =>
+          row.scope === scope
+        );
+        const stream = status.streams.find((row: { stream: string }) =>
+          row.stream === scope
+        );
+        return held?.ready && held.pending === null && stream &&
+          stream.received.sequence === stream.applied.sequence &&
+          stream.received.hash === stream.applied.hash;
+      });
+    });
+  };
   try {
     edge = await process(file('facade'), 'facade: link/local admin ready');
     await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/initialize');
@@ -906,6 +928,12 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       );
     });
     await home.stop();
+    // Shutdown stops between records; it does not drain the received tail.
+    // With home stopped, restart and observe the actual finite auth apply cut
+    // before proving cold offline login from durable authority.
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await authTail(['outside', 'departure']);
     assertEquals((await api('facade', 'login')).body, {
       flows: [{ type: 'm.login.password' }],
     });
@@ -1009,6 +1037,9 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     await edge.stop();
     await configure('facade');
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    // The online strict login may have left another finite auth suffix. As at
+    // the first cold restart, listener readiness is not owner apply completion.
+    await authTail(['outside', 'departure']);
     // Refused GETs and refreshes above must not close the original retry window.
     const retried = await api('facade', 'refresh', {
       refresh_token: session.body.refresh_token,
@@ -1231,10 +1262,10 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       ...login('departure-edge-device'),
       identifier: { type: 'm.id.user', user: 'departure' },
     };
-    // Drain the finite local inbox after the home's final shutdown, then prove
-    // this independent account from a cold facade, not during an apply window.
+    // Restart does not itself prove the finite received tail has been applied.
     await edge.stop();
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    await authTail(['departure']);
     // The preceding verifier-withdrawal/restoration exercise covers every
     // served account asynchronously. Observe this account's restored verifier
     // without minting a new session while its last received cut drains.
@@ -1401,8 +1432,7 @@ async function process(config: string, ready: string) {
   }
   return {
     async stop() {
-      if (ended) return;
-      child.kill('SIGTERM');
+      if (!ended) child.kill('SIGTERM');
       const status = await bounded(output);
       assertEquals(status.code, 0, out + '\n' + err);
       assert(out.includes('shutdown: store closed'));

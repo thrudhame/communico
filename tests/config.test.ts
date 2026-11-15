@@ -88,6 +88,9 @@ replicaterooms = "local"
 mailboxmaxbytes = 0
 mailboxmaxagedays = 0
 maxofflinedays = 0
+replicatecredentials = true
+allowstaleauth = true
+authmaxstalehours = 0
 batchmaxbytes = 12500000
 batchmaxitems = 1000
 
@@ -963,7 +966,7 @@ Deno.test('public directory settings use complete defaults and strict leaf-wise 
   }
 });
 
-Deno.test('143 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('146 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -985,7 +988,7 @@ Deno.test('143 leaves total across the sections (the surface tripwire)', async (
     ['server', 5],
     ['admin', 2],
     ['backup', 2],
-    ['facade', 19],
+    ['facade', 22],
     ['wellknown', 7],
     ['turn', 5],
     ['matrixrtc', 1],
@@ -1006,7 +1009,7 @@ Deno.test('143 leaves total across the sections (the surface tripwire)', async (
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    143,
+    146,
     'the whole config surface includes discovery, TURN, HTTP administrators, backup and facade role',
   );
 });

@@ -372,6 +372,7 @@ export async function openFacadeRuntime(
         keyId: node?.keyId ?? null,
         matrix: false,
         scopes: active ? await (await roomOwner()).scopes(active.id) : [],
+        streams: active ? await journal.streams('home', 'in') : [],
         keyRoster: active
           ? await (await keyOwner()).status()
           : { ready: false, revision: 0, lastHome: null },
