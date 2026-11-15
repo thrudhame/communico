@@ -136,6 +136,9 @@ function viewOf(raw: unknown): KeyEnvelope {
       kind: 'key-history',
       keyKind: row.keyKind,
       operation: object(row.operation) as KeyOperation,
+      ...(row.keyKind === 'device-operation'
+        ? { creation: object(row.creation) as KeyHistory['creation'] }
+        : {}),
     };
   } else {
     view = {
@@ -314,6 +317,13 @@ export class DeviceOperations {
             kind: 'key-history',
             keyKind: kind,
             operation,
+            ...(kind === 'device-operation'
+              ? {
+                creation: history.creations.get(
+                  (operation as DeviceOperation).deviceIncarnation,
+                ),
+              }
+              : {}),
           });
         records.push(await this.publish(view, grant));
       }

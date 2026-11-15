@@ -119,3 +119,36 @@ Deno.test('F2 key bootstrap upgrades tenant33 without manufacturing completeness
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test('F2 passive device creation history upgrades tenant34 without manufacturing registry authority', async () => {
+  const dir = await Deno.makeTempDir({
+    prefix: 'facade-device-history-upgrade-',
+  });
+  const options = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(options, {
+    schemas: { tenant: historicalTenantSchema(34) },
+  });
+  try {
+    await openTenant(store, 'logical.test', { create: true });
+    await store.close();
+    store = await openStore(options, { schemas: { tenant: tenantSchema } });
+    const db = await store.tenant('logical.test');
+    assertEquals(await db.query('SELECT * FROM device_creation_history'), []);
+    assertEquals(await db.query('SELECT * FROM authority_facts'), []);
+    const sql =
+      "SELECT name,sql FROM sqlite_master WHERE name='device_creation_history'";
+    const schema = await db.query(sql);
+    assertEquals(schema.length, 1);
+    await openTenant(store, 'fresh.test', { create: true });
+    assertEquals(await (await store.tenant('fresh.test')).query(sql), schema);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});

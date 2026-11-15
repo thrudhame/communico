@@ -21,7 +21,11 @@ import {
 } from '#engine/tenant/session-authority.ts';
 import { deleteDevices } from '#engine/tenant/devices.ts';
 import { captureDeviceOperations } from '#engine/tenant/device-source.ts';
-import { importDeviceOperation } from '#engine/tenant/device-operations.ts';
+import {
+  importDeviceOperation,
+  publicDeviceKeys,
+} from '#engine/tenant/device-operations.ts';
+import { ownerSigningViews } from '#engine/tenant/cross-signing.ts';
 import {
   captureSigningOperations,
   importSigningOperation,
@@ -321,10 +325,31 @@ Deno.test('F2 foreign-owner device signatures publish overlays without acquiring
         'fallback_keys',
       ]
     ) assertEquals(await edge.db.query('SELECT * FROM ' + table), []);
+    // Direct owner facts are deliberately not an enrolled public baseline.
+    await assertRejects(
+      () =>
+        edge.tenant.tx((tx) =>
+          tx.e2ee.query('alice', ['LAN'], user, user, config().e2ee.maxkeys)
+        ),
+      Error,
+      'key bootstrap unavailable',
+    );
     const query = () =>
-      edge.tenant.tx((tx) =>
-        tx.e2ee.query('alice', ['LAN'], user, user, config().e2ee.maxkeys)
-      );
+      edge.db.tx(async (conn) => {
+        const result: Record<string, Record<string, unknown>> = {};
+        for (const row of (await publicDeviceKeys(conn, 'alice'))!) {
+          if (row.device_id !== 'LAN') continue;
+          const keys = await signatureView(
+            conn,
+            JSON.parse(row.key_json),
+            user,
+            row.device_id,
+            user,
+          );
+          result[row.device_id] = { ...keys, unsigned: {} };
+        }
+        return result;
+      });
     const expectedView = { ...payload.keys, unsigned: {} };
     assertEquals((await query()).LAN, expectedView);
     const beforeRetry = await edge.db.query('SELECT * FROM e2ee_changes');
@@ -488,7 +513,7 @@ Deno.test('F2 portable signature facts survive dependency reordering, duplicates
       importSignatureOperation(conn, f.operation, expected)
     );
     assertEquals(
-      await f.edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, '')),
+      await f.edge.db.tx((conn) => ownerSigningViews(conn, 'alice', user, '')),
       {},
     );
     await f.dependencies();
@@ -497,8 +522,8 @@ Deno.test('F2 portable signature facts survive dependency reordering, duplicates
       (await deviceIdentity(f.home.tenant, 'alice', 'LAN')).generation,
       2,
     );
-    const view = await f.edge.tenant.tx((tx) =>
-      tx.crossSigning.views('alice', user, '')
+    const view = await f.edge.db.tx((conn) =>
+      ownerSigningViews(conn, 'alice', user, '')
     );
     assertEquals(view.master_keys, f.signed);
     const changes = await f.edge.db.query('SELECT * FROM e2ee_changes');
@@ -512,7 +537,7 @@ Deno.test('F2 portable signature facts survive dependency reordering, duplicates
     );
     await f.edge.reopen();
     assertEquals(
-      await f.edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, '')),
+      await f.edge.db.tx((conn) => ownerSigningViews(conn, 'alice', user, '')),
       view,
     );
   } finally {
@@ -528,14 +553,14 @@ Deno.test('F2 portable signatures cannot survive a signer incarnation deletion/r
       importSignatureOperation(conn, f.operation, expected)
     );
     assertEquals(
-      (await f.edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, '')))
+      (await f.edge.db.tx((conn) => ownerSigningViews(conn, 'alice', user, '')))
         .master_keys,
       f.signed,
     );
     await deleteDevices(f.home.tenant, 'alice', ['LAN']);
     await f.dependencies();
     assertEquals(
-      (await f.edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, '')))
+      (await f.edge.db.tx((conn) => ownerSigningViews(conn, 'alice', user, '')))
         .master_keys,
       { ...f.master.json, signatures: {} },
     );
@@ -563,7 +588,7 @@ Deno.test('F2 portable signatures cannot survive a signer incarnation deletion/r
     );
     await f.dependencies();
     assertEquals(
-      (await f.edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, '')))
+      (await f.edge.db.tx((conn) => ownerSigningViews(conn, 'alice', user, '')))
         .master_keys,
       { ...f.master.json, signatures: {} },
     );
@@ -590,7 +615,7 @@ Deno.test('F2 portable signatures cannot survive a signer incarnation deletion/r
       importSignatureOperation(conn, f.operation, expected)
     );
     assertEquals(
-      (await f.edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, '')))
+      (await f.edge.db.tx((conn) => ownerSigningViews(conn, 'alice', user, '')))
         .master_keys,
       { ...next.json, signatures: {} },
     );
@@ -623,7 +648,7 @@ Deno.test('F2 embedded key admission retains original overlay bases once, never 
       );
     }
     assertEquals(
-      (await f.edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, '')))
+      (await f.edge.db.tx((conn) => ownerSigningViews(conn, 'alice', user, '')))
         .master_keys,
       f.signed,
     );

@@ -115,10 +115,20 @@ export async function importDeviceOperation(
         operation.incarnation === identity.edgeIncarnation)
     ))
   ) collision();
-  const [creation] = await conn.query(
+  const [activeCreation] = await conn.query(
     "SELECT node,incarnation,payload FROM authority_facts WHERE id=? AND localpart=? AND kind='device'",
     [operation.deviceIncarnation, operation.localpart],
   );
+  const historicalCreation = history
+    ? await history.retainCreation(conn, operation)
+    : undefined;
+  const creation = historicalCreation
+    ? {
+      node: historicalCreation.node,
+      incarnation: historicalCreation.incarnation,
+      payload: canonicalJson(historicalCreation),
+    }
+    : activeCreation;
   if (!creation) {
     throw new MatrixError(
       503,

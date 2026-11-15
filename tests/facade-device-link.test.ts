@@ -28,6 +28,7 @@ import { updateDeviceName, upsertDevice } from '#engine/tenant/devices.ts';
 import { publicDeviceValues } from '#engine/tenant/device-operations.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
+import { deactivateUser } from '#engine/tenant/users.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { captureSigningOperations } from '#engine/tenant/signing-operations.ts';
@@ -586,6 +587,323 @@ Deno.test('semantic key bootstrap: home retained history preserves original iden
   }
 });
 
+async function retainedDevice(f: Awaited<ReturnType<typeof fixture>>) {
+  const db = await f.home.tenant('logical.test');
+  const [row] = await db.query(
+    "SELECT payload FROM authority_facts WHERE localpart='alice' AND kind='device'",
+  );
+  const creation = {
+    ...JSON.parse(String(row.payload)),
+    incarnation: 'retained-home-device',
+    deviceId: 'OLD',
+  };
+  creation.id = canonicalJson([
+    creation.node,
+    creation.incarnation,
+    creation.seq,
+  ]);
+  const [record] = await f.hs.export('alice', f.bundle.id);
+  const original = (record.payload as { body: DeviceView }).body.operation;
+  const { payloadHash: _hash, ...body } = original;
+  const oldBody = {
+    ...body,
+    incarnation: creation.incarnation,
+    deviceId: creation.deviceId,
+    deviceIncarnation: creation.id,
+    operationId: canonicalJson([
+      creation.node,
+      creation.incarnation,
+      'device',
+      original.sequence,
+    ]),
+  };
+  const operation = {
+    ...oldBody,
+    payloadHash: createHash('sha256').update(canonicalJson(oldBody)).digest(
+      'hex',
+    ),
+  };
+  await db.tx(async (conn) => {
+    await conn.execute('INSERT INTO authority_facts VALUES(?,?,?,?,?,?,?)', [
+      creation.id,
+      creation.node,
+      creation.incarnation,
+      creation.seq,
+      creation.localpart,
+      creation.kind,
+      canonicalJson(creation),
+    ]);
+    await conn.execute(
+      'INSERT INTO device_operations VALUES(?,?,?,?,?,?,?,?,?)',
+      [
+        operation.operationId,
+        operation.source,
+        operation.incarnation,
+        operation.sequence,
+        operation.localpart,
+        operation.deviceId,
+        operation.deviceIncarnation,
+        operation.payloadHash,
+        canonicalJson(operation),
+      ],
+    );
+  });
+  return { creation, operation };
+}
+
+Deno.test('semantic key historical device creation: fresh receiver retains exact passive closure without session authority', async () => {
+  for (const historyFirst of [false, true]) {
+    const f = await fixture();
+    try {
+      const { creation, operation } = await retainedDevice(f);
+      const records = await f.hs.bootstrap('alice', f.bundle.id);
+      const historical = records.find((record) =>
+        record.type === 'key-history'
+      )!;
+      const marker = records.find((record) => record.type === 'key-bootstrap')!;
+      assert(historical);
+      const db = await f.edge.tenant('logical.test');
+      const before = await db.query(
+        'SELECT * FROM authority_facts ORDER BY id',
+      );
+      for (const record of records) await f.ej.receive('home', [record]);
+      await assertRejects(
+        () => f.es.apply(f.ej, marker),
+        Error,
+        'awaits retained key facts',
+      );
+      const dependencies = records.filter((record) =>
+        record !== marker && record !== historical
+      );
+      for (
+        const record of historyFirst
+          ? [historical, ...dependencies]
+          : [...dependencies, historical]
+      ) {
+        await f.es.apply(f.ej, record);
+      }
+      await f.es.apply(f.ej, marker);
+      assertEquals(
+        await db.query('SELECT * FROM authority_facts ORDER BY id'),
+        before,
+      );
+      assertEquals(await db.query('SELECT * FROM authority_devices'), []);
+      assertEquals(await db.query('SELECT * FROM devices'), []);
+      assertEquals(await db.query('SELECT * FROM one_time_keys'), []);
+      assertEquals(await db.query('SELECT * FROM session_authority'), []);
+      assertEquals(
+        JSON.parse(
+          String(
+            (await db.query(
+              'SELECT payload_json FROM device_creation_history WHERE id=?',
+              [creation.id],
+            ))[0].payload_json,
+          ),
+        ),
+        creation,
+      );
+      assertEquals(
+        JSON.parse(
+          String(
+            (await db.query(
+              'SELECT payload_json FROM device_operations WHERE operation_id=?',
+              [operation.operationId],
+            ))[0].payload_json,
+          ),
+        ),
+        operation,
+      );
+      assertEquals(
+        (await db.tx((conn) => publicDeviceValues(conn, 'alice'))).map((
+          value,
+        ) => value.deviceId),
+        ['LAN'],
+      );
+      assertEquals(await f.es.export('alice'), []);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+function rehashHistory(record: LinkRecord) {
+  const signed = record.payload as { body: unknown };
+  record.operationId = 'key-history:' +
+    createHash('sha256').update(canonicalJson(signed.body)).digest('hex');
+  const { hash: _hash, ...body } = record;
+  record.hash = recordHash(body);
+}
+
+Deno.test('semantic key historical device creation: altered closure, account, control and signatures never gain passive or active authority', async () => {
+  for (
+    const fault of [
+      'creation',
+      'identity',
+      'account',
+      'control',
+      'unsigned',
+    ] as const
+  ) {
+    const f = await fixture();
+    try {
+      await retainedDevice(f);
+      const records = await f.hs.bootstrap('alice', f.bundle.id);
+      const record = records.find((record) => record.type === 'key-history')!;
+      const signed = record.payload as {
+        body: import('#engine/tenant/key-bootstrap.ts').KeyHistory;
+        signature: string;
+      };
+      if (fault === 'creation') signed.body.creation!.deviceId = 'FORGED';
+      else if (fault === 'identity') signed.body.creation!.seq++;
+      else if (fault === 'account') signed.body.localpart = 'bob';
+      else if (fault === 'control') signed.body.ownerRevision++;
+      else signed.body.creation!.deviceId = 'UNSIGNED';
+      if (fault !== 'unsigned') {
+        signed.signature = await f.ht.signer().sign(canonicalJson(signed.body));
+      }
+      rehashHistory(record);
+      await f.ej.receive('home', [record]);
+      await assertRejects(() => f.es.apply(f.ej, record));
+      const db = await f.edge.tenant('logical.test');
+      assertEquals(await db.query('SELECT * FROM device_creation_history'), []);
+      assertEquals(await db.query('SELECT * FROM device_operations'), []);
+      assertEquals(await db.query('SELECT * FROM devices'), []);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('semantic key historical device creation: source refuses missing original evidence instead of signing a substitute', async () => {
+  const f = await fixture();
+  try {
+    const { creation } = await retainedDevice(f);
+    await (await f.home.tenant('logical.test')).execute(
+      'DELETE FROM authority_facts WHERE id=?',
+      [creation.id],
+    );
+    await assertRejects(
+      () => f.hs.bootstrap('alice', f.bundle.id),
+      Error,
+      'awaits original device creation',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('semantic key historical device creation: retirement rolls passive closure back with operation and receipt', async () => {
+  for (const cut of ['before', 'during'] as const) {
+    const f = await fixture();
+    let pause;
+    try {
+      await retainedDevice(f);
+      const record = (await f.hs.bootstrap('alice', f.bundle.id)).find((
+        record,
+      ) => record.type === 'key-history')!;
+      await f.ej.receive('home', [record]);
+      pause = pauseImport(f.edge, cut);
+      const rejected = assertRejects(() => f.es.apply(f.ej, record));
+      await pause.reached;
+      await f.fp.retire(await f.hp.revoke(f.bundle.id), 'a'.repeat(64));
+      pause.resume();
+      await rejected;
+      pause.restore();
+      const db = await f.edge.tenant('logical.test');
+      assertEquals(await db.query('SELECT * FROM device_creation_history'), []);
+      assertEquals(await db.query('SELECT * FROM device_operations'), []);
+      assertEquals(
+        (await f.ej.heads('home', 'in', record)).applied.sequence,
+        0,
+      );
+    } finally {
+      pause?.resume();
+      pause?.restore();
+      await f.close();
+    }
+  }
+});
+
+Deno.test('semantic key historical device creation: exact passive closure survives cold ACK loss without becoming active', async () => {
+  const f = await fixture();
+  let reopened;
+  try {
+    const { creation, operation } = await retainedDevice(f);
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const record = records.find((record) => record.type === 'key-history')!;
+    for (const record of records) await f.ej.receive('home', [record]);
+    for (
+      const dependency of records.filter((candidate) =>
+        candidate !== record && candidate.type !== 'key-bootstrap'
+      )
+    ) await f.es.apply(f.ej, dependency);
+    const complete = f.ej.complete.bind(f.ej);
+    f.ej.complete = () => Promise.reject(new Error('historical ACK loss'));
+    await assertRejects(
+      () => f.es.apply(f.ej, record),
+      Error,
+      'historical ACK loss',
+    );
+    f.ej.complete = complete;
+    await f.edge.close();
+    reopened = await f.open('edge');
+    const pairings = new Pairings(
+      await reopened.server(),
+      f.node.signer(),
+      f.node.publicKey,
+      'b'.repeat(64),
+      f.node,
+    );
+    const tenant = await enrolledTenant(
+      reopened,
+      pairings,
+      'logical.test',
+      'edge_a',
+    );
+    const journal = new Journal(await reopened.server(), LINK_SUPPORTED);
+    const receiver = new DeviceOperations(reopened, tenant, pairings, f.node);
+    assertEquals(await receiver.apply(journal, record), true);
+    assertEquals(await receiver.apply(journal, record), false);
+    await receiver.apply(
+      journal,
+      records.find((record) => record.type === 'key-bootstrap')!,
+    );
+    const db = await reopened.tenant('logical.test');
+    assertEquals(
+      JSON.parse(
+        String(
+          (await db.query(
+            'SELECT payload_json FROM device_creation_history WHERE id=?',
+            [creation.id],
+          ))[0].payload_json,
+        ),
+      ),
+      creation,
+    );
+    assertEquals(
+      (await db.query('SELECT * FROM device_operations WHERE operation_id=?', [
+        operation.operationId,
+      ])).length,
+      1,
+    );
+    assertEquals(
+      await db.query('SELECT * FROM authority_facts WHERE id=?', [creation.id]),
+      [],
+    );
+    assertEquals(await db.query('SELECT * FROM devices'), []);
+    assertEquals(await db.query('SELECT * FROM session_authority'), []);
+    assertEquals(
+      (await db.tx((conn) => publicDeviceValues(conn, 'alice'))).map((value) =>
+        value.deviceId
+      ),
+      ['LAN'],
+    );
+  } finally {
+    await reopened?.close();
+    await f.close();
+  }
+});
+
 Deno.test('semantic key bootstrap: revocation before or during declaration admission leaves neither readiness nor receipt', async () => {
   for (const cut of ['before', 'during'] as const) {
     const f = await fixture();
@@ -809,6 +1127,205 @@ Deno.test('semantic key readers: authenticated baseline merges home and edge key
     } finally {
       await f.close();
     }
+  }
+});
+
+Deno.test('semantic key public scope: missing account selection never exposes raw keys or signing material', async () => {
+  for (const publicFirst of [false, true]) {
+    const f = await fixture(publicFirst);
+    try {
+      await signatureInput(f, 'edge');
+      const db = await f.edge.tenant('logical.test');
+      await db.execute(
+        "DELETE FROM account_auth_snapshots WHERE localpart='alice'",
+      );
+      const user = '@alice:logical.test';
+      for (
+        const reader of [
+          () =>
+            f.et.tx((tx) =>
+              tx.e2ee.query('alice', [], user, user, config().e2ee.maxkeys)
+            ),
+          () =>
+            f.et.tx((tx) =>
+              tx.e2ee.query('alice', [], '', user, config().e2ee.maxkeys)
+            ),
+          () => f.et.tx((tx) => tx.e2ee.snapshot('alice', user, config().e2ee)),
+          () => f.et.tx((tx) => tx.crossSigning.views('alice', user, user)),
+          () => f.et.tx((tx) => tx.crossSigning.views('alice', user, '')),
+        ]
+      ) await assertRejects(reader, MatrixError, 'key bootstrap unavailable');
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('semantic key public scope: actual F1-only evidence remains exact and never falls through to raw owner keys', async () => {
+  const f = await fixture();
+  try {
+    const user = '@bob:logical.test';
+    const readers = [
+      () =>
+        f.et.tx((tx) =>
+          tx.e2ee.query('bob', [], user, user, config().e2ee.maxkeys)
+        ),
+      () =>
+        f.et.tx((tx) =>
+          tx.e2ee.query('bob', [], '', user, config().e2ee.maxkeys)
+        ),
+      () => f.et.tx((tx) => tx.e2ee.snapshot('bob', user, config().e2ee)),
+      () => f.et.tx((tx) => tx.crossSigning.views('bob', user, user)),
+      () => f.et.tx((tx) => tx.crossSigning.views('bob', user, '')),
+    ];
+    for (const reader of readers) {
+      await assertRejects(reader, MatrixError, 'key bootstrap unavailable');
+    }
+    const view = await f.ht.tx((tx) =>
+      tx.publicReplica.export('bob', f.ht.serverName)
+    );
+    await f.et.tx((tx) => tx.publicReplica.install(view, f.et.serverName));
+    await upsertDevice(f.et, 'bob', 'RAW');
+    const device = await deviceIdentity(f.et, 'bob', 'RAW');
+    await f.et.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload(
+          {
+            device_keys: {
+              user_id: user,
+              device_id: 'RAW',
+              algorithms: [],
+              keys: { 'ed25519:RAW': 'raw-public' },
+              signatures: {},
+            },
+          },
+          user,
+          'RAW',
+          config().e2ee,
+        ),
+      )
+    );
+    assertEquals(await readers[0](), {});
+    assertEquals(await readers[1](), {});
+    assertEquals(await readers[2](), view.devices);
+    assertEquals(await readers[3](), view.signing);
+    assertEquals(await readers[4](), view.signing);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('semantic key public scope: enrolled foreign-device signature reaches both public key consumers and survives cold reopen', async () => {
+  const f = await fixture(true);
+  let reopened;
+  try {
+    const user = '@alice:logical.test';
+    const masterPair = await generateSigningKeypair() as CryptoKeyPair;
+    const selfPair = await generateSigningKeypair() as CryptoKeyPair;
+    const masterKey = b64encodeStd(
+      await exportPublicKeyRaw(masterPair.publicKey),
+    );
+    const selfKey = b64encodeStd(await exportPublicKeyRaw(selfPair.publicKey));
+    const master = {
+      user_id: user,
+      usage: ['master'],
+      keys: { ['ed25519:' + masterKey]: masterKey },
+    };
+    const self = {
+      user_id: user,
+      usage: ['self_signing'],
+      keys: { ['ed25519:' + selfKey]: selfKey },
+    };
+    await signJson(self, user, 'ed25519:' + masterKey, masterPair.privateKey);
+    await f.ht.tx((tx) =>
+      tx.crossSigning.upload(
+        'alice',
+        user,
+        signingUpload(
+          { master_key: master, self_signing_key: self },
+          user,
+          config().e2ee,
+        ),
+        '{}',
+        false,
+      )
+    );
+    const device = await deviceIdentity(f.ht, 'alice', 'LAN');
+    const keys = {
+      user_id: user,
+      device_id: 'LAN',
+      algorithms: [],
+      keys: { 'ed25519:LAN': 'home-public' },
+      signatures: {},
+    };
+    await f.ht.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload({ device_keys: keys }, user, 'LAN', config().e2ee),
+      )
+    );
+    for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    const signed = structuredClone(keys);
+    await signJson(signed, user, 'ed25519:' + selfKey, selfPair.privateKey);
+    assertEquals(
+      await f.et.tx((tx) =>
+        tx.keySignatures.upload('alice', user, [{
+          user,
+          id: 'LAN',
+          json: signed,
+        }])
+      ),
+      { failures: {} },
+    );
+    const publicQuery = (tenant: typeof f.ht) =>
+      tenant.tx((tx) =>
+        tx.e2ee.query('alice', ['LAN'], user, user, config().e2ee.maxkeys)
+      );
+    const expected = {
+      ...signed,
+      unsigned: { device_display_name: 'home name' },
+    };
+    assertEquals((await publicQuery(f.et)).LAN, expected);
+    for (const record of await f.es.exportSignatures('alice')) {
+      await f.hj.receive('edge_a', [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(await publicQuery(f.ht), await publicQuery(f.et));
+    const snapshot = await f.et.tx((tx) =>
+      tx.e2ee.snapshot('alice', user, config().e2ee)
+    );
+    assertEquals(
+      (snapshot.devices as { device_id: string; keys: unknown }[]).map((
+        device,
+      ) => [device.device_id, device.keys]),
+      [['LAN', expected]],
+    );
+    await f.edge.close();
+    reopened = await f.open('edge');
+    const active = await openTenant(reopened, 'logical.test');
+    assertEquals(await publicQuery(active), await publicQuery(f.ht));
+    const db = await reopened.tenant('logical.test');
+    assertEquals(await db.query('SELECT * FROM devices'), []);
+    assertEquals(await db.query('SELECT * FROM one_time_keys'), []);
+    await deactivateUser(active, 'alice');
+    assert((await db.query('SELECT * FROM signing_operations')).length > 0);
+    assertEquals(await publicQuery(active), {});
+    assertEquals(
+      (await active.tx((tx) => tx.e2ee.snapshot('alice', user, config().e2ee)))
+        .devices,
+      [],
+    );
+    assertEquals(
+      await active.tx((tx) => tx.crossSigning.views('alice', user, user)),
+      {},
+    );
+  } finally {
+    await reopened?.close();
+    await f.close();
   }
 });
 

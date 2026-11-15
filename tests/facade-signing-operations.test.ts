@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { ownerSigningViews } from '#engine/tenant/cross-signing.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
 import { signingUpload } from '#engine/e2ee-signing.ts';
@@ -198,11 +199,12 @@ Deno.test('F2 signing identity imports original home revisions in any order, wit
       await edge.db.tx((conn) => captureSigningOperations(conn, 'alice')),
       [],
     );
-    const own = await edge.tenant.tx((tx) =>
-      tx.crossSigning.views('alice', user, user)
+    // This owner-only fixture has no authenticated public bootstrap.
+    const own = await edge.db.tx((conn) =>
+      ownerSigningViews(conn, 'alice', user, user)
     );
-    const other = await edge.tenant.tx((tx) =>
-      tx.crossSigning.views('alice', user, '@bob:logical.test')
+    const other = await edge.db.tx((conn) =>
+      ownerSigningViews(conn, 'alice', user, '@bob:logical.test')
     );
     assert(own.user_signing_keys);
     assertEquals(other.user_signing_keys, undefined);
@@ -210,7 +212,7 @@ Deno.test('F2 signing identity imports original home revisions in any order, wit
     assertEquals(await edge.db.query('SELECT * FROM one_time_keys'), []);
     await edge.reopen();
     assertEquals(
-      await edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, user)),
+      await edge.db.tx((conn) => ownerSigningViews(conn, 'alice', user, user)),
       own,
     );
     const source = JSON.parse(
@@ -362,7 +364,7 @@ Deno.test('F2 signing identity clear and terminal deactivation cannot be undone 
       {},
     );
     assertEquals(
-      await edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, user)),
+      await edge.db.tx((conn) => ownerSigningViews(conn, 'alice', user, user)),
       {},
     );
     assertEquals(

@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { ownerSigningViews } from '#engine/tenant/cross-signing.ts';
 import { config } from '#engine/config.ts';
 import { signingUpload } from '#engine/e2ee-signing.ts';
 import {
@@ -287,7 +288,7 @@ for (const embedded of [false, true]) {
             )
           ) await edb.tx((conn) => importSigningOperation(conn, op, expected));
           assertEquals(
-            (await replica.tx((tx) => tx.crossSigning.views('alice', user, '')))
+            (await edb.tx((conn) => ownerSigningViews(conn, 'alice', user, '')))
               .master_keys,
             visible,
           );
@@ -298,7 +299,7 @@ for (const embedded of [false, true]) {
           replica = await openTenant(edge, 'logical.test');
           edb = await edge.tenant('logical.test');
           assertEquals(
-            (await replica.tx((tx) => tx.crossSigning.views('alice', user, '')))
+            (await edb.tx((conn) => ownerSigningViews(conn, 'alice', user, '')))
               .master_keys,
             visible,
           );

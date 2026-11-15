@@ -23,11 +23,14 @@ import {
   captureSignatureOperations,
   type SignatureOperation,
 } from './signature-operations.ts';
-import { tenantAuthority } from './session-authority.ts';
+import { type AuthorityFact, tenantAuthority } from './session-authority.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 
 export const KEY_BOOTSTRAP_SQL = `
 CREATE TABLE key_bootstrap_publications(localpart TEXT PRIMARY KEY NOT NULL,pairing TEXT NOT NULL,grant_revision INTEGER NOT NULL,owner_revision INTEGER NOT NULL,source TEXT NOT NULL,incarnation TEXT NOT NULL,sequence INTEGER NOT NULL,hash TEXT NOT NULL,declaration_json TEXT NOT NULL);
+`;
+export const DEVICE_CREATION_HISTORY_SQL = `
+CREATE TABLE device_creation_history(id TEXT PRIMARY KEY NOT NULL,payload_json TEXT NOT NULL);
 `;
 export type KeyOperation =
   | DeviceOperation
@@ -47,7 +50,69 @@ export type KeyHistory = DomainBinding & {
   kind: 'key-history';
   keyKind: KeyKind;
   operation: KeyOperation;
+  creation?: AuthorityFact;
 };
+
+/** Passive evidence has the original authority identity but never enters the
+ * executable registry. Only an exact home-attested device operation uses it. */
+function deviceCreation(
+  raw: unknown,
+  operation: DeviceOperation,
+): AuthorityFact {
+  const creation = raw as AuthorityFact | undefined;
+  if (!creation || !Number.isSafeInteger(creation.seq) || creation.seq < 1) {
+    throw new LinkError(
+      'LINK_IDENTITY_MISMATCH',
+      'invalid historical device creation',
+    );
+  }
+  const expected: AuthorityFact = {
+    id: canonicalJson([operation.source, operation.incarnation, creation.seq]),
+    node: operation.source,
+    incarnation: operation.incarnation,
+    seq: creation.seq,
+    localpart: operation.localpart,
+    kind: 'device',
+    deviceId: operation.deviceId,
+  };
+  if (
+    expected.id !== operation.deviceIncarnation ||
+    canonicalJson(expected) !== canonicalJson(raw)
+  ) {
+    throw new LinkError(
+      'LINK_IDENTITY_MISMATCH',
+      'historical device creation differs',
+    );
+  }
+  return expected;
+}
+
+async function retainedCreation(conn: Conn, operation: DeviceOperation) {
+  const rows = await conn.query(
+    "SELECT payload AS payload_json FROM authority_facts WHERE id=? AND kind='device' UNION ALL SELECT payload_json FROM device_creation_history WHERE id=?",
+    [operation.deviceIncarnation, operation.deviceIncarnation],
+  );
+  if (!rows.length) {
+    throw new LinkError(
+      'LINK_UNAVAILABLE',
+      'key history awaits original device creation',
+      503,
+    );
+  }
+  const creation = deviceCreation(
+    JSON.parse(String(rows[0].payload_json)),
+    operation,
+  );
+  for (const row of rows) {
+    if (
+      canonicalJson(JSON.parse(String(row.payload_json))) !==
+        canonicalJson(creation)
+    ) {
+      throw new LinkError('LINK_DIVERGED', 'retained device creation changed');
+    }
+  }
+  return creation;
+}
 
 /** The enrolled home attests exact retained historical material. Current envelope
  * authority never rewrites an original dot or makes its old incarnation current. */
@@ -86,6 +151,25 @@ export class KeyHistoryProof {
     }
     await requireDomainControl(conn, view);
   }
+
+  async retainCreation(conn: Conn, operation: DeviceOperation) {
+    await this.require(conn, 'device-operation', operation);
+    const view: KeyHistory = JSON.parse(this.encoded);
+    const creation = deviceCreation(view.creation, operation);
+    const encoded = canonicalJson(creation);
+    const rows = await conn.query(
+      'SELECT payload AS payload_json FROM authority_facts WHERE id=? UNION ALL SELECT payload_json FROM device_creation_history WHERE id=?',
+      [creation.id, creation.id],
+    );
+    if (rows.some((row) => String(row.payload_json) !== encoded)) {
+      throw new LinkError('LINK_DIVERGED', 'retained device creation changed');
+    }
+    await conn.execute(
+      'INSERT INTO device_creation_history VALUES(?,?) ON CONFLICT(id) DO NOTHING',
+      [creation.id, encoded],
+    );
+    return creation;
+  }
 }
 
 function unique<T extends KeyOperation>(operations: T[]): T[] {
@@ -119,8 +203,17 @@ export async function captureKeyHistory(conn: Conn, localpart: string) {
         [localpart],
       )).map((row) => JSON.parse(String(row.payload_json)) as T),
     );
+  const deviceOperations = unique(devices);
+  const creations = new Map<string, AuthorityFact>();
+  for (const operation of deviceOperations) {
+    creations.set(
+      operation.deviceIncarnation,
+      await retainedCreation(conn, operation),
+    );
+  }
   return {
-    'device-operation': unique(devices),
+    creations,
+    'device-operation': deviceOperations,
     'signing-operation': await retained<SigningOperation>('signing_operations'),
     'signature-operation': await retained<SignatureOperation>(
       'signature_operations',
@@ -204,8 +297,22 @@ export async function semanticKeyReader(
     'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
     [localpart],
   );
-  if (!selected) return false;
   const authority = await tenantAuthority(conn);
+  if (!selected) {
+    if (!authority || authority.node === 'home') return false;
+    // An F1-only public view remains usable, but neither tenant-wide activation
+    // nor losing the auth-selection row makes retained F2 material complete.
+    const published = await conn.query(
+      'SELECT 1 FROM account_auth_publications WHERE localpart=? UNION ALL SELECT 1 FROM key_bootstrap_publications WHERE localpart=? LIMIT 1',
+      [localpart, localpart],
+    );
+    const evidence = await conn.query(
+      'SELECT 1 FROM public_user_replicas WHERE localpart=?',
+      [localpart],
+    );
+    if (!published.length && evidence.length) return false;
+    throw new MatrixError(503, 'M_UNAVAILABLE', 'key bootstrap unavailable');
+  }
   if (authority?.node === 'home') return true;
   const [row] = await conn.query(
     'SELECT declaration_json FROM key_bootstrap_publications WHERE localpart=? AND pairing=? AND grant_revision=?',
