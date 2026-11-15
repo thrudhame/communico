@@ -288,6 +288,29 @@ async function signatureInput(
   return operation;
 }
 
+Deno.test('key runtime export retains independent signing streams when device export is unavailable', async () => {
+  const f = await fixture();
+  try {
+    await signatureInput(f);
+    f.hs.export = () => Promise.reject(new Error('device export unavailable'));
+    await assertRejects(
+      () => f.hs.exportChanges('alice', f.bundle.id),
+      Error,
+      'device export unavailable',
+    );
+    for (const prefix of ['signing:', 'signatures:']) {
+      assert(
+        (await f.hj.streams('edge_a', 'out')).some((stream) =>
+          stream.stream === prefix + '@alice:logical.test' &&
+          stream.received.sequence > 0
+        ),
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('signature link: a signed portable overlay is applied before its journal ACK', async () => {
   const f = await fixture();
   try {

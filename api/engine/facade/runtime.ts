@@ -44,6 +44,7 @@ import { AuthLinkHealth, FacadeAuth } from './auth.ts';
 import { startDeactivationWork } from '#engine/deactivation.ts';
 import { startProfileFanout } from '#engine/profile-fanout.ts';
 import { DomainOperations } from './domain.ts';
+import { DeviceOperations, isKeyStream } from './devices.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -80,6 +81,7 @@ export async function openFacadeRuntime(
   let inbox: ReturnType<typeof startInboxWorker> | undefined;
   let mailbox: Mailbox | undefined;
   let authExports: ReturnType<typeof startAccountExports> | undefined;
+  let keyExports: ReturnType<typeof startAccountExports> | undefined;
   let deactivation: ReturnType<typeof startDeactivationWork> | undefined;
   let profileFanout: ReturnType<typeof startProfileFanout> | undefined;
   const pairings = () => {
@@ -215,6 +217,26 @@ export async function openFacadeRuntime(
           ),
       });
     }
+    if (settings.phase === 'f2' && !keyExports) {
+      keyExports = startAccountExports({
+        store,
+        tenant,
+        pollseconds: settings.pollseconds,
+        users: async () =>
+          (await (await store.tenant(identity.server)).query(
+            'SELECT localpart FROM account_auth_snapshots ORDER BY localpart',
+          )).map((row) => String(row.localpart)),
+        emit: async (localpart) =>
+          await new DeviceOperations(store, tenant!, await pairings(), node!)
+            .exportChanges(localpart),
+        changed: () => notices.changed(),
+        failed: (error) =>
+          console.error(
+            'facade key export:',
+            error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
+          ),
+      });
+    }
   };
   const acceptConfigured = async () => {
     // A file bootstraps a binding, not a second live registry. Restart never
@@ -257,6 +279,9 @@ export async function openFacadeRuntime(
           ).apply(journal, stream)
           : settings.phase === 'f2' && stream.stream.startsWith('domain:')
           ? await new DomainOperations(store, tenant!, await pairings(), node!)
+            .apply(journal, stream)
+          : settings.phase === 'f2' && isKeyStream(stream)
+          ? await new DeviceOperations(store, tenant!, await pairings(), node!)
             .apply(journal, stream)
           : stream.stream === 'directory'
           ? await new DirectoryReplicas(
@@ -462,6 +487,7 @@ export async function openFacadeRuntime(
     close: () =>
       closed ??= (async () => {
         await authExports?.close();
+        await keyExports?.close();
         await inbox?.close();
         await deactivation?.close();
         await profileFanout?.close();

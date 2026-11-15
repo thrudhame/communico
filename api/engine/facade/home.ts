@@ -32,6 +32,7 @@ import {
 } from './accounts.ts';
 import { exportOwnerControl } from './ownership.ts';
 import { DomainOperations } from './domain.ts';
+import { DeviceOperations, isKeyStream } from './devices.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -76,8 +77,10 @@ export async function startHomeLinks(
   >();
   const jobs = new Map<string, Promise<void>>();
   const authExports = new Map<string, ReturnType<typeof startAccountExports>>();
+  const keyExports = new Map<string, ReturnType<typeof startAccountExports>>();
   const accounts = new AccountSnapshots(app.store, app.tenant, pairings);
   const domains = new DomainOperations(app.store, app.tenant, pairings);
+  const devices = new DeviceOperations(app.store, app.tenant, pairings);
   const collectKeySignature = async (
     keyId: string,
     document: import('#engine/federation/keys.ts').KeyDoc,
@@ -135,6 +138,7 @@ export async function startHomeLinks(
       publicExports.get(id)?.wake();
       directoryExports.get(id)?.wake();
       authExports.get(id)?.wake();
+      keyExports.get(id)?.wake();
       return;
     }
     await exports.get(id)?.close();
@@ -145,6 +149,8 @@ export async function startHomeLinks(
     directoryExports.delete(id);
     await authExports.get(id)?.close();
     authExports.delete(id);
+    await keyExports.get(id)?.close();
+    keyExports.delete(id);
     await workers.get(id)?.close();
     workers.delete(id);
     let secret: string | undefined;
@@ -210,6 +216,8 @@ export async function startHomeLinks(
             ? accounts.applyFromFacade(journal, id, stream)
             : settings.phase === 'f2' && stream.stream.startsWith('domain:')
             ? domains.apply(journal, stream, id)
+            : settings.phase === 'f2' && isKeyStream(stream)
+            ? devices.apply(journal, stream, id)
             : apply(node, stream),
         failed: (error) => failed(node, error),
         acknowledged: (stream) => {
@@ -272,6 +280,20 @@ export async function startHomeLinks(
           failed: (error) => failed(node, error),
         }),
       );
+      // Keys and account-data/receipt recovery have independent progress. A
+      // failed domain export cannot hold a verified key or revocation suffix.
+      keyExports.set(
+        id,
+        startAccountExports({
+          store: app.store,
+          tenant: app.tenant,
+          pollseconds: settings.pollseconds,
+          users: () => app.tenant.tx((tx) => tx.publicReplica.users()),
+          emit: (localpart) => devices.exportChanges(localpart, id),
+          changed: () => workers.get(id)?.wake(),
+          failed: (error) => failed(node, error),
+        }),
+      );
     }
   }
   let scanning: Promise<void> | undefined;
@@ -308,6 +330,9 @@ export async function startHomeLinks(
         await Promise.all(jobs.values());
         await Promise.all(
           [...authExports.values()].map((accounts) => accounts.close()),
+        );
+        await Promise.all(
+          [...keyExports.values()].map((keys) => keys.close()),
         );
         await Promise.all([...exports.values()].map((rooms) => rooms.close()));
         await Promise.all(

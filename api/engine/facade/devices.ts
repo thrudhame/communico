@@ -60,6 +60,12 @@ function keyKind(value: string): value is KeyView['kind'] {
   return Object.hasOwn(keyKinds, value);
 }
 
+export function isKeyStream(stream: Stream): boolean {
+  return Object.values(keyKinds).some(({ stream: prefix }) =>
+    stream.stream.startsWith(prefix)
+  );
+}
+
 function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
 }
@@ -194,6 +200,22 @@ export class DeviceOperations {
       localpart,
       pairing,
     );
+  }
+
+  /** Runtime suffix composition, not a semantic completeness declaration. Each
+   * type retains its own journal so a pending dependency cannot block its peers. */
+  async exportChanges(localpart: string, pairing?: string) {
+    const results = await Promise.allSettled([
+      this.export(localpart, pairing),
+      this.exportSigning(localpart, pairing),
+      this.exportSignatures(localpart, pairing),
+    ]);
+    const records = [];
+    for (const result of results) {
+      if (result.status === 'rejected') throw result.reason;
+      records.push(...result.value);
+    }
+    return records;
   }
 
   private async exportOperations(
