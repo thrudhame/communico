@@ -898,6 +898,11 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       );
     });
     await home.stop();
+    // A ready scope is a complete held cut, not a promise that no successor is
+    // already received. With home stopped, drain that finite inbox through the
+    // normal shutdown before proving cold offline login from durable authority.
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
     assertEquals((await api('facade', 'login')).body, {
       flows: [{ type: 'm.login.password' }],
     });
