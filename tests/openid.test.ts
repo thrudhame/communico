@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
+import { seedLegacySession } from '#tests/fixtures/legacy-session.ts';
 import { deactivateUser, registerUser } from '#engine/tenant/users.ts';
 import { issueOpenIdToken, openIdUserInfo } from '#engine/tenant/openid.ts';
 import { hashToken, lookupToken } from '#engine/tenant/auth.ts';
@@ -88,10 +89,15 @@ Deno.test('tenant v14 upgrades OpenID credentials without touching identity or a
   let store = await openStore(settings, { schemas: { tenant: previous } });
   try {
     let tenant = await openTenant(store, 'upgrade.test', { create: true });
-    const user = await registerUser(tenant, {
-      localpart: 'alice',
-      password: 'pw',
-    });
+    const user = {
+      user_id: '@alice:upgrade.test',
+      access_token: await seedLegacySession(
+        await store.tenant('upgrade.test'),
+        'alice',
+        'D',
+        'Alice',
+      ),
+    };
     const before = JSON.stringify(
       await (await store.tenant('upgrade.test')).query('SELECT * FROM tenant'),
     );

@@ -1,6 +1,7 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { TENANT_V12 } from '#tests/fixtures/tenant-v12.ts';
+import { seedLegacySession } from '#tests/fixtures/legacy-session.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { deactivateUser } from '#engine/tenant/users.ts';
@@ -40,10 +41,12 @@ Deno.test('backup: genuine v11 upgrade, restart, concurrent version cuts and ato
   });
   try {
     let tenant = await openTenant(store, 'backup.test', { create: true });
-    await tenant.tx(async (tx) => {
-      await tx.users.insert('alice', 'Alice');
-      await tx.devices.upsert('D', 'alice', 'Device');
-    });
+    await seedLegacySession(
+      await store.tenant('backup.test'),
+      'alice',
+      'D',
+      'Alice',
+    );
     const identity = tenant.publicB64;
     await store.close();
     store = await openStore(options, { schemas: { tenant: tenantSchema } });
