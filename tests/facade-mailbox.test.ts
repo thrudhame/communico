@@ -17,6 +17,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
 import { openStore } from '#engine/store/index.ts';
@@ -48,9 +49,9 @@ import {
 
 installServerHooks();
 
-async function fixture() {
+async function fixture(seedServer = serverSchema) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-mailbox-' });
-  const open = (name: string) =>
+  const open = (name: string, schema = serverSchema) =>
     openStore({
       dir: dir + '/' + name,
       library: './.native/libturso_ffi.so',
@@ -58,10 +59,10 @@ async function fixture() {
       maxopenfiles: 8,
       idleseconds: 300,
     }, {
-      schemas: { server: serverSchema, room: roomSchema, tenant: tenantSchema },
+      schemas: { server: schema, room: roomSchema, tenant: tenantSchema },
     });
-  let home = await open('home');
-  let edge = await open('edge');
+  let home = await open('home', seedServer);
+  let edge = await open('edge', seedServer);
   const g = await genesis(edge, {
     roomId: '!mailbox:test',
     joinRule: 'public',
@@ -928,7 +929,7 @@ Deno.test('mailbox capacity accounts for distinct collision evidence without cha
 });
 
 Deno.test('mailbox schema upgrades v33 without recreating identity or pairing', async () => {
-  const f = await fixture();
+  const f = await fixture(historicalServerSchema(35));
   try {
     const server = await f.edge().server();
     await server.tx(async (conn) => {
