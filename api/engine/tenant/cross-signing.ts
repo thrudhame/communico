@@ -4,6 +4,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import {
+  publicSigningPayload,
   type SigningUpload,
   signingUsages,
   verifySigningKey,
@@ -21,6 +22,7 @@ import {
   ownerUnavailable,
   tenantAuthority,
 } from '#engine/tenant/session-authority.ts';
+import { captureSigningOperations } from '#engine/tenant/signing-operations.ts';
 
 export async function signingState(
   conn: Conn,
@@ -210,6 +212,8 @@ export async function appendSigningChange(
     kind: publicChanged ? 'public_signing' : 'private_signing',
     ...(publicChanged ? {} : { subject }),
   };
+  const operations = await captureSigningOperations(conn, localpart);
+  if (operations.length) payload.signingOperation = operations.at(-1);
   if (publicChanged) {
     for (const usage of ['master', 'self_signing'] as const) {
       if (next[usage]) {
@@ -221,7 +225,7 @@ export async function appendSigningChange(
         );
       }
     }
-    const { kind: _kind, ...publicKeys } = payload;
+    const publicKeys = publicSigningPayload(payload);
     bounded(
       JSON.parse(encodeEnvelope(domainOf(user)!, Number.MAX_SAFE_INTEGER, [], [{
         edu_type: 'm.signing_key_update',

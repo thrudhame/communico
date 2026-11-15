@@ -25,6 +25,14 @@ export const signingUsages = [
 export type SigningUsage = typeof signingUsages[number];
 export type SigningKey = { id: string; public: string; json: string };
 export type SigningUpload = Partial<Record<SigningUsage, SigningKey>>;
+// Public wire projection is an allowlist, not all fields of a private intent.
+export function publicSigningPayload(payload: Json): Json {
+  const result: Json = {};
+  for (const field of ['master_key', 'self_signing_key']) {
+    if (payload[field] !== undefined) result[field] = payload[field];
+  }
+  return result;
+}
 export function signingKey(
   value: unknown,
   user: string,

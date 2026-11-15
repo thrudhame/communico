@@ -2,6 +2,7 @@
 import type { Conn } from '#engine/store/db.ts';
 import { domainOf } from '#engine/ids.ts';
 import { enqueueEdu } from '#engine/server/delivery.ts';
+import { publicSigningPayload } from '#engine/e2ee-signing.ts';
 
 function wirePayload(raw: string): Record<string, unknown> {
   const payload = JSON.parse(raw);
@@ -185,7 +186,7 @@ export async function fanoutSigningChange(
   pos: number,
   payload: Record<string, unknown>,
 ): Promise<void> {
-  const { kind: _kind, ...publicKeys } = payload;
+  const publicKeys = publicSigningPayload(payload);
   await tx.execute(
     'INSERT INTO public_signing_keys VALUES(?,?,?) ON CONFLICT(subject) DO UPDATE SET source_pos=excluded.source_pos,payload=excluded.payload',
     [subject, pos, JSON.stringify(publicKeys)],
