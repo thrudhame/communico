@@ -833,6 +833,22 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     device_id: device,
     refresh_token: true,
   });
+  const authTail = async (localparts: string[]) => {
+    // FacadeIngress checks ready/pending AND received=applied (including their
+    // digests) before password verification. Wrong-password M_FORBIDDEN is a
+    // read-only consumer proof of that account's applied tail, not merely scope
+    // readiness. Never open a second store while the child owns its lock.
+    for (const localpart of localparts) {
+      await until(async () => {
+        const response = await api('facade', 'login', {
+          ...login('tail-probe', 'not-the-password'),
+          identifier: { type: 'm.id.user', user: localpart },
+        });
+        return response.status === 403 &&
+          response.body.errcode === 'M_FORBIDDEN';
+      });
+    }
+  };
   try {
     edge = await process(file('facade'), 'facade: link/local admin ready');
     await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/initialize');
@@ -906,11 +922,12 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       );
     });
     await home.stop();
-    // A ready scope is a complete held cut, not a promise that no successor is
-    // already received. With home stopped, drain that finite inbox through the
-    // normal shutdown before proving cold offline login from durable authority.
+    // Shutdown stops between records; it does not drain the received tail.
+    // With home stopped, restart and observe the actual finite auth apply cut
+    // before proving cold offline login from durable authority.
     await edge.stop();
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    await authTail(['outside', 'departure']);
     assertEquals((await api('facade', 'login')).body, {
       flows: [{ type: 'm.login.password' }],
     });
@@ -1236,10 +1253,10 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       ...login('departure-edge-device'),
       identifier: { type: 'm.id.user', user: 'departure' },
     };
-    // Drain the finite local inbox after the home's final shutdown, then prove
-    // this independent account from a cold facade, not during an apply window.
+    // Restart does not itself prove the finite received tail has been applied.
     await edge.stop();
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    await authTail(['departure']);
     // The preceding verifier-withdrawal/restoration exercise covers every
     // served account asynchronously. Observe this account's restored verifier
     // without minting a new session while its last received cut drains.
@@ -1406,8 +1423,7 @@ async function process(config: string, ready: string) {
   }
   return {
     async stop() {
-      if (ended) return;
-      child.kill('SIGTERM');
+      if (!ended) child.kill('SIGTERM');
       const status = await bounded(output);
       assertEquals(status.code, 0, out + '\n' + err);
       assert(out.includes('shutdown: store closed'));

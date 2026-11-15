@@ -561,6 +561,29 @@ function bind(
       },
     },
     accountData: {
+      operations: (localpart: string) =>
+        accountdata.accountDataOperations(conn, localpart),
+      import: async (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+      ) => {
+        if (await accountdata.importAccountData(conn, operation)) changed();
+      },
+      tag: async (
+        localpart: string,
+        room: string,
+        tag: string,
+        value?: unknown,
+      ) => {
+        const result = await accountdata.putRoomTag(
+          conn,
+          localpart,
+          room,
+          tag,
+          value,
+        );
+        if (result.changed) changed();
+        if (result.recorded) projectionChanged();
+      },
       listSelection: (localpart: string) =>
         accountdata.listSelectionSnapshot(conn, localpart),
       clear: (localpart: string) =>
@@ -582,14 +605,18 @@ function bind(
         content: string,
         seq: number,
       ) =>
-        accountdata.putAccountDataRow(
-          conn,
-          localpart,
-          roomId,
-          type,
-          content,
-          seq,
-        ),
+        (async () => {
+          if (
+            await accountdata.putAccountDataRow(
+              conn,
+              localpart,
+              roomId,
+              type,
+              content,
+              seq,
+            )
+          ) projectionChanged();
+        })(),
       get: (localpart: string, roomId: string, type: string) =>
         accountdata.accountDataRow(conn, localpart, roomId, type),
       ofRoom: (

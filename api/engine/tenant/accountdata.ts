@@ -8,6 +8,17 @@
 import type { Conn } from '#engine/store/db.ts';
 import type { Tenant, TenantTx } from '#engine/tenant/index.ts';
 import { rulesetAt } from '#engine/tenant/pushrules.ts';
+import {
+  importRegisterOperation,
+  readRegister,
+  registerJson,
+  type RegisterOperation,
+  registerOperations,
+  registerWinner,
+  writeRegister,
+} from '#engine/facade/registers.ts';
+import { tenantAuthority } from '#engine/tenant/session-authority.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 export async function clearAccountData(
   conn: Conn,
   localpart: string,
@@ -42,7 +53,7 @@ export function nextStreamSeq(conn: Conn): Promise<number> {
 
 // --- conn-level rows (bound on TenantTx) -----------------------------------
 
-export async function putAccountDataRow(
+async function materializeAccountData(
   conn: Conn,
   localpart: string,
   roomId: string,
@@ -57,6 +68,302 @@ export async function putAccountDataRow(
        content = excluded.content, seq = excluded.seq`,
     [localpart, roomId, type, content, seq],
   );
+}
+
+function semanticKey(localpart: string, room: string, type: string): string {
+  return JSON.stringify(['account-data', localpart, room, type]);
+}
+
+function address(operation: RegisterOperation): [string, string, string] {
+  let parts: unknown;
+  try {
+    parts = JSON.parse(operation.semanticKey);
+  } catch { /* sanitized below */ }
+  if (
+    !Array.isArray(parts) || parts.length !== 4 ||
+    parts[0] !== 'account-data' ||
+    parts.slice(1).some((part) => typeof part !== 'string') || !parts[1] ||
+    !parts[3] ||
+    operation.kind !== (parts[3] === 'm.tag' ? 'tags' : 'account-data') ||
+    operation.semanticKey !== semanticKey(parts[1], parts[2], parts[3])
+  ) {
+    throw new Error('invalid account-data operation');
+  }
+  return parts.slice(1) as [string, string, string];
+}
+
+type TagOperation =
+  | { action: 'reset'; content: unknown }
+  | { action: 'tag'; tag: string; removed: boolean; value?: unknown };
+
+function object(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function tagOperation(operation: RegisterOperation): TagOperation {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(operation.payload);
+  } catch {
+    throw new Error('invalid tag operation');
+  }
+  const value = object(parsed);
+  if (value.action === 'reset' && Object.hasOwn(value, 'content')) {
+    return { action: 'reset', content: value.content };
+  }
+  if (
+    value.action === 'tag' && typeof value.tag === 'string' && value.tag &&
+    typeof value.removed === 'boolean' &&
+    (value.removed || Object.hasOwn(value, 'value'))
+  ) {
+    return {
+      action: 'tag',
+      tag: value.tag,
+      removed: value.removed,
+      ...(value.removed ? {} : { value: value.value }),
+    };
+  }
+  throw new Error('invalid tag operation');
+}
+
+async function activeAccount(conn: Conn, localpart: string): Promise<void> {
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!user) throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
+  if (user.deactivated === 1) {
+    throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account is deactivated');
+  }
+}
+
+/** The home owns pre-F2 values. Capture its existing value before the first
+ * local mutation; an edge must receive that semantic baseline, not invent a
+ * second author for an F1 materialization. Whole-scope bootstrap uses the same
+ * operation history, and cannot subsequently overwrite a mutable value. */
+async function baseline(
+  conn: Conn,
+  localpart: string,
+  room: string,
+  type: string,
+): Promise<void> {
+  const key = semanticKey(localpart, room, type);
+  if ((await readRegister(conn, key)).winner) return;
+  const held = await accountDataRow(conn, localpart, room, type);
+  if (held === null) return;
+  const authority = (await tenantAuthority(conn))!;
+  if (authority.node !== 'home') {
+    throw new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'account-data baseline unavailable',
+    );
+  }
+  await writeRegister(
+    conn,
+    { source: authority.node, incarnation: authority.incarnation },
+    key,
+    type === 'm.tag' ? 'tags' : 'account-data',
+    type === 'm.tag'
+      ? JSON.stringify({ action: 'reset', content: JSON.parse(held) })
+      : held,
+  );
+}
+
+async function projection(
+  conn: Conn,
+  key: string,
+  tags: boolean,
+): Promise<string | null> {
+  const view = await readRegister(conn, key);
+  if (!view.winner) return null;
+  if (!tags) return view.winner.payload;
+  const rows = [...view.conflicts, view.winner];
+  const decoded = new Map(rows.map((row) => [row, tagOperation(row)]));
+  const resets = rows.filter((row) => decoded.get(row)!.action === 'reset');
+  const reset = registerWinner(resets);
+  const base = reset
+    ? (decoded.get(reset)! as { action: 'reset'; content: unknown }).content
+    : {};
+  if (rows.every((row) => decoded.get(row)!.action === 'reset')) {
+    return registerJson(JSON.stringify(base));
+  }
+  const names = new Set<string>();
+  for (const value of decoded.values()) {
+    if (value.action === 'tag') names.add(value.tag);
+    else {for (const name of Object.keys(object(object(value.content).tags))) {
+        names.add(name);
+      }}
+  }
+  const values = new Map<string, unknown>();
+  for (const name of names) {
+    const winner = registerWinner(rows.filter((row) => {
+      const value = decoded.get(row)!;
+      return value.action === 'reset' || value.tag === name;
+    }))!;
+    const value = decoded.get(winner)!;
+    if (value.action === 'tag') {
+      if (!value.removed) values.set(name, value.value);
+    } else {
+      const tags = object(object(value.content).tags);
+      if (Object.hasOwn(tags, name)) values.set(name, tags[name]);
+    }
+  }
+  return registerJson(
+    JSON.stringify({ ...object(base), tags: Object.fromEntries(values) }),
+  );
+}
+
+/** The account owner records local semantic intent with the ordinary row. The
+ * import path uses the materializer directly, never creating an export echo. */
+export async function putAccountDataRow(
+  conn: Conn,
+  localpart: string,
+  room: string,
+  type: string,
+  content: string,
+  seq: number,
+): Promise<boolean> {
+  const authority = await tenantAuthority(conn);
+  if (!authority) {
+    await materializeAccountData(conn, localpart, room, type, content, seq);
+    return false;
+  }
+  await activeAccount(conn, localpart);
+  await baseline(conn, localpart, room, type);
+  const key = semanticKey(localpart, room, type);
+  await writeRegister(
+    conn,
+    { source: authority.node, incarnation: authority.incarnation },
+    key,
+    type === 'm.tag' ? 'tags' : 'account-data',
+    type === 'm.tag'
+      ? JSON.stringify({ action: 'reset', content: JSON.parse(content) })
+      : content,
+  );
+  const value = await projection(conn, key, type === 'm.tag');
+  const held = await accountDataRow(conn, localpart, room, type);
+  if (value !== null && (held === null || registerJson(held) !== value)) {
+    await materializeAccountData(conn, localpart, room, type, value, seq);
+  }
+  return true;
+}
+
+export async function accountDataOperations(
+  conn: Conn,
+  localpart: string,
+): Promise<RegisterOperation[]> {
+  const rows = await conn.query(
+    "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind IN ('account-data','tags') ORDER BY semantic_key",
+  );
+  const result: RegisterOperation[] = [];
+  for (const row of rows) {
+    for (
+      const operation of await registerOperations(
+        conn,
+        String(row.semantic_key),
+      )
+    ) {
+      if (address(operation)[0] === localpart) result.push(operation);
+    }
+  }
+  return result;
+}
+
+export async function importAccountData(
+  conn: Conn,
+  operation: RegisterOperation,
+): Promise<boolean> {
+  const [localpart, room, type] = address(operation),
+    authority = await tenantAuthority(conn);
+  const allowed = (dot: { source: string; incarnation: string }) =>
+    authority &&
+    ((dot.source === 'home' && dot.incarnation === authority.homeIncarnation) ||
+      (dot.source === authority.edgeNode &&
+        dot.incarnation === authority.edgeIncarnation));
+  if (
+    !allowed(operation) || !Array.isArray(operation.context) ||
+    !operation.context.every(allowed)
+  ) throw new Error('account-data source unavailable');
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!user) throw new Error('account-data account unavailable');
+  if (user.deactivated !== 1 && authority?.node === 'home') {
+    await baseline(conn, localpart, room, type);
+  }
+  if (type === 'm.tag') tagOperation(operation);
+  await importRegisterOperation(conn, operation);
+  // Retained source evidence must not recreate a deactivated account's data.
+  if (user.deactivated === 1) return false;
+  const value = await projection(conn, operation.semanticKey, type === 'm.tag');
+  const held = await accountDataRow(conn, localpart, room, type);
+  if (value === null || (held !== null && registerJson(held) === value)) {
+    return false;
+  }
+  await materializeAccountData(
+    conn,
+    localpart,
+    room,
+    type,
+    value,
+    await nextStreamSeq(conn),
+  );
+  return true;
+}
+
+export async function putRoomTag(
+  conn: Conn,
+  localpart: string,
+  room: string,
+  tag: string,
+  value?: unknown,
+): Promise<{ changed: boolean; recorded: boolean }> {
+  const held = await accountDataRow(conn, localpart, room, 'm.tag');
+  const authority = await tenantAuthority(conn);
+  let content: string;
+  if (authority) {
+    await activeAccount(conn, localpart);
+    await baseline(conn, localpart, room, 'm.tag');
+    const key = semanticKey(localpart, room, 'm.tag');
+    await writeRegister(
+      conn,
+      { source: authority.node, incarnation: authority.incarnation },
+      key,
+      'tags',
+      JSON.stringify({
+        action: 'tag',
+        tag,
+        removed: value === undefined,
+        ...(value === undefined ? {} : { value }),
+      }),
+    );
+    content = (await projection(conn, key, true))!;
+  } else {
+    const current = held === null ? {} : object(JSON.parse(held));
+    const tags = new Map(Object.entries(object(current.tags)));
+    if (value === undefined) {
+      if (!tags.delete(tag)) return { changed: false, recorded: false };
+    } else tags.set(tag, value);
+    content = JSON.stringify({ ...current, tags: Object.fromEntries(tags) });
+  }
+  if (
+    authority && held !== null && registerJson(held) === registerJson(content)
+  ) {
+    return { changed: false, recorded: !!authority };
+  }
+  await materializeAccountData(
+    conn,
+    localpart,
+    room,
+    'm.tag',
+    content,
+    await nextStreamSeq(conn),
+  );
+  return { changed: true, recorded: !!authority };
 }
 
 export async function accountDataRow(
@@ -253,26 +560,7 @@ export async function updateRoomTag(
   tag: string,
   value?: unknown,
 ): Promise<void> {
-  await tenant.tx(async (tx) => {
-    const raw = await tx.accountData.get(localpart, roomId, 'm.tag');
-    const content = raw === null ? {} : JSON.parse(raw);
-    const current = content.tags;
-    const tags = new Map<string, unknown>(
-      current !== null && typeof current === 'object' && !Array.isArray(current)
-        ? Object.entries(current)
-        : [],
-    );
-    if (value === undefined) {
-      if (!tags.delete(tag)) return;
-    } else tags.set(tag, value);
-    await tx.accountData.put(
-      localpart,
-      roomId,
-      'm.tag',
-      JSON.stringify({ ...content, tags: Object.fromEntries(tags) }),
-      await tx.counters.nextStream(),
-    );
-  });
+  await tenant.tx((tx) => tx.accountData.tag(localpart, roomId, tag, value));
 }
 
 // --- tenant-level behaviour --------------------------------------------------

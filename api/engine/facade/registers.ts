@@ -22,6 +22,7 @@ export type RegisterView = {
   winner: RegisterOperation | null;
   frontier: RegisterOperation[];
   conflicts: RegisterOperation[];
+  pending: RegisterOperation[];
 };
 
 function ascii(a: string, b: string): number {
@@ -147,7 +148,7 @@ function fromRow(row: Record<string, unknown>): RegisterOperation {
   };
 }
 
-async function operations(
+export async function registerOperations(
   conn: Conn,
   key: string,
 ): Promise<RegisterOperation[]> {
@@ -178,27 +179,61 @@ function maxima(rows: RegisterOperation[]): RegisterOperation[] {
   );
 }
 
+/** A type owner may project a subset of a shared causal history (tag/reset
+ * operations affecting one tag). The same ordering and dominance still apply. */
+export function registerWinner(
+  rows: RegisterOperation[],
+): RegisterOperation | null {
+  return maxima([...rows].sort(compare)).at(-1) ?? null;
+}
+
+/** Context entries name predecessor dots in this semantic key's counter domain.
+ * Sparse contexts are allowed: a predecessor carries its own transitive context.
+ * Retain out-of-order operations, but never publish them before that closure is
+ * present. This also keeps a missing dependency from entering a local write's
+ * observed context. No arrival-order-dependent rejection or guessed ancestor. */
+function resolved(rows: RegisterOperation[]): RegisterOperation[] {
+  const ready = new Set<string>();
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (const row of rows) {
+      if (ready.has(row.operationId)) continue;
+      if (!row.context.every((dot) => ready.has(identity(dot, row.stream)))) {
+        continue;
+      }
+      ready.add(row.operationId);
+      progress = true;
+    }
+  }
+  return rows.filter((row) => ready.has(row.operationId));
+}
+
 export async function readRegister(
   conn: Conn,
   key: string,
 ): Promise<RegisterView> {
-  const rows = await operations(conn, key);
+  const all = await registerOperations(conn, key), rows = resolved(all);
   const frontier = maxima(rows), winner = frontier.at(-1) ?? null;
+  const ready = new Set(rows.map((row) => row.operationId));
   return {
     winner,
     frontier,
     conflicts: rows.filter((r) => r.operationId !== winner?.operationId),
+    pending: all.filter((row) => !ready.has(row.operationId)),
   };
 }
 
-/** Import has no local authorship or export echo. Delivery order cannot choose
- * the winner: even an absent predecessor is dominated by a retained context. */
+/** Import has no local authorship or export echo. Missing predecessor closure is
+ * durably pending, not a winner. A later predecessor can release successors in
+ * this same owning transaction; materialize the returned winner, not raw input.
+ * Sparse contexts resolve transitively, so every delivery permutation converges. */
 export async function importRegisterOperation(
   conn: Conn,
   raw: RegisterOperation,
 ): Promise<{
   operation: RegisterOperation;
-  winner: RegisterOperation;
+  winner: RegisterOperation | null;
   inserted: boolean;
   changed: boolean;
 }> {
@@ -220,12 +255,16 @@ export async function importRegisterOperation(
     }
     return {
       operation,
-      winner: before.winner!,
+      winner: before.winner,
       inserted: false,
       changed: false,
     };
   }
-  if (before.winner && before.winner.kind !== operation.kind) {
+  const [kind] = await conn.query(
+    'SELECT kind FROM domain_operations WHERE semantic_key=? LIMIT 1',
+    [operation.semanticKey],
+  );
+  if (kind && kind.kind !== operation.kind) {
     throw new Error('register semantic kind mismatch');
   }
   await conn.execute(
@@ -245,7 +284,6 @@ export async function importRegisterOperation(
     ],
   );
   const after = await readRegister(conn, operation.semanticKey);
-  if (!after.winner) throw new Error('register causal cycle');
   await conn.execute('DELETE FROM domain_frontiers WHERE semantic_key=?', [
     operation.semanticKey,
   ]);
@@ -255,25 +293,29 @@ export async function importRegisterOperation(
       [operation.semanticKey, row.operationId],
     );
   }
-  // Conflict bodies already live in immutable operations. Only the former
-  // winner and the incoming dot can become newly losing values; do not rewrite
-  // the entire retained history on every preference change.
-  for (const row of [before.winner, operation]) {
-    if (!row || row.operationId === after.winner.operationId) continue;
+  // A predecessor may release several pending successors. Index newly resolved
+  // losers without rewriting the already indexed retained history.
+  const previousConflicts = new Set(
+    before.conflicts.map((row) => row.operationId),
+  );
+  for (const row of after.conflicts) {
+    if (previousConflicts.has(row.operationId)) continue;
     await conn.execute(
       'INSERT INTO domain_conflicts(semantic_key,operation_id) VALUES(?,?) ON CONFLICT DO NOTHING',
       [operation.semanticKey, row.operationId],
     );
   }
-  await conn.execute(
-    'DELETE FROM domain_conflicts WHERE semantic_key=? AND operation_id=?',
-    [operation.semanticKey, after.winner.operationId],
-  );
+  if (after.winner) {
+    await conn.execute(
+      'DELETE FROM domain_conflicts WHERE semantic_key=? AND operation_id=?',
+      [operation.semanticKey, after.winner.operationId],
+    );
+  }
   return {
     operation,
     winner: after.winner,
     inserted: true,
-    changed: before.winner?.payload !== after.winner.payload,
+    changed: before.winner?.payload !== after.winner?.payload,
   };
 }
 
@@ -287,7 +329,17 @@ export async function writeRegister(
   rawPayload: string,
 ) {
   sourceOf(source);
-  const rows = await operations(conn, semanticKey);
+  const all = await registerOperations(conn, semanticKey), rows = resolved(all);
+  const ready = new Set(rows.map((row) => row.operationId));
+  if (
+    all.some((row) =>
+      domain(row) === domain(source) && !ready.has(row.operationId)
+    )
+  ) {
+    // A restored writer cannot skip its own previously authored causal cut.
+    // Foreign pending operations may remain concurrent; its own cannot.
+    throw new Error('local register predecessor unavailable');
+  }
   const vector = new Map<string, RegisterDot>();
   for (const row of rows) {
     join(vector, row);
@@ -299,7 +351,12 @@ export async function writeRegister(
     source.incarnation,
     stream,
   ]);
-  const observed = vector.get(domain(source))?.sequence ?? 0;
+  let observed = 0;
+  for (const row of all) {
+    if (domain(row) === domain(source)) {
+      observed = Math.max(observed, row.sequence);
+    }
+  }
   await conn.execute(
     'INSERT INTO counters(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=MAX(value,excluded.value)',
     [counter, observed],

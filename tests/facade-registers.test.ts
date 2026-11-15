@@ -4,6 +4,7 @@ import { tenantSchema } from '#engine/tenant/index.ts';
 import {
   importRegisterOperation,
   readRegister,
+  registerOperations,
   writeRegister,
 } from '#engine/facade/registers.ts';
 
@@ -166,6 +167,84 @@ Deno.test('registers: opaque JSON preserves fractions, stable object identity an
   }
 });
 
+Deno.test('registers: missing causal predecessors stay pending through cold reopen and transitive delivery', async () => {
+  const f = await fixture();
+  try {
+    const a = await f.db('dependency-a.test');
+    const b = await f.db('dependency-b.test');
+    const first = (await a.tx((c) =>
+      writeRegister(c, home, key, 'account-data', '"first"')
+    )).operation;
+    await b.tx((c) =>
+      importRegisterOperation(c, first)
+    );
+    const second = (await b.tx((c) =>
+      writeRegister(c, edge, key, 'account-data', '"second"')
+    )).operation;
+    // Sparse external context refers to second, whose predecessor is first.
+    const third = {
+      ...second,
+      source: 'third',
+      incarnation: 'third-store',
+      sequence: 1,
+      operationId: JSON.stringify(['third', 'third-store', second.stream, 1]),
+      context: [{ ...edge, sequence: second.sequence }],
+    };
+    for (const [n, order] of permutations([first, second, third]).entries()) {
+      const target = await f.db('dependency-target' + n + '.test');
+      for (const operation of order) {
+        await target.tx((c) => importRegisterOperation(c, operation));
+        const view = await target.tx((c) => readRegister(c, key));
+        const received = order.slice(0, order.indexOf(operation) + 1);
+        const complete = received.includes(first) && received.includes(second);
+        if (view.winner?.source === 'third') assertEquals(complete, true);
+        if (!received.includes(first)) assertEquals(view.winner, null);
+      }
+      assertEquals(
+        (await target.tx((c) => readRegister(c, key))).frontier.map((r) =>
+          r.source
+        ),
+        ['third'],
+      );
+    }
+    const pending = await f.db('dependency-pending.test');
+    await pending.tx((c) => importRegisterOperation(c, third));
+    await f.store.close();
+    const reopened = await openStore(f.options, {
+      schemas: { tenant: tenantSchema },
+    });
+    try {
+      const cold = await reopened.tenant('dependency-pending.test');
+      assertEquals((await cold.tx((c) => readRegister(c, key))).winner, null);
+      await assertRejects(
+        () =>
+          cold.tx((c) =>
+            writeRegister(
+              c,
+              { source: 'third', incarnation: 'third-store' },
+              key,
+              'account-data',
+              '"unsafe-successor"',
+            )
+          ),
+        Error,
+        'local register predecessor unavailable',
+      );
+      await cold.tx((c) => importRegisterOperation(c, second));
+      assertEquals((await cold.tx((c) => readRegister(c, key))).winner, null);
+      await cold.tx((c) => importRegisterOperation(c, first));
+      assertEquals(
+        (await cold.tx((c) => readRegister(c, key))).winner?.source,
+        'third',
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('registers: operation identity, immutable content and causal domains refuse substitution atomically', async () => {
   const f = await fixture();
   try {
@@ -309,6 +388,25 @@ Deno.test('registers: ASCII source and numeric sequence ordering do not depend o
     // Restored counters cannot reuse an imported local dot or a received cut.
     const restored = await f.db('restored.test');
     await restored.tx((c) => importRegisterOperation(c, next.operation));
+    await assertRejects(
+      () =>
+        restored.tx((c) =>
+          writeRegister(
+            c,
+            { source: 'a', incarnation: 'store' },
+            key,
+            'account-data',
+            '"unsafe-restored"',
+          )
+        ),
+      Error,
+      'local register predecessor unavailable',
+    );
+    // Recovery supplies the retained predecessor closure before this source
+    // authors again. Its imported counter must still never be reused.
+    for (const operation of await lower.tx((c) => registerOperations(c, key))) {
+      await restored.tx((c) => importRegisterOperation(c, operation));
+    }
     const fresh = await restored.tx((c) =>
       writeRegister(
         c,
