@@ -10,6 +10,21 @@ import { deviceChangeOperation } from '#engine/tenant/device-source.ts';
 import type { Json } from '#engine/tenant/e2ee.ts';
 import type { SignatureOperation } from '#engine/tenant/signature-operations.ts';
 
+async function reserveDeviceChange(conn: Conn, localpart: string) {
+  await conn.execute(
+    'INSERT INTO user_device_stream(localpart,value) VALUES(?,1) ON CONFLICT(localpart) DO UPDATE SET value=user_device_stream.value+1',
+    [localpart],
+  );
+  const [stream] = await conn.query(
+    'SELECT value FROM user_device_stream WHERE localpart=?',
+    [localpart],
+  );
+  return {
+    pos: await nextCounter(conn, 'e2ee_changes'),
+    stream: Number(stream.value),
+  };
+}
+
 /** Private restore candidate only; immutable reset intents project before serving. */
 export async function rebaseRestoredDeviceStreams(
   conn: Conn,
@@ -66,15 +81,7 @@ export async function appendDeviceChange(
     'SELECT d.display_name,k.key_json FROM devices d LEFT JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation WHERE d.localpart=? AND d.device_id=? AND d.generation=?',
     [device.localpart, device.deviceId, device.generation],
   );
-  await conn.execute(
-    'INSERT INTO user_device_stream(localpart,value) VALUES(?,1) ON CONFLICT(localpart) DO UPDATE SET value=user_device_stream.value+1',
-    [device.localpart],
-  );
-  const stream = await conn.query(
-    'SELECT value FROM user_device_stream WHERE localpart=?',
-    [device.localpart],
-  );
-  const pos = await nextCounter(conn, 'e2ee_changes');
+  const { pos, stream } = await reserveDeviceChange(conn, device.localpart);
   const payload: Record<string, unknown> = {
     device_id: device.deviceId,
     generation: device.generation,
@@ -112,10 +119,55 @@ export async function appendDeviceChange(
         : JSON.parse(String(rows[0].key_json)) as Json,
     },
   );
+  await retainDeviceChange(conn, device, pos, stream, {
+    ...payload,
+    ...(operation ? { operation } : {}),
+    ...(signatureOperation ? { signatureOperation } : {}),
+  });
+}
+
+/** Verified signatures change a public device view without acquiring the base
+ * device's mutation/session/pool authority. Zero is a publication-only handle,
+ * never a copied generation or an executable device identity. */
+export async function appendDeviceOverlayChange(
+  conn: Conn,
+  localpart: string,
+  deviceId: string,
+  keys: Json,
+  displayName: string | null,
+  signatureOperation: SignatureOperation,
+) {
+  const { pos, stream } = await reserveDeviceChange(conn, localpart);
+  await retainDeviceChange(
+    conn,
+    { localpart, deviceId, generation: 0 },
+    pos,
+    stream,
+    {
+      device_id: deviceId,
+      keys,
+      ...(displayName === null ? {} : { device_display_name: displayName }),
+      signatureOperation,
+    },
+  );
+}
+
+async function retainDeviceChange(
+  conn: Conn,
+  device: DeviceIdentity,
+  pos: number,
+  stream: number,
+  payload: Record<string, unknown>,
+) {
   const [tenant] = await conn.query('SELECT server_name FROM tenant');
   const server = String(tenant.server_name);
-  const { generation: _generation, ...wire } = payload;
-  void _generation;
+  const {
+    generation: _generation,
+    operation: _operation,
+    signatureOperation: _signatureOperation,
+    ...wire
+  } = payload;
+  void [_generation, _operation, _signatureOperation];
   // Like to-device and public signing, reject undeliverable snapshots in their
   // owning transaction, before accepting a durable reliable obligation. Reserve
   // the widest timestamps/stream IDs and causal predecessor, including resets.
@@ -136,12 +188,8 @@ export async function appendDeviceChange(
     device.localpart,
     device.deviceId,
     device.generation,
-    Number(stream[0].value),
-    canonicalJson({
-      ...payload,
-      ...(operation ? { operation } : {}),
-      ...(signatureOperation ? { signatureOperation } : {}),
-    }),
+    stream,
+    canonicalJson(payload),
   ]);
 }
 

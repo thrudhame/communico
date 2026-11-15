@@ -192,6 +192,204 @@ const expected = {
   incarnation: 'home-store',
   localpart: 'alice',
 };
+
+Deno.test('F2 foreign-owner device signatures publish overlays without acquiring device ownership', async () => {
+  const home = await makeFixture('home'), edge = await makeFixture('edge');
+  try {
+    const devicePair = await generateSigningKeypair() as CryptoKeyPair;
+    const devicePub = b64encodeStd(
+      await exportPublicKeyRaw(devicePair.publicKey),
+    );
+    const deviceJson = {
+      user_id: user,
+      device_id: 'LAN',
+      algorithms: [],
+      keys: { 'ed25519:LAN': devicePub },
+      signatures: {},
+    };
+    await upsertDevice(home.tenant, 'alice', 'LAN');
+    const initial = await deviceIdentity(home.tenant, 'alice', 'LAN');
+    await home.tenant.tx((tx) =>
+      tx.e2ee.upload(
+        initial,
+        validateUpload({ device_keys: deviceJson }, user, 'LAN', config().e2ee),
+      )
+    );
+    const master = await key('master'), self = await key('self_signing');
+    await signJson(
+      self.json,
+      user,
+      'ed25519:' + master.pub,
+      master.pair.privateKey,
+    );
+    await home.tenant.tx((tx) =>
+      tx.crossSigning.upload(
+        'alice',
+        user,
+        signingUpload(
+          { master_key: master.json, self_signing_key: self.json },
+          user,
+          config().e2ee,
+        ),
+        '{}',
+        false,
+      )
+    );
+    const transfer = async () => {
+      const facts = await home.db.tx((conn) =>
+        captureSessionAuthority(conn, 'alice')
+      );
+      await edge.db.tx((conn) => installSessionAuthority(conn, 'alice', facts));
+      for (
+        const op of await home.db.tx((conn) =>
+          captureDeviceOperations(conn, 'alice')
+        )
+      ) await edge.db.tx((conn) => importDeviceOperation(conn, op, expected));
+      for (
+        const op of await home.db.tx((conn) =>
+          captureSigningOperations(conn, 'alice')
+        )
+      ) await edge.db.tx((conn) => importSigningOperation(conn, op, expected));
+    };
+    await transfer();
+    const signed = structuredClone(deviceJson);
+    await signJson(signed, user, 'ed25519:' + self.pub, self.pair.privateKey);
+    const beforeRollback = await edge.db.query('SELECT * FROM e2ee_changes');
+    await assertRejects(
+      () =>
+        edge.tenant.tx(async (tx) => {
+          assertEquals(
+            await tx.keySignatures.upload('alice', user, [{
+              user,
+              id: 'LAN',
+              json: signed,
+            }]),
+            { failures: {} },
+          );
+          throw new Error('injected foreign publication rollback');
+        }),
+      Error,
+      'injected foreign publication rollback',
+    );
+    for (const table of ['key_signatures', 'signature_operations']) {
+      assertEquals(await edge.db.query('SELECT * FROM ' + table), []);
+    }
+    assertEquals(
+      await edge.db.query('SELECT * FROM e2ee_changes'),
+      beforeRollback,
+    );
+    assertEquals(
+      await edge.tenant.tx((tx) =>
+        tx.keySignatures.upload('alice', user, [{
+          user,
+          id: 'LAN',
+          json: signed,
+        }])
+      ),
+      { failures: {} },
+    );
+    const [overlay] = await edge.db.tx((conn) =>
+      captureSignatureOperations(conn, 'alice')
+    );
+    assert(overlay);
+    assertEquals(overlay.source, 'edge');
+    const [news] = await edge.db.query(
+      'SELECT * FROM e2ee_changes ORDER BY pos DESC LIMIT 1',
+    );
+    const payload = JSON.parse(String(news.payload));
+    assertEquals(
+      payload.operation,
+      undefined,
+      'a signature is not foreign base-device authorship',
+    );
+    assertEquals(payload.signatureOperation, overlay);
+    assertEquals(
+      payload.keys.signatures[user]['ed25519:' + self.pub],
+      (signed.signatures as Record<string, Record<string, string>>)[user][
+        'ed25519:' + self.pub
+      ],
+    );
+    assertEquals(
+      await edge.db.tx((conn) => captureDeviceOperations(conn, 'alice')),
+      [],
+    );
+    for (
+      const table of [
+        'devices',
+        'device_keys',
+        'one_time_keys',
+        'fallback_keys',
+      ]
+    ) assertEquals(await edge.db.query('SELECT * FROM ' + table), []);
+    const query = () =>
+      edge.tenant.tx((tx) =>
+        tx.e2ee.query('alice', ['LAN'], user, user, config().e2ee.maxkeys)
+      );
+    const expectedView = { ...payload.keys, unsigned: {} };
+    assertEquals((await query()).LAN, expectedView);
+    const beforeRetry = await edge.db.query('SELECT * FROM e2ee_changes');
+    assertEquals(
+      await edge.tenant.tx((tx) =>
+        tx.keySignatures.upload('alice', user, [{
+          user,
+          id: 'LAN',
+          json: signed,
+        }])
+      ),
+      { failures: {} },
+    );
+    const invalidSignature = structuredClone(signed) as Record<string, unknown>;
+    invalidSignature.signatures = {
+      [user]: { ['ed25519:' + self.pub]: 'A'.repeat(86) },
+    };
+    const refused = await edge.tenant.tx((tx) =>
+      tx.keySignatures.upload('alice', user, [{
+        user,
+        id: 'LAN',
+        json: invalidSignature,
+      }])
+    );
+    assert((refused.failures as Record<string, unknown>)[user]);
+    assertEquals(
+      await edge.db.query('SELECT * FROM e2ee_changes'),
+      beforeRetry,
+    );
+    await home.db.tx((conn) =>
+      importSignatureOperation(conn, overlay, {
+        source: 'edge',
+        incarnation: 'edge-store',
+        localpart: 'alice',
+      })
+    );
+    assertEquals(
+      await home.tenant.tx((tx) =>
+        tx.e2ee.query('alice', ['LAN'], user, user, config().e2ee.maxkeys)
+      ),
+      await query(),
+    );
+    await edge.reopen();
+    assertEquals((await query()).LAN, expectedView);
+    // An immutable old overlay cannot attach to a replacement incarnation even
+    // if the owner deliberately uploads the same public key material again.
+    await deleteDevices(home.tenant, 'alice', ['LAN']);
+    await upsertDevice(home.tenant, 'alice', 'LAN');
+    const replacement = await deviceIdentity(home.tenant, 'alice', 'LAN');
+    await home.tenant.tx((tx) =>
+      tx.e2ee.upload(
+        replacement,
+        validateUpload({ device_keys: deviceJson }, user, 'LAN', config().e2ee),
+      )
+    );
+    await transfer();
+    assertEquals(
+      ((await query()).LAN as Record<string, unknown>).signatures,
+      {},
+    );
+  } finally {
+    await home.close();
+    await edge.close();
+  }
+});
 async function setup() {
   const home = await makeFixture('home'), edge = await makeFixture('edge');
   await upsertDevice(home.tenant, 'alice', 'LAN');

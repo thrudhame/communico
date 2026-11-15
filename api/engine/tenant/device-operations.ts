@@ -235,7 +235,12 @@ export async function publicDeviceKeys(conn: Conn, localpart: string) {
   if (!account || account.deactivated === 1) return [];
   const values = new Map<
     string,
-    { device_id: string; display_name: string | null; key_json: string }
+    {
+      device_id: string;
+      display_name: string | null;
+      key_json: string;
+      generation?: number;
+    }
   >();
   for (const operation of await publicDeviceValues(conn, localpart)) {
     if (operation.value?.keys) {
@@ -279,6 +284,7 @@ export async function publicDeviceKeys(conn: Conn, localpart: string) {
           ? null
           : String(row.display_name),
         key_json: String(row.key_json),
+        generation: Number(row.generation),
       });
     }
   }
