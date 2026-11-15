@@ -9,6 +9,13 @@ import {
   graphReceiptsEnabled,
   receiptFrontier,
 } from '#engine/server/receipt-frontier.ts';
+import {
+  acceptReceiptOperation,
+  pendingReceiptOperations,
+  type ReceiptOperation,
+  receiptOperationMark,
+  recordReceiptOperation,
+} from '#engine/server/receipt-operations.ts';
 
 const MAX_UNKNOWN_THREADS = 100;
 /** Protocol identifiers, not arbitrary durable keys. Adapters must not coerce
@@ -219,7 +226,7 @@ export async function setReceiptMark(
       'invalid receipt extremities',
     );
   }
-  const incoming = [...new Set(targets)];
+  const incoming = [...new Set(targets)].sort();
   const ts = opts.ts ?? Date.now();
   const threadId = receiptThreadId(opts.threadId);
   const row = await eventStreamTx(server, async (tx) => {
@@ -264,57 +271,163 @@ export async function setReceiptMark(
         );
       }
     }
-    const [prior] = await tx.query(
-      'SELECT event_ids FROM receipts WHERE room_id=? AND user_id=? AND receipt_type=? AND thread_id=?',
-      [roomId, userId, receiptType, threadId ?? ''],
+    const row = await mergeReceiptMark(
+      tx,
+      roomId,
+      userId,
+      receiptType,
+      incoming,
+      ts,
+      threadId,
     );
-    const graph = await graphReceiptsEnabled(tx);
-    const oldIds: string[] = prior ? JSON.parse(String(prior.event_ids)) : [];
-    const eventIds = graph
-      ? await receiptFrontier(tx, roomId, [...oldIds, ...incoming])
-      : incoming;
-    if (
-      graph && prior &&
-      JSON.stringify(oldIds.toSorted()) === JSON.stringify(eventIds)
-    ) return null;
-    const seq = await next(tx, 'receipts');
-    await tx.execute(
-      `INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_ids,ts_ms,seq) VALUES(?,?,?,?,?,?,?)
-      ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_ids=excluded.event_ids,ts_ms=excluded.ts_ms,seq=excluded.seq`,
-      [
+    if (row) {
+      const [membership] = await tx.query(
+        'SELECT event FROM memberships WHERE room=? AND user=?',
+        [roomId, userId],
+      );
+      await recordReceiptOperation(tx, {
         roomId,
         userId,
         receiptType,
-        threadId ?? '',
-        JSON.stringify(eventIds),
+        eventIds: incoming,
         ts,
-        seq,
-      ],
-    );
-    const now = Date.now();
-    for (const eventId of eventIds) {
-      const admitted = await advanceNotificationRead(
-        tx,
-        userId,
-        roomId,
-        threadId ?? '',
-        eventId,
-        now,
-      );
-      if (!admitted) {
-        throw new MatrixError(
-          429,
-          'M_LIMIT_EXCEEDED',
-          'pending receipt capacity reached',
-        );
-      }
+        threadId,
+        admission: { membershipEvent: String(membership.event) },
+      });
     }
-    return { userId, receiptType, threadId, eventIds, ts, seq };
+    return row;
   });
   if (row === null) return false;
   // Private rows wake their owner, but federation only consumes public rows.
   notify(server, { kind: 'receipt', roomId, receiptType, row });
   return true;
+}
+
+/** Shared projection, not admission. Local callers have checked current
+ * membership; imported callers retain their original authenticated admission. */
+async function mergeReceiptMark(
+  tx: Conn,
+  roomId: string,
+  userId: string,
+  receiptType: 'm.read' | 'm.read.private',
+  incoming: readonly string[],
+  ts: number,
+  threadId: string | null,
+): Promise<ReceiptRow | null> {
+  const [prior] = await tx.query(
+    'SELECT event_ids FROM receipts WHERE room_id=? AND user_id=? AND receipt_type=? AND thread_id=?',
+    [roomId, userId, receiptType, threadId ?? ''],
+  );
+  const graph = await graphReceiptsEnabled(tx);
+  const oldIds: string[] = prior ? JSON.parse(String(prior.event_ids)) : [];
+  const eventIds = graph
+    ? await receiptFrontier(tx, roomId, [...oldIds, ...incoming])
+    : incoming;
+  if (
+    graph && prior &&
+    JSON.stringify(oldIds.toSorted()) === JSON.stringify(eventIds)
+  ) return null;
+  const seq = await next(tx, 'receipts');
+  await tx.execute(
+    `INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_ids,ts_ms,seq) VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_ids=excluded.event_ids,ts_ms=excluded.ts_ms,seq=excluded.seq`,
+    [
+      roomId,
+      userId,
+      receiptType,
+      threadId ?? '',
+      JSON.stringify(eventIds),
+      ts,
+      seq,
+    ],
+  );
+  const now = Date.now();
+  for (const eventId of eventIds) {
+    const admitted = await advanceNotificationRead(
+      tx,
+      userId,
+      roomId,
+      threadId ?? '',
+      eventId,
+      now,
+    );
+    if (!admitted) {
+      throw new MatrixError(
+        429,
+        'M_LIMIT_EXCEEDED',
+        'pending receipt capacity reached',
+      );
+    }
+  }
+  return { userId, receiptType, threadId, eventIds, ts, seq };
+}
+
+/** Typed-link adapter supplies the authenticated enrolled source AND the
+ * selected own-user scope. No public endpoint can nominate either authority. */
+export async function importReceiptOperation(
+  server: Db,
+  operation: ReceiptOperation,
+  authenticated: { source: string; incarnation: string; userId: string },
+): Promise<void> {
+  const mark = receiptOperationMark(operation);
+  if (mark.userId !== authenticated.userId) {
+    throw new Error('receipt account not selected');
+  }
+  const rows = await eventStreamTx(server, async (tx) => {
+    await acceptReceiptOperation(tx, operation, authenticated);
+    return await projectPendingReceipts(tx, mark.roomId);
+  });
+  for (const row of rows) {
+    notify(server, {
+      kind: 'receipt',
+      roomId: mark.roomId,
+      receiptType: row.receiptType,
+      row,
+    });
+  }
+}
+
+async function projectPendingReceipts(tx: Conn, roomId: string) {
+  const rows: ReceiptRow[] = [];
+  for (const operation of await pendingReceiptOperations(tx, roomId)) {
+    const mark = receiptOperationMark(operation), visible: string[] = [];
+    // Original source admission is immutable. Required receiver evidence may
+    // arrive later, including after departure. Missing evidence never ACKs a
+    // mark out of storage or discloses an unknown event ID to local consumers.
+    if (
+      !(await tx.query(
+        "SELECT 1 FROM event_index WHERE event=? AND room=? AND standing='accepted' AND grounding='grounded'",
+        [mark.admission.membershipEvent, roomId],
+      )).length
+    ) continue;
+    for (const event of mark.eventIds) {
+      if (
+        (await tx.query(
+          "SELECT 1 FROM event_index WHERE event=? AND room=? AND standing='accepted' AND grounding='grounded'",
+          [event, roomId],
+        )).length && (mark.threadId === null ||
+          await receiptTargetInThread(tx, roomId, event, mark.threadId))
+      ) visible.push(event);
+    }
+    if (!visible.length) continue;
+    const row = await mergeReceiptMark(
+      tx,
+      roomId,
+      mark.userId,
+      mark.receiptType,
+      visible,
+      mark.ts,
+      mark.threadId,
+    );
+    if (row) rows.push(row);
+    if (visible.length === mark.eventIds.length) {
+      await tx.execute(
+        'UPDATE domain_operations SET applied=1 WHERE operation_id=?',
+        [operation.operationId],
+      );
+    }
+  }
+  return rows;
 }
 
 /** Projection has learned new accepted ancestry. Reduce every retained slot in
@@ -324,6 +437,7 @@ export async function reconcileReceiptMarks(
   roomId: string,
 ): Promise<void> {
   if (!await graphReceiptsEnabled(tx)) return;
+  await projectPendingReceipts(tx, roomId);
   const rows = await tx.query(
     'SELECT user_id,receipt_type,thread_id,event_ids FROM receipts WHERE room_id=?',
     [roomId],

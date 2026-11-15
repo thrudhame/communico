@@ -1,11 +1,19 @@
-import { assertEquals } from '@std/assert';
+import { assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { project } from '#engine/server/project.ts';
-import { receiptRows, setReceipt } from '#engine/server/ephemeral.ts';
+import {
+  importReceiptOperation,
+  receiptRows,
+  setReceipt,
+} from '#engine/server/ephemeral.ts';
+import {
+  receiptOperations,
+  recordReceiptOperation,
+} from '#engine/server/receipt-operations.ts';
 import {
   notificationSnapshot,
   roomNotificationCounts,
@@ -13,6 +21,29 @@ import {
 import { bobJoins, genesis } from '#tests/fixtures/genesis.ts';
 import { historicalServerSchema } from '#tests/fixtures/server-schema-history.ts';
 import { advance, get } from '#engine/store/watermark.ts';
+
+async function activateReceiptSource(f: Awaited<ReturnType<typeof fixture>>) {
+  await f.db.execute(
+    "INSERT INTO publication_domain VALUES(1,'home','publication','domain')",
+  );
+  await f.db.execute(
+    'INSERT INTO facade_owner_controls VALUES(?,?,?,?)',
+    [
+      'receipt-test',
+      1,
+      'verified-test',
+      JSON.stringify({
+        body: {
+          server: 'test',
+          nodes: [
+            { node: 'home', incarnation: 'home-store' },
+            { node: 'edge', incarnation: 'edge-store' },
+          ],
+        },
+      }),
+    ],
+  );
+}
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-receipts-' });
@@ -112,6 +143,244 @@ Deno.test('facade receipts: concurrent graph marks union and only proved ancesto
       (await receiptRows(f.db, f.g.roomId, 0, '@bob:test')).length,
       3,
       'type and thread frontiers stay separate',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: local authenticated admission and immutable source intent commit together', async () => {
+  const f = await fixture();
+  try {
+    await activateReceiptSource(f);
+    await f.read(f.left, 'm.read.private', 'main');
+    const rows = await f.db.query(
+      "SELECT * FROM domain_operations WHERE kind='receipt'",
+    );
+    assertEquals(
+      rows.length,
+      1,
+      'a successful receipt must retain semantic export intent',
+    );
+    const row = rows[0], payload = JSON.parse(String(row.payload_json));
+    assertEquals(row.source, 'home');
+    assertEquals(row.incarnation, 'home-store');
+    assertEquals(payload.eventIds, [f.left]);
+    assertEquals(payload.receiptType, 'm.read.private');
+    assertEquals(payload.threadId, 'main');
+    assertEquals(payload.userId, '@bob:test');
+    assertEquals(typeof payload.admission.membershipEvent, 'string');
+    assertEquals(payload.admission.membershipEvent.startsWith('$'), true);
+    await f.read(f.left, 'm.read.private', 'main');
+    assertEquals(
+      (await f.db.query("SELECT * FROM domain_operations WHERE kind='receipt'"))
+        .length,
+      1,
+    );
+    await assertRejects(() =>
+      f.db.tx(async (tx) => {
+        await recordReceiptOperation(tx, { ...payload, eventIds: [f.right] });
+        await tx.execute(
+          "UPDATE memberships SET membership='leave' WHERE user='@bob:test'",
+        );
+        throw new Error('rollback admission cut');
+      })
+    );
+    assertEquals(
+      (await f.db.tx((tx) => receiptOperations(tx, '@bob:test'))).length,
+      1,
+    );
+    assertEquals(
+      (await f.db.query(
+        "SELECT membership FROM memberships WHERE user='@bob:test'",
+      ))[0].membership,
+      'join',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: concurrent imported same-slot marks converge in both orders and duplicate without a register winner', async () => {
+  const f = await fixture();
+  try {
+    await activateReceiptSource(f);
+    await f.read(f.left);
+    const [home] = await f.db.tx((tx) => receiptOperations(tx, '@bob:test'));
+    await f.db.execute('DELETE FROM domain_operations');
+    await f.db.execute('DELETE FROM receipts');
+    await f.db.execute("UPDATE publication_domain SET node='edge'");
+    await f.read(f.right);
+    const [edge] = await f.db.tx((tx) => receiptOperations(tx, '@bob:test'));
+    assertEquals(home.context, []);
+    assertEquals(edge.context, []);
+    for (const order of [[home, edge], [edge, home]]) {
+      await f.db.execute('DELETE FROM domain_operations');
+      await f.db.execute('DELETE FROM receipts');
+      for (const operation of [...order, ...order]) {
+        await importReceiptOperation(f.db, operation, {
+          source: operation.source,
+          incarnation: operation.incarnation,
+          userId: '@bob:test',
+        });
+      }
+      assertEquals(
+        (await receiptRows(f.db, f.g.roomId))[0].eventIds,
+        [f.left, f.right].sort(),
+      );
+      assertEquals(
+        (await f.db.query(
+          "SELECT * FROM domain_operations WHERE kind='receipt'",
+        )).length,
+        2,
+      );
+      assertEquals(await f.db.query('SELECT * FROM domain_frontiers'), []);
+      assertEquals(await f.db.query('SELECT * FROM domain_conflicts'), []);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: authenticated import retains original admission after departure without an export echo', async () => {
+  const f = await fixture();
+  try {
+    await activateReceiptSource(f);
+    await f.read(f.left, 'm.read.private', 'main');
+    await f.read(f.right);
+    const operations = await f.db.tx((tx) =>
+      receiptOperations(tx, '@bob:test')
+    );
+    assertEquals(operations.length, 2);
+    await sendLocal(f.g.room, {
+      type: 'm.room.member',
+      sender: '@bob:test',
+      state_key: '@bob:test',
+      content: { membership: 'leave' },
+    }, f.g.signer);
+    await project(f.store, f.g.roomId);
+    // Start the receiving replica at this already-projected departed-room cut.
+    // It has the same accepted DAG, but no receipt intents or local positions.
+    await f.db.execute('DELETE FROM domain_operations');
+    await f.db.execute('DELETE FROM receipts');
+    await f.db.execute("UPDATE publication_domain SET node='edge'");
+    const authenticated = {
+      source: 'home',
+      incarnation: 'home-store',
+      userId: '@bob:test',
+    };
+    for (const op of operations.toReversed()) {
+      await importReceiptOperation(f.db, op, authenticated);
+      await importReceiptOperation(f.db, op, authenticated);
+    }
+    const visible = await receiptRows(f.db, f.g.roomId, 0, '@bob:test');
+    assertEquals(visible.length, 2);
+    assertEquals(
+      visible.find((row) => row.receiptType === 'm.read.private')?.eventIds,
+      [f.left],
+    );
+    assertEquals((await receiptRows(f.db, f.g.roomId)).length, 1);
+    assertEquals(
+      (await f.db.tx((tx) => receiptOperations(tx, '@bob:test'))).length,
+      2,
+    );
+    await assertRejects(
+      () =>
+        importReceiptOperation(f.db, operations[0], {
+          ...authenticated,
+          source: 'edge',
+          incarnation: 'edge-store',
+        }),
+      Error,
+      'receipt source unavailable',
+    );
+    await assertRejects(
+      () =>
+        importReceiptOperation(f.db, operations[0], {
+          ...authenticated,
+          userId: '@dev:test',
+        }),
+      Error,
+      'receipt account not selected',
+    );
+    await assertRejects(
+      () =>
+        importReceiptOperation(f.db, {
+          ...operations[0],
+          payloadHash: '0'.repeat(64),
+        }, authenticated),
+      Error,
+      'invalid receipt operation',
+    );
+    const before = await receiptRows(f.db, f.g.roomId, 0, '@bob:test');
+    await f.store.close();
+    const cold = await openStore(f.options, {
+      schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+    });
+    try {
+      await project(cold, f.g.roomId);
+      assertEquals(
+        await receiptRows(await cold.server(), f.g.roomId, 0, '@bob:test'),
+        before,
+      );
+      assertEquals(
+        (await (await cold.server()).tx((tx) =>
+          receiptOperations(tx, '@bob:test')
+        )).length,
+        2,
+      );
+    } finally {
+      await cold.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: missing receiver evidence stays pending and late projection resolves it after departure', async () => {
+  const f = await fixture();
+  try {
+    await activateReceiptSource(f);
+    const future =
+      (await f.message('not yet disclosed', [f.left, f.right])).eventId;
+    await f.read(future, 'm.read.private');
+    const [op] = await f.db.tx((tx) => receiptOperations(tx, '@bob:test'));
+    await f.db.execute('DELETE FROM domain_operations');
+    await f.db.execute('DELETE FROM receipts');
+    await f.db.execute('DELETE FROM notification_graph_reads');
+    await f.db.execute("UPDATE publication_domain SET node='edge'");
+    await importReceiptOperation(f.db, op, {
+      source: 'home',
+      incarnation: 'home-store',
+      userId: '@bob:test',
+    });
+    assertEquals(await receiptRows(f.db, f.g.roomId, 0, '@bob:test'), []);
+    assertEquals(
+      (await f.db.query('SELECT applied FROM domain_operations'))[0].applied,
+      0,
+    );
+    await sendLocal(f.g.room, {
+      type: 'm.room.member',
+      sender: '@bob:test',
+      state_key: '@bob:test',
+      content: { membership: 'leave' },
+    }, f.g.signer);
+    await project(f.store, f.g.roomId);
+    assertEquals(
+      (await receiptRows(f.db, f.g.roomId, 0, '@bob:test'))[0].eventIds,
+      [future],
+    );
+    assertEquals(await receiptRows(f.db, f.g.roomId), []);
+    assertEquals(
+      (await f.db.query('SELECT applied FROM domain_operations'))[0].applied,
+      1,
+    );
+    assertEquals(
+      (await f.db.query(
+        'SELECT read_ms FROM notifications WHERE user=? AND event=?',
+        ['@bob:test', future],
+      ))[0].read_ms !== null,
+      true,
     );
   } finally {
     await f.close();
