@@ -2,6 +2,7 @@
 // the tenant transaction; only the tenant owner may confirm/mint session state.
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Database } from '#engine/store/db.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   authUnavailable,
   requireAccountAuth,
@@ -147,11 +148,19 @@ export class FacadeAuth {
   ) {}
 
   async prepare(): Promise<PreparedIngressAuthority> {
-    // Passive tenant reads still work before activation. Only an actual auth
-    // intent consumes this admission, and unknown tokens keep their normal401.
+    // Passive replication reads still work before activation. Explicit auth or
+    // user-domain intents consume admission; unknown tokens keep their normal401.
     const admission = await this.capture().catch(() => null);
     return {
       check: async (conn, intent) => {
+        const unavailable: () => never = () => {
+          if (intent.kind !== 'domain') return authUnavailable();
+          throw new MatrixError(
+            503,
+            'M_UNAVAILABLE',
+            'domain snapshot unavailable',
+          );
+        };
         let localpart: string;
         if (intent.kind === 'session') {
           await requireSessionAuthority(conn, intent.hash, intent.refresh);
@@ -174,14 +183,23 @@ export class FacadeAuth {
         if (
           !admission ||
           (intent.kind === 'password' && !this.settings.replicatecredentials)
-        ) authUnavailable();
-        const scope = 'auth:@' + localpart + ':' + this.node.server;
+        ) unavailable();
+        const scope = (intent.kind === 'domain' ? 'domain:@' : 'auth:@') +
+          localpart + ':' + this.node.server;
         const cut = admission.scopes.find((row) => row.scope === scope);
-        // A pending successor does not revoke a still-complete held cut in
-        // permissive mode. Exact tenant/source equality below excludes the
-        // mixed-file interval after install and before its durable completion.
-        if (!cut || (cut.ready !== 1 && cut.pending_hash === null)) {
-          authUnavailable();
+        // Auth may use a complete older cut in permissive mode. Domain reads
+        // require complete bootstrap and applied received facts, not a partial
+        // value that masquerades as absence or a completed whole register.
+        if (
+          !cut ||
+          (intent.kind === 'domain'
+            ? cut.ready !== 1 || cut.pending_hash !== null ||
+              Number(cut.source_cut) < 1 ||
+              Number(cut.received) !== Number(cut.applied) ||
+              cut.received_hash !== cut.applied_hash
+            : cut.ready !== 1 && cut.pending_hash === null)
+        ) {
+          unavailable();
         }
         const [activation] = await conn.query(
           'SELECT a.revision,c.signed_json FROM facade_owner_activation a JOIN facade_owner_controls c ON c.pairing=a.pairing AND c.revision=a.revision WHERE a.pairing=?',
@@ -190,7 +208,21 @@ export class FacadeAuth {
         if (
           !activation || activation.revision !== admission.control.revision ||
           activation.signed_json !== admission.control.signed_json
-        ) authUnavailable();
+        ) unavailable();
+        if (intent.kind === 'domain') {
+          // Bootstrap completeness is independent of password replication and
+          // link freshness. Recheck its account/control binding in this file.
+          const [selected] = await conn.query(
+            'SELECT pairing,grant_revision,owner_revision FROM account_auth_snapshots WHERE localpart=?',
+            [localpart],
+          );
+          if (
+            selected?.pairing !== admission.pairing ||
+            Number(selected.grant_revision) !== admission.grantRevision ||
+            Number(selected.owner_revision) !== Number(activation.revision)
+          ) unavailable();
+          return;
+        }
         await requireAccountAuth(
           conn,
           localpart,
@@ -238,7 +270,7 @@ export class FacadeAuth {
         body.nodes[1].incarnation !== this.node.incarnation
       ) authUnavailable();
       const scopes = await conn.query(
-        "SELECT s.scope,s.source_cut,s.ready,s.pending_hash,j.received,j.received_hash,j.applied,j.applied_hash FROM facade_scopes s JOIN facade_streams j ON j.incarnation=s.incarnation AND j.stream=s.scope AND j.peer='home' AND j.direction='in' AND j.source='home' WHERE s.incarnation=? AND s.scope LIKE 'auth:%'",
+        "SELECT s.scope,s.source_cut,s.ready,s.pending_hash,j.received,j.received_hash,j.applied,j.applied_hash FROM facade_scopes s JOIN facade_streams j ON j.incarnation=s.incarnation AND j.stream=s.scope AND j.peer='home' AND j.direction='in' AND j.source='home' WHERE s.incarnation=? AND (s.scope LIKE 'auth:%' OR s.scope LIKE 'domain:%')",
         [pairing],
       );
       return { pairing, grantRevision: grant.body.revision, control, scopes };

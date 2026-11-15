@@ -319,7 +319,10 @@ export function getPublicProfile(
   tenant: Tenant,
   localpart: string,
 ): Promise<Profile | null> {
-  return tenant.tx((tx) => tx.profiles.get(localpart));
+  return tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    return await tx.profiles.get(localpart);
+  });
 }
 
 export function setProfileField(
@@ -328,5 +331,8 @@ export function setProfileField(
   key: string,
   value: unknown,
 ): Promise<void> {
-  return tenant.tx((tx) => tx.profiles.set(localpart, key, value));
+  return tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.profiles.set(localpart, key, value);
+  });
 }

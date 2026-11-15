@@ -11,6 +11,9 @@ import {
   DomainOperations,
 } from '#engine/facade/domain.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
+import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
@@ -29,14 +32,18 @@ import {
   captureAccountDataOperations,
   getAccountData,
   putAccountData,
+  updateRoomTag,
 } from '#engine/tenant/accountdata.ts';
 import {
   captureProfileOperations,
+  getPublicProfile,
   setProfileField,
 } from '#engine/tenant/profiles.ts';
 import {
   capturePushRuleOperations,
   putRule,
+  rulesetFor,
+  setRuleEnabled,
 } from '#engine/tenant/pushrules.ts';
 import {
   importRegisterOperation,
@@ -168,6 +175,99 @@ Deno.test('domain link: semantic operations have an explicitly negotiated reader
     ),
     true,
   );
+});
+
+Deno.test('domain link: user-facing register owners require complete domain bootstrap, independently of password availability', async () => {
+  const f = await fixture();
+  try {
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    const intents = [
+      () => getAccountData(tenant, 'alice', '', 'm.direct'),
+      () => getPublicProfile(tenant, 'alice'),
+      () => rulesetFor(tenant, 'alice'),
+      () =>
+        putAccountData(tenant, 'alice', '', 'm.direct', { protected: true }),
+      () => updateRoomTag(tenant, 'alice', '!r:logical.test', 'work', {}),
+      () => setProfileField(tenant, 'alice', 'org.example.field', 'value'),
+      () => setDisplayName(tenant, 'alice', 'guarded legacy name'),
+      () => setAvatarUrl(tenant, 'alice', 'mxc://logical.test/guarded'),
+      () => setRuleEnabled(tenant, 'alice', 'override', '.m.rule.master', true),
+    ];
+    const before = await f.et.tx((tx) => tx.streams.heads());
+    for (const intent of intents) {
+      await assertRejects(intent, MatrixError, 'domain snapshot unavailable');
+    }
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+    assertEquals(await f.et.tx((tx) => tx.accountData.operations('alice')), []);
+    assertEquals(await f.et.tx((tx) => tx.profiles.operations('alice')), []);
+    assertEquals(await f.et.tx((tx) => tx.pushRules.operations('alice')), []);
+
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(bootstrap);
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), null);
+    assertEquals(
+      (await getPublicProfile(tenant, 'alice'))?.displayname,
+      'Alice',
+    );
+    assertEquals(
+      await rulesetFor(tenant, 'alice'),
+      await rulesetFor(f.ht, 'alice'),
+    );
+    await putAccountData(tenant, 'alice', '', 'm.direct', {
+      after: 'complete',
+    });
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), {
+      after: 'complete',
+    });
+    await updateRoomTag(tenant, 'alice', '!r:logical.test', 'work', {
+      order: 0.5,
+    });
+    assertEquals(
+      await getAccountData(tenant, 'alice', '!r:logical.test', 'm.tag'),
+      { tags: { work: { order: 0.5 } } },
+    );
+    await setProfileField(tenant, 'alice', 'org.example.field', 'value');
+    assertEquals(
+      (await getPublicProfile(tenant, 'alice'))?.['org.example.field'],
+      'value',
+    );
+    await setRuleEnabled(tenant, 'alice', 'override', '.m.rule.master', true);
+    assertEquals((await rulesetFor(tenant, 'alice')).override[0].enabled, true);
+
+    await putAccountData(f.ht, 'alice', '', 'm.direct', { suffix: true });
+    const cut = Math.max(...bootstrap.map((record) => record.sequence));
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > cut
+    );
+    await f.ej.receive('home', suffix);
+    await assertRejects(
+      () => getAccountData(tenant, 'alice', '', 'm.direct'),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+    for (const record of suffix) await f.es.apply(f.ej, record);
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), {
+      suffix: true,
+    });
+  } finally {
+    await f.close();
+  }
 });
 
 Deno.test('domain link: signed owner operations reconcile both directions without export echoes or duplicate news', async () => {

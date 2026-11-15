@@ -563,6 +563,7 @@ export async function captureAccountData(
   global: AccountDataRow[];
   rooms: Map<string, AccountDataRow[]>;
 }> {
+  await tx.ingress.check({ kind: 'domain', localpart });
   const pushSeq = await tx.pushRules.streamSeq(localpart);
   const seq = Math.max(await tx.accountData.maxSeq(localpart), pushSeq);
   const global = await tx.accountData.ofRoom(localpart, '', since ?? -1, seq);
@@ -587,7 +588,10 @@ export async function updateRoomTag(
   tag: string,
   value?: unknown,
 ): Promise<void> {
-  await tenant.tx((tx) => tx.accountData.tag(localpart, roomId, tag, value));
+  await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.accountData.tag(localpart, roomId, tag, value);
+  });
 }
 
 // --- tenant-level behaviour --------------------------------------------------
@@ -602,6 +606,7 @@ export async function putAccountData(
   content: unknown,
 ): Promise<void> {
   await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
     const seq = await tx.counters.nextStream();
     await tx.accountData.put(
       localpart,
@@ -620,9 +625,10 @@ export async function getAccountData(
   roomId: string,
   type: string,
 ): Promise<unknown | null> {
-  const content = await tenant.tx((tx) =>
-    tx.accountData.get(localpart, roomId, type)
-  );
+  const content = await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    return await tx.accountData.get(localpart, roomId, type);
+  });
   return content === null ? null : JSON.parse(content);
 }
 
@@ -631,7 +637,10 @@ export async function listGlobalAccountData(
   tenant: Tenant,
   localpart: string,
 ): Promise<AccountDataRow[]> {
-  return await tenant.tx((tx) => tx.accountData.ofRoom(localpart, ''));
+  return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    return await tx.accountData.ofRoom(localpart, '');
+  });
 }
 
 /** Band C: the user's account data rows FOR ONE ROOM as {type, content}. */
@@ -640,7 +649,10 @@ export async function listRoomAccountData(
   localpart: string,
   roomId: string,
 ): Promise<AccountDataRow[]> {
-  return await tenant.tx((tx) => tx.accountData.ofRoom(localpart, roomId));
+  return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    return await tx.accountData.ofRoom(localpart, roomId);
+  });
 }
 
 // D10: global account-data rows changed since a stream position
@@ -650,7 +662,10 @@ export async function listGlobalAccountDataSince(
   localpart: string,
   aSeq: number,
 ): Promise<AccountDataRow[]> {
-  return await tenant.tx((tx) => tx.accountData.globalSince(localpart, aSeq));
+  return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    return await tx.accountData.globalSince(localpart, aSeq);
+  });
 }
 
 // D10: the syncer's account-data stream position (max seq over account
@@ -660,6 +675,7 @@ export async function accountDataMax(
   localpart: string,
 ): Promise<number> {
   return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
     const data = await tx.accountData.maxSeq(localpart);
     const push = await tx.pushRules.streamSeq(localpart);
     return Math.max(data, push);

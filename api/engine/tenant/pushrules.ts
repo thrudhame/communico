@@ -561,6 +561,7 @@ function mutateRules<T>(
   mutation: (tx: TenantTx) => Promise<T>,
 ): Promise<T> {
   return tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
     await tx.pushRules.prepare(localpart);
     return mutation(tx);
   });
@@ -572,7 +573,10 @@ export async function pushStreamSeq(
   tenant: Tenant,
   localpart: string,
 ): Promise<number> {
-  return await tenant.tx((tx) => tx.pushRules.streamSeq(localpart));
+  return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    return await tx.pushRules.streamSeq(localpart);
+  });
 }
 
 // The ruleset for GET /pushrules/ (D9): every kind array present,
@@ -581,7 +585,10 @@ export async function rulesetFor(
   tenant: Tenant,
   localpart: string,
 ): Promise<Record<PushKind, PushRule[]>> {
-  return await tenant.tx((tx) => rulesetAt(tx, localpart, tenant.serverName));
+  return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    return await rulesetAt(tx, localpart, tenant.serverName);
+  });
 }
 
 export async function rulesetAt(

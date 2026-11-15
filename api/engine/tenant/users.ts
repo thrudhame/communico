@@ -414,6 +414,7 @@ export async function setDisplayName(
   name: string | null,
 ): Promise<{ oldValue: string | null; newValue: string | null }> {
   return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
     const row = await tx.users.byLocalpart(localpart);
     const oldValue = row === null ? null : row.display_name;
     await tx.profiles.set(localpart, 'displayname', name);
@@ -427,6 +428,7 @@ export async function setAvatarUrl(
   url: string | null,
 ): Promise<{ oldValue: string | null; newValue: string | null }> {
   return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
     const row = await tx.users.byLocalpart(localpart);
     const oldValue = row === null ? null : row.avatar_url;
     await tx.users.setAvatarUrl(localpart, url);
