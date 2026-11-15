@@ -12,6 +12,10 @@ import type { SchemaProvider } from '#engine/store/create.ts';
 import { FEDERATION_POLICY_SQL } from '#engine/federation/policy.ts';
 import { KEY_DECISIONS_SQL } from '#engine/federation/key-decisions.ts';
 import { FACADE_EGRESS_SQL } from '#engine/facade/egress.ts';
+import {
+  OWNER_CONTROL_SQL,
+  PUBLICATION_DOMAIN_SQL,
+} from '#engine/facade/schema.ts';
 import { RECOVERY_SQL } from '#engine/server/recovery.ts';
 import {
   FACADE_INGRESS_SQL,
@@ -408,7 +412,7 @@ const FEDERATION_TXNS_RECEIVED_SQL =
   'CREATE INDEX federation_txns_received ON federation_txns(received_ms)';
 
 export const serverSchema: SchemaProvider = {
-  version: 39,
+  version: 40,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -446,6 +450,8 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FACADE_INGRESS_SQL);
     await db.exec(FACADE_EGRESS_SQL);
     await db.exec(NOTIFICATIONS_UNREAD_SQL);
+    await db.exec(OWNER_CONTROL_SQL);
+    await db.exec(PUBLICATION_DOMAIN_SQL);
     await db.exec(FEED_EVENT_SQL);
     await db.exec(OUTBOX_PENDING_SQL);
     await db.exec(FEDERATION_TXNS_RECEIVED_SQL);
@@ -487,8 +493,12 @@ export const serverSchema: SchemaProvider = {
     33: (conn) => conn.exec(FACADE_INGRESS_SQL),
     34: (conn) => conn.exec(FACADE_EGRESS_SQL),
     35: (conn) => conn.exec(NOTIFICATIONS_UNREAD_SQL),
-    36: (conn) => conn.exec(FEED_EVENT_SQL),
-    37: (conn) => conn.exec(OUTBOX_PENDING_SQL),
-    38: (conn) => conn.exec(FEDERATION_TXNS_RECEIVED_SQL),
+    36: async (conn) => {
+      await conn.exec(OWNER_CONTROL_SQL);
+      await conn.exec(PUBLICATION_DOMAIN_SQL);
+    },
+    37: (conn) => conn.exec(FEED_EVENT_SQL),
+    38: (conn) => conn.exec(OUTBOX_PENDING_SQL),
+    39: (conn) => conn.exec(FEDERATION_TXNS_RECEIVED_SQL),
   },
 };

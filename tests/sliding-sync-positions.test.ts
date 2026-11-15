@@ -4,6 +4,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
+import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 
 const configuration = (dir: string) => ({
   dir,
@@ -278,15 +279,7 @@ Deno.test('sliding positions: cancelled or failed initial replacements preserve 
 
 Deno.test('sliding positions: v18 upgrade keeps account and device data', async () => {
   const dir = await Deno.makeTempDir();
-  const previous = {
-    version: 18,
-    apply: async (db: Parameters<typeof tenantSchema.apply>[0]) => {
-      await tenantSchema.apply(db);
-      await db.exec(
-        'DROP TABLE public_user_replicas; DROP TABLE sliding_sync_positions; DROP TABLE sliding_sync_connections; DROP TABLE delayed_events; DROP TABLE delayed_event_receipts',
-      );
-    },
-  };
+  const previous = historicalTenantSchema(18);
   let store = await openStore(configuration(dir), {
     schemas: { tenant: previous },
   });

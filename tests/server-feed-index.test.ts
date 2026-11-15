@@ -22,7 +22,7 @@ for (const mode of ['fresh', 'upgrade']) {
         const old = await openStore(settings, {
           schemas: {
             room: roomSchema,
-            server: historicalServerSchema(36),
+            server: historicalServerSchema(37),
           },
         });
         await old.close();

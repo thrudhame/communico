@@ -12,6 +12,7 @@ import { openStore } from '#engine/store/index.ts';
 import { tenantSchema } from '#engine/tenant/index.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { changedByOther } from '#engine/room/state.ts';
+import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 
 async function setup(name: string) {
   const dir = await Deno.makeTempDir({ prefix: 'delayed-' });
@@ -267,15 +268,7 @@ Deno.test('delayed: v19 upgrade keeps credentials and adds empty scheduling owne
   };
   let store = await openStore(storage, {
     schemas: {
-      tenant: {
-        version: 19,
-        apply: async (db) => {
-          await tenantSchema.apply(db);
-          await db.exec(
-            'DROP TABLE public_user_replicas;DROP TABLE delayed_events;DROP TABLE delayed_event_receipts',
-          );
-        },
-      },
+      tenant: historicalTenantSchema(19),
     },
   });
   try {
