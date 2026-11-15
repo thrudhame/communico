@@ -14,7 +14,7 @@ import { nodeId, type NodeIdentity } from './identity.ts';
 import {
   type Capability,
   integer,
-  LINK_CAPABILITIES,
+  LINK_SUPPORTED,
   LINK_VERSION,
   LinkError,
   negotiate,
@@ -221,7 +221,9 @@ async function entry(conn: Pick<Conn, 'query'>, id: string): Promise<Entry> {
     id,
   ]);
   if (rows.length !== 1) refused('unknown pairing', 401);
-  const row = rows[0];
+  return entryFromRow(rows[0]);
+}
+function entryFromRow(row: Record<string, unknown>): Entry {
   const parsed = <T>(value: unknown): T | null =>
     value === null ? null : JSON.parse(String(value));
   return {
@@ -262,7 +264,7 @@ export class Pairings {
     publicKey: string,
     private readonly pin: string,
     private readonly node?: NodeIdentity,
-    private readonly supported: readonly Capability[] = LINK_CAPABILITIES,
+    private readonly supported: readonly Capability[] = LINK_SUPPORTED,
   ) {
     this.key = keyOf({ keyId: signer.keyId, publicKey });
     pinOf(pin);
@@ -515,13 +517,15 @@ export class Pairings {
 
   async active(): Promise<Grant> {
     if (!this.node) refused('home has no facade authority');
+    // Selection and authority material belong to one committed read cut. A
+    // later retirement must not replace only the selected row's revision.
     const rows = await this.db.query(
-      "SELECT id FROM facade_pairings WHERE side='facade' AND state='paired'",
+      "SELECT * FROM facade_pairings WHERE side='facade' AND state='paired'",
     );
     if (rows.length !== 1) {
       throw new LinkError('LINK_UNPAIRED', 'facade not enrolled', 503);
     }
-    const row = await entry(this.db, String(rows[0].id));
+    const row = entryFromRow(rows[0]);
     if (!row.grant || !row.receipt || !row.transcript) {
       refused('corrupt enrolled authority');
     }
@@ -672,13 +676,17 @@ export class Pairings {
   }
 
   async authorizedHome(id: string, peerPin: string): Promise<Grant> {
-    const row = await entry(this.db, id);
-    live(row, 'facade');
-    if (row.state !== 'paired' || !sameDigest(row.context.homePin, peerPin)) {
+    const grant = await this.active().catch((error) => {
+      if (error instanceof LinkError && error.code === 'LINK_UNPAIRED') {
+        refused('link requires completed enrollment');
+      }
+      throw error;
+    });
+    const context = grant.body.transcript.body.context;
+    if (!sameDigest(context.homePin, peerPin)) {
       refused('link requires completed enrollment');
     }
-    const grant = await this.active();
-    if (grant.body.transcript.body.context.id !== id) {
+    if (context.id !== id) {
       refused('wrong active pairing');
     }
     return grant;

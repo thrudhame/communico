@@ -56,6 +56,17 @@ export const LINK_CAPABILITIES: readonly Capability[] = [{
 }];
 export const EMPTY_CUT: Cut = { sequence: 0, hash: '' };
 
+// Supported readers are not required features of an F1 enrollment or request.
+// New record types negotiate on their own page and cannot activate old readers.
+export const OWNER_CONTROL_CAPABILITY: Capability = {
+  type: 'owner-control',
+  version: 1,
+};
+export const LINK_SUPPORTED: readonly Capability[] = [
+  ...LINK_CAPABILITIES,
+  OWNER_CONTROL_CAPABILITY,
+];
+
 function bad(message: string): never {
   throw new LinkError('LINK_BAD_RECORD', message, 400);
 }

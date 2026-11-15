@@ -482,9 +482,49 @@ cache. Each source snapshot defers file checkpoints without blocking ordinary
 writers and releases as soon as its export finishes; normal catch-up checkpoints
 then resume. This is an online backup, not a pause-free one; `pauseMs` reports
 the common cut rather than a configured deadline. It does not include later
-file-checkpoint pauses. Full live-client measurements for this exporter are
-still pending; the earlier VACUUM baseline had write pauses up to 116.20 seconds
-and exposed sync and typing HTTP500 responses, not a passing workload.
+file-checkpoint pauses.
+
+### Measured online-backup cost
+
+On the retained 43-room workload, both the backup and no-backup windows used
+runtime `ad78332`, the same clients and 2,190.693 seconds of active requests.
+The control reopened the retained source; process lifetime and the naturally
+growing database image were not identical. All consumers below had zero client
+errors in both windows. Sync timings include the clients' unchanged long polls.
+These are observed distributions, not latency or throughput guarantees.
+
+| #  | Consumer         | No-backup requests | No-backup p50/p95/max (ms)   | Backup requests | Backup p50/p95/max (ms)      |
+| -- | ---------------- | ------------------ | ---------------------------- | --------------- | ---------------------------- |
+| 1  | Element Web send | 1208               | 1319/2190/4021               | 903             | 1656/3241/24261              |
+| 2  | Alice send       | 1239               | 1345.608/2264.142/3982.816   | 883             | 1788.366/3728.912/34851.091  |
+| 3  | Bob send         | 1242               | 1356.333/2237.059/4047.230   | 884             | 1757.951/3611.691/31577.518  |
+| 4  | Carol send       | 1237               | 1296.882/2267.258/4003.003   | 883             | 1769.739/3648.884/37488.866  |
+| 5  | Dave send        | 1240               | 1355.386/2266.429/3999.759   | 886             | 1739.250/3750.815/31307.907  |
+| 6  | Synapse send     | 252                | 8614.398/11822.250/15780.563 | 212             | 9816.532/14411.034/18114.441 |
+| 7  | tuwunel send     | 14001              | 3.664/7.174/84.035           | 13053           | 4.347/10.054/93.572          |
+| 8  | Element Web sync | 1927               | 1012/1658/33991              | 941             | 1981/4164/11934              |
+| 9  | Alice sync       | 1664               | 1015.654/1640.276/36188.347  | 941             | 1839.586/3476.400/53752.766  |
+| 10 | Bob sync         | 1731               | 982.984/1583.314/29685.903   | 1027            | 1676.758/3203.818/47108.562  |
+| 11 | Carol sync       | 1733               | 975.124/1592.511/30584.302   | 1059            | 1648.155/3167.754/46883.408  |
+| 12 | Dave sync        | 1750               | 977.817/1597.874/27420.520   | 1066            | 1615.282/3244.576/47193.240  |
+| 13 | Synapse sync     | 700                | 2995.044/4521.799/28549.013  | 575             | 3600.535/5268.915/99362.975  |
+| 14 | tuwunel sync     | 13948              | 12.507/17.590/157.383        | 13001           | 13.516/25.025/120.125        |
+
+The median/p95 increases are accepted online-backup contention costs: local
+sends rose from about 1.3/2.2 seconds to 1.7-1.8/3.2-3.7 seconds; local syncs
+rose from about 1.0/1.6 seconds to 1.6-2.0/3.2-4.2 seconds. The observed local
+send maxima of 24-37 seconds, versus about 4 seconds without backup, are not
+accepted as ordinary backup overhead. Their owner correction and a fixed-tip
+backup comparison remain required; zero errors alone does not settle that tail.
+
+The loaded backup CLI took 2,190.627 seconds: snapshot/export took 1,322.966
+seconds and the remaining audits, media, hashing, fsync, publication and CLI
+work took 867.661 seconds. The common fence was 46.788 ms. Snapshot/private
+export and immutable database audits dominated; overlapping native timings
+cannot be added as exclusive wall-time shares. A separate static export took
+135.154 seconds on an earlier 525,185,024-byte cut in another guest; the loaded
+cut was 674,988,032 bytes. The static figure times export, not the whole CLI,
+and is not a controlled whole-command speed comparison.
 
 Size the service's file-descriptor limit for the complete backup inventory, not
 `store.maxopenfiles`: a common cut must retain every room, tenant and the server

@@ -8,6 +8,7 @@ import {
   cutOf,
   integer,
   LINK_CAPABILITIES,
+  LINK_SUPPORTED,
   LINK_VERSION,
   LinkError,
   negotiate,
@@ -46,7 +47,7 @@ export function enrollmentHandler(options: {
       return new Response(null, { status: 404 });
     }
     const body = await message(request);
-    negotiate(body, options.server, LINK_CAPABILITIES);
+    negotiate(body, options.server, LINK_SUPPORTED);
     const id = text(body.pairing);
     // Enrollment's channel incarnation is the durable one-time pairing ID. The
     // separate journal stream incarnation is carried by each negotiated record.
@@ -135,7 +136,7 @@ export async function enrollLink(
         response.status,
       );
     }
-    negotiate(body, context.server, LINK_CAPABILITIES);
+    negotiate(body, context.server, LINK_SUPPORTED);
     if (body.source !== context.node || body.pairing !== id) {
       throw new LinkError(
         'LINK_IDENTITY_MISMATCH',
@@ -231,7 +232,7 @@ export function linkHandler(options: {
     const body = request.method === 'GET'
       ? object(json(request.headers.get('x-communico-link')))
       : await message(request);
-    negotiate(body, options.server, LINK_CAPABILITIES);
+    negotiate(body, options.server, LINK_SUPPORTED);
     const id = text(body.pairing);
     if (body.source !== 'home' || body.incarnation !== id) {
       throw new LinkError('LINK_IDENTITY_MISMATCH', 'wrong link source', 403);
