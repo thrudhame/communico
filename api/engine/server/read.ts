@@ -14,11 +14,31 @@ export async function redactionOf(
   roomId: string,
   eventId: string,
 ): Promise<string | null> {
-  const rows = await db.query(
-    'SELECT event FROM redactions WHERE room = ? AND target = ?',
-    [roomId, eventId],
-  );
-  return rows.length === 0 ? null : String(rows[0].event);
+  return (await redactionsOf(db, roomId, [eventId])).get(eventId) ?? null;
+}
+
+/** One projection snapshot for a renderer's selected event/previous-content IDs. */
+export async function redactionsOf(
+  db: Db,
+  roomId: string,
+  eventIds: readonly string[],
+): Promise<Map<string, string>> {
+  const ids = [...new Set(eventIds)];
+  if (!ids.length) return new Map();
+  return await db.tx(async (conn) => {
+    const result = new Map<string, string>();
+    for (let start = 0; start < ids.length; start += 32) {
+      const page = ids.slice(start, start + 32);
+      const rows = await conn.query(
+        `SELECT target,event FROM redactions WHERE room=? AND target IN (${
+          page.map(() => '?').join(',')
+        })`,
+        [roomId, ...page],
+      );
+      for (const row of rows) result.set(String(row.target), String(row.event));
+    }
+    return result;
+  });
 }
 
 // --- the feed --------------------------------------------------------------
@@ -262,6 +282,41 @@ export async function relationsOf(
     relType: row.rel_type === null ? null : String(row.rel_type),
     seq: Number(row.seq),
   }));
+}
+
+/** Capture direct candidates for a whole render batch, with the same structural
+ * admission as the paginated relation reader. No result-size truncation. */
+export async function relationsForEvents(
+  db: Db,
+  roomId: string,
+  eventIds: readonly string[],
+): Promise<Map<string, RelationRow[]>> {
+  const ids = [...new Set(eventIds)];
+  if (!ids.length) return new Map();
+  return await db.tx(async (conn) => {
+    const result = new Map<string, RelationRow[]>();
+    for (let start = 0; start < ids.length; start += 32) {
+      const page = ids.slice(start, start + 32);
+      const rows = await conn.query(
+        `SELECT r.relates_to,r.event,r.rel_type,r.seq FROM relations r ${RELATION_ELIGIBILITY}
+         AND r.room=? AND r.relates_to IN (${
+          page.map(() => '?').join(',')
+        }) ORDER BY r.seq ASC,r.event`,
+        [roomId, ...page],
+      );
+      for (const row of rows) {
+        const parent = String(row.relates_to);
+        const entries = result.get(parent) ?? [];
+        entries.push({
+          eventId: String(row.event),
+          relType: row.rel_type === null ? null : String(row.rel_type),
+          seq: Number(row.seq),
+        });
+        result.set(parent, entries);
+      }
+    }
+    return result;
+  });
 }
 
 export async function threadRootsOf(db: Db, roomId: string) {

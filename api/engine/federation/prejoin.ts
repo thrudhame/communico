@@ -11,9 +11,9 @@ import {
   UpstreamError,
 } from '#engine/net/upstream-error.ts';
 import { toWire } from './pdu.ts';
-import { erasurePrunes } from '#engine/erasure.ts';
+import { erasedViews } from '#engine/erasure.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
-import { redactionOf } from '#engine/server/read.ts';
+import { redactionsOf } from '#engine/server/read.ts';
 import { redact } from '#engine/eventid.ts';
 
 export const prejoinTypes = new Set([
@@ -102,18 +102,31 @@ export function savedContentView(saved: unknown, allowed: unknown): unknown {
 // One display decision for held and saved sources. Apply the existing room-
 // version redaction algorithm to the saved event itself; a source view supplies
 // only a further shape ceiling, never values or a second redaction allow-list.
-async function shownPrejoin(
+async function prejoinViews(
   room: Room,
-  source: { id: string; pdu: Pdu },
+  sources: { id: string; pdu: Pdu }[],
   version: string,
   viewer: { userId: string; tenant: Tenant },
+) {
+  const pdus = new Map(sources.map((source) => [source.id, source.pdu]));
+  const redactions = await redactionsOf(await room.store.server(), room.id, [
+    ...pdus.keys(),
+  ]);
+  const shown = await erasedViews(room, pdus, version, {
+    userId: viewer.userId,
+  }, viewer.tenant);
+  return new Set(
+    [...pdus].filter(([id, pdu]) => redactions.has(id) || shown.get(id) !== pdu)
+      .map(([id]) => id),
+  );
+}
+
+function shownPrejoin(
+  source: { id: string; pdu: Pdu },
+  version: string,
+  pruned: boolean,
   saved = source.pdu as unknown as Record<string, unknown>,
 ) {
-  const pruned =
-    await redactionOf(await room.store.server(), room.id, source.id) !== null ||
-    await erasurePrunes(room, source.id, source.pdu, {
-      userId: viewer.userId,
-    }, viewer.tenant);
   const ceiling = pruned
     ? redact(source.pdu as unknown as Record<string, unknown>, version)
     : source.pdu;
@@ -133,17 +146,46 @@ export async function prejoinDisplay(
   member: string,
   viewer: { userId: string; tenant: Tenant },
 ) {
+  const result = (await prejoinDisplays(
+    room,
+    new Map([['one', { ids, member }]]),
+    viewer,
+  )).get('one');
+  return result === undefined ? [] : result;
+}
+
+export async function prejoinDisplays(
+  room: Room,
+  selections: ReadonlyMap<string, { ids: string[]; member: string }>,
+  viewer: { userId: string; tenant: Tenant },
+): Promise<Map<string, Record<string, unknown>[]>> {
+  if (!selections.size) return new Map();
   const loaded = await room.tx(async (tx) => {
     const stay = await tx.segments.latestStay();
-    return stay === null ? null : {
-      version: await roomVersionOf(tx, stay.id),
-      events: await selectedPrejoin(tx, ids, member),
-    };
+    if (stay === null) return null;
+    const events = new Map<string, { id: string; pdu: Pdu }[]>();
+    for (const [key, { ids, member }] of selections) {
+      events.set(key, await selectedPrejoin(tx, ids, member));
+    }
+    return { version: await roomVersionOf(tx, stay.id), events };
   });
-  if (loaded === null) return [];
-  const out: Record<string, unknown>[] = [];
-  for (const source of loaded.events) {
-    out.push(await shownPrejoin(room, source, loaded.version, viewer));
+  if (loaded === null) {
+    return new Map([...selections.keys()].map((key) => [key, []]));
+  }
+  const sources = [
+    ...new Map(
+      [...loaded.events.values()].flat().map((source) => [source.id, source]),
+    ).values(),
+  ];
+  const pruned = await prejoinViews(room, sources, loaded.version, viewer);
+  const out = new Map<string, Record<string, unknown>[]>();
+  for (const [key, events] of loaded.events) {
+    out.set(
+      key,
+      events.map((source) =>
+        shownPrejoin(source, loaded.version, pruned.has(source.id))
+      ),
+    );
   }
   return out;
 }
@@ -173,13 +215,19 @@ export async function savedPrejoinDisplay(
   });
   if (loaded === null) return saved.map(stripPrejoin);
   const sources = new Map(loaded.events.map((event) => [event.id, event]));
+  const pruned = await prejoinViews(
+    room,
+    loaded.events,
+    loaded.version,
+    viewer,
+  );
   const out: Record<string, unknown>[] = [];
   for (const hint of saved) {
     const source = sources.get(String(hint.source_event_id));
     out.push(
       source === undefined
         ? stripPrejoin(redact(hint, loaded.version))
-        : await shownPrejoin(room, source, loaded.version, viewer, hint),
+        : shownPrejoin(source, loaded.version, pruned.has(source.id), hint),
     );
   }
   return out;
