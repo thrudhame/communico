@@ -351,9 +351,10 @@ export async function loginUser(
   return await tenant.tx(async (tx) => {
     // A durable remove-wins tombstone is already a complete refusal. A newer
     // authentication snapshot cannot restore it, so a stale captured cut must
-    // not mask that terminal result as temporary unavailability.
+    // not mask that terminal result as temporary unavailability. Deactivation
+    // destroys the verifier, so no password can disclose the account's status.
     if ((await tx.users.byLocalpart(params.localpart))?.deactivated) {
-      throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account deactivated');
+      throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
     }
     await tx.ingress.check({ kind: 'password', localpart: params.localpart });
     const phc = await tx.credentials.hash(params.localpart);
