@@ -67,6 +67,15 @@ transaction. Remote batches use the shared ingest pipeline after verification
 and bounded missing-event recovery.
 (`api/engine/room/lock.ts:1-27`, `api/engine/room/remote.ts:1-17`)
 
+Local authoring and resident membership templates select ten deepest forward
+extremities, with deterministic event-ID ties, as Synapse does. The shared
+extremity reader separates that per-event parent selection from the complete
+frontier used for state resolution and publication. Unselected heads and their
+events remain retained for later merges; archived-room reopen uses the same
+selection over its prior stay. Explicit parent arrays and inbound PDUs keep the
+protocol's separate twenty-parent validation.
+(`api/engine/room/{extremities,build,membership}.ts`, `api/engine/federation/joins.ts`)
+
 ## Two different state questions
 
 State groups cache resolver output as snapshots or parent-relative deltas.

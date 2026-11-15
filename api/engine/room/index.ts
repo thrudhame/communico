@@ -162,6 +162,7 @@ function bind(conn: Conn, edges: EdgeOverlay) {
     },
     extremities: {
       frontier: (stay: number) => extremities.frontier(conn, stay),
+      parents: (stay: number) => extremities.parents(conn, stay),
       add: (stay: number, event: string) =>
         extremities.addExtremity(conn, stay, event),
       remove: (stay: number, ids: readonly string[]) =>
