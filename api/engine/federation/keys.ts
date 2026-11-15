@@ -679,22 +679,31 @@ export function keyStore(
         return selected.doc;
       });
     } catch (e) {
-      const memory = e instanceof KeyChangeRefused
-        ? refusalMemory
-        : ['transport', 'protocol', 'validation', 'http'].includes(
-            upstreamCategory(e),
-          )
-        ? failureMemory
-        : null;
-      if (!signal?.aborted && epoch.current && memory !== null) {
-        const minutes = (await federationPolicy(server)).keyfailminutes;
-        // Policy I/O can overlap invalidation or the last subscriber leaving.
-        // Publication must recheck both owners without another suspension.
-        if (!signal?.aborted && epoch.current) {
-          memory.set(name, { until: Date.now() + minutes * 60_000, error: e });
-        }
-      }
+      await rememberFailure(name, epoch, signal, e);
       throw e;
+    }
+  }
+
+  // Acquisition and a valid answer lacking a demanded key share one negative
+  // publication owner. No asynchronous policy read may outlive either guard.
+  async function rememberFailure(
+    name: string,
+    epoch: AcquisitionEpoch,
+    signal: AbortSignal | undefined,
+    error: unknown,
+  ): Promise<void> {
+    const memory = error instanceof KeyChangeRefused
+      ? refusalMemory
+      : ['transport', 'protocol', 'validation', 'http'].includes(
+          upstreamCategory(error),
+        )
+      ? failureMemory
+      : null;
+    if (!signal?.aborted && epoch.current && memory !== null) {
+      const minutes = (await federationPolicy(server)).keyfailminutes;
+      if (!signal?.aborted && epoch.current) {
+        memory.set(name, { until: Date.now() + minutes * 60_000, error });
+      }
     }
   }
 
@@ -775,11 +784,7 @@ export function keyStore(
         phase: 'key-lookup',
         reason: 'key unavailable for required purpose and validity',
       });
-      failureMemory.set(name, {
-        until: Date.now() +
-          (await federationPolicy(server)).keyfailminutes * 60_000,
-        error,
-      });
+      await rememberFailure(name, epoch, ctx?.signal, error);
       throw error;
     });
   }
