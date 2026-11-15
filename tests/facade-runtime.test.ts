@@ -728,6 +728,16 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
         scope.cut > before + 1
       );
     });
+    // Captures already queued before logout can advance a numeric cut too.
+    // Observe revocation at the actual authenticated consumer before closing.
+    await until(async () => {
+      const response = await fetch(
+        `http://127.0.0.1:${facadePort}/_matrix/client/v3/account/whoami`,
+        { headers: { authorization: 'Bearer ' + token } },
+      );
+      const body = await response.json();
+      return response.status === 401 && body.errcode === 'M_UNKNOWN_TOKEN';
+    });
     await home.stop();
     await edge.stop();
     const closedHome = await open('home'), closedEdge = await open('facade');
@@ -750,6 +760,412 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       await closedHome.close();
       await closedEdge.close();
     }
+  } finally {
+    await home?.dispose();
+    await edge?.dispose();
+    await tls.close();
+  }
+});
+
+Deno.test('cold F2 public auth uses held authority offline and refuses strict or verifier-off work before effects', async () => {
+  const tls = await facadeTls();
+  const ports: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
+    ports.push(listener.addr.port);
+    listener.close();
+  }
+  const [homePort, facadePort, linkPort] = ports;
+  const bundlefile = tls.dir + '/public-auth-bundle.json';
+  const file = (side: string) => tls.dir + '/' + side + '-public-auth.toml';
+  const configure = async (side: string, extra = '') => {
+    await Deno.writeTextFile(
+      file(side),
+      `[server]\nname="logical.test"\nrole="${side}"\nport=${
+        side === 'home' ? homePort : facadePort
+      }\n` +
+        `[store]\ndir="${tls.dir}/${side}-public-auth-store"\n[media]\nroot="${tls.dir}/${side}-public-auth-media"\n[admin]\nsocket="${tls.dir}/${side}-public-auth.sock"\n[federation]\nenabled=false\n` +
+        `[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://127.0.0.1:${linkPort}"\nlinkport=${linkPort}\nlinkcert="${tls.dir}/${side}.crt"\nlinkkey="${tls.dir}/${side}.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\nreconnectmaxseconds=1\n` +
+        (side === 'home'
+          ? `nodes=["edge_a"]\npairfile="${bundlefile}"\n`
+          : '') +
+        extra,
+    );
+  };
+  await configure('home');
+  await configure('facade');
+  let home: Awaited<ReturnType<typeof process>> | undefined;
+  let edge: Awaited<ReturnType<typeof process>> | undefined;
+  const api = async (
+    side: 'home' | 'facade',
+    path: string,
+    body?: unknown,
+    token?: string,
+    method = body === undefined ? 'GET' : 'POST',
+  ) => {
+    const response = await fetch(
+      `http://127.0.0.1:${
+        side === 'home' ? homePort : facadePort
+      }/_matrix/client/v3/${path}`,
+      {
+        method,
+        headers: {
+          'content-type': 'application/json',
+          ...(token ? { authorization: 'Bearer ' + token } : {}),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      },
+    );
+    return { status: response.status, body: await response.json() };
+  };
+  const login = (device = 'public-device', password = 'offline-password') => ({
+    type: 'm.login.password',
+    identifier: { type: 'm.id.user', user: 'outside' },
+    password,
+    device_id: device,
+    refresh_token: true,
+  });
+  try {
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/initialize');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    const registration = {
+      username: 'outside',
+      password: 'offline-password',
+      device_id: 'home-device',
+    };
+    const challenge = await api('home', 'register', registration);
+    const registered = await api('home', 'register', {
+      ...registration,
+      auth: { type: 'm.login.dummy', session: challenge.body.session },
+    });
+    assertEquals(registered.status, 200);
+    assertEquals(
+      (await adminCall(tls.dir + '/home-public-auth.sock', 'facade/pair', {
+        node: 'edge_a',
+        url: `https://127.0.0.1:${linkPort}`,
+        facadePin: tls.facadePin,
+        expires: Date.now() + 60000,
+        bundlefile,
+      })).status,
+      200,
+    );
+    assertEquals(
+      (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/accept', {
+        bundlefile,
+      })).status,
+      200,
+    );
+    await until(async () =>
+      (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
+        .body.result.scopes.some((scope: { scope: string; ready: boolean }) =>
+          scope.scope === 'auth:@outside:logical.test' && scope.ready
+        )
+    );
+    await home.stop();
+    assertEquals((await api('facade', 'login')).body, {
+      flows: [{ type: 'm.login.password' }],
+    });
+    const session = await api('facade', 'login', login());
+    assertEquals(session.status, 200, JSON.stringify(session));
+    assertEquals(session.body.device_id, 'public-device');
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        session.body.access_token,
+      )).body.user_id,
+      '@outside:logical.test',
+    );
+    assertEquals(
+      (await api('facade', 'login', login('bad-device', 'wrong'))).status,
+      403,
+    );
+    const foreign = await api('facade', 'login', login('home-device'));
+    assertEquals(foreign, {
+      status: 503,
+      body: {
+        errcode: 'M_UNAVAILABLE',
+        error: 'operation owner unavailable at this ingress',
+      },
+    });
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        registered.body.access_token,
+      )).status,
+      503,
+    );
+    assertEquals(
+      (await api('facade', 'account/whoami', undefined, 'unknown')).status,
+      401,
+    );
+    const rotated = await api('facade', 'refresh', {
+      refresh_token: session.body.refresh_token,
+    });
+    assertEquals(rotated.status, 200);
+    await edge.stop();
+    await configure('facade', 'allowstaleauth=false\n');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    const unavailable = {
+      status: 503,
+      body: {
+        errcode: 'M_UNAVAILABLE',
+        error: 'authentication snapshot unavailable',
+      },
+    };
+    assertEquals(
+      await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        rotated.body.access_token,
+      ),
+      unavailable,
+    );
+    assertEquals(
+      await api('facade', 'refresh', {
+        refresh_token: session.body.refresh_token,
+      }),
+      unavailable,
+    );
+    assertEquals(
+      await api('facade', 'login', login('strict-device')),
+      unavailable,
+    );
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    await until(async () =>
+      (await api(
+        'facade',
+        'login',
+        login('online-strict-device'),
+      )).status === 200
+    );
+    await home.stop();
+    await until(async () =>
+      (await api(
+        'facade',
+        'login',
+        login('offline-strict-device'),
+      )).status === 503
+    );
+    await edge.stop();
+    await configure('facade');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    // Refused GETs and refreshes above must not close the original retry window.
+    const retried = await api('facade', 'refresh', {
+      refresh_token: session.body.refresh_token,
+    });
+    assertEquals(retried.status, 200, JSON.stringify(retried));
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        rotated.body.access_token,
+      )).status,
+      401,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        retried.body.access_token,
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await api('facade', 'refresh', {
+        refresh_token: session.body.refresh_token,
+      })).status,
+      401,
+    );
+    const target = await api('facade', 'login', login('delete-target'));
+    assertEquals(target.status, 200);
+    const deletion = await api('facade', 'delete_devices', {
+      devices: ['delete-target'],
+    }, retried.body.access_token);
+    assertEquals(deletion.status, 401);
+    assertEquals(
+      (await api('facade', 'delete_devices', {
+        devices: ['delete-target'],
+        auth: {
+          type: 'm.login.password',
+          session: deletion.body.session,
+          password: 'offline-password',
+        },
+      }, retried.body.access_token)).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        target.body.access_token,
+      )).status,
+      401,
+    );
+    await edge.stop();
+    await configure('facade', 'replicatecredentials=false\n');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    assertEquals((await api('facade', 'login')).body, { flows: [] });
+    assertEquals(
+      await api('facade', 'login', login('disabled-device')),
+      unavailable,
+    );
+    assertEquals(
+      await api(
+        'facade',
+        'delete_devices',
+        { devices: ['public-device'] },
+        retried.body.access_token,
+      ),
+      unavailable,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        retried.body.access_token,
+      )).status,
+      200,
+    );
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    assertEquals(
+      await api('facade', 'login', login('still-disabled')),
+      unavailable,
+    );
+    assertEquals((await api('facade', 'register', {})).status, 503);
+    assertEquals(
+      (await api('facade', 'createRoom', {}, retried.body.access_token)).status,
+      404,
+    );
+    await edge.stop();
+    await configure('facade');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    // Home controls verifier export independently of the facade's local setting.
+    await home.stop();
+    await configure('home', 'replicatecredentials=false\n');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    await until(async () =>
+      (await api('facade', 'login', login('home-kept-verifier'))).status === 503
+    );
+    await home.stop();
+    await until(async () =>
+      (await api(
+          'facade',
+          'account/whoami',
+          undefined,
+          retried.body.access_token,
+        )).status === 200 &&
+      (await api('facade', 'login', login('home-kept-verifier'))).status === 503
+    );
+    assertEquals((await api('facade', 'login')).body, { flows: [] });
+    await configure('home');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    await until(async () =>
+      (await api('facade', 'login', login('verifier-restored'))).status === 200
+    );
+    await home.stop();
+    await until(async () =>
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        retried.body.access_token,
+      )).status === 200
+    );
+    const crossDelete = await api(
+      'facade',
+      'devices/home-device',
+      {
+        auth: { type: 'm.login.password', password: 'offline-password' },
+      },
+      retried.body.access_token,
+      'DELETE',
+    );
+    assertEquals(crossDelete.status, 200, JSON.stringify(crossDelete));
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    await until(async () =>
+      (await api(
+        'home',
+        'account/whoami',
+        undefined,
+        registered.body.access_token,
+      )).status === 401
+    );
+    const homeLogin = await api('home', 'login', login('later-home-device'));
+    assertEquals(homeLogin.status, 200);
+    assertEquals(
+      (await api('home', 'account/deactivate', {
+        auth: { type: 'm.login.password', password: 'offline-password' },
+      }, homeLogin.body.access_token)).status,
+      200,
+    );
+    await until(async () =>
+      (await api('facade', 'login', login('after-deactivation'))).body
+        .errcode === 'M_USER_DEACTIVATED'
+    );
+    await home.stop();
+    // Home shutdown can finish after another capture was received but before
+    // its independent facade owner commits the apply/result. Drain that cut.
+    await until(async () =>
+      (await api('facade', 'login', login('offline-deactivated'))).body
+        .errcode ===
+        'M_USER_DEACTIVATED'
+    );
+    assertEquals(
+      (await api('facade', 'login', login('offline-deactivated'))).body.errcode,
+      'M_USER_DEACTIVATED',
+    );
   } finally {
     await home?.dispose();
     await edge?.dispose();

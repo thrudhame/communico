@@ -86,6 +86,7 @@ export type ReplicaAccess = {
   requireScope(scope: string, allowAbsent?: boolean): Promise<void>;
   keyDocument(): Promise<KeyDoc>;
   publicRooms(): Promise<boolean>;
+  passwordLogin?(): Promise<boolean>;
   keys: KeyStore;
   signer: Signer;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;

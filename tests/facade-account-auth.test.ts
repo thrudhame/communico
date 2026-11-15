@@ -1,4 +1,4 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { canonicalJson } from '#engine/canonical.ts';
 import {
   AccountSnapshots,
@@ -26,10 +26,16 @@ import {
   registerUser,
   verifyUserPassword,
 } from '#engine/tenant/users.ts';
-import { lookupToken, revokeAllTokens } from '#engine/tenant/auth.ts';
+import {
+  hashToken,
+  lookupToken,
+  revokeAllTokens,
+} from '#engine/tenant/auth.ts';
 import { captureSessionAuthority } from '#engine/tenant/session-authority.ts';
 import { deleteDevices } from '#engine/tenant/devices.ts';
 import { bounded } from './helpers/server-process.ts';
+import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
+import { consumeRefreshToken } from '#engine/tenant/auth.ts';
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-account-auth-' });
@@ -113,6 +119,33 @@ async function fixture() {
     journal,
     receiver,
     emit,
+    async guarded(
+      settings: {
+        replicatecredentials: boolean;
+        allowstaleauth: boolean;
+        authmaxstalehours: number;
+      },
+      health = new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+    ) {
+      const ingress = new FacadeAuth(
+        await edge.server(),
+        fp,
+        node,
+        health,
+        settings,
+      );
+      return {
+        ingress,
+        health,
+        tenant: await enrolledTenant(
+          edge,
+          fp,
+          'logical.test',
+          'edge_a',
+          ingress,
+        ),
+      };
+    },
     async nextOwner(install = true) {
       const body = { ...(await owners.ready()), revision: 2 };
       const signed = {
@@ -145,6 +178,257 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('facade ingress admits only an applied bound account cut and keeps unknown bearer semantics', async () => {
+  const f = await fixture();
+  try {
+    const guarded = await f.guarded({
+      replicatecredentials: true,
+      allowstaleauth: true,
+      authmaxstalehours: 0,
+    });
+    assertEquals(await lookupToken(guarded.tenant, 'unknown'), null);
+    await assertRejects(
+      () => verifyUserPassword(guarded.tenant, 'alice', 'pw'),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    const record = await f.emit();
+    await f.journal.receive('home', [record]);
+    await assertRejects(
+      () => verifyUserPassword(guarded.tenant, 'alice', 'pw'),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    await f.receiver.apply(f.journal, record);
+    assertEquals(await verifyUserPassword(guarded.tenant, 'alice', 'pw'), true);
+    const session = await loginUser(guarded.tenant, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'outside',
+      refresh: true,
+    });
+    assertEquals(
+      (await lookupToken(guarded.tenant, session.accessToken))?.localpart,
+      'alice',
+    );
+    const disabled = await f.guarded({
+      replicatecredentials: false,
+      allowstaleauth: true,
+      authmaxstalehours: 0,
+    });
+    assertEquals(
+      (await lookupToken(disabled.tenant, session.accessToken))?.localpart,
+      'alice',
+    );
+    await assertRejects(
+      () => verifyUserPassword(disabled.tenant, 'alice', 'pw'),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    const limited = await f.guarded({
+      replicatecredentials: true,
+      allowstaleauth: true,
+      authmaxstalehours: 1,
+    });
+    await (await f.edge.tenant('logical.test')).execute(
+      'UPDATE account_auth_snapshots SET captured_ms=?',
+      [Date.now() - 7200000],
+    );
+    await assertRejects(
+      () => lookupToken(limited.tenant, session.accessToken),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    await assertRejects(
+      () => consumeRefreshToken(limited.tenant, session.refreshToken!),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    assertEquals(await lookupToken(limited.tenant, 'unknown'), null);
+    await (await f.edge.tenant('logical.test')).execute(
+      'DELETE FROM session_authority WHERE hash=?',
+      [await hashToken(session.accessToken)],
+    );
+    await assertRejects(
+      () => lookupToken(guarded.tenant, session.accessToken),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('strict facade ingress requires live authenticated link and its full current account head, never hello contact alone', async () => {
+  const f = await fixture();
+  try {
+    const guarded = await f.guarded({
+      replicatecredentials: true,
+      allowstaleauth: false,
+      authmaxstalehours: 0,
+    });
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    const connection = new AbortController();
+    guarded.health.connected(f.bundle.id, connection.signal);
+    await assertRejects(
+      () => verifyUserPassword(guarded.tenant, 'alice', 'pw'),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    const declaration = (
+      record: typeof first,
+    ) => [{
+      source: record.source,
+      incarnation: record.incarnation,
+      stream: record.stream,
+      head: { sequence: record.sequence, hash: record.hash },
+    }];
+    guarded.health.observe(f.bundle.id, declaration(first));
+    assertEquals(await verifyUserPassword(guarded.tenant, 'alice', 'pw'), true);
+    const second = await f.emit();
+    guarded.health.observe(f.bundle.id, declaration(second));
+    // An older concurrent page may arrive late, but cannot lower the target.
+    guarded.health.observe(f.bundle.id, declaration(first));
+    await assertRejects(
+      () => verifyUserPassword(guarded.tenant, 'alice', 'pw'),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    await f.journal.receive('home', [second]);
+    await assertRejects(
+      () => verifyUserPassword(guarded.tenant, 'alice', 'pw'),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    await f.receiver.apply(f.journal, second);
+    assertEquals(await verifyUserPassword(guarded.tenant, 'alice', 'pw'), true);
+    connection.abort();
+    await assertRejects(
+      () => verifyUserPassword(guarded.tenant, 'alice', 'pw'),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade prepared admission fences a tenant control or source cut changing before its transaction', async () => {
+  const f = await fixture();
+  try {
+    const record = await f.emit();
+    await f.journal.receive('home', [record]);
+    await f.receiver.apply(f.journal, record);
+    const guarded = await f.guarded({
+      replicatecredentials: true,
+      allowstaleauth: true,
+      authmaxstalehours: 0,
+    });
+    const prepared = await guarded.ingress.prepare();
+    const db = await f.edge.tenant('logical.test');
+    await db.execute(
+      'UPDATE account_auth_snapshots SET source_cut=source_cut+1',
+    );
+    await assertRejects(
+      () =>
+        db.tx((conn) =>
+          prepared.check(conn, { kind: 'password', localpart: 'alice' })
+        ),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    await db.execute(
+      'UPDATE account_auth_snapshots SET source_cut=source_cut-1',
+    );
+    await db.execute('UPDATE facade_owner_activation SET revision=revision+1');
+    await assertRejects(
+      () =>
+        db.tx((conn) =>
+          prepared.check(conn, { kind: 'password', localpart: 'alice' })
+        ),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('permissive auth retains the prior complete snapshot while a successor is pending but cannot consume an unACKed tenant cut', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    const guarded = await f.guarded({
+      replicatecredentials: true,
+      allowstaleauth: true,
+      authmaxstalehours: 0,
+    });
+    const second = await f.emit();
+    await f.journal.receive('home', [second]);
+    await (await f.edge.server()).execute(
+      'UPDATE facade_scopes SET ready=0,pending_hash=? WHERE scope=?',
+      [second.hash, second.stream],
+    );
+    assertEquals(await verifyUserPassword(guarded.tenant, 'alice', 'pw'), true);
+    await (await f.edge.tenant('logical.test')).execute(
+      'UPDATE account_auth_snapshots SET source_cut=source_cut+1',
+    );
+    await assertRejects(
+      () => verifyUserPassword(guarded.tenant, 'alice', 'pw'),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('poll auth health uses configured reconciliation cadence and authenticates every declaration identity', () => {
+  const health = new AuthLinkHealth({ notify: 'poll', pollseconds: 2 });
+  const head = { sequence: 1, hash: 'a'.repeat(64) };
+  const declaration = [{
+    source: 'home',
+    incarnation: 'pair',
+    stream: 'auth:@a:logical.test',
+    head,
+  }];
+  health.observe('pair', declaration, 1000);
+  assertEquals(health.ready('pair', declaration[0].stream, head, 3000), true);
+  assertEquals(health.ready('pair', declaration[0].stream, head, 3001), false);
+  assertEquals(health.ready('pair', declaration[0].stream, head, 999), false);
+  assertEquals(
+    health.ready('other-pair', declaration[0].stream, head, 1000),
+    false,
+  );
+  assertThrows(
+    () =>
+      health.observe('pair', [{ ...declaration[0], source: 'forged' }], 3001),
+    LinkError,
+  );
+  assertThrows(
+    () =>
+      health.observe('pair', [{
+        ...declaration[0],
+        head: { ...head, hash: 'b'.repeat(64) },
+      }], 3001),
+    LinkError,
+  );
+  assertEquals(health.ready('pair', declaration[0].stream, head, 3001), false);
+  health.observe('pair', [{
+    ...declaration[0],
+    stream: 'room:!r:logical.test',
+  }], 3001);
+  health.observe('pair', [{
+    ...declaration[0],
+    stream: 'auth:@other:logical.test',
+  }], 3001);
+  assertEquals(health.ready('pair', declaration[0].stream, head, 3001), false);
+});
 
 Deno.test('signed account auth crosses the negotiated journal and applies before its durable ACK without secrets in results', async () => {
   const f = await fixture();

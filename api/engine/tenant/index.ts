@@ -125,7 +125,7 @@ function bind(
   conn: Conn,
   changed: () => void = () => {},
   projectionChanged: () => void = () => {},
-  ingress?: IngressAuthority,
+  ingress?: import('./ingress.ts').PreparedIngressAuthority,
 ) {
   const authorize = async (intent: AuthIntent) => {
     await ingress?.check(conn, intent);
@@ -424,6 +424,8 @@ function bind(
         })(),
       byId: (deviceId: string, localpart: string) =>
         devices.deviceById(conn, deviceId, localpart),
+      exists: (deviceId: string, localpart: string) =>
+        devices.deviceExists(conn, deviceId, localpart),
       ofUser: (localpart: string) => devices.devicesOfUser(conn, localpart),
       rename: async (
         deviceId: string,
@@ -449,13 +451,11 @@ function bind(
         expiresMs: number | null,
       ) =>
         (async () => {
-          if (deviceId !== null) {
-            await authorize({
-              kind: 'device',
-              localpart,
-              deviceId,
-            });
-          }
+          await authorize(
+            deviceId === null
+              ? { kind: 'account', localpart }
+              : { kind: 'device', localpart, deviceId },
+          );
           await auth.insertAccessToken(
             conn,
             hash,
@@ -769,6 +769,7 @@ export async function provisionTenant(
   store: Store,
   serverName: string,
   identity: { keyId: string; publicB64: string; privateB64: string },
+  options: { ingress?: IngressAuthority } = {},
 ): Promise<Tenant> {
   if (!/^ed25519:[A-Za-z0-9_]+$/.test(identity.keyId)) {
     throw new Error('invalid provisioned tenant identity key ID');
@@ -819,7 +820,7 @@ export async function provisionTenant(
       ],
     );
   });
-  return await openTenant(store, serverName);
+  return await openTenant(store, serverName, options);
 }
 
 export async function openTenant(
@@ -900,6 +901,10 @@ export async function openTenant(
       },
     }),
     tx: async (fn) => {
+      const ingress = options.ingress &&
+        ('prepare' in options.ingress
+          ? await options.ingress.prepare()
+          : options.ingress);
       const { result, changed, projectionRevision } = await db.tx(
         async (conn) => {
           let changed = false;
@@ -908,7 +913,7 @@ export async function openTenant(
             changed = true;
           }, () => {
             projectionChanged = true;
-          }, options.ingress));
+          }, ingress));
           const projectionRevision = projectionChanged
             ? await recordTenantProjection(conn)
             : 0;

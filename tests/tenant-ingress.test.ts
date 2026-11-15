@@ -169,3 +169,21 @@ Deno.test('ingress authority protects direct device owners, not only HTTP middle
     await f.close();
   }
 });
+
+Deno.test('ingress authority also fences device-less token issuance', async () => {
+  const f = await fixture();
+  try {
+    const before = await f.db.query('SELECT * FROM access_tokens');
+    await assertRejects(
+      () =>
+        f.guarded.tx((tx) =>
+          tx.tokens.insert('a'.repeat(64), 'alice', null, null)
+        ),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    assertEquals(await f.db.query('SELECT * FROM access_tokens'), before);
+  } finally {
+    await f.close();
+  }
+});

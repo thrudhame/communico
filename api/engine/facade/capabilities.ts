@@ -1,7 +1,13 @@
 // One F1 public/service capability manifest. This is a pre-dispatch gate, not a
 // second Matrix router: allowed requests still use reflective route discovery.
 export type Role = 'home' | 'facade';
-export type Scope = 'discovery' | 'keys' | 'public' | 'rooms' | 'ingress';
+export type Scope =
+  | 'discovery'
+  | 'keys'
+  | 'public'
+  | 'rooms'
+  | 'ingress'
+  | 'auth';
 type Rule = { method: string; path: RegExp; scope: Scope; action?: 'home' };
 const f = '/_matrix/federation/v1/';
 const k = '/_matrix/key/v2/';
@@ -49,6 +55,32 @@ export const F1_PUBLIC: readonly Rule[] = [
   ),
 ];
 
+// B2 delivers account/session authority only. Room/device-key/private-data
+// capabilities and their workers remain unmounted until their owning slices.
+const F2_AUTH: readonly Rule[] = [
+  ...['v3', 'r0'].flatMap((version) =>
+    ['GET', 'POST'].map((method) =>
+      route(method, literal('/_matrix/client/' + version + '/login'), 'auth')
+    )
+  ),
+  ...['refresh', 'logout', 'logout/all', 'delete_devices'].map((name) =>
+    route('POST', literal('/_matrix/client/v3/' + name), 'auth')
+  ),
+  route('GET', literal('/_matrix/client/v3/account/whoami'), 'auth'),
+  ...['PUT', 'DELETE'].map((method) =>
+    route(method, /^\/_matrix\/client\/v3\/devices\/[^/]+$/, 'auth')
+  ),
+  ...['register', 'account/password', 'keys/device_signing/upload'].map((
+    name,
+  ) => route('POST', literal('/_matrix/client/v3/' + name), 'auth', 'home')),
+  route(
+    'GET',
+    literal('/_matrix/client/v3/register/available'),
+    'auth',
+    'home',
+  ),
+];
+
 const HOME_SERVICES = new Set([
   'recovery',
   'link-client',
@@ -66,7 +98,7 @@ const FACADE_SERVICES = new Set([
   'egress',
 ]);
 
-export function capabilities(role: string) {
+export function capabilities(role: string, phase = 'f1') {
   if (role !== 'home' && role !== 'facade') {
     throw new TypeError('unknown runtime role');
   }
@@ -79,7 +111,8 @@ export function capabilities(role: string) {
     gate(request: Request, ready: (scope: Scope) => boolean): Response | null {
       if (role === 'home') return null;
       const path = new URL(request.url).pathname;
-      const matching = F1_PUBLIC.filter((rule) => rule.path.test(path));
+      const matching = (phase === 'f2' ? [...F1_PUBLIC, ...F2_AUTH] : F1_PUBLIC)
+        .filter((rule) => rule.path.test(path));
       const rule = matching.find((rule) => rule.method === request.method);
       if (!rule) {
         return Response.json({

@@ -40,6 +40,7 @@ import {
   exportSessionAuthority,
   startAccountExports,
 } from './accounts.ts';
+import { AuthLinkHealth, FacadeAuth } from './auth.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -47,7 +48,8 @@ export async function openFacadeRuntime(
     Promise.resolve(false),
 ) {
   const settings = config().facade;
-  const caps = capabilities(config().server.role);
+  const caps = capabilities(config().server.role, settings.phase);
+  const authHealth = new AuthLinkHealth(settings);
   if (!caps.service('link-server')) {
     throw new LinkError(
       'LINK_IDENTITY_MISMATCH',
@@ -130,7 +132,15 @@ export async function openFacadeRuntime(
         403,
       );
     }
-    tenant = await enrolledTenant(store, owner, identity.server, identity.node);
+    tenant = await enrolledTenant(
+      store,
+      owner,
+      identity.server,
+      identity.node,
+      settings.phase === 'f2'
+        ? new FacadeAuth(server, owner, node, authHealth, settings)
+        : undefined,
+    );
     if (settings.phase === 'f2' && !authExports) {
       authExports = startAccountExports({
         store,
@@ -270,6 +280,16 @@ export async function openFacadeRuntime(
         throw error;
       }
     },
+    async passwordLogin() {
+      if (
+        !tenant || settings.phase !== 'f2' || !settings.replicatecredentials
+      ) return false;
+      await (await pairings()).active();
+      const rows = await (await store.tenant(identity.server)).query(
+        'SELECT 1 FROM account_auth_snapshots a JOIN credentials c ON c.localpart=a.localpart JOIN users u ON u.localpart=a.localpart WHERE a.credentials=1 AND u.deactivated=0 LIMIT 1',
+      );
+      return rows.length !== 0;
+    },
     async requireScope(scope: string, allowAbsent?: boolean) {
       return await new DirectoryReplicas(
         server,
@@ -362,6 +382,8 @@ export async function openFacadeRuntime(
         notices,
         changed: refresh,
         contacted: async () => await (await keyOwner()).contact(),
+        reconciling: (pairing, heads) => authHealth.observe(pairing, heads),
+        connected: (pairing, signal) => authHealth.connected(pairing, signal),
         signKeyDocument: async (raw) => await (await keyOwner()).cosign(raw),
       })(request, peerPin);
     },

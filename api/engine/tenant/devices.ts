@@ -18,6 +18,7 @@ import {
   recordDeviceCreation,
   recordDeviceDeletion,
   recordRevocation,
+  registryDevice,
 } from '#engine/tenant/session-authority.ts';
 
 export type DeviceRow = {
@@ -89,6 +90,30 @@ export async function devicesOfUser(
     [localpart],
   );
   return rows.map(deviceRow);
+}
+
+/** Lifecycle existence is not possession of another issuer's mutable device
+ * row. Deletion may target a known foreign incarnation without claiming its
+ * metadata, tokens or pool as locally owned. */
+export async function deviceExists(
+  conn: Conn,
+  deviceId: string,
+  localpart: string,
+): Promise<boolean> {
+  const device = await registryDevice(conn, localpart, deviceId);
+  if (!device) return await deviceById(conn, deviceId, localpart) !== null;
+  return (await conn.query(
+    "SELECT id FROM authority_facts WHERE localpart=? AND kind='delete' AND json_extract(payload,'$.target')=?",
+    [localpart, device.id],
+  )).length === 0;
+}
+
+export async function hasDevice(
+  tenant: Tenant,
+  localpart: string,
+  deviceId: string,
+): Promise<boolean> {
+  return await tenant.tx((tx) => tx.devices.exists(deviceId, localpart));
 }
 
 export async function renameDevice(

@@ -190,6 +190,7 @@ export type AuthSnapshotBinding = {
   pairing: string;
   grantRevision: number;
   ownerRevision: number;
+  sourceCut?: number;
 };
 
 export async function requireAccountAuth(
@@ -209,6 +210,8 @@ export async function requireAccountAuth(
     !row || row.pairing !== binding.pairing ||
     Number(row.grant_revision) !== binding.grantRevision ||
     Number(row.owner_revision) !== binding.ownerRevision ||
+    (binding.sourceCut !== undefined &&
+      Number(row.source_cut) !== binding.sourceCut) ||
     (credentials && row.credentials !== 1)
   ) authUnavailable();
   if (

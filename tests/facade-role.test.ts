@@ -166,3 +166,54 @@ Deno.test('one F1 capability manifest gates public requests before auth and excl
     error: 'operation requires home ingress',
   });
 });
+
+Deno.test('F2 auth manifest enables only delivered account authority and keeps owner-only services unavailable', () => {
+  const facade = capabilities('facade', 'f2');
+  const request = (path: string, method: string) =>
+    new Request('https://logical.test/_matrix/client/' + path, { method });
+  for (
+    const [path, method] of [
+      ['v3/login', 'GET'],
+      ['v3/login', 'POST'],
+      ['r0/login', 'GET'],
+      ['r0/login', 'POST'],
+      ['v3/refresh', 'POST'],
+      ['v3/logout', 'POST'],
+      ['v3/logout/all', 'POST'],
+      ['v3/account/whoami', 'GET'],
+      ['v3/delete_devices', 'POST'],
+      ['v3/devices/target', 'DELETE'],
+      ['v3/devices/target', 'PUT'],
+    ]
+  ) assertEquals(facade.gate(request(path, method), () => true), null);
+  for (
+    const path of ['register', 'account/password', 'keys/device_signing/upload']
+  ) {
+    assertEquals(
+      facade.gate(request('v3/' + path, 'POST'), () => true)?.status,
+      503,
+    );
+  }
+  for (
+    const [path, method] of [
+      ['v3/sync', 'GET'],
+      ['v3/createRoom', 'POST'],
+      ['v3/devices', 'GET'],
+      ['v3/keys/upload', 'POST'],
+      ['v3/sendToDevice/m.test/txn', 'PUT'],
+      ['v3/account/deactivate', 'POST'],
+    ]
+  ) assertEquals(facade.gate(request(path, method), () => true)?.status, 404);
+  for (
+    const service of [
+      'push',
+      'delayed',
+      'media',
+      'device-lists',
+      'link-client',
+      'federation-sender',
+    ]
+  ) {
+    assertEquals(facade.service(service), false);
+  }
+});

@@ -201,6 +201,8 @@ export function linkHandler(options: {
   notices?: NoticeHub;
   changed?(): Promise<void>;
   contacted?(): Promise<void>;
+  reconciling?(pairing: string, heads: unknown): void;
+  connected?(pairing: string, signal: AbortSignal): void;
   signKeyDocument?(raw: unknown): Promise<string>;
 }): (request: Request, peerPin: string) => Promise<Response> {
   const enroll = enrollmentHandler(options);
@@ -320,6 +322,7 @@ export function linkHandler(options: {
         if (!options.notices) {
           throw new LinkError('LINK_UNAVAILABLE', 'notices not composed', 503);
         }
+        options.connected?.(id, request.signal);
         return options.notices.response(read, request.signal, websocket);
       }
       return Response.json(await read());
@@ -391,6 +394,13 @@ export function linkHandler(options: {
     // Validate the result cursor before any page receipt. A malformed request
     // must not partially advance received state and then fail while forming ACK.
     await journal.acknowledgement('home', stream, after, options.limits);
+    if (body.head !== undefined) {
+      const head = cutOf(body.head);
+      if (records.some((record) => record.sequence > head.sequence)) {
+        throw new LinkError('LINK_DIVERGED', 'page exceeds declared home head');
+      }
+      options.reconciling?.(id, [{ ...stream, head }]);
+    }
     await journal.receive('home', records);
     await options.changed?.();
     return response({
