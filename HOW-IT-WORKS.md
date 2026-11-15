@@ -135,7 +135,10 @@ unavailable, it can instead import complete verified state at a nearer pulled
 event, including a held event reached through pulled ancestry. Pushed provenance
 never gains that permission: its direct parents must still be supplied. The
 existing batch budget bounds all attempts, and locked boundary/event authorization
-and current-state checks still decide what can ground or publish.
+and current-state checks still decide what can ground or publish. Known corrupt
+auth ancestry stops that fallback instead of being treated as unavailable history.
+Verified parent supply remains independent of later auth rejection, so invalid
+supplied bytes are not reported as withheld parents.
 (`api/engine/room/remote.ts`)
 
 Recovery authorizes complete evidence graphs outside the mutation lock, reading

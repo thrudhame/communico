@@ -999,6 +999,115 @@ Deno.test('missing: later child after bad JSON retains the trusted frontier when
   });
 });
 
+for (const supplied of [false, true]) {
+  Deno.test(
+    'missing: corrupt ancestry cannot fall through to a nearer boundary: ' +
+      supplied,
+    async () => {
+      await withStore(async (store) => {
+        const s = await setup(store);
+        const far = await msg(
+          s,
+          'corrupt boundary',
+          supplied ? ['$unavailable'] : [s.joinId],
+          50,
+        );
+        const near = await msg(
+          s,
+          'nearer supplied parent',
+          [far.event_id!],
+          51,
+        );
+        const pushed = await msg(s, 'pushed child', [near.event_id!], 52);
+        const stateIds = await s.g.room.tx(async (tx) => {
+          const stay = await tx.segments.openStay();
+          return [
+            ...(await tx.state.groupMap((await tx.state.current(stay!.id))!))
+              .values(),
+          ];
+        });
+        const recording = fakeFetcher({
+          missingEvents: supplied ? [far, near] : [near],
+          stateIds: new Map([
+            [far.event_id!, {
+              pduIds: stateIds,
+              authChainIds: ['$unfetchable-auth'],
+            }],
+            // Even a complete nearer snapshot must not hide a known corrupt
+            // ancestor. Fallback is for unavailable ancestry, not failed auth.
+            [near.event_id!, { pduIds: stateIds, authChainIds: [] }],
+          ]),
+          event: new Map([[far.event_id!, far]]),
+        });
+        s.deps.fetcher = recording.fetcher;
+        const out = await ingestRemote(
+          s.g.room,
+          [pushed],
+          s.server.name,
+          s.deps,
+        );
+        assertEquals(
+          recording.calls.stateIds,
+          supplied ? ['$unavailable', far.event_id!] : [far.event_id!],
+        );
+        assertEquals(out[0].outcome, 'pending');
+        assertEquals(out[0].error, null);
+        assertEquals(await frontierOf(s.g.room), [s.joinId]);
+        await s.g.room.tx(async (tx) => {
+          assertEquals(
+            (await tx.events.getStatus(far.event_id!))?.standing,
+            'rejected',
+          );
+          assertEquals(
+            (await tx.events.getStatus(far.event_id!))?.grounding,
+            'evidence',
+          );
+          for (const pdu of [far, near, pushed]) {
+            assertEquals(await tx.state.eventStateAfter(pdu.event_id!), null);
+            assertEquals(await tx.segments.positionOf(pdu.event_id!), null);
+          }
+        });
+      });
+    },
+  );
+}
+
+Deno.test('missing: corrupt supplied parent is never reported as withheld', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const parent = await msg(
+      s,
+      'supplied corrupt boundary',
+      ['$unavailable'],
+      50,
+    );
+    const pushed = await msg(s, 'pushed child', [parent.event_id!], 51);
+    const recording = fakeFetcher({
+      missingEvents: [parent],
+      stateIds: new Map([[parent.event_id!, {
+        pduIds: [s.g.createId, s.joinId],
+        authChainIds: ['$unfetchable-auth'],
+      }]]),
+    });
+    s.deps.fetcher = recording.fetcher;
+    const out = await ingestRemote(s.g.room, [pushed], s.server.name, s.deps);
+    assertEquals(out[0].outcome, 'pending');
+    assertEquals(out[0].error, null);
+    await s.g.room.tx(async (tx) => {
+      assertEquals(
+        (await tx.events.getStatus(parent.event_id!))?.grounding,
+        'evidence',
+      );
+      assertEquals(
+        (await tx.events.getStatus(parent.event_id!))?.standing,
+        'rejected',
+      );
+      assertEquals(await tx.state.eventStateAfter(pushed.event_id!), null);
+      assertEquals(await tx.segments.positionOf(pushed.event_id!), null);
+    });
+  });
+});
+
 Deno.test('missing: an unfetchable auth chain stores the gap tip rejected as evidence — it grounds nothing', async () => {
   await withStore(async (store) => {
     const s = await setup(store, { roomId: '!m7:test' });
