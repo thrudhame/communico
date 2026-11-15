@@ -621,11 +621,17 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
   }
   let home: Awaited<ReturnType<typeof process>> | undefined;
   let edge: Awaited<ReturnType<typeof process>> | undefined;
-  const api = async (path: string, body?: unknown, token?: string) => {
+  const api = async (
+    path: string,
+    body?: unknown,
+    token?: string,
+    method = body === undefined ? 'GET' : 'POST',
+    port = homePort,
+  ) => {
     const response = await fetch(
-      `http://127.0.0.1:${homePort}/_matrix/client/v3/${path}`,
+      `http://127.0.0.1:${port}/_matrix/client/v3/${path}`,
       {
-        method: body === undefined ? 'GET' : 'POST',
+        method,
         headers: token ? { authorization: 'Bearer ' + token } : {},
         body: body === undefined ? undefined : JSON.stringify(body),
       },
@@ -670,6 +676,25 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     );
     assertEquals(baselineResponse.status, 200);
     await baselineResponse.arrayBuffer();
+    const created = await api(
+      'createRoom',
+      { room_version: '11' },
+      registered.body.access_token,
+    );
+    assertEquals(created.status, 200);
+    const roomId = created.body.room_id;
+    const roomPath = 'rooms/' + encodeURIComponent(roomId);
+    const sent = await api(
+      roomPath + '/send/m.room.encrypted/b3-baseline',
+      {
+        algorithm: 'm.megolm.v1.aes-sha2',
+        ciphertext: 'receipt-baseline',
+      },
+      registered.body.access_token,
+      'PUT',
+    );
+    assertEquals(sent.status, 200);
+    const eventId = sent.body.event_id;
     const paired = await adminCall(tls.dir + '/home-auth.sock', 'facade/pair', {
       node: 'edge_a',
       url: `https://127.0.0.1:${linkPort}`,
@@ -695,6 +720,8 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       ) => scope.scope === 'auth:@outside:logical.test' && scope.ready) &&
         scopes.some((scope: { scope: string; ready: boolean }) =>
           scope.scope === 'domain:@outside:logical.test' && scope.ready
+        ) && scopes.some((scope: { scope: string; ready: boolean }) =>
+          scope.scope === 'room:' + roomId && scope.ready
         );
     });
     await home.stop();
@@ -727,6 +754,198 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     // The mutation happened while both processes were absent. Restart scans
     // durable owner state; an in-memory notification cannot supply this proof.
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    const edgeApi = (path: string, body?: unknown, method?: string) =>
+      api(path, body, token, method, facadePort);
+    const accountPath =
+      'user/%40outside%3Alogical.test/account_data/m.secret_storage.key';
+    const userRoomPath = 'user/%40outside%3Alogical.test/rooms/' +
+      encodeURIComponent(roomId);
+    // Home is absent, federation is disabled, and this is the ordinary public
+    // listener, not an in-process tenant call or the local-admin adapter.
+    await until(async () => {
+      const state =
+        (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
+          .result;
+      return ['domain:@outside:logical.test', 'room:' + roomId].every(
+        (scope) => {
+          const held = state.scopes.find((row: { scope: string }) =>
+            row.scope === scope
+          );
+          const stream = state.streams.find((row: { stream: string }) =>
+            row.stream === scope
+          );
+          return held?.ready && held.pending === null && stream &&
+            stream.received.sequence === stream.applied.sequence;
+        },
+      );
+    });
+    assertEquals(await edgeApi(accountPath), {
+      status: 200,
+      body: { ciphertext: 'edge-recovered' },
+    });
+    assertEquals(
+      (await edgeApi(accountPath, { ciphertext: 'edge-public' }, 'PUT')).status,
+      200,
+    );
+    assertEquals(
+      (await edgeApi(
+        userRoomPath + '/account_data/m.test',
+        { value: 'room' },
+        'PUT',
+      )).status,
+      200,
+    );
+    assertEquals((await edgeApi(userRoomPath + '/account_data/m.test')).body, {
+      value: 'room',
+    });
+    assertEquals(
+      (await edgeApi(
+        userRoomPath + '/tags/m.favourite',
+        { order: 0.25 },
+        'PUT',
+      )).status,
+      200,
+    );
+    assertEquals((await edgeApi(userRoomPath + '/tags')).body, {
+      tags: { 'm.favourite': { order: 0.25 } },
+    });
+    assertEquals(
+      (await edgeApi('profile/%40outside%3Alogical.test/org.test.field', {
+        'org.test.field': 'offline',
+      }, 'PUT')).status,
+      200,
+    );
+    assertEquals(
+      (await edgeApi('profile/%40outside%3Alogical.test'))
+        .body['org.test.field'],
+      'offline',
+    );
+    const rulePath = 'pushrules/global/override/offline-rule';
+    assertEquals(
+      (await edgeApi(
+        rulePath,
+        { actions: ['dont_notify'], conditions: [] },
+        'PUT',
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await edgeApi(rulePath + '/enabled', { enabled: false }, 'PUT')).status,
+      200,
+    );
+    assertEquals((await edgeApi(rulePath + '/enabled')).body, {
+      enabled: false,
+    });
+    assertEquals(
+      (await edgeApi('pushrules/')).body.global.override.some((
+        rule: { rule_id: string },
+      ) => rule.rule_id === 'offline-rule'),
+      true,
+    );
+    for (const type of ['m.read', 'm.read.private']) {
+      assertEquals(
+        (await edgeApi(
+          roomPath + '/receipt/' + type + '/' + encodeURIComponent(eventId),
+          {},
+        )).status,
+        200,
+      );
+    }
+    assertEquals(
+      (await edgeApi(roomPath + '/read_markers', { 'm.fully_read': eventId }))
+        .status,
+      200,
+    );
+    assertEquals(
+      (await edgeApi(userRoomPath + '/account_data/m.fully_read')).body,
+      { event_id: eventId },
+    );
+    assertEquals(
+      (await edgeApi(
+        'profile/%40outside%3Alogical.test/org.test.field',
+        undefined,
+        'DELETE',
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await edgeApi('profile/%40outside%3Alogical.test/org.test.field'))
+        .status,
+      404,
+    );
+    assertEquals(
+      (await edgeApi(userRoomPath + '/tags/m.favourite', undefined, 'DELETE'))
+        .status,
+      200,
+    );
+    assertEquals((await edgeApi(rulePath, undefined, 'DELETE')).status, 200);
+    assertEquals(
+      (await edgeApi(
+        'rooms/!unknown:logical.test/receipt/m.read/%24unknown',
+        {},
+      )).status,
+      403,
+    );
+    assertEquals(
+      (await edgeApi('rooms/!unknown:logical.test/read_markers', {
+        'm.fully_read': '$unknown',
+      })).status,
+      404,
+    );
+    // A held but incomplete scope must refuse before receipt/account effects.
+    // Change only persisted readiness while its owning process is stopped.
+    for (const scope of ['room:' + roomId, 'domain:@outside:logical.test']) {
+      await edge.stop();
+      const held = await open('facade');
+      const server = await held.server();
+      const before = await server.query(
+        "SELECT operation_id FROM domain_operations WHERE kind='receipt' ORDER BY operation_id",
+      );
+      await server.execute('UPDATE facade_scopes SET ready=0 WHERE scope=?', [
+        scope,
+      ]);
+      await held.close();
+      edge = await process(file('facade'), 'facade: link/local admin ready');
+      for (
+        const [path, body] of [
+          [roomPath + '/receipt/m.read/%24not-admitted', {}],
+          [roomPath + '/receipt/m.read.private/%24not-admitted', {
+            thread_id: 'main',
+          }],
+          [roomPath + '/read_markers', { 'm.fully_read': eventId }],
+        ] as const
+      ) assertEquals((await edgeApi(path, body)).status, 503);
+      if (scope.startsWith('domain:')) {
+        for (
+          const path of [
+            accountPath,
+            userRoomPath + '/tags',
+            'pushrules/',
+            'profile/%40outside%3Alogical.test',
+          ]
+        ) {
+          assertEquals((await edgeApi(path)).status, 503);
+        }
+      }
+      await edge.stop();
+      const after = await open('facade');
+      const afterServer = await after.server();
+      assertEquals(
+        await afterServer.query(
+          "SELECT operation_id FROM domain_operations WHERE kind='receipt' ORDER BY operation_id",
+        ),
+        before,
+      );
+      await afterServer.execute(
+        'UPDATE facade_scopes SET ready=1 WHERE scope=?',
+        [scope],
+      );
+      await after.close();
+      edge = await process(file('facade'), 'facade: link/local admin ready');
+    }
+    assertEquals((await edgeApi(accountPath)).body, {
+      ciphertext: 'edge-public',
+    });
     home = await process(file('home'), 'federation: disabled');
     await until(async () => {
       try {
@@ -736,7 +955,7 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           registered.body.access_token,
         );
         return value.status === 200 &&
-          value.body.ciphertext === 'edge-recovered';
+          value.body.ciphertext === 'edge-public';
       } catch {
         return false;
       }

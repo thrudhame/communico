@@ -438,7 +438,8 @@ test('A6: deactivate — flows include m.login.password; wrong pw 401 M_FORBIDDE
     body: loginBody('a6user', 'pw-a6'),
   });
   assertEquals(login.status, 403);
-  assertEquals(login.body.errcode, 'M_USER_DEACTIVATED');
+  assertEquals(login.body.errcode, 'M_FORBIDDEN');
+  assertEquals(login.body.access_token, undefined);
 });
 
 test('A2+A3: profile displayname/avatar_url — authed self-write, UNauthed read, foreign mxc verbatim, other-user write → 403', async () => {

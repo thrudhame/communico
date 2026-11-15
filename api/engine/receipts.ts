@@ -8,12 +8,24 @@ import { putAccountData } from '#engine/tenant/accountdata.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
 
+// The tenant owns complete account-domain admission; the replica owns room
+// readiness. Check both before reading server membership or room visibility so
+// a missing cut cannot become a false 403/404 or a successful durable mark.
+async function requireReceiptScope(roomId: string, userId: string) {
+  const app = theApp();
+  await app.tenant.tx((tx) =>
+    tx.ingress.check({ kind: 'domain', localpart: localpartOf(userId) })
+  );
+  await app.replica?.requireScope('room:' + roomId, true);
+}
+
 export async function setFullyRead(
   roomId: string,
   userId: string,
   eventId: string,
 ): Promise<void> {
   const app = theApp();
+  await requireReceiptScope(roomId, userId);
   let known = false;
   try {
     const room = await openRoom(app.store, roomId);
@@ -52,6 +64,7 @@ export async function setReceipt(
     await setFullyRead(roomId, userId, eventId);
     return;
   }
+  await requireReceiptScope(roomId, userId);
   let threadId: string | null = null;
   if (opts.threadId !== undefined) {
     if (!await isJoined(server, roomId, userId)) {

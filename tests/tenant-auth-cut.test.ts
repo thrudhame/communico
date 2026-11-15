@@ -132,11 +132,13 @@ Deno.test('deactivation facts remove concurrent sessions and verifiers at either
       MatrixError,
       'session authority revoked',
     );
-    await assertRejects(
+    const rejected = await assertRejects(
       () => f.home.login('new'),
       MatrixError,
-      'M_USER_DEACTIVATED',
+      'invalid username or password',
     );
+    assertEquals(rejected.status, 403);
+    assertEquals(rejected.errcode, 'M_FORBIDDEN');
     assertEquals(await verifyUserPassword(f.home.tenant, 'alice', 'pw'), false);
     await f.edge.db.tx((conn) => installAccountAuth(conn, old));
     assertEquals(await verifyUserPassword(f.edge.tenant, 'alice', 'pw'), false);
