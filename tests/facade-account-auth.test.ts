@@ -206,7 +206,8 @@ Deno.test('irreversible deactivation refuses login even when a captured auth cut
         deviceId: 'deactivated',
         refresh: true,
       }), MatrixError);
-    assertEquals(failure.errcode, 'M_USER_DEACTIVATED');
+    assertEquals(failure.status, 403);
+    assertEquals(failure.errcode, 'M_FORBIDDEN');
     assertEquals(
       await (await f.edge.tenant('logical.test')).query(
         'SELECT token FROM access_tokens',

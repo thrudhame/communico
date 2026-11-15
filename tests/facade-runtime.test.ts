@@ -1235,9 +1235,9 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       (await api(
         'facade',
         'login',
-        login('after-deactivation', 'not-the-password'),
+        login('after-deactivation'),
       )).body
-        .errcode === 'M_USER_DEACTIVATED'
+        .errcode === 'M_FORBIDDEN'
     );
     await home.stop();
     // Home shutdown can finish after another capture was received but before
@@ -1249,11 +1249,11 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
         login('offline-deactivated', 'not-the-password'),
       )).body
         .errcode ===
-        'M_USER_DEACTIVATED'
+        'M_FORBIDDEN'
     );
     assertEquals(
       (await api('facade', 'login', login('offline-deactivated'))).body.errcode,
-      'M_USER_DEACTIVATED',
+      'M_FORBIDDEN',
     );
     // A different served account deactivates at the facade with home absent.
     // Its worker must sign the actual replicated-room leave, not only revoke
@@ -1365,13 +1365,13 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     edge = await process(file('facade'), 'facade: link/local admin ready');
     assertEquals(
       (await api('facade', 'login', departureLogin)).body.errcode,
-      'M_USER_DEACTIVATED',
+      'M_FORBIDDEN',
     );
     home = await process(file('home'), 'federation: disabled');
     await until(async () => {
       try {
         return (await api('home', 'login', departureLogin)).body.errcode ===
-          'M_USER_DEACTIVATED';
+          'M_FORBIDDEN';
       } catch {
         return false;
       }
