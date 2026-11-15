@@ -169,55 +169,96 @@ export function mapEntries(map: StateMap): StateChange[] {
   return out;
 }
 
-// The full map of a group as entries: the nearest snapshot plus every
-// delta down to the group, oldest first; a delta's NULL event removes.
+// Immutable group contents are shared only inside one transaction attempt.
+// Repeated frontier refs and sibling deltas reuse their actual ancestor maps;
+// mutable event refs/current pointers and missing groups are never cached.
+export class StateGroups {
+  private active = true;
+  private readonly maps = new Map<number, Promise<StateMap>>();
+
+  constructor(private readonly conn: Conn) {}
+
+  private check(): void {
+    if (!this.active) {
+      throw new Error('transaction state reader has been released');
+    }
+  }
+
+  release(): void {
+    this.active = false;
+    this.maps.clear();
+  }
+
+  private read(group: number): Promise<StateMap> {
+    this.check();
+    const existing = this.maps.get(group);
+    if (existing !== undefined) return existing;
+    const loading = (async () => {
+      const rows = await this.conn.query(
+        'SELECT id, parent FROM state_groups WHERE id = ?',
+        [group],
+      );
+      if (rows.length === 0) throw new Error(`unknown state group ${group}`);
+      const parent = rows[0].parent;
+      const map: StateMap = parent === null
+        ? new Map()
+        : new Map(await this.read(Number(parent)));
+      const entries = await this.conn.query(
+        'SELECT type, state_key, event FROM state_entries WHERE grp = ?',
+        [group],
+      );
+      for (const entry of entries) {
+        const key = String(entry.type) + '\0' + String(entry.state_key);
+        if (entry.event === null) map.delete(key);
+        else map.set(key, String(entry.event));
+      }
+      return map;
+    })().catch((error) => {
+      this.maps.delete(group);
+      throw error;
+    });
+    this.maps.set(group, loading);
+    return loading;
+  }
+
+  async map(group: number): Promise<StateMap> {
+    const map = await this.read(group);
+    this.check();
+    return new Map(map);
+  }
+
+  async entries(group: number): Promise<StateChange[]> {
+    const map = await this.read(group);
+    this.check();
+    return mapEntries(map);
+  }
+
+  async key(
+    group: number,
+    type: string,
+    stateKey: string,
+  ): Promise<string | null> {
+    this.check();
+    const known = this.maps.get(group);
+    if (known === undefined) {
+      return await groupKey(this.conn, group, type, stateKey);
+    }
+    const map = await known;
+    this.check();
+    return map.get(type + '\0' + stateKey) ?? null;
+  }
+}
+
+// Standalone reads use the same reconstruction without retaining a lifetime.
 export async function groupEntries(
   conn: Conn,
   group: number,
 ): Promise<StateChange[]> {
-  const chain: { id: number; parent: number | null }[] = [];
-  let cursor: number | null = group;
-  while (cursor !== null) {
-    const rows = await conn.query(
-      'SELECT id, parent FROM state_groups WHERE id = ?',
-      [cursor],
-    );
-    if (rows.length === 0) throw new Error(`unknown state group ${group}`);
-    chain.push({
-      id: Number(rows[0].id),
-      parent: rows[0].parent === null ? null : Number(rows[0].parent),
-    });
-    cursor = rows[0].parent === null ? null : Number(rows[0].parent);
-  }
-  const map = new Map<string, StateChange>();
-  for (let index = chain.length - 1; index >= 0; index--) {
-    const entries = await conn.query(
-      'SELECT type, state_key, event FROM state_entries WHERE grp = ?',
-      [chain[index].id],
-    );
-    for (const entry of entries) {
-      const key = String(entry.type) + '\0' + String(entry.state_key);
-      if (entry.event === null) map.delete(key);
-      else {
-        map.set(key, {
-          type: String(entry.type),
-          state_key: String(entry.state_key),
-          event: String(entry.event),
-        });
-      }
-    }
-  }
-  return [...map.values()];
+  return await new StateGroups(conn).entries(group);
 }
 
 export async function groupMap(conn: Conn, group: number): Promise<StateMap> {
-  const map: StateMap = new Map();
-  for (const entry of await groupEntries(conn, group)) {
-    if (entry.event !== null) {
-      map.set(entry.type + '\0' + entry.state_key, entry.event);
-    }
-  }
-  return map;
+  return await new StateGroups(conn).map(group);
 }
 
 // Selected-key read: walk ≤ 32 deltas to the nearest snapshot, looking at
