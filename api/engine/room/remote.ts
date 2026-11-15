@@ -32,7 +32,7 @@ import { fetchOrNull, type RemoteDeps } from '#engine/room/deps.ts';
 import { admitLocalJoin, projectAfterWrite } from '#engine/room/hooks.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
 import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
-import type { Room } from '#engine/room/index.ts';
+import type { Room, RoomTx } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { aclAllows, assertAcl } from '#engine/room/acl.ts';
 import { orderEvents } from '#engine/room/order.ts';
@@ -84,6 +84,9 @@ type VerifiedItem = {
 
 // Everything the unlocked fetch phase gathers for the locked batch.
 type FetchAcc = {
+  // Verified supplied identities survive later auth/ingest rejection. Bytes
+  // being invalid does not mean the peer withheld a pushed event's parent.
+  supplied: Set<string>;
   // Verified events to ingest live: pushed PDUs and fetched missing
   // events alike, keyed by id.
   live: Map<string, VerifiedItem>;
@@ -131,12 +134,38 @@ async function parentsSupplied(
     for (const id of ids) {
       signal?.throwIfAborted();
       if (
-        !acc.live.has(id) &&
+        !acc.supplied.has(id) &&
         (await tx.state.eventStateAfter(id)) === null
       ) return false;
     }
     return true;
   });
+}
+
+// A fallback is conditional on the batch's knowledge of its ungrounded prev
+// graph. Later inputs can discover corruption behind an earlier boundary. Walk
+// the shared final graph at reuse and locked admission, stopping only at genuine
+// persisted after-state, never at another cached fallback.
+async function invalidRecoveryAncestry(
+  tx: RoomTx,
+  ids: readonly string[],
+  acc: FetchAcc,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const pending = [...ids];
+  const seen = new Set<string>();
+  while (pending.length > 0) {
+    signal?.throwIfAborted();
+    const id = pending.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if ((await tx.state.eventStateAfter(id)) !== null) continue;
+    signal?.throwIfAborted();
+    if (acc.corrupted.has(id) || acc.terminal.has(id)) return true;
+    const pdu = acc.live.get(id)?.pdu ?? acc.evidence.get(id);
+    pending.push(...(pdu?.prev_events ?? await tx.events.prevsOf(id)));
+  }
+  return false;
 }
 
 // Collect the brief wait and ONE missing-events response per input, with the
@@ -213,6 +242,7 @@ async function fetchMissing(
           roomId: room.id,
           signal: deps.signal,
         });
+        acc.supplied.add(v.eventId);
         if (!acc.live.has(v.eventId)) {
           acc.live.set(v.eventId, {
             index: -1,
@@ -253,8 +283,9 @@ function recoveryOwner(
   // alone do not ground anything; only genuine after-state or a complete
   // fetched boundary can make a branch recoverable. Locked ingest still
   // authorizes every boundary and event before publishing any state.
+  type Recovery = 'ready' | 'unavailable' | 'invalid';
   const attempted = new Set<string>();
-  const recovered = new Map<string, boolean>();
+  const recovered = new Map<string, Recovery>();
   const visiting = new Set<string>();
   const ancestry = new RecoveryAncestry(room, () => {
     deps.signal?.throwIfAborted();
@@ -270,41 +301,51 @@ function recoveryOwner(
     if (next !== snapshot) recovered.clear();
     snapshot = next;
   };
-  const fetchBoundary = async (id: string): Promise<boolean> => {
+  const fetchBoundary = async (id: string): Promise<Recovery> => {
     deps.signal?.throwIfAborted();
     // missinglimit sizes the missing-events answer, not this state-recovery
     // ladder. Charging older misses against it can suppress every usable
     // pulled boundary. All attempts retain the original whole-batch budget.
-    if (budgetLeft() <= 0 || attempted.has(id)) return false;
+    if (acc.corrupted.has(id)) return 'invalid';
+    if (budgetLeft() <= 0 || attempted.has(id)) return 'unavailable';
     attempted.add(id);
     await fetchGapTip(room, id, origin, deps, version, budget, acc);
     // A network wait may have admitted local parents or changed the supplied
     // union/boundaries. No missing/readiness result survives that changed cut.
     await refresh();
-    return acc.boundaries.has(id);
+    return acc.boundaries.has(id)
+      ? 'ready'
+      : acc.corrupted.has(id)
+      ? 'invalid'
+      : 'unavailable';
   };
   const chase = async (
     id: string,
     source: VerifiedItem['source'],
-  ): Promise<boolean> => {
+  ): Promise<Recovery> => {
     type Walk = {
       view: RecoverySnapshot;
       key: string;
       provenance: VerifiedItem['source'];
       prevs: string[];
       next: number;
-      ready: boolean;
+      result: Recovery;
     };
     type Frame = { id: string; source: VerifiedItem['source']; walk?: Walk };
     // Captured held paths may have no I/O before their deepest ancestor.
     // Heap-owned DFS frames, including snapshot retries, never grow the JS stack.
     const stack: Frame[] = [{ id, source }];
-    let result = false;
-    const finish = (ready: boolean) => {
+    let result: Recovery = 'unavailable';
+    const finish = (verdict: Recovery) => {
       stack.pop();
       const parent = stack.at(-1)?.walk;
-      if (parent !== undefined && !ready) parent.ready = false;
-      result = ready;
+      if (parent !== undefined) {
+        if (verdict === 'invalid') parent.result = 'invalid';
+        else if (verdict === 'unavailable' && parent.result === 'ready') {
+          parent.result = 'unavailable';
+        }
+      }
+      result = verdict;
     };
     try {
       while (stack.length > 0) {
@@ -313,14 +354,23 @@ function recoveryOwner(
         const { id, source } = frame;
         if (frame.walk === undefined) {
           if (acc.boundaries.has(id)) {
-            finish(true);
+            finish(
+              await room.tx((tx) =>
+                  invalidRecoveryAncestry(tx, [id], acc, deps.signal)
+                )
+                ? 'invalid'
+                : 'ready',
+            );
             continue;
           }
           if (
-            acc.terminal.has(id) || visiting.has(id) || budgetLeft() <= 0 ||
-            snapshot === null
+            acc.terminal.has(id) || acc.corrupted.has(id) || visiting.has(id)
           ) {
-            finish(false);
+            finish('invalid');
+            continue;
+          }
+          if (budgetLeft() <= 0 || snapshot === null) {
+            finish('unavailable');
             continue;
           }
           const view = snapshot;
@@ -332,12 +382,12 @@ function recoveryOwner(
           }
           const held = view.nodes.get(id);
           if (held?.grounded) {
-            finish(true);
+            finish('ready');
             continue;
           }
           const answered = acc.live.get(id);
           if (answered === undefined && source === 'pushed') {
-            finish(false);
+            finish('unavailable');
             continue;
           }
           if (answered === undefined && held === undefined) {
@@ -354,30 +404,37 @@ function recoveryOwner(
           if (
             provenance === 'pushed' &&
             prevs.some((prev) =>
-              !acc.live.has(prev) && !view.nodes.get(prev)?.grounded
+              !acc.supplied.has(prev) && !view.nodes.get(prev)?.grounded
             )
           ) {
-            finish(false);
+            finish('unavailable');
             continue;
           }
           visiting.add(id);
-          frame.walk = { view, key, provenance, prevs, next: 0, ready: true };
+          frame.walk = {
+            view,
+            key,
+            provenance,
+            prevs,
+            next: 0,
+            result: 'ready',
+          };
         }
         const walk = frame.walk;
         if (walk.next < walk.prevs.length) {
           stack.push({ id: walk.prevs[walk.next++], source: walk.provenance });
           continue;
         }
-        if (!walk.ready && walk.provenance === 'pulled') {
-          walk.ready = await fetchBoundary(id);
+        if (walk.result === 'unavailable' && walk.provenance === 'pulled') {
+          walk.result = await fetchBoundary(id);
         }
         visiting.delete(id);
         if (snapshot !== walk.view) {
           frame.walk = undefined;
           continue;
         }
-        recovered.set(walk.key, walk.ready);
-        finish(walk.ready);
+        recovered.set(walk.key, walk.result);
+        finish(walk.result);
       }
       return result;
     } finally {
@@ -508,6 +565,7 @@ async function fetchGapTip(
         signal: deps.signal,
       });
       if (v.eventId === tip) {
+        acc.supplied.add(tip);
         tipPdu = v.pdu;
         if (supplied === undefined) {
           acc.live.set(tip, {
@@ -713,6 +771,7 @@ export async function ingestRemote(
   // The unlocked fetch phase: gather what is missing before the lock,
   // inside the whole-batch budget (R13 — network never under the lock)
   const acc: FetchAcc = {
+    supplied: new Set(items.map((item) => item.eventId)),
     live: new Map(items.map((item) => [item.eventId, item])),
     evidence: new Map(),
     corrupted: new Map(),
@@ -861,7 +920,11 @@ export async function ingestRemote(
             continue;
           }
           localRejected.delete(id);
-          const boundary = acc.boundaries.get(id);
+          const candidateBoundary = acc.boundaries.get(id);
+          const boundary = candidateBoundary !== undefined &&
+              !await invalidRecoveryAncestry(tx, [id], acc, deps.signal)
+            ? candidateBoundary
+            : undefined;
           const needsBoundary = boundary !== undefined &&
             (await ungroundedPrevs(tx, pdu.prev_events ?? [])).length > 0;
           const invalidBoundary = needsBoundary &&

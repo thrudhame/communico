@@ -145,7 +145,10 @@ unavailable, it can instead import complete verified state at a nearer pulled
 event, including a held event reached through pulled ancestry. Pushed provenance
 never gains that permission: its direct parents must still be supplied. The
 existing batch budget bounds all attempts, and locked boundary/event authorization
-and current-state checks still decide what can ground or publish.
+and current-state checks still decide what can ground or publish. Known corrupt
+auth ancestry stops that fallback instead of being treated as unavailable history.
+Verified parent supply remains independent of later auth rejection, so invalid
+supplied bytes are not reported as withheld parents.
 (`api/engine/room/remote.ts`)
 
 Recovery authorizes complete evidence graphs outside the mutation lock, reading
@@ -346,6 +349,10 @@ tenant OTK/fallback status. No-pos requests have empty device-list deltas;
 disabled extensions do not read or advance their independent cuts. Later enable
 reads from the connection's retained baseline, not an unrelated room-list cut.
 Unchanged status envelopes are not poll updates, while key-pool changes are.
+The tenant's shared key-status owner always includes `signed_curve25519: 0`
+for an exhausted pool, alongside actual counts for other uploaded algorithms,
+as Synapse does. Ordinary sync, sliding sync and key uploads use that same
+status; empty unused-fallback status is an explicit list, never absence.
 (`api/engine/sliding-sync/extensions.ts`)
 
 Final sliding publication runs only after rendering: one tenant transaction

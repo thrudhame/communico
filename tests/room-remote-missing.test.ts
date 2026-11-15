@@ -1029,6 +1029,74 @@ for (
   );
 }
 
+Deno.test('missing: cancellation during cached ancestry validation starts no next native phase', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const far = await msg(s, 'cached boundary', ['$unavailable-older'], 50);
+    const near = await msg(s, 'pulled parent', [far.event_id!], 51);
+    const pushed = await msg(s, 'pushed child', [near.event_id!], 52);
+    const stateIds = await s.g.room.tx(async (tx) => {
+      const stay = (await tx.segments.openStay())!;
+      return [
+        ...(await tx.state.groupMap((await tx.state.current(stay.id))!))
+          .values(),
+      ];
+    });
+    const recording = fakeFetcher({
+      missingEvents: [near, far],
+      stateIds: new Map([[far.event_id!, {
+        pduIds: stateIds,
+        authChainIds: [],
+      }]]),
+      event: new Map([[far.event_id!, far]]),
+    });
+    const controller = new AbortController();
+    const transaction = s.g.room.tx.bind(s.g.room);
+    let validationReads = 0, afterAbortReads = 0;
+    s.g.room.tx = (fn) =>
+      transaction(async (tx) => {
+        const after = tx.state.eventStateAfter.bind(tx.state);
+        tx.state.eventStateAfter = async (id) => {
+          // Observe the actual cached-boundary owner, not a snapshot refresh
+          // that has a separate cancellation contract and runs earlier.
+          const validating = new Error().stack?.includes(
+            'invalidRecoveryAncestry',
+          );
+          if (controller.signal.aborted) afterAbortReads++;
+          const result = await after(id);
+          if (validating && id === far.event_id) {
+            validationReads++;
+            controller.abort();
+          }
+          return result;
+        };
+        const prevs = tx.events.prevsOf.bind(tx.events);
+        tx.events.prevsOf = async (id) => {
+          if (controller.signal.aborted) afterAbortReads++;
+          return await prevs(id);
+        };
+        return await fn(tx);
+      });
+    await assertRejects(() =>
+      ingestRemote(s.g.room, [pushed], s.server.name, {
+        ...s.deps,
+        fetcher: recording.fetcher,
+        signal: controller.signal,
+      }), DOMException);
+    assertEquals(
+      validationReads,
+      1,
+      'the real cached-boundary validation was reached',
+    );
+    assertEquals(afterAbortReads, 0, 'cancellation owns the next native phase');
+    s.g.room.tx = transaction;
+    assertEquals(
+      await transaction((tx) => tx.events.get(pushed.event_id!)),
+      null,
+    );
+  });
+});
+
 for (
   const boundary of [
     'unavailable',
@@ -1222,6 +1290,230 @@ Deno.test('missing: later child after bad JSON retains the trusted frontier when
         assertEquals(await tx.segments.positionOf(id), null);
       }
     });
+  });
+});
+
+for (const supplied of [false, true]) {
+  Deno.test(
+    'missing: corrupt ancestry cannot fall through to a nearer boundary: ' +
+      supplied,
+    async () => {
+      await withStore(async (store) => {
+        const s = await setup(store);
+        const far = await msg(
+          s,
+          'corrupt boundary',
+          supplied ? ['$unavailable'] : [s.joinId],
+          50,
+        );
+        const near = await msg(
+          s,
+          'nearer supplied parent',
+          [far.event_id!],
+          51,
+        );
+        const pushed = await msg(s, 'pushed child', [near.event_id!], 52);
+        const stateIds = await s.g.room.tx(async (tx) => {
+          const stay = await tx.segments.openStay();
+          return [
+            ...(await tx.state.groupMap((await tx.state.current(stay!.id))!))
+              .values(),
+          ];
+        });
+        const recording = fakeFetcher({
+          missingEvents: supplied ? [far, near] : [near],
+          stateIds: new Map([
+            [far.event_id!, {
+              pduIds: stateIds,
+              authChainIds: ['$unfetchable-auth'],
+            }],
+            // Even a complete nearer snapshot must not hide a known corrupt
+            // ancestor. Fallback is for unavailable ancestry, not failed auth.
+            [near.event_id!, { pduIds: stateIds, authChainIds: [] }],
+          ]),
+          event: new Map([[far.event_id!, far]]),
+        });
+        s.deps.fetcher = recording.fetcher;
+        const out = await ingestRemote(
+          s.g.room,
+          [pushed],
+          s.server.name,
+          s.deps,
+        );
+        assertEquals(
+          recording.calls.stateIds,
+          supplied ? ['$unavailable', far.event_id!] : [far.event_id!],
+        );
+        assertEquals(out[0].outcome, 'pending');
+        assertEquals(out[0].error, null);
+        assertEquals(await frontierOf(s.g.room), [s.joinId]);
+        await s.g.room.tx(async (tx) => {
+          assertEquals(
+            (await tx.events.getStatus(far.event_id!))?.standing,
+            'rejected',
+          );
+          assertEquals(
+            (await tx.events.getStatus(far.event_id!))?.grounding,
+            'evidence',
+          );
+          for (const pdu of [far, near, pushed]) {
+            assertEquals(await tx.state.eventStateAfter(pdu.event_id!), null);
+            assertEquals(await tx.segments.positionOf(pdu.event_id!), null);
+          }
+        });
+      });
+    },
+  );
+}
+
+Deno.test('missing: corrupt supplied parent is never reported as withheld', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const parent = await msg(
+      s,
+      'supplied corrupt boundary',
+      ['$unavailable'],
+      50,
+    );
+    const pushed = await msg(s, 'pushed child', [parent.event_id!], 51);
+    const recording = fakeFetcher({
+      missingEvents: [parent],
+      stateIds: new Map([[parent.event_id!, {
+        pduIds: [s.g.createId, s.joinId],
+        authChainIds: ['$unfetchable-auth'],
+      }]]),
+    });
+    s.deps.fetcher = recording.fetcher;
+    const out = await ingestRemote(s.g.room, [pushed], s.server.name, s.deps);
+    assertEquals(out[0].outcome, 'pending');
+    assertEquals(out[0].error, null);
+    await s.g.room.tx(async (tx) => {
+      assertEquals(
+        (await tx.events.getStatus(parent.event_id!))?.grounding,
+        'evidence',
+      );
+      assertEquals(
+        (await tx.events.getStatus(parent.event_id!))?.standing,
+        'rejected',
+      );
+      assertEquals(await tx.state.eventStateAfter(pushed.event_id!), null);
+      assertEquals(await tx.segments.positionOf(pushed.event_id!), null);
+    });
+  });
+});
+
+Deno.test('missing: cached fallbacks cannot hide later discovered corrupt ancestry', async (t) => {
+  for (const reverse of [false, true]) {
+    await t.step(reverse ? 'reverse inputs' : 'forward inputs', async () => {
+      await withStore(async (store) => {
+        const s = await setup(store);
+        const right = await msg(s, 'later corrupt boundary', [
+          '$unavailable-right',
+        ], 49);
+        const farContent = {
+          membership: 'join',
+          displayname: 'later supplied ancestor',
+        };
+        const far = await remoteEvent(s.g.roomId, s.server, '11', {
+          type: 'm.room.member',
+          sender: s.user,
+          state_key: s.user,
+          content: farContent,
+          prev_events: [right.event_id!],
+          auth_events: await authAt(s.g.room, {
+            type: 'm.room.member',
+            sender: s.user,
+            state_key: s.user,
+            content: farContent,
+          }, s.joinId),
+          depth: 50,
+          origin_server_ts: 1050,
+        });
+        const left = await msg(s, 'left fallback', [far.event_id!], 51);
+        const first = await msg(s, 'first pushed', [left.event_id!], 53);
+        const second = await msg(s, 'second pushed', [right.event_id!], 54);
+        const stateIds = await s.g.room.tx(async (tx) => {
+          const stay = await tx.segments.openStay();
+          return [
+            ...(await tx.state.groupMap((await tx.state.current(stay!.id))!))
+              .values(),
+          ];
+        });
+        let farRequests = 0;
+        const recording = fakeFetcher({
+          event: new Map([[far.event_id!, far]]),
+        });
+        recording.fetcher.missingEvents = (_room, _earliest, latest) =>
+          Promise.resolve(latest.includes(first.event_id!) ? [left] : [right]);
+        recording.fetcher.stateIds = (_room, id) => {
+          if (id === far.event_id) {
+            farRequests++;
+            throw new UpstreamHttpError(404, 'federation');
+          }
+          if ([left.event_id, right.event_id].includes(id)) {
+            return Promise.resolve({
+              // The first complete state pack supplies the far event's unknown
+              // prev edge. A distinct later tip then reveals its corruption;
+              // incomplete/corrupt packs need not publish their evidence.
+              pduIds: id === left.event_id
+                ? [...stateIds.filter((id) => id !== s.joinId), far.event_id!]
+                : stateIds,
+              authChainIds: id === right.event_id ? ['$unfetchable-auth'] : [],
+            });
+          }
+          throw new UpstreamHttpError(404, 'federation');
+        };
+        s.deps.fetcher = recording.fetcher;
+        const batch = reverse ? [second, first] : [first, second];
+        const out = await ingestRemote(s.g.room, batch, s.server.name, s.deps);
+        assertEquals(farRequests, 1);
+        assertEquals(out.map((result) => result.outcome), [
+          'pending',
+          'pending',
+        ]);
+        assertEquals(out.map((result) => result.error), [null, null]);
+        assertEquals(await frontierOf(s.g.room), [s.joinId]);
+        await s.g.room.tx(async (tx) => {
+          assertEquals(
+            (await tx.events.getStatus(right.event_id!))?.standing,
+            'rejected',
+          );
+          for (const pdu of [far, left, right, first, second]) {
+            assertEquals(await tx.state.eventStateAfter(pdu.event_id!), null);
+            assertEquals(await tx.segments.positionOf(pdu.event_id!), null);
+          }
+        });
+      });
+    });
+  }
+});
+
+Deno.test('missing: verified gap bytes remain supplied when their state is incomplete', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const parent = await msg(s, 'verified parent', ['$unavailable'], 50);
+    const near = await msg(s, 'pulled near', [parent.event_id!], 51);
+    const first = await msg(s, 'first pushed', [near.event_id!], 52);
+    const second = await msg(s, 'second pushed', [parent.event_id!], 53);
+    const recording = fakeFetcher({
+      stateIds: new Map([[parent.event_id!, {
+        pduIds: [s.g.createId, s.joinId, '$missing-state'],
+        authChainIds: [],
+      }]]),
+      event: new Map([[parent.event_id!, parent]]),
+    });
+    recording.fetcher.missingEvents = (_room, _earliest, latest) =>
+      Promise.resolve(latest.includes(first.event_id!) ? [near] : []);
+    s.deps.fetcher = recording.fetcher;
+    const out = await ingestRemote(
+      s.g.room,
+      [first, second],
+      s.server.name,
+      s.deps,
+    );
+    assertEquals(out.map((result) => result.outcome), ['pending', 'pending']);
+    assertEquals(out.map((result) => result.error), [null, null]);
+    assertEquals(await frontierOf(s.g.room), [s.joinId]);
   });
 });
 

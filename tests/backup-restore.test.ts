@@ -163,7 +163,9 @@ for (const encrypted of [false, true]) {
           (await db.query('SELECT COUNT(*) AS n FROM access_tokens'))[0].n,
           1,
         );
-        assertEquals((await db.tx((tx) => keyStatus(tx, f.device))).counts, {});
+        assertEquals((await db.tx((tx) => keyStatus(tx, f.device))).counts, {
+          signed_curve25519: 0,
+        });
         assertEquals((await db.tx((tx) => keyStatus(tx, f.device))).unused, []);
         assert(
           (await (await app.store.room(f.room.roomId)).query(
