@@ -5,7 +5,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
-import { leave, reopen } from '#engine/room/membership.ts';
+import { join, leave, reopen } from '#engine/room/membership.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { type Genesis, genesis } from './fixtures/genesis.ts';
@@ -13,6 +13,7 @@ import { type Genesis, genesis } from './fixtures/genesis.ts';
 async function withRoom(
   joinRule: string,
   fn: (store: Store, g: Genesis) => Promise<void>,
+  version = '11',
 ) {
   const dir = await Deno.makeTempDir();
   const store = await openStore({
@@ -25,7 +26,7 @@ async function withRoom(
   try {
     await fn(
       store,
-      await genesis(store, { roomId: '!parent-state:test', joinRule }),
+      await genesis(store, { roomId: '!parent-state:test', joinRule, version }),
     );
   } finally {
     await store.close();
@@ -70,6 +71,79 @@ async function depsFor(store: Store, g: Genesis) {
     self: g.signer.serverName,
     signer: g.signer,
   } as InviteDeps;
+}
+
+for (const version of ['11', '12']) {
+  for (const consumer of ['federation template', 'local join']) {
+    Deno.test(`parent state: v${version} restricted ${consumer} selects an authorizer in both views`, async () => {
+      await withRoom('public', async (store, g) => {
+        const allowed = await genesis(store, {
+          roomId: '!parent-allowed:test',
+          joinRule: 'public',
+        });
+        const guest = '@guest:test';
+        await join(allowed.room, guest, g.signer);
+        const rule = await sendLocal(g.room, {
+          type: 'm.room.join_rules',
+          state_key: '',
+          sender: g.creator,
+          content: {
+            join_rule: 'restricted',
+            allow: [{ type: 'm.room_membership', room_id: allowed.roomId }],
+          },
+        }, g.signer);
+        assertEquals(rule.standing, 'accepted');
+        g.tipId = rule.eventId;
+        await deeperBranches(g);
+        const omitted = await sendLocal(g.room, {
+          type: 'm.room.member',
+          state_key: '@aaa:test',
+          sender: '@aaa:test',
+          content: {
+            membership: 'join',
+            join_authorised_via_users_server: g.creator,
+          },
+          prev_events: [g.tipId],
+        }, g.signer);
+        assertEquals(omitted.standing, 'accepted');
+        await g.room.tx(async (tx) => {
+          const stay = (await tx.segments.openStay())!;
+          assert(
+            !(await tx.extremities.parents(stay.id)).includes(omitted.eventId),
+          );
+          assertEquals(
+            await tx.state.groupKey(
+              (await tx.state.current(stay.id))!,
+              'm.room.member',
+              '@aaa:test',
+            ),
+            omitted.eventId,
+          );
+        });
+        if (consumer === 'federation template') {
+          const template = await makeJoin(
+            g.roomId,
+            guest,
+            'test',
+            [version],
+            await depsFor(store, g),
+          );
+          assertEquals(
+            template.event.content.join_authorised_via_users_server,
+            g.creator,
+          );
+          assert(!template.event.auth_events.includes(omitted.eventId));
+        } else {
+          const result = await join(g.room, guest, g.signer);
+          const pdu = await g.room.tx(async (tx) =>
+            JSON.parse((await tx.events.get(result.eventId))!.pdu)
+          );
+          assertEquals(pdu.content.join_authorised_via_users_server, g.creator);
+          assertEquals(pdu.content.membership, 'join');
+        }
+      }, version);
+    });
+  }
 }
 
 Deno.test('parent state: federation template auth cites selected-parent state, not omitted current state', async () => {

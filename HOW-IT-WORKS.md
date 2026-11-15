@@ -75,6 +75,8 @@ events remain retained for later merges; archived-room reopen uses the same
 selection over its prior stay while inheriting its complete frontier into the
 new stay. Membership templates derive their join-rule checks and auth events
 from the selected parents' state, separately from current admission checks.
+Restricted authoring selects an invite-capable local authorizer common to both
+views; inbound nominated authorizers retain their actual-PDU DAG validation.
 Explicit parent arrays and inbound PDUs keep the protocol's separate
 twenty-parent validation.
 (`api/engine/room/{extremities,build,membership}.ts`, `api/engine/federation/joins.ts`)

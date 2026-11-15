@@ -8,7 +8,12 @@ import { domainOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { inviteCapableUsers } from '#engine/rulebook/auth-rules.ts';
-import { loadRulebookStore, roomVersionOf } from './build.ts';
+import {
+  loadRulebookStore,
+  resolvePrevs,
+  roomVersionOf,
+  stateBefore,
+} from './build.ts';
 import { openRoom, type Room, type RoomTx } from './index.ts';
 import { withRoomLock } from './lock.ts';
 
@@ -161,9 +166,24 @@ export async function withRestrictedAdmission<T>(
               'restricted join eligibility not established',
             );
           }
-          const candidates = now.authorizers.filter((u) =>
-            domainOf(u) === self
-          );
+          let candidates = now.authorizers.filter((u) => domainOf(u) === self);
+          if (nominated === undefined) {
+            // Both local joins and federation templates author from the selected
+            // parents. Vouching still needs current eligibility, but a candidate
+            // absent or underpowered in those parents cannot authorize that PDU.
+            // Inbound nominees retain their actual-PDU DAG check in ingest.
+            const rulebook = getRulebook(await roomVersionOf(tx, now.stay));
+            const parents = await resolvePrevs(
+              tx,
+              await tx.extremities.parents(now.stay),
+            );
+            const state = await stateBefore(tx, parents.afterGroups, rulebook);
+            const store = await loadRulebookStore(tx, [...state.values()]);
+            const eligible = new Set(
+              inviteCapableUsers(state, store, rulebook.spec),
+            );
+            candidates = candidates.filter((user) => eligible.has(user));
+          }
           authorizer = nominated === undefined
             ? candidates[0] ?? null
             : candidates.includes(nominated)
