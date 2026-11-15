@@ -11,6 +11,7 @@ import { sendLocal } from '#engine/room/ingest.ts';
 import { project } from '#engine/server/project.ts';
 import {
   importReceiptOperation,
+  onEphemeral,
   receiptRows,
   setReceipt,
 } from '#engine/server/ephemeral.ts';
@@ -138,13 +139,13 @@ Deno.test('facade receipts: admission runs on the actual queued writer cut befor
             }
           },
         };
-        blocker = eventStreamTx(f.db, async () => {
+        blocker = eventStreamTx(f.db, async (conn) => {
           entered.resolve();
           await release.promise;
+          await conn.execute('UPDATE facade_scopes SET ready=0');
         });
         await entered.promise;
         writing = setReceipt(f.db, f.g.roomId, '@bob:test', kind, f.left, opts);
-        await f.db.execute('UPDATE facade_scopes SET ready=0');
         release.resolve();
         await blocker;
         await assertRejects(() => writing!, MatrixError, 'replica unavailable');
@@ -162,6 +163,46 @@ Deno.test('facade receipts: admission runs on the actual queued writer cut befor
         await f.close();
       }
     });
+  }
+});
+
+Deno.test('facade receipts: admitted duplicate and ancestor marks succeed without new receipt news', async (t) => {
+  for (const kind of ['m.read', 'm.read.private'] as const) {
+    for (const threadId of [null, 'main', '$thread']) {
+      await t.step(kind + ':' + threadId, async () => {
+        const f = await fixture();
+        let notices = 0;
+        const stop = onEphemeral((db, change) => {
+          if (db === f.db && change.kind === 'receipt') notices++;
+        });
+        try {
+          await activateReceiptSource(f);
+          assertEquals(await f.read(f.left, kind, threadId ?? undefined), true);
+          const before = await f.db.query(
+            "SELECT value FROM counters WHERE name='receipts'",
+          );
+          assertEquals(await f.read(f.left, kind, threadId ?? undefined), true);
+          assertEquals(await f.read(f.base, kind, threadId ?? undefined), true);
+          assertEquals(
+            await f.db.query(
+              "SELECT value FROM counters WHERE name='receipts'",
+            ),
+            before,
+          );
+          assertEquals(notices, 1);
+          assertEquals(
+            await setReceipt(f.db, f.g.roomId, '@outsider:test', kind, f.left, {
+              threadId,
+            }),
+            false,
+          );
+          assertEquals(notices, 1);
+        } finally {
+          stop();
+          await f.close();
+        }
+      });
+    }
   }
 });
 

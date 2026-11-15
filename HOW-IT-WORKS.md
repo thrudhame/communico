@@ -130,6 +130,14 @@ and verified room-version signatures/hashes enter the evidence pack; complete
 boundary authorization and the original operation budgets still apply.
 (`api/engine/room/boundary-fetch.ts`)
 
+Inbound recovery first tries the deeper DAG connection. If older ancestry is
+unavailable, it can instead import complete verified state at a nearer pulled
+event, including a held event reached through pulled ancestry. Pushed provenance
+never gains that permission: its direct parents must still be supplied. The
+existing batch budget bounds all attempts, and locked boundary/event authorization
+and current-state checks still decide what can ground or publish.
+(`api/engine/room/remote.ts`)
+
 Recovery authorizes complete evidence graphs outside the mutation lock, reading
 and inserting at most 32 evidence events per transaction. Every snapshot and
 write revalidates the room change cut; concurrent ordinary writes can interleave
@@ -1014,6 +1022,15 @@ metadata and PDU/EDU containers before persistence; malformed ephemeral entries
 cannot become typing stops, invented receipt timestamps or default presence.
 Unknown local handler failures propagate without caching transaction success.
 (`api/engine/federation/{discovery,discovery-response,peer-json,transactions,edus}.ts`)
+
+Standalone inbound transactions share one active result for the authenticated
+origin and transaction ID within a store. Concurrent retries do not repeat
+recovery, room ingest or EDU dispatch. Every retry still passes envelope
+admission, receives its own response value and retains the durable completed
+answer. Local failure reaches all waiters without caching success; a later retry
+can own the operation again. Other origins, IDs and stores remain independent.
+Durable facade ingress retains its mailbox-owned serialization and receipts.
+(`api/engine/federation/transactions.ts`, `api/engine/facade/mailbox.ts`)
 
 X-Matrix authorization parses quote-aware comma lists, token/quoted parameter
 values and unique names before signature verification. Discovery validates

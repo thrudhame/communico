@@ -237,7 +237,7 @@ export async function setReceiptMark(
   const incoming = [...new Set(targets)].sort();
   const ts = opts.ts ?? Date.now();
   const threadId = receiptThreadId(opts.threadId);
-  const row = await eventStreamTx(server, async (tx) => {
+  const admitted = await eventStreamTx(server, async (tx) => {
     await opts.authorize?.(tx);
     if (!await isJoined(tx, roomId, userId)) return null;
     if (threadId !== null && threadId !== 'main') {
@@ -303,11 +303,20 @@ export async function setReceiptMark(
       threadId,
     );
     await opts.authorize?.(tx);
-    return row;
+    // Admission and projection are different outcomes: an unchanged frontier
+    // is a successful mark, not a membership rejection.
+    return { row };
   });
-  if (row === null) return false;
+  if (admitted === null) return false;
   // Private rows wake their owner, but federation only consumes public rows.
-  notify(server, { kind: 'receipt', roomId, receiptType, row });
+  if (admitted.row !== null) {
+    notify(server, {
+      kind: 'receipt',
+      roomId,
+      receiptType,
+      row: admitted.row,
+    });
+  }
   return true;
 }
 
