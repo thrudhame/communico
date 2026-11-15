@@ -193,7 +193,7 @@ Deno.test('restore sanitation: purge consuming pools and old delivery authority,
         });
         await candidate.tx(file, async (conn) => {
           const status = await keyStatus(conn, f.device);
-          assertEquals(status.counts, {});
+          assertEquals(status.counts, { signed_curve25519: 0 });
           assertEquals(status.unused, []);
           assert(status.seq > Number(before[0].seq));
           assertEquals(
