@@ -2,6 +2,7 @@
 // devices removes their tokens (and those tokens' pushers and refresh
 // rows) with them.
 import type { Conn } from '#engine/store/db.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { appendDeviceChange } from '#engine/tenant/changes.ts';
@@ -11,6 +12,7 @@ import {
 } from '#engine/tenant/cross-signing.ts';
 import { config } from '#engine/config.ts';
 import { deletePushersForToken } from '#engine/tenant/pushers.ts';
+import { uiaAction, type UiaAuthorization } from '#engine/tenant/uia.ts';
 import {
   assertDeviceOwner,
   recordDeviceCreation,
@@ -265,8 +267,23 @@ export async function deleteDevices(
   tenant: Tenant,
   localpart: string,
   deviceIds: string[],
+  authorization?: UiaAuthorization,
 ): Promise<void> {
   await tenant.tx(async (tx) => {
+    if (authorization) {
+      const name = authorization.request.action.name;
+      if (name !== 'delete-device' && name !== 'delete-devices') {
+        throw new MatrixError(
+          403,
+          'M_FORBIDDEN',
+          'UIA action differs from device deletion',
+        );
+      }
+      await tx.uia.authorize(authorization, {
+        localpart,
+        action: uiaAction(name, deviceIds),
+      });
+    }
     for (const deviceId of deviceIds) {
       await tx.devices.delete(deviceId, localpart);
     }

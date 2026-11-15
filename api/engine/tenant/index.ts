@@ -505,8 +505,17 @@ function bind(
         auth.replaceRefreshToken(conn, hash, nextHash, accessHash),
     },
     uia: {
-      insert: (session: string, flows: { stages: string[] }[]) =>
-        uia.insertUiaSession(conn, session, flows),
+      capture: (request: Parameters<typeof uia.captureUiaState>[1]) =>
+        uia.captureUiaState(conn, request, authorize),
+      authorize: (
+        authorization: uia.UiaAuthorization,
+        expected?: { localpart: string; action: uia.UiaAction },
+      ) => uia.authorizeUia(conn, authorization, authorize, expected),
+      insert: (
+        session: string,
+        flows: { stages: string[] }[],
+        binding?: string | null,
+      ) => uia.insertUiaSession(conn, session, flows, binding),
       byId: (session: string) => uia.uiaSessionById(conn, session),
       complete: (session: string, stages: string[]) =>
         uia.completeUiaSessionStages(conn, session, stages),

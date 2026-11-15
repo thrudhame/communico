@@ -34,6 +34,7 @@ import { clearPushRules } from '#engine/tenant/pushrules.ts';
 import { markErased } from '#engine/tenant/erasure.ts';
 import { recordDeactivation } from '#engine/tenant/session-authority.ts';
 import { config } from '#engine/config.ts';
+import { uiaAction, type UiaAuthorization } from '#engine/tenant/uia.ts';
 
 // Spec appendices: user_id_localpart = 1*user_id_char;
 // user_id_char = DIGIT / a-z / "-" / "." / "=" / "_" / "/" / "+".
@@ -435,12 +436,25 @@ export async function changePassword(
   tenant: Tenant,
   localpart: string,
   newPassword: string,
-  opts: { keepToken?: string; logoutDevices: boolean },
+  opts: {
+    keepToken?: string;
+    logoutDevices: boolean;
+    authorization?: UiaAuthorization;
+  },
 ): Promise<void> {
   const keepHash = opts.keepToken === undefined
     ? null
     : await hashToken(opts.keepToken);
   await tenant.tx(async (tx) => {
+    if (opts.authorization) {
+      await tx.uia.authorize(opts.authorization, {
+        localpart,
+        action: uiaAction('password', {
+          password: newPassword,
+          logoutDevices: opts.logoutDevices,
+        }),
+      });
+    }
     await tx.credentials.set(localpart, hashPassword(newPassword));
     if (!opts.logoutDevices) return;
     let keepDevice: string | null = null;
@@ -469,10 +483,17 @@ export async function deactivateUser(
   tenant: Tenant,
   localpart: string,
   erasureCuts?: Record<string, ErasureCut>,
+  authorization?: UiaAuthorization,
 ): Promise<void> {
-  await tenant.tx((tx) =>
-    tx.users.deactivate(localpart, tenant.serverName, erasureCuts)
-  );
+  await tenant.tx(async (tx) => {
+    if (authorization) {
+      await tx.uia.authorize(authorization, {
+        localpart,
+        action: uiaAction('deactivate', { erase: erasureCuts !== undefined }),
+      });
+    }
+    await tx.users.deactivate(localpart, tenant.serverName, erasureCuts);
+  });
 }
 
 /** One cleanup owner for local deactivation and imported remove-wins status.

@@ -2,7 +2,7 @@ import { parseJson } from '#engine/operation-body.ts';
 import { theApp } from '#engine/app.ts';
 import { deactivateAccount } from '#engine/client/account.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
-import { PASSWORD_FLOWS, requireUia } from '#engine/tenant/uia.ts';
+import { PASSWORD_FLOWS, requireUia, uiaAction } from '#engine/tenant/uia.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 import { MatrixError } from '#engine/matrix-error.ts';
 
@@ -25,11 +25,17 @@ export default async function (request: PathfinderRequest, context: Context) {
   if (body.erase !== undefined && typeof body.erase !== 'boolean') {
     throw new MatrixError(400, 'M_BAD_JSON', 'erase must be a boolean');
   }
-  await requireUia(theApp().tenant, {
+  const authorization = await requireUia(theApp().tenant, {
     body,
     flows: PASSWORD_FLOWS,
     caller,
+    token: context.state.token,
+    action: uiaAction('deactivate', { erase: body.erase === true }),
   });
-  await deactivateAccount(localpartOf(caller), body.erase === true);
+  await deactivateAccount(
+    localpartOf(caller),
+    body.erase === true,
+    authorization,
+  );
   return { id_server_unbind_result: 'success' };
 }
