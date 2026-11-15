@@ -139,9 +139,7 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
           JSON.parse(batch[0].data) as Removal,
           batch[0].pos,
         );
-        return true;
-      }
-      if (batch.length) {
+      } else if (batch.length) {
         // Keep tenant deactivation and notification publication ordered. Only
         // immutable room facts, never tenant policy, escape preparation waits.
         for (const item of prepared) {

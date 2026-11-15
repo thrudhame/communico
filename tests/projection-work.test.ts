@@ -12,6 +12,7 @@ import {
 import { finishRoomRemoval } from '#engine/server/removal.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
 import { bobJoins, genesis } from '#tests/fixtures/genesis.ts';
+import { setTyping, typingIn } from '#engine/typing.ts';
 
 async function withStore(fn: (store: Store) => Promise<void>) {
   const dir = await Deno.makeTempDir();
@@ -384,6 +385,41 @@ Deno.test('projection work: tenant deactivation during room capture is not undon
       hold.release();
       await pending;
       hold.restore();
+    }
+  });
+});
+
+Deno.test('projection work: room removal reconciles typing before notifying completed projection', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!capture-drop-completion:test' });
+    await project(store, g.roomId);
+    const server = await store.server();
+    assertEquals(await setTyping(server, g.roomId, g.creator, true), true);
+    const observed: { typing: string[]; feed: unknown[] }[] = [];
+    const unlisten = onProjected(async (owner, roomId) => {
+      if (owner !== store || roomId !== g.roomId) return;
+      observed.push({
+        typing: typingIn(roomId).userIds,
+        feed: await server.query('SELECT event FROM feed WHERE room=?', [
+          roomId,
+        ]),
+      });
+    });
+    try {
+      await g.room.tx((tx) =>
+        tx.changes.append('drop', null, {
+          why: 'completion regression',
+          intents: [],
+        })
+      );
+      await project(store, g.roomId);
+      assertEquals(
+        { observed, typing: typingIn(g.roomId).userIds },
+        { observed: [{ typing: [], feed: [] }], typing: [] },
+      );
+    } finally {
+      unlisten();
+      await setTyping(server, g.roomId, g.creator, false);
     }
   });
 });
