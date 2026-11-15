@@ -11,9 +11,108 @@ import { putAccountData } from '#engine/tenant/accountdata.ts';
 import { localpartOf } from '#engine/ids.ts';
 import type { Room } from '#engine/room/index.ts';
 import { Turso } from '#engine/store/ffi.ts';
+import { relationBundlesFor } from '#engine/client/relation-view.ts';
+import type { Pdu } from '#engine/pdu.ts';
 import { httpSuite } from '#tests/http-app.ts';
 
 const suite = httpSuite('render batch work ownership');
+suite.test('relation bundles never hydrate unused annotations or disabled threads', async () => {
+  const app = theApp();
+  const user = await suite.registerTestUser('render-reaction-work', 'pw');
+  const { roomId } = await createRoom(app.store, {
+    creator: user.user_id,
+    preset: 'public_chat',
+  }, app.tenant.signer());
+  const room = await openRoom(app.store, roomId);
+  const parents = new Map<string, Pdu>();
+  const annotations = new Set<string>();
+  const threads = new Set<string>();
+  for (let n = 0; n < 2; n++) {
+    const root = await sendLocal(room, {
+      type: 'm.room.message',
+      sender: user.user_id,
+      content: { body: 'root ' + n, msgtype: 'm.text' },
+    }, app.tenant.signer());
+    const row = await room.tx((tx) => tx.events.get(root.eventId));
+    parents.set(root.eventId, JSON.parse(row!.pdu) as Pdu);
+    for (let k = 0; k < 12; k++) {
+      annotations.add(
+        (await sendLocal(room, {
+          type: 'm.reaction',
+          sender: user.user_id,
+          content: {
+            'm.relates_to': {
+              rel_type: 'm.annotation',
+              event_id: root.eventId,
+              key: String(k),
+            },
+          },
+        }, app.tenant.signer())).eventId,
+      );
+    }
+    threads.add(
+      (await sendLocal(room, {
+        type: 'm.room.message',
+        sender: user.user_id,
+        content: {
+          body: 'reply',
+          msgtype: 'm.text',
+          'm.relates_to': { rel_type: 'm.thread', event_id: root.eventId },
+        },
+      }, app.tenant.signer())).eventId,
+    );
+  }
+  const original = Turso.prototype.query;
+  let annotationHydrations = 0;
+  let annotationVisibilityReads = 0;
+  let threadHydrations = 0;
+  Turso.prototype.query = function (...args) {
+    const values = args[2] ?? [];
+    const annotation = values.some((v) =>
+      typeof v === 'string' && annotations.has(v)
+    );
+    if (args[1].includes('FROM events')) {
+      if (annotation) annotationHydrations++;
+      if (values.some((v) => typeof v === 'string' && threads.has(v))) {
+        threadHydrations++;
+      }
+    }
+    if (annotation && args[1].includes('FROM event_state')) {
+      annotationVisibilityReads++;
+    }
+    return original.apply(this, args);
+  };
+  try {
+    const viewer = { userId: user.user_id, deviceId: null, tenant: app.tenant };
+    const disabled = await relationBundlesFor(room, parents, viewer, {
+      threads: false,
+      redacted: new Set(),
+    }, new Set());
+    assertEquals([...disabled.values()].map((v) => v.thread), [null, null]);
+    assertEquals(
+      threadHydrations,
+      0,
+      'disabled thread candidates must not reach the room reader',
+    );
+    const enabled = await relationBundlesFor(room, parents, viewer, {
+      threads: true,
+      redacted: new Set(),
+    }, new Set());
+    assertEquals([...enabled.values()].map((v) => v.thread?.count), [1, 1]);
+    assertEquals(
+      annotationHydrations,
+      0,
+      'annotation bodies are not bundle inputs',
+    );
+    assertEquals(
+      annotationVisibilityReads,
+      0,
+      'unused annotations need no visibility evaluation',
+    );
+  } finally {
+    Turso.prototype.query = original;
+  }
+});
 suite.test('one timeline page captures ignore policy once, not per event or relation kind', async () => {
   const app = theApp();
   const user = await suite.registerTestUser('render-batch', 'pw');

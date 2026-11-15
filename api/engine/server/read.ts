@@ -290,9 +290,10 @@ export async function relationsForEvents(
   db: Db,
   roomId: string,
   eventIds: readonly string[],
+  relTypes: readonly string[],
 ): Promise<Map<string, RelationRow[]>> {
   const ids = [...new Set(eventIds)];
-  if (!ids.length) return new Map();
+  if (!ids.length || !relTypes.length) return new Map();
   return await db.tx(async (conn) => {
     const result = new Map<string, RelationRow[]>();
     for (let start = 0; start < ids.length; start += 32) {
@@ -301,8 +302,9 @@ export async function relationsForEvents(
         `SELECT r.relates_to,r.event,r.rel_type,r.seq FROM relations r ${RELATION_ELIGIBILITY}
          AND r.room=? AND r.relates_to IN (${
           page.map(() => '?').join(',')
-        }) ORDER BY r.seq ASC,r.event`,
-        [roomId, ...page],
+        }) AND r.rel_type IN (${relTypes.map(() => '?').join(',')})
+         ORDER BY r.seq ASC,r.event`,
+        [roomId, ...page, ...relTypes],
       );
       for (const row of rows) {
         const parent = String(row.relates_to);

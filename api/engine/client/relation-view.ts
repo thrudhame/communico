@@ -52,6 +52,7 @@ export async function relationBundlesFor(
     await room.store.server(),
     room.id,
     [...selected.keys()],
+    ['m.reference', 'm.replace', ...(opts.threads ? ['m.thread'] : [])],
   );
   const result = new Map<string, BundleSelection>();
   for (const id of parents.keys()) {
