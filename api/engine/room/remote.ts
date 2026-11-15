@@ -41,6 +41,10 @@ import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { identify, verify } from '#engine/room/verify.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
+import {
+  RecoveryAncestry,
+  type RecoverySnapshot,
+} from '#engine/room/recovery-ancestry.ts';
 
 export type RemoteOutcomeKind =
   | 'accepted'
@@ -169,28 +173,18 @@ async function fetchMissing(
   budget: { until: number },
   acc: FetchAcc,
 ): Promise<void> {
-  // Recovery sees the same verified union as the locked ingest. Supplied
-  // parents are not missing: walk through them to the actual unresolved
-  // edge. Bytes alone are not grounding; only a persisted after-state or
-  // a fetched boundary can end that walk.
+  // Direct-parent supply and ancestry grounding are different questions. A
+  // verified supplied parent needs no repeated brief wait/get_missing_events
+  // through its own held prefix. The batch recovery owner handles that prefix.
   const missingNow = async (): Promise<string[]> =>
     await room.tx(async (tx) => {
       const missing: string[] = [];
-      const seen = new Set<string>();
-      const visit = async (ids: readonly string[]): Promise<void> => {
-        for (const id of ids) {
-          if (seen.has(id)) continue;
-          seen.add(id);
-          if (
-            acc.boundaries.has(id) ||
-            (await tx.state.eventStateAfter(id)) !== null
-          ) continue;
-          const supplied = acc.live.get(id);
-          if (supplied === undefined) missing.push(id);
-          else await visit(supplied.pdu.prev_events ?? []);
-        }
-      };
-      await visit(item.pdu.prev_events ?? []);
+      for (const id of new Set(item.pdu.prev_events ?? [])) {
+        if (
+          !acc.live.has(id) && !acc.boundaries.has(id) &&
+          (await tx.state.eventStateAfter(id)) === null
+        ) missing.push(id);
+      }
       return missing;
     });
   const budgetLeft = () => budget.until - Date.now();
@@ -260,15 +254,14 @@ async function fetchMissing(
 
 // Chase the final supplied union, inside the original whole-batch budget.
 // Only pulled events permit state recovery behind their unresolved parents.
-async function recoverMissing(
+function recoveryOwner(
   room: Room,
-  item: VerifiedItem,
   origin: string,
   deps: RemoteDeps,
   version: string,
   budget: { until: number },
   acc: FetchAcc,
-): Promise<void> {
+): (item: VerifiedItem) => Promise<void> {
   const budgetLeft = () => budget.until - Date.now();
   // 3. Prefer the deeper DAG connection, but retain each pulled event as a
   // possible imported boundary if older ancestry is unavailable. Held bytes
@@ -279,6 +272,17 @@ async function recoverMissing(
   const attempted = new Set<string>();
   const recovered = new Map<string, Recovery>();
   const visiting = new Set<string>();
+  const ancestry = new RecoveryAncestry(room, () => budgetLeft() > 0);
+  let snapshot: RecoverySnapshot | null = null;
+  const refresh = async () => {
+    const next = await ancestry.snapshot(
+      acc.live,
+      acc.boundaries,
+      acc.terminal,
+    );
+    if (next !== snapshot) recovered.clear();
+    snapshot = next;
+  };
   const fetchBoundary = async (id: string): Promise<Recovery> => {
     // missinglimit sizes the missing-events answer, not this state-recovery
     // ladder. Charging older misses against it can suppress every usable
@@ -287,6 +291,9 @@ async function recoverMissing(
     if (budgetLeft() <= 0 || attempted.has(id)) return 'unavailable';
     attempted.add(id);
     await fetchGapTip(room, id, origin, deps, version, budget, acc);
+    // A network wait may have admitted local parents or changed the supplied
+    // union/boundaries. No missing/readiness result survives that changed cut.
+    await refresh();
     return acc.boundaries.has(id)
       ? 'ready'
       : acc.corrupted.has(id)
@@ -306,24 +313,32 @@ async function recoverMissing(
       return 'invalid';
     }
     if (budgetLeft() <= 0) return 'unavailable';
-    const prior = recovered.get(id);
+    if (snapshot === null) return 'unavailable';
+    const view = snapshot;
+    const key = JSON.stringify([id, source]);
+    const prior = recovered.get(key);
     if (prior !== undefined) return prior;
-    const grounding = await groundingOf(room, id);
-    if (grounding === 'grounded') return 'ready';
+    const held = view.nodes.get(id);
+    if (held?.grounded) return 'ready';
     const answered = acc.live.get(id);
     if (answered === undefined && source === 'pushed') return 'unavailable';
-    if (answered === undefined && grounding === 'unknown') {
+    if (answered === undefined && held === undefined) {
       const ready = await fetchBoundary(id);
-      recovered.set(id, ready);
+      if (snapshot !== view) return await chase(id, source);
+      recovered.set(key, ready);
       return ready;
     }
     // Pushed provenance wins over a pulled traversal. Its whole direct parent
     // set must be supplied before following any sibling, and it may never
     // import state to bypass withheld parents.
     const provenance = answered?.source ?? source;
-    const prevs = answered?.pdu.prev_events ??
-      await room.tx((tx) => tx.events.prevsOf(id));
-    if (provenance === 'pushed' && !await parentsSupplied(room, prevs, acc)) {
+    const prevs = answered?.pdu.prev_events ?? held?.prevs ?? [];
+    if (
+      provenance === 'pushed' &&
+      prevs.some((prev) =>
+        !acc.supplied.has(prev) && !view.nodes.get(prev)?.grounded
+      )
+    ) {
       return 'unavailable';
     }
     visiting.add(id);
@@ -344,55 +359,59 @@ async function recoverMissing(
     } finally {
       visiting.delete(id);
     }
-    recovered.set(id, result);
+    if (snapshot !== view) return await chase(id, source);
+    recovered.set(key, result);
     return result;
   };
-  await chase(item.eventId, item.source);
+  return async (item) => {
+    await refresh();
+    await chase(item.eventId, item.source);
 
-  // 4. missing DECLARED AUTH events of everything we are about to ingest
-  //    (this PDU plus what the answer landed) — one /event_auth per
-  //    event, inside the budget
-  if (budgetLeft() > 0) {
-    const want = [item, ...(acc.live.values().filter((v) => v.index === -1))];
-    for (const target of want) {
-      const declared = target.pdu.auth_events ?? [];
-      if (declared.length === 0) continue;
-      const missingAuth: string[] = [];
-      for (const id of declared) {
-        if (acc.evidence.has(id) || acc.live.has(id)) continue;
-        if ((await groundingOf(room, id)) === 'unknown') missingAuth.push(id);
-      }
-      if (missingAuth.length === 0) continue;
-      if (budgetLeft() <= 0) return;
-      const chain = await fetchOrNull(() =>
-        deps.fetcher.eventAuth(
-          room.id,
-          target.eventId,
-          origin,
-        )
-      );
-      if (chain === null) continue;
-      // missinglimit bounds get_missing_events, not this required auth
-      // pack. A prefix is not an auth chain. Verify the whole answer
-      // within the batch budget before exposing any of it to ingest.
-      const sorted = [...chain].sort((a, b) => a.depth - b.depth);
-      const verified = new Map<string, Pdu>();
-      for (const raw of sorted) {
-        if (budgetLeft() <= 0) return;
-        try {
-          const v = await verify(raw, version, deps.keys, {
-            roomId: room.id,
-          });
-          if (!acc.live.has(v.eventId)) verified.set(v.eventId, v.pdu);
-        } catch (error) {
-          if (!recoverableUpstream(error)) throw error;
-          // an unverifiable auth-chain event is simply not evidence
+    // 4. missing DECLARED AUTH events of everything we are about to ingest
+    //    (this PDU plus what the answer landed) — one /event_auth per
+    //    event, inside the budget
+    if (budgetLeft() > 0) {
+      const want = [item, ...(acc.live.values().filter((v) => v.index === -1))];
+      for (const target of want) {
+        const declared = target.pdu.auth_events ?? [];
+        if (declared.length === 0) continue;
+        const missingAuth: string[] = [];
+        for (const id of declared) {
+          if (acc.evidence.has(id) || acc.live.has(id)) continue;
+          if ((await groundingOf(room, id)) === 'unknown') missingAuth.push(id);
         }
+        if (missingAuth.length === 0) continue;
+        if (budgetLeft() <= 0) return;
+        const chain = await fetchOrNull(() =>
+          deps.fetcher.eventAuth(
+            room.id,
+            target.eventId,
+            origin,
+          )
+        );
+        if (chain === null) continue;
+        // missinglimit bounds get_missing_events, not this required auth
+        // pack. A prefix is not an auth chain. Verify the whole answer
+        // within the batch budget before exposing any of it to ingest.
+        const sorted = [...chain].sort((a, b) => a.depth - b.depth);
+        const verified = new Map<string, Pdu>();
+        for (const raw of sorted) {
+          if (budgetLeft() <= 0) return;
+          try {
+            const v = await verify(raw, version, deps.keys, {
+              roomId: room.id,
+            });
+            if (!acc.live.has(v.eventId)) verified.set(v.eventId, v.pdu);
+          } catch (error) {
+            if (!recoverableUpstream(error)) throw error;
+            // an unverifiable auth-chain event is simply not evidence
+          }
+        }
+        if (budgetLeft() <= 0) return;
+        for (const [id, pdu] of verified) acc.evidence.set(id, pdu);
       }
-      if (budgetLeft() <= 0) return;
-      for (const [id, pdu] of verified) acc.evidence.set(id, pdu);
     }
-  }
+  };
 }
 
 // /state_ids + /event for one gap tip: the fetched state is the tip's
@@ -651,6 +670,14 @@ export async function ingestRemote(
     terminal: new Set(),
   };
   const budget = { until: Date.now() + deps.limits.budgetMs };
+  const recoverMissing = recoveryOwner(
+    room,
+    origin,
+    deps,
+    version,
+    budget,
+    acc,
+  );
   if (source === 'pushed') {
     for (const item of items) {
       await fetchMissing(room, item, origin, deps, version, budget, acc);
@@ -663,7 +690,7 @@ export async function ingestRemote(
     if (source === 'pulled') {
       await fetchMissing(room, item, origin, deps, version, budget, acc);
     }
-    await recoverMissing(room, item, origin, deps, version, budget, acc);
+    await recoverMissing(item);
   }
   // A later input's missing-events answer can supply an earlier input's parent.
   // Decide unavailability once from the final verified union, before subsequent
