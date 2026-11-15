@@ -219,16 +219,18 @@ the next projection or startup rolls forward from its watermark.
 `api/engine/room/hooks.ts:21-48`, `api/engine/server/startup.ts:13-38`)
 
 Each room has one store-lifetime projection capture owner. Independent rooms
-prepare immutable room facts outside the global mutation queue; each existing
-500-change page then gets its own writer turn. A caller owes its admitted room
+prepare immutable room facts outside the global mutation queue. The existing
+500-change page bounds capture, not writer ownership: uncontended changes batch,
+but queued writer demand ends the turn at the next complete change. A caller owes its admitted room
 head, not later writes to a continuously busy room. Application rechecks both
 watermarks and the original room capability's incarnation before writing.
-Historical-context seed pages retain their durable cursor and the same writer
-turns. Tenant push decisions remain inside that turn, so preparation cannot
+Historical-context seed edges similarly commit the completed prefix cursor;
+same-room live publication waits for complete context. Tenant push decisions
+are recaptured inside each publication turn, so preparation cannot
 resurrect a deactivated account's notification facts.
 (`api/engine/server/{project,push-project}.ts`)
 
-Projection writes a batch and advances its watermark in one server
+Projection writes a complete change prefix and advances its watermark in one server
 transaction. Rows are idempotent on `(room, pos)`; outbox rows also include
 destination. The server assigns global live-feed sequence numbers here.
 It is durable truth for those numbers, delivery progress and user intent,
@@ -347,6 +349,10 @@ tenant OTK/fallback status. No-pos requests have empty device-list deltas;
 disabled extensions do not read or advance their independent cuts. Later enable
 reads from the connection's retained baseline, not an unrelated room-list cut.
 Unchanged status envelopes are not poll updates, while key-pool changes are.
+The tenant's shared key-status owner always includes `signed_curve25519: 0`
+for an exhausted pool, alongside actual counts for other uploaded algorithms,
+as Synapse does. Ordinary sync, sliding sync and key uploads use that same
+status; empty unused-fallback status is an explicit list, never absence.
 (`api/engine/sliding-sync/extensions.ts`)
 
 Final sliding publication runs only after rendering: one tenant transaction
