@@ -225,10 +225,14 @@ Deno.test('older archive over HTTP: consumed keys never reappear and newer ordin
     await t.step(
       'A consuming pools are empty before any refill; B-consumed material is never reissued',
       async () => {
-        assertEquals((await upload({})).one_time_key_counts, {});
+        assertEquals((await upload({})).one_time_key_counts, {
+          signed_curve25519: 0,
+        });
         assertEquals(await claim(), undefined);
         const reset = await sync(String(ordinaryB.next_batch));
-        assertEquals(reset.device_one_time_keys_count, {});
+        assertEquals(reset.device_one_time_keys_count, {
+          signed_curve25519: 0,
+        });
         assertEquals(reset.device_unused_fallback_key_types, []);
         const queried = await call(client + '/keys/query', bob.token, {
           device_keys: { [alice.user]: [alice.device] },
@@ -342,7 +346,7 @@ Deno.test('older archive over HTTP: consumed keys never reappear and newer ordin
         const encryption = await slide(encryptionRequest);
         assertEquals(
           object(object(encryption.extensions).e2ee).device_one_time_keys_count,
-          {},
+          { signed_curve25519: 0 },
         );
         assertEquals(
           await Promise.all(
