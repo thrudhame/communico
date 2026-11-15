@@ -369,6 +369,13 @@ Deno.test('F2 portable signatures cannot survive a signer incarnation deletion/r
         .master_keys,
       { ...f.master.json, signatures: {} },
     );
+    assertEquals(
+      await f.edge.db.tx((conn) =>
+        signatureView(conn, f.signed, user, f.master.pub, user)
+      ),
+      { ...f.master.json, signatures: {} },
+      'an embedded signature must not revive after same-key signer recreation',
+    );
     const next = await key('master');
     const old = await f.home.tenant.tx((tx) => tx.crossSigning.state('alice'));
     await f.home.tenant.tx((tx) =>
@@ -389,6 +396,99 @@ Deno.test('F2 portable signatures cannot survive a signer incarnation deletion/r
         .master_keys,
       { ...next.json, signatures: {} },
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('F2 embedded key admission retains original overlay bases once, never rebinds an old body on export or reopen', async () => {
+  const f = await setup();
+  try {
+    const old = await f.home.tenant.tx((tx) => tx.crossSigning.state('alice'));
+    await f.home.tenant.tx((tx) =>
+      tx.crossSigning.upload(
+        'alice',
+        user,
+        signingUpload({ master_key: f.signed }, user, config().e2ee),
+        canonicalJson(old),
+        true,
+      )
+    );
+    const operations = await f.home.db.tx((conn) =>
+      captureSignatureOperations(conn, 'alice')
+    );
+    assertEquals(operations.length, 2);
+    await f.dependencies();
+    for (const operation of operations) {
+      await f.edge.db.tx((conn) =>
+        importSignatureOperation(conn, operation, expected)
+      );
+    }
+    assertEquals(
+      (await f.edge.tenant.tx((tx) => tx.crossSigning.views('alice', user, '')))
+        .master_keys,
+      f.signed,
+    );
+    await deleteDevices(f.home.tenant, 'alice', ['LAN']);
+    await upsertDevice(f.home.tenant, 'alice', 'LAN');
+    const device = await deviceIdentity(f.home.tenant, 'alice', 'LAN');
+    const pub = b64encodeStd(await exportPublicKeyRaw(f.pair.publicKey));
+    await f.home.tenant.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload(
+          {
+            device_keys: {
+              user_id: user,
+              device_id: 'LAN',
+              algorithms: [],
+              keys: { 'ed25519:LAN': pub },
+              signatures: {},
+            },
+          },
+          user,
+          'LAN',
+          config().e2ee,
+        ),
+      )
+    );
+    const subordinate = await key('self_signing');
+    await signJson(
+      subordinate.json,
+      user,
+      'ed25519:' + f.master.pub,
+      f.master.pair.privateKey,
+    );
+    const current = await f.home.tenant.tx((tx) =>
+      tx.crossSigning.state('alice')
+    );
+    await f.home.tenant.tx((tx) =>
+      tx.crossSigning.upload(
+        'alice',
+        user,
+        signingUpload(
+          { self_signing_key: subordinate.json },
+          user,
+          config().e2ee,
+        ),
+        canonicalJson(current),
+        true,
+      )
+    );
+    await f.dependencies();
+    assertEquals(
+      await f.home.db.tx((conn) => captureSignatureOperations(conn, 'alice')),
+      operations,
+    );
+    for (const owner of [f.home, f.edge]) {
+      await owner.reopen();
+      assertEquals(
+        await owner.db.tx((conn) =>
+          signatureView(conn, f.signed, user, f.master.pub, user)
+        ),
+        { ...f.master.json, signatures: {} },
+      );
+    }
   } finally {
     await f.close();
   }

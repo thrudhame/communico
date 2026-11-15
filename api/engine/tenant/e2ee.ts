@@ -3,6 +3,7 @@ import type { Conn } from '#engine/store/db.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import { deviceById, deviceExists } from '#engine/tenant/devices.ts';
 import { appendDeviceChange, poolChanged } from '#engine/tenant/changes.ts';
+import { captureEmbeddedSignatures } from '#engine/tenant/signature-operations.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -184,6 +185,14 @@ export async function uploadKeys(
       await conn.execute(
         'INSERT INTO device_keys VALUES(?,?,?,?) ON CONFLICT(localpart,device_id,generation) DO UPDATE SET key_json=excluded.key_json',
         [...args, input.device],
+      );
+      const [tenant] = await conn.query('SELECT server_name FROM tenant');
+      await captureEmbeddedSignatures(
+        conn,
+        device.localpart,
+        '@' + device.localpart + ':' + tenant.server_name,
+        device.deviceId,
+        JSON.parse(input.device),
       );
       await appendDeviceChange(conn, device);
     }

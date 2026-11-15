@@ -28,6 +28,7 @@ import { validateUpload } from '#engine/tenant/e2ee.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { captureSigningOperations } from '#engine/tenant/signing-operations.ts';
+import { captureSignatureOperations } from '#engine/tenant/signature-operations.ts';
 import { signingUpload } from '#engine/e2ee-signing.ts';
 import {
   b64encodeStd,
@@ -74,7 +75,8 @@ function pauseImport(store: Store, cut: 'before' | 'during' | 'after') {
                     const value = await target.execute(...args);
                     if (
                       args[0].startsWith('INSERT INTO device_operations ') ||
-                      args[0].startsWith('INSERT INTO signing_operations ')
+                      args[0].startsWith('INSERT INTO signing_operations ') ||
+                      args[0].startsWith('INSERT INTO signature_operations ')
                     ) {
                       imported = true;
                       if (cut === 'during') await pause();
@@ -225,6 +227,425 @@ async function signingInput() {
   }
   return signingUpload(input, user, config().e2ee);
 }
+
+async function signatureInput(
+  f: Awaited<ReturnType<typeof fixture>>,
+  side: 'home' | 'edge' = 'home',
+) {
+  const tenant = side === 'home' ? f.ht : f.et;
+  const deviceId = side === 'home' ? 'LAN' : 'PHONE';
+  const user = '@alice:logical.test';
+  const pair = await generateSigningKeypair() as CryptoKeyPair;
+  const pub = b64encodeStd(await exportPublicKeyRaw(pair.publicKey));
+  await upsertDevice(tenant, 'alice', deviceId);
+  const device = await deviceIdentity(tenant, 'alice', deviceId);
+  await tenant.tx((tx) =>
+    tx.e2ee.upload(
+      device,
+      validateUpload(
+        {
+          device_keys: {
+            user_id: user,
+            device_id: deviceId,
+            algorithms: [],
+            keys: { ['ed25519:' + deviceId]: pub },
+            signatures: {},
+          },
+        },
+        user,
+        deviceId,
+        config().e2ee,
+      ),
+    )
+  );
+  const input = await signingInput();
+  await f.ht.tx((tx) =>
+    tx.crossSigning.upload('alice', user, input, '{}', false)
+  );
+  if (side === 'edge') {
+    const records = await f.hs.exportSigning('alice', f.bundle.id);
+    await f.ej.receive('home', records);
+    for (const record of records) await f.es.apply(f.ej, record);
+  }
+  const master = JSON.parse(input.master!.json);
+  const id = Object.values(master.keys as Record<string, string>)[0];
+  await signJson(master, user, 'ed25519:' + deviceId, pair.privateKey);
+  assertEquals(
+    await tenant.tx((tx) =>
+      tx.keySignatures.upload('alice', user, [{
+        user,
+        id,
+        json: master,
+      }])
+    ),
+    { failures: {} },
+  );
+  const db = await (side === 'home' ? f.home : f.edge).tenant('logical.test');
+  const [operation] = await db.tx((conn) =>
+    captureSignatureOperations(conn, 'alice')
+  );
+  assert(operation);
+  return operation;
+}
+
+Deno.test('signature link: a signed portable overlay is applied before its journal ACK', async () => {
+  const f = await fixture();
+  try {
+    const operation = await signatureInput(f);
+    const [template] = await f.hs.export('alice', f.bundle.id);
+    const view = {
+      ...(template.payload as { body: DeviceView }).body,
+      kind: 'signature-operation',
+      operation,
+    };
+    const body = {
+      ...template,
+      stream: 'signatures:@alice:logical.test',
+      type: 'signature-operation',
+      operationId: 'signature:' + createHash('sha256').update(canonicalJson([
+        f.bundle.id,
+        view.grantRevision,
+        view.ownerRevision,
+        operation.operationId,
+      ])).digest('hex'),
+      payload: {
+        body: view,
+        signature: await f.ht.signer().sign(canonicalJson(view)),
+      },
+    };
+    const { hash: _hash, ...unsigned } = body;
+    const record = { ...unsigned, hash: recordHash(unsigned) };
+    const journal = new Journal(await f.edge.server(), [...LINK_SUPPORTED, {
+      type: 'signature-operation',
+      version: 1,
+    }]);
+    await journal.receive('home', [record]);
+    assertEquals(await f.es.apply(journal, record), true);
+    assertEquals(
+      (await (await f.edge.tenant('logical.test')).query(
+        'SELECT payload_json FROM signature_operations',
+      )).map((row) => JSON.parse(String(row.payload_json))),
+      [operation],
+    );
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.hash,
+      record.hash,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('signature link: both selected sources export original overlays without echo or device/pool authority', async () => {
+  for (const side of ['home', 'edge'] as const) {
+    const f = await fixture();
+    try {
+      const operation = await signatureInput(f, side);
+      const owner = side === 'home' ? f.hs : f.es;
+      const receiver = side === 'home' ? f.es : f.hs;
+      const journal = side === 'home' ? f.ej : f.hj;
+      const peer = side === 'home' ? 'home' : 'edge_a';
+      const records = await owner.exportSignatures(
+        'alice',
+        side === 'home' ? f.bundle.id : undefined,
+      );
+      assertEquals(records.length, 1);
+      assertEquals(records[0].type, 'signature-operation');
+      assertEquals(records[0].stream, 'signatures:@alice:logical.test');
+      assertEquals(
+        await owner.exportSignatures(
+          'alice',
+          side === 'home' ? f.bundle.id : undefined,
+        ),
+        records,
+      );
+      await journal.receive(peer, records);
+      assertEquals(
+        await receiver.apply(
+          journal,
+          records[0],
+          side === 'edge' ? f.bundle.id : undefined,
+        ),
+        true,
+      );
+      assertEquals(
+        await receiver.apply(
+          journal,
+          records[0],
+          side === 'edge' ? f.bundle.id : undefined,
+        ),
+        false,
+      );
+      const db = await (side === 'home' ? f.edge : f.home).tenant(
+        'logical.test',
+      );
+      assertEquals(
+        (await db.query('SELECT payload_json FROM signature_operations')).map((
+          row,
+        ) => JSON.parse(String(row.payload_json))),
+        [operation],
+      );
+      assertEquals(
+        await receiver.exportSignatures(
+          'alice',
+          side === 'edge' ? f.bundle.id : undefined,
+        ),
+        [],
+      );
+      assertEquals(await db.query('SELECT * FROM device_operations'), []);
+      assertEquals(await db.query('SELECT * FROM one_time_keys'), []);
+      await assertRejects(
+        () =>
+          owner.exportSignatures(
+            'bob',
+            side === 'home' ? f.bundle.id : undefined,
+          ),
+        Error,
+        'account not selected',
+      );
+    } finally {
+      await f.close();
+    }
+  }
+  assert(
+    LINK_SUPPORTED.some((cap) =>
+      cap.type === 'signature-operation' && cap.version === 1
+    ),
+  );
+  assertEquals(
+    LINK_CAPABILITIES.some((cap) => cap.type === 'signature-operation'),
+    false,
+  );
+});
+
+Deno.test('signature link: changed signed scope, type or bytes never imports or ACKs an overlay', async () => {
+  for (
+    const fault of [
+      'signature',
+      'source',
+      'localpart',
+      'grantRevision',
+      'stream',
+      'type',
+    ] as const
+  ) {
+    const f = await fixture();
+    try {
+      await signatureInput(f);
+      const [record] = await f.hs.exportSignatures('alice', f.bundle.id);
+      const signed = record.payload as {
+        body: Record<string, unknown>;
+        signature: string;
+      };
+      if (fault === 'signature') signed.signature = 'A'.repeat(86);
+      else if (fault === 'stream') {
+        record.stream = 'signing:@alice:logical.test';
+      } else if (fault === 'type') record.type = 'signing-operation';
+      else {
+        signed.body[fault] = fault === 'source'
+          ? 'edge_a'
+          : fault === 'localpart'
+          ? 'bob'
+          : Number(signed.body.grantRevision) + 1;
+        signed.signature = await f.ht.signer().sign(canonicalJson(signed.body));
+      }
+      const { hash: _hash, ...body } = record;
+      record.hash = recordHash(body);
+      await f.ej.receive('home', [record]);
+      await assertRejects(() => f.es.apply(f.ej, record), Error);
+      assertEquals(
+        await (await f.edge.tenant('logical.test')).query(
+          'SELECT * FROM signature_operations',
+        ),
+        [],
+      );
+      assertEquals((await f.ej.next('home', record))?.hash, record.hash);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('signature link: current control, selection and pairing fence overlay admission', async () => {
+  for (const fault of ['control', 'selection', 'revoked'] as const) {
+    const f = await fixture();
+    try {
+      await signatureInput(f);
+      const [record] = await f.hs.exportSignatures('alice', f.bundle.id);
+      await f.ej.receive('home', [record]);
+      const db = await f.edge.tenant('logical.test');
+      if (fault === 'control') {
+        await db.tx((conn) =>
+          conn.execute('DELETE FROM facade_owner_activation')
+        );
+      } else if (fault === 'selection') {
+        await db.tx((conn) =>
+          conn.execute(
+            'UPDATE account_auth_snapshots SET grant_revision=grant_revision+1',
+          )
+        );
+      } else await f.fp.retire(await f.hp.revoke(f.bundle.id), 'a'.repeat(64));
+      await assertRejects(() => f.es.apply(f.ej, record), Error);
+      assertEquals(await db.query('SELECT * FROM signature_operations'), []);
+      assertEquals((await f.ej.next('home', record))?.hash, record.hash);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('signature link: revocation before or during overlay admission rolls back fact and receipt', async () => {
+  for (const side of ['home', 'edge'] as const) {
+    for (const cut of ['before', 'during'] as const) {
+      const f = await fixture();
+      try {
+        await signatureInput(f, side === 'home' ? 'edge' : 'home');
+        const records = side === 'home'
+          ? await f.es.exportSignatures('alice')
+          : await f.hs.exportSignatures('alice', f.bundle.id);
+        const store = side === 'home' ? f.home : f.edge;
+        const owner = side === 'home' ? f.hs : f.es;
+        const journal = side === 'home' ? f.hj : f.ej;
+        const peer = side === 'home' ? 'edge_a' : 'home';
+        await journal.receive(peer, records);
+        const paused = pauseImport(store, cut);
+        const outcome = owner.apply(
+          journal,
+          records[0],
+          side === 'home' ? f.bundle.id : undefined,
+        ).then(() => null, (error) => error);
+        try {
+          await Promise.race([
+            paused.reached,
+            outcome.then((error) => {
+              throw error ??
+                new Error('overlay admission did not reach its cut');
+            }),
+          ]);
+          const revoked = await f.hp.revoke(f.bundle.id);
+          if (side === 'edge') await f.fp.retire(revoked, 'a'.repeat(64));
+        } finally {
+          paused.resume();
+          paused.restore();
+        }
+        assert(await outcome instanceof Error);
+        const db = await store.tenant('logical.test');
+        assertEquals(await db.query('SELECT * FROM signature_operations'), []);
+        assertEquals(
+          await db.query('SELECT * FROM facade_link_applications'),
+          [],
+        );
+        assertEquals(
+          (await journal.next(peer, records[0]))?.hash,
+          records[0].hash,
+        );
+      } finally {
+        await f.close();
+      }
+    }
+  }
+});
+
+Deno.test('signature link: admitted overlay survives retirement and ACK loss across actual cold reopen', async () => {
+  for (const side of ['home', 'edge'] as const) {
+    const f = await fixture();
+    try {
+      await signatureInput(f, side === 'home' ? 'edge' : 'home');
+      const records = side === 'home'
+        ? await f.es.exportSignatures('alice')
+        : await f.hs.exportSignatures('alice', f.bundle.id);
+      const store = side === 'home' ? f.home : f.edge;
+      const owner = side === 'home' ? f.hs : f.es;
+      const journal = side === 'home' ? f.hj : f.ej;
+      const peer = side === 'home' ? 'edge_a' : 'home';
+      await journal.receive(peer, records);
+      const paused = pauseImport(store, 'after');
+      journal.complete = () =>
+        Promise.reject(new Error('injected signature ACK loss'));
+      const outcome = owner.apply(
+        journal,
+        records[0],
+        side === 'home' ? f.bundle.id : undefined,
+      ).then(() => null, (error) => error);
+      try {
+        await Promise.race([
+          paused.reached,
+          outcome.then((error) => {
+            throw error ?? new Error('overlay admission did not reach its cut');
+          }),
+        ]);
+        const revoked = await f.hp.revoke(f.bundle.id);
+        if (side === 'edge') await f.fp.retire(revoked, 'a'.repeat(64));
+      } finally {
+        paused.resume();
+        paused.restore();
+      }
+      const error = await outcome;
+      assert(
+        error instanceof Error &&
+          error.message === 'injected signature ACK loss',
+      );
+      await store.close();
+      const reopened = await f.open(side);
+      try {
+        const pairings = side === 'edge'
+          ? new Pairings(
+            await reopened.server(),
+            f.node.signer(),
+            f.node.publicKey,
+            'b'.repeat(64),
+            f.node,
+          )
+          : new Pairings(
+            await reopened.server(),
+            f.ht.signer(),
+            f.ht.publicB64,
+            'a'.repeat(64),
+          );
+        const coldJournal = new Journal(
+          await reopened.server(),
+          LINK_SUPPORTED,
+        );
+        const coldOwner = new DeviceOperations(
+          reopened,
+          side === 'edge' ? f.et : f.ht,
+          pairings,
+          side === 'edge' ? f.node : undefined,
+        );
+        assertEquals(
+          await coldOwner.apply(
+            coldJournal,
+            records[0],
+            side === 'home' ? f.bundle.id : undefined,
+          ),
+          true,
+        );
+        assertEquals(
+          (await coldJournal.heads(peer, 'in', records[0])).applied.hash,
+          records[0].hash,
+        );
+        assertEquals(
+          (await (await reopened.tenant('logical.test')).query(
+            'SELECT * FROM signature_operations',
+          )).length,
+          1,
+        );
+        assertEquals(
+          await coldOwner.apply(
+            coldJournal,
+            records[0],
+            side === 'home' ? f.bundle.id : undefined,
+          ),
+          false,
+        );
+      } finally {
+        await reopened.close();
+      }
+    } finally {
+      await f.close();
+    }
+  }
+});
 
 Deno.test('device link: current owner facts cross the signed journal without granting mutable authority or echoing', async () => {
   const f = await fixture();

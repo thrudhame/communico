@@ -23,7 +23,10 @@ import {
   tenantAuthority,
 } from '#engine/tenant/session-authority.ts';
 import { captureSigningOperations } from '#engine/tenant/signing-operations.ts';
-import type { SignatureOperation } from '#engine/tenant/signature-operations.ts';
+import {
+  captureEmbeddedSignatures,
+  type SignatureOperation,
+} from '#engine/tenant/signature-operations.ts';
 
 export async function signingState(
   conn: Conn,
@@ -191,6 +194,18 @@ export async function uploadSigningKeys(
   const publicChanged = ['master', 'self_signing'].some((u) =>
     old[u as keyof SigningUpload]?.json !== next[u as keyof SigningUpload]?.json
   );
+  for (const usage of signingUsages) {
+    const key = next[usage];
+    if (key && old[usage]?.json !== key.json) {
+      await captureEmbeddedSignatures(
+        conn,
+        localpart,
+        user,
+        key.public,
+        JSON.parse(key.json),
+      );
+    }
+  }
   await appendSigningChange(
     conn,
     localpart,

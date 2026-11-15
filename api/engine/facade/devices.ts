@@ -20,6 +20,11 @@ import {
   type SigningOperation,
 } from '#engine/tenant/signing-operations.ts';
 import {
+  captureSignatureOperations,
+  importSignatureOperation,
+  type SignatureOperation,
+} from '#engine/tenant/signature-operations.ts';
+import {
   linkApplication,
   retainLinkApplication,
 } from '#engine/tenant/link-applications.ts';
@@ -40,7 +45,20 @@ type SigningView = DomainBinding & {
   kind: 'signing-operation';
   operation: SigningOperation;
 };
-type KeyView = DeviceView | SigningView;
+type SignatureView = DomainBinding & {
+  kind: 'signature-operation';
+  operation: SignatureOperation;
+};
+type KeyView = DeviceView | SigningView | SignatureView;
+const keyKinds = {
+  'device-operation': { prefix: 'device:', stream: 'devices:@' },
+  'signing-operation': { prefix: 'signing:', stream: 'signing:@' },
+  'signature-operation': { prefix: 'signature:', stream: 'signatures:@' },
+} as const;
+
+function keyKind(value: string): value is KeyView['kind'] {
+  return Object.hasOwn(keyKinds, value);
+}
 
 function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
@@ -49,7 +67,7 @@ function mismatch(message: string): never {
 function viewOf(raw: unknown): KeyView {
   const row = object(raw), operation = object(row.operation);
   const localpart = text(row.localpart);
-  if (row.kind !== 'device-operation' && row.kind !== 'signing-operation') {
+  if (typeof row.kind !== 'string' || !keyKind(row.kind)) {
     mismatch('unknown public key operation');
   }
   const view = {
@@ -73,7 +91,7 @@ function viewOf(raw: unknown): KeyView {
 }
 
 function operationId(view: KeyView) {
-  return (view.kind === 'device-operation' ? 'device:' : 'signing:') +
+  return keyKinds[view.kind].prefix +
     createHash('sha256').update(canonicalJson([
       view.pairing,
       view.grantRevision,
@@ -83,7 +101,7 @@ function operationId(view: KeyView) {
 }
 
 function streamName(kind: KeyView['kind'], localpart: string, server: string) {
-  return (kind === 'device-operation' ? 'devices:@' : 'signing:@') + localpart +
+  return keyKinds[kind].stream + localpart +
     ':' + server;
 }
 
@@ -169,6 +187,15 @@ export class DeviceOperations {
     return await this.exportOperations('signing-operation', localpart, pairing);
   }
 
+  /** Verified overlays travel independently of the owner of their target keys. */
+  async exportSignatures(localpart: string, pairing?: string) {
+    return await this.exportOperations(
+      'signature-operation',
+      localpart,
+      pairing,
+    );
+  }
+
   private async exportOperations(
     kind: KeyView['kind'],
     localpart: string,
@@ -208,9 +235,14 @@ export class DeviceOperations {
     const operations = await (await this.store.tenant(context.server)).tx(
       async (conn) => {
         await this.tenantSelected(conn, binding);
-        return kind === 'device-operation'
-          ? await captureDeviceOperations(conn, localpart)
-          : await captureSigningOperations(conn, localpart);
+        switch (kind) {
+          case 'device-operation':
+            return await captureDeviceOperations(conn, localpart);
+          case 'signing-operation':
+            return await captureSigningOperations(conn, localpart);
+          case 'signature-operation':
+            return await captureSignatureOperations(conn, localpart);
+        }
       },
     );
     const records = [];
@@ -253,8 +285,7 @@ export class DeviceOperations {
     const record = await journal.next(peer, stream);
     if (!record) return false;
     if (
-      (record.type !== 'device-operation' &&
-        record.type !== 'signing-operation') || record.version !== 1
+      !keyKind(record.type) || record.version !== 1
     ) {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not device operation');
     }
@@ -312,8 +343,10 @@ export class DeviceOperations {
       await this.tenantSelected(conn, view);
       if (view.kind === 'device-operation') {
         await importDeviceOperation(conn, view.operation, view);
-      } else {
+      } else if (view.kind === 'signing-operation') {
         await importSigningOperation(conn, view.operation, view);
+      } else {
+        await importSignatureOperation(conn, view.operation, view);
       }
       const result = { operationId: view.operation.operationId };
       await retainLinkApplication(conn, peer, record, result);

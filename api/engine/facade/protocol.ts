@@ -78,6 +78,10 @@ export const SIGNING_OPERATION_CAPABILITY: Capability = {
   type: 'signing-operation',
   version: 1,
 };
+export const SIGNATURE_OPERATION_CAPABILITY: Capability = {
+  type: 'signature-operation',
+  version: 1,
+};
 export const LINK_SUPPORTED: readonly Capability[] = [
   ...LINK_CAPABILITIES,
   OWNER_CONTROL_CAPABILITY,
@@ -85,6 +89,7 @@ export const LINK_SUPPORTED: readonly Capability[] = [
   DOMAIN_OPERATION_CAPABILITY,
   DEVICE_OPERATION_CAPABILITY,
   SIGNING_OPERATION_CAPABILITY,
+  SIGNATURE_OPERATION_CAPABILITY,
 ];
 
 function bad(message: string): never {

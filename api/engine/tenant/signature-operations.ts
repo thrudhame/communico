@@ -21,6 +21,8 @@ import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import {
   keyMaterial,
   type SignatureSigner,
+  signatureSigner,
+  signatureTargetMaterial,
 } from '#engine/tenant/signature-view.ts';
 
 export const SIGNATURE_OPERATIONS_SQL = `
@@ -98,6 +100,62 @@ export async function appendSignatureOperation(
   });
   await retain(conn, operation);
   return operation;
+}
+
+/** Embedded mutable overlays become the same exact-basis facts as a signature
+ * upload. Call only at original key admission, never while rendering or replaying
+ * an old key body: current possession of a reused public key is not provenance. */
+export async function captureEmbeddedSignatures(
+  conn: Conn,
+  localpart: string,
+  user: string,
+  id: string,
+  json: Json,
+): Promise<void> {
+  if (!await tenantAuthority(conn)) return;
+  const [tenant] = await conn.query('SELECT server_name FROM tenant');
+  const signerUser = '@' + localpart + ':' + tenant.server_name;
+  const signatures = json.signatures;
+  if (
+    !signatures || typeof signatures !== 'object' || Array.isArray(signatures)
+  ) return;
+  const own = (signatures as Json)[signerUser];
+  if (!own || typeof own !== 'object' || Array.isArray(own)) return;
+  const usage = Array.isArray(json.usage) && json.usage.length === 1
+    ? json.usage[0]
+    : null;
+  const signers: SignatureOperation['signers'] = [];
+  for (const [key, signature] of Object.entries(own)) {
+    if (typeof signature !== 'string') continue;
+    const signer = await signatureSigner(conn, localpart, key);
+    if (
+      !signer ||
+      (signerUser !== user
+        ? usage !== 'master' || signer.usage !== 'user_signing'
+        : usage === 'master'
+        ? signer.usage !== 'device'
+        : usage !== null || signer.usage !== 'self_signing')
+    ) continue;
+    try {
+      if (
+        await verifyJson(
+          json,
+          signerUser,
+          key,
+          await importPublicKeyFromRaw(matrixBase64(signer.public, 32)),
+        )
+      ) {
+        signers.push({ signer, signature });
+      }
+    } catch { /* Unverified embedded signatures never become owner facts. */ }
+  }
+  if (!signers.length) return;
+  await appendSignatureOperation(conn, localpart, {
+    user,
+    id,
+    json,
+    material: await signatureTargetMaterial(conn, json, user, id),
+  }, signers);
 }
 
 export async function captureSignatureOperations(
@@ -199,7 +257,9 @@ export async function importSignatureOperation(
       'signature',
       row.sequence,
     ]),
-    ...expected,
+    source: expected.source,
+    incarnation: expected.incarnation,
+    localpart: expected.localpart,
     sequence: Number(row.sequence),
     target: {
       user: target.user,

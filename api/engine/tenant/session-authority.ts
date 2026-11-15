@@ -9,6 +9,10 @@ import { deletePushersForToken } from '#engine/tenant/pushers.ts';
 import { deactivateUserRows } from '#engine/tenant/users.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
 import { authUnavailable } from '#engine/tenant/account-auth.ts';
+import {
+  legacySignatures,
+  retainLegacySignatures,
+} from '#engine/tenant/signature-bootstrap.ts';
 
 export const SESSION_AUTHORITY_SQL = `
 CREATE TABLE tenant_authority(singleton INTEGER PRIMARY KEY CHECK(singleton=1),node TEXT NOT NULL,incarnation TEXT NOT NULL,home_incarnation TEXT NOT NULL,edge_node TEXT NOT NULL,edge_incarnation TEXT NOT NULL);
@@ -90,6 +94,9 @@ export async function activateTenantAuthority(
     ownerUnavailable();
   }
   if (!held) {
+    const signatures = identity.node === 'home'
+      ? await legacySignatures(conn)
+      : [];
     await conn.execute('INSERT INTO tenant_authority VALUES(1,?,?,?,?,?)', [
       identity.node,
       identity.incarnation,
@@ -146,6 +153,7 @@ export async function activateTenantAuthority(
         }
       }
     }
+    await retainLegacySignatures(conn, signatures);
   }
 }
 

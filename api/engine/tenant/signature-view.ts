@@ -157,14 +157,15 @@ export async function signatureView(
           if (typeof signature !== 'string') continue;
           const signer = await signatureSigner(conn, localpartOf(user), id);
           if (!signer) continue;
+          // Mutable overlays require their original admission basis below. Only
+          // intrinsic identity/self signatures may come directly from a body.
           const allowed = user !== owner
-            ? usage === 'master' && signer.usage === 'user_signing'
+            ? false
             : usage === 'master'
-            ? signer.usage === 'device' || signer.usage === 'master'
+            ? signer.usage === 'master' && id === 'ed25519:' + target
             : usage === 'self_signing' || usage === 'user_signing'
             ? signer.usage === 'master'
-            : signer.usage === 'self_signing' ||
-              signer.usage === 'device' && id === 'ed25519:' + target;
+            : signer.usage === 'device' && id === 'ed25519:' + target;
           if (!allowed) continue;
           try {
             if (
