@@ -200,6 +200,7 @@ Deno.test('E1: tenant commit survives projection interruption; replay cannot res
       changes,
     );
     assertEquals((await reopened.tx((tx) => tx.e2ee.status(device))).counts, {
+      signed_curve25519: 0,
       curve25519: 1,
     });
     assertEquals(
@@ -267,7 +268,9 @@ Deno.test('E1: simultaneous claims consume each accepted key once; upload orderi
       ),
     );
     assertEquals(new Set(claims.map((key) => Object.keys(key!)[0])).size, 12);
-    assertEquals((await tenant.tx((tx) => tx.e2ee.status(device))).counts, {});
+    assertEquals((await tenant.tx((tx) => tx.e2ee.status(device))).counts, {
+      signed_curve25519: 0,
+    });
     assertEquals(
       await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
       null,
@@ -380,7 +383,9 @@ Deno.test('F2: consumed OTK identities remain burned across reupload and cold re
     store = await openStore(config(dir), { schemas: { tenant: tenantSchema } });
     tenant = await openTenant(store, 'a.test');
     await tenant.tx((tx) => tx.e2ee.upload(device, input));
-    assertEquals((await tenant.tx((tx) => tx.e2ee.status(device))).counts, {});
+    assertEquals((await tenant.tx((tx) => tx.e2ee.status(device))).counts, {
+      signed_curve25519: 0,
+    });
     for (let n = 0; n < 2; n++) {
       assertEquals(
         await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
@@ -419,7 +424,7 @@ Deno.test('F2: consumed OTK identities remain burned across reupload and cold re
 Deno.test('F2: v27 pool upgrade preserves inventory and installs the same irreversible consumption owner as fresh stores', async () => {
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
-    schemas: { tenant: historicalTenantSchema(27) },
+    schemas: { tenant: historicalTenantSchema(28) },
   });
   try {
     await openTenant(store, 'a.test', { create: true });
@@ -497,7 +502,7 @@ Deno.test('E1: pool overflow rejects the entire mutation and leaves accepted key
       })
     );
     const status = await tenant.tx((tx) => tx.e2ee.status(device));
-    assertEquals(status.counts, { curve25519: 1 });
+    assertEquals(status.counts, { signed_curve25519: 0, curve25519: 1 });
     assertEquals(status.unused, []);
     assertEquals(
       await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),

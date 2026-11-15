@@ -18,7 +18,7 @@ Deno.test('tenant link applications: prior schema upgrade, exact immutable recei
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { tenant: historicalTenantSchema(30) },
+    schemas: { tenant: historicalTenantSchema(31) },
   });
   const body = {
     source: 'home',

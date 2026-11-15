@@ -8,11 +8,13 @@ import {
   exportSessionAuthority,
 } from '#engine/facade/accounts.ts';
 import { DeviceOperations, type DeviceView } from '#engine/facade/devices.ts';
+import { DomainOperations } from '#engine/facade/domain.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { bindRole } from '#engine/facade/role.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   LINK_CAPABILITIES,
   LINK_SUPPORTED,
@@ -103,7 +105,7 @@ function pauseImport(store: Store, cut: 'before' | 'during' | 'after') {
   };
 }
 
-async function fixture() {
+async function fixture(publicFirst = false) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-device-link-' });
   const open = (side: string) =>
     openStore({
@@ -175,6 +177,12 @@ async function fixture() {
   const control = await exportOwnerControl(home, ht, hp, bundle.id);
   await ej.receive('home', [control]);
   await owners.apply(ej, control);
+  if (publicFirst) {
+    const view = await ht.tx((tx) =>
+      tx.publicReplica.export('alice', ht.serverName)
+    );
+    await et.tx((tx) => tx.publicReplica.install(view, et.serverName));
+  }
   const accounts = new AccountSnapshots(home, ht, hp);
   const auth = await exportAccountAuth(home, ht, hp, bundle.id, 'alice', false);
   await ej.receive('home', [auth]);
@@ -202,6 +210,93 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('F2 public evidence cannot replace semantic account state in either bootstrap order or after cold reopen', async () => {
+  for (const publicFirst of [false, true]) {
+    const f = await fixture(publicFirst);
+    let reopened;
+    try {
+      const domains = await new DomainOperations(f.home, f.ht, f.hp).bootstrap(
+        'alice',
+        f.bundle.id,
+      );
+      const receiver = new DomainOperations(f.edge, f.et, f.fp, f.node);
+      await f.ej.receive('home', domains);
+      for (const record of domains) await receiver.apply(f.ej, record);
+      const cuts = {
+        '!kept:logical.test': { changePos: 3, segment: 1, group: 2 },
+      };
+      await f.et.tx(async (tx) => {
+        await tx.profiles.set('alice', 'displayname', 'Outside profile');
+        await tx.erasure.mark('alice', cuts);
+      });
+      await upsertDevice(f.et, 'alice', 'PHONE', 'Outside phone');
+      await f.ht.tx((tx) =>
+        tx.profiles.set('alice', 'displayname', 'Home profile')
+      );
+      const view = await f.ht.tx((tx) =>
+        tx.publicReplica.export('alice', f.ht.serverName)
+      );
+      await f.et.tx((tx) => tx.publicReplica.install(view, f.et.serverName));
+      await f.et.tx((tx) => tx.publicReplica.install(view, f.et.serverName));
+      // F1 terminal evidence is not an authenticated F2 deactivation operation.
+      const terminal = { ...view, cut: view.cut + 1, deactivated: true };
+      await f.et.tx((tx) =>
+        tx.publicReplica.install(terminal, f.et.serverName)
+      );
+      await f.edge.close();
+      reopened = await f.open('edge');
+      const tenant = await openTenant(reopened, 'logical.test');
+      assertEquals(
+        (await tenant.tx((tx) => tx.users.byLocalpart('alice')))?.deactivated,
+        false,
+      );
+      assertEquals(
+        (await tenant.tx((tx) => tx.profiles.get('alice')))?.displayname,
+        'Outside profile',
+      );
+      assertEquals(
+        await tenant.tx((tx) => tx.erasure.get('alice', '!kept:logical.test')),
+        cuts['!kept:logical.test'],
+      );
+      const db = await reopened.tenant('logical.test');
+      assertEquals(
+        (await db.query(
+          'SELECT snapshot_json FROM public_user_replicas WHERE localpart=?',
+          ['alice'],
+        ))[0].snapshot_json,
+        canonicalJson(terminal),
+      );
+      assertEquals(
+        (await tenant.tx((tx) => tx.devices.byId('PHONE', 'alice')))
+          ?.display_name,
+        'Outside phone',
+      );
+      // Selection is per account; activation alone never converts owned users.
+      await tenant.tx((tx) => tx.users.insert('unselected', 'Unselected'));
+      await assertRejects(
+        () =>
+          tenant.tx((tx) =>
+            tx.publicReplica.install({
+              ...view,
+              userId: '@unselected:logical.test',
+              devices: {
+                user_id: '@unselected:logical.test',
+                stream_id: 0,
+                devices: [],
+              },
+              signing: {},
+            }, tenant.serverName)
+          ),
+        MatrixError,
+        'owned account',
+      );
+    } finally {
+      await reopened?.close();
+      await f.close();
+    }
+  }
+});
 
 async function signingInput() {
   const user = '@alice:logical.test';

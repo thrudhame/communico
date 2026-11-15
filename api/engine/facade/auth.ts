@@ -4,6 +4,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import type { Database } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
+  accountAuthPublication,
   authUnavailable,
   requireAccountAuth,
 } from '#engine/tenant/account-auth.ts';
@@ -232,17 +233,31 @@ export class FacadeAuth {
           ) unavailable();
           return;
         }
+        const binding = {
+          pairing: admission.pairing,
+          grantRevision: admission.grantRevision,
+          ownerRevision: Number(activation.revision),
+        };
+        // Read the publication and installed cut from this same owner commit.
+        // The asynchronously projected server scope must not select a different
+        // tenant snapshot for permissive authentication.
+        const publication = await accountAuthPublication(
+          conn,
+          localpart,
+          binding,
+        );
         await requireAccountAuth(
           conn,
           localpart,
           {
-            pairing: admission.pairing,
-            grantRevision: admission.grantRevision,
-            ownerRevision: Number(activation.revision),
-            sourceCut: Number(cut.source_cut),
+            ...binding,
+            sourceCut: publication.sourceCut,
           },
           this.settings,
-          cut.ready === 1 && cut.pending_hash === null &&
+          current() && cut.ready === 1 && cut.pending_hash === null &&
+            Number(cut.source_cut) === publication.sourceCut &&
+            Number(cut.applied) === publication.sequence &&
+            cut.applied_hash === publication.hash &&
             Number(cut.received) === Number(cut.applied) &&
             cut.received_hash === cut.applied_hash &&
             this.health.ready(admission.pairing, scope, {

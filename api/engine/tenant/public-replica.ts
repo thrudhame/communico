@@ -8,6 +8,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import { signingViews } from './cross-signing.ts';
 import { deviceSnapshot, type Json, object } from './e2ee.ts';
+import { tenantAuthority } from './session-authority.ts';
 import {
   materializeProfile,
   profileOperations,
@@ -171,6 +172,16 @@ export async function installPublicUser(
 ): Promise<void> {
   const view = publicUserOf(raw, server);
   const localpart = splitId(view.userId).localpart;
+  // Account auth is the durable semantic transition, independently of which
+  // public stream arrived first. A selected F2 account retains F1 evidence but
+  // its domain/lifecycle owners alone materialize profile and erasure changes.
+  // Freshness controls admission, not a fallback to obsolete F1 write authority.
+  const authority = await tenantAuthority(conn);
+  const semantic = authority && authority.node !== 'home' &&
+    (await conn.query(
+        'SELECT 1 FROM account_auth_snapshots WHERE localpart=?',
+        [localpart],
+      )).length > 0;
   const held = await storedPublicReplica(conn, localpart);
   const encoded = canonicalJson(view);
   if (
@@ -187,7 +198,7 @@ export async function installPublicUser(
   }
   // Never silently turn a real owned account into a projection.
   if (
-    !held &&
+    !held && !semantic &&
     (await conn.query('SELECT 1 FROM users WHERE localpart=?', [localpart]))
       .length
   ) {
@@ -201,7 +212,7 @@ export async function installPublicUser(
     'SELECT deactivated FROM users WHERE localpart=?',
     [localpart],
   );
-  if (user?.deactivated !== 1) {
+  if (!semantic && user?.deactivated !== 1) {
     await conn.execute(
       'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET deactivated=excluded.deactivated',
       [localpart, view.deactivated ? 1 : 0],
@@ -211,6 +222,7 @@ export async function installPublicUser(
     'INSERT INTO public_user_replicas(localpart,source_cut,snapshot_json) VALUES(?,?,?) ON CONFLICT(localpart) DO UPDATE SET source_cut=excluded.source_cut,snapshot_json=excluded.snapshot_json',
     [localpart, view.cut, encoded],
   );
+  if (semantic) return;
   // Retain and acknowledge the authenticated source record while refusing its
   // obsolete materialization. In particular, never delete a local erasure cut.
   if (user?.deactivated === 1) return;

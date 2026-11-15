@@ -21,7 +21,7 @@ Deno.test('F2 public device schema upgrades the prior pool owner and retains imp
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { tenant: historicalTenantSchema(28) },
+    schemas: { tenant: historicalTenantSchema(29) },
   });
   try {
     let tenant = await openTenant(store, 'logical.test', { create: true });
