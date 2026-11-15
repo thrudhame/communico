@@ -144,6 +144,7 @@ export async function startFacade(lifetime: ServerLifetime) {
           pairings: runtime.pairings,
           initialize: runtime.initialize,
           status,
+          tenant: runtime.grantedTenant,
           changed: async () => {
             await runtime.changed();
             await compose();

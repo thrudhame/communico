@@ -48,6 +48,7 @@ import * as slidingSync from '#engine/tenant/sliding-sync.ts';
 import * as users from '#engine/tenant/users.ts';
 import * as openid from '#engine/tenant/openid.ts';
 import * as profiles from '#engine/tenant/profiles.ts';
+import * as conflicts from '#engine/tenant/conflicts.ts';
 import * as erasure from '#engine/tenant/erasure.ts';
 import * as publicReplica from '#engine/tenant/public-replica.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
@@ -150,6 +151,12 @@ function bind(
         publicReplica.installPublicUser(conn, raw, server),
     },
     streams: { heads: () => syncStreamHeads(conn) },
+    conflicts: {
+      inspect: (selector: conflicts.ConflictSelector) =>
+        conflicts.inspectConflicts(conn, selector),
+      export: (selector: conflicts.ConflictSelector, operationId: string) =>
+        conflicts.exportConflict(conn, selector, operationId),
+    },
     keyBackup: {
       clear: (localpart: string) => keyBackup.clearBackup(conn, localpart),
       version: (
