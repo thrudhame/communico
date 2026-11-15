@@ -202,6 +202,11 @@ Deno.test('restore report warnings: lost revocations, cancellations, peer effect
       'never automatic',
       'Frozen federation',
       'COMMUNICO_TURN_SECRET',
+      'explicit empty unused-fallback list',
+      'matrix-sdk-crypto 0.19.1',
+      '7 days old',
+      'one-time keys run out',
+      'Archived fallback keys are never republished',
     ]
   ) assert(text.includes(disclosure), disclosure);
   const cache = warnings.find((warning) =>

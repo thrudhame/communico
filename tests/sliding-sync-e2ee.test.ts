@@ -77,6 +77,7 @@ Deno.test('sliding e2ee: independent device cuts retain disabled-period changes 
     assert(initial);
     assertEquals(initial.response.device_lists, { changed: [], left: [] });
     assertEquals(initial.response.device_one_time_keys_count, {
+      signed_curve25519: 0,
       curve25519: 1,
     });
     assertEquals(initial.response.device_unused_fallback_key_types, [
@@ -135,7 +136,9 @@ Deno.test('sliding e2ee: independent device cuts retain disabled-period changes 
       enabledLater.state.poolSeq,
     );
     assert(consumed);
-    assertEquals(consumed.response.device_one_time_keys_count, {});
+    assertEquals(consumed.response.device_one_time_keys_count, {
+      signed_curve25519: 0,
+    });
     assert(
       consumed.relevant,
       'a changed pool is relevant, an unchanged pool is not',

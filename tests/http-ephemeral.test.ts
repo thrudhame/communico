@@ -895,5 +895,5 @@ suite.test('the keys upload stub retains its old authenticated shape', async () 
     {},
   );
   assertEquals(upload.status, 200);
-  assertEquals(upload.body, { one_time_key_counts: {} });
+  assertEquals(upload.body, { one_time_key_counts: { signed_curve25519: 0 } });
 });

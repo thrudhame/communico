@@ -626,7 +626,14 @@ resumes with normal semantics; there is no additional approval flag.
 An older archive cannot recover post-cut messages, credentials/revocations,
 cancellations, peer acknowledgments or client private keys. Old credentials and
 jobs may revive; external side effects may repeat. Restored OTK/fallback pools
-are cleared so clients can refill them. Ordinary sync receives a fresh recovery
+are cleared so clients can refill them. The server reports an explicit empty
+unused-fallback list, but retained clients may wait for their normal rotation:
+matrix-sdk-crypto 0.19.1 replaces an existing fallback only once it is 7 days old.
+Fallback keys are used only when one-time keys run out; devices can refill OTKs
+while their server fallback pool remains empty until client rotation. Archived
+fallback keys are never republished because they may already have been used.
+Do not reset client crypto stores or change clocks to force rotation.
+Ordinary sync receives a fresh recovery
 identity, sliding positions expire, and peers receive device-list resnapshot
 resets. Keep clients' crypto stores. These mechanisms do not reconstruct lost
 private keys. Ordinary recovery sends admitted restored state at an empty,
