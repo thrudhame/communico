@@ -287,52 +287,104 @@ function recoveryOwner(
     id: string,
     source: VerifiedItem['source'],
   ): Promise<boolean> => {
-    deps.signal?.throwIfAborted();
-    if (acc.boundaries.has(id)) return true;
-    if (acc.terminal.has(id) || visiting.has(id) || budgetLeft() <= 0) {
-      return false;
-    }
-    if (snapshot === null) return false;
-    const view = snapshot;
-    const key = JSON.stringify([id, source]);
-    const prior = recovered.get(key);
-    if (prior !== undefined) return prior;
-    const held = view.nodes.get(id);
-    if (held?.grounded) return true;
-    const answered = acc.live.get(id);
-    if (answered === undefined && source === 'pushed') return false;
-    if (answered === undefined && held === undefined) {
-      const ready = await fetchBoundary(id);
-      if (snapshot !== view) return await chase(id, source);
-      recovered.set(key, ready);
-      return ready;
-    }
-    // Pushed provenance wins over a pulled traversal. Its whole direct parent
-    // set must be supplied before following any sibling, and it may never
-    // import state to bypass withheld parents.
-    const provenance = answered?.source ?? source;
-    const prevs = answered?.pdu.prev_events ?? held?.prevs ?? [];
-    if (
-      provenance === 'pushed' &&
-      prevs.some((prev) =>
-        !acc.live.has(prev) && !view.nodes.get(prev)?.grounded
-      )
-    ) {
-      return false;
-    }
-    visiting.add(id);
-    let ready = true;
+    type Walk = {
+      view: RecoverySnapshot;
+      key: string;
+      provenance: VerifiedItem['source'];
+      prevs: string[];
+      next: number;
+      ready: boolean;
+    };
+    type Frame = { id: string; source: VerifiedItem['source']; walk?: Walk };
+    // Captured held paths may have no I/O before their deepest ancestor.
+    // Heap-owned DFS frames, including snapshot retries, never grow the JS stack.
+    const stack: Frame[] = [{ id, source }];
+    let result = false;
+    const finish = (ready: boolean) => {
+      stack.pop();
+      const parent = stack.at(-1)?.walk;
+      if (parent !== undefined && !ready) parent.ready = false;
+      result = ready;
+    };
     try {
-      for (const prev of prevs) {
-        if (!await chase(prev, provenance)) ready = false;
+      while (stack.length > 0) {
+        deps.signal?.throwIfAborted();
+        const frame = stack.at(-1)!;
+        const { id, source } = frame;
+        if (frame.walk === undefined) {
+          if (acc.boundaries.has(id)) {
+            finish(true);
+            continue;
+          }
+          if (
+            acc.terminal.has(id) || visiting.has(id) || budgetLeft() <= 0 ||
+            snapshot === null
+          ) {
+            finish(false);
+            continue;
+          }
+          const view = snapshot;
+          const key = JSON.stringify([id, source]);
+          const prior = recovered.get(key);
+          if (prior !== undefined) {
+            finish(prior);
+            continue;
+          }
+          const held = view.nodes.get(id);
+          if (held?.grounded) {
+            finish(true);
+            continue;
+          }
+          const answered = acc.live.get(id);
+          if (answered === undefined && source === 'pushed') {
+            finish(false);
+            continue;
+          }
+          if (answered === undefined && held === undefined) {
+            const ready = await fetchBoundary(id);
+            if (snapshot !== view) continue;
+            recovered.set(key, ready);
+            finish(ready);
+            continue;
+          }
+          // Pushed provenance wins and requires the complete direct parent set;
+          // it may never import state to bypass withheld parents.
+          const provenance = answered?.source ?? source;
+          const prevs = answered?.pdu.prev_events ?? held?.prevs ?? [];
+          if (
+            provenance === 'pushed' &&
+            prevs.some((prev) =>
+              !acc.live.has(prev) && !view.nodes.get(prev)?.grounded
+            )
+          ) {
+            finish(false);
+            continue;
+          }
+          visiting.add(id);
+          frame.walk = { view, key, provenance, prevs, next: 0, ready: true };
+        }
+        const walk = frame.walk;
+        if (walk.next < walk.prevs.length) {
+          stack.push({ id: walk.prevs[walk.next++], source: walk.provenance });
+          continue;
+        }
+        if (!walk.ready && walk.provenance === 'pulled') {
+          walk.ready = await fetchBoundary(id);
+        }
+        visiting.delete(id);
+        if (snapshot !== walk.view) {
+          frame.walk = undefined;
+          continue;
+        }
+        recovered.set(walk.key, walk.ready);
+        finish(walk.ready);
       }
-      if (!ready && provenance === 'pulled') ready = await fetchBoundary(id);
+      return result;
     } finally {
-      visiting.delete(id);
+      for (const frame of stack) {
+        if (frame.walk !== undefined) visiting.delete(frame.id);
+      }
     }
-    if (snapshot !== view) return await chase(id, source);
-    recovered.set(key, ready);
-    return ready;
   };
   return async (item) => {
     await refresh();

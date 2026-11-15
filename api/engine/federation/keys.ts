@@ -679,24 +679,20 @@ export function keyStore(
         return selected.doc;
       });
     } catch (e) {
-      if (!signal?.aborted && epoch.current && e instanceof KeyChangeRefused) {
-        refusalMemory.set(name, {
-          until: Date.now() +
-            (await federationPolicy(server)).keyfailminutes * 60_000,
-          error: e,
-        });
-      }
-      if (
-        !signal?.aborted && epoch.current &&
-        ['transport', 'protocol', 'validation', 'http'].includes(
-          upstreamCategory(e),
-        )
-      ) {
-        failureMemory.set(name, {
-          until: Date.now() +
-            (await federationPolicy(server)).keyfailminutes * 60_000,
-          error: e,
-        });
+      const memory = e instanceof KeyChangeRefused
+        ? refusalMemory
+        : ['transport', 'protocol', 'validation', 'http'].includes(
+            upstreamCategory(e),
+          )
+        ? failureMemory
+        : null;
+      if (!signal?.aborted && epoch.current && memory !== null) {
+        const minutes = (await federationPolicy(server)).keyfailminutes;
+        // Policy I/O can overlap invalidation or the last subscriber leaving.
+        // Publication must recheck both owners without another suspension.
+        if (!signal?.aborted && epoch.current) {
+          memory.set(name, { until: Date.now() + minutes * 60_000, error: e });
+        }
       }
       throw e;
     }

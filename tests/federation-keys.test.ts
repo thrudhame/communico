@@ -490,6 +490,95 @@ Deno.test('key policy refusal is remembered separately and admin decisions clear
   }
 });
 
+Deno.test('negative key memory cannot publish after policy-read invalidation or last-demand cancellation', async (t) => {
+  for (const failure of ['peer', 'refusal'] as const) {
+    for (const action of ['forget', 'cancel'] as const) {
+      await t.step(failure + ' / ' + action, async () => {
+        setConfigForTests({ federation: { keychange: 'block' } });
+        try {
+          await withStore(async (store) => {
+            const db = await store.server();
+            const origin = await makeServer(
+              'late-memory-' + failure + '-' + action + '.test',
+            );
+            if (failure === 'refusal') {
+              await seedServer(
+                db,
+                origin,
+                await makeDoc(origin, { validUntilMs: 1 }),
+              );
+            }
+            const doc = await makeDoc(
+              await makeServer(origin.name, 'ed25519:new'),
+            );
+            const entered = Promise.withResolvers<void>();
+            const release = Promise.withResolvers<void>();
+            let calls = 0;
+            let held = false;
+            const original = db.query.bind(db);
+            db.query = async (sql, values = []) => {
+              const rows = await original(sql, values);
+              if (
+                !held && calls === 1 &&
+                sql.includes('SELECT DISTINCT server_name') &&
+                (failure === 'peer' ||
+                  rows.some((r) => r.server_name === origin.name))
+              ) {
+                held = true;
+                entered.resolve();
+                await release.promise;
+              }
+              return rows;
+            };
+            const ks = keyStore(db, {
+              deps: stubDeps({
+                directGet: () => {
+                  calls++;
+                  if (calls === 1 && failure === 'peer') {
+                    throw new UpstreamError('transport', {
+                      phase: 'test',
+                      reason: 'offline',
+                    });
+                  }
+                  return Promise.resolve(doc);
+                },
+              }),
+            });
+            const controller = new AbortController();
+            const run = ks.acquireKeyDoc(origin.name, Date.now(), {
+              signal: controller.signal,
+            });
+            const result = Promise.allSettled([run]);
+            try {
+              await entered.promise;
+              if (action === 'forget') await ks.forgetServerKeys(origin.name);
+              else controller.abort();
+              release.resolve();
+              assertEquals((await result)[0].status, 'rejected');
+              setConfigForTests({ federation: { keychange: 'accept' } });
+              assertEquals(
+                await ks.acquireKeyDoc(origin.name, Date.now()),
+                doc,
+              );
+              assertEquals(
+                calls,
+                2,
+                'a stale negative entry suppressed fresh acquisition',
+              );
+            } finally {
+              release.resolve();
+              await result;
+              db.query = original;
+            }
+          });
+        } finally {
+          setConfigForTests({});
+        }
+      });
+    }
+  }
+});
+
 Deno.test('forget clears peer failure memory as well as persisted keys', async () => {
   await withStore(async (store) => {
     const doc = await makeDoc(await makeServer('forget-failure.test'));

@@ -147,6 +147,83 @@ async function ancestryFixture(store: Store) {
   return { ...s, held, pulled, batch, recording };
 }
 
+Deno.test('ancestry owner: a long retained pending chain reaches its deepest boundary without recursive stack growth', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const count = 12000;
+    const bottom = '$long-chain-unavailable';
+    // Seed retained graph metadata in the real native room file. Recovery reads
+    // immutable edges, not these PDUs; the boundary sentinel stops before ingest.
+    const db = await store.room(s.g.roomId);
+    await db.tx(async (tx) => {
+      for (let start = 0; start < count; start += 100) {
+        const ids = Array.from(
+          { length: Math.min(100, count - start) },
+          (_, i) => start + i,
+        );
+        await tx.execute(
+          'INSERT INTO events(id,pdu,type,state_key,sender,depth,origin_ts) VALUES ' +
+            ids.map(() => '(?,?,?,NULL,?,?,?)').join(','),
+          ids.flatMap((
+            i,
+          ) => [
+            '$long-chain-' + i,
+            '{}',
+            'm.room.message',
+            s.user,
+            i + 100,
+            1000,
+          ]),
+        );
+        await tx.execute(
+          'INSERT INTO prev_edges(event,prev,ord) VALUES ' +
+            ids.map(() => '(?,?,0)').join(','),
+          ids.flatMap((
+            i,
+          ) => [
+            '$long-chain-' + i,
+            i === 0 ? bottom : '$long-chain-' + (i - 1),
+          ]),
+        );
+        await tx.execute(
+          'INSERT INTO event_status(event,standing,grounding,origin,received_ts) VALUES ' +
+            ids.map(() => "(?,'rejected','pending',?,1000)").join(','),
+          ids.flatMap((i) => ['$long-chain-' + i, s.server.name]),
+        );
+      }
+    });
+    const pulled = await msg(s, 'after retained chain', [
+      '$long-chain-' + (count - 1),
+    ], count + 100);
+    const pushed = await msg(
+      s,
+      'new delivery',
+      [pulled.event_id!],
+      count + 101,
+    );
+    const recording = fakeFetcher({ missingEvents: [pulled] });
+    const deepest = new Error('deepest retained boundary reached');
+    recording.fetcher.stateIds = (_room, at) => {
+      assertEquals(at, bottom);
+      throw deepest;
+    };
+    const error = await assertRejects(() =>
+      ingestRemote(s.g.room, [pushed], s.server.name, {
+        ...s.deps,
+        fetcher: recording.fetcher,
+        // The fixture's disk capture is not a recursion-depth or product limit.
+        limits: { ...s.deps.limits, budgetMs: 120000 },
+      })
+    );
+    assertStrictEquals(error, deepest);
+    assertEquals(
+      await s.g.room.tx((tx) => tx.events.get(pushed.event_id!)),
+      null,
+    );
+    assertEquals(await frontierOf(s.g.room), [s.joinId]);
+  });
+});
+
 Deno.test('ancestry owner: siblings share direct-parent supply and failed boundary attempts', async () => {
   await withStore(async (store) => {
     const s = await ancestryFixture(store);
