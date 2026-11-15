@@ -1104,6 +1104,11 @@ jittered backoff; other errors propagate. Transaction bodies must use only
 their connection and attempt-local values, publishing effects after commit.
 The bounded immutable-edge cache follows that contract: attempt overlays
 merge only after a successful room transaction, and contain no database handles.
+Immutable state-group reconstruction is shared within each room transaction
+attempt, including common ancestors of sibling deltas. Callers receive independent
+maps/entries; missing groups, event-state refs and current pointers are not cached.
+The reader is released with its attempt, so rollback/retry and escaped handles
+cannot reuse it. No state maps cross transaction snapshots or file lifetimes.
 (`api/engine/store/db.ts:202-271`, `api/engine/room/edges.ts:1-23`,
 `api/engine/room/index.ts:165-188`)
 
