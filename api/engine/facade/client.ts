@@ -1,6 +1,7 @@
 // Typed home-initiated exchanges. All response identities are checked against
 // the durable grant, not the most recent socket or an untrusted hello.
 import { canonicalJson } from '#engine/canonical.ts';
+import type { KeyDoc } from '#engine/federation/keys.ts';
 import type {
   Acknowledgement,
   Heads,
@@ -217,6 +218,14 @@ export class JournalClient {
       outgoing: heads(value.outgoing, false),
       exportAcks: heads(value.exportAcks, false),
     };
+  }
+
+  async signKeyDocument(
+    document: KeyDoc,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const value = await this.call('key-signature', { document }, signal);
+    return text(value.signature);
   }
 
   async pull(

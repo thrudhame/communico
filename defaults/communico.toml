@@ -70,6 +70,8 @@ replicaterooms = "local"
 # COMMUNICO_FACADE_MAILBOXMAXBYTES / MAILBOXMAXAGEDAYS / MAXOFFLINEDAYS
 mailboxmaxbytes = 0
 mailboxmaxagedays = 0
+# Home's co-signed key-document validity horizon in days; zero is far-future.
+# Facades never renew alone. Receivers still refetch within Matrix's seven days.
 maxofflinedays = 0
 # Whole-record page targets, independent of Matrix transaction envelope limits.
 # Oversized singleton records remain whole. COMMUNICO_FACADE_BATCHMAXBYTES / BATCHMAXITEMS

@@ -1,9 +1,13 @@
 // Force shutdown interleavings through existing database/transport seams.
 // Long timers remain real; a one-second assertion bounds every stop.
-import { assertEquals } from '@std/assert';
+import { assert, assertEquals } from '@std/assert';
 import { setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
-import { listOutbox, startSender } from '#engine/federation/sender.ts';
+import {
+  listOutbox,
+  peerStatus,
+  startSender,
+} from '#engine/federation/sender.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { type Conn, operations } from '#engine/store/db.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
@@ -264,6 +268,7 @@ for (
           false,
           'stop waits for its held in-flight operation',
         );
+        const releasedAt = Date.now();
         release.resolve();
         await bounded(stopping);
         assertEquals(sends, phase === 'preparing' ? 0 : 1);
@@ -273,6 +278,19 @@ for (
           phase === 'in-flight-success' ? 'sent' : 'pending',
         );
         assertEquals(rows[0].attempts, phase === 'in-flight-failure' ? 1 : 0);
+        if (phase === 'in-flight-failure') {
+          const peer = await peerStatus(server, fake.name);
+          assertEquals(
+            peer.failures,
+            1,
+            'the completed failed attempt remains accounted',
+          );
+          assert(peer.nextAttemptMs >= releasedAt + 4000);
+          assert(
+            peer.nextAttemptMs <= Date.now() + 4000,
+            'stop must preserve the first short transaction retry, not publish an exhausted peer ladder',
+          );
+        }
       } finally {
         release.resolve();
         await sender.stop();

@@ -435,6 +435,26 @@ retained until DELETE. Only display names and avatars enter room membership.
 Avatar and timezone values must be strings but are otherwise accepted verbatim,
 matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
+## Facade signing-key retirement
+
+A facade signing key is trusted as a key of the whole Matrix server, not as a
+restricted delegation. Home publishes the current key roster with every active
+key's signature; facades serve that document unchanged. Retirement removes the
+key from `verify_keys` and retains its public key and cutoff in `old_verify_keys`
+so historical events remain verifiable. Facades do not renew the roster alone.
+
+Revocation at stock peers is prospective and best-effort. In interoperability
+testing, tuwunel 1.8.2 accepted a newer event signed only by a retired facade key
+even after refetching the retirement document; Synapse 1.156.0 rejected it.
+Do not assume that refreshing the key document makes every peer enforce the
+cutoff, or that a seven-day refresh bounds acceptance on affected peers.
+
+When retiring or replacing a facade, also revoke its pairing/link credentials
+and remove its old public DNS/routing. Provision replacement link credentials
+through normal enrollment; do not reuse a compromised node's secrets. These
+steps prevent its continued use through your deployment, but cannot force a
+remote server to forget a cached key or reject forged, backdated events.
+
 ## Backup and restore
 
 Run these commands from the installation directory as the server user, with the
