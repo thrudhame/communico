@@ -423,3 +423,265 @@ Deno.test('projection work: room removal reconciles typing before notifying comp
     }
   });
 });
+
+Deno.test('projection work: a capture page yields after each durable change', async () => {
+  await withStore(async (store) => {
+    const tenant = await openTenant(store, 'test', { create: true });
+    await tenant.tx(async (tx) => {
+      await tx.users.insert('dev', 'Dev');
+      await tx.users.insert('bob', 'Bob');
+    });
+    const g = await genesis(store, { roomId: '!writer-changes:test' });
+    await bobJoins(g);
+    await project(store, g.roomId);
+    const events: Awaited<ReturnType<typeof sendLocal>>[] = [];
+    for (const body of ['first', 'second', 'third']) {
+      events.push(
+        await sendLocal(g.room, {
+          type: 'm.room.message',
+          sender: g.creator,
+          content: { body, msgtype: 'm.text' },
+        }, g.signer),
+      );
+    }
+    const changes = await g.room.tx((tx) => tx.changes.after(0, 1000));
+    const first = changes.find((c) =>
+      c.kind === 'event' && c.event === events[0].eventId
+    )!;
+    const db = await store.server();
+    const original = db.tx.bind(db);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let held = false;
+    db.tx = (fn, options) =>
+      original((conn) => {
+        const execute = conn.execute.bind(conn);
+        conn.execute = async (sql, values = []) => {
+          const result = await execute(sql, values);
+          if (
+            !held && sql.startsWith('INSERT INTO feed(') &&
+            values.includes(events[0].eventId)
+          ) {
+            held = true;
+            entered.resolve();
+            await release.promise;
+          }
+          return result;
+        };
+        return fn(conn);
+      }, options);
+    const projecting = project(store, g.roomId);
+    let between: Promise<void> = Promise.resolve();
+    try {
+      await entered.promise;
+      between = withProjectionLock(async () => {
+        assertEquals(
+          (await db.query(
+            'SELECT event FROM feed WHERE event IN (?,?,?) ORDER BY seq',
+            events.map((e) => e.eventId),
+          )).map((r) => r.event),
+          [events[0].eventId],
+          'another writer waited behind the rest of a capture page',
+        );
+        assertEquals(
+          (await db.query('SELECT position FROM watermarks WHERE source=?', [
+            'room:' + g.roomId,
+          ]))[0].position,
+          first.pos,
+        );
+        // The rest of the already captured room page must not retain this
+        // account's old policy across an intervening writer turn.
+        await tenant.tx((tx) => tx.users.markDeactivated('bob'));
+      });
+      release.resolve();
+      await Promise.all([projecting, between]);
+      assertEquals(
+        (await db.query(
+          'SELECT event FROM feed WHERE event IN (?,?,?) ORDER BY seq',
+          events.map((e) => e.eventId),
+        )).map((r) => r.event),
+        events.map((e) => e.eventId),
+      );
+      assertEquals(
+        (await db.query(
+          'SELECT event FROM push_evaluations WHERE user=? AND event IN (?,?,?)',
+          ['@bob:test', ...events.map((e) => e.eventId)],
+        )).map((r) => r.event),
+        [events[0].eventId],
+      );
+      await projectTenant(store, 'test');
+      assertEquals(
+        await db.query('SELECT event FROM notifications WHERE user=?', [
+          '@bob:test',
+        ]),
+        [],
+      );
+    } finally {
+      release.resolve();
+      await Promise.allSettled([projecting, between]);
+      db.tx = original;
+    }
+  });
+});
+
+Deno.test('projection work: a later change failure preserves earlier publication and resumes without duplicates', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!writer-partial-replay:test' });
+    await project(store, g.roomId);
+    const events: Awaited<ReturnType<typeof sendLocal>>[] = [];
+    for (const body of ['committed', 'retry']) {
+      events.push(
+        await sendLocal(g.room, {
+          type: 'm.room.message',
+          sender: g.creator,
+          content: { body, msgtype: 'm.text' },
+        }, g.signer),
+      );
+    }
+    const db = await store.server();
+    const original = db.tx.bind(db);
+    db.tx = (fn, options) =>
+      original((conn) => {
+        const execute = conn.execute.bind(conn);
+        conn.execute = (sql, values = []) => {
+          if (
+            sql.startsWith('INSERT INTO feed(') &&
+            values.includes(events[1].eventId)
+          ) throw new Error('later durable change failure');
+          return execute(sql, values);
+        };
+        return fn(conn);
+      }, options);
+    try {
+      await assertRejects(
+        () => project(store, g.roomId),
+        Error,
+        'later durable change failure',
+      );
+      assertEquals(
+        (await db.query(
+          'SELECT event FROM feed WHERE event IN (?,?) ORDER BY seq',
+          events.map((e) => e.eventId),
+        )).map((r) => r.event),
+        [events[0].eventId],
+      );
+    } finally {
+      db.tx = original;
+    }
+    await Promise.all([project(store, g.roomId), project(store, g.roomId)]);
+    assertEquals(
+      (await db.query(
+        'SELECT event FROM feed WHERE event IN (?,?) ORDER BY seq',
+        events.map((e) => e.eventId),
+      )).map((r) => r.event),
+      events.map((e) => e.eventId),
+    );
+    const head = await g.room.tx((tx) => tx.changes.head());
+    for (const source of ['room:', 'push-context:']) {
+      assertEquals(
+        (await db.query('SELECT position FROM watermarks WHERE source=?', [
+          source + g.roomId,
+        ]))[0].position,
+        head,
+      );
+    }
+  });
+});
+
+Deno.test('projection work: historical context yields at durable edges without completing its room early', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!writer-context:test' });
+    await project(store, g.roomId);
+    const db = await store.server();
+    const head = await g.room.tx((tx) => tx.changes.head());
+    const rows = await db.query(
+      "SELECT event,pos FROM event_index WHERE room=? AND standing='accepted' AND grounding='grounded' ORDER BY pos",
+      [g.roomId],
+    );
+    await db.execute('DELETE FROM watermarks WHERE source=?', [
+      'push-context:' + g.roomId,
+    ]);
+    await db.execute('DELETE FROM notification_own_events WHERE room=?', [
+      g.roomId,
+    ]);
+    const original = db.tx.bind(db);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let held = false;
+    let failLater = true;
+    db.tx = (fn, options) =>
+      original((conn) => {
+        const execute = conn.execute.bind(conn);
+        conn.execute = async (sql, values = []) => {
+          if (
+            failLater &&
+            sql.startsWith('INSERT INTO notification_own_events(') &&
+            values.includes(rows[1].event)
+          ) throw new Error('later context edge failure');
+          const result = await execute(sql, values);
+          if (
+            !held && sql.startsWith('INSERT INTO notification_own_events(') &&
+            values.includes(rows[0].event)
+          ) {
+            held = true;
+            entered.resolve();
+            await release.promise;
+          }
+          return result;
+        };
+        return fn(conn);
+      }, options);
+    const projecting = project(store, g.roomId);
+    const rejected = assertRejects(
+      () => projecting,
+      Error,
+      'later context edge failure',
+    );
+    let between: Promise<void> = Promise.resolve();
+    try {
+      await entered.promise;
+      between = withProjectionLock(async () => {
+        assertEquals(
+          (await db.query(
+            'SELECT event FROM notification_own_events WHERE room=?',
+            [g.roomId],
+          )).map((r) => r.event),
+          [rows[0].event],
+        );
+        assertEquals(
+          (await db.query('SELECT position FROM watermarks WHERE source=?', [
+            'push-context:' + g.roomId,
+          ]))[0]?.position,
+          rows[0].pos,
+        );
+        assertEquals(
+          (await db.query('SELECT position FROM watermarks WHERE source=?', [
+            'room:' + g.roomId,
+          ]))[0].position,
+          head,
+        );
+      });
+      release.resolve();
+      await Promise.all([rejected, between]);
+    } finally {
+      release.resolve();
+      await Promise.allSettled([projecting, rejected, between]);
+      db.tx = original;
+      failLater = false;
+    }
+    await project(store, g.roomId);
+    assertEquals(
+      (await db.query(
+        'SELECT event FROM notification_own_events WHERE room=? ORDER BY event',
+        [g.roomId],
+      )).map((r) => r.event),
+      rows.map((r) => r.event).sort(),
+    );
+    assertEquals(
+      (await db.query('SELECT position FROM watermarks WHERE source=?', [
+        'push-context:' + g.roomId,
+      ]))[0].position,
+      head,
+    );
+  });
+});
