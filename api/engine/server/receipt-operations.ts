@@ -219,7 +219,7 @@ export async function acceptReceiptOperation(
   return true;
 }
 
-export async function recordReceiptOperation(conn: Conn, mark: ReceiptMark) {
+async function writeReceiptOperation(conn: Conn, mark: ReceiptMark) {
   const held = await control(conn);
   // Standalone/F1 and remote-user federation marks have no local F2 authorship.
   if (!held || domainOf(mark.userId) !== held.server) return;
@@ -294,7 +294,11 @@ export async function recordReceiptOperation(conn: Conn, mark: ReceiptMark) {
  * source fact; the historical join is disclosure/admission evidence, not a
  * claim that the original F1 row recorded that particular event. No current
  * membership check, client news, imported-source echo or replacement baseline. */
-export async function captureReceiptOperations(conn: Conn, userId: string) {
+export async function captureReceiptOperations(
+  conn: Conn,
+  userId: string,
+  onlyKey?: string,
+) {
   const held = await control(conn);
   if (!held || held.node !== 'home' || domainOf(userId) !== held.server) {
     throw new Error('receipt bootstrap requires home authority');
@@ -315,6 +319,7 @@ export async function captureReceiptOperations(conn: Conn, userId: string) {
       ts: Number(row.ts_ms),
       admission: { membershipEvent: '', baseline: true },
     };
+    if (onlyKey !== undefined && key(mark) !== onlyKey) continue;
     if (history.some((operation) => operation.semanticKey === key(mark))) {
       continue;
     }
@@ -324,9 +329,26 @@ export async function captureReceiptOperations(conn: Conn, userId: string) {
     );
     if (!join) throw new Error('receipt baseline admission unavailable');
     mark.admission.membershipEvent = String(join.event);
-    await recordReceiptOperation(conn, mark);
+    await writeReceiptOperation(conn, mark);
   }
   return await receiptOperations(conn, userId);
+}
+
+/** Local admission calls this BEFORE changing the visible row. A LAN write can
+ * race initial semantic bootstrap; preserve the acknowledged F1 slot first,
+ * then record the new mark with its actual admission as an observed successor. */
+export async function recordReceiptOperation(conn: Conn, mark: ReceiptMark) {
+  const held = await control(conn);
+  if (
+    held?.node === 'home' && domainOf(mark.userId) === held.server &&
+    !(await conn.query(
+      'SELECT 1 FROM domain_operations WHERE semantic_key=? LIMIT 1',
+      [key(mark)],
+    )).length
+  ) {
+    await captureReceiptOperations(conn, mark.userId, key(mark));
+  }
+  await writeReceiptOperation(conn, mark);
 }
 
 export async function pendingReceiptOperations(conn: Conn, roomId?: string) {

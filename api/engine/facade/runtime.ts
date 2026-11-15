@@ -42,6 +42,7 @@ import {
 } from './accounts.ts';
 import { AuthLinkHealth, FacadeAuth } from './auth.ts';
 import { startDeactivationWork } from '#engine/deactivation.ts';
+import { DomainOperations } from './domain.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -168,15 +169,20 @@ export async function openFacadeRuntime(
           (await (await store.tenant(identity.server)).query(
             'SELECT localpart FROM account_auth_snapshots ORDER BY localpart',
           )).map((row) => String(row.localpart)),
-        emit: async (localpart) =>
-          exportSessionAuthority(
+        emit: async (localpart) => {
+          const owner = await pairings();
+          await exportSessionAuthority(
             store,
             tenant!,
-            await pairings(),
+            owner,
             await ownerControls(),
             node!,
             localpart,
-          ),
+          );
+          await new DomainOperations(store, tenant!, owner, node!).export(
+            localpart,
+          );
+        },
         changed: () => notices.changed(),
         failed: (error) =>
           console.error(
@@ -225,6 +231,9 @@ export async function openFacadeRuntime(
             await pairings(),
             await ownerControls(),
           ).apply(journal, stream)
+          : settings.phase === 'f2' && stream.stream.startsWith('domain:')
+          ? await new DomainOperations(store, tenant!, await pairings(), node!)
+            .apply(journal, stream)
           : stream.stream === 'directory'
           ? await new DirectoryReplicas(
             server,

@@ -512,6 +512,32 @@ Deno.test('facade receipts: bootstrap never reauthors a held foreign receipt as 
   }
 });
 
+Deno.test('facade receipts: a LAN write racing initial bootstrap preserves the prior acknowledged concurrent target', async () => {
+  const f = await fixture();
+  try {
+    await f.read(f.left);
+    await activateReceiptSource(f);
+    await f.read(f.right);
+    const operations = await f.db.tx((tx) =>
+      receiptOperations(tx, '@bob:test')
+    );
+    assertEquals(
+      [...new Set(operations.flatMap((op) => JSON.parse(op.payload).eventIds))]
+        .sort(),
+      [f.left, f.right].sort(),
+    );
+    assertEquals(operations.length, 2);
+    assertEquals(
+      operations.map((op) =>
+        JSON.parse(op.payload).admission.baseline ?? false
+      ),
+      [true, false],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('facade receipts: authenticated import retains original admission after departure without an export echo', async () => {
   const f = await fixture();
   try {

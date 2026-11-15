@@ -12,22 +12,139 @@ import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { checkLocalpart } from '#engine/tenant/users.ts';
 import {
+  captureReceiptOperations,
   receiptOperationMark,
   receiptOperations,
 } from '#engine/server/receipt-operations.ts';
+import { captureAccountDataOperations } from '#engine/tenant/accountdata.ts';
+import { captureProfileOperations } from '#engine/tenant/profiles.ts';
+import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
 import { importReceiptOperation } from '#engine/server/ephemeral.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
 import { integer, LinkError, object, type Stream, text } from './protocol.ts';
-import type { RegisterOperation } from './registers.ts';
+import { readRegister, type RegisterOperation } from './registers.ts';
 import { type DomainBinding, requireDomainControl } from './domain-control.ts';
 
 export type DomainOperation = DomainBinding & {
   kind: 'domain-operation';
   operation: RegisterOperation;
 };
+type Fact = { operationId: string; payloadHash: string };
+export type DomainBootstrap = DomainBinding & {
+  kind: 'domain-bootstrap';
+  tenant: Fact[];
+  receipts: Fact[];
+};
+
+function facts(operations: Fact[]): Fact[] {
+  return operations.map(({ operationId, payloadHash }) => ({
+    operationId,
+    payloadHash,
+  }))
+    .sort((a, b) =>
+      a.operationId < b.operationId ? -1 : a.operationId > b.operationId ? 1 : 0
+    );
+}
+
+function bootstrapOf(raw: unknown): DomainBootstrap {
+  const row = object(raw);
+  const localpart = text(row.localpart);
+  if (
+    row.kind !== 'domain-bootstrap' || checkLocalpart(localpart) !== localpart
+  ) mismatch('invalid domain bootstrap');
+  const refs = (raw: unknown) => {
+    if (!Array.isArray(raw)) {
+      throw new LinkError('LINK_BAD_RECORD', 'invalid domain manifest', 400);
+    }
+    const result = raw.map((raw) => {
+      const row = object(raw), payloadHash = text(row.payloadHash);
+      if (!/^[a-f0-9]{64}$/.test(payloadHash)) {
+        mismatch('invalid domain manifest hash');
+      }
+      return { operationId: text(row.operationId), payloadHash };
+    });
+    if (new Set(result.map((row) => row.operationId)).size !== result.length) {
+      mismatch('duplicate domain manifest fact');
+    }
+    return facts(result);
+  };
+  const view: DomainBootstrap = {
+    kind: 'domain-bootstrap',
+    server: text(row.server),
+    pairing: text(row.pairing),
+    grantRevision: integer(row.grantRevision, 1),
+    ownerRevision: integer(row.ownerRevision, 1),
+    localpart,
+    source: text(row.source),
+    incarnation: text(row.incarnation),
+    tenant: refs(row.tenant),
+    receipts: refs(row.receipts),
+  };
+  if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
+    mismatch('unexpected domain bootstrap material');
+  }
+  return view;
+}
+
+/** Presence is proved in each owning file. Register rows must also have their
+ * authentic predecessor closure; a receipt may remain durably undisclosed while
+ * receiver room evidence is missing, as its receipt owner explicitly permits. */
+async function requireFacts(
+  conn: Conn,
+  view: DomainBootstrap,
+  file: 'tenant' | 'receipts',
+) {
+  const keys = new Set<string>();
+  for (const fact of view[file]) {
+    const [row] = await conn.query(
+      'SELECT semantic_key,kind,payload_hash,payload_json FROM domain_operations WHERE operation_id=?',
+      [fact.operationId],
+    );
+    if (!row) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'domain bootstrap awaits retained facts',
+        503,
+      );
+    }
+    if (row.payload_hash !== fact.payloadHash) {
+      throw new LinkError('LINK_DIVERGED', 'domain bootstrap fact changed');
+    }
+    if (file === 'receipts') {
+      const mark = JSON.parse(String(row.payload_json));
+      if (
+        row.kind !== 'receipt' ||
+        mark.userId !== '@' + view.localpart + ':' + view.server
+      ) mismatch('bootstrap receipt account differs');
+    } else {
+      const key = JSON.parse(String(row.semantic_key));
+      if (
+        !Array.isArray(key) || key[1] !== view.localpart ||
+        !['account-data', 'tags', 'profile', 'push-rules'].includes(
+          String(row.kind),
+        )
+      ) mismatch('bootstrap tenant account differs');
+      keys.add(String(row.semantic_key));
+    }
+  }
+  const retained = new Set(view[file].map((fact) => fact.operationId));
+  for (const key of keys) {
+    if (
+      (await readRegister(conn, key)).pending.some((op) =>
+        retained.has(op.operationId)
+      )
+    ) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'domain bootstrap awaits causal history',
+        503,
+      );
+    }
+  }
+}
 
 function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
@@ -35,7 +152,11 @@ function mismatch(message: string): never {
 function streamName(localpart: string, server: string) {
   return 'domain:@' + localpart + ':' + server;
 }
-function operationId(view: DomainOperation) {
+function operationId(view: DomainOperation | DomainBootstrap) {
+  if (view.kind === 'domain-bootstrap') {
+    return 'domain-bootstrap:' +
+      createHash('sha256').update(canonicalJson(view)).digest('hex');
+  }
   return 'domain:' + createHash('sha256').update(canonicalJson([
     view.pairing,
     view.grantRevision,
@@ -261,6 +382,96 @@ export class DomainOperations {
     return records;
   }
 
+  /** Pin explicit baseline facts in their original owner transactions, export
+   * source operations, then publish a signed completeness declaration. Suffix
+   * writes remain source intent and appear on this same independently drained
+   * account stream; neither a copied F1 snapshot nor receipt news is a baseline. */
+  async bootstrap(localpart: string, pairing: string) {
+    if (this.node) mismatch('only home may declare domain bootstrap');
+    const grant = await this.binding(pairing),
+      context = grant.body.transcript.body.context;
+    const server = await this.store.server();
+    const control = await server.tx(async (conn) => {
+      await this.selected(conn, grant, localpart);
+      const [row] = await conn.query(
+        'SELECT c.signed_json FROM facade_owner_activation a JOIN facade_owner_controls c ON c.pairing=a.pairing AND c.revision=a.revision WHERE a.pairing=?',
+        [context.id],
+      );
+      if (!row) {
+        throw new LinkError(
+          'LINK_UNAVAILABLE',
+          'domain bootstrap awaits control',
+          503,
+        );
+      }
+      return JSON.parse(String(row.signed_json)).body as OwnerControl;
+    });
+    const source = control.nodes.find((node) => node.node === 'home');
+    if (!source) mismatch('home domain source unavailable');
+    const binding: DomainBinding = {
+      server: context.server,
+      pairing: context.id,
+      grantRevision: grant.body.revision,
+      ownerRevision: control.revision,
+      localpart,
+      source: source.node,
+      incarnation: source.incarnation,
+    };
+    const tenantFacts = await (await this.store.tenant(context.server)).tx(
+      async (conn) => {
+        await requireDomainControl(conn, binding);
+        const [user] = await conn.query(
+          'SELECT deactivated FROM users WHERE localpart=?',
+          [localpart],
+        );
+        if (!user) mismatch('domain account unavailable');
+        if (user.deactivated === 1) return [];
+        return facts([
+          ...await captureAccountDataOperations(conn, localpart),
+          ...await captureProfileOperations(conn, localpart),
+          ...await capturePushRuleOperations(conn, localpart, context.server),
+        ]);
+      },
+    );
+    const receiptFacts = await server.tx(async (conn) => {
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      return facts(
+        await captureReceiptOperations(
+          conn,
+          '@' + localpart + ':' + context.server,
+        ),
+      );
+    });
+    const records = await this.export(localpart, pairing);
+    const body = bootstrapOf({
+      ...binding,
+      kind: 'domain-bootstrap',
+      tenant: tenantFacts,
+      receipts: receiptFacts,
+    });
+    const signed = {
+      body,
+      signature: await this.tenant.signer().sign(canonicalJson(body)),
+    };
+    records.push(
+      await server.tx(async (conn) => {
+        await this.selected(conn, grant, localpart);
+        await requireDomainControl(conn, body);
+        return await appendRecord(conn, context.node, {
+          source: 'home',
+          incarnation: context.id,
+          stream: streamName(localpart, context.server),
+          type: 'domain-operation',
+          version: 1,
+          operationId: operationId(body),
+          payload: signed,
+        });
+      }),
+    );
+    return records;
+  }
+
   async apply(
     journal: Journal,
     stream: Stream,
@@ -274,7 +485,10 @@ export class DomainOperations {
     if (record.type !== 'domain-operation' || record.version !== 1) {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not domain operation');
     }
-    const signed = object(record.payload), view = viewOf(signed.body);
+    const signed = object(record.payload);
+    const view = object(signed.body).kind === 'domain-bootstrap'
+      ? bootstrapOf(signed.body)
+      : viewOf(signed.body);
     const sender = this.node ? 'home' : context.node;
     if (
       view.server !== context.server || view.pairing !== context.id ||
@@ -308,6 +522,36 @@ export class DomainOperations {
       await requireDomainControl(conn, view);
     };
     await (await this.store.server()).tx(check);
+    if (view.kind === 'domain-bootstrap') {
+      if (!this.node) mismatch('facade cannot declare domain bootstrap');
+      await (await this.store.tenant(view.server)).tx(async (conn) => {
+        await requireDomainControl(conn, view);
+        const [selected] = await conn.query(
+          'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
+          [view.localpart],
+        );
+        if (
+          selected?.pairing !== view.pairing ||
+          Number(selected.grant_revision) !== view.grantRevision
+        ) mismatch('bootstrap account not selected');
+        await requireFacts(conn, view, 'tenant');
+      });
+      return await journal.apply(peer, stream, async (conn, current) => {
+        await check(conn);
+        if (current.hash !== record.hash) {
+          throw new LinkError(
+            'LINK_DIVERGED',
+            'domain bootstrap application raced',
+          );
+        }
+        await requireFacts(conn, view, 'receipts');
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,1,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=1,pending_hash=NULL',
+          [view.pairing, record.stream, record.sequence],
+        );
+        return { kind: 'domain-bootstrap', localpart: view.localpart };
+      });
+    }
     if (view.operation.kind === 'receipt') {
       await importReceiptOperation(
         await this.store.server(),

@@ -5,7 +5,11 @@ import {
   AccountSnapshots,
   exportAccountAuth,
 } from '#engine/facade/accounts.ts';
-import { DomainOperations } from '#engine/facade/domain.ts';
+import {
+  type DomainBootstrap,
+  type DomainOperation,
+  DomainOperations,
+} from '#engine/facade/domain.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
@@ -397,6 +401,101 @@ Deno.test('domain link: selected account scope is required for export and revers
     assertEquals(
       (await f.hj.heads('edge_a', 'in', record)).applied.sequence,
       0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain bootstrap: explicit complete owner cut enables scope only after all signed operations apply', async () => {
+  const f = await fixture();
+  try {
+    await putAccountData(f.ht, 'alice', '', 'm.secret_storage.key', {
+      ciphertext: 'complete-bootstrap',
+    });
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const marker = records.at(-1)!;
+    const view = (marker.payload as { body: DomainBootstrap }).body;
+    assertEquals(view.kind, 'domain-bootstrap');
+    assertEquals(view.tenant.length >= 3, true);
+    assertEquals(view.receipts, []);
+    await f.toEdge(records.slice(0, -1));
+    assertEquals(
+      await (await f.edge.server()).query(
+        'SELECT ready FROM facade_scopes WHERE scope=?',
+        [marker.stream],
+      ),
+      [],
+    );
+    await f.toEdge([marker]);
+    assertEquals(
+      await (await f.edge.server()).query(
+        'SELECT ready,source_cut FROM facade_scopes WHERE scope=?',
+        [marker.stream],
+      ),
+      [{ ready: 1, source_cut: marker.sequence }],
+    );
+    assertEquals(
+      await getAccountData(f.et, 'alice', '', 'm.secret_storage.key'),
+      { ciphertext: 'complete-bootstrap' },
+    );
+    assertEquals(await f.hs.bootstrap('alice', f.bundle.id), records);
+    assertEquals(await f.es.export('alice'), []);
+    await assertRejects(
+      () => f.es.bootstrap('alice', f.bundle.id),
+      LinkError,
+      'only home',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain bootstrap: missing owner facts prevent readiness and ACK until authentic replay restores them', async () => {
+  const f = await fixture();
+  try {
+    await putAccountData(f.ht, 'alice', '', 'm.secret_storage.key', {
+      ciphertext: 'retained-fact',
+    });
+    const records = await f.hs.bootstrap('alice', f.bundle.id),
+      marker = records.at(-1)!;
+    await f.toEdge(records.slice(0, -1));
+    const operation = (records.find((record) =>
+      (record.payload as { body: DomainOperation }).body.operation?.kind ===
+        'account-data'
+    )!.payload as { body: DomainOperation }).body.operation;
+    const db = await f.edge.tenant('logical.test');
+    await db.execute('DELETE FROM domain_operations WHERE operation_id=?', [
+      operation.operationId,
+    ]);
+    await f.ej.receive('home', [marker]);
+    await assertRejects(
+      () =>
+        f.es.apply(f.ej, marker),
+      LinkError,
+      'awaits retained facts',
+    );
+    assertEquals(
+      (await f.ej.heads('home', 'in', marker)).applied.sequence,
+      marker.sequence - 1,
+    );
+    assertEquals(
+      await (await f.edge.server()).query(
+        'SELECT ready FROM facade_scopes WHERE scope=?',
+        [marker.stream],
+      ),
+      [],
+    );
+    const before = await f.et.tx((tx) => tx.streams.heads());
+    await f.et.tx((tx) => tx.accountData.import(operation));
+    assertEquals(await f.es.apply(f.ej, marker), true);
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+    assertEquals(
+      await (await f.edge.server()).query(
+        'SELECT ready FROM facade_scopes WHERE scope=?',
+        [marker.stream],
+      ),
+      [{ ready: 1 }],
     );
   } finally {
     await f.close();

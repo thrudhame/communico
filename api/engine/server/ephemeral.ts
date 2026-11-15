@@ -271,15 +271,6 @@ export async function setReceiptMark(
         );
       }
     }
-    const row = await mergeReceiptMark(
-      tx,
-      roomId,
-      userId,
-      receiptType,
-      incoming,
-      ts,
-      threadId,
-    );
     const [membership] = await tx.query(
       'SELECT event FROM memberships WHERE room=? AND user=?',
       [roomId, userId],
@@ -293,7 +284,15 @@ export async function setReceiptMark(
       threadId,
       admission: { membershipEvent: String(membership.event) },
     });
-    return row;
+    return await mergeReceiptMark(
+      tx,
+      roomId,
+      userId,
+      receiptType,
+      incoming,
+      ts,
+      threadId,
+    );
   });
   if (row === null) return false;
   // Private rows wake their owner, but federation only consumes public rows.

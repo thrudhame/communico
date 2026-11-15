@@ -15,6 +15,7 @@ import { setConfigForTests } from '#engine/config.ts';
 import { loginUser, verifyUserPassword } from '#engine/tenant/users.ts';
 import { lookupToken } from '#engine/tenant/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { getAccountData, putAccountData } from '#engine/tenant/accountdata.ts';
 import { membershipOf } from '#engine/room/membership.ts';
 import { loadNode } from '#engine/facade/identity.ts';
 import { redact } from '#engine/eventid.ts';
@@ -659,6 +660,16 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       auth: { type: 'm.login.dummy', session: challenge.body.session },
     });
     assertEquals(registered.status, 200);
+    const baselineResponse = await fetch(
+      `http://127.0.0.1:${homePort}/_matrix/client/v3/user/%40outside%3Alogical.test/account_data/m.secret_storage.key`,
+      {
+        method: 'PUT',
+        headers: { authorization: 'Bearer ' + registered.body.access_token },
+        body: JSON.stringify({ ciphertext: 'home-baseline', fraction: 0.125 }),
+      },
+    );
+    assertEquals(baselineResponse.status, 200);
+    await baselineResponse.arrayBuffer();
     const paired = await adminCall(tls.dir + '/home-auth.sock', 'facade/pair', {
       node: 'edge_a',
       url: `https://127.0.0.1:${linkPort}`,
@@ -678,9 +689,13 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
         tls.dir + '/facade-auth.sock',
         'facade/status',
       );
-      return response.body.result.scopes.some((
+      const scopes = response.body.result.scopes;
+      return scopes.some((
         scope: { scope: string; ready: boolean },
-      ) => scope.scope === 'auth:@outside:logical.test' && scope.ready);
+      ) => scope.scope === 'auth:@outside:logical.test' && scope.ready) &&
+        scopes.some((scope: { scope: string; ready: boolean }) =>
+          scope.scope === 'domain:@outside:logical.test' && scope.ready
+        );
     });
     await home.stop();
     await edge.stop();
@@ -688,6 +703,13 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     let token: string;
     try {
       const tenant = await openTenant(offline, 'logical.test');
+      assertEquals(
+        await getAccountData(tenant, 'outside', '', 'm.secret_storage.key'),
+        { ciphertext: 'home-baseline', fraction: 0.125 },
+      );
+      await putAccountData(tenant, 'outside', '', 'm.secret_storage.key', {
+        ciphertext: 'edge-recovered',
+      });
       assertEquals(
         await verifyUserPassword(tenant, 'outside', 'offline-password'),
         true,
@@ -706,6 +728,19 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     // durable owner state; an in-memory notification cannot supply this proof.
     edge = await process(file('facade'), 'facade: link/local admin ready');
     home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        const value = await api(
+          'user/%40outside%3Alogical.test/account_data/m.secret_storage.key',
+          undefined,
+          registered.body.access_token,
+        );
+        return value.status === 200 &&
+          value.body.ciphertext === 'edge-recovered';
+      } catch {
+        return false;
+      }
+    });
     await until(async () => {
       try {
         return (await api('account/whoami', undefined, token)).status === 503;
