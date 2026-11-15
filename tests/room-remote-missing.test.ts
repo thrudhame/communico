@@ -719,13 +719,16 @@ Deno.test('missing: a pulled event with its own missing prev — the chase names
   });
 });
 
-for (const supplied of ['answer', 'held', 'pulled-input'] as const) {
+for (
+  const supplied of ['answer', 'held', 'pulled-input', 'one-answer'] as const
+) {
   Deno.test(
     'missing: pulled boundary fallback survives unavailable older ancestry: ' +
       supplied,
     async () => {
       await withStore(async (store) => {
         const s = await setup(store);
+        if (supplied === 'one-answer') s.deps.limits.limit = 1;
         const far = await msg(s, 'far pulled', ['$unavailable-older'], 50);
         const near = await msg(s, 'near pulled', [far.event_id!], 51);
         const pushed = await msg(s, 'pushed child', [near.event_id!], 52);
@@ -743,7 +746,11 @@ for (const supplied of ['answer', 'held', 'pulled-input'] as const) {
           ];
         });
         const recording = fakeFetcher({
-          missingEvents: supplied === 'answer' ? [near, far] : [near],
+          missingEvents: supplied === 'answer'
+            ? [near, far]
+            : supplied === 'one-answer'
+            ? [far]
+            : [near],
           stateIds: new Map([[far.event_id!, {
             pduIds: stateIds,
             authChainIds: [],
@@ -753,7 +760,11 @@ for (const supplied of ['answer', 'held', 'pulled-input'] as const) {
         s.deps.fetcher = recording.fetcher;
         const out = await ingestRemote(
           s.g.room,
-          supplied === 'pulled-input' ? [far] : [pushed],
+          supplied === 'pulled-input'
+            ? [far]
+            : supplied === 'one-answer'
+            ? [near]
+            : [pushed],
           s.server.name,
           s.deps,
           supplied === 'pulled-input' ? 'pulled' : 'pushed',
@@ -776,7 +787,9 @@ for (const supplied of ['answer', 'held', 'pulled-input'] as const) {
           assertEquals(await tx.events.get('$unavailable-older'), null);
           if (supplied !== 'pulled-input') {
             assertEquals(
-              (await tx.events.getStatus(pushed.event_id!))?.grounding,
+              (await tx.events.getStatus(
+                supplied === 'one-answer' ? near.event_id! : pushed.event_id!,
+              ))?.grounding,
               'grounded',
             );
             assertEquals(

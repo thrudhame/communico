@@ -252,10 +252,10 @@ async function recoverMissing(
   const recovered = new Map<string, boolean>();
   const visiting = new Set<string>();
   const fetchBoundary = async (id: string): Promise<boolean> => {
-    if (
-      budgetLeft() <= 0 || attempted.has(id) ||
-      attempted.size >= deps.limits.limit
-    ) return false;
+    // missinglimit sizes the missing-events answer, not this state-recovery
+    // ladder. Charging older misses against it can suppress every usable
+    // pulled boundary. All attempts retain the original whole-batch budget.
+    if (budgetLeft() <= 0 || attempted.has(id)) return false;
     attempted.add(id);
     await fetchGapTip(room, id, origin, deps, version, budget, acc);
     return acc.boundaries.has(id);
