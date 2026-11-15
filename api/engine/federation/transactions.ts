@@ -270,14 +270,47 @@ function assignOutcomes(results: PduResults, outcomes: RemoteOutcome[]) {
   }
 }
 
+// Standalone ingress owns one active operation per authenticated transaction.
+// Completed answers remain durable; a failed operation releases its identity so
+// a later retry can try again. Store identity prevents cross-install sharing.
+const activeTransactions = new WeakMap<
+  Store,
+  Map<string, Promise<TxnResult>>
+>();
+
 export async function receiveTransaction(
   origin: string,
   txnId: string,
   rawBody: unknown,
   deps: TransactionDeps,
 ): Promise<TxnResult> {
-  const { pdus, edus } = decodeTransaction(rawBody, origin);
+  // Even a retry must pass envelope admission before joining an existing result.
+  const input = decodeTransaction(rawBody, origin);
+  let active = activeTransactions.get(deps.store);
+  if (active === undefined) {
+    active = new Map();
+    activeTransactions.set(deps.store, active);
+  }
+  const key = JSON.stringify([origin, txnId]);
+  let pending = active.get(key);
+  if (pending === undefined) {
+    pending = receiveOwnedTransaction(origin, txnId, input, deps);
+    active.set(key, pending);
+  }
+  try {
+    // Subscribers own their response values, not the operation's shared object.
+    return structuredClone(await pending);
+  } finally {
+    if (active.get(key) === pending) active.delete(key);
+  }
+}
 
+async function receiveOwnedTransaction(
+  origin: string,
+  txnId: string,
+  { pdus, edus }: ReturnType<typeof decodeTransaction>,
+  deps: TransactionDeps,
+): Promise<TxnResult> {
   const server = await deps.store.server();
   // replay: a retried transaction gets the stored answer
   const cached = await server.query(

@@ -243,53 +243,65 @@ async function recoverMissing(
   acc: FetchAcc,
 ): Promise<void> {
   const budgetLeft = () => budget.until - Date.now();
-  // 3. /state_ids + /event for the GAP TIPS (at most missinglimit state
-  //    fetches, the whole chain inside the batch budget): a prev we HOLD
-  //    (pending or evidence) is never /state_ids'd — the gap behind it is
-  const gapTips: string[] = [];
-  const chased = new Set<string>();
-  const chase = async (
-    ids: readonly string[],
-    source: VerifiedItem['source'],
-  ): Promise<void> => {
-    // Gate every pushed ancestor's whole parent set before following any
-    // sibling, not only the original input's parents at the outer call.
-    if (source === 'pushed' && !await parentsSupplied(room, ids, acc)) return;
-    for (const id of ids) {
-      if (
-        chased.has(id) || acc.terminal.has(id) || acc.boundaries.has(id) ||
-        gapTips.length >= deps.limits.limit
-      ) {
-        continue;
-      }
-      // an event the answer already landed joins this batch — it is
-      // "held" for the chase: never /state_ids'd, the gap is behind it
-      const answered = acc.live.get(id);
-      if (answered !== undefined) {
-        chased.add(id);
-        await chase(answered.pdu.prev_events ?? [], answered.source);
-        continue;
-      }
-      const grounding = await groundingOf(room, id);
-      if (grounding === 'grounded') continue;
-      // A pushed event must disclose its own parents via missing-events.
-      // Only a pulled event can justify an imported state boundary behind it;
-      // walking through another pushed parent must not inherit that permission.
-      if (source === 'pushed') continue;
-      chased.add(id);
-      if (grounding === 'unknown') {
-        gapTips.push(id);
-        continue;
-      }
-      const prevs = await room.tx((tx) => tx.events.prevsOf(id));
-      await chase(prevs, source);
-    }
+  // 3. Prefer the deeper DAG connection, but retain each pulled event as a
+  // possible imported boundary if older ancestry is unavailable. Held bytes
+  // alone do not ground anything; only genuine after-state or a complete
+  // fetched boundary can make a branch recoverable. Locked ingest still
+  // authorizes every boundary and event before publishing any state.
+  const attempted = new Set<string>();
+  const recovered = new Map<string, boolean>();
+  const visiting = new Set<string>();
+  const fetchBoundary = async (id: string): Promise<boolean> => {
+    // missinglimit sizes the missing-events answer, not this state-recovery
+    // ladder. Charging older misses against it can suppress every usable
+    // pulled boundary. All attempts retain the original whole-batch budget.
+    if (budgetLeft() <= 0 || attempted.has(id)) return false;
+    attempted.add(id);
+    await fetchGapTip(room, id, origin, deps, version, budget, acc);
+    return acc.boundaries.has(id);
   };
-  await chase(item.pdu.prev_events ?? [], item.source);
-  for (const tip of gapTips) {
-    if (budgetLeft() <= 0) return;
-    await fetchGapTip(room, tip, origin, deps, version, budget, acc);
-  }
+  const chase = async (
+    id: string,
+    source: VerifiedItem['source'],
+  ): Promise<boolean> => {
+    if (acc.boundaries.has(id)) return true;
+    if (acc.terminal.has(id) || visiting.has(id) || budgetLeft() <= 0) {
+      return false;
+    }
+    const prior = recovered.get(id);
+    if (prior !== undefined) return prior;
+    const grounding = await groundingOf(room, id);
+    if (grounding === 'grounded') return true;
+    const answered = acc.live.get(id);
+    if (answered === undefined && source === 'pushed') return false;
+    if (answered === undefined && grounding === 'unknown') {
+      const ready = await fetchBoundary(id);
+      recovered.set(id, ready);
+      return ready;
+    }
+    // Pushed provenance wins over a pulled traversal. Its whole direct parent
+    // set must be supplied before following any sibling, and it may never
+    // import state to bypass withheld parents.
+    const provenance = answered?.source ?? source;
+    const prevs = answered?.pdu.prev_events ??
+      await room.tx((tx) => tx.events.prevsOf(id));
+    if (provenance === 'pushed' && !await parentsSupplied(room, prevs, acc)) {
+      return false;
+    }
+    visiting.add(id);
+    let ready = true;
+    try {
+      for (const prev of prevs) {
+        if (!await chase(prev, provenance)) ready = false;
+      }
+      if (!ready && provenance === 'pulled') ready = await fetchBoundary(id);
+    } finally {
+      visiting.delete(id);
+    }
+    recovered.set(id, ready);
+    return ready;
+  };
+  await chase(item.eventId, item.source);
 
   // 4. missing DECLARED AUTH events of everything we are about to ingest
   //    (this PDU plus what the answer landed) — one /event_auth per
@@ -376,11 +388,13 @@ async function fetchGapTip(
   });
   if (pack === null) return;
   const corruptedAuth = unknown.some((id) => authSet.has(id) && !pack.has(id));
-  // the tip itself via /event
+  // A verified pulled tip already supplied by missing-events (or the pulled
+  // input) needs no second network copy. Keep its provenance and input index.
   let tipPdu: Pdu | null = null;
-  const rawTip = await fetchOrNull(() =>
-    deps.fetcher.event(tip, origin, room.id)
-  );
+  const supplied = acc.live.get(tip);
+  const rawTip = supplied?.source === 'pulled'
+    ? supplied.pdu
+    : await fetchOrNull(() => deps.fetcher.event(tip, origin, room.id));
   if (rawTip !== null) {
     try {
       const v = await verify(rawTip, version, deps.keys, {
@@ -388,13 +402,15 @@ async function fetchGapTip(
       });
       if (v.eventId === tip) {
         tipPdu = v.pdu;
-        acc.live.set(tip, {
-          index: -1,
-          source: 'pulled',
-          pdu: v.pdu,
-          eventId: tip,
-          oversized: v.oversized,
-        });
+        if (supplied === undefined) {
+          acc.live.set(tip, {
+            index: -1,
+            source: 'pulled',
+            pdu: v.pdu,
+            eventId: tip,
+            oversized: v.oversized,
+          });
+        }
       }
     } catch (error) {
       if (!recoverableUpstream(error)) throw error;
