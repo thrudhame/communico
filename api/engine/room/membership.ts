@@ -279,6 +279,7 @@ export async function reopen(
         prev: last.id,
         opening_group: group,
       });
+      await tx.extremities.inherit(last.id, stay);
       await tx.segments.create({
         kind: 'history',
         prev: stay,

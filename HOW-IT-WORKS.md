@@ -72,8 +72,11 @@ extremities, with deterministic event-ID ties, as Synapse does. The shared
 extremity reader separates that per-event parent selection from the complete
 frontier used for state resolution and publication. Unselected heads and their
 events remain retained for later merges; archived-room reopen uses the same
-selection over its prior stay. Explicit parent arrays and inbound PDUs keep the
-protocol's separate twenty-parent validation.
+selection over its prior stay while inheriting its complete frontier into the
+new stay. Membership templates derive their join-rule checks and auth events
+from the selected parents' state, separately from current admission checks.
+Explicit parent arrays and inbound PDUs keep the protocol's separate
+twenty-parent validation.
 (`api/engine/room/{extremities,build,membership}.ts`, `api/engine/federation/joins.ts`)
 
 ## Two different state questions
