@@ -235,6 +235,47 @@ Deno.test('authenticated HTTP journal exchanges durable records and exact result
   }
 });
 
+Deno.test('journal result polling is read-only and does not echo another reconciliation notice', async () => {
+  const f = await fixture();
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const stream = {
+      source: 'home',
+      incarnation: bundle.id,
+      stream: 'control',
+    };
+    const before = f.changes;
+    const initial = await client.push(stream, [], EMPTY_CUT);
+    assertEquals(initial.received, EMPTY_CUT);
+    assertEquals(f.changes, before);
+    const record = await f.hj.append('edge_a', {
+      ...stream,
+      type: 'control',
+      version: 1,
+      operationId: 'notice-boundary',
+      payload: { revision: 1 },
+    });
+    const cut = { sequence: record.sequence, hash: record.hash };
+    await client.push(stream, [record], EMPTY_CUT);
+    assertEquals(f.changes, before + 1);
+    await f.fj.complete('home', stream, cut, { applied: true });
+    const ready = await client.push(stream, [], EMPTY_CUT);
+    assertEquals(ready.applied, cut);
+    assertEquals(ready.results.length, 1);
+    assertEquals(f.changes, before + 1);
+    // A lost receipt may replay a nonempty page and still wake its apply owner.
+    await client.push(stream, [record], cut);
+    assertEquals(f.changes, before + 2);
+    await client.push(stream, [], cut);
+    assertEquals(f.changes, before + 2);
+  } finally {
+    await f.close();
+  }
+});
+
 async function fixture(supported = LINK_CAPABILITIES) {
   const tls = await facadeTls();
   const open = (side: string) =>

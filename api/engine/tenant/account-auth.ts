@@ -214,16 +214,26 @@ export async function requireAccountAuth(
       Number(row.source_cut) !== binding.sourceCut) ||
     (credentials && row.credentials !== 1)
   ) authUnavailable();
+  // Imported authority and this ingress's clock observation are independent
+  // owners. Writing checked_ms on the snapshot makes every authenticated read
+  // compete with its importer, so sustained clients can starve revocations.
+  // Preserve the old field as the upgrade floor; new observations are local
+  // counters and can commit while a newer source snapshot is being installed.
+  const clockName = 'account_auth_checked:' + localpart;
+  const [clock] = await conn.query('SELECT value FROM counters WHERE name=?', [
+    clockName,
+  ]);
+  const checked = Math.max(Number(row.checked_ms), Number(clock?.value ?? 0));
   if (
-    (!settings.allowstaleauth && !reconciled) || now < Number(row.checked_ms) ||
+    (!settings.allowstaleauth && !reconciled) || now < checked ||
     now < Number(row.captured_ms) ||
     (settings.authmaxstalehours > 0 &&
       now - Number(row.captured_ms) > settings.authmaxstalehours * 3600000)
   ) authUnavailable();
-  if (now > Number(row.checked_ms)) {
+  if (now > checked) {
     await conn.execute(
-      'UPDATE account_auth_snapshots SET checked_ms=? WHERE localpart=?',
-      [now, localpart],
+      'INSERT INTO counters(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=MAX(counters.value,excluded.value)',
+      [clockName, now],
     );
   }
 }

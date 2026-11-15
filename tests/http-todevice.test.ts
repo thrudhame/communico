@@ -227,7 +227,7 @@ suite.test('inbox and key-pool mutations wake sync without room events', async (
     Date.now() - started < 2500,
     'key claim must wake sync before timeout',
   );
-  assertEquals(after.device_one_time_keys_count, {});
+  assertEquals(after.device_one_time_keys_count, { signed_curve25519: 0 });
   assert(after.next_batch !== before.next_batch);
   const inboxWait = sync(b.access_token!, after.next_batch, 3000);
   const inboxStarted = Date.now();

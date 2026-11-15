@@ -2,7 +2,7 @@ import { assertEquals, assertRejects } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { eventStreamTx } from '#engine/server/stream.ts';
+import { eventStreamTx, onEventStream } from '#engine/server/stream.ts';
 import { openStore } from '#engine/store/index.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -1111,7 +1111,20 @@ Deno.test('facade receipts: actual v37 upgrade seeds already projected graph wit
     });
     const db = await store.server();
     assertEquals(await db.query('SELECT * FROM receipt_dag_nodes'), []);
-    await project(store, g.roomId);
+    let published = 0;
+    const stop = onEventStream((path) => {
+      if (path === db.path) published++;
+    });
+    try {
+      await project(store, g.roomId);
+    } finally {
+      stop();
+    }
+    assertEquals(
+      published > 0,
+      true,
+      'receipt bootstrap must wake the normal sync consumer',
+    );
     const rows = await receiptRows(db, g.roomId);
     assertEquals(rows[0].eventIds, [end]);
     assertEquals(

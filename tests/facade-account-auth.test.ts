@@ -19,7 +19,11 @@ import {
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
-import { requireAccountAuth } from '#engine/tenant/account-auth.ts';
+import {
+  type AccountAuth,
+  installAccountAuth,
+  requireAccountAuth,
+} from '#engine/tenant/account-auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   deactivateUser,
@@ -179,6 +183,148 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('local auth clock observations cannot abort an imported authority commit', async () => {
+  const f = await fixture();
+  const release = Promise.withResolvers<void>();
+  let importing: Promise<void> | undefined;
+  try {
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    const next = await f.emit();
+    const view =
+      (next.payload as { signed: { body: AccountAuth } }).signed.body;
+    const db = await f.edge.tenant('logical.test');
+    const [original] = await db.query(
+      'SELECT checked_ms FROM account_auth_snapshots WHERE localpart=?',
+      ['alice'],
+    );
+    const binding = {
+      pairing: f.bundle.id,
+      grantRevision: 1,
+      ownerRevision: 1,
+    };
+    const settings = { allowstaleauth: true, authmaxstalehours: 0 };
+    const now = Math.max(Number(original.checked_ms), view.capturedMs) + 1;
+    const prepared = Promise.withResolvers<void>();
+    let attempts = 0;
+    importing = db.tx(async (conn) => {
+      attempts++;
+      await installAccountAuth(conn, view);
+      prepared.resolve();
+      await release.promise;
+    });
+    // Observe a rejection before the test task releases the real writer.
+    importing.catch((error) => prepared.reject(error));
+    await prepared.promise;
+    let admissionError: unknown;
+    try {
+      await db.tx((conn) =>
+        requireAccountAuth(conn, 'alice', binding, settings, true, true, now)
+      );
+    } catch (error) {
+      admissionError = error;
+    } finally {
+      release.resolve();
+      await importing;
+    }
+    assertEquals(
+      admissionError,
+      undefined,
+      'a held complete auth cut remains usable during import',
+    );
+    assertEquals(
+      attempts,
+      1,
+      'local clock observation must not invalidate the imported authority writer',
+    );
+    const [after] = await db.query(
+      'SELECT checked_ms FROM account_auth_snapshots WHERE localpart=?',
+      ['alice'],
+    );
+    assertEquals(
+      Number(after.checked_ms),
+      Math.max(Number(original.checked_ms), view.capturedMs),
+    );
+    await assertRejects(
+      () =>
+        db.tx((conn) =>
+          requireAccountAuth(
+            conn,
+            'alice',
+            binding,
+            settings,
+            true,
+            true,
+            now - 1,
+          )
+        ),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    // A pre-upgrade request observation remains a floor even when it is newer
+    // than the independently persisted local counter.
+    await db.execute(
+      'UPDATE account_auth_snapshots SET checked_ms=? WHERE localpart=?',
+      [now + 2, 'alice'],
+    );
+    await assertRejects(
+      () =>
+        db.tx((conn) =>
+          requireAccountAuth(
+            conn,
+            'alice',
+            binding,
+            settings,
+            true,
+            true,
+            now + 1,
+          )
+        ),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const cold = await reopened.tenant('logical.test');
+      await assertRejects(
+        () =>
+          cold.tx((conn) =>
+            requireAccountAuth(
+              conn,
+              'alice',
+              binding,
+              settings,
+              true,
+              true,
+              now - 1,
+            )
+          ),
+        MatrixError,
+        'authentication snapshot unavailable',
+      );
+      await cold.tx((conn) =>
+        requireAccountAuth(
+          conn,
+          'alice',
+          binding,
+          settings,
+          true,
+          true,
+          now + 2,
+        )
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    release.resolve();
+    await importing?.catch(() => {});
+    await f.close();
+  }
+});
 
 Deno.test('irreversible deactivation refuses login even when a captured auth cut is superseded', async () => {
   const f = await fixture();
