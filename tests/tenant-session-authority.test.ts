@@ -14,6 +14,9 @@ import {
 } from '#engine/tenant/auth.ts';
 import { deleteDevices } from '#engine/tenant/devices.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { config } from '#engine/config.ts';
+import { validateUpload } from '#engine/tenant/e2ee.ts';
+import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import {
   activateTenantAuthority,
@@ -111,6 +114,52 @@ Deno.test('session authority: first ingress owns supplied IDs and foreign recove
     assertEquals(
       (await lookupToken(f.home.tenant, session.accessToken))?.device_id,
       'supplied-byte-for-byte',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('F2: whole-device pools refuse a live foreign owner before exhaustion and direct mutation', async () => {
+  const f = await fixture();
+  try {
+    await f.home.login('HOME');
+    await f.edge.install(await f.home.capture());
+    const device = await deviceIdentity(f.home.tenant, 'alice', 'HOME');
+    const input = validateUpload(
+      {
+        one_time_keys: { 'curve25519:once': 'once' },
+      },
+      '@alice:home.test',
+      'HOME',
+      config().e2ee,
+    );
+    await f.home.tenant.tx((tx) => tx.e2ee.upload(device, input));
+    await assertRejects(
+      () =>
+        f.edge.tenant.tx((tx) => tx.e2ee.claim('alice', 'HOME', 'curve25519')),
+      MatrixError,
+      'operation owner unavailable',
+    );
+    await assertRejects(
+      () => f.edge.tenant.tx((tx) => tx.e2ee.upload(device, input)),
+      MatrixError,
+      'operation owner unavailable',
+    );
+    assertEquals(await f.edge.db.query('SELECT * FROM one_time_keys'), []);
+    assertEquals(
+      await f.home.tenant.tx((tx) =>
+        tx.e2ee.claim('alice', 'HOME', 'curve25519')
+      ),
+      { 'curve25519:once': 'once' },
+    );
+    await deleteDevices(f.home.tenant, 'alice', ['HOME']);
+    await f.edge.install(await f.home.capture());
+    assertEquals(
+      await f.edge.tenant.tx((tx) =>
+        tx.e2ee.claim('alice', 'HOME', 'curve25519')
+      ),
+      null,
     );
   } finally {
     await f.close();

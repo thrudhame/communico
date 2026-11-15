@@ -14,6 +14,7 @@ import { revokeAllTokens, revokeToken } from '#engine/tenant/auth.ts';
 import { deleteDevices, upsertDevice } from '#engine/tenant/devices.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { type KeyLimits, validateUpload } from '#engine/tenant/e2ee.ts';
+import { historicalTenantSchema } from '#tests/fixtures/tenant-schema-history.ts';
 
 const limits: KeyLimits = {
   maxrequestbytes: 1048576,
@@ -271,6 +272,125 @@ Deno.test('E1: simultaneous claims consume each accepted key once; upload orderi
       await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
       null,
     );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('F2: consumed OTK identities remain burned across reupload and cold restart, not fallback reuse or recreation', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: { tenant: tenantSchema },
+  });
+  try {
+    let tenant = await openTenant(store, 'a.test', { create: true });
+    const user = await registerUser(tenant, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'PHONE',
+    });
+    let device = await deviceIdentity(tenant, 'alice', 'PHONE');
+    const input = validateUpload(
+      {
+        one_time_keys: { 'curve25519:once': 'once' },
+        fallback_keys: { 'curve25519:f': 'fallback' },
+      },
+      user.user_id,
+      'PHONE',
+      limits,
+    );
+    await tenant.tx((tx) => tx.e2ee.upload(device, input));
+    assertEquals(
+      await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
+      { 'curve25519:once': 'once' },
+    );
+    await store.close();
+    store = await openStore(config(dir), { schemas: { tenant: tenantSchema } });
+    tenant = await openTenant(store, 'a.test');
+    await tenant.tx((tx) => tx.e2ee.upload(device, input));
+    assertEquals((await tenant.tx((tx) => tx.e2ee.status(device))).counts, {});
+    for (let n = 0; n < 2; n++) {
+      assertEquals(
+        await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
+        { 'curve25519:f': 'fallback' },
+      );
+    }
+    await assertRejects(() =>
+      tenant.tx((tx) =>
+        tx.e2ee.upload(
+          device,
+          validateUpload(
+            {
+              one_time_keys: { 'curve25519:once': 'replacement-material' },
+            },
+            user.user_id,
+            'PHONE',
+            limits,
+          ),
+        )
+      )
+    );
+    await deleteDevices(tenant, 'alice', ['PHONE']);
+    await upsertDevice(tenant, 'alice', 'PHONE');
+    device = await deviceIdentity(tenant, 'alice', 'PHONE');
+    await tenant.tx((tx) => tx.e2ee.upload(device, input));
+    assertEquals(
+      await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
+      { 'curve25519:once': 'once' },
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('F2: v27 pool upgrade preserves inventory and installs the same irreversible consumption owner as fresh stores', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: { tenant: historicalTenantSchema(27) },
+  });
+  try {
+    await openTenant(store, 'a.test', { create: true });
+    const old = await store.tenant('a.test');
+    await old.exec(`
+      INSERT INTO users(localpart) VALUES('alice');
+      INSERT INTO devices VALUES('PHONE','alice',1,NULL);
+      INSERT INTO one_time_keys VALUES('alice','PHONE',1,'curve25519','old',5,'"old-key"');
+    `);
+    await store.close();
+    store = await openStore(config(dir), { schemas: { tenant: tenantSchema } });
+    const tenant = await openTenant(store, 'a.test');
+    assertEquals(
+      await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
+      { 'curve25519:old': 'old-key' },
+    );
+    const device = await deviceIdentity(tenant, 'alice', 'PHONE');
+    await tenant.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload(
+          {
+            one_time_keys: { 'curve25519:old': 'old-key' },
+          },
+          '@alice:a.test',
+          'PHONE',
+          limits,
+        ),
+      )
+    );
+    assertEquals(
+      await tenant.tx((tx) => tx.e2ee.claim('alice', 'PHONE', 'curve25519')),
+      null,
+    );
+    await openTenant(store, 'fresh.test', { create: true });
+    const schema = (name: string) =>
+      store.tenant(name).then((db) =>
+        db.query(
+          "SELECT type,name,sql FROM sqlite_schema WHERE tbl_name='key_consumptions' ORDER BY type,name",
+        )
+      );
+    assertEquals(await schema('a.test'), await schema('fresh.test'));
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });

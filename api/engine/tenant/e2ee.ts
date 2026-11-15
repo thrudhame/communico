@@ -1,7 +1,7 @@
 // Tenant-owned public keys and consuming pools. All writes use the caller's Conn.
 import type { Conn } from '#engine/store/db.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
-import { deviceById } from '#engine/tenant/devices.ts';
+import { deviceById, deviceExists } from '#engine/tenant/devices.ts';
 import { appendDeviceChange, poolChanged } from '#engine/tenant/changes.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
@@ -11,6 +11,12 @@ import { config } from '#engine/config.ts';
 import { forgetDeviceSignatures } from '#engine/tenant/cross-signing.ts';
 import { signatureView } from '#engine/tenant/signature-view.ts';
 import { readPublicReplica } from './public-replica.ts';
+import { createHash } from 'node:crypto';
+import { assertDeviceOwner } from '#engine/tenant/session-authority.ts';
+
+export const KEY_CONSUMPTIONS_SQL = `
+CREATE TABLE key_consumptions(localpart TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL,algorithm TEXT NOT NULL,key_id TEXT NOT NULL,material_hash TEXT NOT NULL,PRIMARY KEY(localpart,device_id,generation,algorithm,key_id));
+`;
 
 export type Json = Record<string, unknown>;
 export type KeyLimits = Config['e2ee'];
@@ -136,10 +142,14 @@ function material(json: string): string {
   const { signatures: _s, unsigned: _u, ...body } = key;
   return canonicalJson(body);
 }
+function materialHash(json: string): string {
+  return createHash('sha256').update(material(json)).digest('hex');
+}
 export async function current(
   conn: Conn,
   device: DeviceIdentity,
 ): Promise<void> {
+  await assertDeviceOwner(conn, device.localpart, device.deviceId);
   const row = await deviceById(conn, device.deviceId, device.localpart);
   if (row === null || row.generation !== device.generation) {
     throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'device no longer exists');
@@ -180,6 +190,22 @@ export async function uploadKeys(
   }
   let changed = false;
   for (const key of input.otks) {
+    // A lost claim response does not make its key available again. Upload is
+    // not a new identity for a consumed key in the same device incarnation.
+    const [consumed] = await conn.query(
+      'SELECT material_hash FROM key_consumptions WHERE localpart=? AND device_id=? AND generation=? AND algorithm=? AND key_id=?',
+      [...args, key.algorithm, key.id],
+    );
+    if (consumed) {
+      if (consumed.material_hash !== materialHash(key.json)) {
+        throw new MatrixError(
+          400,
+          'M_INVALID_PARAM',
+          'conflicting consumed one-time key',
+        );
+      }
+      continue;
+    }
     const old = await conn.query(
       'SELECT key_json FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=? AND algorithm=? AND key_id=?',
       [...args, key.algorithm, key.id],
@@ -238,6 +264,7 @@ export async function keyStatus(
   conn: Conn,
   device: DeviceIdentity,
 ): Promise<{ counts: Record<string, number>; unused: string[]; seq: number }> {
+  await assertDeviceOwner(conn, device.localpart, device.deviceId);
   const args = identity(device);
   const counts: Record<string, number> = Object.create(null);
   for (
@@ -272,6 +299,24 @@ export async function purgeRestoredKeyPools(conn: Conn): Promise<{
     if (!devices.length) break;
     for (const row of devices) {
       const owner = [row.localpart, row.device_id, row.generation];
+      // Restore burns every ambiguous pool identity before dropping inventory.
+      // A later client retry must not re-publish an already consumed old key.
+      for (
+        const key of await conn.query(
+          'SELECT algorithm,key_id,key_json FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=?',
+          owner,
+        )
+      ) {
+        await conn.execute(
+          'INSERT INTO key_consumptions VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING',
+          [
+            ...owner,
+            key.algorithm,
+            key.key_id,
+            materialHash(String(key.key_json)),
+          ],
+        );
+      }
       oneTimeKeys += await conn.execute(
         'DELETE FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=?',
         owner,
@@ -394,6 +439,8 @@ export async function claimKey(
   deviceId: string,
   algorithm: string,
 ): Promise<Json | null> {
+  if (!await deviceExists(conn, deviceId, localpart)) return null;
+  await assertDeviceOwner(conn, localpart, deviceId);
   const row = await deviceById(conn, deviceId, localpart);
   if (row === null) return null;
   const device = { localpart, deviceId, generation: row.generation },
@@ -403,6 +450,15 @@ export async function claimKey(
     [...args, algorithm],
   );
   if (keys.length) {
+    await conn.execute(
+      'INSERT INTO key_consumptions VALUES(?,?,?,?,?,?)',
+      [
+        ...args,
+        algorithm,
+        keys[0].key_id,
+        materialHash(String(keys[0].key_json)),
+      ],
+    );
     await conn.execute(
       'DELETE FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=? AND algorithm=? AND key_id=?',
       [...args, algorithm, keys[0].key_id],
