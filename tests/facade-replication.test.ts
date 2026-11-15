@@ -21,10 +21,15 @@ import {
 } from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
-import { exportPublicReplica, PublicReplicas } from '#engine/facade/public.ts';
+import {
+  exportPublicReplica,
+  PublicReplicas,
+  startPublicExports,
+} from '#engine/facade/public.ts';
 import {
   DirectoryReplicas,
   exportDirectoryReplica,
+  startDirectoryExports,
 } from '#engine/facade/directory.ts';
 import {
   addBlock,
@@ -57,6 +62,7 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { roomOf } from '#engine/server/read.ts';
 import { recoverServer } from '#engine/server/startup.ts';
+import { project } from '#engine/server/project.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
@@ -320,6 +326,139 @@ Deno.test('home room export progresses past a busy or broken room, skips evidenc
     await f.close();
   }
 });
+
+for (const domain of ['room', 'public', 'directory'] as const) {
+  Deno.test(`${domain} exports wake at the committed source without a periodic coordinator tick`, async () => {
+    const f = await fixture();
+    const initial = Promise.withResolvers<void>();
+    const suffix = Promise.withResolvers<void>();
+    const failures: unknown[] = [];
+    let changes = 0;
+    const common = {
+      store: f.home,
+      tenant: f.tenant,
+      self: f.signing.name,
+      peer: f.node.node,
+      pairing: f.bundle.id,
+      changed: () => {
+        if (++changes === 1) initial.resolve();
+        else suffix.resolve();
+      },
+      failed: (error: unknown) => failures.push(error),
+    };
+    await f.tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+    await recoverServer(f.home);
+    const worker = domain === 'room'
+      ? startRoomExports(common)
+      : domain === 'public'
+      ? startPublicExports(common)
+      : startDirectoryExports(common);
+    try {
+      worker.wake();
+      await bounded(initial.promise, 3000);
+      if (domain === 'room') {
+        const message = await f.source.addEvent({
+          type: 'm.room.message',
+          content: { body: 'source wake' },
+        });
+        await f.ingest([message]);
+        await project(f.home, f.room.id);
+      } else {
+        await f.tenant.tx((tx) =>
+          tx.profiles.set('alice', 'displayname', 'Source wake')
+        );
+      }
+      await bounded(suffix.promise, 3000);
+      assertEquals(failures, []);
+      assert(changes >= 2);
+    } finally {
+      await worker.close();
+      await f.close();
+    }
+  });
+}
+
+for (const domain of ['room', 'public'] as const) {
+  for (const fault of ['export', 'enumeration'] as const) {
+    Deno.test(`${domain} exports retain a wake across a failed ${fault} pass`, async () => {
+      const f = await fixture();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const rescanned = Promise.withResolvers<void>();
+      const delivered = Promise.withResolvers<void>();
+      const failed: unknown[] = [];
+      const failure = new Error('injected export pass failure');
+      let injected = false;
+      let scans = 0;
+      await f.tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+      const enumerate = async <T>(read: () => Promise<T>) => {
+        scans++;
+        if (fault === 'enumeration' && !injected) {
+          injected = true;
+          entered.resolve();
+          await release.promise;
+          throw failure;
+        }
+        const value = await read();
+        if (scans > 1) setTimeout(() => rescanned.resolve(), 0);
+        return value;
+      };
+      const rooms = f.home.rooms.bind(f.home);
+      const tx = f.tenant.tx.bind(f.tenant);
+      if (domain === 'room') f.home.rooms = () => enumerate(rooms);
+      else {
+        f.tenant.tx = (action) =>
+          tx((current) => {
+            const users = current.publicReplica.users;
+            current.publicReplica.users = () => enumerate(users);
+            return action(current);
+          });
+      }
+      const db = await f.home.server();
+      const query = db.query.bind(db);
+      db.query = async (sql, values) => {
+        if (
+          fault === 'export' && !injected &&
+          sql.startsWith('SELECT source_cut FROM facade_exports')
+        ) {
+          injected = true;
+          entered.resolve();
+          await release.promise;
+          throw failure;
+        }
+        return await query(sql, values);
+      };
+      const common = {
+        store: f.home,
+        tenant: f.tenant,
+        self: f.signing.name,
+        peer: f.node.node,
+        pairing: f.bundle.id,
+        changed: () => delivered.resolve(),
+        failed: (error: unknown) => failed.push(error),
+      };
+      const worker = domain === 'room'
+        ? startRoomExports(common)
+        : startPublicExports(common);
+      try {
+        worker.wake();
+        await bounded(entered.promise, 3000);
+        worker.wake();
+        if (fault === 'export') await bounded(rescanned.promise, 3000);
+        release.resolve();
+        await bounded(delivered.promise, 3000);
+        assertEquals(failed, [failure]);
+      } finally {
+        release.resolve();
+        await worker.close();
+        f.home.rooms = rooms;
+        f.tenant.tx = tx;
+        db.query = query;
+        await f.close();
+      }
+    });
+  }
+}
 
 Deno.test('room commit before completion survives reopen without readiness or duplicate publication', async () => {
   const f = await fixture();

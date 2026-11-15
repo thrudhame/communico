@@ -24,6 +24,7 @@ type Options = {
   // domain commit then Journal.complete for cross-file effects. No network in tx.
   apply(stream: Stream): Promise<boolean>;
   failed(error: unknown, stream?: Stream): void;
+  acknowledged?(stream: Stream): void;
 };
 function key(stream: Stream) {
   return canonicalJson(streamOf(stream));
@@ -45,6 +46,7 @@ function advance(held: Cut, remote: Cut) {
 
 export class JournalReconciler {
   private readonly running = new Map<string, Promise<void>>();
+  private readonly rerun = new Set<string>();
   constructor(private readonly options: Options) {}
 
   async reconcile(signal?: AbortSignal): Promise<Hello> {
@@ -75,32 +77,59 @@ export class JournalReconciler {
       }
     }
     for (const stream of outgoing) {
-      this.start('out', stream, () => this.push(stream, hello, signal), signal);
+      this.start('out', stream, signal);
     }
     for (const stream of hello.outgoing) {
-      this.start('in', stream, () => this.pull(stream, hello, signal), signal);
+      this.start('in', stream, signal);
     }
     return hello;
   }
 
   private start(
     direction: string,
-    stream: Stream,
-    work: () => Promise<void>,
+    stream: Heads,
     signal?: AbortSignal,
   ) {
     const id = direction + ':' + key(stream);
-    if (this.running.has(id)) return;
-    const job = work().catch((error) => {
-      if (
-        signal?.aborted &&
-        (error === signal.reason ||
-          (error instanceof Error && error.name === 'AbortError'))
-      ) return;
-      this.options.failed(error, stream);
-    });
+    if (this.running.has(id)) {
+      this.rerun.add(id);
+      return;
+    }
+    const job = (async () => {
+      try {
+        do {
+          this.rerun.delete(id);
+          try {
+            // A wake received during an admitted pass is retained. Its next pass
+            // obtains fresh cuts, never the hello preceding the previous ACK.
+            const current = await this.options.client.hello(signal);
+            if (direction === 'out') await this.push(stream, current, signal);
+            else {
+              const source = current.outgoing.find((entry) =>
+                key(entry) === key(stream)
+              );
+              if (!source) {
+                throw new LinkError(
+                  'LINK_DIVERGED',
+                  'facade source stream disappeared',
+                );
+              }
+              await this.pull(source, current, signal);
+            }
+          } catch (error) {
+            if (
+              signal?.aborted &&
+              (error === signal.reason ||
+                (error instanceof Error && error.name === 'AbortError'))
+            ) return;
+            this.options.failed(error, stream);
+          }
+        } while (!signal?.aborted && this.rerun.delete(id));
+      } finally {
+        this.running.delete(id);
+      }
+    })();
     this.running.set(id, job);
-    void job.finally(() => this.running.delete(id));
   }
 
   async drain(): Promise<void> {
@@ -131,6 +160,9 @@ export class JournalReconciler {
         next.applied,
         next.results,
       );
+      if (next.applied.sequence > ack.applied.sequence) {
+        this.options.acknowledged?.(stream);
+      }
       const progressed = !sameCut(ack.received, next.received) ||
         !sameCut(ack.applied, next.applied);
       ack = next;
@@ -289,41 +321,69 @@ export function startInboxWorker(options: {
   let stopped = false;
   let scanning: Promise<void> | undefined;
   const running = new Map<string, Promise<void>>();
-  const scan = () =>
-    scanning ??= (async () => {
+  const rerun = new Set<string>();
+  let dirty = false;
+  const scan = () => {
+    dirty = true;
+    return scanning ??= (async () => {
       try {
-        for (
-          const stream of await options.journal.streams(options.peer, 'in')
-        ) {
-          const id = key(stream);
-          if (stopped || running.has(id)) continue;
-          const work = (async () => {
-            let applied = stream.applied.sequence;
-            while (!stopped && await options.apply(stream)) {
-              const next = await options.journal.heads(
-                options.peer,
-                'in',
-                stream,
-              );
-              if (next.applied.sequence <= applied) {
-                throw new LinkError(
-                  'LINK_DIVERGED',
-                  'domain reported application without durable completion',
-                );
+        do {
+          dirty = false;
+          try {
+            for (
+              const stream of await options.journal.streams(options.peer, 'in')
+            ) {
+              const id = key(stream);
+              if (stopped) break;
+              if (running.has(id)) {
+                rerun.add(id);
+                continue;
               }
-              applied = next.applied.sequence;
-              options.changed();
+              const work = (async () => {
+                try {
+                  do {
+                    rerun.delete(id);
+                    try {
+                      let applied = (await options.journal.heads(
+                        options.peer,
+                        'in',
+                        stream,
+                      ))
+                        .applied.sequence;
+                      while (!stopped && await options.apply(stream)) {
+                        const next = await options.journal.heads(
+                          options.peer,
+                          'in',
+                          stream,
+                        );
+                        if (next.applied.sequence <= applied) {
+                          throw new LinkError(
+                            'LINK_DIVERGED',
+                            'domain reported application without durable completion',
+                          );
+                        }
+                        applied = next.applied.sequence;
+                        options.changed();
+                      }
+                    } catch (error) {
+                      options.failed(error, stream);
+                    }
+                  } while (!stopped && rerun.delete(id));
+                } finally {
+                  running.delete(id);
+                }
+              })();
+              running.set(id, work);
             }
-          })().catch((error) => options.failed(error, stream));
-          running.set(id, work);
-          void work.finally(() => running.delete(id));
-        }
-      } catch (error) {
-        options.failed(error);
+          } catch (error) {
+            options.failed(error);
+          }
+        } while (!stopped && dirty);
       } finally {
         scanning = undefined;
       }
     })();
+  };
   const timer = setInterval(() => void scan(), options.pollseconds * 1000);
   void scan();
   let closed: Promise<void> | undefined;

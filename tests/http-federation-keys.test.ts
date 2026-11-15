@@ -7,6 +7,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { keyStore } from '#engine/federation/keys.ts';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
+import { FacadeKeys, publishKeyDocument } from '#engine/facade/control.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { httpSuite } from './http-app.ts';
@@ -84,9 +85,25 @@ test('both public key-document paths publish the approved roster and exact retir
       required: [{ type: 'control', version: 1 }],
     });
     await edge.accept(bundle);
-    await home.grant(
+    const grant = await home.grant(
       bundle.id,
       await edge.challenge(bundle.id, bundle.secret, homePin),
+    );
+    await home.confirm(
+      bundle.id,
+      await edge.complete(bundle.id, grant, homePin),
+    );
+    const keys = new FacadeKeys(
+      await facade.server(),
+      node.signer(),
+      node.publicKey,
+      edge,
+    );
+    await publishKeyDocument(
+      app.server,
+      app.tenant.signer(),
+      app.tenant.publicB64,
+      (_id, doc) => keys.cosign(doc),
     );
     const cut = Date.now();
     for (const retired of [false, true]) {
@@ -103,6 +120,14 @@ test('both public key-document paths publish the approved roster and exact retir
           });
         } else {
           assertEquals(doc.verify_keys[node.keyId], { key: node.publicKey });
+          assert(
+            await verifyJson(
+              doc,
+              serverName(),
+              node.keyId,
+              await importPublicKeyFromRaw(b64decode(node.publicKey)),
+            ),
+          );
         }
         assert(
           await verifyJson(
