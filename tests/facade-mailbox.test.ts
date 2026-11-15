@@ -933,7 +933,7 @@ Deno.test('mailbox schema upgrades v33 without recreating identity or pairing', 
     const server = await f.edge().server();
     await server.tx(async (conn) => {
       await conn.exec(
-        'DROP TABLE facade_egress_routes; DROP TABLE facade_egress; DROP TABLE facade_ingress_collisions; DROP TABLE facade_ingress_children; DROP TABLE facade_ingress',
+        'DROP TABLE domain_conflicts; DROP TABLE domain_frontiers; DROP TABLE domain_operations; DROP TABLE facade_owner_activation; DROP TABLE facade_owner_controls; DROP TABLE publication_domain; DROP TABLE facade_egress_routes; DROP TABLE facade_egress; DROP TABLE facade_ingress_collisions; DROP TABLE facade_ingress_children; DROP TABLE facade_ingress',
       );
       await conn.execute("UPDATE meta SET v='33' WHERE k='schema_version'");
     }, { mode: 'deferred' });

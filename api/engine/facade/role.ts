@@ -3,6 +3,7 @@
 import type { Store } from '#engine/store/index.ts';
 import { LinkError } from './protocol.ts';
 import { nodeId } from './identity.ts';
+import { publicationIdentity } from './ownership.ts';
 
 export type RoleIdentity = {
   role: 'home' | 'facade';
@@ -17,7 +18,7 @@ export async function bindRole(
   const node = identity.role === 'facade' ? nodeId(identity.node) : '';
   const tenants = await store.tenants();
   const db = await store.server();
-  return await db.tx(async (conn) => {
+  const binding = await db.tx(async (conn) => {
     const [held] = await conn.query(
       'SELECT * FROM runtime_identity WHERE singleton=1',
     );
@@ -65,4 +66,6 @@ export async function bindRole(
     );
     return { ...identity, node, initialized: !!existingNode };
   });
+  await publicationIdentity(db, node || 'home');
+  return binding;
 }

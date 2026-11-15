@@ -289,7 +289,7 @@ Deno.test('egress migration upgrades v34 without losing frozen bytes', async () 
   try {
     await (await f.db()).tx(async (tx) => {
       await tx.exec(
-        'DROP TABLE facade_egress; DROP TABLE facade_egress_routes',
+        'DROP TABLE domain_conflicts; DROP TABLE domain_frontiers; DROP TABLE domain_operations; DROP TABLE facade_owner_activation; DROP TABLE facade_owner_controls; DROP TABLE publication_domain; DROP TABLE facade_egress; DROP TABLE facade_egress_routes',
       );
       await tx.execute("UPDATE meta SET v='34' WHERE k='schema_version'");
     }, { mode: 'deferred' });

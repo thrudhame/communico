@@ -14,7 +14,7 @@ import { nodeId, type NodeIdentity } from './identity.ts';
 import {
   type Capability,
   integer,
-  LINK_CAPABILITIES,
+  LINK_SUPPORTED,
   LINK_VERSION,
   LinkError,
   negotiate,
@@ -262,7 +262,7 @@ export class Pairings {
     publicKey: string,
     private readonly pin: string,
     private readonly node?: NodeIdentity,
-    private readonly supported: readonly Capability[] = LINK_CAPABILITIES,
+    private readonly supported: readonly Capability[] = LINK_SUPPORTED,
   ) {
     this.key = keyOf({ keyId: signer.keyId, publicKey });
     pinOf(pin);
