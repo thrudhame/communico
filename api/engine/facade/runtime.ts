@@ -24,7 +24,8 @@ import { Pairings, pairingStatus } from './pairing.ts';
 import { RoomReplicas } from './replication.ts';
 import { PublicReplicas } from './public.ts';
 import { DirectoryReplicas } from './directory.ts';
-import { LINK_CAPABILITIES, LinkError } from './protocol.ts';
+import { LINK_SUPPORTED, LinkError } from './protocol.ts';
+import { OwnerControls } from './ownership.ts';
 import { bindRole } from './role.ts';
 import { loadLinkTls } from './transport.ts';
 import { startInboxWorker } from './worker.ts';
@@ -61,7 +62,7 @@ export async function openFacadeRuntime(
     beforeStartup: (store) => bindRole(store, identity),
   });
   const server = await store.server();
-  const journal = new Journal(server, LINK_CAPABILITIES);
+  const journal = new Journal(server, LINK_SUPPORTED);
   const notices = new NoticeHub();
   let node: NodeIdentity | undefined;
   let tenant: Tenant | undefined;
@@ -148,6 +149,13 @@ export async function openFacadeRuntime(
       apply: async (stream) =>
         stream.stream === 'control'
           ? await (await keyOwner()).apply(journal, stream)
+          : stream.stream === 'owner-control'
+          ? await new OwnerControls(
+            server,
+            await store.tenant(identity.server),
+            await pairings(),
+            node!,
+          ).apply(journal, stream)
           : stream.stream === 'directory'
           ? await new DirectoryReplicas(
             server,

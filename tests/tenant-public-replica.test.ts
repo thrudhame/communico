@@ -234,7 +234,9 @@ Deno.test('public profile and privacy mutations retain export intent and v20 upg
       previous = next.cut;
     }
     await (await f.db()).tx(async (conn) => {
-      await conn.exec('DROP TABLE public_user_replicas');
+      await conn.exec(
+        'DROP TABLE domain_conflicts; DROP TABLE domain_frontiers; DROP TABLE domain_operations; DROP TABLE facade_owner_activation; DROP TABLE facade_owner_controls; DROP TABLE public_user_replicas',
+      );
       await conn.execute("UPDATE meta SET v='20' WHERE k='schema_version'");
     }, { mode: 'deferred' });
     await f.reopen();

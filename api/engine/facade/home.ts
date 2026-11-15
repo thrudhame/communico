@@ -17,7 +17,7 @@ import { HomeEgress } from './home-egress.ts';
 import { dispatchBatch } from '#engine/federation/sender.ts';
 import { transactionDependencies } from '#engine/federation/dependencies.ts';
 import {
-  LINK_CAPABILITIES,
+  LINK_SUPPORTED,
   LinkError,
   object,
   type Stream,
@@ -59,7 +59,7 @@ export async function startHomeLinks(
     app.tenant.publicB64,
     certificatePin(tls.cert),
   );
-  const journal = new Journal(app.server, LINK_CAPABILITIES);
+  const journal = new Journal(app.server, LINK_SUPPORTED);
   const controller = new AbortController();
   const workers = new Map<string, ReturnType<typeof startHomeLinkWorker>>();
   const exports = new Map<string, ReturnType<typeof startRoomExports>>();
