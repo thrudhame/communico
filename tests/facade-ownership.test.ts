@@ -15,11 +15,7 @@ import {
   LinkError,
 } from '#engine/facade/protocol.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import {
-  OWNER_CONTROL_SQL,
-  PUBLICATION_DOMAIN_SQL,
-} from '#engine/facade/schema.ts';
-import type { SchemaProvider } from '#engine/store/create.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
@@ -378,73 +374,58 @@ Deno.test('cross-file mixed control remains unavailable and replays to completio
   }
 });
 
-Deno.test('ownership schemas upgrade actual server35/tenant21 to the same schema as fresh creation', async () => {
-  const dir = await Deno.makeTempDir({ prefix: 'owner-control-upgrade-' });
-  const cfg = (suffix: string) => ({
-    dir: dir + '/' + suffix,
-    library: './.native/libturso_ffi.so',
-    checkpointlogbytes: 65536,
-    maxopenfiles: 8,
-    idleseconds: 300,
-  });
-  // Omit only this slice's appended creation statements, preserving the actual
-  // previous provider. Do not relabel today's full schema with an old version.
-  const prior = (current: SchemaProvider, version: number): SchemaProvider => ({
-    version,
-    migrations: current.migrations,
-    apply: (conn) =>
-      current.apply(
-        {
-          query: conn.query.bind(conn),
-          execute: conn.execute.bind(conn),
-          exec: (sql: string) =>
-            sql === OWNER_CONTROL_SQL || sql === PUBLICATION_DOMAIN_SQL
-              ? Promise.resolve()
-              : conn.exec(sql),
-        } as typeof conn,
-      ),
-  });
-  let old = await openStore(cfg('upgrade'), {
-    schemas: {
-      server: prior(serverSchema, 35),
-      tenant: historicalTenantSchema(21),
-    },
-  });
-  const fresh = await openStore(cfg('fresh'), {
-    schemas: { server: serverSchema, tenant: tenantSchema },
-  });
-  try {
-    const t = await openTenant(old, 'logical.test', { create: true });
-    await t.tx((tx) => tx.users.insert('existing', 'Existing'));
-    const key = t.publicB64;
-    const ft = await openTenant(fresh, 'logical.test', { create: true });
-    assert(ft.publicB64);
-    await old.close();
-    old = await openStore(cfg('upgrade'), {
+for (const version of [35, 36]) {
+  Deno.test(`ownership schemas upgrade released server${version}/tenant21 to the same schema as fresh creation`, async () => {
+    const dir = await Deno.makeTempDir({ prefix: 'owner-control-upgrade-' });
+    const cfg = (suffix: string) => ({
+      dir: dir + '/' + suffix,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    });
+    let old = await openStore(cfg('upgrade'), {
+      schemas: {
+        server: historicalServerSchema(version),
+        tenant: historicalTenantSchema(21),
+      },
+    });
+    const fresh = await openStore(cfg('fresh'), {
       schemas: { server: serverSchema, tenant: tenantSchema },
     });
-    assertEquals((await openTenant(old, 'logical.test')).publicB64, key);
-    for (const kind of ['server', 'tenant'] as const) {
-      const left = kind === 'server'
-        ? await old.server()
-        : await old.tenant('logical.test');
-      const right = kind === 'server'
-        ? await fresh.server()
-        : await fresh.tenant('logical.test');
-      const sql =
-        "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name";
-      assertEquals(await left.query(sql), await right.query(sql));
+    try {
+      const t = await openTenant(old, 'logical.test', { create: true });
+      await t.tx((tx) => tx.users.insert('existing', 'Existing'));
+      const key = t.publicB64;
+      const ft = await openTenant(fresh, 'logical.test', { create: true });
+      assert(ft.publicB64);
+      await old.close();
+      old = await openStore(cfg('upgrade'), {
+        schemas: { server: serverSchema, tenant: tenantSchema },
+      });
+      assertEquals((await openTenant(old, 'logical.test')).publicB64, key);
+      for (const kind of ['server', 'tenant'] as const) {
+        const left = kind === 'server'
+          ? await old.server()
+          : await old.tenant('logical.test');
+        const right = kind === 'server'
+          ? await fresh.server()
+          : await fresh.tenant('logical.test');
+        const sql =
+          "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name";
+        assertEquals(await left.query(sql), await right.query(sql));
+      }
+      assertEquals(
+        (await openTenant(old, 'logical.test')).serverName,
+        'logical.test',
+      );
+    } finally {
+      await old.close();
+      await fresh.close();
+      await Deno.remove(dir, { recursive: true });
     }
-    assertEquals(
-      (await openTenant(old, 'logical.test')).serverName,
-      'logical.test',
-    );
-  } finally {
-    await old.close();
-    await fresh.close();
-    await Deno.remove(dir, { recursive: true });
-  }
-});
+  });
+}
 
 Deno.test('re-enrollment fences old ownership control and preserves independent publication identity', async () => {
   const f = await fixture();

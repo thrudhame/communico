@@ -12,6 +12,7 @@ import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LinkError } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import type { Database } from '#engine/store/db.ts';
@@ -25,14 +26,14 @@ const cfg = (dir: string) => ({
   maxopenfiles: 8,
   idleseconds: 300,
 });
-async function fixture() {
+async function fixture(seedServer = serverSchema) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-pairing-' });
-  const open = (name: string) =>
+  const open = (name: string, schema = serverSchema) =>
     openStore(cfg(dir + '/' + name), {
-      schemas: { server: serverSchema, tenant: tenantSchema },
+      schemas: { server: schema, tenant: tenantSchema },
     });
-  let home: Store = await open('home');
-  let edge: Store = await open('edge');
+  let home: Store = await open('home', seedServer);
+  let edge: Store = await open('edge', seedServer);
   const tenant = await openTenant(home, 'logical.test', { create: true });
   let node = await initializeNode(
     await edge.server(),
@@ -218,7 +219,7 @@ Deno.test('home key document publishes approved node keys and durable prospectiv
 });
 
 Deno.test('v28 upgrade retains enrolled authority while adding prospective key retirement', async () => {
-  const f = await fixture();
+  const f = await fixture(historicalServerSchema(35));
   try {
     const bundle = await f.create();
     await f.fp.accept(bundle);
@@ -231,7 +232,7 @@ Deno.test('v28 upgrade retains enrolled authority while adding prospective key r
     const server = await f.home().server();
     await server.tx(async (conn) => {
       await conn.exec(
-        'DROP TABLE domain_conflicts; DROP TABLE domain_frontiers; DROP TABLE domain_operations; DROP TABLE facade_owner_activation; DROP TABLE facade_owner_controls; DROP TABLE publication_domain; DROP TABLE facade_egress_routes; DROP TABLE facade_egress; DROP TABLE facade_ingress_collisions; DROP TABLE facade_ingress_children; DROP TABLE facade_ingress; DROP TABLE server_key_decisions; DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports; DROP TABLE facade_key_roster',
+        'DROP TABLE facade_egress_routes; DROP TABLE facade_egress; DROP TABLE facade_ingress_collisions; DROP TABLE facade_ingress_children; DROP TABLE facade_ingress; DROP TABLE server_key_decisions; DROP TABLE federation_policy; DROP TABLE facade_scopes; DROP TABLE facade_exports; DROP TABLE facade_key_roster',
       );
       await conn.exec('ALTER TABLE facade_pairings DROP COLUMN retired_ms');
       await conn.execute("UPDATE meta SET v='28' WHERE k='schema_version'");
