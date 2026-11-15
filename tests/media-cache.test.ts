@@ -140,7 +140,12 @@ Deno.test('media cache: one media cannot create unbounded thumbnail variants, in
     assertEquals(results.filter((r) => r.status === 'fulfilled').length, 32);
     assertEquals(calls, 32, 'over-limit variants never enter the producer');
     assertEquals((await listCachedMedia(db)).length, 32);
-    await fill(0);
+    // Hash completion, not submission order, determines variant admission.
+    const admitted = results.findIndex((result) =>
+      result.status === 'fulfilled'
+    );
+    assert(admitted >= 0);
+    await fill(admitted);
     await fill(40, 'other.test');
     await cache.close();
     const reopened = new MediaCache(db, root);
@@ -150,7 +155,9 @@ Deno.test('media cache: one media cannot create unbounded thumbnail variants, in
         reopened.fetch(identity('a.test', 'new'), 1, producer)
       );
       assertEquals((await listCachedMedia(db)).length, 33);
-      const hit = await reopened.get(identity('a.test', 'crop:0:1:png:false'));
+      const hit = await reopened.get(
+        identity('a.test', 'crop:' + admitted + ':1:png:false'),
+      );
       assert(hit);
       await (await reopened.open(hit)).cancel();
     } finally {
