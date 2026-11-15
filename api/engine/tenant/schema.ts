@@ -10,7 +10,10 @@
 import type { SchemaProvider } from '#engine/store/create.ts';
 import { recordPusherChange } from '#engine/tenant/pushers.ts';
 import { OWNER_CONTROL_SQL } from '#engine/facade/schema.ts';
-import { ACCOUNT_AUTH_SQL } from '#engine/tenant/account-auth.ts';
+import {
+  ACCOUNT_AUTH_PUBLICATION_SQL,
+  ACCOUNT_AUTH_SQL,
+} from '#engine/tenant/account-auth.ts';
 import { SESSION_AUTHORITY_SQL } from '#engine/tenant/session-authority.ts';
 import { UIA_BINDING_SQL } from '#engine/tenant/uia.ts';
 import { PROFILE_FANOUT_SQL } from '#engine/tenant/profile-fanout.ts';
@@ -274,7 +277,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 27,
+  version: 28,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -300,8 +303,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(UIA_BINDING_SQL);
     await db.exec(DEACTIVATION_WORK_SQL);
     await db.exec(PROFILE_FANOUT_SQL);
+    await db.exec(ACCOUNT_AUTH_PUBLICATION_SQL);
   },
   migrations: {
+    27: (conn) => conn.exec(ACCOUNT_AUTH_PUBLICATION_SQL),
     26: (conn) => conn.exec(PROFILE_FANOUT_SQL),
     25: (conn) => conn.exec(DEACTIVATION_WORK_SQL),
     24: (conn) => conn.exec(UIA_BINDING_SQL),
