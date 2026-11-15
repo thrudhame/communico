@@ -3,6 +3,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import {
   AccountSnapshots,
   exportAccountAuth,
+  exportSessionAuthority,
 } from '#engine/facade/accounts.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
@@ -19,7 +20,14 @@ import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { requireAccountAuth } from '#engine/tenant/account-auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { registerUser, verifyUserPassword } from '#engine/tenant/users.ts';
+import {
+  loginUser,
+  registerUser,
+  verifyUserPassword,
+} from '#engine/tenant/users.ts';
+import { lookupToken, revokeAllTokens } from '#engine/tenant/auth.ts';
+import { captureSessionAuthority } from '#engine/tenant/session-authority.ts';
+import { deleteDevices } from '#engine/tenant/devices.ts';
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-account-auth-' });
@@ -90,6 +98,7 @@ async function fixture() {
   const emit = (credentials = true) =>
     exportAccountAuth(home, ht, hp, bundle.id, 'alice', credentials);
   return {
+    open,
     home,
     edge,
     ht,
@@ -417,6 +426,328 @@ Deno.test('future auth waits for its control and a forged obsolete auth never co
       future.sequence,
     );
   } finally {
+    await f.close();
+  }
+});
+
+// Construct the signed wire body independently of the production exporter so
+// receiver tests do not accidentally bless its normalization/identity choices.
+async function reverseFixture() {
+  const f = await fixture();
+  const initial = await f.emit();
+  await f.journal.receive('home', [initial]);
+  await f.receiver.apply(f.journal, initial);
+  const source = new Journal(await f.edge.server(), LINK_SUPPORTED);
+  const destination = new Journal(await f.home.server(), LINK_SUPPORTED);
+  const receiver = new AccountSnapshots(f.home, f.ht, f.hp, f.owners);
+  const capture = () =>
+    (f.edge.tenant('logical.test')).then((db) =>
+      db.tx((conn) => captureSessionAuthority(conn, 'alice'))
+    );
+  const emit = async (
+    change: (body: Record<string, unknown>) => void = () => {},
+    signer = f.node.signer(),
+  ) => {
+    const cut = await capture();
+    const body = {
+      kind: 'session-authority',
+      server: 'logical.test',
+      pairing: f.bundle.id,
+      grantRevision: 1,
+      ownerRevision: 1,
+      localpart: 'alice',
+      source: f.node.node,
+      incarnation: f.node.incarnation,
+      authority: {
+        facts: cut.facts.filter((fact) => fact.node === f.node.node),
+        sessions: cut.sessions.filter((session) =>
+          session.node === f.node.node
+        ),
+      },
+    };
+    change(body);
+    const record = await source.append('home', {
+      source: f.node.node,
+      incarnation: f.node.incarnation,
+      stream: 'authority:@alice:logical.test',
+      type: 'account-auth',
+      version: 1,
+      operationId: crypto.randomUUID(),
+      payload: { body, signature: await signer.sign(canonicalJson(body)) },
+    });
+    await destination.receive(f.node.node, [record]);
+    return record;
+  };
+  return {
+    ...f,
+    source,
+    destination,
+    reverse: receiver,
+    capture,
+    reverseEmit: emit,
+  };
+}
+
+Deno.test('facade authority reaches home durably before ACK and never becomes a second token issuer', async () => {
+  const f = await reverseFixture();
+  try {
+    const session = await loginUser(f.et, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'outside',
+      refresh: true,
+    });
+    const record = await f.reverseEmit();
+    assertEquals(
+      await f.reverse.applyFromFacade(f.destination, f.bundle.id, record),
+      true,
+    );
+    await assertRejects(
+      () => lookupToken(f.ht, session.accessToken),
+      MatrixError,
+      'operation owner unavailable',
+    );
+    assertEquals(
+      await (await f.home.tenant('logical.test')).query(
+        'SELECT * FROM access_tokens',
+      ),
+      [],
+    );
+    assertEquals(
+      (await f.destination.heads(f.node.node, 'in', record)).applied.sequence,
+      record.sequence,
+    );
+    assertEquals(canonicalJson(record).includes(session.accessToken), false);
+    assertEquals(canonicalJson(record).includes(session.refreshToken!), false);
+    assertEquals(canonicalJson(record).includes('$argon2'), false);
+    assertEquals(
+      await f.reverse.applyFromFacade(f.destination, f.bundle.id, record),
+      false,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade logout barrier invalidates a concurrently issued home session at the consumer', async () => {
+  const f = await reverseFixture();
+  try {
+    const session = await loginUser(f.ht, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'lan',
+      refresh: true,
+    });
+    await revokeAllTokens(f.et, 'alice');
+    const record = await f.reverseEmit();
+    await f.reverse.applyFromFacade(f.destination, f.bundle.id, record);
+    await assertRejects(
+      () => lookupToken(f.ht, session.accessToken),
+      MatrixError,
+      'session authority revoked',
+    );
+    assertEquals(
+      await (await f.home.tenant('logical.test')).query(
+        'SELECT * FROM refresh_tokens',
+      ),
+      [],
+    );
+    const fresh = await loginUser(f.ht, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'later',
+      refresh: false,
+    });
+    assertEquals(
+      (await lookupToken(f.ht, fresh.accessToken))?.device_id,
+      'later',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+for (
+  const attack of [
+    'signature',
+    'source',
+    'account',
+    'home-fact',
+    'home-session',
+    'grant',
+    'stream',
+  ] as const
+) {
+  Deno.test(`facade authority refuses ${attack} substitution without an applied ACK`, async () => {
+    const f = await reverseFixture();
+    try {
+      const homeSession = await loginUser(f.ht, {
+        localpart: 'alice',
+        password: 'pw',
+        deviceId: 'lan',
+        refresh: true,
+      });
+      const homeCut = await (await f.home.tenant('logical.test')).tx((conn) =>
+        captureSessionAuthority(conn, 'alice')
+      );
+      const record = await f.reverseEmit((body) => {
+        if (attack === 'source') body.source = 'somewhere-else';
+        if (attack === 'account') body.localpart = 'unselected';
+        if (attack === 'grant') body.grantRevision = 2;
+        const authority = body.authority as typeof homeCut;
+        if (attack === 'home-fact') authority.facts.push(homeCut.facts[0]);
+        if (attack === 'home-session') {
+          authority.sessions.push(homeCut.sessions[0]);
+        }
+      }, attack === 'signature' ? f.ht.signer() : f.node.signer());
+      let stream = record;
+      if (attack === 'stream') {
+        stream = await f.source.append('home', {
+          ...record,
+          stream: 'authority:@bob:logical.test',
+          operationId: crypto.randomUUID(),
+        });
+        await f.destination.receive(f.node.node, [stream]);
+      }
+      await assertRejects(
+        () => f.reverse.applyFromFacade(f.destination, f.bundle.id, stream),
+        LinkError,
+      );
+      assertEquals(
+        (await f.destination.heads(f.node.node, 'in', stream)).applied.sequence,
+        0,
+      );
+      assertEquals(
+        (await lookupToken(f.ht, homeSession.accessToken))?.device_id,
+        'lan',
+      );
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+Deno.test('facade exporter retains only its own digest recovery and cross-ingress deletes target known home incarnations', async () => {
+  const f = await reverseFixture();
+  try {
+    const lan = await loginUser(f.ht, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'lan',
+      refresh: true,
+    });
+    const cut = await f.emit();
+    await f.journal.receive('home', [cut]);
+    await f.receiver.apply(f.journal, cut);
+    await loginUser(f.et, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'outside',
+      refresh: true,
+    });
+    await deleteDevices(f.et, 'alice', ['lan']);
+    const record = await exportSessionAuthority(
+      f.edge,
+      f.et,
+      f.fp,
+      f.owners,
+      f.node,
+      'alice',
+    );
+    const again = await exportSessionAuthority(
+      f.edge,
+      f.et,
+      f.fp,
+      f.owners,
+      f.node,
+      'alice',
+    );
+    assertEquals(again, record);
+    const authority = (record.payload as {
+      body: { authority: Awaited<ReturnType<typeof f.capture>> };
+    }).body.authority;
+    assertEquals(
+      authority.facts.every((fact) => fact.node === f.node.node),
+      true,
+    );
+    assertEquals(
+      authority.sessions.every((session) => session.node === f.node.node),
+      true,
+    );
+    assertEquals(canonicalJson(record).includes('$argon2'), false);
+    await f.destination.receive(f.node.node, [record]);
+    await f.reverse.applyFromFacade(f.destination, f.bundle.id, record);
+    await assertRejects(
+      () => lookupToken(f.ht, lan.accessToken),
+      MatrixError,
+      'session authority revoked',
+    );
+    assertEquals(await f.ht.tx((tx) => tx.devices.byId('lan', 'alice')), null);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('reverse authority retries a committed tenant cut after cold reopen without an early journal ACK', async () => {
+  const f = await reverseFixture();
+  let cold: Awaited<ReturnType<typeof f.open>> | undefined;
+  try {
+    const token = await loginUser(f.ht, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'lan',
+      refresh: true,
+    });
+    await revokeAllTokens(f.et, 'alice');
+    const record = await f.reverseEmit();
+    const interrupted = new Proxy(f.destination, {
+      get(journal, key) {
+        if (key === 'apply') {
+          return () => Promise.reject(new Error('after tenant commit'));
+        }
+        const value = Reflect.get(journal, key);
+        return typeof value === 'function' ? value.bind(journal) : value;
+      },
+    });
+    await assertRejects(
+      () => f.reverse.applyFromFacade(interrupted, f.bundle.id, record),
+      Error,
+      'after tenant commit',
+    );
+    assertEquals(
+      (await f.destination.heads(f.node.node, 'in', record)).applied.sequence,
+      0,
+    );
+    await f.home.close();
+    cold = await f.open('home');
+    const tenant = await openTenant(cold, 'logical.test');
+    const pairings = new Pairings(
+      await cold.server(),
+      tenant.signer(),
+      tenant.publicB64,
+      'a'.repeat(64),
+    );
+    const journal = new Journal(await cold.server(), LINK_SUPPORTED);
+    const receiver = new AccountSnapshots(cold, tenant, pairings, f.owners);
+    await assertRejects(
+      () => lookupToken(tenant, token.accessToken),
+      MatrixError,
+      'session authority revoked',
+    );
+    assertEquals(
+      await receiver.applyFromFacade(journal, f.bundle.id, record),
+      true,
+    );
+    assertEquals(
+      (await journal.heads(f.node.node, 'in', record)).applied.sequence,
+      record.sequence,
+    );
+    const facts = await (await cold.tenant('logical.test')).query(
+      "SELECT id FROM authority_facts WHERE kind='barrier'",
+    );
+    assertEquals(facts.length, 1);
+  } finally {
+    await cold?.close();
     await f.close();
   }
 });

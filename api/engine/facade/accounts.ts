@@ -1,5 +1,6 @@
 // Pinned-link adapter for home-authorized credential/status snapshots. The
 // tenant owner installs semantic state; journal ACK follows its durable commit.
+import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import {
   importPublicKeyFromRaw,
@@ -13,13 +14,210 @@ import {
   captureAccountAuth,
   installAccountAuth,
 } from '#engine/tenant/account-auth.ts';
-import { checkLocalpart } from '#engine/tenant/users.ts';
+import { checkLocalpart, userByLocalpart } from '#engine/tenant/users.ts';
+import {
+  captureSessionAuthority,
+  installSessionAuthority,
+  tenantAuthority,
+} from '#engine/tenant/session-authority.ts';
 import { captureErasureCuts } from '#engine/tenant/erasure.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControls } from './ownership.ts';
-import type { Pairings } from './pairing.ts';
+import type { Grant, Pairings } from './pairing.ts';
+import type { NodeIdentity } from './identity.ts';
 import { integer, LinkError, object, type Stream, text } from './protocol.ts';
 import { applyReplicaScope } from './scopes.ts';
+
+type AuthorityCut = AccountAuth['authority'];
+type SessionAuthority = {
+  kind: 'session-authority';
+  server: string;
+  pairing: string;
+  grantRevision: number;
+  ownerRevision: number;
+  localpart: string;
+  source: string;
+  incarnation: string;
+  authority: AuthorityCut;
+};
+
+function mismatch(message: string): never {
+  throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
+}
+
+function sessionAuthorityOf(raw: unknown): SessionAuthority {
+  const row = object(raw), authority = object(row.authority);
+  if (
+    row.kind !== 'session-authority' ||
+    !Array.isArray(authority.facts) || !Array.isArray(authority.sessions) ||
+    canonicalJson(Object.keys(authority).sort()) !==
+      canonicalJson(['facts', 'sessions'])
+  ) {
+    throw new LinkError(
+      'LINK_BAD_RECORD',
+      'invalid session authority cut',
+      400,
+    );
+  }
+  const localpart = text(row.localpart);
+  if (checkLocalpart(localpart) !== localpart) {
+    mismatch('invalid authority account');
+  }
+  const view: SessionAuthority = {
+    kind: 'session-authority',
+    server: text(row.server),
+    pairing: text(row.pairing),
+    grantRevision: integer(row.grantRevision, 1),
+    ownerRevision: integer(row.ownerRevision, 1),
+    localpart,
+    source: text(row.source),
+    incarnation: text(row.incarnation),
+    authority: authority as AuthorityCut,
+  };
+  if (canonicalJson(view) !== canonicalJson(raw)) {
+    mismatch('unexpected session authority material');
+  }
+  // A facade may contribute its OWN facts/recovery chains only, never mint or
+  // replace home facts already carried by a home-authenticated account cut.
+  for (const raw of [...view.authority.facts, ...view.authority.sessions]) {
+    const item = object(raw);
+    if (
+      item.node !== view.source || item.incarnation !== view.incarnation ||
+      item.localpart !== localpart
+    ) {
+      mismatch('session authority contains another source');
+    }
+  }
+  for (const raw of view.authority.sessions) {
+    if (
+      canonicalJson(Object.keys(raw).sort()) !== canonicalJson([
+        'hash',
+        'node',
+        'incarnation',
+        'localpart',
+        'deviceId',
+        'deviceIncarnation',
+        'barriers',
+        'refresh',
+        'accessHash',
+        'nextHash',
+        'revision',
+      ].sort())
+    ) mismatch('unexpected session recovery material');
+  }
+  return view;
+}
+
+async function assertBinding(
+  conn: Conn,
+  grant: Grant,
+  side: 'home' | 'facade',
+) {
+  const [binding] = await conn.query(
+    'SELECT state,grant_json FROM facade_pairings WHERE id=? AND side=?',
+    [grant.body.transcript.body.context.id, side],
+  );
+  if (
+    binding?.state !== 'paired' || binding.grant_json !== canonicalJson(grant)
+  ) {
+    throw new LinkError(
+      'LINK_UNPAIRED',
+      'session authority grant changed',
+      403,
+    );
+  }
+}
+
+async function requireControl(conn: Conn, view: SessionAuthority) {
+  const [control] = await conn.query(
+    'SELECT a.revision,c.signed_json FROM facade_owner_activation a JOIN facade_owner_controls c ON c.pairing=a.pairing AND c.revision=a.revision WHERE a.pairing=?',
+    [view.pairing],
+  );
+  if (!control || Number(control.revision) < view.ownerRevision) {
+    throw new LinkError(
+      'LINK_UNAVAILABLE',
+      'session authority awaits ownership control',
+      503,
+    );
+  }
+  const body = JSON.parse(String(control.signed_json)).body;
+  if (
+    body.grantRevision !== view.grantRevision ||
+    body.nodes[1].node !== view.source ||
+    body.nodes[1].incarnation !== view.incarnation
+  ) {
+    mismatch('session authority differs from ownership control');
+  }
+}
+
+/** Digest-only reverse exchange, pulled by home on the existing link. No PHC,
+ * bearer plaintext, foreign-authored fact or independent token materialization. */
+export async function exportSessionAuthority(
+  store: Store,
+  tenant: Tenant,
+  pairings: Pairings,
+  owners: Pick<OwnerControls, 'ready'>,
+  node: Pick<NodeIdentity, 'node' | 'incarnation' | 'signer'>,
+  localpart: string,
+) {
+  const grant = await pairings.active(), owner = await owners.ready();
+  const context = grant.body.transcript.body.context;
+  if (
+    owner.pairing !== context.id || node.node !== context.node ||
+    node.incarnation !== grant.body.transcript.body.incarnation
+  ) mismatch('wrong exporting authority');
+  const db = await store.tenant(tenant.serverName);
+  const authority = await db.tx(async (conn) => {
+    const [snapshot] = await conn.query(
+      'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
+      [localpart],
+    );
+    if (
+      snapshot?.pairing !== context.id ||
+      Number(snapshot.grant_revision) !== grant.body.revision
+    ) {
+      mismatch('session authority account not selected');
+    }
+    const view = await captureSessionAuthority(conn, localpart);
+    return {
+      facts: view.facts.filter((fact) =>
+        fact.node === node.node && fact.incarnation === node.incarnation
+      ),
+      sessions: view.sessions.filter((session) =>
+        session.node === node.node && session.incarnation === node.incarnation
+      ),
+    };
+  });
+  const body: SessionAuthority = sessionAuthorityOf({
+    kind: 'session-authority',
+    server: tenant.serverName,
+    pairing: context.id,
+    grantRevision: grant.body.revision,
+    ownerRevision: owner.revision,
+    localpart,
+    source: node.node,
+    incarnation: node.incarnation,
+    authority,
+  });
+  const signed = {
+    body,
+    signature: await node.signer().sign(canonicalJson(body)),
+  };
+  return await (await store.server()).tx(async (conn) => {
+    await assertBinding(conn, grant, 'facade');
+    await requireControl(conn, body);
+    return await appendRecord(conn, 'home', {
+      source: node.node,
+      incarnation: node.incarnation,
+      stream: 'authority:@' + localpart + ':' + tenant.serverName,
+      type: 'account-auth',
+      version: 1,
+      operationId: 'authority:' +
+        createHash('sha256').update(canonicalJson(body)).digest('hex'),
+      payload: signed,
+    });
+  });
+}
 
 function accountAuthOf(raw: unknown): AccountAuth {
   const row = object(raw);
@@ -172,6 +370,88 @@ export class AccountSnapshots {
     private readonly pairings: Pairings,
     private readonly owners: Pick<OwnerControls, 'ready'>,
   ) {}
+
+  async applyFromFacade(
+    journal: Journal,
+    pairing: string,
+    stream: Stream,
+  ): Promise<boolean> {
+    const connection = await this.pairings.connection(pairing);
+    const grant = connection.grant;
+    if (connection.state !== 'paired' || !grant) {
+      mismatch('session authority requires paired home');
+    }
+    const context = connection.context, transcript = grant.body.transcript.body;
+    const record = await journal.next(context.node, stream);
+    if (!record) return false;
+    if (record.type !== 'account-auth' || record.version !== 1) {
+      throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not session authority');
+    }
+    const signed = object(record.payload),
+      view = sessionAuthorityOf(signed.body);
+    if (
+      view.server !== this.tenant.serverName ||
+      view.server !== context.server ||
+      view.pairing !== pairing || view.grantRevision !== grant.body.revision ||
+      view.source !== context.node ||
+      view.incarnation !== transcript.incarnation ||
+      record.source !== view.source ||
+      record.incarnation !== view.incarnation ||
+      record.stream !== 'authority:@' + view.localpart + ':' + view.server
+    ) {
+      mismatch('session authority differs from enrolled source or scope');
+    }
+    let valid = false;
+    try {
+      valid = await crypto.subtle.verify(
+        'Ed25519',
+        await importPublicKeyFromRaw(
+          matrixBase64(transcript.key.publicKey, 32),
+        ),
+        matrixBase64(text(signed.signature), 64),
+        new TextEncoder().encode(canonicalJson(view)),
+      );
+    } catch { /* Malformed signature grants no session authority. */ }
+    if (!valid) mismatch('invalid facade session authority signature');
+    const check = async (conn: Conn) => {
+      await assertBinding(conn, grant, 'home');
+      await requireControl(conn, view);
+      const [selected] = await conn.query(
+        'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+        [context.node, pairing, 'auth:@' + view.localpart + ':' + view.server],
+      );
+      if (!selected) mismatch('session authority account not selected');
+    };
+    await (await this.store.server()).tx(check);
+    const cuts =
+      view.authority.facts.some((fact) =>
+          fact.kind === 'deactivate' && fact.erase
+        )
+        ? await captureErasureCuts(this.store)
+        : undefined;
+    await (await this.store.tenant(view.server)).tx(async (conn) => {
+      await requireControl(conn, view);
+      const identity = await tenantAuthority(conn);
+      if (
+        identity?.node !== 'home' || identity.edgeNode !== view.source ||
+        identity.edgeIncarnation !== view.incarnation ||
+        !await userByLocalpart(conn, view.localpart)
+      ) {
+        mismatch('session authority tenant is not the selected home');
+      }
+      await installSessionAuthority(conn, view.localpart, view.authority, cuts);
+    });
+    return await journal.apply(context.node, stream, async (conn, current) => {
+      await check(conn);
+      if (current.hash !== record.hash) {
+        throw new LinkError(
+          'LINK_DIVERGED',
+          'session authority application raced',
+        );
+      }
+      return { localpart: view.localpart };
+    });
+  }
 
   async apply(journal: Journal, stream: Stream): Promise<boolean> {
     const record = await journal.next('home', stream);
