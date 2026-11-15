@@ -18,7 +18,7 @@ for (const mode of ['fresh', 'upgrade']) {
       };
       if (mode === 'upgrade') {
         const old = await openStore(settings, {
-          schemas: { server: historicalServerSchema(37) },
+          schemas: { server: historicalServerSchema(38) },
         });
         await (await old.server()).execute(
           "INSERT INTO federation_txns VALUES('old.test','retained',50,'{\"pdus\":{}}')",

@@ -2,8 +2,8 @@ import { assert } from '@std/assert';
 import { SERVER_SCHEMA_SQL, serverSchema } from '#engine/server/schema.ts';
 import type { SchemaProvider } from '#engine/store/create.ts';
 
-// Historical fixtures must not call the moving current apply() and then merely
-// relabel its version. Reconstruct their fixed schema from the supported chain.
+// Historical fixtures reconstruct the supported chain, never today's schema
+// relabeled with an older version and future indexes still attached.
 export function historicalServerSchema(version: number): SchemaProvider {
   assert(Number.isSafeInteger(version) && version >= 3);
   assert(version <= serverSchema.version);
