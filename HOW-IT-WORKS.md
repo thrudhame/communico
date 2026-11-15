@@ -1023,6 +1023,15 @@ cannot become typing stops, invented receipt timestamps or default presence.
 Unknown local handler failures propagate without caching transaction success.
 (`api/engine/federation/{discovery,discovery-response,peer-json,transactions,edus}.ts`)
 
+Standalone inbound transactions share one active result for the authenticated
+origin and transaction ID within a store. Concurrent retries do not repeat
+recovery, room ingest or EDU dispatch. Every retry still passes envelope
+admission, receives its own response value and retains the durable completed
+answer. Local failure reaches all waiters without caching success; a later retry
+can own the operation again. Other origins, IDs and stores remain independent.
+Durable facade ingress retains its mailbox-owned serialization and receipts.
+(`api/engine/federation/transactions.ts`, `api/engine/facade/mailbox.ts`)
+
 X-Matrix authorization parses quote-aware comma lists, token/quoted parameter
 values and unique names before signature verification. Discovery validates
 Matrix server names, preserves redirect queries, follows HTTP(S) using the
