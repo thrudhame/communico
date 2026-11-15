@@ -76,7 +76,7 @@ async function template(
     if (membership === 'leave' && current === undefined) {
       throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is not in the room`);
     }
-    const prevs = await tx.extremities.frontier(stay.id);
+    const prevs = await tx.extremities.parents(stay.id);
     const depths = await tx.events.list(prevs);
     const partial = {
       type: 'm.room.member',

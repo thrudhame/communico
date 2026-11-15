@@ -11,6 +11,18 @@ export async function frontier(conn: Conn, stay: number): Promise<string[]> {
   return rows.map((row) => String(row.event));
 }
 
+// One authored event need not reference the entire retained frontier. Follow
+// Synapse's get_prev_events_for_room: choose ten deepest heads and leave the
+// others for later events. Keep the full frontier for state/publication work.
+export async function parents(conn: Conn, stay: number): Promise<string[]> {
+  const rows = await conn.query(
+    `SELECT x.event FROM extremities x JOIN events e ON e.id=x.event
+     WHERE x.stay=? ORDER BY e.depth DESC,x.event ASC LIMIT 10`,
+    [stay],
+  );
+  return rows.map((row) => String(row.event)).sort();
+}
+
 export async function addExtremity(
   conn: Conn,
   stay: number,

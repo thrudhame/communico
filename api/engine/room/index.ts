@@ -30,7 +30,7 @@ export type { Change } from '#engine/room/changes.ts';
 // Count only resolutions in committed attempts, not abandoned snapshots.
 export const resolutionProbe = { resolutions: 0 };
 
-function bind(conn: Conn, edges: EdgeOverlay) {
+function bind(conn: Conn, edges: EdgeOverlay, groups: state.StateGroups) {
   return {
     diagnostics: { resolutions: 0 },
     remoteBatches: {
@@ -85,10 +85,10 @@ function bind(conn: Conn, edges: EdgeOverlay) {
       ) => events.hasAnnotation(conn, target, type, sender, key),
     },
     state: {
-      groupEntries: (group: number) => state.groupEntries(conn, group),
-      groupMap: (group: number) => state.groupMap(conn, group),
+      groupEntries: (group: number) => groups.entries(group),
+      groupMap: (group: number) => groups.map(group),
       groupKey: (group: number, type: string, stateKey: string) =>
-        state.groupKey(conn, group, type, stateKey),
+        groups.key(group, type, stateKey),
       eventStateBefore: (event: string) => state.eventStateBefore(conn, event),
       eventStateAfter: (event: string) => state.eventStateAfter(conn, event),
       eventReadState: (event: string) => state.eventReadState(conn, event),
@@ -162,6 +162,7 @@ function bind(conn: Conn, edges: EdgeOverlay) {
     },
     extremities: {
       frontier: (stay: number) => extremities.frontier(conn, stay),
+      parents: (stay: number) => extremities.parents(conn, stay),
       add: (stay: number, event: string) =>
         extremities.addExtremity(conn, stay, event),
       remove: (stay: number, ids: readonly string[]) =>
@@ -228,13 +229,15 @@ async function roomTransaction<T>(
   const cutoff = roomEdges.cutoff();
   const { result, resolutions, edges } = await run(async (conn) => {
     const edges = roomEdges.attempt(store, roomId, cutoff);
-    const tx = bind(conn, edges);
+    const groups = new state.StateGroups(conn);
+    const tx = bind(conn, edges, groups);
     try {
       const result = await fn(tx);
       return { result, resolutions: tx.diagnostics.resolutions, edges };
     } finally {
       // Cache hits must not let an escaped RoomTx outlive its Conn.
       edges.release();
+      groups.release();
     }
   });
   edges.commit();
