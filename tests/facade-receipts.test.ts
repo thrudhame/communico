@@ -13,6 +13,7 @@ import {
   setReceipt,
 } from '#engine/server/ephemeral.ts';
 import {
+  captureReceiptOperations,
   receiptOperations,
   recordReceiptOperation,
 } from '#engine/server/receipt-operations.ts';
@@ -395,6 +396,117 @@ Deno.test('facade receipts: source admission names an authentic join for the sam
         assertEquals(await receiptRows(f.db, f.g.roomId, 0, '@bob:test'), []);
       });
     }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: explicit home bootstrap captures retained pre-F2 marks after departure without restamping news', async () => {
+  const f = await fixture();
+  try {
+    await f.read(f.left, 'm.read.private', 'main');
+    await f.read(f.right);
+    assertEquals(await f.db.tx((tx) => receiptOperations(tx, '@bob:test')), []);
+    await sendLocal(f.g.room, {
+      type: 'm.room.member',
+      sender: '@bob:test',
+      state_key: '@bob:test',
+      content: { membership: 'leave' },
+    }, f.g.signer);
+    await project(f.store, f.g.roomId);
+    await activateReceiptSource(f);
+    const news = await f.db.query(
+      "SELECT value FROM counters WHERE name='receipts'",
+    );
+    const capture = () =>
+      f.db.tx((tx) => captureReceiptOperations(tx, '@bob:test'));
+    const operations = await capture();
+    assertEquals(operations.length, 2);
+    assertEquals(
+      operations.map((op) => JSON.parse(op.payload).admission.baseline),
+      [true, true],
+    );
+    assertEquals(await capture(), operations);
+    assertEquals(
+      await f.db.query("SELECT value FROM counters WHERE name='receipts'"),
+      news,
+    );
+    await f.db.execute('DELETE FROM receipts');
+    await f.db.execute('DELETE FROM domain_operations');
+    for (const operation of operations) {
+      await importReceiptOperation(f.db, operation, {
+        source: 'home',
+        incarnation: 'home-store',
+        userId: '@bob:test',
+      });
+    }
+    assertEquals(
+      (await receiptRows(f.db, f.g.roomId, 0, '@bob:test')).length,
+      2,
+    );
+    await f.db.execute("UPDATE publication_domain SET node='edge'");
+    await assertRejects(capture, Error, 'requires home authority');
+    const edge = {
+      ...operations[0],
+      source: 'edge',
+      incarnation: 'edge-store',
+    };
+    edge.operationId = JSON.stringify([
+      edge.source,
+      edge.incarnation,
+      edge.stream,
+      edge.sequence,
+    ]);
+    await assertRejects(
+      () =>
+        importReceiptOperation(f.db, edge, {
+          source: 'edge',
+          incarnation: 'edge-store',
+          userId: '@bob:test',
+        }),
+      Error,
+      'receipt source unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: home baseline refuses missing historical join evidence atomically', async () => {
+  const f = await fixture();
+  try {
+    await f.read(f.left);
+    await activateReceiptSource(f);
+    await f.db.execute('DELETE FROM receipt_membership_events WHERE user=?', [
+      '@bob:test',
+    ]);
+    const before = await receiptRows(f.db, f.g.roomId, 0, '@bob:test');
+    await assertRejects(
+      () => f.db.tx((tx) => captureReceiptOperations(tx, '@bob:test')),
+      Error,
+      'baseline admission unavailable',
+    );
+    assertEquals(await f.db.tx((tx) => receiptOperations(tx, '@bob:test')), []);
+    assertEquals(await receiptRows(f.db, f.g.roomId, 0, '@bob:test'), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: bootstrap never reauthors a held foreign receipt as a home baseline', async () => {
+  const f = await fixture();
+  try {
+    await activateReceiptSource(f);
+    await f.db.execute("UPDATE publication_domain SET node='edge'");
+    await f.read(f.left);
+    const before = await f.db.tx((tx) => receiptOperations(tx, '@bob:test'));
+    assertEquals(before.length, 1);
+    assertEquals(before[0].source, 'edge');
+    await f.db.execute("UPDATE publication_domain SET node='home'");
+    assertEquals(
+      await f.db.tx((tx) => captureReceiptOperations(tx, '@bob:test')),
+      before,
+    );
   } finally {
     await f.close();
   }

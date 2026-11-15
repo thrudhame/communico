@@ -15,7 +15,10 @@ export type ReceiptMark = {
   threadId: string | null;
   eventIds: string[];
   ts: number;
-  admission: { membershipEvent: string };
+  // A pre-F2 acknowledged row did not save its original join-event identity.
+  // Home may explicitly attest that retained baseline with authentic historical
+  // join evidence; it must not pretend this was a newly admitted client mark.
+  admission: { membershipEvent: string; baseline?: true };
 };
 export type ReceiptOperation = Dot & {
   operationId: string;
@@ -82,7 +85,10 @@ export function receiptOperationMark(operation: ReceiptOperation): ReceiptMark {
     threadId: mark.threadId,
     eventIds: [...new Set(mark.eventIds)].sort(),
     ts: mark.ts,
-    admission: { membershipEvent: mark.admission.membershipEvent },
+    admission: {
+      membershipEvent: mark.admission.membershipEvent,
+      ...(mark.admission.baseline === true ? { baseline: true as const } : {}),
+    },
   };
   if (
     operation.kind !== 'receipt' || !validDot(operation) ||
@@ -175,6 +181,7 @@ export async function acceptReceiptOperation(
   if (
     !held || domainOf(mark.userId) !== held.server ||
     !allowed(operation) || !operation.context.every(allowed) ||
+    (mark.admission.baseline === true && operation.source !== 'home') ||
     operation.source !== authenticated.source ||
     operation.incarnation !== authenticated.incarnation
   ) throw new Error('receipt source unavailable');
@@ -281,6 +288,45 @@ export async function recordReceiptOperation(conn: Conn, mark: ReceiptMark) {
     'UPDATE domain_operations SET applied=1 WHERE operation_id=?',
     [operation.operationId],
   );
+}
+
+/** Explicit home-only F1 -> F2 capture. The held acknowledged receipt is the
+ * source fact; the historical join is disclosure/admission evidence, not a
+ * claim that the original F1 row recorded that particular event. No current
+ * membership check, client news, imported-source echo or replacement baseline. */
+export async function captureReceiptOperations(conn: Conn, userId: string) {
+  const held = await control(conn);
+  if (!held || held.node !== 'home' || domainOf(userId) !== held.server) {
+    throw new Error('receipt bootstrap requires home authority');
+  }
+  const history = await receiptOperations(conn, userId);
+  for (
+    const row of await conn.query(
+      'SELECT room_id,receipt_type,thread_id,event_ids,ts_ms FROM receipts WHERE user_id=? ORDER BY room_id,receipt_type,thread_id',
+      [userId],
+    )
+  ) {
+    const mark: ReceiptMark = {
+      roomId: String(row.room_id),
+      userId,
+      receiptType: String(row.receipt_type) as ReceiptMark['receiptType'],
+      threadId: row.thread_id === '' ? null : String(row.thread_id),
+      eventIds: [...new Set<string>(JSON.parse(String(row.event_ids)))].sort(),
+      ts: Number(row.ts_ms),
+      admission: { membershipEvent: '', baseline: true },
+    };
+    if (history.some((operation) => operation.semanticKey === key(mark))) {
+      continue;
+    }
+    const [join] = await conn.query(
+      "SELECT m.event FROM receipt_membership_events m JOIN event_index i ON i.room=m.room AND i.event=m.event WHERE m.room=? AND m.user=? AND m.membership='join' AND i.standing='accepted' AND i.grounding='grounded' ORDER BY m.event LIMIT 1",
+      [mark.roomId, userId],
+    );
+    if (!join) throw new Error('receipt baseline admission unavailable');
+    mark.admission.membershipEvent = String(join.event);
+    await recordReceiptOperation(conn, mark);
+  }
+  return await receiptOperations(conn, userId);
 }
 
 export async function pendingReceiptOperations(conn: Conn, roomId?: string) {
