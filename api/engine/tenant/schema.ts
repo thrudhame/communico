@@ -10,6 +10,7 @@
 import type { SchemaProvider } from '#engine/store/create.ts';
 import { recordPusherChange } from '#engine/tenant/pushers.ts';
 import { OWNER_CONTROL_SQL } from '#engine/facade/schema.ts';
+import { ACCOUNT_AUTH_SQL } from '#engine/tenant/account-auth.ts';
 import {
   BACKUP_ACCOUNTING_SQL,
   migrateBackupAccounting,
@@ -263,7 +264,7 @@ CREATE TABLE public_user_replicas(localpart TEXT PRIMARY KEY NOT NULL REFERENCES
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 22,
+  version: 23,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -284,8 +285,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(DELAYED_EVENTS_SQL);
     await db.exec(PUBLIC_REPLICAS_SQL);
     await db.exec(OWNER_CONTROL_SQL);
+    await db.exec(ACCOUNT_AUTH_SQL);
   },
   migrations: {
+    22: (conn) => conn.exec(ACCOUNT_AUTH_SQL),
     21: (conn) => conn.exec(OWNER_CONTROL_SQL),
     20: (conn) => conn.exec(PUBLIC_REPLICAS_SQL),
     19: (conn) => conn.exec(DELAYED_EVENTS_SQL),

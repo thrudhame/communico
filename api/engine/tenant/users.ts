@@ -143,6 +143,7 @@ export async function markDeactivated(
     'UPDATE users SET deactivated = 1, display_name = NULL, avatar_url = NULL WHERE localpart = ?',
     [localpart],
   );
+  await nextCounter(conn, 'credential_revision:' + localpart);
   await conn.execute(
     "INSERT INTO account_changes(pos,localpart,kind) VALUES(?,?,'deactivated')",
     [await nextCounter(conn, 'account_changes'), localpart],
@@ -154,10 +155,22 @@ export async function setCredential(
   localpart: string,
   phc: string,
 ): Promise<void> {
+  if (await credentialHash(conn, localpart) === phc) return;
   await conn.execute(
     "INSERT INTO credentials (localpart, kind, hash, salt, params) VALUES (?, 'argon2id', ?, NULL, NULL) ON CONFLICT (localpart) DO UPDATE SET hash = excluded.hash",
     [localpart, phc],
   );
+  await nextCounter(conn, 'credential_revision:' + localpart);
+}
+
+export async function credentialRevision(
+  conn: Conn,
+  localpart: string,
+): Promise<number> {
+  const [row] = await conn.query('SELECT value FROM counters WHERE name=?', [
+    'credential_revision:' + localpart,
+  ]);
+  return Number(row?.value ?? 0);
 }
 
 export async function credentialHash(
@@ -175,7 +188,11 @@ export async function clearCredential(
   conn: Conn,
   localpart: string,
 ): Promise<void> {
-  await conn.execute('DELETE FROM credentials WHERE localpart=?', [localpart]);
+  const changed = await conn.execute(
+    'DELETE FROM credentials WHERE localpart=?',
+    [localpart],
+  );
+  if (changed) await nextCounter(conn, 'credential_revision:' + localpart);
 }
 
 // --- tenant-level behaviour --------------------------------------------------

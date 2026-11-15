@@ -21,17 +21,32 @@ Deno.test('facade configuration preserves standalone home and exposes typed laye
   assertEquals(cfg.facade.nodeid, 'edge_a');
   assertEquals(cfg.facade.notify, 'sse');
   assertEquals(cfg.facade.maxofflinedays, 0);
+  assertEquals(cfg.facade.replicatecredentials, true);
+  assertEquals(cfg.facade.allowstaleauth, true);
+  assertEquals(cfg.facade.authmaxstalehours, 0);
+  const strict = load({
+    COMMUNICO_FACADE_PHASE: 'f2',
+    COMMUNICO_FACADE_REPLICATECREDENTIALS: 'false',
+    COMMUNICO_FACADE_ALLOWSTALEAUTH: 'false',
+    COMMUNICO_FACADE_AUTHMAXSTALEHOURS: '2',
+  });
+  assertEquals(strict.facade.phase, 'f2');
+  assertEquals(strict.facade.replicatecredentials, false);
+  assertEquals(strict.facade.allowstaleauth, false);
+  assertEquals(strict.facade.authmaxstalehours, 2);
 });
 
 Deno.test('facade configuration refuses unsupported role, protocol modes and unsafe durations', () => {
   for (
     const [key, value] of [
       ['COMMUNICO_SERVER_ROLE', 'proxy'],
-      ['COMMUNICO_FACADE_PHASE', 'f2'],
+      ['COMMUNICO_FACADE_PHASE', 'f3'],
       ['COMMUNICO_FACADE_NOTIFY', 'rpc'],
       ['COMMUNICO_FACADE_OUTBOUND', 'tunnel'],
       ['COMMUNICO_FACADE_POLLSECONDS', '2147484'],
       ['COMMUNICO_FACADE_MAILBOXMAXBYTES', '-1'],
+      ['COMMUNICO_FACADE_AUTHMAXSTALEHOURS', '-1'],
+      ['COMMUNICO_FACADE_REPLICATECREDENTIALS', '0'],
     ]
   ) {
     assertThrows(() => load({ [key]: value }), ConfigError);

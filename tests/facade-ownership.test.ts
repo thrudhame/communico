@@ -20,6 +20,7 @@ import {
   PUBLICATION_DOMAIN_SQL,
 } from '#engine/facade/schema.ts';
 import type { SchemaProvider } from '#engine/store/create.ts';
+import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -206,6 +207,44 @@ Deno.test('F2 ownership control is signed, durable, first-ingress and isolated f
   }
 });
 
+Deno.test('owner readiness revalidates authority after asynchronous activation reads', async () => {
+  const f = await fixture();
+  try {
+    const record = await f.receive();
+    await (await f.owner()).apply(await f.journal(), record);
+    const server = await f.edge().server();
+    const grant = await f.pairings().active();
+    let revoked = false;
+    const owner = new OwnerControls(
+      {
+        ...server,
+        query: async (...args: Parameters<typeof server.query>) => {
+          const rows = await server.query(...args);
+          if (!revoked && args[0].includes('facade_owner_activation')) {
+            revoked = true;
+            await f.pairings().retire(
+              await f.hp.revoke(grant.body.transcript.body.context.id),
+              'a'.repeat(64),
+            );
+          }
+          return rows;
+        },
+      },
+      await f.edge().tenant('logical.test'),
+      f.pairings(),
+      f.node,
+    );
+    await assertRejects(
+      () => owner.ready(),
+      LinkError,
+      'ownership grant changed',
+    );
+    assert(revoked);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('control rejects forged authority, same-revision substitution and revision regression without apply ACK', async () => {
   const f = await fixture();
   try {
@@ -368,7 +407,7 @@ Deno.test('ownership schemas upgrade actual server35/tenant21 to the same schema
   let old = await openStore(cfg('upgrade'), {
     schemas: {
       server: prior(serverSchema, 35),
-      tenant: prior(tenantSchema, 21),
+      tenant: historicalTenantSchema(21),
     },
   });
   const fresh = await openStore(cfg('fresh'), {
