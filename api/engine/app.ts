@@ -54,6 +54,7 @@ import {
 } from '#engine/federation/keys.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
 import type { Dispatch } from '#engine/server/delivery.ts';
+import type { ReplicaRoomAdmission } from '#engine/facade/directory.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks, recoverServer } from '#engine/server/startup.ts';
@@ -92,6 +93,10 @@ export type App = {
  * endpoint tree never reconstructs a home identity or reaches into a link owner. */
 export type ReplicaAccess = {
   requireScope(scope: string, allowAbsent?: boolean): Promise<void>;
+  prepareRoomScope(
+    roomId: string,
+    allowAbsent?: boolean,
+  ): Promise<ReplicaRoomAdmission>;
   keyDocument(): Promise<KeyDoc>;
   publicRooms(): Promise<boolean>;
   passwordLogin?(): Promise<boolean>;

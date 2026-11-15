@@ -195,8 +195,12 @@ export async function setReceipt(
   userId: string,
   receiptType: 'm.read' | 'm.read.private',
   eventId: string,
-  opts: { ts?: number; threadId?: string | null; requireRelated?: boolean } =
-    {},
+  opts: {
+    ts?: number;
+    threadId?: string | null;
+    requireRelated?: boolean;
+    authorize?: (conn: Conn) => Promise<void>;
+  } = {},
 ): Promise<boolean> {
   return await setReceiptMark(
     server,
@@ -216,8 +220,12 @@ export async function setReceiptMark(
   userId: string,
   receiptType: 'm.read' | 'm.read.private',
   targets: readonly string[],
-  opts: { ts?: number; threadId?: string | null; requireRelated?: boolean } =
-    {},
+  opts: {
+    ts?: number;
+    threadId?: string | null;
+    requireRelated?: boolean;
+    authorize?: (conn: Conn) => Promise<void>;
+  } = {},
 ): Promise<boolean> {
   if (!targets.length || targets.some((id) => typeof id !== 'string')) {
     throw new MatrixError(
@@ -230,6 +238,7 @@ export async function setReceiptMark(
   const ts = opts.ts ?? Date.now();
   const threadId = receiptThreadId(opts.threadId);
   const row = await eventStreamTx(server, async (tx) => {
+    await opts.authorize?.(tx);
     if (!await isJoined(tx, roomId, userId)) return null;
     if (threadId !== null && threadId !== 'main') {
       const existing = await tx.query(
@@ -284,7 +293,7 @@ export async function setReceiptMark(
       threadId,
       admission: { membershipEvent: String(membership.event) },
     });
-    return await mergeReceiptMark(
+    const row = await mergeReceiptMark(
       tx,
       roomId,
       userId,
@@ -293,6 +302,8 @@ export async function setReceiptMark(
       ts,
       threadId,
     );
+    await opts.authorize?.(tx);
+    return row;
   });
   if (row === null) return false;
   // Private rows wake their owner, but federation only consumes public rows.

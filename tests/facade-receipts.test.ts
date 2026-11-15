@@ -1,6 +1,8 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { eventStreamTx } from '#engine/server/stream.ts';
 import { openStore } from '#engine/store/index.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -105,6 +107,63 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('facade receipts: admission runs on the actual queued writer cut before any mark or export effect', async (t) => {
+  for (const kind of ['m.read', 'm.read.private'] as const) {
+    await t.step(kind, async () => {
+      const f = await fixture();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let blocker: Promise<void> | undefined;
+      let writing: Promise<boolean> | undefined;
+      try {
+        await activateReceiptSource(f);
+        await f.db.execute('INSERT INTO facade_scopes VALUES(?,?,1,1,NULL)', [
+          'receipt-test',
+          'room:' + f.g.roomId,
+        ]);
+        const opts = {
+          threadId: null,
+          authorize: async (conn: import('#engine/store/db.ts').Conn) => {
+            const [scope] = await conn.query(
+              'SELECT ready FROM facade_scopes WHERE scope=?',
+              ['room:' + f.g.roomId],
+            );
+            if (scope?.ready !== 1) {
+              throw new MatrixError(
+                503,
+                'M_UNAVAILABLE',
+                'replica unavailable',
+              );
+            }
+          },
+        };
+        blocker = eventStreamTx(f.db, async () => {
+          entered.resolve();
+          await release.promise;
+        });
+        await entered.promise;
+        writing = setReceipt(f.db, f.g.roomId, '@bob:test', kind, f.left, opts);
+        await f.db.execute('UPDATE facade_scopes SET ready=0');
+        release.resolve();
+        await blocker;
+        await assertRejects(() => writing!, MatrixError, 'replica unavailable');
+        assertEquals(await f.db.query('SELECT * FROM receipts'), []);
+        assertEquals(await f.db.query('SELECT * FROM domain_operations'), []);
+        await f.db.execute('UPDATE facade_scopes SET ready=1');
+        assertEquals(
+          await setReceipt(f.db, f.g.roomId, '@bob:test', kind, f.left, opts),
+          true,
+        );
+      } finally {
+        release.resolve();
+        await blocker?.catch(() => {});
+        await writing?.catch(() => {});
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('facade receipts: concurrent graph marks union and only proved ancestors retire', async () => {
   const f = await fixture();

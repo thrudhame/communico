@@ -46,6 +46,7 @@ import {
 } from '#engine/server/aliases.ts';
 import { listedRooms, setVisibility } from '#engine/server/directory.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { setReceipt as writeClientReceipt } from '#engine/receipts.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
@@ -1107,6 +1108,8 @@ Deno.test('enrolled replica app composes ordinary reads and recovery without cre
     const app = await openReplicaApp(f.edgeStore(), tenant, {
       requireScope: (scope, allowAbsent) =>
         directory.requireScope(scope, allowAbsent),
+      prepareRoomScope: (roomId, allowAbsent) =>
+        directory.prepareRoomScope(roomId, allowAbsent),
       keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
       signer: f.node.signer(),
       keyDocument: () =>
@@ -1216,6 +1219,88 @@ Deno.test('enrolled replica app composes ordinary reads and recovery without cre
   }
 });
 
+Deno.test('receipt scope: a suffix after preparation refuses all client receipt kinds without effects', async (t) => {
+  for (const kind of ['m.read', 'm.read.private', 'm.fully_read'] as const) {
+    await t.step(kind, async () => {
+      const f = await fixture();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let writing: Promise<void> | undefined;
+      try {
+        const initial = await f.exports();
+        assert(initial);
+        const journal = await f.journal();
+        await journal.receive('home', [initial]);
+        assert(await (await f.replicas()).apply(journal, initial));
+        const inventory = await f.directoryExport();
+        assert(inventory);
+        await journal.receive('home', [inventory]);
+        assert(await (await f.directoryOwner()).apply(journal, inventory));
+        const tenant = await f.edgeTenant();
+        await tenant.tx((tx) => tx.users.insert('zoe', 'Zoe'));
+        setConfigForTests({
+          server: { name: 'logical.test', role: 'facade' },
+          facade: { nodeid: 'edge_a' },
+        });
+        const directory = await f.directoryOwner();
+        const app = await openReplicaApp(f.edgeStore(), tenant, {
+          requireScope: (scope, allowAbsent) =>
+            directory.requireScope(scope, allowAbsent),
+          prepareRoomScope: async (roomId, allowAbsent) => {
+            const admission = await directory.prepareRoomScope(
+              roomId,
+              allowAbsent,
+            );
+            entered.resolve();
+            await release.promise;
+            return admission;
+          },
+          keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+          signer: f.node.signer(),
+          keyDocument: () => Promise.reject(new Error('unused')),
+          publicRooms: async () => (await directory.snapshot())!.publicRooms,
+        });
+        const eventId = String([...f.source.events.values()].at(-1)!.event_id);
+        const before = await app.server.query('SELECT * FROM receipts');
+        writing = writeClientReceipt(
+          f.source.roomId,
+          f.source.creator,
+          kind,
+          eventId,
+        );
+        await entered.promise;
+        const next = await f.source.addEvent({
+          type: 'm.room.message',
+          content: { body: 'pending suffix' },
+        });
+        await f.ingest([next]);
+        const suffix = await f.exports();
+        assert(suffix);
+        await journal.receive('home', [suffix]);
+        await assertRejects(
+          () => directory.requireScope('room:' + f.source.roomId),
+          MatrixError,
+        );
+        release.resolve();
+        await assertRejects(() => writing!, MatrixError, 'replica unavailable');
+        assertEquals(await app.server.query('SELECT * FROM receipts'), before);
+        assertEquals(
+          await tenant.tx((tx) =>
+            tx.accountData.get('zoe', f.source.roomId, 'm.fully_read')
+          ),
+          null,
+        );
+      } finally {
+        release.resolve();
+        await writing?.catch(() => {});
+        await closeApp();
+        setConfigForTests({});
+        await f.close();
+      }
+    });
+  }
+});
+
 Deno.test('directory and peer policy exports use the published server cut without reopening busy or unavailable room files', async () => {
   const f = await fixture();
   const entered = Promise.withResolvers<void>();
@@ -1298,6 +1383,8 @@ Deno.test('real replica HTTP reads distinguish required cuts from absence and bi
     await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
       requireScope: (scope, allowAbsent) =>
         directory.requireScope(scope, allowAbsent),
+      prepareRoomScope: (roomId, allowAbsent) =>
+        directory.prepareRoomScope(roomId, allowAbsent),
       keyDocument: () =>
         Promise.reject(new Error('unused key-document callback')),
       keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),

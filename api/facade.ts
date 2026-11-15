@@ -35,6 +35,7 @@ export async function startFacade(lifetime: ServerLifetime) {
       if (!appBound) {
         await openReplicaApp(runtime.store, tenant, {
           requireScope: runtime.requireScope,
+          prepareRoomScope: runtime.prepareRoomScope,
           keyDocument: runtime.keyDocument,
           publicRooms: runtime.publicRooms,
           passwordLogin: runtime.passwordLogin,

@@ -359,6 +359,13 @@ export async function openFacadeRuntime(
         identity.server,
       ).requireScope(scope, allowAbsent);
     },
+    async prepareRoomScope(roomId: string, allowAbsent?: boolean) {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+      ).prepareRoomScope(roomId, allowAbsent);
+    },
     async publicRooms() {
       const owner = new DirectoryReplicas(
         server,
