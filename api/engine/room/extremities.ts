@@ -34,6 +34,19 @@ export async function addExtremity(
   ]);
 }
 
+// A reopened stay inherits the complete retained DAG, independently of the
+// bounded parent array chosen for its first authored event.
+export async function inherit(
+  conn: Conn,
+  previous: number,
+  stay: number,
+): Promise<void> {
+  await conn.execute(
+    'INSERT INTO extremities(stay,event) SELECT ?,event FROM extremities WHERE stay=?',
+    [stay, previous],
+  );
+}
+
 export async function removeExtremities(
   conn: Conn,
   stay: number,

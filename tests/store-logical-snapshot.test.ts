@@ -169,3 +169,123 @@ Deno.test('logical snapshot: failed export and pin unwind all source maintenance
     await Deno.remove(root, { recursive: true });
   }
 });
+
+Deno.test('logical snapshot: typed rows cross the native boundary once per keyset page', async () => {
+  const { root, ffi, db } = await fixture();
+  let reader: Reader | undefined;
+  try {
+    await db.exec('CREATE TABLE shadowed(rowid TEXT, value INTEGER)');
+    await db.tx(async (tx) => {
+      for (let n = -140; n < 140; n++) {
+        await tx.execute(
+          'INSERT INTO entries(rowid,id,body,bytes,n,absent) VALUES(?,?,?,?,?,?)',
+          [
+            n * 3,
+            String(n),
+            "quoted'\0text",
+            new Uint8Array([0, 255]),
+            n + 0.25,
+            null,
+          ],
+        );
+      }
+      await tx.execute(
+        'INSERT INTO shadowed(_rowid_,rowid,value) VALUES(-9,?,?)',
+        [
+          'ordinary column',
+          Number.MAX_SAFE_INTEGER,
+        ],
+      );
+    });
+    const expected = await db.query(
+      'SELECT rowid,* FROM entries ORDER BY rowid',
+    );
+    reader = await db.readSnapshot();
+    await db.execute("UPDATE entries SET body='after cut'");
+    await db.execute("INSERT INTO entries(id) VALUES('after cut')");
+    const execute = ffi.execute.bind(ffi);
+    const pages: number[] = [];
+    ffi.execute = async (handle, sql, values = []) => {
+      if (sql.startsWith('INSERT INTO "entries"')) {
+        pages.push(values.length / 6);
+      }
+      return await execute(handle, sql, values);
+    };
+    await Deno.mkdir(root + '/out');
+    await reader.export(root + '/out/data.db');
+    await reader.release();
+    reader = undefined;
+    await Deno.mkdir(root + '/independent');
+    await Deno.copyFile(root + '/out/data.db', root + '/independent/data.db');
+    const copy = await Db.open(ffi, root + '/independent/data.db', 65536);
+    try {
+      await integrityCheck(copy);
+      assertEquals(
+        await copy.query('SELECT rowid,* FROM entries ORDER BY rowid'),
+        expected,
+      );
+      assertEquals(
+        await copy.query('SELECT _rowid_ AS native_rowid,* FROM shadowed'),
+        [{
+          rowid: 'ordinary column',
+          value: Number.MAX_SAFE_INTEGER,
+          native_rowid: -9,
+        }],
+      );
+      assertEquals(pages, [128, 128, 24]);
+    } finally {
+      await copy.close();
+    }
+  } finally {
+    await reader?.release();
+    await db.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('logical snapshot: failed native page discards the private target after earlier commits', async () => {
+  const { root, ffi, db } = await fixture();
+  let reader: Reader | undefined;
+  try {
+    await db.tx(async (tx) => {
+      for (let n = 0; n < 129; n++) {
+        await tx.execute('INSERT INTO entries(rowid,id) VALUES(?,?)', [
+          n,
+          String(n),
+        ]);
+      }
+    });
+    reader = await db.readSnapshot();
+    const execute = ffi.execute.bind(ffi);
+    let inserted = 0;
+    ffi.execute = async (handle, sql, values = []) => {
+      const changed = await execute(handle, sql, values);
+      if (sql.startsWith('INSERT INTO "entries"')) {
+        inserted += changed;
+        if (inserted > 128) throw new Error('injected second page failure');
+      }
+      return changed;
+    };
+    await Deno.mkdir(root + '/out');
+    await assertRejects(
+      () => reader!.export(root + '/out/data.db'),
+      Error,
+      'injected second page failure',
+    );
+    assertEquals(inserted, 129);
+    assertEquals(Array.from(Deno.readDirSync(root + '/out')), []);
+    await reader.release();
+    reader = undefined;
+    await db.execute("INSERT INTO entries(id,body) VALUES('after failure',?)", [
+      'x'.repeat(70000),
+    ]);
+    assertEquals(db.gate.stats().active, 0);
+    assert(db.gate.stats().completed > 0);
+  } finally {
+    await reader?.release();
+    await db.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});

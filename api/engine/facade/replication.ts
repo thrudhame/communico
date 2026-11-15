@@ -8,6 +8,7 @@ import {
   type ReplicaRoom,
 } from '#engine/room/replica.ts';
 import type { Store } from '#engine/store/index.ts';
+import { onProjected } from '#engine/server/project.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { Pairings } from './pairing.ts';
 import { applyReplicaScope } from './scopes.ts';
@@ -105,44 +106,72 @@ export function startRoomExports(options: {
   let stopped = false;
   let scanning: Promise<void> | undefined;
   const running = new Map<string, Promise<void>>();
+  const rerun = new Set<string>();
+  let dirty = false;
   const wake = () => {
     if (stopped) return;
+    dirty = true;
     scanning ??= (async () => {
       try {
-        for (const id of await options.store.rooms()) {
-          if (stopped || running.has(id)) continue;
-          const job = (async () => {
-            const room = await openRoom(options.store, id);
-            // Evidence-only/prejoin files carry no authentic participation.
-            if (!await room.tx((tx) => tx.segments.latestStay())) return;
-            if (
-              await exportRoomReplica(
-                options.store,
-                room,
-                options.self,
-                options.peer,
-                options.pairing,
-              )
-            ) {
-              options.changed();
+        do {
+          dirty = false;
+          try {
+            for (const id of await options.store.rooms()) {
+              if (stopped) break;
+              if (running.has(id)) {
+                rerun.add(id);
+                continue;
+              }
+              const job = (async () => {
+                try {
+                  do {
+                    rerun.delete(id);
+                    try {
+                      const room = await openRoom(options.store, id);
+                      // Evidence-only/prejoin files carry no authentic participation.
+                      if (!await room.tx((tx) => tx.segments.latestStay())) {
+                        continue;
+                      }
+                      if (
+                        await exportRoomReplica(
+                          options.store,
+                          room,
+                          options.self,
+                          options.peer,
+                          options.pairing,
+                        )
+                      ) {
+                        options.changed();
+                      }
+                    } catch (error) {
+                      options.failed(error, id);
+                    }
+                  } while (!stopped && rerun.delete(id));
+                } finally {
+                  running.delete(id);
+                }
+              })();
+              running.set(id, job);
             }
-          })().catch((error) => options.failed(error, id));
-          running.set(id, job);
-          void job.finally(() => running.delete(id));
-        }
-      } catch (error) {
-        options.failed(error);
+          } catch (error) {
+            options.failed(error);
+          }
+        } while (!stopped && dirty);
       } finally {
         scanning = undefined;
       }
     })();
   };
+  const unproject = onProjected((store) => {
+    if (store === options.store) wake();
+  });
   let closed: Promise<void> | undefined;
   return {
     wake,
     close: () =>
       closed ??= (async () => {
         stopped = true;
+        unproject();
         await scanning;
         await Promise.all(running.values());
       })(),

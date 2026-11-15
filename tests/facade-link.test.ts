@@ -1,4 +1,12 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
+import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
+import { homeKeyDocument } from '#engine/federation/keydoc.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  importPublicKeyFromRaw,
+  matrixBase64,
+  verifyJson,
+} from '#engine/signing-primitives.js';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { openJournalClient } from '#engine/facade/client.ts';
 import {
@@ -270,6 +278,13 @@ async function fixture() {
       limits: { maxItems: 100, maxBytes: 10000 },
       notices,
       pairings: () => Promise.resolve(fp),
+      signKeyDocument: async (raw) =>
+        await new FacadeKeys(
+          await facade.server(),
+          node.signer(),
+          node.publicKey,
+          fp,
+        ).cosign(raw),
       changed: () => {
         changes++;
         notices.changed();
@@ -293,6 +308,10 @@ async function fixture() {
   return {
     tls,
     notices,
+    home: () => home,
+    tenant: () => tenant,
+    keys: async () =>
+      new FacadeKeys(await facade.server(), node.signer(), node.publicKey, fp),
     get hj() {
       return hj;
     },
@@ -356,6 +375,80 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('co-signed key publication collects over the authenticated link before either public role serves it', async () => {
+  const f = await fixture();
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const tenant = f.tenant();
+    const homeDoc = async () =>
+      await homeKeyDocument(
+        await f.home().server(),
+        tenant.signer(),
+        tenant.publicB64,
+      );
+    await assertRejects(homeDoc, MatrixError, 'not ready');
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    let calls = 0;
+    const record = await exportKeyRoster(
+      f.home(),
+      tenant,
+      'edge_a',
+      bundle.id,
+      async (_id, doc) => {
+        calls++;
+        await assertRejects(homeDoc, MatrixError, 'not ready');
+        return await client.signKeyDocument(doc);
+      },
+    );
+    assertEquals(calls, 1);
+    const document = await homeDoc();
+    assertEquals(
+      Object.keys(document.signatures[tenant.serverName]).sort(),
+      Object.keys(document.verify_keys).sort(),
+    );
+    for (const [id, key] of Object.entries(document.verify_keys)) {
+      assert(
+        await verifyJson(
+          document,
+          tenant.serverName,
+          id,
+          await importPublicKeyFromRaw(matrixBase64(key.key, 32)),
+        ),
+      );
+    }
+    await client.push(record, [record], EMPTY_CUT);
+    await (await f.keys()).apply(f.fj, record);
+    assertEquals(await (await f.keys()).document(), document);
+    const changed = structuredClone(document);
+    changed.valid_until_ts--;
+    await assertRejects(
+      () => client.signKeyDocument(changed),
+      LinkError,
+      'refused',
+    );
+    const unsigned = structuredClone(document);
+    delete unsigned.signatures[tenant.serverName][tenant.keyId];
+    await assertRejects(
+      () => client.signKeyDocument(unsigned),
+      LinkError,
+      'refused',
+    );
+    await f.reopen();
+    assertEquals(await (await f.keys()).document(), document);
+    const reopened = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    await f.hp.revoke(bundle.id);
+    await assertRejects(
+      () => reopened.signKeyDocument(document),
+      LinkError,
+      'no longer active',
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('re-enrollment exposes only active home streams while retaining retired records', async () => {
   const f = await fixture();
@@ -489,6 +582,58 @@ Deno.test('durable result is ACKed before a later operation blocks in the same s
     });
   } finally {
     release.resolve();
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
+Deno.test('durable outgoing ACK progress wakes its consumer without waiting for a fault retry timer', async () => {
+  const f = await fixture();
+  const notifications: string[] = [];
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const record = await f.hj.append('edge_a', {
+      source: 'home',
+      incarnation: bundle.id,
+      stream: 'egress:remote.test',
+      type: 'control',
+      version: 1,
+      operationId: 'ack-wake',
+      payload: {},
+    });
+    await client.push(record, [record], EMPTY_CUT);
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 100, maxBytes: 10000 },
+      apply: () => Promise.resolve(false),
+      failed: (error) => failures.push(error),
+      acknowledged: (stream) => notifications.push(stream.stream),
+    });
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(notifications, [], 'receipt alone is not an applied result');
+    await f.fj.complete('home', record, record, { fence: 'ready' });
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(await f.hj.result('edge_a', 'out', record, record), {
+      result: { fence: 'ready' },
+    });
+    assertEquals(notifications, ['egress:remote.test']);
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(
+      notifications,
+      ['egress:remote.test'],
+      'an unchanged ACK is not progress',
+    );
+    assertEquals(failures, []);
+  } finally {
     await reconciler?.drain();
     await f.close();
   }
@@ -865,6 +1010,140 @@ Deno.test('a blocked domain cannot starve another stream or periodic hello with 
   }
 });
 
+Deno.test('reconciliation preserves an outgoing wake received during an in-flight push', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const base = {
+      source: 'home',
+      incarnation: bundle.id,
+      stream: 'egress:wake.test',
+      type: 'control',
+      version: 1,
+    };
+    const first = await f.hj.append('edge_a', {
+      ...base,
+      operationId: 'first',
+      payload: 1,
+    });
+    const push = client.push.bind(client);
+    let blocked = false;
+    client.push = async (...args) => {
+      const result = await push(...args);
+      if (!blocked) {
+        blocked = true;
+        entered.resolve();
+        await release.promise;
+      }
+      return result;
+    };
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      apply: () => Promise.resolve(false),
+      failed: (error) => failures.push(error),
+    });
+    await reconciler.reconcile();
+    await testDeadline(entered.promise);
+    const second = await f.hj.append('edge_a', {
+      ...base,
+      operationId: 'second',
+      payload: 2,
+    });
+    await reconciler.reconcile();
+    release.resolve();
+    await reconciler.drain();
+    assertEquals(
+      (await f.fj.heads('home', 'in', first)).received.sequence,
+      second.sequence,
+    );
+    assertEquals(
+      failures,
+      [],
+      'a fresh reconciliation must not compare ACKs to stale hello cuts',
+    );
+  } finally {
+    release.resolve();
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
+Deno.test('reconciliation preserves an incoming notice while its domain is finishing a pass', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const base = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      stream: 'ingress:wake.test',
+      type: 'control',
+      version: 1,
+    };
+    const first = await f.fj.append('home', {
+      ...base,
+      operationId: 'first',
+      payload: 1,
+    });
+    let blocked = false;
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      failed: (error) => failures.push(error),
+      apply: async (stream) => {
+        const record = await f.hj.next('edge_a', stream);
+        if (record) {
+          await f.hj.complete('edge_a', stream, record, {
+            exact: record.payload,
+          });
+          return true;
+        }
+        if (!blocked) {
+          blocked = true;
+          entered.resolve();
+          await release.promise;
+        }
+        return false;
+      },
+    });
+    await reconciler.reconcile();
+    await testDeadline(entered.promise);
+    const second = await f.fj.append('home', {
+      ...base,
+      operationId: 'second',
+      payload: 2,
+    });
+    await reconciler.reconcile();
+    release.resolve();
+    await reconciler.drain();
+    assertEquals(
+      (await f.hj.heads('edge_a', 'in', first)).applied.sequence,
+      second.sequence,
+    );
+    assertEquals(failures, []);
+  } finally {
+    release.resolve();
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
 async function testDeadline<T>(work: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -945,3 +1224,143 @@ Deno.test('facade inbox application is independent per stream and drains without
     await f.close();
   }
 });
+
+Deno.test('facade inbox retains a wake during its final empty domain check', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const rescanned = Promise.withResolvers<void>();
+  const delivered = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let worker: ReturnType<typeof startInboxWorker> | undefined;
+  try {
+    const base = {
+      source: 'home',
+      incarnation: 'inbox-wake',
+      stream: 'room:inbox',
+      type: 'control',
+      version: 1,
+    };
+    const first = await f.hj.append('edge_a', {
+      ...base,
+      operationId: 'first',
+      payload: 1,
+    });
+    await f.fj.receive('home', [first]);
+    const streams = f.fj.streams.bind(f.fj);
+    let blocked = false;
+    f.fj.streams = async (...args) => {
+      const result = await streams(...args);
+      if (blocked) rescanned.resolve();
+      return result;
+    };
+    worker = startInboxWorker({
+      journal: f.fj,
+      peer: 'home',
+      pollseconds: 60,
+      changed() {},
+      failed: (error) => failures.push(error),
+      apply: async (stream) => {
+        const next = await f.fj.next('home', stream);
+        if (next) {
+          await f.fj.complete('home', stream, next, { exact: next.payload });
+          if (next.payload === 2) delivered.resolve();
+          return true;
+        }
+        if (!blocked) {
+          blocked = true;
+          entered.resolve();
+          await release.promise;
+        }
+        return false;
+      },
+    });
+    await testDeadline(entered.promise);
+    const second = await f.hj.append('edge_a', {
+      ...base,
+      operationId: 'second',
+      payload: 2,
+    });
+    await f.fj.receive('home', [second]);
+    worker.wake();
+    await testDeadline(rescanned.promise);
+    release.resolve();
+    await testDeadline(delivered.promise);
+    assertEquals((await f.fj.heads('home', 'in', second)).applied.sequence, 2);
+    assertEquals(failures, []);
+  } finally {
+    release.resolve();
+    await worker?.close();
+    await f.close();
+  }
+});
+
+for (const fault of ['apply', 'enumeration'] as const) {
+  Deno.test(`facade inbox retains a wake across a failed ${fault} pass`, async () => {
+    const f = await fixture();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const rescanned = Promise.withResolvers<void>();
+    const delivered = Promise.withResolvers<void>();
+    const failures: unknown[] = [];
+    const failure = new Error('injected inbox pass failure');
+    let injected = false;
+    let worker: ReturnType<typeof startInboxWorker> | undefined;
+    try {
+      const record = await f.hj.append('edge_a', {
+        source: 'home',
+        incarnation: 'inbox-error-wake',
+        stream: 'room:retry',
+        type: 'control',
+        version: 1,
+        operationId: 'retry',
+        payload: 1,
+      });
+      await f.fj.receive('home', [record]);
+      const streams = f.fj.streams.bind(f.fj);
+      let scans = 0;
+      f.fj.streams = async (...args) => {
+        scans++;
+        if (fault === 'enumeration' && !injected) {
+          injected = true;
+          entered.resolve();
+          await release.promise;
+          throw failure;
+        }
+        const result = await streams(...args);
+        if (scans > 1) setTimeout(() => rescanned.resolve(), 0);
+        return result;
+      };
+      worker = startInboxWorker({
+        journal: f.fj,
+        peer: 'home',
+        pollseconds: 60,
+        changed() {},
+        failed: (error) => failures.push(error),
+        apply: async (stream) => {
+          if (fault === 'apply' && !injected) {
+            injected = true;
+            entered.resolve();
+            await release.promise;
+            throw failure;
+          }
+          const next = await f.fj.next('home', stream);
+          if (!next) return false;
+          await f.fj.complete('home', stream, next, { applied: true });
+          delivered.resolve();
+          return true;
+        },
+      });
+      await testDeadline(entered.promise);
+      worker.wake();
+      if (fault === 'apply') await testDeadline(rescanned.promise);
+      release.resolve();
+      await testDeadline(delivered.promise);
+      assertEquals(failures, [failure]);
+    } finally {
+      release.resolve();
+      await worker?.close();
+      await f.close();
+    }
+  });
+}

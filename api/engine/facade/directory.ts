@@ -21,6 +21,8 @@ import {
 } from '#engine/server/public-replica.ts';
 import type { Database } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
+import { onProjected } from '#engine/server/project.ts';
+import { onTenantStream } from '#engine/tenant/streams.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { Pairings } from './pairing.ts';
@@ -169,26 +171,44 @@ export function startDirectoryExports(
   let stopped = false;
   let running: Promise<void> | undefined;
   let closed: Promise<void> | undefined;
+  let dirty = false;
+  const wake = () => {
+    if (stopped) return;
+    dirty = true;
+    running ??= (async () => {
+      try {
+        do {
+          dirty = false;
+          try {
+            const record = await exportDirectoryReplica(
+              options.store,
+              options.tenant,
+              options.peer,
+              options.pairing,
+            );
+            if (record) options.changed();
+          } catch (error) {
+            options.failed(error);
+          }
+        } while (!stopped && dirty);
+      } finally {
+        running = undefined;
+      }
+    })();
+  };
+  const unproject = onProjected((store) => {
+    if (store === options.store) wake();
+  });
+  const untenant = onTenantStream((store, tenant) => {
+    if (store === options.store && tenant === options.tenant.serverName) wake();
+  });
   return {
-    wake() {
-      if (stopped || running) return;
-      running = exportDirectoryReplica(
-        options.store,
-        options.tenant,
-        options.peer,
-        options.pairing,
-      )
-        .then((record) => {
-          if (record) options.changed();
-        })
-        .catch(options.failed)
-        .finally(() => {
-          running = undefined;
-        });
-    },
+    wake,
     close: () =>
       closed ??= (async () => {
         stopped = true;
+        unproject();
+        untenant();
         await running;
       })(),
   };
