@@ -121,6 +121,148 @@ async function frontierOf(room: Room): Promise<string[]> {
   });
 }
 
+async function ancestryFixture(store: Store) {
+  const s = await setup(store);
+  const held: Pdu[] = [];
+  let previous = '$ancestry-unavailable';
+  for (let n = 0; n < 8; n++) {
+    const event = await msg(s, 'held ancestry ' + n, [previous], 100 + n);
+    held.push(event);
+    previous = event.event_id!;
+  }
+  assertEquals(
+    (await ingestRemote(s.g.room, held, s.server.name, {
+      ...s.deps,
+      limits: { ...s.deps.limits, budgetMs: 0 },
+    })).map((o) => o.outcome),
+    Array(held.length).fill('pending'),
+  );
+  const pulled = await msg(s, 'shared pulled parent', [previous], 200);
+  const batch = [];
+  for (let n = 0; n < 4; n++) {
+    batch.push(await msg(s, 'sibling ' + n, [pulled.event_id!], 201 + n));
+  }
+  const recording = fakeFetcher({ missingEvents: [pulled] });
+  s.deps.fetcher = recording.fetcher;
+  return { ...s, held, pulled, batch, recording };
+}
+
+Deno.test('ancestry owner: siblings share direct-parent supply and failed boundary attempts', async () => {
+  await withStore(async (store) => {
+    const s = await ancestryFixture(store);
+    const out = await ingestRemote(s.g.room, s.batch, s.server.name, s.deps);
+    assertEquals(out.map((o) => o.outcome), Array(4).fill('pending'));
+    assertEquals(out.map((o) => o.error), Array(4).fill(null));
+    assertEquals(s.recording.calls.missingEvents.length, 1);
+    assertEquals(
+      s.recording.calls.stateIds.length,
+      new Set(s.recording.calls.stateIds).size,
+    );
+    assertEquals(s.recording.calls.stateIds.length, s.held.length + 2);
+    assertEquals(await frontierOf(s.g.room), [s.joinId]);
+  });
+});
+
+Deno.test('ancestry owner: sibling recovery does not rehydrate the held ancestor prefix', async () => {
+  await withStore(async (store) => {
+    const s = await ancestryFixture(store);
+    const held = new Set(s.held.map((pdu) => pdu.event_id!));
+    const original = s.g.room.tx.bind(s.g.room);
+    let reads = 0;
+    s.g.room.tx = (fn) =>
+      original((tx) => {
+        const get = tx.events.get;
+        tx.events.get = (id) => {
+          if (held.has(id)) reads++;
+          return get(id);
+        };
+        return fn(tx);
+      });
+    try {
+      const out = await ingestRemote(s.g.room, s.batch, s.server.name, s.deps);
+      assertEquals(out.map((o) => o.outcome), Array(4).fill('pending'));
+      assert(
+        reads <= held.size,
+        `${reads} held PDU reads for ${held.size} ancestors`,
+      );
+    } finally {
+      s.g.room.tx = original;
+    }
+  });
+});
+
+Deno.test('ancestry owner: a parent arriving during a boundary read invalidates missing facts', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const parent = await msg(s, 'arrives while fetching', [s.joinId], 100);
+    const pulled = await msg(
+      s,
+      'pulled above arrival',
+      [parent.event_id!],
+      101,
+    );
+    const child = await msg(s, 'pushed above arrival', [pulled.event_id!], 102);
+    const recording = fakeFetcher({ missingEvents: [pulled] });
+    s.deps.fetcher = recording.fetcher;
+    const reads: string[] = [];
+    recording.fetcher.stateIds = async (_room, at) => {
+      reads.push(at);
+      if (at === parent.event_id) {
+        assertEquals(
+          (await ingestRemote(s.g.room, [parent], s.server.name, {
+            ...s.deps,
+            limits: { ...s.deps.limits, budgetMs: 0 },
+          }))[0].outcome,
+          'accepted',
+        );
+      }
+      return null;
+    };
+    const out = await ingestRemote(s.g.room, [child], s.server.name, s.deps);
+    assertEquals(out[0].outcome, 'accepted');
+    assertEquals(reads, [parent.event_id!]);
+    assertEquals(await frontierOf(s.g.room), [child.event_id!]);
+  });
+});
+
+Deno.test('ancestry owner: later pulled supply invalidates an earlier failed ancestry result', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const far = await msg(s, 'new recoverable far', [s.joinId], 100);
+    const parent = await msg(s, 'supplied later', [far.event_id!], 101);
+    const first = await msg(s, 'first pulled', [parent.event_id!], 102);
+    const second = await msg(s, 'second pulled', [parent.event_id!], 103);
+    const recording = fakeFetcher({
+      stateIds: new Map([[far.event_id!, {
+        pduIds: [s.g.createId, s.joinId],
+        authChainIds: [],
+      }]]),
+      event: new Map([[far.event_id!, far]]),
+    });
+    let replies = 0;
+    recording.fetcher.missingEvents = () =>
+      Promise.resolve(++replies === 1 ? [] : [parent]);
+    s.deps.fetcher = recording.fetcher;
+    const out = await ingestRemote(
+      s.g.room,
+      [first, second],
+      s.server.name,
+      s.deps,
+      'pulled',
+    );
+    assertEquals(out.map((o) => o.outcome), ['accepted', 'accepted']);
+    assertEquals(recording.calls.stateIds, [
+      parent.event_id!,
+      first.event_id!,
+      far.event_id!,
+    ]);
+    assertEquals(
+      await frontierOf(s.g.room),
+      [first.event_id!, second.event_id!].sort(),
+    );
+  });
+});
+
 for (const source of ['fetch', 'verify']) {
   Deno.test(
     'missing: local ' + source +
@@ -252,7 +394,9 @@ Deno.test('missing: pushed parents cannot lend state recovery permission to a ba
     assertEquals(out.map((o) => o.outcome), ['pending', 'pending']);
     assertEquals(out[0].error, null); // the child supplied its own direct parent
     assert(out[1].error?.includes('prev_events')); // the parent withheld its prev
-    assertEquals(recording.calls.missingEvents.length, 2);
+    // The child already supplied its direct pushed parent. Only that parent
+    // needs a missing-events read; neither may import withheld pushed state.
+    assertEquals(recording.calls.missingEvents.length, 1);
     assertEquals(recording.calls.stateIds, []);
     assertEquals(recording.calls.event, []);
     assertEquals(await frontierOf(s.g.room), [s.joinId]);
@@ -461,7 +605,12 @@ Deno.test('missing: batch-wide supplied ancestry recovery is independent of inpu
           'accepted',
         ]);
         assertEquals(out.map((result) => result.error), [null, null]);
-        assertEquals(latestCalls, batch.map((pdu) => [pdu.event_id!]));
+        // A supplier-first answer already supplies the other input's direct
+        // parent. Do not fetch its held ancestry again through that input.
+        assertEquals(
+          latestCalls,
+          (reversed ? [second] : batch).map((pdu) => [pdu.event_id!]),
+        );
         assertEquals(recording.calls.stateIds, [far.event_id!]);
         assertEquals(recording.calls.event, [far.event_id!]);
         await s.g.room.tx(async (tx) => {
