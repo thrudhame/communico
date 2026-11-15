@@ -15,6 +15,11 @@ import {
 } from '#engine/tenant/device-source.ts';
 import { importDeviceOperation } from '#engine/tenant/device-operations.ts';
 import {
+  captureSigningOperations,
+  importSigningOperation,
+  type SigningOperation,
+} from '#engine/tenant/signing-operations.ts';
+import {
   linkApplication,
   retainLinkApplication,
 } from '#engine/tenant/link-applications.ts';
@@ -31,16 +36,24 @@ export type DeviceView = DomainBinding & {
   kind: 'device-operation';
   operation: DeviceOperation;
 };
+type SigningView = DomainBinding & {
+  kind: 'signing-operation';
+  operation: SigningOperation;
+};
+type KeyView = DeviceView | SigningView;
 
 function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
 }
 
-function viewOf(raw: unknown): DeviceView {
+function viewOf(raw: unknown): KeyView {
   const row = object(raw), operation = object(row.operation);
   const localpart = text(row.localpart);
-  const view: DeviceView = {
-    kind: 'device-operation',
+  if (row.kind !== 'device-operation' && row.kind !== 'signing-operation') {
+    mismatch('unknown public key operation');
+  }
+  const view = {
+    kind: row.kind,
     server: text(row.server),
     pairing: text(row.pairing),
     grantRevision: integer(row.grantRevision, 1),
@@ -48,8 +61,8 @@ function viewOf(raw: unknown): DeviceView {
     localpart,
     source: text(row.source),
     incarnation: text(row.incarnation),
-    operation: operation as DeviceOperation,
-  };
+    operation,
+  } as KeyView;
   if (
     checkLocalpart(localpart) !== localpart ||
     canonicalJson(view) !== canonicalJson(raw) ||
@@ -59,17 +72,19 @@ function viewOf(raw: unknown): DeviceView {
   return view;
 }
 
-function operationId(view: DeviceView) {
-  return 'device:' + createHash('sha256').update(canonicalJson([
-    view.pairing,
-    view.grantRevision,
-    view.ownerRevision,
-    view.operation.operationId,
-  ])).digest('hex');
+function operationId(view: KeyView) {
+  return (view.kind === 'device-operation' ? 'device:' : 'signing:') +
+    createHash('sha256').update(canonicalJson([
+      view.pairing,
+      view.grantRevision,
+      view.ownerRevision,
+      view.operation.operationId,
+    ])).digest('hex');
 }
 
-function streamName(localpart: string, server: string) {
-  return 'devices:@' + localpart + ':' + server;
+function streamName(kind: KeyView['kind'], localpart: string, server: string) {
+  return (kind === 'device-operation' ? 'devices:@' : 'signing:@') + localpart +
+    ':' + server;
 }
 
 export class DeviceOperations {
@@ -145,6 +160,20 @@ export class DeviceOperations {
   /** Export original local owner intent only. Full bootstrap/history and public
    * reader activation are separate contracts, not implied by this suffix. */
   async export(localpart: string, pairing?: string) {
+    return await this.exportOperations('device-operation', localpart, pairing);
+  }
+
+  /** Home-authored complete cross-signing identities share the device link's
+   * admission/receipt contract, but have their own independently drained stream. */
+  async exportSigning(localpart: string, pairing?: string) {
+    return await this.exportOperations('signing-operation', localpart, pairing);
+  }
+
+  private async exportOperations(
+    kind: KeyView['kind'],
+    localpart: string,
+    pairing?: string,
+  ) {
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
     const server = await this.store.server();
@@ -179,12 +208,14 @@ export class DeviceOperations {
     const operations = await (await this.store.tenant(context.server)).tx(
       async (conn) => {
         await this.tenantSelected(conn, binding);
-        return await captureDeviceOperations(conn, localpart);
+        return kind === 'device-operation'
+          ? await captureDeviceOperations(conn, localpart)
+          : await captureSigningOperations(conn, localpart);
       },
     );
     const records = [];
     for (const operation of operations) {
-      const view = viewOf({ ...binding, kind: 'device-operation', operation });
+      const view = viewOf({ ...binding, kind, operation });
       const signed = {
         body: view,
         signature: await (this.node?.signer() ?? this.tenant.signer()).sign(
@@ -198,8 +229,8 @@ export class DeviceOperations {
           return await appendRecord(conn, this.node ? 'home' : context.node, {
             source: view.source,
             incarnation: this.node ? view.incarnation : context.id,
-            stream: streamName(localpart, context.server),
-            type: 'device-operation',
+            stream: streamName(kind, localpart, context.server),
+            type: kind,
             version: 1,
             operationId: operationId(view),
             payload: signed,
@@ -221,12 +252,15 @@ export class DeviceOperations {
     const peer = this.node ? 'home' : stream.source;
     const record = await journal.next(peer, stream);
     if (!record) return false;
-    if (record.type !== 'device-operation' || record.version !== 1) {
+    if (
+      (record.type !== 'device-operation' &&
+        record.type !== 'signing-operation') || record.version !== 1
+    ) {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not device operation');
     }
     const signed = object(record.payload), view = viewOf(signed.body);
     if (
-      view.server !== this.tenant.serverName ||
+      view.kind !== record.type || view.server !== this.tenant.serverName ||
       (!this.node && view.pairing !== pairing)
     ) {
       mismatch('device completion differs from local scope');
@@ -250,7 +284,7 @@ export class DeviceOperations {
       record.source !== peer ||
       record.incarnation !==
         (this.node ? context.id : grant.body.transcript.body.incarnation) ||
-      record.stream !== streamName(view.localpart, view.server) ||
+      record.stream !== streamName(view.kind, view.localpart, view.server) ||
       record.operationId !== operationId(view)
     ) mismatch('device record differs from enrolled source or scope');
     let valid = false;
@@ -276,7 +310,11 @@ export class DeviceOperations {
     const result = await tenant.tx(async (conn) => {
       unchanged();
       await this.tenantSelected(conn, view);
-      await importDeviceOperation(conn, view.operation, view);
+      if (view.kind === 'device-operation') {
+        await importDeviceOperation(conn, view.operation, view);
+      } else {
+        await importSigningOperation(conn, view.operation, view);
+      }
       const result = { operationId: view.operation.operationId };
       await retainLinkApplication(conn, peer, record, result);
       // This synchronous fence is the admission cut. A retirement begun before

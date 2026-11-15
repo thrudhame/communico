@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
 import {
@@ -6,7 +7,7 @@ import {
   exportAccountAuth,
   exportSessionAuthority,
 } from '#engine/facade/accounts.ts';
-import { DeviceOperations } from '#engine/facade/devices.ts';
+import { DeviceOperations, type DeviceView } from '#engine/facade/devices.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
@@ -26,6 +27,14 @@ import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
+import { captureSigningOperations } from '#engine/tenant/signing-operations.ts';
+import { signingUpload } from '#engine/e2ee-signing.ts';
+import {
+  b64encodeStd,
+  exportPublicKeyRaw,
+  generateSigningKeypair,
+  signJson,
+} from '#engine/signing-primitives.js';
 
 // Pause the real owner at deterministic cross-file boundaries. Revocation runs
 // in the test task, never as a nested server transaction in the owner callback.
@@ -63,7 +72,10 @@ function pauseImport(store: Store, cut: 'before' | 'during' | 'after') {
                 if (key === 'execute') {
                   return async (...args: Parameters<Conn['execute']>) => {
                     const value = await target.execute(...args);
-                    if (args[0].startsWith('INSERT INTO device_operations ')) {
+                    if (
+                      args[0].startsWith('INSERT INTO device_operations ') ||
+                      args[0].startsWith('INSERT INTO signing_operations ')
+                    ) {
                       imported = true;
                       if (cut === 'during') await pause();
                     }
@@ -189,6 +201,31 @@ async function fixture() {
   };
 }
 
+async function signingInput() {
+  const user = '@alice:logical.test';
+  const pair = await generateSigningKeypair() as CryptoKeyPair;
+  const pub = b64encodeStd(await exportPublicKeyRaw(pair.publicKey));
+  const input: Record<string, unknown> = {
+    master_key: {
+      user_id: user,
+      usage: ['master'],
+      keys: { ['ed25519:' + pub]: pub },
+    },
+  };
+  for (const usage of ['self_signing', 'user_signing']) {
+    const subordinate = await generateSigningKeypair() as CryptoKeyPair;
+    const key = b64encodeStd(await exportPublicKeyRaw(subordinate.publicKey));
+    const json = {
+      user_id: user,
+      usage: [usage],
+      keys: { ['ed25519:' + key]: key },
+    };
+    await signJson(json, user, 'ed25519:' + pub, pair.privateKey);
+    input[usage + '_key'] = json;
+  }
+  return signingUpload(input, user, config().e2ee);
+}
+
 Deno.test('device link: current owner facts cross the signed journal without granting mutable authority or echoing', async () => {
   const f = await fixture();
   try {
@@ -292,6 +329,287 @@ Deno.test('device link: reader negotiation does not change F1 required capabilit
     LINK_CAPABILITIES.some((cap) => cap.type === 'device-operation'),
     false,
   );
+});
+
+Deno.test('signing link: an enrolled home-signed complete identity reaches the tenant before its journal ACK', async () => {
+  const f = await fixture();
+  try {
+    const [template] = await f.hs.export('alice', f.bundle.id);
+    const [operation] = await (await f.home.tenant('logical.test')).tx((conn) =>
+      captureSigningOperations(conn, 'alice')
+    );
+    const view = {
+      ...(template.payload as { body: DeviceView }).body,
+      kind: 'signing-operation',
+      operation,
+    };
+    const body = {
+      ...template,
+      stream: 'signing:@alice:logical.test',
+      type: 'signing-operation',
+      operationId: 'signing:' + createHash('sha256').update(canonicalJson([
+        f.bundle.id,
+        view.grantRevision,
+        view.ownerRevision,
+        operation.operationId,
+      ])).digest('hex'),
+      payload: {
+        body: view,
+        signature: await f.ht.signer().sign(canonicalJson(view)),
+      },
+    };
+    const { hash: _hash, ...unsigned } = body;
+    const record = { ...unsigned, hash: recordHash(unsigned) };
+    const journal = new Journal(await f.edge.server(), [
+      ...LINK_SUPPORTED,
+      { type: 'signing-operation', version: 1 },
+    ]);
+    await journal.receive('home', [record]);
+    assertEquals(await f.es.apply(journal, record), true);
+    assertEquals(
+      (await (await f.edge.tenant('logical.test')).query(
+        'SELECT payload_json FROM signing_operations',
+      )).map((row) => JSON.parse(String(row.payload_json))),
+      [operation],
+    );
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.hash,
+      record.hash,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('signing link: selected home identity export is stable and own-user scoped, never edge-authored or a mutable device', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    const input = await signingInput();
+    await f.ht.tx((tx) =>
+      tx.crossSigning.upload('alice', user, input, '{}', false)
+    );
+    const records = await f.hs.exportSigning('alice', f.bundle.id);
+    assertEquals(records.length, 1);
+    assertEquals(records[0].type, 'signing-operation');
+    assertEquals(records[0].stream, 'signing:@alice:logical.test');
+    assertEquals(await f.hs.exportSigning('alice', f.bundle.id), records);
+    await f.ej.receive('home', records);
+    assertEquals(await f.es.apply(f.ej, records[0]), true);
+    assertEquals(await f.es.apply(f.ej, records[0]), false);
+    assertEquals(await f.et.tx((tx) => tx.crossSigning.state('alice')), input);
+    const own = await f.et.tx((tx) =>
+      tx.crossSigning.views('alice', user, user)
+    );
+    const other = await f.et.tx((tx) =>
+      tx.crossSigning.views('alice', user, '@bob:logical.test')
+    );
+    assert(own.user_signing_keys);
+    assertEquals(other.user_signing_keys, undefined);
+    assertEquals(await f.es.exportSigning('alice'), []);
+    assertEquals(
+      await (await f.edge.tenant('logical.test')).query(
+        'SELECT * FROM devices',
+      ),
+      [],
+    );
+    assertEquals(
+      LINK_SUPPORTED.some((cap) =>
+        cap.type === 'signing-operation' && cap.version === 1
+      ),
+      true,
+    );
+    assertEquals(
+      LINK_CAPABILITIES.some((cap) => cap.type === 'signing-operation'),
+      false,
+    );
+    for (
+      const [owner, pairing] of [[f.hs, f.bundle.id], [
+        f.es,
+        undefined,
+      ]] as const
+    ) {
+      await assertRejects(
+        () => owner.exportSigning('bob', pairing),
+        Error,
+        'account not selected',
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('signing link: forged signature, source, account, grant, stream or record kind cannot gain an identity or ACK', async () => {
+  for (
+    const fault of [
+      'signature',
+      'source',
+      'localpart',
+      'grantRevision',
+      'stream',
+      'type',
+    ] as const
+  ) {
+    const f = await fixture();
+    try {
+      const [record] = await f.hs.exportSigning('alice', f.bundle.id);
+      const signed = record.payload as {
+        body: Record<string, unknown>;
+        signature: string;
+      };
+      if (fault === 'signature') signed.signature = 'A'.repeat(86);
+      else if (fault === 'stream') {
+        record.stream = 'devices:@alice:logical.test';
+      } else if (fault === 'type') record.type = 'device-operation';
+      else {
+        signed.body[fault] = fault === 'source'
+          ? 'edge_a'
+          : fault === 'localpart'
+          ? 'bob'
+          : Number(signed.body.grantRevision) + 1;
+        signed.signature = await f.ht.signer().sign(canonicalJson(signed.body));
+      }
+      const { hash: _hash, ...body } = record;
+      record.hash = recordHash(body);
+      await f.ej.receive('home', [record]);
+      await assertRejects(() => f.es.apply(f.ej, record), Error);
+      assertEquals(
+        await (await f.edge.tenant('logical.test')).query(
+          'SELECT * FROM signing_operations',
+        ),
+        [],
+      );
+      assertEquals((await f.ej.next('home', record))?.hash, record.hash);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('signing link: tenant control, account selection and live pairing fence identity import', async () => {
+  for (const fault of ['control', 'selection', 'revoked'] as const) {
+    const f = await fixture();
+    try {
+      const [record] = await f.hs.exportSigning('alice', f.bundle.id);
+      await f.ej.receive('home', [record]);
+      const tenant = await f.edge.tenant('logical.test');
+      if (fault === 'control') {
+        await tenant.tx((conn) =>
+          conn.execute('DELETE FROM facade_owner_activation')
+        );
+      } else if (fault === 'selection') {
+        await tenant.tx((conn) =>
+          conn.execute(
+            'UPDATE account_auth_snapshots SET grant_revision=grant_revision+1',
+          )
+        );
+      } else await f.fp.retire(await f.hp.revoke(f.bundle.id), 'a'.repeat(64));
+      await assertRejects(() => f.es.apply(f.ej, record), Error);
+      assertEquals(await tenant.query('SELECT * FROM signing_operations'), []);
+      assertEquals((await f.ej.next('home', record))?.hash, record.hash);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('signing link: revocation before or during identity admission rolls back both fact and receipt', async () => {
+  for (const cut of ['before', 'during'] as const) {
+    const f = await fixture();
+    try {
+      const [record] = await f.hs.exportSigning('alice', f.bundle.id);
+      await f.ej.receive('home', [record]);
+      const paused = pauseImport(f.edge, cut);
+      const outcome = f.es.apply(f.ej, record).then(
+        () => null,
+        (error) => error,
+      );
+      try {
+        await paused.reached;
+        await f.fp.retire(await f.hp.revoke(f.bundle.id), 'a'.repeat(64));
+      } finally {
+        paused.resume();
+        paused.restore();
+      }
+      assert(await outcome instanceof Error);
+      const tenant = await f.edge.tenant('logical.test');
+      assertEquals(await tenant.query('SELECT * FROM signing_operations'), []);
+      assertEquals(
+        await tenant.query('SELECT * FROM facade_link_applications'),
+        [],
+      );
+      assertEquals((await f.ej.next('home', record))?.hash, record.hash);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('signing link: admitted identity survives retirement and ACK loss with exact cold completion only', async () => {
+  const f = await fixture();
+  try {
+    await f.hs.exportSigning('alice', f.bundle.id);
+    await f.ht.tx(async (tx) =>
+      tx.crossSigning.upload(
+        'alice',
+        '@alice:logical.test',
+        await signingInput(),
+        '{}',
+        false,
+      )
+    );
+    const records = await f.hs.exportSigning('alice', f.bundle.id);
+    assertEquals(records.length, 2);
+    await f.ej.receive('home', records);
+    const paused = pauseImport(f.edge, 'after');
+    f.ej.complete = () =>
+      Promise.reject(new Error('injected signing ACK loss'));
+    const outcome = f.es.apply(f.ej, records[0]).then(
+      () => null,
+      (error) => error,
+    );
+    try {
+      await paused.reached;
+      await f.fp.retire(await f.hp.revoke(f.bundle.id), 'a'.repeat(64));
+    } finally {
+      paused.resume();
+      paused.restore();
+    }
+    const error = await outcome;
+    assert(
+      error instanceof Error && error.message === 'injected signing ACK loss',
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const pairings = new Pairings(
+        await reopened.server(),
+        f.node.signer(),
+        f.node.publicKey,
+        'b'.repeat(64),
+        f.node,
+      );
+      const journal = new Journal(await reopened.server(), LINK_SUPPORTED);
+      const owner = new DeviceOperations(reopened, f.et, pairings, f.node);
+      assertEquals(await owner.apply(journal, records[0]), true);
+      assertEquals(
+        (await journal.heads('home', 'in', records[0])).applied.hash,
+        records[0].hash,
+      );
+      assertEquals(
+        (await (await reopened.tenant('logical.test')).query(
+          'SELECT * FROM signing_operations',
+        )).length,
+        1,
+      );
+      await assertRejects(() => owner.apply(journal, records[1]), Error);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
 });
 
 Deno.test('device link: missing incarnation cannot ACK and resumes only after authentic authority arrives', async () => {
