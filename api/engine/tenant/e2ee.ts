@@ -14,6 +14,7 @@ import { signatureView } from '#engine/tenant/signature-view.ts';
 import { readPublicReplica } from './public-replica.ts';
 import { createHash } from 'node:crypto';
 import { assertDeviceOwner } from '#engine/tenant/session-authority.ts';
+import { publicDeviceKeys } from '#engine/tenant/device-operations.ts';
 
 export const KEY_CONSUMPTIONS_SQL = `
 CREATE TABLE key_consumptions(localpart TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL,algorithm TEXT NOT NULL,key_id TEXT NOT NULL,material_hash TEXT NOT NULL,PRIMARY KEY(localpart,device_id,generation,algorithm,key_id));
@@ -373,14 +374,19 @@ export async function queryKeys(
     limitEntries(Object.keys(result).length, maxKeys);
     return result;
   }
-  const rows = await conn.query(
-    'SELECT d.device_id,d.display_name,k.key_json FROM devices d JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation WHERE d.localpart=?' +
-      (deviceIds.length
-        ? ' AND d.device_id IN (' + deviceIds.map(() => '?').join(',') + ')'
-        : '') +
-      ' ORDER BY d.device_id LIMIT ?',
-    [localpart, ...deviceIds, maxKeys + 1],
-  );
+  const semantic = await publicDeviceKeys(conn, localpart);
+  const rows = semantic === null
+    ? await conn.query(
+      'SELECT d.device_id,d.display_name,k.key_json FROM devices d JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation WHERE d.localpart=?' +
+        (deviceIds.length
+          ? ' AND d.device_id IN (' + deviceIds.map(() => '?').join(',') + ')'
+          : '') +
+        ' ORDER BY d.device_id LIMIT ?',
+      [localpart, ...deviceIds, maxKeys + 1],
+    )
+    : semantic.filter((row) =>
+      !deviceIds.length || deviceIds.includes(row.device_id)
+    );
   limitEntries(rows.length, maxKeys);
   for (const row of rows) {
     if (deviceIds.length && !deviceIds.includes(String(row.device_id))) {

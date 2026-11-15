@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import type { LinkRecord } from '#engine/facade/protocol.ts';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
@@ -78,7 +79,10 @@ function pauseImport(store: Store, cut: 'before' | 'during' | 'after') {
                     if (
                       args[0].startsWith('INSERT INTO device_operations ') ||
                       args[0].startsWith('INSERT INTO signing_operations ') ||
-                      args[0].startsWith('INSERT INTO signature_operations ')
+                      args[0].startsWith('INSERT INTO signature_operations ') ||
+                      args[0].startsWith(
+                        'INSERT INTO key_bootstrap_publications ',
+                      )
                     ) {
                       imported = true;
                       if (cut === 'during') await pause();
@@ -382,6 +386,431 @@ async function signatureInput(
   assert(operation);
   return operation;
 }
+
+Deno.test('semantic key bootstrap: exact complete manifest waits for independently drained facts and survives cold ACK loss', async () => {
+  const f = await fixture(true);
+  let reopened;
+  try {
+    await signatureInput(f);
+    const exporter = f.hs as DeviceOperations & {
+      bootstrap(localpart: string, pairing: string): Promise<LinkRecord[]>;
+    };
+    const records = await exporter.bootstrap('alice', f.bundle.id);
+    const marker = records.find((record) => record.type === 'key-bootstrap');
+    assert(marker);
+    assertEquals(await exporter.bootstrap('alice', f.bundle.id), records);
+    for (const record of records) await f.ej.receive('home', [record]);
+    await assertRejects(
+      () => f.es.apply(f.ej, marker),
+      Error,
+      'awaits retained key facts',
+    );
+    const db = await f.edge.tenant('logical.test');
+    assertEquals(
+      await db.query('SELECT * FROM key_bootstrap_publications'),
+      [],
+    );
+    for (const record of records.filter((record) => record !== marker)) {
+      await f.es.apply(f.ej, record);
+    }
+    const complete = f.ej.complete.bind(f.ej);
+    f.ej.complete = () => Promise.reject(new Error('bootstrap ACK loss'));
+    await assertRejects(
+      () => f.es.apply(f.ej, marker),
+      Error,
+      'bootstrap ACK loss',
+    );
+    assertEquals(
+      (await db.query('SELECT * FROM key_bootstrap_publications')).length,
+      1,
+    );
+    f.ej.complete = complete;
+    await f.edge.close();
+    reopened = await f.open('edge');
+    const pairings = new Pairings(
+      await reopened.server(),
+      f.node.signer(),
+      f.node.publicKey,
+      'b'.repeat(64),
+      f.node,
+    );
+    const tenant = await enrolledTenant(
+      reopened,
+      pairings,
+      'logical.test',
+      'edge_a',
+    );
+    const journal = new Journal(await reopened.server(), LINK_SUPPORTED);
+    const receiver = new DeviceOperations(reopened, tenant, pairings, f.node);
+    assertEquals(await receiver.apply(journal, marker), true);
+    assertEquals(
+      (await journal.streams('home', 'in')).find((stream) =>
+        stream.stream === marker.stream
+      )?.applied.sequence,
+      marker.sequence,
+    );
+    assertEquals(
+      (await (await reopened.tenant('logical.test')).query(
+        'SELECT * FROM key_bootstrap_publications',
+      )).length,
+      1,
+    );
+  } finally {
+    await reopened?.close();
+    await f.close();
+  }
+});
+
+Deno.test('semantic key bootstrap: an empty selected account still has authenticated completeness', async () => {
+  const f = await fixture();
+  try {
+    const exporter = f.hs as DeviceOperations & {
+      bootstrap(localpart: string, pairing: string): Promise<LinkRecord[]>;
+    };
+    const auth = await exportAccountAuth(
+      f.home,
+      f.ht,
+      f.hp,
+      f.bundle.id,
+      'bob',
+      false,
+    );
+    await f.ej.receive('home', [auth]);
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+    const records = await exporter.bootstrap('bob', f.bundle.id);
+    const marker = records.find((record) => record.type === 'key-bootstrap');
+    assert(marker);
+    for (const record of records) await f.ej.receive('home', [record]);
+    for (const record of records) await f.es.apply(f.ej, record);
+    assertEquals(
+      (await (await f.edge.tenant('logical.test')).query(
+        'SELECT * FROM key_bootstrap_publications',
+      )).length,
+      1,
+    );
+    assertEquals(
+      records.filter((record) => record.type === 'device-operation'),
+      [],
+    );
+    await assertRejects(
+      () => exporter.bootstrap('unselected', f.bundle.id),
+      Error,
+      'not selected',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('semantic key bootstrap: home retained history preserves original identity and cannot replace the current signing identity', async () => {
+  const f = await fixture();
+  try {
+    await signatureInput(f);
+    const home = await f.home.tenant('logical.test');
+    const [current] = await home.tx((conn) =>
+      captureSigningOperations(conn, 'alice')
+    );
+    const { payloadHash: _hash, ...body } = current;
+    const oldBody = {
+      ...body,
+      incarnation: 'retained-home-incarnation',
+      operationId: canonicalJson([
+        'home',
+        'retained-home-incarnation',
+        'signing',
+        current.sequence,
+      ]),
+      keys: [],
+    };
+    const prior = {
+      ...oldBody,
+      payloadHash: createHash('sha256').update(canonicalJson(oldBody)).digest(
+        'hex',
+      ),
+    };
+    await home.execute('INSERT INTO signing_operations VALUES(?,?,?,?,?,?)', [
+      prior.operationId,
+      prior.source,
+      prior.incarnation,
+      prior.sequence,
+      prior.localpart,
+      canonicalJson(prior),
+    ]);
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const historical = records.find((record) => record.type === 'key-history');
+    assert(historical);
+    for (const record of records) await f.ej.receive('home', [record]);
+    // Delayed historical arrival must not clear a newer active identity.
+    for (
+      const record of records.filter((record) =>
+        record.type !== 'key-bootstrap' && record !== historical
+      )
+    ) await f.es.apply(f.ej, record);
+    const db = await f.edge.tenant('logical.test');
+    const before = await db.query(
+      'SELECT * FROM cross_signing_keys ORDER BY usage',
+    );
+    assert(before.length > 0);
+    await f.es.apply(f.ej, historical);
+    assertEquals(
+      await db.query('SELECT * FROM cross_signing_keys ORDER BY usage'),
+      before,
+    );
+    assertEquals(
+      JSON.parse(
+        String(
+          (await db.query(
+            'SELECT payload_json FROM signing_operations WHERE operation_id=?',
+            [prior.operationId],
+          ))[0].payload_json,
+        ),
+      ),
+      prior,
+    );
+    for (
+      const marker of records.filter((record) =>
+        record.type === 'key-bootstrap'
+      )
+    ) await f.es.apply(f.ej, marker);
+    const { importSigningOperation } = await import(
+      '#engine/tenant/signing-operations.ts'
+    );
+    await assertRejects(
+      () => db.tx((conn) => importSigningOperation(conn, prior, prior)),
+      Error,
+      'collision',
+    );
+    assertEquals(await f.es.exportSigning('alice'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('semantic key bootstrap: revocation before or during declaration admission leaves neither readiness nor receipt', async () => {
+  for (const cut of ['before', 'during'] as const) {
+    const f = await fixture();
+    let pause;
+    try {
+      const records = await f.hs.bootstrap('alice', f.bundle.id);
+      const marker = records.find((record) => record.type === 'key-bootstrap')!;
+      for (const record of records) await f.ej.receive('home', [record]);
+      for (const record of records.filter((record) => record !== marker)) {
+        await f.es.apply(f.ej, record);
+      }
+      pause = pauseImport(f.edge, cut);
+      const applying = f.es.apply(f.ej, marker);
+      const rejected = assertRejects(() => applying);
+      await pause.reached;
+      await f.fp.retire(await f.hp.revoke(f.bundle.id), 'a'.repeat(64));
+      pause.resume();
+      await rejected;
+      pause.restore();
+      const db = await f.edge.tenant('logical.test');
+      assertEquals(
+        await db.query('SELECT * FROM key_bootstrap_publications'),
+        [],
+      );
+      assertEquals(
+        (await f.ej.streams('home', 'in')).find((stream) =>
+          stream.stream === marker.stream
+        )?.applied.sequence,
+        0,
+      );
+    } finally {
+      pause?.resume();
+      pause?.restore();
+      await f.close();
+    }
+  }
+});
+
+Deno.test('semantic key bootstrap: missing, changed, duplicate or unsigned declaration facts cannot gain readiness', async () => {
+  for (
+    const fault of ['missing', 'changed', 'duplicate', 'unsigned'] as const
+  ) {
+    const f = await fixture();
+    try {
+      const records = await f.hs.bootstrap('alice', f.bundle.id);
+      const marker = records.find((record) => record.type === 'key-bootstrap')!;
+      const signed = marker.payload as {
+        body: import('#engine/tenant/key-bootstrap.ts').KeyBootstrap;
+        signature: string;
+      };
+      const refs = signed.body.manifest['device-operation'];
+      assert(refs.length);
+      if (fault === 'missing') {
+        refs.push({
+          operationId: 'not-retained',
+          payloadHash: 'a'.repeat(64),
+        });
+      } else if (fault === 'changed') refs[0].payloadHash = 'b'.repeat(64);
+      else if (fault === 'duplicate') refs.push(refs[0]);
+      else signed.body.ownerRevision++;
+      if (fault !== 'unsigned') {
+        refs.sort((a, b) =>
+          a.operationId < b.operationId
+            ? -1
+            : a.operationId > b.operationId
+            ? 1
+            : 0
+        );
+        signed.signature = await f.ht.signer().sign(canonicalJson(signed.body));
+      }
+      marker.operationId = 'key-bootstrap:' +
+        createHash('sha256').update(canonicalJson(signed.body)).digest('hex');
+      const { hash: _hash, ...material } = marker;
+      marker.hash = recordHash(material);
+      for (const record of records) await f.ej.receive('home', [record]);
+      for (
+        const record of records.filter((record) => record !== marker)
+      ) await f.es.apply(f.ej, record);
+      await assertRejects(
+        () => f.es.apply(f.ej, marker),
+        Error,
+        fault === 'missing'
+          ? 'awaits retained key facts'
+          : fault === 'changed'
+          ? 'key fact changed'
+          : fault === 'duplicate'
+          ? 'duplicate key manifest fact'
+          : 'invalid device operation signature',
+      );
+      assertEquals(
+        await (await f.edge.tenant('logical.test')).query(
+          'SELECT * FROM key_bootstrap_publications',
+        ),
+        [],
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('semantic key bootstrap: home can return exact edge signature history without changing its source or creating an echo', async () => {
+  const f = await fixture();
+  try {
+    const signature = await signatureInput(f, 'edge');
+    const reverse = await f.es.exportSignatures('alice');
+    for (const record of reverse) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    const db = await f.edge.tenant('logical.test');
+    await db.execute('DELETE FROM signature_operations WHERE operation_id=?', [
+      signature.operationId,
+    ]);
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    for (const record of records) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    const restored = (await db.query(
+      'SELECT payload_json FROM signature_operations WHERE operation_id=?',
+      [signature.operationId],
+    ))[0];
+    assertEquals(JSON.parse(String(restored.payload_json)), signature);
+    assertEquals(await f.es.exportSignatures('alice'), reverse);
+    assertEquals(await db.query('SELECT * FROM one_time_keys'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('semantic key readers: authenticated baseline merges home and edge keys without F1 overwrite or user-signing disclosure', async () => {
+  for (const publicFirst of [false, true]) {
+    const f = await fixture(publicFirst);
+    try {
+      await signatureInput(f);
+      const user = '@alice:logical.test';
+      await upsertDevice(f.et, 'alice', 'PHONE', 'outside phone');
+      const phone = await deviceIdentity(f.et, 'alice', 'PHONE');
+      await f.et.tx((tx) =>
+        tx.e2ee.upload(
+          phone,
+          validateUpload(
+            {
+              device_keys: {
+                user_id: user,
+                device_id: 'PHONE',
+                algorithms: [],
+                keys: { 'ed25519:PHONE': 'edge-public' },
+                signatures: {},
+              },
+            },
+            user,
+            'PHONE',
+            config().e2ee,
+          ),
+        )
+      );
+      const query = () =>
+        f.et.tx((tx) =>
+          tx.e2ee.query('alice', [], user, user, config().e2ee.maxkeys)
+        );
+      // A partial semantic suffix is not a complete home baseline.
+      await assertRejects(query, MatrixError, 'key bootstrap unavailable');
+      const view = await f.ht.tx((tx) =>
+        tx.publicReplica.export('alice', f.ht.serverName)
+      );
+      await f.et.tx((tx) => tx.publicReplica.install(view, f.et.serverName));
+      const records = await f.hs.bootstrap('alice', f.bundle.id);
+      for (const record of records) {
+        await f.ej.receive('home', [record]);
+        await f.es.apply(f.ej, record);
+      }
+      assertEquals(Object.keys(await query()).sort(), ['LAN', 'PHONE']);
+      const snapshot = await f.et.tx((tx) =>
+        tx.e2ee.snapshot('alice', user, config().e2ee)
+      );
+      assertEquals(
+        (snapshot.devices as { device_id: string }[]).map((device) =>
+          device.device_id
+        ).sort(),
+        ['LAN', 'PHONE'],
+      );
+      const own = await f.et.tx((tx) =>
+        tx.crossSigning.views('alice', user, user)
+      );
+      const other = await f.et.tx((tx) =>
+        tx.crossSigning.views('alice', user, '@bob:logical.test')
+      );
+      assert(own.user_signing_keys);
+      assertEquals(other.user_signing_keys, undefined);
+      assertEquals(Object.keys(other).sort(), [
+        'master_keys',
+        'self_signing_keys',
+      ]);
+      // Retained F1 public evidence may arrive again, but cannot hide PHONE.
+      await f.et.tx((tx) => tx.publicReplica.install(view, f.et.serverName));
+      assertEquals(Object.keys(await query()).sort(), ['LAN', 'PHONE']);
+      const authority = await exportSessionAuthority(
+        f.edge,
+        f.et,
+        f.fp,
+        f.owners,
+        f.node,
+        'alice',
+      );
+      await f.hj.receive('edge_a', [authority]);
+      await f.accounts.applyFromFacade(f.hj, f.bundle.id, authority);
+      for (const record of await f.es.export('alice')) {
+        await f.hj.receive('edge_a', [record]);
+        await f.hs.apply(f.hj, record, f.bundle.id);
+      }
+      assertEquals(
+        Object.keys(
+          await f.ht.tx((tx) =>
+            tx.e2ee.query('alice', [], user, user, config().e2ee.maxkeys)
+          ),
+        ).sort(),
+        ['LAN', 'PHONE'],
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
 
 Deno.test('key runtime export retains independent signing streams when device export is unavailable', async () => {
   const f = await fixture();
@@ -937,6 +1366,15 @@ Deno.test('signing link: selected home identity export is stable and own-user sc
     assertEquals(await f.es.apply(f.ej, records[0]), true);
     assertEquals(await f.es.apply(f.ej, records[0]), false);
     assertEquals(await f.et.tx((tx) => tx.crossSigning.state('alice')), input);
+    await assertRejects(
+      () => f.et.tx((tx) => tx.crossSigning.views('alice', user, user)),
+      MatrixError,
+      'key bootstrap unavailable',
+    );
+    for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
     const own = await f.et.tx((tx) =>
       tx.crossSigning.views('alice', user, user)
     );

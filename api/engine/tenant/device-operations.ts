@@ -7,6 +7,7 @@ import { config } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
+import { KeyHistoryProof } from '#engine/tenant/key-bootstrap.ts';
 import { type Json, object, validateUpload } from '#engine/tenant/e2ee.ts';
 import {
   registryDevice,
@@ -88,6 +89,7 @@ export async function importDeviceOperation(
   conn: Conn,
   raw: unknown,
   expected: { source: string; incarnation: string; localpart: string },
+  history?: KeyHistoryProof,
 ): Promise<void> {
   const [tenant] = await conn.query('SELECT server_name FROM tenant');
   const operation = deviceOperationOf(raw, String(tenant.server_name));
@@ -99,15 +101,19 @@ export async function importDeviceOperation(
       'device operation awaits authority',
     );
   }
+  if (history) {
+    if (!(history instanceof KeyHistoryProof)) collision();
+    await history.require(conn, 'device-operation', operation);
+  }
   if (
     operation.source !== expected.source ||
     operation.incarnation !== expected.incarnation ||
-    operation.localpart !== expected.localpart || !(
+    operation.localpart !== expected.localpart || (!history && !(
       (operation.source === 'home' &&
         operation.incarnation === identity.homeIncarnation) ||
       (operation.source === identity.edgeNode &&
         operation.incarnation === identity.edgeIncarnation)
-    )
+    ))
   ) collision();
   const [creation] = await conn.query(
     "SELECT node,incarnation,payload FROM authority_facts WHERE id=? AND localpart=? AND kind='device'",
@@ -126,6 +132,15 @@ export async function importDeviceOperation(
     JSON.parse(String(creation.payload)).deviceId !== operation.deviceId
   ) collision();
   const encoded = canonicalJson(operation);
+  // Source and imported logs share one identity namespace. A home-attested
+  // return of this owner's original history cannot replace it with a tombstone.
+  const [local] = await conn.query(
+    "SELECT json_extract(payload,'$.operation') AS payload_json FROM e2ee_changes WHERE json_extract(payload,'$.operation.operationId')=?",
+    [operation.operationId],
+  );
+  if (
+    local && canonicalJson(JSON.parse(String(local.payload_json))) !== encoded
+  ) collision();
   const [old] = await conn.query(
     'SELECT payload_json FROM device_operations WHERE operation_id=?',
     [operation.operationId],
@@ -205,5 +220,69 @@ export async function publicDeviceValues(
   }
   return result.sort((a, b) =>
     a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0
+  );
+}
+
+/** Current local material needs no export side effect on a read. Registry
+ * binding, not local possession or an imported F1 snapshot, controls inclusion. */
+export async function publicDeviceKeys(conn: Conn, localpart: string) {
+  const identity = await tenantAuthority(conn);
+  if (!identity) return null;
+  const [account] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!account || account.deactivated === 1) return [];
+  const values = new Map<
+    string,
+    { device_id: string; display_name: string | null; key_json: string }
+  >();
+  for (const operation of await publicDeviceValues(conn, localpart)) {
+    if (operation.value?.keys) {
+      values.set(operation.deviceId, {
+        device_id: operation.deviceId,
+        display_name: operation.value.displayName,
+        key_json: canonicalJson(operation.value.keys),
+      });
+    }
+  }
+  for (
+    const row of await conn.query(
+      'SELECT d.device_id,d.display_name,d.generation,k.key_json,a.incarnation FROM devices d JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation JOIN authority_devices a ON a.localpart=d.localpart AND a.device_id=d.device_id AND a.generation=d.generation WHERE d.localpart=?',
+      [localpart],
+    )
+  ) {
+    const creation = await registryDevice(
+      conn,
+      localpart,
+      String(row.device_id),
+    );
+    const removed = await conn.query(
+      "SELECT 1 FROM authority_facts WHERE localpart=? AND kind='delete' AND json_extract(payload,'$.target')=? UNION ALL SELECT 1 FROM device_operations WHERE localpart=? AND device_incarnation=? AND json_type(payload_json,'$.value')='null' UNION ALL SELECT 1 FROM e2ee_changes WHERE localpart=? AND json_extract(payload,'$.operation.deviceIncarnation')=? AND json_type(payload,'$.operation.value')='null' LIMIT 1",
+      [
+        localpart,
+        row.incarnation,
+        localpart,
+        row.incarnation,
+        localpart,
+        row.incarnation,
+      ],
+    );
+    if (
+      !removed.length && creation?.id === row.incarnation &&
+      creation.node === identity.node &&
+      creation.incarnation === identity.incarnation
+    ) {
+      values.set(String(row.device_id), {
+        device_id: String(row.device_id),
+        display_name: row.display_name === null
+          ? null
+          : String(row.display_name),
+        key_json: String(row.key_json),
+      });
+    }
+  }
+  return [...values.values()].sort((a, b) =>
+    a.device_id < b.device_id ? -1 : a.device_id > b.device_id ? 1 : 0
   );
 }

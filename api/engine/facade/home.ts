@@ -289,7 +289,10 @@ export async function startHomeLinks(
           tenant: app.tenant,
           pollseconds: settings.pollseconds,
           users: () => app.tenant.tx((tx) => tx.publicReplica.users()),
-          emit: (localpart) => devices.exportChanges(localpart, id),
+          emit: async (localpart) => {
+            await devices.exportChanges(localpart, id);
+            return await devices.bootstrap(localpart, id);
+          },
           changed: () => workers.get(id)?.wake(),
           failed: (error) => failed(node, error),
         }),

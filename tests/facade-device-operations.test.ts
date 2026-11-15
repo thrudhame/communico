@@ -241,6 +241,36 @@ Deno.test('F2 public device owner needs authentic matching incarnation facts bef
   }
 });
 
+Deno.test('F2 returned local device history cannot substitute a tombstone under an existing source identity', async () => {
+  const f = await setup();
+  try {
+    const [local] = await f.home.db.tx((conn) =>
+      captureDeviceOperations(conn, 'alice')
+    );
+    await assertRejects(
+      () =>
+        f.home.db.tx((conn) =>
+          operations.importDeviceOperation(
+            conn,
+            rehash({ ...local, value: null }),
+            local,
+          )
+        ),
+      Error,
+      'device operation collision',
+    );
+    assertEquals(
+      (await f.home.db.tx((conn) =>
+        operations.publicDeviceValues(conn, 'alice')
+      )).map((op) => op.deviceId),
+      ['LAN'],
+    );
+    assertEquals(await f.home.db.query('SELECT * FROM device_operations'), []);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('F2 public device owner removes stale generations, collision losers and deleted incarnations in every order', async () => {
   const f = await setup();
   try {

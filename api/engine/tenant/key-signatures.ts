@@ -25,7 +25,7 @@ import {
 } from '#engine/tenant/signature-view.ts';
 import { appendDeviceChange } from '#engine/tenant/changes.ts';
 import { appendSigningChange } from '#engine/tenant/cross-signing.ts';
-import { signingViews } from '#engine/tenant/cross-signing.ts';
+import { ownerSigningViews } from '#engine/tenant/cross-signing.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
@@ -177,7 +177,7 @@ export async function uploadSignatures(
             keys: augmented,
           };
         } else {
-          const views = await signingViews(conn, localpart, user, '');
+          const views = await ownerSigningViews(conn, localpart, user, '');
           content = {
             user_id: user,
             master_key: augmented,

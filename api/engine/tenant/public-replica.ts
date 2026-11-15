@@ -9,6 +9,7 @@ import type { Conn } from '#engine/store/db.ts';
 import { signingViews } from './cross-signing.ts';
 import { deviceSnapshot, type Json, object } from './e2ee.ts';
 import { tenantAuthority } from './session-authority.ts';
+import { semanticKeyReader } from './key-bootstrap.ts';
 import {
   materializeProfile,
   profileOperations,
@@ -60,9 +61,9 @@ export async function readPublicReplica(
     'SELECT deactivated FROM users WHERE localpart=?',
     [localpart],
   );
-  return user?.deactivated === 1
-    ? null
-    : await storedPublicReplica(conn, localpart);
+  if (user?.deactivated === 1) return null;
+  if (await semanticKeyReader(conn, localpart)) return null;
+  return await storedPublicReplica(conn, localpart);
 }
 
 export async function exportPublicUser(

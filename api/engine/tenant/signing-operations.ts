@@ -20,6 +20,7 @@ import {
 import { type Json, object } from '#engine/tenant/e2ee.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import { forgetKeySignatures } from '#engine/tenant/signature-view.ts';
+import { KeyHistoryProof } from '#engine/tenant/key-bootstrap.ts';
 
 export const SIGNING_OPERATIONS_SQL = `
 CREATE TABLE signing_operations(operation_id TEXT PRIMARY KEY NOT NULL,source TEXT NOT NULL,incarnation TEXT NOT NULL,sequence INTEGER NOT NULL,localpart TEXT NOT NULL,payload_json TEXT NOT NULL,UNIQUE(source,incarnation,sequence));
@@ -167,6 +168,7 @@ export async function importSigningOperation(
   conn: Conn,
   raw: unknown,
   expected: { source: string; incarnation: string; localpart: string },
+  history?: KeyHistoryProof,
 ): Promise<void> {
   const authority = await tenantAuthority(conn);
   if (!authority) {
@@ -179,10 +181,14 @@ export async function importSigningOperation(
   const [tenant] = await conn.query('SELECT server_name FROM tenant');
   const user = '@' + expected.localpart + ':' + tenant.server_name;
   const operation = await operationOf(raw, user);
+  if (history) {
+    if (!(history instanceof KeyHistoryProof)) collision();
+    await history.require(conn, 'signing-operation', operation);
+  }
   if (
     expected.source !== 'home' || operation.source !== expected.source ||
     operation.incarnation !== expected.incarnation ||
-    operation.incarnation !== authority.homeIncarnation ||
+    (!history && operation.incarnation !== authority.homeIncarnation) ||
     operation.localpart !== expected.localpart || authority.node === 'home'
   ) collision();
   const [old] = await conn.query(
@@ -209,7 +215,10 @@ export async function importSigningOperation(
     );
   }
   await retain(conn, operation);
-  if (newer || account.deactivated === 1) return;
+  if (
+    newer || account.deactivated === 1 ||
+    operation.incarnation !== authority.homeIncarnation
+  ) return;
   const previous = await signingState(conn, operation.localpart);
   for (const usage of signingUsages) {
     const held = previous[usage];

@@ -29,6 +29,16 @@ import {
   retainLinkApplication,
 } from '#engine/tenant/link-applications.ts';
 import { checkLocalpart } from '#engine/tenant/users.ts';
+import {
+  captureKeyHistory,
+  type KeyBootstrap,
+  type KeyHistory,
+  KeyHistoryProof,
+  type KeyKind,
+  type KeyManifest,
+  type KeyOperation,
+  retainKeyBootstrap,
+} from '#engine/tenant/key-bootstrap.ts';
 import { type DomainBinding, requireDomainControl } from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
@@ -50,6 +60,7 @@ type SignatureView = DomainBinding & {
   operation: SignatureOperation;
 };
 type KeyView = DeviceView | SigningView | SignatureView;
+type KeyEnvelope = KeyView | KeyBootstrap | KeyHistory;
 const keyKinds = {
   'device-operation': { prefix: 'device:', stream: 'devices:@' },
   'signing-operation': { prefix: 'signing:', stream: 'signing:@' },
@@ -61,23 +72,28 @@ function keyKind(value: string): value is KeyView['kind'] {
 }
 
 export function isKeyStream(stream: Stream): boolean {
-  return Object.values(keyKinds).some(({ stream: prefix }) =>
-    stream.stream.startsWith(prefix)
-  );
+  return stream.stream.startsWith('key-bootstrap:@') ||
+    stream.stream.startsWith('key-history:@') ||
+    Object.values(keyKinds).some(({ stream: prefix }) =>
+      stream.stream.startsWith(prefix)
+    );
 }
 
 function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
 }
 
-function viewOf(raw: unknown): KeyView {
-  const row = object(raw), operation = object(row.operation);
+function viewOf(raw: unknown): KeyEnvelope {
+  const row = object(raw);
   const localpart = text(row.localpart);
-  if (typeof row.kind !== 'string' || !keyKind(row.kind)) {
+  if (
+    typeof row.kind !== 'string' ||
+    (!keyKind(row.kind) && row.kind !== 'key-bootstrap' &&
+      row.kind !== 'key-history')
+  ) {
     mismatch('unknown public key operation');
   }
-  const view = {
-    kind: row.kind,
+  const binding: DomainBinding = {
     server: text(row.server),
     pairing: text(row.pairing),
     grantRevision: integer(row.grantRevision, 1),
@@ -85,18 +101,67 @@ function viewOf(raw: unknown): KeyView {
     localpart,
     source: text(row.source),
     incarnation: text(row.incarnation),
-    operation,
-  } as KeyView;
+  };
+  let view: KeyEnvelope;
+  if (row.kind === 'key-bootstrap') {
+    const manifest = object(row.manifest), parsed = {} as KeyManifest;
+    for (const kind of Object.keys(keyKinds) as KeyKind[]) {
+      const refs = manifest[kind];
+      if (!Array.isArray(refs)) mismatch('invalid key manifest');
+      parsed[kind] = refs.map((raw) => {
+        const fact = object(raw), payloadHash = text(fact.payloadHash);
+        if (!/^[a-f0-9]{64}$/.test(payloadHash)) {
+          mismatch('invalid key manifest hash');
+        }
+        return { operationId: text(fact.operationId), payloadHash };
+      }).sort((a, b) =>
+        a.operationId < b.operationId
+          ? -1
+          : a.operationId > b.operationId
+          ? 1
+          : 0
+      );
+      if (
+        new Set(parsed[kind].map((fact) => fact.operationId)).size !==
+          parsed[kind].length
+      ) mismatch('duplicate key manifest fact');
+    }
+    view = { ...binding, kind: 'key-bootstrap', manifest: parsed };
+  } else if (row.kind === 'key-history') {
+    if (typeof row.keyKind !== 'string' || !keyKind(row.keyKind)) {
+      mismatch('invalid historical key kind');
+    }
+    view = {
+      ...binding,
+      kind: 'key-history',
+      keyKind: row.keyKind,
+      operation: object(row.operation) as KeyOperation,
+    };
+  } else {
+    view = {
+      ...binding,
+      kind: row.kind as KeyView['kind'],
+      operation: object(row.operation),
+    } as KeyView;
+  }
   if (
     checkLocalpart(localpart) !== localpart ||
     canonicalJson(view) !== canonicalJson(raw) ||
-    operation.localpart !== localpart || operation.source !== view.source ||
-    operation.incarnation !== view.incarnation
+    (view.kind === 'key-bootstrap'
+      ? view.source !== 'home'
+      : view.operation.localpart !== localpart || (view.kind === 'key-history'
+        ? view.source !== 'home'
+        : view.operation.source !== view.source ||
+          view.operation.incarnation !== view.incarnation))
   ) mismatch('device operation differs from signed source or account');
   return view;
 }
 
-function operationId(view: KeyView) {
+function operationId(view: KeyEnvelope) {
+  if (view.kind === 'key-bootstrap' || view.kind === 'key-history') {
+    return view.kind + ':' +
+      createHash('sha256').update(canonicalJson(view)).digest('hex');
+  }
   return keyKinds[view.kind].prefix +
     createHash('sha256').update(canonicalJson([
       view.pairing,
@@ -106,8 +171,12 @@ function operationId(view: KeyView) {
     ])).digest('hex');
 }
 
-function streamName(kind: KeyView['kind'], localpart: string, server: string) {
-  return keyKinds[kind].stream + localpart +
+function streamName(
+  kind: KeyEnvelope['kind'],
+  localpart: string,
+  server: string,
+) {
+  return (keyKind(kind) ? keyKinds[kind].stream : kind + ':@') + localpart +
     ':' + server;
 }
 
@@ -218,11 +287,70 @@ export class DeviceOperations {
     return records;
   }
 
-  private async exportOperations(
-    kind: KeyView['kind'],
-    localpart: string,
-    pairing?: string,
-  ) {
+  /** The same source owners capture one complete tenant cut; each dependency
+   * keeps its own stream. A separate declaration can wait without blocking them. */
+  async bootstrap(localpart: string, pairing: string) {
+    if (this.node) mismatch('only home may declare key bootstrap');
+    const { grant, binding } = await this.accountBinding(localpart, pairing);
+    const history = await (await this.store.tenant(binding.server)).tx(
+      async (conn) => {
+        await this.tenantSelected(conn, binding);
+        return await captureKeyHistory(conn, localpart);
+      },
+    );
+    const records = [];
+    const manifest = {} as KeyManifest;
+    for (const kind of Object.keys(keyKinds) as KeyKind[]) {
+      manifest[kind] = history[kind].map(({ operationId, payloadHash }) => ({
+        operationId,
+        payloadHash,
+      }));
+      for (const operation of history[kind]) {
+        const view = operation.source === binding.source &&
+            operation.incarnation === binding.incarnation
+          ? viewOf({ ...binding, kind, operation })
+          : viewOf({
+            ...binding,
+            kind: 'key-history',
+            keyKind: kind,
+            operation,
+          });
+        records.push(await this.publish(view, grant));
+      }
+    }
+    records.push(
+      await this.publish(
+        viewOf({ ...binding, kind: 'key-bootstrap', manifest }),
+        grant,
+      ),
+    );
+    return records;
+  }
+
+  private async publish(view: KeyEnvelope, grant: Grant) {
+    const context = grant.body.transcript.body.context;
+    const signed = {
+      body: view,
+      signature: await (this.node?.signer() ?? this.tenant.signer()).sign(
+        canonicalJson(view),
+      ),
+    };
+    return await (await this.store.server()).tx(async (conn) => {
+      await this.selected(conn, grant, view.localpart);
+      await requireDomainControl(conn, view);
+      return await appendRecord(conn, this.node ? 'home' : context.node, {
+        source: view.source,
+        incarnation: this.node ? view.incarnation : context.id,
+        stream: streamName(view.kind, view.localpart, view.server),
+        type: view.kind,
+        version: 1,
+        operationId: operationId(view),
+        payload: signed,
+      });
+    });
+  }
+
+  private async accountBinding(localpart: string, pairing?: string) {
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
     const server = await this.store.server();
@@ -254,7 +382,16 @@ export class DeviceOperations {
       source: source.node,
       incarnation: source.incarnation,
     };
-    const operations = await (await this.store.tenant(context.server)).tx(
+    return { grant, binding };
+  }
+
+  private async exportOperations(
+    kind: KeyKind,
+    localpart: string,
+    pairing?: string,
+  ) {
+    const { grant, binding } = await this.accountBinding(localpart, pairing);
+    const operations = await (await this.store.tenant(binding.server)).tx(
       async (conn) => {
         await this.tenantSelected(conn, binding);
         switch (kind) {
@@ -270,27 +407,7 @@ export class DeviceOperations {
     const records = [];
     for (const operation of operations) {
       const view = viewOf({ ...binding, kind, operation });
-      const signed = {
-        body: view,
-        signature: await (this.node?.signer() ?? this.tenant.signer()).sign(
-          canonicalJson(view),
-        ),
-      };
-      records.push(
-        await server.tx(async (conn) => {
-          await this.selected(conn, grant, localpart);
-          await requireDomainControl(conn, view);
-          return await appendRecord(conn, this.node ? 'home' : context.node, {
-            source: view.source,
-            incarnation: this.node ? view.incarnation : context.id,
-            stream: streamName(kind, localpart, context.server),
-            type: kind,
-            version: 1,
-            operationId: operationId(view),
-            payload: signed,
-          });
-        }),
-      );
+      records.push(await this.publish(view, grant));
     }
     return records;
   }
@@ -307,7 +424,8 @@ export class DeviceOperations {
     const record = await journal.next(peer, stream);
     if (!record) return false;
     if (
-      !keyKind(record.type) || record.version !== 1
+      (!keyKind(record.type) && record.type !== 'key-bootstrap' &&
+        record.type !== 'key-history') || record.version !== 1
     ) {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not device operation');
     }
@@ -355,6 +473,17 @@ export class DeviceOperations {
       );
     } catch { /* Malformed signatures carry no public device authority. */ }
     if (!valid) mismatch('invalid device operation signature');
+    if (
+      (view.kind === 'key-bootstrap' || view.kind === 'key-history') &&
+      !this.node
+    ) mismatch('only home may attest key history or completeness');
+    const history = view.kind === 'key-history'
+      ? await KeyHistoryProof.verify(
+        view,
+        text(signed.signature),
+        context.home.publicKey,
+      )
+      : undefined;
     const check = async (conn: Conn) => {
       await this.selected(conn, grant, view.localpart);
       await requireDomainControl(conn, view);
@@ -363,14 +492,33 @@ export class DeviceOperations {
     const result = await tenant.tx(async (conn) => {
       unchanged();
       await this.tenantSelected(conn, view);
-      if (view.kind === 'device-operation') {
-        await importDeviceOperation(conn, view.operation, view);
-      } else if (view.kind === 'signing-operation') {
-        await importSigningOperation(conn, view.operation, view);
+      if (view.kind === 'key-bootstrap') {
+        await retainKeyBootstrap(conn, view, record.sequence, record.hash);
       } else {
-        await importSignatureOperation(conn, view.operation, view);
+        const kind = view.kind === 'key-history' ? view.keyKind : view.kind;
+        const expected = {
+          source: view.operation.source,
+          incarnation: view.operation.incarnation,
+          localpart: view.localpart,
+        };
+        if (kind === 'device-operation') {
+          await importDeviceOperation(conn, view.operation, expected, history);
+        } else if (kind === 'signing-operation') {
+          await importSigningOperation(conn, view.operation, expected, history);
+        } else {
+          await importSignatureOperation(
+            conn,
+            view.operation,
+            expected,
+            history,
+          );
+        }
       }
-      const result = { operationId: view.operation.operationId };
+      const result = {
+        operationId: view.kind === 'key-bootstrap'
+          ? record.operationId
+          : view.operation.operationId,
+      };
       await retainLinkApplication(conn, peer, record, result);
       // This synchronous fence is the admission cut. A retirement begun before
       // it rolls back fact + receipt. Once it passes, a successful owner commit

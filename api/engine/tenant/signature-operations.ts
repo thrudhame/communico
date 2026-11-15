@@ -18,6 +18,7 @@ import {
   object,
 } from '#engine/tenant/e2ee.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
+import { KeyHistoryProof } from '#engine/tenant/key-bootstrap.ts';
 import {
   keyMaterial,
   type SignatureSigner,
@@ -178,6 +179,7 @@ export async function importSignatureOperation(
   conn: Conn,
   raw: unknown,
   expected: { source: string; incarnation: string; localpart: string },
+  history?: KeyHistoryProof,
 ): Promise<void> {
   const identity = await tenantAuthority(conn);
   if (!identity) {
@@ -192,11 +194,14 @@ export async function importSignatureOperation(
     row.version !== 1 || row.source !== expected.source ||
     row.incarnation !== expected.incarnation ||
     row.localpart !== expected.localpart ||
-    row.source === identity.node || !Number.isSafeInteger(row.sequence) ||
+    (!history && row.source === identity.node) ||
+    !Number.isSafeInteger(row.sequence) ||
     Number(row.sequence) < 1 ||
-    !((row.source === 'home' && row.incarnation === identity.homeIncarnation) ||
-      (row.source === identity.edgeNode &&
-        row.incarnation === identity.edgeIncarnation)) ||
+    (!history &&
+      !((row.source === 'home' &&
+        row.incarnation === identity.homeIncarnation) ||
+        (row.source === identity.edgeNode &&
+          row.incarnation === identity.edgeIncarnation))) ||
     !Array.isArray(row.signers) || !row.signers.length
   ) collision();
   const target = object(row.target, 'signature target');
@@ -270,6 +275,10 @@ export async function importSignatureOperation(
     signers,
   });
   if (canonicalJson(operation) !== canonicalJson(raw)) collision();
+  if (history) {
+    if (!(history instanceof KeyHistoryProof)) collision();
+    await history.require(conn, 'signature-operation', operation);
+  }
   const [old] = await conn.query(
     'SELECT payload_json FROM signature_operations WHERE operation_id=?',
     [operation.operationId],

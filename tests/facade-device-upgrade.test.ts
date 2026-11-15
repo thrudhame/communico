@@ -84,3 +84,38 @@ Deno.test('F2 public device schema upgrades the prior pool owner and retains imp
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test('F2 key bootstrap upgrades tenant33 without manufacturing completeness and matches fresh schema', async () => {
+  const dir = await Deno.makeTempDir({
+    prefix: 'facade-key-bootstrap-upgrade-',
+  });
+  const options = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(options, {
+    schemas: { tenant: historicalTenantSchema(33) },
+  });
+  try {
+    await openTenant(store, 'logical.test', { create: true });
+    await store.close();
+    store = await openStore(options, { schemas: { tenant: tenantSchema } });
+    const db = await store.tenant('logical.test');
+    assertEquals(
+      await db.query('SELECT * FROM key_bootstrap_publications'),
+      [],
+    );
+    const sql =
+      "SELECT name,sql FROM sqlite_master WHERE name='key_bootstrap_publications'";
+    const upgraded = await db.query(sql);
+    assertEquals(upgraded.length, 1);
+    await openTenant(store, 'fresh.test', { create: true });
+    assertEquals(await (await store.tenant('fresh.test')).query(sql), upgraded);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});

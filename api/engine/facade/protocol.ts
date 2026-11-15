@@ -82,6 +82,14 @@ export const SIGNATURE_OPERATION_CAPABILITY: Capability = {
   type: 'signature-operation',
   version: 1,
 };
+export const KEY_BOOTSTRAP_CAPABILITY: Capability = {
+  type: 'key-bootstrap',
+  version: 1,
+};
+export const KEY_HISTORY_CAPABILITY: Capability = {
+  type: 'key-history',
+  version: 1,
+};
 export const LINK_SUPPORTED: readonly Capability[] = [
   ...LINK_CAPABILITIES,
   OWNER_CONTROL_CAPABILITY,
@@ -90,6 +98,8 @@ export const LINK_SUPPORTED: readonly Capability[] = [
   DEVICE_OPERATION_CAPABILITY,
   SIGNING_OPERATION_CAPABILITY,
   SIGNATURE_OPERATION_CAPABILITY,
+  KEY_BOOTSTRAP_CAPABILITY,
+  KEY_HISTORY_CAPABILITY,
 ];
 
 function bad(message: string): never {

@@ -90,6 +90,17 @@ export async function signingViews(
     }
     return replica.signing;
   }
+  return await ownerSigningViews(conn, localpart, user, requester);
+}
+
+/** Owner-internal validation/rendering cannot depend on public bootstrap: it
+ * helps admit the very signing/signature facts that the declaration requires. */
+export async function ownerSigningViews(
+  conn: Conn,
+  localpart: string,
+  user: string,
+  requester: string,
+): Promise<Json> {
   const state = await signingState(conn, localpart), result: Json = {};
   for (const usage of signingUsages) {
     if (usage === 'user_signing' && requester !== user) continue;
