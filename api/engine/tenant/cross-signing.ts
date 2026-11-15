@@ -23,6 +23,7 @@ import {
   tenantAuthority,
 } from '#engine/tenant/session-authority.ts';
 import { captureSigningOperations } from '#engine/tenant/signing-operations.ts';
+import type { SignatureOperation } from '#engine/tenant/signature-operations.ts';
 
 export async function signingState(
   conn: Conn,
@@ -206,12 +207,14 @@ export async function appendSigningChange(
   publicChanged: boolean,
   maxEnvelopeBytes: number,
   subject = user,
+  signatureOperation?: SignatureOperation,
 ): Promise<void> {
   const next = await signingState(conn, localpart);
   const payload: Json = {
     kind: publicChanged ? 'public_signing' : 'private_signing',
     ...(publicChanged ? {} : { subject }),
   };
+  if (signatureOperation) payload.signatureOperation = signatureOperation;
   const operations = await captureSigningOperations(conn, localpart);
   if (operations.length) payload.signingOperation = operations.at(-1);
   if (publicChanged) {

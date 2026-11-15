@@ -8,6 +8,7 @@ import { bounded } from '#engine/tenant/e2ee.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { deviceChangeOperation } from '#engine/tenant/device-source.ts';
 import type { Json } from '#engine/tenant/e2ee.ts';
+import type { SignatureOperation } from '#engine/tenant/signature-operations.ts';
 
 /** Private restore candidate only; immutable reset intents project before serving. */
 export async function rebaseRestoredDeviceStreams(
@@ -59,6 +60,7 @@ export async function appendDeviceChange(
   conn: Conn,
   device: DeviceIdentity,
   deleted = false,
+  signatureOperation?: SignatureOperation,
 ): Promise<void> {
   const rows = deleted ? [] : await conn.query(
     'SELECT d.display_name,k.key_json FROM devices d LEFT JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation WHERE d.localpart=? AND d.device_id=? AND d.generation=?',
@@ -102,7 +104,12 @@ export async function appendDeviceChange(
       displayName: rows[0].display_name === null
         ? null
         : String(rows[0].display_name),
-      keys: (payload.keys as Json | undefined) ?? null,
+      // Public overlays have their own exact-target/signer operations. Retain
+      // original owner material here, not a projection that can become stale
+      // when a cross-signing key or another device is replaced.
+      keys: rows[0].key_json === null
+        ? null
+        : JSON.parse(String(rows[0].key_json)) as Json,
     },
   );
   const [tenant] = await conn.query('SELECT server_name FROM tenant');
@@ -130,7 +137,11 @@ export async function appendDeviceChange(
     device.deviceId,
     device.generation,
     Number(stream[0].value),
-    canonicalJson(operation ? { ...payload, operation } : payload),
+    canonicalJson({
+      ...payload,
+      ...(operation ? { operation } : {}),
+      ...(signatureOperation ? { signatureOperation } : {}),
+    }),
   ]);
 }
 

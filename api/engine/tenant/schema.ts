@@ -18,6 +18,7 @@ import { KEY_CONSUMPTIONS_SQL } from '#engine/tenant/e2ee.ts';
 import { DEVICE_OPERATIONS_SQL } from '#engine/tenant/device-operations.ts';
 import { SIGNING_OPERATIONS_SQL } from '#engine/tenant/signing-operations.ts';
 import { LINK_APPLICATIONS_SQL } from '#engine/tenant/link-applications.ts';
+import { SIGNATURE_OPERATIONS_SQL } from '#engine/tenant/signature-operations.ts';
 import {
   BACKUP_ACCOUNTING_SQL,
   migrateBackupAccounting,
@@ -278,7 +279,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 31,
+  version: 32,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -308,8 +309,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(DEVICE_OPERATIONS_SQL);
     await db.exec(SIGNING_OPERATIONS_SQL);
     await db.exec(LINK_APPLICATIONS_SQL);
+    await db.exec(SIGNATURE_OPERATIONS_SQL);
   },
   migrations: {
+    31: (conn) => conn.exec(SIGNATURE_OPERATIONS_SQL),
     30: (conn) => conn.exec(LINK_APPLICATIONS_SQL),
     29: (conn) => conn.exec(SIGNING_OPERATIONS_SQL),
     28: (conn) => conn.exec(DEVICE_OPERATIONS_SQL),

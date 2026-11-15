@@ -6,10 +6,12 @@ import { publicSigningPayload } from '#engine/e2ee-signing.ts';
 
 function wirePayload(raw: string): Record<string, unknown> {
   const payload = JSON.parse(raw);
-  delete payload.generation;
-  delete payload.kind;
-  delete payload.operation;
-  return payload;
+  return Object.fromEntries(
+    ['device_id', 'deleted', 'device_display_name', 'keys']
+      .filter((key) => Object.hasOwn(payload, key)).map((
+        key,
+      ) => [key, payload[key]]),
+  );
 }
 
 /** Subscription activation and restore use the same durable full-reset owner. */

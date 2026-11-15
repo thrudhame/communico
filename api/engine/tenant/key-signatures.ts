@@ -20,6 +20,7 @@ import {
   remoteTargetMaterial,
   type SignatureSigner,
   signatureSigner,
+  signatureTargetMaterial,
   signatureView,
 } from '#engine/tenant/signature-view.ts';
 import { appendDeviceChange } from '#engine/tenant/changes.ts';
@@ -27,6 +28,8 @@ import { appendSigningChange } from '#engine/tenant/cross-signing.ts';
 import { signingViews } from '#engine/tenant/cross-signing.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { tenantAuthority } from '#engine/tenant/session-authority.ts';
+import { appendSignatureOperation } from '#engine/tenant/signature-operations.ts';
 
 export type SignatureTarget = {
   user: string;
@@ -74,7 +77,9 @@ export async function uploadSignatures(
         [targetLocalpart, target.id],
       );
     const row = masterRows[0] ?? deviceRows[0];
-    const material = remote
+    const material = await tenantAuthority(conn)
+      ? await signatureTargetMaterial(conn, target.json, target.user, target.id)
+      : remote
       ? remoteTargetMaterial(target.json, target.remote!.revision)
       : keyMaterial(target.json);
     if (
@@ -230,12 +235,23 @@ export async function uploadSignatures(
       changed = true;
     }
     if (!changed) continue;
+    const signatureOperation = await appendSignatureOperation(conn, localpart, {
+      user: target.user,
+      id: target.id,
+      json: target.json,
+      material,
+    }, signers);
     if (deviceRows.length) {
-      await appendDeviceChange(conn, {
-        localpart,
-        deviceId: target.id,
-        generation: Number(row.generation),
-      });
+      await appendDeviceChange(
+        conn,
+        {
+          localpart,
+          deviceId: target.id,
+          generation: Number(row.generation),
+        },
+        false,
+        signatureOperation,
+      );
     } else {
       await appendSigningChange(
         conn,
@@ -244,6 +260,7 @@ export async function uploadSignatures(
         target.user === user,
         maxEnvelopeBytes,
         target.user,
+        signatureOperation,
       );
     }
   }
