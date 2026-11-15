@@ -128,8 +128,26 @@ export async function graphNotificationRead(
   thread: string,
   event: string,
 ): Promise<boolean> {
-  for (const target of await graphReadTargets(tx, user, room, thread)) {
-    if (await receiptPrecedes(tx, room, event, target)) return true;
-  }
-  return false;
+  return (await graphReadClosure(tx, user, room, thread)).has(event);
+}
+
+/** One set-valued ancestry walk, seeded by every valid held read target. A
+ * notification sweep shares this result across the whole user/room/thread,
+ * instead of multiplying recursive walks by targets x unread notifications. */
+export async function graphReadClosure(
+  tx: Conn,
+  user: string,
+  room: string,
+  thread: string,
+): Promise<Set<string>> {
+  const targets = await graphReadTargets(tx, user, room, thread);
+  if (!targets.length) return new Set();
+  const rows = await tx.query(
+    `WITH RECURSIVE past(event) AS (
+      SELECT value FROM json_each(?)
+      UNION SELECT e.parent FROM receipt_dag_edges e JOIN past p ON e.event=p.event WHERE e.room=?
+    ) SELECT event FROM past`,
+    [JSON.stringify(targets), room],
+  );
+  return new Set(rows.map((row) => String(row.event)));
 }

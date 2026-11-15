@@ -15,6 +15,7 @@ import {
   recordReceiptOperation,
 } from '#engine/server/receipt-operations.ts';
 import {
+  advanceNotificationRead,
   notificationSnapshot,
   roomNotificationCounts,
 } from '#engine/server/notifications.ts';
@@ -88,6 +89,7 @@ async function fixture() {
     db,
     left,
     right,
+    base,
     message,
     read: (
       event: string,
@@ -237,6 +239,116 @@ Deno.test('facade receipts: concurrent imported same-slot marks converge in both
       assertEquals(await f.db.query('SELECT * FROM domain_frontiers'), []);
       assertEquals(await f.db.query('SELECT * FROM domain_conflicts'), []);
     }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: a foreign server-name suffix never grants local account authorship', async () => {
+  const f = await fixture();
+  try {
+    await activateReceiptSource(f);
+    await f.db.execute(
+      "UPDATE memberships SET user='@bob:foreign:test' WHERE user='@bob:test'",
+    );
+    await setReceipt(f.db, f.g.roomId, '@bob:foreign:test', 'm.read', f.left);
+    assertEquals(
+      (await receiptRows(f.db, f.g.roomId))[0].userId,
+      '@bob:foreign:test',
+    );
+    assertEquals(
+      await f.db.query("SELECT * FROM domain_operations WHERE kind='receipt'"),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: a dominated incoming target still records its valid thread read and source intent without stream news', async () => {
+  const f = await fixture();
+  try {
+    await activateReceiptSource(f);
+    const reply = (await sendLocal(f.g.room, {
+      type: 'm.room.message',
+      sender: f.g.creator,
+      content: {
+        body: 'thread notification',
+        'm.relates_to': { rel_type: 'm.thread', event_id: f.left },
+      },
+    }, f.g.signer)).eventId;
+    const outside = (await f.message('outside that thread', [reply])).eventId;
+    await project(f.store, f.g.roomId);
+    await f.read(outside, 'm.read.private', f.left);
+    const before = await f.db.query(
+      "SELECT value FROM counters WHERE name='receipts'",
+    );
+    assertEquals(
+      (await f.db.query(
+        'SELECT read_ms FROM notifications WHERE user=? AND event=?',
+        ['@bob:test', reply],
+      ))[0].read_ms,
+      null,
+    );
+    await f.read(reply, 'm.read.private', f.left);
+    assertEquals(
+      (await f.db.query(
+        'SELECT read_ms FROM notifications WHERE user=? AND event=?',
+        ['@bob:test', reply],
+      ))[0].read_ms !== null,
+      true,
+    );
+    assertEquals(
+      await f.db.query("SELECT value FROM counters WHERE name='receipts'"),
+      before,
+    );
+    assertEquals(
+      (await f.db.tx((tx) => receiptOperations(tx, '@bob:test'))).length,
+      2,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade receipts: one ancestry closure serves every unread notification in a user-room-thread sweep', async () => {
+  const f = await fixture();
+  try {
+    let walks = 0;
+    await f.db.tx(async (tx) => {
+      const counted = new Proxy(tx, {
+        get(target, property) {
+          if (property === 'query') {
+            return (...args: Parameters<typeof tx.query>) => {
+              if (args[0].includes('WITH RECURSIVE')) walks++;
+              return target.query(...args);
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      await advanceNotificationRead(
+        counted,
+        '@bob:test',
+        f.g.roomId,
+        '',
+        f.base,
+        Date.now(),
+      );
+    });
+    assertEquals(
+      walks,
+      1,
+      'unread notification count must not multiply ancestry traversals',
+    );
+    assertEquals(
+      (await f.db.query(
+        'SELECT event FROM notifications WHERE user=? AND read_ms IS NULL',
+        ['@bob:test'],
+      )).length,
+      2,
+    );
   } finally {
     await f.close();
   }

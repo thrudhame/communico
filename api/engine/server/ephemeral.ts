@@ -280,21 +280,19 @@ export async function setReceiptMark(
       ts,
       threadId,
     );
-    if (row) {
-      const [membership] = await tx.query(
-        'SELECT event FROM memberships WHERE room=? AND user=?',
-        [roomId, userId],
-      );
-      await recordReceiptOperation(tx, {
-        roomId,
-        userId,
-        receiptType,
-        eventIds: incoming,
-        ts,
-        threadId,
-        admission: { membershipEvent: String(membership.event) },
-      });
-    }
+    const [membership] = await tx.query(
+      'SELECT event FROM memberships WHERE room=? AND user=?',
+      [roomId, userId],
+    );
+    await recordReceiptOperation(tx, {
+      roomId,
+      userId,
+      receiptType,
+      eventIds: incoming,
+      ts,
+      threadId,
+      admission: { membershipEvent: String(membership.event) },
+    });
     return row;
   });
   if (row === null) return false;
@@ -319,6 +317,31 @@ async function mergeReceiptMark(
     [roomId, userId, receiptType, threadId ?? ''],
   );
   const graph = await graphReceiptsEnabled(tx);
+  const now = Date.now();
+  const admitRead = async (eventId: string) => {
+    if (
+      !await advanceNotificationRead(
+        tx,
+        userId,
+        roomId,
+        threadId ?? '',
+        eventId,
+        now,
+      )
+    ) {
+      throw new MatrixError(
+        429,
+        'M_LIMIT_EXCEEDED',
+        'pending receipt capacity reached',
+      );
+    }
+  };
+  // Read admission precedes wire-frontier reduction. A retained descendant can
+  // be outside this thread, so dropping its valid incoming ancestor must not
+  // erase that ancestor's read fact or its immutable transfer intent.
+  if (graph) {
+    for (const eventId of incoming) await admitRead(eventId);
+  }
   const oldIds: string[] = prior ? JSON.parse(String(prior.event_ids)) : [];
   const eventIds = graph
     ? await receiptFrontier(tx, roomId, [...oldIds, ...incoming])
@@ -341,23 +364,8 @@ async function mergeReceiptMark(
       seq,
     ],
   );
-  const now = Date.now();
   for (const eventId of eventIds) {
-    const admitted = await advanceNotificationRead(
-      tx,
-      userId,
-      roomId,
-      threadId ?? '',
-      eventId,
-      now,
-    );
-    if (!admitted) {
-      throw new MatrixError(
-        429,
-        'M_LIMIT_EXCEEDED',
-        'pending receipt capacity reached',
-      );
-    }
+    if (!graph || !incoming.includes(eventId)) await admitRead(eventId);
   }
   return { userId, receiptType, threadId, eventIds, ts, seq };
 }

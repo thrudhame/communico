@@ -4,6 +4,7 @@ import type { Conn, Database } from '#engine/store/db.ts';
 import type { PushPublication } from '#engine/server/push-project.ts';
 import {
   graphNotificationRead,
+  graphReadClosure,
   graphReceiptsEnabled,
   rememberGraphRead,
 } from '#engine/server/receipt-frontier.ts';
@@ -221,16 +222,15 @@ async function clearGraphNotifications(
     [user, room],
   );
   let changed = false;
+  const closures = new Map<string, Set<string>>();
   for (const row of rows) {
-    if (
-      !await graphNotificationRead(
-        tx,
-        user,
-        room,
-        String(row.thread),
-        String(row.event),
-      )
-    ) continue;
+    const thread = String(row.thread);
+    let closure = closures.get(thread);
+    if (!closure) {
+      closure = await graphReadClosure(tx, user, room, thread);
+      closures.set(thread, closure);
+    }
+    if (!closure.has(String(row.event))) continue;
     await tx.execute(
       'UPDATE notifications SET read_ms=? WHERE seq=? AND read_ms IS NULL',
       [now, Number(row.seq)],

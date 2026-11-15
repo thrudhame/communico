@@ -3,6 +3,7 @@
 // authority is the union of authenticated DAG marks, not a source/clock order.
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
+import { domainOf } from '#engine/ids.ts';
 import type { Conn } from '#engine/store/db.ts';
 
 type Source = { source: string; incarnation: string };
@@ -172,7 +173,7 @@ export async function acceptReceiptOperation(
       node.node === dot.source && node.incarnation === dot.incarnation
     );
   if (
-    !held || !mark.userId.endsWith(':' + held.server) ||
+    !held || domainOf(mark.userId) !== held.server ||
     !allowed(operation) || !operation.context.every(allowed) ||
     operation.source !== authenticated.source ||
     operation.incarnation !== authenticated.incarnation
@@ -214,7 +215,7 @@ export async function acceptReceiptOperation(
 export async function recordReceiptOperation(conn: Conn, mark: ReceiptMark) {
   const held = await control(conn);
   // Standalone/F1 and remote-user federation marks have no local F2 authorship.
-  if (!held || !mark.userId.endsWith(':' + held.server)) return;
+  if (!held || domainOf(mark.userId) !== held.server) return;
   const node = held.nodes.find((node) => node.node === held.node);
   if (!node) throw new Error('receipt source unavailable');
   const source = { source: node.node, incarnation: node.incarnation };
@@ -222,6 +223,12 @@ export async function recordReceiptOperation(conn: Conn, mark: ReceiptMark) {
   const history = (await receiptOperations(conn, mark.userId)).filter((op) =>
     op.semanticKey === semanticKey
   );
+  const ownTargets = new Set(
+    history.filter((op) =>
+      op.source === source.source && op.incarnation === source.incarnation
+    ).flatMap((op) => receiptOperationMark(op).eventIds),
+  );
+  if (mark.eventIds.every((event) => ownTargets.has(event))) return;
   const known = new Set(history.map((op) => op.operationId));
   if (
     history.some((op) =>
