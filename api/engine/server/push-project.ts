@@ -32,6 +32,18 @@ export type PushPublication = {
 };
 
 type Recipient = { tenant: string; user: string; displayName: string | null };
+export type PushCapture = {
+  context: Omit<PushContext, 'userId' | 'displayName'>;
+  recipients: Recipient[];
+};
+
+/** Tenant policy is captured at publication, not while a room page is prepared. */
+export function prepareCapturedPush(
+  store: Store,
+  capture: PushCapture,
+): Promise<PushPublication> {
+  return prepareDecisions(store, capture.context, capture.recipients);
+}
 
 /** Both held-room and OOB sources use one tenant snapshot contract. */
 async function prepareDecisions(
@@ -114,6 +126,20 @@ export async function preparePush(
   pos: number,
   localServers: string[],
 ): Promise<PushPublication> {
+  return await prepareCapturedPush(
+    store,
+    await capturePush(room, eventId, stay, pos, localServers),
+  );
+}
+
+/** Immutable room facts at this change's publication cut, with no tenant I/O. */
+export async function capturePush(
+  room: Room,
+  eventId: string,
+  stay: number,
+  pos: number,
+  localServers: string[],
+): Promise<PushCapture> {
   const context = await room.tx(async (tx) => {
     const group = await tx.state.publishedAt(stay, pos);
     const row = await tx.events.get(eventId);
@@ -177,8 +203,13 @@ export async function preparePush(
       notificationPower: parsed.ok ? parsed.pl.notifications : {},
     };
   });
-  return await prepareDecisions(store, {
-    ...context,
-    event: { ...context.event },
-  }, context.recipients);
+  return {
+    context: {
+      event: { ...context.event },
+      joinedCount: context.joinedCount,
+      senderPower: context.senderPower,
+      notificationPower: context.notificationPower,
+    },
+    recipients: context.recipients,
+  };
 }
