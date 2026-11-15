@@ -954,13 +954,17 @@ async function storePending(
 // waiting, and a failure leaves the wait in place (logged, not fatal).
 export async function resumeWaits(
   room: Room,
-  deps: { self: string },
+  deps: { self: string; signal?: AbortSignal },
 ): Promise<number> {
   const processed = new Set<string>();
   let resumed = 0;
   for (;;) {
+    // Remaining waits are durable work for another arrival/startup. Do not
+    // start another turn for abandoned demand; a committed turn remains real.
+    if (deps.signal?.aborted) return resumed;
     const job = await room.tx(async (tx) => {
       for (const wait of await tx.waits.all()) {
+        if (deps.signal?.aborted) return null;
         if (processed.has(wait.waiting + '|' + wait.kind)) continue;
         if (wait.kind === 'prev') {
           const status = await tx.events.getStatus(wait.waiting);
@@ -995,6 +999,7 @@ export async function resumeWaits(
       if (job.kind === 'prev') {
         await withRoomLock(room.id, () =>
           room.tx(async (tx) => {
+            deps.signal?.throwIfAborted();
             const row = await tx.events.get(job.eventId);
             const status = await tx.events.getStatus(job.eventId);
             const stay = await tx.segments.openStay();
@@ -1015,6 +1020,7 @@ export async function resumeWaits(
       } else {
         await withRoomLock(room.id, () =>
           room.tx(async (tx) => {
+            deps.signal?.throwIfAborted();
             const waiting = await tx.waits.of(job.eventId);
             if (
               !waiting.some((wait) =>
@@ -1048,6 +1054,7 @@ export async function resumeWaits(
       }
       resumed++;
     } catch (e) {
+      if (deps.signal?.aborted && e === deps.signal.reason) return resumed;
       console.error(`resumeWaits: ${job.kind} ${job.eventId} failed:`, e);
     }
   }

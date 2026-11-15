@@ -25,7 +25,9 @@ export async function stageRecoveryEvidence(
   live: ReadonlySet<string>,
   origin: string,
   version: string,
+  signal?: AbortSignal,
 ): Promise<boolean> {
+  signal?.throwIfAborted();
   // Evidence whose auth depends on a live candidate must follow that candidate's
   // real state-dependent verdict. Keep only a bounded tail in the live batch;
   // an excessive dependency cut leaves the whole recovery unresolved instead
@@ -44,6 +46,7 @@ export async function stageRecoveryEvidence(
   if (pack.size - eligible.size > BATCH) return false;
   if (eligible.size === 0) return true;
   for (let attempt = 0; attempt < 3; attempt++) {
+    signal?.throwIfAborted();
     const cut = await room.tx(async (tx) => {
       const stay = await tx.segments.openStay();
       if (
@@ -67,6 +70,7 @@ export async function stageRecoveryEvidence(
     const scheduled = new Set(queue);
     let staleRead = false;
     for (let start = 0; start < queue.length;) {
+      signal?.throwIfAborted();
       const chunk = queue.slice(start, start + BATCH);
       start += chunk.length;
       const ids = chunk.filter((id) => !seen.has(id));
@@ -114,6 +118,7 @@ export async function stageRecoveryEvidence(
       auth: ReturnType<typeof checkDeclaredAuth>;
     }[] = [];
     for (const [id, pdu] of eligible) {
+      signal?.throwIfAborted();
       if (known.has(id)) continue;
       rejected.delete(id);
       const auth = checkDeclaredAuth(pdu, rulebook, store, cut.createId);
@@ -126,8 +131,10 @@ export async function stageRecoveryEvidence(
     let head = cut.head;
     let stale = false;
     for (let start = 0; start < writes.length; start += BATCH) {
+      signal?.throwIfAborted();
       const next = await withRoomLock(room.id, () =>
         room.tx(async (tx) => {
+          signal?.throwIfAborted();
           if (await tx.changes.head() !== head) return null;
           const stay = await tx.segments.openStay();
           if (
@@ -135,6 +142,7 @@ export async function stageRecoveryEvidence(
             !await aclAllows(tx, origin)
           ) return null;
           for (const { id, pdu, auth } of writes.slice(start, start + BATCH)) {
+            signal?.throwIfAborted();
             if (await tx.events.get(id) !== null) continue;
             const standing = auth.ok ? 'accepted' : 'rejected';
             await tx.events.insert(
@@ -162,6 +170,7 @@ export async function stageRecoveryEvidence(
               origin,
             });
           }
+          signal?.throwIfAborted();
           return await tx.changes.head();
         }));
       if (next === null) {
