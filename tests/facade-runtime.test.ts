@@ -963,8 +963,12 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       (await api(
         'facade',
         'login',
-        login('offline-strict-device'),
+        login('offline-strict-probe', 'not-the-password'),
       )).status === 503
+    );
+    assertEquals(
+      await api('facade', 'login', login('offline-strict-device')),
+      unavailable,
     );
     await edge.stop();
     await configure('facade');
@@ -1081,8 +1085,14 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
         return false;
       }
     });
+    // Observe capability withdrawal without issuing new sessions while waiting.
+    // A successful login is a mutation and feeds the account replication loop.
     await until(async () =>
-      (await api('facade', 'login', login('home-kept-verifier'))).status === 503
+      (await api('facade', 'login')).body.flows.length === 0
+    );
+    assertEquals(
+      await api('facade', 'login', login('home-kept-verifier')),
+      unavailable,
     );
     await home.stop();
     await until(async () =>
@@ -1092,7 +1102,11 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
           undefined,
           retried.body.access_token,
         )).status === 200 &&
-      (await api('facade', 'login', login('home-kept-verifier'))).status === 503
+      (await api('facade', 'login')).body.flows.length === 0
+    );
+    assertEquals(
+      await api('facade', 'login', login('home-kept-verifier')),
+      unavailable,
     );
     assertEquals((await api('facade', 'login')).body, { flows: [] });
     await configure('home');
@@ -1151,14 +1165,22 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       200,
     );
     await until(async () =>
-      (await api('facade', 'login', login('after-deactivation'))).body
+      (await api(
+        'facade',
+        'login',
+        login('after-deactivation', 'not-the-password'),
+      )).body
         .errcode === 'M_USER_DEACTIVATED'
     );
     await home.stop();
     // Home shutdown can finish after another capture was received but before
     // its independent facade owner commits the apply/result. Drain that cut.
     await until(async () =>
-      (await api('facade', 'login', login('offline-deactivated'))).body
+      (await api(
+        'facade',
+        'login',
+        login('offline-deactivated', 'not-the-password'),
+      )).body
         .errcode ===
         'M_USER_DEACTIVATED'
     );

@@ -67,6 +67,69 @@ async function pl(
   }, signer);
 }
 
+for (const keepPeer of [false, true]) {
+  Deno.test(`leave reconciliation keepPeer=${keepPeer} serializes its membership check and never authors a second departure after reopen`, async () => {
+    const dir = await Deno.makeTempDir({ prefix: 'leave-reconciliation-' });
+    let store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    try {
+      const { room, signer, creator } = await fixture(store);
+      if (keepPeer) {
+        await invite(room, creator, '@bob:test', signer);
+        await join(room, '@bob:test', signer);
+      }
+      const results = await Promise.all(
+        Array.from({ length: 8 }, () => leave(room, creator, signer)),
+      );
+      assertEquals(results.filter((result) => result.created).length, 1);
+      assertEquals(new Set(results.map((result) => result.eventId)).size, 1);
+      const eventId = results[0].eventId;
+      const roomId = room.id;
+      await store.close();
+      store = await openStore(config(dir), { schemas: { room: roomSchema } });
+      const resumed = await openRoom(store, roomId);
+      assertEquals(
+        await leave(resumed, creator, {
+          ...signer,
+          sign: () =>
+            Promise.reject(
+              new Error('completed departure must not sign again'),
+            ),
+        }),
+        { roomId, eventId, created: false },
+      );
+      assertEquals(await membershipOf(resumed, creator), {
+        membership: 'leave',
+        eventId,
+      });
+    } finally {
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  });
+}
+
+Deno.test('leave reconciliation preserves ordinary rejected-event evidence without changing membership', async () => {
+  await withStore(async (store) => {
+    const { room, signer, creator } = await fixture(store);
+    await invite(room, creator, '@bob:test', signer);
+    await join(room, '@bob:test', signer);
+    await ban(room, creator, '@bob:test', signer);
+    await assertRejects(
+      () => leave(room, '@bob:test', signer),
+      MatrixError,
+      'membership rejected',
+    );
+    assertEquals((await membershipOf(room, '@bob:test'))?.membership, 'ban');
+    assertEquals(
+      await (await store.room(room.id)).query(
+        "SELECT s.standing FROM events e JOIN event_status s ON s.event=e.id WHERE e.sender=? AND e.type='m.room.member' AND json_extract(e.pdu,'$.content.membership')='leave'",
+        ['@bob:test'],
+      ),
+      [{ standing: 'rejected' }],
+    );
+  });
+});
+
 Deno.test('A1: PL 100 via users may lower users_default 100→40', async () => {
   await withStore(async (store) => {
     const { room, signer, creator } = await fixture(store);

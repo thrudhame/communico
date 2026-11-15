@@ -265,8 +265,15 @@ const PUBLIC_REPLICAS_SQL = `
 CREATE TABLE public_user_replicas(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart),source_cut INTEGER NOT NULL,snapshot_json TEXT NOT NULL);
 `;
 
+// Retained roots for leave/privacy reconciliation, independent of the server's
+// account notification watermark. Later room imports must also honor tombstones.
+const DEACTIVATION_WORK_SQL = `
+CREATE TABLE deactivation_work(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart),erase INTEGER NOT NULL);
+INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users WHERE erased_users.localpart=users.localpart) FROM users WHERE deactivated=1;
+`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 25,
+  version: 26,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -290,8 +297,10 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(ACCOUNT_AUTH_SQL);
     await db.exec(SESSION_AUTHORITY_SQL);
     await db.exec(UIA_BINDING_SQL);
+    await db.exec(DEACTIVATION_WORK_SQL);
   },
   migrations: {
+    25: (conn) => conn.exec(DEACTIVATION_WORK_SQL),
     24: (conn) => conn.exec(UIA_BINDING_SQL),
     23: (conn) => conn.exec(SESSION_AUTHORITY_SQL),
     22: (conn) => conn.exec(ACCOUNT_AUTH_SQL),

@@ -8,6 +8,7 @@ import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
+import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -15,18 +16,18 @@ import {
   signJson,
 } from '#engine/signing-primitives.js';
 
-async function fixture() {
+async function fixture(seedTenant = tenantSchema) {
   const dir = await Deno.makeTempDir({ prefix: 'public-user-replica-' });
-  const open = (side: string) =>
+  const open = (side: string, schema = tenantSchema) =>
     openStore({
       dir: dir + '/' + side,
       library: './.native/libturso_ffi.so',
       checkpointlogbytes: 65536,
       maxopenfiles: 8,
       idleseconds: 300,
-    }, { schemas: { tenant: tenantSchema } });
+    }, { schemas: { tenant: schema } });
   const homeStore = await open('home');
-  let edgeStore = await open('edge');
+  let edgeStore = await open('edge', seedTenant);
   const home = await openTenant(homeStore, 'logical.test', { create: true });
   let edge = await openTenant(edgeStore, 'logical.test', { create: true });
   const ownKey = edge.publicB64;
@@ -214,7 +215,7 @@ Deno.test('public user replica preserves coherent ordinary profile/device/signin
 });
 
 Deno.test('public profile and privacy mutations retain export intent and v20 upgrade permits only independent public users', async () => {
-  const f = await fixture();
+  const f = await fixture(historicalTenantSchema(20));
   try {
     let previous = (await f.export()).cut;
     for (
@@ -233,12 +234,6 @@ Deno.test('public profile and privacy mutations retain export intent and v20 upg
       assert(next.cut > previous);
       previous = next.cut;
     }
-    await (await f.db()).tx(async (conn) => {
-      await conn.exec(
-        'DROP TABLE account_auth_snapshots; DROP TABLE account_auth_sources; DROP TABLE domain_conflicts; DROP TABLE domain_frontiers; DROP TABLE domain_operations; DROP TABLE facade_owner_activation; DROP TABLE facade_owner_controls; DROP TABLE public_user_replicas',
-      );
-      await conn.execute("UPDATE meta SET v='20' WHERE k='schema_version'");
-    }, { mode: 'deferred' });
     await f.reopen();
     const view = await f.export();
     await f.install(view);

@@ -530,6 +530,12 @@ export async function deactivateUserRows(
   // A deactivated account never retains a usable verifier, even without erase.
   await clearCredential(conn, localpart);
   await markDeactivated(conn, localpart);
+  // Local requests and imported account/session facts commit the same durable
+  // work root with their cleanup. Replays do not erase it or downgrade erasure.
+  await conn.execute(
+    'INSERT INTO deactivation_work(localpart,erase) SELECT localpart,? FROM users WHERE localpart=? AND deactivated=1 ON CONFLICT(localpart) DO UPDATE SET erase=excluded.erase WHERE deactivation_work.erase=0 AND excluded.erase=1',
+    [erasureCuts === undefined ? 0 : 1, localpart],
+  );
 }
 
 export async function isDeactivated(
