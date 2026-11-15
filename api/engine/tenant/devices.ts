@@ -11,6 +11,12 @@ import {
 } from '#engine/tenant/cross-signing.ts';
 import { config } from '#engine/config.ts';
 import { deletePushersForToken } from '#engine/tenant/pushers.ts';
+import {
+  assertDeviceOwner,
+  recordDeviceCreation,
+  recordDeviceDeletion,
+  recordRevocation,
+} from '#engine/tenant/session-authority.ts';
 
 export type DeviceRow = {
   device_id: string;
@@ -42,6 +48,7 @@ export async function upsertDeviceRow(
   localpart: string,
   displayName: string | null,
 ): Promise<void> {
+  await assertDeviceOwner(conn, localpart, deviceId);
   await signingCollision(conn, localpart, deviceId);
   const existing = await deviceById(conn, deviceId, localpart);
   if (existing !== null) {
@@ -56,6 +63,7 @@ export async function upsertDeviceRow(
     [deviceId, localpart, generation, displayName],
   );
   await appendDeviceChange(conn, { localpart, deviceId, generation });
+  await recordDeviceCreation(conn, localpart, deviceId, generation);
 }
 
 export async function deviceById(
@@ -87,6 +95,7 @@ export async function renameDevice(
   localpart: string,
   displayName: string,
 ): Promise<boolean> {
+  await assertDeviceOwner(conn, localpart, deviceId);
   const device = await deviceById(conn, deviceId, localpart);
   if (device === null) return false;
   if (device.display_name === displayName) return true;
@@ -106,8 +115,10 @@ export async function deleteDevice(
   conn: Conn,
   deviceId: string,
   localpart: string,
+  record = true,
 ): Promise<void> {
   // Sole device lifecycle deletion: all consumers revoke through this owner.
+  if (record) await recordDeviceDeletion(conn, localpart, deviceId);
   await conn.execute(
     'DELETE FROM delayed_event_receipts WHERE localpart=? AND device_id=?',
     [localpart, deviceId],
@@ -132,6 +143,16 @@ export async function deleteDevice(
     'SELECT token FROM access_tokens WHERE localpart = ? AND device_id = ?',
     [localpart, deviceId],
   );
+  if (record) {
+    for (
+      const row of await conn.query(
+        'SELECT token FROM access_tokens WHERE localpart=? AND device_id=? UNION SELECT token FROM refresh_tokens WHERE localpart=? AND device_id=?',
+        [localpart, deviceId, localpart, deviceId],
+      )
+    ) {
+      await recordRevocation(conn, String(row.token));
+    }
+  }
   for (const row of tokens) {
     await deletePushersForToken(conn, String(row.token));
     await conn.execute('DELETE FROM refresh_tokens WHERE access_token = ?', [

@@ -13,6 +13,10 @@ import { tenantSchema } from '#engine/tenant/schema.ts';
 import * as accountdata from '#engine/tenant/accountdata.ts';
 import * as auth from '#engine/tenant/auth.ts';
 import type { AuthIntent, IngressAuthority } from '#engine/tenant/ingress.ts';
+import {
+  recordLogoutBarrier,
+  requireSessionAuthority,
+} from '#engine/tenant/session-authority.ts';
 import * as devices from '#engine/tenant/devices.ts';
 import * as e2ee from '#engine/tenant/e2ee.ts';
 import * as crossSigning from '#engine/tenant/cross-signing.ts';
@@ -123,8 +127,12 @@ function bind(
   projectionChanged: () => void = () => {},
   ingress?: IngressAuthority,
 ) {
-  const authorize = (intent: AuthIntent) =>
-    ingress?.check(conn, intent) ?? Promise.resolve();
+  const authorize = async (intent: AuthIntent) => {
+    await ingress?.check(conn, intent);
+    if (intent.kind === 'session') {
+      await requireSessionAuthority(conn, intent.hash, intent.refresh);
+    }
+  };
   const mutation = async <T>(operation: Promise<T>): Promise<T> => {
     const value = await operation;
     projectionChanged();
@@ -428,6 +436,7 @@ function bind(
         mutation(devices.deleteDevicesOfUser(conn, localpart)),
     },
     tokens: {
+      barrier: (localpart: string) => recordLogoutBarrier(conn, localpart),
       insert: (
         hash: string,
         localpart: string,
