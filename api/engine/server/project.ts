@@ -40,14 +40,15 @@ export function sourceOf(roomId: string): string {
   return 'room:' + roomId;
 }
 
-// Capture pagination, not writer ownership. Each durable change publishes in
-// its own turn, so an unrelated room never queues behind this captured page.
+// Capture pagination, not writer ownership. Contention ends a transaction at
+// its next complete change; uncontended pages retain batched publication.
 const BATCH = 500;
 
 // One publication/lifecycle mutation at a time. Immutable room preparation
 // belongs to each room's capture owner, never this shared writer turn. Failed
 // work releases both owners for the next write or startup roll-forward.
 let queue: Promise<void> = Promise.resolve();
+let waitingWriters = 0;
 const roomQueues = new WeakMap<Store, Map<string, Promise<void>>>();
 
 // Projection listeners (the federation sender's wake, 4c-2): registered
@@ -92,7 +93,7 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
     let contextMark = await get(server, 'push-context:' + roomId);
     const localServers = await store.tenants();
     const seed = await captureHistoricalRelations(room, mark, contextMark);
-    let device = seed === null
+    const device = seed === null
       ? await captureDevicePublication(store, room, mark)
       : null;
     let batch = seed === null
@@ -113,31 +114,26 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
         await get(server, 'push-context:' + roomId) === contextMark;
     };
     if (seed !== null) {
-      // A seed edge is independently durable context, not a live event. Keep
-      // the room's live publication behind the complete seed, but let other
-      // rooms publish between edges. Empty/final pages also advance gaps.
-      const edges = seed.edges.length ? seed.edges : [null];
-      for (const [index, edge] of edges.entries()) {
-        const cursor = index === edges.length - 1 ? seed.cursor : edge!.pos;
+      // Context edges batch until another writer needs the owner. Publish only
+      // the committed prefix cursor; live work still owes the complete seed.
+      let index = 0;
+      do {
         const applied = await withProjectionLock(async () => {
           if (!await current()) return false;
-          await applyHistoricalRelations(server, roomId, {
-            edges: edge === null ? [] : [edge],
-            cursor,
-          });
-          return true;
+          return await applyHistoricalRelations(server, roomId, seed, index);
         });
-        if (!applied) continue capture;
-        contextMark = cursor;
-      }
+        if (applied === false) continue capture;
+        index = applied.end;
+        contextMark = applied.cursor;
+      } while (index < seed.edges.length);
       continue;
     }
     // The empty turn handles upgrade seeding and completion. A removal is
     // similarly one atomic lifecycle turn, never mixed into ordinary work.
-    const turns = prepared.length ? prepared : [null];
-    for (const [index, item] of turns.entries()) {
+    let index = 0;
+    do {
       const outcome = await withProjectionLock(async () => {
-        if (!await current()) return 'retry';
+        if (!await current()) return { kind: 'retry' } as const;
         if (
           device !== null && !(await server.query(
             'SELECT 1 FROM e2ee_rooms WHERE room=?',
@@ -162,19 +158,40 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
             JSON.parse(batch[0].data) as Removal,
             batch[0].pos,
           );
-        } else if (item !== null) {
-          // Policy belongs to this publication turn. Never retain a tenant
-          // snapshot across another writer's deactivation or rule change.
-          if ('pushCapture' in item && item.pushCapture !== null) {
-            item.push = await prepareCapturedPush(store, item.pushCapture);
+        } else if (index < prepared.length) {
+          // Tenant reads cannot run inside a retryable server transaction.
+          // Stop preparing when demand appears, then commit a complete prefix.
+          // Unused policy decisions never escape this writer turn.
+          const ready: Prepared[] = [];
+          for (let at = index; at < prepared.length; at++) {
+            const item = prepared[at];
+            ready.push(
+              'pushCapture' in item && item.pushCapture !== null
+                ? {
+                  ...item,
+                  push: await prepareCapturedPush(store, item.pushCapture),
+                }
+                : item,
+            );
+            if (waitingWriters > 0) break;
           }
           const addedMs = Date.now();
-          await eventStreamTx(server, async (tx) => {
-            await apply(tx, roomId, item, addedMs, localServers);
-            await advance(tx, sourceOf(roomId), item.change.pos);
-            await advance(tx, 'push-context:' + roomId, item.change.pos);
+          const end = await eventStreamTx(server, async (tx) => {
+            let count = 0;
+            for (const item of ready) {
+              await apply(tx, roomId, item, addedMs, localServers);
+              count++;
+              if (waitingWriters > 0) break;
+            }
+            const pos = ready[count - 1].change.pos;
+            await advance(tx, sourceOf(roomId), pos);
+            await advance(tx, 'push-context:' + roomId, pos);
+            return index + count;
           });
-          if (index < turns.length - 1 || item.change.pos < head) return 'more';
+          const pos = prepared[end - 1].change.pos;
+          if (end < prepared.length || pos < head) {
+            return { kind: 'more', end, pos } as const;
+          }
         }
         await reconcileTyping(server, roomId);
         for (const fn of projectedListeners) {
@@ -184,19 +201,23 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
             console.error(`projection listener failed for ${roomId}:`, error);
           }
         }
-        return 'complete';
+        return { kind: 'complete' } as const;
       });
-      if (outcome === 'retry') continue capture;
-      if (outcome === 'complete') return;
-      device = null;
-      if (item !== null) mark = contextMark = item.change.pos;
-    }
+      if (outcome.kind === 'retry') continue capture;
+      if (outcome.kind === 'complete') return;
+      index = outcome.end;
+      mark = contextMark = outcome.pos;
+    } while (index < prepared.length);
   }
 }
 
 /** Room lifecycle operations use the same serialization as projection. */
 export function withProjectionLock<T>(fn: () => Promise<T>): Promise<T> {
-  const run = queue.then(fn);
+  waitingWriters++;
+  const run = queue.then(() => {
+    waitingWriters--;
+    return fn();
+  });
   queue = run.then(
     () => undefined,
     () => undefined,
@@ -292,10 +313,12 @@ async function applyHistoricalRelations(
   server: Awaited<ReturnType<Store['server']>>,
   roomId: string,
   seed: HistoricalSeed,
-): Promise<void> {
+  start: number,
+): Promise<{ end: number; cursor: number }> {
   const now = Date.now();
-  await server.tx(async (tx) => {
-    for (const { event, relation, sender, seq } of seed.edges) {
+  return await server.tx(async (tx) => {
+    let end = start;
+    for (const { event, relation, sender, seq } of seed.edges.slice(start)) {
       if (relation !== null) {
         await tx.execute(
           'INSERT INTO relations(event,relates_to,rel_type,room,seq) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
@@ -309,8 +332,14 @@ async function applyHistoricalRelations(
         );
       }
       await reconcileNotificationEvent(tx, roomId, event, now);
+      end++;
+      if (waitingWriters > 0) break;
     }
-    await advance(tx, 'push-context:' + roomId, seed.cursor);
+    const cursor = end === seed.edges.length
+      ? seed.cursor
+      : seed.edges[end - 1].pos;
+    await advance(tx, 'push-context:' + roomId, cursor);
+    return { end, cursor };
   });
 }
 

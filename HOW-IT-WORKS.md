@@ -199,17 +199,17 @@ the next projection or startup rolls forward from its watermark.
 
 Each room has one store-lifetime projection capture owner. Independent rooms
 prepare immutable room facts outside the global mutation queue. The existing
-500-change page bounds capture, not writer ownership: each change gets its own
-writer turn. A caller owes its admitted room
+500-change page bounds capture, not writer ownership: uncontended changes batch,
+but queued writer demand ends the turn at the next complete change. A caller owes its admitted room
 head, not later writes to a continuously busy room. Application rechecks both
 watermarks and the original room capability's incarnation before writing.
-Historical-context seed edges similarly commit their context cursor separately;
+Historical-context seed edges similarly commit the completed prefix cursor;
 same-room live publication waits for complete context. Tenant push decisions
 are recaptured inside each publication turn, so preparation cannot
 resurrect a deactivated account's notification facts.
 (`api/engine/server/{project,push-project}.ts`)
 
-Projection writes one change and advances its watermark in one server
+Projection writes a complete change prefix and advances its watermark in one server
 transaction. Rows are idempotent on `(room, pos)`; outbox rows also include
 destination. The server assigns global live-feed sequence numbers here.
 It is durable truth for those numbers, delivery progress and user intent,

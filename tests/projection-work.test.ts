@@ -424,7 +424,7 @@ Deno.test('projection work: room removal reconciles typing before notifying comp
   });
 });
 
-Deno.test('projection work: a capture page yields after each durable change', async () => {
+Deno.test('projection work: a capture page yields at the next durable change when another writer waits', async () => {
   await withStore(async (store) => {
     const tenant = await openTenant(store, 'test', { create: true });
     await tenant.tx(async (tx) => {
@@ -540,10 +540,19 @@ Deno.test('projection work: a later change failure preserves earlier publication
     }
     const db = await store.server();
     const original = db.tx.bind(db);
+    let between: Promise<void> = Promise.resolve();
+    let queued = false;
     db.tx = (fn, options) =>
       original((conn) => {
         const execute = conn.execute.bind(conn);
         conn.execute = (sql, values = []) => {
+          if (
+            !queued && sql.startsWith('INSERT INTO feed(') &&
+            values.includes(events[0].eventId)
+          ) {
+            queued = true;
+            between = withProjectionLock(() => Promise.resolve());
+          }
           if (
             sql.startsWith('INSERT INTO feed(') &&
             values.includes(events[1].eventId)
@@ -566,6 +575,7 @@ Deno.test('projection work: a later change failure preserves earlier publication
         [events[0].eventId],
       );
     } finally {
+      await between;
       db.tx = original;
     }
     await Promise.all([project(store, g.roomId), project(store, g.roomId)]);
@@ -584,6 +594,76 @@ Deno.test('projection work: a later change failure preserves earlier publication
         ]))[0].position,
         head,
       );
+    }
+  });
+});
+
+Deno.test('projection work: uncontended publication and historical context batch their durable changes', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!writer-uncontended:test' });
+    await project(store, g.roomId);
+    const events: string[] = [];
+    for (const body of ['one', 'two', 'three']) {
+      events.push(
+        (await sendLocal(g.room, {
+          type: 'm.room.message',
+          sender: g.creator,
+          content: { body, msgtype: 'm.text' },
+        }, g.signer)).eventId,
+      );
+    }
+    const db = await store.server();
+    const original = db.tx.bind(db);
+    let publications = 0;
+    let historical = 0;
+    db.tx = async (fn, options) => {
+      let feed = false;
+      let context = false;
+      const result = await original((conn) => {
+        const execute = conn.execute.bind(conn);
+        conn.execute = (sql, values = []) => {
+          if (sql.startsWith('INSERT INTO feed(')) feed = true;
+          if (sql.startsWith('INSERT INTO notification_own_events(')) {
+            context = true;
+          }
+          return execute(sql, values);
+        };
+        return fn(conn);
+      }, options);
+      if (feed) publications++;
+      if (context) historical++;
+      return result;
+    };
+    try {
+      await project(store, g.roomId);
+      assertEquals(
+        (await db.query(
+          'SELECT event FROM feed WHERE event IN (?,?,?) ORDER BY seq',
+          events,
+        )).map((r) => r.event),
+        events,
+      );
+      historical = 0;
+      await db.execute('DELETE FROM watermarks WHERE source=?', [
+        'push-context:' + g.roomId,
+      ]);
+      await db.execute('DELETE FROM notification_own_events WHERE room=?', [
+        g.roomId,
+      ]);
+      await project(store, g.roomId);
+      assertEquals({ publications, historical }, {
+        publications: 1,
+        historical: 1,
+      }, 'uncontended pages split their durable commits');
+      assertEquals(
+        (await db.query(
+          'SELECT event FROM notification_own_events WHERE room=?',
+          [g.roomId],
+        )).length,
+        8,
+      );
+    } finally {
+      db.tx = original;
     }
   });
 });
