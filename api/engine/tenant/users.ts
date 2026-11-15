@@ -286,7 +286,10 @@ export async function verifyUserPassword(
   localpart: string,
   password: string,
 ): Promise<boolean> {
-  const hash = await tenant.tx((tx) => tx.credentials.hash(localpart));
+  const hash = await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'password', localpart });
+    return await tx.credentials.hash(localpart);
+  });
   if (hash === null) return false;
   return verifyPassword(hash, password);
 }
@@ -312,6 +315,7 @@ export async function loginUser(
     ? null
     : await hashToken(refreshToken);
   return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'password', localpart: params.localpart });
     const phc = await tx.credentials.hash(params.localpart);
     if (phc === null || !verifyPassword(phc, params.password)) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');

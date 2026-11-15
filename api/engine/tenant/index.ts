@@ -12,6 +12,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { tenantSchema } from '#engine/tenant/schema.ts';
 import * as accountdata from '#engine/tenant/accountdata.ts';
 import * as auth from '#engine/tenant/auth.ts';
+import type { AuthIntent, IngressAuthority } from '#engine/tenant/ingress.ts';
 import * as devices from '#engine/tenant/devices.ts';
 import * as e2ee from '#engine/tenant/e2ee.ts';
 import * as crossSigning from '#engine/tenant/cross-signing.ts';
@@ -90,6 +91,7 @@ export async function signingKeyVersionFor(
 }
 
 export type Tenant = {
+  readonly ingress?: IngressAuthority;
   // The server name the tenant file was opened with.
   readonly serverName: string;
   // The key-derived native name (base32 of the public key).
@@ -119,13 +121,17 @@ function bind(
   conn: Conn,
   changed: () => void = () => {},
   projectionChanged: () => void = () => {},
+  ingress?: IngressAuthority,
 ) {
+  const authorize = (intent: AuthIntent) =>
+    ingress?.check(conn, intent) ?? Promise.resolve();
   const mutation = async <T>(operation: Promise<T>): Promise<T> => {
     const value = await operation;
     projectionChanged();
     return value;
   };
   return {
+    ingress: { check: authorize },
     publicReplica: {
       users: () => publicReplica.publicUsers(conn),
       inventory: () => publicReplica.publicInventory(conn),
@@ -397,14 +403,25 @@ function bind(
         localpart: string,
         displayName: string | null,
       ) =>
-        mutation(
-          devices.upsertDeviceRow(conn, deviceId, localpart, displayName),
-        ),
+        (async () => {
+          await authorize({ kind: 'device', localpart, deviceId });
+          await mutation(
+            devices.upsertDeviceRow(conn, deviceId, localpart, displayName),
+          );
+        })(),
       byId: (deviceId: string, localpart: string) =>
         devices.deviceById(conn, deviceId, localpart),
       ofUser: (localpart: string) => devices.devicesOfUser(conn, localpart),
-      rename: (deviceId: string, localpart: string, displayName: string) =>
-        mutation(devices.renameDevice(conn, deviceId, localpart, displayName)),
+      rename: async (
+        deviceId: string,
+        localpart: string,
+        displayName: string,
+      ) => {
+        await authorize({ kind: 'device', localpart, deviceId });
+        return await mutation(
+          devices.renameDevice(conn, deviceId, localpart, displayName),
+        );
+      },
       delete: (deviceId: string, localpart: string) =>
         mutation(devices.deleteDevice(conn, deviceId, localpart)),
       deleteForUser: (localpart: string) =>
@@ -416,7 +433,23 @@ function bind(
         localpart: string,
         deviceId: string | null,
         expiresMs: number | null,
-      ) => auth.insertAccessToken(conn, hash, localpart, deviceId, expiresMs),
+      ) =>
+        (async () => {
+          if (deviceId !== null) {
+            await authorize({
+              kind: 'device',
+              localpart,
+              deviceId,
+            });
+          }
+          await auth.insertAccessToken(
+            conn,
+            hash,
+            localpart,
+            deviceId,
+            expiresMs,
+          );
+        })(),
       byHash: (hash: string) => auth.accessTokenByHash(conn, hash),
       ofUser: (localpart: string) => auth.accessTokensOfUser(conn, localpart),
       ofDevice: (deviceId: string, localpart: string) =>
@@ -431,7 +464,21 @@ function bind(
         localpart: string,
         deviceId: string | null,
         accessHash: string,
-      ) => auth.insertRefreshToken(conn, hash, localpart, deviceId, accessHash),
+      ) =>
+        (async () => {
+          await authorize({
+            kind: 'session',
+            hash: accessHash,
+            refresh: false,
+          });
+          await auth.insertRefreshToken(
+            conn,
+            hash,
+            localpart,
+            deviceId,
+            accessHash,
+          );
+        })(),
       byHash: (hash: string) => auth.refreshTokenByHash(conn, hash),
       delete: (hash: string) => auth.deleteRefreshToken(conn, hash),
       deleteForAccessToken: (accessHash: string) =>
@@ -755,7 +802,7 @@ export async function provisionTenant(
 export async function openTenant(
   store: Store,
   serverName: string,
-  options: { create?: boolean } = {},
+  options: { create?: boolean; ingress?: IngressAuthority } = {},
 ): Promise<Tenant> {
   const db = await store.tenant(serverName, options);
   const { row, privateKey } = await db.tx(async (conn) => {
@@ -810,6 +857,7 @@ export async function openTenant(
     await pendingTenantProjection(db),
   );
   return {
+    ingress: options.ingress,
     serverName,
     nativeName: String(row.native_name),
     keyId: 'ed25519:' + String(row.key_id),
@@ -837,7 +885,7 @@ export async function openTenant(
             changed = true;
           }, () => {
             projectionChanged = true;
-          }));
+          }, options.ingress));
           const projectionRevision = projectionChanged
             ? await recordTenantProjection(conn)
             : 0;

@@ -250,6 +250,7 @@ export async function lookupToken(
 ): Promise<TokenInfo | null> {
   const hash = await hashToken(token);
   return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'session', hash, refresh: false });
     const row = await tx.tokens.byHash(hash);
     if (row === null) return null;
     if (row.device_id !== null) {
@@ -294,6 +295,7 @@ export async function consumeRefreshToken(
 > {
   const hash = await hashToken(refreshToken);
   return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'session', hash, refresh: true });
     const row = await tx.refresh.byHash(hash);
     if (row === null) {
       throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'unknown refresh token');
@@ -344,6 +346,7 @@ export async function consumeRefreshToken(
 export async function revokeToken(tenant: Tenant, token: string) {
   const hash = await hashToken(token);
   await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'session', hash, refresh: false });
     const row = await tx.tokens.byHash(hash);
     const deviceId = row === null ? null : row.device_id;
     await tx.pushers.deleteForToken(hash);
