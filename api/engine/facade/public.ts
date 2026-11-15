@@ -1,6 +1,7 @@
 // Per-user public replication shares the room owner's cross-file completion
 // contract; private tenant state never enters these records.
 import type { Store } from '#engine/store/index.ts';
+import { onTenantStream } from '#engine/tenant/streams.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { publicUserOf } from '#engine/tenant/public-replica.ts';
 import { appendRecord, type Journal } from './journal.ts';
@@ -127,40 +128,67 @@ export function startPublicExports(
   let stopped = false;
   let scanning: Promise<void> | undefined;
   const running = new Map<string, Promise<void>>();
+  const rerun = new Set<string>();
+  let dirty = false;
   const wake = () => {
     if (stopped) return;
+    dirty = true;
     scanning ??= (async () => {
       try {
-        const users = await options.tenant.tx((tx) => tx.publicReplica.users());
-        for (const user of users) {
-          if (stopped || running.has(user)) continue;
-          const work = exportPublicReplica(
-            options.store,
-            options.tenant,
-            user,
-            options.peer,
-            options.pairing,
-          )
-            .then((record) => {
-              if (record) options.changed();
-            })
-            .catch((error) => options.failed(error, user));
-          running.set(user, work);
-          void work.finally(() => running.delete(user));
-        }
-      } catch (error) {
-        options.failed(error);
+        do {
+          dirty = false;
+          try {
+            const users = await options.tenant.tx((tx) =>
+              tx.publicReplica.users()
+            );
+            for (const user of users) {
+              if (stopped) break;
+              if (running.has(user)) {
+                rerun.add(user);
+                continue;
+              }
+              const work = (async () => {
+                try {
+                  do {
+                    rerun.delete(user);
+                    try {
+                      const record = await exportPublicReplica(
+                        options.store,
+                        options.tenant,
+                        user,
+                        options.peer,
+                        options.pairing,
+                      );
+                      if (record) options.changed();
+                    } catch (error) {
+                      options.failed(error, user);
+                    }
+                  } while (!stopped && rerun.delete(user));
+                } finally {
+                  running.delete(user);
+                }
+              })();
+              running.set(user, work);
+            }
+          } catch (error) {
+            options.failed(error);
+          }
+        } while (!stopped && dirty);
       } finally {
         scanning = undefined;
       }
     })();
   };
+  const untenant = onTenantStream((store, tenant) => {
+    if (store === options.store && tenant === options.tenant.serverName) wake();
+  });
   let closed: Promise<void> | undefined;
   return {
     wake,
     close: () =>
       closed ??= (async () => {
         stopped = true;
+        untenant();
         await scanning;
         await Promise.all(running.values());
       })(),

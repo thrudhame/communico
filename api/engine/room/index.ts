@@ -163,6 +163,8 @@ function bind(conn: Conn, edges: EdgeOverlay, groups: state.StateGroups) {
     extremities: {
       frontier: (stay: number) => extremities.frontier(conn, stay),
       parents: (stay: number) => extremities.parents(conn, stay),
+      inherit: (previous: number, stay: number) =>
+        extremities.inherit(conn, previous, stay),
       add: (stay: number, event: string) =>
         extremities.addExtremity(conn, stay, event),
       remove: (stay: number, ids: readonly string[]) =>

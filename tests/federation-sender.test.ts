@@ -40,7 +40,7 @@ import {
   fakeKeyResolver,
   remoteEvent,
 } from './fixtures/remote.ts';
-import { testRemoteServer } from './fixtures/signer.ts';
+import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -71,6 +71,57 @@ async function withStore(
     await Deno.remove(dir, { recursive: true });
   }
 }
+
+Deno.test('sender: a latched owner-progress wake is not delayed by the local fault retry', async () => {
+  await withStore(async (store) => {
+    const db = await store.server();
+    const destination = 'remote.test';
+    await db.tx((tx) =>
+      enqueueEdu(tx, 'owner-progress', destination, 'm.test', {})
+    );
+    const timer = globalThis.setTimeout;
+    let retryTimers = 0;
+    Reflect.set(
+      globalThis,
+      'setTimeout',
+      (...args: Parameters<typeof setTimeout>) => {
+        if (args[1] === 1000) retryTimers++;
+        return Reflect.apply(timer, globalThis, args);
+      },
+    );
+    let calls = 0;
+    let sender: Sender | undefined;
+    try {
+      sender = startSender({
+        store,
+        signer: await testSigner(),
+        dispatch: () => {
+          if (++calls === 1) {
+            sender!.wake(destination);
+            throw new Error(
+              'owner completion became ready before dispatch unwound',
+            );
+          }
+          return Promise.resolve({ pdus: {} });
+        },
+      });
+      await waitFor(async () =>
+        (await db.query(
+          "SELECT state FROM edu_outbox WHERE source='owner-progress'",
+        ))[0]?.state === 'sent'
+      );
+      assertEquals(calls, 2);
+      assertEquals(
+        retryTimers,
+        0,
+        'already observed progress must run rather than arm a fault delay',
+      );
+    } finally {
+      await sender?.stop();
+      globalThis.setTimeout = timer;
+    }
+  });
+});
 
 type SendCall = {
   txnId: string;

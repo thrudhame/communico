@@ -383,7 +383,7 @@ export function startSender(deps: SenderDeps): Sender {
           if (upstreamCategory(e) === 'local' && !stopped) {
             // Durable work remains owned after local signer/store faults. Retry
             // separately from the peer ladder, retaining the frozen envelope.
-            await sleep(1000, destination);
+            if (!rerun.has(destination)) await sleep(1000, destination);
             rerun.add(destination);
           }
         })
@@ -611,8 +611,11 @@ export function startSender(deps: SenderDeps): Sender {
         // publish the configured durable ladder. Restart retains the exact batch.
         const transient = err.status === undefined || err.status === 429 ||
           err.status >= 500;
-        if (!stopped && transient && quickAttempts < 2) {
-          const until = Date.now() + 4000 * 4 ** quickAttempts++;
+        const quickRetry = transient && quickAttempts < 2
+          ? 4000 * 4 ** quickAttempts++
+          : null;
+        if (!stopped && quickRetry !== null) {
+          const until = Date.now() + quickRetry;
           inFlight.delete(destination);
           // Producer wakes cannot accelerate retries. Stop can interrupt this
           // wait; expiry and blocks are rechecked at the normal loop boundary.
@@ -625,7 +628,12 @@ export function startSender(deps: SenderDeps): Sender {
         const now = Date.now();
         await server.tx(async (tx) => {
           const fresh = await peerStatus(tx, destination);
-          const backoff = backoffMs(fresh.failures + 1);
+          // Shutdown drains completed responses, but cannot turn the first
+          // transient failure into an exhausted many-minute peer ladder. Keep
+          // the same short retry at its durable owner for the restarted sender.
+          const backoff = quickRetry == null
+            ? backoffMs(fresh.failures + 1)
+            : quickRetry;
           await recordFailure(
             tx,
             destination,

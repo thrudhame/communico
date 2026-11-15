@@ -313,6 +313,7 @@ export async function openFacadeRuntime(
         notices,
         changed: refresh,
         contacted: async () => await (await keyOwner()).contact(),
+        signKeyDocument: async (raw) => await (await keyOwner()).cosign(raw),
       })(request, peerPin);
     },
     changed: refresh,

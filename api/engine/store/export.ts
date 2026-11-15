@@ -58,9 +58,8 @@ export async function exportSnapshot(
       }
       const selected = [identifier(rowid), ...names.map(identifier)];
       const projection = selected.map((column, n) => `${column} AS c${n}`);
-      const insert = `INSERT INTO ${name}(${selected.join(',')}) VALUES(${
-        selected.map(() => '?').join(',')
-      })`;
+      const insert = `INSERT INTO ${name}(${selected.join(',')}) VALUES`;
+      const parameters = `(${selected.map(() => '?').join(',')})`;
       let last: Value | undefined;
       for (;;) {
         const rows = await ffi.query(
@@ -75,13 +74,14 @@ export async function exportSnapshot(
         // retains a write set proportional to the entire source database.
         await ffi.begin(writer, 'deferred');
         try {
-          for (const row of rows) {
-            await ffi.execute(
-              writer,
-              insert,
-              selected.map((_, n) => row[`c${n}`]),
-            );
-          }
+          // One native statement owns the entire page. Crossing the async FFI
+          // boundary per row multiplies scheduling/serialization overhead by
+          // the source population even though both sides already own a page.
+          await ffi.execute(
+            writer,
+            insert + rows.map(() => parameters).join(','),
+            rows.flatMap((row) => selected.map((_, n) => row[`c${n}`])),
+          );
           await ffi.commit(writer);
         } catch (error) {
           await ffi.rollback(writer);

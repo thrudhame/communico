@@ -112,11 +112,17 @@ Deno.test('parent consumers: archived reopen selects parents and preserves every
       const stay = (await tx.segments.openStay())!;
       assert(stay.id !== archived.id);
       assertEquals(await tx.extremities.frontier(archived.id), archived.heads);
-      assertEquals(await tx.extremities.frontier(stay.id), [joined.eventId]);
       const row = (await tx.events.get(joined.eventId))!;
       const pdu = JSON.parse(row.pdu) as Pdu;
       assertEquals(pdu.prev_events?.length, 10);
       assert(pdu.prev_events?.every((id) => archived.heads.includes(id)));
+      assertEquals(
+        await tx.extremities.frontier(stay.id),
+        [
+          ...archived.heads.filter((id) => !pdu.prev_events!.includes(id)),
+          joined.eventId,
+        ].sort(),
+      );
       assertEquals(
         (await tx.events.getStatus(joined.eventId))?.standing,
         'accepted',
