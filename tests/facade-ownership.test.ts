@@ -20,6 +20,7 @@ import {
   PUBLICATION_DOMAIN_SQL,
 } from '#engine/facade/schema.ts';
 import type { SchemaProvider } from '#engine/store/create.ts';
+import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -406,7 +407,7 @@ Deno.test('ownership schemas upgrade actual server35/tenant21 to the same schema
   let old = await openStore(cfg('upgrade'), {
     schemas: {
       server: prior(serverSchema, 35),
-      tenant: prior(tenantSchema, 21),
+      tenant: historicalTenantSchema(21),
     },
   });
   const fresh = await openStore(cfg('fresh'), {
