@@ -9,6 +9,7 @@ import {
 } from '#engine/tenant/account-auth.ts';
 import { registerUser, verifyUserPassword } from '#engine/tenant/users.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
+import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
 
 const binding = {
   server: 'logical.test',
@@ -77,6 +78,25 @@ async function fixture() {
   const edge = await openTenant(store, 'edge.test', { create: true });
   const hd = await store.tenant('home.test'),
     ed = await store.tenant('edge.test');
+  const identity = {
+    homeIncarnation: 'h',
+    edgeNode: 'edge',
+    edgeIncarnation: 'e',
+  };
+  await hd.tx((conn) =>
+    activateTenantAuthority(conn, {
+      ...identity,
+      node: 'home',
+      incarnation: 'h',
+    })
+  );
+  await ed.tx((conn) =>
+    activateTenantAuthority(conn, {
+      ...identity,
+      node: 'edge',
+      incarnation: 'e',
+    })
+  );
   const capture = (credentials = true, now = 1000000) =>
     hd.tx((conn) =>
       captureAccountAuth(conn, binding, 'alice', credentials, now)
@@ -126,6 +146,7 @@ Deno.test('account auth snapshot installs a verifier for offline password verifi
       Object.keys(view).sort(),
       [
         'capturedMs',
+        'authority',
         'credentials',
         'deactivated',
         'grantRevision',

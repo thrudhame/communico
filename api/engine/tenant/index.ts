@@ -387,6 +387,11 @@ function bind(
         mutation(profiles.clearProfileRows(conn, localpart)),
     },
     users: {
+      deactivate: (
+        localpart: string,
+        server: string,
+        cuts?: Record<string, ErasureCut>,
+      ) => mutation(users.deactivateUserRows(conn, server, localpart, cuts)),
       exists: (localpart: string) => users.userExists(conn, localpart),
       insert: (localpart: string, displayName: string) =>
         mutation(users.insertUser(conn, localpart, displayName)),

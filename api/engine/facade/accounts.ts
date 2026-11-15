@@ -13,6 +13,7 @@ import {
   installAccountAuth,
 } from '#engine/tenant/account-auth.ts';
 import { checkLocalpart } from '#engine/tenant/users.ts';
+import { captureErasureCuts } from '#engine/tenant/erasure.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControls } from './ownership.ts';
 import type { Pairings } from './pairing.ts';
@@ -49,6 +50,21 @@ function accountAuthOf(raw: unknown): AccountAuth {
     credentials: row.credentials,
     phc: row.phc as string | null,
     deactivated: row.deactivated,
+    authority: (() => {
+      const authority = object(row.authority);
+      if (
+        !Array.isArray(authority.facts) || !Array.isArray(authority.sessions) ||
+        canonicalJson(Object.keys(authority).sort()) !==
+          canonicalJson(['facts', 'sessions'])
+      ) {
+        throw new LinkError(
+          'LINK_BAD_RECORD',
+          'invalid session authority cut',
+          400,
+        );
+      }
+      return authority as AccountAuth['authority'];
+    })(),
   };
   if (canonicalJson(view) !== canonicalJson(raw)) {
     throw new LinkError(
@@ -206,8 +222,13 @@ export class AccountSnapshots {
       after: integer(payload.after),
       cut: view.sourceCut,
       apply: async () => {
+        const cuts = view.authority.facts.some((fact) =>
+            fact.kind === 'deactivate' && fact.erase
+          )
+          ? await captureErasureCuts(this.store)
+          : undefined;
         await (await this.store.tenant(view.server)).tx((conn) =>
-          installAccountAuth(conn, view)
+          installAccountAuth(conn, view, cuts)
         );
         return {
           localpart: view.localpart,

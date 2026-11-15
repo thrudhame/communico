@@ -125,9 +125,12 @@ export async function deleteAccessToken(
 export async function deleteAccessTokensOfUser(
   conn: Conn,
   localpart: string,
+  record = true,
 ): Promise<void> {
-  for (const row of await accessTokensOfUser(conn, localpart)) {
-    await recordRevocation(conn, row.token);
+  if (record) {
+    for (const row of await accessTokensOfUser(conn, localpart)) {
+      await recordRevocation(conn, row.token);
+    }
   }
   await conn.execute('DELETE FROM access_tokens WHERE localpart = ?', [
     localpart,
@@ -205,13 +208,16 @@ export async function deleteRefreshForAccessToken(
 export async function deleteRefreshTokensOfUser(
   conn: Conn,
   localpart: string,
+  record = true,
 ): Promise<void> {
-  for (
-    const row of await conn.query(
-      'SELECT token FROM refresh_tokens WHERE localpart=?',
-      [localpart],
-    )
-  ) await recordRevocation(conn, String(row.token));
+  if (record) {
+    for (
+      const row of await conn.query(
+        'SELECT token FROM refresh_tokens WHERE localpart=?',
+        [localpart],
+      )
+    ) await recordRevocation(conn, String(row.token));
+  }
   await conn.execute('DELETE FROM refresh_tokens WHERE localpart = ?', [
     localpart,
   ]);

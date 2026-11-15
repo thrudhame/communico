@@ -18,6 +18,22 @@ import {
 import type { Tenant } from '#engine/tenant/index.ts';
 import { setProfileRow } from '#engine/tenant/profiles.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
+import { deleteDevicesOfUser } from '#engine/tenant/devices.ts';
+import {
+  deleteAccessTokensOfUser,
+  deleteRefreshTokensOfUser,
+} from '#engine/tenant/auth.ts';
+import { deletePushersOfUser } from '#engine/tenant/pushers.ts';
+import { clearOpenId } from '#engine/tenant/openid.ts';
+import { clearSigningKeys } from '#engine/tenant/cross-signing.ts';
+import { clearBackup } from '#engine/tenant/key-backup.ts';
+import { clearProfileRows } from '#engine/tenant/profiles.ts';
+import { clearAccountData } from '#engine/tenant/accountdata.ts';
+import { clearFilters } from '#engine/tenant/filters.ts';
+import { clearPushRules } from '#engine/tenant/pushrules.ts';
+import { markErased } from '#engine/tenant/erasure.ts';
+import { recordDeactivation } from '#engine/tenant/session-authority.ts';
+import { config } from '#engine/config.ts';
 
 // Spec appendices: user_id_localpart = 1*user_id_char;
 // user_id_char = DIGIT / a-z / "-" / "." / "=" / "_" / "/" / "+".
@@ -333,12 +349,12 @@ export async function loginUser(
     : await hashToken(refreshToken);
   return await tenant.tx(async (tx) => {
     await tx.ingress.check({ kind: 'password', localpart: params.localpart });
+    if ((await tx.users.byLocalpart(params.localpart))?.deactivated) {
+      throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account deactivated');
+    }
     const phc = await tx.credentials.hash(params.localpart);
     if (phc === null || !verifyPassword(phc, params.password)) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
-    }
-    if ((await tx.users.byLocalpart(params.localpart))?.deactivated) {
-      throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account deactivated');
     }
     await tx.devices.upsert(
       params.deviceId,
@@ -454,29 +470,45 @@ export async function deactivateUser(
   localpart: string,
   erasureCuts?: Record<string, ErasureCut>,
 ): Promise<void> {
-  await tenant.tx(async (tx) => {
-    if (erasureCuts !== undefined) {
-      await tx.erasure.mark(localpart, erasureCuts);
-    }
-    await tx.pushers.deleteForUser(localpart);
-    await tx.openid.clear(localpart);
-    await tx.refresh.deleteForUser(localpart);
-    await tx.tokens.deleteForUser(localpart);
-    await tx.devices.deleteForUser(localpart);
-    await tx.crossSigning.clear(
-      localpart,
-      '@' + localpart + ':' + tenant.serverName,
-    );
-    await tx.keyBackup.clear(localpart);
-    await tx.profiles.clear(localpart);
-    if (erasureCuts !== undefined) {
-      await tx.accountData.clear(localpart);
-      await tx.filters.clear(localpart);
-      await tx.pushRules.clear(localpart);
-      await tx.credentials.clear(localpart);
-    }
-    await tx.users.markDeactivated(localpart);
-  });
+  await tenant.tx((tx) =>
+    tx.users.deactivate(localpart, tenant.serverName, erasureCuts)
+  );
+}
+
+/** One cleanup owner for local deactivation and imported remove-wins status.
+ * Numeric erasure cuts remain local; they are never copied from another store. */
+export async function deactivateUserRows(
+  conn: Conn,
+  server: string,
+  localpart: string,
+  erasureCuts?: Record<string, ErasureCut>,
+  imported = false,
+): Promise<void> {
+  if (!imported) {
+    await recordDeactivation(conn, localpart, erasureCuts !== undefined);
+  }
+  if (erasureCuts !== undefined) await markErased(conn, localpart, erasureCuts);
+  await deletePushersOfUser(conn, localpart);
+  await clearOpenId(conn, localpart);
+  await deleteRefreshTokensOfUser(conn, localpart, !imported);
+  await deleteAccessTokensOfUser(conn, localpart, !imported);
+  await deleteDevicesOfUser(conn, localpart, !imported);
+  await clearSigningKeys(
+    conn,
+    localpart,
+    '@' + localpart + ':' + server,
+    config().federation.bulkmaxbytes,
+  );
+  await clearBackup(conn, localpart);
+  await clearProfileRows(conn, localpart);
+  if (erasureCuts !== undefined) {
+    await clearAccountData(conn, localpart);
+    await clearFilters(conn, localpart);
+    await clearPushRules(conn, localpart);
+  }
+  // A deactivated account never retains a usable verifier, even without erase.
+  await clearCredential(conn, localpart);
+  await markDeactivated(conn, localpart);
 }
 
 export async function isDeactivated(

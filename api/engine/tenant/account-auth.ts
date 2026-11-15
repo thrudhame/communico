@@ -9,11 +9,18 @@ import {
   clearCredential,
   credentialHash,
   credentialRevision,
+  deactivateUserRows,
   insertUser,
-  markDeactivated,
   setCredential,
   userByLocalpart,
 } from '#engine/tenant/users.ts';
+import {
+  type AuthorityFact,
+  captureSessionAuthority,
+  installSessionAuthority,
+  type SessionFact,
+} from '#engine/tenant/session-authority.ts';
+import type { ErasureCut } from '#engine/room/state.ts';
 
 export const ACCOUNT_AUTH_SQL = `
 CREATE TABLE account_auth_sources(localpart TEXT PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,material_hash TEXT NOT NULL,captured_ms INTEGER NOT NULL);
@@ -33,15 +40,17 @@ export type AccountAuth = {
   credentials: boolean;
   phc: string | null;
   deactivated: boolean;
+  authority: { facts: AuthorityFact[]; sessions: SessionFact[] };
 };
 
 function material(
-  view: Pick<AccountAuth, 'credentials' | 'phc' | 'deactivated'>,
+  view: Pick<AccountAuth, 'credentials' | 'phc' | 'deactivated' | 'authority'>,
 ) {
   return createHash('sha256').update(canonicalJson({
     credentials: view.credentials,
     phc: view.phc,
     deactivated: view.deactivated,
+    authority: view.authority,
   })).digest('hex');
 }
 
@@ -68,7 +77,12 @@ export async function captureAccountAuth(
   const phc = credentials && !user.deactivated
     ? await credentialHash(conn, localpart)
     : null;
-  const view = { credentials, phc, deactivated: user.deactivated };
+  const view = {
+    credentials,
+    phc,
+    deactivated: user.deactivated,
+    authority: await captureSessionAuthority(conn, localpart),
+  };
   const hash = createHash('sha256').update(canonicalJson({
     material: material(view),
     credentialRevision: await credentialRevision(conn, localpart),
@@ -100,6 +114,7 @@ export async function captureAccountAuth(
 export async function installAccountAuth(
   conn: Conn,
   view: AccountAuth,
+  erasureCuts?: Record<string, ErasureCut>,
 ): Promise<void> {
   const [old] = await conn.query(
     'SELECT * FROM account_auth_snapshots WHERE localpart=?',
@@ -130,7 +145,22 @@ export async function installAccountAuth(
     await insertUser(conn, view.localpart, view.localpart);
     user = await userByLocalpart(conn, view.localpart);
   }
-  if (view.deactivated) await markDeactivated(conn, view.localpart);
+  await installSessionAuthority(
+    conn,
+    view.localpart,
+    view.authority,
+    erasureCuts,
+  );
+  user = await userByLocalpart(conn, view.localpart);
+  if (view.deactivated) {
+    await deactivateUserRows(
+      conn,
+      view.server,
+      view.localpart,
+      undefined,
+      true,
+    );
+  }
   if (
     view.deactivated || user?.deactivated || !view.credentials ||
     view.phc === null

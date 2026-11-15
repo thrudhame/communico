@@ -204,9 +204,10 @@ export async function deleteDevice(
 export async function deleteDevicesOfUser(
   conn: Conn,
   localpart: string,
+  record = true,
 ): Promise<void> {
   for (const row of await devicesOfUser(conn, localpart)) {
-    await deleteDevice(conn, row.device_id, localpart);
+    await deleteDevice(conn, row.device_id, localpart, record);
   }
 }
 

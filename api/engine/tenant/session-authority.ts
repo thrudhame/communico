@@ -6,6 +6,9 @@ import type { Conn } from '#engine/store/db.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { deleteDevice } from '#engine/tenant/devices.ts';
 import { deletePushersForToken } from '#engine/tenant/pushers.ts';
+import { deactivateUserRows } from '#engine/tenant/users.ts';
+import type { ErasureCut } from '#engine/room/state.ts';
+import { authUnavailable } from '#engine/tenant/account-auth.ts';
 
 export const SESSION_AUTHORITY_SQL = `
 CREATE TABLE tenant_authority(singleton INTEGER PRIMARY KEY CHECK(singleton=1),node TEXT NOT NULL,incarnation TEXT NOT NULL,home_incarnation TEXT NOT NULL,edge_node TEXT NOT NULL,edge_incarnation TEXT NOT NULL);
@@ -28,9 +31,10 @@ export type AuthorityFact = {
   incarnation: string;
   seq: number;
   localpart: string;
-  kind: 'device' | 'delete' | 'revoke' | 'barrier';
+  kind: 'device' | 'delete' | 'revoke' | 'barrier' | 'deactivate';
   deviceId?: string;
   target?: string;
+  erase?: boolean;
 };
 export type SessionFact = {
   hash: string;
@@ -158,7 +162,7 @@ export async function accountBarriers(
 async function append(
   conn: Conn,
   localpart: string,
-  content: Pick<AuthorityFact, 'kind' | 'deviceId' | 'target'>,
+  content: Pick<AuthorityFact, 'kind' | 'deviceId' | 'target' | 'erase'>,
 ): Promise<AuthorityFact | null> {
   const identity = await tenantAuthority(conn);
   if (!identity) return null;
@@ -284,6 +288,23 @@ export async function recordLogoutBarrier(
   await append(conn, localpart, { kind: 'barrier' });
 }
 
+export async function recordDeactivation(
+  conn: Conn,
+  localpart: string,
+  erase: boolean,
+): Promise<void> {
+  const prior = await conn.query(
+    "SELECT payload FROM authority_facts WHERE localpart=? AND kind='deactivate'",
+    [localpart],
+  );
+  if (
+    !prior.length ||
+    (erase && !prior.some((row) => JSON.parse(String(row.payload)).erase))
+  ) {
+    await append(conn, localpart, { kind: 'deactivate', erase });
+  }
+}
+
 export async function recordSession(
   conn: Conn,
   hash: string,
@@ -365,6 +386,12 @@ export async function requireSessionAuthority(
   ) invalid();
   const observed = JSON.parse(String(session.barriers)) as string[];
   if (
+    (await conn.query(
+      "SELECT id FROM authority_facts WHERE localpart=? AND kind='deactivate'",
+      [session.localpart],
+    )).length
+  ) invalid();
+  if (
     (await accountBarriers(conn, String(session.localpart))).some((id) =>
       !observed.includes(id)
     )
@@ -429,6 +456,7 @@ export async function installSessionAuthority(
   conn: Conn,
   localpart: string,
   view: { facts: AuthorityFact[]; sessions: SessionFact[] },
+  erasureCuts?: Record<string, ErasureCut>,
 ): Promise<void> {
   const identity = await tenantAuthority(conn);
   if (!identity) ownerUnavailable();
@@ -474,7 +502,11 @@ export async function installSessionAuthority(
         expected = { ...common, kind: 'revoke', target: fact.target };
         break;
       case 'barrier':
-        expected = { ...common, kind: 'barrier' };
+        expected = { ...common, kind: fact.kind };
+        break;
+      case 'deactivate':
+        if (typeof fact.erase !== 'boolean') collision();
+        expected = { ...common, kind: 'deactivate', erase: fact.erase };
         break;
       default:
         collision();
@@ -633,6 +665,32 @@ export async function installSessionAuthority(
     if (winner?.id !== mapping.incarnation || deleted.length) {
       await deleteDevice(conn, String(mapping.device_id), localpart, false);
     }
+  }
+  if (
+    (await conn.query(
+      "SELECT id FROM authority_facts WHERE localpart=? AND kind='deactivate'",
+      [localpart],
+    )).length
+  ) {
+    const [tenant] = await conn.query('SELECT server_name FROM tenant');
+    const erase = (await conn.query(
+      "SELECT id FROM authority_facts WHERE localpart=? AND kind='deactivate' AND json_extract(payload,'$.erase')=1",
+      [localpart],
+    )).length > 0;
+    if (
+      erase && erasureCuts === undefined &&
+      !(await conn.query(
+        'SELECT localpart FROM erased_users WHERE localpart=?',
+        [localpart],
+      )).length
+    ) authUnavailable();
+    await deactivateUserRows(
+      conn,
+      String(tenant.server_name),
+      localpart,
+      erase ? erasureCuts : undefined,
+      true,
+    );
   }
   // Replica revocation must also cancel issuer-local push/refresh work. Keeping
   // only an HTTP gate would leave already registered workers authorized.
