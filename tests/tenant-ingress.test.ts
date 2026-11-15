@@ -81,8 +81,8 @@ Deno.test('ingress authority refuses candidate GET before closing the issuer ref
     );
     const hash = await hashToken(refresh);
     assertEquals(
-      (await f.tenant.tx((tx) => tx.refresh.byHash(hash)))?.next_token !== null,
-      true,
+      (await f.tenant.tx((tx) => tx.refresh.byHash(hash)))?.next_token,
+      await hashToken(next.refreshToken),
     );
   } finally {
     await f.close();

@@ -16,6 +16,9 @@ export async function applyReplicaScope(options: {
   after: number;
   cut: number;
   apply(): Promise<unknown>;
+  // A control revision may supersede an authenticated snapshot while its
+  // independent stream drains. Consume that source cut without enabling it.
+  ready?(conn: Conn): Promise<boolean>;
 }): Promise<boolean> {
   const { db, journal, stream, record, scope, after, cut } = options;
   const grant = await options.pairings.active();
@@ -66,9 +69,10 @@ export async function applyReplicaScope(options: {
     if (current.hash !== record.hash) {
       throw new LinkError('LINK_DIVERGED', 'replica application raced');
     }
+    const ready = options.ready ? await options.ready(conn) : true;
     const changed = await conn.execute(
-      'UPDATE facade_scopes SET source_cut=?,ready=1,pending_hash=NULL WHERE incarnation=? AND scope=? AND source_cut=? AND pending_hash=?',
-      [cut, context.id, scope, after, record.hash],
+      'UPDATE facade_scopes SET source_cut=?,ready=?,pending_hash=NULL WHERE incarnation=? AND scope=? AND source_cut=? AND pending_hash=?',
+      [cut, ready ? 1 : 0, context.id, scope, after, record.hash],
     );
     if (changed !== 1) {
       throw new LinkError(

@@ -6,6 +6,7 @@ import {
   matrixBase64,
 } from '#engine/signing-primitives.js';
 import type { Store } from '#engine/store/index.ts';
+import type { Conn } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import {
   type AccountAuth,
@@ -187,7 +188,7 @@ export class AccountSnapshots {
       view.server !== this.tenant.serverName ||
       view.server !== context.server || view.pairing !== context.id ||
       view.grantRevision !== grant.body.revision ||
-      view.ownerRevision !== owner.revision || owner.pairing !== view.pairing
+      owner.pairing !== view.pairing
     ) {
       throw new LinkError(
         'LINK_IDENTITY_MISMATCH',
@@ -211,6 +212,24 @@ export class AccountSnapshots {
         403,
       );
     }
+    // Control and auth streams progress independently. Only authenticated old
+    // snapshots can be retired; future snapshots wait for their control. Repeat
+    // in each owning transaction so an asynchronous control advance cannot
+    // install old credentials or publish obsolete readiness.
+    const current = async (conn: Conn) => {
+      const [activation] = await conn.query(
+        'SELECT revision FROM facade_owner_activation WHERE pairing=?',
+        [view.pairing],
+      );
+      if (!activation || Number(activation.revision) < view.ownerRevision) {
+        throw new LinkError(
+          'LINK_UNAVAILABLE',
+          'account auth awaits ownership control',
+          503,
+        );
+      }
+      return Number(activation.revision) === view.ownerRevision;
+    };
     return await applyReplicaScope({
       db: await this.store.server(),
       pairings: this.pairings,
@@ -221,15 +240,18 @@ export class AccountSnapshots {
       scope: 'auth:@' + view.localpart + ':' + view.server,
       after: integer(payload.after),
       cut: view.sourceCut,
+      ready: current,
       apply: async () => {
         const cuts = view.authority.facts.some((fact) =>
             fact.kind === 'deactivate' && fact.erase
           )
           ? await captureErasureCuts(this.store)
           : undefined;
-        await (await this.store.tenant(view.server)).tx((conn) =>
-          installAccountAuth(conn, view, cuts)
-        );
+        await (await this.store.tenant(view.server)).tx(async (conn) => {
+          if (await current(conn)) {
+            await installAccountAuth(conn, view, cuts);
+          }
+        });
         return {
           localpart: view.localpart,
           cut: view.sourceCut,
