@@ -32,7 +32,7 @@ import { fetchOrNull, type RemoteDeps } from '#engine/room/deps.ts';
 import { admitLocalJoin, projectAfterWrite } from '#engine/room/hooks.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
 import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
-import type { Room } from '#engine/room/index.ts';
+import type { Room, RoomTx } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { aclAllows, assertAcl } from '#engine/room/acl.ts';
 import { orderEvents } from '#engine/room/order.ts';
@@ -132,6 +132,29 @@ async function parentsSupplied(
     }
     return true;
   });
+}
+
+// A fallback is conditional on the batch's knowledge of its ungrounded prev
+// graph. Later inputs can discover corruption behind an earlier boundary. Walk
+// the shared final graph at reuse and locked admission, stopping only at genuine
+// persisted after-state, never at another cached fallback.
+async function invalidRecoveryAncestry(
+  tx: RoomTx,
+  ids: readonly string[],
+  acc: FetchAcc,
+): Promise<boolean> {
+  const pending = [...ids];
+  const seen = new Set<string>();
+  while (pending.length > 0) {
+    const id = pending.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if ((await tx.state.eventStateAfter(id)) !== null) continue;
+    if (acc.corrupted.has(id) || acc.terminal.has(id)) return true;
+    const pdu = acc.live.get(id)?.pdu ?? acc.evidence.get(id);
+    pending.push(...(pdu?.prev_events ?? await tx.events.prevsOf(id)));
+  }
+  return false;
 }
 
 // Collect the brief wait and ONE missing-events response per input, with the
@@ -274,7 +297,11 @@ async function recoverMissing(
     id: string,
     source: VerifiedItem['source'],
   ): Promise<Recovery> => {
-    if (acc.boundaries.has(id)) return 'ready';
+    if (acc.boundaries.has(id)) {
+      return await room.tx((tx) => invalidRecoveryAncestry(tx, [id], acc))
+        ? 'invalid'
+        : 'ready';
+    }
     if (acc.terminal.has(id) || acc.corrupted.has(id) || visiting.has(id)) {
       return 'invalid';
     }
@@ -420,6 +447,7 @@ async function fetchGapTip(
         roomId: room.id,
       });
       if (v.eventId === tip) {
+        acc.supplied.add(tip);
         tipPdu = v.pdu;
         if (supplied === undefined) {
           acc.live.set(tip, {
@@ -747,7 +775,11 @@ export async function ingestRemote(
           continue;
         }
         localRejected.delete(id);
-        const boundary = acc.boundaries.get(id);
+        const candidateBoundary = acc.boundaries.get(id);
+        const boundary = candidateBoundary !== undefined &&
+            !await invalidRecoveryAncestry(tx, [id], acc)
+          ? candidateBoundary
+          : undefined;
         const needsBoundary = boundary !== undefined &&
           (await ungroundedPrevs(tx, pdu.prev_events ?? [])).length > 0;
         const invalidBoundary = needsBoundary &&
