@@ -23,7 +23,7 @@ for (const mode of ['fresh', 'upgrade']) {
       };
       if (mode === 'upgrade') {
         const old = await openStore(settings, {
-          schemas: { server: historicalServerSchema(36) },
+          schemas: { server: historicalServerSchema(37) },
         });
         const db = await old.server();
         await db.execute(
