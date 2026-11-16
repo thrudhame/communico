@@ -1,4 +1,6 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import Olm from '@matrix-org/olm';
+import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import {
   AccountSnapshots,
@@ -189,6 +191,205 @@ function rehash(record: LinkRecord): LinkRecord {
   const { hash: _hash, ...body } = record;
   return { ...body, hash: recordHash(body) };
 }
+
+Deno.test('to-device crypto: owner-claimed fresh Olm key carries a Megolm session across cold home drain and back', async () => {
+  await Olm.init();
+  const alice = new Olm.Account(), bob = new Olm.Account();
+  const outbound = new Olm.Session(), inbound = new Olm.Session();
+  const group = new Olm.OutboundGroupSession();
+  let receiveGroup = new Olm.InboundGroupSession();
+  const f = await fixture();
+  let resumed: Store | undefined;
+  try {
+    alice.create();
+    bob.create();
+    bob.generate_one_time_keys(1);
+    const aliceKeys = JSON.parse(alice.identity_keys());
+    const bobKeys = JSON.parse(bob.identity_keys());
+    const oneTimeKeys = JSON.parse(bob.one_time_keys()).curve25519;
+    const lan = await deviceIdentity(f.ht, 'alice', 'LAN');
+    const phone = await deviceIdentity(f.et, 'alice', 'PHONE');
+    await f.ht.tx((tx) =>
+      tx.e2ee.upload(
+        lan,
+        validateUpload(
+          {
+            one_time_keys: Object.fromEntries(
+              Object.entries(oneTimeKeys).map((
+                [id, key],
+              ) => ['curve25519:' + id, key]),
+            ),
+          },
+          '@alice:logical.test',
+          'LAN',
+          config().e2ee,
+        ),
+      )
+    );
+    const claimed = await f.ht.tx((tx) =>
+      tx.e2ee.claim('alice', 'LAN', 'curve25519')
+    );
+    assert(claimed);
+    assertEquals(
+      await f.ht.tx((tx) => tx.e2ee.claim('alice', 'LAN', 'curve25519')),
+      null,
+    );
+    outbound.create_outbound(
+      alice,
+      bobKeys.curve25519,
+      String(Object.values(claimed)[0]),
+    );
+    bob.mark_keys_as_published();
+    group.create();
+    const roomId = '!fresh-crypto:logical.test';
+    const keyMessage = {
+      sender: '@alice:logical.test',
+      sender_device: 'PHONE',
+      keys: { ed25519: aliceKeys.ed25519 },
+      recipient: '@alice:logical.test',
+      recipient_keys: { ed25519: bobKeys.ed25519 },
+      type: 'm.room_key',
+      content: {
+        algorithm: 'm.megolm.v1.aes-sha2',
+        room_id: roomId,
+        session_id: group.session_id(),
+        session_key: group.session_key(),
+      },
+    };
+    const encrypted = {
+      algorithm: 'm.olm.v1.curve25519-aes-sha2',
+      sender_key: aliceKeys.curve25519,
+      ciphertext: {
+        [bobKeys.curve25519]: outbound.encrypt(JSON.stringify(keyMessage)),
+      },
+    };
+    await f.home.close();
+    await f.et.tx((tx) =>
+      tx.toDevice.send(
+        phone,
+        'logical.test',
+        'm.room.encrypted',
+        'fresh-session',
+        'fresh-session-source',
+        [{ user: '@alice:logical.test', id: 'LAN', content: encrypted }],
+        config().e2ee,
+        { enabled: true, maxBytes: 1048576 },
+      )
+    );
+    const records = await f.es.export('alice');
+    assert(records.length > 0);
+    assertEquals(
+      await (await f.edge.tenant('logical.test')).query(
+        'SELECT * FROM to_device_intents',
+      ),
+      [],
+    );
+    resumed = await f.open('home');
+    const ht = await openTenant(resumed, 'logical.test');
+    const hp = new Pairings(
+      await resumed.server(),
+      ht.signer(),
+      ht.publicB64,
+      'a'.repeat(64),
+    );
+    const journal = new Journal(await resumed.server(), LINK_SUPPORTED);
+    const owner = await coordinator(resumed, ht, hp);
+    for (const record of records) {
+      await journal.receive('edge_a', [record]);
+      await owner.apply(journal, record, f.bundle.id);
+    }
+    const page = await ht.tx((tx) =>
+      tx.toDevice.deliverSliding(lan, 'fresh-crypto', 100, config().e2ee)
+    );
+    assertEquals(page.events.length, 1);
+    assertEquals(page.events[0].type, 'm.room.encrypted');
+    const content = page.events[0].content as typeof encrypted;
+    assertEquals(content, encrypted);
+    const ciphertext = content.ciphertext[bobKeys.curve25519];
+    assertEquals(
+      ciphertext.type,
+      0,
+      'first message must establish a new Olm session',
+    );
+    inbound.create_inbound_from(bob, content.sender_key, ciphertext.body);
+    const decrypted = JSON.parse(
+      inbound.decrypt(ciphertext.type, ciphertext.body),
+    );
+    bob.remove_one_time_keys(inbound);
+    assert(
+      canonicalJson(decrypted) === canonicalJson(keyMessage),
+      'Olm plaintext must match the sent room key',
+    );
+    receiveGroup.create(decrypted.content.session_key);
+    assertEquals(receiveGroup.session_id(), group.session_id());
+    const clear = JSON.stringify({
+      room_id: roomId,
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'fresh-session plaintext' },
+    });
+    assertEquals(receiveGroup.decrypt(group.encrypt(clear)).plaintext, clear);
+    // Client restart restores client-owned state, not a pre-shared group key.
+    const pickleKey = crypto.randomUUID();
+    const pickle = receiveGroup.pickle(pickleKey);
+    receiveGroup.free();
+    receiveGroup = new Olm.InboundGroupSession();
+    receiveGroup.unpickle(pickleKey, pickle);
+    assertEquals(receiveGroup.decrypt(group.encrypt(clear)).plaintext, clear);
+    await ht.tx((tx) =>
+      tx.toDevice.acknowledgeSliding(lan, 'fresh-crypto', page.nextBatch)
+    );
+    const replyPlain = JSON.stringify({
+      type: 'm.key.verification.ready',
+      content: { transaction_id: 'fresh-verification' },
+    });
+    const reply = {
+      algorithm: 'm.olm.v1.curve25519-aes-sha2',
+      sender_key: bobKeys.curve25519,
+      ciphertext: { [aliceKeys.curve25519]: inbound.encrypt(replyPlain) },
+    };
+    await ht.tx((tx) =>
+      tx.toDevice.send(
+        lan,
+        'logical.test',
+        'm.room.encrypted',
+        'fresh-reply',
+        'fresh-reply-source',
+        [{ user: '@alice:logical.test', id: 'PHONE', content: reply }],
+        config().e2ee,
+        { enabled: true, maxBytes: 1048576 },
+      )
+    );
+    for (const record of await owner.export('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    const returned = await f.et.tx((tx) =>
+      tx.toDevice.deliverSliding(phone, 'reply-crypto', 100, config().e2ee)
+    );
+    assertEquals(returned.events.length, 1);
+    const returnedCipher = (returned.events[0].content as typeof reply)
+      .ciphertext[aliceKeys.curve25519];
+    assertEquals(
+      outbound.decrypt(returnedCipher.type, returnedCipher.body),
+      replyPlain,
+    );
+    assertEquals(
+      await (await resumed.tenant('logical.test')).query(
+        'SELECT * FROM to_device_inbox',
+      ),
+      [],
+    );
+  } finally {
+    await resumed?.close();
+    await f.close();
+    receiveGroup.free();
+    group.free();
+    inbound.free();
+    outbound.free();
+    bob.free();
+    alice.free();
+  }
+});
 
 Deno.test('to-device ingress: F2 delivers the local owner before success and freezes home work', async () => {
   const f = await fixture();
