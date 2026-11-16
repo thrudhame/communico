@@ -1,6 +1,5 @@
 // Join and replica bootstrap share the same evidence and state materialization
 // boundary. Call with a verified, authorized original event and the room lock.
-import { canonicalJson } from '#engine/canonical.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { ingestInTx } from './ingest.ts';
 import type { RoomTx } from './index.ts';
@@ -62,7 +61,7 @@ export async function stageSnapshotEvidence(
     const rule = verified.rejected.get(id) ?? null;
     await tx.events.insert(
       id,
-      canonicalJson(pdu as unknown as Record<string, unknown>),
+      pdu,
     );
     await tx.events.setStatus(id, {
       standing: rule === null ? 'accepted' : 'rejected',

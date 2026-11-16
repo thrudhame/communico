@@ -943,7 +943,7 @@ export async function ingestRemote(
             if (rejected) localRejected.add(id);
             await tx.events.insert(
               id,
-              canonicalJson(pdu as unknown as Record<string, unknown>),
+              pdu,
             );
             await tx.events.setStatus(id, {
               standing: rejected ? 'rejected' : 'accepted',

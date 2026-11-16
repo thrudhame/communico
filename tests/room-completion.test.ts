@@ -222,7 +222,7 @@ Deno.test('completion: supported v7 upgrade fixes one legacy baseline across reo
     apply: async (db: Parameters<typeof roomSchema.apply>[0]) => {
       await roomSchema.apply(db);
       await db.exec(
-        'DROP TABLE event_signatures; DROP TABLE completion_receipts; DROP TABLE completion_state;',
+        'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE completion_receipts; DROP TABLE completion_state;',
       );
     },
   };
@@ -295,7 +295,7 @@ Deno.test('completion: legacy retry keeps its original grounding witness after a
     );
     const db = await store.room(g.roomId);
     await db.exec(
-      'DROP TABLE event_signatures; DROP TABLE completion_receipts; DROP TABLE completion_state',
+      'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE completion_receipts; DROP TABLE completion_state',
     );
     await db.execute("UPDATE meta SET v='7' WHERE k='schema_version'");
     await store.close();
@@ -365,7 +365,7 @@ Deno.test('completion: old prepared submission uses its verified fixed upgrade w
     const baseline = await g.room.tx((tx) => tx.changes.head());
     const db = await store.room(g.roomId);
     await db.exec(
-      'DROP TABLE event_signatures; DROP TABLE completion_receipts; DROP TABLE completion_state',
+      'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE completion_receipts; DROP TABLE completion_state',
     );
     await db.execute("UPDATE meta SET v='7' WHERE k='schema_version'");
     await store.close();

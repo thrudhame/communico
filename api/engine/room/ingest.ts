@@ -62,7 +62,7 @@ import {
 } from '#engine/room/redaction.ts';
 import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import { mapEntries } from '#engine/room/state.ts';
-import { oversizedOf } from '#engine/room/verify.ts';
+import { copyEventReceipt, oversizedOf } from '#engine/room/verify.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
 import { assertAcl } from '#engine/room/acl.ts';
 import type { CompletionTarget } from '#engine/room/completion.ts';
@@ -371,7 +371,7 @@ export async function ingestInTx(
   }
   // unsigned is stripped on receipt — never stored (it is covered by
   // neither the signatures nor the content hash).
-  pdu = { ...pdu };
+  pdu = copyEventReceipt(pdu);
   delete pdu.unsigned;
   let expect: string;
   try {
@@ -629,7 +629,7 @@ export async function ingestInTx(
   if (existing === null) {
     await tx.events.insert(
       eventId,
-      canonicalJson(pdu as unknown as Record<string, unknown>),
+      pdu,
     );
   }
   await tx.events.setStatus(eventId, {
@@ -942,7 +942,7 @@ async function storePending(
     // still ungrounded on a redelivery — refresh the waiting set
     await tx.waits.removeOf(eventId);
   } else {
-    await tx.events.insert(eventId, canonical);
+    await tx.events.insert(eventId, pdu);
     await tx.changes.append('event', eventId, {
       standing: 'rejected',
       reason: null,

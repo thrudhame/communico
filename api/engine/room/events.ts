@@ -11,6 +11,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { eventMaterial, type SignatureEvidence } from './signatures.ts';
+import { contentHashMatches, wasHashRedacted } from './verify.ts';
 
 export type EventRow = {
   id: string;
@@ -62,9 +63,11 @@ function remember(cache: EdgeOverlay | undefined, id: string, pdu: string) {
 export async function insertEvent(
   conn: Conn,
   id: string,
-  pdu: string,
+  input: string | Pdu,
   cache?: EdgeOverlay,
 ): Promise<void> {
+  const hashRedacted = typeof input !== 'string' && wasHashRedacted(input);
+  const pdu = typeof input === 'string' ? input : canonicalJson(input);
   const parsed: Record<string, unknown> = JSON.parse(pdu);
   const { type, sender, depth, origin_server_ts: originTs } = parsed;
   if (
@@ -79,8 +82,8 @@ export async function insertEvent(
     throw new TypeError('event state_key must be a string when present');
   }
   await conn.execute(
-    'INSERT INTO events(id, pdu, type, state_key, sender, depth, origin_ts) VALUES(?,?,?,?,?,?,?)',
-    [id, pdu, type, stateKey, sender, depth, originTs],
+    'INSERT INTO events(id, pdu, type, state_key, sender, depth, origin_ts, hash_redacted) VALUES(?,?,?,?,?,?,?,?)',
+    [id, pdu, type, stateKey, sender, depth, originTs, hashRedacted ? 1 : 0],
   );
   const seenPrevs = new Set<string>();
   for (const [ord, prev] of edgeIds(parsed.prev_events).entries()) {
@@ -326,7 +329,16 @@ export async function mergeEventSignatures(
   const row = await rows.get(evidence.eventId);
   if (row === null) return false;
   const pdu = JSON.parse(row.pdu) as Pdu;
-  if (eventMaterial(pdu) !== evidence.material) {
+  const material = eventMaterial(pdu);
+  const [held] = await conn.query(
+    'SELECT e.hash_redacted, s.signatures FROM events e LEFT JOIN event_signatures s ON s.event=e.id WHERE e.id=?',
+    [row.id],
+  );
+  if (
+    material !== evidence.material &&
+    (material !== evidence.redactedMaterial || pdu.type === 'm.room.create' ||
+      (Number(held.hash_redacted) !== 1 && await contentHashMatches(pdu)))
+  ) {
     throw new MatrixError(
       400,
       'M_BAD_JSON',
@@ -336,11 +348,7 @@ export async function mergeEventSignatures(
   // The effective view contains immutable optional signatures which ordinary
   // admission may never have verified. Only this separate map can participate
   // in the deterministic choice between verified candidates.
-  const [held] = await conn.query(
-    'SELECT signatures FROM event_signatures WHERE event=?',
-    [row.id],
-  );
-  const overlay: Pdu['signatures'] = held
+  const overlay: Pdu['signatures'] = held.signatures !== null
     ? JSON.parse(String(held.signatures))
     : {};
   let learned = false;

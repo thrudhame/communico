@@ -157,17 +157,21 @@ UPDATE waits SET state='ready' WHERE
   (kind='prev' AND EXISTS(SELECT 1 FROM event_status WHERE event=waits.missing AND grounding='grounded'));
 `;
 
+const HASH_REDACTION_SQL =
+  'ALTER TABLE events ADD COLUMN hash_redacted INTEGER NOT NULL DEFAULT 0';
+
 export const roomSchema: SchemaProvider = {
-  version: 9,
+  version: 10,
   apply: async (db) => {
     await db.exec(
       ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL +
         ANNOTATION_INDEX_SQL + REMOTE_BATCHES_SQL + WAIT_READY_SQL +
-        EVENT_SIGNATURES_SQL,
+        EVENT_SIGNATURES_SQL + HASH_REDACTION_SQL,
     );
     await db.tx(initializeCompletion, { mode: 'deferred' });
   },
   migrations: {
+    9: (conn) => conn.exec(HASH_REDACTION_SQL),
     8: (conn) => conn.exec(EVENT_SIGNATURES_SQL),
     7: initializeCompletion,
     6: (conn) => conn.exec(WAIT_READY_SQL),

@@ -1,12 +1,13 @@
 // Verified signature evidence is prepared outside room locks. Immutable full
 // material is captured before hash-mismatch redaction can discard content.
-import { canonicalJson } from '#engine/canonical.ts';
+import { redact } from '#engine/eventid.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { b64encodeStd, matrixBase64 } from '#engine/signing-primitives.js';
 import { getRulebook } from '#engine/rulebook/index.ts';
-import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import type { KeyResolver } from './deps.ts';
-import { verify } from './verify.ts';
+import { eventMaterial, verify } from './verify.ts';
+export { eventMaterial } from './verify.ts';
 
 export const EVENT_SIGNATURES_SQL = `
 CREATE TABLE event_signatures(
@@ -15,17 +16,12 @@ CREATE TABLE event_signatures(
 );
 `;
 
-export function eventMaterial(pdu: Pdu): string {
-  const { signatures: _s, unsigned: _u, ...material } = pdu;
-  void _s, _u;
-  return canonicalJson(material);
-}
-
 const verifiedEvidence: unique symbol = Symbol('verified event signatures');
 export type SignatureEvidence = {
   readonly [verifiedEvidence]: true;
   readonly eventId: string;
   readonly material: string;
+  readonly redactedMaterial: string;
   readonly signatures: Readonly<
     Record<string, Readonly<Record<string, string>>>
   >;
@@ -46,8 +42,16 @@ export async function prepareEventSignatures(
     const accepted: Record<string, string> = {};
     for (const [keyId, signature] of Object.entries(entries)) {
       options.signal?.throwIfAborted();
-      if (
-        !await keys.verifyEventSignature({
+      let normalized: string;
+      try {
+        normalized = b64encodeStd(matrixBase64(signature, 64));
+      } catch {
+        // Ordinary admission permits invalid optional evidence. It must not
+        // prevent replication, or become a verified overlay candidate.
+        continue;
+      }
+      try {
+        const valid = await keys.verifyEventSignature({
           server,
           keyId,
           pdu: verified.pdu,
@@ -56,21 +60,28 @@ export async function prepareEventSignatures(
             ? Number(verified.pdu.origin_server_ts)
             : 0,
           signal: options.signal,
-        })
-      ) {
-        throw new UpstreamError('validation', {
-          phase: 'event',
-          reason: 'M_UNAUTHORIZED: additional PDU signature invalid',
         });
+        options.signal?.throwIfAborted();
+        if (!valid) continue;
+      } catch (error) {
+        options.signal?.throwIfAborted();
+        if (!recoverableUpstream(error)) throw error;
+        continue;
       }
-      accepted[keyId] = b64encodeStd(matrixBase64(signature, 64));
+      accepted[keyId] = normalized;
     }
-    signatures[server] = Object.freeze(accepted);
+    if (Object.keys(accepted).length) {
+      signatures[server] = Object.freeze(accepted);
+    }
   }
   const evidence: SignatureEvidence = Object.freeze({
     [verifiedEvidence]: true as const,
     eventId: verified.eventId,
     material,
+    redactedMaterial: eventMaterial(redact(
+      verified.pdu as unknown as Record<string, unknown>,
+      roomVersion,
+    ) as unknown as Pdu),
     signatures: Object.freeze(signatures),
   });
   return { ...verified, evidence };

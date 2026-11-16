@@ -71,7 +71,10 @@ function bind(
         remoteBatches.saveRemoteBatch(conn, operationId, inputHash, outcomes),
     },
     events: {
-      insert: async (id: string, pdu: string) => {
+      insert: async (
+        id: string,
+        pdu: string | import('#engine/pdu.ts').Pdu,
+      ) => {
         await events.insertEvent(conn, id, pdu, edges);
         await waits.readyFor(conn, id);
       },

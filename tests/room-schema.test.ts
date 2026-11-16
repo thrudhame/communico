@@ -61,7 +61,9 @@ Deno.test('room schema: v8 signature overlay upgrade preserves base events and m
         version: 8,
         apply: async (db) => {
           await roomSchema.apply(db);
-          await db.exec('DROP TABLE event_signatures');
+          await db.exec(
+            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted',
+          );
         },
       },
     },
@@ -87,6 +89,9 @@ Deno.test('room schema: v8 signature overlay upgrade preserves base events and m
       pdu: '{}',
     }]);
     assertEquals(await upgraded.query('SELECT * FROM event_signatures'), []);
+    assertEquals(await upgraded.query('SELECT hash_redacted FROM events'), [{
+      hash_redacted: 0,
+    }]);
     assertEquals(
       await upgraded.query('SELECT * FROM completion_state'),
       completion,
@@ -95,6 +100,42 @@ Deno.test('room schema: v8 signature overlay upgrade preserves base events and m
       event: '$old',
       through: 0,
       basis: 'accepted',
+    }]);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('room schema: v9 receipt provenance upgrade preserves immutable events and signature overlays', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: {
+      room: {
+        version: 9,
+        apply: async (db) => {
+          await roomSchema.apply(db);
+          await db.exec('ALTER TABLE events DROP COLUMN hash_redacted');
+        },
+      },
+    },
+  });
+  try {
+    const old = await store.room('!receipt:test', { create: true });
+    await old.execute(
+      "INSERT INTO events(id,pdu,type,sender,depth,origin_ts) VALUES('$old','{}','test','@a:test',1,1)",
+    );
+    await old.execute("INSERT INTO event_signatures VALUES('$old','{}')");
+    await store.close();
+    store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    const upgraded = await store.room('!receipt:test');
+    assertEquals(
+      await upgraded.query('SELECT id,pdu,hash_redacted FROM events'),
+      [{ id: '$old', pdu: '{}', hash_redacted: 0 }],
+    );
+    assertEquals(await upgraded.query('SELECT * FROM event_signatures'), [{
+      event: '$old',
+      signatures: '{}',
     }]);
   } finally {
     await store.close();
@@ -169,7 +210,7 @@ Deno.test('room schema: v3 upgrade preserves old data and starts the future publ
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE event_signatures; DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
+            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
           );
         },
       },
@@ -205,7 +246,7 @@ Deno.test('room schema: v4 annotation index upgrade preserves events and uses ta
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE event_signatures; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
+            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
           );
         },
       },
@@ -262,7 +303,7 @@ Deno.test('room schema: v5 adds durable remote batch receipts without changing e
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE event_signatures; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
+            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
           );
         },
       },
@@ -298,7 +339,7 @@ Deno.test('room schema: v6 admits eligible retained dependencies into the indexe
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE event_signatures; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
+            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
           );
         },
       },

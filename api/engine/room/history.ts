@@ -14,7 +14,6 @@
 // evidence promoted and first-owner positions prepended (R8 — old
 // cursors never renumber). The gap is COMPLETE when the page's boundary
 // events' prevs are all grounded (the create is such an event).
-import { canonicalJson } from '#engine/canonical.ts';
 import { aclAllows } from '#engine/room/acl.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import {
@@ -535,7 +534,7 @@ export async function backfill(
             if (!chain.ok) localRejected.add(id);
             await tx.events.insert(
               id,
-              canonicalJson(pdu as unknown as Record<string, unknown>),
+              pdu,
             );
             await tx.events.setStatus(id, {
               standing: chain.ok ? 'accepted' : 'rejected',
@@ -588,7 +587,7 @@ export async function backfill(
             if (existing === null) {
               await tx.events.insert(
                 item.eventId,
-                canonicalJson(item.pdu as unknown as Record<string, unknown>),
+                item.pdu,
               );
             }
             await tx.events.setStatus(item.eventId, {
@@ -663,7 +662,7 @@ export async function backfill(
           if (existing === null) {
             await tx.events.insert(
               item.eventId,
-              canonicalJson(item.pdu as unknown as Record<string, unknown>),
+              item.pdu,
             );
           }
           const status = await tx.events.getStatus(item.eventId);

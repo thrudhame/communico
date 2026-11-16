@@ -76,6 +76,7 @@ import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { setRoomHooks } from '#engine/room/hooks.ts';
 import { importReplicaGenesis } from '#engine/room/replica.ts';
 import { importReplicaRoom } from '#engine/room/replica-import.ts';
+import { contentHashMatches } from '#engine/room/verify.ts';
 import { stageSnapshotEvidence } from '#engine/room/snapshot-install.ts';
 import { verifySnapshot } from '#engine/room/snapshot.ts';
 import { exportReplicaRoom } from '#engine/room/replica-export.ts';
@@ -262,6 +263,237 @@ async function fixture(seedServer = serverSchema, version = '11') {
     },
   };
 }
+
+Deno.test('replica signature evidence replays hash-redacted non-create events without duplicate news', async () => {
+  const f = await fixture();
+  try {
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'original retained content' },
+    });
+    await f.ingest([structuredClone(message)]);
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    const target = manifest.events.find((pdu) =>
+      pdu.event_id === message.event_id
+    )!;
+    target.content = { msgtype: 'm.text', body: 'hash mismatched in transit' };
+    const apply = () =>
+      importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing),
+        signatureUnion: true,
+      });
+    await apply();
+    const replica = await f.replica();
+    const before = await replica.tx(async (tx) => ({
+      row: await tx.events.get(String(message.event_id)),
+      head: await tx.changes.head(),
+      position: await tx.segments.positionOf(String(message.event_id)),
+    }));
+    assertEquals(JSON.parse(before.row!.pdu).content, {});
+    assert(before.position);
+    await f.reopen();
+    await apply();
+    const after = await (await f.replica()).tx(async (tx) => ({
+      row: await tx.events.get(String(message.event_id)),
+      head: await tx.changes.head(),
+      position: await tx.segments.positionOf(String(message.event_id)),
+    }));
+    assertEquals(after, before);
+    // A peer may retain the authentic full form while this replica retained
+    // hash-redacted bytes. Its signatures can be learned without rewriting us.
+    target.content = structuredClone(message.content);
+    await apply();
+    assertEquals(
+      await (await f.replica()).tx((tx) =>
+        tx.events.get(String(message.event_id))
+      ),
+      before.row,
+    );
+    assertEquals(
+      await (await f.replica()).tx((tx) => tx.changes.head()),
+      before.head,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature replay retains provenance when redaction restores the advertised content hash', async () => {
+  const f = await fixture();
+  try {
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: {},
+    });
+    await f.ingest([structuredClone(message)]);
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    manifest.events.find((pdu) => pdu.event_id === message.event_id)!.content =
+      {
+        injected: true,
+      };
+    const apply = () =>
+      importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing),
+        signatureUnion: true,
+      });
+    await apply();
+    const replica = await f.replica();
+    const before = await replica.tx(async (tx) => ({
+      row: await tx.events.get(String(message.event_id)),
+      head: await tx.changes.head(),
+      position: await tx.segments.positionOf(String(message.event_id)),
+    }));
+    assertEquals(JSON.parse(before.row!.pdu).content, {});
+    assertEquals(await contentHashMatches(JSON.parse(before.row!.pdu)), true);
+    assertEquals(
+      await (await f.edgeStore().room(replica.id)).query(
+        'SELECT hash_redacted FROM events WHERE id=?',
+        [String(message.event_id)],
+      ),
+      [{ hash_redacted: 1 }],
+    );
+    await f.reopen();
+    await apply();
+    assertEquals(
+      await (await f.replica()).tx(async (tx) => ({
+        row: await tx.events.get(String(message.event_id)),
+        head: await tx.changes.head(),
+        position: await tx.segments.positionOf(String(message.event_id)),
+      })),
+      before,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature evidence omits invalid optional entries admitted by ordinary ingress', async () => {
+  const f = await fixture();
+  try {
+    const witness = await makeRemoteServer('optional.test');
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'required sender is valid' },
+    });
+    message.signatures![witness.name] = { [witness.keyId]: 'A'.repeat(86) };
+    await f.ingest([structuredClone(message)]);
+    const retained = await f.room.tx((tx) =>
+      tx.events.get(String(message.event_id))
+    );
+    assert(retained);
+    assertEquals(
+      JSON.parse(retained.pdu).signatures[witness.name],
+      message.signatures![witness.name],
+    );
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    await importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+      self: f.tenant.serverName,
+      keys: fakeKeyResolver(f.signing, witness),
+      signatureUnion: true,
+    });
+    const replica = await f.replica();
+    assertEquals(
+      (await replica.tx((tx) => tx.events.getStatus(String(message.event_id))))
+        ?.grounding,
+      'grounded',
+    );
+    assertEquals(
+      await (await f.edgeStore().room(replica.id)).query(
+        'SELECT * FROM event_signatures WHERE event=?',
+        [String(message.event_id)],
+      ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature receipt provenance is owned by ordinary live and snapshot admission too', async () => {
+  const f = await fixture();
+  try {
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: {},
+    });
+    const incoming = structuredClone(message);
+    incoming.content = { injected: true };
+    await f.ingest([incoming]);
+    assertEquals(
+      await (await f.home.room(f.room.id)).query(
+        'SELECT hash_redacted FROM events WHERE id=?',
+        [String(message.event_id)],
+      ),
+      [{ hash_redacted: 1 }],
+    );
+    const topic = await f.source.addEvent({
+      type: 'm.room.topic',
+      state_key: '',
+      content: {},
+    });
+    const rawTopic = structuredClone(topic);
+    rawTopic.content = { injected: true };
+    const create = [...f.source.events.values()].find((pdu) =>
+      pdu.type === 'm.room.create'
+    )!;
+    const verified = await verifySnapshot({
+      roomId: f.room.id,
+      roomVersion: '11',
+      resident: f.signing.name,
+      self: f.signing.name,
+      keys: fakeKeyResolver(f.signing),
+      state: [structuredClone(create), rawTopic],
+      authChain: [...f.source.events.values()].map((pdu) =>
+        structuredClone(pdu)
+      ),
+    });
+    await f.room.tx((tx) =>
+      stageSnapshotEvidence(tx, verified, '$not-in-snapshot')
+    );
+    assertEquals(
+      await (await f.home.room(f.room.id)).query(
+        'SELECT hash_redacted FROM events WHERE id=?',
+        [String(topic.event_id)],
+      ),
+      [{ hash_redacted: 1 }],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature evidence preserves full material for hash-valid already-redacted-shaped events', async () => {
+  const f = await fixture();
+  try {
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: {},
+    });
+    await f.ingest([structuredClone(message)]);
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    const apply = () =>
+      importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing),
+        signatureUnion: true,
+      });
+    await apply();
+    const replica = await f.replica();
+    const before = await replica.tx((tx) => tx.changes.head());
+    manifest.after = manifest.cut;
+    manifest.steps = [];
+    manifest.events.find((pdu) => pdu.event_id === message.event_id)!.content =
+      {
+        injected: true,
+      };
+    await assertRejects(apply, MatrixError, 'replica changes a retained event');
+    assertEquals(await replica.tx((tx) => tx.changes.head()), before);
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('replica signature-only packs authenticate the actual room version before any overlay commit', async () => {
   const f = await fixture(serverSchema, '5');
@@ -508,10 +740,19 @@ Deno.test('replica signature-only packs union verified signatures without changi
         [witness.keyId]: signature,
       },
     );
-    // A valid sender signature is not proof of an optional signature or of
-    // unchanged full event material (content-hash redaction must not hide it).
+    // Invalid optional evidence is omitted, never a reason to reject the pack
+    // or replace the verified witness. Full material remains immutable.
     target.signatures![witness.name][witness.keyId] = 'A'.repeat(86);
-    await assertRejects(apply);
+    await apply();
+    assertEquals(
+      JSON.parse((await (await f.replica()).tx((tx) => tx.events.get(id)))!.pdu)
+        .signatures[witness.name],
+      { [witness.keyId]: signature },
+    );
+    assertEquals(
+      await (await f.replica()).tx((tx) => tx.changes.head()),
+      head + 1,
+    );
     target.signatures![witness.name][witness.keyId] = signature;
     target.content = { ...target.content, injected: true };
     await assertRejects(apply);
