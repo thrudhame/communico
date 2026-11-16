@@ -30,6 +30,8 @@ const TABLES = [
   'waits',
   'changes',
   'remote_batches',
+  'completion_state',
+  'completion_receipts',
 ];
 
 const INDEXES = [
@@ -48,14 +50,15 @@ const INDEXES = [
   'changes_redaction_target',
   'publications_change',
   'segments_opener',
+  'completion_receipts_through',
 ];
 
-Deno.test('room schema: v7 signature overlay upgrade preserves base events and matches fresh creation', async () => {
+Deno.test('room schema: v8 signature overlay upgrade preserves base events and matches fresh creation', async () => {
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
     schemas: {
       room: {
-        version: 7,
+        version: 8,
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec('DROP TABLE event_signatures');
@@ -68,6 +71,10 @@ Deno.test('room schema: v7 signature overlay upgrade preserves base events and m
     await old.execute(
       "INSERT INTO events(id,pdu,type,sender,depth,origin_ts) VALUES('$old','{}','test','@a:test',1,1)",
     );
+    await old.execute(
+      "INSERT INTO completion_receipts VALUES('$old',0,'accepted')",
+    );
+    const completion = await old.query('SELECT * FROM completion_state');
     await store.close();
     store = await openStore(config(dir), { schemas: { room: roomSchema } });
     const upgraded = await store.room('!old:test');
@@ -80,6 +87,15 @@ Deno.test('room schema: v7 signature overlay upgrade preserves base events and m
       pdu: '{}',
     }]);
     assertEquals(await upgraded.query('SELECT * FROM event_signatures'), []);
+    assertEquals(
+      await upgraded.query('SELECT * FROM completion_state'),
+      completion,
+    );
+    assertEquals(await upgraded.query('SELECT * FROM completion_receipts'), [{
+      event: '$old',
+      through: 0,
+      basis: 'accepted',
+    }]);
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
@@ -153,7 +169,7 @@ Deno.test('room schema: v3 upgrade preserves old data and starts the future publ
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE event_signatures; DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
+            'DROP TABLE event_signatures; DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
           );
         },
       },
@@ -189,7 +205,7 @@ Deno.test('room schema: v4 annotation index upgrade preserves events and uses ta
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE event_signatures; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
+            'DROP TABLE event_signatures; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
           );
         },
       },
@@ -246,7 +262,7 @@ Deno.test('room schema: v5 adds durable remote batch receipts without changing e
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE event_signatures; DROP TABLE remote_batches; DROP INDEX waits_ready',
+            'DROP TABLE event_signatures; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
           );
         },
       },
@@ -281,7 +297,9 @@ Deno.test('room schema: v6 admits eligible retained dependencies into the indexe
         version: 6,
         apply: async (db) => {
           await roomSchema.apply(db);
-          await db.exec('DROP TABLE event_signatures; DROP INDEX waits_ready');
+          await db.exec(
+            'DROP TABLE event_signatures; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
+          );
         },
       },
     },

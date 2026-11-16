@@ -13,6 +13,10 @@
 // the feed, live relation listings and search. Accepted historical relation
 // edges remain available to the shared classifier without publishing news.
 import type { Change } from '#engine/room/changes.ts';
+import type {
+  CompletionCut,
+  CompletionTarget,
+} from '#engine/room/completion.ts';
 import { openRoom, type Room, type RoomTx } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Conn } from '#engine/store/db.ts';
@@ -65,10 +69,11 @@ const roomQueues = new WeakMap<Store, Map<string, Promise<void>>>();
 // owns its audience and completion, but never retains the publication lock
 // while awaiting observers. One listener cannot suppress another's wake.
 const projectedListeners:
-  ((store: Store, roomId: string) => void | Promise<void>)[] = [];
+  ((store: Store, roomId: string, through: number) => void | Promise<void>)[] =
+    [];
 
 export function onProjected(
-  fn: (store: Store, roomId: string) => void | Promise<void>,
+  fn: (store: Store, roomId: string, through: number) => void | Promise<void>,
 ): () => void {
   projectedListeners.push(fn);
   return () => {
@@ -84,6 +89,29 @@ export function project(store: Store, roomId: string): Promise<void> {
     const room = await openRoom(store, roomId);
     return { room, head: await room.tx((tx) => tx.changes.head()) };
   })();
+  return enqueueProjection(store, roomId, admitted);
+}
+
+/** Complete one immutable durable receipt, never recapturing today's head. */
+export function projectThrough(
+  store: Store,
+  target: CompletionCut | CompletionTarget,
+): Promise<void> {
+  const admitted = (async () => {
+    const room = await openRoom(store, target.roomId);
+    await room.tx((tx) => tx.completion.validate(target));
+    return { room, head: target.through, target };
+  })();
+  return enqueueProjection(store, target.roomId, admitted);
+}
+
+function enqueueProjection(
+  store: Store,
+  roomId: string,
+  admitted: Promise<
+    { room: Room; head: number; target?: CompletionCut | CompletionTarget }
+  >,
+): Promise<void> {
   // A failed admission can settle while its predecessor still owns the queue.
   // The queued result below retains the rejection for the actual caller.
   void admitted.catch(() => {});
@@ -93,8 +121,8 @@ export function project(store: Store, roomId: string): Promise<void> {
   // concurrently. A failed page releases its owner for the next roll-forward.
   const run = (rooms.get(roomId) ?? Promise.resolve()).catch(() => {}).then(
     async () => {
-      const { room, head } = await admitted;
-      await projectRoom(store, roomId, room, head);
+      const { room, head, target } = await admitted;
+      await projectRoom(store, roomId, room, head, target);
     },
   );
   rooms.set(roomId, run);
@@ -110,6 +138,7 @@ async function projectRoom(
   roomId: string,
   room: Room,
   head: number,
+  target?: CompletionCut | CompletionTarget,
 ): Promise<void> {
   const server = await store.server();
   capture: for (;;) {
@@ -140,7 +169,10 @@ async function projectRoom(
     const current = async () => {
       // This logical handle fences retirement and the storage incarnation.
       // A drop/recreate cannot publish an earlier incarnation's captured page.
-      await room.tx((tx) => tx.changes.head());
+      await room.tx(async (tx) => {
+        if (target !== undefined) await tx.completion.validate(target);
+        return await tx.changes.head();
+      });
       return await get(server, sourceOf(roomId)) === mark &&
         await get(server, roomSource('push-context', roomId)) === contextMark &&
         await get(server, roomSource('receipt-graph', roomId)) === receiptMark;
@@ -242,13 +274,29 @@ async function projectRoom(
       if (outcome.kind === 'complete') {
         // Preserve acknowledged observer work (including rule migration) and
         // same-room ordering without blocking independent publication writers.
+        const failures: unknown[] = [];
         await Promise.all(outcome.listeners.map(async (fn) => {
           try {
-            await fn(store, roomId);
+            await fn(store, roomId, head);
           } catch (error) {
-            console.error(`projection listener failed for ${roomId}:`, error);
+            failures.push(error);
+            if (target === undefined) {
+              console.error(`projection listener failed for ${roomId}:`, error);
+            }
           }
         }));
+        if (target !== undefined) {
+          if (failures.length) {
+            throw new AggregateError(
+              failures,
+              `E_COMPLETION_CALLBACK: ${roomId}/${head}`,
+            );
+          }
+          await room.tx(async (tx) => {
+            await tx.completion.validate(target);
+            await tx.completion.complete(target.generation, target.through);
+          });
+        }
         return;
       }
       index = outcome.end;
