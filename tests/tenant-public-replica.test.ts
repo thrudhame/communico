@@ -159,6 +159,49 @@ Deno.test('a later public replica cannot resurrect local deactivation, erasure o
   }
 });
 
+Deno.test('later public erasure reaches a deactivated replica without advancing its first erasure boundary', async () => {
+  const f = await fixture();
+  try {
+    const active = await f.export();
+    await f.install(active);
+    await deactivateUser(f.edge(), 'alice');
+    const first = {
+      '!room:logical.test': { changePos: 4, segment: 1, group: 2 },
+    };
+    const terminal = {
+      ...active,
+      cut: active.cut + 1,
+      deactivated: true,
+      erased: first,
+    };
+    await f.install(terminal);
+    assertEquals(
+      await f.edge().tx((tx) => tx.erasure.get('alice', '!room:logical.test')),
+      first['!room:logical.test'],
+    );
+    await f.install({
+      ...terminal,
+      cut: terminal.cut + 1,
+      erased: {
+        '!room:logical.test': { changePos: 9, segment: 2, group: 3 },
+      },
+    });
+    await f.install({ ...active, cut: terminal.cut + 2 });
+    await f.reopen();
+    assertEquals(
+      await f.edge().tx((tx) => tx.erasure.get('alice', '!room:logical.test')),
+      first['!room:logical.test'],
+    );
+    assertEquals(await f.edge().tx((tx) => tx.profiles.get('alice')), {});
+    assertEquals(
+      (await f.edge().tx((tx) => tx.users.byLocalpart('alice')))?.deactivated,
+      true,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('incoming deactivated public snapshots clear profile material for absent and active accounts while retaining source evidence', async () => {
   for (const existing of [false, true]) {
     const f = await fixture();

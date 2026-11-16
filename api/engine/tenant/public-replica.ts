@@ -210,21 +210,28 @@ export async function installPublicUser(
       changedColumns('public_user_replicas', 'source_cut', 'snapshot_json'),
     [localpart, view.cut, encoded],
   );
-  // Retain and acknowledge the authenticated source record while refusing its
-  // obsolete materialization. In particular, never delete a local erasure cut.
-  if (user?.deactivated === 1) return;
-  await replaceProfileRows(
-    conn,
-    localpart,
-    view.deactivated ? {} : view.profile,
-  );
+  // Terminal status fences profile restoration, not later privacy facts.
+  // Like markErased, a terminal account retains its first erasure boundary.
+  const terminal = user?.deactivated === 1;
+  if (!terminal) {
+    await replaceProfileRows(
+      conn,
+      localpart,
+      view.deactivated ? {} : view.profile,
+    );
+  }
   if (view.erased !== null) {
     await conn.execute(
-      'INSERT INTO erased_users(localpart,room_cuts) VALUES(?,?) ON CONFLICT(localpart) DO UPDATE SET room_cuts=excluded.room_cuts WHERE ' +
-        changedColumns('erased_users', 'room_cuts'),
+      'INSERT INTO erased_users(localpart,room_cuts) VALUES(?,?) ON CONFLICT(localpart) ' +
+        (terminal
+          ? 'DO NOTHING'
+          : 'DO UPDATE SET room_cuts=excluded.room_cuts WHERE ' +
+            changedColumns('erased_users', 'room_cuts')),
       [localpart, canonicalJson(view.erased)],
     );
-  } else {await conn.execute('DELETE FROM erased_users WHERE localpart=?', [
+  } else if (!terminal) {
+    await conn.execute('DELETE FROM erased_users WHERE localpart=?', [
       localpart,
-    ]);}
+    ]);
+  }
 }
