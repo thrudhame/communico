@@ -109,6 +109,16 @@ export async function auditServer(
     }
     for (const room of rooms.values()) {
       await snapshot.read(room, async (source) => {
+        const [state] = await source.query(
+          'SELECT completed_through FROM completion_state',
+        );
+        const [mark] = await db.query(
+          'SELECT position FROM watermarks WHERE source=?',
+          ['room:' + room.id],
+        );
+        if (Number(state.completed_through) > Number(mark?.position ?? 0)) {
+          auditFailure('completion progress past publication');
+        }
         // Server projections may lag room truth, but may never name absent
         // source events/change positions.
         for (const table of ['event_index', 'feed', 'outbox']) {

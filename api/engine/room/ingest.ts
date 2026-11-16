@@ -65,6 +65,7 @@ import { mapEntries } from '#engine/room/state.ts';
 import { oversizedOf } from '#engine/room/verify.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
 import { assertAcl } from '#engine/room/acl.ts';
+import type { CompletionTarget } from '#engine/room/completion.ts';
 
 export type Standing = 'accepted' | 'rejected' | 'soft_failed';
 
@@ -81,6 +82,7 @@ export type IngestLocalResult = {
   // room already held grounded (no second write).
   receipt: boolean;
   event: EventRow;
+  completion?: CompletionTarget;
 };
 
 // The remote shape of an ingest (3c-1): the delivering server, our own
@@ -177,6 +179,7 @@ export type LocalSubmission = {
 async function submissionReceipt(
   tx: RoomTx,
   eventId: string,
+  prepared: Pdu | null,
 ): Promise<IngestLocalResult | null> {
   const event = await tx.events.get(eventId);
   if (event === null) return null;
@@ -184,8 +187,17 @@ async function submissionReceipt(
   if (status === null || status.grounding !== 'grounded') {
     throw new Error('E_SUBMISSION_STATUS: ' + eventId);
   }
+  if (
+    prepared !== null &&
+    event.pdu !== canonicalJson(prepared as unknown as Record<string, unknown>)
+  ) {
+    throw new Error('E_SUBMISSION_PDU_MISMATCH: ' + eventId);
+  }
+  const completion = await tx.completion.receipt(eventId) ??
+    await tx.completion.reconcileLegacy(eventId);
   return {
     eventId,
+    completion,
     event,
     standing: status.standing,
     grounding: status.grounding,
@@ -236,7 +248,11 @@ async function submitLocal(
       prepared = await submission.prepare(built);
     }
     const result = await room.tx(async (tx) => {
-      const receipt = await submissionReceipt(tx, prepared.eventId);
+      const receipt = await submissionReceipt(
+        tx,
+        prepared.eventId,
+        prepared.pdu,
+      );
       if (receipt !== null) return receipt;
       if (prepared.pdu === null) {
         throw new Error('E_SUBMISSION_EVENT_MISSING: ' + prepared.eventId);
@@ -392,8 +408,13 @@ export async function ingestInTx(
       redelivery = { standing: status.standing, grounding: status.grounding };
       pdu = JSON.parse(existing.pdu) as Pdu;
     } else {
+      const completion = remote === null
+        ? await tx.completion.receipt(eventId) ??
+          await tx.completion.reconcileLegacy(eventId)
+        : undefined;
       return {
         eventId,
+        completion,
         standing: status.standing,
         reason: null,
         rule: null,
@@ -847,8 +868,12 @@ export async function ingestInTx(
 
   const stored = await tx.events.get(eventId);
   if (stored === null) throw new Error('E_STORE: ' + eventId);
+  const completion = remote === null
+    ? await tx.completion.record(eventId)
+    : undefined;
   return {
     eventId,
+    completion,
     standing,
     reason,
     rule,
