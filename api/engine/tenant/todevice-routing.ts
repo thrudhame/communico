@@ -33,6 +33,10 @@ CREATE TABLE to_device_targets(target_id TEXT PRIMARY KEY NOT NULL,route_id TEXT
 CREATE INDEX to_device_targets_device ON to_device_targets(localpart,device_id,generation,state);
 `;
 
+export const TO_DEVICE_ADMISSION_POLICY_SQL = `
+ALTER TABLE to_device_admissions ADD COLUMN policy TEXT NOT NULL DEFAULT 'routed' CHECK(policy IN ('legacy','routed'));
+`;
+
 type Origin = { kind: 'client' | 'federation'; origin: string; id: string };
 export type ToDeviceRoute = {
   routeId: string;
@@ -88,7 +92,7 @@ function collision(): never {
   );
 }
 
-function messageHash(
+export function toDeviceMessageHash(
   sender: string,
   type: string,
   server: string,
@@ -106,9 +110,55 @@ function messageHash(
   });
 }
 
-/** Old F1/standalone receipts retain their original expansion semantics. A
- * routed admission also retains its immutable decoded message hash, even when
- * its original selector produced no local targets. */
+/** One logical receipt owns the hash and expansion policy across direct receive,
+ * semantic import and old F1 receipts. A legacy receipt has no recoverable old
+ * hash; bind its first retained evidence without ever expanding it again. */
+async function admit(
+  conn: Conn,
+  origin: Origin,
+  hash: string,
+  policy: 'legacy' | 'routed',
+): Promise<{ policy: 'legacy' | 'routed'; fresh: boolean }> {
+  const [held] = await conn.query(
+    'SELECT payload_hash,policy FROM to_device_admissions WHERE kind=? AND origin=? AND message_id=?',
+    [origin.kind, origin.origin, origin.id],
+  );
+  if (held) {
+    if (held.payload_hash !== hash) collision();
+    return { policy: held.policy as 'legacy' | 'routed', fresh: false };
+  }
+  // Earlier semantic readers retained route hashes but not the logical receipt.
+  // Compare those as well, including routes for a different recipient.
+  for (
+    const row of await conn.query(
+      "SELECT payload_json FROM to_device_routes WHERE json_extract(payload_json,'$.origin.kind')=? AND json_extract(payload_json,'$.origin.origin')=? AND json_extract(payload_json,'$.origin.id')=?",
+      [origin.kind, origin.origin, origin.id],
+    )
+  ) {
+    if (
+      (JSON.parse(String(row.payload_json)) as ToDeviceRoute).admissionHash !==
+        hash
+    ) collision();
+  }
+  if (
+    origin.kind === 'federation' && (await conn.query(
+      'SELECT 1 FROM inbound_to_device WHERE origin=? AND message_id=?',
+      [origin.origin, origin.id],
+    )).length
+  ) policy = 'legacy';
+  await conn.execute(
+    'INSERT INTO to_device_admissions(kind,origin,message_id,payload_hash,policy) VALUES(?,?,?,?,?)',
+    [
+      origin.kind,
+      origin.origin,
+      origin.id,
+      hash,
+      policy,
+    ],
+  );
+  return { policy, fresh: true };
+}
+
 export async function checkToDeviceReplay(
   conn: Conn,
   origin: string,
@@ -118,13 +168,12 @@ export async function checkToDeviceReplay(
   server: string,
   messages: Message[],
 ): Promise<void> {
-  const [held] = await conn.query(
-    "SELECT payload_hash FROM to_device_admissions WHERE kind='federation' AND origin=? AND message_id=?",
-    [origin, id],
+  await admit(
+    conn,
+    { kind: 'federation', origin, id },
+    toDeviceMessageHash(sender, type, server, messages),
+    'legacy',
   );
-  if (
-    held && held.payload_hash !== messageHash(sender, type, server, messages)
-  ) collision();
 }
 
 async function appendOperation(
@@ -186,6 +235,17 @@ async function expandRoute(
     [route.routeId],
   );
   if (!held || Number(held.expanded) === 1) return;
+  const [admission] = await conn.query(
+    'SELECT policy FROM to_device_admissions WHERE kind=? AND origin=? AND message_id=?',
+    [route.origin.kind, route.origin.origin, route.origin.id],
+  );
+  if (admission?.policy === 'legacy') {
+    await conn.execute(
+      'UPDATE to_device_routes SET expanded=1 WHERE route_id=?',
+      [route.routeId],
+    );
+    return;
+  }
   const localpart = localpartOf(route.recipient);
   if (
     identity.node !== 'home' && !(await conn.query(
@@ -290,22 +350,17 @@ export async function routeToDeviceMessages(
   sourceLocalpart?: string,
 ): Promise<boolean> {
   const identity = await tenantAuthority(conn);
-  if (!identity) return false;
-  const admissionHash = messageHash(sender, type, server, messages);
-  const [admission] = await conn.query(
-    'SELECT payload_hash FROM to_device_admissions WHERE kind=? AND origin=? AND message_id=?',
-    [origin.kind, origin.origin, origin.id],
+  const admissionHash = toDeviceMessageHash(sender, type, server, messages);
+  const admission = await admit(
+    conn,
+    origin,
+    admissionHash,
+    identity ? 'routed' : 'legacy',
   );
-  if (admission) {
-    if (admission.payload_hash !== admissionHash) collision();
-  } else {
-    await conn.execute('INSERT INTO to_device_admissions VALUES(?,?,?,?)', [
-      origin.kind,
-      origin.origin,
-      origin.id,
-      admissionHash,
-    ]);
-  }
+  if (!identity || admission.policy === 'legacy') return false;
+  // Imported selectors remain the durable obligation. A second ingress cannot
+  // reconstruct a new destination set from its current registry/control map.
+  if (!admission.fresh) return true;
   const users = new Map<string, Message[]>();
   for (const message of messages) {
     if (domainOf(message.user) !== server) continue;
@@ -639,6 +694,9 @@ export async function importToDeviceOperation(
       owner.node === fact.source && owner.incarnation === fact.incarnation
     )
   ) collision();
+  if (fact.kind === 'route') {
+    await admit(conn, fact.value.origin, fact.value.admissionHash, 'routed');
+  }
   const encoded = canonicalJson(fact);
   const [held] = await conn.query(
     'SELECT payload_json FROM to_device_operations WHERE operation_id=? OR (source=? AND incarnation=? AND sequence=?)',

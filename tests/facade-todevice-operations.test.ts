@@ -224,6 +224,248 @@ Deno.test('to-device semantic import: destination alone expands; exact ACK facts
   }
 });
 
+Deno.test('to-device logical admission: imported federation hash fences changed recipients across ingress paths', async () => {
+  const f = await fixture();
+  try {
+    await f.edge.tx((tx) =>
+      tx.toDevice.receive(
+        'remote.test',
+        'logical-id',
+        '@bob:remote.test',
+        'm.room_key',
+        'logical.test',
+        [
+          {
+            user: '@alice:logical.test',
+            id: '*',
+            content: { key: 'original' },
+          },
+        ],
+        config().e2ee,
+      )
+    );
+    const source = await f.ed.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    const before = await f.hd.query('SELECT * FROM to_device_inbox');
+    await assertRejects(
+      () =>
+        f.home.tx((tx) =>
+          tx.toDevice.receive(
+            'remote.test',
+            'logical-id',
+            '@bob:remote.test',
+            'm.room_key',
+            'logical.test',
+            [
+              {
+                user: '@other:logical.test',
+                id: '*',
+                content: { key: 'changed' },
+              },
+            ],
+            config().e2ee,
+          )
+        ),
+      Error,
+      'to-device operation identity changed',
+    );
+    assertEquals(await f.hd.query('SELECT * FROM to_device_inbox'), before);
+    const reopened = await f.reopen();
+    await assertRejects(
+      () =>
+        reopened.hd.tx((conn) =>
+          routing.routeToDeviceMessages(
+            conn,
+            { kind: 'federation', origin: 'remote.test', id: 'logical-id' },
+            '@bob:remote.test',
+            'm.room_key',
+            'logical.test',
+            [
+              {
+                user: '@other:logical.test',
+                id: '*',
+                content: { key: 'changed' },
+              },
+            ],
+            config().e2ee,
+          )
+        ),
+      Error,
+      'to-device operation identity changed',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device logical admission: legacy receipt fences later imported routes and replacement expansion', async () => {
+  const f = await fixture();
+  try {
+    await f.hd.execute('INSERT INTO inbound_to_device VALUES(?,?)', [
+      'remote.test',
+      'legacy-id',
+    ]);
+    await deleteDevices(f.home, 'alice', ['LAN']);
+    await upsertDevice(f.home, 'alice', 'LAN');
+    await f.edge.tx((tx) =>
+      tx.toDevice.receive(
+        'remote.test',
+        'legacy-id',
+        '@bob:remote.test',
+        'm.room_key',
+        'logical.test',
+        [
+          { user: '@alice:logical.test', id: '*', content: { key: 'old' } },
+        ],
+        config().e2ee,
+      )
+    );
+    const source = await f.ed.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    assertEquals(
+      await f.hd.query('SELECT * FROM to_device_inbox'),
+      [],
+      'legacy receipt must suppress routed re-expansion into replacement devices',
+    );
+    const reopened = await f.reopen();
+    for (const op of source) {
+      await reopened.hd.tx((conn) => apply(conn, op, 'edge'));
+    }
+    await reopened.hd.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    assertEquals(await reopened.hd.query('SELECT * FROM to_device_inbox'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device logical admission: direct-first and imported-first retain one target after ACK and recreation', async () => {
+  for (const order of ['direct', 'imported']) {
+    const f = await fixture();
+    try {
+      const receive = () =>
+        f.home.tx((tx) =>
+          tx.toDevice.receive(
+            'remote.test',
+            order,
+            '@bob:remote.test',
+            'm.test',
+            'logical.test',
+            [
+              { user: '@alice:logical.test', id: '*', content: { order } },
+            ],
+            config().e2ee,
+          )
+        );
+      await f.edge.tx((tx) =>
+        tx.toDevice.receive(
+          'remote.test',
+          order,
+          '@bob:remote.test',
+          'm.test',
+          'logical.test',
+          [
+            { user: '@alice:logical.test', id: '*', content: { order } },
+          ],
+          config().e2ee,
+        )
+      );
+      const source = await f.ed.tx((conn) =>
+        routing.captureToDeviceOperations(conn, 'alice')
+      );
+      if (order === 'direct') await receive();
+      for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+      if (order === 'imported') await receive();
+      const lan = await deviceIdentity(f.home, 'alice', 'LAN');
+      const delivered = await f.home.tx((tx) =>
+        tx.toDevice.deliverSliding(lan, order, 100, config().e2ee)
+      );
+      assertEquals(delivered.events.map((event) => event.content), [{ order }]);
+      await f.home.tx((tx) =>
+        tx.toDevice.acknowledgeSliding(lan, order, delivered.nextBatch)
+      );
+      await deleteDevices(f.home, 'alice', ['LAN']);
+      await upsertDevice(f.home, 'alice', 'LAN');
+      await receive();
+      for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+      assertEquals(await f.hd.query('SELECT * FROM to_device_inbox'), []);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('to-device logical admission: historical imported routes fence hash substitution before receipt repair', async () => {
+  const f = await fixture();
+  try {
+    await f.edge.tx((tx) =>
+      tx.toDevice.receive(
+        'remote.test',
+        'old-reader',
+        '@bob:remote.test',
+        'm.test',
+        'logical.test',
+        [
+          { user: '@alice:logical.test', id: '*', content: { kept: true } },
+        ],
+        config().e2ee,
+      )
+    );
+    const source = await f.ed.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    // Reproduce a retained old-reader route, not a future schema relabeled old.
+    await f.hd.execute('DELETE FROM to_device_admissions');
+    const before = await f.hd.query('SELECT * FROM to_device_inbox');
+    await assertRejects(
+      () =>
+        f.home.tx((tx) =>
+          tx.toDevice.receive(
+            'remote.test',
+            'old-reader',
+            '@bob:remote.test',
+            'm.test',
+            'logical.test',
+            [
+              {
+                user: '@other:logical.test',
+                id: '*',
+                content: { changed: true },
+              },
+            ],
+            config().e2ee,
+          )
+        ),
+      Error,
+      'to-device operation identity changed',
+    );
+    await assertRejects(
+      () =>
+        f.hd.tx(async (conn) => {
+          await apply(conn, source.find((op) => op.kind === 'route')!, 'edge');
+          throw new Error('rollback repair');
+        }),
+      Error,
+      'rollback repair',
+    );
+    assertEquals(await f.hd.query('SELECT * FROM to_device_admissions'), []);
+    for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    assertEquals(
+      (await f.hd.query('SELECT policy FROM to_device_admissions'))[0].policy,
+      'routed',
+    );
+    assertEquals(await f.hd.query('SELECT * FROM to_device_inbox'), before);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('to-device semantic import: collision, forged expansion/ACK and missing dependencies roll back without delivery authority', async () => {
   const f = await fixture();
   try {

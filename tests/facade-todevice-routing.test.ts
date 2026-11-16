@@ -305,21 +305,22 @@ Deno.test('routed to-device: tenant37 upgrade preserves legacy inbox and never m
     await tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
     await upsertDevice(tenant, 'alice', 'LAN');
     const device = await deviceIdentity(tenant, 'alice', 'LAN');
-    await tenant.tx((tx) =>
-      tx.toDevice.send(
-        device,
-        tenant.serverName,
-        'm.room_key_request',
-        'legacy',
+    // Seed the actual old inbox shape. Today's sender owns an admission ledger
+    // which did not exist at v37; don't execute a future writer on old storage.
+    await (await store.tenant(tenant.serverName)).execute(
+      'INSERT INTO to_device_inbox VALUES(?,?,?,?,?,?)',
+      [
+        'alice',
+        'LAN',
+        device.generation,
+        1,
         'legacy-source',
-        [{
-          user: '@alice:upgrade-routing.test',
-          id: '*',
+        JSON.stringify({
+          sender: '@alice:upgrade-routing.test',
+          type: 'm.room_key_request',
           content: { kept: true },
-        }],
-        config().e2ee,
-        { enabled: true, maxBytes: 1048576 },
-      )
+        }),
+      ],
     );
     const before = await (await store.tenant(tenant.serverName)).query(
       'SELECT * FROM to_device_inbox',
@@ -346,6 +347,46 @@ Deno.test('routed to-device: tenant37 upgrade preserves legacy inbox and never m
         .v,
       String(tenantSchema.version),
     );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('routed to-device: tenant38 admission upgrade preserves original routed hashes and fresh shape', async () => {
+  const dir = await Deno.makeTempDir();
+  const storage = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(storage, {
+    schemas: { tenant: historicalTenantSchema(38) },
+  });
+  try {
+    const db = await store.tenant('admission-upgrade.test', { create: true });
+    await db.execute('INSERT INTO to_device_admissions VALUES(?,?,?,?)', [
+      'federation',
+      'remote.test',
+      'kept',
+      'a'.repeat(64),
+    ]);
+    await store.close();
+    store = await openStore(storage, { schemas: { tenant: tenantSchema } });
+    const upgraded = await store.tenant('admission-upgrade.test');
+    assertEquals(await upgraded.query('SELECT * FROM to_device_admissions'), [{
+      kind: 'federation',
+      origin: 'remote.test',
+      message_id: 'kept',
+      payload_hash: 'a'.repeat(64),
+      policy: 'routed',
+    }]);
+    const fresh = await store.tenant('admission-fresh.test', { create: true });
+    const shape =
+      "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name LIKE 'to_device_%' ORDER BY type,name";
+    assertEquals(await upgraded.query(shape), await fresh.query(shape));
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });
