@@ -92,12 +92,13 @@ export async function tenantChangesCommitted(
   projectionRevision: number,
   changed = false,
   source: TenantChangeSource = 'local',
+  publicKeysChanged = false,
 ): Promise<void> {
   if (projectionRevision) {
     rememberTenantProjection(store, tenant, projectionRevision);
     await tenantCommitted(store, tenant);
   }
-  if (changed || projectionRevision) {
-    tenantStreamCommitted(store, tenant, source);
+  if (changed || projectionRevision || publicKeysChanged) {
+    tenantStreamCommitted(store, tenant, source, publicKeysChanged);
   }
 }

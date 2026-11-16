@@ -17,6 +17,25 @@ import {
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import { recordTenantProjection } from '#engine/tenant/hooks.ts';
 
+/** A transaction-local cut for classifying committed public key invalidations.
+ * This is receiver discovery only, never a federation stream or auth revision. */
+export async function keyChangesCut(conn: Conn): Promise<number> {
+  const [row] = await conn.query(
+    'SELECT COALESCE(MAX(pos),0) AS pos FROM e2ee_changes',
+  );
+  return Number(row.pos);
+}
+
+export async function publicKeysChangedAfter(
+  conn: Conn,
+  cut: number,
+): Promise<boolean> {
+  return (await conn.query(
+    "SELECT 1 FROM e2ee_changes WHERE pos>? AND (json_extract(payload,'$.kind') IS NULL OR json_extract(payload,'$.kind') IN ('public_signing','restore_reset') OR (json_extract(payload,'$.kind')='imported_keys' AND json_extract(payload,'$.public')=1)) LIMIT 1",
+    [cut],
+  )).length > 0;
+}
+
 /** Imported public facts create receiver-local invalidations, not new semantic
  * operations or federation identities. The original wire remains with its owner.
  * Retain discovery in the same transaction so ACK loss/restart cannot hide news. */

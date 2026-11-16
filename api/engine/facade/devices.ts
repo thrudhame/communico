@@ -15,6 +15,10 @@ import {
 } from '#engine/tenant/device-source.ts';
 import { importDeviceOperation } from '#engine/tenant/device-operations.ts';
 import {
+  keyChangesCut,
+  publicKeysChangedAfter,
+} from '#engine/tenant/changes.ts';
+import {
   captureSigningOperations,
   importSigningOperation,
   type SigningOperation,
@@ -456,14 +460,16 @@ export class DeviceOperations {
       pending: await pendingTenantProjection(conn),
     }));
     if (prior) {
+      const { publicKeysChanged, ...result } = object(prior.result);
       await tenantChangesCommitted(
         this.store,
         this.tenant.serverName,
         pending,
         false,
         'replica',
+        publicKeysChanged === true,
       );
-      await journal.complete(peer, stream, record, prior.result);
+      await journal.complete(peer, stream, record, result);
       return true;
     }
     const server = await this.store.server();
@@ -511,50 +517,68 @@ export class DeviceOperations {
       await requireDomainControl(conn, view);
     };
     await server.tx(check);
-    const { result, projectionRevision } = await tenant.tx(async (conn) => {
-      unchanged();
-      await this.tenantSelected(conn, view);
-      if (view.kind === 'key-bootstrap') {
-        await retainKeyBootstrap(conn, view, record.sequence, record.hash);
-      } else {
-        const kind = view.kind === 'key-history' ? view.keyKind : view.kind;
-        const expected = {
-          source: view.operation.source,
-          incarnation: view.operation.incarnation,
-          localpart: view.localpart,
-        };
-        if (kind === 'device-operation') {
-          await importDeviceOperation(conn, view.operation, expected, history);
-        } else if (kind === 'signing-operation') {
-          await importSigningOperation(conn, view.operation, expected, history);
+    const { result, projectionRevision, publicKeysChanged } = await tenant.tx(
+      async (conn) => {
+        unchanged();
+        await this.tenantSelected(conn, view);
+        const keyCut = await keyChangesCut(conn);
+        if (view.kind === 'key-bootstrap') {
+          await retainKeyBootstrap(conn, view, record.sequence, record.hash);
         } else {
-          await importSignatureOperation(
-            conn,
-            view.operation,
-            expected,
-            history,
-          );
+          const kind = view.kind === 'key-history' ? view.keyKind : view.kind;
+          const expected = {
+            source: view.operation.source,
+            incarnation: view.operation.incarnation,
+            localpart: view.localpart,
+          };
+          if (kind === 'device-operation') {
+            await importDeviceOperation(
+              conn,
+              view.operation,
+              expected,
+              history,
+            );
+          } else if (kind === 'signing-operation') {
+            await importSigningOperation(
+              conn,
+              view.operation,
+              expected,
+              history,
+            );
+          } else {
+            await importSignatureOperation(
+              conn,
+              view.operation,
+              expected,
+              history,
+            );
+          }
         }
-      }
-      const result = {
-        operationId: view.kind === 'key-bootstrap'
-          ? record.operationId
-          : view.operation.operationId,
-      };
-      await retainLinkApplication(conn, peer, record, result);
-      const projectionRevision = await pendingTenantProjection(conn);
-      // This synchronous fence is the admission cut. A retirement begun before
-      // it rolls back fact + receipt. Once it passes, a successful owner commit
-      // is admitted immutable work, even if revocation overlaps native COMMIT.
-      unchanged();
-      return { result, projectionRevision };
-    });
+        const result = {
+          operationId: view.kind === 'key-bootstrap'
+            ? record.operationId
+            : view.operation.operationId,
+        };
+        const publicKeysChanged = await publicKeysChangedAfter(conn, keyCut);
+        await retainLinkApplication(conn, peer, record, {
+          ...result,
+          publicKeysChanged,
+        });
+        const projectionRevision = await pendingTenantProjection(conn);
+        // This synchronous fence is the admission cut. A retirement begun before
+        // it rolls back fact + receipt. Once it passes, a successful owner commit
+        // is admitted immutable work, even if revocation overlaps native COMMIT.
+        unchanged();
+        return { result, projectionRevision, publicKeysChanged };
+      },
+    );
     await tenantChangesCommitted(
       this.store,
       this.tenant.serverName,
       projectionRevision,
       false,
       'replica',
+      publicKeysChanged,
     );
     // Completion cannot retroactively revoke admitted work. After ACK loss,
     // only the exact durable receipt can take this path, including cold replay.

@@ -7,6 +7,10 @@ import {
   matrixBase64,
 } from '#engine/signing-primitives.js';
 import type { Store } from '#engine/store/index.ts';
+import {
+  keyChangesCut,
+  publicKeysChangedAfter,
+} from '#engine/tenant/changes.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import {
@@ -437,32 +441,38 @@ export class AccountSnapshots {
         )
         ? await captureErasureCuts(this.store)
         : undefined;
-    const projectionRevision = await (await this.store.tenant(view.server)).tx(
-      async (conn) => {
-        await requireControl(conn, view);
-        const identity = await tenantAuthority(conn);
-        if (
-          identity?.node !== 'home' || identity.edgeNode !== view.source ||
-          identity.edgeIncarnation !== view.incarnation ||
-          !await userByLocalpart(conn, view.localpart)
-        ) {
-          mismatch('session authority tenant is not the selected home');
-        }
-        await installSessionAuthority(
-          conn,
-          view.localpart,
-          view.authority,
-          cuts,
-        );
-        return await pendingTenantProjection(conn);
-      },
-    );
+    const { projectionRevision, publicKeysChanged } =
+      await (await this.store.tenant(view.server)).tx(
+        async (conn) => {
+          await requireControl(conn, view);
+          const identity = await tenantAuthority(conn);
+          if (
+            identity?.node !== 'home' || identity.edgeNode !== view.source ||
+            identity.edgeIncarnation !== view.incarnation ||
+            !await userByLocalpart(conn, view.localpart)
+          ) {
+            mismatch('session authority tenant is not the selected home');
+          }
+          const keyCut = await keyChangesCut(conn);
+          await installSessionAuthority(
+            conn,
+            view.localpart,
+            view.authority,
+            cuts,
+          );
+          return {
+            projectionRevision: await pendingTenantProjection(conn),
+            publicKeysChanged: await publicKeysChangedAfter(conn, keyCut),
+          };
+        },
+      );
     await tenantChangesCommitted(
       this.store,
       view.server,
       projectionRevision,
       false,
       'replica',
+      publicKeysChanged,
     );
     return await journal.apply(context.node, stream, async (conn, current) => {
       await check(conn);
@@ -551,19 +561,25 @@ export class AccountSnapshots {
           )
           ? await captureErasureCuts(this.store)
           : undefined;
-        const projectionRevision = await (await this.store.tenant(view.server))
-          .tx(async (conn) => {
-            if (await current(conn)) {
-              await publishAccountAuth(conn, view, record, cuts);
-            }
-            return await pendingTenantProjection(conn);
-          });
+        const { projectionRevision, publicKeysChanged } =
+          await (await this.store.tenant(view.server))
+            .tx(async (conn) => {
+              const keyCut = await keyChangesCut(conn);
+              if (await current(conn)) {
+                await publishAccountAuth(conn, view, record, cuts);
+              }
+              return {
+                projectionRevision: await pendingTenantProjection(conn),
+                publicKeysChanged: await publicKeysChangedAfter(conn, keyCut),
+              };
+            });
         await tenantChangesCommitted(
           this.store,
           view.server,
           projectionRevision,
           false,
           'replica',
+          publicKeysChanged,
         );
         return {
           localpart: view.localpart,

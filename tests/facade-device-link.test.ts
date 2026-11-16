@@ -15,6 +15,12 @@ import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
+import {
+  exportPublicReplica,
+  PublicReplicas,
+  startPublicExports,
+} from '#engine/facade/public.ts';
+import { bounded } from './helpers/server-process.ts';
 import { bindRole } from '#engine/facade/role.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
@@ -37,6 +43,8 @@ import {
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
 import {
   appendImportedKeyNotice,
+  keyChangesCut,
+  publicKeysChangedAfter,
   rebaseRestoredDeviceStreams,
 } from '#engine/tenant/changes.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
@@ -46,6 +54,7 @@ import { projectTenant } from '#engine/server/project-tenant.ts';
 import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
 import {
   pendingTenantProjection,
+  tenantChangesCommitted,
   tenantProjectionPending,
 } from '#engine/tenant/hooks.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
@@ -525,6 +534,227 @@ Deno.test('complete-view checkpoints: snapshot rollback leaves allocator frontie
   }
 });
 
+async function observePublicImport(
+  f: Awaited<ReturnType<typeof fixture>>,
+  mutate: () => Promise<void>,
+) {
+  const initial = await exportPublicReplica(
+    f.home,
+    f.ht,
+    'alice',
+    'edge_a',
+    f.bundle.id,
+  );
+  if (initial) {
+    await f.ej.receive('home', [initial]);
+    await new PublicReplicas(f.edge, f.et, f.fp).apply(f.ej, initial);
+  }
+  const changed = Promise.withResolvers<void>();
+  const errors: unknown[] = [];
+  const worker = startPublicExports({
+    store: f.home,
+    tenant: f.ht,
+    peer: 'edge_a',
+    pairing: f.bundle.id,
+    changed: () => changed.resolve(),
+    failed: (error) => errors.push(error),
+  });
+  try {
+    await mutate();
+    // No wake(), coordinator reconciliation or subsequent local mutation.
+    await bounded(changed.promise, 3000);
+  } finally {
+    await worker.close();
+  }
+  assertEquals(errors, []);
+  const records = (await (await f.home.server()).query(
+    "SELECT record_json FROM facade_records WHERE peer='edge_a' AND direction='out' AND stream='public:@alice:logical.test' ORDER BY sequence",
+  )).map((row) => JSON.parse(String(row.record_json)) as LinkRecord);
+  const latest = records.at(-1)!;
+  assert(
+    !initial || latest.sequence > initial.sequence,
+    'the public consumer needs a new complete response',
+  );
+  for (const record of records) {
+    await f.ej.receive('home', [record]);
+    await new PublicReplicas(f.edge, f.et, f.fp).apply(f.ej, record);
+  }
+  const [held] = await (await f.edge.tenant('logical.test')).query(
+    "SELECT snapshot_json FROM public_user_replicas WHERE localpart='alice'",
+  );
+  return JSON.parse(String(held.snapshot_json));
+}
+
+Deno.test('public key import wake: merged facade keys reach the public replica without a coordinator tick', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    await upsertDevice(f.et, 'alice', 'PHONE', 'outside');
+    const device = await deviceIdentity(f.et, 'alice', 'PHONE');
+    await f.et.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload(
+          {
+            device_keys: {
+              user_id: user,
+              device_id: 'PHONE',
+              algorithms: [],
+              keys: { 'ed25519:PHONE': 'outside-key' },
+              signatures: {},
+            },
+          },
+          user,
+          'PHONE',
+          config().e2ee,
+        ),
+      )
+    );
+    const authority = await exportSessionAuthority(
+      f.edge,
+      f.et,
+      f.fp,
+      f.owners,
+      f.node,
+      'alice',
+    );
+    await f.hj.receive('edge_a', [authority]);
+    await f.accounts.applyFromFacade(f.hj, f.bundle.id, authority);
+    const view = await observePublicImport(f, async () => {
+      for (const record of await f.es.export('alice')) {
+        await f.hj.receive('edge_a', [record]);
+        await f.hs.apply(f.hj, record, f.bundle.id);
+      }
+    });
+    assertEquals(
+      view.devices.devices.map((device: { device_id: string }) =>
+        device.device_id
+      ),
+      ['PHONE'],
+    );
+    assertEquals(view.devices.devices[0].keys.keys, {
+      'ed25519:PHONE': 'outside-key',
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('public key import wake: imported deletion of a home device refreshes the public replica before its device suffix', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    const device = await deviceIdentity(f.ht, 'alice', 'LAN');
+    await f.ht.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload(
+          {
+            device_keys: {
+              user_id: user,
+              device_id: 'LAN',
+              algorithms: [],
+              keys: { 'ed25519:LAN': 'home-key' },
+              signatures: {},
+            },
+          },
+          user,
+          'LAN',
+          config().e2ee,
+        ),
+      )
+    );
+    for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    await deleteDevices(f.et, 'alice', ['LAN']);
+    const authority = await exportSessionAuthority(
+      f.edge,
+      f.et,
+      f.fp,
+      f.owners,
+      f.node,
+      'alice',
+    );
+    const view = await observePublicImport(f, async () => {
+      await f.hj.receive('edge_a', [authority]);
+      await f.accounts.applyFromFacade(f.hj, f.bundle.id, authority);
+    });
+    assertEquals(view.devices.devices, []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('public key import wake: private notices and unrelated auth changes do not scan public exports', async () => {
+  const f = await fixture();
+  const tx = f.ht.tx.bind(f.ht);
+  let scans = 0;
+  f.ht.tx = (action) =>
+    tx((owner) => {
+      const users = owner.publicReplica.users;
+      owner.publicReplica.users = () => {
+        scans++;
+        return users();
+      };
+      return action(owner);
+    });
+  const worker = startPublicExports({
+    store: f.home,
+    tenant: f.ht,
+    peer: 'edge_a',
+    pairing: f.bundle.id,
+    changed: () => {
+      throw new Error('private state was publicly exported');
+    },
+    failed: (error) => {
+      throw error;
+    },
+  });
+  try {
+    const db = await f.home.tenant('logical.test');
+    const change = await db.tx(async (conn) => {
+      const cut = await keyChangesCut(conn);
+      await appendImportedKeyNotice(conn, 'alice', '@bob:remote.test', false);
+      return {
+        projection: await pendingTenantProjection(conn),
+        public: await publicKeysChangedAfter(conn, cut),
+      };
+    });
+    assertEquals(change.public, false);
+    await tenantChangesCommitted(
+      f.home,
+      'logical.test',
+      change.projection,
+      false,
+      'replica',
+      change.public,
+    );
+    await f.ht.tx(() => Promise.resolve());
+    await worker.close();
+    assertEquals(scans, 0);
+    await db.tx(async (conn) => {
+      const cut = await keyChangesCut(conn);
+      await appendImportedKeyNotice(conn, 'alice', '@alice:logical.test', true);
+      await appendImportedKeyNotice(conn, 'alice', '@bob:remote.test', false);
+      assertEquals(
+        await publicKeysChangedAfter(conn, cut),
+        true,
+        'a later private row cannot hide an earlier public change in the transaction',
+      );
+      assertEquals(
+        await publicKeysChangedAfter(conn, await keyChangesCut(conn)),
+        false,
+      );
+    });
+  } finally {
+    await worker.close();
+    f.ht.tx = tx;
+    await f.close();
+  }
+});
+
 Deno.test('imported key news: receiver invalidation does not wake source authority exports', async () => {
   const f = await fixture();
   let exporter: ReturnType<typeof startAccountExports> | undefined;
@@ -924,6 +1154,13 @@ Deno.test('imported key news: signing and signature imports retain durable disco
 
 Deno.test('imported key news: rollback has no intent or wake; committed ACK loss cold-replays one consumer publication', async () => {
   const f = await fixture();
+  let watched = f.edge;
+  const publicNotices: boolean[] = [];
+  const stop = onTenantStream((store, _tenant, source, publicKeysChanged) => {
+    if (store === watched && source === 'replica') {
+      publicNotices.push(publicKeysChanged);
+    }
+  });
   try {
     const [record] = await f.hs.export('alice', f.bundle.id);
     await f.ej.receive('home', [record]);
@@ -942,14 +1179,17 @@ Deno.test('imported key news: rollback has no intent or wake; committed ACK loss
     );
     assertEquals(await db.query('SELECT * FROM e2ee_changes'), beforeNews);
     assertEquals(await pendingTenantProjection(db), 0);
+    assertEquals(publicNotices, []);
     f.ej.complete = () => Promise.reject(new Error('news ACK loss'));
     await assertRejects(() => f.es.apply(f.ej, record), Error, 'news ACK loss');
+    assertEquals(publicNotices, [true]);
     assertEquals(
       (await db.query('SELECT * FROM e2ee_changes')).length,
       beforeNews.length + 1,
     );
     await f.edge.close();
     const reopened = await f.open('edge');
+    watched = reopened;
     try {
       const pairings = new Pairings(
         await reopened.server(),
@@ -968,6 +1208,18 @@ Deno.test('imported key news: rollback has no intent or wake; committed ACK loss
       const journal = new Journal(await reopened.server(), LINK_SUPPORTED);
       const owner = new DeviceOperations(reopened, tenant, pairings, f.node);
       await owner.apply(journal, record);
+      assertEquals(
+        publicNotices,
+        [true, true],
+        'cold completion rediscovers the retained public hint',
+      );
+      const [completion] = await (await reopened.server()).query(
+        "SELECT result_json FROM facade_records WHERE direction='in' AND operation_id=?",
+        [record.operationId],
+      );
+      assertEquals(JSON.parse(String(completion.result_json)), {
+        operationId: operation.operationId,
+      }, 'local discovery metadata is not a changed journal response');
       await projectTenant(reopened, 'logical.test');
       const server = await reopened.server();
       const after = await deviceStreamMax(server);
@@ -997,6 +1249,7 @@ Deno.test('imported key news: rollback has no intent or wake; committed ACK loss
       await reopened.close();
     }
   } finally {
+    stop();
     await f.close();
   }
 });
@@ -2443,10 +2696,13 @@ Deno.test('semantic key public scope: enrolled foreign-device signature reaches 
       unsigned: { device_display_name: 'home name' },
     };
     assertEquals((await publicQuery(f.et)).LAN, expected);
-    for (const record of await f.es.exportSignatures('alice')) {
-      await f.hj.receive('edge_a', [record]);
-      await f.hs.apply(f.hj, record, f.bundle.id);
-    }
+    const publicView = await observePublicImport(f, async () => {
+      for (const record of await f.es.exportSignatures('alice')) {
+        await f.hj.receive('edge_a', [record]);
+        await f.hs.apply(f.hj, record, f.bundle.id);
+      }
+    });
+    assertEquals(publicView.devices.devices[0].keys, expected);
     assertEquals(await publicQuery(f.ht), await publicQuery(f.et));
     const snapshot = await f.et.tx((tx) =>
       tx.e2ee.snapshot('alice', user, config().e2ee)

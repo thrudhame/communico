@@ -3,12 +3,23 @@ import type { Store } from '#engine/store/index.ts';
 
 // Replica publication wakes local readers/lifecycle work, but is not new local
 // authoring. Source exporters must not turn these hints into freshness records.
+// Public projections may still need a refresh when an imported key view changes.
 export type TenantChangeSource = 'local' | 'replica';
 const listeners = new Set<
-  (store: Store, tenant: string, source: TenantChangeSource) => void
+  (
+    store: Store,
+    tenant: string,
+    source: TenantChangeSource,
+    publicKeysChanged: boolean,
+  ) => void
 >();
 export function onTenantStream(
-  fn: (store: Store, tenant: string, source: TenantChangeSource) => void,
+  fn: (
+    store: Store,
+    tenant: string,
+    source: TenantChangeSource,
+    publicKeysChanged: boolean,
+  ) => void,
 ): () => void {
   listeners.add(fn);
   return () => {
@@ -19,8 +30,9 @@ export function tenantStreamCommitted(
   store: Store,
   tenant: string,
   source: TenantChangeSource = 'local',
+  publicKeysChanged = false,
 ): void {
-  for (const fn of listeners) fn(store, tenant, source);
+  for (const fn of listeners) fn(store, tenant, source, publicKeysChanged);
 }
 
 // Read allocated maxima, not retained rows or a single device's last change.

@@ -179,12 +179,14 @@ export function startPublicExports(
       }
     })();
   };
-  const untenant = onTenantStream((store, tenant, source) => {
-    if (
-      source === 'local' && store === options.store &&
-      tenant === options.tenant.serverName
-    ) wake();
-  });
+  const untenant = onTenantStream(
+    (store, tenant, source, publicKeysChanged) => {
+      if (
+        (source === 'local' || publicKeysChanged) && store === options.store &&
+        tenant === options.tenant.serverName
+      ) wake();
+    },
+  );
   let closed: Promise<void> | undefined;
   return {
     wake,
