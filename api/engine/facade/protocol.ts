@@ -66,10 +66,15 @@ export const ACCOUNT_AUTH_CAPABILITY: Capability = {
   type: 'account-auth',
   version: 1,
 };
+export const DOMAIN_OPERATION_CAPABILITY: Capability = {
+  type: 'domain-operation',
+  version: 1,
+};
 export const LINK_SUPPORTED: readonly Capability[] = [
   ...LINK_CAPABILITIES,
   OWNER_CONTROL_CAPABILITY,
   ACCOUNT_AUTH_CAPABILITY,
+  DOMAIN_OPERATION_CAPABILITY,
 ];
 
 function bad(message: string): never {

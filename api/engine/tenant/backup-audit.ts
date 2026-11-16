@@ -13,6 +13,7 @@ import {
   importPublicKeyFromRaw,
 } from '#engine/signing-primitives.js';
 import type { Manifest } from '#engine/backup/manifest.ts';
+import { tenantProjectionSources } from '#engine/store/projection-sources.ts';
 
 export async function auditTenant(db: CapturedQuery, id: string) {
   const rows = await db.query(
@@ -54,7 +55,7 @@ export async function auditTenant(db: CapturedQuery, id: string) {
     fingerprint: createHash('sha256').update(pub).digest('hex'),
   };
   const heads = await counters(db);
-  for (const table of ['account_changes', 'e2ee_changes', 'pusher_changes']) {
+  for (const table of new Set(Object.values(tenantProjectionSources))) {
     const [{ head }] = await db.query(
       `SELECT COALESCE(MAX(pos),0) AS head FROM ${table}`,
     );

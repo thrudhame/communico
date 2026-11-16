@@ -2,6 +2,7 @@
 // rejection intent is committed before tenant deletion and replayed on startup.
 import type { Store } from '#engine/store/index.ts';
 import { advance, get } from '#engine/store/watermark.ts';
+import { tenantSource } from '#engine/store/projection-sources.ts';
 import { deleteRejectedPusher } from '#engine/tenant/pushers.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { gatewayUrl } from '#engine/push/registration.ts';
@@ -42,7 +43,7 @@ export async function projectPushTargets(
       }
     });
   }
-  const source = 'tenant:' + tenant + ':pushers';
+  const source = tenantSource('pushers', tenant);
   for (;;) {
     const mark = await get(server, source);
     const rows = await db.query(

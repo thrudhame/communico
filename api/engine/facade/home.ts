@@ -31,6 +31,7 @@ import {
   startAccountExports,
 } from './accounts.ts';
 import { exportOwnerControl } from './ownership.ts';
+import { DomainOperations } from './domain.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -76,6 +77,7 @@ export async function startHomeLinks(
   const jobs = new Map<string, Promise<void>>();
   const authExports = new Map<string, ReturnType<typeof startAccountExports>>();
   const accounts = new AccountSnapshots(app.store, app.tenant, pairings);
+  const domains = new DomainOperations(app.store, app.tenant, pairings);
   const collectKeySignature = async (
     keyId: string,
     document: import('#engine/federation/keys.ts').KeyDoc,
@@ -206,6 +208,8 @@ export async function startHomeLinks(
             ? ingress.apply(journal, stream)
             : settings.phase === 'f2' && stream.stream.startsWith('authority:')
             ? accounts.applyFromFacade(journal, id, stream)
+            : settings.phase === 'f2' && stream.stream.startsWith('domain:')
+            ? domains.apply(journal, stream, id)
             : apply(node, stream),
         failed: (error) => failed(node, error),
         acknowledged: (stream) => {
@@ -253,15 +257,17 @@ export async function startHomeLinks(
           tenant: app.tenant,
           pollseconds: settings.pollseconds,
           users: () => app.tenant.tx((tx) => tx.publicReplica.users()),
-          emit: (localpart) =>
-            exportAccountAuth(
+          emit: async (localpart) => {
+            await exportAccountAuth(
               app.store,
               app.tenant,
               pairings,
               id,
               localpart,
               settings.replicatecredentials,
-            ),
+            );
+            await domains.bootstrap(localpart, id);
+          },
           changed: () => workers.get(id)?.wake(),
           failed: (error) => failed(node, error),
         }),

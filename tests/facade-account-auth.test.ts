@@ -19,7 +19,11 @@ import {
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
-import { requireAccountAuth } from '#engine/tenant/account-auth.ts';
+import {
+  type AccountAuth,
+  installAccountAuth,
+  requireAccountAuth,
+} from '#engine/tenant/account-auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   deactivateUser,
@@ -37,6 +41,65 @@ import { deleteDevices } from '#engine/tenant/devices.ts';
 import { bounded } from './helpers/server-process.ts';
 import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { consumeRefreshToken } from '#engine/tenant/auth.ts';
+import { PASSWORD_FLOWS, requireUia, uiaAction } from '#engine/tenant/uia.ts';
+import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
+
+Deno.test('auth publication migration upgrades tenant27 without inventing a publication for older snapshots', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'auth-publication-upgrade-' });
+  const config = (name: string) => ({
+    dir: dir + '/' + name,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  });
+  let old = await openStore(config('old'), {
+    schemas: { tenant: historicalTenantSchema(27) },
+  });
+  const fresh = await openStore(config('fresh'), {
+    schemas: { tenant: tenantSchema },
+  });
+  try {
+    const tenant = await openTenant(old, 'logical.test', { create: true });
+    await registerUser(tenant, {
+      localpart: 'alice',
+      password: 'pw',
+      accessToken: null,
+    });
+    const publicKey = tenant.publicB64;
+    const db = await old.tenant('logical.test');
+    await db.execute(
+      'INSERT INTO account_auth_snapshots(localpart,pairing,grant_revision,owner_revision,source_cut,revision,material_hash,captured_ms,checked_ms,credentials) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      ['alice', 'pair', 1, 1, 7, 1, 'a'.repeat(64), 1, 1, 1],
+    );
+    const snapshots = await db.query('SELECT * FROM account_auth_snapshots');
+    await old.close();
+    old = await openStore(config('old'), { schemas: { tenant: tenantSchema } });
+    await openTenant(fresh, 'logical.test', { create: true });
+    const upgraded = await old.tenant('logical.test');
+    const sql =
+      "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name";
+    assertEquals(
+      await upgraded.query(sql),
+      await (await fresh.tenant('logical.test')).query(sql),
+    );
+    assertEquals(
+      await upgraded.query('SELECT * FROM account_auth_snapshots'),
+      snapshots,
+    );
+    assertEquals(
+      await upgraded.query('SELECT * FROM account_auth_publications'),
+      [],
+    );
+    const reopened = await openTenant(old, 'logical.test');
+    assertEquals(reopened.publicB64, publicKey);
+    assertEquals(await verifyUserPassword(reopened, 'alice', 'pw'), true);
+  } finally {
+    await old.close();
+    await fresh.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-account-auth-' });
@@ -179,6 +242,148 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('local auth clock observations cannot abort an imported authority commit', async () => {
+  const f = await fixture();
+  const release = Promise.withResolvers<void>();
+  let importing: Promise<void> | undefined;
+  try {
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    const next = await f.emit();
+    const view =
+      (next.payload as { signed: { body: AccountAuth } }).signed.body;
+    const db = await f.edge.tenant('logical.test');
+    const [original] = await db.query(
+      'SELECT checked_ms FROM account_auth_snapshots WHERE localpart=?',
+      ['alice'],
+    );
+    const binding = {
+      pairing: f.bundle.id,
+      grantRevision: 1,
+      ownerRevision: 1,
+    };
+    const settings = { allowstaleauth: true, authmaxstalehours: 0 };
+    const now = Math.max(Number(original.checked_ms), view.capturedMs) + 1;
+    const prepared = Promise.withResolvers<void>();
+    let attempts = 0;
+    importing = db.tx(async (conn) => {
+      attempts++;
+      await installAccountAuth(conn, view);
+      prepared.resolve();
+      await release.promise;
+    });
+    // Observe a rejection before the test task releases the real writer.
+    importing.catch((error) => prepared.reject(error));
+    await prepared.promise;
+    let admissionError: unknown;
+    try {
+      await db.tx((conn) =>
+        requireAccountAuth(conn, 'alice', binding, settings, true, true, now)
+      );
+    } catch (error) {
+      admissionError = error;
+    } finally {
+      release.resolve();
+      await importing;
+    }
+    assertEquals(
+      admissionError,
+      undefined,
+      'a held complete auth cut remains usable during import',
+    );
+    assertEquals(
+      attempts,
+      1,
+      'local clock observation must not invalidate the imported authority writer',
+    );
+    const [after] = await db.query(
+      'SELECT checked_ms FROM account_auth_snapshots WHERE localpart=?',
+      ['alice'],
+    );
+    assertEquals(
+      Number(after.checked_ms),
+      Math.max(Number(original.checked_ms), view.capturedMs),
+    );
+    await assertRejects(
+      () =>
+        db.tx((conn) =>
+          requireAccountAuth(
+            conn,
+            'alice',
+            binding,
+            settings,
+            true,
+            true,
+            now - 1,
+          )
+        ),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    // A pre-upgrade request observation remains a floor even when it is newer
+    // than the independently persisted local counter.
+    await db.execute(
+      'UPDATE account_auth_snapshots SET checked_ms=? WHERE localpart=?',
+      [now + 2, 'alice'],
+    );
+    await assertRejects(
+      () =>
+        db.tx((conn) =>
+          requireAccountAuth(
+            conn,
+            'alice',
+            binding,
+            settings,
+            true,
+            true,
+            now + 1,
+          )
+        ),
+      MatrixError,
+      'authentication snapshot unavailable',
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const cold = await reopened.tenant('logical.test');
+      await assertRejects(
+        () =>
+          cold.tx((conn) =>
+            requireAccountAuth(
+              conn,
+              'alice',
+              binding,
+              settings,
+              true,
+              true,
+              now - 1,
+            )
+          ),
+        MatrixError,
+        'authentication snapshot unavailable',
+      );
+      await cold.tx((conn) =>
+        requireAccountAuth(
+          conn,
+          'alice',
+          binding,
+          settings,
+          true,
+          true,
+          now + 2,
+        )
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    release.resolve();
+    await importing?.catch(() => {});
+    await f.close();
+  }
+});
 
 Deno.test('irreversible deactivation refuses login even when a captured auth cut is superseded', async () => {
   const f = await fixture();
@@ -362,6 +567,259 @@ Deno.test('strict facade ingress requires live authenticated link and its full c
     assertEquals(await verifyUserPassword(guarded.tenant, 'alice', 'pw'), true);
     replacement.abort();
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('auth admission reads one committed publication across preparation and journal completion', async (t) => {
+  for (const completion of [false, true]) {
+    await t.step(
+      completion ? 'after journal completion' : 'before journal completion',
+      async () => {
+        const f = await fixture();
+        const release = Promise.withResolvers<void>();
+        let applying: Promise<boolean> | undefined;
+        try {
+          await loginUser(f.ht, {
+            localpart: 'alice',
+            password: 'pw',
+            deviceId: 'home-target',
+            refresh: false,
+          });
+          const first = await f.emit();
+          await f.journal.receive('home', [first]);
+          await f.receiver.apply(f.journal, first);
+          const guarded = await f.guarded({
+            replicatecredentials: true,
+            allowstaleauth: true,
+            authmaxstalehours: 0,
+          });
+          const session = await loginUser(guarded.tenant, {
+            localpart: 'alice',
+            password: 'pw',
+            deviceId: 'edge-caller',
+            refresh: false,
+          });
+          const prepared = await guarded.ingress.prepare();
+          const held = await enrolledTenant(
+            f.edge,
+            f.fp,
+            'logical.test',
+            'edge_a',
+            prepared,
+          );
+          const strict = await f.guarded({
+            replicatecredentials: true,
+            allowstaleauth: false,
+            authmaxstalehours: 0,
+          });
+          const connection = new AbortController();
+          strict.health.connected(f.bundle.id, connection.signal);
+          const declare = (record: typeof first) => [{
+            source: record.source,
+            incarnation: record.incarnation,
+            stream: record.stream,
+            head: { sequence: record.sequence, hash: record.hash },
+          }];
+          strict.health.observe(f.bundle.id, declare(first));
+          const strictPrepared = await strict.ingress.prepare();
+          const strictHeld = await enrolledTenant(
+            f.edge,
+            f.fp,
+            'logical.test',
+            'edge_a',
+            strictPrepared,
+          );
+          const next = await f.emit();
+          await f.journal.receive('home', [next]);
+          const committed = Promise.withResolvers<void>();
+          const journal = new Proxy(f.journal, {
+            get(target, key) {
+              if (key === 'apply') {
+                return async (...args: Parameters<Journal['apply']>) => {
+                  committed.resolve();
+                  await release.promise;
+                  return await target.apply(...args);
+                };
+              }
+              const value = Reflect.get(target, key);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          applying = f.receiver.apply(journal, next);
+          applying.catch((error) => committed.reject(error));
+          await committed.promise;
+          if (completion) {
+            release.resolve();
+            await applying;
+          }
+          // This is a real verified owner commit, not a fabricated newer counter.
+          assertEquals(
+            (await lookupToken(held, session.accessToken))?.device_id,
+            'edge-caller',
+          );
+          assertEquals(await verifyUserPassword(held, 'alice', 'pw'), true);
+          const authorization = await requireUia(held, {
+            caller: '@alice:logical.test',
+            token: session.accessToken,
+            flows: PASSWORD_FLOWS,
+            action: uiaAction('delete-device', ['home-target']),
+            targets: ['home-target'],
+            body: { auth: { type: 'm.login.password', password: 'pw' } },
+          });
+          await deleteDevices(held, 'alice', ['home-target'], authorization);
+          assertEquals(
+            await held.tx((tx) => tx.devices.exists('home-target', 'alice')),
+            false,
+          );
+          assertEquals(
+            (await lookupToken(held, session.accessToken))?.device_id,
+            'edge-caller',
+          );
+          await assertRejects(
+            () => lookupToken(strictHeld, session.accessToken),
+            MatrixError,
+            'authentication snapshot unavailable',
+          );
+          if (!completion) {
+            await assertRejects(
+              () => lookupToken(strict.tenant, session.accessToken),
+              MatrixError,
+              'authentication snapshot unavailable',
+            );
+            release.resolve();
+            await applying;
+          }
+          strict.health.observe(f.bundle.id, declare(next));
+          assertEquals(
+            (await lookupToken(strict.tenant, session.accessToken))?.localpart,
+            'alice',
+          );
+          connection.abort();
+          await revokeAllTokens(f.ht, 'alice');
+          const revoked = await f.emit();
+          await f.journal.receive('home', [revoked]);
+          await f.receiver.apply(f.journal, revoked);
+          const refusal = await assertRejects(
+            () => lookupToken(held, session.accessToken),
+            MatrixError,
+            'session authority revoked',
+          );
+          assertEquals(refusal.status, 401);
+        } finally {
+          release.resolve();
+          await applying?.catch(() => {});
+          await f.close();
+        }
+      },
+    );
+  }
+});
+
+Deno.test('auth publication rolls back with installation and survives cold loss of the server ACK', async () => {
+  const f = await fixture();
+  let cold: Awaited<ReturnType<typeof f.open>> | undefined;
+  try {
+    const record = await f.emit();
+    await f.journal.receive('home', [record]);
+    const db = await f.edge.tenant('logical.test');
+    const rollback = new AccountSnapshots(
+      new Proxy(f.edge, {
+        get(store, key) {
+          if (key === 'tenant') {
+            return () =>
+              Promise.resolve({
+                ...db,
+                tx: <T>(callback: Parameters<typeof db.tx<T>>[0]) =>
+                  db.tx(async (conn) => {
+                    await callback(conn);
+                    throw new Error('before tenant commit');
+                  }),
+              });
+          }
+          const value = Reflect.get(store, key);
+          return typeof value === 'function' ? value.bind(store) : value;
+        },
+      }),
+      f.et,
+      f.fp,
+      f.owners,
+    );
+    await assertRejects(
+      () => rollback.apply(f.journal, record),
+      Error,
+      'before tenant commit',
+    );
+    assertEquals(await db.query('SELECT * FROM account_auth_snapshots'), []);
+    assertEquals(await db.query('SELECT * FROM account_auth_publications'), []);
+    const interrupted = new Proxy(f.journal, {
+      get(journal, key) {
+        if (key === 'apply') {
+          return () => Promise.reject(new Error('after tenant publication'));
+        }
+        const value = Reflect.get(journal, key);
+        return typeof value === 'function' ? value.bind(journal) : value;
+      },
+    });
+    await assertRejects(
+      () => f.receiver.apply(interrupted, record),
+      Error,
+      'after tenant publication',
+    );
+    assertEquals(
+      (await f.journal.heads('home', 'in', record)).applied.sequence,
+      0,
+    );
+    await f.edge.close();
+    cold = await f.open('edge');
+    const fp = new Pairings(
+      await cold.server(),
+      f.node.signer(),
+      f.node.publicKey,
+      'b'.repeat(64),
+      f.node,
+    );
+    const ingress = new FacadeAuth(
+      await cold.server(),
+      fp,
+      f.node,
+      new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+      {
+        replicatecredentials: true,
+        allowstaleauth: true,
+        authmaxstalehours: 0,
+      },
+    );
+    const tenant = await enrolledTenant(
+      cold,
+      fp,
+      'logical.test',
+      'edge_a',
+      ingress,
+    );
+    assertEquals(await verifyUserPassword(tenant, 'alice', 'pw'), true);
+    const journal = new Journal(await cold.server(), LINK_SUPPORTED);
+    const owners = new OwnerControls(
+      await cold.server(),
+      await cold.tenant('logical.test'),
+      fp,
+      f.node,
+    );
+    const receiver = new AccountSnapshots(cold, tenant, fp, owners);
+    assertEquals(await receiver.apply(journal, record), true);
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      record.sequence,
+    );
+    assertEquals(await verifyUserPassword(tenant, 'alice', 'pw'), true);
+    assertEquals(
+      (await (await cold.tenant('logical.test')).query(
+        'SELECT * FROM account_auth_publications',
+      )).length,
+      1,
+    );
+  } finally {
+    await cold?.close();
     await f.close();
   }
 });

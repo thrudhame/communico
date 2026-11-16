@@ -1,4 +1,6 @@
 import type { App } from '#engine/app.ts';
+import type { Tenant } from '#engine/tenant/index.ts';
+import type { ConflictSelector } from '#engine/tenant/conflicts.ts';
 import { config } from '#engine/config.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import {
@@ -8,7 +10,7 @@ import {
 } from '#engine/facade/identity.ts';
 import { Pairings, pairingStatus } from '#engine/facade/pairing.ts';
 import { integer, LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
-import { AdminError, type Operation, text } from './protocol.ts';
+import { AdminError, type Body, type Operation, text } from './protocol.ts';
 
 type Dependencies = {
   role: 'home' | 'facade';
@@ -16,7 +18,29 @@ type Dependencies = {
   initialize?(): Promise<unknown>;
   status?(): Promise<unknown>;
   changed?(): Promise<void>;
+  tenant?(): Promise<Tenant | null>;
 };
+
+function conflictSelector(body: Body): ConflictSelector {
+  const localpart = text(body, 'localpart');
+  switch (body.kind) {
+    case 'account-data':
+      return {
+        kind: body.kind,
+        localpart,
+        roomId: text(body, 'roomId'),
+        type: text(body, 'type'),
+      };
+    case 'profile':
+    case 'push-rules':
+      return { kind: body.kind, localpart };
+    default:
+      throw new AdminError(
+        'BAD_REQUEST',
+        'expected account-data, profile or push-rules',
+      );
+  }
+}
 export function facadeOperations(
   deps: Dependencies,
 ): Record<string, Operation> {
@@ -25,6 +49,42 @@ export function facadeOperations(
       deps.status
         ? await deps.status()
         : await (await deps.pairings()).status(),
+  };
+  const tenant = async () => {
+    const owner = await deps.tenant?.();
+    if (!owner) {
+      throw new AdminError(
+        'UNAVAILABLE',
+        'tenant recovery data unavailable',
+        503,
+      );
+    }
+    return owner;
+  };
+  operations['/v1/facade/conflicts'] = async (body) => {
+    const selector = conflictSelector(body);
+    return await (await tenant()).tx((tx) => tx.conflicts.inspect(selector));
+  };
+  operations['/v1/facade/conflicts/export'] = async (body) => {
+    const selector = conflictSelector(body);
+    const operationId = text(body, 'operationId');
+    const exportfile = text(body, 'exportfile');
+    const saved = await (await tenant()).tx((tx) =>
+      tx.conflicts.export(selector, operationId)
+    );
+    try {
+      // File I/O happens AFTER the read transaction, never in a retryable body.
+      await writeProtectedFile(exportfile, JSON.stringify(saved));
+    } catch (error) {
+      if (error instanceof Deno.errors.AlreadyExists) {
+        throw new AdminError(
+          'BAD_REQUEST',
+          'conflict export file already exists',
+        );
+      }
+      throw error;
+    }
+    return { operationId, exportfile };
   };
   if (deps.role === 'home') {
     operations['/v1/facade/pair'] = async (body) => {
@@ -90,6 +150,7 @@ export function facadeOperations(
 export function homeFacadeOperations(app: App): Record<string, Operation> {
   return facadeOperations({
     role: 'home',
+    tenant: () => Promise.resolve(app.tenant),
     status: () => pairingStatus(app.server),
     pairings: async () =>
       new Pairings(

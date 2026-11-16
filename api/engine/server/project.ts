@@ -21,6 +21,7 @@ import { openRoom, type Room, type RoomTx } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
+import { roomSource } from '#engine/store/projection-sources.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
 import { advance, get } from '#engine/store/watermark.ts';
 import { changedColumns } from '#engine/store/changed.ts';
@@ -28,6 +29,12 @@ import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { reconcileTyping } from '#engine/typing.ts';
+import {
+  projectReceiptGraph,
+  type ReceiptMembership,
+  receiptMembership,
+} from '#engine/server/receipt-frontier.ts';
+import { reconcileReceiptMarks } from '#engine/server/ephemeral.ts';
 import {
   capturePushesAt,
   prepareCapturedPush,
@@ -37,12 +44,13 @@ import {
 import {
   applyPushPublication,
   reconcileNotificationEvent,
+  reconcileNotificationReads,
 } from '#engine/server/notifications.ts';
 
 // The watermark source naming a room's change log (storage plan's
 // sources() enumerates these; tests already use this shape).
 export function sourceOf(roomId: string): string {
-  return 'room:' + roomId;
+  return roomSource('room', roomId);
 }
 
 // Capture pagination, not writer ownership. Contention ends a transaction at
@@ -135,9 +143,16 @@ async function projectRoom(
   const server = await store.server();
   capture: for (;;) {
     let mark = await get(server, sourceOf(roomId));
-    let contextMark = await get(server, 'push-context:' + roomId);
+    let contextMark = await get(server, roomSource('push-context', roomId));
+    let receiptMark = await get(server, roomSource('receipt-graph', roomId));
     const localServers = await store.tenants();
-    const seed = await captureHistoricalRelations(room, mark, contextMark);
+    // Upgrade cursors are independent, but their immutable room capture shares
+    // the same outside-writer preparation and fair complete-prefix publication.
+    const seed = await captureHistoricalRelations(
+      room,
+      mark,
+      Math.min(contextMark, receiptMark),
+    );
     const device = seed === null
       ? await captureDevicePublication(store, room, mark)
       : null;
@@ -159,7 +174,8 @@ async function projectRoom(
         return await tx.changes.head();
       });
       return await get(server, sourceOf(roomId)) === mark &&
-        await get(server, 'push-context:' + roomId) === contextMark;
+        await get(server, roomSource('push-context', roomId)) === contextMark &&
+        await get(server, roomSource('receipt-graph', roomId)) === receiptMark;
     };
     if (seed !== null) {
       // Context edges batch until another writer needs the owner. Publish only
@@ -172,7 +188,8 @@ async function projectRoom(
         });
         if (applied === false) continue capture;
         index = applied.end;
-        contextMark = applied.cursor;
+        contextMark = Math.max(contextMark, applied.cursor);
+        receiptMark = Math.max(receiptMark, applied.cursor);
       } while (index < seed.edges.length);
       continue;
     }
@@ -231,9 +248,15 @@ async function projectRoom(
               count++;
               if (waitingWriters > 0) break;
             }
+            // Relations, feed positions and graph evidence must all exist at
+            // this committed cut before pending threaded marks are projected.
+            // One sweep per prefix also avoids a whole-room scan per event.
+            await reconcileReceiptMarks(tx, roomId);
+            await reconcileNotificationReads(tx, roomId, addedMs);
             const pos = ready[count - 1].change.pos;
             await advance(tx, sourceOf(roomId), pos);
-            await advance(tx, 'push-context:' + roomId, pos);
+            await advance(tx, roomSource('push-context', roomId), pos);
+            await advance(tx, roomSource('receipt-graph', roomId), pos);
             return index + count;
           });
           const pos = prepared[end - 1].change.pos;
@@ -277,7 +300,7 @@ async function projectRoom(
         return;
       }
       index = outcome.end;
-      mark = contextMark = outcome.pos;
+      mark = contextMark = receiptMark = outcome.pos;
     } while (index < prepared.length);
   }
 }
@@ -344,6 +367,8 @@ type HistoricalSeed = {
     relation: { relatesTo: string; relType: string | null } | null;
     sender: string;
     seq: number | null;
+    prevs: string[];
+    membership: ReceiptMembership | null;
   }[];
 };
 
@@ -372,6 +397,8 @@ async function captureHistoricalRelations(
         relation: relationOf(data, event),
         sender: String(data.sender),
         seq: row.seq === null ? null : Number(row.seq),
+        prevs: await tx.events.prevsOf(event),
+        membership: receiptMembership(data),
       });
     }
     return out;
@@ -389,9 +416,13 @@ async function applyHistoricalRelations(
   start: number,
 ): Promise<{ end: number; cursor: number }> {
   const now = Date.now();
-  return await server.tx(async (tx) => {
+  return await eventStreamTx(server, async (tx) => {
     let end = start;
-    for (const { event, relation, sender, seq } of seed.edges.slice(start)) {
+    for (
+      const { event, relation, sender, seq, prevs, membership } of seed.edges
+        .slice(start)
+    ) {
+      await projectReceiptGraph(tx, roomId, event, prevs, membership);
       if (relation !== null) {
         await tx.execute(
           'INSERT INTO relations(event,relates_to,rel_type,room,seq) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING',
@@ -408,10 +439,13 @@ async function applyHistoricalRelations(
       end++;
       if (waitingWriters > 0) break;
     }
+    await reconcileReceiptMarks(tx, roomId);
+    await reconcileNotificationReads(tx, roomId, now);
     const cursor = end === seed.edges.length
       ? seed.cursor
       : seed.edges[end - 1].pos;
-    await advance(tx, 'push-context:' + roomId, cursor);
+    await advance(tx, roomSource('push-context', roomId), cursor);
+    await advance(tx, roomSource('receipt-graph', roomId), cursor);
     return { end, cursor };
   });
 }
@@ -441,6 +475,8 @@ type Prepared =
     | {
       kind: 'event' | 'transition' | 'history';
       payload: EventPayload;
+      prevs: string[] | null;
+      receiptMembership: ReceiptMembership | null;
       relation: { relatesTo: string; relType: string | null } | null;
       search: { key: string; text: string } | null;
       // A live cut's complete published membership. Reconciliation uses
@@ -610,6 +646,8 @@ async function prepare(
           let relation: { relatesTo: string; relType: string | null } | null =
             null;
           let search: { key: string; text: string } | null = null;
+          let prevs: string[] | null = null;
+          let member: ReceiptMembership | null = null;
           if (
             payload.standing === 'accepted' && payload.grounding === 'grounded'
           ) {
@@ -618,6 +656,8 @@ async function prepare(
               ? null
               : JSON.parse(row.pdu) as Record<string, unknown>;
             if (pdu !== null) {
+              prevs = await tx.events.prevsOf(change.event);
+              member = receiptMembership(pdu);
               relation = relationOf(pdu, change.event);
               if (change.kind !== 'history' && isLive(payload)) {
                 search = searchTextOf(payload, pdu);
@@ -639,6 +679,8 @@ async function prepare(
             change,
             kind: change.kind,
             payload,
+            prevs,
+            receiptMembership: member,
             relation,
             search,
             publication: null,
@@ -876,6 +918,7 @@ async function apply(
           item.payload.origin,
         ],
       );
+      await applyReceiptGraph(tx, roomId, item);
       if (isLive(item.payload)) await applyLive(tx, roomId, item, addedMs);
       else await reconcileNotificationEvent(tx, roomId, change.event!, addedMs);
       await applyPublication(
@@ -917,6 +960,7 @@ async function apply(
           item.payload.origin,
         ],
       );
+      await applyReceiptGraph(tx, roomId, item);
       if (isLive(item.payload)) await applyLive(tx, roomId, item, addedMs);
       else await reconcileNotificationEvent(tx, roomId, change.event!, addedMs);
       await applyPublication(
@@ -961,6 +1005,7 @@ async function apply(
         ],
       );
       await applyRelation(tx, roomId, item);
+      await applyReceiptGraph(tx, roomId, item);
       await reconcileNotificationEvent(tx, roomId, change.event!, addedMs);
       return;
     }
@@ -1028,6 +1073,21 @@ async function apply(
       return;
     }
   }
+}
+
+async function applyReceiptGraph(
+  tx: Conn,
+  roomId: string,
+  item: Extract<Prepared, { payload: EventPayload }>,
+): Promise<void> {
+  if (item.prevs === null) return;
+  await projectReceiptGraph(
+    tx,
+    roomId,
+    item.change.event!,
+    item.prevs,
+    item.receiptMembership,
+  );
 }
 
 // Reconcile against what the server has actually projected, in the same

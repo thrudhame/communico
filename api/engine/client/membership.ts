@@ -263,42 +263,13 @@ export async function joinedRooms(userId: string) {
 
 export async function propagateProfile(
   userId: string,
-  field: 'displayname' | 'avatar_url',
+  _field: 'displayname' | 'avatar_url',
 ) {
   const app = theApp();
-  const profile = await getProfile(
-    app.tenant,
-    localpartOf(userId),
-  );
-  const value = profile?.[field];
-  const failures: { room: string; error: unknown }[] = [];
-  for (const roomId of await joinedRooms(userId)) {
-    try {
-      const row = (await stateAtSeq(roomId, null)).find((r) =>
-        r.type === 'm.room.member' && r.stateKey === userId
-      );
-      const content = { ...(row?.content ?? {}) };
-      if (value == null) delete content[field];
-      else content[field] = value;
-      const room = await requireRoom(roomId);
-      const { sendLocal } = await import('#engine/room/ingest.ts');
-      const res = await sendLocal(room, {
-        type: 'm.room.member',
-        state_key: userId,
-        sender: userId,
-        content,
-      }, app.tenant.signer());
-      if (res.standing === 'rejected') {
-        throw new MatrixError(
-          403,
-          'M_FORBIDDEN',
-          'profile membership rejected',
-        );
-      }
-    } catch (error) {
-      failures.push({ room: roomId, error });
-    }
+  if (!app.profileFanout) {
+    throw new MatrixError(503, 'M_UNAVAILABLE', 'profile fanout unavailable');
   }
+  const failures = await app.profileFanout.drain(localpartOf(userId));
   if (failures.length > 0) {
     const error = new MatrixError(
       503,

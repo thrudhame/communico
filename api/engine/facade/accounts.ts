@@ -12,7 +12,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import {
   type AccountAuth,
   captureAccountAuth,
-  installAccountAuth,
+  publishAccountAuth,
 } from '#engine/tenant/account-auth.ts';
 import { checkLocalpart, userByLocalpart } from '#engine/tenant/users.ts';
 import {
@@ -531,7 +531,7 @@ export class AccountSnapshots {
           : undefined;
         await (await this.store.tenant(view.server)).tx(async (conn) => {
           if (await current(conn)) {
-            await installAccountAuth(conn, view, cuts);
+            await publishAccountAuth(conn, view, record, cuts);
           }
         });
         return {

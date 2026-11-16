@@ -167,7 +167,7 @@ Deno.test('one F1 capability manifest gates public requests before auth and excl
   });
 });
 
-Deno.test('F2 auth manifest enables only delivered account authority and keeps owner-only services unavailable', () => {
+Deno.test('F2 manifest enables delivered auth and registers without later capabilities', () => {
   const facade = capabilities('facade', 'f2');
   const request = (path: string, method: string) =>
     new Request('https://logical.test/_matrix/client/' + path, { method });
@@ -185,6 +185,28 @@ Deno.test('F2 auth manifest enables only delivered account authority and keeps o
       ['v3/account/deactivate', 'POST'],
       ['v3/devices/target', 'DELETE'],
       ['v3/devices/target', 'PUT'],
+      ['v3/profile/%40alice%3Atest', 'GET'],
+      ['v3/profile/%40alice%3Atest/displayname', 'GET'],
+      ['v3/profile/%40alice%3Atest/org.test.field', 'PUT'],
+      ['v3/profile/%40alice%3Atest/org.test.field', 'DELETE'],
+      ['v3/pushrules/', 'GET'],
+      ['v3/pushrules/global/', 'GET'],
+      ['v3/pushrules/global/override/rule', 'GET'],
+      ['v3/pushrules/global/override/rule', 'PUT'],
+      ['v3/pushrules/global/override/rule', 'DELETE'],
+      ['v3/pushrules/global/override/rule/actions', 'GET'],
+      ['v3/pushrules/global/override/rule/actions', 'PUT'],
+      ['v3/pushrules/global/override/rule/enabled', 'GET'],
+      ['v3/pushrules/global/override/rule/enabled', 'PUT'],
+      ['v3/user/%40alice%3Atest/account_data/m.test', 'GET'],
+      ['v3/user/%40alice%3Atest/account_data/m.test', 'PUT'],
+      ['v3/user/%40alice%3Atest/rooms/room/account_data/m.test', 'GET'],
+      ['v3/user/%40alice%3Atest/rooms/room/account_data/m.test', 'PUT'],
+      ['v3/user/%40alice%3Atest/rooms/room/tags', 'GET'],
+      ['v3/user/%40alice%3Atest/rooms/room/tags/tag', 'PUT'],
+      ['v3/user/%40alice%3Atest/rooms/room/tags/tag', 'DELETE'],
+      ['v3/rooms/room/read_markers', 'POST'],
+      ['v3/rooms/room/receipt/m.read/event', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true), null);
   for (
@@ -202,8 +224,14 @@ Deno.test('F2 auth manifest enables only delivered account authority and keeps o
       ['v3/devices', 'GET'],
       ['v3/keys/upload', 'POST'],
       ['v3/sendToDevice/m.test/txn', 'PUT'],
+      ['v3/user/%40alice%3Atest/filter', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true)?.status, 404);
+  assertEquals(
+    facade.gate(request('v3/profile/%40alice%3Atest', 'PUT'), () => true)
+      ?.status,
+    405,
+  );
   assertEquals(facade.service('deactivation'), true);
   assertEquals(capabilities('facade', 'f1').service('deactivation'), false);
   for (

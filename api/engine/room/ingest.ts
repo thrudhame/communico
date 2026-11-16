@@ -170,6 +170,8 @@ function localJoiningUser(event: BuildPartial): string | undefined {
 
 export type PreparedSubmission = { eventId: string; pdu: Pdu | null };
 export type LocalSubmission = {
+  // Read-only precondition: before fresh preparation and again in the actual
+  // room-write transaction. Grounded receipts reconcile without re-admission.
   admit?(tx: RoomTx): Promise<void>;
   lookup(): Promise<PreparedSubmission | null>;
   prepare(pdu: Pdu): Promise<PreparedSubmission>;
@@ -254,6 +256,7 @@ async function submitLocal(
         prepared.pdu,
       );
       if (receipt !== null) return receipt;
+      await submission.admit?.(tx);
       if (prepared.pdu === null) {
         throw new Error('E_SUBMISSION_EVENT_MISSING: ' + prepared.eventId);
       }

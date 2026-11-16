@@ -5,6 +5,17 @@ import type { Conn, Database as Db } from '#engine/store/db.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { isJoined, receiptTargetInThread } from '#engine/server/read.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
+import {
+  graphReceiptsEnabled,
+  receiptFrontier,
+} from '#engine/server/receipt-frontier.ts';
+import {
+  acceptReceiptOperation,
+  pendingReceiptOperations,
+  type ReceiptOperation,
+  receiptOperationMark,
+  recordReceiptOperation,
+} from '#engine/server/receipt-operations.ts';
 
 const MAX_UNKNOWN_THREADS = 100;
 /** Protocol identifiers, not arbitrary durable keys. Adapters must not coerce
@@ -184,8 +195,12 @@ export async function setReceipt(
   userId: string,
   receiptType: 'm.read' | 'm.read.private',
   eventId: string,
-  opts: { ts?: number; threadId?: string | null; requireRelated?: boolean } =
-    {},
+  opts: {
+    ts?: number;
+    threadId?: string | null;
+    requireRelated?: boolean;
+    authorize?: (conn: Conn) => Promise<void>;
+  } = {},
 ): Promise<boolean> {
   return await setReceiptMark(
     server,
@@ -205,8 +220,12 @@ export async function setReceiptMark(
   userId: string,
   receiptType: 'm.read' | 'm.read.private',
   targets: readonly string[],
-  opts: { ts?: number; threadId?: string | null; requireRelated?: boolean } =
-    {},
+  opts: {
+    ts?: number;
+    threadId?: string | null;
+    requireRelated?: boolean;
+    authorize?: (conn: Conn) => Promise<void>;
+  } = {},
 ): Promise<boolean> {
   if (!targets.length || targets.some((id) => typeof id !== 'string')) {
     throw new MatrixError(
@@ -215,10 +234,11 @@ export async function setReceiptMark(
       'invalid receipt extremities',
     );
   }
-  const eventIds = [...new Set(targets)];
+  const incoming = [...new Set(targets)].sort();
   const ts = opts.ts ?? Date.now();
   const threadId = receiptThreadId(opts.threadId);
-  const row = await eventStreamTx(server, async (tx) => {
+  const admitted = await eventStreamTx(server, async (tx) => {
+    await opts.authorize?.(tx);
     if (!await isJoined(tx, roomId, userId)) return null;
     if (threadId !== null && threadId !== 'main') {
       const existing = await tx.query(
@@ -248,7 +268,7 @@ export async function setReceiptMark(
     }
     // Local API admission and read effects share the same relation snapshot.
     // Inbound EDUs may reference targets not held yet and retain their identity.
-    for (const eventId of eventIds) {
+    for (const eventId of incoming) {
       if (
         opts.requireRelated && threadId !== null &&
         !await receiptTargetInThread(tx, roomId, eventId, threadId)
@@ -260,44 +280,216 @@ export async function setReceiptMark(
         );
       }
     }
-    const seq = await next(tx, 'receipts');
-    await tx.execute(
-      `INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_ids,ts_ms,seq) VALUES(?,?,?,?,?,?,?)
-      ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_ids=excluded.event_ids,ts_ms=excluded.ts_ms,seq=excluded.seq`,
-      [
-        roomId,
-        userId,
-        receiptType,
-        threadId ?? '',
-        JSON.stringify(eventIds),
-        ts,
-        seq,
-      ],
+    const [membership] = await tx.query(
+      'SELECT event FROM memberships WHERE room=? AND user=?',
+      [roomId, userId],
     );
-    const now = Date.now();
-    for (const eventId of eventIds) {
-      const admitted = await advanceNotificationRead(
+    await recordReceiptOperation(tx, {
+      roomId,
+      userId,
+      receiptType,
+      eventIds: incoming,
+      ts,
+      threadId,
+      admission: { membershipEvent: String(membership.event) },
+    });
+    const row = await mergeReceiptMark(
+      tx,
+      roomId,
+      userId,
+      receiptType,
+      incoming,
+      ts,
+      threadId,
+    );
+    await opts.authorize?.(tx);
+    // Admission and projection are different outcomes: an unchanged frontier
+    // is a successful mark, not a membership rejection.
+    return { row };
+  });
+  if (admitted === null) return false;
+  // Private rows wake their owner, but federation only consumes public rows.
+  if (admitted.row !== null) {
+    notify(server, {
+      kind: 'receipt',
+      roomId,
+      receiptType,
+      row: admitted.row,
+    });
+  }
+  return true;
+}
+
+/** Shared projection, not admission. Local callers have checked current
+ * membership; imported callers retain their original authenticated admission. */
+async function mergeReceiptMark(
+  tx: Conn,
+  roomId: string,
+  userId: string,
+  receiptType: 'm.read' | 'm.read.private',
+  incoming: readonly string[],
+  ts: number,
+  threadId: string | null,
+): Promise<ReceiptRow | null> {
+  const [prior] = await tx.query(
+    'SELECT event_ids FROM receipts WHERE room_id=? AND user_id=? AND receipt_type=? AND thread_id=?',
+    [roomId, userId, receiptType, threadId ?? ''],
+  );
+  const graph = await graphReceiptsEnabled(tx);
+  const now = Date.now();
+  const admitRead = async (eventId: string) => {
+    if (
+      !await advanceNotificationRead(
         tx,
         userId,
         roomId,
         threadId ?? '',
         eventId,
         now,
+      )
+    ) {
+      throw new MatrixError(
+        429,
+        'M_LIMIT_EXCEEDED',
+        'pending receipt capacity reached',
       );
-      if (!admitted) {
-        throw new MatrixError(
-          429,
-          'M_LIMIT_EXCEEDED',
-          'pending receipt capacity reached',
-        );
-      }
     }
-    return { userId, receiptType, threadId, eventIds, ts, seq };
+  };
+  // Read admission precedes wire-frontier reduction. A retained descendant can
+  // be outside this thread, so dropping its valid incoming ancestor must not
+  // erase that ancestor's read fact or its immutable transfer intent.
+  if (graph) {
+    for (const eventId of incoming) await admitRead(eventId);
+  }
+  const oldIds: string[] = prior ? JSON.parse(String(prior.event_ids)) : [];
+  const eventIds = graph
+    ? await receiptFrontier(tx, roomId, [...oldIds, ...incoming])
+    : incoming;
+  if (
+    graph && prior &&
+    JSON.stringify(oldIds.toSorted()) === JSON.stringify(eventIds)
+  ) return null;
+  const seq = await next(tx, 'receipts');
+  await tx.execute(
+    `INSERT INTO receipts(room_id,user_id,receipt_type,thread_id,event_ids,ts_ms,seq) VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_ids=excluded.event_ids,ts_ms=excluded.ts_ms,seq=excluded.seq`,
+    [
+      roomId,
+      userId,
+      receiptType,
+      threadId ?? '',
+      JSON.stringify(eventIds),
+      ts,
+      seq,
+    ],
+  );
+  for (const eventId of eventIds) {
+    if (!graph || !incoming.includes(eventId)) await admitRead(eventId);
+  }
+  return { userId, receiptType, threadId, eventIds, ts, seq };
+}
+
+/** Typed-link adapter supplies the authenticated enrolled source AND the
+ * selected own-user scope. No public endpoint can nominate either authority. */
+export async function importReceiptOperation(
+  server: Db,
+  operation: ReceiptOperation,
+  authenticated: { source: string; incarnation: string; userId: string },
+  authorize?: (conn: Conn) => Promise<void>,
+  history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+): Promise<void> {
+  const mark = receiptOperationMark(operation);
+  if (mark.userId !== authenticated.userId) {
+    throw new Error('receipt account not selected');
+  }
+  const rows = await eventStreamTx(server, async (tx) => {
+    await authorize?.(tx);
+    await acceptReceiptOperation(tx, operation, authenticated, history);
+    return await projectPendingReceipts(tx, mark.roomId);
   });
-  if (row === null) return false;
-  // Private rows wake their owner, but federation only consumes public rows.
-  notify(server, { kind: 'receipt', roomId, receiptType, row });
-  return true;
+  for (const row of rows) {
+    notify(server, {
+      kind: 'receipt',
+      roomId: mark.roomId,
+      receiptType: row.receiptType,
+      row,
+    });
+  }
+}
+
+async function projectPendingReceipts(tx: Conn, roomId: string) {
+  const rows: ReceiptRow[] = [];
+  for (const operation of await pendingReceiptOperations(tx, roomId)) {
+    const mark = receiptOperationMark(operation), visible: string[] = [];
+    // Original source admission is immutable. Required receiver evidence may
+    // arrive later, including after departure. Missing evidence never ACKs a
+    // mark out of storage or discloses an unknown event ID to local consumers.
+    if (
+      !(await tx.query(
+        "SELECT 1 FROM receipt_membership_events m JOIN event_index i ON i.event=m.event AND i.room=m.room WHERE m.event=? AND m.room=? AND m.user=? AND m.membership='join' AND i.standing='accepted' AND i.grounding='grounded'",
+        [mark.admission.membershipEvent, roomId, mark.userId],
+      )).length
+    ) continue;
+    for (const event of mark.eventIds) {
+      if (
+        (await tx.query(
+          "SELECT 1 FROM event_index WHERE event=? AND room=? AND standing='accepted' AND grounding='grounded'",
+          [event, roomId],
+        )).length && (mark.threadId === null ||
+          await receiptTargetInThread(tx, roomId, event, mark.threadId))
+      ) visible.push(event);
+    }
+    if (!visible.length) continue;
+    const row = await mergeReceiptMark(
+      tx,
+      roomId,
+      mark.userId,
+      mark.receiptType,
+      visible,
+      mark.ts,
+      mark.threadId,
+    );
+    if (row) rows.push(row);
+    if (visible.length === mark.eventIds.length) {
+      await tx.execute(
+        'UPDATE domain_operations SET applied=1 WHERE operation_id=?',
+        [operation.operationId],
+      );
+    }
+  }
+  return rows;
+}
+
+/** Projection has learned new accepted ancestry. Reduce every retained slot in
+ * the same server transaction without changing admission or privacy scope. */
+export async function reconcileReceiptMarks(
+  tx: Conn,
+  roomId: string,
+): Promise<void> {
+  if (!await graphReceiptsEnabled(tx)) return;
+  await projectPendingReceipts(tx, roomId);
+  const rows = await tx.query(
+    'SELECT user_id,receipt_type,thread_id,event_ids FROM receipts WHERE room_id=?',
+    [roomId],
+  );
+  for (const row of rows) {
+    const oldIds: string[] = JSON.parse(String(row.event_ids));
+    const eventIds = await receiptFrontier(tx, roomId, oldIds);
+    if (JSON.stringify(oldIds.toSorted()) === JSON.stringify(eventIds)) {
+      continue;
+    }
+    await tx.execute(
+      'UPDATE receipts SET event_ids=?,seq=? WHERE room_id=? AND user_id=? AND receipt_type=? AND thread_id=?',
+      [
+        JSON.stringify(eventIds),
+        await next(tx, 'receipts'),
+        roomId,
+        String(row.user_id),
+        String(row.receipt_type),
+        String(row.thread_id),
+      ],
+    );
+  }
 }
 // Relevance is a publication read too: use the same public-or-own contract for
 // long-poll wakeups and incremental room selection as for receipt content.
