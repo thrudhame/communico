@@ -67,6 +67,10 @@ export type SnapshotFile = {
 
 export class Store implements StartupStore {
   private stopped = false;
+  private accepting = true;
+  private draining?: Promise<void>;
+  private readonly accepted = new Set<Promise<unknown>>();
+  private readonly drainers = new Set<() => Promise<void>>();
   private closing?: Promise<void>;
   private readonly maintenance = new Set<Promise<unknown>>();
   private readonly serverOperations: Database;
@@ -85,6 +89,37 @@ export class Store implements StartupStore {
 
   server(): Promise<Database> {
     return Promise.resolve(this.serverOperations);
+  }
+
+  // Logical multi-file writes outlive their HTTP request and retain storage
+  // access through their final receipt/enrollment, including during shutdown.
+  accept<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.accepting) {
+      return Promise.reject(new Error('store acceptance closed'));
+    }
+    const task = Promise.resolve().then(fn);
+    this.accepted.add(task);
+    return task.finally(() => this.accepted.delete(task));
+  }
+
+  onDrain(fn: () => Promise<void>): void {
+    this.drainers.add(fn);
+  }
+
+  drain(): Promise<void> {
+    this.accepting = false;
+    return this.draining ??= (async () => {
+      await Promise.allSettled(this.accepted);
+      const results = await Promise.allSettled(
+        [...this.drainers].map((fn) => fn()),
+      );
+      const errors = results.flatMap((r) =>
+        r.status === 'rejected' ? [r.reason] : []
+      );
+      if (errors.length) {
+        throw new AggregateError(errors, 'store completion drain failed');
+      }
+    })();
   }
 
   get directory(): string {
@@ -336,8 +371,14 @@ export class Store implements StartupStore {
   }
 
   async close(): Promise<void> {
-    this.stopped = true;
     await (this.closing ??= (async () => {
+      let failure: unknown;
+      try {
+        await this.drain();
+      } catch (error) {
+        failure = error;
+      }
+      this.stopped = true;
       await Promise.allSettled(this.maintenance);
       // Accepted operations can still need their native commit/publication.
       // Never close that admission while draining the owners that use it.
@@ -345,6 +386,7 @@ export class Store implements StartupStore {
       await this.serverDb.close();
       await this.ffi.unlockStore(this.ownership);
       this.ffi.close();
+      if (failure !== undefined) throw failure;
     })());
   }
 }

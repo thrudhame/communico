@@ -162,6 +162,40 @@ export async function auditServer(
     let historicalUnheldReceipts = 0;
     for (const tenant of snapshot.files.filter((f) => f.kind === 'tenants')) {
       await snapshot.read(tenant, async (source) => {
+        for (
+          const table of ['transaction_completions', 'client_completion_cuts']
+        ) {
+          for await (const target of scan(source, table, '*')) {
+            const room = rooms.get(String(target.room_id));
+            if (room === undefined) {
+              // Keep the old historical-receipt exception, never a lost pending
+              // obligation. Retirement must reconcile pending cuts before unlink.
+              if (table === 'client_completion_cuts') {
+                auditFailure('orphan pending completion');
+              }
+              continue;
+            }
+            await snapshot.read(room, async (held) => {
+              const [identity] = await held.query(
+                'SELECT generation FROM completion_state',
+              );
+              if (identity.generation !== target.room_generation) {
+                auditFailure('completion room generation');
+              }
+              const matching = await held.query(
+                table === 'transaction_completions'
+                  ? 'SELECT event FROM completion_receipts WHERE event=? AND through=?'
+                  : 'SELECT event FROM completion_receipts WHERE through=? LIMIT 1',
+                table === 'transaction_completions'
+                  ? [target.event_id, target.through]
+                  : [target.through],
+              );
+              if (matching.length === 0) {
+                auditFailure('completion target has no exact room receipt');
+              }
+            });
+          }
+        }
         for await (
           const intent of scan(
             source,

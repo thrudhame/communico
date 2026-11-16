@@ -5,6 +5,7 @@ import {
   counterCeiling,
   counters,
   nonnegative,
+  scan,
 } from '#engine/backup/checks.ts';
 import { nativeNameFor } from './index.ts';
 import {
@@ -73,8 +74,44 @@ export async function auditTenant(db: CapturedQuery, id: string) {
       ['key_pools', 'key_pool_updates', 'seq'],
       ['device_generation', 'devices', 'generation'],
       ['cross_signing', 'cross_signing_keys', 'revision'],
+      ['client_completion', 'client_completion_cuts', 'revision'],
     ]
   ) await counterCeiling(db, heads, counter, table, column);
+  for (const table of ['transaction_completions', 'client_completion_cuts']) {
+    for await (const target of scan(db, table, '*')) {
+      const devices = await db.query(
+        'SELECT 1 FROM devices WHERE localpart=? AND device_id=? AND generation=?',
+        [target.localpart, target.device_id, target.generation],
+      );
+      if (
+        devices.length !== 1 || typeof target.room_id !== 'string' ||
+        target.room_id.length === 0 ||
+        typeof target.room_generation !== 'string' ||
+        target.room_generation.length === 0 ||
+        nonnegative(target.through, 'completion cut') === 0
+      ) auditFailure('completion target ownership');
+      if (table === 'client_completion_cuts') {
+        if (nonnegative(target.revision, 'completion revision') === 0) {
+          auditFailure('completion revision');
+        }
+      } else {
+        const receipt = await db.query(
+          'SELECT event_id,room_id,completed FROM transactions WHERE localpart=? AND device_id=? AND generation=? AND endpoint=? AND txn_id=?',
+          [
+            target.localpart,
+            target.device_id,
+            target.generation,
+            target.endpoint,
+            target.txn_id,
+          ],
+        );
+        if (
+          receipt.length !== 1 || receipt[0].event_id !== target.event_id ||
+          receipt[0].room_id !== target.room_id || receipt[0].completed !== 1
+        ) auditFailure('completion transaction receipt');
+      }
+    }
+  }
   const media = (await db.query(
     "SELECT media_id,size_bytes FROM media WHERE state='uploaded' ORDER BY media_id",
   )).map((m) => {

@@ -97,11 +97,59 @@ export function projectThrough(
   return enqueueProjection(store, target.roomId, admitted);
 }
 
+// The owned completion service releases publication waiters independently of
+// required callbacks. Each committed prefix is observable outside the writer.
+export function publishThrough(
+  store: Store,
+  target: CompletionCut | CompletionTarget,
+  progress: () => Promise<void>,
+): Promise<void> {
+  const admitted = (async () => {
+    const room = await openRoom(store, target.roomId);
+    await room.tx((tx) => tx.completion.validate(target));
+    return { room, head: target.through, target, progress };
+  })();
+  return enqueueProjection(store, target.roomId, admitted);
+}
+
+export async function completePublished(
+  store: Store,
+  target: CompletionCut | CompletionTarget,
+): Promise<void> {
+  const room = await openRoom(store, target.roomId);
+  await room.tx((tx) => tx.completion.validate(target));
+  if (
+    await get(await store.server(), sourceOf(target.roomId)) < target.through
+  ) {
+    throw new Error('E_COMPLETION_UNPUBLISHED: ' + target.roomId);
+  }
+  const results = await Promise.allSettled(
+    [...projectedListeners].map((fn) =>
+      Promise.resolve().then(() => fn(store, target.roomId, target.through))
+    ),
+  );
+  const errors = results.flatMap((r) =>
+    r.status === 'rejected' ? [r.reason] : []
+  );
+  if (errors.length) {
+    throw new AggregateError(errors, 'E_COMPLETION_CALLBACK: ' + target.roomId);
+  }
+  await room.tx(async (tx) => {
+    await tx.completion.validate(target);
+    await tx.completion.complete(target.generation, target.through);
+  });
+}
+
 function enqueueProjection(
   store: Store,
   roomId: string,
   admitted: Promise<
-    { room: Room; head: number; target?: CompletionCut | CompletionTarget }
+    {
+      room: Room;
+      head: number;
+      target?: CompletionCut | CompletionTarget;
+      progress?: () => Promise<void>;
+    }
   >,
 ): Promise<void> {
   // A failed admission can settle while its predecessor still owns the queue.
@@ -113,8 +161,8 @@ function enqueueProjection(
   // concurrently. A failed page releases its owner for the next roll-forward.
   const run = (rooms.get(roomId) ?? Promise.resolve()).catch(() => {}).then(
     async () => {
-      const { room, head, target } = await admitted;
-      await projectRoom(store, roomId, room, head, target);
+      const { room, head, target, progress } = await admitted;
+      await projectRoom(store, roomId, room, head, target, progress);
     },
   );
   rooms.set(roomId, run);
@@ -131,6 +179,7 @@ async function projectRoom(
   room: Room,
   head: number,
   target?: CompletionCut | CompletionTarget,
+  progress?: () => Promise<void>,
 ): Promise<void> {
   const server = await store.server();
   capture: for (;;) {
@@ -151,6 +200,12 @@ async function projectRoom(
     const prepared = drop === 0
       ? []
       : await prepare(room, store, roomId, batch, localServers);
+    if (drop === 0) {
+      // Replayed retirement completes the already published prefix BEFORE the
+      // global writer/removal turn. Callbacks may themselves need that writer.
+      const cut = await room.tx((tx) => tx.completion.capture());
+      await completePublished(store, { ...cut, through: batch[0].pos - 1 });
+    }
     const current = async () => {
       // This logical handle fences retirement and the storage incarnation.
       // A drop/recreate cannot publish an earlier incarnation's captured page.
@@ -248,7 +303,9 @@ async function projectRoom(
         } as const;
       });
       if (outcome.kind === 'retry') continue capture;
+      await progress?.();
       if (outcome.kind === 'complete') {
+        if (progress !== undefined) return;
         // Preserve acknowledged observer work (including rule migration) and
         // same-room ordering without blocking independent publication writers.
         const failures: unknown[] = [];

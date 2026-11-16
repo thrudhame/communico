@@ -249,6 +249,27 @@ rows. Ordinary room helpers still await their existing post-commit boundary.
 Backup audits and restored-work inspection retain the new identity, receipt and
 progress facts. (`api/engine/room/completion.ts`, `server/project.ts`)
 
+Device-backed local message sends return after the room event and the tenant's
+transaction receipt, exact completion target and client pending cut are durable.
+One store-owned completion service enrolls committed room targets even if tenant
+finish fails. It settles ready dependencies, publishes immutable prefixes and
+completes required callbacks independently of the HTTP request. Fixed smaller
+waiters can finish before later room work; cancellation removes only a waiter.
+Failures carry room/cut/cause, reject required waiters with 503 and remain logged
+and owned for automatic retry without another arrival. Schema-enabled startup
+discovers lost wakes and publication/completion gaps after the restore-report
+gate. Store shutdown closes new acceptance, drains admitted submissions and
+completion, then releases service callbacks and native storage.
+(`api/engine/server/{completion,startup}.ts`, `store/index.ts`, `tenant/completion.ts`)
+
+Internal local/state/membership/redaction, remote/history and replica helpers
+retain their awaited completion boundary. Explicit room retirement rechecks full
+completion under lifecycle serialization, reconciles satisfied client markers
+while the original generation remains held, then unlinks. Historical completed
+transaction receipts survive that intentional lifecycle; missing or replaced
+outstanding targets are never satisfied by an equal numeric position.
+(`api/engine/room/{ingest,operator}.ts`, `server/removal.ts`)
+
 The room transaction records its mutations and delivery destinations in
 `changes`. After that transaction commits, an injected hook projects them
 into the server file. Projection failure leaves the room write committed;
@@ -290,6 +311,18 @@ body/name/topic text without altering the PDU.
 `api/engine/server/project.ts:578-587`, `api/engine/server/project.ts:419-467`)
 
 ## Client reads and sync
+
+Both ordinary and sliding sync first capture the authenticated device generation's
+pending cuts in one tenant read, release the transaction and await those exact
+publications. This precedes ordinary stream-head clamping and sliding list/lease
+selection, including timeout-zero, initial, full-state, list-only and encryption
+requests. Only successful rendering conditionally retires each captured revision;
+failed/cancelled consumers and concurrently higher revisions retain their markers.
+Shared authenticated effect-read admission uses the same publication boundary
+before event/relation/search/receipt selection, leaving marker retirement to sync.
+Existing filters, visibility, limits and explicit historical tokens retain their
+meaning; completion does not inject an event into a filtered or trimmed response.
+(`api/engine/client/completion.ts`, `auth-context.ts`, `syncfeed.ts`, `sliding-sync/index.ts`)
 
 Client state disclosure has one admission owner, separate from raw state reads
 and event serialization. A grant names the room, viewer and exact publication

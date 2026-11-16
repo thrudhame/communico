@@ -42,6 +42,8 @@ import * as media from '#engine/tenant/media.ts';
 import * as pushers from '#engine/tenant/pushers.ts';
 import * as pushrules from '#engine/tenant/pushrules.ts';
 import * as txns from '#engine/tenant/txns.ts';
+import * as completion from '#engine/tenant/completion.ts';
+import type { CompletionTarget } from '#engine/room/completion.ts';
 import * as delayedEvents from '#engine/tenant/delayed-events.ts';
 import * as uia from '#engine/tenant/uia.ts';
 import * as slidingSync from '#engine/tenant/sliding-sync.ts';
@@ -717,6 +719,14 @@ function bind(
       prepare: (id: string, pdu: Pdu) => delayedEvents.prepare(conn, id, pdu),
       finish: (id: string) => delayedEvents.finish(conn, id),
     },
+    completion: {
+      pending: (device: devices.DeviceIdentity) =>
+        completion.pendingCompletions(conn, device),
+      retire: (
+        device: devices.DeviceIdentity,
+        captured: completion.PendingCompletion,
+      ) => completion.retireCompletion(conn, device, captured),
+    },
     txns: {
       submission: (
         deviceId: devices.DeviceIdentity,
@@ -735,6 +745,7 @@ function bind(
         txnId: string,
         eventId: string,
         accepted: boolean,
+        target?: CompletionTarget,
       ) =>
         txns.finishSubmission(
           conn,
@@ -743,6 +754,7 @@ function bind(
           txnId,
           eventId,
           accepted,
+          target,
         ),
       forEvent: (
         deviceId: devices.DeviceIdentity,

@@ -1,6 +1,6 @@
 // api/engine/server/startup.ts — the store startup hook (R12, plan §2
-// row 4): discovery, then project() for every registered room until each
-// watermark equals its room's last change position. installServerHooks is
+// row 4): discover lifecycle changes, then resume owned durable completion for
+// every held room through its captured publication/callback cut. installServerHooks is
 // explicit: the composition root (stage 5) and the tests call it; without
 // it the room writes stand alone and a later startup catches up.
 import { setRoomHooks } from '#engine/room/hooks.ts';
@@ -13,8 +13,8 @@ import { reconcileDeviceSubscriptions } from '#engine/server/device-federation.t
 import type { Store } from '#engine/store/index.ts';
 import { onStartup, type StartupStore } from '#engine/store/watermark.ts';
 import { installJoinAdmission } from '#engine/server/join-attempts.ts';
-import { openRoom } from '#engine/room/index.ts';
-import { resumeWaits } from '#engine/room/ingest.ts';
+import { completionService } from './completion.ts';
+import { assertRestoreReport } from '#engine/backup/report.ts';
 
 // App composition calls this after the restore-report gate and before workers.
 // Failed dependency work is durable room truth, not a process-local task.
@@ -22,14 +22,18 @@ export async function recoverRoomWaits(
   store: Store,
   self: string,
 ): Promise<void> {
-  for (const roomId of await listRooms(store)) {
-    await resumeWaits(await openRoom(store, roomId), { self }, []);
-    await project(store, roomId);
-  }
+  await completionService(store).discover(self);
 }
 
 export function installServerHooks(): void {
-  setRoomHooks({ project, register: registerRoom });
+  setRoomHooks({
+    project,
+    register: registerRoom,
+    enroll: (room, self, target) =>
+      completionService(room.store).enroll(room, self, target),
+    complete: (room, self, target, signal) =>
+      completionService(room.store).wait(target, 'completion', signal, self),
+  });
   setTenantProjector(projectTenant);
   onStartup(recoverServer);
 }
@@ -47,6 +51,9 @@ export async function recoverServer(store: StartupStore): Promise<void> {
   ) {
     return;
   }
+  // Candidate inspection never runs startup hooks. A normal opening must verify
+  // the durable restore report before discovering any completion-owned work.
+  await assertRestoreReport(concrete);
   installJoinAdmission(concrete);
   await discover(concrete);
   // A completed unlink can precede deletion of its now-orphaned watermark.
@@ -71,4 +78,5 @@ export async function recoverServer(store: StartupStore): Promise<void> {
     )).map((r) => String(r.subject));
     await reconcileDeviceSubscriptions(tx, subjects, localServers);
   });
+  await completionService(concrete).discover(localServers[0] ?? '');
 }

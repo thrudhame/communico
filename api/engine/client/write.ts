@@ -11,7 +11,11 @@ import {
   createRoom as create,
   type CreateRoomOptions,
 } from '#engine/room/create.ts';
-import { redactEvent as redact, sendLocal } from '#engine/room/ingest.ts';
+import {
+  acceptLocal,
+  redactEvent as redact,
+  sendLocal,
+} from '#engine/room/ingest.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { ruleId } from '#engine/rulebook/rule-ids.ts';
 import { membershipOf } from '#engine/server/read.ts';
@@ -82,31 +86,25 @@ export async function sendEvent(
 ) {
   const app = theApp();
   const room = await requireRoom(roomId);
-  const res = await sendLocal(
-    room,
-    {
-      type,
-      sender: userId,
-      content,
-      origin_server_ts: Date.now(),
-    },
-    app.tenant.signer(),
-    transactionSubmission(
+  const submission = transactionSubmission(
+    app.tenant,
+    deviceId === null ? null : await deviceIdentity(
       app.tenant,
-      deviceId === null ? null : await deviceIdentity(
-        app.tenant,
-        localpartOf(userId),
-        deviceId,
-        deviceGeneration,
-      ),
-      {
-        kind: 'send',
-        roomId,
-        eventType: type,
-      },
-      txnId,
+      localpartOf(userId),
+      deviceId,
+      deviceGeneration,
     ),
+    {
+      kind: 'send',
+      roomId,
+      eventType: type,
+    },
+    txnId,
   );
+  const event = { type, sender: userId, content, origin_server_ts: Date.now() };
+  const res = submission === undefined
+    ? await sendLocal(room, event, app.tenant.signer())
+    : await acceptLocal(room, event, app.tenant.signer(), submission);
   if (res.standing === 'rejected') {
     throw new MatrixError(
       403,

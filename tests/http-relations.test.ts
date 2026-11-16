@@ -27,6 +27,8 @@ async function ok(
 ) {
   const result = await call(path, token, body, method);
   assertEquals(result.status, 200, JSON.stringify(result.body));
+  // Establish the sender's published cut before a different client reads it.
+  if (path.includes('/send/')) await ok('v3/sync?timeout=0', token);
   return result.body;
 }
 async function setup(prefix: string) {
