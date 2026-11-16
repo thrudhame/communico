@@ -12,6 +12,7 @@ import {
   cachedDeviceKeys,
 } from '#engine/server/remote-devices.ts';
 import { deviceDelta } from '#engine/e2ee-remote.ts';
+import { deviceListService } from '#engine/federation/device-lists.ts';
 
 const suite = httpSuite('HTTP causal device cache');
 
@@ -233,6 +234,7 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
   let user = '', snapshots = 0, claims = 0;
   let paused = false, release: (() => void) | undefined;
   let snapshotEntered: (() => void) | undefined;
+  let demandOnly: ReturnType<typeof deviceListService> | undefined;
   const key = {
     user_id: '',
     device_id: 'D',
@@ -353,6 +355,15 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
     await relationship([a.user_id, user], 3);
     await new Promise((r) => setTimeout(r, 1100));
     assertEquals(snapshots, 2, 'rejoin remains dormant until fresh demand');
+    // The cancellation case needs one subscriber. A periodic recovery worker
+    // is legitimately independent of the client and must not join this flight.
+    await http.app.deviceLists.stop();
+    demandOnly = deviceListService(
+      http.app.server,
+      http.app.tenant,
+      http.app.federationEdus,
+    );
+    http.app.deviceLists.recover = demandOnly.recover;
     const timedQuery = (timeout: number) =>
       http.matrix(
         new Request('http://x/_matrix/client/v3/keys/query', {
@@ -455,6 +466,7 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
     assertEquals(claims, 1, 'consuming claim remains one-shot');
   } finally {
     release?.();
+    await demandOnly?.stop();
     await http.close();
     await fake.close();
     setConfigForTests({ federation: previous });
