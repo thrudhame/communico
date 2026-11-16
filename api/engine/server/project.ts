@@ -17,6 +17,7 @@ import { openRoom, type Room } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
+import { roomSource } from '#engine/store/projection-sources.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
 import { advance, get } from '#engine/store/watermark.ts';
 import { changedColumns } from '#engine/store/changed.ts';
@@ -45,7 +46,7 @@ import {
 // The watermark source naming a room's change log (storage plan's
 // sources() enumerates these; tests already use this shape).
 export function sourceOf(roomId: string): string {
-  return 'room:' + roomId;
+  return roomSource('room', roomId);
 }
 
 // Capture pagination, not writer ownership. Contention ends a transaction at
@@ -99,8 +100,8 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
   const head = await room.tx((tx) => tx.changes.head());
   capture: for (;;) {
     let mark = await get(server, sourceOf(roomId));
-    let contextMark = await get(server, 'push-context:' + roomId);
-    let receiptMark = await get(server, 'receipt-graph:' + roomId);
+    let contextMark = await get(server, roomSource('push-context', roomId));
+    let receiptMark = await get(server, roomSource('receipt-graph', roomId));
     const localServers = await store.tenants();
     // Upgrade cursors are independent, but their immutable room capture shares
     // the same outside-writer preparation and fair complete-prefix publication.
@@ -127,8 +128,8 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
       // A drop/recreate cannot publish an earlier incarnation's captured page.
       await room.tx((tx) => tx.changes.head());
       return await get(server, sourceOf(roomId)) === mark &&
-        await get(server, 'push-context:' + roomId) === contextMark &&
-        await get(server, 'receipt-graph:' + roomId) === receiptMark;
+        await get(server, roomSource('push-context', roomId)) === contextMark &&
+        await get(server, roomSource('receipt-graph', roomId)) === receiptMark;
     };
     if (seed !== null) {
       // Context edges batch until another writer needs the owner. Publish only
@@ -208,8 +209,8 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
             await reconcileNotificationReads(tx, roomId, addedMs);
             const pos = ready[count - 1].change.pos;
             await advance(tx, sourceOf(roomId), pos);
-            await advance(tx, 'push-context:' + roomId, pos);
-            await advance(tx, 'receipt-graph:' + roomId, pos);
+            await advance(tx, roomSource('push-context', roomId), pos);
+            await advance(tx, roomSource('receipt-graph', roomId), pos);
             return index + count;
           });
           const pos = prepared[end - 1].change.pos;
@@ -379,8 +380,8 @@ async function applyHistoricalRelations(
     const cursor = end === seed.edges.length
       ? seed.cursor
       : seed.edges[end - 1].pos;
-    await advance(tx, 'push-context:' + roomId, cursor);
-    await advance(tx, 'receipt-graph:' + roomId, cursor);
+    await advance(tx, roomSource('push-context', roomId), cursor);
+    await advance(tx, roomSource('receipt-graph', roomId), cursor);
     return { end, cursor };
   });
 }

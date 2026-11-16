@@ -10,6 +10,10 @@ import { advance } from '#engine/store/watermark.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { removeNotificationFacts } from '#engine/server/notifications.ts';
 import { visiblePrejoin } from './prejoin.ts';
+import {
+  roomProjectionSources,
+  roomSource,
+} from '#engine/store/projection-sources.ts';
 
 export type Removal = { why: string; intents: ReviewIntent[] };
 
@@ -34,12 +38,13 @@ export async function finishRoomRemoval(
     );
     await tx.execute('DELETE FROM e2ee_rooms WHERE room=?', [roomId]);
     await removeNotificationFacts(tx, { room: roomId });
-    await tx.execute('DELETE FROM watermarks WHERE source=?', [
-      'push-context:' + roomId,
-    ]);
-    await tx.execute('DELETE FROM watermarks WHERE source=?', [
-      'receipt-graph:' + roomId,
-    ]);
+    for (const { prefix, dropReplay } of Object.values(roomProjectionSources)) {
+      if (!dropReplay) {
+        await tx.execute('DELETE FROM watermarks WHERE source=?', [
+          prefix + roomId,
+        ]);
+      }
+    }
     const rows = await tx.query(
       "SELECT destination, count(*) AS n FROM outbox WHERE room = ? AND state = 'pending' GROUP BY destination",
       [roomId],
@@ -108,13 +113,15 @@ export async function finishRoomRemoval(
       await tx.execute(`DELETE FROM ${table} WHERE room_id = ?`, [roomId]);
     }
     // Keep the drop as the next replay item until its source file is gone.
-    if (position !== null) await advance(tx, 'room:' + roomId, position - 1);
+    if (position !== null) {
+      await advance(tx, roomSource('room', roomId), position - 1);
+    }
     return count;
   });
   await store.removeRoom(roomId);
   roomEdges.forgetOwner(store);
   await db.execute('DELETE FROM watermarks WHERE source = ?', [
-    'room:' + roomId,
+    roomSource('room', roomId),
   ]);
   return settled;
 }
