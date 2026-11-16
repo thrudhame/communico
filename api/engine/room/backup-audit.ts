@@ -61,6 +61,7 @@ export async function auditRoom(
       ['publication_keys', 'change_pos', 'changes', 'pos'],
       ['publication_keys', 'event', 'events', 'id'],
       ['changes', 'event', 'events', 'id'],
+      ['completion_receipts', 'event', 'events', 'id'],
     ]
   ) {
     await absent(
@@ -118,5 +119,37 @@ export async function auditRoom(
   const [{ head }] = await db.query(
     'SELECT COALESCE(MAX(pos),0) AS head FROM changes',
   );
-  return { changes: nonnegative(head, 'room change head') };
+  const states = await db.query('SELECT * FROM completion_state');
+  if (
+    states.length !== 1 || states[0].singleton !== 1 ||
+    typeof states[0].generation !== 'string' ||
+    states[0].generation.trim().length === 0
+  ) {
+    throw new Error('backup audit: completion identity');
+  }
+  const state = states[0];
+  const legacy = nonnegative(
+    state.legacy_through,
+    'completion legacy baseline',
+  );
+  const completed = nonnegative(state.completed_through, 'completion progress');
+  if (legacy > Number(head) || completed > Number(head)) {
+    throw new Error('backup audit: completion ahead of room source');
+  }
+  if (
+    (await db.query(
+      `SELECT 1 FROM completion_receipts WHERE typeof(through)<>'integer' OR through<1 OR through>? OR basis NOT IN ('accepted','legacy-reconciled') OR (basis='legacy-reconciled' AND through<>?) LIMIT 1`,
+      [head, legacy],
+    )).length
+  ) throw new Error('backup audit: completion receipt bounds');
+  await absent(
+    db,
+    `SELECT 1 FROM completion_receipts r WHERE NOT EXISTS(SELECT 1 FROM changes c WHERE c.event=r.event AND c.pos<=r.through) LIMIT 1`,
+    'completion receipt before event',
+  );
+  return {
+    changes: nonnegative(head, 'room change head'),
+    'completion:legacy': legacy,
+    'completion:completed': completed,
+  };
 }

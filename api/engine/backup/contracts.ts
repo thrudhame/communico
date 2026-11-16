@@ -38,6 +38,9 @@ export const tableContracts = {
     ],
     // Accepted recovery obligations and immutable saved remote results.
     retained: ['waits', 'remote_batches'],
+    // Room identity/exact acceptance cuts: auditRoom; completed progress is also
+    // checked against server publication by auditServer.
+    completion: ['completion_state', 'completion_receipts'],
   },
   tenants: {
     // Identity/signing and stream ceilings: auditTenant.
