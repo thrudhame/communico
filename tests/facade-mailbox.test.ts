@@ -324,6 +324,50 @@ Deno.test('mailbox old pending evidence retains F1 admission across F2 upgrade',
   }
 });
 
+Deno.test('mailbox logical to-device admission retains F1 policy across different transaction IDs after activation', async () => {
+  const f = await fixture();
+  try {
+    const edus = [{
+      edu_type: 'm.direct_to_device',
+      content: {
+        sender: '@remote:remote.test',
+        type: 'm.test',
+        message_id: 'logical-before-activation',
+        messages: { ['@target:' + f.self]: { '*': { old: true } } },
+      },
+    }];
+    const first = await f.mailbox();
+    await first.stage('before', await f.evidence('before', [], edus));
+    // The first logical policy is admission-time, even before its child runs.
+    f.phase('f2');
+    await f.reopen();
+    const next = await f.mailbox();
+    await next.stage('after', await f.evidence('after', [], edus));
+    await next.receive(f.remote.name, 'after');
+    await next.receive(f.remote.name, 'before');
+    assertEquals(f.acceptedPhases(), ['f1', 'f1']);
+    const changed = structuredClone(edus);
+    changed[0].content.messages['@target:' + f.self]['*'].old = false;
+    const changedProof = await f.evidence('changed', [], changed);
+    for (let retry = 0; retry < 2; retry++) {
+      const failure = await assertRejects(
+        () => next.stage('changed', changedProof),
+        MatrixError,
+      );
+      assertEquals(failure.status, 400);
+    }
+    assertEquals(f.acceptedPhases(), ['f1', 'f1']);
+    assertEquals(
+      (await (await f.edge().server()).query(
+        'SELECT * FROM facade_ingress_collisions',
+      )).length,
+      1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('mailbox F2 admission survives downgrade and child retry with an additive ingress reader', async () => {
   const f = await fixture();
   try {
@@ -380,6 +424,84 @@ Deno.test('mailbox F2 admission survives downgrade and child retry with an addit
     const [held] = await home.query('SELECT * FROM facade_ingress');
     assertEquals(held.ingress_phase, 'f2');
     assertEquals(JSON.parse(String(held.evidence_json)), proof);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('mailbox logical policy upgrades actual pending v44 evidence without running its child', async () => {
+  const f = await fixture(historicalServerSchema(44));
+  try {
+    const edus = [{
+      edu_type: 'm.direct_to_device',
+      content: {
+        sender: '@remote:remote.test',
+        type: 'm.test',
+        message_id: 'old-logical',
+        messages: { ['@target:' + f.self]: { '*': { old: true } } },
+      },
+    }];
+    const proof = await f.evidence('old-pending', [], edus);
+    const verified = await verifyIngressRequest('old-pending', proof, f.self);
+    const encoded = canonicalJson(proof);
+    await (await f.edge().server()).execute(
+      'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation,ingress_phase) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      [
+        f.remote.name,
+        'old-pending',
+        verified.inputHash,
+        encoded,
+        new TextEncoder().encode(encoded).byteLength,
+        f.bundle.id,
+        1,
+        f.node.node,
+        f.node.incarnation,
+        'f1',
+      ],
+    );
+    f.phase('f2');
+    await f.reopen();
+    const box = await f.mailbox();
+    await box.stage('new-txn', await f.evidence('new-txn', [], edus));
+    await box.receive(f.remote.name, 'new-txn');
+    await box.receive(f.remote.name, 'old-pending');
+    assertEquals(f.acceptedPhases(), ['f1', 'f1']);
+    const [held] = await (await f.edge().server()).query(
+      "SELECT evidence_json FROM facade_ingress WHERE txn_id='old-pending'",
+    );
+    assertEquals(String(held.evidence_json), encoded);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('mailbox logical policy and original admission roll back together', async () => {
+  const f = await fixture();
+  try {
+    const edus = [{
+      edu_type: 'm.direct_to_device',
+      content: {
+        sender: '@remote:remote.test',
+        type: 'm.test',
+        message_id: 'atomic-policy',
+        messages: { ['@target:' + f.self]: { '*': { value: true } } },
+      },
+    }];
+    f.fail((sql) => sql.startsWith('INSERT INTO facade_ingress_edu_policy'));
+    const proof = await f.evidence('policy-loss', [], edus);
+    await assertRejects(
+      () => f.mailbox().then((box) => box.stage('policy-loss', proof)),
+      MatrixError,
+    );
+    const db = await f.edge().server();
+    assertEquals(await db.query('SELECT * FROM facade_ingress'), []);
+    assertEquals(await db.query('SELECT * FROM facade_ingress_edu_policy'), []);
+    f.phase('f2');
+    await f.reopen();
+    const box = await f.mailbox();
+    await box.stage('policy-loss', proof);
+    await box.receive(f.remote.name, 'policy-loss');
+    assertEquals(f.acceptedPhases(), ['f2']);
   } finally {
     await f.close();
   }

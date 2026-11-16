@@ -80,7 +80,7 @@ Deno.test('F1 to-device admission shares home validation but never expands facad
       edu_type: 'm.direct_to_device',
       content: direct,
     }, unused),
-    { kind: 'retained', type: 'm.direct_to_device' },
+    { kind: 'retained', type: 'm.direct_to_device', policy: 'legacy' },
   );
   for (
     const patch of [{ sender: '@fake:other.test' }, { message_id: '' }, {
@@ -180,7 +180,7 @@ Deno.test('F1 explicitly expires volatile activity and delegates receipt marks w
   );
 });
 
-Deno.test('F2 device ingress delivers validated evidence locally but preserves F1 and later to-device boundaries', async () => {
+Deno.test('F2 device ingress delivers validated evidence locally but preserves F1 and separate to-device ownership', async () => {
   const device = {
     user_id: '@alice:remote.test',
     device_id: 'A',
@@ -260,17 +260,19 @@ Deno.test('F2 device ingress delivers validated evidence locally but preserves F
     )).kind,
     'refused',
   );
-  assertEquals(
-    (await acceptIngressEdu(
-      origin,
-      self,
-      {
-        edu_type: 'm.direct_to_device',
-        content: direct,
-      },
-      unused,
-      'f2',
-    )).kind,
-    'retained',
+  await assertRejects(
+    () =>
+      acceptIngressEdu(
+        origin,
+        self,
+        {
+          edu_type: 'm.direct_to_device',
+          content: direct,
+        },
+        unused,
+        'f2',
+      ),
+    Error,
+    'to-device owner unavailable',
   );
 });

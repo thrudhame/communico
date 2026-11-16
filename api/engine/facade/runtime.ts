@@ -464,6 +464,17 @@ export async function openFacadeRuntime(
             raw,
             transaction.edus,
             phase,
+            async (origin, raw) => {
+              if (!tenant) {
+                throw new LinkError(
+                  'LINK_UNAVAILABLE',
+                  'to-device owner unavailable',
+                  503,
+                );
+              }
+              return await new ToDeviceOperations(store, tenant, owner, node!)
+                .ingress(origin, raw);
+            },
           ),
         changed: () => notices.changed(),
       });

@@ -2,6 +2,9 @@
 // inbox positions and ACKs; the journal carries only immutable owner facts.
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
+import { config } from '#engine/config.ts';
+import { decodeToDevice } from '#engine/federation/todevice.ts';
+import { domainOf, localpartOf } from '#engine/ids.ts';
 import {
   importPublicKeyFromRaw,
   matrixBase64,
@@ -10,8 +13,11 @@ import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import {
+  captureIngressToDevice,
   captureToDeviceOperations,
+  completeIngressToDevice,
   importToDeviceOperation,
+  type ToDeviceIngressReceipt,
   type ToDeviceOperation,
 } from '#engine/tenant/todevice-routing.ts';
 import {
@@ -31,6 +37,7 @@ import type { OwnerControl } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
 import { integer, LinkError, object, type Stream, text } from './protocol.ts';
 import { signingFence } from './signing-authority.ts';
+import { receiveMessages } from '#engine/tenant/todevice.ts';
 
 type ToDeviceView = DomainBinding & {
   kind: 'to-device';
@@ -151,6 +158,125 @@ export class ToDeviceOperations {
       row?.pairing !== view.pairing ||
       Number(row.grant_revision) !== view.grantRevision
     ) mismatch('to-device account not selected');
+  }
+
+  /** Original ingress and semantic source intents meet at the existing tenant
+   * owner. The server child can be retried after this commit without recapture. */
+  async ingress(
+    origin: string,
+    raw: unknown,
+    receipt?: ToDeviceIngressReceipt,
+    pairing?: string,
+  ) {
+    const input = decodeToDevice(origin, this.tenant.serverName, raw);
+    const grant = await this.binding(pairing),
+      context = grant.body.transcript.body.context;
+    const server = await this.store.server(), unchanged = signingFence(server);
+    const accounts = [
+      ...new Set(
+        input.messages.filter((m) => domainOf(m.user) === context.server)
+          .map((m) => localpartOf(m.user)),
+      ),
+    ];
+    const bindings: DomainBinding[] = [];
+    await server.tx(async (conn) => {
+      const [row] = await conn.query(
+        'SELECT c.signed_json FROM facade_owner_activation a JOIN facade_owner_controls c ON c.pairing=a.pairing AND c.revision=a.revision WHERE a.pairing=?',
+        [context.id],
+      );
+      if (!row) {
+        throw new LinkError(
+          'LINK_UNAVAILABLE',
+          'ingress awaits ownership control',
+          503,
+        );
+      }
+      const control = JSON.parse(String(row.signed_json)).body as OwnerControl;
+      const source = control.nodes.find((n) =>
+        n.node === (this.node?.node ?? 'home')
+      );
+      if (!source) mismatch('ingress source unavailable');
+      for (const localpart of accounts) {
+        await this.selected(conn, grant, localpart);
+        const view: DomainBinding = {
+          server: context.server,
+          pairing: context.id,
+          grantRevision: grant.body.revision,
+          ownerRevision: control.revision,
+          localpart,
+          source: source.node,
+          incarnation: source.incarnation,
+        };
+        await requireDomainControl(conn, view);
+        bindings.push(view);
+      }
+    });
+    const { result, pending, changed } =
+      await (await this.store.tenant(context.server)).tx(async (conn) => {
+        unchanged();
+        for (const view of bindings) await this.tenantSelected(conn, view);
+        const before = await syncStreamHeads(conn);
+        const [beforeOperation] = await conn.query(
+          'SELECT operation_id FROM to_device_operations ORDER BY rowid DESC LIMIT 1',
+        );
+        if (receipt) {
+          await completeIngressToDevice(
+            conn,
+            origin,
+            input.id,
+            input.sender,
+            input.type,
+            context.server,
+            input.messages,
+            receipt,
+          );
+        } else {
+          const [legacy] = await conn.query(
+            "SELECT 1 FROM to_device_admissions WHERE kind='federation' AND origin=? AND message_id=? AND policy='legacy'",
+            [origin, input.id],
+          );
+          if (!legacy) {
+            await receiveMessages(
+              conn,
+              origin,
+              input.id,
+              input.sender,
+              input.type,
+              context.server,
+              input.messages,
+              config().e2ee,
+            );
+          }
+        }
+        const result = receipt ??
+          await captureIngressToDevice(
+            conn,
+            origin,
+            input.id,
+            input.sender,
+            input.type,
+            context.server,
+            input.messages,
+          );
+        const pending = await pendingTenantProjection(conn);
+        const inboxChanged =
+          (await syncStreamHeads(conn)).inbox !== before.inbox;
+        const [afterOperation] = await conn.query(
+          'SELECT operation_id FROM to_device_operations ORDER BY rowid DESC LIMIT 1',
+        );
+        const changed = inboxChanged ||
+          beforeOperation?.operation_id !== afterOperation?.operation_id;
+        unchanged();
+        return { result, pending, changed };
+      });
+    await tenantChangesCommitted(
+      this.store,
+      context.server,
+      pending,
+      changed,
+      receipt ? 'replica' : 'local',
+    );
+    return result;
   }
 
   async export(localpart: string, pairing?: string) {

@@ -204,6 +204,8 @@ export async function startHomeLinks(
       pairing: id,
       pairings,
       transaction: transactionDependencies(app),
+      toDevice: (origin, raw, receipt) =>
+        toDevice.ingress(origin, raw, receipt, id),
     });
     workers.set(
       id,

@@ -110,6 +110,10 @@ export const OWNER_INGRESS_CAPABILITY: Capability = {
   type: 'ingress',
   version: 2,
 };
+export const ROUTED_INGRESS_CAPABILITY: Capability = {
+  type: 'ingress',
+  version: 3,
+};
 export const LINK_SUPPORTED: readonly Capability[] = [
   ...LINK_CAPABILITIES,
   OWNER_CONTROL_CAPABILITY,
@@ -124,6 +128,7 @@ export const LINK_SUPPORTED: readonly Capability[] = [
   KEY_BOOTSTRAP_V2_CAPABILITY,
   KEY_HISTORY_V2_CAPABILITY,
   TO_DEVICE_CAPABILITY,
+  ROUTED_INGRESS_CAPABILITY,
   OWNER_INGRESS_CAPABILITY,
 ];
 

@@ -50,6 +50,12 @@ export type ToDeviceRoute = {
   type: string;
   selectors: { id: string; content: Json }[];
 };
+export type ToDeviceIngressReceipt = {
+  policy: 'legacy' | 'routed';
+  messageId: string;
+  messageHash: string;
+  routes: ToDeviceRoute[];
+};
 export type ToDeviceTarget = {
   targetId: string;
   deviceId: string;
@@ -173,6 +179,179 @@ export async function checkToDeviceReplay(
     { kind: 'federation', origin, id },
     toDeviceMessageHash(sender, type, server, messages),
     'legacy',
+  );
+}
+
+/** A mailbox child references the exact semantic routes committed by the
+ * receiving registry. A partial import is not a new expansion authority. */
+export async function captureIngressToDevice(
+  conn: Conn,
+  origin: string,
+  id: string,
+  sender: string,
+  type: string,
+  server: string,
+  messages: Message[],
+): Promise<ToDeviceIngressReceipt> {
+  const identity = await tenantAuthority(conn);
+  if (!identity) pending('receiving owner authority');
+  const messageHash = toDeviceMessageHash(sender, type, server, messages);
+  const [admission] = await conn.query(
+    "SELECT payload_hash,policy FROM to_device_admissions WHERE kind='federation' AND origin=? AND message_id=?",
+    [origin, id],
+  );
+  if (!admission || admission.payload_hash !== messageHash) collision();
+  const receipt: ToDeviceIngressReceipt = {
+    policy: admission.policy as ToDeviceIngressReceipt['policy'],
+    messageId: id,
+    messageHash,
+    routes: [],
+  };
+  if (receipt.policy === 'legacy') return receipt;
+  const rows = await conn.query(
+    "SELECT payload_json,expanded FROM to_device_routes WHERE json_extract(payload_json,'$.origin.kind')='federation' AND json_extract(payload_json,'$.origin.origin')=? AND json_extract(payload_json,'$.origin.id')=? ORDER BY route_id",
+    [origin, id],
+  );
+  receipt.routes = rows.map((row) => JSON.parse(String(row.payload_json)));
+  if (
+    receipt.routes.length !== new Set(
+          messages.filter((m) => domainOf(m.user) === server).map((m) =>
+            m.user
+          ),
+        ).size * 2
+  ) {
+    pending('complete signed semantic routes');
+  }
+  validateIngressToDevice(origin, id, sender, type, server, messages, receipt);
+  for (const row of rows) {
+    const route: ToDeviceRoute = JSON.parse(String(row.payload_json));
+    if (
+      route.owner === identity.node &&
+      (route.ownerIncarnation !== identity.incarnation ||
+        Number(row.expanded) !== 1)
+    ) {
+      pending('receiving owner expansion');
+    }
+  }
+  return receipt;
+}
+
+/** Home validates the frozen manifest against original authenticated input.
+ * It never derives new owners from the current control or runs the full EDU. */
+function validateIngressToDevice(
+  origin: string,
+  id: string,
+  sender: string,
+  type: string,
+  server: string,
+  messages: Message[],
+  receipt: ToDeviceIngressReceipt,
+) {
+  if (
+    !receipt || receipt.messageId !== id ||
+    receipt.messageHash !==
+      toDeviceMessageHash(sender, type, server, messages) ||
+    !['legacy', 'routed'].includes(receipt.policy) ||
+    !Array.isArray(receipt.routes)
+  ) collision();
+  if (receipt.policy === 'legacy') {
+    if (receipt.routes.length) collision();
+    return;
+  }
+  const users = new Map<string, Message[]>();
+  for (const message of messages) {
+    if (domainOf(message.user) !== server) continue;
+    const selected = users.get(message.user) ?? [];
+    selected.push(message);
+    users.set(message.user, selected);
+  }
+  if (receipt.routes.length !== users.size * 2) collision();
+  const seen = new Set<string>();
+  for (const route of receipt.routes) {
+    const selected = users.get(route.recipient);
+    if (
+      !selected || seen.has(route.routeId) ||
+      route.origin.kind !== 'federation' || route.origin.origin !== origin ||
+      route.origin.id !== id || route.admissionHash !== receipt.messageHash ||
+      route.sender !== sender || route.type !== type ||
+      route.localpart !== localpartOf(route.recipient) ||
+      !route.owner || !route.ownerIncarnation ||
+      route.routeId !==
+        digest([route.origin, route.recipient, {
+          node: route.owner,
+          incarnation: route.ownerIncarnation,
+        }]) ||
+      canonicalJson(route.selectors) !==
+        canonicalJson(
+          selected.map(({ id, content }) => ({ id, content }))
+            .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+        )
+    ) collision();
+    seen.add(route.routeId);
+  }
+  for (const user of users.keys()) {
+    const routes = receipt.routes.filter((route) => route.recipient === user);
+    if (
+      routes.length !== 2 || routes.filter((route) =>
+          route.owner === 'home'
+        ).length !== 1 ||
+      new Set(routes.map((route) => route.owner)).size !== 2
+    ) collision();
+  }
+}
+
+export async function completeIngressToDevice(
+  conn: Conn,
+  origin: string,
+  id: string,
+  sender: string,
+  type: string,
+  server: string,
+  messages: Message[],
+  receipt: ToDeviceIngressReceipt,
+): Promise<void> {
+  validateIngressToDevice(origin, id, sender, type, server, messages, receipt);
+  const identity = await tenantAuthority(conn);
+  if (!identity || identity.node !== 'home') pending('home owner authority');
+  if (receipt.policy !== 'routed') collision();
+  if (!receipt.routes.length) {
+    await admit(
+      conn,
+      { kind: 'federation', origin, id },
+      receipt.messageHash,
+      'routed',
+    );
+  }
+  const [admission] = await conn.query(
+    "SELECT payload_hash,policy FROM to_device_admissions WHERE kind='federation' AND origin=? AND message_id=?",
+    [origin, id],
+  );
+  if (!admission) pending('signed semantic routes');
+  if (admission.payload_hash !== receipt.messageHash) collision();
+  if (
+    admission.policy === 'legacy' && !(await conn.query(
+      'SELECT 1 FROM inbound_to_device WHERE origin=? AND message_id=?',
+      [origin, id],
+    )).length
+  ) pending('original legacy completion');
+  for (const route of receipt.routes) {
+    const [held] = await conn.query(
+      'SELECT payload_json,expanded FROM to_device_routes WHERE route_id=?',
+      [route.routeId],
+    );
+    if (!held) pending('signed semantic routes');
+    if (canonicalJson(route) !== held.payload_json) collision();
+    if (
+      route.owner === 'home' &&
+      (route.ownerIncarnation !== identity.incarnation ||
+        Number(held.expanded) !== 1)
+    ) {
+      pending('home owner expansion');
+    }
+  }
+  await conn.execute(
+    'INSERT INTO inbound_to_device VALUES(?,?) ON CONFLICT(origin,message_id) DO NOTHING',
+    [origin, id],
   );
 }
 
@@ -348,6 +527,7 @@ export async function routeToDeviceMessages(
   messages: Message[],
   limits: KeyLimits,
   sourceLocalpart?: string,
+  policy?: 'legacy',
 ): Promise<boolean> {
   const identity = await tenantAuthority(conn);
   const admissionHash = toDeviceMessageHash(sender, type, server, messages);
@@ -355,7 +535,7 @@ export async function routeToDeviceMessages(
     conn,
     origin,
     admissionHash,
-    identity ? 'routed' : 'legacy',
+    identity && policy !== 'legacy' ? 'routed' : 'legacy',
   );
   if (!identity || admission.policy === 'legacy') return false;
   // Imported selectors remain the durable obligation. A second ingress cannot

@@ -23,6 +23,7 @@ import {
 } from '#engine/server/receipt-frontier.ts';
 import {
   FACADE_INGRESS_PHASE_SQL,
+  FACADE_INGRESS_POLICY_SQL,
   FACADE_INGRESS_SQL,
   FACADE_JOURNAL_SQL,
   FACADE_KEY_RETIREMENT_SQL,
@@ -425,7 +426,7 @@ const FEDERATION_TXNS_RECEIVED_SQL =
   'CREATE INDEX federation_txns_received ON federation_txns(received_ms)';
 
 export const serverSchema: SchemaProvider = {
-  version: 44,
+  version: 45,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -472,6 +473,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(RECEIPT_ADMISSION_SQL);
     await db.exec(DEVICE_PUBLICATIONS_SQL);
     await db.exec(FACADE_INGRESS_PHASE_SQL);
+    await db.exec(FACADE_INGRESS_POLICY_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -538,5 +540,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
 `);
     },
     43: (conn) => conn.exec(FACADE_INGRESS_PHASE_SQL),
+    44: (conn) => conn.exec(FACADE_INGRESS_POLICY_SQL),
   },
 };

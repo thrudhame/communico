@@ -212,6 +212,7 @@ export const tableContracts = {
       'facade_ingress',
       'facade_ingress_children',
       'facade_ingress_collisions',
+      'facade_ingress_edu_policy',
       'facade_egress',
       'facade_egress_routes',
       'publication_domain',

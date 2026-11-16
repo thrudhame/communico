@@ -360,6 +360,7 @@ function bind(
         server: string,
         messages: todevice.Message[],
         limits: e2ee.KeyLimits,
+        policy?: 'legacy',
       ) =>
         mutation(
           () =>
@@ -372,6 +373,7 @@ function bind(
               server,
               messages,
               limits,
+              policy,
             ),
         ),
       acknowledge: (d: devices.DeviceIdentity, since: StreamToken | null) =>

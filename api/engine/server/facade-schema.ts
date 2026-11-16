@@ -42,3 +42,8 @@ CREATE TABLE facade_ingress_collisions(origin TEXT NOT NULL,txn_id TEXT NOT NULL
 export const FACADE_INGRESS_PHASE_SQL = `
 ALTER TABLE facade_ingress ADD COLUMN ingress_phase TEXT NOT NULL DEFAULT 'f1' CHECK(ingress_phase IN ('f1','f2'));
 `;
+
+export const FACADE_INGRESS_POLICY_SQL = `
+ALTER TABLE facade_ingress ADD COLUMN policies_indexed INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE facade_ingress_edu_policy(origin TEXT NOT NULL,message_id TEXT NOT NULL,payload_hash TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('f1','f2')),PRIMARY KEY(origin,message_id));
+`;

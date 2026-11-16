@@ -15,6 +15,7 @@ import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { domainOf, localpartOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { hashToken } from '#engine/tenant/auth.ts';
+import { registryDevice, tenantAuthority } from './session-authority.ts';
 import { encodeStreamToken, type StreamToken } from '#engine/client/tokens.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import {
@@ -228,6 +229,7 @@ export async function receiveMessages(
   server: string,
   messages: Message[],
   limits: KeyLimits,
+  policy?: 'legacy',
 ): Promise<void> {
   if (
     (await conn.query(
@@ -246,6 +248,8 @@ export async function receiveMessages(
     server,
     messages,
     limits,
+    undefined,
+    policy,
   );
   if (routed) {
     await conn.execute('INSERT INTO inbound_to_device VALUES(?,?)', [
@@ -253,6 +257,14 @@ export async function receiveMessages(
       id,
     ]);
     return;
+  }
+  const identity = await tenantAuthority(conn);
+  if (identity && identity.node !== 'home') {
+    throw new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'legacy to-device delivery requires home owner',
+    );
   }
   for (const m of targetSelectors(messages)) {
     if (domainOf(m.user) !== server) continue;
@@ -262,6 +274,13 @@ export async function receiveMessages(
       : [await deviceById(conn, m.id, lp)];
     for (const target of targets) {
       if (target === null) continue;
+      if (identity) {
+        const creation = await registryDevice(conn, lp, target.device_id);
+        if (
+          !creation || creation.node !== 'home' ||
+          creation.incarnation !== identity.incarnation
+        ) continue;
+      }
       // Wire entries are sender-bounded before this transaction. Wildcard
       // expansion belongs to the local device owner, not that wire budget.
       await insertMessage(

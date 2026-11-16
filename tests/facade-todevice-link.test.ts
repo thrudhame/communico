@@ -5,6 +5,7 @@ import {
   exportAccountAuth,
 } from '#engine/facade/accounts.ts';
 import type { DeviceOperations } from '#engine/facade/devices.ts';
+import type { ToDeviceOperations } from '#engine/facade/todevice.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
@@ -26,6 +27,22 @@ import { onTenantStream } from '#engine/tenant/streams.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
 import { pendingTenantProjection } from '#engine/tenant/hooks.ts';
 import { insertMessage } from '#engine/tenant/todevice.ts';
+import { acceptIngressEdu } from '#engine/facade/ingress-edus.ts';
+import { eduState } from '#engine/federation/edus.ts';
+import { registerToDevice } from '#engine/federation/todevice.ts';
+import { Mailbox } from '#engine/facade/mailbox.ts';
+import { HomeIngress } from '#engine/facade/drain.ts';
+import {
+  fakeFetcher,
+  fakeKeyResolver,
+  makeRemoteServer,
+} from './fixtures/remote.ts';
+import { directOnly, makeDoc } from './federation/doc-helper.ts';
+import { requestCanonical } from '#engine/federation/request-signature.ts';
+import { captureRequestEvidence } from '#engine/federation/request-evidence.ts';
+import { keyStore } from '#engine/federation/keys.ts';
+import { signJson } from '#engine/signing-primitives.js';
+import { canonicalJson } from '#engine/canonical.ts';
 import {
   captureDeviceStreamFloor,
   installDeviceStreamFloor,
@@ -37,10 +54,7 @@ async function coordinator(
   ...args: ConstructorParameters<typeof DeviceOperations>
 ) {
   const module = await import('#engine/facade/' + 'todevice.ts');
-  return new module.ToDeviceOperations(...args) as Pick<
-    DeviceOperations,
-    'export' | 'apply'
-  >;
+  return new module.ToDeviceOperations(...args) as ToDeviceOperations;
 }
 
 async function fixture() {
@@ -175,6 +189,468 @@ function rehash(record: LinkRecord): LinkRecord {
   const { hash: _hash, ...body } = record;
   return { ...body, hash: recordHash(body) };
 }
+
+Deno.test('to-device ingress: F2 delivers the local owner before success and freezes home work', async () => {
+  const f = await fixture();
+  // This isolated owner fixture has no live app projector. Discharge its setup
+  // revision before observing only this admission's source-export hints.
+  await projectTenant(f.edge, 'logical.test');
+  const notifications: string[] = [];
+  const stop = onTenantStream((store, name, source) => {
+    if (store === f.edge && name === 'logical.test') notifications.push(source);
+  });
+  try {
+    const edus = eduState(await f.edge.server(), 'logical.test', f.edge);
+    registerToDevice(edus, f.et);
+    const raw = {
+      edu_type: 'm.direct_to_device',
+      content: {
+        sender: '@remote:remote.test',
+        type: 'm.room_key',
+        message_id: 'ingress',
+        messages: { '@alice:logical.test': { '*': { session_id: 'fresh' } } },
+      },
+    };
+    const accepted = await acceptIngressEdu(
+      'remote.test',
+      'logical.test',
+      raw,
+      edus,
+      'f2',
+      (origin, content) => f.es.ingress(origin, content),
+    );
+    const db = await f.edge.tenant('logical.test');
+    assertEquals(
+      (await db.query('SELECT * FROM to_device_inbox')).length,
+      1,
+      'HTTP success must follow actual owner inbox insertion',
+    );
+    assertEquals(
+      (await db.query('SELECT * FROM to_device_routes')).length,
+      2,
+      'the unseen home registry remains an immutable owner obligation',
+    );
+    assert(accepted.kind === 'routed');
+    await assertRejects(
+      () =>
+        f.hs.ingress('remote.test', raw.content, accepted.receipt, f.bundle.id),
+      Error,
+      'signed semantic routes',
+    );
+    const records = await f.es.export('alice');
+    await f.hj.receive('edge_a', records);
+    for (const record of records) await f.hs.apply(f.hj, record, f.bundle.id);
+    await f.hs.ingress(
+      'remote.test',
+      raw.content,
+      accepted.receipt,
+      f.bundle.id,
+    );
+    const homeDb = await f.home.tenant('logical.test');
+    assertEquals(
+      (await homeDb.query('SELECT * FROM to_device_inbox')).length,
+      1,
+    );
+    assertEquals((await db.query('SELECT * FROM to_device_inbox')).length, 1);
+    // Both owners have already captured their wildcard, not the replacement.
+    await deleteDevices(f.ht, 'alice', ['LAN']);
+    await upsertDevice(f.ht, 'alice', 'LAN');
+    await f.hs.ingress(
+      'remote.test',
+      raw.content,
+      accepted.receipt,
+      f.bundle.id,
+    );
+    assertEquals(
+      (await homeDb.query('SELECT * FROM to_device_inbox')).length,
+      0,
+    );
+    const retried = await acceptIngressEdu(
+      'remote.test',
+      'logical.test',
+      raw,
+      edus,
+      'f2',
+      (origin, content) => f.es.ingress(origin, content),
+    );
+    assertEquals(
+      retried,
+      accepted,
+      'child completion loss reuses the exact frozen manifest',
+    );
+    assertEquals(
+      notifications,
+      ['local'],
+      'local durable routes wake the export owner once, not an import echo',
+    );
+    const forged = structuredClone(accepted.receipt);
+    forged.routes.pop();
+    await assertRejects(
+      () => f.hs.ingress('remote.test', raw.content, forged, f.bundle.id),
+      Error,
+      'identity changed',
+    );
+  } finally {
+    stop();
+    await f.close();
+  }
+});
+
+Deno.test('to-device ingress: original signed mailbox completion waits for semantic home routes without full redispatch', async () => {
+  const f = await fixture();
+  try {
+    const remote = await makeRemoteServer('remote.test');
+    const content = {
+      sender: '@remote:remote.test',
+      type: 'm.room_key',
+      message_id: 'mailbox',
+      messages: { '@alice:logical.test': { '*': { session_id: 'actual' } } },
+    };
+    const raw = { edu_type: 'm.direct_to_device', content };
+    const request = {
+      method: 'PUT',
+      uri: '/_matrix/federation/v1/send/mailbox',
+      authorization: '',
+      body: new TextEncoder().encode(
+        JSON.stringify({
+          origin: remote.name,
+          origin_server_ts: 1,
+          pdus: [],
+          edus: [raw],
+        }),
+      ),
+    };
+    const signed = JSON.parse(
+      requestCanonical('logical.test', request, remote.name),
+    );
+    await signJson(signed, remote.name, remote.keyId, remote.kp.privateKey);
+    request.authorization =
+      `X-Matrix origin="${remote.name}",destination="logical.test",key="${remote.keyId}",sig="${
+        signed.signatures[remote.name][remote.keyId]
+      }"`;
+    const edgeServer = await f.edge.server();
+    const keys = keyStore(edgeServer, {
+      deps: directOnly(await makeDoc(remote)),
+    });
+    const publicKey = await keys.getVerifyKey(
+      remote.name,
+      remote.keyId,
+      Date.now(),
+      'request',
+    );
+    const evidence = await captureRequestEvidence(
+      keys,
+      'logical.test',
+      request,
+      { origin: remote.name, keyId: remote.keyId, publicKey },
+    );
+    const edus = eduState(edgeServer, 'logical.test', f.edge);
+    const dependencies = {
+      self: 'logical.test',
+      store: f.edge,
+      keys: fakeKeyResolver(remote),
+      fetcher: fakeFetcher({}).fetcher,
+      edus,
+    };
+    let cut = true;
+    const interrupted = {
+      ...edgeServer,
+      tx: <T>(
+        fn: (conn: Conn) => Promise<T>,
+        options?: Parameters<typeof edgeServer.tx>[1],
+      ) =>
+        edgeServer.tx((conn) =>
+          fn(
+            new Proxy(conn, {
+              get(target, key) {
+                if (key === 'execute') {
+                  return (...args: Parameters<Conn['execute']>) => {
+                    if (
+                      cut &&
+                      args[0].startsWith('INSERT INTO facade_ingress_children')
+                    ) {
+                      cut = false;
+                      throw new Error('child completion loss');
+                    }
+                    return target.execute(...args);
+                  };
+                }
+                const value = Reflect.get(target, key);
+                return typeof value === 'function' ? value.bind(target) : value;
+              },
+            }),
+          ), options),
+    };
+    const box = new Mailbox(interrupted, {
+      self: 'logical.test',
+      node: f.node,
+      pairings: f.fp,
+      phase: 'f2',
+      transaction: dependencies,
+      scopeState: () => Promise.resolve('ready'),
+      acceptEdu: (origin, raw, phase) =>
+        acceptIngressEdu(
+          origin,
+          'logical.test',
+          raw,
+          edus,
+          phase,
+          (origin, content) => f.es.ingress(origin, content),
+        ),
+      changed() {},
+    });
+    await box.stage('mailbox', evidence);
+    await assertRejects(() => box.receive(remote.name, 'mailbox'), Error);
+    const edgeDb = await f.edge.tenant('logical.test');
+    assertEquals(
+      (await edgeDb.query('SELECT * FROM to_device_inbox')).length,
+      1,
+    );
+    assertEquals(
+      await edgeServer.query(
+        "SELECT * FROM facade_records WHERE stream LIKE 'ingress:%'",
+      ),
+      [],
+    );
+    await box.receive(remote.name, 'mailbox');
+    const [saved] = await edgeServer.query(
+      "SELECT record_json FROM facade_records WHERE stream LIKE 'ingress:%'",
+    );
+    const record = JSON.parse(String(saved.record_json)) as LinkRecord;
+    assertEquals(record.version, 3);
+    const old = new Journal(
+      await f.home.server(),
+      LINK_SUPPORTED.filter((cap) => cap.type !== 'ingress' || cap.version < 3),
+    );
+    await assertRejects(
+      () => old.receive('edge_a', [record]),
+      Error,
+      'unsupported record',
+    );
+    await f.hj.receive('edge_a', [record]);
+    let redispatched = 0;
+    const homeServer = await f.home.server();
+    const homeDependencies = {
+      ...dependencies,
+      store: f.home,
+      edus: {
+        dispatch: () => {
+          redispatched++;
+          return Promise.resolve();
+        },
+      },
+    };
+    const noOwner = new HomeIngress(homeServer, {
+      peer: 'edge_a',
+      pairing: f.bundle.id,
+      pairings: f.hp,
+      transaction: homeDependencies,
+    });
+    await assertRejects(
+      () => noOwner.apply(f.hj, record),
+      Error,
+      'home owner unavailable',
+    );
+    let homeCut = true;
+    const homeInterrupted = {
+      ...homeServer,
+      tx: <T>(
+        fn: (conn: Conn) => Promise<T>,
+        options?: Parameters<typeof homeServer.tx>[1],
+      ) =>
+        homeServer.tx((conn) =>
+          fn(
+            new Proxy(conn, {
+              get(target, key) {
+                if (key === 'execute') {
+                  return (...args: Parameters<Conn['execute']>) => {
+                    if (
+                      homeCut &&
+                      args[0].startsWith('INSERT INTO facade_ingress_children')
+                    ) {
+                      homeCut = false;
+                      throw new Error('home child completion loss');
+                    }
+                    return target.execute(...args);
+                  };
+                }
+                const value = Reflect.get(target, key);
+                return typeof value === 'function' ? value.bind(target) : value;
+              },
+            }),
+          ), options),
+    };
+    const drain = new HomeIngress(homeInterrupted, {
+      peer: 'edge_a',
+      pairing: f.bundle.id,
+      pairings: f.hp,
+      transaction: homeDependencies,
+      toDevice: (origin, raw, receipt) =>
+        f.hs.ingress(origin, raw, receipt, f.bundle.id),
+    });
+    await assertRejects(
+      () => drain.apply(f.hj, record),
+      Error,
+      'signed semantic routes',
+    );
+    assertEquals(
+      (await f.hj.heads('edge_a', 'in', record)).applied.sequence,
+      0,
+    );
+    assertEquals(
+      await homeServer.query(
+        "SELECT * FROM facade_ingress_children WHERE kind='edu'",
+      ),
+      [],
+    );
+    const routes = await f.es.export('alice');
+    await f.hj.receive('edge_a', routes);
+    for (const item of routes) await f.hs.apply(f.hj, item, f.bundle.id);
+    await assertRejects(
+      () => drain.apply(f.hj, record),
+      Error,
+      'home child completion loss',
+    );
+    assertEquals(
+      (await f.hj.heads('edge_a', 'in', record)).applied.sequence,
+      0,
+    );
+    assertEquals(await drain.apply(f.hj, record), true);
+    assertEquals(await drain.apply(f.hj, record), false);
+    assertEquals(
+      redispatched,
+      0,
+      'home never invokes the whole original to-device handler',
+    );
+    const homeDb = await f.home.tenant('logical.test');
+    assertEquals(
+      (await homeDb.query('SELECT * FROM to_device_inbox')).length,
+      1,
+    );
+    assertEquals(
+      (await edgeDb.query('SELECT * FROM to_device_inbox')).length,
+      1,
+    );
+    const [held] = await homeServer.query(
+      'SELECT evidence_json FROM facade_ingress',
+    );
+    assertEquals(String(held.evidence_json), canonicalJson(evidence));
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device ingress: unknown and deleted explicit device targets finish without delivering to replacements', async () => {
+  const f = await fixture();
+  try {
+    await deleteDevices(f.et, 'alice', ['PHONE']);
+    for (const deviceId of ['UNKNOWN', 'PHONE']) {
+      const content = {
+        sender: '@remote:remote.test',
+        type: 'm.room_key',
+        message_id: 'absent-' + deviceId,
+        messages: {
+          '@alice:logical.test': { [deviceId]: { key: 'not-for-replacement' } },
+        },
+      };
+      const receipt = await f.es.ingress('remote.test', content);
+      const routes = await f.es.export('alice');
+      await f.hj.receive('edge_a', routes);
+      for (const record of routes) await f.hs.apply(f.hj, record, f.bundle.id);
+      await f.hs.ingress('remote.test', content, receipt, f.bundle.id);
+    }
+    await upsertDevice(f.et, 'alice', 'PHONE');
+    for (const store of [f.home, f.edge]) {
+      assertEquals(
+        await (await store.tenant('logical.test')).query(
+          'SELECT * FROM to_device_inbox',
+        ),
+        [],
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device ingress: missing tenant control cannot fall back to standalone delivery', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.tenant('logical.test');
+    await db.execute('DELETE FROM facade_owner_activation');
+    await assertRejects(() =>
+      f.es.ingress('remote.test', {
+        sender: '@remote:remote.test',
+        type: 'm.room_key',
+        message_id: 'unready',
+        messages: { '@alice:logical.test': { '*': { key: 'not-admitted' } } },
+      }), Error);
+    for (
+      const table of [
+        'to_device_inbox',
+        'to_device_routes',
+        'to_device_admissions',
+        'inbound_to_device',
+      ]
+    ) {
+      assertEquals(await db.query('SELECT * FROM ' + table), []);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device ingress: a completed legacy home receipt discharges imported frozen work without re-expansion', async () => {
+  const f = await fixture();
+  try {
+    const content = {
+      sender: '@remote:remote.test',
+      type: 'm.room_key',
+      message_id: 'home-legacy',
+      messages: {
+        '@alice:logical.test': { '*': { key: 'original-home-cut' } },
+      },
+    };
+    await f.ht.tx((tx) =>
+      tx.toDevice.receive(
+        'remote.test',
+        content.message_id,
+        content.sender,
+        content.type,
+        'logical.test',
+        [{
+          user: '@alice:logical.test',
+          id: '*',
+          content: { key: 'original-home-cut' },
+        }],
+        config().e2ee,
+        'legacy',
+      )
+    );
+    await deleteDevices(f.ht, 'alice', ['LAN']);
+    await upsertDevice(f.ht, 'alice', 'LAN');
+    const receipt = await f.es.ingress('remote.test', content);
+    const records = await f.es.export('alice');
+    await f.hj.receive('edge_a', records);
+    for (const record of records) await f.hs.apply(f.hj, record, f.bundle.id);
+    await f.hs.ingress('remote.test', content, receipt, f.bundle.id);
+    assertEquals(
+      await (await f.home.tenant('logical.test')).query(
+        'SELECT * FROM to_device_inbox',
+      ),
+      [],
+      'the completed F1 home expansion must not attach to its later replacement',
+    );
+    assertEquals(
+      (await (await f.edge.tenant('logical.test')).query(
+        'SELECT * FROM to_device_inbox',
+      )).length,
+      1,
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('to-device link: reader capability is additive and old readers refuse before receive effects', async () => {
   assert(

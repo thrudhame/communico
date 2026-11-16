@@ -10,9 +10,15 @@ import { type EduState, PermanentEduRefusal } from '#engine/federation/edus.ts';
 import { eduEnvelope } from '#engine/federation/peer-json.ts';
 import { decodeToDevice } from '#engine/federation/todevice.ts';
 import { dispatchTransactionEdu } from '#engine/federation/transactions.ts';
+import type { ToDeviceIngressReceipt } from '#engine/tenant/todevice-routing.ts';
 
 export type IngressEduDisposition =
-  | { kind: 'retained' | 'expired' | 'ignored'; type: string }
+  | {
+    kind: 'retained' | 'expired' | 'ignored';
+    type: string;
+    policy?: 'legacy';
+  }
+  | { kind: 'routed'; type: string; receipt: ToDeviceIngressReceipt }
   | { kind: 'refused'; type: string; errcode: string; error: string };
 
 export async function acceptIngressEdu(
@@ -21,13 +27,27 @@ export async function acceptIngressEdu(
   raw: unknown,
   edus: Pick<EduState, 'dispatch'>,
   phase = 'f1',
+  toDevice?: (origin: string, raw: unknown) => Promise<ToDeviceIngressReceipt>,
 ): Promise<IngressEduDisposition> {
   const { type, content } = eduEnvelope(raw);
   try {
     switch (type) {
       case 'm.direct_to_device':
         decodeToDevice(origin, self, content);
-        return { kind: 'retained', type };
+        if (phase === 'f2') {
+          if (!toDevice) {
+            throw new MatrixError(
+              503,
+              'M_UNAVAILABLE',
+              'to-device owner unavailable',
+            );
+          }
+          const receipt = await toDevice(origin, content);
+          return receipt.policy === 'legacy'
+            ? { kind: 'retained', type, policy: 'legacy' }
+            : { kind: 'routed', type, receipt };
+        }
+        return { kind: 'retained', type, policy: 'legacy' };
       case 'm.device_list_update':
       case 'm.signing_key_update':
         if (
