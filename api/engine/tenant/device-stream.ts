@@ -1,5 +1,6 @@
 // File-local wire identity owner. Signed control assigns lanes; tenant source
 // positions remain local publication cursors and never become causal order.
+import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
@@ -10,6 +11,83 @@ import type { DeviceOperation } from '#engine/tenant/device-source.ts';
 import type { Json } from '#engine/tenant/e2ee.ts';
 
 export type DeviceWire = { streamId: number; prevIds: number[] };
+
+/** Exact publication evidence, independent of device execution authority. Some
+ * publications only join a signature overlay or a complete snapshot frontier. */
+export type DevicePublication = {
+  version: 1;
+  operationId: string;
+  source: string;
+  incarnation: string;
+  localpart: string;
+  wire: DeviceWire;
+  payloadHash: string;
+};
+
+export async function captureDevicePublications(
+  conn: Conn,
+  localpart: string,
+): Promise<DevicePublication[]> {
+  return (await conn.query(
+    'SELECT operation_id,source,incarnation,wire_json FROM device_stream_publications WHERE localpart=? ORDER BY operation_id',
+    [localpart],
+  )).map((row) => {
+    const body = {
+      version: 1 as const,
+      operationId: String(row.operation_id),
+      source: String(row.source),
+      incarnation: String(row.incarnation),
+      localpart,
+      wire: deviceWireOf(JSON.parse(String(row.wire_json))),
+    };
+    return {
+      ...body,
+      payloadHash: createHash('sha256').update(canonicalJson(body)).digest(
+        'hex',
+      ),
+    };
+  });
+}
+
+export async function importDevicePublication(
+  conn: Conn,
+  raw: unknown,
+  expected: { source: string; incarnation: string; localpart: string },
+  proof?: KeyHistoryProof,
+): Promise<void> {
+  const operation = raw as DevicePublication | undefined;
+  if (
+    !operation || operation.version !== 1 ||
+    typeof operation.operationId !== 'string' || !operation.operationId ||
+    operation.source !== expected.source ||
+    operation.incarnation !== expected.incarnation ||
+    operation.localpart !== expected.localpart
+  ) collision();
+  const body = {
+    version: 1 as const,
+    operationId: operation.operationId,
+    ...expected,
+    wire: deviceWireOf(operation.wire),
+  };
+  if (
+    canonicalJson({
+      ...body,
+      payloadHash: createHash('sha256').update(canonicalJson(body)).digest(
+        'hex',
+      ),
+    }) !== canonicalJson(raw)
+  ) collision();
+  if (proof) await proof.require(conn, 'device-publication', operation);
+  await retainDeviceWire(
+    conn,
+    operation.localpart,
+    operation.operationId,
+    operation.source,
+    operation.incarnation,
+    operation.wire,
+    proof ? { proof, operation, kind: 'device-publication' } : undefined,
+  );
+}
 
 export const DEVICE_STREAM_SQL = `
 CREATE TABLE device_stream_publications(localpart TEXT NOT NULL,stream_id INTEGER NOT NULL,operation_id TEXT NOT NULL,source TEXT NOT NULL,incarnation TEXT NOT NULL,wire_json TEXT NOT NULL,PRIMARY KEY(localpart,stream_id),UNIQUE(localpart,operation_id));
@@ -228,7 +306,17 @@ export async function retainDeviceWire(
   source: string,
   incarnation: string,
   raw: DeviceWire,
-  history?: { proof: KeyHistoryProof; operation: DeviceOperation },
+  history?:
+    | {
+      proof: KeyHistoryProof;
+      operation: DeviceOperation;
+      kind?: 'device-operation';
+    }
+    | {
+      proof: KeyHistoryProof;
+      operation: DevicePublication;
+      kind: 'device-publication';
+    },
 ): Promise<void> {
   const wire = deviceWireOf(raw);
   const installed = await controls(conn, false);
@@ -247,7 +335,11 @@ export async function retainDeviceWire(
       history.operation.incarnation !== incarnation ||
       canonicalJson(history.operation.wire) !== canonicalJson(wire)
     ) collision();
-    await history.proof.require(conn, 'device-operation', history.operation);
+    await history.proof.require(
+      conn,
+      history.kind ?? 'device-operation',
+      history.operation,
+    );
     // A fresh receiver need not hold the retired pairing's control. Home's
     // exact-history signature attests that original source. F2's signed control
     // fixes the same role lanes for every incarnation; this is not a new grant.

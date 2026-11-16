@@ -25,6 +25,10 @@ import {
 } from './signature-operations.ts';
 import { type AuthorityFact, tenantAuthority } from './session-authority.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  captureDevicePublications,
+  type DevicePublication,
+} from './device-stream.ts';
 
 export const KEY_BOOTSTRAP_SQL = `
 CREATE TABLE key_bootstrap_publications(localpart TEXT PRIMARY KEY NOT NULL,pairing TEXT NOT NULL,grant_revision INTEGER NOT NULL,owner_revision INTEGER NOT NULL,source TEXT NOT NULL,incarnation TEXT NOT NULL,sequence INTEGER NOT NULL,hash TEXT NOT NULL,declaration_json TEXT NOT NULL);
@@ -35,13 +39,17 @@ CREATE TABLE device_creation_history(id TEXT PRIMARY KEY NOT NULL,payload_json T
 export type KeyOperation =
   | DeviceOperation
   | SigningOperation
-  | SignatureOperation;
+  | SignatureOperation
+  | DevicePublication;
 export type KeyKind =
   | 'device-operation'
   | 'signing-operation'
-  | 'signature-operation';
+  | 'signature-operation'
+  | 'device-publication';
 export type KeyFact = { operationId: string; payloadHash: string };
-export type KeyManifest = Record<KeyKind, KeyFact[]>;
+export type KeyManifest =
+  & Record<Exclude<KeyKind, 'device-publication'>, KeyFact[]>
+  & { 'device-publication'?: KeyFact[] };
 export type KeyBootstrap = DomainBinding & {
   kind: 'key-bootstrap';
   manifest: KeyManifest;
@@ -218,6 +226,7 @@ export async function captureKeyHistory(conn: Conn, localpart: string) {
     'signature-operation': await retained<SignatureOperation>(
       'signature_operations',
     ),
+    'device-publication': await captureDevicePublications(conn, localpart),
   };
 }
 
@@ -227,8 +236,28 @@ export async function retainKeyBootstrap(
   sequence: number,
   hash: string,
 ) {
+  const publications = new Map(
+    (view.manifest['device-publication']
+      ? await captureDevicePublications(conn, view.localpart)
+      : [])
+      .map((operation) => [operation.operationId, operation]),
+  );
   for (const [kind, facts] of Object.entries(view.manifest)) {
     for (const fact of facts) {
+      if (kind === 'device-publication') {
+        const publication = publications.get(fact.operationId);
+        if (!publication) {
+          throw new LinkError(
+            'LINK_UNAVAILABLE',
+            'bootstrap awaits retained publications',
+            503,
+          );
+        }
+        if (publication.payloadHash !== fact.payloadHash) {
+          throw new LinkError('LINK_DIVERGED', 'bootstrap publication changed');
+        }
+        continue;
+      }
       const rows = kind === 'device-operation'
         ? await conn.query(
           "SELECT json_extract(payload,'$.operation') AS payload_json FROM e2ee_changes WHERE localpart=? AND json_extract(payload,'$.operation.operationId')=? UNION ALL SELECT payload_json FROM device_operations WHERE localpart=? AND operation_id=?",
@@ -323,7 +352,8 @@ export async function semanticKeyReader(
   }
   const view: KeyBootstrap = JSON.parse(String(row.declaration_json));
   if (
-    view.source !== 'home' || view.incarnation !== authority.homeIncarnation
+    view.source !== 'home' || view.incarnation !== authority.homeIncarnation ||
+    !view.manifest['device-publication']
   ) throw new MatrixError(503, 'M_UNAVAILABLE', 'key bootstrap unavailable');
   try {
     await requireDomainControl(conn, view);

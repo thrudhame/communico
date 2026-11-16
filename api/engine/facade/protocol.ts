@@ -90,6 +90,18 @@ export const KEY_HISTORY_CAPABILITY: Capability = {
   type: 'key-history',
   version: 1,
 };
+export const DEVICE_PUBLICATION_CAPABILITY: Capability = {
+  type: 'device-publication',
+  version: 1,
+};
+export const KEY_BOOTSTRAP_V2_CAPABILITY: Capability = {
+  type: 'key-bootstrap',
+  version: 2,
+};
+export const KEY_HISTORY_V2_CAPABILITY: Capability = {
+  type: 'key-history',
+  version: 2,
+};
 export const LINK_SUPPORTED: readonly Capability[] = [
   ...LINK_CAPABILITIES,
   OWNER_CONTROL_CAPABILITY,
@@ -100,6 +112,9 @@ export const LINK_SUPPORTED: readonly Capability[] = [
   SIGNATURE_OPERATION_CAPABILITY,
   KEY_BOOTSTRAP_CAPABILITY,
   KEY_HISTORY_CAPABILITY,
+  DEVICE_PUBLICATION_CAPABILITY,
+  KEY_BOOTSTRAP_V2_CAPABILITY,
+  KEY_HISTORY_V2_CAPABILITY,
 ];
 
 function bad(message: string): never {

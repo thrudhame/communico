@@ -42,6 +42,15 @@ import {
 } from '#engine/tenant/device-operations.ts';
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
 import {
+  captureDevicePublications,
+  type DevicePublication,
+  importDevicePublication,
+} from '#engine/tenant/device-stream.ts';
+import {
+  type KeyHistory,
+  KeyHistoryProof,
+} from '#engine/tenant/key-bootstrap.ts';
+import {
   appendImportedKeyNotice,
   keyChangesCut,
   publicKeysChangedAfter,
@@ -251,6 +260,346 @@ async function fixture(publicFirst = false, legacyChanges = 0) {
     },
   };
 }
+
+Deno.test('original wire publication: checkpoint suffix joins exact evidence without device authority, echo, news or allocation', async () => {
+  const f = await fixture();
+  try {
+    for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    const snapshot = await f.et.tx((tx) =>
+      tx.e2ee.snapshot('alice', '@alice:logical.test', config().e2ee)
+    );
+    const edgeDb = await f.edge.tenant('logical.test');
+    const homeDb = await f.home.tenant('logical.test');
+    const records = await f.es.exportChanges('alice');
+    const publication = records.find((r) => r.type === 'device-publication');
+    assert(
+      publication,
+      'snapshot-only publications must participate in runtime exchange',
+    );
+    const operation =
+      (publication.payload as { body: { operation: DevicePublication } }).body
+        .operation;
+    assertEquals(operation.wire.streamId, snapshot.stream_id);
+    const sourceRows = await edgeDb.query(
+      'SELECT * FROM device_stream_publications',
+    );
+    const before = await homeDb.query('SELECT * FROM devices');
+    const cut = await homeDb.tx(keyChangesCut);
+    await f.hj.receive('edge_a', [publication]);
+    await f.hs.apply(f.hj, publication, f.bundle.id);
+    assertEquals(await homeDb.query('SELECT * FROM devices'), before);
+    assertEquals(
+      await homeDb.tx((conn) => publicKeysChangedAfter(conn, cut)),
+      false,
+    );
+    assertEquals(
+      await homeDb.query(
+        'SELECT * FROM device_stream_publications WHERE operation_id=?',
+        [operation.operationId],
+      ),
+      sourceRows.filter((row) => row.operation_id === operation.operationId),
+    );
+    assertEquals(await f.es.exportChanges('alice'), records);
+    assertEquals(
+      await edgeDb.query('SELECT * FROM device_stream_publications'),
+      sourceRows,
+    );
+    assert(
+      !(await f.hs.exportPublications('alice', f.bundle.id)).some((r) =>
+        (r.payload as { body: { operation: DevicePublication } }).body.operation
+          .operationId === operation.operationId
+      ),
+    );
+    await updateDeviceName(f.ht, 'alice', 'LAN', 'observed checkpoint');
+    const [next] = (await f.hs.export('alice', f.bundle.id)).slice(-1);
+    assertEquals(
+      (next.payload as { body: DeviceView }).body.operation.wire!.prevIds,
+      [snapshot.stream_id],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('original wire publication: extended bootstrap waits for checkpoint history, cold replays exact ACK and does not grant retired authority', async () => {
+  const f = await fixture();
+  let reopened;
+  try {
+    // Retained source evidence from before the current pairing. This history
+    // has no DeviceOperation or executable device-creation fact at all.
+    const homeDb = await f.home.tenant('logical.test');
+    const operationId = canonicalJson([
+      'device-checkpoint',
+      'home',
+      'retired-publication',
+      'alice',
+      101,
+    ]);
+    await homeDb.execute(
+      'INSERT INTO device_stream_publications VALUES(?,?,?,?,?,?)',
+      [
+        'alice',
+        101,
+        operationId,
+        'home',
+        'retired-publication',
+        canonicalJson({ streamId: 101, prevIds: [] }),
+      ],
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const publication = records.find((r) =>
+      r.type === 'key-history' &&
+      (r.payload as { body: KeyHistory }).body.keyKind === 'device-publication'
+    )!;
+    assert(
+      publication,
+      'complete history includes original checkpoint-only evidence',
+    );
+    const marker = records.find((r) => r.type === 'key-bootstrap')!;
+    assertEquals(publication.version, 2);
+    assertEquals(marker.version, 2);
+    const oldReader = new Journal(
+      await f.edge.server(),
+      LINK_SUPPORTED.filter((cap) =>
+        cap.type !== 'device-publication' && !(cap.version === 2 &&
+          (cap.type === 'key-bootstrap' || cap.type === 'key-history'))
+      ),
+    );
+    for (const record of [publication, marker]) {
+      await assertRejects(
+        () => oldReader.receive('home', [record]),
+        Error,
+        'unsupported record type',
+      );
+      assertEquals(
+        (await f.ej.heads('home', 'in', record)).received.sequence,
+        0,
+      );
+    }
+    for (const record of records) await f.ej.receive('home', [record]);
+    for (
+      const record of records.filter((r) => r !== publication && r !== marker)
+    ) await f.es.apply(f.ej, record);
+    await assertRejects(
+      () => f.es.apply(f.ej, marker),
+      Error,
+      'awaits retained publications',
+    );
+    const complete = f.ej.complete.bind(f.ej);
+    f.ej.complete = () => Promise.reject(new Error('publication ACK loss'));
+    await assertRejects(
+      () => f.es.apply(f.ej, publication),
+      Error,
+      'publication ACK loss',
+    );
+    f.ej.complete = complete;
+    const expected = await homeDb.query(
+      'SELECT * FROM device_stream_publications WHERE operation_id=?',
+      [operationId],
+    );
+    const edgeDb = await f.edge.tenant('logical.test');
+    assertEquals(
+      await edgeDb.query(
+        'SELECT * FROM device_stream_publications WHERE operation_id=?',
+        [operationId],
+      ),
+      expected,
+    );
+    assertEquals(
+      await edgeDb.query(
+        "SELECT * FROM authority_facts WHERE incarnation='retired-publication'",
+      ),
+      [],
+    );
+    assertEquals(await edgeDb.query('SELECT * FROM devices'), []);
+    assertEquals(
+      await edgeDb.query('SELECT * FROM key_bootstrap_publications'),
+      [],
+    );
+    await f.edge.close();
+    reopened = await f.open('edge');
+    const pairings = new Pairings(
+      await reopened.server(),
+      f.node.signer(),
+      f.node.publicKey,
+      'b'.repeat(64),
+      f.node,
+    );
+    const tenant = await enrolledTenant(
+      reopened,
+      pairings,
+      'logical.test',
+      'edge_a',
+    );
+    const journal = new Journal(await reopened.server(), LINK_SUPPORTED);
+    const receiver = new DeviceOperations(reopened, tenant, pairings, f.node);
+    assertEquals(await receiver.apply(journal, publication), true);
+    assertEquals(await receiver.apply(journal, marker), true);
+    assertEquals(
+      await (await reopened.tenant('logical.test')).query(
+        'SELECT * FROM device_stream_publications WHERE operation_id=?',
+        [operationId],
+      ),
+      expected,
+    );
+    assertEquals(
+      (await journal.heads('home', 'in', publication)).applied.sequence,
+      publication.sequence,
+    );
+    assertEquals(await receiver.exportPublications('alice'), []);
+  } finally {
+    await reopened?.close();
+    await f.close();
+  }
+});
+
+Deno.test('original wire publication: canonical hashes, original lanes, immutable identities, history kind and rollback are enforced', async () => {
+  const f = await fixture();
+  try {
+    await f.hs.export('alice', f.bundle.id);
+    const homeDb = await f.home.tenant('logical.test');
+    const [operation] = await homeDb.tx((conn) =>
+      captureDevicePublications(conn, 'alice')
+    );
+    assert(operation);
+    const edgeDb = await f.edge.tenant('logical.test');
+    const expected = {
+      source: operation.source,
+      incarnation: operation.incarnation,
+      localpart: 'alice',
+    };
+    const rehash = (
+      body: Omit<DevicePublication, 'payloadHash'>,
+    ): DevicePublication => ({
+      ...body,
+      payloadHash: createHash('sha256').update(canonicalJson(body)).digest(
+        'hex',
+      ),
+    });
+    const { payloadHash: _hash, ...body } = operation;
+    for (
+      const forged of [
+        { ...operation, payloadHash: '0'.repeat(64) },
+        rehash({ ...body, wire: { streamId: 2, prevIds: [] } }),
+        rehash({ ...body, incarnation: 'not-enrolled' }),
+        { ...operation, unexpected: true },
+      ]
+    ) {
+      await assertRejects(
+        () =>
+          edgeDb.tx((conn) => importDevicePublication(conn, forged, expected)),
+        MatrixError,
+        'wire publication collision',
+      );
+    }
+    await assertRejects(
+      () =>
+        edgeDb.tx(async (conn) => {
+          await importDevicePublication(conn, operation, expected);
+          throw new Error('publication rollback');
+        }),
+      Error,
+      'publication rollback',
+    );
+    assertEquals(
+      await edgeDb.query('SELECT * FROM device_stream_publications'),
+      [],
+    );
+    await edgeDb.tx((conn) =>
+      importDevicePublication(conn, operation, expected)
+    );
+    await assertRejects(
+      () =>
+        edgeDb.tx((conn) =>
+          importDevicePublication(
+            conn,
+            rehash({ ...body, operationId: 'reused-wire' }),
+            expected,
+          )
+        ),
+      MatrixError,
+      'wire publication collision',
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const marker = records.find((r) => r.type === 'key-bootstrap')!;
+    const binding = (marker.payload as {
+      body: import('#engine/tenant/key-bootstrap.ts').KeyBootstrap;
+    }).body;
+    const history: KeyHistory = {
+      server: binding.server,
+      pairing: binding.pairing,
+      grantRevision: binding.grantRevision,
+      ownerRevision: binding.ownerRevision,
+      localpart: 'alice',
+      source: binding.source,
+      incarnation: binding.incarnation,
+      kind: 'key-history',
+      keyKind: 'device-operation',
+      operation,
+    };
+    const proof = await KeyHistoryProof.verify(
+      history,
+      await f.ht.signer().sign(canonicalJson(history)),
+      f.ht.publicB64,
+    );
+    await assertRejects(
+      () =>
+        edgeDb.tx((conn) =>
+          importDevicePublication(conn, operation, expected, proof)
+        ),
+      Error,
+      'historical key fact differs',
+    );
+    assertEquals(await edgeDb.query('SELECT * FROM authority_devices'), []);
+    assertEquals(await edgeDb.query('SELECT * FROM one_time_keys'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('original wire publication: legacy completeness remains readable but cannot activate the extended public reader', async () => {
+  const f = await fixture();
+  try {
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const marker = records.find((r) => r.type === 'key-bootstrap')!;
+    const signed = marker.payload as {
+      body: import('#engine/tenant/key-bootstrap.ts').KeyBootstrap;
+      signature: string;
+    };
+    delete signed.body.manifest['device-publication'];
+    signed.signature = await f.ht.signer().sign(canonicalJson(signed.body));
+    marker.version = 1;
+    marker.operationId = 'key-bootstrap:' +
+      createHash('sha256').update(canonicalJson(signed.body)).digest('hex');
+    const { hash: _hash, ...material } = marker;
+    marker.hash = recordHash(material);
+    for (
+      const record of records.filter((r) => r.type !== 'device-publication')
+    ) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    assertEquals(
+      (await (await f.edge.tenant('logical.test')).query(
+        'SELECT * FROM key_bootstrap_publications',
+      )).length,
+      1,
+    );
+    await assertRejects(
+      () =>
+        f.et.tx((tx) =>
+          tx.e2ee.snapshot('alice', '@alice:logical.test', config().e2ee)
+        ),
+      MatrixError,
+      'key bootstrap unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('complete-view checkpoints: retained full snapshots join imported lower IDs and cold-reuse their exact cut', async () => {
   const f = await fixture();
@@ -2697,12 +3046,34 @@ Deno.test('semantic key public scope: enrolled foreign-device signature reaches 
     };
     assertEquals((await publicQuery(f.et)).LAN, expected);
     const publicView = await observePublicImport(f, async () => {
-      for (const record of await f.es.exportSignatures('alice')) {
+      for (const record of await f.es.exportChanges('alice')) {
         await f.hj.receive('edge_a', [record]);
         await f.hs.apply(f.hj, record, f.bundle.id);
       }
     });
     assertEquals(publicView.devices.devices[0].keys, expected);
+    const [originalWire] = await (await f.edge.tenant('logical.test')).query(
+      "SELECT * FROM device_stream_publications WHERE localpart='alice' AND json_extract(operation_id,'$[2]')='device-publication'",
+    );
+    assert(
+      originalWire,
+      'the foreign-owner signature has its own original wire publication',
+    );
+    const originalIdentity = JSON.parse(String(originalWire.wire_json));
+    assert(
+      originalIdentity.prevIds.some((id: number) =>
+        id > originalIdentity.streamId
+      ),
+      'a smaller source ID still follows an observed higher ID',
+    );
+    assertEquals(
+      await (await f.home.tenant('logical.test')).query(
+        'SELECT * FROM device_stream_publications WHERE localpart=? AND operation_id=?',
+        ['alice', originalWire.operation_id],
+      ),
+      [originalWire],
+      'signature exchange must join the original wire rather than only its semantic overlay',
+    );
     assertEquals(await publicQuery(f.ht), await publicQuery(f.et));
     const snapshot = await f.et.tx((tx) =>
       tx.e2ee.snapshot('alice', user, config().e2ee)
@@ -2748,7 +3119,7 @@ Deno.test('key runtime export retains independent signing streams when device ex
       Error,
       'device export unavailable',
     );
-    for (const prefix of ['signing:', 'signatures:']) {
+    for (const prefix of ['signing:', 'signatures:', 'device-publications:']) {
       assert(
         (await f.hj.streams('edge_a', 'out')).some((stream) =>
           stream.stream === prefix + '@alice:logical.test' &&

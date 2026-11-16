@@ -15,6 +15,11 @@ import {
 } from '#engine/tenant/device-source.ts';
 import { importDeviceOperation } from '#engine/tenant/device-operations.ts';
 import {
+  captureDevicePublications,
+  type DevicePublication,
+  importDevicePublication,
+} from '#engine/tenant/device-stream.ts';
+import {
   keyChangesCut,
   publicKeysChangedAfter,
 } from '#engine/tenant/changes.ts';
@@ -67,12 +72,20 @@ type SignatureView = DomainBinding & {
   kind: 'signature-operation';
   operation: SignatureOperation;
 };
-type KeyView = DeviceView | SigningView | SignatureView;
+type PublicationView = DomainBinding & {
+  kind: 'device-publication';
+  operation: DevicePublication;
+};
+type KeyView = DeviceView | SigningView | SignatureView | PublicationView;
 type KeyEnvelope = KeyView | KeyBootstrap | KeyHistory;
 const keyKinds = {
   'device-operation': { prefix: 'device:', stream: 'devices:@' },
   'signing-operation': { prefix: 'signing:', stream: 'signing:@' },
   'signature-operation': { prefix: 'signature:', stream: 'signatures:@' },
+  'device-publication': {
+    prefix: 'publication:',
+    stream: 'device-publications:@',
+  },
 } as const;
 
 function keyKind(value: string): value is KeyView['kind'] {
@@ -91,7 +104,7 @@ function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
 }
 
-function viewOf(raw: unknown): KeyEnvelope {
+function viewOf(raw: unknown, version = 2): KeyEnvelope {
   const row = object(raw);
   const localpart = text(row.localpart);
   if (
@@ -114,6 +127,7 @@ function viewOf(raw: unknown): KeyEnvelope {
   if (row.kind === 'key-bootstrap') {
     const manifest = object(row.manifest), parsed = {} as KeyManifest;
     for (const kind of Object.keys(keyKinds) as KeyKind[]) {
+      if (version === 1 && kind === 'device-publication') continue;
       const refs = manifest[kind];
       if (!Array.isArray(refs)) mismatch('invalid key manifest');
       parsed[kind] = refs.map((raw) => {
@@ -130,13 +144,16 @@ function viewOf(raw: unknown): KeyEnvelope {
           : 0
       );
       if (
-        new Set(parsed[kind].map((fact) => fact.operationId)).size !==
-          parsed[kind].length
+        new Set(parsed[kind]!.map((fact) => fact.operationId)).size !==
+          parsed[kind]!.length
       ) mismatch('duplicate key manifest fact');
     }
     view = { ...binding, kind: 'key-bootstrap', manifest: parsed };
   } else if (row.kind === 'key-history') {
-    if (typeof row.keyKind !== 'string' || !keyKind(row.keyKind)) {
+    if (
+      typeof row.keyKind !== 'string' || !keyKind(row.keyKind) ||
+      (version === 1 && row.keyKind === 'device-publication')
+    ) {
       mismatch('invalid historical key kind');
     }
     view = {
@@ -290,12 +307,27 @@ export class DeviceOperations {
       this.exportSigning(localpart, pairing),
       this.exportSignatures(localpart, pairing),
     ]);
+    // Capture after source owners settle, including when one is unavailable.
+    // Its independent journal still drains the retained publication evidence.
+    results.push(
+      ...await Promise.allSettled([
+        this.exportPublications(localpart, pairing),
+      ]),
+    );
     const records = [];
     for (const result of results) {
       if (result.status === 'rejected') throw result.reason;
       records.push(...result.value);
     }
     return records;
+  }
+
+  async exportPublications(localpart: string, pairing?: string) {
+    return await this.exportOperations(
+      'device-publication',
+      localpart,
+      pairing,
+    );
   }
 
   /** The same source owners capture one complete tenant cut; each dependency
@@ -361,7 +393,13 @@ export class DeviceOperations {
         incarnation: this.node ? view.incarnation : context.id,
         stream: streamName(view.kind, view.localpart, view.server),
         type: view.kind,
-        version: 1,
+        // Existing historical envelopes keep their original immutable record
+        // version. Only the extended manifest/publication history requires v2.
+        version: view.kind === 'key-bootstrap' ||
+            (view.kind === 'key-history' &&
+              view.keyKind === 'device-publication')
+          ? 2
+          : 1,
         operationId: operationId(view),
         payload: signed,
       });
@@ -419,6 +457,13 @@ export class DeviceOperations {
             return await captureSigningOperations(conn, localpart);
           case 'signature-operation':
             return await captureSignatureOperations(conn, localpart);
+          case 'device-publication':
+            return (await captureDevicePublications(conn, localpart)).filter((
+              operation,
+            ) =>
+              operation.source === binding.source &&
+              operation.incarnation === binding.incarnation
+            );
         }
       },
     );
@@ -443,11 +488,20 @@ export class DeviceOperations {
     if (!record) return false;
     if (
       (!keyKind(record.type) && record.type !== 'key-bootstrap' &&
-        record.type !== 'key-history') || record.version !== 1
+        record.type !== 'key-history') ||
+      (record.type === 'key-bootstrap' || record.type === 'key-history'
+        ? record.version !== 1 && record.version !== 2
+        : record.version !== 1)
     ) {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not device operation');
     }
-    const signed = object(record.payload), view = viewOf(signed.body);
+    const signed = object(record.payload),
+      view = viewOf(
+        signed.body,
+        record.type === 'key-bootstrap' || record.type === 'key-history'
+          ? record.version
+          : 2,
+      );
     if (
       view.kind !== record.type || view.server !== this.tenant.serverName ||
       (!this.node && view.pairing !== pairing)
@@ -545,8 +599,15 @@ export class DeviceOperations {
               expected,
               history,
             );
-          } else {
+          } else if (kind === 'signature-operation') {
             await importSignatureOperation(
+              conn,
+              view.operation,
+              expected,
+              history,
+            );
+          } else {
+            await importDevicePublication(
               conn,
               view.operation,
               expected,
