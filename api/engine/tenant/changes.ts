@@ -16,6 +16,7 @@ import {
 } from '#engine/tenant/device-stream.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import { recordTenantProjection } from '#engine/tenant/hooks.ts';
+import { publicDeviceKeys } from '#engine/tenant/device-operations.ts';
 
 /** A transaction-local cut for classifying committed public key invalidations.
  * This is receiver discovery only, never a federation stream or auth revision. */
@@ -31,14 +32,15 @@ export async function publicKeysChangedAfter(
   cut: number,
 ): Promise<boolean> {
   return (await conn.query(
-    "SELECT 1 FROM e2ee_changes WHERE pos>? AND (json_extract(payload,'$.kind') IS NULL OR json_extract(payload,'$.kind') IN ('public_signing','restore_reset') OR (json_extract(payload,'$.kind')='imported_keys' AND json_extract(payload,'$.public')=1)) LIMIT 1",
+    "SELECT 1 FROM e2ee_changes WHERE pos>? AND (json_extract(payload,'$.kind') IS NULL OR json_extract(payload,'$.kind') IN ('public_signing','restore_reset','semantic_reset') OR (json_extract(payload,'$.kind')='imported_keys' AND json_extract(payload,'$.public')=1)) LIMIT 1",
     [cut],
   )).length > 0;
 }
 
 /** Imported public facts create receiver-local invalidations, not new semantic
  * operations or federation identities. The original wire remains with its owner.
- * Retain discovery in the same transaction so ACK loss/restart cannot hide news. */
+ * Retain discovery in the same transaction so ACK loss/restart cannot hide news.
+ * Stale local wire snapshots need a separate correction, never a rewritten fact. */
 export async function appendImportedKeyNotice(
   conn: Conn,
   localpart: string,
@@ -54,6 +56,65 @@ export async function appendImportedKeyNotice(
     canonicalJson({ kind: 'imported_keys', subject, public: publicChanged }),
   ]);
   await recordTenantProjection(conn);
+  if (publicChanged) await reconcileDevicePublications(conn, localpart);
+}
+
+/** Immutable source snapshots cannot be changed when later semantic material
+ * invalidates them. Join that reconciliation with one new durable reset instead.
+ * A reset covers every older source snapshot; replay cannot mint an echo loop. */
+export async function reconcileDevicePublications(
+  conn: Conn,
+  localpart: string,
+): Promise<void> {
+  const latest = new Map<string, Record<string, unknown>>();
+  for (
+    const row of await conn.query(
+      "SELECT device_id,payload FROM e2ee_changes WHERE localpart=? AND stream_id>0 AND json_type(payload,'$.wire')='object' ORDER BY pos",
+      [localpart],
+    )
+  ) {
+    const payload = JSON.parse(String(row.payload));
+    if (payload.kind === 'restore_reset' || payload.kind === 'semantic_reset') {
+      latest.clear();
+    } else if (row.device_id) latest.set(String(row.device_id), payload);
+  }
+  if (!latest.size) return;
+  const [tenant] = await conn.query('SELECT server_name FROM tenant');
+  const user = '@' + localpart + ':' + tenant.server_name;
+  const current = new Map((await publicDeviceKeys(conn, localpart) ?? [])
+    .map((device) => [device.device_id, device]));
+  for (const [deviceId, payload] of latest) {
+    // Keyless creation/name notices do not retain public key material that can
+    // resurrect. A later upload for this device replaces that source snapshot.
+    if (!payload.keys && !payload.deleted) continue;
+    const device = current.get(deviceId);
+    const keys = device
+      ? await signatureView(conn, JSON.parse(device.key_json), user, deviceId)
+      : undefined;
+    const matches = payload.deleted
+      ? !device
+      : device && canonicalJson(keys) === canonicalJson(payload.keys) &&
+        (device.display_name ?? null) === (payload.device_display_name ?? null);
+    if (matches) continue;
+    const { pos, stream, wire } = await reserveDeviceChange(conn, localpart);
+    if (!wire) {
+      throw new Error('semantic device reset lost enrolled wire authority');
+    }
+    await retainDeviceChange(
+      conn,
+      { localpart, deviceId: '', generation: 0 },
+      pos,
+      stream,
+      {
+        kind: 'semantic_reset',
+        device_id: '',
+        deleted: true,
+        wire,
+      },
+    );
+    await recordTenantProjection(conn);
+    return;
+  }
 }
 
 async function reserveDeviceChange(conn: Conn, localpart: string) {
@@ -192,6 +253,7 @@ export async function appendDeviceChange(
     ...(operation ? { operation } : {}),
     ...(signatureOperation ? { signatureOperation } : {}),
   });
+  await reconcileDevicePublications(conn, device.localpart);
 }
 
 /** Verified signatures change a public device view without acquiring the base
@@ -219,6 +281,7 @@ export async function appendDeviceOverlayChange(
       ...(wire ? { wire } : {}),
     },
   );
+  await reconcileDevicePublications(conn, localpart);
 }
 
 async function retainDeviceChange(

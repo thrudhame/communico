@@ -23,6 +23,7 @@ import {
   tenantAuthority,
 } from '#engine/tenant/session-authority.ts';
 import { captureSigningOperations } from '#engine/tenant/signing-operations.ts';
+import { reconcileDevicePublications } from '#engine/tenant/changes.ts';
 import {
   captureEmbeddedSignatures,
   type SignatureOperation,
@@ -272,6 +273,7 @@ export async function appendSigningChange(
     0,
     canonicalJson(payload),
   ]);
+  if (publicChanged) await reconcileDevicePublications(conn, localpart);
 }
 
 export async function clearSigningKeys(

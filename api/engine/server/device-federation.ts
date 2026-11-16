@@ -228,7 +228,8 @@ export async function fanoutDeviceChange(
   raw: string,
 ): Promise<void> {
   const payload = JSON.parse(raw);
-  const reset = payload.kind === 'restore_reset';
+  const reset = payload.kind === 'restore_reset' ||
+    payload.kind === 'semantic_reset';
   const subscriptions = await tx.query(
     'SELECT destination,queued_stream,epoch FROM device_subscriptions WHERE subject=? AND active=1',
     [subject],

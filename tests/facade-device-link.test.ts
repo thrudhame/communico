@@ -55,12 +55,17 @@ import {
   keyChangesCut,
   publicKeysChangedAfter,
   rebaseRestoredDeviceStreams,
+  reconcileDevicePublications,
 } from '#engine/tenant/changes.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deactivateUser } from '#engine/tenant/users.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
-import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
+import {
+  deviceListsBetween,
+  deviceStreamMax,
+  reconcileDeviceRoom,
+} from '#engine/server/e2ee.ts';
 import {
   pendingTenantProjection,
   tenantChangesCommitted,
@@ -3106,6 +3111,264 @@ Deno.test('semantic key public scope: enrolled foreign-device signature reaches 
   } finally {
     await reopened?.close();
     await f.close();
+  }
+});
+
+Deno.test('stale wire correction: delayed foreign-device snapshots get a durable current-view reset after reconciliation', async (t) => {
+  for (
+    const variant of ['deleted', 'same-key-recreation', 'renamed'] as const
+  ) {
+    await t.step(variant, async () => {
+      const f = await fixture(true);
+      const user = '@alice:logical.test';
+      let reopened;
+      try {
+        const masterPair = await generateSigningKeypair() as CryptoKeyPair;
+        const selfPair = await generateSigningKeypair() as CryptoKeyPair;
+        const masterKey = b64encodeStd(
+          await exportPublicKeyRaw(masterPair.publicKey),
+        );
+        const selfKey = b64encodeStd(
+          await exportPublicKeyRaw(selfPair.publicKey),
+        );
+        const master = {
+          user_id: user,
+          usage: ['master'],
+          keys: { ['ed25519:' + masterKey]: masterKey },
+        };
+        const self = {
+          user_id: user,
+          usage: ['self_signing'],
+          keys: { ['ed25519:' + selfKey]: selfKey },
+        };
+        await signJson(
+          self,
+          user,
+          'ed25519:' + masterKey,
+          masterPair.privateKey,
+        );
+        await f.ht.tx((tx) =>
+          tx.crossSigning.upload(
+            'alice',
+            user,
+            signingUpload(
+              { master_key: master, self_signing_key: self },
+              user,
+              config().e2ee,
+            ),
+            '{}',
+            false,
+          )
+        );
+        const keys = {
+          user_id: user,
+          device_id: 'LAN',
+          algorithms: [],
+          keys: { 'ed25519:LAN': 'original-home-key' },
+          signatures: {},
+        };
+        const device = await deviceIdentity(f.ht, 'alice', 'LAN');
+        await f.ht.tx((tx) =>
+          tx.e2ee.upload(
+            device,
+            validateUpload({ device_keys: keys }, user, 'LAN', config().e2ee),
+          )
+        );
+        for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+          await f.ej.receive('home', [record]);
+          await f.es.apply(f.ej, record);
+        }
+        const edgeServer = await f.edge.server();
+        await edgeServer.tx((conn) =>
+          reconcileDeviceRoom(
+            conn,
+            '!room:logical.test',
+            [user, '@bob:remote.test'],
+            false,
+            null,
+            1,
+            ['logical.test'],
+          )
+        );
+        const signed = structuredClone(keys);
+        await signJson(signed, user, 'ed25519:' + selfKey, selfPair.privateKey);
+        assertEquals(
+          await f.et.tx((tx) =>
+            tx.keySignatures.upload('alice', user, [{
+              user,
+              id: 'LAN',
+              json: signed,
+            }])
+          ),
+          { failures: {} },
+        );
+        const edgeDb = await f.edge.tenant('logical.test');
+        const tables = [
+          'e2ee_changes',
+          'device_stream_publications',
+          'device_stream_frontier',
+          'user_device_stream',
+        ];
+        const before = await Promise.all(
+          tables.map((table) => edgeDb.query('SELECT * FROM ' + table)),
+        );
+        await edgeDb.tx((conn) => reconcileDevicePublications(conn, 'alice'));
+        assertEquals(
+          await Promise.all(
+            tables.map((table) => edgeDb.query('SELECT * FROM ' + table)),
+          ),
+          before,
+          'an unchanged current view cannot allocate a correction',
+        );
+        await assertRejects(
+          () =>
+            edgeDb.tx(async (conn) => {
+              await conn.execute(
+                "UPDATE users SET deactivated=1 WHERE localpart='alice'",
+              );
+              await reconcileDevicePublications(conn, 'alice');
+              assert(
+                (await conn.query(
+                  "SELECT 1 FROM e2ee_changes WHERE json_extract(payload,'$.kind')='semantic_reset'",
+                )).length > 0,
+              );
+              throw new Error('rollback semantic reset');
+            }),
+          Error,
+          'rollback semantic reset',
+        );
+        assertEquals(
+          await Promise.all(
+            tables.map((table) => edgeDb.query('SELECT * FROM ' + table)),
+          ),
+          before,
+        );
+        // This already-committed source snapshot may still be awaiting projection
+        // or reliable delivery when the foreign device's deletion reaches us.
+        if (variant === 'renamed') {
+          await updateDeviceName(f.ht, 'alice', 'LAN', 'new home name');
+        } else {
+          await deleteDevices(f.ht, 'alice', ['LAN']);
+          if (variant === 'same-key-recreation') {
+            await upsertDevice(f.ht, 'alice', 'LAN', 'recreated home');
+            const recreated = await deviceIdentity(f.ht, 'alice', 'LAN');
+            await f.ht.tx((tx) =>
+              tx.e2ee.upload(
+                recreated,
+                validateUpload(
+                  { device_keys: keys },
+                  user,
+                  'LAN',
+                  config().e2ee,
+                ),
+              )
+            );
+          }
+        }
+        const auth = await exportAccountAuth(
+          f.home,
+          f.ht,
+          f.hp,
+          f.bundle.id,
+          'alice',
+          false,
+        );
+        await f.ej.receive('home', [auth]);
+        await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(
+          f.ej,
+          auth,
+        );
+        for (const record of await f.hs.exportChanges('alice', f.bundle.id)) {
+          await f.ej.receive('home', [record]);
+          await f.es.apply(f.ej, record);
+        }
+        const snapshot = await f.et.tx((tx) =>
+          tx.e2ee.snapshot('alice', user, config().e2ee)
+        );
+        if (variant === 'deleted') {
+          assertEquals(snapshot.devices, []);
+        } else {
+          const devices = snapshot.devices as {
+            device_id: string;
+            device_display_name: string;
+            keys: { signatures: unknown };
+          }[];
+          assertEquals(devices.length, 1);
+          assertEquals(
+            devices[0].device_display_name,
+            variant === 'renamed' ? 'new home name' : 'recreated home',
+          );
+          if (variant === 'same-key-recreation') {
+            assertEquals(
+              devices[0].keys.signatures,
+              {},
+              'old generation signatures cannot authorize identical recreated keys',
+            );
+          }
+        }
+        await projectTenant(f.edge, 'logical.test');
+        const changes = (await edgeServer.query(
+          "SELECT payload FROM edu_outbox WHERE edu_type='m.device_list_update' AND destination='remote.test' ORDER BY enqueue_pos",
+        )).map((row) => JSON.parse(String(row.payload)));
+        const stale = changes.findLastIndex((change) =>
+          change.device_id === 'LAN' && change.keys
+        );
+        assert(
+          stale >= 0,
+          'retain the original signature-only wire obligation, do not rewrite or erase it',
+        );
+        const correction = changes.slice(stale + 1).find((change) =>
+          change.prev_id.length === 0
+        );
+        assert(
+          correction,
+          'a stale original overlay needs a later durable reset so stock peers refetch the current empty device view',
+        );
+        assert(
+          correction.stream_id !== changes[stale].stream_id,
+          'correction has a new identity, never changed original wire bytes',
+        );
+        const retained = await Promise.all(
+          tables.map((table) => edgeDb.query('SELECT * FROM ' + table)),
+        );
+        const queued = await edgeServer.query(
+          'SELECT source,payload FROM edu_outbox ORDER BY enqueue_pos',
+        );
+        await edgeDb.tx((conn) => reconcileDevicePublications(conn, 'alice'));
+        await projectTenant(f.edge, 'logical.test');
+        assertEquals(
+          await Promise.all(
+            tables.map((table) => edgeDb.query('SELECT * FROM ' + table)),
+          ),
+          retained,
+        );
+        assertEquals(
+          await edgeServer.query(
+            'SELECT source,payload FROM edu_outbox ORDER BY enqueue_pos',
+          ),
+          queued,
+        );
+        await f.edge.close();
+        reopened = await f.open('edge');
+        await projectTenant(reopened, 'logical.test');
+        assertEquals(
+          await (await reopened.server()).query(
+            'SELECT source,payload FROM edu_outbox ORDER BY enqueue_pos',
+          ),
+          queued,
+        );
+        const coldDb = await reopened.tenant('logical.test');
+        assertEquals(
+          await Promise.all(
+            tables.map((table) => coldDb.query('SELECT * FROM ' + table)),
+          ),
+          retained,
+        );
+      } finally {
+        await reopened?.close();
+        await f.close();
+      }
+    });
   }
 });
 
