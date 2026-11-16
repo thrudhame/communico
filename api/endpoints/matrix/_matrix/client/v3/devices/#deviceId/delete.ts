@@ -1,8 +1,8 @@
 import { parseJson } from '#engine/operation-body.ts';
 import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { deleteDevices, getDevice } from '#engine/tenant/devices.ts';
-import { PASSWORD_FLOWS, requireUia } from '#engine/tenant/uia.ts';
+import { deleteDevices, hasDevice } from '#engine/tenant/devices.ts';
+import { PASSWORD_FLOWS, requireUia, uiaAction } from '#engine/tenant/uia.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
@@ -24,16 +24,18 @@ export default async function (request: PathfinderRequest, context: Context) {
     if (e instanceof Error && e.name === 'ParseError') body = {};
     else throw e;
   }
-  await requireUia(theApp().tenant, {
+  const deviceId = request.params.deviceId as string;
+  const authorization = await requireUia(theApp().tenant, {
     body,
     flows: PASSWORD_FLOWS,
     caller,
+    token: context.state.token,
+    action: uiaAction('delete-device', [deviceId]),
+    targets: [deviceId],
   });
-  const deviceId = request.params.deviceId as string;
-  const device = await getDevice(theApp().tenant, localpart, deviceId);
-  if (device === null) {
+  if (!await hasDevice(theApp().tenant, localpart, deviceId)) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'unknown device');
   }
-  await deleteDevices(theApp().tenant, localpart, [deviceId]);
+  await deleteDevices(theApp().tenant, localpart, [deviceId], authorization);
   return {};
 }

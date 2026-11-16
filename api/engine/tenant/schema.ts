@@ -10,6 +10,9 @@
 import type { SchemaProvider } from '#engine/store/create.ts';
 import { recordPusherChange } from '#engine/tenant/pushers.ts';
 import { OWNER_CONTROL_SQL } from '#engine/facade/schema.ts';
+import { ACCOUNT_AUTH_SQL } from '#engine/tenant/account-auth.ts';
+import { SESSION_AUTHORITY_SQL } from '#engine/tenant/session-authority.ts';
+import { UIA_BINDING_SQL } from '#engine/tenant/uia.ts';
 import {
   BACKUP_ACCOUNTING_SQL,
   migrateBackupAccounting,
@@ -262,8 +265,15 @@ const PUBLIC_REPLICAS_SQL = `
 CREATE TABLE public_user_replicas(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart),source_cut INTEGER NOT NULL,snapshot_json TEXT NOT NULL);
 `;
 
+// Retained roots for leave/privacy reconciliation, independent of the server's
+// account notification watermark. Later room imports must also honor tombstones.
+const DEACTIVATION_WORK_SQL = `
+CREATE TABLE deactivation_work(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart),erase INTEGER NOT NULL);
+INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users WHERE erased_users.localpart=users.localpart) FROM users WHERE deactivated=1;
+`;
+
 export const tenantSchema: SchemaProvider = {
-  version: 22,
+  version: 26,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -284,8 +294,16 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(DELAYED_EVENTS_SQL);
     await db.exec(PUBLIC_REPLICAS_SQL);
     await db.exec(OWNER_CONTROL_SQL);
+    await db.exec(ACCOUNT_AUTH_SQL);
+    await db.exec(SESSION_AUTHORITY_SQL);
+    await db.exec(UIA_BINDING_SQL);
+    await db.exec(DEACTIVATION_WORK_SQL);
   },
   migrations: {
+    25: (conn) => conn.exec(DEACTIVATION_WORK_SQL),
+    24: (conn) => conn.exec(UIA_BINDING_SQL),
+    23: (conn) => conn.exec(SESSION_AUTHORITY_SQL),
+    22: (conn) => conn.exec(ACCOUNT_AUTH_SQL),
     21: (conn) => conn.exec(OWNER_CONTROL_SQL),
     20: (conn) => conn.exec(PUBLIC_REPLICAS_SQL),
     19: (conn) => conn.exec(DELAYED_EVENTS_SQL),

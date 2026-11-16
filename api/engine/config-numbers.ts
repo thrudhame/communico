@@ -24,6 +24,7 @@ export const INTEGER_DOMAINS = {
   'facade.mailboxmaxbytes': nonnegative,
   'facade.mailboxmaxagedays': days,
   'facade.maxofflinedays': days,
+  'facade.authmaxstalehours': hours,
   'facade.batchmaxbytes': positive,
   'facade.batchmaxitems': positive,
   'turn.ttl': { min: 0, scale: 1000 },

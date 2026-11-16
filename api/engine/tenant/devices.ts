@@ -2,6 +2,7 @@
 // devices removes their tokens (and those tokens' pushers and refresh
 // rows) with them.
 import type { Conn } from '#engine/store/db.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { appendDeviceChange } from '#engine/tenant/changes.ts';
@@ -11,6 +12,14 @@ import {
 } from '#engine/tenant/cross-signing.ts';
 import { config } from '#engine/config.ts';
 import { deletePushersForToken } from '#engine/tenant/pushers.ts';
+import { uiaAction, type UiaAuthorization } from '#engine/tenant/uia.ts';
+import {
+  assertDeviceOwner,
+  recordDeviceCreation,
+  recordDeviceDeletion,
+  recordRevocation,
+  registryDevice,
+} from '#engine/tenant/session-authority.ts';
 
 export type DeviceRow = {
   device_id: string;
@@ -42,6 +51,7 @@ export async function upsertDeviceRow(
   localpart: string,
   displayName: string | null,
 ): Promise<void> {
+  await assertDeviceOwner(conn, localpart, deviceId);
   await signingCollision(conn, localpart, deviceId);
   const existing = await deviceById(conn, deviceId, localpart);
   if (existing !== null) {
@@ -56,6 +66,7 @@ export async function upsertDeviceRow(
     [deviceId, localpart, generation, displayName],
   );
   await appendDeviceChange(conn, { localpart, deviceId, generation });
+  await recordDeviceCreation(conn, localpart, deviceId, generation);
 }
 
 export async function deviceById(
@@ -81,12 +92,37 @@ export async function devicesOfUser(
   return rows.map(deviceRow);
 }
 
+/** Lifecycle existence is not possession of another issuer's mutable device
+ * row. Deletion may target a known foreign incarnation without claiming its
+ * metadata, tokens or pool as locally owned. */
+export async function deviceExists(
+  conn: Conn,
+  deviceId: string,
+  localpart: string,
+): Promise<boolean> {
+  const device = await registryDevice(conn, localpart, deviceId);
+  if (!device) return await deviceById(conn, deviceId, localpart) !== null;
+  return (await conn.query(
+    "SELECT id FROM authority_facts WHERE localpart=? AND kind='delete' AND json_extract(payload,'$.target')=?",
+    [localpart, device.id],
+  )).length === 0;
+}
+
+export async function hasDevice(
+  tenant: Tenant,
+  localpart: string,
+  deviceId: string,
+): Promise<boolean> {
+  return await tenant.tx((tx) => tx.devices.exists(deviceId, localpart));
+}
+
 export async function renameDevice(
   conn: Conn,
   deviceId: string,
   localpart: string,
   displayName: string,
 ): Promise<boolean> {
+  await assertDeviceOwner(conn, localpart, deviceId);
   const device = await deviceById(conn, deviceId, localpart);
   if (device === null) return false;
   if (device.display_name === displayName) return true;
@@ -106,8 +142,10 @@ export async function deleteDevice(
   conn: Conn,
   deviceId: string,
   localpart: string,
+  record = true,
 ): Promise<void> {
   // Sole device lifecycle deletion: all consumers revoke through this owner.
+  if (record) await recordDeviceDeletion(conn, localpart, deviceId);
   await conn.execute(
     'DELETE FROM delayed_event_receipts WHERE localpart=? AND device_id=?',
     [localpart, deviceId],
@@ -132,6 +170,16 @@ export async function deleteDevice(
     'SELECT token FROM access_tokens WHERE localpart = ? AND device_id = ?',
     [localpart, deviceId],
   );
+  if (record) {
+    for (
+      const row of await conn.query(
+        'SELECT token FROM access_tokens WHERE localpart=? AND device_id=? UNION SELECT token FROM refresh_tokens WHERE localpart=? AND device_id=?',
+        [localpart, deviceId, localpart, deviceId],
+      )
+    ) {
+      await recordRevocation(conn, String(row.token));
+    }
+  }
   for (const row of tokens) {
     await deletePushersForToken(conn, String(row.token));
     await conn.execute('DELETE FROM refresh_tokens WHERE access_token = ?', [
@@ -183,9 +231,10 @@ export async function deleteDevice(
 export async function deleteDevicesOfUser(
   conn: Conn,
   localpart: string,
+  record = true,
 ): Promise<void> {
   for (const row of await devicesOfUser(conn, localpart)) {
-    await deleteDevice(conn, row.device_id, localpart);
+    await deleteDevice(conn, row.device_id, localpart, record);
   }
 }
 
@@ -243,8 +292,23 @@ export async function deleteDevices(
   tenant: Tenant,
   localpart: string,
   deviceIds: string[],
+  authorization?: UiaAuthorization,
 ): Promise<void> {
   await tenant.tx(async (tx) => {
+    if (authorization) {
+      const name = authorization.request.action.name;
+      if (name !== 'delete-device' && name !== 'delete-devices') {
+        throw new MatrixError(
+          403,
+          'M_FORBIDDEN',
+          'UIA action differs from device deletion',
+        );
+      }
+      await tx.uia.authorize(authorization, {
+        localpart,
+        action: uiaAction(name, deviceIds),
+      });
+    }
     for (const deviceId of deviceIds) {
       await tx.devices.delete(deviceId, localpart);
     }

@@ -59,7 +59,7 @@ Deno.test('review session: same device string is independent across users at log
   }
 });
 
-Deno.test('review session: only valid credentials disclose deactivation', async () => {
+Deno.test('review session: destroyed credentials do not disclose deactivation', async () => {
   const http = await startHttp();
   try {
     await http.registerTestUser('inactive', 'pw');
@@ -71,7 +71,9 @@ Deno.test('review session: only valid credentials disclose deactivation', async 
     assertEquals(wrong.body.errcode, 'M_FORBIDDEN');
     const valid = await login(http, 'inactive', 'device');
     assertEquals(valid.status, 403);
-    assertEquals(valid.body.errcode, 'M_USER_DEACTIVATED');
+    assertEquals(valid.body.errcode, 'M_FORBIDDEN');
+    assertEquals(valid.body.access_token, undefined);
+    assertEquals(wrong.body.access_token, undefined);
   } finally {
     await http.close();
   }

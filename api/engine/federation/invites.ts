@@ -332,7 +332,7 @@ export async function prejoinSnapshot(
 // Every pending invite of a user (stage 5's /sync invite section).
 export async function invitesOf(
   userId: string,
-  deps: InviteDeps,
+  deps: Pick<InviteDeps, 'server'>,
 ): Promise<StoredInvite[]> {
   const rows = await deps.server.query(
     `SELECT * FROM prejoin_memberships p WHERE user_id = ? AND ${
@@ -543,7 +543,7 @@ export function candidatesOf(invite: StoredInvite, self: string): string[] {
 export async function rejectInviteRemote(
   roomId: string,
   userId: string,
-  deps: InviteDeps,
+  deps: Pick<InviteDeps, 'store' | 'server' | 'signer' | 'self' | 'wake'>,
   reason?: string,
 ): Promise<void> {
   const candidates = await inviteTransition(deps.server, async (tx) => {
@@ -557,6 +557,13 @@ export async function rejectInviteRemote(
     const invite = rows.length === 0 ? null : inviteOf(rows[0]);
     if (invite === null || invite.status === 'joined') {
       throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
+    }
+    // Client retries and durable account cleanup share this transition owner.
+    // Never replace a prepared departure or restart its remote intent/revision.
+    if (['rejecting', 'rejected', 'failed-retract'].includes(invite.status)) {
+      return invite.status === 'rejecting'
+        ? candidatesOf(invite, deps.self)
+        : [];
     }
     await withdrawInvitePush(tx, userId, roomId, invite.eventId);
     const localLeave = await buildLocalPrejoinLeave(
@@ -578,7 +585,7 @@ export async function rejectInviteRemote(
     return candidatesOf(invite, deps.self);
   });
   // nothing ingested an event — wake the first candidate's loop directly
-  deps.wake(candidates[0]);
+  if (candidates.length) deps.wake(candidates[0]);
 }
 
 // A local OOB departure is a real signed membership, not an edited invite or

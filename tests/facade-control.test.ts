@@ -17,6 +17,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { openStore } from '#engine/store/index.ts';
 import type { Database } from '#engine/store/db.ts';
+import type { Signer } from '#engine/room/signer.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
   importPublicKeyFromRaw,
@@ -73,8 +74,8 @@ async function fixture(seedServer = serverSchema) {
   );
   const journal = () => new Journal(edgeServer, LINK_CAPABILITIES);
   let edgeServer = await edge.server();
-  const keys = (database = edgeServer) =>
-    new FacadeKeys(database, node.signer(), node.publicKey, fp);
+  const keys = (database = edgeServer, signer: Signer = node.signer()) =>
+    new FacadeKeys(database, signer, node.publicKey, fp);
   const exportRoster = (now?: number) =>
     exportKeyRoster(
       home,
@@ -396,6 +397,150 @@ Deno.test('facade request signing refuses an expired offline authority before cr
       Date.now = clock;
     }
   } finally {
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('prepared facade signer uses no database inside a room transaction and expires before signing', async () => {
+  setConfigForTests({ facade: { maxofflinedays: 1 } });
+  const f = await fixture();
+  try {
+    const record = await f.receive();
+    await f.keys().apply(f.journal(), record);
+    let forbidden = false;
+    const server = f.server();
+    const database: Database = {
+      ...server,
+      tx(fn, options) {
+        if (forbidden) throw new Error('nested server database access');
+        return server.tx(fn, options);
+      },
+      query(sql, values) {
+        if (forbidden) throw new Error('nested server database access');
+        return server.query(sql, values);
+      },
+    };
+    let signatures = 0;
+    const raw = f.node.signer();
+    const keys = f.keys(database, {
+      ...raw,
+      sign(bytes) {
+        signatures++;
+        return raw.sign(bytes);
+      },
+    });
+    const permit = await keys.prepareSigner();
+    const doc = await keys.document();
+    forbidden = true;
+    assertEquals(await permit.sign('room bytes'), await raw.sign('room bytes'));
+    const clock = Date.now;
+    try {
+      Date.now = () => doc.valid_until_ts;
+      await assertRejects(() => permit.sign('expired'), MatrixError, 'expired');
+    } finally {
+      Date.now = clock;
+    }
+    assertEquals(signatures, 1);
+  } finally {
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('prepared facade signing is fenced across owners and during asynchronous signatures', async () => {
+  setConfigForTests({ federation: { keyvalidityhours: 1 } });
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  try {
+    const record = await f.receive();
+    await f.keys().apply(f.journal(), record);
+    const prior = await f.keys().prepareSigner();
+    const raw = f.node.signer();
+    const delayed = await f.keys(f.server(), {
+      ...raw,
+      async sign(bytes) {
+        entered.resolve();
+        await release.promise;
+        return raw.sign(bytes);
+      },
+    }).prepareSigner();
+    const pending = assertRejects(
+      () => delayed.sign('racing room bytes'),
+      MatrixError,
+      'changed',
+    );
+    await entered.promise;
+    const next = await f.reenroll();
+    release.resolve();
+    await pending;
+    await assertRejects(() => prior.sign('stale'), MatrixError, 'changed');
+    await f.journal().receive('home', [next]);
+    await f.keys().apply(f.journal(), next);
+    const fresh = await f.keys().prepareSigner();
+    assertEquals(await fresh.sign('fresh'), await raw.sign('fresh'));
+  } finally {
+    release.resolve();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('key-document replacement fences permits before its transaction completes', async () => {
+  setConfigForTests({
+    federation: { keyvalidityhours: 1 },
+    facade: { maxofflinedays: 1 },
+  });
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let applying: Promise<boolean> | undefined;
+  try {
+    const first = await f.receive();
+    await f.keys().apply(f.journal(), first);
+    const prior = await f.keys().prepareSigner();
+    const replacement = await f.exportRoster(Date.now() + 3600000);
+    assert(replacement.sequence > first.sequence);
+    await f.journal().receive('home', [replacement]);
+    const server = f.server();
+    let calls = 0;
+    const database: Database = {
+      ...server,
+      async tx(fn, options) {
+        if (++calls === 2) {
+          entered.resolve();
+          await release.promise;
+        }
+        return server.tx(fn, options);
+      },
+    };
+    applying = f.keys().apply(
+      new Journal(database, LINK_CAPABILITIES),
+      replacement,
+    );
+    await entered.promise;
+    await assertRejects(
+      () => prior.sign('pending document'),
+      MatrixError,
+      'changed',
+    );
+    await assertRejects(() => f.keys().prepareSigner(), MatrixError, 'changed');
+    release.resolve();
+    await applying;
+    await assertRejects(
+      () => prior.sign('old document'),
+      MatrixError,
+      'changed',
+    );
+    const fresh = await f.keys().prepareSigner();
+    assertEquals(
+      await fresh.sign('fresh'),
+      await f.node.signer().sign('fresh'),
+    );
+  } finally {
+    release.resolve();
+    await applying;
     await f.close();
     setConfigForTests({});
   }

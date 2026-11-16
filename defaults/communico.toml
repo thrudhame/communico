@@ -39,7 +39,8 @@ encrypt = false
 passphrasefile = ""
 
 [facade]
-# Delivered role capability. F2/F3 are not implemented. COMMUNICO_FACADE_PHASE
+# Maximum phase; individual scopes activate only when delivered and ready.
+# COMMUNICO_FACADE_PHASE
 phase = "f1"
 # Enabled peer IDs from the durable home pairing registry. Empty is standalone.
 # COMMUNICO_FACADE_NODES
@@ -73,6 +74,16 @@ mailboxmaxagedays = 0
 # Home's co-signed key-document validity horizon in days; zero is far-future.
 # Facades never renew alone. Receivers still refetch within Matrix's seven days.
 maxofflinedays = 0
+# Export selected accounts' password verifiers over the authenticated link.
+# False makes facade password login/UIA unavailable, even with home online.
+# COMMUNICO_FACADE_REPLICATECREDENTIALS
+replicatecredentials = true
+# Permit held auth/status/barrier cuts while home is offline. This cannot make
+# revocations instantly visible across a partition. COMMUNICO_FACADE_ALLOWSTALEAUTH
+allowstaleauth = true
+# Maximum age of the applied home auth cut in hours; zero is unlimited.
+# Unrelated link contact does not refresh it. COMMUNICO_FACADE_AUTHMAXSTALEHOURS
+authmaxstalehours = 0
 # Whole-record page targets, independent of Matrix transaction envelope limits.
 # Oversized singleton records remain whole. COMMUNICO_FACADE_BATCHMAXBYTES / BATCHMAXITEMS
 batchmaxbytes = 12500000

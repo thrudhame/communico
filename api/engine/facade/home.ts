@@ -25,6 +25,12 @@ import {
 } from './protocol.ts';
 import { loadLinkTls } from './transport.ts';
 import { startHomeLinkWorker } from './worker.ts';
+import {
+  AccountSnapshots,
+  exportAccountAuth,
+  startAccountExports,
+} from './accounts.ts';
+import { exportOwnerControl } from './ownership.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -68,6 +74,8 @@ export async function startHomeLinks(
     ReturnType<typeof startPublicExports>
   >();
   const jobs = new Map<string, Promise<void>>();
+  const authExports = new Map<string, ReturnType<typeof startAccountExports>>();
+  const accounts = new AccountSnapshots(app.store, app.tenant, pairings);
   const collectKeySignature = async (
     keyId: string,
     document: import('#engine/federation/keys.ts').KeyDoc,
@@ -124,6 +132,7 @@ export async function startHomeLinks(
       exports.get(id)?.wake();
       publicExports.get(id)?.wake();
       directoryExports.get(id)?.wake();
+      authExports.get(id)?.wake();
       return;
     }
     await exports.get(id)?.close();
@@ -132,6 +141,8 @@ export async function startHomeLinks(
     publicExports.delete(id);
     await directoryExports.get(id)?.close();
     directoryExports.delete(id);
+    await authExports.get(id)?.close();
+    authExports.delete(id);
     await workers.get(id)?.close();
     workers.delete(id);
     let secret: string | undefined;
@@ -168,6 +179,9 @@ export async function startHomeLinks(
     );
     const client = await openJournalClient(pairings, id, tls);
     if (controller.signal.aborted) return;
+    if (settings.phase === 'f2') {
+      await exportOwnerControl(app.store, app.tenant, pairings, id);
+    }
     const ingress = new HomeIngress(app.server, {
       peer: node,
       pairing: id,
@@ -190,6 +204,8 @@ export async function startHomeLinks(
         apply: (stream) =>
           stream.stream.startsWith('ingress:')
             ? ingress.apply(journal, stream)
+            : settings.phase === 'f2' && stream.stream.startsWith('authority:')
+            ? accounts.applyFromFacade(journal, id, stream)
             : apply(node, stream),
         failed: (error) => failed(node, error),
         acknowledged: (stream) => {
@@ -229,6 +245,28 @@ export async function startHomeLinks(
     });
     directoryExports.set(id, directory);
     directory.wake();
+    if (settings.phase === 'f2') {
+      authExports.set(
+        id,
+        startAccountExports({
+          store: app.store,
+          tenant: app.tenant,
+          pollseconds: settings.pollseconds,
+          users: () => app.tenant.tx((tx) => tx.publicReplica.users()),
+          emit: (localpart) =>
+            exportAccountAuth(
+              app.store,
+              app.tenant,
+              pairings,
+              id,
+              localpart,
+              settings.replicatecredentials,
+            ),
+          changed: () => workers.get(id)?.wake(),
+          failed: (error) => failed(node, error),
+        }),
+      );
+    }
   }
   let scanning: Promise<void> | undefined;
   const scan = () =>
@@ -262,6 +300,9 @@ export async function startHomeLinks(
         controller.abort();
         await scanning;
         await Promise.all(jobs.values());
+        await Promise.all(
+          [...authExports.values()].map((accounts) => accounts.close()),
+        );
         await Promise.all([...exports.values()].map((rooms) => rooms.close()));
         await Promise.all(
           [...publicExports.values()].map((users) => users.close()),

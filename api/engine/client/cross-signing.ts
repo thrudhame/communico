@@ -4,7 +4,12 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { domainOf, localpartOf } from '#engine/ids.ts';
 import { signingUpload } from '#engine/e2ee-signing.ts';
 import { needsSigningAuth } from '#engine/tenant/cross-signing.ts';
-import { PASSWORD_FLOWS, requireUia } from '#engine/tenant/uia.ts';
+import {
+  PASSWORD_FLOWS,
+  requireUia,
+  uiaAction,
+  type UiaAuthorization,
+} from '#engine/tenant/uia.ts';
 import { object } from '#engine/tenant/e2ee.ts';
 import { signatureTargets } from '#engine/tenant/key-signatures.ts';
 import { queryKeys } from '#engine/client/e2ee.ts';
@@ -81,25 +86,33 @@ export async function uploadSignatures(user: string, body: unknown) {
 export async function uploadSigningKeys(
   user: string,
   body: unknown,
+  token?: string,
 ): Promise<void> {
   const tenant = theApp().tenant, localpart = localpartOf(user);
   const input = signingUpload(body, user, config().e2ee);
   const old = await tenant.tx((tx) => tx.crossSigning.state(localpart));
   const authenticated = needsSigningAuth(old, input);
+  const action = uiaAction('cross-signing', input);
+  let authorization: UiaAuthorization | undefined;
   if (authenticated) {
-    await requireUia(tenant, {
+    authorization = await requireUia(tenant, {
       body: object(body, 'body'),
       caller: user,
       flows: PASSWORD_FLOWS,
+      token,
+      action,
     });
   }
-  await tenant.tx((tx) =>
-    tx.crossSigning.upload(
+  await tenant.tx(async (tx) => {
+    if (authorization) {
+      await tx.uia.authorize(authorization, { localpart, action });
+    }
+    await tx.crossSigning.upload(
       localpart,
       user,
       input,
       canonicalJson(old),
       authenticated,
-    )
-  );
+    );
+  });
 }

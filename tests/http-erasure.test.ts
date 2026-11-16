@@ -2,6 +2,7 @@ import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
 import { theApp } from '#engine/app.ts';
 import { requireRoom } from '#engine/client/room.ts';
+import { membershipOf } from '#engine/room/membership.ts';
 
 const suite = httpSuite('HTTP local account erasure');
 type Json = Record<string, unknown>;
@@ -48,6 +49,10 @@ suite.test('erase prunes newcomers across event, state, context, search and bund
   });
   const second = await call(roomPath + '/state/m.room.topic', a, 'PUT', {
     topic: 'public-new-topic',
+  });
+  await call(roomPath + '/send/m.room.message/safe-before-erasure', b, 'PUT', {
+    msgtype: 'm.text',
+    body: 'safe-before-erasure',
   });
   // Carol was not joined at the event but had shared-history visibility before erasure.
   await call(roomPath + '/join', c, 'POST', {});
@@ -135,36 +140,47 @@ suite.test('erase prunes newcomers across event, state, context, search and bund
   const category = (search.body.search_categories as Json).room_events as Json;
   assertEquals(category.count, 0);
   assertEquals(category.results, []);
+  // Observe the worker's actual departure before constructing a later context.
+  const departureDeadline = Date.now() + 20000;
+  while ((await membershipOf(stored, alice.user_id))?.membership !== 'leave') {
+    assert(Date.now() < departureDeadline, 'deactivation departure observed');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   await call(roomPath + '/send/m.room.message/safe-result', b, 'PUT', {
     msgtype: 'm.text',
     body: 'safe-result',
   });
-  for (
-    const [token, expected] of [[d, {}], [c, {
-      displayname: 'erase-a',
-    }]] as const
-  ) {
-    const response = await call('/search', token, 'POST', {
-      search_categories: {
-        room_events: {
-          search_term: 'safe-result',
-          filter: { rooms: [roomId] },
-          event_context: {
-            before_limit: 100,
-            after_limit: 0,
-            include_profile: true,
+  // profile_info describes the context end, not each sender's last nonempty
+  // profile. Preserve prior shared visibility at the earlier historical cut.
+  for (const searchTerm of ['safe-before-erasure', 'safe-result']) {
+    for (
+      const [token, expected] of [[d, {}], [
+        c,
+        searchTerm === 'safe-before-erasure' ? { displayname: 'erase-a' } : {},
+      ]] as const
+    ) {
+      const response = await call('/search', token, 'POST', {
+        search_categories: {
+          room_events: {
+            search_term: searchTerm,
+            filter: { rooms: [roomId] },
+            event_context: {
+              before_limit: 100,
+              after_limit: 0,
+              include_profile: true,
+            },
           },
         },
-      },
-    });
-    const result =
-      (((response.body.search_categories as Json).room_events as Json)
-        .results as Json[])[0];
-    assert(result);
-    assertEquals(
-      ((result.context as Json).profile_info as Json)[alice.user_id],
-      expected,
-    );
+      });
+      const result =
+        (((response.body.search_categories as Json).room_events as Json)
+          .results as Json[])[0];
+      assert(result);
+      assertEquals(
+        ((result.context as Json).profile_info as Json)[alice.user_id],
+        expected,
+      );
+    }
   }
   assertEquals(
     (await call(
@@ -209,7 +225,8 @@ suite.test('erase defaults false and rejects non-boolean input without deactivat
     (await call('/account/deactivate', token, 'POST', { auth })).status,
     200,
   );
-  await call(path + '/join', readToken, 'POST', {});
+  const joined = await call(path + '/join', readToken, 'POST', {});
+  assertEquals(joined.status, 200, JSON.stringify(joined));
   assertEquals(
     (await call(
       path + '/event/' + encodeURIComponent(String(sent.body.event_id)),

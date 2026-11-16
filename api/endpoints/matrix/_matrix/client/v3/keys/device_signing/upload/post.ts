@@ -6,6 +6,7 @@ export default async function (request: PathfinderRequest, context: Context) {
   await uploadSigningKeys(
     context.state.user as string,
     await parseJson(request),
+    context.state.token,
   );
   return {};
 }

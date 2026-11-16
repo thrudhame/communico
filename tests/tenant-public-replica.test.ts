@@ -5,9 +5,10 @@ import { signingUpload } from '#engine/e2ee-signing.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
-import { registerUser } from '#engine/tenant/users.ts';
+import { deactivateUser, registerUser } from '#engine/tenant/users.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
+import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -15,18 +16,18 @@ import {
   signJson,
 } from '#engine/signing-primitives.js';
 
-async function fixture() {
+async function fixture(seedTenant = tenantSchema) {
   const dir = await Deno.makeTempDir({ prefix: 'public-user-replica-' });
-  const open = (side: string) =>
+  const open = (side: string, schema = tenantSchema) =>
     openStore({
       dir: dir + '/' + side,
       library: './.native/libturso_ffi.so',
       checkpointlogbytes: 65536,
       maxopenfiles: 8,
       idleseconds: 300,
-    }, { schemas: { tenant: tenantSchema } });
+    }, { schemas: { tenant: schema } });
   const homeStore = await open('home');
-  let edgeStore = await open('edge');
+  let edgeStore = await open('edge', seedTenant);
   const home = await openTenant(homeStore, 'logical.test', { create: true });
   let edge = await openTenant(edgeStore, 'logical.test', { create: true });
   const ownKey = edge.publicB64;
@@ -113,6 +114,134 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('a later public replica cannot resurrect local deactivation, erasure or read-through key/profile material', async () => {
+  const f = await fixture();
+  try {
+    await f.install(await f.export());
+    await deactivateUser(f.edge(), 'alice', {});
+    await f.home.tx((tx) =>
+      tx.profiles.set('alice', 'displayname', 'Stale home profile')
+    );
+    const successor = await f.export();
+    await f.install(successor);
+    await f.install(successor);
+    await f.reopen();
+    assertEquals(
+      (await f.edge().tx((tx) => tx.users.byLocalpart('alice')))?.deactivated,
+      true,
+    );
+    assertEquals(await f.edge().tx((tx) => tx.profiles.get('alice')), {});
+    assertEquals(
+      await f.edge().tx((tx) =>
+        tx.e2ee.query('alice', [], '', f.user, config().e2ee.maxkeys)
+      ),
+      {},
+    );
+    assertEquals(
+      await f.edge().tx((tx) => tx.crossSigning.views('alice', f.user, '')),
+      {},
+    );
+    assertEquals(
+      await (await f.db()).query(
+        'SELECT localpart,room_cuts FROM erased_users',
+      ),
+      [{ localpart: 'alice', room_cuts: '{}' }],
+    );
+    assertEquals(
+      await (await f.db()).query(
+        'SELECT localpart,erase FROM deactivation_work',
+      ),
+      [{ localpart: 'alice', erase: 1 }],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('later public erasure reaches a deactivated replica without advancing its first erasure boundary', async () => {
+  const f = await fixture();
+  try {
+    const active = await f.export();
+    await f.install(active);
+    await deactivateUser(f.edge(), 'alice');
+    const first = {
+      '!room:logical.test': { changePos: 4, segment: 1, group: 2 },
+    };
+    const terminal = {
+      ...active,
+      cut: active.cut + 1,
+      deactivated: true,
+      erased: first,
+    };
+    await f.install(terminal);
+    assertEquals(
+      await f.edge().tx((tx) => tx.erasure.get('alice', '!room:logical.test')),
+      first['!room:logical.test'],
+    );
+    await f.install({
+      ...terminal,
+      cut: terminal.cut + 1,
+      erased: {
+        '!room:logical.test': { changePos: 9, segment: 2, group: 3 },
+      },
+    });
+    await f.install({ ...active, cut: terminal.cut + 2 });
+    await f.reopen();
+    assertEquals(
+      await f.edge().tx((tx) => tx.erasure.get('alice', '!room:logical.test')),
+      first['!room:logical.test'],
+    );
+    assertEquals(await f.edge().tx((tx) => tx.profiles.get('alice')), {});
+    assertEquals(
+      (await f.edge().tx((tx) => tx.users.byLocalpart('alice')))?.deactivated,
+      true,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('incoming deactivated public snapshots clear profile material for absent and active accounts while retaining source evidence', async () => {
+  for (const existing of [false, true]) {
+    const f = await fixture();
+    try {
+      const active = await f.export();
+      if (existing) await f.install(active);
+      const erased = {
+        '!room:logical.test': { changePos: 4, segment: 1, group: 2 },
+      };
+      const terminal = {
+        ...active,
+        cut: active.cut + 1,
+        deactivated: true,
+        erased,
+      };
+      await f.install(terminal);
+      await f.install(terminal);
+      await f.reopen();
+      assertEquals(await f.edge().tx((tx) => tx.profiles.get('alice')), {});
+      assertEquals(
+        (await (await f.db()).query(
+          'SELECT snapshot_json FROM public_user_replicas',
+        ))[0].snapshot_json,
+        canonicalJson(terminal),
+      );
+      assertEquals(
+        await (await f.db()).query('SELECT room_cuts FROM erased_users'),
+        [{ room_cuts: canonicalJson(erased) }],
+      );
+      await f.install({ ...active, cut: terminal.cut + 1 });
+      assertEquals(await f.edge().tx((tx) => tx.profiles.get('alice')), {});
+      assertEquals(
+        await (await f.db()).query('SELECT room_cuts FROM erased_users'),
+        [{ room_cuts: canonicalJson(erased) }],
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
 
 Deno.test('public user replica preserves coherent ordinary profile/device/signing reads without credentials, pools or private signing', async () => {
   const f = await fixture();
@@ -214,7 +343,7 @@ Deno.test('public user replica preserves coherent ordinary profile/device/signin
 });
 
 Deno.test('public profile and privacy mutations retain export intent and v20 upgrade permits only independent public users', async () => {
-  const f = await fixture();
+  const f = await fixture(historicalTenantSchema(20));
   try {
     let previous = (await f.export()).cut;
     for (
@@ -233,12 +362,6 @@ Deno.test('public profile and privacy mutations retain export intent and v20 upg
       assert(next.cut > previous);
       previous = next.cut;
     }
-    await (await f.db()).tx(async (conn) => {
-      await conn.exec(
-        'DROP TABLE domain_conflicts; DROP TABLE domain_frontiers; DROP TABLE domain_operations; DROP TABLE facade_owner_activation; DROP TABLE facade_owner_controls; DROP TABLE public_user_replicas',
-      );
-      await conn.execute("UPDATE meta SET v='20' WHERE k='schema_version'");
-    }, { mode: 'deferred' });
     await f.reopen();
     const view = await f.export();
     await f.install(view);
