@@ -232,6 +232,7 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
   const http = await startHttp();
   let user = '', snapshots = 0, claims = 0;
   let paused = false, release: (() => void) | undefined;
+  let snapshotEntered: (() => void) | undefined;
   const key = {
     user_id: '',
     device_id: 'D',
@@ -252,6 +253,7 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
         return (async () => {
           snapshots++;
           if (paused) {
+            snapshotEntered?.();
             await new Promise<void>((r) => {
               release = r;
             });
@@ -351,27 +353,75 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
     await relationship([a.user_id, user], 3);
     await new Promise((r) => setTimeout(r, 1100));
     assertEquals(snapshots, 2, 'rejoin remains dormant until fresh demand');
-    paused = true;
-    const started = Date.now();
-    const timed = await http.matrix(
-      new Request('http://x/_matrix/client/v3/keys/query', {
-        method: 'POST',
-        headers: { authorization: 'Bearer ' + a.access_token },
-        body: JSON.stringify({
-          timeout: 200,
-          device_keys: { [user]: [], [a.user_id]: [] },
+    const timedQuery = (timeout: number) =>
+      http.matrix(
+        new Request('http://x/_matrix/client/v3/keys/query', {
+          method: 'POST',
+          headers: { authorization: 'Bearer ' + a.access_token },
+          body: JSON.stringify({
+            timeout,
+            device_keys: { [user]: [], [a.user_id]: [] },
+          }),
         }),
-      }),
-    );
-    assertEquals(timed.status, 200);
-    const timedBody = await timed.json();
-    assert(
-      Date.now() - started < 1500,
-      'snapshot phase exceeded the client deadline',
-    );
-    assert(timedBody.failures[fake.name]);
-    assertEquals(timedBody.device_keys[a.user_id], {});
-    assertEquals(snapshots, 3);
+      );
+    // An already-expired budget need not initiate a network request.
+    const expired = await timedQuery(0);
+    assertEquals(expired.status, 200);
+    const expiredBody = await expired.json();
+    assert(expiredBody.failures[fake.name]);
+    assertEquals(expiredBody.device_keys[a.user_id], {});
+    assertEquals(snapshots, 2);
+
+    // Exercise cancellation of an actual in-flight snapshot independently of
+    // how much of the 200ms budget admission/storage/scheduling consumes.
+    // Control only the existing client deadline callback, not transport timers.
+    const originalTimeout = globalThis.setTimeout;
+    let expire: (() => void) | undefined;
+    const entered = new Promise<void>((resolve) => snapshotEntered = resolve);
+    let watchdog: ReturnType<typeof originalTimeout> | undefined;
+    const deadlock = new Promise<never>((_, reject) => {
+      watchdog = originalTimeout(
+        () => reject(new Error('device snapshot deadline did not settle')),
+        30000,
+      );
+    });
+    globalThis.setTimeout = ((
+      callback: Parameters<typeof originalTimeout>[0],
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      if (new Error().stack?.includes('/api/engine/client/e2ee.ts:')) {
+        assertEquals(delay, 200);
+        assertEquals(expire, undefined, 'one client deadline owner');
+        expire = () => Reflect.apply(callback, globalThis, args);
+        return originalTimeout(() => {}, delay);
+      }
+      return Reflect.apply(originalTimeout, globalThis, [
+        callback,
+        delay,
+        ...args,
+      ]);
+    }) as typeof originalTimeout;
+    paused = true;
+    const pending = timedQuery(200);
+    try {
+      await Promise.race([entered, deadlock]);
+      assertEquals(snapshots, 3);
+      assert(expire, 'client deadline must be armed before remote initiation');
+      expire();
+      const timed = await Promise.race([pending, deadlock]);
+      assertEquals(timed.status, 200);
+      const timedBody = await timed.json();
+      assert(timedBody.failures[fake.name]);
+      assertEquals(timedBody.device_keys[a.user_id], {});
+      assertEquals(snapshots, 3);
+    } finally {
+      globalThis.setTimeout = originalTimeout;
+      clearTimeout(watchdog);
+      expire?.();
+      release?.();
+      await pending;
+    }
     paused = false;
     release!();
     await new Promise((r) => setTimeout(r, 150));
