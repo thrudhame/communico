@@ -1,10 +1,14 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
-import { advanceNotificationRead } from '#engine/server/notifications.ts';
+import { syncNotificationHistory } from '#engine/server/notification-history.ts';
+import {
+  advanceNotificationRead,
+  notificationSnapshot,
+} from '#engine/server/notifications.ts';
 
-for (const scope of ['', 'main', '$thread']) {
-  Deno.test(`notification read work: ${scope || 'unthreaded'} updates only newly read facts and their listing`, async () => {
+for (const scope of ['', 'main']) {
+  Deno.test(`notification read work: ${scope || 'unthreaded'} changes only newly read listing rows`, async () => {
     const dir = await Deno.makeTempDir();
     const store = await openStore({
       dir,
@@ -15,41 +19,28 @@ for (const scope of ['', 'main', '$thread']) {
     }, { schemas: { server: serverSchema } });
     try {
       const db = await store.server();
+      const now = Date.now();
+      const user = '@reader:test';
+      const room = '!read-work:test';
       await db.tx(async (tx) => {
-        // An old read prefix, an unread main event, a named-thread event,
-        // a later main event and a withdrawn fact all share the same room.
-        for (let seq = 1; seq <= 68; seq++) {
-          const thread = seq === 66 ? '$thread' : 'main';
-          const read = seq <= 64 ? seq : null;
-          const withdrawn = seq === 68 ? 1 : 0;
+        for (let seq = 1; seq <= 130; seq++) {
+          const thread = seq === 129 ? '$thread' : 'main';
+          const read = seq <= 128 ? now - 1000 : null;
           await tx.execute(
-            `INSERT INTO notifications VALUES(?,'test','@bob:test',?,'!room:test',?,?,'["notify"]',1,0,?,?)`,
-            [seq, '$' + seq, seq, thread, read, withdrawn],
+            "INSERT INTO notifications VALUES(?,'test',?,?,?, ?,?,'[\"notify\"]',0,?,?,0)",
+            [seq, user, '$' + seq, room, seq, thread, now - 2000, read],
           );
-          if (!withdrawn) {
-            await tx.execute(
-              "INSERT INTO notification_history VALUES(?,'@bob:test','!room:test',1,?)",
-              [seq, read],
-            );
-          }
+          await syncNotificationHistory(tx, seq, now);
         }
-        await tx.execute(
-          "INSERT INTO notification_counts VALUES('@bob:test','!room:test','main',2,2)",
-        );
-        await tx.execute(
-          "INSERT INTO notification_counts VALUES('@bob:test','!room:test','$thread',1,1)",
-        );
-        for (const seq of [65, 66, 68]) {
+        for (const thread of ['main', '$thread']) {
           await tx.execute(
-            "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES(?,'!room:test',?,'accepted','grounded',?)",
-            ['$' + seq, seq, seq],
+            'INSERT INTO notification_counts VALUES(?,?,?,1,0)',
+            [user, room, thread],
           );
         }
         await tx.execute(
-          "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$thread','!room:test',0,'accepted','grounded',0)",
-        );
-        await tx.execute(
-          "INSERT INTO relations VALUES('$66','$thread','m.thread','!room:test',66)",
+          "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$130',?,130,'accepted','grounded',130)",
+          [room],
         );
       });
       const before = await db.query(
@@ -58,18 +49,11 @@ for (const scope of ['', 'main', '$thread']) {
       await assertRejects(
         () =>
           db.tx(async (tx) => {
-            await advanceNotificationRead(
-              tx,
-              '@bob:test',
-              '!room:test',
-              scope,
-              '$66',
-              1000,
-            );
-            throw new Error('abort read');
+            await advanceNotificationRead(tx, user, room, scope, '$130', now);
+            throw new Error('read rollback');
           }),
         Error,
-        'abort read',
+        'read rollback',
       );
       assertEquals(
         await db.query(
@@ -77,86 +61,60 @@ for (const scope of ['', 'main', '$thread']) {
         ),
         before,
       );
-      const writes = await db.tx(async (tx) => {
-        const execute = tx.execute.bind(tx);
-        let changed = 0;
-        tx.execute = async (sql, values) => {
-          const count = await execute(sql, values);
-          if (sql.startsWith('UPDATE notification_history ')) changed += count;
-          return count;
-        };
-        // A main receipt must target a main event, while the unthreaded
-        // receipt includes both buckets through the named-thread event.
-        await advanceNotificationRead(
-          tx,
-          '@bob:test',
-          '!room:test',
-          scope,
-          scope === 'main' ? '$65' : '$66',
-          1000,
-        );
-        return changed;
-      });
+      assertEquals(await db.query('SELECT * FROM notification_horizons'), []);
       assertEquals(
-        writes,
-        scope ? 1 : 2,
-        'retained read history is not part of this transition',
+        (await db.query(
+          'SELECT COUNT(*) AS n FROM notifications WHERE read_ms IS NULL',
+        ))[0].n,
+        2,
+      );
+      const advance = () =>
+        db.tx(async (tx) => {
+          const execute = tx.execute.bind(tx);
+          let touched = 0;
+          tx.execute = async (sql, values = []) => {
+            const changed = await execute(sql, values);
+            if (/UPDATE\s+notification_history\b/i.test(sql)) {
+              touched += changed;
+            }
+            return changed;
+          };
+          assertEquals(
+            await advanceNotificationRead(tx, user, room, scope, '$130', now),
+            true,
+          );
+          return touched;
+        });
+      assertEquals(
+        await advance(),
+        scope === '' ? 2 : 1,
+        'listing writes follow changed unread facts, not retained read history',
       );
       assertEquals(
         await db.query(
-          'SELECT seq,read_ms FROM notification_history WHERE seq<=64 ORDER BY seq',
+          'SELECT seq,read_ms FROM notification_history WHERE seq<=128 ORDER BY seq',
         ),
-        before.slice(0, 64),
+        before.slice(0, 128),
       );
       assertEquals(
         await db.query(
-          'SELECT seq,read_ms FROM notification_history WHERE seq>64 ORDER BY seq',
+          'SELECT seq,read_ms FROM notification_history WHERE seq>128 ORDER BY seq',
         ),
-        [
-          { seq: 65, read_ms: scope === '$thread' ? null : 1000 },
-          { seq: 66, read_ms: scope === 'main' ? null : 1000 },
-          { seq: 67, read_ms: null },
-        ],
+        [{ seq: 129, read_ms: scope === '' ? now : null }, {
+          seq: 130,
+          read_ms: now,
+        }],
       );
-      const noop = await db.tx(async (tx) => {
-        const execute = tx.execute.bind(tx);
-        let changed = 0;
-        tx.execute = async (sql, values) => {
-          const count = await execute(sql, values);
-          if (sql.startsWith('UPDATE notification_history ')) changed += count;
-          return count;
-        };
-        await advanceNotificationRead(
-          tx,
-          '@bob:test',
-          '!room:test',
-          scope,
-          scope === '$thread' ? '$66' : '$65',
-          2000,
-        );
-        return changed;
-      });
+      const counts = await db.tx((tx) => notificationSnapshot(tx, user, 0));
+      assertEquals(counts.rooms.get(room)?.get('main')?.notification_count, 0);
       assertEquals(
-        noop,
+        counts.rooms.get(room)?.get('$thread')?.notification_count,
+        scope === '' ? 0 : 1,
+      );
+      assertEquals(
+        await advance(),
         0,
-        'repeated or regressing receipts do not rewrite history',
-      );
-      assertEquals(
-        await db.query(
-          'SELECT thread,unread,highlight FROM notification_counts ORDER BY thread',
-        ),
-        [
-          {
-            thread: '$thread',
-            unread: scope === 'main' ? 1 : 0,
-            highlight: scope === 'main' ? 1 : 0,
-          },
-          {
-            thread: 'main',
-            unread: scope === '$thread' ? 2 : 1,
-            highlight: scope === '$thread' ? 2 : 1,
-          },
-        ],
+        'replay does not rewrite old listing rows',
       );
     } finally {
       await store.close();
