@@ -22,7 +22,11 @@ import {
 } from '#engine/tenant/session-authority.ts';
 import * as routing from '#engine/tenant/todevice-routing.ts';
 import type { Conn } from '#engine/store/db.ts';
-import { deliverSliding, insertMessage } from '#engine/tenant/todevice.ts';
+import {
+  deliverSliding,
+  insertMessage,
+  receiveMessages,
+} from '#engine/tenant/todevice.ts';
 
 const expected = (source: string) => ({
   source,
@@ -461,6 +465,115 @@ Deno.test('to-device logical admission: historical imported routes fence hash su
       'routed',
     );
     assertEquals(await f.hd.query('SELECT * FROM to_device_inbox'), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device logical admission: partial import leaves a different recipient retryable without rebuilding routes', async () => {
+  const f = await fixture();
+  const messages = [
+    { user: '@alice:logical.test', id: '*', content: { key: 'alice' } },
+    { user: '@bob:logical.test', id: '*', content: { key: 'bob' } },
+  ];
+  try {
+    await f.home.tx((tx) => tx.users.insert('bob', 'Bob'));
+    await upsertDevice(f.home, 'bob', 'BOB_LAN');
+    await f.edge.tx((tx) =>
+      tx.toDevice.receive(
+        'remote.test',
+        'partial',
+        '@sender:remote.test',
+        'm.test',
+        'logical.test',
+        messages,
+        config().e2ee,
+      )
+    );
+    const alice = await f.ed.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    const bob = await f.ed.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'bob')
+    );
+    for (const op of alice) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    const receive = () =>
+      f.home.tx((tx) =>
+        tx.toDevice.receive(
+          'remote.test',
+          'partial',
+          '@sender:remote.test',
+          'm.test',
+          'logical.test',
+          messages,
+          config().e2ee,
+        )
+      );
+    const routes = await f.hd.query('SELECT * FROM to_device_routes');
+    await assertRejects(
+      receive,
+      Error,
+      'to-device operation awaits retained recipient routes',
+    );
+    assertEquals(
+      await f.hd.query('SELECT * FROM inbound_to_device'),
+      [],
+      'partial recipient coverage cannot acknowledge a direct retry',
+    );
+    assertEquals(
+      await f.hd.query('SELECT * FROM to_device_routes'),
+      routes,
+      'retry must not manufacture missing routes from current control',
+    );
+    const lan = await deviceIdentity(f.home, 'alice', 'LAN');
+    const issued = await f.home.tx((tx) =>
+      tx.toDevice.deliverSliding(lan, 'partial', 100, config().e2ee)
+    );
+    assertEquals(issued.events.map((event) => event.content), [{
+      key: 'alice',
+    }]);
+    await f.home.tx((tx) =>
+      tx.toDevice.acknowledgeSliding(lan, 'partial', issued.nextBatch)
+    );
+    await deleteDevices(f.home, 'alice', ['LAN']);
+    await upsertDevice(f.home, 'alice', 'LAN');
+    for (const op of bob) {
+      await f.hd.tx((conn) =>
+        routing.importToDeviceOperation(conn, op, {
+          ...expected('edge'),
+          localpart: 'bob',
+        }, 'logical.test')
+      );
+    }
+    await receive();
+    assertEquals(
+      (await f.hd.query('SELECT localpart,event_json FROM to_device_inbox'))
+        .map((row) => ({
+          localpart: row.localpart,
+          content: JSON.parse(String(row.event_json)).content,
+        })),
+      [{ localpart: 'bob', content: { key: 'bob' } }],
+    );
+    const reopened = await f.reopen();
+    await reopened.hd.tx((conn) =>
+      receiveMessages(
+        conn,
+        'remote.test',
+        'partial',
+        '@sender:remote.test',
+        'm.test',
+        'logical.test',
+        messages,
+        config().e2ee,
+      )
+    );
+    assertEquals(
+      (await reopened.hd.query('SELECT localpart FROM to_device_inbox')).map((
+        row,
+      ) => row.localpart),
+      ['bob'],
+      'cold retry cannot expand the acknowledged wildcard into its replacement',
+    );
   } finally {
     await f.close();
   }

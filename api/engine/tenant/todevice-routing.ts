@@ -360,7 +360,33 @@ export async function routeToDeviceMessages(
   if (!identity || admission.policy === 'legacy') return false;
   // Imported selectors remain the durable obligation. A second ingress cannot
   // reconstruct a new destination set from its current registry/control map.
-  if (!admission.fresh) return true;
+  if (!admission.fresh) {
+    if (origin.kind === 'federation') {
+      const covered = new Set<string>();
+      for (
+        const row of await conn.query(
+          "SELECT payload_json,expanded FROM to_device_routes WHERE json_extract(payload_json,'$.origin.kind')=? AND json_extract(payload_json,'$.origin.origin')=? AND json_extract(payload_json,'$.origin.id')=?",
+          [origin.kind, origin.origin, origin.id],
+        )
+      ) {
+        const route: ToDeviceRoute = JSON.parse(String(row.payload_json));
+        if (
+          route.owner === identity.node &&
+          route.ownerIncarnation === identity.incarnation &&
+          Number(row.expanded) === 1
+        ) covered.add(route.recipient);
+      }
+      // One imported recipient proves the message hash, not completion of all
+      // receiving-owner work. Keep a direct retry pending until its original
+      // routes actually arrive and apply; never rebuild from current control.
+      for (const message of messages) {
+        if (domainOf(message.user) === server && !covered.has(message.user)) {
+          pending('retained recipient routes');
+        }
+      }
+    }
+    return true;
+  }
   const users = new Map<string, Message[]>();
   for (const message of messages) {
     if (domainOf(message.user) !== server) continue;
