@@ -73,12 +73,17 @@ import {
 import { bounded } from './helpers/server-process.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { setRoomHooks } from '#engine/room/hooks.ts';
 import { importReplicaGenesis } from '#engine/room/replica.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
-import { roomOf } from '#engine/server/read.ts';
-import { recoverServer } from '#engine/server/startup.ts';
+import {
+  membershipOf as projectedMembershipOf,
+  roomOf,
+} from '#engine/server/read.ts';
+import { installServerHooks, recoverServer } from '#engine/server/startup.ts';
+import { registerRoom } from '#engine/server/registry.ts';
 import { project } from '#engine/server/project.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -1384,6 +1389,25 @@ Deno.test('facade authorship captures room permits and never exposes the raw ten
       preset: 'public_chat',
     });
     const room = await openRoom(app.store, created.roomId);
+    const joined = await localMembership.membershipOf(room, user);
+    assert(joined);
+    const joiningCut = { preparations, signatures };
+    allowed = false;
+    for (
+      const retry of [
+        () => localMembership.join(room, user, app.tenant.signer()),
+        () => localMembership.joinResident(room, user, app.tenant.signer()),
+        () => localMembership.reopen(room, user, app.tenant.signer(), {}),
+      ]
+    ) {
+      assertEquals(await retry(), {
+        roomId: room.id,
+        eventId: joined.eventId,
+        created: false,
+      });
+      assertEquals({ preparations, signatures }, joiningCut);
+    }
+    allowed = true;
     const message = await sendEvent(
       room.id,
       user,
@@ -1401,7 +1425,31 @@ Deno.test('facade authorship captures room permits and never exposes the raw ten
       null,
       'redact',
     );
-    await localMembership.leave(room, user, app.tenant.signer());
+    // Hold the ordinary projection hook to model the room-commit / server-cut
+    // crash window, then let the same expired-authority retry repair it.
+    setRoomHooks({
+      project: (store, id) =>
+        store === app.store ? Promise.resolve() : project(store, id),
+      register: registerRoom,
+    });
+    const left = await localMembership.leave(room, user, app.tenant.signer());
+    assertEquals(
+      (await projectedMembershipOf(app.server, room.id, user))?.membership,
+      'join',
+    );
+    installServerHooks();
+    const leavingCut = { preparations, signatures };
+    allowed = false;
+    assertEquals(await localMembership.leave(room, user, app.tenant.signer()), {
+      ...left,
+      created: false,
+    });
+    assertEquals({ preparations, signatures }, leavingCut);
+    assertEquals(
+      (await projectedMembershipOf(app.server, room.id, user))?.membership,
+      'leave',
+    );
+    allowed = true;
     await localMembership.reopen(room, user, app.tenant.signer(), {});
     let saved: PreparedSubmission | null = null;
     const submission = {
@@ -1439,6 +1487,86 @@ Deno.test('facade authorship captures room permits and never exposes the raw ten
     );
     assertEquals(signatures, cut.signatures);
     assert(preparations >= 8);
+  } finally {
+    installServerHooks();
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('facade create variants refuse home-owned directory writes before any room or signature', async (t) => {
+  const f = await fixture();
+  let signatures = 0;
+  const raw = f.node.signer();
+  const signer = {
+    ...raw,
+    sign: (bytes: string) => {
+      signatures++;
+      return raw.sign(bytes);
+    },
+  };
+  try {
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      keys: keyStore(await f.edgeServer(), { signer }),
+      signer,
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+    });
+    await registerAlias(
+      app.server,
+      '#held:logical.test',
+      f.room.id,
+      '@alice:logical.test',
+    );
+    const before = {
+      rooms: await app.store.rooms(),
+      aliases: await app.server.query('SELECT * FROM aliases'),
+      visibility: await app.server.query('SELECT * FROM visibility'),
+    };
+    for (
+      const variant of [
+        { alias: 'fresh' },
+        { alias: 'held' },
+        { visibility: 'public' },
+        { alias: 'fresh', visibility: 'public' },
+      ]
+    ) {
+      await t.step(JSON.stringify(variant), async () => {
+        const error = await assertRejects(
+          () =>
+            createClientRoom({ creator: '@alice:logical.test', ...variant }),
+          MatrixError,
+        );
+        assertEquals(error.status, 503);
+        assertEquals(error.errcode, 'M_UNAVAILABLE');
+        assertEquals(signatures, 0);
+        assertEquals({
+          rooms: await app.store.rooms(),
+          aliases: await app.server.query('SELECT * FROM aliases'),
+          visibility: await app.server.query('SELECT * FROM visibility'),
+        }, before);
+      });
+    }
+    // Public join rules are room PDUs, not directory publication authority.
+    const created = await createClientRoom({
+      creator: '@alice:logical.test',
+      preset: 'public_chat',
+      visibility: 'private',
+    });
+    assert(await openRoom(app.store, created.roomId));
+    assert(signatures > 0);
+    assertEquals(await lookupAlias(app.server, '#fresh:logical.test'), null);
+    assertEquals(
+      await app.server.query('SELECT * FROM visibility'),
+      before.visibility,
+    );
   } finally {
     await closeApp();
     await f.close();
