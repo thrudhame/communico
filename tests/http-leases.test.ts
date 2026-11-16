@@ -7,16 +7,19 @@ import { createRoom } from '#engine/room/create.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { clear, remember } from '#tests/fixtures/http-leases/lease/get.ts';
+import type { Pool } from '#engine/store/pool.ts';
+import { idleTurns } from '#tests/support/pool-turn.ts';
 
 Deno.test('HTTP leases: more rooms than maxopenfiles, idle close, concurrent tenant and room operations', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'http-leases-' });
-  const app = await openApp({
-    dir,
-    library: './.native/libturso_ffi.so',
-    checkpointlogbytes: 65536,
-    maxopenfiles: 1,
-    idleseconds: 1,
-  });
+  const { value: app, turn: sweep } = await idleTurns(() =>
+    openApp({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 1,
+      idleseconds: 1,
+    }), (app) => (app.store as unknown as { pool: Pool }).pool);
   const handler = await pathfinder({
     roots: ['api/endpoints/matrix/', 'tests/fixtures/http-leases/'],
   });
@@ -61,12 +64,7 @@ Deno.test('HTTP leases: more rooms than maxopenfiles, idle close, concurrent ten
       });
     };
     for (const room of rooms) await read(room.id);
-    // App workers may briefly reopen an idle file. Observe the eviction itself
-    // within the existing wait window, not one sample at an unrelated tick.
-    const deadline = Date.now() + 2600;
-    while (app.store.stats().openFiles !== 0 && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
+    await sweep(1001);
     assertEquals(
       app.store.stats().openFiles,
       0,
