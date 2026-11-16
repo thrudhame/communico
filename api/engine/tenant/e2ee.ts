@@ -9,12 +9,16 @@ import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Config } from '#engine/config-schema.ts';
 import { config } from '#engine/config.ts';
-import { forgetDeviceSignatures } from '#engine/tenant/cross-signing.ts';
+import {
+  forgetDeviceSignatures,
+  signingViews,
+} from '#engine/tenant/cross-signing.ts';
 import { signatureView } from '#engine/tenant/signature-view.ts';
 import { readPublicReplica } from './public-replica.ts';
 import { createHash } from 'node:crypto';
 import { assertDeviceOwner } from '#engine/tenant/session-authority.ts';
 import { publicDeviceKeys } from '#engine/tenant/device-operations.ts';
+import { checkpointDeviceSnapshot } from '#engine/tenant/device-stream.ts';
 
 export const KEY_CONSUMPTIONS_SQL = `
 CREATE TABLE key_consumptions(localpart TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL,algorithm TEXT NOT NULL,key_id TEXT NOT NULL,material_hash TEXT NOT NULL,PRIMARY KEY(localpart,device_id,generation,algorithm,key_id));
@@ -413,7 +417,23 @@ export async function queryKeys(
   return result;
 }
 
-/** The list and causal anchor are captured on the same tenant connection. */
+async function publicDeviceSnapshot(
+  conn: Conn,
+  localpart: string,
+  owner: string,
+  response: Json,
+): Promise<Json> {
+  const signing = await signingViews(conn, localpart, owner, '');
+  for (const usage of ['master', 'self_signing']) {
+    if (signing[usage + '_keys'] !== undefined) {
+      response[usage + '_key'] = signing[usage + '_keys'];
+    }
+  }
+  return response;
+}
+
+/** Render the complete federation response before naming its causal cut. The
+ * adapter must not attach mutable public signing material after retention. */
 export async function deviceSnapshot(
   conn: Conn,
   localpart: string,
@@ -426,8 +446,11 @@ export async function deviceSnapshot(
       throw new Error('public replica owner mismatch');
     }
     limitEntries((replica.devices.devices as unknown[]).length, limits.maxkeys);
-    bounded(replica.devices, limits.maxrequestbytes);
-    return replica.devices;
+    const response = await publicDeviceSnapshot(conn, localpart, owner, {
+      ...replica.devices,
+    });
+    bounded(response, limits.maxrequestbytes);
+    return response;
   }
   const keys = await queryKeys(conn, localpart, [], '', owner, limits.maxkeys);
   const rows = await conn.query(
@@ -445,11 +468,12 @@ export async function deviceSnapshot(
         : { device_display_name: unsigned.device_display_name }),
     };
   });
-  const response = {
+  const complete = await publicDeviceSnapshot(conn, localpart, owner, {
     user_id: owner,
     stream_id: rows.length ? Number(rows[0].value) : 0,
     devices,
-  };
+  });
+  const response = await checkpointDeviceSnapshot(conn, localpart, complete);
   bounded(response, limits.maxrequestbytes);
   return response;
 }

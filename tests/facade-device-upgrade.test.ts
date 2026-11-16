@@ -11,6 +11,41 @@ import {
 import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
 import { historicalTenantSchema } from '#tests/fixtures/tenant-schema-history.ts';
 
+Deno.test('F2 complete-view checkpoints upgrade tenant36 with no fabricated snapshots and match fresh schema', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'facade-checkpoint-upgrade-' });
+  const options = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(options, {
+    schemas: { tenant: historicalTenantSchema(36) },
+  });
+  try {
+    await openTenant(store, 'logical.test', { create: true });
+    const old = await store.tenant('logical.test');
+    await old.execute("INSERT INTO user_device_stream VALUES('alice',10)");
+    const retained = await old.query('SELECT * FROM user_device_stream');
+    await store.close();
+    store = await openStore(options, { schemas: { tenant: tenantSchema } });
+    const db = await store.tenant('logical.test');
+    assertEquals(await db.query('SELECT * FROM device_stream_checkpoints'), []);
+    assertEquals(await db.query('SELECT * FROM user_device_stream'), retained);
+    const sql =
+      "SELECT name,sql FROM sqlite_master WHERE name LIKE 'device_stream_%' ORDER BY name";
+    await openTenant(store, 'fresh.test', { create: true });
+    assertEquals(
+      await db.query(sql),
+      await (await store.tenant('fresh.test')).query(sql),
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('F2 wire frontier upgrades tenant35 without inventing original publication evidence', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'facade-device-wire-upgrade-' });
   const options = {

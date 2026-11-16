@@ -243,6 +243,288 @@ async function fixture(publicFirst = false, legacyChanges = 0) {
   };
 }
 
+Deno.test('complete-view checkpoints: retained full snapshots join imported lower IDs and cold-reuse their exact cut', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  const snapshot = () =>
+    f.et.tx((tx) => tx.e2ee.snapshot('alice', user, config().e2ee));
+  try {
+    const homeDevice = await deviceIdentity(f.ht, 'alice', 'LAN');
+    await f.ht.tx((tx) =>
+      tx.e2ee.upload(
+        homeDevice,
+        validateUpload(
+          {
+            device_keys: {
+              user_id: user,
+              device_id: 'LAN',
+              algorithms: [],
+              keys: { 'ed25519:LAN': 'home-key' },
+              signatures: {},
+            },
+          },
+          user,
+          'LAN',
+          config().e2ee,
+        ),
+      )
+    );
+    for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    await upsertDevice(f.et, 'alice', 'PHONE');
+    for (let i = 0; i < 8; i++) {
+      await updateDeviceName(f.et, 'alice', 'PHONE', 'outside-' + i);
+    }
+    const db = await f.edge.tenant('logical.test');
+    const [head] = await db.query(
+      "SELECT value FROM user_device_stream WHERE localpart='alice'",
+    );
+    const first = await snapshot();
+    assert(
+      Number(first.stream_id) > Number(head.value),
+      'a complete merged view needs its own fresh lane checkpoint, not the last local delta',
+    );
+    assertEquals(
+      await snapshot(),
+      first,
+      'an unchanged complete cut reuses its exact scalar identity',
+    );
+    const retained = await db.query(
+      'SELECT * FROM device_stream_checkpoints ORDER BY stream_id',
+    );
+    assertEquals(retained.length, 1);
+    assertEquals(JSON.parse(String(retained[0].snapshot_json)), first);
+    assertEquals(
+      await db.query('SELECT stream_id FROM device_stream_frontier'),
+      [{ stream_id: Number(first.stream_id) }],
+    );
+
+    // Home remains below the higher edge cut; its independent update was NOT
+    // included in that cut even though max(frontier) would remain unchanged.
+    await updateDeviceName(f.ht, 'alice', 'LAN', 'lower concurrent home');
+    const [lower] = (await f.hs.export('alice', f.bundle.id)).slice(-1);
+    const lowerId = Number(
+      (lower.payload as { body: DeviceView }).body.operation.wire!.streamId,
+    );
+    assert(lowerId < Number(first.stream_id));
+    await f.ej.receive('home', [lower]);
+    await f.es.apply(f.ej, lower);
+    const second = await snapshot();
+    assert(Number(second.stream_id) > Number(first.stream_id));
+    assert(
+      (second.devices as { device_id: string; device_display_name?: string }[])
+        .some((device) =>
+          device.device_id === 'LAN' &&
+          device.device_display_name === 'lower concurrent home'
+        ),
+    );
+    assertEquals(
+      (await db.query(
+        'SELECT * FROM device_stream_checkpoints ORDER BY stream_id',
+      ))[0],
+      retained[0],
+      'old complete response/frontier mappings are immutable',
+    );
+    assertEquals(await snapshot(), second);
+
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const pairings = new Pairings(
+        await reopened.server(),
+        f.node.signer(),
+        f.node.publicKey,
+        'b'.repeat(64),
+        f.node,
+      );
+      const tenant = await enrolledTenant(
+        reopened,
+        pairings,
+        'logical.test',
+        'edge_a',
+      );
+      assertEquals(
+        await tenant.tx((tx) => tx.e2ee.snapshot('alice', user, config().e2ee)),
+        second,
+      );
+      await updateDeviceName(tenant, 'alice', 'PHONE', 'after checkpoint');
+      const owner = new DeviceOperations(reopened, tenant, pairings, f.node);
+      const [delta] = (await owner.export('alice')).slice(-1);
+      assertEquals(
+        (delta.payload as { body: DeviceView }).body.operation.wire!.prevIds,
+        [second.stream_id],
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('complete-view checkpoints: exact full response includes public signing material and changes cut when only that material changes', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    await signatureInput(f);
+    for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    const snapshot = () =>
+      f.et.tx((tx) => tx.e2ee.snapshot('alice', user, config().e2ee));
+    const first = await snapshot();
+    const signing = await f.et.tx((tx) =>
+      tx.crossSigning.views('alice', user, '')
+    );
+    assertEquals(
+      first.master_key,
+      signing.master_keys,
+      'the retained complete response must include federation public signing keys',
+    );
+    assertEquals(first.self_signing_key, signing.self_signing_keys);
+    assertEquals(
+      first.user_signing_key,
+      undefined,
+      'own-user private scope never enters the public snapshot',
+    );
+    const db = await f.edge.tenant('logical.test');
+    const [held] = await db.query(
+      'SELECT snapshot_json FROM device_stream_checkpoints WHERE stream_id=?',
+      [Number(first.stream_id)],
+    );
+    assertEquals(JSON.parse(String(held.snapshot_json)), first);
+    const replacement = await signingInput();
+    await f.ht.tx(async (tx) =>
+      tx.crossSigning.upload(
+        'alice',
+        user,
+        replacement,
+        canonicalJson(await tx.crossSigning.state('alice')),
+        true,
+      )
+    );
+    for (const record of await f.hs.exportSigning('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    const second = await snapshot();
+    assertEquals(second.devices, first.devices);
+    assert(Number(second.stream_id) > Number(first.stream_id));
+    assertEquals(
+      second.master_key,
+      (await f.et.tx((tx) => tx.crossSigning.views('alice', user, '')))
+        .master_keys,
+    );
+    assertEquals(await snapshot(), second);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('complete-view checkpoints: an unchanged key view still joins newly observed concurrent wire material', async () => {
+  const f = await fixture();
+  try {
+    for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    await upsertDevice(f.et, 'alice', 'PHONE');
+    for (let i = 0; i < 6; i++) {
+      await updateDeviceName(f.et, 'alice', 'PHONE', 'outside-' + i);
+    }
+    const first = await f.et.tx((tx) =>
+      tx.e2ee.snapshot('alice', '@alice:logical.test', config().e2ee)
+    );
+    assertEquals(
+      first.devices,
+      [],
+      'a device with no uploaded keys is absent from the public response',
+    );
+    await updateDeviceName(f.ht, 'alice', 'LAN', 'still no keys');
+    const [record] = (await f.hs.export('alice', f.bundle.id)).slice(-1);
+    assert(
+      Number(
+        (record.payload as { body: DeviceView }).body.operation.wire!.streamId,
+      ) < Number(first.stream_id),
+    );
+    await f.ej.receive('home', [record]);
+    await f.es.apply(f.ej, record);
+    const second = await f.et.tx((tx) =>
+      tx.e2ee.snapshot('alice', '@alice:logical.test', config().e2ee)
+    );
+    assertEquals(second.devices, first.devices);
+    assert(
+      Number(second.stream_id) > Number(first.stream_id),
+      'equal rendered JSON does not prove an unobserved lower wire identity was included',
+    );
+    const db = await f.edge.tenant('logical.test');
+    const rows = await db.query(
+      'SELECT * FROM device_stream_checkpoints ORDER BY stream_id',
+    );
+    assertEquals(rows.length, 2);
+    assertEquals(
+      JSON.parse(String(rows[1].frontier_json)),
+      [
+        Number(
+          (record.payload as { body: DeviceView }).body.operation.wire!
+            .streamId,
+        ),
+        Number(first.stream_id),
+      ].sort((a, b) => a - b),
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('complete-view checkpoints: snapshot rollback leaves allocator frontier and retained mappings untouched', async () => {
+  const f = await fixture();
+  try {
+    for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    const db = await f.edge.tenant('logical.test');
+    const tables = [
+      'user_device_stream',
+      'device_stream_frontier',
+      'device_stream_publications',
+    ];
+    const before = await Promise.all(
+      tables.map((table) => db.query('SELECT * FROM ' + table)),
+    );
+    await assertRejects(
+      () =>
+        f.et.tx(async (tx) => {
+          const value = await tx.e2ee.snapshot(
+            'alice',
+            '@alice:logical.test',
+            config().e2ee,
+          );
+          assert(
+            Number(value.stream_id) > 0,
+            'even an empty merged view needs an allocated complete cut',
+          );
+          throw new Error('rollback complete-view checkpoint');
+        }),
+      Error,
+      'rollback complete-view checkpoint',
+    );
+    assertEquals(
+      await Promise.all(
+        tables.map((table) => db.query('SELECT * FROM ' + table)),
+      ),
+      before,
+    );
+    assertEquals(await db.query('SELECT * FROM device_stream_checkpoints'), []);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('imported key news: receiver invalidation does not wake source authority exports', async () => {
   const f = await fixture();
   let exporter: ReturnType<typeof startAccountExports> | undefined;

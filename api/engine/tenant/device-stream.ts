@@ -7,6 +7,7 @@ import type { OwnerControl } from '#engine/facade/ownership.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import { KeyHistoryProof } from '#engine/tenant/key-bootstrap.ts';
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
+import type { Json } from '#engine/tenant/e2ee.ts';
 
 export type DeviceWire = { streamId: number; prevIds: number[] };
 
@@ -17,6 +18,69 @@ CREATE INDEX device_stream_descendants ON device_stream_predecessors(localpart,p
 CREATE TABLE device_stream_frontier(localpart TEXT NOT NULL,stream_id INTEGER NOT NULL,PRIMARY KEY(localpart,stream_id));
 CREATE TABLE device_stream_baselines(localpart TEXT PRIMARY KEY NOT NULL,floor INTEGER NOT NULL);
 `;
+
+export const DEVICE_CHECKPOINT_SQL = `
+CREATE TABLE device_stream_checkpoints(localpart TEXT NOT NULL,stream_id INTEGER NOT NULL,frontier_json TEXT NOT NULL,snapshot_json TEXT NOT NULL,PRIMARY KEY(localpart,stream_id));
+`;
+
+/** Name a complete public view, not the numeric maximum of independent deltas.
+ * The caller renders on this same owner connection. Checkpoint allocation,
+ * exact response retention and frontier join commit or roll back together. */
+export async function checkpointDeviceSnapshot(
+  conn: Conn,
+  localpart: string,
+  snapshot: Json,
+): Promise<Json> {
+  const wire = await allocateDeviceWire(
+    conn,
+    localpart,
+    Number(snapshot.stream_id),
+  );
+  if (!wire) return snapshot;
+  if (wire.prevIds.length === 1) {
+    const [held] = await conn.query(
+      'SELECT snapshot_json FROM device_stream_checkpoints WHERE localpart=? AND stream_id=?',
+      [localpart, wire.prevIds[0]],
+    );
+    if (held) {
+      const previous = JSON.parse(String(held.snapshot_json)) as Json;
+      if (
+        canonicalJson({ ...previous, stream_id: 0 }) ===
+          canonicalJson({ ...snapshot, stream_id: 0 })
+      ) {
+        return previous;
+      }
+    }
+  }
+  const identity = await tenantAuthority(conn);
+  if (!identity) throw new Error('device checkpoint lost authority');
+  const complete = { ...snapshot, stream_id: wire.streamId };
+  await retainDeviceWire(
+    conn,
+    localpart,
+    canonicalJson([
+      'device-checkpoint',
+      identity.node,
+      identity.incarnation,
+      localpart,
+      wire.streamId,
+    ]),
+    identity.node,
+    identity.incarnation,
+    wire,
+  );
+  await conn.execute('INSERT INTO device_stream_checkpoints VALUES(?,?,?,?)', [
+    localpart,
+    wire.streamId,
+    canonicalJson(wire.prevIds),
+    canonicalJson(complete),
+  ]);
+  await conn.execute(
+    'INSERT INTO user_device_stream VALUES(?,?) ON CONFLICT(localpart) DO UPDATE SET value=excluded.value',
+    [localpart, wire.streamId],
+  );
+  return complete;
+}
 
 function collision(): never {
   throw new MatrixError(409, 'M_UNKNOWN', 'device wire publication collision');
