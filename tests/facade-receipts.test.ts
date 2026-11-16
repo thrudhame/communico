@@ -911,6 +911,7 @@ Deno.test('facade receipts: whole-room reconciliation scans once per committed l
           ]);
         }
         let scans = 0;
+        let notificationScans = 0;
         f.db.tx = (fn, options) =>
           original((conn) => {
             const query = conn.query.bind(conn);
@@ -919,6 +920,12 @@ Deno.test('facade receipts: whole-room reconciliation scans once per committed l
                 sql ===
                   'SELECT user_id,receipt_type,thread_id,event_ids FROM receipts WHERE room_id=?'
               ) scans++;
+              if (
+                sql ===
+                  'SELECT DISTINCT user FROM notification_graph_reads WHERE room=?'
+              ) {
+                notificationScans++;
+              }
               return query(sql, values);
             };
             return fn(conn);
@@ -928,6 +935,11 @@ Deno.test('facade receipts: whole-room reconciliation scans once per committed l
           scans,
           1,
           'one retained-slot sweep for the complete committed prefix',
+        );
+        assertEquals(
+          notificationScans,
+          1,
+          'one graph notification sweep for the complete committed prefix',
         );
       } finally {
         f.db.tx = original;

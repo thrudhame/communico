@@ -729,8 +729,10 @@ Use `kind:"profile"` or `kind:"push-rules"` with `localpart` for the other
 complete registers. Select an `operationId` from `alternatives`, then POST the
 same selector plus `operationId` and an absolute `exportfile` path to
 `/v1/facade/conflicts/export`. The server creates a runtime-owned mode-0600 file
-containing `{selector,operation}`; `operation.payload` is the original opaque
-JSON string. Existing files and symlinks are never overwritten. The response
+containing `{selector,operation}`; `operation.payload` is the stored opaque
+JSON string after parsing and reserialization, not the original wire bytes.
+Key order can change and large integer literals can be rounded during parsing.
+Existing files and symlinks are never overwritten. The response
 contains only the selected identity and path. Treat the file as private account
 data, even when its contents are encrypted; do not put its contents in logs.
 

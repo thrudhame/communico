@@ -410,6 +410,14 @@ export async function reconcileNotificationEvent(
       }
     }
   }
+}
+
+/** Revisit graph reads after all event-local work in one committed prefix. */
+export async function reconcileNotificationReads(
+  tx: Conn,
+  room: string,
+  now: number,
+): Promise<void> {
   if (await graphReceiptsEnabled(tx)) {
     const users = await tx.query(
       'SELECT DISTINCT user FROM notification_graph_reads WHERE room=?',
