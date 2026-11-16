@@ -115,13 +115,15 @@ export async function finishPushWork(
   }
   if (work.badge) {
     await tx.execute(
-      'UPDATE push_badges SET sent_revision=MAX(sent_revision,?),attempts=CASE WHEN revision=? THEN 0 ELSE attempts END,next_ms=CASE WHEN revision=? THEN 0 ELSE next_ms END,error=CASE WHEN revision=? THEN NULL ELSE error END WHERE incarnation=?',
+      'UPDATE push_badges SET sent_revision=MAX(sent_revision,?),attempts=CASE WHEN revision=? THEN 0 ELSE attempts END,next_ms=CASE WHEN revision=? THEN 0 ELSE next_ms END,error=CASE WHEN revision=? THEN NULL ELSE error END WHERE incarnation=? AND (sent_revision<? OR (revision=? AND (attempts!=0 OR next_ms!=0 OR error IS NOT NULL)))',
       [
         work.badge.revision,
         work.badge.revision,
         work.badge.revision,
         work.badge.revision,
         target.incarnation,
+        work.badge.revision,
+        work.badge.revision,
       ],
     );
   }

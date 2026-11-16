@@ -22,7 +22,11 @@ import {
 import { verify, verifyJoinForCountersign } from '#engine/room/verify.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import { withRestrictedAdmission } from '#engine/room/restricted.ts';
-import { loadRulebookStore } from '#engine/room/build.ts';
+import {
+  loadRulebookStore,
+  resolvePrevs,
+  stateBefore,
+} from '#engine/room/build.ts';
 import { prejoinStateInTx } from './prejoin.ts';
 
 async function template(
@@ -43,7 +47,7 @@ async function template(
   ) => {
     await assertAcl(tx, origin);
     const snapshot = await currentSnapshot(tx);
-    const { version, state, stay } = snapshot;
+    const { version, stay } = snapshot;
     if (versions.length > 0 && !versions.includes(version)) {
       const error =
         `This server does not know how to join a room of version ${version}`;
@@ -53,31 +57,45 @@ async function template(
         room_version: version,
       });
     }
-    const contentAt = async (type: string, key = '') => {
-      const id = state.get(type + '\0' + key);
-      const pdu = id === undefined ? null : await pduAt(tx, id);
-      return pdu === null || pdu.content == null ? {} : pdu.content;
-    };
-    const joinRule = (await contentAt('m.room.join_rules')).join_rule;
-    const current = (await contentAt('m.room.member', userId)).membership;
-    if (current === 'ban') {
-      throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is banned`);
+    // Current admission and the event's DAG state are separate contracts.
+    // A bounded parent set must not borrow auth from an omitted frontier head.
+    const prevs = await tx.extremities.parents(stay.id);
+    const parents = await resolvePrevs(tx, prevs);
+    const state = await stateBefore(
+      tx,
+      parents.afterGroups,
+      getRulebook(version),
+    );
+    for (const admitted of [snapshot.state, state]) {
+      const contentAt = async (type: string, key = '') => {
+        const id = admitted.get(type + '\0' + key);
+        const pdu = id === undefined ? null : await pduAt(tx, id);
+        return pdu === null || pdu.content == null ? {} : pdu.content;
+      };
+      const joinRule = (await contentAt('m.room.join_rules')).join_rule;
+      const current = (await contentAt('m.room.member', userId)).membership;
+      if (current === 'ban') {
+        throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is banned`);
+      }
+      if (
+        membership === 'join' && joinRule === 'invite' &&
+        current !== 'invite' &&
+        current !== 'join'
+      ) {
+        throw new MatrixError(
+          403,
+          'M_FORBIDDEN',
+          `${userId} has no invite to ${roomId}`,
+        );
+      }
+      if (membership === 'leave' && current === undefined) {
+        throw new MatrixError(
+          403,
+          'M_FORBIDDEN',
+          `${userId} is not in the room`,
+        );
+      }
     }
-    if (
-      membership === 'join' && joinRule === 'invite' && current !== 'invite' &&
-      current !== 'join'
-    ) {
-      throw new MatrixError(
-        403,
-        'M_FORBIDDEN',
-        `${userId} has no invite to ${roomId}`,
-      );
-    }
-    if (membership === 'leave' && current === undefined) {
-      throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is not in the room`);
-    }
-    const prevs = await tx.extremities.frontier(stay.id);
-    const depths = await tx.events.list(prevs);
     const partial = {
       type: 'm.room.member',
       state_key: userId,
@@ -114,18 +132,24 @@ async function template(
           partial as unknown as Pdu,
           state,
         ),
-        depth: Math.max(0, ...[...depths.values()].map((r) => r.depth)) + 1,
+        depth: Math.max(0, ...parents.depths) + 1,
         origin_server_ts: Date.now(),
         hashes: { sha256: '' },
         signatures: {},
       };
-      const verdict = rulebook.checkAuthAgainstState(
-        candidate,
-        state,
-        await loadRulebookStore(tx, [...state.values()]),
+      const auth = await loadRulebookStore(
+        tx,
+        [...state.values(), ...snapshot.state.values()],
       );
-      if (!verdict.ok) {
-        throw new MatrixError(403, 'M_FORBIDDEN', verdict.reason);
+      for (const admitted of [state, snapshot.state]) {
+        const verdict = rulebook.checkAuthAgainstState(
+          candidate,
+          admitted,
+          auth,
+        );
+        if (!verdict.ok) {
+          throw new MatrixError(403, 'M_FORBIDDEN', verdict.reason);
+        }
       }
     }
     return {
@@ -138,7 +162,7 @@ async function template(
           partial as unknown as Pdu,
           state,
         ),
-        depth: Math.max(0, ...[...depths.values()].map((r) => r.depth)) + 1,
+        depth: Math.max(0, ...parents.depths) + 1,
         origin: deps.self,
         origin_server_ts: Date.now(),
       },

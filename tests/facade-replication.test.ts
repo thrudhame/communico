@@ -50,6 +50,8 @@ import { setReceipt as writeClientReceipt } from '#engine/receipts.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
+import { applyReplicaScope } from '#engine/facade/scopes.ts';
+import type { Database } from '#engine/store/db.ts';
 import {
   exportRoomReplica,
   RoomReplicas,
@@ -189,6 +191,7 @@ async function fixture(seedServer = serverSchema) {
         tenant.serverName,
       ),
     edgeServer: () => edge.server(),
+    edgePairings,
     edgeStore: () => edge,
     edgeTenant: async () =>
       enrolledTenant(edge, await edgePairings(), tenant.serverName, node.node),
@@ -273,6 +276,86 @@ Deno.test('room replication pins bootstrap, applies only durable semantic suffix
     assertEquals(
       (await (await f.journal()).heads('home', 'in', suffix)).applied.sequence,
       2,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica scope retry retains its pending identity without rewriting equal preparation', async () => {
+  const f = await fixture();
+  try {
+    const record = await f.exports();
+    assert(record);
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    const db = await f.edgeServer();
+    let writes = 0;
+    const observed: Database = {
+      ...db,
+      tx: (fn, options) =>
+        db.tx((conn) =>
+          fn(
+            new Proxy(conn, {
+              get(target, key) {
+                if (key === 'execute') {
+                  return async (
+                    sql: string,
+                    args: Parameters<typeof conn.execute>[1],
+                  ) => {
+                    const n = await conn.execute(sql, args);
+                    if (sql.startsWith('INSERT INTO facade_scopes')) {
+                      writes += n;
+                    }
+                    return n;
+                  };
+                }
+                const value = Reflect.get(target, key);
+                return typeof value === 'function' ? value.bind(target) : value;
+              },
+            }),
+          ), options),
+    };
+    const options = {
+      db: observed,
+      pairings: await f.edgePairings(),
+      self: f.signing.name,
+      journal,
+      stream: record,
+      record,
+      scope: record.stream,
+      after: 0,
+      cut: 1,
+      apply: () => Promise.reject(new Error('domain interrupted')),
+    };
+    await assertRejects(
+      () => applyReplicaScope(options),
+      Error,
+      'domain interrupted',
+    );
+    writes = 0;
+    const start = performance.now();
+    await assertRejects(
+      () => applyReplicaScope(options),
+      Error,
+      'domain interrupted',
+    );
+    console.log(
+      JSON.stringify({
+        owner: 'replica pending preparation replay',
+        writes,
+        elapsed_ms: performance.now() - start,
+      }),
+    );
+    assertEquals(writes, 0);
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      0,
+    );
+    assertEquals(await (await f.replicas()).apply(journal, record), true);
+    assertEquals(
+      (await (await f.replicas()).status(f.source.roomId))?.ready,
+      true,
     );
   } finally {
     await f.close();

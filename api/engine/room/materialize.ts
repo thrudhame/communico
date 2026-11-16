@@ -6,6 +6,7 @@
 // the existing group via the UNIQUE fingerprint, and a zero-change
 // newGroup returns the parent (R4; dedup documented in the stage notes).
 import type { Conn } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import {
   groupEntries,
@@ -152,7 +153,10 @@ export async function setEventState(
   await conn.execute(
     `INSERT INTO event_state(event, before_group, after_group, provenance) VALUES(?,?,?,?)
      ON CONFLICT(event) DO UPDATE SET before_group = excluded.before_group,
-       after_group = excluded.after_group, provenance = excluded.provenance`,
+       after_group = excluded.after_group, provenance = excluded.provenance
+     WHERE ${
+      changedColumns('event_state', 'before_group', 'after_group', 'provenance')
+    }`,
     [event, before, after, provenance],
   );
 }
@@ -254,8 +258,11 @@ export async function setCurrent(
   group: number,
 ): Promise<void> {
   const updated = await conn.execute(
-    'UPDATE segments SET current_group = ? WHERE id = ?',
-    [group, stay],
+    'UPDATE segments SET current_group = ? WHERE id = ? AND current_group IS NOT ?',
+    [group, stay, group],
   );
-  if (updated === 0) throw new Error(`unknown stay ${stay}`);
+  if (
+    updated === 0 &&
+    !(await conn.query('SELECT 1 FROM segments WHERE id=?', [stay])).length
+  ) throw new Error(`unknown stay ${stay}`);
 }

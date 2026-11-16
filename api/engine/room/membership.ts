@@ -335,12 +335,13 @@ export async function reopen(
     if (last === null || group === null) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'no snapshot to reopen');
     }
-    const prevs = await tx.extremities.frontier(last.id);
+    const prevs = await tx.extremities.parents(last.id);
     const stay = await tx.segments.create({
       kind: 'stay',
       prev: last.id,
       opening_group: group,
     });
+    await tx.extremities.inherit(last.id, stay);
     await tx.segments.create({
       kind: 'history',
       prev: stay,

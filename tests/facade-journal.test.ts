@@ -10,6 +10,7 @@ import {
 } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
+import { Turso } from '#engine/store/ffi.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 
 const capabilities = [{ type: 'control', version: 1 }];
@@ -45,6 +46,69 @@ function rewrite(record: LinkRecord, patch: Partial<LinkRecord>) {
   const { hash: _hash, ...body } = { ...record, ...patch };
   return { ...body, hash: recordHash(body) };
 }
+
+Deno.test('journal repeated terminal ACK validates retained truth without rewriting it', async () => {
+  await fixture(async (_store, journal) => {
+    const records = [];
+    for (let i = 0; i < 32; i++) {
+      records.push(await journal.append('edge', input('ack-' + i)));
+    }
+    const last = cut(records.at(-1)!);
+    const results = records.map((record) => ({
+      ...cut(record),
+      result: { accepted: true },
+    }));
+    await journal.ack('edge', stream, last, last, results);
+    const execute = Turso.prototype.execute;
+    const writes: Record<string, number> = {};
+    Turso.prototype.execute = async function (...args) {
+      const changed = await execute.apply(this, args);
+      const table = /^(?:INSERT INTO|UPDATE) (\w+)/.exec(args[1])?.[1];
+      if (table) writes[table] = (writes[table] ?? 0) + changed;
+      return changed;
+    };
+    const start = performance.now();
+    try {
+      assertEquals(await journal.ack('edge', stream, last, last, results), {
+        received: last,
+        applied: last,
+      });
+    } finally {
+      Turso.prototype.execute = execute;
+    }
+    console.log(
+      JSON.stringify({
+        owner: 'terminal ACK replay',
+        records: records.length,
+        writes,
+        elapsed_ms: performance.now() - start,
+      }),
+    );
+    await assertRejects(
+      () =>
+        journal.ack('edge', stream, last, last, [{
+          ...results[0],
+          result: { accepted: false },
+        }]),
+      LinkError,
+      'changed remote terminal result',
+    );
+    assertEquals(await journal.acknowledged('edge', stream), {
+      received: last,
+      applied: last,
+    });
+    const next = await journal.append('edge', input('ack-next'));
+    await journal.ack('edge', stream, cut(next), cut(next), [{
+      ...cut(next),
+      result: null,
+    }]);
+    assertEquals(await journal.result('edge', 'out', stream, cut(next)), {
+      result: null,
+    });
+    assertEquals(writes.facade_records ?? 0, 0);
+    assertEquals(writes.facade_export_acks, 0);
+  });
+});
 
 Deno.test('link negotiation refuses skew and identity before record mutation', () => {
   const hello = {

@@ -2,6 +2,7 @@
 // pending admission claims, cached key evidence or operator annotations.
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import {
   exportKeyDecisions,
   type KeyDecision,
@@ -109,13 +110,31 @@ export async function installPeerPolicy(
 ): Promise<void> {
   const policy = peerPolicyOf(raw);
   await conn.execute(
-    'INSERT INTO federation_policy(singleton,policy_json) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET policy_json=excluded.policy_json',
+    'INSERT INTO federation_policy(singleton,policy_json) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET policy_json=excluded.policy_json WHERE ' +
+      changedColumns('federation_policy', 'policy_json'),
     [JSON.stringify(policy.federation)],
   );
-  await conn.execute('DELETE FROM federation_peers');
+  const peers = new Set(policy.peers.map((p) => p.name));
+  for (const row of await conn.query('SELECT name FROM federation_peers')) {
+    if (!peers.has(String(row.name))) {
+      await conn.execute('DELETE FROM federation_peers WHERE name=?', [
+        row.name,
+      ]);
+    }
+  }
   for (const p of policy.peers) {
     await conn.execute(
-      'INSERT INTO federation_peers(name,host,port,trust,pin_spki_sha256,added_ms,added_by,note) VALUES(?,?,?,?,?,?,?,NULL)',
+      'INSERT INTO federation_peers(name,host,port,trust,pin_spki_sha256,added_ms,added_by,note) VALUES(?,?,?,?,?,?,?,NULL) ON CONFLICT(name) DO UPDATE SET host=excluded.host,port=excluded.port,trust=excluded.trust,pin_spki_sha256=excluded.pin_spki_sha256,added_ms=excluded.added_ms,added_by=excluded.added_by,note=NULL WHERE ' +
+        changedColumns(
+          'federation_peers',
+          'host',
+          'port',
+          'trust',
+          'pin_spki_sha256',
+          'added_ms',
+          'added_by',
+          'note',
+        ),
       [p.name, p.host, p.port, p.trust, p.pin, p.added, p.by],
     );
     await conn.execute(
@@ -123,10 +142,18 @@ export async function installPeerPolicy(
       [p.name],
     );
   }
-  await conn.execute('DELETE FROM federation_blocks');
+  const blocks = new Set(policy.blocks.map((b) => b.pattern));
+  for (const row of await conn.query('SELECT pattern FROM federation_blocks')) {
+    if (!blocks.has(String(row.pattern))) {
+      await conn.execute('DELETE FROM federation_blocks WHERE pattern=?', [
+        row.pattern,
+      ]);
+    }
+  }
   for (const b of policy.blocks) {
     await conn.execute(
-      'INSERT INTO federation_blocks(pattern,added_ms,note) VALUES(?,?,NULL)',
+      'INSERT INTO federation_blocks(pattern,added_ms,note) VALUES(?,?,NULL) ON CONFLICT(pattern) DO UPDATE SET added_ms=excluded.added_ms,note=NULL WHERE ' +
+        changedColumns('federation_blocks', 'added_ms', 'note'),
       [b.pattern, b.added],
     );
   }
