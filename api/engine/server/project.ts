@@ -13,7 +13,7 @@
 // the feed, live relation listings and search. Accepted historical relation
 // edges remain available to the shared classifier without publishing news.
 import type { Change } from '#engine/room/changes.ts';
-import { openRoom, type Room } from '#engine/room/index.ts';
+import { openRoom, type Room, type RoomTx } from '#engine/room/index.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
@@ -32,7 +32,7 @@ import {
 } from '#engine/server/receipt-frontier.ts';
 import { reconcileReceiptMarks } from '#engine/server/ephemeral.ts';
 import {
-  capturePush,
+  capturePushesAt,
   prepareCapturedPush,
   type PushCapture,
   type PushPublication,
@@ -289,16 +289,18 @@ async function captureDevicePublication(
       [room.id, mark],
     );
     if (cut.length) {
-      const ids = await memberIdsAt(
-        room,
-        Number(cut[0].stay),
-        Number(cut[0].pos),
-        true,
-      );
-      if (ids !== null) {
-        const members = await membersAt(room, ids.members, new Map());
-        return { publication: { ...ids, members }, pos: Number(cut[0].pos) };
-      }
+      const publication = await room.tx(async (tx) => {
+        const ids = await memberIdsAt(
+          tx,
+          Number(cut[0].stay),
+          Number(cut[0].pos),
+          true,
+        );
+        if (ids === null) return null;
+        const members = await membersAt(tx, ids.members, new Map());
+        return { ...ids, members };
+      });
+      if (publication !== null) return { publication, pos: Number(cut[0].pos) };
     }
   }
   return null;
@@ -473,7 +475,7 @@ type Publication = {
 // Offset zero is the stay's first live position, whose opening boundary
 // still needs projection even if the room read fallback has the same group.
 async function memberIdsAt(
-  room: Room,
+  tx: RoomTx,
   stay: number | null,
   pos: number,
   first: boolean,
@@ -485,56 +487,52 @@ async function memberIdsAt(
   } | null
 > {
   if (stay === null) return null;
-  return await room.tx(async (tx) => {
-    const group = await tx.state.publishedAt(stay, pos);
-    if (group === null) return null;
-    if (!first && group === await tx.state.publishedAt(stay, pos - 1)) {
-      return null;
-    }
-    const map = await tx.state.groupMap(group);
-    const prefix = 'm.room.member\0';
-    const encryption = map.get('m.room.encryption\0') ?? null;
-    const key = encryption === null ? null : await tx.events.get(encryption);
-    const algorithm = key === null
-      ? null
-      : (JSON.parse(key.pdu) as Pdu).content?.algorithm;
-    return {
-      encryption,
-      encrypted: typeof algorithm === 'string' && algorithm.length > 0,
-      members: new Map(
-        [...map].filter(([key]) => key.startsWith(prefix)).map(
-          ([key, event]) => [key.slice(prefix.length), event],
-        ),
+  const group = await tx.state.publishedAt(stay, pos);
+  if (group === null) return null;
+  if (!first && group === await tx.state.publishedAt(stay, pos - 1)) {
+    return null;
+  }
+  const map = await tx.state.groupMap(group);
+  const prefix = 'm.room.member\0';
+  const encryption = map.get('m.room.encryption\0') ?? null;
+  const key = encryption === null ? null : await tx.events.get(encryption);
+  const algorithm = key === null
+    ? null
+    : (JSON.parse(key.pdu) as Pdu).content?.algorithm;
+  return {
+    encryption,
+    encrypted: typeof algorithm === 'string' && algorithm.length > 0,
+    members: new Map(
+      [...map].filter(([key]) => key.startsWith(prefix)).map(
+        ([key, event]) => [key.slice(prefix.length), event],
       ),
-    };
-  });
+    ),
+  };
 }
 
 // The baseline is the actual projected rows plus prior publications in
 // this batch. Immutable member events only need reading when their id moved.
 async function membersAt(
-  room: Room,
+  tx: RoomTx,
   ids: Map<string, string>,
   projected: Map<string, PublishedMember>,
 ): Promise<PublishedMember[]> {
-  return await room.tx(async (tx) => {
-    const out: PublishedMember[] = [];
-    for (const [user, toId] of ids) {
-      const prior = projected.get(user);
-      if (prior?.toId === toId) {
-        out.push(prior);
-        continue;
-      }
-      const row = await tx.events.get(toId);
-      if (row === null) {
-        throw new Error(`published member event missing: ${toId}`);
-      }
-      const membership = (JSON.parse(row.pdu) as Pdu).content?.membership;
-      const to = typeof membership === 'string' ? membership : 'leave';
-      out.push({ user, to, toId });
+  const out: PublishedMember[] = [];
+  for (const [user, toId] of ids) {
+    const prior = projected.get(user);
+    if (prior?.toId === toId) {
+      out.push(prior);
+      continue;
     }
-    return out;
-  });
+    const row = await tx.events.get(toId);
+    if (row === null) {
+      throw new Error(`published member event missing: ${toId}`);
+    }
+    const membership = (JSON.parse(row.pdu) as Pdu).content?.membership;
+    const to = typeof membership === 'string' ? membership : 'leave';
+    out.push({ user, to, toId });
+  }
+  return out;
 }
 
 // The read phase on the room file: every fact the server transaction
@@ -546,6 +544,7 @@ async function prepare(
   batch: Change[],
   localServers: string[],
 ): Promise<Prepared[]> {
+  if (batch.length === 0) return [];
   // The triggers of membership changes whose own event change sits in an
   // earlier batch: their feed rows are already committed in the server
   // file. The batch's own event changes resolve from the batch itself.
@@ -561,172 +560,202 @@ async function prepare(
       }
     }
   }
-  const out: Prepared[] = [];
-  // Loaded only when a cut needs reconciliation. Advancing this baseline
-  // keeps selective event reads correct across multiple cuts in one batch.
-  let projected: Map<string, PublishedMember> | null = null;
+  // Cross-file positions are captured before entering the room attempt.
   for (const change of batch) {
-    switch (change.kind) {
-      case 'event':
-      case 'transition':
-      case 'history': {
-        if (change.event === null) {
-          throw new Error(`${change.kind} change without an event id`);
-        }
-        const payload = eventPayloadOf(change);
-        let relation: { relatesTo: string; relType: string | null } | null =
-          null;
-        let search: { key: string; text: string } | null = null;
-        let prevs: string[] | null = null;
-        let member: ReceiptMembership | null = null;
-        if (
-          payload.standing === 'accepted' && payload.grounding === 'grounded'
-        ) {
-          const facts = await room.tx(async (tx) => {
-            const row = await tx.events.get(change.event!);
-            return row === null ? null : {
-              pdu: JSON.parse(row.pdu) as Record<string, unknown>,
-              prevs: await tx.events.prevsOf(change.event!),
-            };
-          });
-          if (facts !== null) {
-            prevs = facts.prevs;
-            member = receiptMembership(facts.pdu);
-            relation = relationOf(facts.pdu, change.event);
-            if (change.kind !== 'history' && isLive(payload)) {
-              search = searchTextOf(payload, facts.pdu);
+    if (
+      change.kind !== 'membership' || change.event === null ||
+      inBatch.has(change.event)
+    ) continue;
+    const data = JSON.parse(change.data) as { user?: unknown; to?: unknown };
+    if (typeof data.user !== 'string' || typeof data.to !== 'string') continue;
+    const server = await store.server();
+    const rows = await server.query(
+      'SELECT pos, stay FROM feed WHERE room = ? AND event = ?',
+      [roomId, change.event],
+    );
+    if (rows.length > 0) {
+      inBatch.set(change.event, {
+        pos: Number(rows[0].pos),
+        stay: Number(rows[0].stay),
+      });
+    }
+  }
+  const { prepared: out, publications } = await room.tx(async (tx) => {
+    const out: Prepared[] = [];
+    const publications: {
+      index: number;
+      ids: NonNullable<Awaited<ReturnType<typeof memberIdsAt>>>;
+    }[] = [];
+    for (const change of batch) {
+      switch (change.kind) {
+        case 'event':
+        case 'transition':
+        case 'history': {
+          if (change.event === null) {
+            throw new Error(`${change.kind} change without an event id`);
+          }
+          const payload = eventPayloadOf(change);
+          let relation: { relatesTo: string; relType: string | null } | null =
+            null;
+          let search: { key: string; text: string } | null = null;
+          let prevs: string[] | null = null;
+          let member: ReceiptMembership | null = null;
+          if (
+            payload.standing === 'accepted' && payload.grounding === 'grounded'
+          ) {
+            const row = await tx.events.get(change.event);
+            const pdu = row === null
+              ? null
+              : JSON.parse(row.pdu) as Record<string, unknown>;
+            if (pdu !== null) {
+              prevs = await tx.events.prevsOf(change.event);
+              member = receiptMembership(pdu);
+              relation = relationOf(pdu, change.event);
+              if (change.kind !== 'history' && isLive(payload)) {
+                search = searchTextOf(payload, pdu);
+              }
             }
           }
-        }
-        const ids = change.kind !== 'history' && isLive(payload)
-          ? await memberIdsAt(
-            room,
-            payload.stay,
-            change.pos,
-            payload.offset === 0,
-          )
-          : null;
-        let publication: Publication | null = null;
-        if (ids !== null) {
-          if (projected === null) {
-            const server = await store.server();
-            const rows = await server.query(
-              'SELECT user, membership, event FROM memberships WHERE room = ?',
-              [roomId],
-            );
-            projected = new Map(rows.map((row) => [String(row.user), {
-              user: String(row.user),
-              to: String(row.membership),
-              toId: String(row.event),
-            }]));
-          }
-          publication = {
-            ...ids,
-            members: await membersAt(room, ids.members, projected),
-          };
-          projected = new Map(
-            publication.members.map((member) => [member.user, member]),
-          );
-        }
-        out.push({
-          change,
-          kind: change.kind,
-          payload,
-          prevs,
-          receiptMembership: member,
-          relation,
-          search,
-          publication,
-          push: null,
-          pushCapture: localServers.length > 0 && change.kind !== 'history' &&
-              isLive(payload)
-            ? await capturePush(
-              room,
-              change.event,
-              payload.stay!,
+          const ids = change.kind !== 'history' && isLive(payload)
+            ? await memberIdsAt(
+              tx,
+              payload.stay,
               change.pos,
-              localServers,
+              payload.offset === 0,
             )
-            : null,
-        });
-        break;
-      }
-      case 'membership': {
-        if (change.event === null) {
-          throw new Error('membership change without an event id');
-        }
-        const data = JSON.parse(change.data) as {
-          user?: unknown;
-          to?: unknown;
-        };
-        if (typeof data.user !== 'string') {
-          throw new Error(
-            `malformed membership change at pos ${change.pos}: ${change.data}`,
-          );
-        }
-        const to = typeof data.to === 'string' ? data.to : null;
-        // The published member event of `to` (the old fold's own event):
-        // the publication at the trigger's event-change position. The
-        // trigger's (stay, pos) comes from this batch or — already
-        // projected — from its feed row.
-        let toId: string | null = null;
-        if (to !== null) {
-          let at = inBatch.get(change.event) ?? null;
-          if (at === null) {
-            const server = await store.server();
-            const rows = await server.query(
-              'SELECT pos, stay FROM feed WHERE room = ? AND event = ?',
-              [roomId, change.event],
-            );
-            if (rows.length > 0) {
-              at = { pos: Number(rows[0].pos), stay: Number(rows[0].stay) };
-            }
+            : null;
+          if (ids !== null) {
+            publications.push({ index: out.length, ids });
           }
-          if (at !== null) {
-            toId = await room.tx(async (tx) => {
-              const group = await tx.state.publishedAt(at!.stay, at!.pos);
-              if (group === null) return null;
-              return await tx.state.groupKey(
+          out.push({
+            change,
+            kind: change.kind,
+            payload,
+            prevs,
+            receiptMembership: member,
+            relation,
+            search,
+            publication: null,
+            push: null,
+            pushCapture: null,
+          });
+          break;
+        }
+        case 'membership': {
+          if (change.event === null) {
+            throw new Error('membership change without an event id');
+          }
+          const data = JSON.parse(change.data) as {
+            user?: unknown;
+            to?: unknown;
+          };
+          if (typeof data.user !== 'string') {
+            throw new Error(
+              `malformed membership change at pos ${change.pos}: ${change.data}`,
+            );
+          }
+          const to = typeof data.to === 'string' ? data.to : null;
+          // The published member event of `to` (the old fold's own event):
+          // the publication at the trigger's event-change position. The
+          // trigger's (stay, pos) comes from this batch or — already
+          // projected — from its feed row.
+          let toId: string | null = null;
+          if (to !== null) {
+            const at = inBatch.get(change.event) ?? null;
+            if (at !== null) {
+              const group = await tx.state.publishedAt(at.stay, at.pos);
+              toId = group === null ? null : await tx.state.groupKey(
                 group,
                 'm.room.member',
-                data.user as string,
+                data.user,
               );
-            });
+            }
           }
+          out.push({ change, kind: 'membership', user: data.user, to, toId });
+          break;
         }
-        out.push({ change, kind: 'membership', user: data.user, to, toId });
-        break;
-      }
-      case 'redaction': {
-        const data = JSON.parse(change.data) as { target?: unknown };
-        if (typeof data.target !== 'string') {
+        case 'redaction': {
+          const data = JSON.parse(change.data) as { target?: unknown };
+          if (typeof data.target !== 'string') {
+            throw new Error(
+              `malformed redaction change at pos ${change.pos}: ${change.data}`,
+            );
+          }
+          out.push({ change, kind: 'redaction', target: data.target });
+          break;
+        }
+        case 'delivery': {
+          const data = JSON.parse(change.data) as { destinations?: unknown };
+          if (!Array.isArray(data.destinations)) {
+            throw new Error(
+              `malformed delivery change at pos ${change.pos}: ${change.data}`,
+            );
+          }
+          out.push({
+            change,
+            kind: 'delivery',
+            destinations: data.destinations.map((d) => String(d)),
+          });
+          break;
+        }
+        default:
           throw new Error(
-            `malformed redaction change at pos ${change.pos}: ${change.data}`,
+            `unknown change kind ${
+              JSON.stringify(change.kind)
+            } at pos ${change.pos}`,
           );
-        }
-        out.push({ change, kind: 'redaction', target: data.target });
-        break;
       }
-      case 'delivery': {
-        const data = JSON.parse(change.data) as { destinations?: unknown };
-        if (!Array.isArray(data.destinations)) {
-          throw new Error(
-            `malformed delivery change at pos ${change.pos}: ${change.data}`,
-          );
-        }
-        out.push({
-          change,
-          kind: 'delivery',
-          destinations: data.destinations.map((d) => String(d)),
-        });
-        break;
+    }
+    // A page shares the room attempt's immutable state reconstruction. Tenant
+    // policy remains fresh inside each later publication turn, never here.
+    const live = out.filter((
+      item,
+    ): item is Extract<Prepared, { payload: EventPayload }> =>
+      (item.kind === 'event' || item.kind === 'transition') &&
+      isLive(item.payload)
+    );
+    if (localServers.length > 0 && live.length > 0) {
+      const captures = await capturePushesAt(
+        tx,
+        roomId,
+        live.map((item) => ({
+          eventId: item.change.event!,
+          stay: item.payload.stay!,
+          pos: item.change.pos,
+        })),
+        localServers,
+      );
+      for (let at = 0; at < live.length; at++) {
+        live[at].pushCapture = captures[at];
       }
-      default:
-        throw new Error(
-          `unknown change kind ${
-            JSON.stringify(change.kind)
-          } at pos ${change.pos}`,
-        );
+    }
+    return { prepared: out, publications };
+  });
+  // Only publication changes need a server baseline. No server/tenant I/O is
+  // nested inside either room attempt, and retry-local baselines never escape.
+  if (publications.length > 0) {
+    const server = await store.server();
+    const rows = await server.query(
+      'SELECT user, membership, event FROM memberships WHERE room = ?',
+      [roomId],
+    );
+    const completed = await room.tx(async (tx) => {
+      let projected = new Map(rows.map((row) => [String(row.user), {
+        user: String(row.user),
+        to: String(row.membership),
+        toId: String(row.event),
+      }]));
+      const completed: { index: number; publication: Publication }[] = [];
+      for (const { index, ids } of publications) {
+        const members = await membersAt(tx, ids.members, projected);
+        completed.push({ index, publication: { ...ids, members } });
+        projected = new Map(members.map((member) => [member.user, member]));
+      }
+      return completed;
+    });
+    for (const { index, publication } of completed) {
+      const item = out[index];
+      if ('publication' in item) item.publication = publication;
     }
   }
   return out;
