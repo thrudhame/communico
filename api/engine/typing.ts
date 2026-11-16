@@ -96,7 +96,7 @@ export async function setTyping(
       typing.get(roomId)?.delete(userId);
     }
     bump(roomId);
-    for (const l of listeners) {
+    for (const l of [...listeners]) {
       try {
         l(roomId, userId, isTyping);
       } catch (e) {
@@ -112,7 +112,7 @@ function clearTyping(roomId: string, userId: string): void {
   if (!typing.get(roomId)?.delete(userId)) return;
   if (typing.get(roomId)?.size === 0) typing.delete(roomId);
   bump(roomId);
-  for (const listener of listeners) {
+  for (const listener of [...listeners]) {
     try {
       listener(roomId, userId, false);
     } catch (error) {

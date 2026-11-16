@@ -24,7 +24,11 @@ import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
 import { setRoomHooks } from '#engine/room/hooks.ts';
 import { project } from '#engine/server/project.ts';
 import { authAt } from './fixtures/auth.ts';
-import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
+import {
+  afterRoomCommit,
+  ingestInTx,
+  resumeWaits,
+} from '#engine/room/ingest.ts';
 
 const receive = receiveTransaction;
 
@@ -584,18 +588,66 @@ Deno.test('request cancellation: ready drain stops between committed turns and p
       return result;
     };
     const demand = { self: 'test', signal: controller.signal };
-    assertEquals(await resumeWaits(f.g.room, demand), 1);
+    assertEquals(await resumeWaits(f.g.room, demand, []), 1);
     assertEquals(
       (await transaction((tx) => tx.events.getStatus(tail.event_id!)))
         ?.grounding,
       'pending',
     );
     f.g.room.tx = transaction;
-    assertEquals(await resumeWaits(f.g.room, { self: 'test' }), 1);
+    assertEquals(await resumeWaits(f.g.room, { self: 'test' }, []), 1);
     assertEquals(
       (await transaction((tx) => tx.events.getStatus(tail.event_id!)))
         ?.grounding,
       'grounded',
     );
   });
+});
+
+Deno.test('request cancellation: shared completion projects committed work after an aborted or failed retry drain', async () => {
+  for (const cause of ['abort', 'failure'] as const) {
+    await withStore(async (store) => {
+      const f = await validMessage(store);
+      const committed = await ingestRemote(f.g.room, [f.pdu], 'test', f.deps);
+      assertEquals(committed.map((result) => result.outcome), ['accepted']);
+      const transaction = f.g.room.tx.bind(f.g.room);
+      const failure = new Error('retry capture failed');
+      let reads = 0, projections = 0;
+      f.g.room.tx = (_fn) => {
+        reads++;
+        return Promise.reject(failure);
+      };
+      setRoomHooks({
+        project: async (actualStore, roomId) => {
+          projections++;
+          f.g.room.tx = transaction;
+          await project(actualStore, roomId);
+        },
+        register: () => Promise.resolve(),
+      });
+      const controller = new AbortController();
+      if (cause === 'abort') controller.abort();
+      try {
+        const run = () =>
+          afterRoomCommit(f.g.room, 'test', [], controller.signal);
+        if (cause === 'abort') await run();
+        else await assertRejects(run, Error, failure.message);
+        assertEquals(reads, cause === 'abort' ? 0 : 1);
+        assertEquals(projections, 1);
+        assertEquals(
+          (await (await store.server()).query(
+            'SELECT event FROM feed WHERE event=?',
+            [f.pdu.event_id!],
+          )).map((row) => row.event),
+          [f.pdu.event_id!],
+        );
+      } finally {
+        f.g.room.tx = transaction;
+        setRoomHooks({
+          project: () => Promise.resolve(),
+          register: () => Promise.resolve(),
+        });
+      }
+    });
+  }
 });

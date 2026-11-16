@@ -29,9 +29,9 @@ import {
   ungroundedPrevs,
 } from '#engine/room/build.ts';
 import { fetchOrNull, type RemoteDeps } from '#engine/room/deps.ts';
-import { admitLocalJoin, projectAfterWrite } from '#engine/room/hooks.ts';
+import { admitLocalJoin } from '#engine/room/hooks.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
-import { ingestInTx, resumeWaits } from '#engine/room/ingest.ts';
+import { afterRoomCommit, ingestInTx } from '#engine/room/ingest.ts';
 import type { Room, RoomTx } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { aclAllows, assertAcl } from '#engine/room/acl.ts';
@@ -651,11 +651,14 @@ export async function replayRemoteBatch(
     )
   );
   if (prior) {
-    try {
-      await resumeWaits(room, { self, signal });
-    } finally {
-      await projectAfterWrite(room.store, room.id);
-    }
+    await afterRoomCommit(
+      room,
+      self,
+      prior.flatMap((outcome) =>
+        outcome.eventId === null ? [] : [outcome.eventId]
+      ),
+      signal,
+    );
   }
   return prior;
 }
@@ -814,6 +817,7 @@ export async function ingestRemote(
 
   // Evidence may commit in bounded pages before the live batch. Regardless of
   // cancellation or failure, every committed change retains its projection owner.
+  let arrived: string[] = [];
   try {
     deps.signal?.throwIfAborted();
     if (
@@ -1033,20 +1037,14 @@ export async function ingestRemote(
       });
     });
 
-    // A later arrival re-runs what waited for it (R10 — each recheck is a
-    // locked ingest of its own, after this lock released)
-    const hasWaiters = !deps.signal?.aborted && await room.tx(async (tx) => {
-      for (const id of committed.grounded) {
-        if (deps.signal?.aborted) return false;
-        if ((await tx.waits.for(id)).length > 0) return true;
-      }
-      return false;
-    });
-    if (hasWaiters) {
-      await resumeWaits(room, { self: deps.self, signal: deps.signal });
-    }
+    arrived = [
+      ...identified.map((item) => item.eventId),
+      ...acc.evidence.keys(),
+      ...acc.corrupted.keys(),
+      ...committed.grounded,
+    ];
     return committed.outcomes;
   } finally {
-    await projectAfterWrite(room.store, room.id);
+    await afterRoomCommit(room, deps.self, arrived, deps.signal);
   }
 }

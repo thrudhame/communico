@@ -292,11 +292,23 @@ export async function afterLocalCommit(
   eventId: string,
   self: string,
 ): Promise<void> {
-  const hasWaiters = await room.tx(async (tx) =>
-    (await tx.waits.for(eventId)).length > 0
-  );
-  if (hasWaiters) await resumeWaits(room, { self });
-  await projectAfterWrite(room.store, room.id);
+  await afterRoomCommit(room, self, [eventId]);
+}
+
+// Every arrival-capable composition completes the same durable dependency
+// queue before projection, including history and snapshot evidence. Call only
+// after releasing the room lock; recovery acquires it for each eligible job.
+export async function afterRoomCommit(
+  room: Room,
+  self: string,
+  arrived: readonly string[] = [],
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    await resumeWaits(room, { self, signal }, arrived);
+  } finally {
+    await projectAfterWrite(room.store, room.id);
+  }
 }
 
 // The tx-scoped core: the caller holds the room lock and composes (the
@@ -945,78 +957,116 @@ async function storePending(
   };
 }
 
-// The recheck driver (R10, old ruling B): waiting work is re-run when
-// what it missed arrives — a pending event whose prevs all ground now is
-// re-ingested (each in its own locked transaction, oldest first; an
-// accepted one re-runs ITS waiters in turn) and a waiting redaction
-// whose target is now held gets its effect evaluated. No fetching here
-// (the network is the caller's layer); a still-ungrounded event keeps
-// waiting, and a failure leaves the wait in place (logged, not fatal).
+// Drain durable ready/retry work plus dependency edges from committed arrivals,
+// never unrelated unresolved history. Newly grounded children feed this owner.
+// Each candidate is revalidated in its own transaction, oldest first; ingest
+// and redaction effects retain the room lock. No network work happens here.
 export async function resumeWaits(
   room: Room,
   deps: { self: string; signal?: AbortSignal },
+  arrived: readonly string[],
 ): Promise<number> {
-  const processed = new Set<string>();
   let resumed = 0;
-  for (;;) {
-    // Remaining waits are durable work for another arrival/startup. Do not
-    // start another turn for abandoned demand; a committed turn remains real.
+  try {
     if (deps.signal?.aborted) return resumed;
-    const job = await room.tx(async (tx) => {
-      for (const wait of await tx.waits.all()) {
-        if (deps.signal?.aborted) return null;
-        if (processed.has(wait.waiting + '|' + wait.kind)) continue;
+    const processed = new Set<string>();
+    const pending = await room.tx(async (tx) => {
+      deps.signal?.throwIfAborted();
+      for (const id of new Set(arrived)) await tx.waits.arrive(id);
+      return await tx.waits.ready();
+    });
+    const enqueue = async (ids: readonly string[]) => {
+      if (deps.signal?.aborted) return;
+      const fresh = [...new Set(ids)];
+      if (fresh.length === 0) return;
+      const waits = await room.tx(async (tx) => {
+        const result: typeof pending = [];
+        for (const id of fresh) {
+          result.push(
+            ...(await tx.waits.for(id)).filter((wait) =>
+              wait.state === 'ready'
+            ),
+          );
+        }
+        return result;
+      });
+      pending.push(...waits);
+      pending.sort((a, b) => {
+        if (a.since !== b.since) return a.since - b.since;
+        for (const key of ['waiting', 'missing', 'kind'] as const) {
+          if (a[key] !== b[key]) return a[key] < b[key] ? -1 : 1;
+        }
+        return 0;
+      });
+    };
+    // The initial ready query already includes every committed arrival. A
+    // subsequent grounding transition must reread its newly ready dependents,
+    // even when that identity was also an input. Only attempted jobs, not
+    // prerequisite identities, are deduplicated for this drain.
+    while (pending.length > 0) {
+      // Cancellation leaves committed readiness for the next arrival/startup.
+      if (deps.signal?.aborted) return resumed;
+      const wait = pending.shift()!;
+      if (processed.has(wait.waiting + '|' + wait.kind)) continue;
+      const job = await room.tx(async (tx) => {
+        deps.signal?.throwIfAborted();
         if (wait.kind === 'prev') {
           const status = await tx.events.getStatus(wait.waiting);
           if (status === null || status.grounding !== 'pending') {
             await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
-            continue;
+            return null;
           }
           const row = await tx.events.get(wait.waiting);
           if (row === null) {
             await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
-            continue;
+            return null;
           }
           const prevIds = (JSON.parse(row.pdu) as Pdu).prev_events ?? [];
-          const missing = await ungroundedPrevs(tx, prevIds);
-          if (missing.length > 0) continue;
+          if ((await ungroundedPrevs(tx, prevIds)).length > 0) {
+            await tx.waits.defer(wait);
+            return null;
+          }
           return { kind: 'prev' as const, eventId: wait.waiting };
         }
         if (wait.kind === 'redaction') {
-          if ((await tx.events.get(wait.missing)) === null) continue;
+          if ((await tx.events.get(wait.missing)) === null) return null;
           return {
             kind: 'redaction' as const,
             eventId: wait.waiting,
             target: wait.missing,
           };
         }
-      }
-      return null;
-    });
-    if (job === null) return resumed;
-    processed.add(job.eventId + '|' + job.kind);
-    try {
+        return null;
+      });
+      if (job === null) continue;
+      processed.add(job.eventId + '|' + job.kind);
+      // Failure leaves the committed ready row for another arrival or startup.
       if (job.kind === 'prev') {
-        await withRoomLock(room.id, () =>
-          room.tx(async (tx) => {
-            deps.signal?.throwIfAborted();
-            const row = await tx.events.get(job.eventId);
-            const status = await tx.events.getStatus(job.eventId);
-            const stay = await tx.segments.openStay();
-            if (row === null || status === null || stay === null) return;
-            const version = await roomVersionOf(tx, stay.id);
-            const pdu = JSON.parse(row.pdu) as Pdu;
-            await ingestInTx(tx, room.id, pdu, {
-              remote: {
-                origin: status.origin ?? '',
-                self: deps.self,
-                // recomputed — the flag is a deterministic function of
-                // the verified bytes and the version, never persisted
-                oversized: oversizedOf(pdu, version),
-                ungroundedMs: 0,
-              },
-            });
-          }));
+        const grounded = await withRoomLock(
+          room.id,
+          () =>
+            room.tx(async (tx) => {
+              deps.signal?.throwIfAborted();
+              const row = await tx.events.get(job.eventId);
+              const status = await tx.events.getStatus(job.eventId);
+              const stay = await tx.segments.openStay();
+              if (row === null || status === null || stay === null) return;
+              const version = await roomVersionOf(tx, stay.id);
+              const pdu = JSON.parse(row.pdu) as Pdu;
+              const result = await ingestInTx(tx, room.id, pdu, {
+                remote: {
+                  origin: status.origin ?? '',
+                  self: deps.self,
+                  // recomputed — the flag is a deterministic function of
+                  // the verified bytes and the version, never persisted
+                  oversized: oversizedOf(pdu, version),
+                  ungroundedMs: 0,
+                },
+              });
+              return result.grounding === 'grounded';
+            }),
+        );
+        if (grounded) await enqueue([job.eventId]);
       } else {
         await withRoomLock(room.id, () =>
           room.tx(async (tx) => {
@@ -1053,10 +1103,11 @@ export async function resumeWaits(
           }));
       }
       resumed++;
-    } catch (e) {
-      if (deps.signal?.aborted && e === deps.signal.reason) return resumed;
-      console.error(`resumeWaits: ${job.kind} ${job.eventId} failed:`, e);
     }
+    return resumed;
+  } catch (error) {
+    if (deps.signal?.aborted && error === deps.signal.reason) return resumed;
+    throw error;
   }
 }
 

@@ -138,7 +138,8 @@ export async function advanceNotificationRead(
   const seq = Number(target.seq);
   await tx.execute(
     `INSERT INTO notification_horizons(user,room,scope,event_seq) VALUES(?,?,?,?)
-    ON CONFLICT(user,room,scope) DO UPDATE SET event_seq=MAX(event_seq,excluded.event_seq)`,
+    ON CONFLICT(user,room,scope) DO UPDATE SET event_seq=excluded.event_seq
+    WHERE excluded.event_seq>notification_horizons.event_seq`,
     [user, room, scope, seq],
   );
   const horizon = Number(

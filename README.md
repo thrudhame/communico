@@ -475,14 +475,86 @@ Writes pause for the consistent whole-store cut, then resume while the bundle is
 assembled. There is no configured backup duration deadline. Use the completed
 bundle, not a copy of live database files or an unfinished private staging tree.
 
-The current baseline keeps storage admission closed through every database
-export. The pause grows with file count and data size: live-traffic measurements
-observed a 15.75-second median at 12 database files, 36.23 seconds at 21 files
-(19 rooms), and 94.49 seconds at 45 files (43 rooms), with a maximum of
-116.20 seconds. The heavy live workload also exposed sync and typing HTTP500
-responses. Sends and sync reads can stall or fail during this baseline operation.
-This is an online backup, not a pause-free one; `pauseMs` reports the actual cut
-rather than a configured deadline.
+The store prepares and retains every source before the common admission fence,
+then pins logical MVCC read snapshots together. SQL export runs after admission
+reopens, including for inactive databases and stores larger than the open-file
+cache. Each source snapshot defers file checkpoints without blocking ordinary
+writers and releases as soon as its export finishes; normal catch-up checkpoints
+then resume. This is an online backup, not a pause-free one; `pauseMs` reports
+the common cut rather than a configured deadline. It does not include later
+file-checkpoint pauses.
+
+The pinned engine's non-experimental checkpoint modes block transactions. After
+an export releases its snapshot, a committing writer can therefore pay the
+accumulated logical-log checkpoint debt, delaying other sends behind that file's
+owner. The measured server catch-up checkpoint took 5.25 seconds on the 43-room
+store, processing 23.59 MB of log after 722.81 seconds of snapshot retention;
+four slow local sends depended on it. This is an accepted, documented limitation,
+not a latency bound: the debt grows with writes during the export. The experimental
+PASSIVE database profile is not enabled.
+
+### Measured online-backup cost
+
+On the retained 43-room workload, the final backup window used the integrated
+R2/main/performance preview tree `04f783db`; the completed no-backup control used
+`ad78332`. The table compares the same clients over 2,190.693 seconds of active
+requests, retaining response tails. The backup naturally ran for 2,313.959 seconds.
+Runtime, process lifetime and the naturally growing database image were not
+identical. All consumers below had zero client errors in both windows. Sync
+timings include the clients' unchanged long polls. These are observed
+distributions, not latency or throughput guarantees.
+
+| #  | Consumer         | No-backup requests | No-backup p50/p95/max (ms)   | Backup requests | Backup p50/p95/max (ms)      |
+| -- | ---------------- | ------------------ | ---------------------------- | --------------- | ---------------------------- |
+| 1  | Element Web send | 1208               | 1319/2190/4021               | 939             | 1773/3327/8958               |
+| 2  | Alice send       | 1239               | 1345.608/2264.142/3982.816   | 971             | 1672.740/3137.641/6299.815   |
+| 3  | Bob send         | 1242               | 1356.333/2237.059/4047.230   | 970             | 1665.370/3251.187/7917.790   |
+| 4  | Carol send       | 1237               | 1296.882/2267.258/4003.003   | 974             | 1671.645/3199.387/9115.358   |
+| 5  | Dave send        | 1240               | 1355.386/2266.429/3999.759   | 983             | 1657.006/3198.789/7796.032   |
+| 6  | Synapse send     | 252                | 8614.398/11822.250/15780.563 | 226             | 9493.243/13807.828/16634.023 |
+| 7  | tuwunel send     | 14001              | 3.664/7.174/84.035           | 13832           | 3.636/7.549/109.124          |
+| 8  | Element Web sync | 1927               | 1012/1658/33991              | 1454            | 1398/2457/25876              |
+| 9  | Alice sync       | 1664               | 1015.654/1640.276/36188.347  | 1289            | 1349.617/2272.299/29834.918  |
+| 10 | Bob sync         | 1731               | 982.984/1583.314/29685.903   | 1330            | 1331.672/2236.265/26257.839  |
+| 11 | Carol sync       | 1733               | 975.124/1592.511/30584.302   | 1348            | 1324.483/2206.473/26851.968  |
+| 12 | Dave sync        | 1750               | 977.817/1597.874/27420.520   | 1324            | 1328.983/2275.370/26731.365  |
+| 13 | Synapse sync     | 700                | 2995.044/4521.799/28549.013  | 629             | 3129.740/5082.597/76276.542  |
+| 14 | tuwunel sync     | 13948              | 12.507/17.590/157.383        | 13771           | 13.095/18.506/103.950        |
+
+The median/p95 increases are accepted online-backup contention costs. The final
+local send maxima were 6.3-9.1 seconds, versus about 4 seconds in the control.
+Live per-send attribution identified four handlers dependent on the 5.25-second
+catch-up checkpoint above; the other 78 local handlers above the control maximum
+had room/projection-owner work or waits without that checkpoint dependency.
+The final window is accepted with the documented checkpoint limitation, not as
+proof of zero backup cost or a worst-case send-latency guarantee.
+
+The 76.277-second Synapse sync maximum was its first initial sync against stock
+Synapse, returning 903 timeline events. During that interval communico completed
+191 overlapping sync handlers, all HTTP 200, with a 29.802-second maximum; no
+recorded checkpoint overlapped. This attributes the measured maximum to the
+stock-peer sync response boundary, not to a communico sync handler. Stock-peer
+internal timing and indirect shared-host contention were not isolated.
+
+The loaded backup CLI took 2,313.757 seconds: snapshot/export took 1,647.473
+seconds and the remaining audits, media, hashing, fsync, publication and CLI
+work took 666.284 seconds. The common fence was 80.973 ms. Snapshot/private
+export and immutable database audits dominated; overlapping native timings
+cannot be added as exclusive wall-time shares. A separate static export took
+135.154 seconds on an earlier 525,185,024-byte cut in another guest; the loaded
+cut was 841,687,040 bytes. The static figure times export, not the whole CLI,
+and is not a controlled whole-command speed comparison.
+
+Size the service's file-descriptor limit for the complete backup inventory, not
+`store.maxopenfiles`: a common cut must retain every room, tenant and the server
+file simultaneously, including retired files not yet removed. On the qualified
+Linux/Turso build, each newly opened source uses five descriptors (1/10/43 sources
+used 5/50/215 additional descriptors). Budget at least `5 * (rooms + tenants + 1)`
+for sources alone, plus export targets, HTTP connections, logs and runtime files;
+already-open sources share their native owner. Inspect the running process's
+`/proc/<pid>/limits` and peak `/proc/<pid>/fd` count under normal traffic and a
+backup, and set the supervisor's `LimitNOFILE` or launch-shell `ulimit -n`
+accordingly. `maxopenfiles` only sizes the ordinary idle cache, not this cut.
 
 The format-1 bundle includes database files, signing private keys, password
 hashes, uploaded local media, effective configuration, the original operator
@@ -554,11 +626,26 @@ resumes with normal semantics; there is no additional approval flag.
 An older archive cannot recover post-cut messages, credentials/revocations,
 cancellations, peer acknowledgments or client private keys. Old credentials and
 jobs may revive; external side effects may repeat. Restored OTK/fallback pools
-are cleared so clients can refill them. Ordinary sync receives a fresh recovery
+are cleared so clients can refill them. The server reports an explicit empty
+unused-fallback list, but retained clients may wait for their normal rotation:
+matrix-sdk-crypto 0.19.1 replaces an existing fallback only once it is 7 days old.
+Fallback keys are used only when one-time keys run out; devices can refill OTKs
+while their server fallback pool remains empty until client rotation. Archived
+fallback keys are never republished because they may already have been used.
+Do not reset client crypto stores or change clocks to force rotation.
+Ordinary sync receives a fresh recovery
 identity, sliding positions expire, and peers receive device-list resnapshot
 resets. Keep clients' crypto stores. These mechanisms do not reconstruct lost
-private keys or guarantee that every newer client cache will converge. The
-report records sanitation, pending work and these security/RPO implications.
+private keys. Ordinary recovery sends admitted restored state at an empty,
+limited timeline boundary; archived history remains available by pagination.
+Clients can still display rooms created after the cut and account-data types
+first written after it: the archive cannot name those objects to remove them
+from newer caches. Before optional signout, have clients securely preserve their
+private crypto stores and recovery secrets; the server cannot export those stores.
+An operator can then optionally use existing device/token
+revocation to sign users out so clients drop these caches on next login. This
+is never automatic.
+The report records sanitation, pending work and these security/RPO implications.
 
 ## Operator tools
 

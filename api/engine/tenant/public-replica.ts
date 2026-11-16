@@ -6,9 +6,10 @@ import { config } from '#engine/config.ts';
 import { splitId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import { signingViews } from './cross-signing.ts';
 import { deviceSnapshot, type Json, object } from './e2ee.ts';
-import { profileRow, setProfileRow } from './profiles.ts';
+import { profileRow, replaceProfileRows } from './profiles.ts';
 
 export type PublicUserReplica = {
   version: 1;
@@ -179,24 +180,23 @@ export async function installPublicUser(
     );
   }
   await conn.execute(
-    'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET display_name=NULL,avatar_url=NULL,deactivated=excluded.deactivated',
+    'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET deactivated=excluded.deactivated WHERE ' +
+      changedColumns('users', 'deactivated'),
     [localpart, view.deactivated ? 1 : 0],
   );
-  await conn.execute('DELETE FROM profile_fields WHERE localpart=?', [
-    localpart,
-  ]);
-  for (const [key, value] of Object.entries(view.profile)) {
-    await setProfileRow(conn, localpart, key, value);
-  }
-  await conn.execute('DELETE FROM erased_users WHERE localpart=?', [localpart]);
+  await replaceProfileRows(conn, localpart, view.profile);
   if (view.erased !== null) {
     await conn.execute(
-      'INSERT INTO erased_users(localpart,room_cuts) VALUES(?,?)',
+      'INSERT INTO erased_users(localpart,room_cuts) VALUES(?,?) ON CONFLICT(localpart) DO UPDATE SET room_cuts=excluded.room_cuts WHERE ' +
+        changedColumns('erased_users', 'room_cuts'),
       [localpart, canonicalJson(view.erased)],
     );
-  }
+  } else {await conn.execute('DELETE FROM erased_users WHERE localpart=?', [
+      localpart,
+    ]);}
   await conn.execute(
-    'INSERT INTO public_user_replicas(localpart,source_cut,snapshot_json) VALUES(?,?,?) ON CONFLICT(localpart) DO UPDATE SET source_cut=excluded.source_cut,snapshot_json=excluded.snapshot_json',
+    'INSERT INTO public_user_replicas(localpart,source_cut,snapshot_json) VALUES(?,?,?) ON CONFLICT(localpart) DO UPDATE SET source_cut=excluded.source_cut,snapshot_json=excluded.snapshot_json WHERE ' +
+      changedColumns('public_user_replicas', 'source_cut', 'snapshot_json'),
     [localpart, view.cut, encoded],
   );
 }
