@@ -35,12 +35,14 @@ export async function startFacade(lifetime: ServerLifetime) {
       if (!appBound) {
         await openReplicaApp(runtime.store, tenant, {
           requireScope: runtime.requireScope,
+          prepareRoomScope: runtime.prepareRoomScope,
           keyDocument: runtime.keyDocument,
           publicRooms: runtime.publicRooms,
           passwordLogin: runtime.passwordLogin,
           keys: await runtime.verificationKeys(),
           signer: await runtime.requestSigner(),
           ingress: runtime.ingress,
+          profileFanout: runtime.profileFanout,
         });
       }
       appBound = true;
@@ -144,6 +146,7 @@ export async function startFacade(lifetime: ServerLifetime) {
           pairings: runtime.pairings,
           initialize: runtime.initialize,
           status,
+          tenant: runtime.grantedTenant,
           changed: async () => {
             await runtime.changed();
             await compose();

@@ -9,7 +9,11 @@ import type { Conn } from '#engine/store/db.ts';
 import { changedColumns } from '#engine/store/changed.ts';
 import { signingViews } from './cross-signing.ts';
 import { deviceSnapshot, type Json, object } from './e2ee.ts';
-import { profileRow, replaceProfileRows } from './profiles.ts';
+import {
+  materializeProfile,
+  profileOperations,
+  profileRow,
+} from './profiles.ts';
 
 export type PublicUserReplica = {
   version: 1;
@@ -213,8 +217,13 @@ export async function installPublicUser(
   // Terminal status fences profile restoration, not later privacy facts.
   // Like markErased, a terminal account retains its first erasure boundary.
   const terminal = user?.deactivated === 1;
-  if (!terminal) {
-    await replaceProfileRows(
+  // An F1 public snapshot is still evidence, not authority to overwrite an F2
+  // complete-profile register or generate a local semantic export echo.
+  if (
+    !terminal &&
+    (view.deactivated || !(await profileOperations(conn, localpart)).length)
+  ) {
+    await materializeProfile(
       conn,
       localpart,
       view.deactivated ? {} : view.profile,

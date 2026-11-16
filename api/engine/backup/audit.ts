@@ -10,6 +10,7 @@ import { auditTenant } from '#engine/tenant/backup-audit.ts';
 import { auditServer } from '#engine/server/backup-audit.ts';
 import { auditFailure } from './checks.ts';
 import type { Manifest } from './manifest.ts';
+import { auditTables } from './contracts.ts';
 
 export async function auditSnapshot(
   config: Pick<StoreConfig, 'library' | 'checkpointlogbytes'>,
@@ -28,6 +29,7 @@ export async function auditSnapshot(
     const media: { tenant: string; id: string; path: string; size: number }[] =
       [];
     for (const file of snapshot.files) {
+      await snapshot.read(file, (db) => auditTables(db, file.kind));
       if (file.kind === 'server') continue;
       let heads: Record<string, number>;
       if (file.kind === 'rooms') {
