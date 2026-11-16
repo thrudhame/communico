@@ -205,6 +205,77 @@ export async function getEvents(
   return found;
 }
 
+/** Existing immutable rows belong to one room transaction attempt, not a store. */
+export class EventReads {
+  private active = true;
+  private readonly rows = new Map<string, Promise<EventRow | null>>();
+
+  constructor(
+    private readonly conn: Conn,
+    private readonly edges: EdgeOverlay,
+  ) {}
+
+  private check(): void {
+    if (!this.active) {
+      throw new Error('transaction event reader has been released');
+    }
+  }
+
+  release(): void {
+    this.active = false;
+    this.rows.clear();
+  }
+
+  private hold(
+    id: string,
+    loading: Promise<EventRow | null>,
+  ): Promise<EventRow | null> {
+    const pending = loading.then((row) => {
+      // A miss cannot hide a later insert in this same transaction.
+      if (row === null && this.rows.get(id) === pending) this.rows.delete(id);
+      return row;
+    }).catch((error) => {
+      if (this.rows.get(id) === pending) this.rows.delete(id);
+      throw error;
+    });
+    this.rows.set(id, pending);
+    return pending;
+  }
+
+  private read(id: string): Promise<EventRow | null> {
+    this.check();
+    return this.rows.get(id) ??
+      this.hold(id, getEvent(this.conn, id, this.edges));
+  }
+
+  async get(id: string): Promise<EventRow | null> {
+    const row = await this.read(id);
+    this.check();
+    return row === null ? null : { ...row };
+  }
+
+  async list(ids: readonly string[]): Promise<Map<string, EventRow>> {
+    this.check();
+    const wanted = [...new Set(ids)];
+    const missing = wanted.filter((id) => !this.rows.has(id));
+    if (missing.length) {
+      const loading = getEvents(this.conn, missing, this.edges);
+      for (const id of missing) {
+        this.hold(id, loading.then((found) => found.get(id) ?? null));
+      }
+    }
+    const entries = await Promise.all(
+      wanted.map(async (id) => [id, await this.read(id)] as const),
+    );
+    this.check();
+    return new Map(
+      entries.flatMap(([id, row]) =>
+        row === null ? [] : [[id, { ...row }] as const]
+      ),
+    );
+  }
+}
+
 export type AncestryNode = { prevs: string[]; grounded: boolean };
 
 /** Recovery needs held graph facts, not immutable PDU bodies. Genuine after-state
