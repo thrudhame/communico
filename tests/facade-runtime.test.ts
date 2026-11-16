@@ -852,6 +852,18 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       );
       const device = await deviceIdentity(tenant, 'outside', 'outside-device');
       await tenant.tx((tx) =>
+        tx.toDevice.send(
+          device,
+          'logical.test',
+          'm.room_key_request',
+          'cold-runtime-request',
+          'cold-runtime-request-source',
+          [{ user, id: '*', content: { request_id: 'cold-runtime-key' } }],
+          config().e2ee,
+          { enabled: false, maxBytes: 1048576 },
+        )
+      );
+      await tenant.tx((tx) =>
         tx.e2ee.upload(
           device,
           validateUpload(
@@ -1106,6 +1118,86 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
             signatures: Record<string, Record<string, string>>;
           }).signatures[user]['ed25519:outside-device'];
     });
+    // The independent to-device lane must export durable work authored with both
+    // processes closed. Neither this test nor its consumer calls a link adapter.
+    await until(async () => {
+      const sync = await api(
+        'sync?timeout=0',
+        undefined,
+        registered.body.access_token,
+      );
+      return sync.status === 200 && sync.body.to_device.events.some(
+        (event: { type: string; content: { request_id?: string } }) =>
+          event.type === 'm.room_key_request' &&
+          event.content.request_id === 'cold-runtime-key',
+      );
+    });
+    let homeToDeviceCut = 0;
+    await until(async () => {
+      const state =
+        (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status'))
+          .body.result;
+      const stream = state.streams.find((stream: {
+        stream: string;
+        received: { sequence: number };
+        applied: { sequence: number };
+      }) => stream.stream === 'to-device:' + user);
+      homeToDeviceCut = stream?.applied.sequence ?? 0;
+      return homeToDeviceCut > 0 &&
+        stream.received.sequence === homeToDeviceCut;
+    });
+    assertEquals(
+      (await api(
+        'sendToDevice/m.room_key_request/runtime-reply',
+        {
+          messages: {
+            [user]: { 'outside-device': { request_id: 'home-runtime-key' } },
+          },
+        },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    // This exact explicit-device send retains two owner routes and home's empty
+    // expansion. An older wildcard expansion is not evidence of this reply.
+    await until(async () => {
+      const state =
+        (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status'))
+          .body.result;
+      return state.streams.some((stream: {
+        stream: string;
+        applied: { sequence: number };
+      }) =>
+        stream.stream === 'to-device:' + user &&
+        stream.applied.sequence >= homeToDeviceCut + 3
+      );
+    });
+    await edge.stop();
+    const delivered = await open('facade');
+    try {
+      const tenant = await openTenant(delivered, 'logical.test');
+      const device = await deviceIdentity(tenant, 'outside', 'outside-device');
+      const page = await tenant.tx((tx) =>
+        tx.toDevice.deliverSliding(
+          device,
+          'runtime-observation',
+          100,
+          config().e2ee,
+        )
+      );
+      assertEquals(
+        page.events.filter((event) =>
+          event.type === 'm.room_key_request' &&
+          (event.content as { request_id?: string }).request_id ===
+            'home-runtime-key'
+        ).length,
+        1,
+      );
+    } finally {
+      await delivered.close();
+    }
+    edge = await process(file('facade'), 'facade: link/local admin ready');
     const before =
       (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
         .result.scopes.find((scope: { scope: string }) =>
