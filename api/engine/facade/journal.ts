@@ -303,6 +303,9 @@ export class Journal {
     } finally {
       state.revision++;
       state.writing--;
+      // The path registry is weak; the pending owner must retain the whole map,
+      // not merely this stream's state, across the asynchronous transaction.
+      fence.set(id, state);
     }
   }
 

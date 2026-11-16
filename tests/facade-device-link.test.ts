@@ -905,20 +905,40 @@ async function observePublicImport(
   }
   const changed = Promise.withResolvers<void>();
   const errors: unknown[] = [];
+  let targetCut: number | undefined;
+  let observing = Promise.resolve();
+  const observe = () => {
+    observing = observing.then(async () => {
+      const [row] = await (await f.home.server()).query(
+        'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+        ['edge_a', f.bundle.id, 'public:@alice:logical.test'],
+      );
+      if (
+        targetCut !== undefined && row && Number(row.source_cut) >= targetCut
+      ) {
+        changed.resolve();
+      }
+    }).catch((error) => changed.reject(error));
+  };
   const worker = startPublicExports({
     store: f.home,
     tenant: f.ht,
     peer: 'edge_a',
     pairing: f.bundle.id,
-    changed: () => changed.resolve(),
+    changed: observe,
     failed: (error) => errors.push(error),
   });
   try {
     await mutate();
+    targetCut = (await f.ht.tx((tx) => tx.publicReplica.inventory())).cut;
+    // An intermediate creation/key export is not the final mutation's cut.
+    // Observe committed progress only; never manufacture another export/wake.
+    observe();
     // No wake(), coordinator reconciliation or subsequent local mutation.
     await bounded(changed.promise, 3000);
   } finally {
     await worker.close();
+    await observing;
   }
   assertEquals(errors, []);
   const records = (await (await f.home.server()).query(

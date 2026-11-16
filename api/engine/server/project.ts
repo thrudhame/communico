@@ -39,6 +39,7 @@ import {
 import {
   applyPushPublication,
   reconcileNotificationEvent,
+  reconcileNotificationReads,
 } from '#engine/server/notifications.ts';
 
 // The watermark source naming a room's change log (storage plan's
@@ -204,6 +205,7 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
             // this committed cut before pending threaded marks are projected.
             // One sweep per prefix also avoids a whole-room scan per event.
             await reconcileReceiptMarks(tx, roomId);
+            await reconcileNotificationReads(tx, roomId, addedMs);
             const pos = ready[count - 1].change.pos;
             await advance(tx, sourceOf(roomId), pos);
             await advance(tx, 'push-context:' + roomId, pos);
@@ -373,6 +375,7 @@ async function applyHistoricalRelations(
       if (waitingWriters > 0) break;
     }
     await reconcileReceiptMarks(tx, roomId);
+    await reconcileNotificationReads(tx, roomId, now);
     const cursor = end === seed.edges.length
       ? seed.cursor
       : seed.edges[end - 1].pos;
