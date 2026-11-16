@@ -271,6 +271,7 @@ export class JournalClient {
     records: readonly unknown[],
     after: Cut,
     signal?: AbortSignal,
+    head?: Cut,
   ): Promise<Acknowledgement> {
     this.stream(stream, true);
     const value = await this.call('records', {
@@ -284,6 +285,7 @@ export class JournalClient {
       stream: streamOf(stream),
       records,
       after: cutOf(after),
+      ...(head ? { head: cutOf(head) } : {}),
     }, signal);
     return acknowledgement(value.ack);
   }

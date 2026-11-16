@@ -18,6 +18,23 @@ import {
 import type { Tenant } from '#engine/tenant/index.ts';
 import { setProfileRow } from '#engine/tenant/profiles.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
+import { deleteDevicesOfUser } from '#engine/tenant/devices.ts';
+import {
+  deleteAccessTokensOfUser,
+  deleteRefreshTokensOfUser,
+} from '#engine/tenant/auth.ts';
+import { deletePushersOfUser } from '#engine/tenant/pushers.ts';
+import { clearOpenId } from '#engine/tenant/openid.ts';
+import { clearSigningKeys } from '#engine/tenant/cross-signing.ts';
+import { clearBackup } from '#engine/tenant/key-backup.ts';
+import { clearProfileRows } from '#engine/tenant/profiles.ts';
+import { clearAccountData } from '#engine/tenant/accountdata.ts';
+import { clearFilters } from '#engine/tenant/filters.ts';
+import { clearPushRules } from '#engine/tenant/pushrules.ts';
+import { markErased } from '#engine/tenant/erasure.ts';
+import { recordDeactivation } from '#engine/tenant/session-authority.ts';
+import { config } from '#engine/config.ts';
+import { uiaAction, type UiaAuthorization } from '#engine/tenant/uia.ts';
 
 // Spec appendices: user_id_localpart = 1*user_id_char;
 // user_id_char = DIGIT / a-z / "-" / "." / "=" / "_" / "/" / "+".
@@ -143,6 +160,7 @@ export async function markDeactivated(
     'UPDATE users SET deactivated = 1, display_name = NULL, avatar_url = NULL WHERE localpart = ?',
     [localpart],
   );
+  await nextCounter(conn, 'credential_revision:' + localpart);
   await conn.execute(
     "INSERT INTO account_changes(pos,localpart,kind) VALUES(?,?,'deactivated')",
     [await nextCounter(conn, 'account_changes'), localpart],
@@ -154,10 +172,22 @@ export async function setCredential(
   localpart: string,
   phc: string,
 ): Promise<void> {
+  if (await credentialHash(conn, localpart) === phc) return;
   await conn.execute(
     "INSERT INTO credentials (localpart, kind, hash, salt, params) VALUES (?, 'argon2id', ?, NULL, NULL) ON CONFLICT (localpart) DO UPDATE SET hash = excluded.hash",
     [localpart, phc],
   );
+  await nextCounter(conn, 'credential_revision:' + localpart);
+}
+
+export async function credentialRevision(
+  conn: Conn,
+  localpart: string,
+): Promise<number> {
+  const [row] = await conn.query('SELECT value FROM counters WHERE name=?', [
+    'credential_revision:' + localpart,
+  ]);
+  return Number(row?.value ?? 0);
 }
 
 export async function credentialHash(
@@ -175,7 +205,11 @@ export async function clearCredential(
   conn: Conn,
   localpart: string,
 ): Promise<void> {
-  await conn.execute('DELETE FROM credentials WHERE localpart=?', [localpart]);
+  const changed = await conn.execute(
+    'DELETE FROM credentials WHERE localpart=?',
+    [localpart],
+  );
+  if (changed) await nextCounter(conn, 'credential_revision:' + localpart);
 }
 
 // --- tenant-level behaviour --------------------------------------------------
@@ -286,7 +320,10 @@ export async function verifyUserPassword(
   localpart: string,
   password: string,
 ): Promise<boolean> {
-  const hash = await tenant.tx((tx) => tx.credentials.hash(localpart));
+  const hash = await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'password', localpart });
+    return await tx.credentials.hash(localpart);
+  });
   if (hash === null) return false;
   return verifyPassword(hash, password);
 }
@@ -312,12 +349,17 @@ export async function loginUser(
     ? null
     : await hashToken(refreshToken);
   return await tenant.tx(async (tx) => {
+    // A durable remove-wins tombstone is already a complete refusal. A newer
+    // authentication snapshot cannot restore it, so a stale captured cut must
+    // not mask that terminal result as temporary unavailability. Deactivation
+    // destroys the verifier, so no password can disclose the account's status.
+    if ((await tx.users.byLocalpart(params.localpart))?.deactivated) {
+      throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
+    }
+    await tx.ingress.check({ kind: 'password', localpart: params.localpart });
     const phc = await tx.credentials.hash(params.localpart);
     if (phc === null || !verifyPassword(phc, params.password)) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'invalid username or password');
-    }
-    if ((await tx.users.byLocalpart(params.localpart))?.deactivated) {
-      throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account deactivated');
     }
     await tx.devices.upsert(
       params.deviceId,
@@ -398,27 +440,28 @@ export async function changePassword(
   tenant: Tenant,
   localpart: string,
   newPassword: string,
-  opts: { keepToken?: string; logoutDevices: boolean },
+  opts: {
+    keepToken?: string;
+    logoutDevices: boolean;
+    authorization?: UiaAuthorization;
+  },
 ): Promise<void> {
   const keepHash = opts.keepToken === undefined
     ? null
     : await hashToken(opts.keepToken);
   await tenant.tx(async (tx) => {
+    if (opts.authorization) {
+      await tx.uia.authorize(opts.authorization, {
+        localpart,
+        action: uiaAction('password', {
+          password: newPassword,
+          logoutDevices: opts.logoutDevices,
+        }),
+      });
+    }
     await tx.credentials.set(localpart, hashPassword(newPassword));
     if (!opts.logoutDevices) return;
-    let keepDevice: string | null = null;
-    if (keepHash !== null) {
-      const keep = await tx.tokens.byHash(keepHash);
-      if (keep !== null && keep.localpart === localpart) {
-        keepDevice = keep.device_id;
-      }
-    }
-    for (const token of await tx.tokens.ofUser(localpart)) {
-      if (keepHash !== null && token.token === keepHash) continue;
-      await tx.pushers.deleteForToken(token.token);
-      await tx.refresh.deleteForAccessToken(token.token);
-      await tx.tokens.delete(token.token);
-    }
+    const keepDevice = await tx.tokens.deleteOthers(localpart, keepHash);
     for (const device of await tx.devices.ofUser(localpart)) {
       if (keepDevice !== null && device.device_id === keepDevice) continue;
       await tx.devices.delete(device.device_id, localpart);
@@ -432,30 +475,59 @@ export async function deactivateUser(
   tenant: Tenant,
   localpart: string,
   erasureCuts?: Record<string, ErasureCut>,
+  authorization?: UiaAuthorization,
 ): Promise<void> {
   await tenant.tx(async (tx) => {
-    if (erasureCuts !== undefined) {
-      await tx.erasure.mark(localpart, erasureCuts);
+    if (authorization) {
+      await tx.uia.authorize(authorization, {
+        localpart,
+        action: uiaAction('deactivate', { erase: erasureCuts !== undefined }),
+      });
     }
-    await tx.pushers.deleteForUser(localpart);
-    await tx.openid.clear(localpart);
-    await tx.refresh.deleteForUser(localpart);
-    await tx.tokens.deleteForUser(localpart);
-    await tx.devices.deleteForUser(localpart);
-    await tx.crossSigning.clear(
-      localpart,
-      '@' + localpart + ':' + tenant.serverName,
-    );
-    await tx.keyBackup.clear(localpart);
-    await tx.profiles.clear(localpart);
-    if (erasureCuts !== undefined) {
-      await tx.accountData.clear(localpart);
-      await tx.filters.clear(localpart);
-      await tx.pushRules.clear(localpart);
-      await tx.credentials.clear(localpart);
-    }
-    await tx.users.markDeactivated(localpart);
+    await tx.users.deactivate(localpart, tenant.serverName, erasureCuts);
   });
+}
+
+/** One cleanup owner for local deactivation and imported remove-wins status.
+ * Numeric erasure cuts remain local; they are never copied from another store. */
+export async function deactivateUserRows(
+  conn: Conn,
+  server: string,
+  localpart: string,
+  erasureCuts?: Record<string, ErasureCut>,
+  imported = false,
+): Promise<void> {
+  if (!imported) {
+    await recordDeactivation(conn, localpart, erasureCuts !== undefined);
+  }
+  if (erasureCuts !== undefined) await markErased(conn, localpart, erasureCuts);
+  await deletePushersOfUser(conn, localpart);
+  await clearOpenId(conn, localpart);
+  await deleteRefreshTokensOfUser(conn, localpart, !imported);
+  await deleteAccessTokensOfUser(conn, localpart, !imported);
+  await deleteDevicesOfUser(conn, localpart, !imported);
+  await clearSigningKeys(
+    conn,
+    localpart,
+    '@' + localpart + ':' + server,
+    config().federation.bulkmaxbytes,
+  );
+  await clearBackup(conn, localpart);
+  await clearProfileRows(conn, localpart);
+  // Private account state is removed on every deactivation. The erase flag
+  // separately controls viewer-specific pruning of public room history.
+  await clearAccountData(conn, localpart);
+  await clearFilters(conn, localpart);
+  await clearPushRules(conn, localpart);
+  // A deactivated account never retains a usable verifier, even without erase.
+  await clearCredential(conn, localpart);
+  await markDeactivated(conn, localpart);
+  // Local requests and imported account/session facts commit the same durable
+  // work root with their cleanup. Replays do not erase it or downgrade erasure.
+  await conn.execute(
+    'INSERT INTO deactivation_work(localpart,erase) SELECT localpart,? FROM users WHERE localpart=? AND deactivated=1 ON CONFLICT(localpart) DO UPDATE SET erase=excluded.erase WHERE deactivation_work.erase=0 AND excluded.erase=1',
+    [erasureCuts === undefined ? 0 : 1, localpart],
+  );
 }
 
 export async function isDeactivated(

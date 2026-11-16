@@ -4,6 +4,18 @@ import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { splitId } from '#engine/ids.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
+import { openRoom } from '#engine/room/index.ts';
+
+export async function captureErasureCuts(
+  store: Store,
+): Promise<Record<string, ErasureCut>> {
+  const cuts: Record<string, ErasureCut> = {};
+  for (const id of await store.rooms()) {
+    const room = await openRoom(store, id);
+    cuts[id] = await room.tx((tx) => tx.state.erasureCut());
+  }
+  return cuts;
+}
 
 export async function markErased(
   conn: Conn,

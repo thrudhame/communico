@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
+import { seedLegacySession } from '#tests/fixtures/legacy-session.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import {
   consumeRefreshToken,
@@ -185,8 +186,12 @@ Deno.test('push targets: supported v13 upgrade preserves registration/token/iden
   try {
     let tenant = await openTenant(store, 'test', { create: true });
     const key = tenant.publicB64;
-    await tenant.tx((tx) => tx.users.insert('bob', 'Bob'));
-    const token = await issueToken(tenant, 'bob', 'B');
+    const token = await seedLegacySession(
+      await store.tenant('test'),
+      'bob',
+      'B',
+      'Bob',
+    );
     const db = await store.tenant('test');
     const hash = (await db.query('SELECT token FROM access_tokens'))[0].token;
     await db.execute('INSERT INTO pushers VALUES(?,?,?,?,?,?,?,?,?,?)', [

@@ -3,7 +3,7 @@ import { theApp } from '#engine/app.ts';
 import { decodePasswordRequest } from '#engine/tenant/session-request.ts';
 import { changePassword } from '#engine/tenant/users.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
-import { PASSWORD_FLOWS, requireUia } from '#engine/tenant/uia.ts';
+import { PASSWORD_FLOWS, requireUia, uiaAction } from '#engine/tenant/uia.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
 // POST /_matrix/client/v3/account/password — "Changes the password for an
@@ -18,10 +18,12 @@ export default async function (request: PathfinderRequest, context: Context) {
     await parseJson(request),
   );
   const caller = context.state.user as string;
-  await requireUia(theApp().tenant, {
+  const authorization = await requireUia(theApp().tenant, {
     body,
     flows: PASSWORD_FLOWS,
     caller,
+    token: context.state.token,
+    action: uiaAction('password', { password, logoutDevices }),
   });
   await changePassword(
     theApp().tenant,
@@ -30,6 +32,7 @@ export default async function (request: PathfinderRequest, context: Context) {
     {
       keepToken: context.state.token,
       logoutDevices,
+      authorization,
     },
   );
   return {};

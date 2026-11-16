@@ -26,6 +26,7 @@ import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import { homePublicKeys, type Pairings } from './pairing.ts';
+import { changeSigningAuthority, signingFence } from './signing-authority.ts';
 import {
   integer,
   LinkError,
@@ -435,8 +436,38 @@ export class FacadeKeys {
       serverName: this.signer.serverName,
       keyId: this.signer.keyId,
       sign: async (canonical) => {
-        await this.document();
-        return await this.signer.sign(canonical);
+        return await (await this.prepareSigner()).sign(canonical);
+      },
+    };
+  }
+
+  /** Capture outside room transactions. The resulting byte signer checks only
+   * the approved deadline and process-local control fence, before and after crypto.
+   * A changed authority discards an in-flight signature rather than publishing it. */
+  async prepareSigner(): Promise<Signer> {
+    const unchanged = signingFence(this.db);
+    unchanged();
+    const document = await this.document();
+    unchanged();
+    const deadline = document.valid_until_ts;
+    const check = () => {
+      unchanged();
+      if (Date.now() >= deadline) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'offline signing validity expired',
+        );
+      }
+    };
+    return {
+      serverName: this.signer.serverName,
+      keyId: this.signer.keyId,
+      sign: async (canonical) => {
+        check();
+        const signature = await this.signer.sign(canonical);
+        check();
+        return signature;
       },
     };
   }
@@ -596,45 +627,53 @@ export class FacadeKeys {
     return await writeRoster(
       this.db,
       () =>
-        journal.apply('home', stream, async (conn, current) => {
-          if (current.hash !== record.hash) {
-            throw new LinkError('LINK_DIVERGED', 'control apply raced');
-          }
-          const [binding] = await conn.query(
-            "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
-            [context.id],
-          );
-          if (
-            binding?.state !== 'paired' ||
-            Number(binding.revision) !== grant.body.revision
-          ) {
-            throw new LinkError('LINK_UNPAIRED', 'control grant changed', 403);
-          }
-          const [held] = await conn.query(
-            'SELECT revision,roster_json FROM facade_key_roster WHERE singleton=1',
-          );
-          if (
-            Number(held.revision) > body.revision ||
-            (Number(held.revision) === body.revision &&
-              held.roster_json !== encoded)
-          ) {
-            throw new LinkError(
-              'LINK_DIVERGED',
-              'regressing or changed control revision',
-            );
-          }
-          if (document || Number(held.revision) !== body.revision) {
-            await conn.execute(
-              'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=?,issued_ms=NULL WHERE singleton=1',
-              [
-                body.revision,
-                encoded,
-                document ? canonicalJson(document) : null,
-              ],
-            );
-          }
-          return { revision: body.revision };
-        }),
+        changeSigningAuthority(
+          this.db,
+          () =>
+            journal.apply('home', stream, async (conn, current) => {
+              if (current.hash !== record.hash) {
+                throw new LinkError('LINK_DIVERGED', 'control apply raced');
+              }
+              const [binding] = await conn.query(
+                "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
+                [context.id],
+              );
+              if (
+                binding?.state !== 'paired' ||
+                Number(binding.revision) !== grant.body.revision
+              ) {
+                throw new LinkError(
+                  'LINK_UNPAIRED',
+                  'control grant changed',
+                  403,
+                );
+              }
+              const [held] = await conn.query(
+                'SELECT revision,roster_json FROM facade_key_roster WHERE singleton=1',
+              );
+              if (
+                Number(held.revision) > body.revision ||
+                (Number(held.revision) === body.revision &&
+                  held.roster_json !== encoded)
+              ) {
+                throw new LinkError(
+                  'LINK_DIVERGED',
+                  'regressing or changed control revision',
+                );
+              }
+              if (document || Number(held.revision) !== body.revision) {
+                await conn.execute(
+                  'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=?,issued_ms=NULL WHERE singleton=1',
+                  [
+                    body.revision,
+                    encoded,
+                    document ? canonicalJson(document) : null,
+                  ],
+                );
+              }
+              return { revision: body.revision };
+            }),
+        ),
     );
   }
 

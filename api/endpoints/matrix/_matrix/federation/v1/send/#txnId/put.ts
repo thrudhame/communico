@@ -33,6 +33,7 @@ export default async function (
     request.params.txnId as string,
     body,
     transactionDeps(),
+    request._raw.signal,
   );
   return result.body;
 }

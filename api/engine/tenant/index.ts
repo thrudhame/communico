@@ -12,6 +12,11 @@ import type { Pdu } from '#engine/pdu.ts';
 import { tenantSchema } from '#engine/tenant/schema.ts';
 import * as accountdata from '#engine/tenant/accountdata.ts';
 import * as auth from '#engine/tenant/auth.ts';
+import type { AuthIntent, IngressAuthority } from '#engine/tenant/ingress.ts';
+import {
+  recordLogoutBarrier,
+  requireSessionAuthority,
+} from '#engine/tenant/session-authority.ts';
 import * as devices from '#engine/tenant/devices.ts';
 import * as e2ee from '#engine/tenant/e2ee.ts';
 import * as crossSigning from '#engine/tenant/cross-signing.ts';
@@ -90,6 +95,7 @@ export async function signingKeyVersionFor(
 }
 
 export type Tenant = {
+  readonly ingress?: IngressAuthority;
   // The server name the tenant file was opened with.
   readonly serverName: string;
   // The key-derived native name (base32 of the public key).
@@ -119,13 +125,21 @@ function bind(
   conn: Conn,
   changed: () => void = () => {},
   projectionChanged: () => void = () => {},
+  ingress?: import('./ingress.ts').PreparedIngressAuthority,
 ) {
+  const authorize = async (intent: AuthIntent) => {
+    await ingress?.check(conn, intent);
+    if (intent.kind === 'session') {
+      await requireSessionAuthority(conn, intent.hash, intent.refresh);
+    }
+  };
   const mutation = async <T>(operation: Promise<T>): Promise<T> => {
     const value = await operation;
     projectionChanged();
     return value;
   };
   return {
+    ingress: { check: authorize },
     publicReplica: {
       users: () => publicReplica.publicUsers(conn),
       inventory: () => publicReplica.publicInventory(conn),
@@ -373,6 +387,11 @@ function bind(
         mutation(profiles.clearProfileRows(conn, localpart)),
     },
     users: {
+      deactivate: (
+        localpart: string,
+        server: string,
+        cuts?: Record<string, ErasureCut>,
+      ) => mutation(users.deactivateUserRows(conn, server, localpart, cuts)),
       exists: (localpart: string) => users.userExists(conn, localpart),
       insert: (localpart: string, displayName: string) =>
         mutation(users.insertUser(conn, localpart, displayName)),
@@ -397,26 +416,56 @@ function bind(
         localpart: string,
         displayName: string | null,
       ) =>
-        mutation(
-          devices.upsertDeviceRow(conn, deviceId, localpart, displayName),
-        ),
+        (async () => {
+          await authorize({ kind: 'device', localpart, deviceId });
+          await mutation(
+            devices.upsertDeviceRow(conn, deviceId, localpart, displayName),
+          );
+        })(),
       byId: (deviceId: string, localpart: string) =>
         devices.deviceById(conn, deviceId, localpart),
+      exists: (deviceId: string, localpart: string) =>
+        devices.deviceExists(conn, deviceId, localpart),
       ofUser: (localpart: string) => devices.devicesOfUser(conn, localpart),
-      rename: (deviceId: string, localpart: string, displayName: string) =>
-        mutation(devices.renameDevice(conn, deviceId, localpart, displayName)),
+      rename: async (
+        deviceId: string,
+        localpart: string,
+        displayName: string,
+      ) => {
+        await authorize({ kind: 'device', localpart, deviceId });
+        return await mutation(
+          devices.renameDevice(conn, deviceId, localpart, displayName),
+        );
+      },
       delete: (deviceId: string, localpart: string) =>
         mutation(devices.deleteDevice(conn, deviceId, localpart)),
       deleteForUser: (localpart: string) =>
         mutation(devices.deleteDevicesOfUser(conn, localpart)),
     },
     tokens: {
+      deleteOthers: (localpart: string, keepHash: string | null) =>
+        auth.deleteOtherTokens(conn, localpart, keepHash),
+      barrier: (localpart: string) => recordLogoutBarrier(conn, localpart),
       insert: (
         hash: string,
         localpart: string,
         deviceId: string | null,
         expiresMs: number | null,
-      ) => auth.insertAccessToken(conn, hash, localpart, deviceId, expiresMs),
+      ) =>
+        (async () => {
+          await authorize(
+            deviceId === null
+              ? { kind: 'account', localpart }
+              : { kind: 'device', localpart, deviceId },
+          );
+          await auth.insertAccessToken(
+            conn,
+            hash,
+            localpart,
+            deviceId,
+            expiresMs,
+          );
+        })(),
       byHash: (hash: string) => auth.accessTokenByHash(conn, hash),
       ofUser: (localpart: string) => auth.accessTokensOfUser(conn, localpart),
       ofDevice: (deviceId: string, localpart: string) =>
@@ -431,7 +480,21 @@ function bind(
         localpart: string,
         deviceId: string | null,
         accessHash: string,
-      ) => auth.insertRefreshToken(conn, hash, localpart, deviceId, accessHash),
+      ) =>
+        (async () => {
+          await authorize({
+            kind: 'session',
+            hash: accessHash,
+            refresh: false,
+          });
+          await auth.insertRefreshToken(
+            conn,
+            hash,
+            localpart,
+            deviceId,
+            accessHash,
+          );
+        })(),
       byHash: (hash: string) => auth.refreshTokenByHash(conn, hash),
       delete: (hash: string) => auth.deleteRefreshToken(conn, hash),
       deleteForAccessToken: (accessHash: string) =>
@@ -444,8 +507,17 @@ function bind(
         auth.replaceRefreshToken(conn, hash, nextHash, accessHash),
     },
     uia: {
-      insert: (session: string, flows: { stages: string[] }[]) =>
-        uia.insertUiaSession(conn, session, flows),
+      capture: (request: Parameters<typeof uia.captureUiaState>[1]) =>
+        uia.captureUiaState(conn, request, authorize),
+      authorize: (
+        authorization: uia.UiaAuthorization,
+        expected?: { localpart: string; action: uia.UiaAction },
+      ) => uia.authorizeUia(conn, authorization, authorize, expected),
+      insert: (
+        session: string,
+        flows: { stages: string[] }[],
+        binding?: string | null,
+      ) => uia.insertUiaSession(conn, session, flows, binding),
       byId: (session: string) => uia.uiaSessionById(conn, session),
       complete: (session: string, stages: string[]) =>
         uia.completeUiaSessionStages(conn, session, stages),
@@ -701,6 +773,7 @@ export async function provisionTenant(
   store: Store,
   serverName: string,
   identity: { keyId: string; publicB64: string; privateB64: string },
+  options: { ingress?: IngressAuthority } = {},
 ): Promise<Tenant> {
   if (!/^ed25519:[A-Za-z0-9_]+$/.test(identity.keyId)) {
     throw new Error('invalid provisioned tenant identity key ID');
@@ -751,13 +824,13 @@ export async function provisionTenant(
       ],
     );
   });
-  return await openTenant(store, serverName);
+  return await openTenant(store, serverName, options);
 }
 
 export async function openTenant(
   store: Store,
   serverName: string,
-  options: { create?: boolean } = {},
+  options: { create?: boolean; ingress?: IngressAuthority } = {},
 ): Promise<Tenant> {
   const db = await store.tenant(serverName, options);
   const { row, privateKey } = await db.tx(async (conn) => {
@@ -812,6 +885,7 @@ export async function openTenant(
     await pendingTenantProjection(db),
   );
   return {
+    ingress: options.ingress,
     serverName,
     nativeName: String(row.native_name),
     keyId: 'ed25519:' + String(row.key_id),
@@ -831,6 +905,10 @@ export async function openTenant(
       },
     }),
     tx: async (fn) => {
+      const ingress = options.ingress &&
+        ('prepare' in options.ingress
+          ? await options.ingress.prepare()
+          : options.ingress);
       const { result, changed, projectionRevision } = await db.tx(
         async (conn) => {
           let changed = false;
@@ -839,7 +917,7 @@ export async function openTenant(
             changed = true;
           }, () => {
             projectionChanged = true;
-          }));
+          }, ingress));
           const projectionRevision = projectionChanged
             ? await recordTenantProjection(conn)
             : 0;

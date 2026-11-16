@@ -2,6 +2,7 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
 import { adminCall } from './admin-client.ts';
 import { bounded, pause } from './helpers/server-process.ts';
+import { ColdAuthTimings } from './helpers/cold-auth-timings.ts';
 import { facadeTls } from './support/facade-tls.ts';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -12,6 +13,17 @@ import { listedRooms } from '#engine/server/directory.ts';
 import { makeServer, seedServer } from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
 import { setConfigForTests } from '#engine/config.ts';
+import { loginUser, verifyUserPassword } from '#engine/tenant/users.ts';
+import { lookupToken } from '#engine/tenant/auth.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { membershipOf } from '#engine/room/membership.ts';
+import { loadNode } from '#engine/facade/identity.ts';
+import { redact } from '#engine/eventid.ts';
+import {
+  b64decode,
+  importPublicKeyFromRaw,
+  verifyJson,
+} from '#engine/signing-primitives.js';
 
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   setConfigForTests({ server: { name: 'logical.test' } });
@@ -585,6 +597,829 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
   }
 });
 
+Deno.test('cold F2 link workers export account cuts and recover facade authority before home ACK', async () => {
+  const tls = await facadeTls();
+  const ports: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
+    ports.push(listener.addr.port);
+    listener.close();
+  }
+  const [homePort, facadePort, linkPort] = ports;
+  const bundlefile = tls.dir + '/auth-bundle.json';
+  const file = (side: string) => tls.dir + '/' + side + '-auth.toml';
+  for (const side of ['home', 'facade']) {
+    await Deno.writeTextFile(
+      file(side),
+      `[server]\nname="logical.test"\nrole="${side}"\nport=${
+        side === 'home' ? homePort : facadePort
+      }\n` +
+        `[store]\ndir="${tls.dir}/${side}-auth-store"\n[media]\nroot="${tls.dir}/${side}-auth-media"\n[admin]\nsocket="${tls.dir}/${side}-auth.sock"\n[federation]\nenabled=false\n` +
+        `[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://127.0.0.1:${linkPort}"\nlinkport=${linkPort}\nlinkcert="${tls.dir}/${side}.crt"\nlinkkey="${tls.dir}/${side}.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\nreconnectmaxseconds=1\n` +
+        (side === 'home' ? `nodes=["edge_a"]\npairfile="${bundlefile}"\n` : ''),
+    );
+  }
+  let home: Awaited<ReturnType<typeof process>> | undefined;
+  let edge: Awaited<ReturnType<typeof process>> | undefined;
+  const api = async (path: string, body?: unknown, token?: string) => {
+    const response = await fetch(
+      `http://127.0.0.1:${homePort}/_matrix/client/v3/${path}`,
+      {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: token ? { authorization: 'Bearer ' + token } : {},
+        body: body === undefined ? undefined : JSON.stringify(body),
+      },
+    );
+    return { status: response.status, body: await response.json() };
+  };
+  const open = (side: string) =>
+    openStore({
+      dir: `${tls.dir}/${side}-auth-store`,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, {
+      schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+    });
+  try {
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await adminCall(tls.dir + '/facade-auth.sock', 'facade/initialize');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    const registration = { username: 'outside', password: 'offline-password' };
+    const challenge = await api('register', registration);
+    const registered = await api('register', {
+      ...registration,
+      auth: { type: 'm.login.dummy', session: challenge.body.session },
+    });
+    assertEquals(registered.status, 200);
+    const paired = await adminCall(tls.dir + '/home-auth.sock', 'facade/pair', {
+      node: 'edge_a',
+      url: `https://127.0.0.1:${linkPort}`,
+      facadePin: tls.facadePin,
+      expires: Date.now() + 60000,
+      bundlefile,
+    });
+    assertEquals(paired.status, 200);
+    assertEquals(
+      (await adminCall(tls.dir + '/facade-auth.sock', 'facade/accept', {
+        bundlefile,
+      })).status,
+      200,
+    );
+    await until(async () => {
+      const response = await adminCall(
+        tls.dir + '/facade-auth.sock',
+        'facade/status',
+      );
+      return response.body.result.scopes.some((
+        scope: { scope: string; ready: boolean },
+      ) => scope.scope === 'auth:@outside:logical.test' && scope.ready);
+    });
+    await home.stop();
+    await edge.stop();
+    const offline = await open('facade');
+    let token: string;
+    try {
+      const tenant = await openTenant(offline, 'logical.test');
+      assertEquals(
+        await verifyUserPassword(tenant, 'outside', 'offline-password'),
+        true,
+      );
+      const session = await loginUser(tenant, {
+        localpart: 'outside',
+        password: 'offline-password',
+        deviceId: 'outside-device',
+        refresh: true,
+      });
+      token = session.accessToken;
+    } finally {
+      await offline.close();
+    }
+    // The mutation happened while both processes were absent. Restart scans
+    // durable owner state; an in-memory notification cannot supply this proof.
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('account/whoami', undefined, token)).status === 503;
+      } catch {
+        return false;
+      }
+    });
+    const before =
+      (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
+        .result.scopes.find((scope: { scope: string }) =>
+          scope.scope === 'auth:@outside:logical.test'
+        ).cut;
+    assertEquals(
+      (await api('logout/all', {}, registered.body.access_token)).status,
+      200,
+    );
+    await until(async () => {
+      const response = await adminCall(
+        tls.dir + '/facade-auth.sock',
+        'facade/status',
+      );
+      // One capture may already be in flight at logout; its successor is taken
+      // after that mutation by the account's serialized export owner.
+      return response.body.result.scopes.some((
+        scope: { scope: string; ready: boolean; cut: number },
+      ) =>
+        scope.scope === 'auth:@outside:logical.test' && scope.ready &&
+        scope.cut > before + 1
+      );
+    });
+    // Captures already queued before logout can advance a numeric cut too.
+    // Observe revocation at the actual authenticated consumer before closing.
+    await until(async () => {
+      const response = await fetch(
+        `http://127.0.0.1:${facadePort}/_matrix/client/v3/account/whoami`,
+        { headers: { authorization: 'Bearer ' + token } },
+      );
+      const body = await response.json();
+      return response.status === 401 && body.errcode === 'M_UNKNOWN_TOKEN';
+    });
+    await home.stop();
+    await edge.stop();
+    const closedHome = await open('home'), closedEdge = await open('facade');
+    try {
+      const [received] = await (await closedHome.server()).query(
+        "SELECT received,applied FROM facade_streams WHERE direction='in' AND stream='authority:@outside:logical.test'",
+      );
+      assert(Number(received.applied) > 0);
+      const [ack] = await (await closedEdge.server()).query(
+        "SELECT result_json FROM facade_records WHERE direction='out' AND stream='authority:@outside:logical.test' AND result_json IS NOT NULL LIMIT 1",
+      );
+      assert(ack);
+      const tenant = await openTenant(closedEdge, 'logical.test');
+      await assertRejects(
+        () => lookupToken(tenant, token),
+        MatrixError,
+        'session authority revoked',
+      );
+    } finally {
+      await closedHome.close();
+      await closedEdge.close();
+    }
+  } finally {
+    await home?.dispose();
+    await edge?.dispose();
+    await tls.close();
+  }
+});
+
+Deno.test('cold F2 public auth uses held authority offline and refuses strict or verifier-off work before effects', async () => {
+  const timings = new ColdAuthTimings();
+  timings.phase('configure and enroll');
+  const tls = await facadeTls();
+  const ports: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
+    ports.push(listener.addr.port);
+    listener.close();
+  }
+  const [homePort, facadePort, linkPort] = ports;
+  const bundlefile = tls.dir + '/public-auth-bundle.json';
+  const file = (side: string) => tls.dir + '/' + side + '-public-auth.toml';
+  const configure = async (side: string, extra = '') => {
+    await Deno.writeTextFile(
+      file(side),
+      `[server]\nname="logical.test"\nrole="${side}"\nport=${
+        side === 'home' ? homePort : facadePort
+      }\n` +
+        `[store]\ndir="${tls.dir}/${side}-public-auth-store"\n[media]\nroot="${tls.dir}/${side}-public-auth-media"\n[admin]\nsocket="${tls.dir}/${side}-public-auth.sock"\n[federation]\nenabled=false\n` +
+        `[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://127.0.0.1:${linkPort}"\nlinkport=${linkPort}\nlinkcert="${tls.dir}/${side}.crt"\nlinkkey="${tls.dir}/${side}.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\nreconnectmaxseconds=1\n` +
+        (side === 'home'
+          ? `nodes=["edge_a"]\npairfile="${bundlefile}"\n`
+          : '') +
+        extra,
+    );
+  };
+  await configure('home');
+  await configure('facade');
+  let home: Awaited<ReturnType<typeof process>> | undefined;
+  let edge: Awaited<ReturnType<typeof process>> | undefined;
+  const api = async (
+    side: 'home' | 'facade',
+    path: string,
+    body?: unknown,
+    token?: string,
+    method = body === undefined ? 'GET' : 'POST',
+  ) => {
+    return await timings.request(side + ' ' + method + ' ' + path, async () => {
+      const response = await fetch(
+        `http://127.0.0.1:${
+          side === 'home' ? homePort : facadePort
+        }/_matrix/client/v3/${path}`,
+        {
+          method,
+          headers: {
+            'content-type': 'application/json',
+            ...(token ? { authorization: 'Bearer ' + token } : {}),
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        },
+      );
+      return { status: response.status, body: await response.json() };
+    });
+  };
+  const login = (device = 'public-device', password = 'offline-password') => ({
+    type: 'm.login.password',
+    identifier: { type: 'm.id.user', user: 'outside' },
+    password,
+    device_id: device,
+    refresh_token: true,
+  });
+  const authTail = async (localparts: string[]) => {
+    // Permissive auth may use a complete older cut. Observe the journal through
+    // its owning process instead; home is stopped so its received tail is finite.
+    // Never open a second store while the child owns its lock.
+    await until(async () => {
+      const status =
+        (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
+          .body.result;
+      return localparts.every((localpart) => {
+        const scope = 'auth:@' + localpart + ':logical.test';
+        const held = status.scopes.find((row: { scope: string }) =>
+          row.scope === scope
+        );
+        const stream = status.streams.find((row: { stream: string }) =>
+          row.stream === scope
+        );
+        return held?.ready && held.pending === null && stream &&
+          stream.received.sequence === stream.applied.sequence &&
+          stream.received.hash === stream.applied.hash;
+      });
+    });
+  };
+  try {
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/initialize');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    const registration = {
+      username: 'outside',
+      password: 'offline-password',
+      device_id: 'home-device',
+    };
+    const challenge = await api('home', 'register', registration);
+    const registered = await api('home', 'register', {
+      ...registration,
+      auth: { type: 'm.login.dummy', session: challenge.body.session },
+    });
+    assertEquals(registered.status, 200);
+    const departureRegistration = {
+      username: 'departure',
+      password: 'offline-password',
+      device_id: 'departure-home-device',
+    };
+    const departureChallenge = await api(
+      'home',
+      'register',
+      departureRegistration,
+    );
+    const departure = await api('home', 'register', {
+      ...departureRegistration,
+      auth: { type: 'm.login.dummy', session: departureChallenge.body.session },
+    });
+    assertEquals(departure.status, 200);
+    const departureRoom = await api('home', 'createRoom', {
+      preset: 'public_chat',
+      room_version: '11',
+    }, departure.body.access_token);
+    assertEquals(departureRoom.status, 200);
+    assertEquals(
+      (await adminCall(tls.dir + '/home-public-auth.sock', 'facade/pair', {
+        node: 'edge_a',
+        url: `https://127.0.0.1:${linkPort}`,
+        facadePin: tls.facadePin,
+        expires: Date.now() + 60000,
+        bundlefile,
+      })).status,
+      200,
+    );
+    assertEquals(
+      (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/accept', {
+        bundlefile,
+      })).status,
+      200,
+    );
+    await until(async () => {
+      const scopes =
+        (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
+          .body.result.scopes;
+      return [
+        'auth:@outside:logical.test',
+        'auth:@departure:logical.test',
+        'room:' + departureRoom.body.room_id,
+      ].every((required) =>
+        scopes.some((scope: { scope: string; ready: boolean }) =>
+          scope.scope === required && scope.ready
+        )
+      );
+    });
+    await home.stop();
+    // Shutdown stops between records; it does not drain the received tail.
+    // With home stopped, restart and observe the actual finite auth apply cut
+    // before proving cold offline login from durable authority.
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await authTail(['outside', 'departure']);
+    assertEquals((await api('facade', 'login')).body, {
+      flows: [{ type: 'm.login.password' }],
+    });
+    const session = await api('facade', 'login', login());
+    assertEquals(session.status, 200, JSON.stringify(session));
+    assertEquals(session.body.device_id, 'public-device');
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        session.body.access_token,
+      )).body.user_id,
+      '@outside:logical.test',
+    );
+    assertEquals(
+      (await api('facade', 'login', login('bad-device', 'wrong'))).status,
+      403,
+    );
+    const foreign = await api('facade', 'login', login('home-device'));
+    assertEquals(foreign, {
+      status: 503,
+      body: {
+        errcode: 'M_UNAVAILABLE',
+        error: 'operation owner unavailable at this ingress',
+      },
+    });
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        registered.body.access_token,
+      )).status,
+      503,
+    );
+    assertEquals(
+      (await api('facade', 'account/whoami', undefined, 'unknown')).status,
+      401,
+    );
+    const rotated = await api('facade', 'refresh', {
+      refresh_token: session.body.refresh_token,
+    });
+    assertEquals(rotated.status, 200);
+    await edge.stop();
+    await configure('facade', 'allowstaleauth=false\n');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    const unavailable = {
+      status: 503,
+      body: {
+        errcode: 'M_UNAVAILABLE',
+        error: 'authentication snapshot unavailable',
+      },
+    };
+    assertEquals(
+      await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        rotated.body.access_token,
+      ),
+      unavailable,
+    );
+    assertEquals(
+      await api('facade', 'refresh', {
+        refresh_token: session.body.refresh_token,
+      }),
+      unavailable,
+    );
+    assertEquals(
+      await api('facade', 'login', login('strict-device')),
+      unavailable,
+    );
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    await until(async () =>
+      (await api(
+        'facade',
+        'login',
+        login('online-strict-device'),
+      )).status === 200
+    );
+    await home.stop();
+    await until(async () =>
+      (await api(
+        'facade',
+        'login',
+        login('offline-strict-probe', 'not-the-password'),
+      )).status === 503
+    );
+    assertEquals(
+      await api('facade', 'login', login('offline-strict-device')),
+      unavailable,
+    );
+    await edge.stop();
+    await configure('facade');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    // The online strict login may have left another finite auth suffix. As at
+    // the first cold restart, listener readiness is not owner apply completion.
+    await authTail(['outside', 'departure']);
+    // Refused GETs and refreshes above must not close the original retry window.
+    const retried = await api('facade', 'refresh', {
+      refresh_token: session.body.refresh_token,
+    });
+    assertEquals(retried.status, 200, JSON.stringify(retried));
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        rotated.body.access_token,
+      )).status,
+      401,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        retried.body.access_token,
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await api('facade', 'refresh', {
+        refresh_token: session.body.refresh_token,
+      })).status,
+      401,
+    );
+    const target = await api('facade', 'login', login('delete-target'));
+    assertEquals(target.status, 200);
+    const deletion = await api('facade', 'delete_devices', {
+      devices: ['delete-target'],
+    }, retried.body.access_token);
+    assertEquals(deletion.status, 401);
+    assertEquals(
+      (await api('facade', 'delete_devices', {
+        devices: ['delete-target'],
+        auth: {
+          type: 'm.login.password',
+          session: deletion.body.session,
+          password: 'offline-password',
+        },
+      }, retried.body.access_token)).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        target.body.access_token,
+      )).status,
+      401,
+    );
+    await edge.stop();
+    await configure('facade', 'replicatecredentials=false\n');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    assertEquals((await api('facade', 'login')).body, { flows: [] });
+    assertEquals(
+      await api('facade', 'login', login('disabled-device')),
+      unavailable,
+    );
+    assertEquals(
+      await api(
+        'facade',
+        'delete_devices',
+        { devices: ['public-device'] },
+        retried.body.access_token,
+      ),
+      unavailable,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        retried.body.access_token,
+      )).status,
+      200,
+    );
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    assertEquals(
+      await api('facade', 'login', login('still-disabled')),
+      unavailable,
+    );
+    assertEquals((await api('facade', 'register', {})).status, 503);
+    assertEquals(
+      (await api('facade', 'createRoom', {}, retried.body.access_token)).status,
+      404,
+    );
+    await edge.stop();
+    await configure('facade');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    // Home controls verifier export independently of the facade's local setting.
+    await home.stop();
+    await configure('home', 'replicatecredentials=false\n');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    // Observe capability withdrawal without issuing new sessions while waiting.
+    // A successful login is a mutation and feeds the account replication loop.
+    await until(async () =>
+      (await api('facade', 'login')).body.flows.length === 0
+    );
+    assertEquals(
+      await api('facade', 'login', login('home-kept-verifier')),
+      unavailable,
+    );
+    await home.stop();
+    await until(async () =>
+      (await api(
+          'facade',
+          'account/whoami',
+          undefined,
+          retried.body.access_token,
+        )).status === 200 &&
+      (await api('facade', 'login')).body.flows.length === 0
+    );
+    assertEquals(
+      await api('facade', 'login', login('home-kept-verifier')),
+      unavailable,
+    );
+    assertEquals((await api('facade', 'login')).body, { flows: [] });
+    await configure('home');
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    await until(async () =>
+      (await api('facade', 'login', login('verifier-restored'))).status === 200
+    );
+    await home.stop();
+    await until(async () =>
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        retried.body.access_token,
+      )).status === 200
+    );
+    const crossDelete = await api(
+      'facade',
+      'devices/home-device',
+      {
+        auth: { type: 'm.login.password', password: 'offline-password' },
+      },
+      retried.body.access_token,
+      'DELETE',
+    );
+    assertEquals(crossDelete.status, 200, JSON.stringify(crossDelete));
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      try {
+        return (await api('home', 'login')).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    await until(async () =>
+      (await api(
+        'home',
+        'account/whoami',
+        undefined,
+        registered.body.access_token,
+      )).status === 401
+    );
+    timings.phase('home deactivation login');
+    const homeLogin = await api('home', 'login', login('later-home-device'));
+    assertEquals(homeLogin.status, 200);
+    timings.phase('home deactivation HTTP commit');
+    assertEquals(
+      (await api('home', 'account/deactivate', {
+        auth: { type: 'm.login.password', password: 'offline-password' },
+      }, homeLogin.body.access_token)).status,
+      200,
+    );
+    timings.phase('facade observes home deactivation');
+    await until(async () =>
+      (await api(
+        'facade',
+        'login',
+        login('after-deactivation'),
+      )).body
+        .errcode === 'M_FORBIDDEN'
+    );
+    timings.phase('home deactivation shutdown');
+    await home.stop();
+    // Home shutdown can finish after another capture was received but before
+    // its independent facade owner commits the apply/result. Drain that cut.
+    timings.phase('facade drains deactivation tail offline');
+    await until(async () =>
+      (await api(
+        'facade',
+        'login',
+        login('offline-deactivated', 'not-the-password'),
+      )).body
+        .errcode ===
+        'M_FORBIDDEN'
+    );
+    assertEquals(
+      (await api('facade', 'login', login('offline-deactivated'))).body.errcode,
+      'M_FORBIDDEN',
+    );
+    // A different served account deactivates at the facade with home absent.
+    // Its worker must sign the actual replicated-room leave, not only revoke
+    // tokens or retain a tenant root. UIA is exercised over public HTTP.
+    const departureLogin = {
+      ...login('departure-edge-device'),
+      identifier: { type: 'm.id.user', user: 'departure' },
+    };
+    // Restart does not itself prove the finite received tail has been applied.
+    timings.phase('departure facade restart');
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    timings.phase('departure auth tail');
+    await authTail(['departure']);
+    // The preceding verifier-withdrawal/restoration exercise covers every
+    // served account asynchronously. Observe this account's restored verifier
+    // without minting a new session while its last received cut drains.
+    await until(async () =>
+      (await api('facade', 'login', {
+        ...departureLogin,
+        password: 'not-the-password',
+      })).status === 403
+    );
+    timings.phase('departure login and UIA');
+    const departureSession = await api('facade', 'login', departureLogin);
+    assertEquals(
+      departureSession.status,
+      200,
+      JSON.stringify(departureSession),
+    );
+    const departureUia = await api('facade', 'account/deactivate', {
+      erase: true,
+    }, departureSession.body.access_token);
+    assertEquals(departureUia.status, 401, JSON.stringify(departureUia));
+    assertEquals(
+      (await api('facade', 'account/deactivate', {
+        erase: true,
+        auth: {
+          type: 'm.login.password',
+          session: departureUia.body.session,
+          password: 'offline-password',
+        },
+      }, departureSession.body.access_token)).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        departureSession.body.access_token,
+      )).status,
+      401,
+    );
+    timings.phase('departure leave commit and facade shutdown');
+    await edge.stop();
+    const closed = await openStore({
+      dir: tls.dir + '/facade-public-auth-store',
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, {
+      schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
+    });
+    let leaveId: string;
+    try {
+      const room = await openRoom(closed, departureRoom.body.room_id);
+      const member = await membershipOf(room, '@departure:logical.test');
+      assertEquals(member?.membership, 'leave');
+      leaveId = member!.eventId;
+      const event = await room.tx((tx) => tx.events.get(leaveId));
+      assert(event);
+      const pdu = JSON.parse(event.pdu);
+      assertEquals(pdu.content, { membership: 'leave' });
+      assert(
+        Object.keys(pdu.signatures['logical.test']).some((id) =>
+          id.startsWith('ed25519:edge_a_')
+        ),
+      );
+      const identity = await loadNode(
+        await closed.server(),
+        'logical.test',
+        'edge_a',
+      );
+      const signed = redact(pdu, '11');
+      delete signed.event_id;
+      assert(
+        await verifyJson(
+          signed,
+          'logical.test',
+          identity.keyId,
+          await importPublicKeyFromRaw(b64decode(identity.publicKey)),
+        ),
+      );
+      const forged = {
+        ...signed,
+        signatures: { 'logical.test': { [identity.keyId]: 'A'.repeat(86) } },
+      };
+      assertEquals(
+        await verifyJson(
+          forged,
+          'logical.test',
+          identity.keyId,
+          await importPublicKeyFromRaw(b64decode(identity.publicKey)),
+        ),
+        false,
+      );
+      assertEquals(await room.tx((tx) => tx.segments.openStay()), null);
+    } finally {
+      await closed.close();
+    }
+    timings.phase('departure cold facade refusal');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    assertEquals(
+      (await api('facade', 'login', departureLogin)).body.errcode,
+      'M_FORBIDDEN',
+    );
+    timings.phase('departure home restart');
+    home = await process(file('home'), 'federation: disabled');
+    timings.phase('home observes facade deactivation');
+    await until(async () => {
+      try {
+        return (await api('home', 'login', departureLogin)).body.errcode ===
+          'M_FORBIDDEN';
+      } catch {
+        return false;
+      }
+    });
+  } catch (error) {
+    const owners = await Promise.all(['home', 'facade'].map(async (side) => {
+      try {
+        const status = (await adminCall(
+          tls.dir + '/' + side + '-public-auth.sock',
+          'facade/status',
+        )).body.result;
+        return { side, scopes: status.scopes, streams: status.streams };
+      } catch {
+        return { side, unavailable: true };
+      }
+    }));
+    console.error(
+      'cold auth phase diagnostics',
+      JSON.stringify({
+        phases: timings.snapshot(),
+        owners,
+      }),
+    );
+    throw error;
+  } finally {
+    await home?.dispose();
+    await edge?.dispose();
+    await tls.close();
+  }
+});
+
 async function until(probe: () => Promise<boolean>) {
   const deadline = Date.now() + 20000;
   while (!await probe()) {
@@ -634,8 +1469,7 @@ async function process(config: string, ready: string) {
   }
   return {
     async stop() {
-      if (ended) return;
-      child.kill('SIGTERM');
+      if (!ended) child.kill('SIGTERM');
       const status = await bounded(output);
       assertEquals(status.code, 0, out + '\n' + err);
       assert(out.includes('shutdown: store closed'));

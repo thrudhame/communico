@@ -69,9 +69,10 @@ export async function join(
   const content = { ...profile, ...extra, membership: 'join' };
   const room = await lookupRoom(roomId);
   let result;
-  if (room !== null && await room.tx((tx) => tx.segments.openStay()) !== null) {
+  if (room !== null) {
     try {
-      result = await local.join(room, userId, signer, content);
+      result = await local.joinResident(room, userId, signer, content) ??
+        undefined;
     } catch (error) {
       const code = (error as { errcode?: string }).errcode;
       if (

@@ -6,6 +6,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import type { Fetcher, KeyResolver } from './deps.ts';
 import { identify, verify } from './verify.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
+import { settleAll } from '#engine/net/demand.ts';
 
 export async function fetchBoundaryEvents(
   unknown: readonly string[],
@@ -31,6 +32,7 @@ export async function fetchBoundaryEvents(
   const wanted = new Set(unknown);
   const verification = {
     roomId: opts.roomId,
+    signal: opts.signal,
     exemptPrevAuthLimits: opts.exemptPrevAuthLimits === true,
   };
   // Use recomputed IDs even when a response has an event_id annotation. Held,
@@ -82,7 +84,7 @@ export async function fetchBoundaryEvents(
   for (let start = 0; start < remaining.length; start += opts.concurrency) {
     if (!opts.active()) return null;
     const wave = remaining.slice(start, start + opts.concurrency);
-    await Promise.all(wave.map(async (id) => {
+    await settleAll(wave.map(async (id) => {
       const raw = await opts.read(() =>
         opts.fetcher.event(id, opts.via, opts.roomId, opts.signal)
       );

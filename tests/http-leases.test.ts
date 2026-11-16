@@ -61,7 +61,12 @@ Deno.test('HTTP leases: more rooms than maxopenfiles, idle close, concurrent ten
       });
     };
     for (const room of rooms) await read(room.id);
-    await new Promise((resolve) => setTimeout(resolve, 2600));
+    // App workers may briefly reopen an idle file. Observe the eviction itself
+    // within the existing wait window, not one sample at an unrelated tick.
+    const deadline = Date.now() + 2600;
+    while (app.store.stats().openFiles !== 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
     assertEquals(
       app.store.stats().openFiles,
       0,

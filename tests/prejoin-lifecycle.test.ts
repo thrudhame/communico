@@ -165,6 +165,26 @@ async function fixture(
   }
 }
 
+Deno.test('prejoin: repeated concurrent rejection retains one signed local departure and revision', () =>
+  fixture(async (f) => {
+    await Promise.all(
+      Array.from({ length: 4 }, () => f.reject('account deactivated')),
+    );
+    const before = await inviteFor(f.roomId, f.user, f.deps);
+    assertEquals(before?.status, 'rejecting');
+    assert(before?.localLeaveJson);
+    await rejectInviteRemote(f.roomId, f.user, {
+      ...f.deps,
+      signer: {
+        ...f.deps.signer,
+        sign: () =>
+          Promise.reject(new Error('completed departure must not sign again')),
+      },
+    });
+    assertEquals(await inviteFor(f.roomId, f.user, f.deps), before);
+    assertEquals(before.revision, 2);
+  }));
+
 Deno.test('prejoin: late rejection completion cannot overtake a room publication', () =>
   fixture(async (f) => {
     await f.reject();

@@ -13,6 +13,7 @@ import { assertRestoreReport } from '#engine/backup/report.ts';
 import { bindRole } from '#engine/facade/role.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
+import { startDeactivationWork } from '#engine/deactivation.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { MediaService } from '#engine/media/service.ts';
 import { installRuleMigration } from '#engine/client/rule-migration.ts';
@@ -90,6 +91,7 @@ export type ReplicaAccess = {
   requireScope(scope: string, allowAbsent?: boolean): Promise<void>;
   keyDocument(): Promise<KeyDoc>;
   publicRooms(): Promise<boolean>;
+  passwordLogin?(): Promise<boolean>;
   keys: KeyStore;
   signer: Signer;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
@@ -170,6 +172,15 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       },
     };
     registerToDevice(app.federationEdus, tenant);
+    const deactivation = startDeactivationWork({
+      store,
+      tenant,
+      pollseconds: config().facade.pollseconds,
+      prepareSigner: () => Promise.resolve(tenant.signer()),
+      wake: (destination) => app.sender?.wake(destination),
+      failed: (error) => console.error('account deactivation pending:', error),
+    });
+    services.push(() => deactivation.close());
     current = app;
     app.delayedEvents.wake();
     return app;
