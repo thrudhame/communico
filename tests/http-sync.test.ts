@@ -782,6 +782,7 @@ suite.test('backfilled history never appears as new in HTTP sync', async () => {
     limit: 20,
     via: fr.server.name,
   }, {
+    self: 'localhost',
     keys,
     fetcher: transport.fetcher,
   });
@@ -891,11 +892,33 @@ suite.test('long poll wakes on relevant projections and committed tenant changes
   );
   const room = await openRoom(app.store, roomId);
   let before = await sync(alice.access_token!);
+  const controller = new AbortController();
+  const setTimeout = globalThis.setTimeout;
+  // A deadlock watchdog, not a send/render latency promise. Disable only the
+  // shared wait owner's polling callbacks so neither wake can pass by polling.
+  const watchdog = setTimeout(() => controller.abort(), 30000);
+  let pollingTimers = 0;
+  const pollingCallbacks: (() => void)[] = [];
+  globalThis.setTimeout = ((
+    callback: Parameters<typeof setTimeout>[0],
+    delay?: number,
+    ...args: unknown[]
+  ) => {
+    if (new Error().stack?.includes('/api/engine/sync-wait.ts:')) {
+      pollingTimers++;
+      pollingCallbacks.push(() => Reflect.apply(callback, globalThis, args));
+      return setTimeout(() => {}, delay);
+    }
+    return Reflect.apply(setTimeout, globalThis, [callback, delay, ...args]);
+  }) as typeof setTimeout;
   const longPoll = (since: unknown) =>
     suite.matrix(
       new Request(
-        'http://x/_matrix/client/v3/sync?timeout=3000&since=' + since,
-        { headers: { Authorization: `Bearer ${alice.access_token}` } },
+        'http://x/_matrix/client/v3/sync?timeout=30000&since=' + since,
+        {
+          headers: { Authorization: `Bearer ${alice.access_token}` },
+          signal: controller.signal,
+        },
       ),
     ).then((r) => r.json() as Promise<Json>);
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -904,46 +927,50 @@ suite.test('long poll wakes on relevant projections and committed tenant changes
     finished = true;
     return body;
   });
-  await sleep(60);
-  await putAccountData(app.tenant, 'sy-unrelated', '', 'other.test', {});
-  await sleep(60);
-  assertEquals(
-    finished,
-    false,
-    'unrelated account data must not complete this sync',
-  );
-  let start = performance.now();
-  const sent = await sendLocal(room, {
-    type: 'm.room.message',
-    sender: alice.user_id,
-    content: { body: 'wake' },
-  }, signer);
-  const projected = await waiting;
-  assert(
-    performance.now() - start < 450,
-    'projection wake must beat the polling fallback',
-  );
-  assert(
-    ((roomSection(projected, 'join', roomId)!.timeline as Json)
-      .events as Json[]).some((e) => e.event_id === sent.eventId),
-  );
-  before = projected;
-  finished = false;
-  waiting = longPoll(before.next_batch).then((body) => {
-    finished = true;
-    return body;
-  });
-  await sleep(60);
-  start = performance.now();
-  await putAccountData(app.tenant, 'sy-wait', '', 'wake.test', { value: 2 });
-  const account = await waiting;
-  assert(
-    performance.now() - start < 450,
-    'tenant wake must beat the polling fallback',
-  );
-  assertEquals((account.account_data as Json).events, [{
-    type: 'wake.test',
-    content: { value: 2 },
-  }]);
+  try {
+    await sleep(60);
+    await putAccountData(app.tenant, 'sy-unrelated', '', 'other.test', {});
+    await sleep(60);
+    assertEquals(
+      finished,
+      false,
+      'unrelated account data must not complete this sync',
+    );
+    const sent = await sendLocal(room, {
+      type: 'm.room.message',
+      sender: alice.user_id,
+      content: { body: 'wake' },
+    }, signer);
+    const projected = await waiting;
+    assert(
+      ((roomSection(projected, 'join', roomId)!.timeline as Json)
+        .events as Json[]).some((e) => e.event_id === sent.eventId),
+    );
+    before = projected;
+    finished = false;
+    waiting = longPoll(before.next_batch).then((body) => {
+      finished = true;
+      return body;
+    });
+    await sleep(60);
+    await putAccountData(app.tenant, 'sy-wait', '', 'wake.test', { value: 2 });
+    const account = await waiting;
+    assertEquals((account.account_data as Json).events, [{
+      type: 'wake.test',
+      content: { value: 2 },
+    }]);
+    assert(
+      pollingTimers >= 2,
+      'both HTTP waits must exercise disabled polling',
+    );
+  } finally {
+    globalThis.setTimeout = setTimeout;
+    clearTimeout(watchdog);
+    controller.abort();
+    // Let an already disconnected HTTP handler drain too. Waking it here is
+    // cleanup after the assertions/client abort, never evidence of a good wake.
+    for (const callback of pollingCallbacks) callback();
+    await waiting.catch(() => {});
+  }
   void bob;
 });

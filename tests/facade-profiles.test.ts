@@ -4,7 +4,7 @@ import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
 import { getPublicProfile, setProfileField } from '#engine/tenant/profiles.ts';
 import { registerUser } from '#engine/tenant/users.ts';
-import { registerOperations } from '#engine/facade/registers.ts';
+import { readRegister, registerOperations } from '#engine/facade/registers.ts';
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-profiles-' });
@@ -124,6 +124,41 @@ Deno.test('facade profiles: concurrent individually valid large edits select one
     } finally {
       await cold.close();
     }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade profiles: an equal visible write still supersedes observed concurrent alternatives', async () => {
+  const f = await fixture();
+  try {
+    await setProfileField(f.home, 'alice', 'displayname', 'Baseline');
+    for (const op of await f.home.tx((tx) => tx.profiles.operations('alice'))) {
+      await f.edge.tx((tx) => tx.profiles.import(op));
+    }
+    await setProfileField(f.home, 'alice', 'displayname', 'Home');
+    await setProfileField(f.edge, 'alice', 'displayname', 'Edge');
+    for (const op of await f.home.tx((tx) => tx.profiles.operations('alice'))) {
+      await f.edge.tx((tx) => tx.profiles.import(op));
+    }
+    const db = await f.store.tenant(f.edge.serverName);
+    const key = JSON.stringify(['profile', 'alice']);
+    assertEquals(
+      (await db.tx((conn) => readRegister(conn, key))).frontier.length,
+      2,
+    );
+    assertEquals(
+      (await getPublicProfile(f.edge, 'alice'))?.displayname,
+      'Home',
+    );
+    await setProfileField(f.edge, 'alice', 'displayname', 'Home');
+    const selected = await db.tx((conn) => readRegister(conn, key));
+    assertEquals(selected.frontier.length, 1);
+    assertEquals(selected.winner?.source, 'edge');
+    assertEquals(
+      (await getPublicProfile(f.edge, 'alice'))?.displayname,
+      'Home',
+    );
   } finally {
     await f.close();
   }

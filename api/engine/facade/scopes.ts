@@ -1,6 +1,7 @@
 // Cross-file replica completion. A domain commits independently and idempotently;
 // readiness, its terminal result and contiguous journal application commit once.
 import type { Conn, Database } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import type { Journal } from './journal.ts';
 import type { Pairings } from './pairing.ts';
 import { LinkError, type LinkRecord, type Stream } from './protocol.ts';
@@ -59,7 +60,8 @@ export async function applyReplicaScope(options: {
       );
     }
     await conn.execute(
-      'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,0,?) ON CONFLICT(incarnation,scope) DO UPDATE SET ready=0,pending_hash=excluded.pending_hash',
+      'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,0,?) ON CONFLICT(incarnation,scope) DO UPDATE SET ready=0,pending_hash=excluded.pending_hash WHERE ' +
+        changedColumns('facade_scopes', 'ready', 'pending_hash'),
       [context.id, scope, after, record.hash],
     );
   });

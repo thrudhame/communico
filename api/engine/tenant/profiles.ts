@@ -16,6 +16,7 @@ import { tenantAuthority } from './session-authority.ts';
 import { requireTenantDomainSource } from './domain-source.ts';
 import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
 import { recordProfileFanout } from './profile-fanout.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 
 export type Profile = Record<string, unknown> & {
   displayname?: string;
@@ -112,29 +113,9 @@ export async function materializeProfile(
   localpart: string,
   profile: Profile,
 ): Promise<void> {
-  validateProfile(profile);
-  await conn.execute(
-    'UPDATE users SET display_name=?,avatar_url=? WHERE localpart=?',
-    [
-      profile.displayname ?? null,
-      profile.avatar_url ?? null,
-      localpart,
-    ],
-  );
-  await conn.execute('DELETE FROM profile_fields WHERE localpart=?', [
-    localpart,
-  ]);
-  for (const [key, value] of Object.entries(profile)) {
-    if (key === 'displayname' || key === 'avatar_url') continue;
-    await conn.execute(
-      'INSERT INTO profile_fields(localpart,key,value) VALUES(?,?,?)',
-      [
-        localpart,
-        key,
-        JSON.stringify(value),
-      ],
-    );
-  }
+  // The passive legacy representation may contain null unset fields. Normalize
+  // them before validating the complete stored profile, as ordinary writes do.
+  await replaceProfileRows(conn, localpart, profile);
 }
 
 export async function importProfile(
@@ -229,12 +210,7 @@ export async function profileRow(
 
 /** undefined means DELETE; null remains JSON null for custom fields. Legacy
  * null retains the established unset behavior on displayname/avatar_url. */
-export async function setProfileRow(
-  conn: Conn,
-  localpart: string,
-  key: string,
-  value: unknown,
-): Promise<void> {
+function checkField(key: string, value: unknown): void {
   checkProfileKey(key);
   const legacy = key === 'displayname' || key === 'avatar_url';
   // Synapse-compatible defaults: the field type is enforced, but avatar and
@@ -254,13 +230,9 @@ export async function setProfileRow(
       'legacy profile value must be a string or null',
     );
   }
-  const profile = await profileRow(conn, localpart);
-  if (profile === null) {
-    throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
-  }
-  const previous = { ...profile };
-  if (value === undefined || (legacy && value === null)) delete profile[key];
-  else profile[key] = value;
+}
+
+function checkSize(profile: Profile): void {
   if (encoder.encode(JSON.stringify(profile)).length >= 65536) {
     throw new MatrixError(
       400,
@@ -268,10 +240,61 @@ export async function setProfileRow(
       'profile must be under 64 KiB',
     );
   }
+}
+
+async function writeField(
+  conn: Conn,
+  localpart: string,
+  key: string,
+  value: unknown,
+) {
+  if (key === 'displayname' || key === 'avatar_url') {
+    const column = key === 'displayname' ? 'display_name' : 'avatar_url';
+    const stored = typeof value === 'string' ? value : null;
+    await conn.execute(
+      'UPDATE users SET ' + column + '=? WHERE localpart=? AND ' + column +
+        ' IS NOT ?',
+      [stored, localpart, stored],
+    );
+  } else if (value === undefined) {
+    await conn.execute(
+      'DELETE FROM profile_fields WHERE localpart=? AND key=?',
+      [localpart, key],
+    );
+  } else {
+    await conn.execute(
+      'INSERT INTO profile_fields(localpart,key,value) VALUES(?,?,?) ON CONFLICT(localpart,key) DO UPDATE SET value=excluded.value WHERE ' +
+        changedColumns('profile_fields', 'value'),
+      [localpart, key, JSON.stringify(value)],
+    );
+  }
+}
+
+export async function setProfileRow(
+  conn: Conn,
+  localpart: string,
+  key: string,
+  value: unknown,
+): Promise<void> {
+  checkField(key, value);
+  const profile = await profileRow(conn, localpart);
+  if (profile === null) {
+    throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
+  }
+  const previous = { ...profile };
+  const prior = profile[key];
+  if (
+    value === undefined ||
+    ((key === 'displayname' || key === 'avatar_url') && value === null)
+  ) delete profile[key];
+  else profile[key] = value;
+  checkSize(profile);
   const authority = await tenantAuthority(conn);
   if (authority) {
     await activeAccount(conn, localpart);
     await baseline(conn, localpart, previous);
+    // Even an equal public value can observe and supersede concurrent losers.
+    // Passive materialization below still changes only actual field deltas.
     const { winner } = await writeRegister(
       conn,
       { source: authority.node, incarnation: authority.incarnation },
@@ -286,23 +309,41 @@ export async function setProfileRow(
     }
     return;
   }
+  if (
+    registerJson(JSON.stringify(prior ?? null)) ===
+      registerJson(JSON.stringify(profile[key] ?? null)) &&
+    (prior === undefined) === (profile[key] === undefined)
+  ) return;
   await recordProfileFanout(conn, localpart, previous, profile);
-  if (legacy) {
-    const column = key === 'displayname' ? 'display_name' : 'avatar_url';
-    await conn.execute('UPDATE users SET ' + column + '=? WHERE localpart=?', [
-      typeof value === 'string' ? value : null,
-      localpart,
-    ]);
-  } else if (value === undefined) {
-    await conn.execute(
-      'DELETE FROM profile_fields WHERE localpart=? AND key=?',
-      [localpart, key],
-    );
-  } else {
-    await conn.execute(
-      'INSERT INTO profile_fields(localpart,key,value) VALUES(?,?,?) ON CONFLICT(localpart,key) DO UPDATE SET value=excluded.value',
-      [localpart, key, JSON.stringify(value)],
-    );
+  await writeField(conn, localpart, key, value);
+}
+
+/** Authoritative profile replacement validates the final assembled value once,
+ * then applies only material field differences inside the caller's transaction. */
+export async function replaceProfileRows(
+  conn: Conn,
+  localpart: string,
+  raw: Profile,
+): Promise<void> {
+  const next: Profile = {};
+  for (const [key, value] of Object.entries(raw)) {
+    checkField(key, value);
+    if (
+      value !== undefined &&
+      !((key === 'displayname' || key === 'avatar_url') && value === null)
+    ) next[key] = value;
+  }
+  checkSize(next);
+  const prior = await profileRow(conn, localpart);
+  if (prior === null) throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
+  for (const key of new Set([...Object.keys(prior), ...Object.keys(next)])) {
+    const before = prior[key], after = next[key];
+    if (
+      (before === undefined) === (after === undefined) &&
+      registerJson(JSON.stringify(before ?? null)) ===
+        registerJson(JSON.stringify(after ?? null))
+    ) continue;
+    await writeField(conn, localpart, key, after);
   }
 }
 

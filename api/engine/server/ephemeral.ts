@@ -64,7 +64,7 @@ export function onEphemeral(
   };
 }
 function notify(server: Db, change: EphemeralChange): void {
-  for (const fn of listeners) {
+  for (const fn of [...listeners]) {
     try {
       fn(server, change);
     } catch (error) {

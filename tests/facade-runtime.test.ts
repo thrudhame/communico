@@ -2,6 +2,7 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
 import { adminCall } from './admin-client.ts';
 import { bounded, pause } from './helpers/server-process.ts';
+import { ColdAuthTimings } from './helpers/cold-auth-timings.ts';
 import { facadeTls } from './support/facade-tls.ts';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -1168,6 +1169,8 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
 });
 
 Deno.test('cold F2 public auth uses held authority offline and refuses strict or verifier-off work before effects', async () => {
+  const timings = new ColdAuthTimings();
+  timings.phase('configure and enroll');
   const tls = await facadeTls();
   const ports: number[] = [];
   for (let i = 0; i < 3; i++) {
@@ -1203,20 +1206,22 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     token?: string,
     method = body === undefined ? 'GET' : 'POST',
   ) => {
-    const response = await fetch(
-      `http://127.0.0.1:${
-        side === 'home' ? homePort : facadePort
-      }/_matrix/client/v3/${path}`,
-      {
-        method,
-        headers: {
-          'content-type': 'application/json',
-          ...(token ? { authorization: 'Bearer ' + token } : {}),
+    return await timings.request(side + ' ' + method + ' ' + path, async () => {
+      const response = await fetch(
+        `http://127.0.0.1:${
+          side === 'home' ? homePort : facadePort
+        }/_matrix/client/v3/${path}`,
+        {
+          method,
+          headers: {
+            'content-type': 'application/json',
+            ...(token ? { authorization: 'Bearer ' + token } : {}),
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
         },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      },
-    );
-    return { status: response.status, body: await response.json() };
+      );
+      return { status: response.status, body: await response.json() };
+    });
   };
   const login = (device = 'public-device', password = 'offline-password') => ({
     type: 'm.login.password',
@@ -1615,14 +1620,17 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
         registered.body.access_token,
       )).status === 401
     );
+    timings.phase('home deactivation login');
     const homeLogin = await api('home', 'login', login('later-home-device'));
     assertEquals(homeLogin.status, 200);
+    timings.phase('home deactivation HTTP commit');
     assertEquals(
       (await api('home', 'account/deactivate', {
         auth: { type: 'm.login.password', password: 'offline-password' },
       }, homeLogin.body.access_token)).status,
       200,
     );
+    timings.phase('facade observes home deactivation');
     await until(async () =>
       (await api(
         'facade',
@@ -1631,9 +1639,11 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       )).body
         .errcode === 'M_FORBIDDEN'
     );
+    timings.phase('home deactivation shutdown');
     await home.stop();
     // Home shutdown can finish after another capture was received but before
     // its independent facade owner commits the apply/result. Drain that cut.
+    timings.phase('facade drains deactivation tail offline');
     await until(async () =>
       (await api(
         'facade',
@@ -1655,8 +1665,10 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       identifier: { type: 'm.id.user', user: 'departure' },
     };
     // Restart does not itself prove the finite received tail has been applied.
+    timings.phase('departure facade restart');
     await edge.stop();
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    timings.phase('departure auth tail');
     await authTail(['departure']);
     // The preceding verifier-withdrawal/restoration exercise covers every
     // served account asynchronously. Observe this account's restored verifier
@@ -1667,6 +1679,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
         password: 'not-the-password',
       })).status === 403
     );
+    timings.phase('departure login and UIA');
     const departureSession = await api('facade', 'login', departureLogin);
     assertEquals(
       departureSession.status,
@@ -1697,6 +1710,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       )).status,
       401,
     );
+    timings.phase('departure leave commit and facade shutdown');
     await edge.stop();
     const closed = await openStore({
       dir: tls.dir + '/facade-public-auth-store',
@@ -1754,12 +1768,15 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     } finally {
       await closed.close();
     }
+    timings.phase('departure cold facade refusal');
     edge = await process(file('facade'), 'facade: link/local admin ready');
     assertEquals(
       (await api('facade', 'login', departureLogin)).body.errcode,
       'M_FORBIDDEN',
     );
+    timings.phase('departure home restart');
     home = await process(file('home'), 'federation: disabled');
+    timings.phase('home observes facade deactivation');
     await until(async () => {
       try {
         return (await api('home', 'login', departureLogin)).body.errcode ===
@@ -1768,6 +1785,26 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
         return false;
       }
     });
+  } catch (error) {
+    const owners = await Promise.all(['home', 'facade'].map(async (side) => {
+      try {
+        const status = (await adminCall(
+          tls.dir + '/' + side + '-public-auth.sock',
+          'facade/status',
+        )).body.result;
+        return { side, scopes: status.scopes, streams: status.streams };
+      } catch {
+        return { side, unavailable: true };
+      }
+    }));
+    console.error(
+      'cold auth phase diagnostics',
+      JSON.stringify({
+        phases: timings.snapshot(),
+        owners,
+      }),
+    );
+    throw error;
   } finally {
     await home?.dispose();
     await edge?.dispose();

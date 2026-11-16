@@ -6,6 +6,7 @@ import { config } from '#engine/config.ts';
 import { splitId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import { signingViews } from './cross-signing.ts';
 import { deviceSnapshot, type Json, object } from './e2ee.ts';
 import { tenantAuthority } from './session-authority.ts';
@@ -215,32 +216,44 @@ export async function installPublicUser(
   );
   if (!semantic && user?.deactivated !== 1) {
     await conn.execute(
-      'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET deactivated=excluded.deactivated',
+      'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET deactivated=excluded.deactivated WHERE ' +
+        changedColumns('users', 'deactivated'),
       [localpart, view.deactivated ? 1 : 0],
     );
   }
   await conn.execute(
-    'INSERT INTO public_user_replicas(localpart,source_cut,snapshot_json) VALUES(?,?,?) ON CONFLICT(localpart) DO UPDATE SET source_cut=excluded.source_cut,snapshot_json=excluded.snapshot_json',
+    'INSERT INTO public_user_replicas(localpart,source_cut,snapshot_json) VALUES(?,?,?) ON CONFLICT(localpart) DO UPDATE SET source_cut=excluded.source_cut,snapshot_json=excluded.snapshot_json WHERE ' +
+      changedColumns('public_user_replicas', 'source_cut', 'snapshot_json'),
     [localpart, view.cut, encoded],
   );
   if (semantic) return;
-  // Retain and acknowledge the authenticated source record while refusing its
-  // obsolete materialization. In particular, never delete a local erasure cut.
-  if (user?.deactivated === 1) return;
+  // Terminal status fences profile restoration, not later privacy facts.
+  // Like markErased, a terminal account retains its first erasure boundary.
+  const terminal = user?.deactivated === 1;
   // An F1 public snapshot is still evidence, not authority to overwrite an F2
   // complete-profile register or generate a local semantic export echo.
-  if (view.deactivated || !(await profileOperations(conn, localpart)).length) {
+  if (
+    !terminal &&
+    (view.deactivated || !(await profileOperations(conn, localpart)).length)
+  ) {
     await materializeProfile(
       conn,
       localpart,
       view.deactivated ? {} : view.profile,
     );
   }
-  await conn.execute('DELETE FROM erased_users WHERE localpart=?', [localpart]);
   if (view.erased !== null) {
     await conn.execute(
-      'INSERT INTO erased_users(localpart,room_cuts) VALUES(?,?)',
+      'INSERT INTO erased_users(localpart,room_cuts) VALUES(?,?) ON CONFLICT(localpart) ' +
+        (terminal
+          ? 'DO NOTHING'
+          : 'DO UPDATE SET room_cuts=excluded.room_cuts WHERE ' +
+            changedColumns('erased_users', 'room_cuts')),
       [localpart, canonicalJson(view.erased)],
     );
+  } else if (!terminal) {
+    await conn.execute('DELETE FROM erased_users WHERE localpart=?', [
+      localpart,
+    ]);
   }
 }

@@ -346,8 +346,8 @@ export async function finalizeBuilt(
 }
 
 // Build a local PDU inside the caller's room transaction: prevs default to
-// the live stay's extremities (deterministic sorted order from the 3a
-// frontier read), depth = max prev depth + 1, auth events selected over
+// the live stay's selected authoring parents, depth = max prev depth + 1,
+// auth events selected over
 // the state before the event.
 export async function buildInTx(
   tx: RoomTx,
@@ -367,7 +367,7 @@ export async function buildInTx(
   const rulebook = getRulebook(version);
 
   const prevIds = partial.prev_events ??
-    (stay === null ? [] : await tx.extremities.frontier(stay.id));
+    (stay === null ? [] : await tx.extremities.parents(stay.id));
   if (prevIds.length > 20) {
     throw new Error('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
   }

@@ -359,7 +359,7 @@ Deno.test('F2 device publication upgrade preserves multiple legacy frozen resets
   let store = await openStore(options(dir), {
     schemas: {
       server: {
-        version: 39,
+        version: 42,
         apply: async (db) => {
           await serverSchema.apply(db);
           await db.exec(

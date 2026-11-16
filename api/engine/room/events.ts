@@ -3,6 +3,7 @@
 // deleted; a duplicate id is a constraint error — redelivery idempotency
 // is the ingest layer's composition). Edge order preserves PDU list order.
 import type { Conn } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import type { EdgeKind, EdgeOverlay } from '#engine/room/edges.ts';
 import { indexTopology } from './topology.ts';
@@ -297,7 +298,16 @@ export async function setStatus(
     `INSERT INTO event_status(event, standing, grounding, origin, received_ts) VALUES(?,?,?,?,?)
      ON CONFLICT(event) DO UPDATE SET standing = excluded.standing,
        grounding = excluded.grounding, origin = excluded.origin,
-       received_ts = excluded.received_ts`,
+       received_ts = excluded.received_ts
+     WHERE ${
+      changedColumns(
+        'event_status',
+        'standing',
+        'grounding',
+        'origin',
+        'received_ts',
+      )
+    }`,
     [
       event,
       status.standing,

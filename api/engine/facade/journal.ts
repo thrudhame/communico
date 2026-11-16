@@ -2,6 +2,7 @@
 // This owner never runs a network call or a second-file transaction in db.tx.
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import {
   assertCapability,
   type Capability,
@@ -491,6 +492,7 @@ export class Journal {
         if (held.result !== null && held.result !== result.encoded) {
           diverged('changed remote terminal result');
         }
+        if (held.result !== null) continue;
         await conn.execute(
           'UPDATE facade_records SET result_json=? WHERE peer=? AND direction=? AND source=? AND incarnation=? AND stream=? AND sequence=?',
           [result.encoded, ...key(peer, 'out', stream), result.sequence],
@@ -505,7 +507,17 @@ export class Journal {
         diverged('applied ACK is missing terminal results');
       }
       await conn.execute(
-        'INSERT INTO facade_export_acks(peer,source,incarnation,stream,received,received_hash,applied,applied_hash) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(peer,source,incarnation,stream) DO UPDATE SET received=excluded.received,received_hash=excluded.received_hash,applied=excluded.applied,applied_hash=excluded.applied_hash',
+        `INSERT INTO facade_export_acks(peer,source,incarnation,stream,received,received_hash,applied,applied_hash) VALUES(?,?,?,?,?,?,?,?)
+         ON CONFLICT(peer,source,incarnation,stream) DO UPDATE SET received=excluded.received,received_hash=excluded.received_hash,applied=excluded.applied,applied_hash=excluded.applied_hash
+         WHERE ${
+          changedColumns(
+            'facade_export_acks',
+            'received',
+            'received_hash',
+            'applied',
+            'applied_hash',
+          )
+        }`,
         [
           peer,
           stream.source,

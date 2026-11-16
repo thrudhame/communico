@@ -32,7 +32,13 @@ export function tenantStreamCommitted(
   source: TenantChangeSource = 'local',
   publicKeysChanged = false,
 ): void {
-  for (const fn of listeners) fn(store, tenant, source, publicKeysChanged);
+  for (const fn of [...listeners]) {
+    try {
+      fn(store, tenant, source, publicKeysChanged);
+    } catch (error) {
+      console.error('tenant stream listener error:', error);
+    }
+  }
 }
 
 // Read allocated maxima, not retained rows or a single device's last change.

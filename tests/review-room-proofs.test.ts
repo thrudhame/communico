@@ -297,7 +297,7 @@ for (
             from: [tip.event_id!],
             via: fr.server.name,
             limit: 100,
-          }, { keys, fetcher: scripted.fetcher });
+          }, { self: 'test', keys, fetcher: scripted.fetcher });
           assertEquals(
             result.positioned.includes(tip.event_id!),
             valid || route === 'history-page',
@@ -401,7 +401,7 @@ for (const route of ['remote', 'history'] as const) {
           from: [tip.event_id!],
           via: fr.server.name,
           limit: 100,
-        }, { keys, fetcher: scripted.fetcher });
+        }, { self: 'test', keys, fetcher: scripted.fetcher });
         assertEquals(result.positioned, []);
       }
       for (const event of [bad, dependent, tip]) {

@@ -153,7 +153,8 @@ export async function advanceNotificationRead(
   const seq = Number(target.seq);
   await tx.execute(
     `INSERT INTO notification_horizons(user,room,scope,event_seq) VALUES(?,?,?,?)
-    ON CONFLICT(user,room,scope) DO UPDATE SET event_seq=MAX(event_seq,excluded.event_seq)`,
+    ON CONFLICT(user,room,scope) DO UPDATE SET event_seq=excluded.event_seq
+    WHERE excluded.event_seq>notification_horizons.event_seq`,
     [user, room, scope, seq],
   );
   const horizon = Number(
@@ -162,14 +163,26 @@ export async function advanceNotificationRead(
       [user, room, scope],
     ))[0].event_seq,
   );
+  const unread =
+    "user=? AND room=? AND read_ms IS NULL AND event_seq<=? AND (?='' OR thread=?)";
+  const bounds = [user, room, horizon, scope, scope];
   const affected = await tx.query(
     `SELECT thread,COUNT(*) AS n,SUM(highlight) AS h FROM notifications
-    WHERE user=? AND room=? AND read_ms IS NULL AND withdrawn=0 AND event_seq<=? AND (?='' OR thread=?) GROUP BY thread`,
-    [user, room, horizon, scope, scope],
+    WHERE ${unread} AND withdrawn=0 GROUP BY thread`,
+    bounds,
   );
+  if (affected.length) {
+    // Listing retention follows the same unread delta before its facts change.
+    // Already-read room history is neither rewritten nor hydrated for a receipt.
+    await tx.execute(
+      `UPDATE notification_history SET read_ms=? WHERE seq IN
+      (SELECT seq FROM notifications WHERE ${unread})`,
+      [now, ...bounds],
+    );
+  }
   await tx.execute(
-    `UPDATE notifications SET read_ms=? WHERE user=? AND room=? AND read_ms IS NULL AND event_seq<=? AND (?='' OR thread=?)`,
-    [now, user, room, horizon, scope, scope],
+    `UPDATE notifications SET read_ms=? WHERE ${unread}`,
+    [now, ...bounds],
   );
   for (const row of affected) {
     await delta(
@@ -182,10 +195,6 @@ export async function advanceNotificationRead(
     );
   }
   if (affected.length) {
-    await tx.execute(
-      'UPDATE notification_history SET read_ms=(SELECT read_ms FROM notifications WHERE seq=notification_history.seq) WHERE user=? AND room=?',
-      [user, room],
-    );
     await pruneNotificationHistory(tx, now);
   }
   return true;

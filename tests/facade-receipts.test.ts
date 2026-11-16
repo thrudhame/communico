@@ -1080,7 +1080,7 @@ Deno.test('facade receipts: late accepted ancestry applies an already admitted m
   }
 });
 
-Deno.test('facade receipts: v37 horizons retain exact graph target identity on upgrade, never an inferred foreign position', async () => {
+Deno.test('facade receipts: v40 horizons retain exact graph target identity on upgrade, never an inferred foreign position', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'receipt-horizon-upgrade-' });
   const options = {
     dir,
@@ -1090,7 +1090,7 @@ Deno.test('facade receipts: v37 horizons retain exact graph target identity on u
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { server: historicalServerSchema(37) },
+    schemas: { server: historicalServerSchema(40) },
   });
   try {
     const old = await store.server();
@@ -1122,7 +1122,7 @@ Deno.test('facade receipts: v37 horizons retain exact graph target identity on u
   }
 });
 
-Deno.test('facade receipts: actual v38 upgrade re-seeds authentic membership evidence without new feed publication', async () => {
+Deno.test('facade receipts: actual v41 upgrade re-seeds authentic membership evidence without new feed publication', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'receipt-admission-upgrade-' });
   const options = {
     dir,
@@ -1132,7 +1132,7 @@ Deno.test('facade receipts: actual v38 upgrade re-seeds authentic membership evi
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { room: roomSchema, server: historicalServerSchema(38) },
+    schemas: { room: roomSchema, server: historicalServerSchema(41) },
   });
   try {
     const g = await genesis(store, {
@@ -1196,7 +1196,7 @@ Deno.test('facade receipts: actual v38 upgrade re-seeds authentic membership evi
   }
 });
 
-Deno.test('facade receipts: actual v37 upgrade seeds already projected graph without publishing historical events as news', async () => {
+Deno.test('facade receipts: actual v40 upgrade seeds already projected graph without publishing historical events as news', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'receipt-upgrade-' });
   const options = {
     dir,
@@ -1206,7 +1206,7 @@ Deno.test('facade receipts: actual v37 upgrade seeds already projected graph wit
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { room: roomSchema, server: historicalServerSchema(37) },
+    schemas: { room: roomSchema, server: historicalServerSchema(40) },
   });
   try {
     const g = await genesis(store, { roomId: '!receipt-upgrade:test' });

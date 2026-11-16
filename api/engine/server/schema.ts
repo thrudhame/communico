@@ -415,8 +415,16 @@ UPDATE receipts SET event_ids=json_array(event_ids);
 const NOTIFICATIONS_UNREAD_SQL =
   'CREATE INDEX notifications_unread ON notifications(user,room,thread,event_seq,withdrawn,highlight) WHERE read_ms IS NULL';
 
+// Event identity is shared by delivery, state admission, search and projection.
+// A room/sequence index cannot serve these point lookups without scanning history.
+const FEED_EVENT_SQL = 'CREATE INDEX feed_event ON feed(event)';
+const OUTBOX_PENDING_SQL =
+  "CREATE INDEX outbox_pending_destination ON outbox(destination) WHERE state='pending'";
+const FEDERATION_TXNS_RECEIVED_SQL =
+  'CREATE INDEX federation_txns_received ON federation_txns(received_ms)';
+
 export const serverSchema: SchemaProvider = {
-  version: 40,
+  version: 43,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -456,6 +464,9 @@ export const serverSchema: SchemaProvider = {
     await db.exec(NOTIFICATIONS_UNREAD_SQL);
     await db.exec(OWNER_CONTROL_SQL);
     await db.exec(PUBLICATION_DOMAIN_SQL);
+    await db.exec(FEED_EVENT_SQL);
+    await db.exec(OUTBOX_PENDING_SQL);
+    await db.exec(FEDERATION_TXNS_RECEIVED_SQL);
     await db.exec(RECEIPT_GRAPH_SQL);
     await db.exec(RECEIPT_ADMISSION_SQL);
     await db.exec(DEVICE_PUBLICATIONS_SQL);
@@ -501,8 +512,11 @@ export const serverSchema: SchemaProvider = {
       await conn.exec(OWNER_CONTROL_SQL);
       await conn.exec(PUBLICATION_DOMAIN_SQL);
     },
-    37: (conn) => conn.exec(RECEIPT_GRAPH_SQL),
-    38: async (conn) => {
+    37: (conn) => conn.exec(FEED_EVENT_SQL),
+    38: (conn) => conn.exec(OUTBOX_PENDING_SQL),
+    39: (conn) => conn.exec(FEDERATION_TXNS_RECEIVED_SQL),
+    40: (conn) => conn.exec(RECEIPT_GRAPH_SQL),
+    41: async (conn) => {
       await conn.exec(RECEIPT_ADMISSION_SQL);
       // This is a derived evidence index. Re-read held immutable events at
       // the existing cut, without replaying feed positions or local news.
@@ -510,7 +524,7 @@ export const serverSchema: SchemaProvider = {
         "DELETE FROM watermarks WHERE source LIKE 'receipt-graph:%'",
       );
     },
-    39: async (conn) => {
+    42: async (conn) => {
       await conn.exec(DEVICE_PUBLICATIONS_SQL);
       // The old scalar describes only the old serial chain's anchor. Preserve
       // frozen bytes and exact pending identities, without inventing their

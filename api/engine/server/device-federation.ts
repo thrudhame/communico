@@ -186,7 +186,9 @@ export async function reconcileDeviceSubscriptions(
       );
       const prior = priorBySubject.get(subject) ?? [];
       for (const old of prior) {
-        if (!destinations.has(String(old.destination))) {
+        if (
+          Number(old.active) !== 0 && !destinations.has(String(old.destination))
+        ) {
           await tx.execute(
             'UPDATE device_subscriptions SET active=0 WHERE subject=? AND destination=?',
             [subject, old.destination],

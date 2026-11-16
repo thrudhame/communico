@@ -195,9 +195,27 @@ Deno.test('restore report warnings: lost revocations, cancellations, peer effect
       'revocation',
       'old credentials',
       'private crypto stores',
+      'rooms created after the cut',
+      'account-data types first written after the cut',
+      'device/token revocation',
+      'next login',
+      'never automatic',
       'Frozen federation',
       'COMMUNICO_TURN_SECRET',
+      'explicit empty unused-fallback list',
+      'matrix-sdk-crypto 0.19.1',
+      '7 days old',
+      'one-time keys run out',
+      'Archived fallback keys are never republished',
     ]
   ) assert(text.includes(disclosure), disclosure);
+  const cache = warnings.find((warning) =>
+    warning.includes('rooms created after the cut')
+  )!;
+  assert(cache.indexOf('private crypto stores') >= 0);
+  assert(
+    cache.indexOf('private crypto stores') <
+      cache.indexOf('device/token revocation'),
+  );
   assert(!text.includes('approval'));
 });
