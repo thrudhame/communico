@@ -39,7 +39,7 @@ export class HomeIngress {
     const { peer, pairing, pairings, transaction } = this.options;
     const record = await journal.next(peer, stream);
     if (!record) return false;
-    if (record.type !== 'ingress' || record.version !== 1) {
+    if (record.type !== 'ingress' || ![1, 2].includes(record.version)) {
       throw new LinkError(
         'LINK_CAPABILITY_MISMATCH',
         'not an ingress obligation',
@@ -61,6 +61,18 @@ export class HomeIngress {
     if (payload.kind !== 'ingress' || !Array.isArray(payload.rooms)) {
       throw new LinkError('LINK_BAD_RECORD', 'invalid ingress obligation', 400);
     }
+    if (
+      record.version === 1
+        ? payload.phase !== undefined
+        : payload.phase !== 'f2'
+    ) {
+      throw new LinkError(
+        'LINK_BAD_RECORD',
+        'ingress phase differs from reader version',
+        400,
+      );
+    }
+    const phase = record.version === 2 ? 'f2' : 'f1';
     const txnId = text(payload.txnId);
     const verified = await verifyIngressRequest(
       txnId,
@@ -102,16 +114,16 @@ export class HomeIngress {
     await this.db.tx(async (conn) => {
       await checkBinding(conn);
       const [held] = await conn.query(
-        'SELECT input_hash,evidence_json FROM facade_ingress WHERE origin=? AND txn_id=?',
+        'SELECT input_hash,evidence_json,ingress_phase FROM facade_ingress WHERE origin=? AND txn_id=?',
         [origin, txnId],
       );
       if (
-        held && !await sameIngressRequest(
+        held && (held.ingress_phase !== phase || !await sameIngressRequest(
           txnId,
           transaction.self,
           held,
           verified,
-        )
+        ))
       ) {
         throw new LinkError(
           'LINK_DIVERGED',
@@ -121,7 +133,7 @@ export class HomeIngress {
       if (!held) {
         const encoded = canonicalJson(verified.evidence);
         await conn.execute(
-          'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation) VALUES(?,?,?,?,?,?,?,?,?)',
+          'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation,ingress_phase) VALUES(?,?,?,?,?,?,?,?,?,?)',
           [
             origin,
             txnId,
@@ -132,6 +144,7 @@ export class HomeIngress {
             revision,
             peer,
             record.incarnation,
+            phase,
           ],
         );
       }

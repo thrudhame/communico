@@ -9,7 +9,7 @@ import {
 import { initializeNode } from '#engine/facade/identity.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { Journal } from '#engine/facade/journal.ts';
-import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
+import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
 import { keyStore } from '#engine/federation/keys.ts';
 import { captureRequestEvidence } from '#engine/federation/request-evidence.ts';
 import { requestCanonical } from '#engine/federation/request-signature.ts';
@@ -104,6 +104,8 @@ async function fixture(seedServer = serverSchema) {
   const remote = await makeRemoteServer('remote.test');
   const doc = await makeDoc(remote);
   let accepted = 0;
+  let phase: 'f1' | 'f2' = 'f1';
+  const acceptedPhases: (string | undefined)[] = [];
   let fail: ((sql: string, args: readonly unknown[]) => boolean) | undefined;
   let blocked = false;
   const absent = new Set<string>();
@@ -137,6 +139,7 @@ async function fixture(seedServer = serverSchema) {
   };
   const mailbox = async () =>
     new Mailbox(await db(), {
+      ...{ phase },
       self,
       node,
       pairings: await pairings(),
@@ -155,8 +158,9 @@ async function fixture(seedServer = serverSchema) {
           : absent.has(scope)
           ? Promise.resolve('absent')
           : Promise.resolve('ready'),
-      acceptEdu: () => {
+      acceptEdu: (_origin: string, _raw: unknown, admittedPhase?: string) => {
         accepted++;
+        acceptedPhases.push(admittedPhase);
         return Promise.resolve({ kind: 'retained' });
       },
       changed() {},
@@ -226,6 +230,10 @@ async function fixture(seedServer = serverSchema) {
     evidence,
     edge: () => edge,
     accepted: () => accepted,
+    acceptedPhases: () => acceptedPhases,
+    phase(value: 'f1' | 'f2') {
+      phase = value;
+    },
     block(value: boolean) {
       blocked = value;
     },
@@ -261,6 +269,121 @@ async function fixture(seedServer = serverSchema) {
     },
   };
 }
+
+Deno.test('mailbox old pending evidence retains F1 admission across F2 upgrade', async () => {
+  const f = await fixture(historicalServerSchema(43));
+  try {
+    const proof = await f.evidence('before-activation');
+    // Persist the actual historical v43 admission shape before opening it with
+    // the new schema/code; do not run a future writer against an old schema.
+    const verified = await verifyIngressRequest(
+      'before-activation',
+      proof,
+      f.self,
+    );
+    const encoded = canonicalJson(proof);
+    await (await f.edge().server()).execute(
+      'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation) VALUES(?,?,?,?,?,?,?,?,?)',
+      [
+        f.remote.name,
+        'before-activation',
+        verified.inputHash,
+        encoded,
+        new TextEncoder().encode(encoded).byteLength,
+        f.bundle.id,
+        1,
+        f.node.node,
+        f.node.incarnation,
+      ],
+    );
+    f.phase('f2');
+    await f.reopen();
+    const box = await f.mailbox();
+    await box.stage(
+      'before-activation',
+      await f.evidence('before-activation', [], undefined, 2),
+    );
+    assertEquals(
+      (await box.receive(f.remote.name, 'before-activation')).status,
+      200,
+    );
+    assertEquals(f.acceptedPhases(), ['f1']);
+    const [held] = await (await f.edge().server()).query(
+      'SELECT * FROM facade_ingress',
+    );
+    assertEquals(held.ingress_phase, 'f1');
+    assertEquals(JSON.parse(String(held.evidence_json)), proof);
+    const [row] = await (await f.edge().server()).query(
+      "SELECT record_json FROM facade_records WHERE direction='out'",
+    );
+    const record = JSON.parse(String(row.record_json));
+    assertEquals(record.version, 1);
+    assertEquals(record.payload.phase, undefined);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('mailbox F2 admission survives downgrade and child retry with an additive ingress reader', async () => {
+  const f = await fixture();
+  try {
+    f.phase('f2');
+    const proof = await f.evidence('after-activation');
+    await (await f.mailbox()).stage('after-activation', proof);
+    f.fail((sql) => sql.startsWith('INSERT INTO facade_ingress_children'));
+    await assertRejects(
+      () =>
+        f.mailbox().then((box) =>
+          box.receive(f.remote.name, 'after-activation')
+        ),
+      MatrixError,
+    );
+    f.phase('f1');
+    await f.reopen();
+    await (await f.mailbox()).receive(f.remote.name, 'after-activation');
+    assertEquals(f.acceptedPhases(), ['f2', 'f2']);
+    const [row] = await (await f.edge().server()).query(
+      "SELECT record_json FROM facade_records WHERE direction='out'",
+    );
+    const record = JSON.parse(String(row.record_json));
+    assertEquals(record.version, 2);
+    assertEquals(record.payload.phase, 'f2');
+    const home = await f.home().server();
+    await assertRejects(
+      () => new Journal(home, LINK_CAPABILITIES).receive(f.node.node, [record]),
+      Error,
+      'unsupported record',
+    );
+    const journal = new Journal(home, LINK_SUPPORTED);
+    await journal.receive(f.node.node, [record]);
+    let delivered = 0;
+    const drain = new HomeIngress(home, {
+      peer: f.node.node,
+      pairing: f.bundle.id,
+      pairings: await f.homePairings(),
+      transaction: {
+        self: f.self,
+        store: f.home(),
+        keys: fakeKeyResolver(f.remote),
+        fetcher: fakeFetcher({}).fetcher,
+        edus: {
+          dispatch: () => {
+            delivered++;
+            return Promise.resolve();
+          },
+        },
+      },
+    });
+    assertEquals(await drain.apply(journal, record), true);
+    assertEquals(await drain.apply(journal, record), false);
+    assertEquals(delivered, 1);
+    const [held] = await home.query('SELECT * FROM facade_ingress');
+    assertEquals(held.ingress_phase, 'f2');
+    assertEquals(JSON.parse(String(held.evidence_json)), proof);
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('mailbox commits the exact complete answer and home obligation atomically across cold retry', async () => {
   const f = await fixture();

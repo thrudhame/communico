@@ -106,6 +106,10 @@ export const TO_DEVICE_CAPABILITY: Capability = {
   type: 'to-device',
   version: 1,
 };
+export const OWNER_INGRESS_CAPABILITY: Capability = {
+  type: 'ingress',
+  version: 2,
+};
 export const LINK_SUPPORTED: readonly Capability[] = [
   ...LINK_CAPABILITIES,
   OWNER_CONTROL_CAPABILITY,
@@ -120,6 +124,7 @@ export const LINK_SUPPORTED: readonly Capability[] = [
   KEY_BOOTSTRAP_V2_CAPABILITY,
   KEY_HISTORY_V2_CAPABILITY,
   TO_DEVICE_CAPABILITY,
+  OWNER_INGRESS_CAPABILITY,
 ];
 
 function bad(message: string): never {

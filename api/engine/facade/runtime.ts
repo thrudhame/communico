@@ -455,14 +455,15 @@ export async function openFacadeRuntime(
         node: node!,
         pairings: owner,
         transaction,
+        phase: settings.phase as 'f1' | 'f2',
         scopeState: (scope) => directory.scopeState(scope),
-        acceptEdu: (origin, raw) =>
+        acceptEdu: (origin, raw, phase) =>
           acceptIngressEdu(
             origin,
             identity.server,
             raw,
             transaction.edus,
-            settings.phase,
+            phase,
           ),
         changed: () => notices.changed(),
       });

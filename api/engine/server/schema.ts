@@ -22,6 +22,7 @@ import {
   RECEIPT_GRAPH_SQL,
 } from '#engine/server/receipt-frontier.ts';
 import {
+  FACADE_INGRESS_PHASE_SQL,
   FACADE_INGRESS_SQL,
   FACADE_JOURNAL_SQL,
   FACADE_KEY_RETIREMENT_SQL,
@@ -424,7 +425,7 @@ const FEDERATION_TXNS_RECEIVED_SQL =
   'CREATE INDEX federation_txns_received ON federation_txns(received_ms)';
 
 export const serverSchema: SchemaProvider = {
-  version: 43,
+  version: 44,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -470,6 +471,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(RECEIPT_GRAPH_SQL);
     await db.exec(RECEIPT_ADMISSION_SQL);
     await db.exec(DEVICE_PUBLICATIONS_SQL);
+    await db.exec(FACADE_INGRESS_PHASE_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -535,5 +537,6 @@ INSERT INTO device_publications SELECT json_extract(payload,'$.user_id'),destina
 INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destination,p.epoch,p.stream_id,j.value FROM device_publications p,json_each(p.content,'$.prev_id') j;
 `);
     },
+    43: (conn) => conn.exec(FACADE_INGRESS_PHASE_SQL),
   },
 };

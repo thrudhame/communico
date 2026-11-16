@@ -36,6 +36,7 @@ export type IngressRoom = {
 export type IngressEdu = { index: number; disposition: unknown };
 export type IngressObligation = {
   kind: 'ingress';
+  phase?: 'f2';
   txnId: string;
   evidence: RequestEvidence;
   rooms: IngressRoom[];
@@ -49,6 +50,7 @@ type Binding = {
   incarnation: string;
 };
 type Admission = Binding & {
+  phase: 'f1' | 'f2';
   origin: string;
   txnId: string;
   evidence: RequestEvidence;
@@ -150,8 +152,13 @@ export class Mailbox {
       node: NodeIdentity;
       pairings: Pairings;
       transaction: TransactionDeps;
+      phase?: 'f1' | 'f2';
       scopeState(scope: string): Promise<'ready' | 'absent'>;
-      acceptEdu(origin: string, raw: unknown): Promise<unknown>;
+      acceptEdu(
+        origin: string,
+        raw: unknown,
+        phase: 'f1' | 'f2',
+      ): Promise<unknown>;
       changed(): void;
     },
   ) {}
@@ -233,7 +240,7 @@ export class Mailbox {
         return true;
       }
       await conn.execute(
-        'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation) VALUES(?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation,ingress_phase) VALUES(?,?,?,?,?,?,?,?,?,?)',
         [
           evidence.origin,
           txnId,
@@ -244,6 +251,7 @@ export class Mailbox {
           binding.revision,
           binding.source,
           binding.incarnation,
+          this.options.phase ?? 'f1',
         ],
       );
       return false;
@@ -283,6 +291,7 @@ export class Mailbox {
     return {
       origin,
       txnId,
+      phase: row.ingress_phase as Admission['phase'],
       pairing: String(row.pairing),
       revision: Number(row.revision),
       source: String(row.source),
@@ -367,7 +376,11 @@ export class Mailbox {
           tail.push(
             await this.child(entry, 'edu', String(index), async () => ({
               index,
-              disposition: await this.options.acceptEdu(origin, raw),
+              disposition: await this.options.acceptEdu(
+                origin,
+                raw,
+                entry.phase,
+              ),
             })),
           );
         } catch (error) {
@@ -386,6 +399,7 @@ export class Mailbox {
     const response: TxnResult = { status: 200, body: { pdus: results } };
     const payload: IngressObligation = {
       kind: 'ingress',
+      ...(entry.phase === 'f2' ? { phase: 'f2' as const } : {}),
       txnId,
       evidence: entry.evidence,
       rooms,
@@ -399,7 +413,7 @@ export class Mailbox {
         incarnation: entry.incarnation,
         stream: 'ingress:' + origin,
         type: 'ingress',
-        version: 1,
+        version: entry.phase === 'f2' ? 2 : 1,
         operationId: ingressOperation(origin, txnId),
         payload,
       });
