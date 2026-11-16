@@ -1,0 +1,418 @@
+import { assert, assertEquals, assertRejects } from '@std/assert';
+import { createHash } from 'node:crypto';
+import { canonicalJson } from '#engine/canonical.ts';
+import { config } from '#engine/config.ts';
+import { openStore } from '#engine/store/index.ts';
+import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
+import { deleteDevices, upsertDevice } from '#engine/tenant/devices.ts';
+import { deviceIdentity } from '#engine/tenant/txns.ts';
+import {
+  captureAccountAuth,
+  installAccountAuth,
+} from '#engine/tenant/account-auth.ts';
+import {
+  activateTenantAuthority,
+  captureSessionAuthority,
+  installSessionAuthority,
+} from '#engine/tenant/session-authority.ts';
+import * as routing from '#engine/tenant/todevice-routing.ts';
+import type { Conn } from '#engine/store/db.ts';
+
+const expected = (source: string) => ({
+  source,
+  incarnation: source + '-store',
+  localpart: 'alice',
+});
+const apply = (conn: Conn, fact: routing.ToDeviceOperation, source: string) => {
+  const importer = (routing as unknown as {
+    importToDeviceOperation: (
+      conn: Conn,
+      fact: routing.ToDeviceOperation,
+      binding: ReturnType<typeof expected>,
+      server: string,
+    ) => Promise<void>;
+  }).importToDeviceOperation;
+  assertEquals(
+    typeof importer,
+    'function',
+    'semantic transfer must have an owner-local import boundary',
+  );
+  return importer(conn, fact, expected(source), 'logical.test');
+};
+function rehash(op: routing.ToDeviceOperation): routing.ToDeviceOperation {
+  const { payloadHash: _hash, ...body } = op;
+  return {
+    ...body,
+    payloadHash: createHash('sha256').update(canonicalJson(body)).digest('hex'),
+  };
+}
+async function fixture() {
+  const dir = await Deno.makeTempDir({ prefix: 'facade-todevice-operations-' });
+  const open = () =>
+    openStore({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, { schemas: { tenant: tenantSchema } });
+  let store = await open();
+  const home = await openTenant(store, 'home-file.test', { create: true });
+  const edge = await openTenant(store, 'edge-file.test', { create: true });
+  // Separate tenant files stand in for the two stores. Wire identities stay the
+  // same logical Matrix server; no public snapshot is used as inbox authority.
+  for (const [tenant, node] of [[home, 'home'], [edge, 'edge']] as const) {
+    await tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+    await (await store.tenant(tenant.serverName)).tx((conn) =>
+      activateTenantAuthority(conn, {
+        node,
+        incarnation: node + '-store',
+        homeIncarnation: 'home-store',
+        edgeNode: 'edge',
+        edgeIncarnation: 'edge-store',
+      })
+    );
+  }
+  const hd = await store.tenant(home.serverName),
+    ed = await store.tenant(edge.serverName);
+  await upsertDevice(home, 'alice', 'LAN');
+  const snapshot = await hd.tx((conn) =>
+    captureAccountAuth(
+      conn,
+      {
+        server: 'logical.test',
+        pairing: 'pair',
+        grantRevision: 1,
+        ownerRevision: 1,
+      },
+      'alice',
+      false,
+      Date.now(),
+    )
+  );
+  await ed.tx((conn) => installAccountAuth(conn, snapshot));
+  await upsertDevice(edge, 'alice', 'PHONE');
+  const facts = await ed.tx((conn) => captureSessionAuthority(conn, 'alice'));
+  await hd.tx((conn) => installSessionAuthority(conn, 'alice', facts));
+  const source = await deviceIdentity(edge, 'alice', 'PHONE');
+  const send = (id: string) =>
+    edge.tx((tx) =>
+      tx.toDevice.send(
+        source,
+        'logical.test',
+        'm.room_key',
+        id,
+        id,
+        [{ user: '@alice:logical.test', id: '*', content: { key: id } }],
+        config().e2ee,
+        { enabled: true, maxBytes: 1048576 },
+      )
+    );
+  return {
+    dir,
+    store,
+    home,
+    edge,
+    hd,
+    ed,
+    send,
+    async reopen() {
+      await store.close();
+      store = await open();
+      return {
+        hd: await store.tenant(home.serverName),
+        ed: await store.tenant(edge.serverName),
+      };
+    },
+    async close() {
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    },
+  };
+}
+
+Deno.test('to-device semantic import: destination alone expands; exact ACK facts cannot delete the other inbox', async () => {
+  const f = await fixture();
+  try {
+    await f.send('first');
+    const source = await f.ed.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    const local = source.find((op) => op.kind === 'expansion');
+    assert(local?.kind === 'expansion');
+    const edgeBefore = await f.ed.query('SELECT * FROM to_device_targets');
+    const homeBefore = await f.hd.query('SELECT * FROM devices');
+    for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    assertEquals(await f.hd.query('SELECT * FROM devices'), homeBefore);
+    assertEquals((await f.hd.query('SELECT * FROM to_device_inbox')).length, 1);
+    assertEquals(
+      (await f.hd.query('SELECT * FROM to_device_targets')).length,
+      1,
+      'foreign targets are evidence, never local inbox handles',
+    );
+    const facts = await f.hd.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    assert(
+      facts.every((op) => op.source === 'home'),
+      'foreign facts cannot echo as local source intent',
+    );
+    for (const op of facts) await f.ed.tx((conn) => apply(conn, op, 'home'));
+    assertEquals(
+      await f.ed.query('SELECT * FROM to_device_targets'),
+      edgeBefore,
+    );
+    const lan = await deviceIdentity(f.home, 'alice', 'LAN');
+    const delivered = await f.home.tx((tx) =>
+      tx.toDevice.deliverSliding(lan, 'lan', 100, config().e2ee)
+    );
+    assertEquals(delivered.events.map((event) => event.content), [{
+      key: 'first',
+    }]);
+    await f.home.tx((tx) =>
+      tx.toDevice.acknowledgeSliding(lan, 'lan', delivered.nextBatch)
+    );
+    const completed = await f.hd.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    for (const op of completed) {
+      await f.ed.tx((conn) => apply(conn, op, 'home'));
+    }
+    assertEquals(
+      await f.ed.query('SELECT * FROM to_device_targets'),
+      edgeBefore,
+      'foreign ACK must never mutate local delivery state',
+    );
+    for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    assertEquals(
+      await f.hd.query('SELECT * FROM to_device_inbox'),
+      [],
+      'lost transfer/ACK response cannot recreate acknowledged inbox material',
+    );
+    await deleteDevices(f.home, 'alice', ['LAN']);
+    await upsertDevice(f.home, 'alice', 'LAN');
+    for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    assertEquals(
+      await f.hd.query('SELECT * FROM to_device_inbox'),
+      [],
+      'old wildcard never expands at replacement generation',
+    );
+    const reopened = await f.reopen();
+    for (const op of source) {
+      await reopened.hd.tx((conn) => apply(conn, op, 'edge'));
+    }
+    for (const op of completed) {
+      await reopened.ed.tx((conn) => apply(conn, op, 'home'));
+    }
+    assertEquals(
+      await reopened.hd.query('SELECT * FROM to_device_inbox'),
+      [],
+      'cold replay preserves exact committed ACK and expansion cuts',
+    );
+    assertEquals(
+      await reopened.ed.query('SELECT * FROM to_device_targets'),
+      edgeBefore,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device semantic import: collision, forged expansion/ACK and missing dependencies roll back without delivery authority', async () => {
+  const f = await fixture();
+  try {
+    await f.send('forgery');
+    const source = await f.ed.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    const route = source.find((op) =>
+      op.kind === 'route' && op.value.owner === 'edge'
+    );
+    const expansion = source.find((op) => op.kind === 'expansion');
+    assert(route?.kind === 'route' && expansion?.kind === 'expansion');
+    await assertRejects(
+      () => f.hd.tx((conn) => apply(conn, expansion, 'edge')),
+      Error,
+      'awaits route',
+    );
+    assertEquals(await f.hd.query('SELECT * FROM to_device_operations'), []);
+    await f.hd.tx((conn) => apply(conn, route, 'edge'));
+    const before = await f.hd.query('SELECT * FROM to_device_operations');
+    const changed = rehash({
+      ...route,
+      value: { ...route.value, type: 'changed' },
+    });
+    await assertRejects(
+      () => f.hd.tx((conn) => apply(conn, changed, 'edge')),
+      Error,
+      'identity changed',
+    );
+    const forged = rehash({
+      ...expansion,
+      source: 'home',
+      incarnation: 'home-store',
+      operationId: canonicalJson([
+        'home',
+        'home-store',
+        'to-device',
+        expansion.sequence,
+      ]),
+    });
+    await assertRejects(
+      () => f.hd.tx((conn) => apply(conn, forged, 'home')),
+      Error,
+      'destination owner',
+    );
+    const badTarget = rehash({
+      ...expansion,
+      value: {
+        ...expansion.value,
+        targets: expansion.value.targets.map((target) => ({
+          ...target,
+          event: {
+            type: 'm.room_key',
+            sender: '@alice:logical.test',
+            content: { forged: true },
+          },
+        })),
+      },
+    });
+    await assertRejects(
+      () => f.hd.tx((conn) => apply(conn, badTarget, 'edge')),
+      Error,
+      'target differs',
+    );
+    assertEquals(
+      await f.hd.query('SELECT * FROM to_device_operations'),
+      before,
+    );
+    const authority = await f.ed.tx((conn) =>
+      captureSessionAuthority(conn, 'alice')
+    );
+    await f.hd.execute("DELETE FROM authority_facts WHERE node='edge'");
+    const legacy = rehash({
+      ...expansion,
+      value: {
+        ...expansion.value,
+        targets: expansion.value.targets.map((
+          { creation: _creation, ...target },
+        ) => target),
+      },
+    });
+    await assertRejects(
+      () => f.hd.tx((conn) => apply(conn, legacy, 'edge')),
+      Error,
+      'awaits target incarnation',
+    );
+    assertEquals(
+      await f.hd.query('SELECT * FROM to_device_operations'),
+      before,
+    );
+    await f.hd.tx((conn) => installSessionAuthority(conn, 'alice', authority));
+    const wrongCreation = rehash({
+      ...expansion,
+      value: {
+        ...expansion.value,
+        targets: expansion.value.targets.map((target) => ({
+          ...target,
+          creation: { ...target.creation!, localpart: 'another-account' },
+        })),
+      },
+    });
+    await assertRejects(
+      () => f.hd.tx((conn) => apply(conn, wrongCreation, 'edge')),
+      Error,
+      'target differs',
+    );
+    await f.hd.tx((conn) => apply(conn, expansion, 'edge'));
+    const badAck = rehash({
+      ...expansion,
+      sequence: expansion.sequence + 50,
+      operationId: canonicalJson([
+        'edge',
+        'edge-store',
+        'to-device',
+        expansion.sequence + 50,
+      ]),
+      kind: 'ack',
+      value: { routeId: route.value.routeId, targetIds: ['unseen-target'] },
+    });
+    await assertRejects(
+      () => f.hd.tx((conn) => apply(conn, badAck, 'edge')),
+      Error,
+      'target differs',
+    );
+    await assertRejects(
+      () =>
+        f.hd.tx(async (conn) => {
+          await apply(
+            conn,
+            source.find((op) =>
+              op.kind === 'route' && op.value.owner === 'home'
+            )!,
+            'edge',
+          );
+          throw new Error('rollback inbox and expansion');
+        }),
+      Error,
+      'rollback inbox',
+    );
+    assertEquals(await f.hd.query('SELECT * FROM to_device_inbox'), []);
+    assertEquals(await f.hd.query('SELECT * FROM to_device_targets'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device semantic import: cross-account targets use the recipient registry, not the sender stream or foreign generation', async () => {
+  const f = await fixture();
+  try {
+    await f.home.tx((tx) => tx.users.insert('bob', 'Bob'));
+    await upsertDevice(f.home, 'bob', 'BOB');
+    const sender = await deviceIdentity(f.edge, 'alice', 'PHONE');
+    await f.edge.tx((tx) =>
+      tx.toDevice.send(
+        sender,
+        'logical.test',
+        'm.room_key',
+        'cross-user',
+        'cross-user',
+        [{ user: '@bob:logical.test', id: '*', content: { cross: true } }],
+        config().e2ee,
+        { enabled: true, maxBytes: 1048576 },
+      )
+    );
+    const source = await f.ed.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    const bob = await deviceIdentity(f.home, 'bob', 'BOB');
+    const delivered = await f.home.tx((tx) =>
+      tx.toDevice.deliverSliding(bob, 'bob', 100, config().e2ee)
+    );
+    assertEquals(delivered.events, [{
+      sender: '@alice:logical.test',
+      type: 'm.room_key',
+      content: { cross: true },
+    }]);
+    assertEquals(
+      (await f.hd.query('SELECT localpart,device_id FROM to_device_targets'))
+        .map((row) => [row.localpart, row.device_id]),
+      [['bob', 'BOB']],
+    );
+    const disposition = await f.hd.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    assertEquals(disposition.map((op) => op.localpart), ['alice']);
+    for (const op of disposition) {
+      await f.ed.tx((conn) => apply(conn, op, 'home'));
+    }
+    assertEquals(
+      await f.ed.query("SELECT * FROM authority_facts WHERE localpart='bob'"),
+      [],
+      'a target disposition cannot install another account or its registry authority',
+    );
+  } finally {
+    await f.close();
+  }
+});

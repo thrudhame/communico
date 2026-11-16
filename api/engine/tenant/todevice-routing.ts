@@ -8,8 +8,15 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import { nextCounter } from './accountdata.ts';
 import { type DeviceIdentity, devicesOfUser } from './devices.ts';
-import type { Json, KeyLimits } from './e2ee.ts';
 import {
+  bounded,
+  type Json,
+  type KeyLimits,
+  limitEntries,
+  object,
+} from './e2ee.ts';
+import {
+  type AuthorityFact,
   type AuthorityIdentity,
   registryDevice,
   tenantAuthority,
@@ -44,6 +51,7 @@ export type ToDeviceTarget = {
   deviceId: string;
   deviceIncarnation: string;
   event: Json;
+  creation?: AuthorityFact;
 };
 type OperationValue =
   | { kind: 'route'; value: ToDeviceRoute }
@@ -224,6 +232,7 @@ async function expandRoute(
           targetId: digest([route.routeId, creation.id]),
           deviceId: device.device_id,
           deviceIncarnation: creation.id,
+          creation,
           event: {
             sender: route.sender,
             type: route.type,
@@ -436,4 +445,320 @@ async function finishTargets(
     });
   }
   return routes.size > 0;
+}
+
+function requiredText(value: unknown): string {
+  if (typeof value !== 'string' || !value) collision();
+  return value;
+}
+
+/** The destination attests the exact creation it expanded. A sender may deliver
+ * to a local account outside its own replicated scope; learning that disposition
+ * must not require importing the recipient's account/session authority. */
+function creationOf(raw: unknown): AuthorityFact {
+  const row = object(raw, 'to-device target creation');
+  const node = requiredText(row.node),
+    incarnation = requiredText(row.incarnation);
+  if (
+    row.kind !== 'device' || !Number.isSafeInteger(row.seq) ||
+    Number(row.seq) < 1
+  ) collision();
+  const fact: AuthorityFact = {
+    id: canonicalJson([node, incarnation, row.seq]),
+    node,
+    incarnation,
+    seq: Number(row.seq),
+    localpart: requiredText(row.localpart),
+    kind: 'device',
+    deviceId: requiredText(row.deviceId),
+  };
+  if (canonicalJson(fact) !== canonicalJson(raw)) collision();
+  return fact;
+}
+
+/** Decode an immutable operation, not a row clone. No local generation or
+ * publication position exists on this wire. */
+function operationOf(raw: unknown, server: string): ToDeviceOperation {
+  const row = object(raw, 'to-device operation');
+  const source = requiredText(row.source),
+    incarnation = requiredText(row.incarnation);
+  const localpart = requiredText(row.localpart), sequence = row.sequence;
+  if (
+    row.version !== 1 || !Number.isSafeInteger(sequence) || Number(sequence) < 1
+  ) collision();
+  const input = object(row.value, 'to-device operation value');
+  let operation: OperationValue;
+  if (row.kind === 'route') {
+    const origin = object(input.origin, 'to-device origin');
+    if (origin.kind !== 'client' && origin.kind !== 'federation') collision();
+    if (!Array.isArray(input.selectors)) collision();
+    limitEntries(input.selectors.length, config().e2ee.maxkeys);
+    const selectors = input.selectors.map((raw) => {
+      const selector = object(raw, 'to-device selector');
+      const content = object(selector.content, 'to-device content');
+      bounded(content, config().e2ee.maxkeybytes);
+      return { id: requiredText(selector.id), content };
+    }).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    if (new Set(selectors.map(({ id }) => id)).size !== selectors.length) {
+      collision();
+    }
+    const value: ToDeviceRoute = {
+      routeId: requiredText(input.routeId),
+      origin: {
+        kind: origin.kind,
+        origin: requiredText(origin.origin),
+        id: requiredText(origin.id),
+      },
+      admissionHash: requiredText(input.admissionHash),
+      localpart,
+      recipient: requiredText(input.recipient),
+      owner: requiredText(input.owner),
+      ownerIncarnation: requiredText(input.ownerIncarnation),
+      sender: requiredText(input.sender),
+      type: requiredText(input.type),
+      selectors,
+    };
+    if (
+      !/^[a-f0-9]{64}$/.test(value.admissionHash) ||
+      !/^@[^:]+:.+$/.test(value.recipient) ||
+      domainOf(value.recipient) !== server ||
+      !/^@[^:]+:.+$/.test(value.sender) ||
+      domainOf(value.sender) !== value.origin.origin ||
+      (value.origin.kind === 'client'
+        ? value.origin.origin !== server ||
+          localpartOf(value.sender) !== localpart
+        : localpartOf(value.recipient) !== localpart) ||
+      value.routeId !==
+        digest([value.origin, value.recipient, {
+          node: value.owner,
+          incarnation: value.ownerIncarnation,
+        }])
+    ) collision();
+    operation = { kind: 'route', value };
+  } else if (row.kind === 'expansion') {
+    if (!Array.isArray(input.targets)) collision();
+    const targets = input.targets.map((raw) => {
+      const target = object(raw, 'to-device target');
+      const event = object(target.event, 'to-device event');
+      bounded([event], config().e2ee.maxrequestbytes);
+      return {
+        targetId: requiredText(target.targetId),
+        deviceId: requiredText(target.deviceId),
+        deviceIncarnation: requiredText(target.deviceIncarnation),
+        event,
+        ...(Object.hasOwn(target, 'creation')
+          ? { creation: creationOf(target.creation) }
+          : {}),
+      };
+    });
+    if (
+      new Set(targets.map(({ targetId }) => targetId)).size !== targets.length
+    ) collision();
+    operation = {
+      kind: 'expansion',
+      value: { routeId: requiredText(input.routeId), targets },
+    };
+  } else if (row.kind === 'ack' || row.kind === 'cancel') {
+    if (!Array.isArray(input.targetIds)) collision();
+    const targetIds = input.targetIds.map(requiredText).sort();
+    if (new Set(targetIds).size !== targetIds.length || !targetIds.length) {
+      collision();
+    }
+    operation = {
+      kind: row.kind,
+      value: { routeId: requiredText(input.routeId), targetIds },
+    };
+  } else collision();
+  const body = {
+    version: 1 as const,
+    operationId: canonicalJson([source, incarnation, 'to-device', sequence]),
+    source,
+    incarnation,
+    sequence: Number(sequence),
+    localpart,
+    ...operation,
+  };
+  const fact: ToDeviceOperation = { ...body, payloadHash: digest(body) };
+  if (canonicalJson(fact) !== canonicalJson(raw)) collision();
+  return fact;
+}
+
+function pending(message: string): never {
+  throw new MatrixError(
+    503,
+    'M_UNAVAILABLE',
+    'to-device operation awaits ' + message,
+  );
+}
+
+/** The authenticated adapter supplies the current source. Retain foreign
+ * expansion/ACK facts as evidence only; only this file's own registry can insert
+ * or delete its inbox. Fact, local expansion and local source intent share the
+ * caller's transaction, so a link ACK cannot outrun destination application. */
+export async function importToDeviceOperation(
+  conn: Conn,
+  raw: unknown,
+  expected: { source: string; incarnation: string; localpart: string },
+  server: string,
+): Promise<void> {
+  const fact = operationOf(raw, server), identity = await tenantAuthority(conn);
+  if (!identity) pending('authority');
+  const owners = [{ node: 'home', incarnation: identity.homeIncarnation }, {
+    node: identity.edgeNode,
+    incarnation: identity.edgeIncarnation,
+  }];
+  if (
+    fact.source !== expected.source ||
+    fact.incarnation !== expected.incarnation ||
+    fact.localpart !== expected.localpart ||
+    !owners.some((owner) =>
+      owner.node === fact.source && owner.incarnation === fact.incarnation
+    )
+  ) collision();
+  const encoded = canonicalJson(fact);
+  const [held] = await conn.query(
+    'SELECT payload_json FROM to_device_operations WHERE operation_id=? OR (source=? AND incarnation=? AND sequence=?)',
+    [fact.operationId, fact.source, fact.incarnation, fact.sequence],
+  );
+  if (held) {
+    if (held.payload_json !== encoded) collision();
+    return;
+  }
+  if (fact.kind === 'route') {
+    const route = fact.value;
+    if (
+      !owners.some((owner) =>
+        owner.node === route.owner &&
+        owner.incarnation === route.ownerIncarnation
+      )
+    ) collision();
+    const [prior] = await conn.query(
+      'SELECT payload_json FROM to_device_routes WHERE route_id=?',
+      [route.routeId],
+    );
+    if (prior) {
+      if (prior.payload_json !== canonicalJson(route)) collision();
+    } else {
+      await conn.execute('INSERT INTO to_device_routes VALUES(?,?,?,0)', [
+        route.routeId,
+        route.localpart,
+        canonicalJson(route),
+      ]);
+    }
+  } else {
+    const [row] = await conn.query(
+      'SELECT payload_json FROM to_device_routes WHERE route_id=?',
+      [fact.value.routeId],
+    );
+    if (!row) pending('route');
+    const route: ToDeviceRoute = JSON.parse(String(row.payload_json));
+    if (
+      route.localpart !== fact.localpart || route.owner !== fact.source ||
+      route.ownerIncarnation !== fact.incarnation
+    ) {
+      throw new MatrixError(
+        400,
+        'M_BAD_JSON',
+        'to-device disposition differs from destination owner',
+      );
+    }
+    const [expanded] = await conn.query(
+      "SELECT payload_json FROM to_device_operations WHERE kind='expansion' AND json_extract(payload_json,'$.value.routeId')=?",
+      [route.routeId],
+    );
+    if (fact.kind === 'expansion') {
+      if (
+        expanded &&
+        canonicalJson(
+            (JSON.parse(String(expanded.payload_json)) as ToDeviceOperation)
+              .value,
+          ) !== canonicalJson(fact.value)
+      ) collision();
+      const devices = new Set<string>();
+      for (const target of fact.value.targets) {
+        const selector = route.selectors.find(({ id }) =>
+          id === target.deviceId
+        ) ??
+          (route.selectors.length === 1 && route.selectors[0].id === '*'
+            ? route.selectors[0]
+            : undefined);
+        const event = {
+          sender: route.sender,
+          type: route.type,
+          content: selector?.content,
+        };
+        if (
+          !selector || devices.has(target.deviceId) ||
+          target.targetId !==
+            digest([route.routeId, target.deviceIncarnation]) ||
+          canonicalJson(event) !== canonicalJson(target.event)
+        ) {
+          throw new MatrixError(
+            400,
+            'M_BAD_JSON',
+            'to-device target differs from selector',
+          );
+        }
+        devices.add(target.deviceId);
+        const [heldCreation] = await conn.query(
+          "SELECT node,incarnation,payload FROM authority_facts WHERE id=? AND localpart=? AND kind='device'",
+          [target.deviceIncarnation, localpartOf(route.recipient)],
+        );
+        // Old retained source facts can use an already authenticated creation;
+        // new expansions carry it as immutable disposition evidence only.
+        const creation = target.creation ?? (heldCreation
+          ? creationOf(JSON.parse(String(heldCreation.payload)))
+          : undefined);
+        if (!creation) pending('target incarnation');
+        if (
+          creation.id !== target.deviceIncarnation ||
+          creation.localpart !== localpartOf(route.recipient) ||
+          creation.node !== fact.source ||
+          creation.incarnation !== fact.incarnation ||
+          creation.deviceId !== target.deviceId ||
+          (heldCreation &&
+            canonicalJson(creation) !==
+              canonicalJson(JSON.parse(String(heldCreation.payload))))
+        ) {
+          throw new MatrixError(
+            400,
+            'M_BAD_JSON',
+            'to-device target differs from destination registry',
+          );
+        }
+      }
+    } else {
+      if (!expanded) pending('expansion');
+      const expansion = JSON.parse(String(expanded.payload_json)) as Extract<
+        ToDeviceOperation,
+        { kind: 'expansion' }
+      >;
+      const targets = new Set(
+        expansion.value.targets.map(({ targetId }) => targetId),
+      );
+      if (fact.value.targetIds.some((id) => !targets.has(id))) {
+        throw new MatrixError(
+          400,
+          'M_BAD_JSON',
+          'to-device target differs from expansion',
+        );
+      }
+    }
+  }
+  await conn.execute(
+    'INSERT INTO to_device_operations VALUES(?,?,?,?,?,?,?,?)',
+    [
+      fact.operationId,
+      fact.source,
+      fact.incarnation,
+      fact.sequence,
+      fact.localpart,
+      fact.kind,
+      fact.payloadHash,
+      encoded,
+    ],
+  );
+  if (fact.kind === 'route') {
+    await expandRoute(conn, identity, fact.value, config().e2ee);
+  }
 }
