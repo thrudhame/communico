@@ -102,10 +102,14 @@ export async function closeSegment(conn: Conn, id: number): Promise<void> {
   ]);
   if (rows.length === 0) throw new Error(`unknown segment ${id}`);
   const terminal = String(rows[0].kind) === 'stay' ? 'closed' : 'complete';
-  await conn.execute('UPDATE segments SET status = ? WHERE id = ?', [
-    terminal,
-    id,
-  ]);
+  await conn.execute(
+    'UPDATE segments SET status = ? WHERE id = ? AND status IS NOT ?',
+    [
+      terminal,
+      id,
+      terminal,
+    ],
+  );
 }
 
 // Name the event a stay was opened by (a remote join): set once, right

@@ -15,6 +15,7 @@ import {
   cutOf,
   integer,
   LINK_CAPABILITIES,
+  LINK_SUPPORTED,
   LINK_VERSION,
   LinkError,
   negotiate,
@@ -127,7 +128,7 @@ export class JournalClient {
 
   private response(raw: unknown): Record<string, unknown> {
     const value = object(raw);
-    negotiate(value, this.peer.server, LINK_CAPABILITIES);
+    negotiate(value, this.peer.server, LINK_SUPPORTED);
     if (
       value.source !== this.peer.node ||
       value.incarnation !== this.peer.incarnation ||
@@ -273,6 +274,13 @@ export class JournalClient {
   ): Promise<Acknowledgement> {
     this.stream(stream, true);
     const value = await this.call('records', {
+      required: [...new Map([
+        ...LINK_CAPABILITIES,
+        ...records.map(recordOf).map(({ type, version }) => ({
+          type,
+          version,
+        })),
+      ].map((item) => [`${item.type}/${item.version}`, item])).values()],
       stream: streamOf(stream),
       records,
       after: cutOf(after),

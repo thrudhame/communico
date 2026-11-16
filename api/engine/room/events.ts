@@ -3,6 +3,7 @@
 // deleted; a duplicate id is a constraint error — redelivery idempotency
 // is the ingest layer's composition). Edge order preserves PDU list order.
 import type { Conn } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import type { EdgeKind, EdgeOverlay } from '#engine/room/edges.ts';
 import { indexTopology } from './topology.ts';
@@ -204,6 +205,36 @@ export async function getEvents(
   return found;
 }
 
+export type AncestryNode = { prevs: string[]; grounded: boolean };
+
+/** Recovery needs held graph facts, not immutable PDU bodies. Genuine after-state
+ * is the grounding proof; unknown IDs have no map entry, not a cached verdict. */
+export async function ancestryNodes(
+  conn: Conn,
+  ids: readonly string[],
+): Promise<Map<string, AncestryNode>> {
+  const found = new Map<string, AncestryNode>();
+  for (const page of chunks(ids)) {
+    const rows = await conn.query(
+      `SELECT e.id,s.after_group,p.prev FROM events e
+       LEFT JOIN event_state s ON s.event=e.id
+       LEFT JOIN prev_edges p ON p.event=e.id
+       WHERE e.id IN (${page.map(() => '?').join(',')}) ORDER BY e.id,p.ord`,
+      page,
+    );
+    for (const row of rows) {
+      const id = String(row.id);
+      let node = found.get(id);
+      if (node === undefined) {
+        node = { prevs: [], grounded: row.after_group !== null };
+        found.set(id, node);
+      }
+      if (row.prev !== null) node.prevs.push(String(row.prev));
+    }
+  }
+  return found;
+}
+
 export async function prevsOf(
   conn: Conn,
   event: string,
@@ -267,7 +298,16 @@ export async function setStatus(
     `INSERT INTO event_status(event, standing, grounding, origin, received_ts) VALUES(?,?,?,?,?)
      ON CONFLICT(event) DO UPDATE SET standing = excluded.standing,
        grounding = excluded.grounding, origin = excluded.origin,
-       received_ts = excluded.received_ts`,
+       received_ts = excluded.received_ts
+     WHERE ${
+      changedColumns(
+        'event_status',
+        'standing',
+        'grounding',
+        'origin',
+        'received_ts',
+      )
+    }`,
     [
       event,
       status.standing,

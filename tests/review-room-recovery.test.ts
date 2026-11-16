@@ -132,7 +132,9 @@ Deno.test('review recovery: pulled batches expose their actual gap without refet
     }, 'pulled');
     assertEquals(result.map((item) => item.outcome), ['accepted', 'accepted']);
     assertEquals(scripted.calls.stateIds, [gap.event_id!]);
-    assertEquals(scripted.calls.missingEvents.length, 1);
+    // The complete supplied parent union exposes the actual gap directly;
+    // neither supplied input needs another missing-events request.
+    assertEquals(scripted.calls.missingEvents.length, 0);
     assert(!scripted.calls.event.includes(parent.event_id!));
     assert(!scripted.calls.event.includes(child.event_id!));
   });
@@ -199,7 +201,7 @@ for (const route of ['remote', 'history'] as const) {
             from: [gap.event_id!, good.event_id!],
             via: fr.server.name,
             limit: 100,
-          }, { keys, fetcher: scripted.fetcher });
+          }, { self: 'test', keys, fetcher: scripted.fetcher });
           assertEquals(result.positioned, [good.event_id!]);
           assertEquals(
             await room.tx((tx) => tx.state.eventStateAfter(gap.event_id!)),

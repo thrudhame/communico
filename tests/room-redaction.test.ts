@@ -114,8 +114,8 @@ Deno.test('redact: competing resume drivers consume one locked wait and publish 
     };
     try {
       await Promise.all([
-        resumeWaits(g.room, { self: 'test' }),
-        resumeWaits(g.room, { self: 'test' }),
+        resumeWaits(g.room, { self: 'test' }, [target.event_id!]),
+        resumeWaits(g.room, { self: 'test' }, [target.event_id!]),
       ]);
     } finally {
       g.room.tx = original;

@@ -130,7 +130,7 @@ for (const route of ['remote', 'history'] as const) {
             from: [gap.event_id!],
             via: fr.server.name,
             limit: 100,
-          }, { keys, fetcher, budget });
+          }, { self: 'test', keys, fetcher, budget });
           assertEquals(result.positioned.includes(gap.event_id!), !invalid);
         }
         assertEquals(bulkCalls, mode === 'request-budget' ? 0 : 1);

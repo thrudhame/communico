@@ -178,9 +178,12 @@ export async function claim(
   // Selection is only a hint. A concurrent heartbeat may have restarted the
   // deadline before this transaction acquired the command.
   if (event === null || event.due > now) return null;
-  await conn.execute("UPDATE delayed_events SET phase='sending' WHERE id=?", [
-    id,
-  ]);
+  await conn.execute(
+    "UPDATE delayed_events SET phase='sending' WHERE id=? AND phase!='sending'",
+    [
+      id,
+    ],
+  );
   return event;
 }
 export async function submission(
@@ -214,7 +217,7 @@ export async function prepare(
 }
 export async function finish(conn: Conn, id: string): Promise<void> {
   await conn.execute(
-    'UPDATE delayed_events SET completed=1,pending_pdu=NULL WHERE id=?',
+    'UPDATE delayed_events SET completed=1,pending_pdu=NULL WHERE id=? AND (completed!=1 OR pending_pdu IS NOT NULL)',
     [id],
   );
 }
