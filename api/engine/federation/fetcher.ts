@@ -94,7 +94,7 @@ export function productionFetcher(
     },
 
     // POST /_matrix/federation/v1/get_missing_events/{roomId}.
-    missingEvents: async (roomId, earliest, latest, limit, via) => {
+    missingEvents: async (roomId, earliest, latest, limit, via, signal) => {
       const res = await federationRequest(server, signer, {
         room: { store, id: roomId },
         destination: via,
@@ -111,6 +111,7 @@ export function productionFetcher(
           }),
         ),
         maxBytes: bulk(),
+        signal,
       });
       const body = objectOf(res.json, 'missing-events');
       return pduList(
@@ -160,7 +161,7 @@ export function productionFetcher(
     },
 
     // GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}.
-    eventAuth: async (roomId, id, via) => {
+    eventAuth: async (roomId, id, via, signal) => {
       try {
         const res = await federationRequest(server, signer, {
           room: { store, id: roomId },
@@ -171,13 +172,14 @@ export function productionFetcher(
           }/${encodeURIComponent(id)}`,
           body: null,
           maxBytes: bulk(),
+          signal,
         });
         return pduList(
           objectOf(res.json, 'event-auth').auth_chain,
           'event-auth',
         );
       } catch (error) {
-        if (recoverableUpstream(error)) return null;
+        if (recoverableUpstream(error, signal)) return null;
         throw error;
       }
     },

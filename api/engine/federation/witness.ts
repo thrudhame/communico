@@ -6,6 +6,7 @@
 // the caller's comment says so.
 import { b64decode } from '#engine/signing-primitives.js';
 import { arrayOf, objectOf } from '#engine/net/json.ts';
+import { settleAll } from '#engine/net/demand.ts';
 import {
   recoverableUpstream,
   upstreamCategory,
@@ -81,7 +82,7 @@ export async function askWitnesses(opts: {
     disagreements: WitnessDisagreement[];
   } | null
 > {
-  const answers = await Promise.all(
+  const answers = await settleAll(
     opts.peers.map(async (peer) => {
       try {
         const raw = await opts.query(

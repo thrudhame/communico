@@ -26,6 +26,11 @@ import type { Store } from '#engine/store/index.ts';
 import { ReliableEduError } from '#engine/federation/edus.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import type { RequestEvidence } from './request-evidence.ts';
+import {
+  type DemandedWork,
+  demandedWork,
+  joinDemand,
+} from '#engine/net/demand.ts';
 
 export type TransactionDeps = {
   store: Store;
@@ -49,9 +54,14 @@ export type PduResults = Record<
   Record<string, never> | { error: string }
 >;
 
-async function identifyRoomInputs(pdus: Pdu[], version: string) {
+async function identifyRoomInputs(
+  pdus: Pdu[],
+  version: string,
+  signal?: AbortSignal,
+) {
   const identified: { pdu: Pdu; eventId: string }[] = [];
   for (const pdu of pdus) {
+    signal?.throwIfAborted();
     let eventId: string;
     try {
       eventId = await eventIdFor(
@@ -72,9 +82,11 @@ async function identifyRoomInputs(pdus: Pdu[], version: string) {
 export async function absentTransactionRoom(
   pdus: Pdu[],
   rescind?: (pdu: Pdu) => Promise<boolean>,
+  signal?: AbortSignal,
 ): Promise<PduResults> {
   const results: PduResults = {};
-  for (const { pdu, eventId } of await identifyRoomInputs(pdus, '11')) {
+  for (const { pdu, eventId } of await identifyRoomInputs(pdus, '11', signal)) {
+    signal?.throwIfAborted();
     results[eventId] = rescind && await rescind(pdu)
       ? {}
       : { error: 'unknown room' };
@@ -139,7 +151,9 @@ export async function receiveTransactionRoom(
   origin: string,
   deps: TransactionDeps,
   operationId?: string,
+  signal?: AbortSignal,
 ): Promise<PduResults> {
+  signal?.throwIfAborted();
   const fed = config().federation;
   const results: PduResults = {};
   await receiveRoom(
@@ -151,6 +165,7 @@ export async function receiveTransactionRoom(
       keys: deps.keys,
       fetcher: deps.fetcher,
       self: deps.self,
+      signal,
       limits: {
         waitMs: fed.missingwaitms,
         limit: fed.missinglimit,
@@ -179,6 +194,7 @@ async function receiveRoom(
   results: PduResults,
   operationId?: string,
 ): Promise<void> {
+  remoteDeps.signal?.throwIfAborted();
   let room: Room | null = null;
   try {
     room = await openRoom(deps.store, roomId);
@@ -206,6 +222,7 @@ async function receiveRoom(
       await absentTransactionRoom(
         pdus,
         deps.rescind ? (pdu) => deps.rescind!(roomId, pdu) : undefined,
+        remoteDeps.signal,
       ),
     );
     return;
@@ -213,7 +230,7 @@ async function receiveRoom(
   // the result key is the event's COMPUTED id (uncomputable → no entry —
   // Complement counts them, federation_room_get_missing_events_test.go:292-294)
   // Restore derived event IDs on the wire form before shared remote admission.
-  const identified = await identifyRoomInputs(pdus, version);
+  const identified = await identifyRoomInputs(pdus, version, remoteDeps.signal);
   if (operationId !== undefined) {
     const prior = await replayRemoteBatch(
       room,
@@ -221,6 +238,8 @@ async function receiveRoom(
       origin,
       deps.self,
       operationId,
+      'pushed',
+      remoteDeps.signal,
     );
     if (prior) {
       assignOutcomes(results, prior);
@@ -275,7 +294,7 @@ function assignOutcomes(results: PduResults, outcomes: RemoteOutcome[]) {
 // a later retry can try again. Store identity prevents cross-install sharing.
 const activeTransactions = new WeakMap<
   Store,
-  Map<string, Promise<TxnResult>>
+  Map<string, DemandedWork<TxnResult>>
 >();
 
 export async function receiveTransaction(
@@ -283,7 +302,9 @@ export async function receiveTransaction(
   txnId: string,
   rawBody: unknown,
   deps: TransactionDeps,
+  signal?: AbortSignal,
 ): Promise<TxnResult> {
+  signal?.throwIfAborted();
   // Even a retry must pass envelope admission before joining an existing result.
   const input = decodeTransaction(rawBody, origin);
   let active = activeTransactions.get(deps.store);
@@ -293,16 +314,27 @@ export async function receiveTransaction(
   }
   const key = JSON.stringify([origin, txnId]);
   let pending = active.get(key);
+  if (pending?.abort.signal.aborted) {
+    // The old callback may still own a native transaction or projection. A new
+    // retry cannot overlap it merely because its transport disappeared.
+    try {
+      await pending.run;
+    } catch { /* Subscribers retain the old result. */ }
+    signal?.throwIfAborted();
+    return await receiveTransaction(origin, txnId, rawBody, deps, signal);
+  }
   if (pending === undefined) {
-    pending = receiveOwnedTransaction(origin, txnId, input, deps);
+    pending = demandedWork((demand) =>
+      receiveOwnedTransaction(origin, txnId, input, deps, demand)
+    );
     active.set(key, pending);
+    const owned = pending;
+    void pending.run.finally(() => {
+      if (active.get(key) === owned) active.delete(key);
+    }).catch(() => {}); // Subscribers observe the original callback's failure.
   }
-  try {
-    // Subscribers own their response values, not the operation's shared object.
-    return structuredClone(await pending);
-  } finally {
-    if (active.get(key) === pending) active.delete(key);
-  }
+  // Subscribers own their response values, not the operation's shared object.
+  return structuredClone(await joinDemand(pending, signal));
 }
 
 async function receiveOwnedTransaction(
@@ -310,7 +342,9 @@ async function receiveOwnedTransaction(
   txnId: string,
   { pdus, edus }: ReturnType<typeof decodeTransaction>,
   deps: TransactionDeps,
+  signal: AbortSignal,
 ): Promise<TxnResult> {
+  signal.throwIfAborted();
   const server = await deps.store.server();
   // replay: a retried transaction gets the stored answer
   const cached = await server.query(
@@ -329,20 +363,31 @@ async function receiveOwnedTransaction(
   // one room at a time, in first-seen order (the room's own sequencing
   // lives inside ingestRemote's locked batch)
   for (const [roomId, roomPdus] of transactionRooms(pdus)) {
+    signal.throwIfAborted();
     Object.assign(
       results,
-      await receiveTransactionRoom(roomId, roomPdus, origin, deps),
+      await receiveTransactionRoom(
+        roomId,
+        roomPdus,
+        origin,
+        deps,
+        undefined,
+        signal,
+      ),
     );
   }
 
   // Reliable acceptance must finish before the transport success is cached.
   for (const raw of edus) {
+    signal.throwIfAborted();
     await dispatchTransactionEdu(origin, raw, deps.edus);
   }
 
   const response = { pdus: results };
+  signal.throwIfAborted();
   // the replay cache — pruned on insert after txnhours
   await server.tx(async (tx) => {
+    signal.throwIfAborted();
     await tx.execute(
       'DELETE FROM federation_txns WHERE received_ms < ?',
       [Date.now() - fed.txnhours * 3_600_000],
