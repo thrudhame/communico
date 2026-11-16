@@ -70,7 +70,6 @@ suite.test('remote reliable acceptance reaches sync, dedups across transactions 
     messages: {
       [b.user_id]: {
         '*': { ciphertext: 'opaque' },
-        unknown: { ignored: true },
       },
       '@foreign:elsewhere.test': { '*': { ignored: true } },
     },
@@ -88,6 +87,16 @@ suite.test('remote reliable acceptance reaches sync, dedups across transactions 
     type: content.type,
     content: { ciphertext: 'opaque' },
   }]);
+  // Synapse expands '*' only as the sole selector. In a mixed map it is a
+  // literal unknown device, not a second wildcard delivery path.
+  await receive('mixed-selectors', {
+    ...content,
+    message_id: 'mixed-selectors',
+    messages: {
+      [b.user_id]: { '*': { ignored: true }, unknown: { ignored: true } },
+    },
+  });
+  assertEquals((await sync(b.access_token!)).to_device.events.length, 1);
   await loginUser(app.tenant, {
     localpart: 'transport-b',
     password: 'pw',
@@ -118,20 +127,19 @@ suite.test('remote reliable acceptance reaches sync, dedups across transactions 
   try {
     setConfigForTests({ e2ee: { maxinboxmessages: 1 } });
     const second = { ...content, message_id: 'logical-2' };
-    await assertRejects(() => receive('retryable', second));
+    assertEquals((await receive('retryable', second)).status, 200);
     assertEquals(
       await app.server.query(
         "SELECT 1 FROM federation_txns WHERE txn_id='retryable'",
       ),
-      [],
+      [{ 1: 1 }],
     );
     assertEquals(
       await tenant.query(
         "SELECT 1 FROM inbound_to_device WHERE message_id='logical-2'",
       ),
-      [],
+      [{ 1: 1 }],
     );
-    setConfigForTests({ e2ee: limits });
     await receive('retryable', second);
     assertEquals((await sync(b.access_token!)).to_device.events.length, 2);
   } finally {

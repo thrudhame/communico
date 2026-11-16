@@ -1,7 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
-import { config } from '#engine/config.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
@@ -22,7 +22,7 @@ import {
 } from '#engine/tenant/session-authority.ts';
 import * as routing from '#engine/tenant/todevice-routing.ts';
 import type { Conn } from '#engine/store/db.ts';
-import { deliverSliding } from '#engine/tenant/todevice.ts';
+import { deliverSliding, insertMessage } from '#engine/tenant/todevice.ts';
 
 const expected = (source: string) => ({
   source,
@@ -425,13 +425,26 @@ Deno.test('to-device semantic import: cross-account targets use the recipient re
 
 Deno.test('to-device semantic import: recipient auth alone resumes a cold cross-account selector atomically without sender retry', async () => {
   const f = await fixture();
+  const previous = { ...config().e2ee };
   try {
+    setConfigForTests({ e2ee: { maxinboxmessages: 1 } });
     await f.home.tx((tx) => tx.users.insert('bob', 'Bob'));
     await f.edge.tx((tx) => tx.users.insert('bob', 'Bob'));
     // Independent device authority can already be held while auth bootstrap
     // for this account has not yet arrived. It is not an empty registry.
     await upsertDevice(f.edge, 'bob', 'BOB');
+    await upsertDevice(f.edge, 'bob', 'SECOND');
     const recipient = await deviceIdentity(f.edge, 'bob', 'BOB');
+    const second = await deviceIdentity(f.edge, 'bob', 'SECOND');
+    const retained = {
+      sender: '@alice:logical.test',
+      type: 'm.room_key',
+      content: { key: 'retained-before-auth' },
+    };
+    await f.ed.tx((conn) =>
+      insertMessage(conn, recipient, 'retained', retained, config().e2ee)
+    );
+    const before = await f.ed.query('SELECT * FROM to_device_inbox');
     const sender = await deviceIdentity(f.home, 'alice', 'LAN');
     await f.home.tx((tx) =>
       tx.toDevice.send(
@@ -462,7 +475,7 @@ Deno.test('to-device semantic import: recipient auth alone resumes a cold cross-
       ),
       [{ expanded: 0 }],
     );
-    assertEquals(await f.ed.query('SELECT * FROM to_device_inbox'), []);
+    assertEquals(await f.ed.query('SELECT * FROM to_device_inbox'), before);
     const snapshot = await f.hd.tx((conn) =>
       captureAccountAuth(
         conn,
@@ -487,7 +500,7 @@ Deno.test('to-device semantic import: recipient auth alone resumes a cold cross-
       Error,
       'rollback recipient bootstrap',
     );
-    assertEquals(await ed.query('SELECT * FROM to_device_inbox'), []);
+    assertEquals(await ed.query('SELECT * FROM to_device_inbox'), before);
     assertEquals(
       await ed.query('SELECT * FROM account_auth_snapshots WHERE localpart=?', [
         'bob',
@@ -498,15 +511,22 @@ Deno.test('to-device semantic import: recipient auth alone resumes a cold cross-
     const delivered = await ed.tx((conn) =>
       deliverSliding(conn, recipient, 'bob', 100, config().e2ee)
     );
-    assertEquals(delivered.events, [{
+    const resumed = {
       sender: '@alice:logical.test',
       type: 'm.room_key',
       content: { key: 'deferred' },
-    }]);
+    };
+    assertEquals(delivered.events, [retained, resumed]);
+    assertEquals(
+      (await ed.tx((conn) =>
+        deliverSliding(conn, second, 'second', 100, config().e2ee)
+      )).events,
+      [resumed],
+    );
     await ed.tx((conn) => installAccountAuth(conn, snapshot));
     assertEquals(
       (await ed.query('SELECT source_id FROM to_device_inbox')).length,
-      1,
+      3,
     );
     const facts = await ed.query(
       'SELECT localpart,kind FROM to_device_operations ORDER BY sequence',
@@ -542,6 +562,7 @@ Deno.test('to-device semantic import: recipient auth alone resumes a cold cross-
       [],
     );
   } finally {
+    setConfigForTests({ e2ee: previous });
     await f.close();
   }
 });

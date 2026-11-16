@@ -1,5 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
-import { config } from '#engine/config.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
 import {
   AccountSnapshots,
   exportAccountAuth,
@@ -25,6 +25,7 @@ import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
 import { pendingTenantProjection } from '#engine/tenant/hooks.ts';
+import { insertMessage } from '#engine/tenant/todevice.ts';
 import {
   captureDeviceStreamFloor,
   installDeviceStreamFloor,
@@ -208,8 +209,10 @@ Deno.test('to-device link: reader capability is additive and old readers refuse 
 
 Deno.test('to-device link: recipient auth commits and wakes a pending other-account inbox without sender export or unrelated news', async () => {
   const f = await fixture();
+  const previous = { ...config().e2ee };
   let stop = () => {};
   try {
+    setConfigForTests({ e2ee: { maxinboxmessages: 1 } });
     await f.et.tx((tx) => tx.users.insert('bob', 'Bob'));
     // The independently deliverable key bootstrap can install this genuine
     // home allocation floor without granting credential/auth readiness.
@@ -222,6 +225,15 @@ Deno.test('to-device link: recipient auth commits and wakes a pending other-acco
     );
     await upsertDevice(f.et, 'bob', 'BOB');
     const recipient = await deviceIdentity(f.et, 'bob', 'BOB');
+    const retained = {
+      sender: '@alice:logical.test',
+      type: 'm.room_key',
+      content: { key: 'retained-before-auth' },
+    };
+    const db = await f.edge.tenant('logical.test');
+    await db.tx((conn) =>
+      insertMessage(conn, recipient, 'retained', retained, config().e2ee)
+    );
     const sender = await deviceIdentity(f.ht, 'alice', 'LAN');
     await f.ht.tx((tx) =>
       tx.toDevice.send(
@@ -245,8 +257,7 @@ Deno.test('to-device link: recipient auth commits and wakes a pending other-acco
       await f.ej.receive('home', [record]);
       await f.es.apply(f.ej, record);
     }
-    const db = await f.edge.tenant('logical.test');
-    assertEquals(await db.query('SELECT * FROM to_device_inbox'), []);
+    assertEquals((await db.query('SELECT * FROM to_device_inbox')).length, 1);
     await projectTenant(f.edge, 'logical.test');
     assertEquals(await pendingTenantProjection(db), 0);
     let hints = 0;
@@ -278,14 +289,15 @@ Deno.test('to-device link: recipient auth commits and wakes a pending other-acco
     const delivered = await f.et.tx((tx) =>
       tx.toDevice.deliverSliding(recipient, 'bob', 100, config().e2ee)
     );
-    assertEquals(delivered.events, [{
+    assertEquals(delivered.events, [retained, {
       sender: '@alice:logical.test',
       type: 'm.room_key',
       content: { key: 'new-session' },
     }]);
-    assertEquals((await db.query('SELECT * FROM to_device_inbox')).length, 1);
+    assertEquals((await db.query('SELECT * FROM to_device_inbox')).length, 2);
   } finally {
     stop();
+    setConfigForTests({ e2ee: previous });
     await f.close();
   }
 });

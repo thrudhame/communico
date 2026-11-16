@@ -247,7 +247,7 @@ suite.test('inbox and key-pool mutations wake sync without room events', async (
   assertEquals((await fallbackWait).device_unused_fallback_key_types, []);
 });
 
-suite.test('configured queue overflow rejects atomically and device recreation cannot inherit queue or cuts', async () => {
+suite.test('local inbox growth retains accepted messages and device recreation cannot inherit queue or cuts', async () => {
   const a = await suite.registerTestUser('cap-a', 'pw');
   const b = await suite.registerTestUser('cap-b', 'pw');
   const limits = { ...config().e2ee };
@@ -257,9 +257,18 @@ suite.test('configured queue overflow rejects atomically and device recreation c
     await send(a.access_token!, 'overflow', {
       [a.user_id]: { '*': { n: 2 } },
       [b.user_id]: { '*': { n: 2 } },
-    }, 413);
-    assertEquals((await sync(a.access_token!)).to_device.events, []);
+    });
+    assertEquals(
+      (await sync(a.access_token!)).to_device.events.map((
+        e: { content: unknown },
+      ) => e.content),
+      [{ n: 2 }],
+    );
     const issued = await sync(b.access_token!);
+    assertEquals(
+      issued.to_device.events.map((e: { content: unknown }) => e.content),
+      [{ n: 1 }, { n: 2 }],
+    );
     await call(b.access_token!, 'logout', {});
     const replacement = await loginUser(theApp().tenant, {
       localpart: 'cap-b',
@@ -273,8 +282,18 @@ suite.test('configured queue overflow rejects atomically and device recreation c
     );
     await send(a.access_token!, 'overflow', { [a.user_id]: { '*': { n: 3 } } });
     assertEquals((await sync(a.access_token!)).to_device.events[0].content, {
-      n: 3,
+      n: 2,
     });
+    await send(a.access_token!, 'fresh', { [a.user_id]: { '*': { n: 3 } } });
+    const retained = await sync(a.access_token!);
+    assertEquals(
+      retained.to_device.events.map((e: { content: unknown }) => e.content),
+      [{ n: 2 }, { n: 3 }],
+    );
+    assertEquals(
+      (await sync(a.access_token!, retained.next_batch)).to_device.events,
+      [],
+    );
   } finally {
     setConfigForTests({ e2ee: limits });
   }

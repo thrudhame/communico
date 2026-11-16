@@ -43,12 +43,6 @@ export function targetSelectors(messages: Message[]) {
     wildcard: message.id === '*' && counts.get(message.user) === 1,
   }));
 }
-/** Queue pressure is temporary, unlike a permanently oversized wire object. */
-export class InboxFullError extends MatrixError {
-  constructor() {
-    super(413, 'M_TOO_LARGE', 'device inbox is full');
-  }
-}
 export type DeliveryPolicy = { enabled: boolean; maxBytes: number };
 export function validateMessages(body: unknown, limits: KeyLimits): Message[] {
   bounded(body, limits.maxrequestbytes);
@@ -92,11 +86,10 @@ export async function insertMessage(
       [...owner, source],
     )).length
   ) return;
-  const count = await conn.query(
-    'SELECT COUNT(*) AS n FROM to_device_inbox WHERE localpart=? AND device_id=? AND generation=?',
-    owner,
-  );
-  if (Number(count[0].n) >= limits.maxinboxmessages) throw new InboxFullError();
+  // Like Synapse, retain inbox rows until their issued receipt is acknowledged
+  // or this device incarnation is deleted. Remote-intent admission budgets do
+  // not bound a receiving device's durable inbox. Actual I/O errors still abort
+  // the caller's whole transaction, including its route expansion and receipt.
   const pos = await nextCounter(conn, 'to_device');
   await conn.execute('INSERT INTO to_device_inbox VALUES(?,?,?,?,?,?)', [
     ...owner,

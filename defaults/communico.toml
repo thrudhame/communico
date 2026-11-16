@@ -264,6 +264,9 @@ maxkeys = 1000
 # Unclaimed OTKs per device; reject overflow, never prune accepted keys.
 # COMMUNICO_E2EE_MAXONETIMEKEYS
 maxonetimekeys = 10000
+# Pending outbound remote to-device intents per tenant, not per-device inbox rows.
+# Local inboxes retain accepted messages until ACK or device deletion.
+# COMMUNICO_E2EE_MAXINBOXMESSAGES
 maxinboxmessages = 10000
 # Pending remote to-device intents per destination, across all senders.
 # Also limited to maxinboxmessages - 1, reserving capacity for another peer.
