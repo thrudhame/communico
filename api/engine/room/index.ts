@@ -30,7 +30,12 @@ export type { Change } from '#engine/room/changes.ts';
 // Count only resolutions in committed attempts, not abandoned snapshots.
 export const resolutionProbe = { resolutions: 0 };
 
-function bind(conn: Conn, edges: EdgeOverlay, groups: state.StateGroups) {
+function bind(
+  conn: Conn,
+  edges: EdgeOverlay,
+  groups: state.StateGroups,
+  rows: events.EventReads,
+) {
   return {
     diagnostics: { resolutions: 0 },
     remoteBatches: {
@@ -48,8 +53,8 @@ function bind(conn: Conn, edges: EdgeOverlay, groups: state.StateGroups) {
         await events.insertEvent(conn, id, pdu, edges);
         await waits.readyFor(conn, id);
       },
-      get: (id: string) => events.getEvent(conn, id, edges),
-      list: (ids: readonly string[]) => events.getEvents(conn, ids, edges),
+      get: (id: string) => rows.get(id),
+      list: (ids: readonly string[]) => rows.list(ids),
       ancestry: (ids: readonly string[]) => events.ancestryNodes(conn, ids),
       prevsOf: (event: string) => events.prevsOf(conn, event, edges),
       authsOf: (event: string) => events.authsOf(conn, event, edges),
@@ -233,7 +238,8 @@ async function roomTransaction<T>(
   const { result, resolutions, edges } = await run(async (conn) => {
     const edges = roomEdges.attempt(store, roomId, cutoff);
     const groups = new state.StateGroups(conn);
-    const tx = bind(conn, edges, groups);
+    const rows = new events.EventReads(conn, edges);
+    const tx = bind(conn, edges, groups, rows);
     try {
       const result = await fn(tx);
       return { result, resolutions: tx.diagnostics.resolutions, edges };
@@ -241,6 +247,7 @@ async function roomTransaction<T>(
       // Cache hits must not let an escaped RoomTx outlive its Conn.
       edges.release();
       groups.release();
+      rows.release();
     }
   });
   edges.commit();
