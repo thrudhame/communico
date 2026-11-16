@@ -403,8 +403,16 @@ UPDATE receipts SET event_ids=json_array(event_ids);
 const NOTIFICATIONS_UNREAD_SQL =
   'CREATE INDEX notifications_unread ON notifications(user,room,thread,event_seq,withdrawn,highlight) WHERE read_ms IS NULL';
 
+// Event identity is shared by delivery, state admission, search and projection.
+// A room/sequence index cannot serve these point lookups without scanning history.
+const FEED_EVENT_SQL = 'CREATE INDEX feed_event ON feed(event)';
+const OUTBOX_PENDING_SQL =
+  "CREATE INDEX outbox_pending_destination ON outbox(destination) WHERE state='pending'";
+const FEDERATION_TXNS_RECEIVED_SQL =
+  'CREATE INDEX federation_txns_received ON federation_txns(received_ms)';
+
 export const serverSchema: SchemaProvider = {
-  version: 37,
+  version: 40,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -444,6 +452,9 @@ export const serverSchema: SchemaProvider = {
     await db.exec(NOTIFICATIONS_UNREAD_SQL);
     await db.exec(OWNER_CONTROL_SQL);
     await db.exec(PUBLICATION_DOMAIN_SQL);
+    await db.exec(FEED_EVENT_SQL);
+    await db.exec(OUTBOX_PENDING_SQL);
+    await db.exec(FEDERATION_TXNS_RECEIVED_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -486,5 +497,8 @@ export const serverSchema: SchemaProvider = {
       await conn.exec(OWNER_CONTROL_SQL);
       await conn.exec(PUBLICATION_DOMAIN_SQL);
     },
+    37: (conn) => conn.exec(FEED_EVENT_SQL),
+    38: (conn) => conn.exec(OUTBOX_PENDING_SQL),
+    39: (conn) => conn.exec(FEDERATION_TXNS_RECEIVED_SQL),
   },
 };
