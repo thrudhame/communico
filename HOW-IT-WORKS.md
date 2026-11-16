@@ -283,6 +283,8 @@ Client state disclosure has one admission owner, separate from raw state reads
 and event serialization. A grant names the room, viewer and exact publication
 or event-state snapshot. Joined/authorized snapshots retain old and imported
 state keys; a declined invitation alone never grants a private snapshot.
+Admission uses direct snapshot permission before asking for historical joined
+evidence; only an otherwise-unqualified leave/ban snapshot needs that witness.
 Without snapshot permission, only individually visible state survives. Published
 participation history fixes the real departure boundary: a later ban, declined
 reinvitation or current join cannot disclose a different private interval.
