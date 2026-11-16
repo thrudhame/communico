@@ -1,6 +1,7 @@
 // Own TLS from socket creation through final close, independently of the
 // caller's injected trust policy and TCP-only or handshake-inclusive budget.
 import tls from 'node:tls';
+import { isIP } from 'node:net';
 import { Buffer } from 'node:buffer';
 import type { WireConn } from './http1.ts';
 import { UpstreamError } from './upstream-error.ts';
@@ -28,10 +29,19 @@ export class TlsConnection implements WireConn {
 
   constructor(opts: TlsConnectionOptions) {
     opts.signal.throwIfAborted();
+    // Verification identity and wire SNI are distinct: IP SAN verification is
+    // still required when an IP literal cannot be sent in ClientHello.
+    const identity = opts.sni === null
+      ? opts.connectIp
+      : opts.sni.replace(/^\[|\]$/g, '');
     this.#socket = tls.connect({
       host: opts.connectIp,
       port: opts.port,
-      servername: opts.sni === null ? undefined : opts.sni,
+      servername: opts.sni === null || isIP(identity) !== 0
+        ? undefined
+        : identity,
+      checkServerIdentity: (_hostname, certificate) =>
+        tls.checkServerIdentity(identity, certificate),
       ...opts.trust,
     });
     const socket = this.#socket;

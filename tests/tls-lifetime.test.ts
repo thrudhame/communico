@@ -4,6 +4,7 @@ import net from 'node:net';
 import { http1Request } from '#engine/net/http1.ts';
 import { dialNodeTls } from '#engine/federation/dial-node-tls.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { TlsConnection } from '#engine/net/tls-connection.ts';
 
 function deferred() {
   let resolve!: () => void;
@@ -54,9 +55,31 @@ for (const caller of ['http1', 'federation'] as const) {
       : dialNodeTls({ ...common, sni, trust: { kind: 'ca', caCerts } });
   };
 
-  for (const outcome of ['success', 'protocol failure', 'abort'] as const) {
+  for (
+    const outcome of [
+      'success',
+      'protocol failure',
+      'abort',
+      'body abort',
+    ] as const
+  ) {
     Deno.test(`${caller}: TLS owner releases the actual peer on ${outcome}`, async () => {
       const accepted = deferred(), closed = deferred(), requested = deferred();
+      const bodyReading = deferred();
+      const read = TlsConnection.prototype.read;
+      let sawBody = false;
+      let received = '';
+      if (outcome === 'body abort') {
+        TlsConnection.prototype.read = async function (buffer) {
+          if (sawBody) bodyReading.resolve();
+          const count = await read.call(this, buffer);
+          if (count !== null) {
+            received += new TextDecoder().decode(buffer.subarray(0, count));
+            sawBody = received.includes('\r\n\r\no');
+          }
+          return count;
+        };
+      }
       const sockets = new Set<net.Socket>();
       const server = tls.createServer({ cert, key }, (socket) => {
         accepted.resolve();
@@ -64,7 +87,9 @@ for (const caller of ['http1', 'federation'] as const) {
           requested.resolve();
           if (outcome !== 'abort') {
             socket.write(
-              outcome === 'success'
+              outcome === 'body abort'
+                ? 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no'
+                : outcome === 'success'
                 ? 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'
                 : 'HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n',
             );
@@ -93,14 +118,22 @@ for (const caller of ['http1', 'federation'] as const) {
         await observed(accepted.promise, 'verified TLS connection');
         await observed(requested.promise, 'HTTP bytes received');
         if (outcome === 'abort') ac.abort(reason);
+        if (outcome === 'body abort') {
+          await observed(
+            bodyReading.promise,
+            'partial TLS body consumed before cancellation',
+          );
+          ac.abort(reason);
+        }
         const result = await observed(pending, 'request settles');
         if (outcome === 'success') {
           assert('value' in result);
           assertEquals(new TextDecoder().decode(result.value.body), 'ok');
         } else {
           assert('error' in result);
-          if (outcome === 'abort') assertStrictEquals(result.error, reason);
-          else {
+          if (outcome === 'abort' || outcome === 'body abort') {
+            assertStrictEquals(result.error, reason);
+          } else {
             assert(result.error instanceof UpstreamError);
             assertEquals(result.error.category, 'protocol');
           }
@@ -108,6 +141,7 @@ for (const caller of ['http1', 'federation'] as const) {
         // Observe the remote transport, before any test-side socket cleanup.
         await observed(closed.promise, 'TLS peer must close before cleanup');
       } finally {
+        TlsConnection.prototype.read = read;
         ac.abort(reason);
         for (const socket of sockets) socket.destroy();
         await pending;
@@ -233,11 +267,27 @@ for (const caller of ['http1', 'federation'] as const) {
   }
 
   for (
-    const identity of ['localhost', null, 'wrong.invalid', 'untrusted'] as const
+    const identity of [
+      'localhost',
+      null,
+      '127.0.0.1',
+      '[::1]',
+      'wrong.invalid',
+      'untrusted',
+    ] as const
   ) {
     Deno.test(`${caller}: TLS identity ${identity ?? 'IP SAN'}`, async () => {
       let requests = 0;
-      const server = tls.createServer({ cert, key }, (socket) => {
+      let servername: string | false | undefined;
+      const context = tls.createSecureContext({ cert, key });
+      const server = tls.createServer({
+        cert,
+        key,
+        SNICallback(name, callback) {
+          servername = name;
+          callback(null, context);
+        },
+      }, (socket) => {
         socket.once('data', () => {
           requests++;
           socket.end('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
@@ -256,12 +306,24 @@ for (const caller of ['http1', 'federation'] as const) {
           identity === 'untrusted' ? [] : [ca],
         )
           .then((value) => value, (error) => error);
-        if (identity === 'wrong.invalid' || identity === 'untrusted') {
+        if (
+          identity === 'wrong.invalid' || identity === 'untrusted' ||
+          identity === '[::1]'
+        ) {
           assert(result instanceof UpstreamError);
           assertEquals(requests, 0);
         } else {
-          assertEquals(result.status, 200);
+          assertEquals(
+            result.status,
+            200,
+            'IP identity must verify without sending an IP literal SNI',
+          );
           assertEquals(requests, 1);
+          assertEquals(
+            servername || false,
+            identity === 'localhost' ? 'localhost' : false,
+            'IP identity must verify without sending an IP literal SNI',
+          );
         }
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
