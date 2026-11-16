@@ -18,6 +18,10 @@ import { HomeEgress } from '#engine/facade/home-egress.ts';
 import type { Dispatch } from '#engine/server/delivery.ts';
 import { startSender } from '#engine/federation/sender.ts';
 import { bounded } from './helpers/server-process.ts';
+import { config } from '#engine/config.ts';
+import { upsertDevice } from '#engine/tenant/devices.ts';
+import { deviceIdentity } from '#engine/tenant/txns.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
 
 function localDispatch(owner: EgressOwner): Dispatch {
   const dispatch = Reflect.get(owner, 'dispatchLocal');
@@ -274,6 +278,180 @@ Deno.test('facade local egress publishes an ordinary sender device EDU only afte
       await (await f.db()).query('SELECT * FROM federation_batches'),
       [],
     );
+    assertEquals(await (await f.db()).query('SELECT * FROM edu_outbox'), []);
+  } finally {
+    await sender?.stop();
+    await f.close();
+  }
+});
+
+Deno.test('to-device tenant intent follows the shared egress lease, uncertain bytes and durable result through cold restart', async () => {
+  const f = await fixture();
+  let sender: ReturnType<typeof startSender> | undefined;
+  try {
+    const tenant = await openTenant(f.store(), 'logical.test', {
+      create: true,
+    });
+    await tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+    await upsertDevice(tenant, 'alice', 'PHONE');
+    const device = await deviceIdentity(tenant, 'alice', 'PHONE');
+    const messages = [{
+      user: '@bob:remote.test',
+      id: '*',
+      content: { ciphertext: 'original' },
+    }];
+    await tenant.tx((tx) =>
+      tx.toDevice.send(
+        device,
+        'logical.test',
+        'm.room.encrypted',
+        'client-txn',
+        'logical-message',
+        messages,
+        config().e2ee,
+        { enabled: true, maxBytes: 1048576 },
+      )
+    );
+    const intent = await (await f.store().tenant('logical.test')).query(
+      'SELECT * FROM to_device_intents',
+    );
+    assertEquals(intent.length, 1);
+    assertEquals(intent[0].projected, 0);
+    assertEquals(await (await f.db()).query('SELECT * FROM edu_outbox'), []);
+    const home = await f.append({ kind: 'propose', ...f.envelope });
+    await (await f.owner()).apply(await f.journal(), home);
+    const grant = (await (await f.journal()).result('home', 'in', home, home))!
+      .result as { fence: string };
+    await projectTenant(f.store(), 'logical.test');
+    const source = 'tenant:logical.test:to-device:logical-message:remote.test';
+    assertEquals(
+      await (await f.db()).query('SELECT source,state FROM edu_outbox'),
+      [{ source, state: 'pending' }],
+    );
+    // No direct transport is available: every attempt goes through the owner.
+    const run = async (afterOwner = false) => {
+      const attempted = Promise.withResolvers<void>();
+      const owner = await f.owner();
+      sender = startSender({
+        store: f.store(),
+        signer: f.node.signer(),
+        dispatch: async (envelope) => {
+          try {
+            const result = await owner.dispatchLocal(envelope);
+            if (afterOwner) throw new Error('lost local outbox completion');
+            return result;
+          } finally {
+            attempted.resolve();
+          }
+        },
+        onDelivered: () => projectTenant(f.store(), 'logical.test'),
+      });
+      await bounded(attempted.promise);
+      await sender.stop();
+      sender = undefined;
+    };
+    await run();
+    assertEquals(
+      f.sent,
+      [],
+      'home lease must block the actual to-device batch',
+    );
+    const frozen = await frozenBatch(await f.db(), 'remote.test', true);
+    assertEquals(frozen?.sources, [source]);
+    assertEquals(JSON.parse(frozen!.body).edus, [{
+      edu_type: 'm.direct_to_device',
+      content: {
+        sender: '@alice:logical.test',
+        type: 'm.room.encrypted',
+        message_id: 'logical-message',
+        messages: { '@bob:remote.test': { '*': { ciphertext: 'original' } } },
+      },
+    }]);
+    await f.reopen();
+    const completed = await f.append({
+      kind: 'complete',
+      ...f.envelope,
+      fence: grant.fence,
+      response: { pdus: {} },
+    });
+    await (await f.owner()).apply(await f.journal(), completed);
+    f.fail(true);
+    await run();
+    assertEquals(f.sent.length, 1);
+    assertEquals(await frozenBatch(await f.db(), 'remote.test', true), frozen);
+    assertEquals(
+      (await (await f.store().tenant('logical.test')).query(
+        'SELECT * FROM to_device_intents',
+      )).length,
+      1,
+    );
+    await f.reopen();
+    f.fail(false);
+    await run(true);
+    assertEquals(f.sent.length, 2);
+    assertEquals(
+      f.sent[0],
+      f.sent[1],
+      'uncertain retry must retain the exact ID and bytes',
+    );
+    assertEquals(await frozenBatch(await f.db(), 'remote.test', true), frozen);
+    assertEquals(
+      (await (await f.db()).query(
+        'SELECT result_json FROM facade_egress WHERE txn_id=?',
+        [frozen!.txnId],
+      ))[0].result_json,
+      '{"pdus":{}}',
+    );
+    await f.reopen();
+    const reopened = await openTenant(f.store(), 'logical.test');
+    await reopened.tx((tx) =>
+      tx.toDevice.send(
+        device,
+        'logical.test',
+        'm.room.encrypted',
+        'client-txn',
+        'changed-source',
+        [{ ...messages[0], content: { changed: true } }],
+        config().e2ee,
+        { enabled: true, maxBytes: 1048576 },
+      )
+    );
+    await projectTenant(f.store(), 'logical.test');
+    assertEquals(
+      (await (await f.store().tenant('logical.test')).query(
+        'SELECT * FROM to_device_intents',
+      )).length,
+      1,
+    );
+    const delivered = Promise.withResolvers<void>();
+    const owner = await f.owner();
+    sender = startSender({
+      store: f.store(),
+      signer: f.node.signer(),
+      dispatch: (envelope) => owner.dispatchLocal(envelope),
+      onDelivered: async () => {
+        await projectTenant(f.store(), 'logical.test');
+        delivered.resolve();
+      },
+    });
+    await bounded(delivered.promise);
+    await sender.stop();
+    sender = undefined;
+    assertEquals(
+      f.sent.length,
+      2,
+      'saved owner result must complete local ACK without retransmission',
+    );
+    assertEquals(
+      await (await f.store().tenant('logical.test')).query(
+        'SELECT * FROM to_device_intents',
+      ),
+      [],
+    );
+    assertEquals(await (await f.db()).query('SELECT * FROM edu_outbox'), []);
+    assertEquals(await frozenBatch(await f.db(), 'remote.test', true), null);
+    await f.reopen();
+    await projectTenant(f.store(), 'logical.test');
     assertEquals(await (await f.db()).query('SELECT * FROM edu_outbox'), []);
   } finally {
     await sender?.stop();

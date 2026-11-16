@@ -1463,11 +1463,83 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       (await api('facade', 'account/whoami', undefined, 'unknown')).status,
       401,
     );
+    const toDevicePath = 'sendToDevice/m.room_key_request/public-owner-send';
+    const originalRequest = {
+      messages: {
+        '@outside:logical.test': { '*': { request_id: 'public-owner-send' } },
+      },
+    };
+    assertEquals(
+      (await api(
+        'facade',
+        toDevicePath,
+        originalRequest,
+        session.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        toDevicePath,
+        {
+          messages: {
+            '@outside:logical.test': {
+              '*': { request_id: 'must-not-replace' },
+            },
+          },
+        },
+        session.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        toDevicePath + '-wrong',
+        originalRequest,
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      503,
+    );
     const rotated = await api('facade', 'refresh', {
       refresh_token: session.body.refresh_token,
     });
     assertEquals(rotated.status, 200);
     await edge.stop();
+    const sentStore = await openStore({
+      dir: tls.dir + '/facade-public-auth-store',
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, {
+      schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
+    });
+    try {
+      const db = await sentStore.tenant('logical.test');
+      assertEquals(
+        (await db.query(
+          'SELECT * FROM to_device_transactions WHERE txn_id LIKE ?',
+          ['public-owner-send%'],
+        )).length,
+        1,
+      );
+      const received = await db.query(
+        'SELECT event_json FROM to_device_inbox WHERE localpart=? AND device_id=?',
+        ['outside', 'public-device'],
+      );
+      assertEquals(
+        received.map((row) => JSON.parse(String(row.event_json)).content),
+        [{ request_id: 'public-owner-send' }],
+      );
+      assertEquals(await db.query('SELECT * FROM to_device_intents'), []);
+    } finally {
+      await sentStore.close();
+    }
     await configure('facade', 'allowstaleauth=false\n');
     edge = await process(file('facade'), 'facade: link/local admin ready');
     const unavailable = {

@@ -191,6 +191,7 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       ['v3/keys/query', 'POST'],
       ['v3/keys/claim', 'POST'],
       ['v3/keys/signatures/upload', 'POST'],
+      ['v3/sendToDevice/m.test/txn', 'PUT'],
       ['v3/profile/%40alice%3Atest', 'GET'],
       ['v3/profile/%40alice%3Atest/displayname', 'GET'],
       ['v3/profile/%40alice%3Atest/org.test.field', 'PUT'],
@@ -228,7 +229,6 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       ['v3/sync', 'GET'],
       ['v3/createRoom', 'POST'],
       ['v3/keys/changes', 'GET'],
-      ['v3/sendToDevice/m.test/txn', 'PUT'],
       ['v3/user/%40alice%3Atest/filter', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true)?.status, 404);
@@ -240,6 +240,26 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
   assertEquals(facade.service('deactivation'), true);
   assertEquals(facade.service('device-lists'), true);
   assertEquals(facade.service('federation-sender'), true);
+  const send = request('v3/sendToDevice/m.room.encrypted/client-txn', 'PUT');
+  const scopes: string[] = [];
+  assertEquals(
+    facade.gate(send, (scope) => {
+      scopes.push(scope);
+      return true;
+    }),
+    null,
+  );
+  assertEquals(scopes, ['auth']);
+  assertEquals(facade.gate(send, () => false)?.status, 503);
+  assertEquals(
+    capabilities('facade', 'f1').gate(send, () => true)?.status,
+    404,
+  );
+  assertEquals(
+    facade.gate(request('v3/sendToDevice/m.test/txn', 'POST'), () => true)
+      ?.status,
+    405,
+  );
   assertEquals(
     capabilities('facade', 'f1').service('federation-sender'),
     false,
