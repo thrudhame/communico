@@ -21,6 +21,7 @@ import { type Json, object } from '#engine/tenant/e2ee.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import { forgetKeySignatures } from '#engine/tenant/signature-view.ts';
 import { KeyHistoryProof } from '#engine/tenant/key-bootstrap.ts';
+import { recordTenantProjection } from '#engine/tenant/hooks.ts';
 
 export const SIGNING_OPERATIONS_SQL = `
 CREATE TABLE signing_operations(operation_id TEXT PRIMARY KEY NOT NULL,source TEXT NOT NULL,incarnation TEXT NOT NULL,sequence INTEGER NOT NULL,localpart TEXT NOT NULL,payload_json TEXT NOT NULL,UNIQUE(source,incarnation,sequence));
@@ -252,5 +253,6 @@ export async function importSigningOperation(
       ),
       config().federation.bulkmaxbytes,
     );
+    await recordTenantProjection(conn);
   }
 }

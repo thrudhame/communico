@@ -19,6 +19,7 @@ import {
 } from '#engine/tenant/e2ee.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import { KeyHistoryProof } from '#engine/tenant/key-bootstrap.ts';
+import { appendImportedKeyNotice } from '#engine/tenant/changes.ts';
 import {
   keyMaterial,
   type SignatureSigner,
@@ -288,6 +289,12 @@ export async function importSignatureOperation(
     return;
   }
   await retain(conn, operation);
+  await appendImportedKeyNotice(
+    conn,
+    operation.localpart,
+    operation.target.user,
+    operation.target.user === user,
+  );
 }
 
 export async function signatureOperationOverlays(

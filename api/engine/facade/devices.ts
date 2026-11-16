@@ -30,6 +30,10 @@ import {
 } from '#engine/tenant/link-applications.ts';
 import { checkLocalpart } from '#engine/tenant/users.ts';
 import {
+  pendingTenantProjection,
+  tenantChangesCommitted,
+} from '#engine/tenant/hooks.ts';
+import {
   captureKeyHistory,
   type KeyBootstrap,
   type KeyHistory,
@@ -447,10 +451,18 @@ export class DeviceOperations {
       mismatch('device completion differs from local scope');
     }
     const tenant = await this.store.tenant(this.tenant.serverName);
-    const prior = await tenant.tx((conn) =>
-      linkApplication(conn, peer, record)
-    );
+    const { prior, pending } = await tenant.tx(async (conn) => ({
+      prior: await linkApplication(conn, peer, record),
+      pending: await pendingTenantProjection(conn),
+    }));
     if (prior) {
+      await tenantChangesCommitted(
+        this.store,
+        this.tenant.serverName,
+        pending,
+        false,
+        'replica',
+      );
       await journal.complete(peer, stream, record, prior.result);
       return true;
     }
@@ -499,7 +511,7 @@ export class DeviceOperations {
       await requireDomainControl(conn, view);
     };
     await server.tx(check);
-    const result = await tenant.tx(async (conn) => {
+    const { result, projectionRevision } = await tenant.tx(async (conn) => {
       unchanged();
       await this.tenantSelected(conn, view);
       if (view.kind === 'key-bootstrap') {
@@ -530,12 +542,20 @@ export class DeviceOperations {
           : view.operation.operationId,
       };
       await retainLinkApplication(conn, peer, record, result);
+      const projectionRevision = await pendingTenantProjection(conn);
       // This synchronous fence is the admission cut. A retirement begun before
       // it rolls back fact + receipt. Once it passes, a successful owner commit
       // is admitted immutable work, even if revocation overlaps native COMMIT.
       unchanged();
-      return result;
+      return { result, projectionRevision };
     });
+    await tenantChangesCommitted(
+      this.store,
+      this.tenant.serverName,
+      projectionRevision,
+      false,
+      'replica',
+    );
     // Completion cannot retroactively revoke admitted work. After ACK loss,
     // only the exact durable receipt can take this path, including cold replay.
     await journal.complete(peer, stream, record, result);

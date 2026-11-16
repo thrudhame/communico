@@ -116,14 +116,39 @@ Deno.test('store Db: transaction commit, rollback, released Conn and canonical o
     let retained: Conn | undefined;
     const result = await db.tx(async (tx) => {
       retained = tx;
+      assertEquals(tx.writes, 0);
       await tx.execute('INSERT INTO rows_test VALUES(?, ?)', [1, 'committed']);
+      assertEquals(tx.writes, 1);
+      assertEquals(
+        await tx.execute(
+          'INSERT INTO rows_test VALUES(?, ?) ON CONFLICT(id) DO NOTHING',
+          [1, 'ignored'],
+        ),
+        0,
+      );
+      assertEquals(
+        await tx.execute('DELETE FROM rows_test WHERE id=?', [2]),
+        0,
+      );
+      await tx.query('SELECT * FROM rows_test');
+      assertEquals(
+        tx.writes,
+        1,
+        'empty writes and reads must not become mutation work',
+      );
       return 'result';
     });
     assertEquals(result, 'result');
     assertThrows(() => retained!.query('SELECT 1'), Error, 'released');
+    assertThrows(() => retained!.writes, Error, 'released');
     await assertRejects(
       () =>
         db.tx(async (tx) => {
+          assertEquals(
+            tx.writes,
+            0,
+            'a later attempt never inherits another connection write marker',
+          );
           await tx.execute('INSERT INTO rows_test VALUES(?, ?)', [
             2,
             'rolled back',

@@ -200,8 +200,11 @@ export function startDirectoryExports(
   const unproject = onProjected((store) => {
     if (store === options.store) wake();
   });
-  const untenant = onTenantStream((store, tenant) => {
-    if (store === options.store && tenant === options.tenant.serverName) wake();
+  const untenant = onTenantStream((store, tenant, source) => {
+    if (
+      source === 'local' && store === options.store &&
+      tenant === options.tenant.serverName
+    ) wake();
   });
   return {
     wake,

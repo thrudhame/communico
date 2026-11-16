@@ -21,6 +21,10 @@ import {
   tenantAuthority,
 } from '#engine/tenant/session-authority.ts';
 import { captureErasureCuts } from '#engine/tenant/erasure.ts';
+import {
+  pendingTenantProjection,
+  tenantChangesCommitted,
+} from '#engine/tenant/hooks.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControls } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
@@ -433,18 +437,33 @@ export class AccountSnapshots {
         )
         ? await captureErasureCuts(this.store)
         : undefined;
-    await (await this.store.tenant(view.server)).tx(async (conn) => {
-      await requireControl(conn, view);
-      const identity = await tenantAuthority(conn);
-      if (
-        identity?.node !== 'home' || identity.edgeNode !== view.source ||
-        identity.edgeIncarnation !== view.incarnation ||
-        !await userByLocalpart(conn, view.localpart)
-      ) {
-        mismatch('session authority tenant is not the selected home');
-      }
-      await installSessionAuthority(conn, view.localpart, view.authority, cuts);
-    });
+    const projectionRevision = await (await this.store.tenant(view.server)).tx(
+      async (conn) => {
+        await requireControl(conn, view);
+        const identity = await tenantAuthority(conn);
+        if (
+          identity?.node !== 'home' || identity.edgeNode !== view.source ||
+          identity.edgeIncarnation !== view.incarnation ||
+          !await userByLocalpart(conn, view.localpart)
+        ) {
+          mismatch('session authority tenant is not the selected home');
+        }
+        await installSessionAuthority(
+          conn,
+          view.localpart,
+          view.authority,
+          cuts,
+        );
+        return await pendingTenantProjection(conn);
+      },
+    );
+    await tenantChangesCommitted(
+      this.store,
+      view.server,
+      projectionRevision,
+      false,
+      'replica',
+    );
     return await journal.apply(context.node, stream, async (conn, current) => {
       await check(conn);
       if (current.hash !== record.hash) {
@@ -532,11 +551,20 @@ export class AccountSnapshots {
           )
           ? await captureErasureCuts(this.store)
           : undefined;
-        await (await this.store.tenant(view.server)).tx(async (conn) => {
-          if (await current(conn)) {
-            await publishAccountAuth(conn, view, record, cuts);
-          }
-        });
+        const projectionRevision = await (await this.store.tenant(view.server))
+          .tx(async (conn) => {
+            if (await current(conn)) {
+              await publishAccountAuth(conn, view, record, cuts);
+            }
+            return await pendingTenantProjection(conn);
+          });
+        await tenantChangesCommitted(
+          this.store,
+          view.server,
+          projectionRevision,
+          false,
+          'replica',
+        );
         return {
           localpart: view.localpart,
           cut: view.sourceCut,
@@ -600,8 +628,11 @@ export function startAccountExports(options: {
       }
     })();
   };
-  const untenant = onTenantStream((store, name) => {
-    if (store === options.store && name === options.tenant.serverName) wake();
+  const untenant = onTenantStream((store, name, source) => {
+    if (
+      source === 'local' && store === options.store &&
+      name === options.tenant.serverName
+    ) wake();
   });
   const timer = setInterval(wake, options.pollseconds * 1000);
   let closed: Promise<void> | undefined;

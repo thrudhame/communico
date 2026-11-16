@@ -15,6 +15,27 @@ import {
   retainDeviceWire,
 } from '#engine/tenant/device-stream.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
+import { recordTenantProjection } from '#engine/tenant/hooks.ts';
+
+/** Imported public facts create receiver-local invalidations, not new semantic
+ * operations or federation identities. The original wire remains with its owner.
+ * Retain discovery in the same transaction so ACK loss/restart cannot hide news. */
+export async function appendImportedKeyNotice(
+  conn: Conn,
+  localpart: string,
+  subject: string,
+  publicChanged: boolean,
+): Promise<void> {
+  await conn.execute('INSERT INTO e2ee_changes VALUES(?,?,?,?,?,?)', [
+    await nextCounter(conn, 'e2ee_changes'),
+    localpart,
+    '',
+    0,
+    0,
+    canonicalJson({ kind: 'imported_keys', subject, public: publicChanged }),
+  ]);
+  await recordTenantProjection(conn);
+}
 
 async function reserveDeviceChange(conn: Conn, localpart: string) {
   const [prior] = await conn.query(

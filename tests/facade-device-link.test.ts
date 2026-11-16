@@ -7,6 +7,7 @@ import {
   AccountSnapshots,
   exportAccountAuth,
   exportSessionAuthority,
+  startAccountExports,
 } from '#engine/facade/accounts.ts';
 import { DeviceOperations, type DeviceView } from '#engine/facade/devices.ts';
 import { DomainOperations } from '#engine/facade/domain.ts';
@@ -24,16 +25,34 @@ import {
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
-import { updateDeviceName, upsertDevice } from '#engine/tenant/devices.ts';
+import {
+  deleteDevices,
+  updateDeviceName,
+  upsertDevice,
+} from '#engine/tenant/devices.ts';
 import {
   importDeviceOperation,
   publicDeviceValues,
 } from '#engine/tenant/device-operations.ts';
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
-import { rebaseRestoredDeviceStreams } from '#engine/tenant/changes.ts';
+import {
+  appendImportedKeyNotice,
+  rebaseRestoredDeviceStreams,
+} from '#engine/tenant/changes.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deactivateUser } from '#engine/tenant/users.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
+import { deviceListsBetween, deviceStreamMax } from '#engine/server/e2ee.ts';
+import {
+  pendingTenantProjection,
+  tenantProjectionPending,
+} from '#engine/tenant/hooks.ts';
+import { onTenantStream } from '#engine/tenant/streams.ts';
+import {
+  activateTenantAuthority,
+  tenantAuthority,
+} from '#engine/tenant/session-authority.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { captureSigningOperations } from '#engine/tenant/signing-operations.ts';
@@ -224,6 +243,482 @@ async function fixture(publicFirst = false, legacyChanges = 0) {
   };
 }
 
+Deno.test('imported key news: receiver invalidation does not wake source authority exports', async () => {
+  const f = await fixture();
+  let exporter: ReturnType<typeof startAccountExports> | undefined;
+  let stopNotice: (() => void) | undefined;
+  try {
+    const records = await f.hs.export('alice', f.bundle.id);
+    assert(records.length > 0);
+    const initial = Promise.withResolvers<void>();
+    let captures = 0, notices = 0;
+    exporter = startAccountExports({
+      store: f.edge,
+      tenant: f.et,
+      pollseconds: config().facade.pollseconds,
+      users: () => Promise.resolve(['alice']),
+      emit: () => {
+        captures++;
+        initial.resolve();
+        return Promise.resolve();
+      },
+      changed: () => {},
+      failed: (error) => {
+        throw error;
+      },
+    });
+    await initial.promise;
+    stopNotice = onTenantStream((store) => {
+      if (store === f.edge) notices++;
+    });
+    for (const record of records) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    await exporter.close();
+    assert(notices > 0, 'receiver clients still discover the committed news');
+    assertEquals(
+      captures,
+      1,
+      'imported client news is not local authority authoring',
+    );
+  } finally {
+    stopNotice?.();
+    await exporter?.close();
+    await f.close();
+  }
+});
+
+Deno.test('imported key news: device facts publish local ordinary and sliding news exactly once without echo or copied wire positions', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    await projectTenant(f.edge, 'logical.test');
+    const db = await f.edge.tenant('logical.test');
+    const server = await f.edge.server();
+    const before = await deviceStreamMax(server);
+    const records = await f.hs.export('alice', f.bundle.id);
+    let committed = 0;
+    const off = onTenantStream((store, tenant) => {
+      if (store === f.edge && tenant === 'logical.test') committed++;
+    });
+    try {
+      for (const record of records) {
+        await f.ej.receive('home', [record]);
+        await f.es.apply(f.ej, record);
+      }
+      assert(
+        await pendingTenantProjection(db) > 0,
+        'import needs durable roll-forward intent',
+      );
+      assert(
+        tenantProjectionPending(f.edge, 'logical.test'),
+        'committed import must be discoverable without reopening the tenant',
+      );
+      assert(committed > 0, 'owner streams must wake after import commit');
+      await projectTenant(f.edge, 'logical.test');
+      const after = await deviceStreamMax(server);
+      assert(after > before, 'receiver allocates its own client news');
+      for (const scope of ['sync', 'keys'] as const) {
+        assertEquals(
+          await deviceListsBetween(server, user, before, after, scope),
+          { changed: [user], left: [] },
+        );
+      }
+      assertEquals(await f.es.export('alice'), []);
+      assertEquals(await server.query('SELECT * FROM device_changes'), []);
+      assertEquals(await server.query('SELECT * FROM device_publications'), []);
+      assertEquals(await db.query('SELECT * FROM devices'), []);
+      const [news] = await db.query('SELECT * FROM e2ee_changes');
+      assertEquals(
+        Number(news.stream_id),
+        0,
+        'client invalidation is not a new federation identity',
+      );
+      const count = committed;
+      await projectTenant(f.edge, 'logical.test');
+      assertEquals(await f.es.apply(f.ej, records[0]), false);
+      assertEquals(await deviceStreamMax(server), after);
+      assertEquals(committed, count);
+    } finally {
+      off();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('imported key news: facade facts reach home clients in the home publication domain', async () => {
+  const f = await fixture();
+  try {
+    await upsertDevice(f.et, 'alice', 'PHONE', 'outside');
+    const authority = await exportSessionAuthority(
+      f.edge,
+      f.et,
+      f.fp,
+      f.owners,
+      f.node,
+      'alice',
+    );
+    await f.hj.receive('edge_a', [authority]);
+    await f.accounts.applyFromFacade(f.hj, f.bundle.id, authority);
+    await projectTenant(f.home, 'logical.test');
+    const server = await f.home.server();
+    const before = await deviceStreamMax(server);
+    const own = await f.hs.export('alice', f.bundle.id);
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive('edge_a', [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    const db = await f.home.tenant('logical.test');
+    assert(await pendingTenantProjection(db) > 0);
+    await projectTenant(f.home, 'logical.test');
+    const after = await deviceStreamMax(server);
+    assert(after > before);
+    for (const scope of ['sync', 'keys'] as const) {
+      assertEquals(
+        await deviceListsBetween(
+          server,
+          '@alice:logical.test',
+          before,
+          after,
+          scope,
+        ),
+        { changed: ['@alice:logical.test'], left: [] },
+      );
+    }
+    assertEquals(await f.hs.export('alice', f.bundle.id), own);
+    assertEquals(
+      (await db.query('SELECT device_id FROM devices')).map((row) =>
+        row.device_id
+      ),
+      ['LAN'],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('imported authority news: independently drained deletion removes keys and publishes receiver client news before a device suffix arrives', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    const device = await deviceIdentity(f.ht, 'alice', 'LAN');
+    await f.ht.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload(
+          {
+            device_keys: {
+              user_id: user,
+              device_id: 'LAN',
+              algorithms: [],
+              keys: { 'ed25519:LAN': 'public-home-key' },
+              signatures: {},
+            },
+          },
+          user,
+          'LAN',
+          config().e2ee,
+        ),
+      )
+    );
+    for (const record of await f.hs.bootstrap('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    assertEquals(
+      Object.keys(
+        await f.et.tx((tx) => tx.e2ee.query('alice', [], user, user, 100)),
+      ),
+      ['LAN'],
+    );
+    await projectTenant(f.edge, 'logical.test');
+    const server = await f.edge.server();
+    const before = await deviceStreamMax(server);
+    const db = await f.edge.tenant('logical.test');
+    const oldFacts = await db.query(
+      'SELECT * FROM device_operations ORDER BY operation_id',
+    );
+    await deleteDevices(f.ht, 'alice', ['LAN']);
+    const auth = await exportAccountAuth(
+      f.home,
+      f.ht,
+      f.hp,
+      f.bundle.id,
+      'alice',
+      false,
+    );
+    await f.ej.receive('home', [auth]);
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+    assertEquals(
+      await f.et.tx((tx) => tx.e2ee.query('alice', [], user, user, 100)),
+      {},
+    );
+    assertEquals(
+      await db.query('SELECT * FROM device_operations ORDER BY operation_id'),
+      oldFacts,
+      'device suffix has not crossed',
+    );
+    assert(
+      await pendingTenantProjection(db) > 0,
+      'authority import must durably discover its changed public view',
+    );
+    assert(tenantProjectionPending(f.edge, 'logical.test'));
+    await projectTenant(f.edge, 'logical.test');
+    const after = await deviceStreamMax(server);
+    assert(after > before);
+    for (const scope of ['sync', 'keys'] as const) {
+      assertEquals(
+        await deviceListsBetween(server, user, before, after, scope),
+        { changed: [user], left: [] },
+      );
+    }
+    assertEquals(await f.es.export('alice'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('imported authority news: facade deletion reaches home clients without a new public device operation', async () => {
+  const f = await fixture();
+  try {
+    await upsertDevice(f.et, 'alice', 'PHONE');
+    const syncAuthority = async () => {
+      const record = await exportSessionAuthority(
+        f.edge,
+        f.et,
+        f.fp,
+        f.owners,
+        f.node,
+        'alice',
+      );
+      await f.hj.receive('edge_a', [record]);
+      await f.accounts.applyFromFacade(f.hj, f.bundle.id, record);
+    };
+    await syncAuthority();
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive('edge_a', [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    const db = await f.home.tenant('logical.test');
+    assert(
+      (await db.tx((conn) => publicDeviceValues(conn, 'alice'))).some((op) =>
+        op.deviceId === 'PHONE'
+      ),
+    );
+    await projectTenant(f.home, 'logical.test');
+    const server = await f.home.server();
+    const before = await deviceStreamMax(server);
+    const facts = await db.query(
+      'SELECT * FROM device_operations ORDER BY operation_id',
+    );
+    await deleteDevices(f.et, 'alice', ['PHONE']);
+    await syncAuthority();
+    assertEquals(
+      (await db.tx((conn) => publicDeviceValues(conn, 'alice'))).some((op) =>
+        op.deviceId === 'PHONE'
+      ),
+      false,
+    );
+    assertEquals(
+      await db.query('SELECT * FROM device_operations ORDER BY operation_id'),
+      facts,
+    );
+    assert(await pendingTenantProjection(db) > 0);
+    assert(tenantProjectionPending(f.home, 'logical.test'));
+    await projectTenant(f.home, 'logical.test');
+    const after = await deviceStreamMax(server);
+    assert(after > before);
+    for (const scope of ['sync', 'keys'] as const) {
+      assertEquals(
+        await deviceListsBetween(
+          server,
+          '@alice:logical.test',
+          before,
+          after,
+          scope,
+        ),
+        { changed: ['@alice:logical.test'], left: [] },
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('imported key news: private signature notices retain subject and never become another observer news or federation work', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.tenant('logical.test');
+    await projectTenant(f.edge, 'logical.test');
+    const server = await f.edge.server();
+    const before = await deviceStreamMax(server);
+    await db.tx((conn) =>
+      appendImportedKeyNotice(conn, 'alice', '@bob:remote.test', false)
+    );
+    await projectTenant(f.edge, 'logical.test');
+    const head = await deviceStreamMax(server);
+    for (const scope of ['sync', 'keys'] as const) {
+      assertEquals(
+        await deviceListsBetween(
+          server,
+          '@alice:logical.test',
+          before,
+          head,
+          scope,
+        ),
+        { changed: ['@bob:remote.test'], left: [] },
+      );
+      assertEquals(
+        await deviceListsBetween(
+          server,
+          '@eve:logical.test',
+          before,
+          head,
+          scope,
+        ),
+        { changed: [], left: [] },
+      );
+    }
+    assertEquals(await server.query('SELECT * FROM device_changes'), []);
+    assertEquals(await server.query('SELECT * FROM device_publications'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('imported key news: signing and signature imports retain durable discoverable client news', async () => {
+  const f = await fixture();
+  try {
+    await signatureInput(f);
+    const db = await f.edge.tenant('logical.test');
+    const server = await f.edge.server();
+    await projectTenant(f.edge, 'logical.test');
+    const signing = await f.hs.exportSigning('alice', f.bundle.id);
+    const signatures = await f.hs.exportSignatures('alice', f.bundle.id);
+    for (const records of [signing, signatures]) {
+      assert(records.length > 0);
+      const before = await deviceStreamMax(server);
+      for (const record of records) {
+        await f.ej.receive('home', [record]);
+        await f.es.apply(f.ej, record);
+      }
+      assert(
+        await pendingTenantProjection(db) > 0,
+        'every imported key kind needs durable discovery',
+      );
+      assert(tenantProjectionPending(f.edge, 'logical.test'));
+      await projectTenant(f.edge, 'logical.test');
+      const after = await deviceStreamMax(server);
+      assert(
+        after > before,
+        'each imported key kind reaches the local consumer',
+      );
+      for (const scope of ['sync', 'keys'] as const) {
+        assertEquals(
+          await deviceListsBetween(
+            server,
+            '@alice:logical.test',
+            before,
+            after,
+            scope,
+          ),
+          { changed: ['@alice:logical.test'], left: [] },
+        );
+      }
+      for (const record of records) {
+        assertEquals(await f.es.apply(f.ej, record), false);
+      }
+      await projectTenant(f.edge, 'logical.test');
+      assertEquals(await deviceStreamMax(server), after);
+    }
+    assertEquals(await f.es.exportSignatures('alice'), []);
+    assertEquals(await f.es.export('alice'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('imported key news: rollback has no intent or wake; committed ACK loss cold-replays one consumer publication', async () => {
+  const f = await fixture();
+  try {
+    const [record] = await f.hs.export('alice', f.bundle.id);
+    await f.ej.receive('home', [record]);
+    const db = await f.edge.tenant('logical.test');
+    await projectTenant(f.edge, 'logical.test');
+    const beforeNews = await db.query('SELECT * FROM e2ee_changes');
+    const operation = (record.payload as { body: DeviceView }).body.operation;
+    await assertRejects(
+      () =>
+        db.tx(async (conn) => {
+          await importDeviceOperation(conn, operation, operation);
+          throw new Error('rollback imported news');
+        }),
+      Error,
+      'rollback imported news',
+    );
+    assertEquals(await db.query('SELECT * FROM e2ee_changes'), beforeNews);
+    assertEquals(await pendingTenantProjection(db), 0);
+    f.ej.complete = () => Promise.reject(new Error('news ACK loss'));
+    await assertRejects(() => f.es.apply(f.ej, record), Error, 'news ACK loss');
+    assertEquals(
+      (await db.query('SELECT * FROM e2ee_changes')).length,
+      beforeNews.length + 1,
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const pairings = new Pairings(
+        await reopened.server(),
+        f.node.signer(),
+        f.node.publicKey,
+        'b'.repeat(64),
+        f.node,
+      );
+      const tenant = await enrolledTenant(
+        reopened,
+        pairings,
+        'logical.test',
+        'edge_a',
+      );
+      assert(tenantProjectionPending(reopened, 'logical.test'));
+      const journal = new Journal(await reopened.server(), LINK_SUPPORTED);
+      const owner = new DeviceOperations(reopened, tenant, pairings, f.node);
+      await owner.apply(journal, record);
+      await projectTenant(reopened, 'logical.test');
+      const server = await reopened.server();
+      const after = await deviceStreamMax(server);
+      assert(after > 0);
+      for (const scope of ['sync', 'keys'] as const) {
+        assertEquals(
+          await deviceListsBetween(
+            server,
+            '@alice:logical.test',
+            0,
+            after,
+            scope,
+          ),
+          { changed: ['@alice:logical.test'], left: [] },
+        );
+      }
+      assertEquals(await owner.apply(journal, record), false);
+      await projectTenant(reopened, 'logical.test');
+      assertEquals(await deviceStreamMax(server), after);
+      assertEquals(
+        (await (await reopened.tenant('logical.test')).query(
+          'SELECT * FROM e2ee_changes',
+        )).length,
+        beforeNews.length + 1,
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('device wire lanes: first offline facade creation cannot reuse the legacy home serial namespace', async () => {
   const f = await fixture(false, 6);
   try {
@@ -276,10 +771,41 @@ Deno.test('device wire lanes: first offline facade creation cannot reuse the leg
   }
 });
 
+Deno.test('device wire lanes: a replacement incarnation cannot reuse the held role lane through authority activation', async () => {
+  const f = await fixture();
+  try {
+    await upsertDevice(f.et, 'alice', 'PHONE');
+    for (const store of [f.home, f.edge]) {
+      const db = await store.tenant('logical.test');
+      const held = await db.tx(tenantAuthority);
+      assert(held);
+      const before = await db.query('SELECT * FROM device_stream_baselines');
+      const replacement = {
+        ...held,
+        edgeIncarnation: 'replacement-store',
+        ...(held.node === 'home' ? {} : { incarnation: 'replacement-store' }),
+      };
+      await assertRejects(
+        () => db.tx((conn) => activateTenantAuthority(conn, replacement)),
+        MatrixError,
+        'operation owner unavailable at this ingress',
+      );
+      assertEquals(await db.tx(tenantAuthority), held);
+      assertEquals(
+        await db.query('SELECT * FROM device_stream_baselines'),
+        before,
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('device wire lanes: missing signed home baseline refuses effects instead of using an old serial snapshot', async () => {
   const f = await fixture();
   try {
     const db = await f.edge.tenant('logical.test');
+    const beforeNews = await db.query('SELECT * FROM e2ee_changes');
     await db.execute('DELETE FROM device_stream_baselines');
     await assertRejects(
       () => upsertDevice(f.et, 'alice', 'PHONE'),
@@ -292,7 +818,7 @@ Deno.test('device wire lanes: missing signed home baseline refuses effects inste
       [],
     );
     assertEquals(await db.query('SELECT * FROM user_device_stream'), []);
-    assertEquals(await db.query('SELECT * FROM e2ee_changes'), []);
+    assertEquals(await db.query('SELECT * FROM e2ee_changes'), beforeNews);
   } finally {
     await f.close();
   }

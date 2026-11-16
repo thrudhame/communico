@@ -179,8 +179,11 @@ export function startPublicExports(
       }
     })();
   };
-  const untenant = onTenantStream((store, tenant) => {
-    if (store === options.store && tenant === options.tenant.serverName) wake();
+  const untenant = onTenantStream((store, tenant, source) => {
+    if (
+      source === 'local' && store === options.store &&
+      tenant === options.tenant.serverName
+    ) wake();
   });
   let closed: Promise<void> | undefined;
   return {

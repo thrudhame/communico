@@ -35,7 +35,7 @@ import {
   pendingTenantProjection,
   recordTenantProjection,
   rememberTenantProjection,
-  tenantCommitted,
+  tenantChangesCommitted,
 } from '#engine/tenant/hooks.ts';
 import * as filters from '#engine/tenant/filters.ts';
 import * as media from '#engine/tenant/media.ts';
@@ -53,7 +53,6 @@ import * as conflicts from '#engine/tenant/conflicts.ts';
 import * as erasure from '#engine/tenant/erasure.ts';
 import * as publicReplica from '#engine/tenant/public-replica.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
-import { tenantStreamCommitted } from '#engine/tenant/streams.ts';
 import { writeCertificate } from '#engine/tenant/certificate.ts';
 import {
   type DomainBinding,
@@ -141,9 +140,12 @@ function bind(
       await requireSessionAuthority(conn, intent.hash, intent.refresh);
     }
   };
-  const mutation = async <T>(operation: Promise<T>): Promise<T> => {
-    const value = await operation;
-    projectionChanged();
+  const mutation = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const before = conn.writes;
+    const value = await operation();
+    // The owner may have returned an existing result or found nothing to do.
+    // Empty work must not compete with reconciliation on projection_revision.
+    if (conn.writes !== before) projectionChanged();
     return value;
   };
   return {
@@ -249,25 +251,27 @@ function bind(
         targets: keySignatures.SignatureTarget[],
       ) =>
         mutation(
-          keySignatures.uploadSignatures(
-            conn,
-            localpart,
-            user,
-            targets,
-            config().e2ee,
-            config().federation.bulkmaxbytes,
-          ),
+          () =>
+            keySignatures.uploadSignatures(
+              conn,
+              localpart,
+              user,
+              targets,
+              config().e2ee,
+              config().federation.bulkmaxbytes,
+            ),
         ),
     },
     crossSigning: {
       clear: (localpart: string, user: string) =>
         mutation(
-          crossSigning.clearSigningKeys(
-            conn,
-            localpart,
-            user,
-            config().federation.bulkmaxbytes,
-          ),
+          () =>
+            crossSigning.clearSigningKeys(
+              conn,
+              localpart,
+              user,
+              config().federation.bulkmaxbytes,
+            ),
         ),
       state: (localpart: string) => crossSigning.signingState(conn, localpart),
       views: (localpart: string, user: string, requester: string) =>
@@ -280,15 +284,16 @@ function bind(
         authenticated: boolean,
       ) =>
         mutation(
-          crossSigning.uploadSigningKeys(
-            conn,
-            localpart,
-            user,
-            input,
-            basis,
-            authenticated,
-            config().federation.bulkmaxbytes,
-          ),
+          () =>
+            crossSigning.uploadSigningKeys(
+              conn,
+              localpart,
+              user,
+              input,
+              basis,
+              authenticated,
+              config().federation.bulkmaxbytes,
+            ),
         ),
     },
     slidingSync: {
@@ -334,17 +339,18 @@ function bind(
         delivery: todevice.DeliveryPolicy,
       ) =>
         mutation(
-          todevice.sendMessages(
-            conn,
-            d,
-            server,
-            type,
-            txn,
-            source,
-            messages,
-            limits,
-            delivery,
-          ),
+          () =>
+            todevice.sendMessages(
+              conn,
+              d,
+              server,
+              type,
+              txn,
+              source,
+              messages,
+              limits,
+              delivery,
+            ),
         ),
       receive: (
         origin: string,
@@ -356,16 +362,17 @@ function bind(
         limits: e2ee.KeyLimits,
       ) =>
         mutation(
-          todevice.receiveMessages(
-            conn,
-            origin,
-            id,
-            sender,
-            type,
-            server,
-            messages,
-            limits,
-          ),
+          () =>
+            todevice.receiveMessages(
+              conn,
+              origin,
+              id,
+              sender,
+              type,
+              server,
+              messages,
+              limits,
+            ),
         ),
       acknowledge: (d: devices.DeviceIdentity, since: StreamToken | null) =>
         todevice.acknowledge(conn, d, since),
@@ -396,7 +403,7 @@ function bind(
     },
     e2ee: {
       upload: (device: devices.DeviceIdentity, input: e2ee.Upload) =>
-        mutation(e2ee.uploadKeys(conn, device, input)),
+        mutation(() => e2ee.uploadKeys(conn, device, input)),
       query: (
         localpart: string,
         ids: string[],
@@ -405,14 +412,14 @@ function bind(
         maxKeys: number,
       ) => e2ee.queryKeys(conn, localpart, ids, requester, owner, maxKeys),
       claim: (localpart: string, id: string, algorithm: string) =>
-        mutation(e2ee.claimKey(conn, localpart, id, algorithm)),
+        mutation(() => e2ee.claimKey(conn, localpart, id, algorithm)),
       status: (device: devices.DeviceIdentity) => e2ee.keyStatus(conn, device),
       snapshot: (localpart: string, owner: string, limits: e2ee.KeyLimits) =>
         e2ee.deviceSnapshot(conn, localpart, owner, limits),
     },
     erasure: {
       mark: (localpart: string, cuts: Record<string, ErasureCut>) =>
-        mutation(erasure.markErased(conn, localpart, cuts)),
+        mutation(() => erasure.markErased(conn, localpart, cuts)),
       get: (localpart: string, roomId: string) =>
         erasure.erasureRow(conn, localpart, roomId),
     },
@@ -459,27 +466,28 @@ function bind(
         }
       },
       set: (localpart: string, key: string, value: unknown) =>
-        mutation(profiles.setProfileRow(conn, localpart, key, value)),
+        mutation(() => profiles.setProfileRow(conn, localpart, key, value)),
       clear: (localpart: string) =>
-        mutation(profiles.clearProfileRows(conn, localpart)),
+        mutation(() => profiles.clearProfileRows(conn, localpart)),
     },
     users: {
       deactivate: (
         localpart: string,
         server: string,
         cuts?: Record<string, ErasureCut>,
-      ) => mutation(users.deactivateUserRows(conn, server, localpart, cuts)),
+      ) =>
+        mutation(() => users.deactivateUserRows(conn, server, localpart, cuts)),
       exists: (localpart: string) => users.userExists(conn, localpart),
       insert: (localpart: string, displayName: string) =>
-        mutation(users.insertUser(conn, localpart, displayName)),
+        mutation(() => users.insertUser(conn, localpart, displayName)),
       byLocalpart: (localpart: string) =>
         users.userByLocalpart(conn, localpart),
       setDisplayName: (localpart: string, name: string | null) =>
-        mutation(users.setUserDisplayName(conn, localpart, name)),
+        mutation(() => users.setUserDisplayName(conn, localpart, name)),
       setAvatarUrl: (localpart: string, url: string | null) =>
-        mutation(users.setUserAvatarUrl(conn, localpart, url)),
+        mutation(() => users.setUserAvatarUrl(conn, localpart, url)),
       markDeactivated: (localpart: string) =>
-        mutation(users.markDeactivated(conn, localpart)),
+        mutation(() => users.markDeactivated(conn, localpart)),
     },
     credentials: {
       clear: (localpart: string) => users.clearCredential(conn, localpart),
@@ -496,7 +504,8 @@ function bind(
         (async () => {
           await authorize({ kind: 'device', localpart, deviceId });
           await mutation(
-            devices.upsertDeviceRow(conn, deviceId, localpart, displayName),
+            () =>
+              devices.upsertDeviceRow(conn, deviceId, localpart, displayName),
           );
         })(),
       byId: (deviceId: string, localpart: string) =>
@@ -511,13 +520,13 @@ function bind(
       ) => {
         await authorize({ kind: 'device', localpart, deviceId });
         return await mutation(
-          devices.renameDevice(conn, deviceId, localpart, displayName),
+          () => devices.renameDevice(conn, deviceId, localpart, displayName),
         );
       },
       delete: (deviceId: string, localpart: string) =>
-        mutation(devices.deleteDevice(conn, deviceId, localpart)),
+        mutation(() => devices.deleteDevice(conn, deviceId, localpart)),
       deleteForUser: (localpart: string) =>
-        mutation(devices.deleteDevicesOfUser(conn, localpart)),
+        mutation(() => devices.deleteDevicesOfUser(conn, localpart)),
     },
     tokens: {
       deleteOthers: (localpart: string, keepHash: string | null) =>
@@ -611,21 +620,25 @@ function bind(
       moveToken: (oldHash: string, newHash: string) =>
         pushers.movePusherToken(conn, oldHash, newHash),
       deleteForToken: (accessHash: string) =>
-        mutation(pushers.deletePushersForToken(conn, accessHash)),
+        mutation(() => pushers.deletePushersForToken(conn, accessHash)),
       deleteForUser: (localpart: string) =>
-        mutation(pushers.deletePushersOfUser(conn, localpart)),
+        mutation(() => pushers.deletePushersOfUser(conn, localpart)),
       delete: (localpart: string, appId: string, pushkey: string) =>
-        mutation(pushers.deletePusherRow(conn, localpart, appId, pushkey)),
+        mutation(() =>
+          pushers.deletePusherRow(conn, localpart, appId, pushkey)
+        ),
       deleteOtherUsers: (localpart: string, appId: string, pushkey: string) =>
         mutation(
-          pushers.deleteOtherPusherUsers(conn, localpart, appId, pushkey),
+          () => pushers.deleteOtherPusherUsers(conn, localpart, appId, pushkey),
         ),
       upsert: (
         localpart: string,
         pusher: pushers.PusherInput & { kind: string },
         accessHash: string,
       ) =>
-        mutation(pushers.upsertPusherRow(conn, localpart, pusher, accessHash)),
+        mutation(() =>
+          pushers.upsertPusherRow(conn, localpart, pusher, accessHash)
+        ),
       ofUser: (localpart: string) => pushers.pushersOfUser(conn, localpart),
       incarnations: (localpart: string) =>
         pushers.pusherIncarnations(conn, localpart),
@@ -1047,13 +1060,12 @@ export async function openTenant(
           return { result, changed, projectionRevision };
         },
       );
-      if (projectionRevision) {
-        rememberTenantProjection(store, serverName, projectionRevision);
-        await tenantCommitted(store, serverName);
-      }
-      if (changed || projectionRevision) {
-        tenantStreamCommitted(store, serverName);
-      }
+      await tenantChangesCommitted(
+        store,
+        serverName,
+        projectionRevision,
+        changed,
+      );
       return result;
     },
   };

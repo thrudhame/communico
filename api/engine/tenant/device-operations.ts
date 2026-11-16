@@ -13,6 +13,7 @@ import {
   retainDeviceWire,
 } from '#engine/tenant/device-stream.ts';
 import { type Json, object, validateUpload } from '#engine/tenant/e2ee.ts';
+import { appendImportedKeyNotice } from '#engine/tenant/changes.ts';
 import {
   registryDevice,
   tenantAuthority,
@@ -189,6 +190,14 @@ export async function importDeviceOperation(
       encoded,
     ],
   );
+  if (!local) {
+    await appendImportedKeyNotice(
+      conn,
+      operation.localpart,
+      '@' + operation.localpart + ':' + tenant.server_name,
+      true,
+    );
+  }
 }
 
 /** Source sequences order one incarnation's owner writes only. Registry

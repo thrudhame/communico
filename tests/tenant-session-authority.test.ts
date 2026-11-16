@@ -91,6 +91,42 @@ async function fixture() {
   };
 }
 
+Deno.test('session authority: retained facts and retired device mappings are not new reconciliation writes', async () => {
+  const f = await fixture();
+  try {
+    await f.edge.login('retired');
+    await deleteDevices(f.edge.tenant, 'alice', ['retired']);
+    const view = await f.edge.capture();
+    const mappings = await f.edge.db.query('SELECT * FROM authority_devices');
+    const redundant: string[] = [];
+    await f.edge.db.tx(async (conn) => {
+      const execute = conn.execute.bind(conn);
+      conn.execute = (sql, values) => {
+        if (
+          sql.startsWith('INSERT INTO authority_facts') ||
+          sql.startsWith('DELETE FROM ')
+        ) {
+          redundant.push(sql);
+        }
+        return execute(sql, values);
+      };
+      await installSessionAuthority(conn, 'alice', view);
+    });
+    assertEquals(
+      redundant,
+      [],
+      'immutable replay and retained incarnation history are not mutable lifecycle work',
+    );
+    assertEquals(
+      await f.edge.db.query('SELECT * FROM authority_devices'),
+      mappings,
+    );
+    assertEquals(await f.edge.capture(), view);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('session authority: first ingress owns supplied IDs and foreign recovery cannot confirm or rotate', async () => {
   const f = await fixture();
   try {

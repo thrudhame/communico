@@ -1,17 +1,26 @@
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 
-const listeners = new Set<(store: Store, tenant: string) => void>();
+// Replica publication wakes local readers/lifecycle work, but is not new local
+// authoring. Source exporters must not turn these hints into freshness records.
+export type TenantChangeSource = 'local' | 'replica';
+const listeners = new Set<
+  (store: Store, tenant: string, source: TenantChangeSource) => void
+>();
 export function onTenantStream(
-  fn: (store: Store, tenant: string) => void,
+  fn: (store: Store, tenant: string, source: TenantChangeSource) => void,
 ): () => void {
   listeners.add(fn);
   return () => {
     listeners.delete(fn);
   };
 }
-export function tenantStreamCommitted(store: Store, tenant: string): void {
-  for (const fn of listeners) fn(store, tenant);
+export function tenantStreamCommitted(
+  store: Store,
+  tenant: string,
+  source: TenantChangeSource = 'local',
+): void {
+  for (const fn of listeners) fn(store, tenant, source);
 }
 
 // Read allocated maxima, not retained rows or a single device's last change.
