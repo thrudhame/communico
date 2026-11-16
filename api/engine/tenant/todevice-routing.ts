@@ -383,6 +383,30 @@ export async function captureToDeviceOperations(
   )).map((row) => JSON.parse(String(row.payload_json)) as ToDeviceOperation);
 }
 
+/** Auth readiness discharges the recipient's dependency, regardless of which
+ * sender owns the retained route stream. Expansion keeps its original identity
+ * and is atomic with the snapshot installation; an expanded selector is final. */
+export async function resumePendingToDeviceRoutes(
+  conn: Conn,
+  recipient: string,
+): Promise<void> {
+  const identity = await tenantAuthority(conn);
+  if (!identity) return;
+  for (
+    const row of await conn.query(
+      "SELECT payload_json FROM to_device_routes WHERE expanded=0 AND json_extract(payload_json,'$.recipient')=?",
+      [recipient],
+    )
+  ) {
+    await expandRoute(
+      conn,
+      identity,
+      JSON.parse(String(row.payload_json)),
+      config().e2ee,
+    );
+  }
+}
+
 /** Publication positions are local. Only the exact targets in the actually
  * issued prefix become exportable ACK facts, in the transaction deleting them. */
 export async function acknowledgeToDeviceTargets(

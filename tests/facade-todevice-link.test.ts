@@ -24,6 +24,11 @@ import { deleteDevices, upsertDevice } from '#engine/tenant/devices.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
+import { pendingTenantProjection } from '#engine/tenant/hooks.ts';
+import {
+  captureDeviceStreamFloor,
+  installDeviceStreamFloor,
+} from '#engine/tenant/device-stream.ts';
 
 // Let the capability regression fail before the new module exists, rather than
 // mistaking a static resolution error for the missing durable reader contract.
@@ -123,6 +128,7 @@ async function fixture() {
     fp,
     node,
     bundle,
+    owners,
     hj,
     ej,
     hs: await coordinator(home, ht, hp),
@@ -196,6 +202,90 @@ Deno.test('to-device link: reader capability is additive and old readers refuse 
       0,
     );
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device link: recipient auth commits and wakes a pending other-account inbox without sender export or unrelated news', async () => {
+  const f = await fixture();
+  let stop = () => {};
+  try {
+    await f.et.tx((tx) => tx.users.insert('bob', 'Bob'));
+    // The independently deliverable key bootstrap can install this genuine
+    // home allocation floor without granting credential/auth readiness.
+    const floor = await (await f.home.tenant('logical.test')).tx((conn) =>
+      captureDeviceStreamFloor(conn, 'bob')
+    );
+    assert(typeof floor === 'number');
+    await (await f.edge.tenant('logical.test')).tx((conn) =>
+      installDeviceStreamFloor(conn, 'bob', floor)
+    );
+    await upsertDevice(f.et, 'bob', 'BOB');
+    const recipient = await deviceIdentity(f.et, 'bob', 'BOB');
+    const sender = await deviceIdentity(f.ht, 'alice', 'LAN');
+    await f.ht.tx((tx) =>
+      tx.toDevice.send(
+        sender,
+        'logical.test',
+        'm.room_key',
+        'bob-wake',
+        'bob-wake',
+        [
+          {
+            user: '@bob:logical.test',
+            id: '*',
+            content: { key: 'new-session' },
+          },
+        ],
+        config().e2ee,
+        { enabled: true, maxBytes: 1048576 },
+      )
+    );
+    for (const record of await f.hs.export('alice', f.bundle.id)) {
+      await f.ej.receive('home', [record]);
+      await f.es.apply(f.ej, record);
+    }
+    const db = await f.edge.tenant('logical.test');
+    assertEquals(await db.query('SELECT * FROM to_device_inbox'), []);
+    await projectTenant(f.edge, 'logical.test');
+    assertEquals(await pendingTenantProjection(db), 0);
+    let hints = 0;
+    stop = onTenantStream((store, tenant, source) => {
+      if (
+        store === f.edge && tenant === 'logical.test' && source === 'replica'
+      ) hints++;
+    });
+    const snapshots = new AccountSnapshots(f.edge, f.et, f.fp, f.owners);
+    for (const expectedHints of [1, 1]) {
+      const auth = await exportAccountAuth(
+        f.home,
+        f.ht,
+        f.hp,
+        f.bundle.id,
+        'bob',
+        false,
+      );
+      await f.ej.receive('home', [auth]);
+      assertEquals(await snapshots.apply(f.ej, auth), true);
+      assertEquals(
+        hints,
+        expectedHints,
+        'inbox-only publication must wake once after commit',
+      );
+      assertEquals(await snapshots.apply(f.ej, auth), false);
+    }
+    assertEquals(await pendingTenantProjection(db), 0);
+    const delivered = await f.et.tx((tx) =>
+      tx.toDevice.deliverSliding(recipient, 'bob', 100, config().e2ee)
+    );
+    assertEquals(delivered.events, [{
+      sender: '@alice:logical.test',
+      type: 'm.room_key',
+      content: { key: 'new-session' },
+    }]);
+    assertEquals((await db.query('SELECT * FROM to_device_inbox')).length, 1);
+  } finally {
+    stop();
     await f.close();
   }
 });

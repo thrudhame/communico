@@ -4,7 +4,12 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
-import { deleteDevices, upsertDevice } from '#engine/tenant/devices.ts';
+import {
+  deleteDevice,
+  deleteDevices,
+  upsertDevice,
+  upsertDeviceRow,
+} from '#engine/tenant/devices.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import {
   captureAccountAuth,
@@ -17,6 +22,7 @@ import {
 } from '#engine/tenant/session-authority.ts';
 import * as routing from '#engine/tenant/todevice-routing.ts';
 import type { Conn } from '#engine/store/db.ts';
+import { deliverSliding } from '#engine/tenant/todevice.ts';
 
 const expected = (source: string) => ({
   source,
@@ -411,6 +417,129 @@ Deno.test('to-device semantic import: cross-account targets use the recipient re
       await f.ed.query("SELECT * FROM authority_facts WHERE localpart='bob'"),
       [],
       'a target disposition cannot install another account or its registry authority',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device semantic import: recipient auth alone resumes a cold cross-account selector atomically without sender retry', async () => {
+  const f = await fixture();
+  try {
+    await f.home.tx((tx) => tx.users.insert('bob', 'Bob'));
+    await f.edge.tx((tx) => tx.users.insert('bob', 'Bob'));
+    // Independent device authority can already be held while auth bootstrap
+    // for this account has not yet arrived. It is not an empty registry.
+    await upsertDevice(f.edge, 'bob', 'BOB');
+    const recipient = await deviceIdentity(f.edge, 'bob', 'BOB');
+    const sender = await deviceIdentity(f.home, 'alice', 'LAN');
+    await f.home.tx((tx) =>
+      tx.toDevice.send(
+        sender,
+        'logical.test',
+        'm.room_key',
+        'pending-bob',
+        'pending-bob',
+        [
+          { user: '@bob:logical.test', id: '*', content: { key: 'deferred' } },
+        ],
+        config().e2ee,
+        { enabled: true, maxBytes: 1048576 },
+      )
+    );
+    const operations = await f.hd.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    const route = operations.find((op) =>
+      op.kind === 'route' && op.value.owner === 'edge'
+    )!;
+    assert(route);
+    await f.ed.tx((conn) => apply(conn, route, 'home'));
+    assertEquals(
+      await f.ed.query(
+        'SELECT expanded FROM to_device_routes WHERE route_id=?',
+        [route.kind === 'route' ? route.value.routeId : ''],
+      ),
+      [{ expanded: 0 }],
+    );
+    assertEquals(await f.ed.query('SELECT * FROM to_device_inbox'), []);
+    const snapshot = await f.hd.tx((conn) =>
+      captureAccountAuth(
+        conn,
+        {
+          server: 'logical.test',
+          pairing: 'pair',
+          grantRevision: 1,
+          ownerRevision: 1,
+        },
+        'bob',
+        false,
+        Date.now(),
+      )
+    );
+    const { ed } = await f.reopen();
+    await assertRejects(
+      () =>
+        ed.tx(async (conn) => {
+          await installAccountAuth(conn, snapshot);
+          throw new Error('rollback recipient bootstrap');
+        }),
+      Error,
+      'rollback recipient bootstrap',
+    );
+    assertEquals(await ed.query('SELECT * FROM to_device_inbox'), []);
+    assertEquals(
+      await ed.query('SELECT * FROM account_auth_snapshots WHERE localpart=?', [
+        'bob',
+      ]),
+      [],
+    );
+    await ed.tx((conn) => installAccountAuth(conn, snapshot));
+    const delivered = await ed.tx((conn) =>
+      deliverSliding(conn, recipient, 'bob', 100, config().e2ee)
+    );
+    assertEquals(delivered.events, [{
+      sender: '@alice:logical.test',
+      type: 'm.room_key',
+      content: { key: 'deferred' },
+    }]);
+    await ed.tx((conn) => installAccountAuth(conn, snapshot));
+    assertEquals(
+      (await ed.query('SELECT source_id FROM to_device_inbox')).length,
+      1,
+    );
+    const facts = await ed.query(
+      'SELECT localpart,kind FROM to_device_operations ORDER BY sequence',
+    );
+    assert(facts.every((fact) => fact.localpart === 'alice'));
+    assertEquals(facts.map((fact) => fact.kind).sort(), ['expansion', 'route']);
+    assertEquals(
+      await ed.query(
+        'SELECT payload_json FROM to_device_operations WHERE operation_id=?',
+        [route.operationId],
+      ),
+      [{ payload_json: canonicalJson(route) }],
+    );
+    await ed.tx(async (conn) => {
+      await deleteDevice(conn, 'BOB', 'bob');
+      await upsertDeviceRow(conn, 'BOB', 'bob', null);
+      await installAccountAuth(conn, snapshot);
+    });
+    const [replacement] = await ed.query(
+      "SELECT generation FROM devices WHERE localpart='bob' AND device_id='BOB'",
+    );
+    assert(Number(replacement.generation) > recipient.generation);
+    assertEquals(
+      (await ed.tx((conn) =>
+        deliverSliding(
+          conn,
+          { ...recipient, generation: Number(replacement.generation) },
+          'replacement',
+          100,
+          config().e2ee,
+        )
+      )).events,
+      [],
     );
   } finally {
     await f.close();
