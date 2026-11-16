@@ -252,7 +252,10 @@ room capability and head are captured at admission, before waiting for an earlie
 room owner; later writes cannot enlarge that queued caller's obligation. Application rechecks both
 watermarks and the original room capability's incarnation before writing.
 Historical-context seed edges similarly commit the completed prefix cursor;
-same-room live publication waits for complete context. Tenant push decisions
+same-room live publication waits for complete context. A page's immutable event,
+publication and push contexts share one room attempt and its state-group reader;
+unchanged publication state is not reconstructed once per event. Single-event
+push readers use the same capture owner. Tenant push decisions
 are recaptured inside each publication turn, so preparation cannot
 resurrect a deactivated account's notification facts.
 (`api/engine/server/{project,push-project}.ts`)
@@ -280,6 +283,8 @@ Client state disclosure has one admission owner, separate from raw state reads
 and event serialization. A grant names the room, viewer and exact publication
 or event-state snapshot. Joined/authorized snapshots retain old and imported
 state keys; a declined invitation alone never grants a private snapshot.
+Admission uses direct snapshot permission before asking for historical joined
+evidence; only an otherwise-unqualified leave/ban snapshot needs that witness.
 Without snapshot permission, only individually visible state survives. Published
 participation history fixes the real departure boundary: a later ban, declined
 reinvitation or current join cannot disclose a different private interval.

@@ -166,19 +166,20 @@ export async function admitState(
         ['joined', 'invited', 'world_readable'].includes(String(raw))
           ? raw
           : 'shared';
-      const joinedAtPoint = await tx.state.hasJoinedBefore(
-        user,
-        Math.min(pointPos, boundary?.pos ?? pointPos),
-      );
       // Snapshot admission, not the creation-time visibility of each old state key.
       // Declined invitations do not satisfy any joined-history branch.
-      const full = membership === 'join' || visibility === 'world_readable' ||
+      let full = membership === 'join' || visibility === 'world_readable' ||
         (membership === 'invite' &&
           (visibility === 'invited' ||
             (input.allowInvited && member?.membership === 'invite' &&
               visibility !== 'joined'))) ||
-        (participation !== null && visibility === 'shared') ||
-        (joinedAtPoint && (membership === 'leave' || membership === 'ban'));
+        (participation !== null && visibility === 'shared');
+      if (!full && (membership === 'leave' || membership === 'ban')) {
+        full = await tx.state.hasJoinedBefore(
+          user,
+          Math.min(pointPos, boundary?.pos ?? pointPos),
+        );
+      }
       for (const id of entries.values()) {
         if (full || await canSeeEventAt(user, tx, id, group)) events.add(id);
       }

@@ -5,6 +5,7 @@ import { openRoom } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { eventStreamMax } from '#engine/server/stream.ts';
 import { heldRoomSummary } from '#engine/client/summary.ts';
+import { Turso } from '#engine/store/ffi.ts';
 import { httpSuite } from '#tests/http-app.ts';
 
 type Json = Record<string, unknown>;
@@ -89,6 +90,39 @@ async function fixture(prefix: string, visibility = 'shared', space = false) {
     base,
   };
 }
+
+suite.test('joined snapshot admission uses its direct proof without historical join scans', async () => {
+  const f = await fixture('admit-direct-proof');
+  const readers = [
+    f.base + '/state',
+    f.base + '/members',
+    f.base + '/initialSync',
+    'v3/sync?full_state=true',
+  ];
+  const original = Turso.prototype.query;
+  let historicalJoins = 0;
+  Turso.prototype.query = function (...args) {
+    if (args[1].includes('SELECT DISTINCT p.grp FROM events e')) {
+      historicalJoins++;
+    }
+    return original.apply(this, args);
+  };
+  try {
+    for (const reader of readers) {
+      historicalJoins = 0;
+      const response = await call(reader, f.alice.access_token!);
+      assertEquals(response.status, 200, reader);
+      assert(json(response.body).includes(secret), reader);
+      assertEquals(
+        historicalJoins,
+        0,
+        'joined snapshot permission must not scan historical joins: ' + reader,
+      );
+    }
+  } finally {
+    Turso.prototype.query = original;
+  }
+});
 
 for (const after of [false, true]) {
   suite.test(
