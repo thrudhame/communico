@@ -45,6 +45,11 @@ import { startDeactivationWork } from '#engine/deactivation.ts';
 import { startProfileFanout } from '#engine/profile-fanout.ts';
 import { DomainOperations } from './domain.ts';
 import { DeviceOperations, isKeyStream } from './devices.ts';
+import type { EduState } from '#engine/federation/edus.ts';
+import {
+  type DeviceListService,
+  deviceListService,
+} from '#engine/federation/device-lists.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -84,6 +89,8 @@ export async function openFacadeRuntime(
   let keyExports: ReturnType<typeof startAccountExports> | undefined;
   let deactivation: ReturnType<typeof startDeactivationWork> | undefined;
   let profileFanout: ReturnType<typeof startProfileFanout> | undefined;
+  let deviceLists: DeviceListService | undefined;
+  let deviceEdus: EduState | undefined;
   const pairings = () => {
     if (!node) {
       throw new LinkError(
@@ -328,6 +335,35 @@ export async function openFacadeRuntime(
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),
     prepareSigner: async () => (await keyOwner()).prepareSigner(),
+    async deviceLists(edus: EduState) {
+      if (!caps.service('device-lists')) return undefined;
+      const signer = (await keyOwner()).requestSigner();
+      if (closed) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'facade is closing');
+      }
+      if (deviceLists) {
+        if (deviceEdus !== edus) {
+          throw new Error(
+            'facade device service already bound to another EDU state',
+          );
+        }
+        return deviceLists;
+      }
+      const granted = tenant;
+      if (!granted) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'device service requires enrollment',
+        );
+      }
+      // No await after the binding check: one runtime owns one service and its
+      // dispatcher, including recovery flights which must stop before the store.
+      deviceLists = deviceListService(server, granted, edus, signer);
+      deviceEdus = edus;
+      deviceLists.start();
+      return deviceLists;
+    },
     async profileFanout(localpart?: string) {
       if (!profileFanout) {
         throw new MatrixError(
@@ -350,7 +386,13 @@ export async function openFacadeRuntime(
         transaction,
         scopeState: (scope) => directory.scopeState(scope),
         acceptEdu: (origin, raw) =>
-          acceptIngressEdu(origin, identity.server, raw, transaction.edus),
+          acceptIngressEdu(
+            origin,
+            identity.server,
+            raw,
+            transaction.edus,
+            settings.phase,
+          ),
         changed: () => notices.changed(),
       });
       return mailbox;
@@ -491,6 +533,7 @@ export async function openFacadeRuntime(
         await inbox?.close();
         await deactivation?.close();
         await profileFanout?.close();
+        await deviceLists?.stop();
         await store.close();
       })(),
   };

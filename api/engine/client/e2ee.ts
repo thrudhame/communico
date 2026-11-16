@@ -282,7 +282,7 @@ async function composed(
             const res = missing.length
               ? await federationRequest(
                 app.server,
-                app.tenant.signer(),
+                app.replica?.signer ?? app.tenant.signer(),
                 {
                   destination: origin,
                   method: 'POST',

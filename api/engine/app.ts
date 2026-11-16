@@ -102,6 +102,7 @@ export type ReplicaAccess = {
   passwordLogin?(): Promise<boolean>;
   keys: KeyStore;
   signer: Signer;
+  deviceLists?(edus: EduState): Promise<DeviceListService | undefined>;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
   profileFanout?(localpart?: string): Promise<ProfileFanoutFailure[]>;
 };
@@ -207,10 +208,9 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   }
 }
 
-/** Bind already-enrolled tenant/store capabilities to the ordinary read tree.
- * No owner-only service is constructed. Asking for one refuses at this common
- * service boundary, even if a future adapter accidentally bypasses route gates.
- * The caller retains the node/link lifecycle; closeApp drains its store as usual.
+/** Bind already-enrolled tenant/store capabilities to the ordinary endpoint tree.
+ * Only explicitly granted services are borrowed from the node lifecycle owner.
+ * Others refuse even if an adapter accidentally bypasses route gates.
  */
 export async function openReplicaApp(
   store: Store,
@@ -252,12 +252,14 @@ export async function openReplicaApp(
       name + ' service unavailable at this ingress',
     );
   };
+  const federationEdus = eduState(server, tenant.serverName, store);
+  const deviceLists = await replica.deviceLists?.(federationEdus);
   const app: App = {
     store,
     server,
     tenant,
     federationKeys: replica.keys,
-    federationEdus: eduState(server, tenant.serverName, store),
+    federationEdus,
     get federationIngress() {
       return ingress;
     },
@@ -267,7 +269,7 @@ export async function openReplicaApp(
       ? { drain: replica.profileFanout }
       : undefined,
     get deviceLists() {
-      return unavailable('device-lists');
+      return deviceLists ?? unavailable('device-lists');
     },
     get pushSender() {
       return unavailable('push');
