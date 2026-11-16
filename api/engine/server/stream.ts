@@ -24,7 +24,13 @@ export async function eventStreamTx<T>(
   writers.set(db.path, settled);
   try {
     const result = await run;
-    for (const fn of listeners) fn(db.path);
+    for (const fn of [...listeners]) {
+      try {
+        fn(db.path);
+      } catch (error) {
+        console.error('event stream listener error:', error);
+      }
+    }
     return result;
   } finally {
     if (writers.get(db.path) === settled) writers.delete(db.path);

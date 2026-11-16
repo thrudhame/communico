@@ -53,8 +53,9 @@ let waitingWriters = 0;
 const roomQueues = new WeakMap<Store, Map<string, Promise<void>>>();
 
 // Projection listeners (the federation sender's wake, 4c-2): registered
-// like the room hooks, fired after each completed projection. A listener
-// never breaks the projection — errors are logged.
+// like the room hooks, fired after each completed projection. Each emission
+// owns its audience and completion, but never retains the publication lock
+// while awaiting observers. One listener cannot suppress another's wake.
 const projectedListeners:
   ((store: Store, roomId: string) => void | Promise<void>)[] = [];
 
@@ -195,17 +196,24 @@ async function projectRoom(store: Store, roomId: string): Promise<void> {
           }
         }
         await reconcileTyping(server, roomId);
-        for (const fn of projectedListeners) {
+        return {
+          kind: 'complete',
+          listeners: [...projectedListeners],
+        } as const;
+      });
+      if (outcome.kind === 'retry') continue capture;
+      if (outcome.kind === 'complete') {
+        // Preserve acknowledged observer work (including rule migration) and
+        // same-room ordering without blocking independent publication writers.
+        await Promise.all(outcome.listeners.map(async (fn) => {
           try {
             await fn(store, roomId);
           } catch (error) {
             console.error(`projection listener failed for ${roomId}:`, error);
           }
-        }
-        return { kind: 'complete' } as const;
-      });
-      if (outcome.kind === 'retry') continue capture;
-      if (outcome.kind === 'complete') return;
+        }));
+        return;
+      }
       index = outcome.end;
       mark = contextMark = outcome.pos;
     } while (index < prepared.length);

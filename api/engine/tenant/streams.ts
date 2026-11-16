@@ -11,7 +11,13 @@ export function onTenantStream(
   };
 }
 export function tenantStreamCommitted(store: Store, tenant: string): void {
-  for (const fn of listeners) fn(store, tenant);
+  for (const fn of [...listeners]) {
+    try {
+      fn(store, tenant);
+    } catch (error) {
+      console.error('tenant stream listener error:', error);
+    }
+  }
 }
 
 // Read allocated maxima, not retained rows or a single device's last change.
