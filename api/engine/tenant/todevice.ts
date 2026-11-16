@@ -17,6 +17,11 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { hashToken } from '#engine/tenant/auth.ts';
 import { encodeStreamToken, type StreamToken } from '#engine/client/tokens.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
+import {
+  acknowledgeToDeviceTargets,
+  checkToDeviceReplay,
+  routeToDeviceMessages,
+} from './todevice-routing.ts';
 
 const args = (d: DeviceIdentity) => [d.localpart, d.deviceId, d.generation];
 
@@ -26,6 +31,18 @@ export function forgetRestoredDeliveries(conn: Conn): Promise<number> {
   return conn.execute('DELETE FROM sync_deliveries');
 }
 export type Message = { user: string; id: string; content: Json };
+/** Like Synapse, only a sole '*' selector expands the owning registry. Mixed
+ * maps use literal device IDs, never entry-order-dependent overlapping fanout. */
+export function targetSelectors(messages: Message[]) {
+  const counts = new Map<string, number>();
+  for (const message of messages) {
+    counts.set(message.user, (counts.get(message.user) ?? 0) + 1);
+  }
+  return messages.map((message) => ({
+    ...message,
+    wildcard: message.id === '*' && counts.get(message.user) === 1,
+  }));
+}
 /** Queue pressure is temporary, unlike a permanently oversized wire object. */
 export class InboxFullError extends MatrixError {
   constructor() {
@@ -108,9 +125,19 @@ export async function sendMessages(
       receipt,
     )).length
   ) return;
+  const routed = await routeToDeviceMessages(
+    conn,
+    { kind: 'client', origin: server, id: source },
+    '@' + d.localpart + ':' + server,
+    type,
+    server,
+    messages,
+    limits,
+    d.localpart,
+  );
   let fanout = 0;
   const remote = new Map<string, Record<string, Record<string, Json>>>();
-  for (const m of messages) {
+  for (const m of targetSelectors(messages)) {
     const destination = domainOf(m.user);
     if (destination !== server) {
       let users = remote.get(destination);
@@ -122,8 +149,9 @@ export async function sendMessages(
       users![m.user][m.id] = m.content;
       continue;
     }
+    if (routed) continue;
     const lp = localpartOf(m.user);
-    const targets = m.id === '*'
+    const targets = m.wildcard
       ? await devicesOfUser(conn, lp)
       : [await deviceById(conn, m.id, lp)];
     for (const target of targets) {
@@ -213,11 +241,30 @@ export async function receiveMessages(
       'SELECT 1 FROM inbound_to_device WHERE origin=? AND message_id=?',
       [origin, id],
     )).length
-  ) return;
-  for (const m of messages) {
+  ) {
+    await checkToDeviceReplay(conn, origin, id, sender, type, server, messages);
+    return;
+  }
+  const routed = await routeToDeviceMessages(
+    conn,
+    { kind: 'federation', origin, id },
+    sender,
+    type,
+    server,
+    messages,
+    limits,
+  );
+  if (routed) {
+    await conn.execute('INSERT INTO inbound_to_device VALUES(?,?)', [
+      origin,
+      id,
+    ]);
+    return;
+  }
+  for (const m of targetSelectors(messages)) {
     if (domainOf(m.user) !== server) continue;
     const lp = localpartOf(m.user);
-    const targets = m.id === '*'
+    const targets = m.wildcard
       ? await devicesOfUser(conn, lp)
       : [await deviceById(conn, m.id, lp)];
     for (const target of targets) {
@@ -245,6 +292,7 @@ export async function acknowledge(
   conn: Conn,
   d: DeviceIdentity,
   since: StreamToken | null,
+  sourceChanged?: () => void,
 ): Promise<number> {
   await current(conn, d);
   if (since !== null) {
@@ -262,6 +310,7 @@ export async function acknowledge(
     conn,
     d,
     since === null ? null : await hashToken(encodeStreamToken(since)),
+    sourceChanged,
   );
 }
 
@@ -275,12 +324,14 @@ export async function acknowledgeSliding(
   d: DeviceIdentity,
   connection: string,
   since: string | null,
+  sourceChanged?: () => void,
 ): Promise<number> {
   await current(conn, d);
   return await acknowledgeIssued(
     conn,
     d,
     since === null ? null : await hashToken(slidingReceipt(connection, since)),
+    sourceChanged,
   );
 }
 
@@ -288,9 +339,11 @@ async function acknowledgeIssued(
   conn: Conn,
   d: DeviceIdentity,
   tokenHash: string | null,
+  sourceChanged?: () => void,
 ): Promise<number> {
   const owner = args(d);
   const ack = await issuedAck(conn, d, tokenHash);
+  if (await acknowledgeToDeviceTargets(conn, d, ack)) sourceChanged?.();
   await conn.execute(
     `INSERT INTO device_ack VALUES(?,?,?,?) ON CONFLICT(localpart,device_id,generation) DO UPDATE SET msg_pos=excluded.msg_pos WHERE ${
       changedColumns('device_ack', 'msg_pos')

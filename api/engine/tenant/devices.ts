@@ -13,6 +13,7 @@ import {
 import { config } from '#engine/config.ts';
 import { deletePushersForToken } from '#engine/tenant/pushers.ts';
 import { uiaAction, type UiaAuthorization } from '#engine/tenant/uia.ts';
+import { cancelToDeviceTargets } from './todevice-routing.ts';
 import {
   assertDeviceOwner,
   recordDeviceCreation,
@@ -151,6 +152,7 @@ export async function deleteDevice(
     [localpart, deviceId],
   );
   const device = await deviceById(conn, deviceId, localpart);
+  await cancelToDeviceTargets(conn, localpart, deviceId);
   await conn.execute(
     'DELETE FROM sliding_sync_positions WHERE connection_id IN (SELECT id FROM sliding_sync_connections WHERE localpart=? AND device_id=?)',
     [localpart, deviceId],
