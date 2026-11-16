@@ -260,6 +260,18 @@ are recaptured inside each publication turn, so preparation cannot
 resurrect a deactivated account's notification facts.
 (`api/engine/server/{project,push-project}.ts`)
 
+F2 room-replica v2 verifies each added signature and unions it in a room-owned
+overlay without changing the retained base PDU. Scalar/bulk event reads hydrate
+the effective map in the same query, and a union updates the attempt-local
+reader. The overlay and signature-only export intent commit atomically. Server
+projection consumes that intent without new live feed, push or egress work;
+semantic export carries the effective event even when it has no live step.
+The signed create authenticates the declared version before any overlay write.
+Only explicitly verified, normalized candidates enter the overlay; a deterministic
+choice per server/key repairs invalid optional base entries without arrival-order
+dependence. Retaining an unchanged proof produces no new export intent.
+F1 room-replica v1 keeps its original strict event comparison.
+
 Projection writes a complete change prefix and advances its watermark in one server
 transaction. Rows are idempotent on `(room, pos)`; outbox rows also include
 destination. The server assigns global live-feed sequence numbers here.
@@ -1195,6 +1207,9 @@ attempt, including common ancestors of sibling deltas. Callers receive independe
 maps/entries; missing groups, event-state refs and current pointers are not cached.
 The reader is released with its attempt, so rollback/retry and escaped handles
 cannot reuse it. No state maps cross transaction snapshots or file lifetimes.
+Immutable event-row hydration shares that same attempt lifetime across scalar
+and set-based readers. Returned rows are independent values; misses, failures,
+mutable status and publication facts are never retained as cached truth.
 (`api/engine/store/db.ts:202-271`, `api/engine/room/edges.ts:1-23`,
 `api/engine/room/index.ts:165-188`)
 

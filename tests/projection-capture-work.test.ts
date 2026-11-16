@@ -30,6 +30,7 @@ Deno.test('projection capture: unchanged state is reconstructed once per room pa
     await project(store, g.roomId);
     const sent: string[] = [];
     let reconstructedGroups: number[] = [];
+    const duplicateMaxima: number[] = [];
     const measure = async (bodies: string[], state = false) => {
       for (const body of bodies) {
         const result = await sendLocal(g.room, {
@@ -41,9 +42,21 @@ Deno.test('projection capture: unchanged state is reconstructed once per room pa
         sent.push(result.eventId);
       }
       const original = Turso.prototype.query;
+      const originalBegin = Turso.prototype.begin;
+      const epochs = new Map<number, number>();
+      const reads = new Map<string, number>();
+      Turso.prototype.begin = function (connection, mode) {
+        epochs.set(connection, (epochs.get(connection) ?? 0) + 1);
+        return originalBegin.call(this, connection, mode);
+      };
       let stateReads = 0;
       const groupReads = new Map<number, number>();
       Turso.prototype.query = function (...args) {
+        if (args[1].endsWith('FROM events WHERE id = ?')) {
+          const key = String(args[0]) + ':' + String(epochs.get(args[0])) +
+            ':' + String(args[2]?.[0]);
+          reads.set(key, (reads.get(key) ?? 0) + 1);
+        }
         if (/\bFROM state_(?:groups|entries)\b/i.test(args[1])) stateReads++;
         if (args[1] === 'SELECT id, parent FROM state_groups WHERE id = ?') {
           const group = Number(args[2]?.[0]);
@@ -55,8 +68,17 @@ Deno.test('projection capture: unchanged state is reconstructed once per room pa
         await project(store, g.roomId);
       } finally {
         Turso.prototype.query = original;
+        Turso.prototype.begin = originalBegin;
       }
       reconstructedGroups = [...groupReads.values()];
+      const maximum = Math.max(0, ...reads.values());
+      duplicateMaxima.push(maximum);
+      console.log(JSON.stringify({
+        messages: bodies.length,
+        pdu_native_reads: [...reads.values()].reduce((a, b) => a + b, 0),
+        distinct_attempt_pdu_pairs: reads.size,
+        max_reads_for_same_pdu_in_one_attempt: maximum,
+      }));
       return stateReads;
     };
     const single = await measure(['single']);
@@ -90,6 +112,11 @@ Deno.test('projection capture: unchanged state is reconstructed once per room pa
       ]))
         .filter((row) => sent.includes(String(row.event))).length,
       sent.length,
+    );
+    assertEquals(
+      Math.max(...duplicateMaxima),
+      1,
+      'one projection capture attempt must hydrate each immutable PDU once',
     );
     await measure(['changed publication one', 'changed publication two'], true);
     assertEquals(reconstructedGroups.length > 0, true);

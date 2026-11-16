@@ -192,6 +192,170 @@ function rehash(record: LinkRecord): LinkRecord {
   return { ...body, hash: recordHash(body) };
 }
 
+Deno.test('to-device link: idle exports do no retained-history signing or journal work', async () => {
+  const f = await fixture();
+  try {
+    await send(f);
+    let signatures = 0;
+    const signer = f.node.signer();
+    const owner = await coordinator(f.edge, f.et, f.fp, {
+      ...f.node,
+      signer: () => ({
+        ...signer,
+        sign: (body: string) => {
+          signatures++;
+          return signer.sign(body);
+        },
+      }),
+    });
+    const records = await owner.export('alice');
+    assert(records.length > 0);
+    const first = signatures;
+    const db = await f.edge.server();
+    const rows = await db.query('SELECT * FROM facade_records');
+    await owner.export('alice');
+    assertEquals(
+      signatures,
+      first,
+      'an idle scan must not sign retained operations',
+    );
+    assertEquals(await db.query('SELECT * FROM facade_records'), rows);
+    assertEquals(await owner.export('alice'), []);
+    // An independent coordinator after reopening the server file observes the
+    // same durable export cut; source history is retained, not destructively read.
+    const operations = await (await f.edge.tenant('logical.test')).query(
+      'SELECT * FROM to_device_operations',
+    );
+    await f.edge.close();
+    const cold = await f.open('edge');
+    try {
+      const node = await initializeNode(
+        await cold.server(),
+        'logical.test',
+        'edge_a',
+      );
+      const pairings = new Pairings(
+        await cold.server(),
+        node.signer(),
+        node.publicKey,
+        'b'.repeat(64),
+        node,
+      );
+      const tenant = await enrolledTenant(
+        cold,
+        pairings,
+        'logical.test',
+        'edge_a',
+      );
+      assertEquals(
+        await (await coordinator(cold, tenant, pairings, node)).export('alice'),
+        [],
+      );
+      assertEquals(
+        await (await cold.tenant('logical.test')).query(
+          'SELECT * FROM to_device_operations',
+        ),
+        operations,
+      );
+    } finally {
+      await cold.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device link: export cut rolls back with journal append and later scans export only new intent', async () => {
+  for (const side of ['home', 'edge'] as const) {
+    const f = await fixture();
+    const store = side === 'home' ? f.home : f.edge;
+    const original = store.server.bind(store);
+    const owner = side === 'home' ? f.hs : f.es;
+    const pairing = side === 'home' ? f.bundle.id : undefined;
+    try {
+      await send(f, side);
+      const db = await original();
+      const recordsBefore = await db.query('SELECT * FROM facade_records');
+      const cutsBefore = await db.query('SELECT * FROM facade_exports');
+      let faults = 0;
+      store.server = () =>
+        Promise.resolve({
+          ...db,
+          tx: (fn, options) =>
+            db.tx((conn) =>
+              fn(
+                new Proxy(conn, {
+                  get(target, key) {
+                    if (key === 'execute') {
+                      return async (...args: Parameters<Conn['execute']>) => {
+                        const result = await target.execute(...args);
+                        if (args[0].startsWith('INSERT INTO facade_exports(')) {
+                          faults++;
+                          throw new Error('fault after source cut write');
+                        }
+                        return result;
+                      };
+                    }
+                    const value = Reflect.get(target, key);
+                    return typeof value === 'function'
+                      ? value.bind(target)
+                      : value;
+                  },
+                }),
+              ), options),
+        });
+      await assertRejects(
+        () => owner.export('alice', pairing),
+        Error,
+        'fault after source cut write',
+      );
+      store.server = original;
+      assertEquals(faults, 1);
+      assertEquals(
+        await db.query('SELECT * FROM facade_records'),
+        recordsBefore,
+      );
+      assertEquals(await db.query('SELECT * FROM facade_exports'), cutsBefore);
+      const first = await owner.export('alice', pairing);
+      assert(
+        first.length > 0,
+        'rollback must leave every source operation exportable',
+      );
+      assertEquals(await owner.export('alice', pairing), []);
+      const tenant = side === 'home' ? f.ht : f.et;
+      const device = await deviceIdentity(
+        tenant,
+        'alice',
+        side === 'home' ? 'LAN' : 'PHONE',
+      );
+      await tenant.tx((tx) =>
+        tx.toDevice.send(
+          device,
+          tenant.serverName,
+          'm.room_key_request',
+          'new-intent',
+          'new-body',
+          [{
+            user: '@alice:logical.test',
+            id: '*',
+            content: { request_id: 'second-session' },
+          }],
+          config().e2ee,
+          { enabled: true, maxBytes: 1048576 },
+        )
+      );
+      const second = await owner.export('alice', pairing);
+      assert(second.length > 0);
+      const previous = new Set(first.map((record) => record.operationId));
+      assert(second.every((record) => !previous.has(record.operationId)));
+      assertEquals(await owner.export('alice', pairing), []);
+    } finally {
+      store.server = original;
+      await f.close();
+    }
+  }
+});
+
 Deno.test('to-device crypto: owner-claimed fresh Olm key carries a Megolm session across cold home drain and back', async () => {
   await Olm.init();
   const alice = new Olm.Account(), bob = new Olm.Account();
@@ -985,7 +1149,7 @@ Deno.test('to-device link: signed owner admission precedes ACK, reverse disposit
     await send(f);
     const records = await f.es.export('alice');
     assert(records.length > 0);
-    assertEquals(await f.es.export('alice'), records);
+    assertEquals(await f.es.export('alice'), []);
     const hdb = await f.home.tenant('logical.test'),
       edb = await f.edge.tenant('logical.test');
     const before = await edb.query('SELECT * FROM to_device_inbox');
@@ -1053,7 +1217,7 @@ Deno.test('to-device link: signed owner admission precedes ACK, reverse disposit
       assertEquals(await edb.query('SELECT * FROM to_device_inbox'), before);
       assertEquals(
         await f.es.export('alice'),
-        records,
+        [],
         'foreign dispositions cannot echo as local intent',
       );
       assertEquals(await hdb.query('SELECT * FROM to_device_inbox'), []);

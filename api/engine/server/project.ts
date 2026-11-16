@@ -446,6 +446,7 @@ type Prepared =
     }
     | { kind: 'redaction'; target: string }
     | { kind: 'delivery'; destinations: string[] }
+    | { kind: 'signature' }
   );
 
 function eventPayloadOf(change: Change): EventPayload {
@@ -639,6 +640,15 @@ async function prepare(
             push: null,
             pushCapture: null,
           });
+          break;
+        }
+        case 'signature': {
+          if (
+            change.event === null || await tx.events.get(change.event) === null
+          ) {
+            throw new Error('signature change without a retained event');
+          }
+          out.push({ change, kind: 'signature' });
           break;
         }
         case 'membership': {
@@ -855,6 +865,10 @@ async function apply(
 ): Promise<void> {
   const { change } = item;
   switch (item.kind) {
+    // Signature evidence is export intent, never a new event, feed row, push,
+    // membership transition or independent federation delivery obligation.
+    case 'signature':
+      return;
     case 'event': {
       await tx.execute(
         `INSERT INTO event_index(event, room, pos, standing, grounding, reason, rule, origin, seq)

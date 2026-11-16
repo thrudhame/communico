@@ -15,7 +15,11 @@ import { importReplicaBoundary, importReplicaGenesis } from './replica.ts';
 import type { ReplicaRoom } from './replica-export.ts';
 import { stageSnapshotEvidence } from './snapshot-install.ts';
 import { verifySnapshot } from './snapshot.ts';
-import { verify } from './verify.ts';
+import { type Verified, verify } from './verify.ts';
+import {
+  prepareEventSignatures,
+  type SignatureEvidence,
+} from './signatures.ts';
 
 function unavailable(message: string): never {
   throw new MatrixError(503, 'M_UNAVAILABLE', message);
@@ -24,7 +28,12 @@ function unavailable(message: string): never {
 export async function importReplicaRoom(
   store: Store,
   manifest: ReplicaRoom,
-  input: { self: string; keys: KeyResolver; signal?: AbortSignal },
+  input: {
+    self: string;
+    keys: KeyResolver;
+    signal?: AbortSignal;
+    signatureUnion?: boolean;
+  },
 ): Promise<void> {
   if (manifest.version !== 1) {
     throw new MatrixError(400, 'M_BAD_JSON', 'replica manifest version');
@@ -32,15 +41,30 @@ export async function importReplicaRoom(
   if (manifest.after > 0) await openRoom(store, manifest.roomId);
   const residents = new Map(Object.entries(manifest.residents));
   const pack = new Map<string, Pdu>();
+  const signatures = new Map<string, SignatureEvidence>();
   for (const raw of manifest.events) {
     input.signal?.throwIfAborted();
-    const verified = await verify(raw, manifest.roomVersion, input.keys, {
+    const options = {
       roomId: manifest.roomId,
+      signal: input.signal,
       exemptPrevAuthLimits: true,
       localSnapshotFallback: residents.has(String(raw.event_id))
         ? { self: input.self, resident: residents.get(String(raw.event_id))! }
         : undefined,
-    });
+    };
+    let verified: Verified;
+    if (input.signatureUnion) {
+      const prepared = await prepareEventSignatures(
+        raw,
+        manifest.roomVersion,
+        input.keys,
+        options,
+      );
+      signatures.set(prepared.eventId, prepared.evidence);
+      verified = prepared;
+    } else {
+      verified = await verify(raw, manifest.roomVersion, input.keys, options);
+    }
     if (raw.event_id !== verified.eventId || pack.has(verified.eventId)) {
       throw new MatrixError(
         400,
@@ -99,7 +123,42 @@ export async function importReplicaRoom(
   const stays = new Map(
     manifest.stays.map((stay) => [stay.opening.eventId, stay]),
   );
+  const first = manifest.stays[0];
+  if (!first) unavailable('replica has no participation');
+  const verifyPack = () =>
+    verifySnapshot({
+      ...input,
+      roomId: manifest.roomId,
+      roomVersion: manifest.roomVersion,
+      resident: input.self,
+      residents,
+      state: [event(first.opening.createId)],
+      authChain: [...pack.values()],
+    });
+  // Verification using a declared version is not proof that it is the room's
+  // version. Authenticate the signed create before any v2 overlay can commit.
+  const packEvidence = input.signatureUnion ? await verifyPack() : undefined;
   const initialized = new Set<string>();
+  // Known auth/genesis events and signature-only packs need the same immutable
+  // comparison/union as live steps. Validate them before any bootstrap writes.
+  if (packEvidence && (await store.rooms()).includes(manifest.roomId)) {
+    const room = await openRoom(store, manifest.roomId);
+    await withRoomLock(room.id, () =>
+      room.tx(async (tx) => {
+        const stay = await tx.segments.latestStay();
+        if (stay && await roomCreateId(tx, stay.id) !== packEvidence.createId) {
+          throw new MatrixError(
+            400,
+            'M_BAD_JSON',
+            'replica replaces retained room create',
+          );
+        }
+        await tx.events.list([...signatures.keys()]);
+        for (const evidence of signatures.values()) {
+          await tx.events.mergeSignatures(evidence);
+        }
+      }));
+  }
   const ensure = async (id: string) => {
     if (initialized.has(id)) return;
     const stay = stays.get(id);
@@ -193,10 +252,15 @@ export async function importReplicaRoom(
       : undefined;
     await withRoomLock(room.id, () =>
       room.tx(async (tx) => {
-        const existing = await tx.events.get(step.eventId);
-        if (existing) {
-          const held = JSON.parse(existing.pdu) as Pdu;
-          if (canonicalJson(held) !== canonicalJson(verified.pdu)) {
+        if (input.signatureUnion) {
+          await tx.events.mergeSignatures(signatures.get(step.eventId)!);
+        } else {
+          const existing = await tx.events.get(step.eventId);
+          if (
+            existing &&
+            canonicalJson(JSON.parse(existing.pdu)) !==
+              canonicalJson(verified.pdu)
+          ) {
             throw new MatrixError(
               400,
               'M_BAD_JSON',
@@ -259,17 +323,7 @@ export async function importReplicaRoom(
   // Retain outlier/pending bytes as independently auth-checked evidence, not
   // copied source status or live publication. Later source transitions can
   // ground them normally. This also works after the final stay has closed.
-  const first = manifest.stays[0];
-  if (!first) unavailable('replica has no participation');
-  const evidence = await verifySnapshot({
-    ...input,
-    roomId: manifest.roomId,
-    roomVersion: manifest.roomVersion,
-    resident: input.self,
-    residents,
-    state: [event(first.opening.createId)],
-    authChain: [...pack.values()],
-  });
+  const evidence = packEvidence ?? await verifyPack();
   const room = await openRoom(store, manifest.roomId);
   await withRoomLock(room.id, () =>
     room.tx(async (tx) => {

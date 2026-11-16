@@ -7,6 +7,7 @@
 import type { SchemaProvider } from '#engine/store/create.ts';
 import { rebuildTopology, TOPOLOGY_SQL } from './topology.ts';
 import { REMOTE_BATCHES_SQL } from './remote-batches.ts';
+import { EVENT_SIGNATURES_SQL } from './signatures.ts';
 
 export const ROOM_SCHEMA_SQL = `
 CREATE TABLE events(
@@ -156,14 +157,16 @@ UPDATE waits SET state='ready' WHERE
 `;
 
 export const roomSchema: SchemaProvider = {
-  version: 7,
+  version: 8,
   apply: async (db) => {
     await db.exec(
       ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL +
-        ANNOTATION_INDEX_SQL + REMOTE_BATCHES_SQL + WAIT_READY_SQL,
+        ANNOTATION_INDEX_SQL + REMOTE_BATCHES_SQL + WAIT_READY_SQL +
+        EVENT_SIGNATURES_SQL,
     );
   },
   migrations: {
+    7: (conn) => conn.exec(EVENT_SIGNATURES_SQL),
     6: (conn) => conn.exec(WAIT_READY_SQL),
     5: (conn) => conn.exec(REMOTE_BATCHES_SQL),
     4: async (conn) => {

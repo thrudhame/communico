@@ -75,6 +75,13 @@ import type { Pdu } from '#engine/pdu.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { setRoomHooks } from '#engine/room/hooks.ts';
 import { importReplicaGenesis } from '#engine/room/replica.ts';
+import { importReplicaRoom } from '#engine/room/replica-import.ts';
+import { stageSnapshotEvidence } from '#engine/room/snapshot-install.ts';
+import { verifySnapshot } from '#engine/room/snapshot.ts';
+import { exportReplicaRoom } from '#engine/room/replica-export.ts';
+import { canonicalJson } from '#engine/canonical.ts';
+import { redact } from '#engine/eventid.ts';
+import { b64encodeStd } from '#engine/signing-primitives.js';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
@@ -94,7 +101,7 @@ import {
 } from './fixtures/remote.ts';
 import { makeFakeRoom } from './fixtures/remote-room.ts';
 
-async function fixture(seedServer = serverSchema) {
+async function fixture(seedServer = serverSchema, version = '11') {
   const dir = await Deno.makeTempDir({ prefix: 'facade-replication-' });
   const open = (name: string, schema = serverSchema) =>
     openStore({
@@ -149,6 +156,7 @@ async function fixture(seedServer = serverSchema) {
   const source = await makeFakeRoom({
     roomId: '!replicated:logical.test',
     server: signing,
+    version,
   });
   const keys = fakeKeyResolver(signing);
   const pdus = [...source.events.values()];
@@ -254,6 +262,267 @@ async function fixture(seedServer = serverSchema) {
     },
   };
 }
+
+Deno.test('replica signature-only packs authenticate the actual room version before any overlay commit', async () => {
+  const f = await fixture(serverSchema, '5');
+  try {
+    const initial = await f.exports();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await (await f.replicas()).apply(journal, initial);
+    const replica = await f.replica();
+    const head = await replica.tx((tx) => tx.changes.head());
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    manifest.after = manifest.cut;
+    manifest.steps = [];
+    // v4 and v5 share event hashing/redaction, but only the real v5 version
+    // enforces this key's validity floor. The signed create still declares v5.
+    manifest.roomVersion = '4';
+    const target = manifest.events.find((pdu) => pdu.type === 'm.room.create')!;
+    const witness = await makeRemoteServer('expired.test', { validUntilMs: 0 });
+    const body = redact(target as unknown as Record<string, unknown>, '4');
+    delete body.event_id;
+    delete body.signatures;
+    target.signatures[witness.name] = {
+      [witness.keyId]: b64encodeStd(
+        new Uint8Array(
+          await crypto.subtle.sign(
+            { name: 'Ed25519' },
+            witness.kp.privateKey,
+            new TextEncoder().encode(canonicalJson(body)),
+          ),
+        ),
+      ),
+    };
+    await assertRejects(() =>
+      importReplicaRoom(f.edgeStore(), manifest, {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing, witness),
+        signatureUnion: true,
+      })
+    );
+    assertEquals(await replica.tx((tx) => tx.changes.head()), head);
+    const retained = JSON.parse(
+      (await replica.tx((tx) => tx.events.get(String(target.event_id))))!.pdu,
+    );
+    assertEquals(retained.signatures[witness.name], undefined);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature-only packs reject substituted creates before any retained overlay commit', async () => {
+  const f = await fixture(serverSchema, '5');
+  try {
+    const initial = await f.exports();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await (await f.replicas()).apply(journal, initial);
+    const replica = await f.replica();
+    const head = await replica.tx((tx) => tx.changes.head());
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    manifest.after = manifest.cut;
+    manifest.steps = [];
+    manifest.roomVersion = '4';
+    const target = manifest.events.find((pdu) => pdu.type === 'm.room.create')!;
+    const witness = await makeRemoteServer('expired.test', { validUntilMs: 0 });
+    const body = redact(target as unknown as Record<string, unknown>, '4');
+    delete body.event_id;
+    delete body.signatures;
+    target.signatures[witness.name] = {
+      [witness.keyId]: b64encodeStd(
+        new Uint8Array(
+          await crypto.subtle.sign(
+            { name: 'Ed25519' },
+            witness.kp.privateKey,
+            new TextEncoder().encode(canonicalJson(body)),
+          ),
+        ),
+      ),
+    };
+    // A valid alternate create authenticates v4, but not this retained room.
+    // Rejected auth-chain evidence must not confer that version on known PDUs.
+    const substitute = await makeFakeRoom({
+      roomId: manifest.roomId,
+      server: f.signing,
+      version: '4',
+    });
+    manifest.events.push(substitute.events.get(substitute.createId)!);
+    manifest.stays[0].opening.createId = substitute.createId;
+    await assertRejects(() =>
+      importReplicaRoom(f.edgeStore(), manifest, {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing, witness),
+        signatureUnion: true,
+      })
+    );
+    assertEquals(await replica.tx((tx) => tx.changes.head()), head);
+    const retained = JSON.parse(
+      (await replica.tx((tx) => tx.events.get(String(target.event_id))))!.pdu,
+    );
+    assertEquals(retained.signatures[witness.name], undefined);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica v2 verified join bootstrap preserves evidence-only rooms with no prior participation', async () => {
+  const f = await fixture();
+  try {
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    const keys = fakeKeyResolver(f.signing);
+    const evidence = await verifySnapshot({
+      self: f.tenant.serverName,
+      keys,
+      roomId: manifest.roomId,
+      roomVersion: manifest.roomVersion,
+      resident: f.tenant.serverName,
+      state: [manifest.events.find((event) => event.type === 'm.room.create')!],
+      authChain: manifest.events,
+    });
+    // Present the original signed creator join as an authentic snapshot opening,
+    // not as an unpublished-file genesis. Its create belongs to before-state.
+    const opening = manifest.stays[0].opening;
+    opening.kind = 'join';
+    manifest.boundaries.push({
+      eventId: opening.eventId,
+      resident: f.tenant.serverName,
+      state: [opening.createId],
+      authChain: [],
+    });
+    manifest.steps = manifest.steps.filter((step) =>
+      step.eventId !== opening.createId
+    );
+    const room = await openRoom(f.edgeStore(), manifest.roomId, {
+      create: true,
+    });
+    await room.tx((tx) => stageSnapshotEvidence(tx, evidence, opening.eventId));
+    assertEquals(await room.tx((tx) => tx.segments.latestStay()), null);
+    assert(await room.tx((tx) => tx.events.get(evidence.createId)));
+    await importReplicaRoom(f.edgeStore(), manifest, {
+      self: f.tenant.serverName,
+      keys,
+      signatureUnion: true,
+    });
+    assert(await room.tx((tx) => tx.segments.latestStay()));
+    assertEquals(
+      (await room.tx((tx) => tx.events.getStatus(opening.eventId)))
+        ?.grounding,
+      'grounded',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature-only packs union verified signatures without changing base bytes or live news', async () => {
+  const f = await fixture();
+  try {
+    const initial = await f.exports();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await (await f.replicas()).apply(journal, initial);
+    const replica = await f.replica();
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    manifest.after = manifest.cut;
+    manifest.steps = [];
+    const target = manifest.events.find((pdu) => pdu.type === 'm.room.create')!;
+    const id = String(target.event_id);
+    const witness = await makeRemoteServer('witness.test');
+    const body = redact(
+      target as unknown as Record<string, unknown>,
+      manifest.roomVersion,
+    );
+    delete body.event_id;
+    delete body.signatures;
+    const signature = b64encodeStd(
+      new Uint8Array(
+        await crypto.subtle.sign(
+          { name: 'Ed25519' },
+          witness.kp.privateKey,
+          new TextEncoder().encode(canonicalJson(body)),
+        ),
+      ),
+    );
+    target.signatures![witness.name] = { [witness.keyId]: signature };
+    const db = await f.edgeStore().room(replica.id);
+    await project(f.edgeStore(), replica.id);
+    const server = await f.edgeServer();
+    const feed = await server.query(
+      'SELECT * FROM feed WHERE room=? ORDER BY seq',
+      [replica.id],
+    );
+    assert(feed.length > 0);
+    const base = await db.query('SELECT pdu FROM events WHERE id=?', [id]);
+    const head = await replica.tx((tx) => tx.changes.head());
+    const position = await replica.tx((tx) => tx.segments.positionOf(id));
+    const apply = () =>
+      importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing, witness),
+        signatureUnion: true,
+      });
+    await apply();
+    await project(f.edgeStore(), replica.id);
+    assertEquals(
+      await server.query('SELECT * FROM feed WHERE room=? ORDER BY seq', [
+        replica.id,
+      ]),
+      feed,
+    );
+    assertEquals(
+      JSON.parse((await replica.tx((tx) => tx.events.get(id)))!.pdu)
+        .signatures[witness.name],
+      {
+        [witness.keyId]: signature,
+      },
+    );
+    assertEquals(
+      await db.query('SELECT pdu FROM events WHERE id=?', [id]),
+      base,
+    );
+    assertEquals(
+      await replica.tx((tx) => tx.segments.positionOf(id)),
+      position,
+    );
+    const suffix = await exportReplicaRoom(replica, f.tenant.serverName, head);
+    assertEquals(suffix.steps, []);
+    assertEquals(suffix.cut, head + 1);
+    assertEquals(
+      suffix.events.find((pdu) => pdu.event_id === id)!
+        .signatures![witness.name],
+      {
+        [witness.keyId]: signature,
+      },
+    );
+    await apply();
+    assertEquals(await replica.tx((tx) => tx.changes.head()), head + 1);
+    await f.reopen();
+    assertEquals(
+      JSON.parse((await (await f.replica()).tx((tx) => tx.events.get(id)))!.pdu)
+        .signatures[witness.name],
+      {
+        [witness.keyId]: signature,
+      },
+    );
+    // A valid sender signature is not proof of an optional signature or of
+    // unchanged full event material (content-hash redaction must not hide it).
+    target.signatures![witness.name][witness.keyId] = 'A'.repeat(86);
+    await assertRejects(apply);
+    target.signatures![witness.name][witness.keyId] = signature;
+    target.content = { ...target.content, injected: true };
+    await assertRejects(apply);
+    assertEquals(
+      await (await f.replica()).tx((tx) => tx.changes.head()),
+      head + 1,
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('room replication pins bootstrap, applies only durable semantic suffixes, and completes readiness with its journal result', async () => {
   const f = await fixture();

@@ -14,6 +14,7 @@ const config = (dir: string) => ({
 
 const TABLES = [
   'events',
+  'event_signatures',
   'event_status',
   'event_topology',
   'prev_edges',
@@ -48,6 +49,42 @@ const INDEXES = [
   'publications_change',
   'segments_opener',
 ];
+
+Deno.test('room schema: v7 signature overlay upgrade preserves base events and matches fresh creation', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: {
+      room: {
+        version: 7,
+        apply: async (db) => {
+          await roomSchema.apply(db);
+          await db.exec('DROP TABLE event_signatures');
+        },
+      },
+    },
+  });
+  try {
+    const old = await store.room('!old:test', { create: true });
+    await old.execute(
+      "INSERT INTO events(id,pdu,type,sender,depth,origin_ts) VALUES('$old','{}','test','@a:test',1,1)",
+    );
+    await store.close();
+    store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    const upgraded = await store.room('!old:test');
+    const fresh = await store.room('!fresh:test', { create: true });
+    const schema =
+      "SELECT name,sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE '__turso%' ORDER BY name";
+    assertEquals(await upgraded.query(schema), await fresh.query(schema));
+    assertEquals(await upgraded.query('SELECT id,pdu FROM events'), [{
+      id: '$old',
+      pdu: '{}',
+    }]);
+    assertEquals(await upgraded.query('SELECT * FROM event_signatures'), []);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('room schema: tables and indexes land on create, version recorded', async () => {
   const dir = await Deno.makeTempDir();
@@ -116,7 +153,7 @@ Deno.test('room schema: v3 upgrade preserves old data and starts the future publ
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
+            'DROP TABLE event_signatures; DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
           );
         },
       },
@@ -152,7 +189,7 @@ Deno.test('room schema: v4 annotation index upgrade preserves events and uses ta
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
+            'DROP TABLE event_signatures; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
           );
         },
       },
@@ -208,7 +245,9 @@ Deno.test('room schema: v5 adds durable remote batch receipts without changing e
         version: 5,
         apply: async (db) => {
           await roomSchema.apply(db);
-          await db.exec('DROP TABLE remote_batches; DROP INDEX waits_ready');
+          await db.exec(
+            'DROP TABLE event_signatures; DROP TABLE remote_batches; DROP INDEX waits_ready',
+          );
         },
       },
     },
@@ -242,7 +281,7 @@ Deno.test('room schema: v6 admits eligible retained dependencies into the indexe
         version: 6,
         apply: async (db) => {
           await roomSchema.apply(db);
-          await db.exec('DROP INDEX waits_ready');
+          await db.exec('DROP TABLE event_signatures; DROP INDEX waits_ready');
         },
       },
     },

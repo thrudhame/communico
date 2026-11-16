@@ -7,6 +7,10 @@ import { changedColumns } from '#engine/store/changed.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import type { EdgeKind, EdgeOverlay } from '#engine/room/edges.ts';
 import { indexTopology } from './topology.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { canonicalJson } from '#engine/canonical.ts';
+import type { Pdu } from '#engine/pdu.ts';
+import { eventMaterial, type SignatureEvidence } from './signatures.ts';
 
 export type EventRow = {
   id: string;
@@ -100,10 +104,35 @@ export async function insertEvent(
   remember(cache, id, pdu);
 }
 
+function effectiveSignatures(
+  base: Pdu['signatures'],
+  overlay: Pdu['signatures'],
+): Pdu['signatures'] {
+  const signatures = { ...base };
+  for (const [server, entries] of Object.entries(overlay)) {
+    Object.defineProperty(signatures, server, {
+      value: { ...signatures[server], ...entries },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return signatures;
+}
+
 function eventOf(row: Row): EventRow {
+  let pdu = String(row.pdu);
+  if (row.signature_overlay !== null && row.signature_overlay !== undefined) {
+    const effective = JSON.parse(pdu);
+    effective.signatures = effectiveSignatures(
+      effective.signatures,
+      JSON.parse(String(row.signature_overlay)),
+    );
+    pdu = JSON.stringify(effective);
+  }
   return {
     id: String(row.id),
-    pdu: String(row.pdu),
+    pdu,
     type: String(row.type),
     state_key: row.state_key === null ? null : String(row.state_key),
     sender: String(row.sender),
@@ -140,7 +169,10 @@ export async function getEvent(
   id: string,
   cache?: EdgeOverlay,
 ): Promise<EventRow | null> {
-  const rows = await conn.query('SELECT * FROM events WHERE id = ?', [id]);
+  const rows = await conn.query(
+    'SELECT *, (SELECT signatures FROM event_signatures WHERE event=events.id) AS signature_overlay FROM events WHERE id = ?',
+    [id],
+  );
   if (rows.length === 0) return null;
   const event = eventOf(rows[0]);
   remember(cache, event.id, event.pdu);
@@ -193,7 +225,7 @@ export async function getEvents(
   for (const chunk of chunks(ids)) {
     const marks = chunk.map(() => '?').join(',');
     const rows = await conn.query(
-      `SELECT * FROM events WHERE id IN (${marks})`,
+      `SELECT *, (SELECT signatures FROM event_signatures WHERE event=events.id) AS signature_overlay FROM events WHERE id IN (${marks})`,
       chunk,
     );
     for (const row of rows) {
@@ -205,7 +237,136 @@ export async function getEvents(
   return found;
 }
 
+/** Existing immutable rows belong to one room transaction attempt, not a store. */
+export class EventReads {
+  private active = true;
+  private readonly rows = new Map<string, Promise<EventRow | null>>();
+
+  constructor(
+    private readonly conn: Conn,
+    private readonly edges: EdgeOverlay,
+  ) {}
+
+  private check(): void {
+    if (!this.active) {
+      throw new Error('transaction event reader has been released');
+    }
+  }
+
+  release(): void {
+    this.active = false;
+    this.rows.clear();
+  }
+
+  private hold(
+    id: string,
+    loading: Promise<EventRow | null>,
+  ): Promise<EventRow | null> {
+    const pending = loading.then((row) => {
+      // A miss cannot hide a later insert in this same transaction.
+      if (row === null && this.rows.get(id) === pending) this.rows.delete(id);
+      return row;
+    }).catch((error) => {
+      if (this.rows.get(id) === pending) this.rows.delete(id);
+      throw error;
+    });
+    this.rows.set(id, pending);
+    return pending;
+  }
+
+  private read(id: string): Promise<EventRow | null> {
+    this.check();
+    return this.rows.get(id) ??
+      this.hold(id, getEvent(this.conn, id, this.edges));
+  }
+
+  async get(id: string): Promise<EventRow | null> {
+    const row = await this.read(id);
+    this.check();
+    return row === null ? null : { ...row };
+  }
+
+  replace(row: EventRow): void {
+    this.check();
+    this.rows.set(row.id, Promise.resolve({ ...row }));
+  }
+
+  async list(ids: readonly string[]): Promise<Map<string, EventRow>> {
+    this.check();
+    const wanted = [...new Set(ids)];
+    const missing = wanted.filter((id) => !this.rows.has(id));
+    if (missing.length) {
+      const loading = getEvents(this.conn, missing, this.edges);
+      for (const id of missing) {
+        this.hold(id, loading.then((found) => found.get(id) ?? null));
+      }
+    }
+    const entries = await Promise.all(
+      wanted.map(async (id) => [id, await this.read(id)] as const),
+    );
+    this.check();
+    return new Map(
+      entries.flatMap(([id, row]) =>
+        row === null ? [] : [[id, { ...row }] as const]
+      ),
+    );
+  }
+}
+
 export type AncestryNode = { prevs: string[]; grounded: boolean };
+
+/** Only verified additions affect the effective view. Base bytes, status and
+ * live publication remain untouched; the caller journals export intent in this
+ * same transaction. No resolver/network call occurs under the room lock. */
+export async function mergeEventSignatures(
+  conn: Conn,
+  rows: EventReads,
+  evidence: SignatureEvidence,
+): Promise<boolean> {
+  const row = await rows.get(evidence.eventId);
+  if (row === null) return false;
+  const pdu = JSON.parse(row.pdu) as Pdu;
+  if (eventMaterial(pdu) !== evidence.material) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'replica changes a retained event',
+    );
+  }
+  // The effective view contains immutable optional signatures which ordinary
+  // admission may never have verified. Only this separate map can participate
+  // in the deterministic choice between verified candidates.
+  const [held] = await conn.query(
+    'SELECT signatures FROM event_signatures WHERE event=?',
+    [row.id],
+  );
+  const overlay: Pdu['signatures'] = held
+    ? JSON.parse(String(held.signatures))
+    : {};
+  let learned = false;
+  for (const [server, entries] of Object.entries(evidence.signatures)) {
+    for (const [keyId, signature] of Object.entries(entries)) {
+      const prior = overlay[server]?.[keyId];
+      if (prior !== undefined && prior <= signature) continue;
+      Object.defineProperty(overlay, server, {
+        value: { ...overlay[server], [keyId]: signature },
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+      learned = true;
+    }
+  }
+  if (!learned) return false;
+  await conn.execute(
+    'INSERT INTO event_signatures(event,signatures) VALUES(?,?) ON CONFLICT(event) DO UPDATE SET signatures=excluded.signatures',
+    [row.id, JSON.stringify(overlay)],
+  );
+  const signatures = effectiveSignatures(pdu.signatures, overlay);
+  if (canonicalJson(signatures) === canonicalJson(pdu.signatures)) return false;
+  rows.replace({ ...row, pdu: JSON.stringify({ ...pdu, signatures }) });
+  return true;
+}
 
 /** Recovery needs held graph facts, not immutable PDU bodies. Genuine after-state
  * is the grounding proof; unknown IDs have no map entry, not a cached verdict. */
