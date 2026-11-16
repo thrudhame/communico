@@ -74,9 +74,12 @@ export function completeRoomWrite(
 ): Promise<void> | undefined {
   const complete = hooks?.complete;
   if (complete === undefined) return undefined;
-  return room.tx((tx) => tx.completion.capture()).then((target) =>
-    complete(room, self, target, signal)
-  );
+  return room.tx((tx) => tx.completion.capture()).then((target) => {
+    // The committed obligation belongs to the store even if this caller's
+    // signal was already cancelled before its completion wait is admitted.
+    enrollCompletion(room, self, target);
+    return complete(room, self, target, signal);
+  });
 }
 
 // After a successful room write: project. A projection failure is logged

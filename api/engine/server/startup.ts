@@ -32,7 +32,7 @@ export function installServerHooks(): void {
     enroll: (room, self, target) =>
       completionService(room.store).enroll(room, self, target),
     complete: (room, self, target, signal) =>
-      completionService(room.store).wait(target, 'completion', signal, self),
+      completionService(room.store).complete(room, self, target, signal),
   });
   setTenantProjector(projectTenant);
   onStartup(recoverServer);

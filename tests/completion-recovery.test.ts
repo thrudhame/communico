@@ -2,7 +2,7 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { buildInTx } from '#engine/room/build.ts';
-import { ingestInTx } from '#engine/room/ingest.ts';
+import { afterRoomCommit, ingestInTx } from '#engine/room/ingest.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import {
   CompletionFailure,
@@ -11,6 +11,8 @@ import {
 import { installServerHooks } from '#engine/server/startup.ts';
 import { onProjected, publishThrough } from '#engine/server/project.ts';
 import { type Genesis, genesis } from '#tests/fixtures/genesis.ts';
+import { makeRemoteServer, remoteEvent } from '#tests/fixtures/remote.ts';
+import { finishRoomRemoval } from '#engine/server/removal.ts';
 
 installServerHooks();
 const config = (dir: string) => ({
@@ -281,6 +283,214 @@ Deno.test('completion owner: failure without a full waiter is observable and aut
       );
     } finally {
       console.error = original;
+      dispose();
+    }
+  });
+});
+
+Deno.test('completion owner: an already cancelled remote completion still owns committed publication', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!owned-aborted-arrival:test' });
+    const event = await g.room.tx(async (tx) =>
+      ingestInTx(
+        tx,
+        g.roomId,
+        await buildInTx(tx, g.roomId, {
+          type: 'm.room.message',
+          sender: g.creator,
+          content: { msgtype: 'm.text', body: 'committed before disconnect' },
+        }, g.signer),
+        {
+          remote: {
+            origin: 'test',
+            self: 'test',
+            oversized: false,
+            ungroundedMs: 0,
+          },
+        },
+      )
+    );
+    const published = Promise.withResolvers<void>();
+    const dispose = onProjected(async (owner, room) => {
+      if (owner === store && room === g.roomId) {
+        assertEquals(
+          await (await store.server()).query(
+            'SELECT event FROM feed WHERE room=? AND event=?',
+            [g.roomId, event.eventId],
+          ),
+          [{ event: event.eventId }],
+        );
+        published.resolve();
+      }
+    });
+    const controller = new AbortController();
+    controller.abort(new Error('waiter disconnected'));
+    try {
+      await assertRejects(
+        () =>
+          afterRoomCommit(g.room, 'test', [event.eventId], controller.signal),
+        Error,
+        'waiter disconnected',
+      );
+      await guard(published.promise); // No second arrival or waiter wakes this room.
+    } finally {
+      dispose();
+    }
+  });
+});
+
+Deno.test('completion owner: completed arrival includes its ready dependency tail but a publication waiter stays fixed', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!owned-dependent-tail:test' });
+    const parent = await g.room.tx((tx) =>
+      buildInTx(tx, g.roomId, {
+        type: 'm.room.message',
+        sender: g.creator,
+        content: { msgtype: 'm.text', body: 'missing parent' },
+      }, g.signer)
+    );
+    const child = await remoteEvent(
+      g.roomId,
+      await makeRemoteServer('test'),
+      '11',
+      {
+        ...parent,
+        prev_events: [parent.event_id!],
+        depth: parent.depth + 1,
+        content: { msgtype: 'm.text', body: 'ready child' },
+      },
+    );
+    const remote = {
+      origin: 'test',
+      self: 'test',
+      oversized: false,
+      ungroundedMs: 3600000,
+    };
+    assertEquals(
+      (await g.room.tx((tx) => ingestInTx(tx, g.roomId, child, { remote })))
+        .grounding,
+      'pending',
+    );
+    await g.room.tx((tx) => ingestInTx(tx, g.roomId, parent, { remote }));
+    const parentCut = await g.room.tx((tx) => tx.completion.capture());
+    const server = await store.server();
+    const transaction = server.tx.bind(server);
+    const entered = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>();
+    server.tx = (fn, options) =>
+      transaction(async (tx) => {
+        const execute = tx.execute.bind(tx);
+        tx.execute = async (sql, values = []) => {
+          if (
+            sql.startsWith('INSERT INTO feed(') && values[3] === child.event_id
+          ) {
+            entered.resolve();
+            await release.promise;
+          }
+          return await execute(sql, values);
+        };
+        return await fn(tx);
+      }, options);
+    let returned = false;
+    const completed = afterRoomCommit(g.room, 'test', [parent.event_id!]).then(
+      () => returned = true,
+    );
+    try {
+      await guard(entered.promise);
+      await guard(
+        completionService(store).wait(
+          parentCut,
+          'publication',
+          undefined,
+          'test',
+        ),
+      );
+      // Give the completed helper every chance to incorrectly return at P while
+      // the real child's Q publication transaction remains explicitly held.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assertEquals(
+        returned,
+        false,
+        'dependent helper returned before its ready child publication',
+      );
+      release.resolve();
+      await guard(completed);
+      assertEquals(
+        await server.query('SELECT event FROM feed WHERE event=?', [
+          child.event_id!,
+        ]),
+        [{ event: child.event_id! }],
+      );
+    } finally {
+      release.resolve();
+      await completed;
+      server.tx = transaction;
+    }
+  });
+});
+
+Deno.test('completion owner: late smaller callback settlement releases the old room generation', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, {
+      roomId: '!owned-callback-retirement:test',
+    });
+    const smaller = await committed(g, 'smaller');
+    const larger = await committed(g, 'larger');
+    const smallEntered = Promise.withResolvers<void>(),
+      bigEntered = Promise.withResolvers<void>();
+    const smallRelease = Promise.withResolvers<void>(),
+      bigRelease = Promise.withResolvers<void>();
+    const dispose = onProjected(async (actual, room, through) => {
+      if (actual !== store || room !== g.roomId) return;
+      if (through === larger.through) {
+        bigEntered.resolve();
+        await bigRelease.promise;
+      }
+      if (through === smaller.through) {
+        smallEntered.resolve();
+        await smallRelease.promise;
+      }
+    });
+    const owner = completionService(store);
+    const big = owner.wait(larger, 'completion', undefined, 'test');
+    let small: Promise<void> | undefined;
+    try {
+      await guard(bigEntered.promise);
+      small = owner.wait(smaller, 'completion', undefined, 'test');
+      await guard(smallEntered.promise);
+      bigRelease.resolve();
+      await guard(big); // The worker ends while the smaller callback is still held.
+      await guard(small);
+      smallRelease.resolve();
+      // Observe all actual callback continuations settling before lifecycle reuse.
+      const demands = (owner as unknown as {
+        rooms: Map<
+          string,
+          { running?: Promise<void>; callbacks: Map<number, Promise<void>> }
+        >;
+      }).rooms;
+      const demand = demands.get(g.roomId);
+      await guard(
+        Promise.all([demand?.running, ...demand?.callbacks.values() ?? []]),
+      );
+      await Promise.resolve();
+      assertEquals(
+        demands.has(g.roomId),
+        false,
+        'idle callback demand retained the retired generation',
+      );
+      await finishRoomRemoval(store, g.roomId, {
+        why: 'test generation replacement',
+        intents: [],
+      }, null);
+      const recreated = await genesis(store, { roomId: g.roomId });
+      const next = await committed(recreated, 'new generation');
+      assert(next.generation !== smaller.generation);
+      await guard(owner.wait(next, 'completion', undefined, 'test'));
+    } finally {
+      smallRelease.resolve();
+      bigRelease.resolve();
+      await Promise.allSettled([big, small]);
       dispose();
     }
   });

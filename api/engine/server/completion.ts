@@ -24,6 +24,7 @@ type Demand = {
   self: string;
   target: Target;
   running?: Promise<void>;
+  ready?: Promise<CompletionCut>;
   callbacks: Map<number, Promise<void>>;
   waiters: Set<Waiter>;
   failure?: CompletionFailure;
@@ -57,6 +58,43 @@ export class RoomCompletion {
   private timer?: ReturnType<typeof setTimeout>;
   private closing = false;
   constructor(private readonly store: Store) {}
+
+  // Completed arrival helpers include the ready children their arrival grounds.
+  // This shares the worker's drain; ordinary publication waiters keep their
+  // original fixed cut and never inherit this dependent-composition tail.
+  async complete(
+    room: Room,
+    self: string,
+    target: Target,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const demand = this.enroll(room, self, target);
+    signal?.throwIfAborted();
+    let tail: CompletionCut;
+    try {
+      tail = await this.ready(demand);
+    } catch (cause) {
+      signal?.throwIfAborted();
+      throw new CompletionFailure(target, 'completion', cause);
+    }
+    this.enroll(room, self, tail);
+    await this.wait(tail, 'completion', signal, self);
+  }
+
+  private ready(demand: Demand): Promise<CompletionCut> {
+    if (demand.ready !== undefined) return demand.ready;
+    const task = Promise.resolve().then(async () => {
+      await resumeWaits(demand.room, { self: demand.self }, []);
+      return await demand.room.tx((tx) => tx.completion.capture());
+    });
+    demand.ready = task;
+    const release = () => {
+      if (demand.ready === task) demand.ready = undefined;
+      this.releaseIdle(demand);
+    };
+    void task.then(release, release);
+    return task;
+  }
 
   enroll(room: Room, self: string, target: Target): Demand {
     if (this.closing) {
@@ -128,7 +166,17 @@ export class RoomCompletion {
     } finally {
       signal?.removeEventListener('abort', abort);
       demand.waiters.delete(waiter);
+      this.releaseIdle(demand);
     }
+  }
+
+  private releaseIdle(demand: Demand): void {
+    if (
+      this.rooms.get(demand.room.id) === demand &&
+      demand.running === undefined && demand.ready === undefined &&
+      demand.waiters.size === 0 && demand.callbacks.size === 0 &&
+      demand.failure === undefined
+    ) this.rooms.delete(demand.room.id);
   }
 
   private fail(
@@ -195,44 +243,53 @@ export class RoomCompletion {
       () => this.refresh(demand),
       (error) => {
         this.fail(demand, target, 'completion', error);
+        this.retry();
         throw error;
       },
     );
     demand.callbacks.set(target.through, task);
     // Owned by the demand, including failures observed by the worker or close.
-    void task.then(
-      () => demand.callbacks.delete(target.through),
-      () => demand.callbacks.delete(target.through),
-    );
+    const release = () => {
+      if (demand.callbacks.get(target.through) === task) {
+        demand.callbacks.delete(target.through);
+      }
+      this.releaseIdle(demand);
+    };
+    void task.then(release, release);
     return task;
   }
 
   private start(demand: Demand): void {
     if (demand.running !== undefined || this.closing) return;
-    const target = demand.target;
+    const failure = demand.failure;
+    const target = failure?.target ?? demand.target;
     let phase: Phase = 'publication';
     const run = Promise.resolve().then(async () => {
-      await resumeWaits(demand.room, { self: demand.self }, []);
-      const tail = await demand.room.tx((tx) => tx.completion.capture());
+      const tail = await this.ready(demand);
       if (tail.through > demand.target.through) demand.target = tail;
       const state = await demand.room.tx((tx) => tx.completion.state());
-      if (state.completedThrough >= target.through) {
+      if (
+        state.completedThrough >= target.through &&
+        failure?.phase !== 'completion'
+      ) {
         await this.refresh(demand);
+        if (demand.failure === failure) demand.failure = undefined;
         return;
       }
       await publishThrough(this.store, target, () => this.refresh(demand));
       phase = 'completion';
       await this.callbacks(demand, target);
       await this.refresh(demand);
-      demand.failure = undefined;
+      // A late callback from another cut can fail while this worker succeeds.
+      // Only clear the failure this run actually retried, never that newer work.
+      if (demand.failure === failure) demand.failure = undefined;
     });
     demand.running = run;
     void run.then(() => {
       demand.running = undefined;
-      if (demand.target.through > target.through) this.start(demand);
-      else if (demand.waiters.size === 0 && demand.callbacks.size === 0) {
-        this.rooms.delete(demand.room.id);
-      }
+      if (demand.failure !== undefined) this.retry();
+      else if (demand.target.through > target.through) this.start(demand);
+      this.releaseIdle(demand);
     }, (error) => {
       demand.running = undefined;
       this.fail(demand, target, phase, error);
@@ -271,10 +328,7 @@ export class RoomCompletion {
           demands.flatMap((d) => [d.running!, ...d.callbacks.values()]),
         );
         for (const demand of demands) {
-          if (
-            demand.running === undefined && demand.callbacks.size === 0 &&
-            demand.waiters.size === 0
-          ) this.rooms.delete(demand.room.id);
+          this.releaseIdle(demand);
         }
       }
     } finally {
