@@ -7,6 +7,8 @@ import { openTenant } from '#engine/tenant/index.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { auditSnapshot } from '#engine/backup/audit.ts';
 import { describePayload } from '#engine/backup/manifest.ts';
+import { roomProjectionSources } from '#engine/store/projection-sources.ts';
+import { recoverServer } from '#engine/server/startup.ts';
 
 async function fixture() {
   const root = await Deno.makeTempDir({ prefix: 'backup-audit-' });
@@ -190,7 +192,7 @@ Deno.test('backup audit: retired-room orphan watermark and historical completed 
       1,
     ]);
     const server = await f.app.store.server();
-    for (const prefix of ['room:', 'push-context:', 'client-room-rules:']) {
+    for (const { prefix } of Object.values(roomProjectionSources)) {
       await server.execute('INSERT INTO watermarks VALUES(?,?)', [
         prefix + '!removed:test',
         17,
@@ -203,6 +205,80 @@ Deno.test('backup audit: retired-room orphan watermark and historical completed 
       17,
     ]);
     await assertRejects(f.audit, Error, 'watermark has no captured source');
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('backup audit: every room cursor uses the captured cut and startup clears only recognized orphan cursors', async () => {
+  const f = await fixture();
+  try {
+    const server = await f.app.store.server();
+    for (const { prefix } of Object.values(roomProjectionSources)) {
+      await server.execute(
+        'INSERT INTO watermarks VALUES(?,999999) ON CONFLICT(source) DO UPDATE SET position=999999',
+        [prefix + f.room],
+      );
+      await assertRejects(f.audit, Error, 'watermark ahead of captured source');
+      await server.execute('UPDATE watermarks SET position=0 WHERE source=?', [
+        prefix + f.room,
+      ]);
+      await server.execute('INSERT INTO watermarks VALUES(?,17)', [
+        prefix + '!removed:test',
+      ]);
+    }
+    await server.execute(
+      "INSERT INTO watermarks VALUES('unknown-owner:!removed:test',17)",
+    );
+    await recoverServer(f.app.store);
+    assertEquals(
+      await server.query(
+        "SELECT source FROM watermarks WHERE source LIKE '%!removed:test'",
+      ),
+      [{ source: 'unknown-owner:!removed:test' }],
+    );
+    await assertRejects(f.audit, Error, 'watermark has no captured source');
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('backup audit: receipt graph projections must name authentic captured event, edge and membership evidence', async (t) => {
+  for (
+    const [name, sql] of [
+      ['unheld room', "UPDATE receipt_dag_nodes SET room='!missing:test'"],
+      ['unheld event', "INSERT INTO receipt_dag_nodes VALUES(?, '$missing')"],
+      ['invented parent', "UPDATE receipt_dag_edges SET parent='$missing'"],
+      [
+        'invented membership',
+        "UPDATE receipt_membership_events SET membership='ban'",
+      ],
+    ]
+  ) {
+    await t.step(name, async () => {
+      const f = await fixture();
+      try {
+        const server = await f.app.store.server();
+        await server.execute(sql, sql.includes('?') ? [f.room] : []);
+        await assertRejects(
+          f.audit,
+          Error,
+          name === 'unheld room' ? 'projection room' : 'receipt graph',
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('backup audit: an unregistered durable table cannot bypass the captured-file contract', async () => {
+  const f = await fixture();
+  try {
+    await (await f.app.store.server()).exec(
+      'CREATE TABLE unknown_durable_state(value TEXT)',
+    );
+    await assertRejects(f.audit, Error, 'unregistered durable table');
   } finally {
     await f.close();
   }

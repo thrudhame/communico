@@ -8,12 +8,26 @@ import { putAccountData } from '#engine/tenant/accountdata.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
 
+// The tenant owns complete account-domain admission; the replica owns room
+// readiness. Check both before reading server membership or room visibility so
+// a missing cut cannot become a false 403/404 or a successful durable mark.
+async function requireReceiptScope(roomId: string, userId: string) {
+  const app = theApp();
+  await app.tenant.tx((tx) =>
+    tx.ingress.check({ kind: 'domain', localpart: localpartOf(userId) })
+  );
+  const admission = await app.replica?.prepareRoomScope(roomId, true);
+  admission?.checkCurrent();
+  return admission;
+}
+
 export async function setFullyRead(
   roomId: string,
   userId: string,
   eventId: string,
 ): Promise<void> {
   const app = theApp();
+  const admission = await requireReceiptScope(roomId, userId);
   let known = false;
   try {
     const room = await openRoom(app.store, roomId);
@@ -21,6 +35,7 @@ export async function setFullyRead(
   } catch (error) {
     if (!(error instanceof Deno.errors.NotFound)) throw error;
   }
+  admission?.checkCurrent();
   if (!known) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'event not found in room');
   }
@@ -30,6 +45,7 @@ export async function setFullyRead(
     roomId,
     'm.fully_read',
     { event_id: eventId },
+    admission?.checkCurrent,
   );
 }
 
@@ -52,9 +68,12 @@ export async function setReceipt(
     await setFullyRead(roomId, userId, eventId);
     return;
   }
+  const admission = await requireReceiptScope(roomId, userId);
   let threadId: string | null = null;
   if (opts.threadId !== undefined) {
-    if (!await isJoined(server, roomId, userId)) {
+    const joined = await isJoined(server, roomId, userId);
+    admission?.checkCurrent();
+    if (!joined) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);
     }
     if (typeof opts.threadId !== 'string' || opts.threadId.length === 0) {
@@ -70,6 +89,7 @@ export async function setReceipt(
     !await rows.setReceipt(server, roomId, userId, receiptType, eventId, {
       threadId,
       requireRelated: true,
+      authorize: admission?.check,
     })
   ) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);

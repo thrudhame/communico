@@ -1195,6 +1195,9 @@ attempt, including common ancestors of sibling deltas. Callers receive independe
 maps/entries; missing groups, event-state refs and current pointers are not cached.
 The reader is released with its attempt, so rollback/retry and escaped handles
 cannot reuse it. No state maps cross transaction snapshots or file lifetimes.
+Immutable event-row hydration shares that same attempt lifetime across scalar
+and set-based readers. Returned rows are independent values; misses, failures,
+mutable status and publication facts are never retained as cached truth.
 (`api/engine/store/db.ts:202-271`, `api/engine/room/edges.ts:1-23`,
 `api/engine/room/index.ts:165-188`)
 

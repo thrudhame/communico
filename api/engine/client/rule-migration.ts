@@ -6,13 +6,14 @@ import { localpartOf } from '#engine/ids.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { listRooms } from '#engine/server/registry.ts';
 import { advance, get } from '#engine/store/watermark.ts';
+import { roomSource } from '#engine/store/projection-sources.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { migrateRoomRules } from '#engine/tenant/pushrules.ts';
 async function catchUp(store: Store, tenant: Tenant, roomId: string) {
   const room = await openRoom(store, roomId),
     server = await store.server(),
-    source = 'client-room-rules:' + roomId;
+    source = roomSource('client-room-rules', roomId);
   for (;;) {
     const mark = await get(server, source),
       batch = await room.tx((tx) => tx.changes.after(mark, 500));

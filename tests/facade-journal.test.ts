@@ -1,5 +1,5 @@
 import { assertEquals, assertRejects, assertThrows } from '@std/assert';
-import { Journal } from '#engine/facade/journal.ts';
+import { Journal, receivedFence } from '#engine/facade/journal.ts';
 import {
   EMPTY_CUT,
   LinkError,
@@ -211,6 +211,44 @@ Deno.test('journal receipt is not application; holes and changed replay roll bac
       LinkError,
     );
     assertEquals(await journal.next('home', stream), two);
+  });
+});
+
+Deno.test('journal receive fences retained and pending cross-file cuts by exact stream through commit and rollback', async () => {
+  await fixture(async (store, journal) => {
+    const db = await store.server();
+    const one = await journal.append('edge', input('one'));
+    const other = { ...stream, stream: 'domain:@bob:logical.test' };
+    for (const fail of [false, true]) {
+      const held = Promise.withResolvers<void>();
+      const before = receivedFence(db);
+      const receiver = new Journal({
+        ...db,
+        tx: async (fn, options) => {
+          await held.promise;
+          if (fail) throw new Error('receive rollback');
+          return await db.tx(fn, options);
+        },
+      }, capabilities);
+      const receiving = receiver.receive('home', [one]);
+      const during = receivedFence(db);
+      for (const check of [before, during]) {
+        assertEquals(check('home', stream), false);
+        assertEquals(check('home', other), true);
+        assertEquals(check('another-peer', stream), true);
+        assertEquals(
+          check('home', { ...stream, incarnation: 'another' }),
+          true,
+        );
+      }
+      held.resolve();
+      if (fail) await assertRejects(() => receiving, Error, 'receive rollback');
+      else await receiving;
+      for (const check of [before, during]) {
+        assertEquals(check('home', stream), false);
+      }
+      assertEquals(receivedFence(db)('home', stream), true);
+    }
   });
 });
 
