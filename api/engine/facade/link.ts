@@ -392,7 +392,9 @@ export function linkHandler(options: {
     // must not partially advance received state and then fail while forming ACK.
     await journal.acknowledgement('home', stream, after, options.limits);
     await journal.receive('home', records);
-    await options.changed?.();
+    // An empty page polls durable results, not a source mutation. Echoing it as
+    // a notice makes every reconciler pass schedule another identical pass.
+    if (records.length) await options.changed?.();
     return response({
       ack: await journal.acknowledgement('home', stream, after, options.limits),
     });
