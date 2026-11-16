@@ -242,7 +242,15 @@ export class HomeIngress {
               if (type === 'm.typing' || type === 'm.presence') {
                 return { index, kind: 'expired', type };
               }
-              await dispatchTransactionEdu(origin, raw, transaction.edus);
+              await dispatchTransactionEdu(
+                origin,
+                raw,
+                transaction.edus,
+                phase === 'f2' &&
+                  ['m.device_list_update', 'm.signing_key_update'].includes(
+                    type,
+                  ),
+              );
               return { index, kind: 'processed', type };
             }),
           );

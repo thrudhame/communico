@@ -254,7 +254,7 @@ export type EduHandler = (
 ) => Promise<void>;
 
 export type EduState = {
-  dispatch(origin: string, raw: unknown): Promise<void>;
+  dispatch(origin: string, raw: unknown, required?: boolean): Promise<void>;
   register(type: string, handler: EduHandler, reliable?: boolean): void;
   // Reads share the durable stream owner; typing remains ephemeral.
   typingOf(roomId: string): { userIds: string[] };
@@ -388,10 +388,24 @@ export function eduState(server: Db, self: string, store: Store): EduState {
   });
 
   return {
-    dispatch: async (origin, raw) => {
+    dispatch: async (origin, raw, required = false) => {
       const { type, content } = eduEnvelope(raw);
       const handler = handlers.get(type);
-      if (handler === undefined) return; // unknown types ignored silently
+      if (handler === undefined) {
+        // Ordinary unknown EDUs are ignored. A retained obligation naming a
+        // required consumer cannot become complete just because this runtime
+        // has not composed that consumer (for example after an F1 restart).
+        if (required) {
+          throw new ReliableEduError(
+            new MatrixError(
+              503,
+              'M_UNAVAILABLE',
+              'required EDU consumer unavailable',
+            ),
+          );
+        }
+        return;
+      }
       try {
         await handler(origin, content);
       } catch (error) {

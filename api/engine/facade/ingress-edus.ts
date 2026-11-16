@@ -41,7 +41,9 @@ export async function acceptIngressEdu(
         } else publicSigning(content, content.user_id, config().e2ee);
         // The existing service owns tracking, signatures and predecessor recovery
         // at each replica. This child runs outside the mailbox transaction.
-        if (phase === 'f2') await dispatchTransactionEdu(origin, raw, edus);
+        if (phase === 'f2') {
+          await dispatchTransactionEdu(origin, raw, edus, true);
+        }
         return { kind: 'retained', type };
       case 'm.receipt':
         await dispatchTransactionEdu(origin, raw, edus);
