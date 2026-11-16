@@ -19,13 +19,14 @@ import {
   installDirectoryFacts,
   publishedRoomScopes,
 } from '#engine/server/public-replica.ts';
-import type { Database } from '#engine/store/db.ts';
+import type { Conn, Database } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
-import { appendRecord, type Journal } from './journal.ts';
+import { appendRecord, type Journal, receivedFence } from './journal.ts';
 import type { Pairings } from './pairing.ts';
+import { signingFence } from './signing-authority.ts';
 import {
   integer,
   LinkError,
@@ -214,6 +215,11 @@ export function startDirectoryExports(
   };
 }
 
+export type ReplicaRoomAdmission = {
+  check(conn: Conn): Promise<void>;
+  checkCurrent(): void;
+};
+
 export class DirectoryReplicas {
   constructor(
     private readonly db: Database,
@@ -260,18 +266,84 @@ export class DirectoryReplicas {
       return 'ready';
     }
     const grant = await this.pairings.active();
-    const [held] = await this.db.query(
-      "SELECT s.received,s.applied,v.source_cut,v.ready FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
-      [grant.body.transcript.body.context.id, scope],
+    return await this.db.tx((conn) =>
+      this.scopeStateAt(
+        conn,
+        scope,
+        grant.body.transcript.body.context.id,
+        view!.cuts[scope],
+      )
     );
-    const required = view!.cuts[scope];
+  }
+
+  /** Prepare outside owning transactions. Server writers recheck durable scope
+   * state on their connection; tenant writers use the same receive/control
+   * fences without opening the server file from a tenant callback. */
+  async prepareRoomScope(
+    roomId: string,
+    allowAbsent = false,
+  ): Promise<ReplicaRoomAdmission> {
+    const received = receivedFence(this.db), authority = signingFence(this.db);
+    const grant = await this.pairings.active();
+    const pairing = grant.body.transcript.body.context.id;
+    const view = await this.snapshot();
+    const unavailable = (): never => {
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
+    };
+    if (!view) unavailable();
+    const scope = 'room:' + roomId;
+    const checkCurrent = () => {
+      authority();
+      for (const stream of ['directory', scope]) {
+        if (
+          !received('home', { source: 'home', incarnation: pairing, stream })
+        ) unavailable();
+      }
+    };
+    const check = async (conn: Conn) => {
+      checkCurrent();
+      const [binding] = await conn.query(
+        "SELECT state,grant_json FROM facade_pairings WHERE id=? AND side='facade'",
+        [pairing],
+      );
+      if (
+        binding?.state !== 'paired' ||
+        binding.grant_json !== canonicalJson(grant)
+      ) unavailable();
+      const state = await this.scopeStateAt(
+        conn,
+        scope,
+        pairing,
+        view!.cuts[scope],
+      );
+      if (state === 'absent' && !allowAbsent) {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
+      }
+      checkCurrent();
+    };
+    await this.db.tx(check);
+    return { check, checkCurrent };
+  }
+
+  private async scopeStateAt(
+    conn: Conn,
+    scope: string,
+    pairing: string,
+    required?: number,
+  ): Promise<'ready' | 'absent'> {
+    const [held] = await conn.query(
+      "SELECT s.received,s.applied,v.source_cut,v.ready FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
+      [pairing, scope],
+    );
     // A newer stream may precede the next inventory. Do not hide that held scope.
     if (
       held && Number(held.ready) === 1 &&
       Number(held.received) === Number(held.applied) &&
       Number(held.source_cut) >= (required ?? 0)
     ) return 'ready';
-    if (required !== undefined || held) unavailable();
+    if (required !== undefined || held) {
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
+    }
     return 'absent';
   }
 

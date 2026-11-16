@@ -3,7 +3,7 @@
 import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
-import { roomSchema } from '#engine/room/index.ts';
+import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type StoreConfig } from '#engine/store/index.ts';
 import { type Tenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -42,6 +42,8 @@ import {
 } from './accounts.ts';
 import { AuthLinkHealth, FacadeAuth } from './auth.ts';
 import { startDeactivationWork } from '#engine/deactivation.ts';
+import { startProfileFanout } from '#engine/profile-fanout.ts';
+import { DomainOperations } from './domain.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -79,6 +81,7 @@ export async function openFacadeRuntime(
   let mailbox: Mailbox | undefined;
   let authExports: ReturnType<typeof startAccountExports> | undefined;
   let deactivation: ReturnType<typeof startDeactivationWork> | undefined;
+  let profileFanout: ReturnType<typeof startProfileFanout> | undefined;
   const pairings = () => {
     if (!node) {
       throw new LinkError(
@@ -159,6 +162,28 @@ export async function openFacadeRuntime(
           ),
       });
     }
+    if (settings.phase === 'f2' && !profileFanout) {
+      profileFanout = startProfileFanout({
+        store,
+        tenant,
+        pollseconds: settings.pollseconds,
+        room: async (roomId) => {
+          await new DirectoryReplicas(server, owner, identity.server)
+            .requireScope('room:' + roomId);
+          return await openRoom(store, roomId);
+        },
+        prepareSigner: async (work) => {
+          await new DirectoryReplicas(server, await pairings(), identity.server)
+            .requireScope('domain:@' + work.localpart + ':' + identity.server);
+          return await (await keyOwner()).prepareSigner();
+        },
+        failed: (error) =>
+          console.error(
+            'facade profile fanout pending:',
+            error instanceof LinkError ? error.code : 'M_UNAVAILABLE',
+          ),
+      });
+    }
     if (settings.phase === 'f2' && !authExports) {
       authExports = startAccountExports({
         store,
@@ -168,15 +193,20 @@ export async function openFacadeRuntime(
           (await (await store.tenant(identity.server)).query(
             'SELECT localpart FROM account_auth_snapshots ORDER BY localpart',
           )).map((row) => String(row.localpart)),
-        emit: async (localpart) =>
-          exportSessionAuthority(
+        emit: async (localpart) => {
+          const owner = await pairings();
+          await exportSessionAuthority(
             store,
             tenant!,
-            await pairings(),
+            owner,
             await ownerControls(),
             node!,
             localpart,
-          ),
+          );
+          await new DomainOperations(store, tenant!, owner, node!).export(
+            localpart,
+          );
+        },
         changed: () => notices.changed(),
         failed: (error) =>
           console.error(
@@ -225,6 +255,9 @@ export async function openFacadeRuntime(
             await pairings(),
             await ownerControls(),
           ).apply(journal, stream)
+          : settings.phase === 'f2' && stream.stream.startsWith('domain:')
+          ? await new DomainOperations(store, tenant!, await pairings(), node!)
+            .apply(journal, stream)
           : stream.stream === 'directory'
           ? await new DirectoryReplicas(
             server,
@@ -270,6 +303,16 @@ export async function openFacadeRuntime(
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),
     prepareSigner: async () => (await keyOwner()).prepareSigner(),
+    async profileFanout(localpart?: string) {
+      if (!profileFanout) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'profile fanout unavailable',
+        );
+      }
+      return await profileFanout.drain(localpart);
+    },
     async ingress(transaction: TransactionDeps) {
       if (mailbox) return mailbox;
       const owner = await pairings();
@@ -315,6 +358,13 @@ export async function openFacadeRuntime(
         await pairings(),
         identity.server,
       ).requireScope(scope, allowAbsent);
+    },
+    async prepareRoomScope(roomId: string, allowAbsent?: boolean) {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+      ).prepareRoomScope(roomId, allowAbsent);
     },
     async publicRooms() {
       const owner = new DirectoryReplicas(
@@ -414,6 +464,7 @@ export async function openFacadeRuntime(
         await authExports?.close();
         await inbox?.close();
         await deactivation?.close();
+        await profileFanout?.close();
         await store.close();
       })(),
   };

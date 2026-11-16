@@ -1,5 +1,9 @@
 import type { CapturedQuery } from '#engine/store/inspect.ts';
 import { inventoryRows } from '#engine/backup/checks.ts';
+import {
+  tenantProjectionSources,
+  tenantSource,
+} from '#engine/store/projection-sources.ts';
 
 /** Every retained command, including completed reconciliation work, is visible. */
 export async function restoredTenantWork(
@@ -28,14 +32,12 @@ export async function restoredTenantWork(
   );
   const unprojected = [];
   for (
-    const [suffix, table] of [
-      ['accounts', 'account_changes'],
-      ['e2ee', 'e2ee_changes'],
-      ['public-signing', 'e2ee_changes'],
-      ['pushers', 'pusher_changes'],
-    ]
+    const suffix of Object.keys(
+      tenantProjectionSources,
+    ) as (keyof typeof tenantProjectionSources)[]
   ) {
-    const source = 'tenant:' + tenant + ':' + suffix;
+    const table = tenantProjectionSources[suffix];
+    const source = tenantSource(suffix, tenant);
     const position = marks.get(source) ?? 0;
     const [{ head, count }] = await db.query(
       `SELECT COALESCE(MAX(pos),0) AS head,COUNT(*) AS count FROM ${table} WHERE pos>?`,

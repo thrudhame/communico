@@ -18,6 +18,10 @@ import {
 } from '#engine/facade/schema.ts';
 import { RECOVERY_SQL } from '#engine/server/recovery.ts';
 import {
+  RECEIPT_ADMISSION_SQL,
+  RECEIPT_GRAPH_SQL,
+} from '#engine/server/receipt-frontier.ts';
+import {
   FACADE_INGRESS_SQL,
   FACADE_JOURNAL_SQL,
   FACADE_KEY_RETIREMENT_SQL,
@@ -412,7 +416,7 @@ const FEDERATION_TXNS_RECEIVED_SQL =
   'CREATE INDEX federation_txns_received ON federation_txns(received_ms)';
 
 export const serverSchema: SchemaProvider = {
-  version: 40,
+  version: 42,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -455,6 +459,8 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FEED_EVENT_SQL);
     await db.exec(OUTBOX_PENDING_SQL);
     await db.exec(FEDERATION_TXNS_RECEIVED_SQL);
+    await db.exec(RECEIPT_GRAPH_SQL);
+    await db.exec(RECEIPT_ADMISSION_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -500,5 +506,14 @@ export const serverSchema: SchemaProvider = {
     37: (conn) => conn.exec(FEED_EVENT_SQL),
     38: (conn) => conn.exec(OUTBOX_PENDING_SQL),
     39: (conn) => conn.exec(FEDERATION_TXNS_RECEIVED_SQL),
+    40: (conn) => conn.exec(RECEIPT_GRAPH_SQL),
+    41: async (conn) => {
+      await conn.exec(RECEIPT_ADMISSION_SQL);
+      // This is a derived evidence index. Re-read held immutable events at
+      // the existing cut, without replaying feed positions or local news.
+      await conn.execute(
+        "DELETE FROM watermarks WHERE source LIKE 'receipt-graph:%'",
+      );
+    },
   },
 };

@@ -50,11 +50,18 @@ import * as slidingSync from '#engine/tenant/sliding-sync.ts';
 import * as users from '#engine/tenant/users.ts';
 import * as openid from '#engine/tenant/openid.ts';
 import * as profiles from '#engine/tenant/profiles.ts';
+import * as profileFanout from '#engine/tenant/profile-fanout.ts';
+import * as conflicts from '#engine/tenant/conflicts.ts';
 import * as erasure from '#engine/tenant/erasure.ts';
 import * as publicReplica from '#engine/tenant/public-replica.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
 import { tenantStreamCommitted } from '#engine/tenant/streams.ts';
 import { writeCertificate } from '#engine/tenant/certificate.ts';
+import {
+  type DomainBinding,
+  requireDomainControl,
+} from '#engine/facade/domain-control.ts';
+import { LinkError } from '#engine/facade/protocol.ts';
 import {
   b32encode,
   b64decode,
@@ -125,6 +132,7 @@ type IdentityRow = {
 
 function bind(
   conn: Conn,
+  serverName: string,
   changed: () => void = () => {},
   projectionChanged: () => void = () => {},
   ingress?: import('./ingress.ts').PreparedIngressAuthority,
@@ -142,6 +150,29 @@ function bind(
   };
   return {
     ingress: { check: authorize },
+    domains: {
+      authorize: async (
+        view: DomainBinding,
+        selected?: { pairing: string; revision: number },
+      ) => {
+        await requireDomainControl(conn, view);
+        if (!selected) return;
+        const [row] = await conn.query(
+          'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
+          [view.localpart],
+        );
+        if (
+          row?.pairing !== selected.pairing ||
+          Number(row.grant_revision) !== selected.revision
+        ) {
+          throw new LinkError(
+            'LINK_IDENTITY_MISMATCH',
+            'domain account not selected',
+            403,
+          );
+        }
+      },
+    },
     publicReplica: {
       users: () => publicReplica.publicUsers(conn),
       inventory: () => publicReplica.publicInventory(conn),
@@ -151,6 +182,12 @@ function bind(
         publicReplica.installPublicUser(conn, raw, server),
     },
     streams: { heads: () => syncStreamHeads(conn) },
+    conflicts: {
+      inspect: (selector: conflicts.ConflictSelector) =>
+        conflicts.inspectConflicts(conn, selector),
+      export: (selector: conflicts.ConflictSelector, operationId: string) =>
+        conflicts.exportConflict(conn, selector, operationId),
+    },
     keyBackup: {
       clear: (localpart: string) => keyBackup.clearBackup(conn, localpart),
       version: (
@@ -382,7 +419,47 @@ function bind(
         erasure.erasureRow(conn, localpart, roomId),
     },
     profiles: {
+      fanout: {
+        list: (localpart?: string) =>
+          profileFanout.profileFanouts(conn, localpart),
+        discover: (
+          work: profileFanout.ProfileFanout,
+          rooms: readonly string[],
+        ) => profileFanout.discoverProfileRooms(conn, work, rooms),
+        rooms: (work: profileFanout.ProfileFanout) =>
+          profileFanout.profileRoomResults(conn, work),
+        submission: (work: profileFanout.ProfileFanout, room: string) =>
+          profileFanout.profileSubmission(conn, work, room),
+        prepare: (
+          work: profileFanout.ProfileFanout,
+          room: string,
+          pdu: import('#engine/pdu.ts').Pdu,
+        ) => profileFanout.prepareProfileSubmission(conn, work, room, pdu),
+        finish: (
+          work: profileFanout.ProfileFanout,
+          room: string,
+          eventId: string | null,
+          accepted: boolean | null,
+        ) =>
+          profileFanout.finishProfileSubmission(
+            conn,
+            work,
+            room,
+            eventId,
+            accepted,
+          ),
+      },
       get: (localpart: string) => profiles.profileRow(conn, localpart),
+      operations: (localpart: string) =>
+        profiles.profileOperations(conn, localpart),
+      import: async (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => {
+        if (await profiles.importProfile(conn, operation, history)) {
+          projectionChanged();
+        }
+      },
       set: (localpart: string, key: string, value: unknown) =>
         mutation(profiles.setProfileRow(conn, localpart, key, value)),
       clear: (localpart: string) =>
@@ -563,6 +640,32 @@ function bind(
       },
     },
     accountData: {
+      operations: (localpart: string) =>
+        accountdata.accountDataOperations(conn, localpart),
+      import: async (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => {
+        if (await accountdata.importAccountData(conn, operation, history)) {
+          changed();
+        }
+      },
+      tag: async (
+        localpart: string,
+        room: string,
+        tag: string,
+        value?: unknown,
+      ) => {
+        const result = await accountdata.putRoomTag(
+          conn,
+          localpart,
+          room,
+          tag,
+          value,
+        );
+        if (result.changed) changed();
+        if (result.recorded) projectionChanged();
+      },
       listSelection: (localpart: string) =>
         accountdata.listSelectionSnapshot(conn, localpart),
       clear: (localpart: string) =>
@@ -584,14 +687,18 @@ function bind(
         content: string,
         seq: number,
       ) =>
-        accountdata.putAccountDataRow(
-          conn,
-          localpart,
-          roomId,
-          type,
-          content,
-          seq,
-        ),
+        (async () => {
+          if (
+            await accountdata.putAccountDataRow(
+              conn,
+              localpart,
+              roomId,
+              type,
+              content,
+              seq,
+            )
+          ) projectionChanged();
+        })(),
       get: (localpart: string, roomId: string, type: string) =>
         accountdata.accountDataRow(conn, localpart, roomId, type),
       ofRoom: (
@@ -613,6 +720,20 @@ function bind(
       expire: (now: number) => openid.expireOpenId(conn, now),
     },
     pushRules: {
+      prepare: (localpart: string) =>
+        pushrules.preparePushRules(conn, localpart, serverName),
+      operations: (localpart: string) =>
+        pushrules.pushRuleOperations(conn, localpart),
+      import: async (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => {
+        if (
+          await pushrules.importPushRules(conn, operation, serverName, history)
+        ) {
+          changed();
+        }
+      },
       clear: (localpart: string) => pushrules.clearPushRules(conn, localpart),
       rulesetRows: (localpart: string) =>
         pushrules.rulesetRows(conn, localpart),
@@ -670,8 +791,12 @@ function bind(
         newRoomId: string,
         row: pushrules.RuleRow,
       ) => pushrules.copyRoomRule(conn, localpart, newRoomId, row),
-      stampStream: (localpart: string, seq: number) =>
-        pushrules.stampPushStream(conn, localpart, seq),
+      stampStream: async (localpart: string, seq: number) => {
+        if (await pushrules.recordPushRules(conn, localpart, serverName, seq)) {
+          projectionChanged();
+        }
+        changed();
+      },
       streamSeq: (localpart: string) =>
         pushrules.pushStreamSeqRow(conn, localpart),
     },
@@ -925,7 +1050,7 @@ export async function openTenant(
         async (conn) => {
           let changed = false;
           let projectionChanged = false;
-          const result = await fn(bind(conn, () => {
+          const result = await fn(bind(conn, serverName, () => {
             changed = true;
           }, () => {
             projectionChanged = true;

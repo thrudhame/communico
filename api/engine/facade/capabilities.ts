@@ -1,4 +1,4 @@
-// One F1 public/service capability manifest. This is a pre-dispatch gate, not a
+// One phased public/service capability manifest. This is a pre-dispatch gate, not a
 // second Matrix router: allowed requests still use reflective route discovery.
 export type Role = 'home' | 'facade';
 export type Scope =
@@ -7,7 +7,8 @@ export type Scope =
   | 'public'
   | 'rooms'
   | 'ingress'
-  | 'auth';
+  | 'auth'
+  | 'domain';
 type Rule = { method: string; path: RegExp; scope: Scope; action?: 'home' };
 const f = '/_matrix/federation/v1/';
 const k = '/_matrix/key/v2/';
@@ -55,8 +56,8 @@ export const F1_PUBLIC: readonly Rule[] = [
   ),
 ];
 
-// B2 delivers account/session authority only. Room/device-key/private-data
-// capabilities and their workers remain unmounted until their owning slices.
+// B2 delivers account/session authority. Later capabilities remain unmounted
+// until their owning slices, even when their endpoints exist on home.
 const F2_AUTH: readonly Rule[] = [
   ...['v3', 'r0'].flatMap((version) =>
     ['GET', 'POST'].map((method) =>
@@ -79,6 +80,61 @@ const F2_AUTH: readonly Rule[] = [
     literal('/_matrix/client/v3/register/available'),
     'auth',
     'home',
+  ),
+];
+
+// B3's type owners enforce complete per-user domain cuts. Receipt entry points
+// additionally require their room cut. These client scopes do not depend on the
+// federation switch; the existing federation public/rooms rules still do.
+const F2_REGISTERS: readonly Rule[] = [
+  route('GET', /^\/_matrix\/client\/v3\/profile\/[^/]+(?:\/[^/]+)?$/, 'domain'),
+  ...['PUT', 'DELETE'].map((method) =>
+    route(method, /^\/_matrix\/client\/v3\/profile\/[^/]+\/[^/]+$/, 'domain')
+  ),
+  route('GET', /^\/_matrix\/client\/v3\/pushrules\/?$/, 'domain'),
+  route('GET', /^\/_matrix\/client\/v3\/pushrules\/global\/?$/, 'domain'),
+  ...['GET', 'PUT', 'DELETE'].map((method) =>
+    route(
+      method,
+      /^\/_matrix\/client\/v3\/pushrules\/global\/[^/]+\/[^/]+$/,
+      'domain',
+    )
+  ),
+  ...['GET', 'PUT'].map((method) =>
+    route(
+      method,
+      /^\/_matrix\/client\/v3\/pushrules\/global\/[^/]+\/[^/]+\/(actions|enabled)$/,
+      'domain',
+    )
+  ),
+  ...['GET', 'PUT'].map((method) =>
+    route(
+      method,
+      /^\/_matrix\/client\/v3\/user\/[^/]+\/(?:rooms\/[^/]+\/)?account_data\/[^/]+$/,
+      'domain',
+    )
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/user\/[^/]+\/rooms\/[^/]+\/tags$/,
+    'domain',
+  ),
+  ...['PUT', 'DELETE'].map((method) =>
+    route(
+      method,
+      /^\/_matrix\/client\/v3\/user\/[^/]+\/rooms\/[^/]+\/tags\/[^/]+$/,
+      'domain',
+    )
+  ),
+  route(
+    'POST',
+    /^\/_matrix\/client\/v3\/rooms\/[^/]+\/read_markers$/,
+    'domain',
+  ),
+  route(
+    'POST',
+    /^\/_matrix\/client\/v3\/rooms\/[^/]+\/receipt\/[^/]+\/[^/]+$/,
+    'domain',
   ),
 ];
 
@@ -116,8 +172,11 @@ export function capabilities(role: string, phase = 'f1') {
     gate(request: Request, ready: (scope: Scope) => boolean): Response | null {
       if (role === 'home') return null;
       const path = new URL(request.url).pathname;
-      const matching = (phase === 'f2' ? [...F1_PUBLIC, ...F2_AUTH] : F1_PUBLIC)
-        .filter((rule) => rule.path.test(path));
+      const matching =
+        (phase === 'f2'
+          ? [...F1_PUBLIC, ...F2_AUTH, ...F2_REGISTERS]
+          : F1_PUBLIC)
+          .filter((rule) => rule.path.test(path));
       const rule = matching.find((rule) => rule.method === request.method);
       if (!rule) {
         return Response.json({

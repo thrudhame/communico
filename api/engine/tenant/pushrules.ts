@@ -7,6 +7,18 @@
 // mutation stamps it inside the same tenant transaction (so a delete
 // that empties the table still moves the token's _a<n>).
 import type { Conn } from '#engine/store/db.ts';
+import {
+  captureRegisterBaseline,
+  importRegisterOperation,
+  registerJson,
+  type RegisterOperation,
+  registerOperations,
+  writeRegister,
+} from '#engine/facade/registers.ts';
+import { tenantAuthority } from '#engine/tenant/session-authority.ts';
+import { requireTenantDomainSource } from './domain-source.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
+import { nextStreamSeq } from '#engine/tenant/accountdata.ts';
 export async function clearPushRules(
   conn: Conn,
   localpart: string,
@@ -316,13 +328,268 @@ export async function pushStreamSeqRow(
   return rows.length === 0 || rows[0].seq == null ? 0 : Number(rows[0].seq);
 }
 
+function semanticKey(localpart: string): string {
+  return JSON.stringify(['push-rules', localpart]);
+}
+
+async function rulesetRow(
+  conn: Conn,
+  localpart: string,
+  server: string,
+): Promise<Ruleset> {
+  const stored = {} as Ruleset;
+  for (const kind of PUSH_KINDS) {
+    stored[kind] = (await kindRows(conn, localpart, kind)).map(rowToRule);
+  }
+  return effectiveRules(`@${localpart}:${server}`, stored);
+}
+
+async function activeAccount(conn: Conn, localpart: string): Promise<void> {
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!user) throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
+  if (user.deactivated === 1) {
+    throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account is deactivated');
+  }
+}
+
+export function pushRuleOperations(conn: Conn, localpart: string) {
+  return registerOperations(conn, semanticKey(localpart));
+}
+
+/** The initial semantic value includes the complete effective default catalog
+ * and ordering, not merely the operator-overridden SQL rows. */
+export async function capturePushRuleOperations(
+  conn: Conn,
+  localpart: string,
+  server: string,
+) {
+  if ((await tenantAuthority(conn))?.node !== 'home') {
+    throw new Error('push-rules bootstrap requires home authority');
+  }
+  await activeAccount(conn, localpart);
+  await baseline(conn, localpart, server);
+  return await pushRuleOperations(conn, localpart);
+}
+
+async function baseline(
+  conn: Conn,
+  localpart: string,
+  server: string,
+  incoming?: RegisterOperation,
+): Promise<void> {
+  if ((await pushRuleOperations(conn, localpart)).length) return;
+  const authority = (await tenantAuthority(conn))!;
+  if (authority.node !== 'home') {
+    throw new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'push-rules baseline unavailable',
+    );
+  }
+  await captureRegisterBaseline(
+    conn,
+    {
+      source: authority.node,
+      incarnation: authority.incarnation,
+    },
+    semanticKey(localpart),
+    'push-rules',
+    JSON.stringify(await rulesetRow(conn, localpart, server)),
+    incoming,
+  );
+}
+
+/** Every user mutation captures the old complete value before editing rows.
+ * Its existing final stream stamp then records exactly one complete revision,
+ * not repack steps or independently mergeable priority integers. */
+export async function preparePushRules(
+  conn: Conn,
+  localpart: string,
+  server: string,
+): Promise<void> {
+  if (!await tenantAuthority(conn)) return;
+  await activeAccount(conn, localpart);
+  await baseline(conn, localpart, server);
+}
+
+export async function recordPushRules(
+  conn: Conn,
+  localpart: string,
+  server: string,
+  seq: number,
+): Promise<boolean> {
+  const authority = await tenantAuthority(conn);
+  if (authority) {
+    await activeAccount(conn, localpart);
+    await writeRegister(
+      conn,
+      {
+        source: authority.node,
+        incarnation: authority.incarnation,
+      },
+      semanticKey(localpart),
+      'push-rules',
+      JSON.stringify(await rulesetRow(conn, localpart, server)),
+    );
+  }
+  await stampPushStream(conn, localpart, seq);
+  return !!authority;
+}
+
+function validatedRuleset(
+  raw: unknown,
+  localpart: string,
+  server: string,
+): Ruleset {
+  if (!object(raw) || Object.keys(raw).length !== PUSH_KINDS.length) {
+    throw new Error('invalid push-rules operation');
+  }
+  const rules = {} as Ruleset;
+  for (const kind of PUSH_KINDS) {
+    const values = raw[kind];
+    if (!Array.isArray(values)) throw new Error('invalid push-rules operation');
+    const seen = new Set<string>();
+    rules[kind] = values.map((rule) => {
+      if (
+        !object(rule) || typeof rule.rule_id !== 'string' ||
+        Object.keys(rule).some((key) =>
+          !['rule_id', 'default', 'enabled', 'actions', 'conditions', 'pattern']
+            .includes(key)
+        ) ||
+        typeof rule.enabled !== 'boolean' ||
+        typeof rule.default !== 'boolean' ||
+        seen.has(rule.rule_id) ||
+        (!rule.default &&
+          (rule.rule_id.startsWith('.') || rule.rule_id.includes('/') ||
+            rule.rule_id.includes('\\'))) ||
+        (rule.conditions !== undefined &&
+          (!Array.isArray(rule.conditions) ||
+            !rule.conditions.every(validCondition))) ||
+        (rule.pattern !== undefined && typeof rule.pattern !== 'string')
+      ) {
+        throw new Error('invalid push-rules operation');
+      }
+      assertActions(rule.actions);
+      seen.add(rule.rule_id);
+      return rule as PushRule;
+    });
+  }
+  // Default identity, fixed order and conditions remain owned by the catalog.
+  // Only enabled/actions may differ. Custom arrays keep their complete order.
+  if (
+    registerJson(
+      JSON.stringify(effectiveRules(`@${localpart}:${server}`, rules)),
+    ) !== registerJson(JSON.stringify(raw))
+  ) {
+    throw new Error('invalid push-rules catalog');
+  }
+  return rules;
+}
+
+export async function importPushRules(
+  conn: Conn,
+  operation: RegisterOperation,
+  server: string,
+  history?: DomainHistoryProof,
+): Promise<boolean> {
+  let address: unknown, payload: unknown;
+  try {
+    address = JSON.parse(operation.semanticKey);
+    payload = JSON.parse(operation.payload);
+  } catch {
+    throw new Error('invalid push-rules operation');
+  }
+  if (
+    !Array.isArray(address) || address.length !== 2 ||
+    address[0] !== 'push-rules' ||
+    typeof address[1] !== 'string' || !address[1] ||
+    operation.semanticKey !== semanticKey(address[1]) ||
+    operation.kind !== 'push-rules'
+  ) {
+    throw new Error('invalid push-rules operation');
+  }
+  const localpart = address[1],
+    authority = await requireTenantDomainSource(
+      conn,
+      operation,
+      localpart,
+      history,
+    );
+  validatedRuleset(payload, localpart, server);
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!user) throw new Error('push-rules account unavailable');
+  if (user.deactivated !== 1 && authority!.node === 'home') {
+    await baseline(conn, localpart, server, operation);
+  }
+  const { winner } = await importRegisterOperation(conn, operation);
+  if (
+    user.deactivated === 1 || !winner ||
+    registerJson(JSON.stringify(await rulesetRow(conn, localpart, server))) ===
+      winner.payload
+  ) return false;
+  const selected = validatedRuleset(
+    JSON.parse(winner.payload),
+    localpart,
+    server,
+  );
+  const seq = await nextStreamSeq(conn);
+  await conn.execute('DELETE FROM push_rules WHERE localpart=?', [localpart]);
+  for (const kind of PUSH_KINDS) {
+    for (const [index, rule] of selected[kind].entries()) {
+      await conn.execute(
+        `INSERT INTO push_rules(localpart,scope,kind,rule_id,priority,actions,conditions,pattern,enabled,is_default,seq)
+        VALUES(?,'global',?,?,?,?,?,?,?,?,?)`,
+        [
+          localpart,
+          kind,
+          rule.rule_id,
+          (index + 1) * 100,
+          JSON.stringify(rule.actions),
+          rule.conditions === undefined
+            ? null
+            : JSON.stringify(rule.conditions),
+          rule.pattern ?? null,
+          rule.enabled ? 1 : 0,
+          rule.default ? 1 : 0,
+          rule.default ? null : seq,
+        ],
+      );
+    }
+  }
+  // Imported winners publish a local account-data cut but no local authorship,
+  // historical notification evaluation, or second source operation.
+  await stampPushStream(conn, localpart, seq);
+  return true;
+}
+
+function mutateRules<T>(
+  tenant: Tenant,
+  localpart: string,
+  mutation: (tx: TenantTx) => Promise<T>,
+): Promise<T> {
+  return tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.pushRules.prepare(localpart);
+    return mutation(tx);
+  });
+}
+
 // --- tenant-level behaviour --------------------------------------------------
 
 export async function pushStreamSeq(
   tenant: Tenant,
   localpart: string,
 ): Promise<number> {
-  return await tenant.tx((tx) => tx.pushRules.streamSeq(localpart));
+  return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    return await tx.pushRules.streamSeq(localpart);
+  });
 }
 
 // The ruleset for GET /pushrules/ (D9): every kind array present,
@@ -331,7 +598,10 @@ export async function rulesetFor(
   tenant: Tenant,
   localpart: string,
 ): Promise<Record<PushKind, PushRule[]>> {
-  return await tenant.tx((tx) => rulesetAt(tx, localpart, tenant.serverName));
+  return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart });
+    return await rulesetAt(tx, localpart, tenant.serverName);
+  });
 }
 
 export async function rulesetAt(
@@ -498,7 +768,7 @@ export async function putRule(
       'rule_id may not start with . or contain slashes',
     );
   }
-  await tenant.tx(async (tx) => {
+  await mutateRules(tenant, localpart, async (tx) => {
     // User rules stay ahead of defaults, with master unconditionally first.
     // Placement relative to a default can only name that boundary.
     let boundary: 'top' | 'bottom' | null = null;
@@ -628,7 +898,7 @@ export async function deleteRule(
       'default rules cannot be deleted',
     );
   }
-  await tenant.tx(async (tx) => {
+  await mutateRules(tenant, localpart, async (tx) => {
     if ((await tx.pushRules.byId(localpart, kind, ruleId)) === null) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'The push rule was not found.');
     }
@@ -645,7 +915,7 @@ export async function setRuleEnabled(
   ruleId: string,
   enabled: boolean,
 ): Promise<void> {
-  await tenant.tx(async (tx) => {
+  await mutateRules(tenant, localpart, async (tx) => {
     await requireStored(tx, localpart, tenant.serverName, kind, ruleId);
     await tx.pushRules.setEnabled(localpart, kind, ruleId, enabled);
     await tx.pushRules.stampStream(localpart, await tx.counters.nextStream());
@@ -661,7 +931,7 @@ export async function setRuleActions(
 ): Promise<void> {
   assertScopeKind('global', kind);
   assertActions(actions);
-  await tenant.tx(async (tx) => {
+  await mutateRules(tenant, localpart, async (tx) => {
     await requireStored(tx, localpart, tenant.serverName, kind, ruleId);
     await tx.pushRules.setActions(
       localpart,
@@ -688,6 +958,9 @@ export async function migrateRoomRules(
     const rows = await tx.pushRules.roomRulesOf(oldRoomId, onlyLocalpart);
     const touched = new Set<string>();
     for (const row of rows) {
+      if (!touched.has(row.localpart!)) {
+        await tx.pushRules.prepare(row.localpart!);
+      }
       await tx.pushRules.copyRoomRule(row.localpart!, newRoomId, row);
       touched.add(row.localpart!);
     }

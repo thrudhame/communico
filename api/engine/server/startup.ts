@@ -15,6 +15,7 @@ import { onStartup, type StartupStore } from '#engine/store/watermark.ts';
 import { installJoinAdmission } from '#engine/server/join-attempts.ts';
 import { completionService } from './completion.ts';
 import { assertRestoreReport } from '#engine/backup/report.ts';
+import { roomProjectionSources } from '#engine/store/projection-sources.ts';
 
 // App composition calls this after the restore-report gate and before workers.
 // Failed dependency work is durable room truth, not a process-local task.
@@ -57,12 +58,12 @@ export async function recoverServer(store: StartupStore): Promise<void> {
   installJoinAdmission(concrete);
   await discover(concrete);
   // A completed unlink can precede deletion of its now-orphaned watermark.
-  await server.execute(
-    "DELETE FROM watermarks WHERE source LIKE 'room:%' AND NOT EXISTS (SELECT 1 FROM rooms WHERE room_id = substr(watermarks.source,6))",
-  );
-  await server.execute(
-    "DELETE FROM watermarks WHERE source LIKE 'push-context:%' AND NOT EXISTS (SELECT 1 FROM rooms WHERE room_id = substr(watermarks.source,14))",
-  );
+  for (const { prefix } of Object.values(roomProjectionSources)) {
+    await server.execute(
+      'DELETE FROM watermarks WHERE substr(source,1,?)=? AND NOT EXISTS (SELECT 1 FROM rooms WHERE room_id=substr(watermarks.source,?))',
+      [prefix.length, prefix, prefix.length + 1],
+    );
+  }
   for (const roomId of await listRooms(concrete)) {
     await project(concrete, roomId);
   }

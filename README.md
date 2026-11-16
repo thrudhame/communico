@@ -709,6 +709,43 @@ lists all reports, oldest first. Resolution is idempotent: the first resolution
 and its timestamp are retained. Reports are not deleted on resolution.
 Admin UI: TODO.
 
+### Recovering facade conflict values
+
+F2 keeps losing complete account-data, push-rules and profile revisions. A
+runtime operator can inspect one semantic key on the private admin Unix socket;
+this is not a Matrix endpoint and does not require the home link to be online.
+Inspection returns operation identities, hashes, concurrent/superseded state
+and the number of pending operations, never the values. Generic status does not
+include them. Pending values with missing predecessor history are not exported
+as complete alternatives.
+
+```sh
+curl --unix-socket /srv/communico/admin.sock -H 'Content-Type: application/json' \
+  -d '{"kind":"account-data","localpart":"alice","roomId":"","type":"m.secret_storage.key.example"}' \
+  http://localhost/v1/facade/conflicts
+```
+
+Use `kind:"profile"` or `kind:"push-rules"` with `localpart` for the other
+complete registers. Select an `operationId` from `alternatives`, then POST the
+same selector plus `operationId` and an absolute `exportfile` path to
+`/v1/facade/conflicts/export`. The server creates a runtime-owned mode-0600 file
+containing `{selector,operation}`; `operation.payload` is the stored opaque
+JSON string after parsing and reserialization, not the original wire bytes.
+Key order can change and large integer literals can be rounded during parsing.
+Existing files and symlinks are never overwritten. The response
+contains only the selected identity and path. Treat the file as private account
+data, even when its contents are encrypted; do not put its contents in logs.
+
+Export does not change the winner, stream cuts or operation history. Give the
+selected value to the account owner through a private channel. They recover it
+using ordinary authenticated account-data PUTs, profile field writes, or the
+push-rules APIs, preserving any desired complete rule order. Those writes
+validate normally and create new causal operations observing the held history;
+the operator does not replace rows or reimport an old operation as a new write.
+`m.tag` inspection is retained put/remove/reset history, labeled `retained`, not
+a losing complete tag map; reconstruct the desired tags and use an ordinary
+`m.tag` PUT. A deactivated account cannot use recovery to regain write authority.
+
 ## Server lifecycle
 
 SIGTERM and SIGINT stop admission on all listeners. Admitted handlers and

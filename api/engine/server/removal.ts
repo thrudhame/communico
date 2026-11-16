@@ -13,6 +13,10 @@ import { visiblePrejoin } from './prejoin.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { get } from '#engine/store/watermark.ts';
 import { reconcileRoomCompletions } from '#engine/tenant/completion.ts';
+import {
+  roomProjectionSources,
+  roomSource,
+} from '#engine/store/projection-sources.ts';
 
 export type Removal = { why: string; intents: ReviewIntent[] };
 
@@ -26,7 +30,10 @@ export async function finishRoomRemoval(
   try {
     const room = await openRoom(store, roomId);
     const state = await room.tx((tx) => tx.completion.state());
-    const published = await get(await store.server(), 'room:' + roomId);
+    const published = await get(
+      await store.server(),
+      roomSource('room', roomId),
+    );
     completed = {
       roomId,
       generation: state.generation,
@@ -57,9 +64,13 @@ export async function finishRoomRemoval(
     );
     await tx.execute('DELETE FROM e2ee_rooms WHERE room=?', [roomId]);
     await removeNotificationFacts(tx, { room: roomId });
-    await tx.execute('DELETE FROM watermarks WHERE source=?', [
-      'push-context:' + roomId,
-    ]);
+    for (const { prefix, dropReplay } of Object.values(roomProjectionSources)) {
+      if (!dropReplay) {
+        await tx.execute('DELETE FROM watermarks WHERE source=?', [
+          prefix + roomId,
+        ]);
+      }
+    }
     const rows = await tx.query(
       "SELECT destination, count(*) AS n FROM outbox WHERE room = ? AND state = 'pending' GROUP BY destination",
       [roomId],
@@ -102,6 +113,8 @@ export async function finishRoomRemoval(
     for (
       const table of [
         'event_index',
+        'receipt_dag_edges',
+        'receipt_dag_nodes',
         'feed',
         'memberships',
         'redactions',
@@ -126,13 +139,15 @@ export async function finishRoomRemoval(
       await tx.execute(`DELETE FROM ${table} WHERE room_id = ?`, [roomId]);
     }
     // Keep the drop as the next replay item until its source file is gone.
-    if (position !== null) await advance(tx, 'room:' + roomId, position - 1);
+    if (position !== null) {
+      await advance(tx, roomSource('room', roomId), position - 1);
+    }
     return count;
   });
   await store.removeRoom(roomId);
   roomEdges.forgetOwner(store);
   await db.execute('DELETE FROM watermarks WHERE source = ?', [
-    'room:' + roomId,
+    roomSource('room', roomId),
   ]);
   return settled;
 }

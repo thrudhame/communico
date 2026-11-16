@@ -27,6 +27,10 @@ CREATE TABLE account_auth_sources(localpart TEXT PRIMARY KEY NOT NULL,revision I
 CREATE TABLE account_auth_snapshots(localpart TEXT PRIMARY KEY NOT NULL,pairing TEXT NOT NULL,grant_revision INTEGER NOT NULL,owner_revision INTEGER NOT NULL,source_cut INTEGER NOT NULL,revision INTEGER NOT NULL,material_hash TEXT NOT NULL,captured_ms INTEGER NOT NULL,checked_ms INTEGER NOT NULL,credentials INTEGER NOT NULL);
 `;
 
+export const ACCOUNT_AUTH_PUBLICATION_SQL = `
+CREATE TABLE account_auth_publications(localpart TEXT PRIMARY KEY NOT NULL,pairing TEXT NOT NULL,grant_revision INTEGER NOT NULL,owner_revision INTEGER NOT NULL,source_cut INTEGER NOT NULL,sequence INTEGER NOT NULL,hash TEXT NOT NULL);
+`;
+
 export type AccountAuth = {
   kind: 'account-auth';
   server: string;
@@ -193,6 +197,58 @@ export type AuthSnapshotBinding = {
   sourceCut?: number;
 };
 
+/** The verified receiver publishes admission with the installed owner state.
+ * The server journal ACK is a recoverable projection, not a second commit point
+ * that can be paired with a newer tenant snapshot by a concurrent request. */
+export async function publishAccountAuth(
+  conn: Conn,
+  view: AccountAuth,
+  cut: { sequence: number; hash: string },
+  erasureCuts?: Record<string, ErasureCut>,
+): Promise<void> {
+  const [held] = await conn.query(
+    'SELECT pairing,source_cut,sequence,hash FROM account_auth_publications WHERE localpart=?',
+    [view.localpart],
+  );
+  if (
+    held?.pairing === view.pairing &&
+    Number(held.source_cut) === view.sourceCut &&
+    (Number(held.sequence) !== cut.sequence || held.hash !== cut.hash)
+  ) authUnavailable();
+  await installAccountAuth(conn, view, erasureCuts);
+  await conn.execute(
+    'INSERT INTO account_auth_publications(localpart,pairing,grant_revision,owner_revision,source_cut,sequence,hash) VALUES(?,?,?,?,?,?,?) ON CONFLICT(localpart) DO UPDATE SET pairing=excluded.pairing,grant_revision=excluded.grant_revision,owner_revision=excluded.owner_revision,source_cut=excluded.source_cut,sequence=excluded.sequence,hash=excluded.hash',
+    [
+      view.localpart,
+      view.pairing,
+      view.grantRevision,
+      view.ownerRevision,
+      view.sourceCut,
+      cut.sequence,
+      cut.hash,
+    ],
+  );
+}
+
+/** Read both halves at the caller's tenant transaction cut. Bare installation
+ * or a fabricated newer source counter never grants published admission. */
+export async function accountAuthPublication(
+  conn: Conn,
+  localpart: string,
+  binding: Omit<AuthSnapshotBinding, 'sourceCut'>,
+) {
+  const [row] = await conn.query(
+    'SELECT p.source_cut,p.sequence,p.hash FROM account_auth_publications p JOIN account_auth_snapshots s ON s.localpart=p.localpart AND s.pairing=p.pairing AND s.grant_revision=p.grant_revision AND s.owner_revision=p.owner_revision AND s.source_cut=p.source_cut WHERE p.localpart=? AND p.pairing=? AND p.grant_revision=? AND p.owner_revision=?',
+    [localpart, binding.pairing, binding.grantRevision, binding.ownerRevision],
+  );
+  if (!row) authUnavailable();
+  return {
+    sourceCut: Number(row.source_cut),
+    sequence: Number(row.sequence),
+    hash: String(row.hash),
+  };
+}
+
 export async function requireAccountAuth(
   conn: Conn,
   localpart: string,
@@ -214,16 +270,26 @@ export async function requireAccountAuth(
       Number(row.source_cut) !== binding.sourceCut) ||
     (credentials && row.credentials !== 1)
   ) authUnavailable();
+  // Imported authority and this ingress's clock observation are independent
+  // owners. Writing checked_ms on the snapshot makes every authenticated read
+  // compete with its importer, so sustained clients can starve revocations.
+  // Preserve the old field as the upgrade floor; new observations are local
+  // counters and can commit while a newer source snapshot is being installed.
+  const clockName = 'account_auth_checked:' + localpart;
+  const [clock] = await conn.query('SELECT value FROM counters WHERE name=?', [
+    clockName,
+  ]);
+  const checked = Math.max(Number(row.checked_ms), Number(clock?.value ?? 0));
   if (
-    (!settings.allowstaleauth && !reconciled) || now < Number(row.checked_ms) ||
+    (!settings.allowstaleauth && !reconciled) || now < checked ||
     now < Number(row.captured_ms) ||
     (settings.authmaxstalehours > 0 &&
       now - Number(row.captured_ms) > settings.authmaxstalehours * 3600000)
   ) authUnavailable();
-  if (now > Number(row.checked_ms)) {
+  if (now > checked) {
     await conn.execute(
-      'UPDATE account_auth_snapshots SET checked_ms=? WHERE localpart=?',
-      [now, localpart],
+      'INSERT INTO counters(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=MAX(counters.value,excluded.value)',
+      [clockName, now],
     );
   }
 }
