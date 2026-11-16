@@ -166,7 +166,7 @@ for (
           ],
           via: fr.server.name,
           limit: 100,
-        }, { keys, fetcher: scripted.fetcher });
+        }, { self: 'test', keys, fetcher: scripted.fetcher });
         assertEquals(result.positioned, []);
       }
       await room.tx(async (tx) => {

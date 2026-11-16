@@ -1,5 +1,6 @@
 // Inbox, send receipts and issued acknowledgments belong to the tenant file.
 import type { Conn } from '#engine/store/db.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import { deviceById, devicesOfUser } from '#engine/tenant/devices.ts';
 import {
@@ -291,7 +292,9 @@ async function acknowledgeIssued(
   const owner = args(d);
   const ack = await issuedAck(conn, d, tokenHash);
   await conn.execute(
-    'INSERT INTO device_ack VALUES(?,?,?,?) ON CONFLICT(localpart,device_id,generation) DO UPDATE SET msg_pos=excluded.msg_pos',
+    `INSERT INTO device_ack VALUES(?,?,?,?) ON CONFLICT(localpart,device_id,generation) DO UPDATE SET msg_pos=excluded.msg_pos WHERE ${
+      changedColumns('device_ack', 'msg_pos')
+    }`,
     [...owner, ack],
   );
   await conn.execute(

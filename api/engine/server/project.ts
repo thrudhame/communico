@@ -19,6 +19,7 @@ import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
 import { advance, get } from '#engine/store/watermark.ts';
+import { changedColumns } from '#engine/store/changed.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
@@ -795,7 +796,16 @@ async function apply(
          VALUES(?,?,?,?,?,?,?,?,NULL)
          ON CONFLICT(event) DO UPDATE SET
            standing = excluded.standing, grounding = excluded.grounding,
-           reason = excluded.reason, rule = excluded.rule`,
+           reason = excluded.reason, rule = excluded.rule
+         WHERE ${
+          changedColumns(
+            'event_index',
+            'standing',
+            'grounding',
+            'reason',
+            'rule',
+          )
+        }`,
         [
           change.event,
           roomId,
@@ -828,7 +838,17 @@ async function apply(
          ON CONFLICT(event) DO UPDATE SET
            standing = excluded.standing, grounding = excluded.grounding,
            reason = excluded.reason, rule = excluded.rule,
-           origin = excluded.origin`,
+           origin = excluded.origin
+         WHERE ${
+          changedColumns(
+            'event_index',
+            'standing',
+            'grounding',
+            'reason',
+            'rule',
+            'origin',
+          )
+        }`,
         [
           change.event,
           roomId,
@@ -1024,18 +1044,16 @@ async function applyLive(
   addedMs: number,
 ): Promise<void> {
   const existing = await feedSeqAtPos(tx, roomId, item.change.pos);
+  const seq = existing ?? await nextEventSeq(tx);
   if (existing === null) {
-    const seq = await nextEventSeq(tx);
     await tx.execute(
       'INSERT INTO feed(seq, room, pos, event, stay) VALUES(?,?,?,?,?)',
       [seq, roomId, item.change.pos, item.change.event, item.payload.stay],
     );
   }
   await tx.execute(
-    `UPDATE event_index SET seq = (
-       SELECT seq FROM feed WHERE room = ? AND pos = ?
-     ) WHERE event = ?`,
-    [roomId, item.change.pos, item.change.event],
+    'UPDATE event_index SET seq=? WHERE event=? AND seq IS NOT ?',
+    [seq, item.change.event, seq],
   );
   await applyRelation(tx, roomId, item);
   await reconcileNotificationEvent(tx, roomId, item.change.event!, addedMs);
@@ -1061,7 +1079,7 @@ async function applyLive(
       tx,
       roomId,
       item.change.event!,
-      (await feedSeqAtPos(tx, roomId, item.change.pos))!,
+      seq,
       item.change.pos,
       item.push,
       addedMs,
@@ -1078,7 +1096,8 @@ async function applyRelation(
     await tx.execute(
       `INSERT INTO relations(event, relates_to, rel_type, room, seq)
        VALUES(?,?,?,?,(SELECT seq FROM feed WHERE room = ? AND event = ?))
-        ON CONFLICT(event) DO UPDATE SET seq=COALESCE(relations.seq,excluded.seq)`,
+        ON CONFLICT(event) DO UPDATE SET seq=excluded.seq
+        WHERE relations.seq IS NULL AND excluded.seq IS NOT NULL`,
       [
         item.change.event,
         item.relation.relatesTo,

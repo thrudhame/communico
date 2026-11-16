@@ -266,6 +266,14 @@ Deno.test('C1 recovery charges only peer failures, not local storage or revision
     );
     const original = db.tx;
     const fault = new Error('injected snapshot persistence failure');
+    const retained = { ...device(), user_id: remote };
+    // The empty snapshot removes a real retained key. An already-empty cache
+    // has no key deletion to fail after selective snapshot reconciliation.
+    await db.execute('INSERT INTO remote_device_keys VALUES(?,?,?)', [
+      remote,
+      'D',
+      JSON.stringify(retained),
+    ]);
     let injected = 0;
     db.tx = (fn, options) =>
       original(async (tx) => {
@@ -288,6 +296,14 @@ Deno.test('C1 recovery charges only peer failures, not local storage or revision
       db.tx = original;
     }
     assertEquals(injected, 1);
+    assertEquals(
+      await db.query(
+        'SELECT key_json FROM remote_device_keys WHERE user_id=? AND device_id=?',
+        [remote, 'D'],
+      ),
+      [{ key_json: JSON.stringify(retained) }],
+      'local persistence failure rolls back the retained key',
+    );
     const row = (await db.query(
       'SELECT failures,retry_at,stale FROM remote_device_users WHERE user_id=?',
       [remote],

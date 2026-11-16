@@ -6,6 +6,7 @@ import { basename, join } from '@std/path';
 import { type Conn, type Database, Db } from '#engine/store/db.ts';
 import { type Row, Turso } from '#engine/store/ffi.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
+import type { Admission } from '#engine/store/admission.ts';
 
 export type CreateOptions = {
   checkpointlogbytes: number;
@@ -13,6 +14,7 @@ export type CreateOptions = {
   verify: (db: Database) => Promise<void>;
   beforeRename?: (temporary: string, final: string) => Promise<void>;
   discardOnFailure?: boolean;
+  publication?: Admission;
 };
 
 // A schema provider owns one database kind's domain tables. Safe create
@@ -191,8 +193,12 @@ export async function createDatabase(
     }
     await syncTree(temporary);
     await options.beforeRename?.(temporary, final);
-    await Deno.rename(temporary, final);
-    await sync(parent);
+    const publish = async () => {
+      await Deno.rename(temporary, final);
+      await sync(parent);
+    };
+    if (options.publication) await options.publication.run(publish);
+    else await publish();
     return final;
   } catch (error) {
     if (options.discardOnFailure) {
