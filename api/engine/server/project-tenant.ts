@@ -2,6 +2,7 @@
 import type { Store } from '#engine/store/index.ts';
 import { withProjectionLock } from '#engine/server/project.ts';
 import { advance, get } from '#engine/store/watermark.ts';
+import { tenantSource } from '#engine/store/projection-sources.ts';
 import { nextDeviceSeq, publishDeviceChange } from '#engine/server/e2ee.ts';
 import { enqueueEdu } from '#engine/server/delivery.ts';
 import { removeNotificationFacts } from '#engine/server/notifications.ts';
@@ -20,7 +21,7 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
     const server = await store.server(), db = await store.tenant(tenant);
     const pending = await pendingTenantProjection(db);
     await projectPushTargets(store, tenant);
-    const accountSource = 'tenant:' + tenant + ':accounts';
+    const accountSource = tenantSource('accounts', tenant);
     for (;;) {
       const mark = await get(server, accountSource);
       const rows = await db.query(
@@ -39,7 +40,7 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
         await advance(conn, accountSource, Number(rows.at(-1)!.pos));
       });
     }
-    const source = 'tenant:' + tenant + ':e2ee';
+    const source = tenantSource('e2ee', tenant);
     for (;;) {
       const mark = await get(server, source);
       const rows = await db.query(
@@ -99,7 +100,7 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
     }
     // E4 public-signing intents predate federation support. A distinct durable
     // cursor replays them even if the notification watermark already advanced.
-    const signingSource = 'tenant:' + tenant + ':public-signing';
+    const signingSource = tenantSource('public-signing', tenant);
     for (;;) {
       const mark = await get(server, signingSource);
       const rows = await db.query(

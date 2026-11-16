@@ -70,6 +70,9 @@ Deno.test('sync wait: arm before capture, recheck unrelated hints, and return on
 
 Deno.test('sync wait: config-only relevance returns immediately and timeout stays absolute under unrelated commits', async () => {
   const f = await fixture();
+  const originalClock = Date.now;
+  let now = originalClock();
+  Date.now = () => now;
   try {
     assertEquals(
       await waitForSync(
@@ -82,13 +85,31 @@ Deno.test('sync wait: config-only relevance returns immediately and timeout stay
     let calls = 0;
     const result = await waitForSync(f, { timeoutMs: 40 }, async () => {
       calls++;
+      assertEquals(
+        calls <= 4,
+        true,
+        'unrelated hints cannot reset the deadline',
+      );
       // Every read races another irrelevant stream commit. Restarting a
-      // relative timeout here would never finish.
+      // relative timeout would exceed four captures. Native transaction time
+      // is not evidence that a second capture fits into a real 40ms window.
       await eventStreamTx(f.server, async () => {});
+      now += 10;
       return { relevant: false, value: 'timeout' };
     });
     assertEquals(result, 'timeout');
-    assertEquals(calls > 1, true);
+    assertEquals(calls, 4);
+    let slowCalls = 0;
+    assertEquals(
+      await waitForSync(f, { timeoutMs: 40 }, async () => {
+        slowCalls++;
+        await eventStreamTx(f.server, async () => {});
+        now += 40;
+        return { relevant: false, value: 'capture-used-deadline' };
+      }),
+      'capture-used-deadline',
+    );
+    assertEquals(slowCalls, 1);
     assertEquals(
       await waitForSync(
         f,
@@ -98,6 +119,7 @@ Deno.test('sync wait: config-only relevance returns immediately and timeout stay
       'no-wait',
     );
   } finally {
+    Date.now = originalClock;
     await f.close();
   }
 });

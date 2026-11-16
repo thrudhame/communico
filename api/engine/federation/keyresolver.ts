@@ -22,6 +22,7 @@ export function productionKeyResolver(
 ): KeyResolver {
   return {
     verifyEventSignature: async (args) => {
+      args.signal?.throwIfAborted();
       let pub: CryptoKey;
       try {
         pub = await keys.getVerifyKey(
@@ -29,13 +30,16 @@ export function productionKeyResolver(
           args.keyId,
           args.minValidUntilMs,
           'event',
+          { signal: args.signal },
         );
       } catch (error) {
+        args.signal?.throwIfAborted();
         if (
           !(error instanceof KeyChangeRefused) && !recoverableUpstream(error)
         ) throw error;
         return false; // key unknown, expired before the floor, unobtainable
       }
+      args.signal?.throwIfAborted();
       let redacted: Record<string, unknown>;
       try {
         redacted = redact(

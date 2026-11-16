@@ -305,9 +305,13 @@ export async function afterRoomCommit(
   room: Room,
   self: string,
   arrived: readonly string[] = [],
+  signal?: AbortSignal,
 ): Promise<void> {
-  await resumeWaits(room, { self }, arrived);
-  await projectAfterWrite(room.store, room.id);
+  try {
+    await resumeWaits(room, { self, signal }, arrived);
+  } finally {
+    await projectAfterWrite(room.store, room.id);
+  }
 }
 
 // The tx-scoped core: the caller holds the room lock and composes (the
@@ -962,137 +966,152 @@ async function storePending(
 // and redaction effects retain the room lock. No network work happens here.
 export async function resumeWaits(
   room: Room,
-  deps: { self: string },
+  deps: { self: string; signal?: AbortSignal },
   arrived: readonly string[],
 ): Promise<number> {
-  const processed = new Set<string>();
-  const pending = await room.tx(async (tx) => {
-    for (const id of new Set(arrived)) await tx.waits.arrive(id);
-    return await tx.waits.ready();
-  });
-  const enqueue = async (ids: readonly string[]) => {
-    const fresh = [...new Set(ids)];
-    if (fresh.length === 0) return;
-    const waits = await room.tx(async (tx) => {
-      const result: typeof pending = [];
-      for (const id of fresh) {
-        result.push(
-          ...(await tx.waits.for(id)).filter((wait) => wait.state === 'ready'),
-        );
-      }
-      return result;
-    });
-    pending.push(...waits);
-    pending.sort((a, b) => {
-      if (a.since !== b.since) return a.since - b.since;
-      for (const key of ['waiting', 'missing', 'kind'] as const) {
-        if (a[key] !== b[key]) return a[key] < b[key] ? -1 : 1;
-      }
-      return 0;
-    });
-  };
   let resumed = 0;
-  // The initial ready query already includes every committed arrival. A
-  // subsequent grounding transition must reread its newly ready dependents,
-  // even when that identity was also an input. Only attempted jobs, not
-  // prerequisite identities, are deduplicated for this drain.
-  while (pending.length > 0) {
-    const wait = pending.shift()!;
-    if (processed.has(wait.waiting + '|' + wait.kind)) continue;
-    const job = await room.tx(async (tx) => {
-      if (wait.kind === 'prev') {
-        const status = await tx.events.getStatus(wait.waiting);
-        if (status === null || status.grounding !== 'pending') {
-          await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
-          return null;
-        }
-        const row = await tx.events.get(wait.waiting);
-        if (row === null) {
-          await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
-          return null;
-        }
-        const prevIds = (JSON.parse(row.pdu) as Pdu).prev_events ?? [];
-        if ((await ungroundedPrevs(tx, prevIds)).length > 0) {
-          await tx.waits.defer(wait);
-          return null;
-        }
-        return { kind: 'prev' as const, eventId: wait.waiting };
-      }
-      if (wait.kind === 'redaction') {
-        if ((await tx.events.get(wait.missing)) === null) return null;
-        return {
-          kind: 'redaction' as const,
-          eventId: wait.waiting,
-          target: wait.missing,
-        };
-      }
-      return null;
+  try {
+    if (deps.signal?.aborted) return resumed;
+    const processed = new Set<string>();
+    const pending = await room.tx(async (tx) => {
+      deps.signal?.throwIfAborted();
+      for (const id of new Set(arrived)) await tx.waits.arrive(id);
+      return await tx.waits.ready();
     });
-    if (job === null) continue;
-    processed.add(job.eventId + '|' + job.kind);
-    // Failure leaves the committed ready row for another arrival or startup.
-    if (job.kind === 'prev') {
-      const grounded = await withRoomLock(
-        room.id,
-        () =>
+    const enqueue = async (ids: readonly string[]) => {
+      if (deps.signal?.aborted) return;
+      const fresh = [...new Set(ids)];
+      if (fresh.length === 0) return;
+      const waits = await room.tx(async (tx) => {
+        const result: typeof pending = [];
+        for (const id of fresh) {
+          result.push(
+            ...(await tx.waits.for(id)).filter((wait) =>
+              wait.state === 'ready'
+            ),
+          );
+        }
+        return result;
+      });
+      pending.push(...waits);
+      pending.sort((a, b) => {
+        if (a.since !== b.since) return a.since - b.since;
+        for (const key of ['waiting', 'missing', 'kind'] as const) {
+          if (a[key] !== b[key]) return a[key] < b[key] ? -1 : 1;
+        }
+        return 0;
+      });
+    };
+    // The initial ready query already includes every committed arrival. A
+    // subsequent grounding transition must reread its newly ready dependents,
+    // even when that identity was also an input. Only attempted jobs, not
+    // prerequisite identities, are deduplicated for this drain.
+    while (pending.length > 0) {
+      // Cancellation leaves committed readiness for the next arrival/startup.
+      if (deps.signal?.aborted) return resumed;
+      const wait = pending.shift()!;
+      if (processed.has(wait.waiting + '|' + wait.kind)) continue;
+      const job = await room.tx(async (tx) => {
+        deps.signal?.throwIfAborted();
+        if (wait.kind === 'prev') {
+          const status = await tx.events.getStatus(wait.waiting);
+          if (status === null || status.grounding !== 'pending') {
+            await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
+            return null;
+          }
+          const row = await tx.events.get(wait.waiting);
+          if (row === null) {
+            await tx.waits.remove(wait.missing, wait.waiting, wait.kind);
+            return null;
+          }
+          const prevIds = (JSON.parse(row.pdu) as Pdu).prev_events ?? [];
+          if ((await ungroundedPrevs(tx, prevIds)).length > 0) {
+            await tx.waits.defer(wait);
+            return null;
+          }
+          return { kind: 'prev' as const, eventId: wait.waiting };
+        }
+        if (wait.kind === 'redaction') {
+          if ((await tx.events.get(wait.missing)) === null) return null;
+          return {
+            kind: 'redaction' as const,
+            eventId: wait.waiting,
+            target: wait.missing,
+          };
+        }
+        return null;
+      });
+      if (job === null) continue;
+      processed.add(job.eventId + '|' + job.kind);
+      // Failure leaves the committed ready row for another arrival or startup.
+      if (job.kind === 'prev') {
+        const grounded = await withRoomLock(
+          room.id,
+          () =>
+            room.tx(async (tx) => {
+              deps.signal?.throwIfAborted();
+              const row = await tx.events.get(job.eventId);
+              const status = await tx.events.getStatus(job.eventId);
+              const stay = await tx.segments.openStay();
+              if (row === null || status === null || stay === null) return;
+              const version = await roomVersionOf(tx, stay.id);
+              const pdu = JSON.parse(row.pdu) as Pdu;
+              const result = await ingestInTx(tx, room.id, pdu, {
+                remote: {
+                  origin: status.origin ?? '',
+                  self: deps.self,
+                  // recomputed — the flag is a deterministic function of
+                  // the verified bytes and the version, never persisted
+                  oversized: oversizedOf(pdu, version),
+                  ungroundedMs: 0,
+                },
+              });
+              return result.grounding === 'grounded';
+            }),
+        );
+        if (grounded) await enqueue([job.eventId]);
+      } else {
+        await withRoomLock(room.id, () =>
           room.tx(async (tx) => {
+            deps.signal?.throwIfAborted();
+            const waiting = await tx.waits.of(job.eventId);
+            if (
+              !waiting.some((wait) =>
+                wait.kind === 'redaction' && wait.missing === job.target
+              )
+            ) return;
             const row = await tx.events.get(job.eventId);
-            const status = await tx.events.getStatus(job.eventId);
+            const target = await tx.events.get(job.target);
+            if (row === null || target === null) return;
+            const before = await tx.state.eventStateBefore(job.eventId);
+            if (before === null) return;
             const stay = await tx.segments.openStay();
-            if (row === null || status === null || stay === null) return;
+            if (stay === null) return;
             const version = await roomVersionOf(tx, stay.id);
             const pdu = JSON.parse(row.pdu) as Pdu;
-            const result = await ingestInTx(tx, room.id, pdu, {
-              remote: {
-                origin: status.origin ?? '',
-                self: deps.self,
-                // recomputed — the flag is a deterministic function of
-                // the verified bytes and the version, never persisted
-                oversized: oversizedOf(pdu, version),
-                ungroundedMs: 0,
-              },
-            });
-            return result.grounding === 'grounded';
-          }),
-      );
-      if (grounded) await enqueue([job.eventId]);
-    } else {
-      await withRoomLock(room.id, () =>
-        room.tx(async (tx) => {
-          const waiting = await tx.waits.of(job.eventId);
-          if (
-            !waiting.some((wait) =>
-              wait.kind === 'redaction' && wait.missing === job.target
-            )
-          ) return;
-          const row = await tx.events.get(job.eventId);
-          const target = await tx.events.get(job.target);
-          if (row === null || target === null) return;
-          const before = await tx.state.eventStateBefore(job.eventId);
-          if (before === null) return;
-          const stay = await tx.segments.openStay();
-          if (stay === null) return;
-          const version = await roomVersionOf(tx, stay.id);
-          const pdu = JSON.parse(row.pdu) as Pdu;
-          if (
-            await redactionEffectAllowed(
-              tx,
-              getRulebook(version).spec,
-              pdu,
-              target,
-              before.group,
-            )
-          ) {
-            await tx.changes.append('redaction', job.eventId, {
-              target: job.target,
-            });
-          }
-          await tx.waits.remove(job.target, job.eventId, 'redaction');
-        }));
+            if (
+              await redactionEffectAllowed(
+                tx,
+                getRulebook(version).spec,
+                pdu,
+                target,
+                before.group,
+              )
+            ) {
+              await tx.changes.append('redaction', job.eventId, {
+                target: job.target,
+              });
+            }
+            await tx.waits.remove(job.target, job.eventId, 'redaction');
+          }));
+      }
+      resumed++;
     }
-    resumed++;
+    return resumed;
+  } catch (error) {
+    if (deps.signal?.aborted && error === deps.signal.reason) return resumed;
+    throw error;
   }
-  return resumed;
 }
 
 async function statePduOf(

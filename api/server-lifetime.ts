@@ -2,6 +2,7 @@
 // Never call HttpServer.shutdown while an admitted request may read its body.
 export class ServerLifetime {
   readonly controller = new AbortController();
+  #operations = new AbortController();
   #draining = false;
   #active = new Map<string, number>();
   #idle = new Set<() => void>();
@@ -23,6 +24,14 @@ export class ServerLifetime {
         );
       }
       this.#active.set(name, (this.#active.get(name) ?? 0) + 1);
+      const disconnected = new AbortController();
+      const operation = new Request(request, {
+        signal: AbortSignal.any([
+          request.signal,
+          disconnected.signal,
+          this.#operations.signal,
+        ]),
+      });
       let handled = false, delivered = false;
       const release = () => {
         if (!handled || !delivered) return;
@@ -34,12 +43,13 @@ export class ServerLifetime {
       info.completed.then(() => {
         delivered = true;
         release();
-      }, () => {
+      }, (error) => {
+        disconnected.abort(error);
         delivered = true;
         release();
       });
       try {
-        return await handler(request, info);
+        return await handler(operation, info);
       } finally {
         handled = true;
         release();
@@ -53,7 +63,21 @@ export class ServerLifetime {
 
   abort(): void {
     this.#draining = true;
+    this.#operations.abort();
     this.controller.abort();
+  }
+
+  async settled(): Promise<void> {
+    if (this.count === 0) return;
+    let idle!: () => void;
+    try {
+      await new Promise<void>((resolve) => {
+        idle = resolve;
+        this.#idle.add(idle);
+      });
+    } finally {
+      this.#idle.delete(idle);
+    }
   }
 
   async drain(seconds: number): Promise<Record<string, number>> {

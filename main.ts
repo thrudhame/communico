@@ -34,7 +34,7 @@ globalThis.addEventListener('unhandledrejection', (event) => {
       : new Error(String(event.reason)).stack,
   );
   const timer = setTimeout(() => Deno.exit(1), 2000);
-  void closeStore().then(() => {
+  void lifetime.settled().then(closeStore).then(() => {
     console.error('fatal: store closed');
     clearTimeout(timer);
     Deno.exit(1);
@@ -174,6 +174,7 @@ async function shutdown(): Promise<void> {
     ...servers.map((server) => server.shutdown()),
     admin.shutdown(),
   ]);
+  await lifetime.settled();
   if (fatal) return;
   await closeStore();
   if (fatal) return;

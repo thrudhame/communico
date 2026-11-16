@@ -8,8 +8,16 @@ import {
   scan,
 } from '#engine/backup/checks.ts';
 import type { Manifest } from '#engine/backup/manifest.ts';
+import { receiptMembership } from '#engine/server/receipt-frontier.ts';
+import {
+  roomProjectionSources,
+  tenantProjectionSources,
+  tenantSource,
+} from '#engine/store/projection-sources.ts';
 
-const roomWatermarks = ['room:', 'push-context:', 'client-room-rules:'];
+const roomWatermarks = Object.values(roomProjectionSources).map(({ prefix }) =>
+  prefix
+);
 
 export async function auditServer(
   snapshot: CapturedStore,
@@ -42,15 +50,13 @@ export async function auditServer(
         }
       } else if (file.kind === 'tenants') {
         for (
-          const [suffix, name] of [
-            ['accounts', 'account_changes'],
-            ['e2ee', 'e2ee_changes'],
-            ['public-signing', 'e2ee_changes'],
-            ['pushers', 'pusher_changes'],
-          ]
+          const suffix of Object.keys(
+            tenantProjectionSources,
+          ) as (keyof typeof tenantProjectionSources)[]
         ) {
+          const name = tenantProjectionSources[suffix];
           sourceHeads.set(
-            'tenant:' + file.id + ':' + suffix,
+            tenantSource(suffix, file.id!),
             file.heads['source:' + name] ?? 0,
           );
         }
@@ -95,6 +101,9 @@ export async function auditServer(
         ['redactions', 'room'],
         ['relations', 'room'],
         ['search', 'room'],
+        ['receipt_dag_nodes', 'room'],
+        ['receipt_dag_edges', 'room'],
+        ['receipt_membership_events', 'room'],
       ]
     ) {
       for (
@@ -109,6 +118,58 @@ export async function auditServer(
     }
     for (const room of rooms.values()) {
       await snapshot.read(room, async (source) => {
+        for await (
+          const row of scan(db, 'receipt_dag_nodes', 'event', 'room=?', [
+            room.id,
+          ])
+        ) {
+          if (
+            !(await source.query('SELECT 1 FROM events WHERE id=?', [
+              row.event,
+            ])).length
+          ) auditFailure('receipt graph event reference');
+        }
+        for await (
+          const row of scan(db, 'receipt_dag_edges', 'event,parent', 'room=?', [
+            room.id,
+          ])
+        ) {
+          if (
+            !(await source.query(
+              'SELECT 1 FROM prev_edges WHERE event=? AND prev=?',
+              [row.event, row.parent],
+            )).length ||
+            !(await db.query(
+              'SELECT 1 FROM receipt_dag_nodes WHERE room=? AND event=?',
+              [room.id, row.event],
+            )).length
+          ) auditFailure('receipt graph edge reference');
+        }
+        for await (
+          const row of scan(
+            db,
+            'receipt_membership_events',
+            'event,user,membership',
+            'room=?',
+            [room.id],
+          )
+        ) {
+          const [held] = await source.query(
+            'SELECT pdu FROM events WHERE id=?',
+            [row.event],
+          );
+          const membership = held
+            ? receiptMembership(JSON.parse(String(held.pdu)))
+            : null;
+          if (
+            !membership || membership.user !== row.user ||
+            membership.membership !== row.membership ||
+            !(await db.query(
+              'SELECT 1 FROM receipt_dag_nodes WHERE room=? AND event=?',
+              [room.id, row.event],
+            )).length
+          ) auditFailure('receipt graph membership reference');
+        }
         // Server projections may lag room truth, but may never name absent
         // source events/change positions.
         for (const table of ['event_index', 'feed', 'outbox']) {
