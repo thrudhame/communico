@@ -9,7 +9,12 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
 import { advance } from '#engine/store/watermark.ts';
-import { type Sender, startSender } from '#engine/federation/sender.ts';
+import {
+  notifyPeerAlive,
+  peerStatus,
+  type Sender,
+  startSender,
+} from '#engine/federation/sender.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { signingUpload } from '#engine/e2ee-signing.ts';
 import { startFakeServer } from './federation/fake-server.ts';
@@ -140,6 +145,10 @@ Deno.test('public signing projection replays old intents, seeds subscriptions an
     tenant = await openTenant(store, 'local.test');
     db = await store.server();
     accept = true;
+    // The completed 503 can publish backoff before stop drains. Model the
+    // recovered peer's authenticated contact instead of racing that outcome.
+    await notifyPeerAlive(db, fake.name);
+    assertEquals((await peerStatus(db, fake.name)).nextAttemptMs, 0);
     sender = startSender({ store, signer: tenant.signer() });
     await waitFor(() => received.length === 2);
     assertEquals(attempts[1], attempts[0]);
