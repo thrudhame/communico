@@ -1,7 +1,7 @@
 // Room-owned durable acceptance identities. Only committed targets may leave a
 // room attempt; numeric positions never identify a different room incarnation.
 import type { Conn } from '#engine/store/db.ts';
-import { head } from './changes.ts';
+import { changePosOf, head } from './changes.ts';
 
 export type CompletionCut = Readonly<{
   roomId: string;
@@ -101,11 +101,10 @@ export async function reconcileLegacyCompletion(
   const existing = await completionReceipt(conn, roomId, eventId);
   if (existing !== null) return existing;
   const state = await completionState(conn);
-  const [row] = await conn.query(
-    'SELECT MAX(pos) AS pos FROM changes WHERE event=?',
-    [eventId],
-  );
-  if (row.pos === null || Number(row.pos) > state.legacyThrough) {
+  // Grounding belongs to event/transition records. A later dependency arrival
+  // can append an effect keyed by this event without reauthoring/regrounding it.
+  const groundedAt = await changePosOf(conn, eventId);
+  if (groundedAt === null || groundedAt > state.legacyThrough) {
     throw new Error('E_COMPLETION_LEGACY_CUT: ' + eventId);
   }
   await conn.execute(

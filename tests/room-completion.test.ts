@@ -2,7 +2,8 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
-import { sendLocal } from '#engine/room/ingest.ts';
+import { ingestLocal, redactEvent, sendLocal } from '#engine/room/ingest.ts';
+import { buildInTx } from '#engine/room/build.ts';
 import { genesis } from '#tests/fixtures/genesis.ts';
 import { onProjected, projectThrough } from '#engine/server/project.ts';
 import type { CompletionTarget } from '#engine/room/completion.ts';
@@ -247,6 +248,98 @@ Deno.test('completion: supported v7 upgrade fixes one legacy baseline across reo
     assertEquals(
       await (await openRoom(store, room.id)).tx((tx) => tx.completion.state()),
       state,
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('completion: legacy retry keeps its original grounding witness after a delayed redaction effect', async () => {
+  const dir = await Deno.makeTempDir({
+    prefix: 'legacy-redaction-completion-',
+  });
+  const config = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 16,
+    idleseconds: 300,
+  };
+  const schemas = { room: roomSchema, server: serverSchema };
+  let store = await openStore(config, { schemas });
+  try {
+    const g = await genesis(store, {
+      roomId: '!legacy-redaction-completion:test',
+    });
+    const target = await g.room.tx((tx) =>
+      buildInTx(tx, g.roomId, {
+        type: 'm.room.message',
+        sender: g.creator,
+        content: { body: 'arrives after upgrade' },
+      }, g.signer)
+    );
+    const redaction = await redactEvent(
+      g.room,
+      g.creator,
+      target.event_id!,
+      g.signer,
+    );
+    const pdu = JSON.parse(
+      (await g.room.tx((tx) => tx.events.get(redaction.eventId)))!.pdu,
+    );
+    const baseline = await g.room.tx((tx) => tx.changes.head());
+    assertEquals(
+      await g.room.tx((tx) => tx.changes.redactionOf(target.event_id!)),
+      null,
+    );
+    const db = await store.room(g.roomId);
+    await db.exec(
+      'DROP TABLE completion_receipts; DROP TABLE completion_state',
+    );
+    await db.execute("UPDATE meta SET v='7' WHERE k='schema_version'");
+    await store.close();
+    store = await openStore(config, { schemas });
+    const room = await openRoom(store, g.roomId);
+    await ingestLocal(room, target, g.signer.serverName);
+    assertEquals(
+      await room.tx((tx) => tx.changes.redactionOf(target.event_id!)),
+      redaction.eventId,
+    );
+    const effects = await room.tx(async (tx) =>
+      (await tx.changes.after(baseline, 100)).filter((change) =>
+        change.kind === 'redaction' && change.event === redaction.eventId
+      )
+    );
+    assertEquals(effects.length, 1);
+    assert(effects[0].pos > baseline);
+    assert(
+      (await room.tx((tx) => tx.changes.posOf(redaction.eventId)))! <= baseline,
+    );
+    let finished = '';
+    const result = await sendLocal(
+      room,
+      { type: 'm.room.message', sender: g.creator, content: {} },
+      g.signer,
+      {
+        lookup: () => Promise.resolve({ eventId: redaction.eventId, pdu }),
+        prepare: () => {
+          throw new Error('must not reauthor legacy redaction');
+        },
+        finish: (id) => {
+          finished = id;
+          return Promise.resolve();
+        },
+      },
+    );
+    assertEquals(finished, redaction.eventId);
+    assertEquals(result.completion!.through, baseline);
+    assertEquals(
+      await (await store.room(room.id)).query(
+        'SELECT basis FROM completion_receipts WHERE event=?',
+        [redaction.eventId],
+      ),
+      [{ basis: 'legacy-reconciled' }],
     );
   } finally {
     await store.close();
