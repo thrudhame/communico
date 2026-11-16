@@ -104,7 +104,7 @@ export async function joinResident(
   signer: Signer,
   extraContent?: Record<string, unknown>,
 ): Promise<MembershipOpResult | null> {
-  return await admitJoin(room, userId, signer, extraContent, () => null);
+  return await admitJoin(room, userId, signer, extraContent, () => null, false);
 }
 
 async function admitJoin(
@@ -116,6 +116,7 @@ async function admitJoin(
     tx: RoomTx,
     signer: Signer,
   ) => Promise<MembershipOpResult | null> | null,
+  prepareAbsent = true,
 ): Promise<MembershipOpResult | null> {
   let prepared = signer;
   const result = await withRestrictedAdmission(
@@ -154,10 +155,11 @@ async function admitJoin(
       return { roomId: room.id, eventId: res.eventId, created: true };
     },
     undefined,
-    async () => {
+    async (resident) => {
       await admitLocalJoin(room.store, room.id, userId);
       // This runs under the authoring lock, but outside the room transaction.
       // A retained result needs projection repair, not fresh signing authority.
+      if (!resident && !prepareAbsent) return;
       if ((await membershipOf(room, userId))?.membership !== 'join') {
         prepared = await prepareSigner(signer);
       }
