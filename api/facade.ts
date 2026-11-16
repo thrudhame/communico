@@ -37,6 +37,7 @@ export async function startFacade(lifetime: ServerLifetime) {
           requireScope: runtime.requireScope,
           keyDocument: runtime.keyDocument,
           publicRooms: runtime.publicRooms,
+          passwordLogin: runtime.passwordLogin,
           keys: await runtime.verificationKeys(),
           signer: await runtime.requestSigner(),
           ingress: runtime.ingress,

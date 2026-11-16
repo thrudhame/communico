@@ -62,6 +62,81 @@ function pwAuth(localpart: string, password: string, session?: string): Json {
   return auth;
 }
 
+test('UIA cannot be replayed at another device path or with a changed deletion list', async () => {
+  const localpart = 'uia-bound-paths';
+  const user = await registerTestUser(localpart, 'pw');
+  for (const device of ['first-target', 'second-target']) {
+    assertEquals(
+      (await call('/_matrix/client/v3/login', {
+        method: 'POST',
+        body: loginBody(localpart, 'pw', { device_id: device }),
+      })).status,
+      200,
+    );
+  }
+  const first = '/_matrix/client/v3/devices/first-target';
+  const second = '/_matrix/client/v3/devices/second-target';
+  const challenge = await call(first, {
+    method: 'DELETE',
+    token: user.access_token,
+  });
+  assertEquals(challenge.status, 401);
+  const proof = {
+    auth: pwAuth(localpart, 'pw', challenge.body.session as string),
+  };
+  const changedPath = await call(second, {
+    method: 'DELETE',
+    token: user.access_token,
+    body: proof,
+  });
+  assertEquals([changedPath.status, changedPath.body.errcode], [
+    403,
+    'M_FORBIDDEN',
+  ]);
+  assertEquals((await call(second, { token: user.access_token })).status, 200);
+  assertEquals(
+    (await call(first, {
+      method: 'DELETE',
+      token: user.access_token,
+      body: proof,
+    })).status,
+    200,
+  );
+  const bulk = '/_matrix/client/v3/delete_devices';
+  const held = await call(bulk, {
+    method: 'POST',
+    token: user.access_token,
+    body: { devices: ['second-target'] },
+  });
+  assertEquals(held.status, 401);
+  const auth = pwAuth(localpart, 'pw', held.body.session as string);
+  const changedList = await call(bulk, {
+    method: 'POST',
+    token: user.access_token,
+    body: { devices: [user.device_id], auth },
+  });
+  assertEquals([changedList.status, changedList.body.errcode], [
+    403,
+    'M_FORBIDDEN',
+  ]);
+  assertEquals((await call(second, { token: user.access_token })).status, 200);
+  assertEquals(
+    (await call(bulk, {
+      method: 'POST',
+      token: user.access_token,
+      body: { devices: ['second-target'], auth },
+    })).status,
+    200,
+  );
+  assertEquals((await call(second, { token: user.access_token })).status, 404);
+  assertEquals(
+    (await call('/_matrix/client/v3/account/whoami', {
+      token: user.access_token,
+    })).status,
+    200,
+  );
+});
+
 test('register: dummy auth WITHOUT a session → 401 (session required); with the session → 200', async () => {
   // Wire pin for the Complement TestRegistration regression caught by the
   // M2 baseline run: register's UIA session is required, never one-shot
@@ -363,7 +438,8 @@ test('A6: deactivate — flows include m.login.password; wrong pw 401 M_FORBIDDE
     body: loginBody('a6user', 'pw-a6'),
   });
   assertEquals(login.status, 403);
-  assertEquals(login.body.errcode, 'M_USER_DEACTIVATED');
+  assertEquals(login.body.errcode, 'M_FORBIDDEN');
+  assertEquals(login.body.access_token, undefined);
 });
 
 test('A2+A3: profile displayname/avatar_url — authed self-write, UNauthed read, foreign mxc verbatim, other-user write → 403', async () => {

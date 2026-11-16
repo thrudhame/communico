@@ -8,6 +8,13 @@ import type { Conn } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Tenant, TenantTx } from '#engine/tenant/index.ts';
 import { deviceById } from '#engine/tenant/devices.ts';
+import {
+  recordOtherSessionRevocations,
+  recordRefreshReplacement,
+  recordRevocation,
+  recordSession,
+} from '#engine/tenant/session-authority.ts';
+import { deletePushersForToken } from '#engine/tenant/pushers.ts';
 
 // The informational access-token lifetime advertised at refresh (band C
 // D8: expires_in_ms is advertised, never enforced — spec: optional).
@@ -54,6 +61,7 @@ export async function insertAccessToken(
     'INSERT INTO access_tokens (token, localpart, device_id, generation, expires_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT (token) DO NOTHING',
     [hash, localpart, deviceId, device?.generation ?? null, expiresMs],
   );
+  await recordSession(conn, hash, localpart, deviceId);
 }
 
 export type AccessTokenRow = {
@@ -112,13 +120,40 @@ export async function deleteAccessToken(
   conn: Conn,
   hash: string,
 ): Promise<void> {
+  await recordRevocation(conn, hash);
   await conn.execute('DELETE FROM access_tokens WHERE token = ?', [hash]);
+}
+
+export async function deleteOtherTokens(
+  conn: Conn,
+  localpart: string,
+  keepHash: string | null,
+): Promise<string | null> {
+  const keep = keepHash === null
+    ? null
+    : await accessTokenByHash(conn, keepHash);
+  if (!keep || keep.localpart !== localpart) keepHash = null;
+  const keepDevice = keepHash === null ? null : keep!.device_id;
+  await recordOtherSessionRevocations(conn, localpart, keepHash, keepDevice);
+  for (const token of await accessTokensOfUser(conn, localpart)) {
+    if (token.token === keepHash) continue;
+    await deletePushersForToken(conn, token.token);
+    await deleteRefreshForAccessToken(conn, token.token);
+    await deleteAccessToken(conn, token.token);
+  }
+  return keepDevice;
 }
 
 export async function deleteAccessTokensOfUser(
   conn: Conn,
   localpart: string,
+  record = true,
 ): Promise<void> {
+  if (record) {
+    for (const row of await accessTokensOfUser(conn, localpart)) {
+      await recordRevocation(conn, row.token);
+    }
+  }
   await conn.execute('DELETE FROM access_tokens WHERE localpart = ?', [
     localpart,
   ]);
@@ -140,6 +175,7 @@ export async function insertRefreshToken(
     'INSERT INTO refresh_tokens (token, localpart, device_id, generation, access_token) VALUES (?, ?, ?, ?, ?)',
     [hash, localpart, deviceId, access.generation, accessHash],
   );
+  await recordSession(conn, hash, localpart, deviceId, accessHash);
 }
 
 export type RefreshTokenRow = {
@@ -172,6 +208,7 @@ export async function deleteRefreshToken(
   conn: Conn,
   hash: string,
 ): Promise<void> {
+  await recordRevocation(conn, hash);
   await conn.execute('DELETE FROM refresh_tokens WHERE token = ?', [hash]);
 }
 
@@ -179,6 +216,12 @@ export async function deleteRefreshForAccessToken(
   conn: Conn,
   accessHash: string,
 ): Promise<void> {
+  for (
+    const row of await conn.query(
+      'SELECT token FROM refresh_tokens WHERE access_token=?',
+      [accessHash],
+    )
+  ) await recordRevocation(conn, String(row.token));
   await conn.execute('DELETE FROM refresh_tokens WHERE access_token = ?', [
     accessHash,
   ]);
@@ -187,7 +230,16 @@ export async function deleteRefreshForAccessToken(
 export async function deleteRefreshTokensOfUser(
   conn: Conn,
   localpart: string,
+  record = true,
 ): Promise<void> {
+  if (record) {
+    for (
+      const row of await conn.query(
+        'SELECT token FROM refresh_tokens WHERE localpart=?',
+        [localpart],
+      )
+    ) await recordRevocation(conn, String(row.token));
+  }
   await conn.execute('DELETE FROM refresh_tokens WHERE localpart = ?', [
     localpart,
   ]);
@@ -198,6 +250,12 @@ export async function confirmRefreshToken(
   conn: Conn,
   hash: string,
 ): Promise<void> {
+  for (
+    const row of await conn.query(
+      'SELECT token FROM refresh_tokens WHERE next_token=?',
+      [hash],
+    )
+  ) await recordRevocation(conn, String(row.token));
   await conn.execute('DELETE FROM refresh_tokens WHERE next_token = ?', [hash]);
 }
 
@@ -205,6 +263,12 @@ export async function confirmAccessToken(
   conn: Conn,
   hash: string,
 ): Promise<void> {
+  for (
+    const row of await conn.query(
+      'SELECT token FROM refresh_tokens WHERE access_token=? AND next_token IS NOT NULL',
+      [hash],
+    )
+  ) await recordRevocation(conn, String(row.token));
   await conn.execute(
     'DELETE FROM refresh_tokens WHERE access_token = ? AND next_token IS NOT NULL',
     [hash],
@@ -219,6 +283,7 @@ export async function replaceRefreshToken(
   nextHash: string,
   accessHash: string,
 ): Promise<void> {
+  await recordRefreshReplacement(conn, hash, nextHash, accessHash);
   await conn.execute(
     'UPDATE refresh_tokens SET next_token = ?, access_token = ? WHERE token = ?',
     [nextHash, accessHash, hash],
@@ -250,6 +315,7 @@ export async function lookupToken(
 ): Promise<TokenInfo | null> {
   const hash = await hashToken(token);
   return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'session', hash, refresh: false });
     const row = await tx.tokens.byHash(hash);
     if (row === null) return null;
     if (row.device_id !== null) {
@@ -294,6 +360,7 @@ export async function consumeRefreshToken(
 > {
   const hash = await hashToken(refreshToken);
   return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'session', hash, refresh: true });
     const row = await tx.refresh.byHash(hash);
     if (row === null) {
       throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'unknown refresh token');
@@ -344,6 +411,7 @@ export async function consumeRefreshToken(
 export async function revokeToken(tenant: Tenant, token: string) {
   const hash = await hashToken(token);
   await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'session', hash, refresh: false });
     const row = await tx.tokens.byHash(hash);
     const deviceId = row === null ? null : row.device_id;
     await tx.pushers.deleteForToken(hash);
@@ -374,6 +442,7 @@ export async function revokeAllTokens(
   localpart: string,
 ): Promise<void> {
   await tenant.tx(async (tx) => {
+    await tx.tokens.barrier(localpart);
     await tx.pushers.deleteForUser(localpart);
     await tx.refresh.deleteForUser(localpart);
     await tx.tokens.deleteForUser(localpart);

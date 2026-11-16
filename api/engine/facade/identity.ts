@@ -25,6 +25,7 @@ export async function enrolledTenant(
   pairings: Pairings,
   server: string,
   node: string,
+  ingress?: import('#engine/tenant/ingress.ts').IngressAuthority,
 ): Promise<Tenant> {
   const grant = await pairings.active();
   const db = await store.server();
@@ -49,7 +50,7 @@ export async function enrolledTenant(
     keyId: identity.keyId,
     publicB64: identity.publicKey,
     privateB64: String(row.private_key),
-  });
+  }, { ingress });
 }
 
 export type NodeIdentity = {

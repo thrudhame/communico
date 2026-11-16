@@ -35,6 +35,13 @@ import type { TransactionDeps } from '#engine/federation/transactions.ts';
 import type { Stream } from './protocol.ts';
 import { EgressOwner } from './egress.ts';
 import { dispatchBatch } from '#engine/federation/sender.ts';
+import {
+  AccountSnapshots,
+  exportSessionAuthority,
+  startAccountExports,
+} from './accounts.ts';
+import { AuthLinkHealth, FacadeAuth } from './auth.ts';
+import { startDeactivationWork } from '#engine/deactivation.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -42,7 +49,8 @@ export async function openFacadeRuntime(
     Promise.resolve(false),
 ) {
   const settings = config().facade;
-  const caps = capabilities(config().server.role);
+  const caps = capabilities(config().server.role, settings.phase);
+  const authHealth = new AuthLinkHealth(settings);
   if (!caps.service('link-server')) {
     throw new LinkError(
       'LINK_IDENTITY_MISMATCH',
@@ -69,6 +77,8 @@ export async function openFacadeRuntime(
   let initializing: Promise<NodeIdentity> | undefined;
   let inbox: ReturnType<typeof startInboxWorker> | undefined;
   let mailbox: Mailbox | undefined;
+  let authExports: ReturnType<typeof startAccountExports> | undefined;
+  let deactivation: ReturnType<typeof startDeactivationWork> | undefined;
   const pairings = () => {
     if (!node) {
       throw new LinkError(
@@ -96,6 +106,13 @@ export async function openFacadeRuntime(
         (await keyOwner()).verificationKeys(),
       ),
     );
+  const ownerControls = async () =>
+    new OwnerControls(
+      server,
+      await store.tenant(identity.server),
+      await pairings(),
+      node!,
+    );
   const refresh = async () => {
     notices.changed();
     inbox?.wake();
@@ -117,7 +134,57 @@ export async function openFacadeRuntime(
         403,
       );
     }
-    tenant = await enrolledTenant(store, owner, identity.server, identity.node);
+    tenant = await enrolledTenant(
+      store,
+      owner,
+      identity.server,
+      identity.node,
+      settings.phase === 'f2'
+        ? new FacadeAuth(server, owner, node, authHealth, settings)
+        : undefined,
+    );
+    if (caps.service('deactivation') && !deactivation) {
+      deactivation = startDeactivationWork({
+        store,
+        tenant,
+        pollseconds: settings.pollseconds,
+        prepareSigner: async () => (await keyOwner()).prepareSigner(),
+        // OOB rejection is durable at its existing intent owner. B7 composes
+        // the performing sender; link observers are woken without a home RPC.
+        wake: () => notices.changed(),
+        failed: (error) =>
+          console.error(
+            'facade deactivation pending:',
+            error instanceof LinkError ? error.code : 'M_UNAVAILABLE',
+          ),
+      });
+    }
+    if (settings.phase === 'f2' && !authExports) {
+      authExports = startAccountExports({
+        store,
+        tenant,
+        pollseconds: settings.pollseconds,
+        users: async () =>
+          (await (await store.tenant(identity.server)).query(
+            'SELECT localpart FROM account_auth_snapshots ORDER BY localpart',
+          )).map((row) => String(row.localpart)),
+        emit: async (localpart) =>
+          exportSessionAuthority(
+            store,
+            tenant!,
+            await pairings(),
+            await ownerControls(),
+            node!,
+            localpart,
+          ),
+        changed: () => notices.changed(),
+        failed: (error) =>
+          console.error(
+            'facade auth export:',
+            error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
+          ),
+      });
+    }
   };
   const acceptConfigured = async () => {
     // A file bootstraps a binding, not a second live registry. Restart never
@@ -150,11 +217,13 @@ export async function openFacadeRuntime(
         stream.stream === 'control'
           ? await (await keyOwner()).apply(journal, stream)
           : stream.stream === 'owner-control'
-          ? await new OwnerControls(
-            server,
-            await store.tenant(identity.server),
+          ? await (await ownerControls()).apply(journal, stream)
+          : settings.phase === 'f2' && stream.stream.startsWith('auth:')
+          ? await new AccountSnapshots(
+            store,
+            tenant!,
             await pairings(),
-            node!,
+            await ownerControls(),
           ).apply(journal, stream)
           : stream.stream === 'directory'
           ? await new DirectoryReplicas(
@@ -200,6 +269,7 @@ export async function openFacadeRuntime(
     pairings,
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),
+    prepareSigner: async () => (await keyOwner()).prepareSigner(),
     async ingress(transaction: TransactionDeps) {
       if (mailbox) return mailbox;
       const owner = await pairings();
@@ -228,6 +298,16 @@ export async function openFacadeRuntime(
         }
         throw error;
       }
+    },
+    async passwordLogin() {
+      if (
+        !tenant || settings.phase !== 'f2' || !settings.replicatecredentials
+      ) return false;
+      await (await pairings()).active();
+      const rows = await (await store.tenant(identity.server)).query(
+        'SELECT 1 FROM account_auth_snapshots a JOIN credentials c ON c.localpart=a.localpart JOIN users u ON u.localpart=a.localpart WHERE a.credentials=1 AND u.deactivated=0 LIMIT 1',
+      );
+      return rows.length !== 0;
     },
     async requireScope(scope: string, allowAbsent?: boolean) {
       return await new DirectoryReplicas(
@@ -292,6 +372,7 @@ export async function openFacadeRuntime(
         keyId: node?.keyId ?? null,
         matrix: false,
         scopes: active ? await (await roomOwner()).scopes(active.id) : [],
+        streams: active ? await journal.streams('home', 'in') : [],
         keyRoster: active
           ? await (await keyOwner()).status()
           : { ready: false, revision: 0, lastHome: null },
@@ -321,6 +402,8 @@ export async function openFacadeRuntime(
         notices,
         changed: refresh,
         contacted: async () => await (await keyOwner()).contact(),
+        reconciling: () => authHealth.reconciliation(),
+        connected: (pairing, signal) => authHealth.connected(pairing, signal),
         signKeyDocument: async (raw) => await (await keyOwner()).cosign(raw),
       })(request, peerPin);
     },
@@ -328,7 +411,9 @@ export async function openFacadeRuntime(
     keyDocument: async () => await (await keyOwner()).document(),
     close: () =>
       closed ??= (async () => {
+        await authExports?.close();
         await inbox?.close();
+        await deactivation?.close();
         await store.close();
       })(),
   };

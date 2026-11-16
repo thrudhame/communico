@@ -10,6 +10,7 @@ import {
 import type { Conn, Database } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { Grant, Pairings, Signed } from './pairing.ts';
@@ -249,9 +250,16 @@ export async function exportOwnerControl(
       payload: signed,
     });
   });
-  await (await store.tenant(tenant.serverName)).tx((conn) =>
-    install(conn, signed)
-  );
+  await (await store.tenant(tenant.serverName)).tx(async (conn) => {
+    await install(conn, signed);
+    await activateTenantAuthority(conn, {
+      node: 'home',
+      incarnation: body.nodes[0].incarnation,
+      homeIncarnation: body.nodes[0].incarnation,
+      edgeNode: body.nodes[1].node,
+      edgeIncarnation: body.nodes[1].incarnation,
+    });
+  });
   return record;
 }
 
@@ -329,7 +337,16 @@ export class OwnerControls {
       await assertGrant(conn, grant, 'facade');
       await install(conn, signed);
     });
-    await this.tenant.tx((conn) => install(conn, signed));
+    await this.tenant.tx(async (conn) => {
+      await install(conn, signed);
+      await activateTenantAuthority(conn, {
+        node: this.node.node,
+        incarnation: this.node.incarnation,
+        homeIncarnation: signed.body.nodes[0].incarnation,
+        edgeNode: signed.body.nodes[1].node,
+        edgeIncarnation: signed.body.nodes[1].incarnation,
+      });
+    });
     // Authority revalidation and the apply ACK share the journal transaction.
     // A separate check followed by complete() would reopen a revocation race.
     return await journal.apply('home', stream, async (conn, current) => {

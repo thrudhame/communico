@@ -3,7 +3,7 @@ import { localpartOf } from '#engine/tenant/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { theApp } from '#engine/app.ts';
 import { deleteDevices } from '#engine/tenant/devices.ts';
-import { PASSWORD_FLOWS, requireUia } from '#engine/tenant/uia.ts';
+import { PASSWORD_FLOWS, requireUia, uiaAction } from '#engine/tenant/uia.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
 // POST /_matrix/client/v3/delete_devices — "Deletes the given devices, and
@@ -26,15 +26,19 @@ export default async function (request: PathfinderRequest, context: Context) {
     }
   }
   const caller = context.state.user as string;
-  await requireUia(theApp().tenant, {
+  const authorization = await requireUia(theApp().tenant, {
     body,
     flows: PASSWORD_FLOWS,
     caller,
+    token: context.state.token,
+    action: uiaAction('delete-devices', deviceIds),
+    targets: deviceIds as string[],
   });
   await deleteDevices(
     theApp().tenant,
     localpartOf(caller),
     body.devices as string[],
+    authorization,
   );
   return {};
 }

@@ -152,7 +152,13 @@ export class JournalReconciler {
         ack.received.sequence,
         limits,
       );
-      const next = await client.push(stream, page.records, ack.applied, signal);
+      const next = await client.push(
+        stream,
+        page.records,
+        ack.applied,
+        signal,
+        page.head,
+      );
       await journal.ack(
         peer,
         stream,

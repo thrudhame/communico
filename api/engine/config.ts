@@ -307,7 +307,7 @@ export function loadConfig(opts: {
   for (
     const [node, allowed] of [
       ['server.role', ['home', 'facade']],
-      ['facade.phase', ['f1']],
+      ['facade.phase', ['f1', 'f2']],
       ['facade.notify', ['websocket', 'sse', 'poll']],
       ['facade.outbound', ['direct', 'facade']],
       ['facade.replicaterooms', ['local']],
