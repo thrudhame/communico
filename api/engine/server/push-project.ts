@@ -1,7 +1,7 @@
 // Prepare immutable push input outside the server transaction. Room context
 // is one snapshot; each tenant's rules, ignore list and revisions share a tx.
 import { canSeeEventAt } from '#engine/client/visibility.ts';
-import type { Room } from '#engine/room/index.ts';
+import type { Room, RoomTx } from '#engine/room/index.ts';
 import type { Store } from '#engine/store/index.ts';
 import { openTenant } from '#engine/tenant/index.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
@@ -140,76 +140,106 @@ export async function capturePush(
   pos: number,
   localServers: string[],
 ): Promise<PushCapture> {
-  const context = await room.tx(async (tx) => {
-    const group = await tx.state.publishedAt(stay, pos);
-    const row = await tx.events.get(eventId);
-    if (row === null || group === null) {
-      throw new Error('push publication lacks room context');
-    }
-    const event = {
-      ...JSON.parse(row.pdu),
-      event_id: eventId,
-      room_id: room.id,
-    } as Pdu;
-    const live = await tx.state.groupMap(group);
-    const pduAt = async (id: string | undefined) => {
-      const r = id === undefined ? null : await tx.events.get(id);
-      return r === null ? null : JSON.parse(r.pdu) as Pdu;
-    };
-    const members = [];
-    for (const [key, id] of live) {
-      if (!key.startsWith('m.room.member\0')) continue;
-      const pdu = await pduAt(id);
-      const user = key.slice('m.room.member\0'.length);
-      members.push({ user, content: pdu?.content ?? {} });
-    }
-    const refs = await tx.state.eventReadState(eventId);
-    const at = refs === null
-      ? new Map<string, string>()
-      : await tx.state.groupMap(refs.before.group);
-    // The create event has an empty before-state; it supplies its own version.
-    const create = event.type === 'm.room.create'
-      ? event
-      : await pduAt(at.get('m.room.create\0'));
-    if (create === null) throw new Error('push publication lacks create event');
-    const spec = getRulebook(create.content.room_version ?? '1').spec;
-    const power = await pduAt(at.get('m.room.power_levels\0'));
-    const parsed = parsePowerLevels(power?.content, spec);
-    const recipients = [];
-    for (const member of members) {
-      if (member.user === event.sender) continue;
-      const domain = member.user.slice(member.user.indexOf(':') + 1);
-      if (!localServers.includes(domain)) continue;
-      const invited = event.type === 'm.room.member' &&
-        event.state_key === member.user &&
-        event.content.membership === 'invite';
-      if (member.content.membership !== 'join' && !invited) continue;
-      if (!await canSeeEventAt(member.user, tx, eventId, group)) continue;
-      recipients.push({
-        tenant: domain,
-        user: member.user,
-        displayName: typeof member.content.displayname === 'string'
-          ? member.content.displayname
-          : null,
-      });
-    }
-    return {
-      event,
-      recipients,
-      joinedCount: members.filter((m) =>
-        m.content.membership === 'join'
-      ).length,
-      senderPower: userPowerLevel(event.sender, power, create, spec),
-      notificationPower: parsed.ok ? parsed.pl.notifications : {},
-    };
-  });
+  const [capture] = await capturePushes(
+    room,
+    [{ eventId, stay, pos }],
+    localServers,
+  );
+  return capture;
+}
+
+/** One attempt owns the page's immutable state reader; that reader never escapes. */
+export async function capturePushes(
+  room: Room,
+  events: readonly { eventId: string; stay: number; pos: number }[],
+  localServers: string[],
+): Promise<PushCapture[]> {
+  if (events.length === 0) return [];
+  return await room.tx((tx) =>
+    capturePushesAt(tx, room.id, events, localServers)
+  );
+}
+
+/** Compose with a caller's room-only capture attempt, never a tenant transaction. */
+export async function capturePushesAt(
+  tx: RoomTx,
+  roomId: string,
+  events: readonly { eventId: string; stay: number; pos: number }[],
+  localServers: string[],
+): Promise<PushCapture[]> {
+  const captures: PushCapture[] = [];
+  for (const event of events) {
+    captures.push(await capturePushAt(tx, roomId, event, localServers));
+  }
+  return captures;
+}
+
+async function capturePushAt(
+  tx: RoomTx,
+  roomId: string,
+  { eventId, stay, pos }: { eventId: string; stay: number; pos: number },
+  localServers: string[],
+): Promise<PushCapture> {
+  const group = await tx.state.publishedAt(stay, pos);
+  const row = await tx.events.get(eventId);
+  if (row === null || group === null) {
+    throw new Error('push publication lacks room context');
+  }
+  const event = {
+    ...JSON.parse(row.pdu),
+    event_id: eventId,
+    room_id: roomId,
+  } as Pdu;
+  const live = await tx.state.groupMap(group);
+  const pduAt = async (id: string | undefined) => {
+    const r = id === undefined ? null : await tx.events.get(id);
+    return r === null ? null : JSON.parse(r.pdu) as Pdu;
+  };
+  const members = [];
+  for (const [key, id] of live) {
+    if (!key.startsWith('m.room.member\0')) continue;
+    const pdu = await pduAt(id);
+    const user = key.slice('m.room.member\0'.length);
+    members.push({ user, content: pdu?.content ?? {} });
+  }
+  const refs = await tx.state.eventReadState(eventId);
+  const at = refs === null
+    ? new Map<string, string>()
+    : await tx.state.groupMap(refs.before.group);
+  // The create event has an empty before-state; it supplies its own version.
+  const create = event.type === 'm.room.create'
+    ? event
+    : await pduAt(at.get('m.room.create\0'));
+  if (create === null) throw new Error('push publication lacks create event');
+  const spec = getRulebook(create.content.room_version ?? '1').spec;
+  const power = await pduAt(at.get('m.room.power_levels\0'));
+  const parsed = parsePowerLevels(power?.content, spec);
+  const recipients = [];
+  for (const member of members) {
+    if (member.user === event.sender) continue;
+    const domain = member.user.slice(member.user.indexOf(':') + 1);
+    if (!localServers.includes(domain)) continue;
+    const invited = event.type === 'm.room.member' &&
+      event.state_key === member.user &&
+      event.content.membership === 'invite';
+    if (member.content.membership !== 'join' && !invited) continue;
+    if (!await canSeeEventAt(member.user, tx, eventId, group)) continue;
+    recipients.push({
+      tenant: domain,
+      user: member.user,
+      displayName: typeof member.content.displayname === 'string'
+        ? member.content.displayname
+        : null,
+    });
+  }
   return {
     context: {
-      event: { ...context.event },
-      joinedCount: context.joinedCount,
-      senderPower: context.senderPower,
-      notificationPower: context.notificationPower,
+      event: { ...event },
+      joinedCount:
+        members.filter((m) => m.content.membership === 'join').length,
+      senderPower: userPowerLevel(event.sender, power, create, spec),
+      notificationPower: parsed.ok ? parsed.pl.notifications : {},
     },
-    recipients: context.recipients,
+    recipients,
   };
 }

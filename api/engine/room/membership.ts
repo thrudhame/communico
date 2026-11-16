@@ -9,7 +9,7 @@ import { validEventUserId } from '#engine/ids.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Room, RoomTx } from '#engine/room/index.ts';
 import { afterLocalCommit, sendLocal } from '#engine/room/ingest.ts';
-import type { Signer } from '#engine/room/signer.ts';
+import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -114,6 +114,7 @@ async function admitJoin(
   extraContent?: Record<string, unknown>,
   absent?: (tx: RoomTx) => Promise<MembershipOpResult | null> | null,
 ): Promise<MembershipOpResult | null> {
+  signer = await prepareSigner(signer);
   const result = await withRestrictedAdmission(
     room,
     userId,
@@ -179,6 +180,7 @@ export async function leave(
   signer: Signer,
   reason?: string,
 ): Promise<MembershipOpResult> {
+  signer = await prepareSigner(signer);
   const outcome = await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
       const current = await membershipInTx(tx, userId);
@@ -329,6 +331,7 @@ export async function reopen(
   signer: Signer,
   content: Record<string, unknown>,
 ): Promise<MembershipOpResult> {
+  signer = await prepareSigner(signer);
   return (await admitJoin(room, userId, signer, content, async (tx) => {
     const last = await tx.segments.latestStay();
     const group = last === null ? null : await tx.state.current(last.id);

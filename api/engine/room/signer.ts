@@ -9,4 +9,11 @@ export interface Signer {
   // Sign the canonical bytes of the (redacted) event; returns the base64
   // signature.
   sign(canonical: string): Promise<string>;
+  // A guarded request signer captures its byte-only event permit before a room
+  // transaction. Prepared permits and standalone signers have no preparation.
+  prepare?(): Promise<Signer>;
+}
+
+export async function prepareSigner(signer: Signer): Promise<Signer> {
+  return signer.prepare ? await signer.prepare() : signer;
 }

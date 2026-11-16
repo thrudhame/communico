@@ -435,6 +435,7 @@ export class FacadeKeys {
     return {
       serverName: this.signer.serverName,
       keyId: this.signer.keyId,
+      prepare: () => this.prepareSigner(),
       sign: async (canonical) => {
         return await (await this.prepareSigner()).sign(canonical);
       },

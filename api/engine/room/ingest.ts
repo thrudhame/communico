@@ -60,7 +60,7 @@ import {
   redactionEffectAllowed,
   redactionTarget,
 } from '#engine/room/redaction.ts';
-import type { Signer } from '#engine/room/signer.ts';
+import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import { mapEntries } from '#engine/room/state.ts';
 import { oversizedOf } from '#engine/room/verify.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
@@ -124,7 +124,7 @@ export async function sendLocal(
   return await submitLocal(
     room,
     signer,
-    (tx) => buildInTx(tx, room.id, partial, signer),
+    (tx, permit) => buildInTx(tx, room.id, partial, permit),
     submission,
     localJoiningUser(partial),
   );
@@ -204,7 +204,7 @@ async function submissionReceipt(
 async function submitLocal(
   room: Room,
   signer: Signer,
-  build: (tx: RoomTx) => Promise<Pdu>,
+  build: (tx: RoomTx, signer: Signer) => Promise<Pdu>,
   submission?: LocalSubmission,
   joiningUser?: string,
 ): Promise<IngestLocalResult> {
@@ -213,17 +213,19 @@ async function submitLocal(
       await admitLocalJoin(room.store, room.id, joiningUser);
     }
     if (submission === undefined) {
+      const permit = await prepareSigner(signer);
       return await room.tx(async (tx) => {
-        const pdu = await build(tx);
+        const pdu = await build(tx, permit);
         await assertLocalAnnotation(tx, pdu);
         return await ingestInTx(tx, room.id, pdu, { self: signer.serverName });
       });
     }
     let prepared = await submission.lookup();
     if (prepared === null) {
+      const permit = await prepareSigner(signer);
       const built = await room.tx(async (tx) => {
         await submission.admit?.(tx);
-        const pdu = await build(tx);
+        const pdu = await build(tx, permit);
         await assertLocalAnnotation(tx, pdu);
         const stay = await tx.segments.openStay();
         const group = stay === null ? null : await tx.state.current(stay.id);
@@ -1140,7 +1142,7 @@ export async function redactEvent(
   reason?: string,
   submission?: LocalSubmission,
 ): Promise<{ eventId: string }> {
-  const res = await submitLocal(room, signer, async (tx) => {
+  const res = await submitLocal(room, signer, async (tx, permit) => {
     const stay = await tx.segments.openStay();
     if (stay === null) {
       throw new Error('E_ROOM_ARCHIVED: no open stay for ' + room.id);
@@ -1185,7 +1187,7 @@ export async function redactEvent(
       partial.redacts = targetEventId;
     }
     if (reason !== undefined) content.reason = reason;
-    return await buildInTx(tx, room.id, partial, signer);
+    return await buildInTx(tx, room.id, partial, permit);
   }, submission);
   if (res.standing === 'rejected') {
     throw new MatrixError(

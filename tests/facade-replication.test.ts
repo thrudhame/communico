@@ -7,6 +7,14 @@ import {
 } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
+import {
+  createRoom as createClientRoom,
+  redactEvent,
+  sendEvent,
+  writeStateKey,
+} from '#engine/client/write.ts';
+import { type PreparedSubmission, sendLocal } from '#engine/room/ingest.ts';
+import * as localMembership from '#engine/room/membership.ts';
 import { deviceListService } from '#engine/federation/device-lists.ts';
 import { eduState } from '#engine/federation/edus.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
@@ -1311,6 +1319,128 @@ Deno.test('replica device composition borrows the node service and binds its dis
     await recovery?.stop();
     await closeApp();
     await peer.close();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('facade authorship captures room permits and never exposes the raw tenant signer', async () => {
+  const f = await fixture();
+  let allowed = true, preparations = 0, signatures = 0;
+  const raw = f.node.signer();
+  const guarded = {
+    serverName: raw.serverName,
+    keyId: raw.keyId,
+    sign: () =>
+      Promise.reject(
+        new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'request signer is not a room permit',
+        ),
+      ),
+    prepare: async () => {
+      preparations++;
+      // The store rejects this cross-file access if preparation happens inside
+      // a room transaction. The byte signer below must not open this file.
+      await (await f.edgeServer()).query('SELECT 1');
+      if (!allowed) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'signing expired');
+      }
+      return {
+        serverName: raw.serverName,
+        keyId: raw.keyId,
+        sign: async (bytes: string) => {
+          if (!allowed) {
+            throw new MatrixError(503, 'M_UNAVAILABLE', 'signing expired');
+          }
+          signatures++;
+          return await raw.sign(bytes);
+        },
+      };
+    },
+  };
+  try {
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      keys: keyStore(await f.edgeServer(), { signer: guarded }),
+      signer: guarded,
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+    });
+    await assertRejects(
+      () => app.tenant.signer().sign('unprepared'),
+      MatrixError,
+      'request signer',
+    );
+    const user = '@alice:logical.test';
+    const created = await createClientRoom({
+      creator: user,
+      preset: 'public_chat',
+    });
+    const room = await openRoom(app.store, created.roomId);
+    const message = await sendEvent(
+      room.id,
+      user,
+      'm.room.encrypted',
+      { algorithm: 'm.megolm.v1.aes-sha2', ciphertext: 'opaque' },
+      null,
+      'send',
+    );
+    await writeStateKey(room.id, user, 'm.room.topic', '', { topic: 'facade' });
+    await redactEvent(
+      room.id,
+      user,
+      message.event_id,
+      undefined,
+      null,
+      'redact',
+    );
+    await localMembership.leave(room, user, app.tenant.signer());
+    await localMembership.reopen(room, user, app.tenant.signer(), {});
+    let saved: PreparedSubmission | null = null;
+    const submission = {
+      lookup: () => Promise.resolve(saved),
+      prepare: (pdu: Pdu) =>
+        Promise.resolve(saved = { eventId: String(pdu.event_id), pdu }),
+      finish: () => Promise.resolve(),
+    };
+    const partial = {
+      type: 'm.room.encrypted',
+      sender: user,
+      content: { algorithm: 'm.megolm.v1.aes-sha2', ciphertext: 'receipt' },
+    };
+    const original = await sendLocal(
+      room,
+      partial,
+      app.tenant.signer(),
+      submission,
+    );
+    const cut = { preparations, signatures };
+    allowed = false;
+    const replay = await sendLocal(
+      room,
+      { ...partial, content: { ciphertext: 'changed retry' } },
+      app.tenant.signer(),
+      submission,
+    );
+    assertEquals(replay.eventId, original.eventId);
+    assertEquals(replay.receipt, true);
+    assertEquals({ preparations, signatures }, cut);
+    await assertRejects(
+      () => sendLocal(room, partial, app.tenant.signer()),
+      MatrixError,
+      'expired',
+    );
+    assertEquals(signatures, cut.signatures);
+    assert(preparations >= 8);
+  } finally {
+    await closeApp();
     await f.close();
     setConfigForTests({});
   }

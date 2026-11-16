@@ -265,7 +265,9 @@ export async function openReplicaApp(
     const app: App = {
       store,
       server,
-      tenant,
+      // Public clients may not recover the provisioned raw key by reaching
+      // through the tenant. Link coordinators keep their own node identity.
+      tenant: { ...tenant, signer: () => replica.signer },
       federationKeys: replica.keys,
       federationEdus,
       get federationIngress() {
