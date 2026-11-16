@@ -33,6 +33,7 @@ export type FederationRequest_ = {
   authorization: string | null;
   // the raw body (empty when there is none)
   body: Uint8Array;
+  signal?: AbortSignal;
 };
 
 export type AuthDeps = {
@@ -56,6 +57,7 @@ export async function authenticateRequest(
   destination: string,
   req: FederationRequest_,
 ): Promise<string> {
+  req.signal?.throwIfAborted();
   // 1. federation must be on
   assertFederationEnabled();
 
@@ -68,6 +70,7 @@ export async function authenticateRequest(
 
   const now = Date.now();
   for (const candidate of candidates) {
+    req.signal?.throwIfAborted();
     // 3. destination, when present, must be the tenant we arrived at
     if (
       candidate.destination !== null && candidate.destination !== destination
@@ -102,8 +105,10 @@ export async function authenticateRequest(
         candidate.key,
         now,
         'request',
+        { signal: req.signal },
       );
     } catch (error) {
+      req.signal?.throwIfAborted();
       if (!(error instanceof KeyChangeRefused) && !recoverableUpstream(error)) {
         throw error;
       }
@@ -116,6 +121,7 @@ export async function authenticateRequest(
       new TextEncoder().encode(canonical),
     );
     if (!ok) continue;
+    req.signal?.throwIfAborted();
     if (deps.onVerified !== undefined) {
       await deps.onVerified(
         await captureRequestEvidence(deps.keys, destination, req, {
@@ -125,6 +131,7 @@ export async function authenticateRequest(
         }),
       );
     }
+    req.signal?.throwIfAborted();
     // 7. authenticated — and only NOW the first contact is recorded (open
     //    mode, no roster row: nothing durable on a stranger's word before
     //    this point). The contact hook resets the destination's delivery

@@ -56,6 +56,7 @@ export type Verified = Identified & {
 
 type VerifyOptions = {
   roomId?: string;
+  signal?: AbortSignal;
   exemptPrevAuthLimits?: boolean;
   // Re-join snapshots may carry our own historical events with a resident
   // signature. Only our sender domain is eligible, after all normal checks.
@@ -228,6 +229,7 @@ export async function verify(
   keys: KeyResolver,
   opts: VerifyOptions = {},
 ): Promise<Verified> {
+  opts.signal?.throwIfAborted();
   return await verifyRequired(pdu, roomVersion, keys, opts);
 }
 
@@ -332,6 +334,7 @@ async function verifyRequired(
       )
     ) {
       try {
+        opts.signal?.throwIfAborted();
         if (
           await keys.verifyEventSignature({
             server,
@@ -339,11 +342,14 @@ async function verifyRequired(
             pdu,
             roomVersion,
             minValidUntilMs,
+            signal: opts.signal,
           })
         ) {
+          opts.signal?.throwIfAborted();
           return true;
         }
       } catch (error) {
+        opts.signal?.throwIfAborted();
         if (!recoverableUpstream(error)) throw error;
         // key unobtainable under this id - try the next
       }

@@ -147,6 +147,83 @@ async function ancestryFixture(store: Store) {
   return { ...s, held, pulled, batch, recording };
 }
 
+Deno.test('ancestry owner: a long retained pending chain reaches its deepest boundary without recursive stack growth', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const count = 12000;
+    const bottom = '$long-chain-unavailable';
+    // Seed retained graph metadata in the real native room file. Recovery reads
+    // immutable edges, not these PDUs; the boundary sentinel stops before ingest.
+    const db = await store.room(s.g.roomId);
+    await db.tx(async (tx) => {
+      for (let start = 0; start < count; start += 100) {
+        const ids = Array.from(
+          { length: Math.min(100, count - start) },
+          (_, i) => start + i,
+        );
+        await tx.execute(
+          'INSERT INTO events(id,pdu,type,state_key,sender,depth,origin_ts) VALUES ' +
+            ids.map(() => '(?,?,?,NULL,?,?,?)').join(','),
+          ids.flatMap((
+            i,
+          ) => [
+            '$long-chain-' + i,
+            '{}',
+            'm.room.message',
+            s.user,
+            i + 100,
+            1000,
+          ]),
+        );
+        await tx.execute(
+          'INSERT INTO prev_edges(event,prev,ord) VALUES ' +
+            ids.map(() => '(?,?,0)').join(','),
+          ids.flatMap((
+            i,
+          ) => [
+            '$long-chain-' + i,
+            i === 0 ? bottom : '$long-chain-' + (i - 1),
+          ]),
+        );
+        await tx.execute(
+          'INSERT INTO event_status(event,standing,grounding,origin,received_ts) VALUES ' +
+            ids.map(() => "(?,'rejected','pending',?,1000)").join(','),
+          ids.flatMap((i) => ['$long-chain-' + i, s.server.name]),
+        );
+      }
+    });
+    const pulled = await msg(s, 'after retained chain', [
+      '$long-chain-' + (count - 1),
+    ], count + 100);
+    const pushed = await msg(
+      s,
+      'new delivery',
+      [pulled.event_id!],
+      count + 101,
+    );
+    const recording = fakeFetcher({ missingEvents: [pulled] });
+    const deepest = new Error('deepest retained boundary reached');
+    recording.fetcher.stateIds = (_room, at) => {
+      assertEquals(at, bottom);
+      throw deepest;
+    };
+    const error = await assertRejects(() =>
+      ingestRemote(s.g.room, [pushed], s.server.name, {
+        ...s.deps,
+        fetcher: recording.fetcher,
+        // The fixture's disk capture is not a recursion-depth or product limit.
+        limits: { ...s.deps.limits, budgetMs: 120000 },
+      })
+    );
+    assertStrictEquals(error, deepest);
+    assertEquals(
+      await s.g.room.tx((tx) => tx.events.get(pushed.event_id!)),
+      null,
+    );
+    assertEquals(await frontierOf(s.g.room), [s.joinId]);
+  });
+});
+
 Deno.test('ancestry owner: siblings share direct-parent supply and failed boundary attempts', async () => {
   await withStore(async (store) => {
     const s = await ancestryFixture(store);
@@ -951,6 +1028,74 @@ for (
     },
   );
 }
+
+Deno.test('missing: cancellation during cached ancestry validation starts no next native phase', async () => {
+  await withStore(async (store) => {
+    const s = await setup(store);
+    const far = await msg(s, 'cached boundary', ['$unavailable-older'], 50);
+    const near = await msg(s, 'pulled parent', [far.event_id!], 51);
+    const pushed = await msg(s, 'pushed child', [near.event_id!], 52);
+    const stateIds = await s.g.room.tx(async (tx) => {
+      const stay = (await tx.segments.openStay())!;
+      return [
+        ...(await tx.state.groupMap((await tx.state.current(stay.id))!))
+          .values(),
+      ];
+    });
+    const recording = fakeFetcher({
+      missingEvents: [near, far],
+      stateIds: new Map([[far.event_id!, {
+        pduIds: stateIds,
+        authChainIds: [],
+      }]]),
+      event: new Map([[far.event_id!, far]]),
+    });
+    const controller = new AbortController();
+    const transaction = s.g.room.tx.bind(s.g.room);
+    let validationReads = 0, afterAbortReads = 0;
+    s.g.room.tx = (fn) =>
+      transaction(async (tx) => {
+        const after = tx.state.eventStateAfter.bind(tx.state);
+        tx.state.eventStateAfter = async (id) => {
+          // Observe the actual cached-boundary owner, not a snapshot refresh
+          // that has a separate cancellation contract and runs earlier.
+          const validating = new Error().stack?.includes(
+            'invalidRecoveryAncestry',
+          );
+          if (controller.signal.aborted) afterAbortReads++;
+          const result = await after(id);
+          if (validating && id === far.event_id) {
+            validationReads++;
+            controller.abort();
+          }
+          return result;
+        };
+        const prevs = tx.events.prevsOf.bind(tx.events);
+        tx.events.prevsOf = async (id) => {
+          if (controller.signal.aborted) afterAbortReads++;
+          return await prevs(id);
+        };
+        return await fn(tx);
+      });
+    await assertRejects(() =>
+      ingestRemote(s.g.room, [pushed], s.server.name, {
+        ...s.deps,
+        fetcher: recording.fetcher,
+        signal: controller.signal,
+      }), DOMException);
+    assertEquals(
+      validationReads,
+      1,
+      'the real cached-boundary validation was reached',
+    );
+    assertEquals(afterAbortReads, 0, 'cancellation owns the next native phase');
+    s.g.room.tx = transaction;
+    assertEquals(
+      await transaction((tx) => tx.events.get(pushed.event_id!)),
+      null,
+    );
+  });
+});
 
 for (
   const boundary of [

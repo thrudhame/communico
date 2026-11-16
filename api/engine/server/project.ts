@@ -70,12 +70,24 @@ export function onProjected(
 }
 
 export function project(store: Store, roomId: string): Promise<void> {
+  // Admission fixes this caller's obligation before an earlier room owner can
+  // append more work. Keep the capability with its cut for lifecycle fencing.
+  const admitted = (async () => {
+    const room = await openRoom(store, roomId);
+    return { room, head: await room.tx((tx) => tx.changes.head()) };
+  })();
+  // A failed admission can settle while its predecessor still owns the queue.
+  // The queued result below retains the rejection for the actual caller.
+  void admitted.catch(() => {});
   let rooms = roomQueues.get(store);
   if (rooms === undefined) roomQueues.set(store, rooms = new Map());
   // This room's baseline has one capture owner; independent rooms prepare
   // concurrently. A failed page releases its owner for the next roll-forward.
   const run = (rooms.get(roomId) ?? Promise.resolve()).catch(() => {}).then(
-    () => projectRoom(store, roomId),
+    async () => {
+      const { room, head } = await admitted;
+      await projectRoom(store, roomId, room, head);
+    },
   );
   rooms.set(roomId, run);
   const release = () => {
@@ -85,11 +97,13 @@ export function project(store: Store, roomId: string): Promise<void> {
   return run;
 }
 
-async function projectRoom(store: Store, roomId: string): Promise<void> {
+async function projectRoom(
+  store: Store,
+  roomId: string,
+  room: Room,
+  head: number,
+): Promise<void> {
   const server = await store.server();
-  const room = await openRoom(store, roomId);
-  // Owe this admitted cut, not every later write to a continuously busy room.
-  const head = await room.tx((tx) => tx.changes.head());
   capture: for (;;) {
     let mark = await get(server, sourceOf(roomId));
     let contextMark = await get(server, 'push-context:' + roomId);

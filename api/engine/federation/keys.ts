@@ -36,6 +36,11 @@ import { upstreamCategory, UpstreamError } from '#engine/net/upstream-error.ts';
 import { keyDocument, oldKeysOf } from './key-document.ts';
 import { federationPolicy } from './policy.ts';
 import {
+  type DemandedWork,
+  demandedWork,
+  joinDemand,
+} from '#engine/net/demand.ts';
+import {
   keyDecisionsOf,
   persistKeyDocument,
   recordKeyDecision,
@@ -60,12 +65,14 @@ export type KeysDeps = {
   directGet: (
     serverName: string,
     minimumValidUntilTs: number,
+    signal?: AbortSignal,
   ) => Promise<unknown>;
   // one witness's notary answer for serverName (client.ts)
   witnessQuery: (
     peer: string,
     serverName: string,
     minimumValidUntilTs: number,
+    signal?: AbortSignal,
   ) => Promise<unknown>;
   // roster witnesses by seniority (peers.ts), then the event's room's
   // servers when ctx carries a roomId
@@ -99,14 +106,14 @@ export type KeyStore = {
   acquireKeyDoc: (
     name: string,
     minimumValidUntilTs: number,
-    ctx?: { roomId?: string },
+    ctx?: { roomId?: string; signal?: AbortSignal },
   ) => Promise<KeyDoc>;
   getVerifyKey: (
     name: string,
     keyId: string,
     minimumValidUntilTs: number,
     purpose: 'request' | 'event',
-    ctx?: { roomId?: string },
+    ctx?: { roomId?: string; signal?: AbortSignal },
   ) => Promise<CryptoKey>;
   listServerKeys: (
     name: string | null,
@@ -120,16 +127,17 @@ export type KeyStore = {
 // witnesses from the roster in the same server file.
 function productionDeps(server: Db, signer: Signer): KeysDeps {
   return {
-    directGet: async (name, _minimumValidUntilTs) => {
+    directGet: async (name, _minimumValidUntilTs, signal) => {
       const res = await federationRequest(server, signer, {
         destination: name,
         method: 'GET',
         path: '/_matrix/key/v2/server',
         body: null,
+        signal,
       });
       return res.json;
     },
-    witnessQuery: async (peer, name, minimumValidUntilTs) => {
+    witnessQuery: async (peer, name, minimumValidUntilTs, signal) => {
       const res = await federationRequest(server, signer, {
         destination: peer,
         method: 'GET',
@@ -137,6 +145,7 @@ function productionDeps(server: Db, signer: Signer): KeysDeps {
           encodeURIComponent(name)
         }?minimum_valid_until_ts=${minimumValidUntilTs}`,
         body: null,
+        signal,
       });
       return res.json;
     },
@@ -147,7 +156,7 @@ function productionDeps(server: Db, signer: Signer): KeysDeps {
 type AcquisitionEpoch = { current: boolean; users: number };
 
 type AcquisitionState = {
-  inFlight: Map<string, Promise<KeyDoc>>;
+  inFlight: Map<string, DemandedWork<KeyDoc>>;
   failureMemory: Map<string, { until: number; error: unknown }>;
   refusalMemory: Map<string, { until: number; error: KeyChangeRefused }>;
   warnedOnce: Set<string>;
@@ -461,9 +470,10 @@ export function keyStore(
   async function acquireKeyDoc(
     name: string,
     minimumValidUntilTs: number,
-    ctx?: { roomId?: string },
+    ctx?: { roomId?: string; signal?: AbortSignal },
     wantKeyId?: string,
   ): Promise<KeyDoc> {
+    ctx?.signal?.throwIfAborted();
     return await withEpoch(name, async (epoch) => {
       // rung 4: a key-is-name server IS its ed25519 key — nothing to fetch
       if (isKeyName(name)) {
@@ -487,6 +497,7 @@ export function keyStore(
       // enter inFlight: a generic cached answer cannot satisfy a rotated-key
       // caller merely because both requests concern the same server.
       const row = await readDocRow(name);
+      ctx?.signal?.throwIfAborted();
       requireCurrent(epoch);
       if (row !== null) {
         const cached = JSON.parse(row.key_json) as KeyDoc;
@@ -499,15 +510,25 @@ export function keyStore(
         );
         if (hasKey && effectiveUntil >= minimumValidUntilTs) return cached;
       }
-      const existing = inFlight.get(name);
-      if (existing !== undefined) return await existing;
-      const p = doAcquire(name, minimumValidUntilTs, epoch, ctx);
-      inFlight.set(name, p);
-      try {
-        return await p;
-      } finally {
-        if (inFlight.get(name) === p) inFlight.delete(name);
+      let work = inFlight.get(name);
+      if (work?.abort.signal.aborted) {
+        try {
+          await work.run;
+        } catch { /* Old subscribers own that result. */ }
+        ctx?.signal?.throwIfAborted();
+        return await acquireKeyDoc(name, minimumValidUntilTs, ctx, wantKeyId);
       }
+      if (work === undefined) {
+        work = demandedWork((signal) =>
+          doAcquire(name, minimumValidUntilTs, epoch, { ...ctx, signal })
+        );
+        inFlight.set(name, work);
+        const owned = work;
+        void work.run.finally(() => {
+          if (inFlight.get(name) === owned) inFlight.delete(name);
+        }).catch(() => {}); // Original failures reach the waiting subscribers.
+      }
+      return await joinDemand(work, ctx?.signal);
     });
   }
 
@@ -515,9 +536,11 @@ export function keyStore(
     name: string,
     minimumValidUntilTs: number,
     epoch: AcquisitionEpoch,
-    ctx?: { roomId?: string },
+    ctx?: { roomId?: string; signal?: AbortSignal },
   ): Promise<KeyDoc> {
+    const signal = ctx?.signal;
     try {
+      signal?.throwIfAborted();
       let candidate: { doc: KeyDoc; via: string } | null = null;
       const disagreements: WitnessDisagreement[] = [];
 
@@ -529,16 +552,27 @@ export function keyStore(
         0,
         (await federationPolicy(server)).witnesses,
       );
+      signal?.throwIfAborted();
       if (peers.length > 0) {
         const result = await askWitnesses({
           serverName: name,
           minimumValidUntilTs,
           peers,
-          query: deps.witnessQuery,
-          selfCheck: (doc) => validatedKeyDocument(name, doc),
+          query: async (peer, name, horizon) => {
+            signal?.throwIfAborted();
+            const answer = await deps.witnessQuery(peer, name, horizon, signal);
+            signal?.throwIfAborted();
+            return answer;
+          },
+          selfCheck: (doc) => {
+            signal?.throwIfAborted();
+            return validatedKeyDocument(name, doc);
+          },
           witnessCheck: async (peer, doc) => {
+            signal?.throwIfAborted();
             const witnessRows = await readKeyRows(peer);
             for (const w of witnessRows) {
+              signal?.throwIfAborted();
               if (
                 w.expired_ts !== null || w.valid_until_ts < Date.now() ||
                 !w.key_id.startsWith('ed25519:')
@@ -561,13 +595,16 @@ export function keyStore(
       // no usable witness answer at all → direct (open-mode fallback; in
       // closed mode only roster peers reach here — a consented address)
       if (candidate === null) {
-        const raw = await deps.directGet(name, minimumValidUntilTs);
+        signal?.throwIfAborted();
+        const raw = await deps.directGet(name, minimumValidUntilTs, signal);
+        signal?.throwIfAborted();
         const doc = await validatedKeyDocument(name, raw);
         candidate = { doc, via: 'direct' };
       }
 
       const selected = candidate;
       return await mutate(name, async () => {
+        signal?.throwIfAborted();
         requireCurrent(epoch);
         for (const disagreement of disagreements) {
           await recordDisagreement(name, disagreement);
@@ -642,26 +679,31 @@ export function keyStore(
         return selected.doc;
       });
     } catch (e) {
-      if (epoch.current && e instanceof KeyChangeRefused) {
-        refusalMemory.set(name, {
-          until: Date.now() +
-            (await federationPolicy(server)).keyfailminutes * 60_000,
-          error: e,
-        });
-      }
-      if (
-        epoch.current &&
-        ['transport', 'protocol', 'validation', 'http'].includes(
-          upstreamCategory(e),
-        )
-      ) {
-        failureMemory.set(name, {
-          until: Date.now() +
-            (await federationPolicy(server)).keyfailminutes * 60_000,
-          error: e,
-        });
-      }
+      await rememberFailure(name, epoch, signal, e);
       throw e;
+    }
+  }
+
+  // Acquisition and a valid answer lacking a demanded key share one negative
+  // publication owner. No asynchronous policy read may outlive either guard.
+  async function rememberFailure(
+    name: string,
+    epoch: AcquisitionEpoch,
+    signal: AbortSignal | undefined,
+    error: unknown,
+  ): Promise<void> {
+    const memory = error instanceof KeyChangeRefused
+      ? refusalMemory
+      : ['transport', 'protocol', 'validation', 'http'].includes(
+          upstreamCategory(error),
+        )
+      ? failureMemory
+      : null;
+    if (!signal?.aborted && epoch.current && memory !== null) {
+      const minutes = (await federationPolicy(server)).keyfailminutes;
+      if (!signal?.aborted && epoch.current) {
+        memory.set(name, { until: Date.now() + minutes * 60_000, error });
+      }
     }
   }
 
@@ -697,8 +739,9 @@ export function keyStore(
     keyId: string,
     minimumValidUntilTs: number,
     purpose: 'request' | 'event',
-    ctx?: { roomId?: string },
+    ctx?: { roomId?: string; signal?: AbortSignal },
   ): Promise<CryptoKey> {
+    ctx?.signal?.throwIfAborted();
     if (!/^ed25519:[a-zA-Z0-9_]+$/.test(keyId)) {
       throw new UpstreamError('validation', {
         phase: 'key-lookup',
@@ -721,9 +764,11 @@ export function keyStore(
         minimumValidUntilTs,
         purpose,
       );
+      ctx?.signal?.throwIfAborted();
       requireCurrent(epoch);
       if (hit !== null) return hit;
       await acquireKeyDoc(name, minimumValidUntilTs, ctx, keyId);
+      ctx?.signal?.throwIfAborted();
       const again = await cachedVerifyKey(
         name,
         keyId,
@@ -739,11 +784,7 @@ export function keyStore(
         phase: 'key-lookup',
         reason: 'key unavailable for required purpose and validity',
       });
-      failureMemory.set(name, {
-        until: Date.now() +
-          (await federationPolicy(server)).keyfailminutes * 60_000,
-        error,
-      });
+      await rememberFailure(name, epoch, ctx?.signal, error);
       throw error;
     });
   }

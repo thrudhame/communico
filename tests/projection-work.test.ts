@@ -178,6 +178,76 @@ Deno.test('projection work: queued same-room callers owe separate finite cuts in
   });
 });
 
+Deno.test('projection work: queued callers never inherit later room writes', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!admission-cut:test' });
+    await project(store, g.roomId);
+    const write = (body: string) =>
+      sendLocal(g.room, {
+        type: 'm.room.message',
+        sender: g.creator,
+        content: { body, msgtype: 'm.text' },
+      }, g.signer);
+    const first = await write('first owner');
+    const firstHold = holdEvent(store, g.roomId, first.eventId, true);
+    const jobs = [project(store, g.roomId)];
+    let laterHold: ReturnType<typeof holdEvent> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let late: Awaited<ReturnType<typeof write>> | undefined;
+    let invoked = false;
+    let unlisten = () => {};
+    try {
+      await firstHold.entered;
+      const admitted = await write('queued callers own cut');
+      unlisten = onProjected(async (owner, id) => {
+        if (owner !== store || id !== g.roomId || invoked) return;
+        invoked = true;
+        late = await write('future write outside the queued callers cut');
+        laterHold = holdEvent(store, g.roomId, late.eventId, true);
+      });
+      const caller = project(store, g.roomId);
+      jobs.push(caller);
+      firstHold.release();
+      const completed = await Promise.race([
+        caller.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), 30000);
+        }),
+      ]);
+      assertEquals(
+        completed,
+        true,
+        'queued projection inherited a later event and blocked in its capture',
+      );
+      assertEquals(invoked, true);
+      const server = await store.server();
+      assertEquals(
+        (await server.query(
+          'SELECT event FROM feed WHERE event IN (?,?) ORDER BY seq',
+          [admitted.eventId, late!.eventId],
+        )).map((row) => row.event),
+        [admitted.eventId],
+      );
+    } finally {
+      clearTimeout(timer);
+      firstHold.release();
+      laterHold?.release();
+      await Promise.all(jobs);
+      laterHold?.restore();
+      firstHold.restore();
+      unlisten();
+    }
+    await project(store, g.roomId);
+    const server = await store.server();
+    assertEquals(
+      (await server.query('SELECT event FROM feed WHERE event=?', [
+        late!.eventId,
+      ])).map((row) => row.event),
+      [late!.eventId],
+    );
+  });
+});
+
 Deno.test('projection work: a live backlog releases the writer between its existing pages', async () => {
   await withStore(async (store) => {
     const backlog = await genesis(store, { roomId: '!capture-backlog:test' });

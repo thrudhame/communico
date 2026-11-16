@@ -540,6 +540,8 @@ function bind(
     },
     pushRules: {
       clear: (localpart: string) => pushrules.clearPushRules(conn, localpart),
+      rulesetRows: (localpart: string) =>
+        pushrules.rulesetRows(conn, localpart),
       putDefault: (localpart: string, kind: string, rule: pushrules.PushRule) =>
         pushrules.putDefaultOverride(conn, localpart, kind, rule),
       kindRows: (localpart: string, kind: string) =>
