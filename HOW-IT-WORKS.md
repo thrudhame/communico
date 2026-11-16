@@ -247,8 +247,9 @@ the next projection or startup rolls forward from its watermark.
 Each room has one store-lifetime projection capture owner. Independent rooms
 prepare immutable room facts outside the global mutation queue. The existing
 500-change page bounds capture, not writer ownership: uncontended changes batch,
-but queued writer demand ends the turn at the next complete change. A caller owes its admitted room
-head, not later writes to a continuously busy room. Application rechecks both
+but queued writer demand ends the turn at the next complete change. A caller's
+room capability and head are captured at admission, before waiting for an earlier
+room owner; later writes cannot enlarge that queued caller's obligation. Application rechecks both
 watermarks and the original room capability's incarnation before writing.
 Historical-context seed edges similarly commit the completed prefix cursor;
 same-room live publication waits for complete context. Tenant push decisions
