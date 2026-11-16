@@ -25,6 +25,7 @@ export default async function (request: PathfinderRequest, context: Context) {
       uri: url.pathname + url.search,
       authorization: request.headers.get('authorization'),
       body: await request.body.bytes(),
+      signal: request._raw.signal,
     },
   );
 }

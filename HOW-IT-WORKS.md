@@ -1103,6 +1103,17 @@ can own the operation again. Other origins, IDs and stores remain independent.
 Durable facade ingress retains its mailbox-owned serialization and receipts.
 (`api/engine/federation/transactions.ts`, `api/engine/facade/mailbox.ts`)
 
+Standalone flights and shared signing-key acquisition own subscriber demand.
+One disconnected caller cannot cancel another; the last caller cancels the
+actual recovery fetches, verification and speculative room work. Cancelled
+operations retain their callbacks until real settlement and never cache a
+successful transaction response. Native transactions roll back an interrupted
+batch, while already committed room changes still finish their projection.
+Parallel boundary and witness waves drain every started callback before
+returning a failure, so no sibling retains an unowned storage capability.
+(`api/engine/net/demand.ts`, `api/engine/room/{remote,recovery}.ts`,
+`api/engine/federation/{keys,transactions}.ts`)
+
 X-Matrix authorization parses quote-aware comma lists, token/quoted parameter
 values and unique names before signature verification. Discovery validates
 Matrix server names, preserves redirect queries, follows HTTP(S) using the
@@ -1376,6 +1387,12 @@ non-zero exit. See README for socket paths, certificate bootstrap and a
 supervisor example.
 (`api/engine/config.ts:1-5`, `api/engine/config.ts:135-165`,
 `api/engine/config.ts:253-301`, `main.ts:20-42`, `main.ts:139-162`)
+
+The listener gives each admitted handler an operation signal that observes
+disconnects and forced listener aborts. Graceful drain still permits readable
+bodies to finish. Transport completion alone cannot release a running callback;
+shutdown retains the store until both handler and transport ownership settle.
+(`api/server-lifetime.ts`, `main.ts`)
 
 ## Discovery, TURN and whois
 

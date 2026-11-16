@@ -26,6 +26,7 @@ export interface KeyResolver {
     pdu: Pdu;
     roomVersion: string;
     minValidUntilMs: number;
+    signal?: AbortSignal;
   }): Promise<boolean>;
 }
 
@@ -58,6 +59,7 @@ export interface Fetcher {
     latest: string[],
     limit: number,
     via: string,
+    signal?: AbortSignal,
   ): Promise<Pdu[]>;
   // GET /_matrix/federation/v1/state_ids/{roomId}?event_id=at — the full
   // state at the event plus its auth chain (events.yaml:124-142).
@@ -77,7 +79,12 @@ export interface Fetcher {
   ): Promise<{ state: Pdu[]; authChain: Pdu[] } | null>;
   // GET /_matrix/federation/v1/event_auth/{roomId}/{eventId} — the
   // complete auth chain of the event (event_auth.yaml).
-  eventAuth(roomId: string, id: string, via: string): Promise<Pdu[] | null>;
+  eventAuth(
+    roomId: string,
+    id: string,
+    via: string,
+    signal?: AbortSignal,
+  ): Promise<Pdu[] | null>;
   // GET /_matrix/federation/v1/backfill/{roomId}?v=…&limit= — the PDUs
   // preceding the `from` ids (themselves included), up to limit
   // (backfill.yaml). The prev/auth count limits MUST NOT be validated on
@@ -136,6 +143,7 @@ export type RemoteDeps = {
   keys: KeyResolver;
   fetcher: Fetcher;
   self: string;
+  signal?: AbortSignal;
   limits: {
     waitMs: number; // [federation] missingwaitms
     limit: number; // [federation] missinglimit
