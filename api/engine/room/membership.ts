@@ -11,9 +11,8 @@ import type { Room } from '#engine/room/index.ts';
 import { afterLocalCommit, sendLocal } from '#engine/room/ingest.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { buildInTx } from '#engine/room/build.ts';
-import { ingestInTx } from '#engine/room/ingest.ts';
+import { afterRoomCommit, ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
-import { projectAfterWrite } from '#engine/room/hooks.ts';
 import { admitLocalJoin } from '#engine/room/hooks.ts';
 import { withRestrictedAdmission } from './restricted.ts';
 
@@ -274,12 +273,13 @@ export async function reopen(
       if (last === null || group === null) {
         throw new MatrixError(403, 'M_FORBIDDEN', 'no snapshot to reopen');
       }
-      const prevs = await tx.extremities.frontier(last.id);
+      const prevs = await tx.extremities.parents(last.id);
       const stay = await tx.segments.create({
         kind: 'stay',
         prev: last.id,
         opening_group: group,
       });
+      await tx.extremities.inherit(last.id, stay);
       await tx.segments.create({
         kind: 'history',
         prev: stay,
@@ -306,6 +306,6 @@ export async function reopen(
       return { roomId: room.id, eventId: res.eventId, created: true };
     });
   });
-  await projectAfterWrite(room.store, room.id);
+  await afterRoomCommit(room, signer.serverName);
   return result;
 }

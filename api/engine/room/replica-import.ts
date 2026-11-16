@@ -8,9 +8,8 @@ import { assertAcl } from './acl.ts';
 import { roomCreateId, roomVersionOf } from './build.ts';
 import type { Fetcher, KeyResolver } from './deps.ts';
 import { backfill } from './history.ts';
-import { projectAfterWrite } from './hooks.ts';
+import { afterRoomCommit, ingestInTx } from './ingest.ts';
 import { openRoom } from './index.ts';
-import { ingestInTx } from './ingest.ts';
 import { withRoomLock } from './lock.ts';
 import { importReplicaBoundary, importReplicaGenesis } from './replica.ts';
 import type { ReplicaRoom } from './replica-export.ts';
@@ -161,6 +160,7 @@ export async function importReplicaRoom(
         stay: stay.id,
         isolated: step.anchor !== null,
       }, {
+        self: input.self,
         keys: input.keys,
         fetcher,
         signal,
@@ -236,7 +236,7 @@ export async function importReplicaRoom(
           unavailable('replica live event did not ground');
         }
       }));
-    await projectAfterWrite(store, room.id);
+    await afterRoomCommit(room, input.self);
   }
   for (const [id, expected] of stays) {
     if (!initialized.has(id)) {
@@ -283,5 +283,5 @@ export async function importReplicaRoom(
       }
       await stageSnapshotEvidence(tx, evidence, evidence.createId);
     }));
-  await projectAfterWrite(store, room.id);
+  await afterRoomCommit(room, input.self);
 }

@@ -37,7 +37,7 @@ import {
   fetchOrNull,
   type KeyResolver,
 } from '#engine/room/deps.ts';
-import { projectAfterWrite } from '#engine/room/hooks.ts';
+import { afterRoomCommit } from '#engine/room/ingest.ts';
 import type { Room } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { orderEvents } from '#engine/room/order.ts';
@@ -47,6 +47,7 @@ import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 export type BackfillDeps = {
+  self: string;
   keys: KeyResolver;
   fetcher: Fetcher;
   signal?: AbortSignal;
@@ -782,6 +783,6 @@ export async function backfill(
     if (error instanceof HistoryExhausted) return empty;
     throw error;
   }
-  await projectAfterWrite(room.store, room.id);
+  await afterRoomCommit(room, deps.self);
   return written;
 }

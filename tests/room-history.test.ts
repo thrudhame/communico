@@ -175,7 +175,7 @@ Deno.test('backfill: oversized boundaries retain evidence without blocking later
       from: [s.gapTip],
       limit: 10,
       via: s.fr.server.name,
-    }, { keys: s.deps.keys, fetcher: recording.fetcher });
+    }, { self: s.deps.self, keys: s.deps.keys, fetcher: recording.fetcher });
     assertEquals(
       (await s.room.tx((tx) => tx.events.getStatus(large.event_id!)))
         ?.grounding,
@@ -225,6 +225,7 @@ Deno.test('backfill: one operation bounds requests across all independent bounda
       limit: 200,
       via: s.fr.server.name,
     }, {
+      self: s.deps.self,
       keys: s.deps.keys,
       fetcher: recording.fetcher,
     });
@@ -255,6 +256,7 @@ Deno.test('backfill: cancellation settles a stalled injected fetcher; storage fa
     });
     const args = { from: [s.gapTip], limit: 10, via: s.fr.server.name };
     const out = await backfill(s.room, args, {
+      self: s.deps.self,
       keys: s.deps.keys,
       fetcher: recording.fetcher,
       signal: abort.signal,
@@ -277,6 +279,7 @@ Deno.test('backfill: cancellation settles a stalled injected fetcher; storage fa
       });
     try {
       const rolledBack = await backfill(s.room, args, {
+        self: s.deps.self,
         keys: s.deps.keys,
         fetcher: fakeFetcher({ backfill: [cancelled] }).fetcher,
         signal: duringWrite.signal,
