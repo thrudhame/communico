@@ -622,7 +622,11 @@ export async function routeToDeviceMessages(
 export async function captureToDeviceOperations(
   conn: Conn,
   localpart: string,
+  after = 0,
 ): Promise<ToDeviceOperation[]> {
+  if (!Number.isSafeInteger(after) || after < 0) {
+    throw new TypeError('invalid to-device source cut');
+  }
   const identity = await tenantAuthority(conn);
   if (!identity) return [];
   for (
@@ -639,8 +643,8 @@ export async function captureToDeviceOperations(
     );
   }
   return (await conn.query(
-    'SELECT payload_json FROM to_device_operations WHERE localpart=? AND source=? AND incarnation=? ORDER BY sequence',
-    [localpart, identity.node, identity.incarnation],
+    'SELECT payload_json FROM to_device_operations WHERE localpart=? AND source=? AND incarnation=? AND sequence>? ORDER BY sequence',
+    [localpart, identity.node, identity.incarnation, after],
   )).map((row) => JSON.parse(String(row.payload_json)) as ToDeviceOperation);
 }
 

@@ -312,12 +312,25 @@ export class ToDeviceOperations {
       source: source.node,
       incarnation: source.incarnation,
     };
+    const peer = this.node ? 'home' : context.node;
+    // This is a source-operation cut, not an inbox or journal position. A
+    // different grant/control/account/source gets an independent replay scope.
+    const scope = 'to-device-export:' + canonicalJson(binding);
+    const [exported] = await server.query(
+      'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+      [peer, context.id, scope],
+    );
+    const after = exported ? Number(exported.source_cut) : 0;
     const { operations, pending, inboxChanged } =
       await (await this.store.tenant(binding.server)).tx(async (conn) => {
         unchanged();
         await this.tenantSelected(conn, binding);
         const before = await syncStreamHeads(conn);
-        const operations = await captureToDeviceOperations(conn, localpart);
+        const operations = await captureToDeviceOperations(
+          conn,
+          localpart,
+          after,
+        );
         const pending = await pendingTenantProjection(conn);
         const inboxChanged =
           (await syncStreamHeads(conn)).inbox !== before.inbox;
@@ -341,21 +354,33 @@ export class ToDeviceOperations {
           canonicalJson(view),
         ),
       };
-      records.push(
-        await server.tx(async (conn) => {
-          await this.selected(conn, grant, localpart);
-          await requireDomainControl(conn, view);
-          return await appendRecord(conn, this.node ? 'home' : context.node, {
-            source: view.source,
-            incarnation: this.node ? view.incarnation : context.id,
-            stream: streamName(localpart, view.server),
-            type: 'to-device',
-            version: 1,
-            operationId: operationId(view),
-            payload: signed,
-          });
-        }),
-      );
+      const record = await server.tx(async (conn) => {
+        await this.selected(conn, grant, localpart);
+        await requireDomainControl(conn, view);
+        const [current] = await conn.query(
+          'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+          [peer, context.id, scope],
+        );
+        if (current && Number(current.source_cut) >= operation.sequence) {
+          return null;
+        }
+        const record = await appendRecord(conn, peer, {
+          source: view.source,
+          incarnation: this.node ? view.incarnation : context.id,
+          stream: streamName(localpart, view.server),
+          type: 'to-device',
+          version: 1,
+          operationId: operationId(view),
+          payload: signed,
+        });
+        // Append and source-cut advancement cannot be separated by a crash.
+        await conn.execute(
+          'INSERT INTO facade_exports(peer,incarnation,scope,source_cut) VALUES(?,?,?,?) ON CONFLICT(peer,incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut',
+          [peer, context.id, scope, operation.sequence],
+        );
+        return record;
+      });
+      if (record) records.push(record);
     }
     return records;
   }
