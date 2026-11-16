@@ -1125,6 +1125,18 @@ Deno.test('replica device composition borrows the node service and binds its dis
       return Promise.resolve();
     },
   };
+  const sender = {
+    wake() {},
+    contactHook: () => () => {},
+    setIntentProvider() {},
+    stop: () => {
+      stopped = true;
+      return Promise.resolve();
+    },
+    snapshot: () => [],
+    reviewIntents: () => Promise.resolve(null),
+    pruneIntents: () => Promise.resolve(null),
+  };
   try {
     const inventory = await f.directoryExport();
     assert(inventory);
@@ -1151,6 +1163,7 @@ Deno.test('replica device composition borrows the node service and binds its dis
         bound = true;
         return Promise.resolve(deviceLists);
       },
+      sender: () => Promise.resolve(sender),
       ingress: (deps) => {
         assert(bound);
         assertEquals(deps.edus, theDispatcher);
@@ -1162,6 +1175,7 @@ Deno.test('replica device composition borrows the node service and binds its dis
     });
     // The application exposes exactly the borrowed object, not a second worker.
     assertEquals(app.deviceLists, deviceLists);
+    assertEquals(app.sender, sender);
     await app.deviceLists.recover('@remote:elsewhere.test');
     assertEquals(recovered, '@remote:elsewhere.test');
     const remote = '@remote:' + peer.name;
@@ -1214,6 +1228,75 @@ Deno.test('replica device composition borrows the node service and binds its dis
     await recovery?.stop();
     await closeApp();
     await peer.close();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('replica service acquisition releases a failed composition before retrying with a new dispatcher', async () => {
+  const f = await fixture();
+  let dispatcher: unknown, releases = 0, attempts = 0;
+  try {
+    const tenant = await f.edgeTenant();
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const service = {
+      recover: () => Promise.resolve(),
+      start() {},
+      stop: () => Promise.resolve(),
+    };
+    const access = {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+      deviceLists: (edus: ReturnType<typeof eduState>) => {
+        if (dispatcher && dispatcher !== edus) {
+          throw new Error('old dispatcher retained');
+        }
+        dispatcher = edus;
+        return Promise.resolve(service);
+      },
+      ingress: () => {
+        if (++attempts === 1) {
+          return Promise.reject(new Error('composition interrupted'));
+        }
+        return Promise.resolve({
+          stage: () => Promise.resolve(),
+          receive: () => Promise.resolve({ status: 200, body: {} }),
+        });
+      },
+      releaseServices: async () => {
+        await service.stop();
+        dispatcher = undefined;
+        releases++;
+      },
+    };
+    await assertRejects(
+      () => openReplicaApp(f.edgeStore(), tenant, access),
+      Error,
+      'composition interrupted',
+    );
+    assertEquals(
+      releases,
+      1,
+      'runtime owner must release services after failed acquisition',
+    );
+    const app = await openReplicaApp(f.edgeStore(), tenant, access);
+    assertEquals(app.deviceLists, service);
+    assertEquals(attempts, 2);
+    await closeApp();
+    assertEquals(
+      releases,
+      1,
+      'borrower does not stop successfully acquired owner services',
+    );
+  } finally {
+    await closeApp();
     await f.close();
     setConfigForTests({});
   }

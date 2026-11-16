@@ -42,6 +42,8 @@ export async function startFacade(lifetime: ServerLifetime) {
           keys: await runtime.verificationKeys(),
           signer: await runtime.requestSigner(),
           deviceLists: runtime.deviceLists,
+          sender: runtime.sender,
+          releaseServices: runtime.releaseServices,
           ingress: runtime.ingress,
           profileFanout: runtime.profileFanout,
         });

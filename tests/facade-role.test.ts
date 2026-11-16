@@ -239,6 +239,11 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
   );
   assertEquals(facade.service('deactivation'), true);
   assertEquals(facade.service('device-lists'), true);
+  assertEquals(facade.service('federation-sender'), true);
+  assertEquals(
+    capabilities('facade', 'f1').service('federation-sender'),
+    false,
+  );
   assertEquals(
     facade.gate(
       new Request(
@@ -256,7 +261,6 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       'delayed',
       'media',
       'link-client',
-      'federation-sender',
     ]
   ) {
     assertEquals(facade.service(service), false);

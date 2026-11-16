@@ -176,7 +176,7 @@ export function capabilities(role: string, phase = 'f1') {
     service(name: string): boolean {
       if (
         role === 'facade' && phase === 'f2' &&
-        ['deactivation', 'device-lists'].includes(name)
+        ['deactivation', 'device-lists', 'federation-sender'].includes(name)
       ) {
         return true;
       }

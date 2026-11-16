@@ -103,6 +103,8 @@ export type ReplicaAccess = {
   keys: KeyStore;
   signer: Signer;
   deviceLists?(edus: EduState): Promise<DeviceListService | undefined>;
+  sender?(): Promise<Sender | undefined>;
+  releaseServices?(): Promise<void>;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
   profileFanout?(localpart?: string): Promise<ProfileFanoutFailure[]>;
 };
@@ -252,39 +254,47 @@ export async function openReplicaApp(
       name + ' service unavailable at this ingress',
     );
   };
-  const federationEdus = eduState(server, tenant.serverName, store);
-  const deviceLists = await replica.deviceLists?.(federationEdus);
-  const app: App = {
-    store,
-    server,
-    tenant,
-    federationKeys: replica.keys,
-    federationEdus,
-    get federationIngress() {
-      return ingress;
-    },
-    sender: null,
-    replica,
-    profileFanout: replica.profileFanout
-      ? { drain: replica.profileFanout }
-      : undefined,
-    get deviceLists() {
-      return deviceLists ?? unavailable('device-lists');
-    },
-    get pushSender() {
-      return unavailable('push');
-    },
-    get media() {
-      return unavailable('media');
-    },
-    get delayedEvents() {
-      return unavailable('delayed');
-    },
-    close: () => store.close(),
-  };
-  const ingress = await replica.ingress?.(transactionDependencies(app));
-  current = app;
-  return app;
+  try {
+    const federationEdus = eduState(server, tenant.serverName, store);
+    const deviceLists = await replica.deviceLists?.(federationEdus);
+    const app: App = {
+      store,
+      server,
+      tenant,
+      federationKeys: replica.keys,
+      federationEdus,
+      get federationIngress() {
+        return ingress;
+      },
+      sender: null,
+      replica,
+      profileFanout: replica.profileFanout
+        ? { drain: replica.profileFanout }
+        : undefined,
+      get deviceLists() {
+        return deviceLists ?? unavailable('device-lists');
+      },
+      get pushSender() {
+        return unavailable('push');
+      },
+      get media() {
+        return unavailable('media');
+      },
+      get delayedEvents() {
+        return unavailable('delayed');
+      },
+      close: () => store.close(),
+    };
+    const ingress = await replica.ingress?.(transactionDependencies(app));
+    app.sender = await replica.sender?.() ?? null;
+    current = app;
+    return app;
+  } catch (error) {
+    await drainResources([async () => {
+      await replica.releaseServices?.();
+    }], [error]);
+    throw error;
+  }
 }
 
 /** The federation services of doltgres:main.ts's startSender() block:

@@ -34,7 +34,12 @@ import { acceptIngressEdu } from './ingress-edus.ts';
 import type { TransactionDeps } from '#engine/federation/transactions.ts';
 import type { Stream } from './protocol.ts';
 import { EgressOwner } from './egress.ts';
-import { dispatchBatch } from '#engine/federation/sender.ts';
+import {
+  dispatchBatch,
+  type Sender,
+  startSender,
+} from '#engine/federation/sender.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
 import {
   AccountSnapshots,
   exportSessionAuthority,
@@ -91,6 +96,7 @@ export async function openFacadeRuntime(
   let profileFanout: ReturnType<typeof startProfileFanout> | undefined;
   let deviceLists: DeviceListService | undefined;
   let deviceEdus: EduState | undefined;
+  let sender: Sender | undefined;
   const pairings = () => {
     if (!node) {
       throw new LinkError(
@@ -324,6 +330,13 @@ export async function openFacadeRuntime(
     });
   }
   let closed: Promise<void> | undefined;
+  const releaseServices = async () => {
+    await sender?.stop();
+    sender = undefined;
+    await deviceLists?.stop();
+    deviceLists = undefined;
+    deviceEdus = undefined;
+  };
   return {
     store,
     server,
@@ -335,6 +348,34 @@ export async function openFacadeRuntime(
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),
     prepareSigner: async () => (await keyOwner()).prepareSigner(),
+    releaseServices,
+    async sender() {
+      if (!caps.service('federation-sender') || !config().federation.enabled) {
+        return undefined;
+      }
+      const signer = (await keyOwner()).requestSigner();
+      const binding = await pairings();
+      if (closed || !tenant) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'facade sender requires active enrollment',
+        );
+      }
+      if (sender) return sender;
+      const owner = new EgressOwner(
+        server,
+        binding,
+        (envelope) => dispatchBatch(server, signer, envelope),
+      );
+      sender = startSender({
+        store,
+        signer,
+        dispatch: (envelope) => owner.dispatchLocal(envelope),
+        onDelivered: () => projectTenant(store, identity.server),
+      });
+      return sender;
+    },
     async deviceLists(edus: EduState) {
       if (!caps.service('device-lists')) return undefined;
       const signer = (await keyOwner()).requestSigner();
@@ -533,7 +574,7 @@ export async function openFacadeRuntime(
         await inbox?.close();
         await deactivation?.close();
         await profileFanout?.close();
-        await deviceLists?.stop();
+        await releaseServices();
         await store.close();
       })(),
   };
