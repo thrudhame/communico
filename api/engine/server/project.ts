@@ -934,8 +934,8 @@ async function apply(
   switch (item.kind) {
     case 'local-participation':
       await tx.execute(
-        'UPDATE event_index SET local_join_user=? WHERE room=? AND event=?',
-        [item.user, roomId, change.event],
+        'UPDATE event_index SET local_join_user=? WHERE room=? AND event=? AND local_join_user IS NOT ?',
+        [item.user, roomId, change.event, item.user],
       );
       return;
     // Signature evidence is export intent, never a new event, feed row, push,
