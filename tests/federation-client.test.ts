@@ -36,6 +36,8 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { randomSigner } from './fixtures/signer.ts';
 import { type FakeServer, startFakeServer } from './federation/fake-server.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
+import { controlledTimeouts } from '#tests/support/timers.ts';
 
 async function withStore(
   fn: (store: Store) => Promise<void>,
@@ -271,10 +273,7 @@ Deno.test('client: raw streaming shares verified signing and completed-error pro
 
 Deno.test('client: total deadline includes a blocked raw sink', async () => {
   const identity = await makeIdentity('raw-timeout.test');
-  let release!: () => void;
-  const blocked = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  const entered = latch(), blocked = latch(), aborted = latch();
   await withStore(async (store) => {
     const server = await store.server();
     await withFake(identity, async (fake) => {
@@ -282,26 +281,48 @@ Deno.test('client: total deadline includes a blocked raw sink', async () => {
       setConfigForTests({
         federation: { timeoutms: 200, cacerts: ['tests/fixtures/tls/ca.crt'] },
       });
-      const started = Date.now();
+      const timers = controlledTimeouts(200);
+      const pending = federationRequestRaw(server, identity.signer, {
+        destination: `localhost:${fake.port}`,
+        method: 'GET',
+        path: '/raw',
+        body: null,
+        sink: () =>
+          new WritableStream<Uint8Array>({
+            write: () => {
+              entered.release();
+              return blocked.wait;
+            },
+            abort: () => aborted.release(),
+          }),
+      }).then(() => 'unexpected success', (error) => error);
       try {
-        const error = await assertRejects(
-          () =>
-            federationRequestRaw(server, identity.signer, {
-              destination: `localhost:${fake.port}`,
-              method: 'GET',
-              path: '/raw',
-              body: null,
-              sink: () =>
-                new WritableStream<Uint8Array>({ write: () => blocked }),
-            }),
-          UpstreamError,
+        await watchdog(
+          entered.wait,
+          'raw sink write enters before total deadline',
         );
+        assertEquals(
+          timers.timers.length,
+          1,
+          'configured total deadline registered',
+        );
+        timers.timers[0].fire();
+        const error = await watchdog(
+          pending,
+          'raw deadline rejects while sink write stays held',
+        );
+        assert(error instanceof UpstreamError);
+        assertEquals(error.context.phase, 'deadline');
         assert(error.message.includes('timeout'), error.message);
-        assert(Date.now() - started < 2000);
+        assertEquals(blocked.released, false);
+        assertEquals(fake.requests.at(-1)!.verified, true);
       } finally {
-        release();
+        blocked.release();
+        await pending;
+        timers.restore();
         setConfigForTests({ federation: { timeoutms: previous } });
       }
+      await watchdog(aborted.wait, 'released sink joins its queued abort');
     }, (req) => req.url.pathname === '/raw' ? new Response('bytes') : null);
   });
 });
@@ -880,7 +901,6 @@ Deno.test('resolve: real well-known handshake cancellation closes its socket wit
         (e: unknown) => e,
       );
       let peer: Deno.Conn | undefined;
-      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         peer = await listener.accept();
         const buffer = new Uint8Array(4096);
@@ -894,16 +914,13 @@ Deno.test('resolve: real well-known handshake cancellation closes its socket wit
           return 'closed';
         })();
         assertEquals(
-          await Promise.race([
+          await watchdog(
             closed,
-            new Promise<string>((resolve) => {
-              timer = setTimeout(() => resolve('still open'), 500);
-            }),
-          ]),
+            'cancelled well-known handshake closes its actual peer',
+          ),
           'closed',
         );
       } finally {
-        clearTimeout(timer);
         ac.abort();
         try {
           peer?.close();
@@ -954,15 +971,22 @@ Deno.test('client: cancellation during signing prevents a late consuming dial', 
       const signing = new Promise<void>((resolve) => {
         entered = resolve;
       });
+      let signed: Promise<string> | undefined;
       const signer: Signer = {
         ...identity.signer,
-        sign: async (data) => {
+        sign: (data) => {
           entered();
-          await held;
-          return await identity.signer.sign(data);
+          signed = held.then(() => identity.signer.sign(data));
+          return signed;
         },
       };
       const ac = new AbortController();
+      const connect = tls.connect;
+      let dials = 0;
+      tls.connect = ((...args: Parameters<typeof tls.connect>) => {
+        dials++;
+        return connect(...args);
+      }) as typeof tls.connect;
       const pending = federationRequest(await store.server(), signer, {
         destination: fake.name,
         method: 'POST',
@@ -970,15 +994,21 @@ Deno.test('client: cancellation during signing prevents a late consuming dial', 
         body: new TextEncoder().encode('{}'),
         signal: ac.signal,
       }).then(() => 'unexpected success', (error: unknown) => error);
-      await signing;
-      ac.abort();
       try {
-        assert((await pending) instanceof DOMException);
+        await watchdog(signing, 'signer enters before cancellation');
+        ac.abort();
+        assert(
+          (await watchdog(
+            pending,
+            'cancellation returns while signing stays held',
+          )) instanceof DOMException,
+        );
       } finally {
         release();
+        await watchdog(signed!, 'actual cancelled signing work finishes');
+        tls.connect = connect;
       }
-      await held;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      assertEquals(dials, 0, 'cancelled signing never starts a consuming dial');
       assertEquals(fake.requests.length, 0);
     });
   });
