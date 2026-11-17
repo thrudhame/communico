@@ -1,6 +1,7 @@
 // Room-owned durable acceptance identities. Only committed targets may leave a
 // room attempt; numeric positions never identify a different room incarnation.
 import type { Conn } from '#engine/store/db.ts';
+import type { Row } from '#engine/store/ffi.ts';
 import { changePosOf, head } from './changes.ts';
 
 export type CompletionCut = Readonly<{
@@ -42,7 +43,10 @@ export async function initializeCompletion(conn: Conn): Promise<void> {
 }
 
 export async function completionState(conn: Conn): Promise<CompletionState> {
-  const rows = await conn.query('SELECT * FROM completion_state');
+  return stateOf(await conn.query('SELECT * FROM completion_state'));
+}
+
+function stateOf(rows: Row[]): CompletionState {
   const row = rows[0];
   if (
     rows.length !== 1 || row.singleton !== 1 ||
@@ -55,6 +59,49 @@ export async function completionState(conn: Conn): Promise<CompletionState> {
     legacyThrough: Number(row.legacy_through),
     completedThrough: Number(row.completed_through),
   };
+}
+
+type CompletionSnapshot = {
+  state: CompletionState;
+  head: number;
+  receiptThrough: number | null;
+};
+
+// One operation reads its related authority together. This is an attempt-local
+// value, never a cache: later validation or completion reads fresh facts, even
+// when it follows a mutation in this same transaction.
+async function completionSnapshot(
+  conn: Conn,
+  eventId?: string,
+): Promise<CompletionSnapshot> {
+  const receipt = eventId === undefined
+    ? 'NULL'
+    : '(SELECT through FROM completion_receipts WHERE event=?)';
+  const rows = await conn.query(
+    `SELECT completion_state.*,
+      (SELECT COALESCE(MAX(pos),0) FROM changes) AS head,
+      ${receipt} AS receipt_through FROM completion_state`,
+    eventId === undefined ? [] : [eventId],
+  );
+  const state = stateOf(rows);
+  return {
+    state,
+    head: Number(rows[0].head),
+    receiptThrough: rows[0].receipt_through === null
+      ? null
+      : Number(rows[0].receipt_through),
+  };
+}
+
+function validateSnapshot(
+  snapshot: CompletionSnapshot,
+  cut: CompletionCut,
+): void {
+  if (
+    cut.generation !== snapshot.state.generation ||
+    !Number.isSafeInteger(cut.through) || cut.through < 0 ||
+    cut.through > snapshot.head
+  ) throw new Error('E_COMPLETION_TARGET: ' + cut.roomId);
 }
 
 export async function completionReceipt(
@@ -118,12 +165,9 @@ export async function validateCompletion(
   conn: Conn,
   target: CompletionTarget,
 ): Promise<void> {
-  await validateCompletionCut(conn, target);
-  const receipt = await completionReceipt(conn, target.roomId, target.eventId);
-  if (
-    receipt === null || receipt.generation !== target.generation ||
-    receipt.through !== target.through || target.through > await head(conn)
-  ) {
+  const snapshot = await completionSnapshot(conn, target.eventId);
+  validateSnapshot(snapshot, target);
+  if (snapshot.receiptThrough !== target.through) {
     throw new Error(
       'E_COMPLETION_TARGET: ' + target.roomId + '/' + target.eventId,
     );
@@ -134,8 +178,12 @@ export async function captureCompletionCut(
   conn: Conn,
   roomId: string,
 ): Promise<CompletionCut> {
-  const state = await completionState(conn);
-  return { roomId, generation: state.generation, through: await head(conn) };
+  const snapshot = await completionSnapshot(conn);
+  return {
+    roomId,
+    generation: snapshot.state.generation,
+    through: snapshot.head,
+  };
 }
 
 export async function captureAcceptedCut(
@@ -160,11 +208,7 @@ export async function validateCompletionCut(
   conn: Conn,
   cut: CompletionCut,
 ): Promise<void> {
-  const state = await completionState(conn);
-  if (
-    cut.generation !== state.generation || !Number.isSafeInteger(cut.through) ||
-    cut.through < 0 || cut.through > await head(conn)
-  ) throw new Error('E_COMPLETION_TARGET: ' + cut.roomId);
+  validateSnapshot(await completionSnapshot(conn), cut);
 }
 
 export async function markCompleted(
@@ -172,10 +216,11 @@ export async function markCompleted(
   generation: string,
   through: number,
 ): Promise<void> {
-  const state = await completionState(conn);
+  const snapshot = await completionSnapshot(conn);
+  const state = snapshot.state;
   if (
     state.generation !== generation || !Number.isSafeInteger(through) ||
-    through < 0 || through > await head(conn)
+    through < 0 || through > snapshot.head
   ) throw new Error('E_COMPLETION_PROGRESS');
   if (through > state.completedThrough) {
     await conn.execute(
