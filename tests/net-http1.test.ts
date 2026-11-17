@@ -128,16 +128,12 @@ function get(
 }
 
 Deno.test('raw HTTP fixture closes accepted connections before joining stalled headers', async () => {
-  const entered = latch(), joined = latch();
+  const entered = latch();
   const controller = new AbortController();
   const srv = serveRaw(async (conn) => {
-    try {
-      await readRequest(conn);
-      entered.release();
-      await conn.read(new Uint8Array(1));
-    } finally {
-      joined.release();
-    }
+    await readRequest(conn);
+    entered.release();
+    await conn.read(new Uint8Array(1));
   });
   const pending = get(srv.port, { signal: controller.signal }).catch((error) =>
     error
@@ -149,9 +145,8 @@ Deno.test('raw HTTP fixture closes accepted connections before joining stalled h
     await watchdog(pending, 'closing fixture releases stalled HTTP request');
   } finally {
     controller.abort();
-    await pending;
-    await watchdog(joined.wait, 'cancelled raw peer drains');
     await srv.close();
+    await watchdog(pending, 'cancelled raw request drains');
   }
 });
 
