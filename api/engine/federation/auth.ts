@@ -17,7 +17,8 @@ import { admit } from './gate.ts';
 import { assertFederationEnabled } from './keydoc.ts';
 import { KeyChangeRefused, type KeyStore } from './keys.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
-import { lookupPeer, recordPending } from './peers.ts';
+import { lookupPeer } from './peers.ts';
+import type { PendingContacts } from './pending-contacts.ts';
 import { parseXMatrixHeaders } from './xmatrix.ts';
 import { requestCanonical } from './request-signature.ts';
 import {
@@ -39,6 +40,7 @@ export type FederationRequest_ = {
 export type AuthDeps = {
   server: Db;
   keys: KeyStore;
+  contacts: PendingContacts;
   // After a request verifies: the sender's contact hook (peer-alive
   // reset + queue wake). Injected so auth stands alone (commit 1) and
   // every authenticated endpoint wires the same hook (old D2).
@@ -140,11 +142,9 @@ export async function authenticateRequest(
     if (deps.onContact !== undefined) deps.onContact(candidate.origin);
     const peer = await lookupPeer(deps.server, candidate.origin);
     if (peer === null) {
-      await recordPending(
-        deps.server,
+      deps.contacts.record(
         candidate.origin,
         'inbound',
-        true,
         req.uri,
       );
     }
