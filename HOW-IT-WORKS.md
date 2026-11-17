@@ -237,6 +237,18 @@ published state, extremities and delivery stay unchanged.
 
 ## Room-first writes and server projection
 
+Room schema v8 persists one UUID generation and an immutable upgrade change
+baseline. Each new local ingest records its first end-of-acceptance cut in the
+same room transaction, after delivery/redaction effects. Retries reuse that
+receipt, never a later head. Old prepared events use an explicitly labeled legacy
+baseline witness after identity verification, not a guessed original cut.
+`projectThrough` validates the durable identity and exact receipt, publishes that
+fixed prefix and propagates required callback failures. Publication and recorded
+callback completion remain separate; callback replay cannot duplicate feed/outbox
+rows. Ordinary room helpers still await their existing post-commit boundary.
+Backup audits and restored-work inspection retain the new identity, receipt and
+progress facts. (`api/engine/room/completion.ts`, `server/project.ts`)
+
 The room transaction records its mutations and delivery destinations in
 `changes`. After that transaction commits, an injected hook projects them
 into the server file. Projection failure leaves the room write committed;

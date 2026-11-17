@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
@@ -358,19 +359,20 @@ Deno.test('F2 device publication upgrade preserves multiple legacy frozen resets
   const dir = await Deno.makeTempDir({ prefix: 'device-publication-upgrade-' });
   let store = await openStore(options(dir), {
     schemas: {
-      server: {
-        version: 42,
-        apply: async (db) => {
-          await serverSchema.apply(db);
-          await db.exec(
-            'DROP TABLE device_publications; DROP TABLE device_publication_predecessors; DROP TABLE device_publication_frontier',
-          );
-        },
-      },
+      server: historicalServerSchema(42),
     },
   });
   try {
     let db = await store.server();
+    // The v42 fixture must not contain columns first introduced by B5. Merely
+    // dropping publication tables from today's schema leaves those columns.
+    assertEquals(
+      (await db.query('PRAGMA table_info(facade_ingress)'))
+        .filter((column) =>
+          column.name === 'ingress_phase' || column.name === 'policies_indexed'
+        ),
+      [],
+    );
     const payload = JSON.stringify({
       user_id: subject,
       device_id: 'PHONE',

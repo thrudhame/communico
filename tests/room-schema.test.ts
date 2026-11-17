@@ -29,6 +29,8 @@ const TABLES = [
   'waits',
   'changes',
   'remote_batches',
+  'completion_state',
+  'completion_receipts',
 ];
 
 const INDEXES = [
@@ -47,6 +49,7 @@ const INDEXES = [
   'changes_redaction_target',
   'publications_change',
   'segments_opener',
+  'completion_receipts_through',
 ];
 
 Deno.test('room schema: tables and indexes land on create, version recorded', async () => {
@@ -116,7 +119,7 @@ Deno.test('room schema: v3 upgrade preserves old data and starts the future publ
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
+            'DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
           );
         },
       },
@@ -152,7 +155,7 @@ Deno.test('room schema: v4 annotation index upgrade preserves events and uses ta
         apply: async (db) => {
           await roomSchema.apply(db);
           await db.exec(
-            'DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready',
+            'DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
           );
         },
       },
@@ -208,7 +211,9 @@ Deno.test('room schema: v5 adds durable remote batch receipts without changing e
         version: 5,
         apply: async (db) => {
           await roomSchema.apply(db);
-          await db.exec('DROP TABLE remote_batches; DROP INDEX waits_ready');
+          await db.exec(
+            'DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
+          );
         },
       },
     },
@@ -242,7 +247,9 @@ Deno.test('room schema: v6 admits eligible retained dependencies into the indexe
         version: 6,
         apply: async (db) => {
           await roomSchema.apply(db);
-          await db.exec('DROP INDEX waits_ready');
+          await db.exec(
+            'DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
+          );
         },
       },
     },
