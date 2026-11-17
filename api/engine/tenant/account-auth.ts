@@ -138,6 +138,7 @@ export async function installAccountAuth(
     [view.localpart],
   );
   const hash = material(view);
+  let installed = false;
   if (old?.pairing === view.pairing) {
     if (
       view.sourceCut < Number(old.source_cut) ||
@@ -156,42 +157,50 @@ export async function installAccountAuth(
       ) authUnavailable();
       return;
     }
+    installed = view.revision === Number(old.revision) &&
+      Number(old.grant_revision) === view.grantRevision &&
+      Number(old.owner_revision) === view.ownerRevision;
   }
-  let user = await userByLocalpart(conn, view.localpart);
-  if (!user) {
-    await insertUser(conn, view.localpart, view.localpart);
+  // Freshness is a new source declaration, not a new semantic authority cut.
+  // Its material/binding has already been authenticated and installed. Replaying
+  // retained sessions here makes periodic freshness compete with revocations.
+  if (!installed) {
+    let user = await userByLocalpart(conn, view.localpart);
+    if (!user) {
+      await insertUser(conn, view.localpart, view.localpart);
+      user = await userByLocalpart(conn, view.localpart);
+    }
+    await installSessionAuthority(
+      conn,
+      view.localpart,
+      view.authority,
+      erasureCuts,
+    );
+    if (view.deviceStreamFloor !== undefined) {
+      await installDeviceStreamFloor(
+        conn,
+        view.localpart,
+        view.deviceStreamFloor,
+      );
+    }
     user = await userByLocalpart(conn, view.localpart);
-  }
-  await installSessionAuthority(
-    conn,
-    view.localpart,
-    view.authority,
-    erasureCuts,
-  );
-  if (view.deviceStreamFloor !== undefined) {
-    await installDeviceStreamFloor(
-      conn,
-      view.localpart,
-      view.deviceStreamFloor,
-    );
-  }
-  user = await userByLocalpart(conn, view.localpart);
-  if (view.deactivated) {
-    await deactivateUserRows(
-      conn,
-      view.server,
-      view.localpart,
-      undefined,
-      true,
-    );
-  }
-  if (
-    view.deactivated || user?.deactivated || !view.credentials ||
-    view.phc === null
-  ) {
-    await clearCredential(conn, view.localpart);
-  } else {
-    await setCredential(conn, view.localpart, view.phc);
+    if (view.deactivated) {
+      await deactivateUserRows(
+        conn,
+        view.server,
+        view.localpart,
+        undefined,
+        true,
+      );
+    }
+    if (
+      view.deactivated || user?.deactivated || !view.credentials ||
+      view.phc === null
+    ) {
+      await clearCredential(conn, view.localpart);
+    } else {
+      await setCredential(conn, view.localpart, view.phc);
+    }
   }
   await conn.execute(
     'INSERT INTO account_auth_snapshots(localpart,pairing,grant_revision,owner_revision,source_cut,revision,material_hash,captured_ms,checked_ms,credentials) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(localpart) DO UPDATE SET pairing=excluded.pairing,grant_revision=excluded.grant_revision,owner_revision=excluded.owner_revision,source_cut=excluded.source_cut,revision=excluded.revision,material_hash=excluded.material_hash,captured_ms=excluded.captured_ms,checked_ms=excluded.checked_ms,credentials=excluded.credentials',
@@ -208,6 +217,58 @@ export async function installAccountAuth(
       view.credentials ? 1 : 0,
     ],
   );
+}
+
+/** A complete authority snapshot can replace only its own authenticated prefix.
+ * Omitted tombstones or sessions are not proof of supersession. */
+export function accountAuthSupersedes(
+  prior: AccountAuth,
+  next: AccountAuth,
+): boolean {
+  if (
+    prior.server !== next.server || prior.localpart !== next.localpart ||
+    prior.pairing !== next.pairing ||
+    prior.grantRevision !== next.grantRevision ||
+    prior.ownerRevision !== next.ownerRevision ||
+    next.sourceCut <= prior.sourceCut ||
+    next.revision < prior.revision || next.capturedMs < prior.capturedMs ||
+    (prior.deactivated && !next.deactivated) ||
+    (next.revision === prior.revision && material(prior) !== material(next))
+  ) return false;
+  const facts = new Map(
+    next.authority.facts.map((fact) => [fact.id, canonicalJson(fact)]),
+  );
+  if (
+    prior.authority.facts.some((fact) =>
+      facts.get(fact.id) !== canonicalJson(fact)
+    )
+  ) return false;
+  const sessions = new Map(
+    next.authority.sessions.map((session) => [session.hash, session]),
+  );
+  return prior.authority.sessions.every((session) => {
+    const held = sessions.get(session.hash);
+    if (!held || held.revision < session.revision) return false;
+    if (held.revision === session.revision) {
+      return canonicalJson(held) === canonicalJson(session);
+    }
+    if (
+      !session.refresh || (session.nextHash !== null && held.nextHash === null)
+    ) return false;
+    const {
+      revision: _oldRevision,
+      accessHash: _oldAccess,
+      nextHash: _oldNext,
+      ...oldIdentity
+    } = session;
+    const {
+      revision: _newRevision,
+      accessHash: _newAccess,
+      nextHash: _newNext,
+      ...newIdentity
+    } = held;
+    return canonicalJson(oldIdentity) === canonicalJson(newIdentity);
+  });
 }
 
 export type AuthSnapshotBinding = {
