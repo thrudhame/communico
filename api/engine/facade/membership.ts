@@ -90,6 +90,41 @@ function operationId(view: MembershipView) {
     ])).digest('hex');
 }
 
+/** A contiguous journal must never put a successor ahead of evidence needed to
+ * apply that same head. Source counters retain their order across rooms too. */
+function bootstrapOrder(operations: MembershipOperation[]) {
+  const remaining = [...operations], ordered: MembershipOperation[] = [];
+  const admitted = new Map<string, MembershipOperation>();
+  while (remaining.length) {
+    const at = remaining.findIndex((operation) =>
+      operation.context.every((dot) => {
+        const predecessor = admitted.get(canonicalJson([
+          dot.source,
+          dot.incarnation,
+          operation.stream,
+          dot.sequence,
+        ]));
+        return predecessor?.semanticKey === operation.semanticKey;
+      }) && !remaining.some((prior) =>
+        prior.source === operation.source &&
+        prior.incarnation === operation.incarnation &&
+        prior.stream === operation.stream && prior.sequence < operation.sequence
+      )
+    );
+    if (at < 0) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'membership bootstrap awaits historical predecessors',
+        503,
+      );
+    }
+    const [operation] = remaining.splice(at, 1);
+    ordered.push(operation);
+    admitted.set(operation.operationId, operation);
+  }
+  return ordered;
+}
+
 /** Verify original signed evidence without countersigning or installing a room.
  * A terminal row may render a leave while retaining the original invite ID. */
 async function verifiedState(
@@ -327,45 +362,117 @@ export class MembershipOperations {
       }
       return await membershipOperations(conn, userId);
     });
-    const records = await this.export(localpart, pairing);
-    for (const operation of operations) {
-      if (
-        operation.source === source.node &&
-        operation.incarnation === source.incarnation
-      ) continue;
+    // Compute the complete schedule before any append/cut. Historical evidence
+    // and current authorship share this journal, so two separate export passes
+    // could deadlock its first successor on history queued behind that head.
+    const ordered = bootstrapOrder(operations);
+    const records: LinkRecord[] = [];
+    for (const operation of ordered) {
       const view = viewOf({
         ...binding,
-        kind: 'membership-history',
+        kind: operation.source === source.node &&
+            operation.incarnation === source.incarnation
+          ? 'membership-operation'
+          : 'membership-history',
         operation,
       });
-      const signed = {
-        body: view,
-        signature: await this.tenant.signer().sign(canonicalJson(view)),
-      };
-      records.push(
-        await server.tx(async (conn) => {
-          unchanged();
-          await this.selected(conn, grant, localpart);
-          await requireDomainControl(conn, view);
-          const record = await appendRecord(
-            conn,
-            grant.body.transcript.body.context.node,
-            {
-              source: view.source,
-              incarnation: view.pairing,
-              stream: operation.stream,
-              type: 'membership-operation',
-              version: 1,
-              operationId: operationId(view),
-              payload: signed,
-            },
-          );
-          unchanged();
-          return record;
-        }),
-      );
+      const record = await this.append(view, grant, unchanged, true);
+      if (record) records.push(record);
     }
     return records;
+  }
+
+  private async append(
+    view: MembershipView,
+    grant: Grant,
+    unchanged: () => void,
+    replay = false,
+  ) {
+    const server = await this.store.server();
+    const context = grant.body.transcript.body.context;
+    const peer = this.node ? 'home' : context.node;
+    const signed = {
+      body: view,
+      signature: await (this.node?.signer() ?? this.tenant.signer()).sign(
+        canonicalJson(view),
+      ),
+    };
+    return await server.tx(async (conn) => {
+      unchanged();
+      await this.selected(conn, grant, view.localpart);
+      await requireDomainControl(conn, view);
+      const { kind: _kind, operation: _operation, ...binding } = view;
+      const scope = 'membership-export:' + canonicalJson(binding);
+      if (view.kind === 'membership-operation' && !replay) {
+        const [current] = await conn.query(
+          'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+          [peer, context.id, scope],
+        );
+        if (Number(current?.source_cut ?? 0) >= view.operation.sequence) {
+          return null;
+        }
+      }
+      const [control] = await conn.query(
+        'SELECT c.signed_json FROM facade_owner_activation a JOIN facade_owner_controls c ON c.pairing=a.pairing AND c.revision=a.revision WHERE a.pairing=?',
+        [view.pairing],
+      );
+      const receiver =
+        (JSON.parse(String(control.signed_json)).body as OwnerControl)
+          .nodes.find((node) => node.node === peer);
+      for (const dot of view.operation.context) {
+        const predecessor = canonicalJson([
+          dot.source,
+          dot.incarnation,
+          view.operation.stream,
+          dot.sequence,
+        ]);
+        const retained = await conn.query(
+          "SELECT 1 FROM domain_operations WHERE operation_id=? AND semantic_key=? AND kind='membership'",
+          [predecessor, view.operation.semanticKey],
+        );
+        // The current receiver authored its own durable facts. Every other
+        // dependency must precede this append, including ordinary export calls
+        // racing bootstrap. Never queue a blocked head and its evidence later.
+        const owned = receiver?.node === dot.source &&
+          receiver.incarnation === dot.incarnation;
+        const prior = operationId({
+          ...view,
+          kind:
+            dot.source === view.source && dot.incarnation === view.incarnation
+              ? 'membership-operation'
+              : 'membership-history',
+          operation: { ...view.operation, operationId: predecessor },
+        });
+        const sent = owned ? true : (await conn.query(
+          "SELECT 1 FROM facade_records WHERE peer=? AND direction='out' AND source=? AND incarnation=? AND operation_id=?",
+          [peer, view.source, this.node ? view.incarnation : context.id, prior],
+        )).length > 0;
+        if (!retained.length || !sent) {
+          throw new LinkError(
+            'LINK_UNAVAILABLE',
+            'membership export awaits historical predecessors',
+            503,
+          );
+        }
+      }
+      const record = await appendRecord(conn, peer, {
+        source: view.source,
+        incarnation: this.node ? view.incarnation : context.id,
+        stream: view.operation.stream,
+        type: 'membership-operation',
+        version: 1,
+        operationId: operationId(view),
+        payload: signed,
+      });
+      if (view.kind === 'membership-operation') {
+        await conn.execute(
+          'INSERT INTO facade_exports(peer,incarnation,scope,source_cut) VALUES(?,?,?,?) ON CONFLICT(peer,incarnation,scope) DO UPDATE SET source_cut=MAX(source_cut,excluded.source_cut)',
+          [peer, context.id, scope, view.operation.sequence],
+        );
+      }
+      unchanged();
+      return record;
+    });
   }
 
   /** Only committed immutable source facts are signed. A mutable display scan
@@ -405,37 +512,7 @@ export class MembershipOperations {
         kind: 'membership-operation',
         operation,
       };
-      const signed = {
-        body: view,
-        signature: await (this.node?.signer() ?? this.tenant.signer()).sign(
-          canonicalJson(view),
-        ),
-      };
-      const record = await server.tx(async (conn) => {
-        unchanged();
-        await this.selected(conn, grant, localpart);
-        await requireDomainControl(conn, view);
-        const [current] = await conn.query(
-          'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-          [peer, context.id, scope],
-        );
-        if (Number(current?.source_cut ?? 0) >= operation.sequence) return null;
-        const record = await appendRecord(conn, peer, {
-          source: view.source,
-          incarnation: this.node ? view.incarnation : context.id,
-          stream: 'membership:@' + localpart + ':' + view.server,
-          type: 'membership-operation',
-          version: 1,
-          operationId: operationId(view),
-          payload: signed,
-        });
-        await conn.execute(
-          'INSERT INTO facade_exports(peer,incarnation,scope,source_cut) VALUES(?,?,?,?) ON CONFLICT(peer,incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut',
-          [peer, context.id, scope, operation.sequence],
-        );
-        unchanged();
-        return record;
-      });
+      const record = await this.append(view, grant, unchanged);
       if (record) records.push(record);
     }
     return records;

@@ -40,7 +40,8 @@ async function fixture() {
       maxopenfiles: 8,
       idleseconds: 300,
     }, { schemas: { server: serverSchema, tenant: tenantSchema } });
-  const home = await open('home'), edge = await open('edge');
+  let home = await open('home');
+  const edge = await open('edge');
   await bindRole(home, { role: 'home', server: 'logical.test', node: '' });
   await bindRole(edge, {
     role: 'facade',
@@ -116,6 +117,18 @@ async function fixture() {
     bundle,
     es,
     hs,
+    reopenHome: async () => {
+      await home.close();
+      home = await open('home');
+      const tenant = await openTenant(home, 'logical.test');
+      const pairings = new Pairings(
+        await home.server(),
+        tenant.signer(),
+        tenant.publicB64,
+        'a'.repeat(64),
+      );
+      return { home, owner: new MembershipOperations(home, tenant, pairings) };
+    },
     close: async () => {
       await home.close();
       await edge.close();
@@ -854,6 +867,245 @@ Deno.test('membership history: home attests exact retained foreign dots without 
       history,
       'exact bootstrap retries retain journal identity',
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership bootstrap scheduling: historical predecessors precede current-source successors on the actual journal', async () => {
+  const f = await fixture();
+  try {
+    const home = await f.home.server();
+    const predecessor = await source(f, 1, 'edge');
+    await home.tx((conn) => retainMembershipOperation(conn, predecessor));
+    const successor = await source(f, 1, 'home');
+    successor.context = [{
+      source: predecessor.source,
+      incarnation: predecessor.incarnation,
+      sequence: predecessor.sequence,
+    }];
+    await home.execute(
+      'UPDATE domain_operations SET context_json=? WHERE operation_id=?',
+      [canonicalJson(successor.context), successor.operationId],
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(
+      records.map((record) =>
+        (record.payload as { body: { operation: MembershipOperation } }).body
+          .operation.operationId
+      ),
+      [predecessor.operationId, successor.operationId],
+    );
+    assertEquals(records.map((record) => record.sequence), [1, 2]);
+    assertEquals(records[1].previous, records[0].hash);
+    const actual = await home.query(
+      "SELECT record_json FROM facade_records WHERE direction='out' AND stream=? ORDER BY sequence",
+      [successor.stream],
+    );
+    assertEquals(
+      actual.map((row) => JSON.parse(String(row.record_json))),
+      records,
+    );
+    const again = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(
+      again,
+      records,
+      'bootstrap retry preserves the complete ordered cut',
+    );
+    assertEquals(
+      await home.query(
+        "SELECT source_cut FROM facade_exports WHERE scope LIKE 'membership-export:%'",
+      ),
+      [{ source_cut: 1 }],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership bootstrap scheduling: missing historical closure appends no blocked head or source cut', async () => {
+  const f = await fixture();
+  try {
+    const operation = await source(f, 1, 'home');
+    const home = await f.home.server();
+    await home.execute(
+      'UPDATE domain_operations SET context_json=? WHERE operation_id=?',
+      [
+        canonicalJson([{
+          source: 'retired',
+          incarnation: 'missing',
+          sequence: 1,
+        }]),
+        operation.operationId,
+      ],
+    );
+    await assertRejects(() => f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals(
+      await home.query('SELECT * FROM facade_records WHERE stream=?', [
+        operation.stream,
+      ]),
+      [],
+    );
+    assertEquals(
+      await home.query(
+        "SELECT * FROM facade_exports WHERE scope LIKE 'membership-export:%'",
+      ),
+      [],
+    );
+    assertEquals(await home.query('SELECT * FROM membership_operations'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership bootstrap scheduling: transitive old history is ordered after opposite arrival and cold reopen', async () => {
+  const f = await fixture();
+  try {
+    const successor = await source(f, 1, 'home');
+    const home = await f.home.server();
+    const predecessor = {
+      ...successor,
+      source: 'z-retired',
+      incarnation: 'old-z',
+    };
+    predecessor.operationId = canonicalJson([
+      predecessor.source,
+      predecessor.incarnation,
+      predecessor.stream,
+      predecessor.sequence,
+    ]);
+    const middle = {
+      ...successor,
+      source: 'a-retired',
+      incarnation: 'old-a',
+      context: [{
+        source: predecessor.source,
+        incarnation: predecessor.incarnation,
+        sequence: predecessor.sequence,
+      }],
+    };
+    middle.operationId = canonicalJson([
+      middle.source,
+      middle.incarnation,
+      middle.stream,
+      middle.sequence,
+    ]);
+    successor.context = [{
+      source: middle.source,
+      incarnation: middle.incarnation,
+      sequence: middle.sequence,
+    }];
+    await home.execute(
+      'UPDATE domain_operations SET context_json=? WHERE operation_id=?',
+      [canonicalJson(successor.context), successor.operationId],
+    );
+    for (const operation of [middle, predecessor]) {
+      await home.tx((conn) => retainMembershipOperation(conn, operation));
+    }
+    const reopened = await f.reopenHome();
+    const records = await reopened.owner.bootstrap('alice', f.bundle.id);
+    assertEquals(
+      records.map((record) =>
+        (record.payload as { body: { operation: MembershipOperation } }).body
+          .operation.operationId
+      ),
+      [predecessor.operationId, middle.operationId, successor.operationId],
+    );
+    assertEquals(records.map((record) => record.sequence), [1, 2, 3]);
+    const again = await f.reopenHome();
+    assertEquals(await again.owner.bootstrap('alice', f.bundle.id), records);
+    const db = await again.home.server();
+    assertEquals(
+      await db.query(
+        'SELECT source,applied FROM domain_operations ORDER BY source',
+      ),
+      [
+        { source: 'a-retired', applied: 0 },
+        { source: 'home', applied: 1 },
+        { source: 'z-retired', applied: 0 },
+      ],
+    );
+    assertEquals(await db.query('SELECT * FROM membership_operations'), []);
+    assertEquals(await db.query('SELECT * FROM prejoin_memberships'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership export scheduling: ordinary export cannot bypass historical bootstrap and append its blocked successor first', async () => {
+  const f = await fixture();
+  try {
+    const original = await source(f, 1, 'edge');
+    const predecessor = { ...original, source: 'retired', incarnation: 'old' };
+    predecessor.operationId = canonicalJson([
+      predecessor.source,
+      predecessor.incarnation,
+      predecessor.stream,
+      predecessor.sequence,
+    ]);
+    const home = await f.home.server();
+    await home.tx((conn) => retainMembershipOperation(conn, predecessor));
+    const successor = await source(f, 1, 'home');
+    successor.context = [{
+      source: predecessor.source,
+      incarnation: predecessor.incarnation,
+      sequence: predecessor.sequence,
+    }];
+    await home.execute(
+      'UPDATE domain_operations SET context_json=? WHERE operation_id=?',
+      [canonicalJson(successor.context), successor.operationId],
+    );
+    await assertRejects(() => f.hs.export('alice', f.bundle.id));
+    assertEquals(
+      await home.query('SELECT * FROM facade_records WHERE stream=?', [
+        successor.stream,
+      ]),
+      [],
+    );
+    assertEquals(
+      await home.query(
+        "SELECT * FROM facade_exports WHERE scope LIKE 'membership-export:%'",
+      ),
+      [],
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(
+      records.map((record) =>
+        (record.payload as { body: { operation: MembershipOperation } }).body
+          .operation.operationId
+      ),
+      [predecessor.operationId, successor.operationId],
+    );
+    assertEquals(await f.hs.export('alice', f.bundle.id), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership export scheduling: the current peer already owns its own retained predecessor without a historical echo', async () => {
+  const f = await fixture();
+  try {
+    const predecessor = await source(f, 1, 'edge');
+    const home = await f.home.server();
+    await home.tx((conn) => retainMembershipOperation(conn, predecessor));
+    const successor = await source(f, 1, 'home');
+    successor.context = [{
+      source: predecessor.source,
+      incarnation: predecessor.incarnation,
+      sequence: predecessor.sequence,
+    }];
+    await home.execute(
+      'UPDATE domain_operations SET context_json=? WHERE operation_id=?',
+      [canonicalJson(successor.context), successor.operationId],
+    );
+    const records = await f.hs.export('alice', f.bundle.id);
+    assertEquals(records.length, 1);
+    const body = (records[0].payload as {
+      body: { kind: string; operation: MembershipOperation };
+    }).body;
+    assertEquals(body.kind, 'membership-operation');
+    assertEquals(body.operation, successor);
+    assertEquals(await f.hs.export('alice', f.bundle.id), []);
   } finally {
     await f.close();
   }
