@@ -56,6 +56,18 @@ function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
 }
 
+function accountLocalpart(localpart: string): string {
+  try {
+    return checkLocalpart(localpart);
+  } catch (error) {
+    if (
+      !(error instanceof MatrixError) || error.status !== 400 ||
+      error.errcode !== 'M_INVALID_USERNAME'
+    ) throw error;
+    throw new LinkError('LINK_BAD_RECORD', 'invalid account localpart', 400);
+  }
+}
+
 function authorityCutOf(
   raw: unknown,
   localpart: string,
@@ -83,7 +95,7 @@ function sessionAuthorityOf(raw: unknown): SessionAuthority {
     );
   }
   const localpart = text(row.localpart);
-  if (checkLocalpart(localpart) !== localpart) {
+  if (accountLocalpart(localpart) !== localpart) {
     mismatch('invalid authority account');
   }
   const view: SessionAuthority = {
@@ -249,7 +261,7 @@ function accountAuthOf(
   const row = object(raw);
   const localpart = text(row.localpart);
   if (
-    row.kind !== 'account-auth' || checkLocalpart(localpart) !== localpart ||
+    row.kind !== 'account-auth' || accountLocalpart(localpart) !== localpart ||
     typeof row.credentials !== 'boolean' ||
     typeof row.deactivated !== 'boolean' ||
     (row.phc !== null &&

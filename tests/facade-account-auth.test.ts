@@ -825,6 +825,8 @@ Deno.test('malformed signed authority tails cannot conceal a valid deactivation 
       'null session',
       'unknown source',
       'missing dependency',
+      'invalid localpart',
+      'overlong localpart',
     ]
   ) {
     await t.step(malformed, async () => {
@@ -839,6 +841,12 @@ Deno.test('malformed signed authority tails cannot conceal a valid deactivation 
         payload.after = payload.signed.body.sourceCut;
         payload.signed.body.sourceCut++;
         payload.signed.body.revision++;
+        if (malformed === 'invalid localpart') {
+          payload.signed.body.localpart = 'bad:account';
+        }
+        if (malformed === 'overlong localpart') {
+          payload.signed.body.localpart = 'a'.repeat(256);
+        }
         const authority = payload.signed.body.authority;
         if (malformed === 'null fact') {
           (authority.facts as unknown[]).push(null);
@@ -904,7 +912,9 @@ Deno.test('malformed signed authority tails cannot conceal a valid deactivation 
         await assertRejects(
           () => f.receiver.apply(f.journal, invalid),
           LinkError,
-          'invalid session authority cut',
+          malformed.endsWith('localpart')
+            ? 'invalid account localpart'
+            : 'invalid session authority cut',
         );
         assertEquals(
           (await f.journal.heads('home', 'in', deactivated)).applied.sequence,
