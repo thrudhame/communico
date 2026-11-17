@@ -42,6 +42,13 @@ async function idleTurn(pool: Pool, ageMs: number, sweep: () => void) {
     queue: Promise<unknown>;
     fileWork: Map<string, Promise<unknown>>;
   };
+  // Finish preceding metadata, including releases that update lastUsed.
+  // Recheck the tail because its callbacks can enqueue another metadata turn.
+  let preceding: Promise<unknown>;
+  do {
+    preceding = state.queue;
+    await watchdog(preceding, 'metadata before idle age');
+  } while (preceding !== state.queue);
   const now = Date.now;
   const lastUsed = Math.max(
     ...[...state.entries.values()].map((entry) => entry.lastUsed),
