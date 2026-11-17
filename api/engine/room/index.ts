@@ -62,6 +62,8 @@ function bind(
         completion.markCompleted(conn, generation, through),
     },
     membershipReceipts: {
+      has: (operation: string) =>
+        membershipReceipts.hasMembershipReceipt(conn, operation),
       get: (operation: string, inputHash: string) =>
         membershipReceipts.membershipReceipt(conn, operation, inputHash),
       save: (

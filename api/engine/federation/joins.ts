@@ -34,6 +34,7 @@ import {
   stateBefore,
 } from '#engine/room/build.ts';
 import { prejoinStateInTx } from './prejoin.ts';
+import { joinResponse } from './join-response.ts';
 
 async function template(
   roomId: string,
@@ -224,11 +225,19 @@ async function sendMembership(
   membership: 'join' | 'leave' | 'knock',
   apiVersion: 'v1' | 'v2',
   deps: InviteDeps,
+  omitMembers = false,
 ) {
   const room = await heldRoom(deps.store, roomId);
-  const version = await room.tx(async (tx) =>
-    (await currentSnapshot(tx)).version
-  );
+  const operation = canonicalJson([origin, membership, eventId]);
+  const version = await room.tx(async (tx) => {
+    // A completed operation is replayable after an ACL update. New work keeps
+    // the normal current-ACL admission order, including malformed requests.
+    // Existence alone exposes no saved result; authentication remains below.
+    if (!await tx.membershipReceipts.has(operation)) {
+      await assertAcl(tx, origin);
+    }
+    return (await currentSnapshot(tx)).version;
+  });
   const pdu = raw as Pdu;
   if (pdu.room_id !== roomId) {
     throw new MatrixError(400, 'M_BAD_JSON', 'room_id does not match the path');
@@ -275,28 +284,25 @@ async function sendMembership(
     ) sigOk = true;
   }
   if (!sigOk) throw new MatrixError(403, 'M_FORBIDDEN', 'bad signature');
-  const operation = canonicalJson([origin, membership, eventId]);
   const inputHash = createHash('sha256').update(
     eventMaterial({ ...pdu, event_id: eventId }),
   ).digest('hex');
-  const render = (result: Record<string, unknown>) => {
+  const finish = async (result: Record<string, unknown>) => {
+    // A saved result closes room mutation, not its derived publication. Both
+    // new and replayed operations finish through the same roll-forward owner.
+    await projectAfterWrite(deps.store, roomId);
     if (membership === 'knock') return result;
     if (membership === 'leave') {
       return apiVersion === 'v2' ? result : [200, result];
     }
-    const { servers_in_room, ...body } = result;
-    return apiVersion === 'v1' ? [200, body] : {
-      ...body,
-      members_omitted: false,
-      servers_in_room,
-    };
+    return await joinResponse(result, version, apiVersion, omitMembers);
   };
   // A completed protocol operation survives later ACL/membership/key changes.
   // Current request origin/signature checks above still precede the receipt.
   const retained = await room.tx((tx) =>
     tx.membershipReceipts.get(operation, inputHash)
   );
-  if (retained !== null) return render(retained);
+  if (retained !== null) return await finish(retained);
   const prepared =
     await (membership === 'join'
       ? verifyJoinForCountersign(pdu, version, deps.keys, deps.self, roomId)
@@ -415,8 +421,7 @@ async function sendMembership(
       typeof nominated === 'string' ? nominated : undefined,
     )
     : await withRoomLock(roomId, () => room.tx(publish));
-  await projectAfterWrite(deps.store, roomId);
-  return render(answer);
+  return await finish(answer);
 }
 
 export function sendJoin(
@@ -426,8 +431,18 @@ export function sendJoin(
   origin: string,
   apiVersion: 'v1' | 'v2',
   deps: InviteDeps,
+  omitMembers = false,
 ) {
-  return sendMembership(roomId, eventId, pdu, origin, 'join', apiVersion, deps);
+  return sendMembership(
+    roomId,
+    eventId,
+    pdu,
+    origin,
+    'join',
+    apiVersion,
+    deps,
+    omitMembers,
+  );
 }
 
 export function sendLeave(

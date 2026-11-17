@@ -12,6 +12,18 @@ CREATE TABLE membership_receipts(
 );
 `;
 
+// Admission may distinguish new work from a retained operation without reading
+// its result. Authentication/material checks still precede membershipReceipt.
+export async function hasMembershipReceipt(
+  conn: Conn,
+  operation: string,
+): Promise<boolean> {
+  return (await conn.query(
+    'SELECT 1 FROM membership_receipts WHERE operation=?',
+    [operation],
+  )).length !== 0;
+}
+
 export async function membershipReceipt(
   conn: Conn,
   operation: string,

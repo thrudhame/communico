@@ -17,6 +17,9 @@ import { verify } from '#engine/room/verify.ts';
 import { config } from '#engine/config.ts';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { setRoomHooks } from '#engine/room/hooks.ts';
+import { project } from '#engine/server/project.ts';
+import { registerRoom } from '#engine/server/registry.ts';
 import { fakeKeyResolver, makeRemoteServer } from './fixtures/remote.ts';
 import { signerFor, signTemplate } from './http-federation.ts';
 
@@ -96,6 +99,7 @@ async function fixture(knock = false) {
     room,
     topic,
     changes,
+    store: () => store,
     signatures: () => signatures,
     expire() {
       expired = true;
@@ -131,6 +135,15 @@ Deno.test('membership receipts pin the pre-join response across later room write
       'v2',
       await f.deps(),
     );
+    const partial = await sendJoin(
+      f.roomId,
+      String(join.event_id),
+      wire,
+      f.remote.name,
+      'v2',
+      await f.deps(),
+      true,
+    );
     await f.topic('after the original join');
     const before = await f.changes();
     await f.reopen();
@@ -143,6 +156,19 @@ Deno.test('membership receipts pin the pre-join response across later room write
       await f.deps(),
     );
     assertEquals(retry, first, 'retry must not render a newer state/auth cut');
+    assertEquals(
+      await sendJoin(
+        f.roomId,
+        String(join.event_id),
+        wire,
+        f.remote.name,
+        'v2',
+        await f.deps(),
+        true,
+      ),
+      partial,
+      'partial variants use the same pinned cut after cold reopen',
+    );
     assertEquals(await f.changes(), before, 'a replay is not new arrival news');
   } finally {
     await f.close();
@@ -204,6 +230,56 @@ Deno.test('membership receipts replay retained signed work without minting a sig
       MatrixError,
     );
     assertEquals(error.status, 403);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('completed membership replays survive later ACL changes while new operations retain ACL admission', async () => {
+  const f = await fixture();
+  try {
+    const deps = await f.deps();
+    const made = await makeJoin(f.roomId, guest, f.remote.name, ['11'], deps);
+    const join = await signTemplate(made.event, f.remote);
+    const wire = toWire(join, '11');
+    const result = await sendJoin(
+      f.roomId,
+      String(join.event_id),
+      wire,
+      f.remote.name,
+      'v2',
+      deps,
+    );
+    const acl = await sendLocal(await f.room(), {
+      type: 'm.room.server_acl',
+      state_key: '',
+      sender: creator,
+      content: { allow: ['*'], deny: [f.remote.name] },
+      origin_server_ts: Date.now(),
+    }, deps.signer);
+    assertEquals(acl.standing, 'accepted');
+    const head = await f.changes();
+    await f.reopen();
+    assertEquals(
+      await sendJoin(
+        f.roomId,
+        String(join.event_id),
+        wire,
+        f.remote.name,
+        'v2',
+        await f.deps(),
+      ),
+      result,
+    );
+    const reopened = await f.deps();
+    const refused = await assertRejects(
+      () =>
+        sendJoin(f.roomId, '$new-operation', {}, f.remote.name, 'v2', reopened),
+      MatrixError,
+    );
+    assertEquals(refused.status, 403);
+    assertEquals(refused.message, 'M_FORBIDDEN: server denied by room ACL');
+    assertEquals(await f.changes(), head);
   } finally {
     await f.close();
   }
@@ -386,5 +462,101 @@ Deno.test('membership receipt and actual room ingest roll back together before p
     assert(!Array.isArray(result) && result.event !== undefined);
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('membership receipt retries finish interrupted projection after cold reopen', async (t) => {
+  for (const membership of ['join', 'knock', 'leave'] as const) {
+    await t.step(membership, async () => {
+      const f = await fixture(membership !== 'join');
+      try {
+        await registerRoom(f.store(), f.roomId);
+        await project(f.store(), f.roomId);
+        const deps = await f.deps();
+        // A leave needs prior membership. A knock needs only the room's rule.
+        if (membership === 'leave') {
+          const made = await makeKnock(
+            f.roomId,
+            guest,
+            f.remote.name,
+            ['11'],
+            deps,
+          );
+          const knock = await signTemplate(made.event, f.remote);
+          await sendKnock(
+            f.roomId,
+            String(knock.event_id),
+            toWire(knock, '11'),
+            f.remote.name,
+            deps,
+          );
+          await project(f.store(), f.roomId);
+        }
+        const make = membership === 'join'
+          ? makeJoin
+          : membership === 'knock'
+          ? makeKnock
+          : makeLeave;
+        const made = await make(f.roomId, guest, f.remote.name, ['11'], deps);
+        const signed = await signTemplate(made.event, f.remote);
+        const id = String(signed.event_id);
+        const send = async () =>
+          membership === 'knock'
+            ? await sendKnock(
+              f.roomId,
+              id,
+              toWire(signed, '11'),
+              f.remote.name,
+              await f.deps(),
+            )
+            : await (membership === 'join' ? sendJoin : sendLeave)(
+              f.roomId,
+              id,
+              toWire(signed, '11'),
+              f.remote.name,
+              'v2',
+              await f.deps(),
+            );
+        setRoomHooks({
+          project: () =>
+            Promise.reject(new Error('membership projection interrupted')),
+          register: registerRoom,
+        });
+        const first = await send();
+        const count = async () =>
+          (await (await f.store().server()).query(
+            'SELECT COUNT(*) AS n FROM feed WHERE room=? AND event=?',
+            [f.roomId, id],
+          ))[0].n;
+        assertEquals(
+          await count(),
+          0,
+          'room commit precedes derived publication',
+        );
+        const head = await f.changes();
+        await f.reopen();
+        setRoomHooks({ project, register: registerRoom });
+        assertEquals(await send(), first);
+        assertEquals(
+          await count(),
+          1,
+          'a retained result must not bypass pending projection',
+        );
+        assertEquals(
+          await f.changes(),
+          head,
+          'projection retry adds no room news',
+        );
+        assertEquals(await send(), first);
+        assertEquals(
+          await count(),
+          1,
+          'the projected membership remains unique',
+        );
+      } finally {
+        setRoomHooks({ project: async () => {}, register: async () => {} });
+        await f.close();
+      }
+    });
   }
 });
