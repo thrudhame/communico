@@ -1,22 +1,36 @@
 // F2: a retained typed tenant/room survives LRU churn and idle eviction.
 // Observe both through real authenticated HTTP, at the consumer boundary.
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { closeApp, openApp } from '#engine/app.ts';
+import { type App, closeApp, openApp } from '#engine/app.ts';
 import { createRoom } from '#engine/room/create.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { clear, remember } from '#tests/fixtures/http-leases/lease/get.ts';
+import type { Pool } from '#engine/store/pool.ts';
+import { idleTurns } from '#tests/support/pool-turn.ts';
+import { keyFor } from '#engine/store/layout.ts';
+import type { Db } from '#engine/store/db.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
 
-Deno.test('HTTP leases: more rooms than maxopenfiles, idle close, concurrent tenant and room operations', async () => {
+async function withLeaseApp(
+  maxopenfiles: number,
+  run: (
+    app: App,
+    base: string,
+    sweep: (ageMs: number) => Promise<void>,
+    pool: Pool,
+  ) => Promise<void>,
+) {
   const dir = await Deno.makeTempDir({ prefix: 'http-leases-' });
-  const app = await openApp({
-    dir,
-    library: './.native/libturso_ffi.so',
-    checkpointlogbytes: 65536,
-    maxopenfiles: 1,
-    idleseconds: 1,
-  });
+  const { value: app, turn: sweep } = await idleTurns(() =>
+    openApp({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles,
+      idleseconds: 1,
+    }), (app) => (app.store as unknown as { pool: Pool }).pool);
   const handler = await pathfinder({
     roots: ['api/endpoints/matrix/', 'tests/fixtures/http-leases/'],
   });
@@ -27,6 +41,17 @@ Deno.test('HTTP leases: more rooms than maxopenfiles, idle close, concurrent ten
   }, handler);
   const base = `http://127.0.0.1:${server.addr.port}`;
   try {
+    await run(app, base, sweep, (app.store as unknown as { pool: Pool }).pool);
+  } finally {
+    clear();
+    await server.shutdown();
+    await closeApp();
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+
+Deno.test('HTTP leases: more rooms than maxopenfiles and concurrent tenant and room operations', async () => {
+  await withLeaseApp(1, async (app, base) => {
     const user = await registerUser(app.tenant, {
       localpart: 'lease-user',
       password: 'pw',
@@ -61,18 +86,6 @@ Deno.test('HTTP leases: more rooms than maxopenfiles, idle close, concurrent ten
       });
     };
     for (const room of rooms) await read(room.id);
-    // App workers may briefly reopen an idle file. Observe the eviction itself
-    // within the existing wait window, not one sample at an unrelated tick.
-    const deadline = Date.now() + 2600;
-    while (app.store.stats().openFiles !== 0 && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    assertEquals(
-      app.store.stats().openFiles,
-      0,
-      'idle sweep actually evicted the files',
-    );
-    await read(rooms[0].id);
     // Hold a tenant read while HTTP room reads churn the pool. max=1 may
     // temporarily overflow when both files are leased, then returns to 1.
     let release!: () => void;
@@ -98,10 +111,81 @@ Deno.test('HTTP leases: more rooms than maxopenfiles, idle close, concurrent ten
     }
     assert(app.store.stats().openFiles <= 1);
     assertEquals(app.store.stats().poolErrors, []);
-  } finally {
-    clear();
-    await server.shutdown();
-    await closeApp();
-    await Deno.remove(dir, { recursive: true });
-  }
+  });
+});
+
+Deno.test('HTTP leases: idle eviction closes a room while an unrelated tenant lease remains usable', async () => {
+  // Two slots keep this room idle instead of evicting it through the max=1
+  // churn above. A real held tenant transaction makes global zero incorrect.
+  await withLeaseApp(2, async (app, base, sweep, pool) => {
+    const user = await registerUser(app.tenant, {
+      localpart: 'idle-lease-user',
+      password: 'pw',
+    });
+    const result = await createRoom(
+      app.store,
+      { creator: user.user_id },
+      app.tenant.signer(),
+    );
+    const room = await openRoom(app.store, result.roomId);
+    remember(room);
+    const read = async () => {
+      const response = await fetch(
+        base + '/lease?room=' + encodeURIComponent(room.id),
+        {
+          headers: { Authorization: 'Bearer ' + user.access_token },
+        },
+      );
+      assertEquals(response.status, 200);
+      assertEquals(await response.json(), {
+        room: room.id,
+        membership: 'join',
+        user: user.user_id,
+      });
+    };
+    const entered = latch(), release = latch();
+    const tenantRead = app.tenant.tx(async (tx) => {
+      assertEquals(await tx.users.exists('idle-lease-user'), true);
+      entered.release();
+      await release.wait;
+      assertEquals(await tx.users.exists('idle-lease-user'), true);
+    });
+    // Own an early failure even if it happens before the entered observation.
+    void tenantRead.catch(() => {});
+    let idleDb: Db | undefined;
+    try {
+      await watchdog(entered.wait, 'tenant lease enters before idle sweep');
+      await read();
+      const key = 'rooms:' + await keyFor(room.id);
+      const state = pool as unknown as {
+        entries: Map<string, { db: Db; leases: number }>;
+      };
+      const idle = state.entries.get(key);
+      assert(idle, 'known room must be cached before idle sweep');
+      idleDb = idle.db;
+      assertEquals(idle.leases, 0, 'known room must be unleased');
+      await sweep(1001);
+      assertEquals(
+        state.entries.has(key),
+        false,
+        'idle sweep actually evicted the room',
+      );
+      await assertRejects(
+        () => idle.db.query('SELECT value FROM id'),
+        Error,
+        'database is closing or closed',
+      );
+      assertEquals(
+        release.released,
+        false,
+        'tenant lease remains held through eviction',
+      );
+      await read();
+      assertEquals(app.store.stats().poolErrors, []);
+    } finally {
+      release.release();
+      await tenantRead;
+      await idleDb?.close();
+    }
+  });
 });
