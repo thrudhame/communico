@@ -12,12 +12,20 @@ import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
 import { bindRole } from '#engine/facade/role.ts';
+import { recordHash } from '#engine/facade/protocol.ts';
+import {
+  countersign,
+  inviteIntentProvider,
+  invitesOf,
+} from '#engine/federation/invites.ts';
+import { createRoom } from '#engine/room/create.ts';
+import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { retainMembershipOperation } from '#engine/server/membership-history.ts';
 import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
 import { membershipHistory } from '#engine/server/membership-history.ts';
 import { fakeKeyResolver, remoteEvent } from '#tests/fixtures/remote.ts';
-import { testRemoteServer } from '#tests/fixtures/signer.ts';
+import { testRemoteServer, testSigner } from '#tests/fixtures/signer.ts';
 import type { LinkRecord } from '#engine/facade/protocol.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -39,7 +47,9 @@ async function fixture() {
       checkpointlogbytes: 65536,
       maxopenfiles: 8,
       idleseconds: 300,
-    }, { schemas: { server: serverSchema, tenant: tenantSchema } });
+    }, {
+      schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+    });
   let home = await open('home');
   const edge = await open('edge');
   await bindRole(home, { role: 'home', server: 'logical.test', node: '' });
@@ -141,6 +151,7 @@ async function source(
   f: Awaited<ReturnType<typeof fixture>>,
   sequence = 1,
   side: 'home' | 'edge' = 'edge',
+  roomId = '!unheld:remote.test',
 ) {
   const server = await f[side].server();
   const [row] = await server.query(
@@ -153,7 +164,7 @@ async function source(
   // This is the already-committed source-owner boundary. The real invite/knock/
   // departure capture and PDU validation are exercised in prejoin-lifecycle.
   const state: MembershipState = {
-    roomId: '!unheld:remote.test',
+    roomId,
     userId: '@alice:logical.test',
     eventId: '$invite-' + sequence,
     roomVersion: '11',
@@ -440,15 +451,20 @@ Deno.test('membership export: authority retirement while signing rolls back appe
 async function incoming(
   f: Awaited<ReturnType<typeof fixture>>,
   side: 'home' | 'edge' = 'edge',
+  kind: 'invite' | 'knock' = 'invite',
+  roomId?: string,
 ) {
-  const operation = await source(f, 1, side);
-  const remote = await testRemoteServer('remote.test');
+  const operation = await source(f, 1, side, roomId);
+  const remote = await testRemoteServer(
+    kind === 'knock' ? 'logical.test' : 'remote.test',
+  );
   const state = JSON.parse(operation.payload) as MembershipState;
+  state.kind = kind;
   const pdu = await remoteEvent(state.roomId, remote, '11', {
     type: 'm.room.member',
-    sender: '@inviter:remote.test',
+    sender: kind === 'knock' ? state.userId : '@inviter:remote.test',
     state_key: state.userId,
-    content: { membership: 'invite' },
+    content: { membership: kind },
     prev_events: [],
   });
   state.eventId = String(pdu.event_id);
@@ -467,6 +483,466 @@ async function incoming(
       : f.hs.export('alice', f.bundle.id));
   return { record, state, keys: fakeKeyResolver(remote), operation };
 }
+
+type MembershipApplication = (
+  journal: Journal,
+  stream: LinkRecord,
+  keys: Parameters<MembershipOperations['retain']>[1],
+  pairing?: string,
+) => Promise<boolean>;
+
+function lifecycleApplication(owner: MembershipOperations) {
+  const apply = (owner as MembershipOperations & {
+    apply?: MembershipApplication;
+  }).apply;
+  assert(apply, 'membership lifecycle application is unavailable');
+  return apply.bind(owner);
+}
+
+Deno.test('membership application: authenticated OOB facts reach ordinary invite consumers in both roles before applied ACK', async () => {
+  for (const side of ['edge', 'home'] as const) {
+    const f = await fixture();
+    try {
+      const { record, state, keys } = await incoming(f, side);
+      const receiver = side === 'edge' ? f.hs : f.es;
+      const db = await f[side === 'edge' ? 'home' : 'edge'].server();
+      const journal = new Journal(db, [...LINK_SUPPORTED, {
+        type: 'membership-operation',
+        version: 1,
+      }]);
+      const apply = lifecycleApplication(receiver);
+      const peer = record.source;
+      await journal.receive(peer, [record]);
+      assertEquals(
+        (await journal.heads(peer, 'in', record)).applied.sequence,
+        0,
+      );
+      assertEquals(await invitesOf(state.userId, { server: db }), []);
+      assertEquals(await apply(journal, record, keys, f.bundle.id), true);
+      const displayed = await invitesOf(state.userId, { server: db });
+      assertEquals(displayed.length, 1);
+      assertEquals(displayed[0].eventId, state.eventId);
+      assertEquals(displayed[0].status, 'pending');
+      assertEquals(
+        (await journal.heads(peer, 'in', record)).applied.sequence,
+        record.sequence,
+      );
+      assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+      assertEquals(
+        await db.query(
+          'SELECT input_hash,result_json FROM membership_operations',
+        ),
+        [{
+          input_hash: record.hash,
+          result_json: canonicalJson({
+            operationId:
+              (record.payload as { body: { operation: MembershipOperation } })
+                .body.operation.operationId,
+          }),
+        }],
+        'the lifecycle commit retains only its exact link completion, not a federation request',
+      );
+      assertEquals(
+        (await db.query(
+          "SELECT DISTINCT source FROM domain_operations WHERE kind='membership'",
+        )).map((row) => row.source),
+        [record.source],
+        'import does not re-author an operation at the receiver',
+      );
+      const before = await db.query('SELECT * FROM counters ORDER BY name');
+      assertEquals(await apply(journal, record, keys, f.bundle.id), false);
+      assertEquals(
+        await db.query('SELECT * FROM counters ORDER BY name'),
+        before,
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('membership application: cold replay retains the exact displayed identity and does not publish twice', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys } = await incoming(f);
+    let db = await f.home.server();
+    let journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+    const before = await invitesOf(state.userId, { server: db });
+    const counters = await db.query('SELECT * FROM counters ORDER BY name');
+    const reopened = await f.reopenHome();
+    db = await reopened.home.server();
+    journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    assertEquals(await journal.next(record.source, record), null);
+    assertEquals(
+      await lifecycleApplication(reopened.owner)(
+        journal,
+        record,
+        keys,
+        f.bundle.id,
+      ),
+      false,
+    );
+    assertEquals(await invitesOf(state.userId, { server: db }), before);
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      counters,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership application: missing historical closure retains the received head without display or applied ACK', async () => {
+  const f = await fixture();
+  try {
+    const { record, operation, keys } = await incoming(f);
+    operation.context = [{
+      source: 'old-home',
+      incarnation: 'retired',
+      sequence: 1,
+    }];
+    (record.payload as { body: { operation: MembershipOperation } }).body
+      .operation = operation;
+    await resign(f, record);
+    const { hash: _hash, ...body } = record;
+    record.hash = recordHash(body);
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    const apply = lifecycleApplication(f.hs);
+    await journal.receive(record.source, [record]);
+    await assertRejects(() => apply(journal, record, keys, f.bundle.id));
+    assertEquals(
+      (await journal.heads(record.source, 'in', record)).received.sequence,
+      1,
+    );
+    assertEquals(
+      (await journal.heads(record.source, 'in', record)).applied.sequence,
+      0,
+    );
+    assertEquals(await db.query('SELECT * FROM prejoin_memberships'), []);
+    assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+    assertEquals(
+      (await db.query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      )).length,
+      1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership application: an owner-committed cold retry finishes its exact journal record after retirement without new verification or publication', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys } = await incoming(f);
+    let db = await f.home.server();
+    let journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    journal.complete = () =>
+      Promise.reject(new Error('lost journal completion'));
+    await assertRejects(
+      () => lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id),
+      Error,
+      'lost journal completion',
+    );
+    const displayed = await invitesOf(state.userId, { server: db });
+    assertEquals(displayed.length, 1);
+    assertEquals(
+      (await journal.heads(record.source, 'in', record)).applied.sequence,
+      0,
+    );
+    const counters = await db.query('SELECT * FROM counters ORDER BY name');
+    await f.hp.revoke(f.bundle.id);
+    const reopened = await f.reopenHome();
+    db = await reopened.home.server();
+    journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    keys.verifyEventSignature = () => {
+      throw new Error('retired receipt must not mint new authority');
+    };
+    assertEquals(
+      await lifecycleApplication(reopened.owner)(
+        journal,
+        record,
+        keys,
+        f.bundle.id,
+      ),
+      true,
+    );
+    assertEquals(
+      (await journal.heads(record.source, 'in', record)).applied.sequence,
+      record.sequence,
+    );
+    assertEquals(await invitesOf(state.userId, { server: db }), displayed);
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      counters,
+    );
+    assertEquals(
+      await lifecycleApplication(reopened.owner)(
+        journal,
+        record,
+        keys,
+        f.bundle.id,
+      ),
+      false,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership application: authenticated retention without a receipt cannot authorize display or ACK after retirement', async () => {
+  const f = await fixture();
+  try {
+    const { record, keys } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    await f.hs.retain(record, keys, f.bundle.id);
+    await f.hp.revoke(f.bundle.id);
+    await assertRejects(() =>
+      lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id)
+    );
+    assertEquals(await db.query('SELECT * FROM prejoin_memberships'), []);
+    assertEquals(await db.query('SELECT * FROM membership_operations'), []);
+    assertEquals(
+      (await journal.heads(record.source, 'in', record)).applied.sequence,
+      0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership application: failed lifecycle receipt rolls back display, position and selected binding before ACK', async () => {
+  const f = await fixture();
+  try {
+    const { record, keys } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    const counters = await db.query('SELECT * FROM counters ORDER BY name');
+    const tx = db.tx.bind(db);
+    db.tx = (fn) =>
+      tx((conn) =>
+        fn(
+          new Proxy(conn, {
+            get(target, property) {
+              if (property === 'execute') {
+                return (...args: Parameters<typeof conn.execute>) => {
+                  if (args[0].includes('INSERT INTO membership_operations')) {
+                    throw new Error('membership receipt commit failed');
+                  }
+                  return target.execute(...args);
+                };
+              }
+              const value = Reflect.get(target, property);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          }),
+        )
+      );
+    try {
+      await assertRejects(
+        () => lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id),
+        Error,
+        'membership receipt commit failed',
+      );
+    } finally {
+      db.tx = tx;
+    }
+    assertEquals(await db.query('SELECT * FROM prejoin_memberships'), []);
+    assertEquals(await db.query('SELECT * FROM domain_frontiers'), []);
+    assertEquals(await db.query('SELECT * FROM membership_operations'), []);
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      counters,
+    );
+    assertEquals(
+      (await journal.heads(record.source, 'in', record)).applied.sequence,
+      0,
+    );
+    assertEquals(
+      await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id),
+      true,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership application: a foreign pending knock displays but never creates a sender or review job', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys } = await incoming(f, 'edge', 'knock');
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    assertEquals(
+      await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id),
+      true,
+    );
+    const displayed = await invitesOf(state.userId, { server: db });
+    assertEquals(displayed.length, 1);
+    assertEquals(displayed[0].kind, 'knock');
+    const provider = inviteIntentProvider({
+      store: f.home,
+      server: db,
+      signer: f.ht.signer(),
+      keys,
+      self: 'logical.test',
+      wake: () => {},
+    });
+    assertEquals(await provider.review(), []);
+    assertEquals(await provider(db, 'remote.test'), null);
+    assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership evidence: a valid signature enrichment updates exact evidence without a second client position or push', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys, operation: first } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+    const before = await invitesOf(state.userId, { server: db });
+    const counters = await db.query('SELECT * FROM counters ORDER BY name');
+    const pdu = JSON.parse(state.eventJson);
+    await countersign(pdu, '11', await testSigner('overlay.test'));
+    state.eventJson = canonicalJson(pdu);
+    const next = await source(f, 2);
+    next.context = [{
+      source: first.source,
+      incarnation: first.incarnation,
+      sequence: first.sequence,
+    }];
+    next.payload = canonicalJson(state);
+    next.payloadHash = createHash('sha256').update(next.payload).digest('hex');
+    await (await f.edge.server()).execute(
+      'UPDATE domain_operations SET payload_json=?,payload_hash=?,context_json=? WHERE operation_id=?',
+      [
+        next.payload,
+        next.payloadHash,
+        canonicalJson(next.context),
+        next.operationId,
+      ],
+    );
+    const [successor] = await f.es.export('alice');
+    await journal.receive(successor.source, [successor]);
+    const mergedKeys = fakeKeyResolver(
+      await testRemoteServer('remote.test'),
+      await testRemoteServer('overlay.test'),
+    );
+    assertEquals(
+      await lifecycleApplication(f.hs)(
+        journal,
+        successor,
+        mergedKeys,
+        f.bundle.id,
+      ),
+      true,
+    );
+    const displayed = await invitesOf(state.userId, { server: db });
+    assertEquals(displayed.length, 1);
+    assertEquals(displayed[0].eventId, before[0].eventId);
+    assertEquals(
+      displayed[0].seq,
+      before[0].seq,
+      'signature evidence is not another lifecycle publication',
+    );
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      counters,
+    );
+    assert(JSON.parse(displayed[0].eventJson).signatures['overlay.test']);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership evidence: a genuinely held room keeps its normal DAG state and receives no OOB display or client position', async () => {
+  const f = await fixture();
+  try {
+    const created = await createRoom(
+      f.home,
+      { creator: '@alice:logical.test' },
+      f.ht.signer(),
+    );
+    const room = await openRoom(f.home, created.roomId);
+    const capture = () =>
+      room.tx(async (tx) => {
+        const stay = await tx.segments.openStay();
+        assert(stay);
+        const group = await tx.state.current(stay.id);
+        assert(group !== null);
+        return await tx.state.groupEntries(group);
+      });
+    const before = await capture();
+    const { record, state, keys } = await incoming(
+      f,
+      'edge',
+      'invite',
+      created.roomId,
+    );
+    const db = await f.home.server();
+    const counters = await db.query('SELECT * FROM counters ORDER BY name');
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    assertEquals(
+      await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id),
+      true,
+    );
+    assertEquals(await capture(), before);
+    assertEquals(await invitesOf(state.userId, { server: db }), []);
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      counters,
+    );
+    assertEquals(
+      (await journal.heads(record.source, 'in', record)).applied.sequence,
+      record.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 async function resign(
   f: Awaited<ReturnType<typeof fixture>>,

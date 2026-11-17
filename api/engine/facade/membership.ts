@@ -8,6 +8,17 @@ import type { KeyResolver } from '#engine/room/deps.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { domainOf } from '#engine/ids.ts';
 import { verify } from '#engine/room/verify.ts';
+import { eventMaterial } from '#engine/room/verify.ts';
+import { prepareEventSignatures } from '#engine/room/signatures.ts';
+import { openRoom } from '#engine/room/index.ts';
+import { withRoomLock } from '#engine/room/lock.ts';
+import { validatePrejoin } from '#engine/federation/prejoin.ts';
+import { membershipDisplay } from '#engine/server/membership-display.ts';
+import { materializeMembershipDisplay } from '#engine/server/membership-application.ts';
+import { prejoinResult, savePrejoinResult } from '#engine/server/prejoin.ts';
+import { withProjectionLock } from '#engine/server/project.ts';
+import { prepareInvitePush } from '#engine/server/push-project.ts';
+import { eventStreamTx } from '#engine/server/stream.ts';
 import {
   checkedMembershipOperation,
   retainMembershipOperation,
@@ -25,7 +36,7 @@ import {
 } from '#engine/server/membership-operations.ts';
 import { type DomainBinding, requireDomainControl } from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
-import { appendRecord } from './journal.ts';
+import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
 import {
@@ -33,6 +44,7 @@ import {
   LinkError,
   type LinkRecord,
   object,
+  type Stream,
   text,
 } from './protocol.ts';
 import { signingFence } from './signing-authority.ts';
@@ -300,6 +312,179 @@ export class MembershipOperations {
       unchanged();
     });
     return state;
+  }
+
+  /** Semantic completion precedes journal ACK. The exact saved record can
+   * finish after retirement; retained evidence alone cannot grant new work. */
+  async apply(
+    journal: Journal,
+    stream: Stream,
+    keys: KeyResolver,
+    pairing?: string,
+  ): Promise<boolean> {
+    if (!this.node && !pairing) {
+      mismatch('home membership exchange requires pairing');
+    }
+    const peer = this.node ? 'home' : stream.source;
+    const record = await journal.next(peer, stream);
+    if (!record) return false;
+    if (record.type !== 'membership-operation' || record.version !== 1) {
+      throw new LinkError(
+        'LINK_CAPABILITY_MISMATCH',
+        'not membership operation',
+      );
+    }
+    const view = viewOf(object(record.payload).body);
+    if (
+      view.server !== this.tenant.serverName ||
+      (!this.node && view.pairing !== pairing)
+    ) mismatch('membership completion differs from local scope');
+    const server = await this.store.server();
+    const application = canonicalJson([
+      'link',
+      peer,
+      record.source,
+      record.incarnation,
+      record.stream,
+      record.sequence,
+    ]);
+    const prior = await prejoinResult(server, application, record.hash);
+    if (prior !== null) {
+      await journal.complete(peer, stream, record, prior);
+      return true;
+    }
+    const unchanged = signingFence(server);
+    await this.retain(record, keys, pairing);
+    const grant = await this.binding(pairing);
+    const selection = await server.tx((conn) =>
+      membershipDisplay(conn, view.operation.semanticKey, false)
+    );
+    if (
+      !selection.ready.some((op) =>
+        op.operationId === view.operation.operationId
+      )
+    ) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'membership application awaits historical predecessors',
+        503,
+      );
+    }
+    if (!selection.display.length) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'membership application awaits display evidence',
+        503,
+      );
+    }
+    // All validation and tenant policy capture happens before room/server locks.
+    // Optional signature overlays join only after the shared verifier accepts them.
+    const normalized: MembershipState[] = [];
+    for (const operation of selection.display) {
+      const state = await verifiedState(operation, keys);
+      const prepared = await prepareEventSignatures(
+        JSON.parse(state.eventJson) as Pdu,
+        state.roomVersion,
+        keys,
+        { roomId: state.roomId },
+      );
+      prepared.pdu.signatures = structuredClone(prepared.evidence.signatures);
+      normalized.push({
+        ...state,
+        eventJson: canonicalJson(prepared.pdu),
+        inviteRoomState: canonicalJson(
+          await validatePrejoin(
+            JSON.parse(state.inviteRoomState),
+            state.roomId,
+            state.roomVersion,
+            keys,
+          ),
+        ),
+      });
+    }
+    const state = normalized[0];
+    const event = JSON.parse(state.eventJson) as Pdu;
+    for (const other of normalized.slice(1)) {
+      const pdu = JSON.parse(other.eventJson) as Pdu;
+      if (eventMaterial(pdu) !== eventMaterial(event)) {
+        throw new LinkError(
+          'LINK_DIVERGED',
+          'selected membership event material changed',
+        );
+      }
+      for (const [origin, signatures] of Object.entries(pdu.signatures ?? {})) {
+        event.signatures ??= {};
+        event.signatures[origin] = {
+          ...event.signatures[origin],
+          ...signatures,
+        };
+      }
+    }
+    state.eventJson = canonicalJson(event);
+    const publication = await prepareInvitePush(this.store, view.server, event);
+    const result = await withRoomLock(
+      state.roomId,
+      () =>
+        withProjectionLock(async () => {
+          if (await this.store.roomRetired(state.roomId)) {
+            throw new LinkError(
+              'LINK_UNAVAILABLE',
+              'membership room removal is pending',
+              503,
+            );
+          }
+          const held = (await this.store.rooms()).includes(state.roomId) &&
+            await (await openRoom(this.store, state.roomId)).tx(async (tx) =>
+              (await tx.segments.openStay()) !== null
+            );
+          return await eventStreamTx(server, async (conn) => {
+            unchanged();
+            const retained = await prejoinResult(
+              conn,
+              application,
+              record.hash,
+            );
+            if (retained !== null) return retained;
+            await this.selected(conn, grant, view.localpart);
+            await requireDomainControl(conn, view);
+            const [published] = await conn.query(
+              'SELECT event FROM memberships WHERE room=? AND user=?',
+              [state.roomId, state.userId],
+            );
+            // A new receiver position cannot make old OOB evidence overtake a
+            // newer normal publication or replace a held room's DAG authority.
+            if (
+              !held && (!published || normalized.every((value) =>
+                value.publication?.eventId === published.event &&
+                value.publication.follows
+              ))
+            ) {
+              await materializeMembershipDisplay(
+                conn,
+                selection.display,
+                state,
+                publication,
+                Date.now(),
+              );
+            }
+            await conn.execute(
+              "UPDATE domain_operations SET applied=1 WHERE operation_id=? AND kind='membership'",
+              [view.operation.operationId],
+            );
+            const result = await savePrejoinResult(
+              conn,
+              application,
+              state.roomId,
+              record.hash,
+              { operationId: view.operation.operationId },
+            );
+            unchanged();
+            return result;
+          });
+        }),
+    );
+    await journal.complete(peer, stream, record, result);
+    return true;
   }
 
   private async exportBinding(localpart: string, pairing?: string) {
