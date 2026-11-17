@@ -56,7 +56,7 @@ function peerOf(row: Record<string, unknown>): PeerRow {
 }
 
 export async function lookupPeer(
-  server: Db,
+  server: Db | Conn,
   name: string,
 ): Promise<PeerRow | null> {
   const rows = await server.query(
@@ -217,17 +217,21 @@ export async function recordPending(
   kind: 'inbound' | 'outbound' | 'disagreement' | 'refused',
   verified: boolean,
   detail: string | null,
+  increment = 1,
 ): Promise<void> {
   // Standalone callers own a transaction; delivery transitions pass theirs so
   // the door log cannot commit independently of the outcome it describes.
   if ('tx' in server) {
     return await server.tx((tx) =>
-      recordPending(tx, name, kind, verified, detail)
+      recordPending(tx, name, kind, verified, detail, increment)
     );
   }
   const fed = config().federation;
   const now = Date.now();
   const coalesceMs = fed.keyfailminutes * 60_000;
+  // A disabled coalescing interval still resets on each sighting, including a
+  // batch. Otherwise one flush contributes all of its verified contacts.
+  const count = coalesceMs > 0 ? increment : 1;
   const existing = await server.query(
     'SELECT first_ms, last_ms, count FROM federation_pending WHERE name = ? AND kind = ?',
     [name, kind],
@@ -236,13 +240,13 @@ export async function recordPending(
     existing.length > 0 && now - Number(existing[0].last_ms) < coalesceMs
   ) {
     await server.execute(
-      'UPDATE federation_pending SET last_ms = ?, count = count + 1, detail = ?, verified = verified OR ? WHERE name = ? AND kind = ?',
-      [now, detail, verified ? 1 : 0, name, kind],
+      'UPDATE federation_pending SET last_ms = ?, count = count + ?, detail = ?, verified = verified OR ? WHERE name = ? AND kind = ?',
+      [now, count, detail, verified ? 1 : 0, name, kind],
     );
   } else {
     await server.execute(
-      'INSERT INTO federation_pending(name, kind, verified, first_ms, last_ms, count, detail) VALUES(?,?,?,?,?,1,?) ON CONFLICT(name, kind) DO UPDATE SET first_ms = excluded.first_ms, last_ms = excluded.last_ms, count = 1, detail = excluded.detail, verified = excluded.verified',
-      [name, kind, verified ? 1 : 0, now, now, detail],
+      'INSERT INTO federation_pending(name, kind, verified, first_ms, last_ms, count, detail) VALUES(?,?,?,?,?,?,?) ON CONFLICT(name, kind) DO UPDATE SET first_ms = excluded.first_ms, last_ms = excluded.last_ms, count = excluded.count, detail = excluded.detail, verified = excluded.verified',
+      [name, kind, verified ? 1 : 0, now, now, count, detail],
     );
   }
   if (!verified) {
