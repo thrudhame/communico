@@ -3,7 +3,7 @@ import { bounded, serverProcess } from './helpers/server-process.ts';
 
 for (const fatal of ['close', 'hang', 'second'] as const) {
   Deno.test(`unhandled rejection is fatal with stack, closed admission and bounded cleanup (${fatal})`, async () => {
-    const server = await serverProcess({ fatal });
+    const server = await serverProcess({ fatal, holdAdminAbort: true });
     try {
       const started = performance.now();
       const exited = server.output.then((output) => ({
@@ -42,6 +42,7 @@ for (const fatal of ['close', 'hang', 'second'] as const) {
       const { output, at } = await bounded(exited, 5000);
       const elapsed = at - started;
       assertEquals(output.code, 1, output.stderr);
+      assert(output.stdout.includes('test: admin automatic abort held'));
       assert(output.stderr.includes('fatal: unhandled rejection'));
       assert(output.stderr.includes('Error: fatal-test-rejection'));
       assert(output.stderr.includes('at '), output.stderr);
@@ -64,3 +65,24 @@ for (const fatal of ['close', 'hang', 'second'] as const) {
     }
   });
 }
+
+Deno.test('fatal cleanup leaves a replacement admin socket owned by another listener', async () => {
+  const server = await serverProcess({ fatal: 'close', holdAdminAbort: true });
+  let replacement: Deno.UnixListener | undefined;
+  try {
+    await Deno.remove(server.socket);
+    replacement = Deno.listen({ transport: 'unix', path: server.socket });
+    const bound = await Deno.lstat(server.socket);
+    await Deno.writeTextFile(`${server.dir}/fatal-trigger`, 'reject');
+    const output = await bounded(server.output);
+    assertEquals(output.code, 1, output.stderr);
+    assert(output.stderr.includes('fatal: store closed'), output.stderr);
+    assert(output.stdout.includes('test: admin automatic abort held'));
+    const retained = await Deno.lstat(server.socket);
+    assertEquals(retained.ino, bound.ino);
+    assertEquals(retained.dev, bound.dev);
+  } finally {
+    replacement?.close();
+    await server.dispose();
+  }
+});
