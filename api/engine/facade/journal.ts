@@ -360,6 +360,34 @@ export class Journal {
     });
   }
 
+  /** Capture a finite received prefix for a snapshot domain. Receipt/ordering
+   * remains journal-owned; only that domain can decide semantic supersession. */
+  async pending(peer: string, stream: Stream): Promise<LinkRecord[]> {
+    return await this.db.tx(async (conn) => {
+      const heads = await headsInTx(conn, peer, 'in', stream);
+      const rows = await conn.query(
+        'SELECT record_json FROM facade_records WHERE peer=? AND direction=? AND source=? AND incarnation=? AND stream=? AND sequence>? AND sequence<=? ORDER BY sequence',
+        [
+          ...key(peer, 'in', stream),
+          heads.applied.sequence,
+          heads.received.sequence,
+        ],
+      );
+      const records = rows.map((row) =>
+        recordOf(JSON.parse(String(row.record_json)))
+      );
+      if (
+        records.length !== heads.received.sequence - heads.applied.sequence ||
+        records.some((record, index) =>
+          record.sequence !== heads.applied.sequence + index + 1
+        )
+      ) {
+        diverged('missing retained received prefix');
+      }
+      return records;
+    });
+  }
+
   /** Call only after idempotent cross-file domain completion. For server-owned
    * effects use apply(), which commits effects and completion in the same tx. */
   async complete(
@@ -408,22 +436,38 @@ export class Journal {
     peer: string,
     stream: Stream,
     handler: (conn: Conn, record: LinkRecord) => Promise<unknown>,
+    through?: Cut,
   ): Promise<boolean> {
     return this.db.tx(async (conn) => {
       const heads = await headsInTx(conn, peer, 'in', stream);
-      const next = await recordInTx(
-        conn,
-        peer,
-        'in',
-        stream,
-        heads.applied.sequence + 1,
-      );
-      if (!next) return false;
-      const result = await handler(conn, next.record);
-      await this.finish(conn, peer, stream, {
-        sequence: next.record.sequence,
-        hash: next.record.hash,
-      }, canonicalJson(result));
+      const end = through ? cutOf(through) : undefined;
+      if (end) {
+        const held = await recordInTx(conn, peer, 'in', stream, end.sequence);
+        if (
+          !held || held.record.hash !== end.hash ||
+          end.sequence > heads.received.sequence
+        ) {
+          diverged('application prefix has no matching received cut');
+        }
+        if (end.sequence <= heads.applied.sequence) return false;
+      }
+      const last = end?.sequence ?? heads.applied.sequence + 1;
+      for (
+        let sequence = heads.applied.sequence + 1;
+        sequence <= last;
+        sequence++
+      ) {
+        const next = await recordInTx(conn, peer, 'in', stream, sequence);
+        if (!next) {
+          if (!end) return false;
+          diverged('application prefix omitted a received record');
+        }
+        const result = await handler(conn, next.record);
+        await this.finish(conn, peer, stream, {
+          sequence: next.record.sequence,
+          hash: next.record.hash,
+        }, canonicalJson(result));
+      }
       return true;
     });
   }

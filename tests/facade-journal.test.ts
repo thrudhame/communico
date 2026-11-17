@@ -110,6 +110,64 @@ Deno.test('journal repeated terminal ACK validates retained truth without rewrit
   });
 });
 
+Deno.test('journal prefix application remains finite, atomic and individually acknowledged', async () => {
+  await fixture(async (_store, journal) => {
+    const records = [
+      await journal.append('edge', input('first')),
+      await journal.append('edge', input('second')),
+    ];
+    await journal.receive('home', records);
+    const pending = await journal.pending('home', stream);
+    assertEquals(pending, records);
+    const later = await journal.append('edge', input('later'));
+    await journal.receive('home', [later]);
+    await assertRejects(
+      () =>
+        journal.apply('home', stream, (_conn, record) => {
+          if (record.sequence === records[1].sequence) {
+            throw new Error('prefix rollback');
+          }
+          return Promise.resolve({ sequence: record.sequence });
+        }, cut(records[1])),
+      Error,
+      'prefix rollback',
+    );
+    assertEquals(
+      (await journal.heads('home', 'in', stream)).applied,
+      EMPTY_CUT,
+    );
+    for (const record of records) {
+      assertEquals(
+        await journal.result('home', 'in', stream, cut(record)),
+        null,
+      );
+    }
+    await journal.apply(
+      'home',
+      stream,
+      (_conn, record) => Promise.resolve({ sequence: record.sequence }),
+      cut(pending.at(-1)!),
+    );
+    assertEquals(
+      (await journal.heads('home', 'in', stream)).applied,
+      cut(records[1]),
+    );
+    assertEquals(await journal.pending('home', stream), [later]);
+    const ack = await journal.acknowledgement(
+      'home',
+      stream,
+      EMPTY_CUT,
+      limits,
+    );
+    assertEquals(ack.results.length, 2);
+    await journal.ack('edge', stream, ack.received, ack.applied, ack.results);
+    assertEquals(
+      (await journal.acknowledged('edge', stream)).applied,
+      cut(records[1]),
+    );
+  });
+});
+
 Deno.test('link negotiation refuses skew and identity before record mutation', () => {
   const hello = {
     protocol: { major: 1, minor: 9 },

@@ -21,6 +21,9 @@ export async function applyReplicaScope(options: {
   // single active home binding and the F1 source contract by default.
   pairing?: string;
   authorize?(conn: Conn): Promise<void>;
+  // A snapshot owner may prove these predecessors subsumed by record. They
+  // still receive individual durable results in the same contiguous commit.
+  superseded?: readonly { record: LinkRecord; result: unknown }[];
   apply(): Promise<unknown>;
   // A control revision may supersede an authenticated snapshot while its
   // independent stream drains. Consume that source cut without enabling it.
@@ -35,6 +38,10 @@ export async function applyReplicaScope(options: {
   if (!grant || (connection && connection.state !== 'paired')) {
     throw new LinkError('LINK_UNPAIRED', 'replica requires paired source', 403);
   }
+  const prefix = [...(options.superseded ?? []), { record, result: undefined }];
+  const entries = new Map(
+    prefix.map((entry) => [entry.record.sequence, entry]),
+  );
   const context = grant.body.transcript.body.context;
   const peer = connection ? context.node : 'home';
   const source = peer;
@@ -42,8 +49,14 @@ export async function applyReplicaScope(options: {
     ? grant.body.transcript.body.incarnation
     : context.id;
   if (
-    record.source !== source || record.incarnation !== incarnation ||
     (connection && context.id !== options.pairing) ||
+    prefix.some((entry, index) =>
+      entry.record.source !== source ||
+      entry.record.incarnation !== incarnation ||
+      entry.record.stream !== scope ||
+      (index > 0 &&
+        entry.record.sequence !== prefix[index - 1].record.sequence + 1)
+    ) ||
     context.server !== options.self || scope !== stream.stream
   ) {
     throw new LinkError(
@@ -86,22 +99,31 @@ export async function applyReplicaScope(options: {
     );
   });
   const result = await options.apply();
-  return await journal.apply(peer, stream, async (conn, current) => {
-    await checkGrant(conn);
-    if (current.hash !== record.hash) {
-      throw new LinkError('LINK_DIVERGED', 'replica application raced');
-    }
-    const ready = options.ready ? await options.ready(conn) : true;
-    const changed = await conn.execute(
-      'UPDATE facade_scopes SET source_cut=?,ready=?,pending_hash=NULL WHERE incarnation=? AND scope=? AND source_cut=? AND pending_hash=?',
-      [cut, ready ? 1 : 0, context.id, scope, after, record.hash],
-    );
-    if (changed !== 1) {
-      throw new LinkError(
-        'LINK_DIVERGED',
-        'replica completion lost its pending identity',
+  return await journal.apply(
+    peer,
+    stream,
+    async (conn, current) => {
+      await checkGrant(conn);
+      const entry = entries.get(current.sequence);
+      if (current.hash !== entry?.record.hash) {
+        throw new LinkError('LINK_DIVERGED', 'replica application raced');
+      }
+      if (current.hash !== record.hash) return entry.result;
+      const ready = options.ready ? await options.ready(conn) : true;
+      const changed = await conn.execute(
+        'UPDATE facade_scopes SET source_cut=?,ready=?,pending_hash=NULL WHERE incarnation=? AND scope=? AND source_cut=? AND pending_hash=?',
+        [cut, ready ? 1 : 0, context.id, scope, after, record.hash],
       );
-    }
-    return result;
-  });
+      if (changed !== 1) {
+        throw new LinkError(
+          'LINK_DIVERGED',
+          'replica completion lost its pending identity',
+        );
+      }
+      return result;
+    },
+    options.superseded?.length
+      ? { sequence: record.sequence, hash: record.hash }
+      : undefined,
+  );
 }
