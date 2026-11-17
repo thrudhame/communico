@@ -38,6 +38,7 @@ import {
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { randomSigner } from './fixtures/signer.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
 import type { Database } from '#engine/store/db.ts';
 import { documentsFromAnswer } from '#engine/federation/witness.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
@@ -673,15 +674,15 @@ for (const outcome of ['success', 'failure']) {
           await makeServer(origin.name, 'ed25519:fresh'),
         );
         let enterOld!: () => void, enterFresh!: () => void;
-        let releaseOld!: () => void, releaseFresh!: () => void;
+        const obsoleteOwner = latch(), freshOwner = latch();
+        const releaseOld = obsoleteOwner.release,
+          releaseFresh = freshOwner.release;
         const oldEntered = new Promise<void>((resolve) => enterOld = resolve);
         const freshEntered = new Promise<void>((resolve) =>
           enterFresh = resolve
         );
-        const oldHeld = new Promise<void>((resolve) => releaseOld = resolve);
-        const freshHeld = new Promise<void>((resolve) =>
-          releaseFresh = resolve
-        );
+        const oldHeld = obsoleteOwner.wait;
+        const freshHeld = freshOwner.wait;
         const fault = new UpstreamError('transport', {
           phase: 'test',
           reason: 'old acquisition failed',
@@ -710,24 +711,18 @@ for (const outcome of ['success', 'failure']) {
         );
         let fresh: Promise<unknown> | undefined,
           joined: Promise<unknown> | undefined;
-        let timer: ReturnType<typeof setTimeout> | undefined;
         try {
           await oldEntered;
           await keyStore(await store.server(), { deps: directOnly(freshDoc) })
             .forgetServerKeys(origin.name);
           fresh = ks.acquireKeyDoc(origin.name, 0);
           // A post-forget lookup must start first contact, never join the held
-          // pre-forget request. The timeout only bounds a broken implementation.
-          await Promise.race([
+          // pre-forget request, which stays held until fresh entry is observed.
+          await watchdog(
             freshEntered,
-            new Promise<never>((_, reject) => {
-              timer = setTimeout(() =>
-                reject(
-                  new Error('post-forget lookup joined obsolete acquisition'),
-                ), 2000);
-            }),
-          ]);
-          clearTimeout(timer);
+            'post-forget lookup joined obsolete acquisition',
+          );
+          assertEquals(obsoleteOwner.released, false);
           releaseOld();
           const obsolete = await oldResult;
           if (outcome === 'failure') assertStrictEquals(obsolete.error, fault);
@@ -751,7 +746,6 @@ for (const outcome of ['success', 'failure']) {
           );
           assertEquals(await ks.acquireKeyDoc(origin.name, 0), freshDoc);
         } finally {
-          clearTimeout(timer);
           releaseOld();
           releaseFresh();
           await Promise.allSettled(

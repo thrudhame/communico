@@ -3,6 +3,7 @@ import { httpSuite } from '#tests/http-app.ts';
 import { theApp } from '#engine/app.ts';
 import { loginUser } from '#engine/tenant/users.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
 
 type Json = {
   next_batch: string;
@@ -23,10 +24,12 @@ async function call(
   body?: unknown,
   method = 'POST',
   status = 200,
+  signal?: AbortSignal,
 ): Promise<Json> {
   const r = await suite.matrix(
     new Request('http://x/_matrix/client/v3/' + path, {
       method: body === undefined ? 'GET' : method,
+      signal,
       headers: { Authorization: 'Bearer ' + token },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     }),
@@ -34,11 +37,20 @@ async function call(
   assertEquals(r.status, status, await r.clone().text());
   return await r.json();
 }
-const sync = (token: string, since?: string, timeout = 0) =>
+const sync = (
+  token: string,
+  since?: string,
+  timeout = 0,
+  signal?: AbortSignal,
+) =>
   call(
     token,
     'sync?timeout=' + timeout +
       (since ? '&since=' + encodeURIComponent(since) : ''),
+    undefined,
+    'GET',
+    200,
+    signal,
   );
 const send = (token: string, txn: string, messages: unknown, status = 200) =>
   call(token, 'sendToDevice/m.test/' + txn, { messages }, 'PUT', status);
@@ -217,34 +229,43 @@ suite.test('inbox and key-pool mutations wake sync without room events', async (
     fallback_keys: { 'curve25519:f': 'fallback' },
   });
   const before = await sync(b.access_token!);
-  const started = Date.now();
-  const pending = sync(b.access_token!, before.next_batch, 3000);
-  await call(a.access_token!, 'keys/claim', {
-    one_time_keys: { [b.user_id]: { [b.device_id]: 'curve25519' } },
-  });
-  const after = await pending;
-  assert(
-    Date.now() - started < 2500,
-    'key claim must wake sync before timeout',
-  );
-  assertEquals(after.device_one_time_keys_count, { signed_curve25519: 0 });
-  assert(after.next_batch !== before.next_batch);
-  const inboxWait = sync(b.access_token!, after.next_batch, 3000);
-  const inboxStarted = Date.now();
-  await send(a.access_token!, 'wake', {
-    [b.user_id]: { [b.device_id]: { wake: true } },
-  });
-  assertEquals((await inboxWait).to_device.events.length, 1);
-  assert(
-    Date.now() - inboxStarted < 2500,
-    'inbox send must wake sync before timeout',
-  );
-  const fallbackBefore = await sync(b.access_token!);
-  const fallbackWait = sync(b.access_token!, fallbackBefore.next_batch, 3000);
-  await call(a.access_token!, 'keys/claim', {
-    one_time_keys: { [b.user_id]: { [b.device_id]: 'curve25519' } },
-  });
-  assertEquals((await fallbackWait).device_unused_fallback_key_types, []);
+  const turns = observeSyncWait();
+  try {
+    const pending = turns.start((signal) =>
+      sync(b.access_token!, before.next_batch, 3000, signal)
+    );
+    await pending.capture();
+    await call(a.access_token!, 'keys/claim', {
+      one_time_keys: { [b.user_id]: { [b.device_id]: 'curve25519' } },
+    });
+    const after = await pending.finish();
+    assertEquals(after.device_one_time_keys_count, { signed_curve25519: 0 });
+    assert(after.next_batch !== before.next_batch);
+    const inboxWait = turns.start((signal) =>
+      sync(b.access_token!, after.next_batch, 3000, signal)
+    );
+    await inboxWait.capture();
+    await send(a.access_token!, 'wake', {
+      [b.user_id]: { [b.device_id]: { wake: true } },
+    });
+    const inbox = await inboxWait.finish();
+    assertEquals(inbox.to_device.events.length, 1);
+    assertEquals(inbox.to_device.events[0].content, { wake: true });
+    const fallbackBefore = await sync(b.access_token!);
+    const fallbackWait = turns.start((signal) =>
+      sync(b.access_token!, fallbackBefore.next_batch, 3000, signal)
+    );
+    await fallbackWait.capture();
+    await call(a.access_token!, 'keys/claim', {
+      one_time_keys: { [b.user_id]: { [b.device_id]: 'curve25519' } },
+    });
+    assertEquals(
+      (await fallbackWait.finish()).device_unused_fallback_key_types,
+      [],
+    );
+  } finally {
+    await turns.close();
+  }
 });
 
 suite.test('local inbox growth retains accepted messages and device recreation cannot inherit queue or cuts', async () => {

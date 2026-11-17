@@ -11,6 +11,8 @@
 import { config, setConfigForTests } from '#engine/config.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { authenticateRequest } from '#engine/federation/auth.ts';
+import { PendingContacts } from '#engine/federation/pending-contacts.ts';
+import { drainResources } from '#engine/lifetime.ts';
 import {
   type EduQueues,
   eduQueues,
@@ -183,6 +185,7 @@ export async function startInstance(): Promise<Instance> {
     },
   );
   const server = await store.server();
+  const contacts = new PendingContacts(server);
 
   // the listener first (the server name carries its port), the tenant
   // after — then everything that needs the name
@@ -266,8 +269,11 @@ export async function startInstance(): Promise<Instance> {
     close: async () => {
       await instance.sender.stop();
       await instance.stopNet();
-      await store.close();
-      await Deno.remove(dir, { recursive: true });
+      await drainResources([
+        () => contacts.close(),
+        () => store.close(),
+        () => Deno.remove(dir, { recursive: true }),
+      ]);
     },
   };
 
@@ -279,6 +285,7 @@ export async function startInstance(): Promise<Instance> {
       {
         server,
         keys,
+        contacts,
         onContact: instance.sender.contactHook(),
       },
       name,

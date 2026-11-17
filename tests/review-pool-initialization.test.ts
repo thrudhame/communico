@@ -2,6 +2,7 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { Turso } from '#engine/store/ffi.ts';
 import { Pool } from '#engine/store/pool.ts';
+import { enrollment, watchdog } from '#tests/support/ordering.ts';
 
 function barrier() {
   let release!: () => void;
@@ -102,28 +103,30 @@ Deno.test('review pool: close drains an initializer before releasing native life
     await db.query('SELECT value FROM id');
   });
   await entered.wait;
+  const drain = enrollment(
+    (pool as unknown as { released: (() => void)[] }).released,
+  );
   let closed = false;
   const closing = pool.close().then(() => closed = true);
-  // A checkpoint in the task queue lets an incorrectly untracked close
-  // finish, without making correctness depend on database I/O speed.
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  const premature = closed;
-  finish.release();
   try {
+    await watchdog(
+      drain.wait,
+      'pool shutdown never enrolled the initializer drain',
+    );
+    assertEquals(closed, false, 'close returned during staged initialization');
+    finish.release();
     await initializing;
     await closing;
-    assertEquals(
-      premature,
-      false,
-      'close returned during staged initialization',
-    );
     await assertRejects(
       () => pool.initialize('rooms', 'late', () => Promise.resolve()),
       Error,
       'pool is closed',
     );
   } finally {
+    finish.release();
+    await initializing;
     await closing;
+    drain.restore();
     ffi.close();
     await Deno.remove(root, { recursive: true });
   }

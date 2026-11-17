@@ -3,9 +3,8 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { Turso } from '#engine/store/ffi.ts';
 import { Pool } from '#engine/store/pool.ts';
-
-const delay = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
+import { enrollment, watchdog } from '#tests/support/ordering.ts';
+import { idleTurns } from '#tests/support/pool-turn.ts';
 
 Deno.test('store pool: failed admissions publish no incarnation and preserve existing fences', async () => {
   const root = await Deno.makeTempDir();
@@ -150,18 +149,28 @@ Deno.test('store pool: a file in use is never evicted', async () => {
 Deno.test('store pool: idle close evicts after idleseconds', async () => {
   const root = await Deno.makeTempDir();
   const ffi = new Turso('./.native/libturso_ffi.so');
-  const pool = new Pool(ffi, root, {
-    checkpointlogbytes: 65536,
-    maxopenfiles: 8,
-    idleseconds: 1,
-  });
+  const { value: pool, turn: sweep } = await idleTurns(
+    () =>
+      new Pool(ffi, root, {
+        checkpointlogbytes: 65536,
+        maxopenfiles: 8,
+        idleseconds: 1,
+      }),
+    (pool) => pool,
+  );
   try {
     const first = await pool.acquire('tenants', '@tenant:test', {
       create: true,
     });
     assertEquals(pool.size, 1);
     await first.release();
-    await delay(2600);
+    await sweep(999);
+    assertEquals(
+      pool.size,
+      1,
+      'idle sweep preserves a file before its policy age',
+    );
+    await sweep(1001);
     assertEquals(pool.size, 0);
     const second = await pool.acquire('tenants', '@tenant:test');
     assert(first !== second, 'idle close must reopen, not recycle');
@@ -179,22 +188,33 @@ Deno.test('store pool: idle close evicts after idleseconds', async () => {
 Deno.test('store pool: a lease protects the gap before a transaction, idle close and concurrent acquire', async () => {
   const root = await Deno.makeTempDir();
   const ffi = new Turso('./.native/libturso_ffi.so');
-  const pool = new Pool(ffi, root, {
-    checkpointlogbytes: 65536,
-    maxopenfiles: 1,
-    idleseconds: 1,
-  });
+  const { value: pool, turn: sweep } = await idleTurns(
+    () =>
+      new Pool(ffi, root, {
+        checkpointlogbytes: 65536,
+        maxopenfiles: 1,
+        idleseconds: 1,
+      }),
+    (pool) => pool,
+  );
+  const leases: Awaited<ReturnType<typeof pool.acquire>>[] = [];
+  let closing: Promise<void> | undefined;
+  const drain = enrollment(
+    (pool as unknown as { released: (() => void)[] }).released,
+  );
   try {
-    const leases = await Promise.all(
-      Array.from(
-        { length: 6 },
-        () => pool.acquire('rooms', '!same:test', { create: true }),
+    leases.push(
+      ...await Promise.all(
+        Array.from(
+          { length: 6 },
+          () => pool.acquire('rooms', '!same:test', { create: true }),
+        ),
       ),
     );
     assertEquals(pool.size, 1);
     const other = await pool.acquire('rooms', '!other:test', { create: true });
     await other.release();
-    await delay(2600);
+    await sweep(1001);
     assertEquals(pool.size, 1, 'leased file survives idle sweep');
     for (const lease of leases) {
       assertEquals(await lease.db.query('SELECT value FROM id'), [{
@@ -202,10 +222,13 @@ Deno.test('store pool: a lease protects the gap before a transaction, idle close
       }]);
     }
     let closed = false;
-    const closing = pool.close().then(() => {
+    closing = pool.close().then(() => {
       closed = true;
     });
-    await delay(10);
+    await watchdog(
+      drain.wait,
+      'pool shutdown never enrolled the retained lease drain',
+    );
     assertEquals(closed, false, 'shutdown waits for outstanding leases');
     for (const lease of leases) await lease.release();
     await closing;
@@ -216,6 +239,9 @@ Deno.test('store pool: a lease protects the gap before a transaction, idle close
       'lease has been released',
     );
   } finally {
+    for (const lease of leases) await lease.release();
+    await closing;
+    drain.restore();
     await pool.close();
     ffi.close();
     await Deno.remove(root, { recursive: true });

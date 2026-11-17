@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
 
 const suite = httpSuite('HTTP access log credential boundary');
 suite.test('real successes, errors and misses redact path credentials without query logging', async () => {
@@ -24,16 +25,34 @@ suite.test('real successes, errors and misses redact path credentials without qu
   ];
   const lines: string[] = [];
   const original = console.log;
+  let completion = latch();
   console.log = (...args: unknown[]) => {
-    lines.push(args.join(' '));
+    const line = args.join(' ');
+    lines.push(line);
+    if (/^\[pathfinder\] GET .* sent [\d.]+ms$/.test(line)) {
+      completion.release();
+    }
   };
   try {
     for (const path of paths) {
+      completion = latch();
+      const before = lines.filter((line) =>
+        /^\[pathfinder\] GET /.test(line)
+      ).length;
       const response = await suite.matrix(new Request('http://x' + path));
       assert([200, 401, 404, 405].includes(response.status));
       await response.text();
+      await watchdog(
+        completion.wait,
+        'real HTTP access-log completion callback',
+      );
+      assertEquals(
+        lines.filter((line) => /^\[pathfinder\] GET /.test(line)).length -
+          before,
+        2,
+        'each request owns exactly its head and completion log lines',
+      );
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
   } finally {
     console.log = original;
   }
