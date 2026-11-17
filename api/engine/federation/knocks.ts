@@ -25,15 +25,19 @@ import { UpstreamError } from '#engine/net/upstream-error.ts';
 
 // A signed attempt is durable BEFORE send_knock. Retry the exact same event,
 // never a reconstructed knock whose new ID could resurrect an old request.
+// True means this exact operation is completed; supersession is not completion.
 export async function performKnockAttempt(
   attempt: StoredInvite,
   deps: InviteDeps,
-): Promise<void> {
+): Promise<boolean> {
   const current = await inviteFor(attempt.roomId, attempt.userId, deps);
   if (
-    current?.revision !== attempt.revision || current.status !== 'attempting' ||
+    current?.revision !== attempt.revision ||
+    current.eventId !== attempt.eventId || current.kind !== 'knock' ||
     await deps.store.roomRetired(attempt.roomId)
-  ) return;
+  ) return false;
+  if (current.status === 'pending') return true;
+  if (current.status !== 'attempting') return false;
   const pdu = JSON.parse(attempt.eventJson) as Pdu;
   const answer = await federationRequest(deps.server, deps.signer, {
     room: { store: deps.store, id: attempt.roomId, participation: true },
@@ -52,30 +56,35 @@ export async function performKnockAttempt(
     attempt.roomVersion,
     deps.keys,
   );
-  await withRoomLock(attempt.roomId, () =>
-    withProjectionLock(async () => {
-      if (await deps.store.roomRetired(attempt.roomId)) return;
-      await assertRoomAcl(deps.store, attempt.roomId, deps.self);
-      await eventStreamTx(deps.server, async (tx) => {
-        const rows = await tx.query(
-          `SELECT 1 FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND revision=? AND status='attempting' AND ${
-            visiblePrejoin('p')
-          }`,
-          [attempt.roomId, attempt.userId, attempt.revision],
-        );
-        if (!rows.length) return;
-        await tx.execute(
-          "UPDATE prejoin_memberships SET status='pending', invite_room_state=?, seq=?, expires_ms=NULL WHERE room_id=? AND user_id=? AND revision=?",
-          [
-            JSON.stringify(stripped),
-            await nextEventSeq(tx),
-            attempt.roomId,
-            attempt.userId,
-            attempt.revision,
-          ],
-        );
-      });
-    }));
+  return await withRoomLock(
+    attempt.roomId,
+    () =>
+      withProjectionLock(async () => {
+        if (await deps.store.roomRetired(attempt.roomId)) return false;
+        await assertRoomAcl(deps.store, attempt.roomId, deps.self);
+        return await eventStreamTx(deps.server, async (tx) => {
+          const rows = await tx.query(
+            `SELECT status FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND revision=? AND event_id=? AND kind='knock' AND ${
+              visiblePrejoin('p')
+            }`,
+            [attempt.roomId, attempt.userId, attempt.revision, attempt.eventId],
+          );
+          if (rows[0]?.status === 'pending') return true;
+          if (rows[0]?.status !== 'attempting') return false;
+          await tx.execute(
+            "UPDATE prejoin_memberships SET status='pending', invite_room_state=?, seq=?, expires_ms=NULL WHERE room_id=? AND user_id=? AND revision=?",
+            [
+              JSON.stringify(stripped),
+              await nextEventSeq(tx),
+              attempt.roomId,
+              attempt.userId,
+              attempt.revision,
+            ],
+          );
+          return true;
+        });
+      }),
+  );
 }
 
 export async function knockRemote(
@@ -239,7 +248,13 @@ export async function knockRemote(
         },
       );
       try {
-        await performKnockAttempt(attempt, deps);
+        if (!await performKnockAttempt(attempt, deps)) {
+          throw new MatrixError(
+            409,
+            'M_BAD_STATE',
+            'membership changed during knock',
+          );
+        }
       } catch (error) {
         // The receiver may have accepted it. Keep the journal, retry the same
         // signed event after restart, and never fail over to another send.

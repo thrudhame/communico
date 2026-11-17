@@ -1175,7 +1175,9 @@ export function inviteIntentProvider(
         return {
           id: 'knock-attempt:' +
             JSON.stringify([invite.roomId, invite.userId, invite.revision]),
-          run: () => performKnockAttempt(invite, deps),
+          run: async () => {
+            await performKnockAttempt(invite, deps);
+          },
           failed: async () => {},
         } satisfies IntentJob;
       }

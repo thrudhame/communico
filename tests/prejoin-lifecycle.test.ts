@@ -9,7 +9,7 @@ import {
   receiveInvite,
   rejectInviteRemote,
 } from '#engine/federation/invites.ts';
-import { knockRemote } from '#engine/federation/knocks.ts';
+import { knockRemote, performKnockAttempt } from '#engine/federation/knocks.ts';
 import { admitLocalJoin } from '#engine/room/hooks.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { installJoinAdmission } from '#engine/server/join-attempts.ts';
@@ -39,8 +39,12 @@ async function fixture(
     user: string;
     origin: string;
     publish: () => Promise<number>;
+    publishInvite: () => Promise<void>;
     reject: (reason?: string) => Promise<void>;
     sentLeave: () => Pdu | null;
+    knockRequests: () => number;
+    sentKnocks: () => Pdu[];
+    knockAnswer: (answer: () => Promise<Response>) => void;
     sent: Promise<void>;
     finish: () => void;
     reopen: () => Promise<void>;
@@ -64,6 +68,10 @@ async function fixture(
   const gate = new Promise<void>((r) => finish = r);
   let room: Awaited<ReturnType<typeof createFakeRoom>>;
   let sentLeave: Pdu | null = null;
+  let knockRequests = 0;
+  const sentKnocks: Pdu[] = [];
+  let knockAnswer = () =>
+    Promise.resolve(Response.json({ knock_room_state: [] }));
   const us = await testRemoteServer('test');
   const fake = await startFakeServer({
     ourKeyDoc: async () => ({
@@ -97,7 +105,9 @@ async function fixture(
         });
       }
       if (req.url.pathname.includes('/send_knock/')) {
-        return Response.json({ knock_room_state: [] });
+        knockRequests++;
+        sentKnocks.push(req.json() as Pdu);
+        return await knockAnswer();
       }
       return new Response('', { status: 404 });
     },
@@ -155,8 +165,30 @@ async function fixture(
       user,
       origin: fake.name,
       publish,
+      publishInvite: async () => {
+        const newer = await room.addEvent({
+          type: 'm.room.member',
+          sender: '@owner:' + fake.name,
+          state_key: user,
+          content: { membership: 'invite', reason: 'newer invitation' },
+        });
+        await receiveInvite(
+          room.roomId,
+          String(newer.event_id),
+          {
+            room_version: '11',
+            event: room.wire(newer),
+            invite_room_state: [],
+          },
+          fake.name,
+          deps,
+        );
+      },
       reject: (reason) => reject(room.roomId, user, deps, reason),
       sentLeave: () => sentLeave,
+      knockRequests: () => knockRequests,
+      sentKnocks: () => sentKnocks,
+      knockAnswer: (answer) => knockAnswer = answer,
       sent,
       finish,
       reopen: async () => {
@@ -431,4 +463,125 @@ Deno.test('prejoin: a hidden revision does not prevent a fresh remote knock', ()
     const current = await inviteFor(f.roomId, f.user, f.deps);
     assertEquals(current?.revision, 2);
     assertEquals(current?.status, 'pending');
+  }));
+
+Deno.test('prejoin knock: supersession before dispatch cannot report a completed knock', () =>
+  fixture(async (f) => {
+    await f.publish();
+    const query = f.deps.server.query.bind(f.deps.server);
+    let armed = true;
+    f.deps.server.query = async (sql, args) => {
+      const rows = await query(sql, args);
+      if (
+        armed && sql.includes('AS visible FROM prejoin_memberships p') &&
+        rows[0]?.status === 'attempting'
+      ) {
+        armed = false;
+        await f.publish();
+        return await query(sql, args);
+      }
+      return rows;
+    };
+    await assertRejects(
+      () => knockRemote(f.roomId, f.user, {}, [f.origin], f.deps),
+      Error,
+      'membership changed during knock',
+    );
+    assertEquals(armed, false);
+    assertEquals(f.knockRequests(), 0);
+    assertEquals(await inviteFor(f.roomId, f.user, f.deps), null);
+  }));
+
+Deno.test('prejoin knock: completed exact retry after restart succeeds without another dispatch or signature', () =>
+  fixture(async (f) => {
+    await f.publish();
+    await knockRemote(f.roomId, f.user, {}, [f.origin], f.deps);
+    const completed = await inviteFor(f.roomId, f.user, f.deps);
+    assert(completed);
+    const cut = await eventStreamMax(f.deps.server);
+    await f.reopen();
+    f.deps.signer = {
+      ...f.deps.signer,
+      sign: () => Promise.reject(new Error('completed knock must not sign')),
+    };
+    assertEquals(await performKnockAttempt(completed, f.deps), true);
+    assertEquals(f.knockRequests(), 1);
+    assertEquals(await inviteFor(f.roomId, f.user, f.deps), completed);
+    assertEquals(await eventStreamMax(f.deps.server), cut);
+  }));
+
+Deno.test('prejoin knock: a late response cannot overtake a newer publication', () =>
+  fixture(async (f) => {
+    await f.publish();
+    let cut = 0;
+    f.knockAnswer(async () => {
+      cut = await f.publish();
+      return Response.json({ knock_room_state: [] });
+    });
+    await assertRejects(
+      () => knockRemote(f.roomId, f.user, {}, [f.origin], f.deps),
+      Error,
+      'membership changed during knock',
+    );
+    assertEquals(f.knockRequests(), 1);
+    assertEquals(await inviteFor(f.roomId, f.user, f.deps), null);
+    assertEquals(await eventStreamMax(f.deps.server), cut);
+  }));
+
+Deno.test('prejoin knock: uncertain response retains the exact attempt for the cold sender owner', () =>
+  fixture(async (f) => {
+    await f.publish();
+    f.knockAnswer(() => Promise.resolve(Response.json({})));
+    await assertRejects(() =>
+      knockRemote(f.roomId, f.user, { reason: 'held' }, [f.origin], f.deps)
+    );
+    const attempt = await inviteFor(f.roomId, f.user, f.deps);
+    assert(attempt);
+    assertEquals(attempt.status, 'attempting');
+    assertEquals(f.knockRequests(), 1);
+    await f.reopen();
+    f.knockAnswer(() =>
+      Promise.resolve(Response.json({ knock_room_state: [] }))
+    );
+    const job = await inviteIntentProvider(f.deps)(f.deps.server, f.origin);
+    assert(job);
+    await job.run();
+    const completed = await inviteFor(f.roomId, f.user, f.deps);
+    assertEquals(completed?.status, 'pending');
+    assertEquals(completed?.eventId, attempt.eventId);
+    assertEquals(completed?.revision, attempt.revision);
+    assertEquals(completed?.eventJson, attempt.eventJson);
+    assertEquals(f.sentKnocks()[1], f.sentKnocks()[0]);
+    assertEquals(f.knockRequests(), 2);
+    assertEquals(
+      await inviteIntentProvider(f.deps)(f.deps.server, f.origin),
+      null,
+    );
+    assertEquals(await f.deps.store.rooms(), []);
+  }));
+
+Deno.test('prejoin knock: a later invitation survives the old attempt response and retry', () =>
+  fixture(async (f) => {
+    await f.publish();
+    const snapshots: Array<Awaited<ReturnType<typeof inviteFor>>> = [];
+    f.knockAnswer(async () => {
+      snapshots.push(await inviteFor(f.roomId, f.user, f.deps));
+      await f.publishInvite();
+      snapshots.push(await inviteFor(f.roomId, f.user, f.deps));
+      return Response.json({ knock_room_state: [] });
+    });
+    await assertRejects(
+      () => knockRemote(f.roomId, f.user, {}, [f.origin], f.deps),
+      Error,
+      'membership changed during knock',
+    );
+    const [attempt, invitation] = snapshots;
+    assert(attempt);
+    assert(invitation);
+    assertEquals(invitation.kind, 'invite');
+    const cut = await eventStreamMax(f.deps.server);
+    assertEquals(await performKnockAttempt(attempt, f.deps), false);
+    assertEquals(f.knockRequests(), 1);
+    assertEquals(await inviteFor(f.roomId, f.user, f.deps), invitation);
+    assertEquals(await eventStreamMax(f.deps.server), cut);
   }));
