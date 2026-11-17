@@ -12,6 +12,7 @@ import { facadeTls } from './support/facade-tls.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { pause } from './helpers/server-process.ts';
 
 function record(stream = 'control', sequence = 1) {
   const record = {
@@ -61,7 +62,7 @@ Deno.test('facade observations do not substitute another stream, fact or old com
     record: record('directory', 2),
   });
   observations.accept({ kind: 'applied', peer: 'home', record: old });
-  await Promise.resolve();
+  await pause(0);
   assertEquals(completed, false);
   observations.accept({ kind: 'applied', peer: 'home', record: expected });
   assertEquals(await pending, expected);
@@ -114,7 +115,7 @@ Deno.test('facade observations bind fact completion to the peer and source incar
     peer: 'home',
     record: { ...expected, incarnation: 'old' },
   });
-  await Promise.resolve();
+  await pause(0);
   assertEquals(completed, false);
   observations.accept({ kind: 'applied', peer: 'home', record: expected });
   await pending;
