@@ -7,6 +7,7 @@ import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { lookupToken, type TokenInfo } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import { roomCompletion } from '#engine/client/completion.ts';
 
 export type AuthContext = TokenInfo & { tenant: Tenant; token: string };
 
@@ -21,6 +22,17 @@ export async function authorizeFull(
   const info = await lookupToken(tenant, token);
   if (info === null) {
     throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'token not recognized');
+  }
+  // Explicit room GET admission shares the same captured room boundary as sync
+  // and audience reads. Peeking and receipts own their boundary in the engine;
+  // search/notifications supply their actual audience there. Do not recapture
+  // their cuts here or wait behind unrelated private pending-room obligations.
+  const roomId = request.params.roomId;
+  if (
+    request.method === 'GET' && typeof roomId === 'string' &&
+    !request.path.endsWith('/initialSync')
+  ) {
+    await roomCompletion(theApp(), [roomId], request._raw.signal);
   }
   return { ...info, tenant, token };
 }

@@ -994,7 +994,7 @@ Deno.test('F2 signature operations append migration31 and fresh/upgrade retain t
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { tenant: historicalTenantSchema(32) },
+    schemas: { tenant: historicalTenantSchema(33) },
   });
   try {
     const old = await openTenant(store, 'logical.test', { create: true });

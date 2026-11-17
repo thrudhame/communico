@@ -21,6 +21,7 @@ import { searchPage } from './search-page.ts';
 import { clientEventsForRows, clientStateFor } from './state.ts';
 import { canSeeEvent } from './visibility.ts';
 import { erasurePrunes } from '#engine/erasure.ts';
+import { roomCompletion } from './completion.ts';
 export interface SearchRoomEvents {
   search_term: string;
   keys?: unknown;
@@ -64,10 +65,12 @@ export async function search(
   deviceId: string | null,
   req: SearchRoomEvents,
   nextBatch: string | null,
+  signal?: AbortSignal,
 ) {
   const request = searchRequest(req), { filter, keys } = request;
   const tokens = request.term.toLowerCase().split(/\s+/).filter(Boolean);
   const rooms = await roomScope(userId, filter);
+  await roomCompletion(theApp(), rooms, signal);
   const matched = new Map<string, Hit>();
   // roomScope owns predecessor expansion and exclusions. Apply the same
   // resolved scope to event filtering, not the unexpanded request room list.

@@ -12,6 +12,8 @@ import { canonicalJson } from '#engine/canonical.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import { deviceById } from '#engine/tenant/devices.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import type { CompletionTarget } from '#engine/room/completion.ts';
+import { finishCompletion } from './completion.ts';
 
 export async function deviceIdentity(
   tenant: Tenant,
@@ -206,6 +208,7 @@ export async function finishSubmission(
   txnId: string,
   eventId: string,
   accepted: boolean,
+  target?: CompletionTarget,
 ): Promise<void> {
   const key = [...scope(device), endpointKey(endpoint), txnId, eventId];
   if (accepted) {
@@ -213,6 +216,15 @@ export async function finishSubmission(
       'UPDATE transactions SET completed = 1, pending_pdu = NULL WHERE localpart = ? AND device_id = ? AND generation = ? AND endpoint = ? AND txn_id = ? AND event_id = ? AND (completed != 1 OR pending_pdu IS NOT NULL)',
       key,
     );
+    if (target !== undefined) {
+      await finishCompletion(
+        conn,
+        device,
+        endpointKey(endpoint),
+        txnId,
+        target,
+      );
+    }
   } else {
     await conn.execute(
       'DELETE FROM transactions WHERE localpart = ? AND device_id = ? AND generation = ? AND endpoint = ? AND txn_id = ? AND event_id = ? AND completed = 0',
@@ -235,9 +247,9 @@ export function transactionSubmission(
       tenant.tx((tx) => tx.txns.submission(device, endpoint, txnId)),
     prepare: (pdu) =>
       tenant.tx((tx) => tx.txns.prepare(device, endpoint, txnId, pdu)),
-    finish: (eventId, accepted) =>
+    finish: (eventId, accepted, target) =>
       tenant.tx((tx) =>
-        tx.txns.finish(device, endpoint, txnId, eventId, accepted)
+        tx.txns.finish(device, endpoint, txnId, eventId, accepted, target)
       ),
   };
 }
