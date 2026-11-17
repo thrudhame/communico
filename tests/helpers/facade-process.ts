@@ -5,6 +5,7 @@ import metadata from '#root/deno.json' with { type: 'json' };
 import type { Cut, LinkRecord, Stream } from '#engine/facade/protocol.ts';
 import type { Journal } from '#engine/facade/journal.ts';
 import { bounded, pause } from './server-process.ts';
+import { childDiagnostics } from './child-diagnostics.ts';
 
 export const observationPrefix = 'facade-test: ';
 export type FacadeObservation =
@@ -215,6 +216,7 @@ export async function facadeProcess(
 ) {
   const observations = new FacadeObservations();
   const initialHolds = new Set(heldPublications);
+  const diagnostics = await childDiagnostics();
   const child = new Deno.Command(Deno.execPath(), {
     args: [
       ...metadata.tasks.start.split(' ').slice(1, -1),
@@ -251,12 +253,19 @@ export async function facadeProcess(
         } else save(line + '\n');
       }
     }
-    if (tail) save(tail);
+    // An interrupted private record is no more public than a complete one.
+    if (tail && !(structured && tail.startsWith(observationPrefix))) save(tail);
   };
   const output = Promise.all([
     child.status,
-    read(child.stdout, (text) => out += text, true),
-    read(child.stderr, (text) => err += text),
+    read(child.stdout, (text) => {
+      out += text;
+      diagnostics.stdout(text);
+    }, true),
+    read(child.stderr, (text) => {
+      err += text;
+      diagnostics.stderr(text);
+    }),
   ]).then(([status]) => {
     ended = true;
     observations.close(
@@ -302,6 +311,7 @@ export async function facadeProcess(
     throw error;
   }
   return {
+    diagnostics,
     observations,
     listening: (port: number) =>
       observations.wait((event) =>

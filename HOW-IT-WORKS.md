@@ -990,6 +990,13 @@ Malformed/miss paths cross the same boundary. The real routing/authentication
 request is unchanged; this adds neither log lines nor IP/user-agent collection.
 (`api/engine/access-log.ts`)
 
+Application-owned admin and link HTTP/pre-upgrade failure handlers emit one
+request-correlated diagnostic record with method, redacted path and exception
+name/message/stack. They reuse the access-log disclosure owner and never
+serialize headers, bodies, queries or arbitrary exception properties/causes.
+This does not add an observer to Pathfinder's internal error handling.
+(`api/engine/request-diagnostics.ts`, `api/admin/handler.ts`, `api/engine/facade/transport.ts`)
+
 Encrypted backup ciphertext, per-room entry sizes and per-version restore bytes
 share one tenant transaction. PUT capacity checks use those exact UTF-8 JSON
 totals, including escaped identifiers and separators, instead of scanning all
