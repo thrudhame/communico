@@ -7,6 +7,7 @@ import {
 } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
+import { canSeeEvent } from '#engine/client/visibility.ts';
 import {
   createRoom as createClientRoom,
   redactEvent,
@@ -74,7 +75,10 @@ import { bounded } from './helpers/server-process.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { setRoomHooks } from '#engine/room/hooks.ts';
-import { importReplicaGenesis } from '#engine/room/replica.ts';
+import {
+  importReplicaBoundary,
+  importReplicaGenesis,
+} from '#engine/room/replica.ts';
 import { importReplicaRoom } from '#engine/room/replica-import.ts';
 import { contentHashMatches } from '#engine/room/verify.ts';
 import { stageSnapshotEvidence } from '#engine/room/snapshot-install.ts';
@@ -969,6 +973,301 @@ Deno.test('room replication exports an enrolled facade suffix under its own sour
       (await incoming.heads(f.node.node, 'in', next)).applied.sequence,
       edgeSuffix.sequence,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica participation reconciles concurrent last-local leave and join in both arrival orders', async (t) => {
+  for (const closedFirst of [true, false]) {
+    await t.step(
+      closedFirst ? 'closed receiver first' : 'closed source first',
+      async () => {
+        const f = await fixture();
+        try {
+          const options = {
+            self: f.signing.name,
+            keys: fakeKeyResolver(f.signing),
+            signatureUnion: true,
+          };
+          await importReplicaRoom(
+            f.edgeStore(),
+            await exportReplicaRoom(f.room, options.self),
+            options,
+          );
+          const replica = await f.replica();
+          const homeCut = await f.room.tx((tx) => tx.changes.head());
+          const edgeCut = await replica.tx((tx) => tx.changes.head());
+          const parent = f.source.tipId;
+          const historical = await replica.tx((tx) =>
+            tx.state.eventReadState(parent)
+          );
+          const newcomer = '@newcomer:' + options.self;
+          const leave = await f.source.addEvent({
+            type: 'm.room.member',
+            state_key: f.source.creator,
+            content: { membership: 'leave' },
+            prev_events: [parent],
+          });
+          const join = await f.source.addEvent({
+            type: 'm.room.member',
+            sender: newcomer,
+            state_key: newcomer,
+            content: { membership: 'join' },
+            prev_events: [parent],
+          });
+          await f.ingest([leave]);
+          assertEquals(await f.room.tx((tx) => tx.segments.openStay()), null);
+          await ingestRemote(replica, [join], options.self, {
+            ...options,
+            fetcher: fakeFetcher({}).fetcher,
+            limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+            ungroundedMs: 3600000,
+          });
+          const homeSuffix = await exportReplicaRoom(
+            f.room,
+            options.self,
+            homeCut,
+          );
+          const edgeSuffix = await exportReplicaRoom(
+            replica,
+            options.self,
+            edgeCut,
+          );
+          const reopen = () =>
+            importReplicaRoom(f.home, structuredClone(edgeSuffix), options);
+          const retain = () =>
+            importReplicaRoom(
+              f.edgeStore(),
+              structuredClone(homeSuffix),
+              options,
+            );
+          for (
+            const apply of closedFirst ? [reopen, retain] : [retain, reopen]
+          ) await apply();
+          for (const room of [f.room, replica]) {
+            const retained = await room.tx(async (tx) => {
+              const stay = await tx.segments.openStay();
+              assert(stay);
+              const group = await tx.state.current(stay.id);
+              assert(group !== null);
+              return {
+                creator: await tx.state.groupKey(
+                  group,
+                  'm.room.member',
+                  f.source.creator,
+                ),
+                newcomer: await tx.state.groupKey(
+                  group,
+                  'm.room.member',
+                  newcomer,
+                ),
+                frontier: await tx.extremities.frontier(stay.id),
+              };
+            });
+            assertEquals(retained.creator, leave.event_id);
+            assertEquals(retained.newcomer, join.event_id);
+            assertEquals(
+              retained.frontier.sort(),
+              [String(leave.event_id), String(join.event_id)].sort(),
+            );
+            for (const pdu of [leave, join]) {
+              assertEquals(
+                (await room.tx((tx) =>
+                  tx.events.getStatus(String(pdu.event_id))
+                ))?.standing,
+                'accepted',
+              );
+              assertEquals(
+                (await room.tx((tx) => tx.changes.after(0, 100))).filter((
+                  change,
+                ) =>
+                  ['event', 'transition'].includes(change.kind) &&
+                  change.event === pdu.event_id &&
+                  JSON.parse(change.data).grounding === 'grounded'
+                ).length,
+                1,
+              );
+            }
+            assert(await canSeeEvent(f.source.creator, room, parent));
+            assert(await canSeeEvent(newcomer, room, parent));
+            assertEquals(
+              await canSeeEvent('@unjoined:' + options.self, room, parent),
+              false,
+            );
+          }
+          assertEquals(
+            await replica.tx((tx) => tx.state.eventReadState(parent)),
+            historical,
+          );
+          const heads = await Promise.all(
+            [f.room, replica].map((room) => room.tx((tx) => tx.changes.head())),
+          );
+          await reopen();
+          await retain();
+          assertEquals(
+            await Promise.all(
+              [f.room, replica].map((room) =>
+                room.tx((tx) => tx.changes.head())
+              ),
+            ),
+            heads,
+          );
+        } finally {
+          await f.close();
+        }
+      },
+    );
+  }
+});
+
+Deno.test('replica participation merges a new source stay into an active receiver without replacing its branch', async () => {
+  const f = await fixture();
+  try {
+    const options = {
+      self: f.signing.name,
+      keys: fakeKeyResolver(f.signing),
+      signatureUnion: true,
+    };
+    await importReplicaRoom(
+      f.edgeStore(),
+      await exportReplicaRoom(f.room, options.self),
+      options,
+    );
+    const replica = await f.replica();
+    const parent = f.source.tipId;
+    const leave = await f.source.addEvent({
+      type: 'm.room.member',
+      state_key: f.source.creator,
+      content: { membership: 'leave' },
+      prev_events: [parent],
+    });
+    const resident = '@resident:' + options.self;
+    const localJoin = await f.source.addEvent({
+      type: 'm.room.member',
+      sender: resident,
+      state_key: resident,
+      content: { membership: 'join' },
+      prev_events: [parent],
+    });
+    await f.ingest([localJoin]);
+    await ingestRemote(replica, [leave], options.self, {
+      ...options,
+      fetcher: fakeFetcher({}).fetcher,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    assertEquals(await replica.tx((tx) => tx.segments.openStay()), null);
+    const noBoundary = await exportReplicaRoom(f.room, options.self);
+    noBoundary.boundaries = noBoundary.boundaries.filter((boundary) =>
+      boundary.eventId !== localJoin.event_id
+    );
+    await assertRejects(
+      () => importReplicaRoom(f.edgeStore(), noBoundary, options),
+      MatrixError,
+      'replica live participation',
+    );
+    assertEquals(await replica.tx((tx) => tx.segments.openStay()), null);
+    const newcomer = '@newcomer:' + options.self;
+    const join = await f.source.addEvent({
+      type: 'm.room.member',
+      sender: newcomer,
+      state_key: newcomer,
+      content: { membership: 'join' },
+      prev_events: [String(leave.event_id)],
+    });
+    const before = f.source.stateIdsAt(String(join.event_id))!;
+    // A previously staged authentic join must be promoted once, not treated as
+    // a completed receipt that opens an empty stay.
+    const child = await f.source.addEvent({
+      type: 'm.room.message',
+      sender: newcomer,
+      content: { msgtype: 'm.text', body: 'evidence only' },
+    });
+    const evidenceIds = f.source.stateIdsAt(String(child.event_id))!;
+    const evidence = await verifySnapshot({
+      ...options,
+      roomId: replica.id,
+      roomVersion: f.source.version,
+      resident: options.self,
+      state: evidenceIds.pduIds.map((id) => f.source.event(id)!),
+      authChain: evidenceIds.authChainIds.map((id) => f.source.event(id)!),
+    });
+    await replica.tx((tx) =>
+      stageSnapshotEvidence(tx, evidence, String(child.event_id))
+    );
+    assertEquals(
+      (await replica.tx((tx) => tx.events.getStatus(String(join.event_id))))
+        ?.grounding,
+      'evidence',
+    );
+    await importReplicaBoundary(f.edgeStore(), {
+      ...options,
+      reconcile: true,
+      roomId: replica.id,
+      roomVersion: f.source.version,
+      resident: options.self,
+      join,
+      state: before.pduIds.map((id) => f.source.event(id)!),
+      authChain: before.authChainIds.map((id) => f.source.event(id)!),
+    });
+    const active = await f.room.tx((tx) => tx.segments.openStay());
+    assert(active);
+    const suffix = await exportReplicaRoom(replica, options.self);
+    await importReplicaRoom(f.home, structuredClone(suffix), options);
+    assertEquals(
+      (await f.room.tx((tx) => tx.segments.openStay()))?.id,
+      active.id,
+    );
+    const held = await f.room.tx(async (tx) => {
+      const group = await tx.state.current(active.id);
+      assert(group !== null);
+      return {
+        resident: await tx.state.groupKey(group, 'm.room.member', resident),
+        newcomer: await tx.state.groupKey(group, 'm.room.member', newcomer),
+        creator: await tx.state.groupKey(
+          group,
+          'm.room.member',
+          f.source.creator,
+        ),
+        frontier: await tx.extremities.frontier(active.id),
+      };
+    });
+    assertEquals(held.resident, localJoin.event_id);
+    assertEquals(held.newcomer, join.event_id);
+    assertEquals(held.creator, leave.event_id);
+    assertEquals(
+      held.frontier.sort(),
+      [String(localJoin.event_id), String(join.event_id)].sort(),
+    );
+    const count = await f.room.tx((tx) => tx.segments.list());
+    const head = await f.room.tx((tx) => tx.changes.head());
+    await importReplicaRoom(f.home, suffix, options);
+    assertEquals(await f.room.tx((tx) => tx.changes.head()), head);
+    assertEquals(await f.room.tx((tx) => tx.segments.list()), count);
+    const residentLeave = await f.source.addEvent({
+      type: 'm.room.member',
+      sender: resident,
+      state_key: resident,
+      content: { membership: 'leave' },
+      prev_events: [String(localJoin.event_id), String(join.event_id)],
+    });
+    const newcomerLeave = await f.source.addEvent({
+      type: 'm.room.member',
+      sender: newcomer,
+      state_key: newcomer,
+      content: { membership: 'leave' },
+    });
+    await f.ingest([residentLeave, newcomerLeave]);
+    assertEquals(await f.room.tx((tx) => tx.segments.openStay()), null);
+    const archived = await f.room.tx((tx) => tx.segments.list());
+    const archivedHead = await f.room.tx((tx) => tx.changes.head());
+    // That old source opening was grounded in our existing stay. Replaying it
+    // after a later departure must not manufacture an empty reopened stay.
+    await importReplicaRoom(f.home, structuredClone(suffix), options);
+    assertEquals(await f.room.tx((tx) => tx.segments.openStay()), null);
+    assertEquals(await f.room.tx((tx) => tx.segments.list()), archived);
+    assertEquals(await f.room.tx((tx) => tx.changes.head()), archivedHead);
   } finally {
     await f.close();
   }

@@ -1,6 +1,7 @@
 // Rebuild a semantic room manifest with the existing admission, ingest and
 // history owners. Source row IDs and source verdicts never become local truth.
 import { canonicalJson } from '#engine/canonical.ts';
+import { domainOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Store } from '#engine/store/index.ts';
@@ -178,6 +179,7 @@ export async function importReplicaRoom(
         roomId: manifest.roomId,
         roomVersion: manifest.roomVersion,
         join: event(id),
+        reconcile: input.signatureUnion,
         ...snapshot(id),
       });
     }
@@ -238,6 +240,40 @@ export async function importReplicaRoom(
       continue;
     }
     i++;
+    if (
+      input.signatureUnion &&
+      await room.tx((tx) => tx.segments.openStay()) === null &&
+      (await room.tx((tx) => tx.events.getStatus(step.eventId)))?.grounding !==
+        'grounded'
+    ) {
+      // A source stay may never have closed. Its next logical-local join is
+      // still authentic participation for this receiver. Install that verified
+      // boundary before suffix admission, without discarding our archived DAG.
+      let candidate: ReplicaRoom['steps'][number] | undefined;
+      for (const entry of manifest.steps) {
+        const pdu = event(entry.eventId);
+        if (
+          entry.kind === 'live' && boundaries.has(entry.eventId) &&
+          pdu.type === 'm.room.member' && pdu.state_key === pdu.sender &&
+          domainOf(pdu.sender) === input.self &&
+          pdu.content?.membership === 'join' &&
+          (await room.tx((tx) => tx.events.getStatus(entry.eventId)))
+              ?.grounding !== 'grounded'
+        ) {
+          candidate = entry;
+          break;
+        }
+      }
+      if (!candidate) unavailable('replica live participation is unavailable');
+      await importReplicaBoundary(store, {
+        ...input,
+        roomId: manifest.roomId,
+        roomVersion: manifest.roomVersion,
+        join: event(candidate.eventId),
+        reconcile: true,
+        ...snapshot(candidate.eventId),
+      });
+    }
     const pdu = event(step.eventId);
     const verified = await verify(pdu, manifest.roomVersion, input.keys, {
       roomId: manifest.roomId,
@@ -316,7 +352,7 @@ export async function importReplicaRoom(
       );
       return stay?.status === 'closed';
     });
-    if (closed !== expected.closed) {
+    if (!input.signatureUnion && closed !== expected.closed) {
       unavailable('replica participation cut is incomplete');
     }
   }

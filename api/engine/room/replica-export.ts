@@ -175,9 +175,15 @@ export function exportReplicaRoom(
     );
     for (const id of [...pack.keys()]) {
       const before = await tx.state.eventStateBefore(id);
+      const pdu = await read(id);
+      // Another replica may have archived its own last-local departure while
+      // this stay remained open. Any authentic local join can be its boundary.
+      const localJoin = pdu.type === 'm.room.member' &&
+        pdu.state_key === pdu.sender && domainOf(pdu.sender) === self &&
+        pdu.content?.membership === 'join';
       if (
         before === null ||
-        (before.provenance !== 'imported' && !openings.has(id))
+        (before.provenance !== 'imported' && !openings.has(id) && !localJoin)
       ) continue;
       const state = [
         ...new Set((await tx.state.groupMap(before.group)).values()),

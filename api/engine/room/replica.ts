@@ -17,7 +17,10 @@ import {
   type SnapshotInput,
   verifySnapshot,
 } from './snapshot.ts';
-import { installSnapshotBoundary } from './snapshot-install.ts';
+import {
+  installSnapshotBoundary,
+  stageSnapshotEvidence,
+} from './snapshot-install.ts';
 import { oversizedOf, verify } from './verify.ts';
 
 export { exportReplicaRoom, type ReplicaRoom } from './replica-export.ts';
@@ -116,6 +119,7 @@ export async function importReplicaBoundary(
   store: Store,
   input: SnapshotInput & {
     join: Pdu;
+    reconcile?: boolean;
   },
 ): Promise<{ roomId: string; eventId: string }> {
   const verified = await verifySnapshot(input);
@@ -152,7 +156,8 @@ export async function importReplicaBoundary(
         stays.some((stay) => stay.opened_by === admitted.eventId) &&
         existing?.standing === 'accepted' && existing.grounding === 'grounded'
       ) return;
-      if (await tx.segments.openStay() !== null) {
+      const active = await tx.segments.openStay();
+      if (active !== null && !input.reconcile) {
         throw new MatrixError(
           400,
           'M_BAD_STATE',
@@ -170,6 +175,32 @@ export async function importReplicaBoundary(
           'snapshot replaces the room create',
         );
       }
+      // A previously grounded join is retained history, not permission to
+      // reopen again after a later local departure.
+      if (input.reconcile && existing?.grounding === 'grounded') return;
+      if (active !== null) {
+        // A source's new stay is not a new receiver stay. Verify its evidence,
+        // then let ordinary ingest retain and resolve this branch locally.
+        await stageSnapshotEvidence(tx, verified, admitted.eventId);
+        const result = await ingestInTx(tx, input.roomId, join, {
+          remote: {
+            origin: input.resident,
+            self: input.self,
+            oversized: admitted.oversized,
+            ungroundedMs: 0,
+            promoteEvidence: true,
+            boundary: verified.snapshot,
+          },
+        });
+        if (result.grounding !== 'grounded') {
+          throw new MatrixError(
+            503,
+            'M_UNAVAILABLE',
+            'replica join did not ground',
+          );
+        }
+        return;
+      }
       await installSnapshotBoundary(tx, {
         roomId: input.roomId,
         roomVersion: input.roomVersion,
@@ -178,6 +209,7 @@ export async function importReplicaBoundary(
         resident: input.resident,
         self: input.self,
         previousStay: previous?.id ?? null,
+        preserveFrontier: input.reconcile,
       });
     }));
   await afterRoomCommit(room, input.self);

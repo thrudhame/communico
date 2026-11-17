@@ -17,25 +17,34 @@ export async function installSnapshotBoundary(
     resident: string;
     self: string;
     previousStay: number | null;
+    preserveFrontier?: boolean;
   },
 ): Promise<void> {
   const eventId = String(input.event.event_id);
   await stageSnapshotEvidence(tx, input.verified, eventId);
-  const group = await tx.materialize.newGroup(
-    null,
-    mapEntries(input.verified.snapshot),
-  );
+  const group = input.preserveFrontier && input.previousStay !== null
+    ? await tx.state.current(input.previousStay)
+    : await tx.materialize.newGroup(null, mapEntries(input.verified.snapshot));
+  if (group === null) {
+    throw new Error('E_STATE_MISSING: archived replica state');
+  }
   const stay = await tx.segments.create({
     kind: 'stay',
     prev: input.previousStay,
     opening_group: group,
   });
+  if (input.preserveFrontier && input.previousStay !== null) {
+    // Keep the receiver's concurrent branch. Incoming before-state is evidence
+    // for the join, never a replacement for already published local history.
+    await tx.extremities.inherit(input.previousStay, stay);
+  }
   const result = await ingestInTx(tx, input.roomId, input.event, {
     remote: {
       origin: input.resident,
       self: input.self,
       oversized: oversizedOf(input.event, input.roomVersion),
       ungroundedMs: 0,
+      promoteEvidence: input.preserveFrontier,
       boundary: input.verified.snapshot,
     },
   });
