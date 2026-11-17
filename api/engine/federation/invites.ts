@@ -24,6 +24,7 @@
 // federation_invites row, from the inviter, is a remote rejection
 // (tuwunel is the only prior art, handle_incoming_pdu.rs:125-133).
 import { canonicalJson } from '#engine/canonical.ts';
+import { createHash } from 'node:crypto';
 import { config } from '#engine/config.ts';
 import { eventIdFor, redact } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -70,7 +71,12 @@ import { withRoomLock } from '#engine/room/lock.ts';
 import { admit } from './gate.ts';
 import { domainOf, toWire } from './pdu.ts';
 import { prejoinState, validatePrejoin } from './prejoin.ts';
-import { beginPrejoinLeave, visiblePrejoin } from '#engine/server/prejoin.ts';
+import {
+  beginPrejoinLeave,
+  prejoinResult,
+  savePrejoinResult,
+  visiblePrejoin,
+} from '#engine/server/prejoin.ts';
 import { performKnockAttempt } from './knocks.ts';
 import type {
   IntentJob,
@@ -556,7 +562,15 @@ export async function receiveInvite(
   origin: string,
   deps: InviteDeps,
 ): Promise<Record<string, unknown>> {
-  await assertRoomAcl(deps.store, roomId, origin);
+  const operation = canonicalJson([origin, 'invite', roomId, eventId]);
+  // Keep new-work ACL ordering, but completed authenticated work remains
+  // replayable after a later ACL change, departure or room removal.
+  if (
+    !(await deps.server.query(
+      'SELECT 1 FROM membership_operations WHERE operation=?',
+      [operation],
+    )).length
+  ) await assertRoomAcl(deps.store, roomId, origin);
   const body = (raw == null ? {} : raw) as {
     room_version?: unknown;
     event?: unknown;
@@ -637,6 +651,12 @@ export async function receiveInvite(
     throw new MatrixError(403, 'M_FORBIDDEN', 'bad signature');
   }
   (pdu as unknown as Record<string, unknown>).event_id = eventId;
+  const inputHash = createHash('sha256').update(canonicalJson([
+    roomVersion,
+    eventMaterial(pdu),
+  ])).digest('hex');
+  const retained = await prejoinResult(deps.server, operation, inputHash);
+  if (retained !== null) return retained;
   // Full create validation is shared with knocks. Legacy malformed hints are
   // filtered; v12 identity is strict. TODO Admin UI: compatibility warning.
   const stripped = await validatePrejoin(
@@ -646,35 +666,51 @@ export async function receiveInvite(
     deps.keys,
   );
   // countersign and answer
-  await verify(pdu, roomVersion, deps.keys, { roomId }).catch((error) => {
-    if (!recoverableUpstream(error)) throw error;
-    throw new MatrixError(403, 'M_FORBIDDEN', String(error));
-  });
-  await countersign(pdu, roomVersion, deps.signer);
+  const prepared = await verify(pdu, roomVersion, deps.keys, { roomId }).catch(
+    (error) => {
+      if (!recoverableUpstream(error)) throw error;
+      throw new MatrixError(403, 'M_FORBIDDEN', String(error));
+    },
+  );
+  const signed = prepared.pdu;
+  await countersign(signed, roomVersion, await prepareSigner(deps.signer));
+  const response = { event: toWire(signed, roomVersion) };
   // store: a room we HOLD does nothing else (the event arrives by /send
   // too, invites-v2.yaml:40-42); otherwise the out-of-band row so the
   // invitee sees it
-  await withRoomLock(roomId, () =>
+  return await withRoomLock(roomId, () =>
     withProjectionLock(async () => {
+      const retained = await prejoinResult(deps.server, operation, inputHash);
+      if (retained !== null) return retained;
       await assertRoomAcl(deps.store, roomId, origin);
       if (await deps.store.roomRetired(roomId)) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
       }
-      if (await participating(deps.store, roomId)) return;
-      const publication = await prepareInvitePush(deps.store, deps.self, pdu);
+      if (await participating(deps.store, roomId)) {
+        return await deps.server.tx((tx) =>
+          savePrejoinResult(tx, operation, roomId, inputHash, response)
+        );
+      }
+      const publication = await prepareInvitePush(
+        deps.store,
+        deps.self,
+        signed,
+      );
       const now = Date.now();
-      await eventStreamTx(deps.server, async (tx) => {
+      return await eventStreamTx(deps.server, async (tx) => {
+        const finish = () =>
+          savePrejoinResult(tx, operation, roomId, inputHash, response);
         const evaluated = await tx.query(
           'SELECT 1 FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
           [deps.self, target, eventId],
         );
-        if (evaluated.length) return;
+        if (evaluated.length) return await finish();
         const previous = await tx.query(
           'SELECT event_id FROM prejoin_memberships WHERE room_id=? AND user_id=?',
           [roomId, target],
         );
         // Redelivery is not a new invitation, including after local rejection.
-        if (previous[0]?.event_id === eventId) return;
+        if (previous[0]?.event_id === eventId) return await finish();
         if (previous.length) {
           await withdrawInvitePush(
             tx,
@@ -697,7 +733,7 @@ export async function receiveInvite(
             target,
             eventId,
             roomVersion,
-            JSON.stringify(pdu),
+            JSON.stringify(signed),
             JSON.stringify(stripped),
             origin,
             now,
@@ -705,9 +741,9 @@ export async function receiveInvite(
           ],
         );
         await applyInvitePush(tx, roomId, eventId, seq, publication, now);
+        return await finish();
       });
     }));
-  return { event: toWire(pdu, roomVersion) };
 }
 
 // --- REJECT (ruling F) -----------------------------------------------------

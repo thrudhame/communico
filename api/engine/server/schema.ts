@@ -17,6 +17,7 @@ import {
   PUBLICATION_DOMAIN_SQL,
 } from '#engine/facade/schema.ts';
 import { RECOVERY_SQL } from '#engine/server/recovery.ts';
+import { MEMBERSHIP_OPERATIONS_SQL } from '#engine/server/prejoin.ts';
 import {
   RECEIPT_ADMISSION_SQL,
   RECEIPT_GRAPH_SQL,
@@ -436,7 +437,7 @@ CREATE INDEX event_index_local_participation ON event_index(room,local_join_user
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 48,
+  version: 49,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -489,6 +490,7 @@ export const serverSchema: SchemaProvider = {
       'ALTER TABLE federation_join_attempts ADD COLUMN join_json TEXT',
     );
     await db.exec(OUTBOUND_INVITES_SQL);
+    await db.exec(MEMBERSHIP_OPERATIONS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -562,5 +564,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
         'ALTER TABLE federation_join_attempts ADD COLUMN join_json TEXT',
       ),
     47: (conn) => conn.exec(OUTBOUND_INVITES_SQL),
+    48: (conn) => conn.exec(MEMBERSHIP_OPERATIONS_SQL),
   },
 };

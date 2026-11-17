@@ -97,3 +97,46 @@ Deno.test('outbound invite attempt migration appends to v47 with fresh-schema eq
     await Deno.remove(root, { recursive: true });
   }
 });
+
+Deno.test('inbound membership receipt migration appends to v48 without invented receipts', async () => {
+  const root = await Deno.makeTempDir();
+  const settings = (name: string) => ({
+    dir: root + '/' + name,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  });
+  let old = await openStore(settings('old'), {
+    schemas: { server: historicalServerSchema(48) },
+  });
+  const fresh = await openStore(settings('fresh'), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    assertEquals(
+      await (await old.server()).query(
+        "SELECT name FROM sqlite_master WHERE name='membership_operations'",
+      ),
+      [],
+    );
+    await old.close();
+    old = await openStore(settings('old'), {
+      schemas: { server: serverSchema },
+    });
+    const sql =
+      "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso%' ORDER BY type,name";
+    assertEquals(
+      await (await old.server()).query(sql),
+      await (await fresh.server()).query(sql),
+    );
+    assertEquals(
+      await (await old.server()).query('SELECT * FROM membership_operations'),
+      [],
+    );
+  } finally {
+    await old.close();
+    await fresh.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});

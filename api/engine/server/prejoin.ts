@@ -1,5 +1,50 @@
 import type { Store } from '#engine/store/index.ts';
 import type { Conn } from '#engine/store/db.ts';
+import { canonicalJson } from '#engine/canonical.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+
+// OOB protocol results belong to the same server transaction as their prejoin
+// transition. They outlive the current display row and are not display authority.
+export const MEMBERSHIP_OPERATIONS_SQL = `
+CREATE TABLE membership_operations(operation TEXT PRIMARY KEY NOT NULL,room_id TEXT NOT NULL,input_hash TEXT NOT NULL,result_json TEXT NOT NULL);
+`;
+
+export async function prejoinResult(
+  tx: Pick<Conn, 'query'>,
+  operation: string,
+  inputHash: string,
+): Promise<Record<string, unknown> | null> {
+  const [row] = await tx.query(
+    'SELECT input_hash,result_json FROM membership_operations WHERE operation=?',
+    [operation],
+  );
+  if (!row) return null;
+  if (row.input_hash !== inputHash) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'membership operation material changed',
+    );
+  }
+  return JSON.parse(String(row.result_json));
+}
+
+export async function savePrejoinResult(
+  tx: Conn,
+  operation: string,
+  roomId: string,
+  inputHash: string,
+  result: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const retained = await prejoinResult(tx, operation, inputHash);
+  if (retained !== null) return retained;
+  const encoded = canonicalJson(result);
+  await tx.execute(
+    'INSERT INTO membership_operations(operation,room_id,input_hash,result_json) VALUES(?,?,?,?)',
+    [operation, roomId, inputHash, encoded],
+  );
+  return JSON.parse(encoded);
+}
 
 // The room publication and OOB membership share the event allocator. A later
 // room publication wins, even before a post-join marker can clear the OOB row.

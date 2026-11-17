@@ -41,6 +41,7 @@ import {
   exportPublicKeyRaw,
 } from '#engine/signing-primitives.js';
 import { openStore, type Store } from '#engine/store/index.ts';
+import type { Conn } from '#engine/store/db.ts';
 import { genesis } from './fixtures/genesis.ts';
 import { authAt } from './fixtures/auth.ts';
 import {
@@ -52,6 +53,7 @@ import {
 } from './fixtures/remote.ts';
 import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import { assertAuthored } from './fixtures/authored.ts';
+import { sendLocal } from '#engine/room/ingest.ts';
 
 async function ourKeyDoc(name: string): Promise<Record<string, unknown>> {
   const us = await testRemoteServer(name);
@@ -842,6 +844,348 @@ Deno.test('invitee: the validation matrix, the countersigned answer, the stored 
       (await inviteFor(roomId, '@dev:test', deps))?.status,
       'joined',
     );
+  });
+});
+
+Deno.test('invitee: cold replay retains its signed response without resurrecting superseded OOB state', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: { room: roomSchema, server: serverSchema },
+  });
+  try {
+    const srv = await makeRemoteServer('remote.test');
+    let deps = await inviteDepsFor(store, srv);
+    const roomId = '!retained-invite:remote.test';
+    const invite = await remoteInvite(srv, roomId, '@dev:test', ['$p1']);
+    const eventId = String(invite.event_id);
+    const body = {
+      room_version: '11',
+      event: wireOf(invite),
+      invite_room_state: [],
+    };
+    const result = await receiveInvite(
+      roomId,
+      eventId,
+      structuredClone(body),
+      srv.name,
+      deps,
+    );
+    await rejectInviteRemote(roomId, '@dev:test', deps);
+    const rejected = await inviteFor(roomId, '@dev:test', deps);
+    assertEquals(
+      await receiveInvite(
+        roomId,
+        eventId,
+        structuredClone(body),
+        srv.name,
+        deps,
+      ),
+      result,
+    );
+    assertEquals(await inviteFor(roomId, '@dev:test', deps), rejected);
+    const next = await remoteInvite(srv, roomId, '@dev:test', ['$p2']);
+    await receiveInvite(
+      roomId,
+      String(next.event_id),
+      {
+        ...body,
+        event: wireOf(next),
+      },
+      srv.name,
+      deps,
+    );
+    const before = await inviteFor(roomId, '@dev:test', deps);
+    const counts = await deps.server.query(
+      "SELECT * FROM counters WHERE name='events'",
+    );
+    await store.close();
+    store = await openStore(config(dir), {
+      schemas: { room: roomSchema, server: serverSchema },
+    });
+    deps = await inviteDepsFor(store, srv);
+    deps.signer = {
+      ...deps.signer,
+      sign: () =>
+        Promise.reject(new Error('new signing authority unavailable')),
+    };
+    assertEquals(
+      await receiveInvite(
+        roomId,
+        eventId,
+        structuredClone(body),
+        srv.name,
+        deps,
+      ),
+      result,
+    );
+    assertEquals(await inviteFor(roomId, '@dev:test', deps), before);
+    assertEquals(
+      await deps.server.query("SELECT * FROM counters WHERE name='events'"),
+      counts,
+    );
+    const invalid = structuredClone(body);
+    invalid.event.signatures = { [srv.name]: { 'ed25519:1': 'AAAA' } };
+    await assertRejects(
+      () => receiveInvite(roomId, eventId, invalid, srv.name, deps),
+      MatrixError,
+      'bad signature',
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('invitee: held-room response survives ACL change and explicit room removal without OOB publication', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, { roomId: '!held-invite:test' });
+    const srv = await makeRemoteServer('remote.test');
+    const deps = await inviteDepsFor(store, srv);
+    const invite = await remoteInvite(srv, g.roomId, '@other:test', ['$p1']);
+    const eventId = String(invite.event_id);
+    const body = {
+      room_version: '11',
+      event: wireOf(invite),
+      invite_room_state: [],
+    };
+    const result = await receiveInvite(
+      g.roomId,
+      eventId,
+      structuredClone(body),
+      srv.name,
+      deps,
+    );
+    assertEquals(await inviteFor(g.roomId, '@other:test', deps), null);
+    await sendLocal(g.room, {
+      type: 'm.room.server_acl',
+      state_key: '',
+      sender: g.creator,
+      content: { allow: ['*'], deny: [srv.name] },
+      origin_server_ts: Date.now(),
+    }, g.signer);
+    deps.signer = {
+      ...deps.signer,
+      sign: () => Promise.reject(new Error('no new authority')),
+    };
+    assertEquals(
+      await receiveInvite(
+        g.roomId,
+        eventId,
+        structuredClone(body),
+        srv.name,
+        deps,
+      ),
+      result,
+    );
+    const fresh = await remoteInvite(srv, g.roomId, '@other:test', ['$p2']);
+    const denied = await assertRejects(
+      () =>
+        receiveInvite(
+          g.roomId,
+          String(fresh.event_id),
+          {
+            ...body,
+            event: wireOf(fresh),
+          },
+          srv.name,
+          deps,
+        ),
+      MatrixError,
+    );
+    assertEquals(denied.status, 403);
+    await finishRoomRemoval(store, g.roomId, {
+      why: 'explicit retirement',
+      intents: [],
+    }, null);
+    assertEquals(
+      await receiveInvite(
+        g.roomId,
+        eventId,
+        structuredClone(body),
+        srv.name,
+        deps,
+      ),
+      result,
+    );
+    assertEquals(await store.rooms(), []);
+    assertEquals(await inviteFor(g.roomId, '@other:test', deps), null);
+    assertEquals(
+      (await deps.server.query('SELECT * FROM membership_operations')).length,
+      1,
+    );
+  });
+});
+
+Deno.test('invitee: response and OOB transition recover atomically at transaction cuts', async (t) => {
+  for (const cut of ['before-commit', 'after-commit']) {
+    await t.step(cut, async () => {
+      const dir = await Deno.makeTempDir();
+      let store = await openStore(config(dir), {
+        schemas: { room: roomSchema, server: serverSchema },
+      });
+      try {
+        const srv = await makeRemoteServer('remote.test');
+        const deps = await inviteDepsFor(store, srv);
+        const roomId = '!atomic-invite:remote.test';
+        const invite = await remoteInvite(srv, roomId, '@dev:test', ['$p1']);
+        const eventId = String(invite.event_id);
+        const body = {
+          room_version: '11',
+          event: wireOf(invite),
+          invite_room_state: [],
+        };
+        const fault = new Error(cut);
+        const server = deps.server;
+        deps.server = {
+          ...server,
+          tx: async (fn, options) => {
+            let wrote = false;
+            const result = await server.tx((tx) =>
+              fn(
+                new Proxy(tx, {
+                  get(target, key) {
+                    if (key === 'execute') {
+                      return async (...args: Parameters<Conn['execute']>) => {
+                        const result = await target.execute(...args);
+                        if (
+                          args[0].startsWith(
+                            'INSERT INTO membership_operations',
+                          )
+                        ) {
+                          wrote = true;
+                          if (cut === 'before-commit') throw fault;
+                        }
+                        return result;
+                      };
+                    }
+                    const value = Reflect.get(target, key);
+                    return typeof value === 'function'
+                      ? value.bind(target)
+                      : value;
+                  },
+                }),
+              ), options);
+            if (wrote && cut === 'after-commit') throw fault;
+            return result;
+          },
+        };
+        assertEquals(
+          await assertRejects(() =>
+            receiveInvite(
+              roomId,
+              eventId,
+              structuredClone(body),
+              srv.name,
+              deps,
+            )
+          ),
+          fault,
+        );
+        await store.close();
+        store = await openStore(config(dir), {
+          schemas: { room: roomSchema, server: serverSchema },
+        });
+        const cold = await inviteDepsFor(store, srv);
+        assertEquals(
+          await store.rooms(),
+          [],
+          'OOB invite never provisions a room',
+        );
+        const receipts = await cold.server.query(
+          'SELECT * FROM membership_operations',
+        );
+        const pending = await inviteFor(roomId, '@dev:test', cold);
+        if (cut === 'before-commit') {
+          assertEquals(receipts, []);
+          assertEquals(pending, null);
+          assertEquals(
+            await cold.server.query(
+              "SELECT * FROM counters WHERE name='events'",
+            ),
+            [],
+          );
+        } else {
+          assertEquals(receipts.length, 1);
+          assert(pending !== null);
+          assertEquals(pending.seq, 1);
+          cold.signer = {
+            ...cold.signer,
+            sign: () => Promise.reject(new Error('signer unavailable')),
+          };
+        }
+        const result = await receiveInvite(
+          roomId,
+          eventId,
+          structuredClone(body),
+          srv.name,
+          cold,
+        );
+        assertEquals(
+          await cold.server.query(
+            "SELECT value FROM counters WHERE name='events'",
+          ),
+          [{ value: 1 }],
+        );
+        assertEquals(
+          (await cold.server.query('SELECT * FROM membership_operations'))
+            .length,
+          1,
+        );
+        assertEquals(
+          (await inviteFor(roomId, '@dev:test', cold))?.eventId,
+          eventId,
+        );
+        if (cut === 'after-commit') {
+          assertEquals(result, JSON.parse(String(receipts[0].result_json)));
+        }
+      } finally {
+        await store.close();
+        await Deno.remove(dir, { recursive: true });
+      }
+    });
+  }
+});
+
+Deno.test('invitee: same reference ID cannot replace retained immutable material', async () => {
+  await withStore(async (store) => {
+    const srv = await makeRemoteServer('remote.test');
+    const deps = await inviteDepsFor(store, srv);
+    const roomId = '!invite-collision:remote.test';
+    const invite = await remoteInvite(srv, roomId, '@dev:test', ['$p1']);
+    const eventId = String(invite.event_id);
+    const body = {
+      room_version: '11',
+      event: wireOf(invite),
+      invite_room_state: [],
+    };
+    const response = await receiveInvite(
+      roomId,
+      eventId,
+      structuredClone(body),
+      srv.name,
+      deps,
+    );
+    const before = await inviteFor(roomId, '@dev:test', deps);
+    const changed = structuredClone(body);
+    (changed.event.content as Record<string, unknown>).reason =
+      'changed without changing reference ID';
+    const error = await assertRejects(
+      () => receiveInvite(roomId, eventId, changed, srv.name, deps),
+      MatrixError,
+    );
+    assertEquals(error.status, 400);
+    assertEquals(error.errcode, 'M_BAD_JSON');
+    assertEquals(
+      await receiveInvite(
+        roomId,
+        eventId,
+        structuredClone(body),
+        srv.name,
+        deps,
+      ),
+      response,
+    );
+    assertEquals(await inviteFor(roomId, '@dev:test', deps), before);
   });
 });
 
