@@ -1406,6 +1406,9 @@ for (
     'account',
     'home-fact',
     'home-session',
+    'null-fact',
+    'null-session',
+    'unknown-kind',
     'grant',
     'stream',
   ] as const
@@ -1427,6 +1430,13 @@ for (
         if (attack === 'account') body.localpart = 'unselected';
         if (attack === 'grant') body.grantRevision = 2;
         const authority = body.authority as typeof homeCut;
+        if (attack === 'null-fact') (authority.facts as unknown[]).push(null);
+        if (attack === 'null-session') {
+          (authority.sessions as unknown[]).push(null);
+        }
+        if (attack === 'unknown-kind') {
+          (authority.facts as unknown[]).push({ kind: 'unknown' });
+        }
         if (attack === 'home-fact') authority.facts.push(homeCut.facts[0]);
         if (attack === 'home-session') {
           authority.sessions.push(homeCut.sessions[0]);

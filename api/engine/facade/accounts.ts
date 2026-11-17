@@ -2,6 +2,7 @@
 // tenant owner installs semantic state; journal ACK follows its durable commit.
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   importPublicKeyFromRaw,
   matrixBase64,
@@ -19,6 +20,7 @@ import {
   captureSessionAuthority,
   installSessionAuthority,
   tenantAuthority,
+  validateSessionAuthority,
 } from '#engine/tenant/session-authority.ts';
 import { captureErasureCuts } from '#engine/tenant/erasure.ts';
 import { appendRecord, type Journal } from './journal.ts';
@@ -46,14 +48,26 @@ function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
 }
 
+function authorityCutOf(
+  raw: unknown,
+  localpart: string,
+  options: Parameters<typeof validateSessionAuthority>[2] = {},
+): AuthorityCut {
+  try {
+    return validateSessionAuthority(localpart, raw, options);
+  } catch (error) {
+    if (!(error instanceof MatrixError) || error.status !== 409) throw error;
+    throw new LinkError(
+      'LINK_BAD_RECORD',
+      'invalid session authority cut',
+      400,
+    );
+  }
+}
+
 function sessionAuthorityOf(raw: unknown): SessionAuthority {
-  const row = object(raw), authority = object(row.authority);
-  if (
-    row.kind !== 'session-authority' ||
-    !Array.isArray(authority.facts) || !Array.isArray(authority.sessions) ||
-    canonicalJson(Object.keys(authority).sort()) !==
-      canonicalJson(['facts', 'sessions'])
-  ) {
+  const row = object(raw);
+  if (row.kind !== 'session-authority') {
     throw new LinkError(
       'LINK_BAD_RECORD',
       'invalid session authority cut',
@@ -73,7 +87,7 @@ function sessionAuthorityOf(raw: unknown): SessionAuthority {
     localpart,
     source: text(row.source),
     incarnation: text(row.incarnation),
-    authority: authority as AuthorityCut,
+    authority: authorityCutOf(row.authority, localpart),
   };
   if (canonicalJson(view) !== canonicalJson(raw)) {
     mismatch('unexpected session authority material');
@@ -220,7 +234,10 @@ export async function exportSessionAuthority(
   });
 }
 
-function accountAuthOf(raw: unknown): AccountAuth {
+function accountAuthOf(
+  raw: unknown,
+  sources: readonly { node: string; incarnation: string }[],
+): AccountAuth {
   const row = object(raw);
   const localpart = text(row.localpart);
   if (
@@ -250,21 +267,10 @@ function accountAuthOf(raw: unknown): AccountAuth {
     credentials: row.credentials,
     phc: row.phc as string | null,
     deactivated: row.deactivated,
-    authority: (() => {
-      const authority = object(row.authority);
-      if (
-        !Array.isArray(authority.facts) || !Array.isArray(authority.sessions) ||
-        canonicalJson(Object.keys(authority).sort()) !==
-          canonicalJson(['facts', 'sessions'])
-      ) {
-        throw new LinkError(
-          'LINK_BAD_RECORD',
-          'invalid session authority cut',
-          400,
-        );
-      }
-      return authority as AccountAuth['authority'];
-    })(),
+    authority: authorityCutOf(row.authority, localpart, {
+      sources,
+      complete: true,
+    }),
   };
   if (canonicalJson(view) !== canonicalJson(raw)) {
     throw new LinkError(
@@ -461,11 +467,11 @@ export class AccountSnapshots {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not account auth');
     }
     const payload = object(record.payload), signed = object(payload.signed);
-    const view = accountAuthOf(signed.body);
     const grant = await this.pairings.active();
     if (!this.owners) mismatch('account snapshots require facade ownership');
     const owner = await this.owners.ready();
     const context = grant.body.transcript.body.context;
+    const view = accountAuthOf(signed.body, owner.nodes);
     if (
       view.server !== this.tenant.serverName ||
       view.server !== context.server || view.pairing !== context.id ||
