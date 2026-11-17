@@ -716,6 +716,260 @@ Deno.test('auth admission reads one committed publication across preparation and
   }
 });
 
+Deno.test('auth snapshot owner installs only the newest received authority before completing its superseded prefix', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    const older = [await f.emit(), await f.emit()];
+    await deactivateUser(f.ht, 'alice');
+    const latest = await f.emit();
+    await f.journal.receive('home', [...older, latest]);
+    const db = await f.edge.tenant('logical.test');
+    const installs: number[] = [];
+    const receiver = new AccountSnapshots(
+      new Proxy(f.edge, {
+        get(store, key) {
+          if (key === 'tenant') {
+            return () =>
+              Promise.resolve({
+                ...db,
+                tx: <T>(callback: Parameters<typeof db.tx<T>>[0]) =>
+                  db.tx(async (conn) => {
+                    const execute = conn.execute.bind(conn);
+                    conn.execute = (sql, values = []) => {
+                      if (
+                        sql.startsWith('INSERT INTO account_auth_snapshots(')
+                      ) installs.push(Number(values[4]));
+                      return execute(sql, values);
+                    };
+                    return await callback(conn);
+                  }),
+              });
+          }
+          const value = Reflect.get(store, key);
+          return typeof value === 'function' ? value.bind(store) : value;
+        },
+      }),
+      f.et,
+      f.fp,
+      f.owners,
+    );
+    assertEquals(await receiver.apply(f.journal, latest), true);
+    const body =
+      (latest.payload as { signed: { body: AccountAuth } }).signed.body;
+    assertEquals(installs, [body.sourceCut]);
+    assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), false);
+    assertEquals(
+      (await f.journal.heads('home', 'in', latest)).applied.sequence,
+      latest.sequence,
+    );
+    for (const record of [...older, latest]) {
+      assertEquals(
+        (await f.journal.result('home', 'in', record, record)) !== null,
+        true,
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('an invalid newer auth snapshot cannot conceal an earlier valid deactivation', async () => {
+  const f = await fixture();
+  try {
+    const earlier = await f.emit();
+    await deactivateUser(f.ht, 'alice');
+    const deactivated = await f.emit();
+    const payload = structuredClone(deactivated.payload) as {
+      signed: { body: AccountAuth };
+    };
+    payload.signed.body.capturedMs++;
+    const invalid = await new Journal(await f.home.server(), LINK_SUPPORTED)
+      .append('edge_a', {
+        source: 'home',
+        incarnation: f.bundle.id,
+        stream: deactivated.stream,
+        type: 'account-auth',
+        version: 1,
+        operationId: 'invalid-newer-snapshot',
+        payload,
+      });
+    await f.journal.receive('home', [earlier, deactivated, invalid]);
+    assertEquals(await f.receiver.apply(f.journal, deactivated), true);
+    assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), false);
+    assertEquals(
+      (await f.journal.heads('home', 'in', deactivated)).applied.sequence,
+      deactivated.sequence,
+    );
+    await assertRejects(
+      () => f.receiver.apply(f.journal, invalid),
+      LinkError,
+      'invalid home account auth signature',
+    );
+    assertEquals(
+      (await f.journal.heads('home', 'in', deactivated)).applied.sequence,
+      deactivated.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('malformed signed authority tails cannot conceal a valid deactivation prefix', async (t) => {
+  for (
+    const malformed of [
+      'null fact',
+      'unknown kind',
+      'null session',
+      'unknown source',
+      'missing dependency',
+    ]
+  ) {
+    await t.step(malformed, async () => {
+      const f = await fixture();
+      try {
+        await deactivateUser(f.ht, 'alice');
+        const deactivated = await f.emit();
+        const payload = structuredClone(deactivated.payload) as {
+          after: number;
+          signed: { body: AccountAuth; signature: string };
+        };
+        payload.after = payload.signed.body.sourceCut;
+        payload.signed.body.sourceCut++;
+        payload.signed.body.revision++;
+        const authority = payload.signed.body.authority;
+        if (malformed === 'null fact') {
+          (authority.facts as unknown[]).push(null);
+        }
+        if (malformed === 'unknown kind') {
+          (authority.facts as unknown[]).push({ kind: 'unknown' });
+        }
+        if (malformed === 'null session') {
+          (authority.sessions as unknown[]).push(null);
+        }
+        const source = authority.facts[0];
+        if (malformed === 'unknown source') {
+          authority.facts.push({
+            ...source,
+            node: 'unselected',
+            seq: source.seq + 1,
+            id: canonicalJson([
+              'unselected',
+              source.incarnation,
+              source.seq + 1,
+            ]),
+          });
+        }
+        if (malformed === 'missing dependency') {
+          authority.sessions.push({
+            hash: 'a'.repeat(64),
+            node: source.node,
+            incarnation: source.incarnation,
+            localpart: 'alice',
+            deviceId: 'missing',
+            deviceIncarnation: 'missing',
+            barriers: [],
+            refresh: false,
+            accessHash: null,
+            nextHash: null,
+            revision: 1,
+          });
+        }
+        payload.signed.signature = await f.ht.signer().sign(
+          canonicalJson(payload.signed.body),
+        );
+        const invalid = await new Journal(await f.home.server(), LINK_SUPPORTED)
+          .append('edge_a', {
+            source: 'home',
+            incarnation: f.bundle.id,
+            stream: deactivated.stream,
+            type: 'account-auth',
+            version: 1,
+            operationId: 'malformed-signed-tail',
+            payload,
+          });
+        await f.journal.receive('home', [deactivated, invalid]);
+        assertEquals(await f.receiver.apply(f.journal, deactivated), true);
+        assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), false);
+        assertEquals(
+          (await f.journal.heads('home', 'in', deactivated)).applied.sequence,
+          deactivated.sequence,
+        );
+        assertEquals(
+          await f.journal.result('home', 'in', invalid, invalid),
+          null,
+        );
+        await assertRejects(
+          () => f.receiver.apply(f.journal, invalid),
+          LinkError,
+          'invalid session authority cut',
+        );
+        assertEquals(
+          (await f.journal.heads('home', 'in', deactivated)).applied.sequence,
+          deactivated.sequence,
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('interrupted coalesced auth installation resumes its admitted prefix before a later received tail', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    const older = await f.emit();
+    await deactivateUser(f.ht, 'alice');
+    const newest = await f.emit();
+    await f.journal.receive('home', [older, newest]);
+    const interrupted = new Proxy(f.journal, {
+      get(journal, key) {
+        if (key === 'apply') {
+          return () =>
+            Promise.reject(new Error('prefix completion interrupted'));
+        }
+        const value = Reflect.get(journal, key);
+        return typeof value === 'function' ? value.bind(journal) : value;
+      },
+    });
+    await assertRejects(
+      () => f.receiver.apply(interrupted, newest),
+      Error,
+      'prefix completion interrupted',
+    );
+    assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), false);
+    assertEquals(
+      (await f.journal.heads('home', 'in', newest)).applied.sequence,
+      first.sequence,
+    );
+    const later = await f.emit();
+    await f.journal.receive('home', [later]);
+    assertEquals(await f.receiver.apply(f.journal, later), true);
+    assertEquals(
+      (await f.journal.heads('home', 'in', newest)).applied.sequence,
+      newest.sequence,
+    );
+    assertEquals(
+      (await f.journal.pending('home', newest)).map((record) =>
+        record.sequence
+      ),
+      [later.sequence],
+    );
+    assertEquals(await f.receiver.apply(f.journal, later), true);
+    assertEquals(
+      (await f.journal.heads('home', 'in', newest)).applied.sequence,
+      later.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('auth publication rolls back with installation and survives cold loss of the server ACK', async () => {
   const f = await fixture();
   let cold: Awaited<ReturnType<typeof f.open>> | undefined;
