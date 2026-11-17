@@ -5,6 +5,7 @@ import { requireRoom } from '#engine/client/room.ts';
 import { renderEvent } from '#engine/client/render.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { startHttp } from '#tests/http-app.ts';
+import { completeAccepted } from '#tests/complete-accepted.ts';
 
 type Http = Awaited<ReturnType<typeof startHttp>>;
 type Json = Record<string, unknown>;
@@ -65,6 +66,7 @@ for (const kind of ['send', 'redact'] as const) {
           kind === 'send' ? 'm.room.message' : 'm.room.redaction',
         ]);
         assertEquals(rows.length, kind === 'send' ? 2 : 1);
+        await completeAccepted(theApp(), f.roomId, eventId);
         assertEquals(
           (await theApp().server.query(
             'SELECT event FROM feed WHERE room = ? AND event = ?',

@@ -4,6 +4,7 @@ import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
 import { theApp } from '#engine/app.ts';
 import { eventStreamMax } from '#engine/server/stream.ts';
+import { completeAccepted } from '#tests/complete-accepted.ts';
 const { matrix, registerTestUser, test } = httpSuite('HTTP room compatibility');
 type Json = Record<string, unknown>;
 async function call(
@@ -158,6 +159,7 @@ test('relations: mixed event types/replacements, ten-child pages in both directi
   );
   const root3 = await send(id, A, 'root3');
   for (let i = 0; i < 5; i++) await send(id, A, 'before ' + i, rel(root3));
+  await completeAccepted(theApp(), id);
   const token = `s${await eventStreamMax(theApp().server)}_p0_t0_r0_a0`,
     after: string[] = [];
   for (let i = 0; i < 5; i++) {

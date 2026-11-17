@@ -54,6 +54,7 @@ export default async function (
         (context.state.device as string | undefined) ?? null,
         req,
         request.query.get('next_batch'),
+        request._raw.signal,
       ),
     },
   };

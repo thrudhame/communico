@@ -196,6 +196,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
         const sender = app.sender;
         app.sender = null;
         await drainResources([
+          () => store.drain(),
           () => sender?.stop(),
           stopServices,
           () => store.close(),

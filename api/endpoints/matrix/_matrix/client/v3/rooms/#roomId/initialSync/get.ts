@@ -11,5 +11,6 @@ export default async function (request: PathfinderRequest, context: Context) {
       config().peeking.maxevents,
       config().peeking.maxevents,
     ),
+    request._raw.signal,
   );
 }

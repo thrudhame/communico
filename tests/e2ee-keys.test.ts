@@ -424,7 +424,7 @@ Deno.test('F2: consumed OTK identities remain burned across reupload and cold re
 Deno.test('F2: v27 pool upgrade preserves inventory and installs the same irreversible consumption owner as fresh stores', async () => {
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
-    schemas: { tenant: historicalTenantSchema(28) },
+    schemas: { tenant: historicalTenantSchema(29) },
   });
   try {
     await openTenant(store, 'a.test', { create: true });

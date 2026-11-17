@@ -5,6 +5,7 @@ import { renderEvent, renderInviteNotification } from './render.ts';
 import { notificationHistoryCutoff } from '#engine/server/notification-history.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
+import { completionAudience, roomCompletion } from './completion.ts';
 
 function invalid(message: string): never {
   throw new MatrixError(400, 'M_INVALID_PARAM', message);
@@ -16,6 +17,7 @@ export async function notificationsFor(
   userId: string,
   deviceId: string | null,
   query: URLSearchParams,
+  signal?: AbortSignal,
 ) {
   const from = query.get('from');
   let cursor = Number.MAX_SAFE_INTEGER;
@@ -33,6 +35,7 @@ export async function notificationsFor(
   const only = query.get('only');
   if (only !== null && only !== 'highlight') invalid('only must be highlight');
   const app = theApp();
+  await roomCompletion(app, await completionAudience(app, userId), signal);
   const now = Date.now();
   const rows = await app.server.query(
     `SELECT n.* FROM notification_history h JOIN notifications n ON n.seq=h.seq
