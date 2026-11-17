@@ -4,6 +4,7 @@ export class ServerLifetime {
   readonly controller = new AbortController();
   #operations = new AbortController();
   #draining = false;
+  #cancelled = false;
   #active = new Map<string, number>();
   #idle = new Set<() => void>();
 
@@ -12,25 +13,24 @@ export class ServerLifetime {
     handler: Deno.ServeHandler<A>,
   ): Deno.ServeHandler<A> {
     return async (request, info) => {
-      if (this.#draining) {
-        return Response.json(
-          name === 'admin'
-            ? {
-              ok: false,
-              error: { code: 'UNAVAILABLE', message: 'server draining' },
-            }
-            : { errcode: 'M_UNKNOWN', error: 'server draining' },
-          { status: 503, headers: { connection: 'close' } },
-        );
-      }
+      if (this.#draining) return this.#unavailable(name);
       this.#active.set(name, (this.#active.get(name) ?? 0) + 1);
       const disconnected = new AbortController();
+      const signal = AbortSignal.any([
+        request.signal,
+        disconnected.signal,
+        this.#operations.signal,
+      ]);
       const operation = new Request(request, {
-        signal: AbortSignal.any([
-          request.signal,
-          disconnected.signal,
-          this.#operations.signal,
-        ]),
+        signal,
+        // Aborting a Request signal does not interrupt reads of an existing
+        // body. The listener owns both cancellation paths, not each adapter.
+        body: request.body?.pipeThrough(new TransformStream(), {
+          signal,
+          // Cancelling the native input also tears down its HTTP transport.
+          // Retain it until the retryable response has been delivered.
+          preventCancel: true,
+        }),
       });
       let handled = false, delivered = false;
       const release = () => {
@@ -49,12 +49,32 @@ export class ServerLifetime {
         release();
       });
       try {
-        return await handler(operation, info);
+        const response = await handler(operation, info);
+        if (!this.#cancelled || !signal.aborted) return response;
+        // Adapters may render cancellation themselves (including a generic
+        // 500). Shutdown owns its retryable wire outcome, for every listener.
+        await response.body?.cancel();
+        return this.#unavailable(name);
+      } catch (error) {
+        if (this.#cancelled && signal.aborted) return this.#unavailable(name);
+        throw error;
       } finally {
         handled = true;
         release();
       }
     };
+  }
+
+  #unavailable(name: string): Response {
+    return Response.json(
+      name === 'admin'
+        ? {
+          ok: false,
+          error: { code: 'UNAVAILABLE', message: 'server draining' },
+        }
+        : { errcode: 'M_UNKNOWN', error: 'server draining' },
+      { status: 503, headers: { connection: 'close' } },
+    );
   }
 
   get count(): number {
@@ -99,7 +119,12 @@ export class ServerLifetime {
     const remaining = Object.fromEntries(
       [...this.#active].filter(([, count]) => count !== 0),
     );
-    if (this.count !== 0) this.abort();
+    if (this.count !== 0) {
+      this.#cancelled = true;
+      // Keep transports alive until the cancelled handlers and their retryable
+      // responses settle. Fatal abort() deliberately closes them immediately.
+      this.#operations.abort();
+    }
     return remaining;
   }
 }

@@ -170,6 +170,10 @@ async function shutdown(): Promise<void> {
   if (forced) {
     console.error('shutdown: forced aborts', JSON.stringify(remaining));
   }
+  await lifetime.settled();
+  // Only expired drains retain unread native inputs. A normal drain must let
+  // HttpServer.shutdown flush its responses rather than aborting transports.
+  if (forced) lifetime.controller.abort();
   await Promise.all([
     ...servers.map((server) => server.shutdown()),
     admin.shutdown(),
@@ -179,7 +183,7 @@ async function shutdown(): Promise<void> {
   await closeStore();
   if (fatal) return;
   console.log('shutdown: store closed');
-  Deno.exit(forced ? 1 : 0);
+  Deno.exit(0);
 }
 Deno.addSignalListener('SIGINT', () => void shutdown());
 Deno.addSignalListener('SIGTERM', () => void shutdown());

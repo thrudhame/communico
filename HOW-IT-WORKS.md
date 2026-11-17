@@ -1471,6 +1471,11 @@ The listener gives each admitted handler an operation signal that observes
 disconnects and forced listener aborts. Graceful drain still permits readable
 bodies to finish. Transport completion alone cannot release a running callback;
 shutdown retains the store until both handler and transport ownership settle.
+At grace expiry the listener cancels operation signals and derived body reads
+before closing transports. Fully read cancelled requests get retryable 503s;
+unread native bodies end in retryable transport EOF/reset, as in Synapse.
+Clean storage closure exits successfully even when cancellation was needed;
+fatal rejection and storage-close failures retain their non-zero outcomes.
 (`api/server-lifetime.ts`, `main.ts`)
 
 ## Discovery, TURN and whois
