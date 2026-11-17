@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP push thread counts');
@@ -8,12 +9,14 @@ async function call(
   token: string,
   body?: unknown,
   method?: string,
+  signal?: AbortSignal,
 ) {
   const response = await suite.matrix(
     new Request('http://x/_matrix/client/v3/' + path, {
       method: method ?? (body === undefined ? 'GET' : 'POST'),
       headers: { Authorization: 'Bearer ' + token },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     }),
   );
   assertEquals(response.status, 200, await response.clone().text());
@@ -156,18 +159,29 @@ suite.test('private count-only zero wakes owner with a filtered timeline', async
   );
   const first = await call('sync?filter=' + filter, b.access_token!);
   assertEquals(entry(first, room).unread_notifications, count(1));
-  const pending = call(
-    'sync?timeout=3000&filter=' + filter + '&since=' + first.next_batch,
-    b.access_token!,
+  const turns = observeSyncWait();
+  const pending = turns.start((signal) =>
+    call(
+      'sync?timeout=3000&filter=' + filter + '&since=' + first.next_batch,
+      b.access_token!,
+      undefined,
+      undefined,
+      signal,
+    )
   );
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  await call(
-    base + '/receipt/m.read.private/' +
-      encodeURIComponent(String(sent.event_id)),
-    b.access_token!,
-    {},
-  );
-  const result = await pending;
+  let result: Json;
+  try {
+    await pending.capture();
+    await call(
+      base + '/receipt/m.read.private/' +
+        encodeURIComponent(String(sent.event_id)),
+      b.access_token!,
+      {},
+    );
+    result = await pending.finish();
+  } finally {
+    await turns.close();
+  }
   assert(
     Number(String(result.next_batch).match(/_n(\d+)/)?.[1]) >
       Number(String(first.next_batch).match(/_n(\d+)/)?.[1]),
@@ -250,18 +264,29 @@ suite.test('redaction withdraws unread contributions and wakes a count-only zero
   );
   const first = await call('sync?filter=' + filter, b.access_token!);
   assertEquals(entry(first, room).unread_notifications, count(1, 1));
-  const pending = call(
-    'sync?timeout=3000&filter=' + filter + '&since=' + first.next_batch,
-    b.access_token!,
+  const turns = observeSyncWait();
+  const pending = turns.start((signal) =>
+    call(
+      'sync?timeout=3000&filter=' + filter + '&since=' + first.next_batch,
+      b.access_token!,
+      undefined,
+      undefined,
+      signal,
+    )
   );
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  await call(
-    base + '/redact/' + encodeURIComponent(event) + '/withdraw',
-    a.access_token!,
-    {},
-    'PUT',
-  );
-  const result = await pending;
+  let result: Json;
+  try {
+    await pending.capture();
+    await call(
+      base + '/redact/' + encodeURIComponent(event) + '/withdraw',
+      a.access_token!,
+      {},
+      'PUT',
+    );
+    result = await pending.finish();
+  } finally {
+    await turns.close();
+  }
   assertEquals(entry(result, room).unread_notifications, count(0));
   assertEquals((entry(result, room).timeline as Json).events, []);
   assert(
