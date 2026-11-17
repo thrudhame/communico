@@ -1,19 +1,24 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { canonicalJson } from '#engine/canonical.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import {
   type InviteDeps,
   inviteFor,
   inviteIntentProvider,
+  markInviteJoined,
   prejoinDeparture,
+  pruneRejectIntents,
   receiveInvite,
   rejectInviteRemote,
 } from '#engine/federation/invites.ts';
 import { knockRemote, performKnockAttempt } from '#engine/federation/knocks.ts';
+import { toWire } from '#engine/federation/pdu.ts';
 import { admitLocalJoin } from '#engine/room/hooks.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { installJoinAdmission } from '#engine/server/join-attempts.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
 import {
   eventStreamMax,
   eventStreamTx,
@@ -49,6 +54,7 @@ async function fixture(
     finish: () => void;
     reopen: () => Promise<void>;
   }) => Promise<void>,
+  semanticSource: false | 'home' | 'edge' = false,
 ) {
   const dir = await Deno.makeTempDir();
   const options = {
@@ -120,6 +126,34 @@ async function fixture(
     });
     const user = '@dev:test';
     let server = await store.server();
+    if (semanticSource) {
+      // Start at the already-verified per-file activation boundary. Link/control
+      // signature admission has its own tests; this exercises the real OOB owner.
+      await server.execute(
+        "INSERT INTO publication_domain VALUES(1,?,'publication','domain')",
+        [semanticSource],
+      );
+      await server.execute(
+        'INSERT INTO facade_owner_controls VALUES(?,?,?,?)',
+        [
+          'membership-test',
+          1,
+          'verified-test',
+          JSON.stringify({
+            body: {
+              server: 'test',
+              nodes: [
+                { node: 'home', incarnation: 'home-store' },
+                { node: 'edge', incarnation: 'edge-store' },
+              ],
+            },
+          }),
+        ],
+      );
+      await server.execute(
+        "INSERT INTO facade_owner_activation VALUES('membership-test',1,'verified-test')",
+      );
+    }
     const deps: InviteDeps = {
       store,
       server,
@@ -208,6 +242,304 @@ async function fixture(
     resetCaCertsForTests();
   }
 }
+
+Deno.test('prejoin: typed source intent retains overwritten invitation and departure across cold reopen', () =>
+  fixture(async (f) => {
+    const facts = async () => (await f.deps.server.query(
+      "SELECT * FROM domain_operations WHERE kind='membership' ORDER BY sequence",
+    ));
+    const initial = await facts();
+    assertEquals(
+      initial.length,
+      1,
+      'invitation and immutable export intent commit together',
+    );
+    const first = JSON.parse(String(initial[0].payload_json));
+    assertEquals(first.status, 'pending');
+    await f.reject('retained local departure');
+    const departure = await facts();
+    assertEquals(departure.length, 2);
+    const leave = JSON.parse(String(departure[1].payload_json));
+    assertEquals(leave.status, 'rejecting');
+    assertEquals(
+      JSON.parse(leave.localLeaveJson).content.reason,
+      'retained local departure',
+    );
+    await f.reject('must not replace it');
+    assertEquals(
+      await facts(),
+      departure,
+      'exact retry creates no new source identity',
+    );
+    await f.publishInvite();
+    const retained = await facts();
+    assertEquals(retained.length, 3);
+    assertEquals(
+      retained.slice(0, 2),
+      departure,
+      'later display replacement cannot erase acknowledged source facts',
+    );
+    const last = JSON.parse(String(retained[2].payload_json));
+    assertEquals(last.status, 'pending');
+    assert(last.eventId !== first.eventId);
+    for (const row of retained) {
+      const payload = JSON.parse(String(row.payload_json));
+      assertEquals(payload.roomId, f.roomId);
+      assertEquals(payload.userId, f.user);
+      assertEquals(
+        payload.seq,
+        undefined,
+        'publication numbers never become semantic authority',
+      );
+      assertEquals(
+        payload.revision,
+        undefined,
+        'local lifecycle revisions never become foreign authority',
+      );
+    }
+    await f.reopen();
+    assertEquals(await facts(), retained);
+    assertEquals(
+      (await f.deps.store.rooms()).includes(f.roomId),
+      false,
+      'OOB evidence never fabricates a joined room',
+    );
+  }, 'home'));
+
+Deno.test('prejoin: source intent failure rolls back lifecycle, publication and source counter', () =>
+  fixture(async (f) => {
+    const before = await f.deps.server.query(
+      'SELECT * FROM prejoin_memberships',
+    );
+    const counters = await f.deps.server.query(
+      'SELECT * FROM counters ORDER BY name',
+    );
+    const facts = await f.deps.server.query('SELECT * FROM domain_operations');
+    const transact = f.deps.server.tx.bind(f.deps.server);
+    f.deps.server.tx = (fn) =>
+      transact((conn) =>
+        fn(
+          new Proxy(conn, {
+            get(target, property) {
+              if (property === 'execute') {
+                return (...args: Parameters<typeof conn.execute>) => {
+                  if (
+                    args[0].startsWith('INSERT INTO domain_operations')
+                  ) throw new Error('source intent storage failure');
+                  return target.execute(...args);
+                };
+              }
+              const value = Reflect.get(target, property);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          }),
+        )
+      );
+    try {
+      await assertRejects(
+        () => f.reject(),
+        Error,
+        'source intent storage failure',
+      );
+    } finally {
+      f.deps.server.tx = transact;
+    }
+    assertEquals(
+      await f.deps.server.query('SELECT * FROM prejoin_memberships'),
+      before,
+    );
+    assertEquals(
+      await f.deps.server.query('SELECT * FROM counters ORDER BY name'),
+      counters,
+    );
+    assertEquals(
+      await f.deps.server.query('SELECT * FROM domain_operations'),
+      facts,
+    );
+    await f.reject();
+    const retained = await f.deps.server.query(
+      "SELECT * FROM domain_operations WHERE kind='membership' ORDER BY sequence",
+    );
+    assertEquals(retained.map((row) => row.source), ['edge', 'edge']);
+    assertEquals(retained.map((row) => row.sequence), [1, 2]);
+    const context = JSON.parse(String(retained[1].context_json));
+    assertEquals(context, [{
+      source: 'edge',
+      incarnation: 'edge-store',
+      sequence: 1,
+    }]);
+  }, 'edge'));
+
+Deno.test('prejoin: semantic knock intent retains uncertain attempt, exact completion and joined retirement', () =>
+  fixture(async (f) => {
+    const facts = async () => (await f.deps.server.query(
+      "SELECT * FROM domain_operations WHERE kind='membership' ORDER BY sequence",
+    ));
+    await f.publish();
+    f.knockAnswer(() =>
+      Promise.resolve(Response.json({ knock_room_state: null }))
+    );
+    await assertRejects(() =>
+      knockRemote(f.roomId, f.user, {}, [f.origin], f.deps)
+    );
+    const pending = await facts();
+    assertEquals(pending.length, 2);
+    const attempt = JSON.parse(String(pending[1].payload_json));
+    assertEquals(attempt.kind, 'knock');
+    assertEquals(attempt.status, 'attempting');
+    assertEquals<unknown>(
+      toWire(JSON.parse(attempt.eventJson), attempt.roomVersion),
+      f.sentKnocks()[0],
+    );
+    await f.reopen();
+    f.knockAnswer(() =>
+      Promise.resolve(Response.json({ knock_room_state: [] }))
+    );
+    const job = await inviteIntentProvider(f.deps)(f.deps.server, f.origin);
+    assert(job);
+    await job.run();
+    const complete = await facts();
+    assertEquals(complete.length, 3);
+    const completed = JSON.parse(String(complete[2].payload_json));
+    assertEquals(completed.status, 'pending');
+    assertEquals(completed.eventId, attempt.eventId);
+    assertEquals(f.sentKnocks()[0], f.sentKnocks()[1]);
+    await markInviteJoined(f.roomId, f.user, f.deps);
+    const joined = await facts();
+    assertEquals(joined.length, 4);
+    assertEquals(JSON.parse(String(joined[3].payload_json)).status, 'joined');
+    await markInviteJoined(f.roomId, f.user, f.deps);
+    assertEquals(await facts(), joined);
+  }, 'edge'));
+
+Deno.test('prejoin: a local successor never recaptures the selected foreign source fact as local intent', () =>
+  fixture(async (f) => {
+    await f.publishInvite();
+    const facts = await f.deps.server.query(
+      "SELECT * FROM domain_operations WHERE kind='membership' ORDER BY sequence",
+    );
+    assertEquals(facts.length, 2);
+    const current = facts[1];
+    // Start at a foreign operation owner's authenticated, already-materialized
+    // selection boundary. This test targets local source capture, not wire trust.
+    const imported = canonicalJson([
+      'home',
+      'home-store',
+      current.stream,
+      current.sequence,
+    ]);
+    await f.deps.server.tx(async (conn) => {
+      await conn.execute(
+        'UPDATE domain_operations SET operation_id=?,source=?,incarnation=?,context_json=? WHERE operation_id=?',
+        [imported, 'home', 'home-store', '[]', current.operation_id as string],
+      );
+      await conn.execute('DELETE FROM domain_frontiers WHERE semantic_key=?', [
+        current.semantic_key as string,
+      ]);
+      await conn.execute(
+        'INSERT INTO domain_frontiers(semantic_key,operation_id) VALUES(?,?)',
+        [current.semantic_key as string, imported],
+      );
+    });
+    await f.reject();
+    const after = await f.deps.server.query(
+      "SELECT * FROM domain_operations WHERE kind='membership' ORDER BY sequence,source",
+    );
+    assertEquals(
+      after.length,
+      3,
+      'local mutation must not copy the imported display as a new source fact',
+    );
+    const local = after.filter((row) => row.source === 'edge');
+    assertEquals(local.length, 2);
+    assertEquals(JSON.parse(String(local[1].payload_json)).status, 'rejecting');
+    assert(
+      JSON.parse(String(local[1].context_json)).some((
+        dot: { source: string },
+      ) => dot.source === 'home'),
+    );
+  }, 'edge'));
+
+Deno.test('prejoin: semantic source freezes its observed room publication without reauthoring a hidden older invite', () =>
+  fixture(async (f) => {
+    const facts = () =>
+      f.deps.server.query(
+        "SELECT * FROM domain_operations WHERE kind='membership' ORDER BY sequence",
+      );
+    const first = await facts();
+    assertEquals(
+      JSON.parse(String(first[0].payload_json)).publication,
+      null,
+      'a future receiver needs the original publication relationship, not whichever room snapshot survives export',
+    );
+    await f.publish();
+    await f.publishInvite();
+    const newer = await facts();
+    assertEquals(
+      newer.length,
+      2,
+      'pre-mutation capture does not restamp the old invite after room publication',
+    );
+    assertEquals(JSON.parse(String(newer[1].payload_json)).publication, {
+      eventId: '$published',
+      membership: 'leave',
+      follows: true,
+    });
+    await f.publish();
+    await f.deps.server.tx((conn) =>
+      recordMembershipOperation(conn, f.roomId, f.user)
+    );
+    assertEquals(
+      await facts(),
+      newer,
+      'later room publication cannot rewrite original OOB admission intent',
+    );
+    await f.reopen();
+    assertEquals(await facts(), newer);
+  }, 'edge'));
+
+Deno.test('prejoin: compensating departure materialization retains its exact signed source intent', () =>
+  fixture(async (f) => {
+    const facts = () =>
+      f.deps.server.query(
+        "SELECT * FROM domain_operations WHERE kind='membership' ORDER BY sequence",
+      );
+    await f.publish();
+    f.knockAnswer(() =>
+      Promise.resolve(Response.json({ knock_room_state: null }))
+    );
+    await assertRejects(() =>
+      knockRemote(f.roomId, f.user, {}, [f.origin], f.deps)
+    );
+    assertEquals(
+      await pruneRejectIntents(f.deps.server, f.deps.self, f.origin),
+      1,
+    );
+    const intent = await inviteFor(f.roomId, f.user, f.deps);
+    assert(intent);
+    assertEquals(intent.status, 'rejecting');
+    assertEquals(intent.localLeaveJson, null);
+    const before = await facts();
+    const departure = await prejoinDeparture(intent, f.deps);
+    assert(departure);
+    const retained = await facts();
+    assertEquals(
+      retained.length,
+      before.length + 1,
+      'the real signed departure and its export intent must commit together',
+    );
+    assertEquals(
+      JSON.parse(
+        JSON.parse(String(retained.at(-1)!.payload_json)).localLeaveJson,
+      ),
+      departure,
+    );
+    await f.reopen();
+    const current = await inviteFor(f.roomId, f.user, f.deps);
+    assert(current);
+    assertEquals(await prejoinDeparture(current, f.deps), departure);
+    assertEquals(await facts(), retained);
+  }, 'edge'));
 
 Deno.test('prejoin: repeated concurrent rejection retains one signed local departure and revision', () =>
   fixture(async (f) => {

@@ -22,6 +22,7 @@ import { validatePrejoin } from './prejoin.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
 import { knockResponse, membershipTemplate } from './responses.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
 
 // A signed attempt is durable BEFORE send_knock. Retry the exact same event,
 // never a reconstructed knock whose new ID could resurrect an old request.
@@ -71,6 +72,7 @@ export async function performKnockAttempt(
           );
           if (rows[0]?.status === 'pending') return true;
           if (rows[0]?.status !== 'attempting') return false;
+          await recordMembershipOperation(tx, attempt.roomId, attempt.userId);
           await tx.execute(
             "UPDATE prejoin_memberships SET status='pending', invite_room_state=?, seq=?, expires_ms=NULL WHERE room_id=? AND user_id=? AND revision=?",
             [
@@ -81,6 +83,7 @@ export async function performKnockAttempt(
               attempt.revision,
             ],
           );
+          await recordMembershipOperation(tx, attempt.roomId, attempt.userId);
           return true;
         });
       }),
@@ -204,6 +207,7 @@ export async function knockRemote(
                 );
               }
               const revision = previousRevision + 1;
+              await recordMembershipOperation(tx, roomId, userId);
               const now = Date.now();
               const seq = await nextEventSeq(tx);
               const expires = now +
@@ -225,6 +229,7 @@ export async function knockRemote(
                   expires,
                 ],
               );
+              await recordMembershipOperation(tx, roomId, userId);
               return {
                 roomId,
                 userId,

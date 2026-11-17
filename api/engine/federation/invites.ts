@@ -78,6 +78,7 @@ import {
   visiblePrejoin,
 } from '#engine/server/prejoin.ts';
 import { performKnockAttempt } from './knocks.ts';
+import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
 import type {
   IntentJob,
   ReviewableIntentProvider,
@@ -711,6 +712,7 @@ export async function receiveInvite(
         );
         // Redelivery is not a new invitation, including after local rejection.
         if (previous[0]?.event_id === eventId) return await finish();
+        await recordMembershipOperation(tx, roomId, target);
         if (previous.length) {
           await withdrawInvitePush(
             tx,
@@ -741,6 +743,7 @@ export async function receiveInvite(
           ],
         );
         await applyInvitePush(tx, roomId, eventId, seq, publication, now);
+        await recordMembershipOperation(tx, roomId, target);
         return await finish();
       });
     }));
@@ -818,6 +821,7 @@ export async function rejectInviteRemote(
           'membership changed during rejection',
         );
       }
+      await recordMembershipOperation(tx, roomId, userId);
       await withdrawInvitePush(tx, userId, roomId, invite.eventId);
       const localLeave = await buildLocalPrejoinLeave(
         invite,
@@ -835,6 +839,7 @@ export async function rejectInviteRemote(
           userId,
         ],
       );
+      await recordMembershipOperation(tx, roomId, userId);
       return candidatesOf(invite, deps.self);
     });
   });
@@ -910,6 +915,7 @@ export async function prejoinDeparture(
       if (rows[0]?.local_leave_json != null) {
         return JSON.parse(String(rows[0].local_leave_json)) as Pdu;
       }
+      await recordMembershipOperation(tx, invite.roomId, invite.userId);
       const signed = await buildLocalPrejoinLeave(invite, prepared);
       await tx.execute(
         'UPDATE prejoin_memberships SET local_leave_json=? WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
@@ -921,6 +927,7 @@ export async function prejoinDeparture(
           invite.seq,
         ],
       );
+      await recordMembershipOperation(tx, invite.roomId, invite.userId);
       return signed;
     });
   });
@@ -1069,11 +1076,13 @@ async function performRejectInvite(
         [roomId, userId, invite.eventId, invite.revision],
       );
       if (pending.length === 0) return;
+      await recordMembershipOperation(tx, roomId, userId);
       if (Number(pending[0].visible) !== 1) {
         await tx.execute(
           "UPDATE prejoin_memberships SET status='rejected' WHERE room_id=? AND user_id=?",
           [roomId, userId],
         );
+        await recordMembershipOperation(tx, roomId, userId);
         return;
       }
       const seq = await nextEventSeq(tx);
@@ -1086,6 +1095,7 @@ async function performRejectInvite(
           userId,
         ],
       );
+      await recordMembershipOperation(tx, roomId, userId);
     });
   } finally {
     release();
@@ -1154,8 +1164,9 @@ export function inviteIntentProvider(
       if (invite.expiresMs !== null && Date.now() >= invite.expiresMs) {
         await inviteTransition(
           server,
-          (tx) =>
-            tx.execute(
+          async (tx) => {
+            await recordMembershipOperation(tx, invite.roomId, invite.userId);
+            const changed = await tx.execute(
               'UPDATE prejoin_memberships SET status=? WHERE room_id=? AND user_id=? AND revision=? AND status=?',
               [
                 invite.status === 'attempting'
@@ -1166,7 +1177,10 @@ export function inviteIntentProvider(
                 invite.revision,
                 invite.status,
               ],
-            ),
+            );
+            await recordMembershipOperation(tx, invite.roomId, invite.userId);
+            return changed;
+          },
         );
         continue;
       }
@@ -1337,6 +1351,7 @@ export async function pruneRejectIntents(
         ) as [string, string];
         // An ambiguous remote side effect cannot be discarded by prune. Turn
         // it into explicit compensating leave work, visible locally at once.
+        await recordMembershipOperation(tx, roomId, userId);
         count += await tx.execute(
           "UPDATE prejoin_memberships SET status='rejecting',revision=revision+1,seq=?,expires_ms=? WHERE room_id=? AND user_id=? AND status IN ('attempting','failed-attempt')",
           [
@@ -1346,14 +1361,17 @@ export async function pruneRejectIntents(
             userId,
           ],
         );
+        await recordMembershipOperation(tx, roomId, userId);
         continue;
       }
       const key = row.id.slice('reject-invite:'.length);
       const [roomId, userId] = JSON.parse(key) as [string, string];
+      await recordMembershipOperation(tx, roomId, userId);
       count += await tx.execute(
         "UPDATE prejoin_memberships SET status = 'rejected', revision=revision+1, seq = ? WHERE room_id = ? AND user_id = ? AND status IN ('rejecting','failed-retract')",
         [await nextEventSeq(tx), roomId, userId],
       );
+      await recordMembershipOperation(tx, roomId, userId);
       progress.delete(key);
     }
     return count;
@@ -1381,6 +1399,7 @@ export async function retryPrejoinIntents(
         string,
         string,
       ];
+      await recordMembershipOperation(tx, roomId, userId);
       await tx.execute(
         "UPDATE prejoin_memberships SET status=CASE WHEN status='failed-attempt' THEN 'attempting' ELSE 'rejecting' END,revision=revision+1,expires_ms=? WHERE room_id=? AND user_id=? AND status IN ('failed-attempt','failed-retract')",
         [
@@ -1389,6 +1408,7 @@ export async function retryPrejoinIntents(
           userId,
         ],
       );
+      await recordMembershipOperation(tx, roomId, userId);
     }
   });
 }
@@ -1423,6 +1443,7 @@ export async function acceptRescind(
     const stored = JSON.parse(invite.eventJson) as Record<string, unknown>;
     const inviter = typeof stored.sender === 'string' ? stored.sender : null;
     if (inviter === null || sender !== inviter) return false;
+    await recordMembershipOperation(tx, roomId, target);
     await withdrawInvitePush(tx, target, roomId, invite.eventId);
     const seq = await nextEventSeq(tx);
     await tx.execute(
@@ -1434,6 +1455,7 @@ export async function acceptRescind(
         target,
       ],
     );
+    await recordMembershipOperation(tx, roomId, target);
     return true;
   });
 }
@@ -1468,11 +1490,13 @@ export async function markInviteJoined(
       [roomId, userId],
     );
     if (rows.length === 0) return;
+    await recordMembershipOperation(tx, roomId, userId);
     await withdrawInvitePush(tx, userId, roomId, String(rows[0].event_id));
     const seq = await nextEventSeq(tx);
     await tx.execute(
       "UPDATE prejoin_memberships SET status = 'joined', revision=revision+1, seq = ? WHERE room_id = ? AND user_id = ? AND status IN ('pending','attempting')",
       [seq, roomId, userId],
     );
+    await recordMembershipOperation(tx, roomId, userId);
   });
 }

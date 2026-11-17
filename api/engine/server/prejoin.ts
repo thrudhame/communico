@@ -2,6 +2,7 @@ import type { Store } from '#engine/store/index.ts';
 import type { Conn } from '#engine/store/db.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { recordMembershipOperation } from './membership-operations.ts';
 
 // OOB protocol results belong to the same server transaction as their prejoin
 // transition. They outlive the current display row and are not display authority.
@@ -80,10 +81,12 @@ export async function settleSupersededPrejoin(
   room: string,
   user: string,
 ) {
+  await recordMembershipOperation(tx, room, user);
   await tx.execute(
     `UPDATE prejoin_memberships SET status='rejected' WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract') AND NOT (${
       visiblePrejoin('prejoin_memberships')
     })`,
     [room, user],
   );
+  await recordMembershipOperation(tx, room, user);
 }
