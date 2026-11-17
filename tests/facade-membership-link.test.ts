@@ -15,6 +15,10 @@ import { bindRole } from '#engine/facade/role.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { retainMembershipOperation } from '#engine/server/membership-history.ts';
 import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
+import { membershipHistory } from '#engine/server/membership-history.ts';
+import { fakeKeyResolver, remoteEvent } from '#tests/fixtures/remote.ts';
+import { testRemoteServer } from '#tests/fixtures/signer.ts';
+import type { LinkRecord } from '#engine/facade/protocol.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import type {
@@ -413,6 +417,398 @@ Deno.test('membership export: authority retirement while signing rolls back appe
       await db.query(
         "SELECT * FROM facade_records WHERE json_extract(record_json,'$.type')='membership-operation'",
       ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+async function incoming(
+  f: Awaited<ReturnType<typeof fixture>>,
+  side: 'home' | 'edge' = 'edge',
+) {
+  const operation = await source(f, 1, side);
+  const remote = await testRemoteServer('remote.test');
+  const state = JSON.parse(operation.payload) as MembershipState;
+  const pdu = await remoteEvent(state.roomId, remote, '11', {
+    type: 'm.room.member',
+    sender: '@inviter:remote.test',
+    state_key: state.userId,
+    content: { membership: 'invite' },
+    prev_events: [],
+  });
+  state.eventId = String(pdu.event_id);
+  state.eventJson = canonicalJson(pdu);
+  operation.payload = canonicalJson(state);
+  operation.payloadHash = createHash('sha256').update(operation.payload).digest(
+    'hex',
+  );
+  await (await f[side].server()).execute(
+    'UPDATE domain_operations SET payload_json=?,payload_hash=? WHERE operation_id=?',
+    [operation.payload, operation.payloadHash, operation.operationId],
+  );
+  const [record] =
+    await (side === 'edge'
+      ? f.es.export('alice')
+      : f.hs.export('alice', f.bundle.id));
+  return { record, state, keys: fakeKeyResolver(remote), operation };
+}
+
+async function resign(
+  f: Awaited<ReturnType<typeof fixture>>,
+  record: LinkRecord,
+) {
+  const signed = record.payload as {
+    body: Record<string, unknown>;
+    signature: string;
+  };
+  signed.signature = await f.node.signer().sign(canonicalJson(signed.body));
+}
+
+Deno.test('membership admission: authentic facts retain in both roles without display, publication or journal completion', async () => {
+  for (const side of ['edge', 'home'] as const) {
+    const f = await fixture();
+    try {
+      const { record, state, keys } = await incoming(f, side);
+      const receiver = side === 'edge' ? f.hs : f.es;
+      const db = await f[side === 'edge' ? 'home' : 'edge'].server();
+      const before = await db.query('SELECT * FROM counters');
+      assertEquals(await receiver.retain(record, keys, f.bundle.id), state);
+      assertEquals(await receiver.retain(record, keys, f.bundle.id), state);
+      assertEquals(
+        (await db.query(
+          "SELECT * FROM domain_operations WHERE kind='membership'",
+        )).length,
+        1,
+      );
+      assertEquals(await db.query('SELECT * FROM prejoin_memberships'), []);
+      assertEquals(await db.query('SELECT * FROM membership_operations'), []);
+      assertEquals(await db.query('SELECT * FROM domain_frontiers'), []);
+      assertEquals(await db.query('SELECT * FROM counters'), before);
+      const history = await db.tx((conn) =>
+        membershipHistory(
+          conn,
+          canonicalJson(['membership', state.roomId, state.userId]),
+        )
+      );
+      assertEquals(history.ready.length, 1);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('membership admission: enrolled signatures and record identity are authority, not private payload claims', async (t) => {
+  for (
+    const change of [
+      'signature',
+      'source',
+      'stream',
+      'incarnation',
+      'operationId',
+      'version',
+    ] as const
+  ) {
+    await t.step(change, async () => {
+      const f = await fixture();
+      try {
+        const { record, keys } = await incoming(f);
+        if (change === 'signature') {
+          (record.payload as { signature: string }).signature = 'A'.repeat(86);
+        } else if (change === 'version') record.version++;
+        else record[change] = 'wrong';
+        await assertRejects(() => f.hs.retain(record, keys, f.bundle.id));
+        assertEquals(
+          await (await f.home.server()).query(
+            "SELECT * FROM domain_operations WHERE kind='membership'",
+          ),
+          [],
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('membership admission: signed account/source substitution and unselected accounts cannot retain facts', async (t) => {
+  for (
+    const change of [
+      'localpart',
+      'source',
+      'incarnation',
+      'pairing',
+      'grantRevision',
+      'ownerRevision',
+    ] as const
+  ) {
+    await t.step(change, async () => {
+      const f = await fixture();
+      try {
+        const { record, keys } = await incoming(f);
+        const body = (record.payload as { body: Record<string, unknown> }).body;
+        body[change] = change.endsWith('Revision') ? 999 : 'bob';
+        await resign(f, record);
+        await assertRejects(() => f.hs.retain(record, keys, f.bundle.id));
+        assertEquals(
+          await (await f.home.server()).query(
+            "SELECT * FROM domain_operations WHERE kind='membership'",
+          ),
+          [],
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('membership admission: link-authenticated payload still needs actual PDU signature and lifecycle identity', async (t) => {
+  for (
+    const change of ['signature', 'eventId', 'userId', 'localLeave'] as const
+  ) {
+    await t.step(change, async () => {
+      const f = await fixture();
+      try {
+        const { record, keys, state, operation } = await incoming(f);
+        if (change === 'signature') {
+          const pdu = JSON.parse(state.eventJson);
+          pdu.signatures['remote.test']['ed25519:test'] = 'A'.repeat(86);
+          state.eventJson = canonicalJson(pdu);
+        } else if (change === 'eventId') state.eventId = '$substituted';
+        else if (change === 'userId') state.userId = '@bob:logical.test';
+        else state.localLeaveJson = state.eventJson;
+        operation.payload = canonicalJson(state);
+        operation.payloadHash = createHash('sha256').update(operation.payload)
+          .digest('hex');
+        (record.payload as { body: { operation: MembershipOperation } }).body
+          .operation = operation;
+        await resign(f, record);
+        await assertRejects(() => f.hs.retain(record, keys, f.bundle.id));
+        assertEquals(
+          await (await f.home.server()).query(
+            "SELECT * FROM domain_operations WHERE kind='membership'",
+          ),
+          [],
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('membership admission: retirement during key verification cannot commit retained facts', async () => {
+  const f = await fixture();
+  try {
+    const { record, keys } = await incoming(f, 'home');
+    const verifying = keys.verifyEventSignature.bind(keys);
+    keys.verifyEventSignature = async (args) => {
+      const valid = await verifying(args);
+      await f.fp.retire(await f.hp.revoke(f.bundle.id), 'a'.repeat(64));
+      return valid;
+    };
+    await assertRejects(() => f.es.retain(record, keys));
+    assertEquals(
+      await (await f.edge.server()).query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership admission: a correctly signed unselected account is refused before key lookup', async () => {
+  const f = await fixture();
+  try {
+    const { record, keys, state, operation } = await incoming(f);
+    const body = (record.payload as { body: Record<string, unknown> }).body;
+    state.userId = '@bob:logical.test';
+    operation.stream = 'membership:' + state.userId;
+    operation.semanticKey = canonicalJson([
+      'membership',
+      state.roomId,
+      state.userId,
+    ]);
+    operation.operationId = canonicalJson([
+      operation.source,
+      operation.incarnation,
+      operation.stream,
+      operation.sequence,
+    ]);
+    operation.payload = canonicalJson(state);
+    operation.payloadHash = createHash('sha256').update(operation.payload)
+      .digest('hex');
+    body.localpart = 'bob';
+    body.operation = operation;
+    record.stream = operation.stream;
+    record.operationId = 'membership:' +
+      createHash('sha256').update(canonicalJson([
+        body.pairing,
+        body.grantRevision,
+        body.ownerRevision,
+        operation.operationId,
+      ])).digest('hex');
+    await resign(f, record);
+    let lookedUp = false;
+    keys.verifyEventSignature = () => {
+      lookedUp = true;
+      return Promise.resolve(true);
+    };
+    await assertRejects(() => f.hs.retain(record, keys, f.bundle.id));
+    assertEquals(lookedUp, false);
+    assertEquals(
+      await (await f.home.server()).query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership admission: key verification stays outside the retaining transaction and incomplete causal history stays pending', async () => {
+  const f = await fixture();
+  try {
+    const { record, keys, state, operation } = await incoming(f);
+    operation.context = [{
+      source: 'home',
+      incarnation: 'missing-history',
+      sequence: 7,
+    }];
+    (record.payload as { body: { operation: MembershipOperation } }).body
+      .operation = operation;
+    await resign(f, record);
+    const db = await f.home.server(), tx = db.tx.bind(db);
+    let inTransaction = false, checked = false;
+    db.tx = (fn) =>
+      tx(async (conn) => {
+        inTransaction = true;
+        try {
+          return await fn(conn);
+        } finally {
+          inTransaction = false;
+        }
+      });
+    const verifying = keys.verifyEventSignature.bind(keys);
+    keys.verifyEventSignature = (args) => {
+      assertEquals(inTransaction, false);
+      checked = true;
+      return verifying(args);
+    };
+    await f.hs.retain(record, keys, f.bundle.id);
+    assertEquals(checked, true);
+    const history = await db.tx((conn) =>
+      membershipHistory(conn, operation.semanticKey)
+    );
+    assertEquals(history.ready, []);
+    assertEquals(history.pending.length, 1);
+    assertEquals(await db.query('SELECT * FROM prejoin_memberships'), []);
+    assertEquals(await db.query('SELECT * FROM memberships'), []);
+    assertEquals(JSON.parse(history.pending[0].payload), state);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership admission: retained room and origin cannot be substituted around a valid PDU', async (t) => {
+  for (const change of ['room', 'origin'] as const) {
+    await t.step(change, async () => {
+      const f = await fixture();
+      try {
+        const { record, keys, state, operation } = await incoming(f);
+        if (change === 'room') {
+          state.roomId = '!another:remote.test';
+          operation.semanticKey = canonicalJson([
+            'membership',
+            state.roomId,
+            state.userId,
+          ]);
+        } else state.origin = 'different.test';
+        operation.payload = canonicalJson(state);
+        operation.payloadHash = createHash('sha256').update(operation.payload)
+          .digest('hex');
+        (record.payload as { body: { operation: MembershipOperation } }).body
+          .operation = operation;
+        await resign(f, record);
+        await assertRejects(() => f.hs.retain(record, keys, f.bundle.id));
+        assertEquals(
+          await (await f.home.server()).query(
+            "SELECT * FROM domain_operations WHERE kind='membership'",
+          ),
+          [],
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('membership admission: verified terminal leave retains original invitation identity, not an invented matching event ID', async () => {
+  const f = await fixture();
+  try {
+    const { record, keys, state, operation } = await incoming(f);
+    const remote = await testRemoteServer('remote.test');
+    const leave = await remoteEvent(state.roomId, remote, '11', {
+      type: 'm.room.member',
+      sender: '@inviter:remote.test',
+      state_key: state.userId,
+      content: { membership: 'leave' },
+      prev_events: [state.eventId],
+    });
+    assert(leave.event_id !== state.eventId);
+    state.status = 'rejected';
+    state.eventJson = canonicalJson(leave);
+    operation.payload = canonicalJson(state);
+    operation.payloadHash = createHash('sha256').update(operation.payload)
+      .digest('hex');
+    (record.payload as { body: { operation: MembershipOperation } }).body
+      .operation = operation;
+    await resign(f, record);
+    assertEquals(await f.hs.retain(record, keys, f.bundle.id), state);
+    assertEquals(
+      await (await f.home.server()).query('SELECT * FROM prejoin_memberships'),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership admission: an accepted local-user knock keeps the remote resident origin without foreign execution', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, operation } = await incoming(f);
+    const local = await testRemoteServer('logical.test');
+    const knock = await remoteEvent(state.roomId, local, '11', {
+      type: 'm.room.member',
+      sender: state.userId,
+      state_key: state.userId,
+      content: { membership: 'knock' },
+      prev_events: [],
+    });
+    state.kind = 'knock';
+    state.eventId = String(knock.event_id);
+    state.eventJson = canonicalJson(knock);
+    operation.payload = canonicalJson(state);
+    operation.payloadHash = createHash('sha256').update(operation.payload)
+      .digest('hex');
+    (record.payload as { body: { operation: MembershipOperation } }).body
+      .operation = operation;
+    await resign(f, record);
+    assertEquals(
+      await f.hs.retain(record, fakeKeyResolver(local), f.bundle.id),
+      state,
+    );
+    const db = await f.home.server();
+    assertEquals(await db.query('SELECT * FROM prejoin_memberships'), []);
+    assertEquals(
+      await db.query('SELECT * FROM federation_invite_attempts'),
       [],
     );
   } finally {

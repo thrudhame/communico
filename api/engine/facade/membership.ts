@@ -4,17 +4,36 @@ import { canonicalJson } from '#engine/canonical.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import type { KeyResolver } from '#engine/room/deps.ts';
+import type { Pdu } from '#engine/pdu.ts';
+import { domainOf } from '#engine/ids.ts';
+import { verify } from '#engine/room/verify.ts';
+import {
+  checkedMembershipOperation,
+  retainMembershipOperation,
+} from '#engine/server/membership-history.ts';
+import {
+  importPublicKeyFromRaw,
+  matrixBase64,
+} from '#engine/signing-primitives.js';
 import { checkLocalpart } from '#engine/tenant/users.ts';
 import {
   type MembershipOperation,
   membershipOperations,
+  type MembershipState,
 } from '#engine/server/membership-operations.ts';
 import { type DomainBinding, requireDomainControl } from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
-import { LinkError, type LinkRecord } from './protocol.ts';
+import {
+  integer,
+  LinkError,
+  type LinkRecord,
+  object,
+  text,
+} from './protocol.ts';
 import { signingFence } from './signing-authority.ts';
 
 type MembershipView = DomainBinding & {
@@ -24,6 +43,89 @@ type MembershipView = DomainBinding & {
 
 function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
+}
+
+function viewOf(raw: unknown): MembershipView {
+  const row = object(raw);
+  const view: MembershipView = {
+    kind: 'membership-operation',
+    server: text(row.server),
+    pairing: text(row.pairing),
+    grantRevision: integer(row.grantRevision, 1),
+    ownerRevision: integer(row.ownerRevision, 1),
+    localpart: text(row.localpart),
+    source: text(row.source),
+    incarnation: text(row.incarnation),
+    operation: checkedMembershipOperation(
+      object(row.operation) as MembershipOperation,
+    ),
+  };
+  if (
+    canonicalJson(view) !== canonicalJson(raw) ||
+    checkLocalpart(view.localpart) !== view.localpart ||
+    view.operation.source !== view.source ||
+    view.operation.incarnation !== view.incarnation ||
+    view.operation.stream !==
+      'membership:@' + view.localpart + ':' + view.server
+  ) mismatch('membership operation differs from signed source or account');
+  return view;
+}
+
+function operationId(view: MembershipView) {
+  return 'membership:' + createHash('sha256').update(canonicalJson([
+    view.pairing,
+    view.grantRevision,
+    view.ownerRevision,
+    view.operation.operationId,
+  ])).digest('hex');
+}
+
+/** Verify original signed evidence without countersigning or installing a room.
+ * A terminal row may render a leave while retaining the original invite ID. */
+async function verifiedState(
+  operation: MembershipOperation,
+  keys: KeyResolver,
+): Promise<MembershipState> {
+  const state = JSON.parse(operation.payload) as MembershipState;
+  const inRoom = async (raw: string) => {
+    const { pdu } = await verify(
+      JSON.parse(raw) as Pdu,
+      state.roomVersion,
+      keys,
+      {
+        roomId: state.roomId,
+      },
+    );
+    if (pdu.room_id !== undefined && pdu.room_id !== state.roomId) {
+      mismatch('membership PDU differs from retained room');
+    }
+    return pdu;
+  };
+  const event = await inRoom(state.eventJson);
+  const membership = event.content?.membership;
+  const original = membership === state.kind;
+  if (
+    event.type !== 'm.room.member' || event.state_key !== state.userId ||
+    (!original &&
+      (state.status !== 'rejected' ||
+        !['leave', 'ban'].includes(String(membership)))) ||
+    (original && String(event.event_id) !== state.eventId) ||
+    (state.kind === 'invite' && original &&
+      domainOf(event.sender) !== state.origin) ||
+    (state.kind === 'knock' && original && event.sender !== state.userId)
+  ) mismatch('membership PDU differs from retained lifecycle');
+  let localLeaveJson = state.localLeaveJson;
+  if (localLeaveJson !== null) {
+    const leave = await inRoom(localLeaveJson);
+    if (
+      leave.type !== 'm.room.member' || leave.state_key !== state.userId ||
+      leave.sender !== state.userId || leave.content?.membership !== 'leave'
+    ) mismatch('membership departure differs from local user');
+    localLeaveJson = canonicalJson(leave);
+  }
+  // The immutable operation retains original evidence. Only the verifier's
+  // normalized PDU can subsequently supply a materialized display.
+  return { ...state, eventJson: canonicalJson(event), localLeaveJson };
 }
 
 export class MembershipOperations {
@@ -86,6 +188,70 @@ export class MembershipOperations {
         [context.node, context.id, scope],
       );
     if (!selected.length) mismatch('membership account not selected');
+  }
+
+  /** Retention alone never completes a journal record or changes a display.
+   * A retry without an application receipt still requires current authority. */
+  async retain(
+    record: LinkRecord,
+    keys: KeyResolver,
+    pairing?: string,
+  ): Promise<MembershipState> {
+    if (record.type !== 'membership-operation' || record.version !== 1) {
+      throw new LinkError(
+        'LINK_CAPABILITY_MISMATCH',
+        'not membership operation',
+      );
+    }
+    const signed = object(record.payload), view = viewOf(signed.body);
+    const server = await this.store.server(), unchanged = signingFence(server);
+    const grant = await this.binding(pairing),
+      context = grant.body.transcript.body.context;
+    const peer = this.node ? 'home' : context.node;
+    if (
+      view.server !== this.tenant.serverName ||
+      view.server !== context.server ||
+      view.pairing !== context.id ||
+      view.grantRevision !== grant.body.revision ||
+      view.source !== peer || record.source !== peer ||
+      record.incarnation !==
+        (this.node ? context.id : grant.body.transcript.body.incarnation) ||
+      record.stream !== view.operation.stream ||
+      record.operationId !== operationId(view)
+    ) mismatch('membership record differs from enrolled source or scope');
+    let valid = false;
+    try {
+      valid = await crypto.subtle.verify(
+        'Ed25519',
+        await importPublicKeyFromRaw(
+          matrixBase64(
+            this.node
+              ? context.home.publicKey
+              : grant.body.transcript.body.key.publicKey,
+            32,
+          ),
+        ),
+        matrixBase64(text(signed.signature), 64),
+        new TextEncoder().encode(canonicalJson(view)),
+      );
+    } catch {
+      /* Invalid signatures cannot grant retained membership authority. */
+    }
+    if (!valid) mismatch('invalid membership operation signature');
+    await server.tx(async (conn) => {
+      unchanged();
+      await this.selected(conn, grant, view.localpart);
+      await requireDomainControl(conn, view);
+    });
+    const state = await verifiedState(view.operation, keys);
+    await server.tx(async (conn) => {
+      unchanged();
+      await this.selected(conn, grant, view.localpart);
+      await requireDomainControl(conn, view);
+      await retainMembershipOperation(conn, view.operation);
+      unchanged();
+    });
+    return state;
   }
 
   /** Only committed immutable source facts are signed. A mutable display scan
@@ -171,13 +337,7 @@ export class MembershipOperations {
           stream: 'membership:@' + localpart + ':' + view.server,
           type: 'membership-operation',
           version: 1,
-          operationId: 'membership:' +
-            createHash('sha256').update(canonicalJson([
-              view.pairing,
-              view.grantRevision,
-              view.ownerRevision,
-              operation.operationId,
-            ])).digest('hex'),
+          operationId: operationId(view),
           payload: signed,
         });
         await conn.execute(
