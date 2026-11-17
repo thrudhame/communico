@@ -3,14 +3,7 @@ import { Db } from '#engine/store/db.ts';
 import { Turso } from '#engine/store/ffi.ts';
 import { keyFor } from '#engine/store/layout.ts';
 import { Pool } from '#engine/store/pool.ts';
-
-function latch() {
-  let release!: () => void;
-  return {
-    wait: new Promise<void>((resolve) => release = resolve),
-    release: () => release(),
-  };
-}
+import { latch, watchdog } from '#tests/support/ordering.ts';
 
 async function fixture(maxopenfiles = 8) {
   const root = await Deno.makeTempDir({ prefix: 'pool-progress-' });
@@ -30,22 +23,26 @@ async function fixture(maxopenfiles = 8) {
 async function progress(pool: Pool) {
   const lease = await pool.acquire('rooms', '!active:test');
   try {
-    await lease.db.query('SELECT value FROM id');
+    assertEquals(await lease.db.query('SELECT value FROM id'), [{
+      value: '!active:test',
+    }]);
   } finally {
     await lease.release();
   }
 }
 
-async function assertProgress(task: Promise<unknown>) {
-  let completed = false;
-  const observed = task.then(() => completed = true);
-  await Promise.race([
-    observed,
-    new Promise((resolve) => setTimeout(resolve, 500)),
-  ]);
-  assert(
-    completed,
-    'unrelated acquire/query/release waited behind native work in the pool queue',
+async function assertProgress(
+  task: Promise<unknown>,
+  held: ReturnType<typeof latch>,
+) {
+  await watchdog(
+    task,
+    'unrelated pool acquire/query/release while native owner is held',
+  );
+  assertEquals(
+    held.released,
+    false,
+    'native owner resumed before independent progress',
   );
 }
 
@@ -62,7 +59,7 @@ Deno.test('store pool progress: initializing another file holds no metadata queu
     });
     await entered.wait;
     probe = progress(pool);
-    await assertProgress(probe);
+    await assertProgress(probe, resume);
   } finally {
     resume.release();
     await initialization;
@@ -95,7 +92,7 @@ Deno.test('store pool progress: inactive ordinary open holds no metadata queue',
     );
     await entered.wait;
     probe = progress(pool);
-    await assertProgress(probe);
+    await assertProgress(probe, resume);
   } finally {
     resume.release();
     await opening;
@@ -125,7 +122,7 @@ Deno.test('store pool progress: identity listing waits outside metadata admissio
     listing = pool.list('rooms');
     await entered.wait;
     probe = progress(pool);
-    await assertProgress(probe);
+    await assertProgress(probe, resume);
   } finally {
     resume.release();
     await listing;
@@ -155,7 +152,7 @@ Deno.test('store pool progress: detached eviction close does not hold the metada
     evicting = progress(pool);
     await entered.wait;
     probe = progress(pool);
-    await assertProgress(probe);
+    await assertProgress(probe, resume);
   } finally {
     resume.release();
     await evicting;

@@ -275,12 +275,23 @@ Deno.test('recovery: an auth response arriving after the budget cannot expose a 
       depth: 100,
     });
     s.deps.limits.budgetMs = 1000;
+    const clock = Date.now;
+    let now = clock();
     const recording = fakeFetcher({
       eventAuth: new Map([[pushed.event_id!, s.chain]]),
-      onEventAuth: () => new Promise((resolve) => setTimeout(resolve, 1100)),
+      onEventAuth: () => {
+        now += s.deps.limits.budgetMs + 1;
+        return Promise.resolve();
+      },
     });
     s.deps.fetcher = recording.fetcher;
-    const out = await ingestRemote(s.room, [pushed], s.server.name, s.deps);
+    let out: Awaited<ReturnType<typeof ingestRemote>>;
+    Date.now = () => now;
+    try {
+      out = await ingestRemote(s.room, [pushed], s.server.name, s.deps);
+    } finally {
+      Date.now = clock;
+    }
     assertEquals(recording.calls.eventAuth, [pushed.event_id]);
     assertEquals(out[0].outcome, 'pending');
     await s.room.tx(async (tx) => {

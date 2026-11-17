@@ -1,6 +1,12 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { fetchLocation, type LocationPolicy } from '#engine/media/location.ts';
 import type { DialOpts } from '#engine/federation/dial-node-tls.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
+import {
+  controlledDeadline,
+  controlledTimeouts,
+} from '#tests/support/timers.ts';
 
 const policy: LocationPolicy = {
   maxBytes: 100,
@@ -142,21 +148,45 @@ Deno.test('media Location: hop cap and total byte budget apply across redirects'
 });
 Deno.test('media Location: total cancellation covers DNS without a late dial', async () => {
   const calls: DialOpts[] = [];
-  await assertRejects(() =>
-    fetchLocation('https://cdn.example/x', sink(), signal(), {
-      ...policy,
-      timeoutMs: 20,
-    }, {
-      resolve: () => new Promise(() => {}),
-      dial: dialer([{ status: 200 }], calls),
-    })
-  );
+  const entered = latch(), released = latch();
+  const deadline = controlledDeadline(20);
+  let resolving: Promise<string[]> | undefined;
+  const pending = fetchLocation('https://cdn.example/x', sink(), signal(), {
+    ...policy,
+    timeoutMs: 20,
+  }, {
+    resolve: () => {
+      entered.release();
+      resolving = released.wait.then(() => ['1.2.3.4']);
+      return resolving;
+    },
+    dial: dialer([{ status: 200 }], calls),
+  }).then(() => 'unexpected success', (error) => error);
+  try {
+    await watchdog(entered.wait, 'media Location DNS enters before deadline');
+    deadline.fire();
+    const error = await watchdog(
+      pending,
+      'Location deadline rejects with DNS held',
+    );
+    assert(error instanceof UpstreamError);
+    assertEquals(error.context.phase, 'deadline');
+    assertEquals(released.released, false);
+    assertEquals(calls.length, 0);
+  } finally {
+    released.release();
+    await resolving;
+    await pending;
+    deadline.restore();
+  }
   assertEquals(calls.length, 0);
 });
 
 Deno.test('media Location: real TLS streams CDN bytes, checks CA/name, rejects redirect to private and closes on cancellation', async () => {
   const seen: Headers[] = [];
   let cancelled = false;
+  const remoteClosed = latch();
+  let stalled: ReadableStreamDefaultController<Uint8Array> | undefined;
   const server = Deno.serve({
     hostname: '127.0.0.1',
     port: 0,
@@ -176,10 +206,12 @@ Deno.test('media Location: real TLS streams CDN bytes, checks CA/name, rejects r
       return new Response(
         new ReadableStream<Uint8Array>({
           start(c) {
+            stalled = c;
             c.enqueue(new Uint8Array([1]));
           },
           cancel() {
             cancelled = true;
+            remoteClosed.release();
           },
         }),
       );
@@ -243,17 +275,57 @@ Deno.test('media Location: real TLS streams CDN bytes, checks CA/name, rejects r
       }, { resolve: () => Promise.resolve(['127.0.0.1']) })
     );
     assertEquals(seen.length, before);
-    await assertRejects(() =>
-      fetchLocation(root + '/stall', sink(), signal(), {
+    const body = latch();
+    const deadline = controlledDeadline(30);
+    const timers = controlledTimeouts(30);
+    const pending = fetchLocation(
+      root + '/stall',
+      new WritableStream({
+        write() {
+          body.release();
+        },
+      }),
+      signal(),
+      {
         ...tls,
         timeoutMs: 30,
-      }, { resolve: () => Promise.resolve(['127.0.0.1']) })
-    );
-    for (let i = 0; i < 30 && !cancelled; i++) {
-      await new Promise((r) => setTimeout(r, 10));
+      },
+      { resolve: () => Promise.resolve(['127.0.0.1']) },
+    )
+      .then(() => 'unexpected success', (error) => error);
+    try {
+      await watchdog(
+        body.wait,
+        'real Location body reaches consumer before deadline',
+      );
+      assertEquals(
+        timers.timers.length,
+        2,
+        'TLS total and connect deadlines registered',
+      );
+      assertEquals(
+        timers.timers[1].active,
+        false,
+        'TLS connect completes before body',
+      );
+      deadline.fire();
+      const error = await watchdog(
+        pending,
+        'Location body deadline reaches consumer',
+      );
+      assert(error instanceof UpstreamError);
+      assertEquals(error.context.phase, 'deadline');
+      await watchdog(
+        remoteClosed.wait,
+        'Location deadline cancels the actual remote stream',
+      );
+      assertEquals(cancelled, true);
+    } finally {
+      deadline.restore();
+      timers.restore();
     }
-    assertEquals(cancelled, true);
   } finally {
+    if (!cancelled) stalled?.close();
     await server.shutdown();
     await server.finished;
   }

@@ -6,6 +6,8 @@ import { config, setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { wireKey } from '#tests/fixtures/e2ee-wire.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
+import { observeOriginWorkers } from '#tests/support/origin-workers.ts';
 
 type Json = Record<string, unknown>;
 type KeyResponse = {
@@ -273,8 +275,10 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
   const peers: Awaited<ReturnType<typeof startFakeServer>>[] = [];
   let active = 0, peak = 0;
   const ready = Promise.withResolvers<void>();
+  const release = latch();
+  const workers = observeOriginWorkers();
+  let pending: Promise<KeyResponse> | undefined;
   let arrivals = 0;
-  let barrierTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     for (let n = 0; n < 6; n++) {
       const fake = await startFakeServer({
@@ -292,23 +296,11 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
             active++;
             peak = Math.max(peak, active);
             try {
-              if (++arrivals === 1) {
-                barrierTimer = setTimeout(
-                  () =>
-                    ready.reject(
-                      new Error(
-                        'four origin workers did not reach the consumer',
-                      ),
-                    ),
-                  1500,
-                );
-              }
+              arrivals++;
               if (arrivals === 4) {
-                clearTimeout(barrierTimer);
                 ready.resolve();
               }
-              if (arrivals <= 4) await ready.promise;
-              await new Promise((resolve) => setTimeout(resolve, 40));
+              await release.wait;
               const user = Object.keys(
                 (req.json() as { device_keys: Json }).device_keys,
               )[0];
@@ -345,12 +337,32 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
       e2ee: { maxrequestbytes: 1600 },
       federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
     });
-    const bytes = await post(a.access_token!, 'query', { device_keys });
+    pending = post(a.access_token!, 'query', { device_keys });
+    void pending.catch(() => undefined);
+    await watchdog(
+      workers.enrolled,
+      'origin owner enrolls its complete worker group',
+    );
+    assertEquals(
+      workers.count(),
+      4,
+      'exactly four origin workers, including the upper bound',
+    );
+    await watchdog(
+      ready.promise,
+      'four origin workers reach held TLS consumers',
+    );
+    assertEquals(arrivals, 4);
+    release.release();
+    const bytes = await watchdog(
+      pending,
+      'released origin responses reach key consumer',
+    );
+    assertEquals(peak, 4, 'four origin workers overlap at the TLS consumer');
     assert(bytes.device_keys[a.user_id][a.device_id]);
     assert(Object.keys(bytes.device_keys).length > 1);
     assert(Object.keys(bytes.failures).length > 0);
     assert(new TextEncoder().encode(JSON.stringify(bytes)).length <= 1600);
-    assertEquals(peak, 4);
     setConfigForTests({
       e2ee: { maxrequestbytes: previous.e2ee.maxrequestbytes, maxkeys: 7 },
       federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
@@ -365,10 +377,22 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
     );
     assertEquals(Object.keys(count.failures).length, 3);
   } finally {
-    clearTimeout(barrierTimer);
-    await Promise.all(peers.map((p) => p.close()));
-    setConfigForTests(previous);
-    resetCaCertsForTests();
+    ready.resolve();
+    release.release();
+    try {
+      await watchdog(
+        Promise.allSettled(pending ? [pending] : []),
+        'origin query drains',
+      );
+    } finally {
+      workers.restore();
+      try {
+        await Promise.all(peers.map((p) => p.close()));
+      } finally {
+        setConfigForTests(previous);
+        resetCaCertsForTests();
+      }
+    }
   }
 });
 
@@ -492,37 +516,91 @@ suite.test('the same deadline bounds admission and discovery before any consumin
   const query = server.query;
   try {
     for (const stage of ['admission', 'discovery']) {
-      let delayed = false;
+      const entered = latch(), release = latch();
       let peerReads = 0;
+      const schedule = globalThis.setTimeout;
+      const then = Promise.prototype.then;
+      const phases: Promise<unknown>[] = [];
+      let expire: (() => void) | undefined;
+      // Join the actual non-cancellable primitives observed by abortable, not
+      // an arbitrary event-loop turn after the public response has returned.
+      Promise.prototype.then = function (
+        this: Promise<unknown>,
+        fulfilled,
+        rejected,
+      ) {
+        const caller = new Error().stack?.split('\n')[2];
+        if (caller?.includes('/api/engine/net/abort.ts:')) {
+          phases.push(then.call(this, () => undefined, () => undefined));
+        }
+        return then.call(this, fulfilled, rejected);
+      } as typeof Promise.prototype.then;
+      globalThis.setTimeout = ((
+        handler: (...args: unknown[]) => void,
+        ms?: number,
+        ...args: unknown[]
+      ) => {
+        const caller = new Error().stack?.split('\n')[2];
+        if (ms !== 100 || !caller?.includes('/api/engine/client/e2ee.ts:')) {
+          return schedule(handler, ms, ...args);
+        }
+        assertEquals(expire, undefined, 'one total client deadline');
+        expire = () => handler(...args);
+        const id = schedule(() => undefined, 0);
+        clearTimeout(id);
+        return id;
+      }) as typeof setTimeout;
       server.query = async function (sql, values) {
         const target = stage === 'admission'
           ? sql === 'SELECT pattern FROM federation_blocks'
           : sql.includes('FROM federation_peers WHERE name = ?') &&
             ++peerReads === 2;
         if (target) {
-          delayed = true;
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          entered.release();
+          await release.wait;
         }
         return await query.call(this, sql, values);
       };
-      const started = performance.now();
-      const result = await post(a.access_token!, 'claim', {
-        timeout: 100,
-        one_time_keys: { ['@remote:' + fake.name]: { D: 'curve25519' } },
-      });
-      assert(delayed, 'did not exercise ' + stage);
-      assert(
-        performance.now() - started < 350,
-        stage + ' ignored the deadline',
-      );
-      assert(result.failures[fake.name]);
-      await new Promise((resolve) => setTimeout(resolve, 600));
-      assertEquals(
-        fake.requests.length,
-        0,
-        'late discovery started a consuming dial',
-      );
-      server.query = query;
+      let pending: Promise<KeyResponse> | undefined;
+      try {
+        pending = post(a.access_token!, 'claim', {
+          timeout: 100,
+          one_time_keys: { ['@remote:' + fake.name]: { D: 'curve25519' } },
+        });
+        void pending.catch(() => undefined);
+        await watchdog(entered.wait, stage + ' reaches its held query');
+        assert(expire, 'configured total deadline must be registered');
+        assert(phases.length > 0, 'observe actual abortable phase ownership');
+        expire();
+        const result = await watchdog(
+          pending,
+          stage + ' honors deadline while query remains held',
+        );
+        assert(result.failures[fake.name]);
+        release.release();
+        await watchdog(
+          Promise.allSettled(phases),
+          stage + ' late primitives drain',
+        );
+        assertEquals(
+          fake.requests.length,
+          0,
+          'late discovery started a consuming dial',
+        );
+      } finally {
+        release.release();
+        expire?.();
+        try {
+          await watchdog(
+            Promise.allSettled([...(pending ? [pending] : []), ...phases]),
+            stage + ' owned tasks drain',
+          );
+        } finally {
+          server.query = query;
+          globalThis.setTimeout = schedule;
+          Promise.prototype.then = then;
+        }
+      }
     }
   } finally {
     server.query = query;

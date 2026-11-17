@@ -9,6 +9,8 @@ import { listCachedMedia } from '#engine/server/media.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
+import { mediaDemand } from '#tests/support/media-demand.ts';
 
 Deno.test('media cache: v20 upgrade preserves server truth and adds only the cache owner', async () => {
   const root = await Deno.makeTempDir({ prefix: 'media-cache-upgrade-' });
@@ -70,6 +72,28 @@ const producer = async (out: WritableStream<Uint8Array>) => {
   await w.close();
   return { contentType: 'image/png', filename: 'a.png', size: 3 };
 };
+
+function waitForProducerAbort(signal: AbortSignal, notify = () => {}) {
+  signal.throwIfAborted();
+  return new Promise<never>((_resolve, reject) =>
+    signal.addEventListener('abort', () => {
+      notify();
+      reject(signal.reason);
+    }, { once: true })
+  );
+}
+
+Deno.test('media fake producer rejects cancellation that precedes its entry', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await watchdog(
+    assertRejects(
+      async () => await waitForProducerAbort(controller.signal),
+      DOMException,
+    ),
+    'pre-aborted fake media producer rejects',
+  );
+});
 async function fixture(
   fn: (
     cache: MediaCache,
@@ -255,12 +279,9 @@ Deno.test('media cache: distinct downloads obey the shared concurrency limit and
     let began!: () => void;
     const ready = new Promise<void>((r) => began = r);
     const pending = cache.fetch(identity('cancel.test'), 1, (_out, signal) => {
+      const pending = waitForProducerAbort(signal);
       began();
-      return new Promise((_resolve, reject) =>
-        signal.addEventListener('abort', () => reject(signal.reason), {
-          once: true,
-        })
-      );
+      return pending;
     });
     const rejected = assertRejects(() => pending);
     await ready;
@@ -272,35 +293,70 @@ Deno.test('media cache: distinct downloads obey the shared concurrency limit and
 Deno.test('media cache: one disconnected subscriber cannot cancel another; last subscriber closes the owned transfer', async () => {
   await fixture(async (cache) => {
     const a = new AbortController(), b = new AbortController();
+    const demand = mediaDemand(cache);
+    const aborted = latch();
     let cancelled = false;
     let began!: () => void;
     const ready = new Promise<void>((resolve) => began = resolve);
     const work = (_out: WritableStream<Uint8Array>, signal: AbortSignal) => {
+      const pending = waitForProducerAbort(signal, () => {
+        cancelled = true;
+        aborted.release();
+      });
       began();
-      return new Promise<never>((_resolve, reject) =>
-        signal.addEventListener('abort', () => {
-          cancelled = true;
-          reject(signal.reason);
-        }, { once: true })
-      );
+      return pending;
     };
     const first = cache.fetch(identity(), 1, work, a.signal);
     const second = cache.fetch(identity(), 1, work, b.signal);
-    const rejected = Promise.all([
-      assertRejects(() => first),
-      assertRejects(() => second),
-    ]);
-    await ready;
-    a.abort();
-    await new Promise((r) => setTimeout(r, 10));
-    assertEquals(cancelled, false);
-    b.abort();
-    await new Promise((r) => setTimeout(r, 10));
+    const firstVerdict = first.then(() => 'fulfilled', () => 'rejected');
+    const secondVerdict = second.then(() => 'fulfilled', () => 'rejected');
     try {
+      await watchdog(ready, 'media producer enters');
+      await watchdog(
+        demand.joined,
+        'both callers enroll in the same media owner',
+      );
+      a.abort();
+      assertEquals(
+        await watchdog(firstVerdict, 'first media subscriber leaves'),
+        'rejected',
+      );
+      await watchdog(
+        demand.firstLeft,
+        'first media subscription actually leaves its owner',
+      );
+      assertEquals(
+        demand.entry.users,
+        1,
+        'second media subscriber retains demand',
+      );
+      assertEquals(demand.entry.controller.signal.aborted, false);
+      assertEquals(cancelled, false);
+      b.abort();
+      assertEquals(
+        await watchdog(secondVerdict, 'last media subscriber leaves'),
+        'rejected',
+      );
+      await watchdog(
+        demand.lastLeft,
+        'last media subscription actually leaves its owner',
+      );
+      await watchdog(
+        aborted.wait,
+        'last media subscriber aborts the actual producer',
+      );
+      await watchdog(
+        demand.entry.run.catch(() => {}),
+        'cancelled media producer fully settles',
+      );
       assertEquals(cancelled, true);
+      assertEquals(demand.entry.users, 0);
     } finally {
+      a.abort();
+      b.abort();
       await cache.close();
-      await rejected;
+      await Promise.all([firstVerdict, secondVerdict]);
+      demand.restore();
     }
   });
 });
