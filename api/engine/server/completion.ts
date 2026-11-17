@@ -77,8 +77,11 @@ export class RoomCompletion {
       signal?.throwIfAborted();
       throw new CompletionFailure(target, 'completion', cause);
     }
-    this.enroll(room, self, tail);
-    await this.wait(tail, 'completion', signal, self);
+    // A shared readiness pass may have captured before this caller committed.
+    // Include its dependent tail without replacing the caller's own obligation.
+    const required = tail.through < target.through ? target : tail;
+    this.enroll(room, self, required);
+    await this.wait(required, 'completion', signal, self);
   }
 
   private ready(demand: Demand): Promise<CompletionCut> {

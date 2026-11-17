@@ -15,6 +15,7 @@ CREATE TABLE transaction_completions(
   localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL,
   endpoint TEXT NOT NULL, txn_id TEXT NOT NULL, room_id TEXT NOT NULL,
   room_generation TEXT NOT NULL, event_id TEXT NOT NULL, through INTEGER NOT NULL,
+  retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)),
   PRIMARY KEY(localpart,device_id,generation,endpoint,txn_id)
 );
 CREATE INDEX transaction_completions_room ON transaction_completions(room_id,room_generation,through);
@@ -74,7 +75,7 @@ export async function finishCompletion(
     ) throw new Error('E_CLIENT_COMPLETION_TARGET');
   } else {
     await conn.execute(
-      'INSERT INTO transaction_completions VALUES(?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO transaction_completions(localpart,device_id,generation,endpoint,txn_id,room_id,room_generation,event_id,through) VALUES(?,?,?,?,?,?,?,?,?)',
       [
         ...key,
         target.roomId,
@@ -169,6 +170,22 @@ export async function reconcileRoomCompletions(
   ) {
     throw new Error('E_CLIENT_COMPLETION_RETIREMENT: ' + roomId);
   }
+  const receipts = await conn.query(
+    'SELECT room_generation,through FROM transaction_completions WHERE room_id=? AND retired=0',
+    [roomId],
+  );
+  if (
+    receipts.some((row) =>
+      completed === null || row.room_generation !== completed.generation ||
+      Number(row.through) > completed.through
+    )
+  ) throw new Error('E_CLIENT_COMPLETION_RETIREMENT: ' + roomId);
+  // This durable witness is written only while the exact source incarnation and
+  // its completed publication are still held. It survives reuse of the room ID.
+  await conn.execute(
+    'UPDATE transaction_completions SET retired=1 WHERE room_id=? AND retired=0',
+    [roomId],
+  );
   await conn.execute('DELETE FROM client_completion_cuts WHERE room_id=?', [
     roomId,
   ]);

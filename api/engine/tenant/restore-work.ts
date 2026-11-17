@@ -55,7 +55,7 @@ export async function restoredTenantWork(
   const completionReceipts = await inventoryRows(
     db,
     'transaction_completions',
-    'localpart,device_id,generation,endpoint,txn_id,room_id,room_generation,event_id,through',
+    'localpart,device_id,generation,endpoint,txn_id,room_id,room_generation,event_id,through,retired',
   );
   const pendingCompletions = await inventoryRows(
     db,

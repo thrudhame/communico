@@ -227,14 +227,14 @@ export async function auditServer(
           const table of ['transaction_completions', 'client_completion_cuts']
         ) {
           for await (const target of scan(source, table, '*')) {
+            if (table === 'transaction_completions' && target.retired === 1) {
+              continue;
+            }
             const room = rooms.get(String(target.room_id));
             if (room === undefined) {
-              // Keep the old historical-receipt exception, never a lost pending
-              // obligation. Retirement must reconcile pending cuts before unlink.
-              if (table === 'client_completion_cuts') {
-                auditFailure('orphan pending completion');
-              }
-              continue;
+              // New exact receipts require the lifecycle's durable witness;
+              // legacy historical receipts below retain their old exception.
+              auditFailure('orphan pending completion');
             }
             await snapshot.read(room, async (held) => {
               const [identity] = await held.query(
@@ -293,11 +293,22 @@ export async function auditServer(
                 const receipt of scan(
                   source,
                   'transactions',
-                  'event_id',
+                  'localpart,device_id,generation,endpoint,txn_id,event_id',
                   'completed=1 AND room_id=?',
                   [room_id],
                 )
               ) {
+                const retired = await source.query(
+                  'SELECT 1 FROM transaction_completions WHERE localpart=? AND device_id=? AND generation=? AND endpoint=? AND txn_id=? AND retired=1',
+                  [
+                    receipt.localpart,
+                    receipt.device_id,
+                    receipt.generation,
+                    receipt.endpoint,
+                    receipt.txn_id,
+                  ],
+                );
+                if (retired.length) continue;
                 if (
                   !(await r.query('SELECT id FROM events WHERE id=?', [
                     receipt.event_id,

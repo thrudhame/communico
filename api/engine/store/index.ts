@@ -145,6 +145,13 @@ export class Store implements StartupStore {
     return this.maintain(Promise.resolve().then(fn));
   }
 
+  // Draining owners retain access to their existing files, but cannot admit a
+  // new file lifetime. Previously admitted initialization still owns publication.
+  private create<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.accepting) return Promise.reject(new Error('store is closed'));
+    return this.run(fn);
+  }
+
   async room(
     id: string,
     options: { create?: boolean } = {},
@@ -165,7 +172,9 @@ export class Store implements StartupStore {
     id: string,
     options: { create?: boolean } = {},
   ): Promise<Lease> {
-    const lease = await this.run(() => this.pool.acquire('rooms', id, options));
+    const acquire = () => this.pool.acquire('rooms', id, options);
+    const lease =
+      await (options.create ? this.create(acquire) : this.run(acquire));
     return {
       ...lease,
       db: operations(
@@ -181,7 +190,7 @@ export class Store implements StartupStore {
     options: { create?: boolean },
   ): Promise<Database> {
     // Preserve open/create validation without retaining the opening lease.
-    return await this.run(async () => {
+    const acquire = async () => {
       const initial = await this.pool.acquire(kind, id, options);
       const path = initial.db.path;
       const incarnation = initial.incarnation;
@@ -195,7 +204,8 @@ export class Store implements StartupStore {
             await lease.release();
           }
         }), path);
-    });
+    };
+    return await (options.create ? this.create(acquire) : this.run(acquire));
   }
 
   // The room ids recorded on disk (the server stage's startup discovery).
@@ -226,7 +236,7 @@ export class Store implements StartupStore {
   }
 
   initializeRoom<T>(id: string, fn: (db: Database) => Promise<T>): Promise<T> {
-    return this.run(() => this.pool.initialize('rooms', id, fn));
+    return this.create(() => this.pool.initialize('rooms', id, fn));
   }
 
   // One crash-consistent cut for every file, including inactive rooms/tenants.

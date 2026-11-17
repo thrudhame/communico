@@ -96,6 +96,9 @@ export async function auditTenant(db: CapturedQuery, id: string) {
           auditFailure('completion revision');
         }
       } else {
+        if (target.retired !== 0 && target.retired !== 1) {
+          auditFailure('completion retirement witness');
+        }
         const receipt = await db.query(
           'SELECT event_id,room_id,completed FROM transactions WHERE localpart=? AND device_id=? AND generation=? AND endpoint=? AND txn_id=?',
           [
