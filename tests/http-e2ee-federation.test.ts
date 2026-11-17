@@ -6,6 +6,7 @@ import { config, setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { wireKey } from '#tests/fixtures/e2ee-wire.ts';
+import { watchdog } from '#tests/support/ordering.ts';
 
 type Json = Record<string, unknown>;
 type KeyResponse = {
@@ -274,7 +275,6 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
   let active = 0, peak = 0;
   const ready = Promise.withResolvers<void>();
   let arrivals = 0;
-  let barrierTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     for (let n = 0; n < 6; n++) {
       const fake = await startFakeServer({
@@ -292,23 +292,16 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
             active++;
             peak = Math.max(peak, active);
             try {
-              if (++arrivals === 1) {
-                barrierTimer = setTimeout(
-                  () =>
-                    ready.reject(
-                      new Error(
-                        'four origin workers did not reach the consumer',
-                      ),
-                    ),
-                  1500,
-                );
-              }
+              arrivals++;
               if (arrivals === 4) {
-                clearTimeout(barrierTimer);
                 ready.resolve();
               }
-              if (arrivals <= 4) await ready.promise;
-              await new Promise((resolve) => setTimeout(resolve, 40));
+              if (arrivals <= 4) {
+                await watchdog(
+                  ready.promise,
+                  'four origin workers reach TLS consumers',
+                );
+              }
               const user = Object.keys(
                 (req.json() as { device_keys: Json }).device_keys,
               )[0];
@@ -346,11 +339,11 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
       federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
     });
     const bytes = await post(a.access_token!, 'query', { device_keys });
+    assertEquals(peak, 4, 'four origin workers overlap at the TLS consumer');
     assert(bytes.device_keys[a.user_id][a.device_id]);
     assert(Object.keys(bytes.device_keys).length > 1);
     assert(Object.keys(bytes.failures).length > 0);
     assert(new TextEncoder().encode(JSON.stringify(bytes)).length <= 1600);
-    assertEquals(peak, 4);
     setConfigForTests({
       e2ee: { maxrequestbytes: previous.e2ee.maxrequestbytes, maxkeys: 7 },
       federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
@@ -365,7 +358,7 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
     );
     assertEquals(Object.keys(count.failures).length, 3);
   } finally {
-    clearTimeout(barrierTimer);
+    ready.resolve();
     await Promise.all(peers.map((p) => p.close()));
     setConfigForTests(previous);
     resetCaCertsForTests();
