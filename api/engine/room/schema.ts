@@ -9,6 +9,7 @@ import { rebuildTopology, TOPOLOGY_SQL } from './topology.ts';
 import { REMOTE_BATCHES_SQL } from './remote-batches.ts';
 import { EVENT_SIGNATURES_SQL } from './signatures.ts';
 import { initializeCompletion } from './completion.ts';
+import { MEMBERSHIP_RECEIPTS_SQL } from './membership-receipts.ts';
 
 export const ROOM_SCHEMA_SQL = `
 CREATE TABLE events(
@@ -161,16 +162,18 @@ const HASH_REDACTION_SQL =
   'ALTER TABLE events ADD COLUMN hash_redacted INTEGER NOT NULL DEFAULT 0';
 
 export const roomSchema: SchemaProvider = {
-  version: 10,
+  version: 11,
   apply: async (db) => {
     await db.exec(
       ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL +
         ANNOTATION_INDEX_SQL + REMOTE_BATCHES_SQL + WAIT_READY_SQL +
-        EVENT_SIGNATURES_SQL + HASH_REDACTION_SQL,
+        EVENT_SIGNATURES_SQL + HASH_REDACTION_SQL + ';' +
+        MEMBERSHIP_RECEIPTS_SQL,
     );
     await db.tx(initializeCompletion, { mode: 'deferred' });
   },
   migrations: {
+    10: (conn) => conn.exec(MEMBERSHIP_RECEIPTS_SQL),
     9: (conn) => conn.exec(HASH_REDACTION_SQL),
     8: (conn) => conn.exec(EVENT_SIGNATURES_SQL),
     7: initializeCompletion,

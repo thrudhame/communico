@@ -15,6 +15,7 @@ import { roomSchema } from '#engine/room/schema.ts';
 import * as state from '#engine/room/state.ts';
 import * as waits from '#engine/room/waits.ts';
 import * as remoteBatches from '#engine/room/remote-batches.ts';
+import * as membershipReceipts from '#engine/room/membership-receipts.ts';
 import * as completion from '#engine/room/completion.ts';
 import type { RemoteOutcome } from '#engine/room/remote.ts';
 import { orderKeys } from '#engine/room/topology.ts';
@@ -59,6 +60,21 @@ function bind(
       },
       complete: (generation: string, through: number) =>
         completion.markCompleted(conn, generation, through),
+    },
+    membershipReceipts: {
+      get: (operation: string, inputHash: string) =>
+        membershipReceipts.membershipReceipt(conn, operation, inputHash),
+      save: (
+        operation: string,
+        inputHash: string,
+        result: Record<string, unknown>,
+      ) =>
+        membershipReceipts.saveMembershipReceipt(
+          conn,
+          operation,
+          inputHash,
+          result,
+        ),
     },
     remoteBatches: {
       get: (operationId: string, inputHash: string) =>

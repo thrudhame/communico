@@ -1,0 +1,390 @@
+import { assert, assertEquals, assertRejects } from '@std/assert';
+import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  makeJoin,
+  makeKnock,
+  makeLeave,
+  sendJoin,
+  sendKnock,
+  sendLeave,
+} from '#engine/federation/joins.ts';
+import type { InviteDeps } from '#engine/federation/invites.ts';
+import { toWire } from '#engine/federation/pdu.ts';
+import { createRoom } from '#engine/room/create.ts';
+import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { ingestInTx, sendLocal } from '#engine/room/ingest.ts';
+import { verify } from '#engine/room/verify.ts';
+import { config } from '#engine/config.ts';
+import { openStore } from '#engine/store/index.ts';
+import { serverSchema } from '#engine/server/schema.ts';
+import { fakeKeyResolver, makeRemoteServer } from './fixtures/remote.ts';
+import { signerFor, signTemplate } from './http-federation.ts';
+
+const self = 'logical.test';
+const creator = '@alice:' + self;
+const guest = '@zoe:remote.test';
+
+async function fixture(knock = false) {
+  const dir = await Deno.makeTempDir({ prefix: 'membership-receipt-' });
+  const options = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  const schemas = { room: roomSchema, server: serverSchema };
+  let store = await openStore(options, { schemas });
+  const local = await makeRemoteServer(self);
+  const remote = await makeRemoteServer('remote.test');
+  const rawSigner = signerFor(local);
+  let signatures = 0;
+  let expired = false;
+  const signer = {
+    ...rawSigner,
+    sign: (bytes: string) => {
+      signatures++;
+      if (expired) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'signing authority expired',
+        );
+      }
+      return rawSigner.sign(bytes);
+    },
+  };
+  const { roomId } = await createRoom(store, {
+    creator,
+    preset: 'public_chat',
+    version: '11',
+    ...(knock
+      ? {
+        initial_state: [{
+          type: 'm.room.join_rules',
+          state_key: '',
+          content: { join_rule: 'knock' },
+        }],
+      }
+      : {}),
+  }, signer);
+  const deps = async (): Promise<InviteDeps> => ({
+    store,
+    server: await store.server(),
+    signer,
+    keys: fakeKeyResolver(local, remote),
+    self,
+    wake() {},
+  });
+  const room = () => openRoom(store, roomId);
+  const topic = async (text: string) => {
+    const held = await room();
+    const result = await sendLocal(held, {
+      type: 'm.room.topic',
+      state_key: '',
+      sender: creator,
+      content: { topic: text },
+      origin_server_ts: Date.now(),
+    }, signer);
+    assertEquals(result.standing, 'accepted');
+  };
+  const changes = async () => (await room()).tx((tx) => tx.changes.head());
+  return {
+    roomId,
+    remote,
+    deps,
+    room,
+    topic,
+    changes,
+    signatures: () => signatures,
+    expire() {
+      expired = true;
+    },
+    async reopen() {
+      await store.close();
+      store = await openStore(options, { schemas });
+    },
+    async close() {
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    },
+  };
+}
+
+Deno.test('membership receipts pin the pre-join response across later room writes and cold retry', async () => {
+  const f = await fixture();
+  try {
+    const made = await makeJoin(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      await f.deps(),
+    );
+    const join = await signTemplate(made.event, f.remote);
+    const wire = toWire(join, '11');
+    const first = await sendJoin(
+      f.roomId,
+      String(join.event_id),
+      wire,
+      f.remote.name,
+      'v2',
+      await f.deps(),
+    );
+    await f.topic('after the original join');
+    const before = await f.changes();
+    await f.reopen();
+    const retry = await sendJoin(
+      f.roomId,
+      String(join.event_id),
+      { ...wire, unsigned: { retry: true } },
+      f.remote.name,
+      'v2',
+      await f.deps(),
+    );
+    assertEquals(retry, first, 'retry must not render a newer state/auth cut');
+    assertEquals(await f.changes(), before, 'a replay is not new arrival news');
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership receipts replay retained signed work without minting a signature after expiry', async () => {
+  const f = await fixture();
+  try {
+    const made = await makeJoin(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      await f.deps(),
+    );
+    const join = await signTemplate(made.event, f.remote);
+    const wire = toWire(join, '11');
+    const first = await sendJoin(
+      f.roomId,
+      String(join.event_id),
+      wire,
+      f.remote.name,
+      'v2',
+      await f.deps(),
+    );
+    const signatures = f.signatures();
+    await f.reopen();
+    f.expire();
+    assertEquals(
+      await sendJoin(
+        f.roomId,
+        String(join.event_id),
+        wire,
+        f.remote.name,
+        'v2',
+        await f.deps(),
+      ),
+      first,
+    );
+    assertEquals(
+      f.signatures(),
+      signatures,
+      'saved result needs no new permit',
+    );
+    const forged = structuredClone(wire);
+    forged.signatures = { [f.remote.name]: { [f.remote.keyId]: 'AAAA' } };
+    const deps = await f.deps();
+    const error = await assertRejects(
+      () =>
+        sendJoin(
+          f.roomId,
+          String(join.event_id),
+          forged,
+          f.remote.name,
+          'v2',
+          deps,
+        ),
+      MatrixError,
+    );
+    assertEquals(error.status, 403);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership receipts reject changed full material under a retained event identity', async () => {
+  const f = await fixture();
+  try {
+    const made = await makeJoin(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      await f.deps(),
+    );
+    const join = await signTemplate(made.event, f.remote);
+    const wire = toWire(join, '11');
+    await sendJoin(
+      f.roomId,
+      String(join.event_id),
+      wire,
+      f.remote.name,
+      'v2',
+      await f.deps(),
+    );
+    const before = await f.changes();
+    const deps = await f.deps();
+    const substituted = {
+      ...wire,
+      content: { ...join.content, displayname: 'changed material' },
+    };
+    const error = await assertRejects(
+      () =>
+        sendJoin(
+          f.roomId,
+          String(join.event_id),
+          substituted,
+          f.remote.name,
+          'v2',
+          deps,
+        ),
+      MatrixError,
+    );
+    assertEquals(error.status, 400);
+    assertEquals(error.errcode, 'M_BAD_JSON');
+    assertEquals(await f.changes(), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership receipts pin knock results and share one leave result across API envelopes', async () => {
+  const f = await fixture(true);
+  try {
+    const made = await makeKnock(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      await f.deps(),
+    );
+    const knock = await signTemplate(made.event, f.remote);
+    const wire = toWire(knock, '11');
+    const first = await sendKnock(
+      f.roomId,
+      String(knock.event_id),
+      wire,
+      f.remote.name,
+      await f.deps(),
+    );
+    await f.topic('after the original knock');
+    await f.reopen();
+    assertEquals(
+      await sendKnock(
+        f.roomId,
+        String(knock.event_id),
+        wire,
+        f.remote.name,
+        await f.deps(),
+      ),
+      first,
+    );
+    const leaving = await makeLeave(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      await f.deps(),
+    );
+    const leave = await signTemplate(leaving.event, f.remote);
+    const leaveWire = toWire(leave, '11');
+    assertEquals(
+      await sendLeave(
+        f.roomId,
+        String(leave.event_id),
+        leaveWire,
+        f.remote.name,
+        'v1',
+        await f.deps(),
+      ),
+      [200, {}],
+    );
+    const before = await f.changes();
+    const signatures = f.signatures();
+    await f.reopen();
+    f.expire();
+    assertEquals(
+      await sendLeave(
+        f.roomId,
+        String(leave.event_id),
+        leaveWire,
+        f.remote.name,
+        'v2',
+        await f.deps(),
+      ),
+      {},
+    );
+    assertEquals(f.signatures(), signatures);
+    assertEquals(await f.changes(), before);
+    assert(
+      'knock_room_state' in first && Array.isArray(first.knock_room_state) &&
+        first.knock_room_state.length > 0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership receipt and actual room ingest roll back together before publication', async () => {
+  const f = await fixture();
+  try {
+    const deps = await f.deps();
+    const made = await makeJoin(f.roomId, guest, f.remote.name, ['11'], deps);
+    const join = await signTemplate(made.event, f.remote);
+    const prepared = await verify(join, '11', deps.keys, { roomId: f.roomId });
+    const held = await f.room();
+    const before = await f.changes();
+    await assertRejects(
+      () =>
+        held.tx(async (tx) => {
+          const result = await ingestInTx(tx, f.roomId, prepared.pdu, {
+            remote: {
+              origin: f.remote.name,
+              self,
+              oversized: prepared.oversized,
+              ungroundedMs: config().federation.ungroundedmillihours * 3600,
+              residentMembership: true,
+            },
+          });
+          assertEquals(result.standing, 'accepted');
+          await tx.membershipReceipts.save('aborted', 'same-input', {
+            event: prepared.pdu,
+          });
+          throw new Error('abort after membership result');
+        }),
+      Error,
+      'abort after membership result',
+    );
+    await f.reopen();
+    const reopened = await f.room();
+    assertEquals(
+      await reopened.tx((tx) => tx.events.get(String(join.event_id))),
+      null,
+    );
+    assertEquals(
+      await reopened.tx((tx) =>
+        tx.membershipReceipts.get('aborted', 'same-input')
+      ),
+      null,
+    );
+    assertEquals(await f.changes(), before);
+    const result = await sendJoin(
+      f.roomId,
+      String(join.event_id),
+      toWire(join, '11'),
+      f.remote.name,
+      'v2',
+      await f.deps(),
+    );
+    assert(!Array.isArray(result) && result.event !== undefined);
+  } finally {
+    await f.close();
+  }
+});

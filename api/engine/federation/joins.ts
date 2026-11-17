@@ -1,6 +1,8 @@
 // Resident-side membership dances. Network verification precedes the room lock;
 // the snapshot, lifecycle check and ingest share one critical section (R13).
 import { config } from '#engine/config.ts';
+import { canonicalJson } from '#engine/canonical.ts';
+import { createHash } from 'node:crypto';
 import { eventIdFor } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -19,7 +21,11 @@ import {
   pduAt,
   serverInState,
 } from './room.ts';
-import { verify, verifyJoinForCountersign } from '#engine/room/verify.ts';
+import {
+  eventMaterial,
+  verify,
+  verifyJoinForCountersign,
+} from '#engine/room/verify.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import { withRestrictedAdmission } from '#engine/room/restricted.ts';
 import {
@@ -220,10 +226,9 @@ async function sendMembership(
   deps: InviteDeps,
 ) {
   const room = await heldRoom(deps.store, roomId);
-  const version = await room.tx(async (tx) => {
-    await assertAcl(tx, origin);
-    return (await currentSnapshot(tx)).version;
-  });
+  const version = await room.tx(async (tx) =>
+    (await currentSnapshot(tx)).version
+  );
   const pdu = raw as Pdu;
   if (pdu.room_id !== roomId) {
     throw new MatrixError(400, 'M_BAD_JSON', 'room_id does not match the path');
@@ -270,6 +275,28 @@ async function sendMembership(
     ) sigOk = true;
   }
   if (!sigOk) throw new MatrixError(403, 'M_FORBIDDEN', 'bad signature');
+  const operation = canonicalJson([origin, membership, eventId]);
+  const inputHash = createHash('sha256').update(
+    eventMaterial({ ...pdu, event_id: eventId }),
+  ).digest('hex');
+  const render = (result: Record<string, unknown>) => {
+    if (membership === 'knock') return result;
+    if (membership === 'leave') {
+      return apiVersion === 'v2' ? result : [200, result];
+    }
+    const { servers_in_room, ...body } = result;
+    return apiVersion === 'v1' ? [200, body] : {
+      ...body,
+      members_omitted: false,
+      servers_in_room,
+    };
+  };
+  // A completed protocol operation survives later ACL/membership/key changes.
+  // Current request origin/signature checks above still precede the receipt.
+  const retained = await room.tx((tx) =>
+    tx.membershipReceipts.get(operation, inputHash)
+  );
+  if (retained !== null) return render(retained);
   const prepared =
     await (membership === 'join'
       ? verifyJoinForCountersign(pdu, version, deps.keys, deps.self, roomId)
@@ -305,6 +332,8 @@ async function sendMembership(
         : deps.keys.verifyEventSignature(args),
   }, { roomId });
   const publish = async (tx: Parameters<Parameters<typeof room.tx>[0]>[0]) => {
+    const retained = await tx.membershipReceipts.get(operation, inputHash);
+    if (retained !== null) return retained;
     await assertAcl(tx, origin);
     const snapshot = await currentSnapshot(tx);
     if (
@@ -323,19 +352,6 @@ async function sendMembership(
         throw new MatrixError(404, 'M_NOT_FOUND', roomId);
       }
     }
-    const ids = [...snapshot.state.values()];
-    const declaredAuth = pdu.auth_events == null ? [] : pdu.auth_events;
-    const closure = await authClosure(tx, [
-      ...ids,
-      ...declaredAuth,
-    ]);
-    const state = ids.map((id) => closure.pdus.get(id)).filter((
-      p,
-    ): p is Pdu => p !== undefined);
-    const chain = new Set([...closure.ids, ...declaredAuth]);
-    const auth = [...chain].map((id) => closure.pdus.get(id)).filter((
-      p,
-    ): p is Pdu => p !== undefined);
     const result = await ingestInTx(tx, roomId, verified.pdu, {
       remote: {
         origin,
@@ -352,21 +368,43 @@ async function sendMembership(
         `membership rejected (${result.reason})`,
       );
     }
-    if (membership === 'leave') return apiVersion === 'v2' ? {} : [200, {}];
-    if (membership === 'knock') {
-      return { knock_room_state: await prejoinStateInTx(tx, pdu.sender) };
+    if (membership === 'leave') {
+      return await tx.membershipReceipts.save(operation, inputHash, {});
     }
+    if (membership === 'knock') {
+      return await tx.membershipReceipts.save(operation, inputHash, {
+        knock_room_state: await prejoinStateInTx(tx, pdu.sender),
+      });
+    }
+    // Pin the event's actual pre-state, not a later current-state projection.
+    const before = await tx.state.eventStateBefore(eventId);
+    if (before === null) {
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'join pre-state unavailable');
+    }
+    const ids = [...(await tx.state.groupMap(before.group)).values()];
+    const declaredAuth = pdu.auth_events == null ? [] : pdu.auth_events;
+    const closure = await authClosure(tx, [...ids, ...declaredAuth]);
+    const state = ids.map((id) => closure.pdus.get(id)).filter((p): p is Pdu =>
+      p !== undefined
+    );
+    const chain = new Set([...closure.ids, ...declaredAuth]);
+    const auth = [...chain].map((id) => closure.pdus.get(id)).filter((
+      p,
+    ): p is Pdu => p !== undefined);
     const event = toWire(verified.pdu, version);
     const response = {
       state: state.map((p) => toWire(p, version)),
       auth_chain: auth.map((p) => toWire(p, version)),
       event,
+      servers_in_room: [
+        ...new Set(
+          state.filter((p) =>
+            p.type === 'm.room.member' && p.content?.membership === 'join'
+          ).map((p) => domainOf(String(p.state_key))),
+        ),
+      ].sort(),
     };
-    return apiVersion === 'v1' ? [200, response] : {
-      ...response,
-      members_omitted: false,
-      servers_in_room: [deps.self],
-    };
+    return await tx.membershipReceipts.save(operation, inputHash, response);
   };
   const answer = membership === 'join'
     ? await withRestrictedAdmission(
@@ -378,7 +416,7 @@ async function sendMembership(
     )
     : await withRoomLock(roomId, () => room.tx(publish));
   await projectAfterWrite(deps.store, roomId);
-  return answer;
+  return render(answer);
 }
 
 export function sendJoin(
