@@ -15,6 +15,7 @@ import { roomSchema } from '#engine/room/schema.ts';
 import * as state from '#engine/room/state.ts';
 import * as waits from '#engine/room/waits.ts';
 import * as remoteBatches from '#engine/room/remote-batches.ts';
+import * as completion from '#engine/room/completion.ts';
 import type { RemoteOutcome } from '#engine/room/remote.ts';
 import { orderKeys } from '#engine/room/topology.ts';
 
@@ -32,12 +33,33 @@ export const resolutionProbe = { resolutions: 0 };
 
 function bind(
   conn: Conn,
+  roomId: string,
   edges: EdgeOverlay,
   groups: state.StateGroups,
   rows: events.EventReads,
 ) {
   return {
     diagnostics: { resolutions: 0 },
+    completion: {
+      state: () => completion.completionState(conn),
+      capture: () => completion.captureCompletionCut(conn, roomId),
+      receipt: (eventId: string) =>
+        completion.completionReceipt(conn, roomId, eventId),
+      record: (eventId: string) =>
+        completion.recordCompletion(conn, roomId, eventId),
+      reconcileLegacy: (eventId: string) =>
+        completion.reconcileLegacyCompletion(conn, roomId, eventId),
+      validate: (
+        target: completion.CompletionCut | completion.CompletionTarget,
+      ) => {
+        if (target.roomId !== roomId) throw new Error('E_COMPLETION_ROOM');
+        return 'eventId' in target
+          ? completion.validateCompletion(conn, target)
+          : completion.validateCompletionCut(conn, target);
+      },
+      complete: (generation: string, through: number) =>
+        completion.markCompleted(conn, generation, through),
+    },
     remoteBatches: {
       get: (operationId: string, inputHash: string) =>
         remoteBatches.remoteBatch(conn, operationId, inputHash),
@@ -239,7 +261,7 @@ async function roomTransaction<T>(
     const edges = roomEdges.attempt(store, roomId, cutoff);
     const groups = new state.StateGroups(conn);
     const rows = new events.EventReads(conn, edges);
-    const tx = bind(conn, edges, groups, rows);
+    const tx = bind(conn, roomId, edges, groups, rows);
     try {
       const result = await fn(tx);
       return { result, resolutions: tx.diagnostics.resolutions, edges };
