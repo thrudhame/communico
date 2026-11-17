@@ -3,7 +3,7 @@
 import type { App } from '#engine/app.ts';
 import { config } from '#engine/config.ts';
 import { capabilities } from './capabilities.ts';
-import { exportKeyRoster, homeVerificationKeys } from './control.ts';
+import { exportKeyRoster } from './control.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { openJournalClient } from './client.ts';
 import { certificatePin, readProtectedFile } from './identity.ts';
@@ -92,15 +92,7 @@ export async function startHomeLinks(
     app.store,
     pairings,
     app.tenant.serverName,
-    productionKeyResolver(
-      app.server,
-      app.tenant.signer(),
-      homeVerificationKeys(
-        app.server,
-        app.tenant.signer(),
-        app.tenant.publicB64,
-      ),
-    ),
+    productionKeyResolver(app.federationKeys),
   );
   const collectKeySignature = async (
     keyId: string,

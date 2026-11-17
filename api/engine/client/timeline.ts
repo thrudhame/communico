@@ -239,7 +239,7 @@ export async function messages(
           config().federation.backfillbatch,
           {
             self: signer.serverName,
-            keys: productionKeyResolver(theApp().server, signer),
+            keys: productionKeyResolver(theApp().federationKeys),
             fetcher: productionFetcher(theApp().server, signer, theApp().store),
           },
         );
@@ -293,7 +293,7 @@ export async function messages(
             first[0]?.offset !== step.cursor.offset,
         }, {
           self: signer.serverName,
-          keys: productionKeyResolver(theApp().server, signer),
+          keys: productionKeyResolver(theApp().federationKeys),
           fetcher: productionFetcher(theApp().server, signer, theApp().store),
         });
         outcome = res.outcome;

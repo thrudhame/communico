@@ -30,7 +30,7 @@ export function inviteDeps() {
     store: app.store,
     server: app.server,
     signer,
-    keys: productionKeyResolver(app.server, signer),
+    keys: productionKeyResolver(app.federationKeys),
     self: serverName(),
     wake: (destination: string) => app.sender?.wake(destination),
   };

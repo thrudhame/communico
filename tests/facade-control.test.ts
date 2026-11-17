@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { setConfigForTests } from '#engine/config.ts';
+import { closeApp, openApp } from '#engine/app.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import {
   exportKeyRoster,
@@ -38,6 +39,7 @@ async function fixture(seedServer = serverSchema) {
       idleseconds: 300,
     }, { schemas: { server: schema, tenant: tenantSchema } });
   const home = await open('home', seedServer);
+  let homeClosed = false;
   let edge = await open('edge', seedServer);
   const tenant = await openTenant(home, 'logical.test', { create: true });
   const node = await initializeNode(
@@ -89,6 +91,17 @@ async function fixture(seedServer = serverSchema) {
     );
   return {
     home,
+    async openHomeApp() {
+      await home.close();
+      homeClosed = true;
+      return await openApp({
+        dir: dir + '/home',
+        library: './.native/libturso_ffi.so',
+        checkpointlogbytes: 65536,
+        maxopenfiles: 8,
+        idleseconds: 300,
+      });
+    },
     tenant,
     node,
     hp,
@@ -155,12 +168,102 @@ async function fixture(seedServer = serverSchema) {
       );
     },
     async close() {
-      await home.close();
+      if (!homeClosed) await home.close();
       await edge.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
 }
+
+Deno.test('home-only App resolves its own key without logical-self acquisition', async () => {
+  setConfigForTests({ server: { name: 'logical.test', role: 'home' } });
+  const dir = await Deno.makeTempDir({ prefix: 'home-app-keys-' });
+  try {
+    const app = await openApp({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    });
+    assertEquals(
+      (await app.federationKeys.getVerifyKey(
+        'logical.test',
+        app.tenant.keyId,
+        Date.now(),
+        'event',
+      )).algorithm.name,
+      'Ed25519',
+    );
+    await assertRejects(
+      () =>
+        app.federationKeys.getVerifyKey(
+          'logical.test',
+          'ed25519:unknown',
+          0,
+          'event',
+        ),
+      UpstreamError,
+      'local key unavailable',
+    );
+  } finally {
+    await closeApp();
+    await Deno.remove(dir, { recursive: true });
+    setConfigForTests({});
+  }
+});
+
+Deno.test('cold home App resolves its enrolled co-signed logical-server roster', async () => {
+  setConfigForTests({ server: { name: 'logical.test', role: 'home' } });
+  const f = await fixture();
+  try {
+    await f.receive();
+    const app = await f.openHomeApp();
+    for (const keyId of [f.tenant.keyId, f.node.keyId]) {
+      assertEquals(
+        (await app.federationKeys.getVerifyKey(
+          'logical.test',
+          keyId,
+          Date.now(),
+          'event',
+        )).algorithm.name,
+        'Ed25519',
+      );
+    }
+    const [held] = await app.server.query(
+      'SELECT document_json FROM facade_key_roster WHERE singleton=1',
+    );
+    const partial = JSON.parse(String(held.document_json));
+    delete partial.signatures['logical.test'][f.node.keyId];
+    for (const invalid of [null, '{', canonicalJson(partial)]) {
+      await app.server.execute(
+        'UPDATE facade_key_roster SET document_json=? WHERE singleton=1',
+        [invalid],
+      );
+      for (const keyId of [f.tenant.keyId, f.node.keyId]) {
+        await assertRejects(
+          () =>
+            app.federationKeys.getVerifyKey(
+              'logical.test',
+              keyId,
+              0,
+              'event',
+            ),
+          UpstreamError,
+          'local key unavailable',
+        );
+      }
+    }
+    await app.server.execute(
+      'UPDATE facade_key_roster SET document_json=? WHERE singleton=1',
+      [held.document_json],
+    );
+  } finally {
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
 
 Deno.test('co-signed publication includes every current key and is served unchanged offline', async () => {
   setConfigForTests({

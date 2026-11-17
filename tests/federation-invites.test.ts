@@ -25,6 +25,7 @@ import {
   rejectInviteRemote,
 } from '#engine/federation/invites.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
+import { keyStore } from '#engine/federation/keys.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { startSender } from '#engine/federation/sender.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
@@ -202,7 +203,7 @@ Deno.test('inviter: the /v2/invite shape, merged signatures, outbox to joined se
         store,
         server,
         signer: g.signer,
-        keys: productionKeyResolver(server, g.signer),
+        keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
         self: g.signer.serverName,
         wake: () => {},
       };

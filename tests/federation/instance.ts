@@ -106,7 +106,7 @@ function remoteDepsOf(
 ): RemoteDeps {
   const fed = config().federation;
   return {
-    keys: productionKeyResolver(server, signer),
+    keys: productionKeyResolver(keyStore(server, { signer })),
     fetcher: productionFetcher(server, signer, store),
     self,
     limits: {
@@ -225,7 +225,7 @@ export async function startInstance(): Promise<Instance> {
     store,
     server,
     signer,
-    keys: productionKeyResolver(server, signer),
+    keys: productionKeyResolver(keys),
     self: name,
     wake: (destination) => sender.wake(destination),
   };
@@ -438,7 +438,7 @@ export async function startInstance(): Promise<Instance> {
         });
         const res = await receiveTransaction(origin, txnId, bodyJson, {
           store,
-          keys: productionKeyResolver(server, signer),
+          keys: productionKeyResolver(keys),
           fetcher: productionFetcher(server, signer, store),
           self: name,
           edus,

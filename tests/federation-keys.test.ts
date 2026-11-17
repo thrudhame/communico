@@ -1145,7 +1145,7 @@ Deno.test('key fault ownership: production event resolver does not turn local re
       },
     });
     const { signer } = await randomSigner('local.test');
-    const resolver = productionKeyResolver(broken, signer);
+    const resolver = productionKeyResolver(keyStore(broken, { signer }));
     assertStrictEquals(
       await assertRejects(() =>
         resolver.verifyEventSignature({

@@ -8,6 +8,7 @@ import {
   type KeyDoc,
   type KeyStore,
   keyStore,
+  ourKeyDocument,
   signWithSigner,
 } from '#engine/federation/keys.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -171,6 +172,15 @@ export function homeVerificationKeys(
 ): KeyStore {
   return approvedVerificationKeys(db, signer, async () => {
     const roster = await homeRoster(db, signer, publicKey);
+    // The durable enrollment roster, not configured peers, decides whether
+    // ordinary home-only authority is sufficient. Never fall back for a
+    // multi-key roster whose co-signed publication is missing or invalid.
+    if (roster.keys.length === 1) {
+      return {
+        roster,
+        document: canonicalJson(await ourKeyDocument(signer, publicKey)),
+      };
+    }
     const [held] = await db.query(
       'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
     );

@@ -8,8 +8,10 @@ import {
 import { setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
+import { versionOf } from '#engine/client/room.ts';
 import {
   createRoom as createClientRoom,
+  inviteDeps,
   redactEvent,
   sendEvent,
   writeStateKey,
@@ -25,6 +27,8 @@ import { serveEvent } from '#engine/federation/serve.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { keyStore } from '#engine/federation/keys.ts';
+import { inviteDependencies } from '#engine/federation/dependencies.ts';
+import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
 import * as serving from '#engine/federation/serve.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import {
@@ -2582,6 +2586,86 @@ Deno.test('facade authorship captures room permits and never exposes the raw ten
     assert(preparations >= 8);
   } finally {
     installServerHooks();
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('client room dependencies preserve the App approved logical-server key owner', async () => {
+  const f = await fixture();
+  try {
+    const owner = new FacadeKeys(
+      await f.edgeServer(),
+      f.node.signer(),
+      f.node.publicKey,
+      await f.edgePairings(),
+    );
+    const record = await exportKeyRoster(
+      f.home,
+      f.tenant,
+      f.node.node,
+      f.bundle.id,
+      (_key, document) => owner.cosign(document),
+    );
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    await owner.apply(journal, record);
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      keys: owner.verificationKeys(),
+      signer: f.node.signer(),
+      keyDocument: () => owner.document(),
+      publicRooms: () => Promise.resolve(false),
+    });
+    const created = await createClientRoom({ creator: '@alice:logical.test' });
+    const room = await openRoom(app.store, created.roomId);
+    const join = await localMembership.membershipOf(
+      room,
+      '@alice:logical.test',
+    );
+    assert(join);
+    const event = await room.tx((tx) => tx.events.get(join.eventId));
+    assert(event);
+    const args = {
+      pdu: JSON.parse(event.pdu) as Pdu,
+      roomVersion: await versionOf(room),
+      server: 'logical.test',
+      keyId: f.node.keyId,
+      minValidUntilMs: Date.now(),
+    };
+    assert(await inviteDependencies(app).keys.verifyEventSignature(args));
+    assert(await inviteDeps().keys.verifyEventSignature(args));
+    // The same authority also verifies home-authored PDUs without self-HTTP.
+    const homeCreated = await (await import('#engine/room/create.ts'))
+      .createRoom(
+        f.home,
+        { creator: '@alice:logical.test' },
+        f.tenant.signer(),
+      );
+    const homeRoom = await openRoom(f.home, homeCreated.roomId);
+    const homeJoin = await localMembership.membershipOf(
+      homeRoom,
+      '@alice:logical.test',
+    );
+    assert(homeJoin);
+    const homeEvent = await homeRoom.tx((tx) =>
+      tx.events.get(homeJoin.eventId)
+    );
+    assert(homeEvent);
+    assert(
+      await inviteDeps().keys.verifyEventSignature({
+        ...args,
+        pdu: JSON.parse(homeEvent.pdu) as Pdu,
+        keyId: f.tenant.keyId,
+      }),
+    );
+  } finally {
     await closeApp();
     await f.close();
     setConfigForTests({});

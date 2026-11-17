@@ -11,6 +11,7 @@
 import { config, serverName } from '#engine/config.ts';
 import { assertRestoreReport } from '#engine/backup/report.ts';
 import { bindRole } from '#engine/facade/role.ts';
+import { homeVerificationKeys } from '#engine/facade/control.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
 import { startDeactivationWork } from '#engine/deactivation.ts';
@@ -47,11 +48,7 @@ import {
 } from '#engine/federation/invites.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { joinCleanupProvider } from '#engine/federation/join-cleanup.ts';
-import {
-  type KeyDoc,
-  type KeyStore,
-  keyStore,
-} from '#engine/federation/keys.ts';
+import { type KeyDoc, type KeyStore } from '#engine/federation/keys.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
 import type { Dispatch } from '#engine/server/delivery.ts';
 import type { ReplicaRoomAdmission } from '#engine/facade/directory.ts';
@@ -178,7 +175,11 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       store,
       server,
       tenant,
-      federationKeys: keyStore(server, { signer: tenant.signer() }),
+      federationKeys: homeVerificationKeys(
+        server,
+        tenant.signer(),
+        tenant.publicB64,
+      ),
       federationEdus,
       deviceLists,
       sender: null,
@@ -341,7 +342,7 @@ export function startFederationServices(app: App, dispatch?: Dispatch): void {
     store: app.store,
     server: app.server,
     signer,
-    keys: productionKeyResolver(app.server, signer),
+    keys: productionKeyResolver(app.federationKeys),
     self: name,
     wake: (destination) => sender.wake(destination),
   };

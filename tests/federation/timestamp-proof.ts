@@ -40,7 +40,7 @@ Deno.test('timestamp: real signed remote lookup yields usable HTTP context and b
     }).acquireKeyDoc(signer.serverName, 0);
     const deps = {
       self: signer.serverName,
-      keys: productionKeyResolver(app.server, signer),
+      keys: productionKeyResolver(app.federationKeys),
       fetcher: productionFetcher(app.server, signer, app.store),
     };
     await joinRemote(app.store, {

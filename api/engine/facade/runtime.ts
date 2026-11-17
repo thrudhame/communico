@@ -130,8 +130,6 @@ export async function openFacadeRuntime(
       await pairings(),
       identity.server,
       productionKeyResolver(
-        server,
-        node!.signer(),
         (await keyOwner()).verificationKeys(),
       ),
     );

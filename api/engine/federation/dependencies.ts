@@ -12,7 +12,7 @@ export function inviteDependencies(app: App): InviteDeps {
     store: app.store,
     server: app.server,
     signer,
-    keys: productionKeyResolver(app.server, signer, app.federationKeys),
+    keys: productionKeyResolver(app.federationKeys),
     self: app.tenant.serverName,
     wake: (destination) => app.sender?.wake(destination),
   };
