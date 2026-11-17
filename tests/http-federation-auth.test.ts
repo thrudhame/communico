@@ -64,6 +64,7 @@ test('valid signature reaches protected miss, recording only verified contact', 
     status: 404,
     code: 'M_UNRECOGNIZED',
   });
+  await theApp().federationContacts.drain();
   const pending = await listPending(theApp().server);
   assertEquals(pending.length, 1);
   assertEquals(pending[0].verified, true);
@@ -138,6 +139,7 @@ test('blocked, closed unknown and blocking key change are 403', async () => {
       status: 403,
       code: 'M_FORBIDDEN',
     });
+    await theApp().federationContacts.drain();
     const pending = await listPending(db);
     assertEquals(pending[0].kind, 'inbound');
   } finally {
