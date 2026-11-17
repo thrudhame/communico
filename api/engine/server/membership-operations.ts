@@ -47,10 +47,18 @@ function fromRow(row: Record<string, unknown>): MembershipOperation {
   };
 }
 
-export async function membershipOperations(conn: Conn, userId: string) {
+export async function membershipOperations(
+  conn: Conn,
+  userId: string,
+  after?: RegisterDot,
+) {
   return (await conn.query(
-    "SELECT * FROM domain_operations WHERE kind='membership' AND json_extract(payload_json,'$.userId')=? ORDER BY source,incarnation,sequence",
-    [userId],
+    "SELECT * FROM domain_operations WHERE kind='membership' AND json_extract(payload_json,'$.userId')=?" +
+      (after ? ' AND source=? AND incarnation=? AND sequence>?' : '') +
+      ' ORDER BY source,incarnation,sequence',
+    after
+      ? [userId, after.source, after.incarnation, after.sequence]
+      : [userId],
   )).map(fromRow);
 }
 
