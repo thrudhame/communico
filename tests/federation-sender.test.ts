@@ -46,6 +46,7 @@ import {
   exportPublicKeyRaw,
 } from '#engine/signing-primitives.js';
 import { type FakeServer, startFakeServer } from './federation/fake-server.ts';
+import { observeSenderWait } from '#tests/support/sender-turn.ts';
 
 installServerHooks();
 
@@ -487,57 +488,77 @@ Deno.test('sender: reliable EDU-only retry survives restart byte-for-byte and ne
 
 Deno.test('sender: transient transaction failures retry before the production peer ladder', async () => {
   await withStore(async (store) => {
-    await withSetup(store, async ({ g, fake, dest, sends, steer, sender }) => {
-      setConfigForTests({
-        federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
-      });
-      const server = await store.server();
-      steer.status = 503;
-      await devSays(g.room, g.signer, 'short outage');
-      await waitFor(() => sends.length === 1);
-      await waitFor(() => sender.snapshot().length === 0);
-      const first = fake.requests.find((r) => r.method === 'PUT')!;
-      for (let i = 0; i < 10; i++) sender.wake(dest);
-      await new Promise((r) => setTimeout(r, 150));
-      assertEquals(
-        sends.length,
-        1,
-        'producer wakes cannot bypass transient retry wait',
-      );
-      steer.status = 200;
-      await waitFor(
-        async () =>
-          (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
-        6000,
-      );
-      const puts = fake.requests.filter((r) => r.method === 'PUT');
-      assertEquals(puts.length, 2);
-      assertEquals(puts[1].path, first.path);
-      assertEquals(puts[1].body, first.body);
-      assertEquals((await peerStatus(server, dest)).failuresTotal, 0);
+    const turns = observeSenderWait();
+    try {
+      await withSetup(
+        store,
+        async ({ g, fake, dest, sends, steer, sender }) => {
+          setConfigForTests({
+            federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+          });
+          const server = await store.server();
+          steer.status = 503;
+          await devSays(g.room, g.signer, 'short outage');
+          assertEquals((await turns.after(0)).delay, 4000);
+          assertEquals(sends.length, 1);
+          assertEquals(sender.snapshot().length, 0);
+          const first = fake.requests.find((r) => r.method === 'PUT')!;
+          for (let i = 0; i < 10; i++) {
+            const count = turns.count();
+            sender.wake(dest);
+            assertEquals((await turns.after(count)).delay, 4000);
+          }
+          assertEquals(
+            sends.length,
+            1,
+            'producer wakes cannot bypass transient retry wait',
+          );
+          steer.status = 200;
+          turns.advance();
+          await waitFor(
+            async () =>
+              (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
+            6000,
+          );
+          const puts = fake.requests.filter((r) => r.method === 'PUT');
+          assertEquals(puts.length, 2);
+          assertEquals(puts[1].path, first.path);
+          assertEquals(puts[1].body, first.body);
+          assertEquals((await peerStatus(server, dest)).failuresTotal, 0);
 
-      // Exhaust only the bounded short phase, then retain the real 450s ladder.
-      steer.status = 500;
-      sends.splice(0);
-      const started = Date.now();
-      await devSays(g.room, g.signer, 'long outage');
-      await waitFor(
-        async () => (await peerStatus(server, dest)).failures === 1,
-        25000,
+          // Exhaust only the bounded short phase, then retain the real 450s ladder.
+          steer.status = 500;
+          sends.splice(0);
+          const started = turns.now(), count = turns.count();
+          await devSays(g.room, g.signer, 'long outage');
+          assertEquals((await turns.after(count)).delay, 4000);
+          let registered = turns.count();
+          turns.advance();
+          assertEquals((await turns.after(registered)).delay, 16000);
+          registered = turns.count();
+          turns.advance();
+          assertEquals((await turns.after(registered)).delay, 450000);
+          const status = await peerStatus(server, dest);
+          assertEquals(status.failures, 1);
+          assertEquals(sends.length, 3);
+          assertEquals(turns.now() - started, 20000);
+          assert(status.nextAttemptMs > turns.now() + 440_000);
+          const before = sends.length;
+          for (let i = 0; i < 10; i++) {
+            const count = turns.count();
+            sender.wake(dest);
+            assertEquals((await turns.after(count)).delay, 450000);
+          }
+          assertEquals(
+            sends.length,
+            before,
+            'new traffic never bypasses durable backoff',
+          );
+        },
       );
-      const status = await peerStatus(server, dest);
-      assertEquals(sends.length, 3);
-      assert(Date.now() - started >= 20000);
-      assert(status.nextAttemptMs > Date.now() + 440_000);
-      const before = sends.length;
-      for (let i = 0; i < 10; i++) sender.wake(dest);
-      await new Promise((r) => setTimeout(r, 150));
-      assertEquals(
-        sends.length,
-        before,
-        'new traffic never bypasses durable backoff',
-      );
-    });
+    } finally {
+      turns.restore();
+    }
   });
 });
 
@@ -721,51 +742,62 @@ Deno.test('sender: the contact hook resets the ladder and wakes the queue', asyn
 
 Deno.test('sender: a block stops the loop, rows left for the operator; prune + retry are the doors', async () => {
   await withStore(async (store) => {
-    await withSetup(store, async ({ g, dest, sends, steer, sender }) => {
-      const server = await store.server();
-      steer.status = 500;
-      await devSays(g.room, g.signer, 'blocked soon');
-      await waitFor(() => sends.length >= 1, 3000);
-      await addBlock(server, dest, 'test block');
-      sender.wake(dest);
-      const before = sends.length;
-      await new Promise((r) => setTimeout(r, 400));
-      assertEquals(
-        sends.length,
-        before,
-        'a blocked destination is not dialled',
-      );
-      assertEquals(
-        (await listOutbox(server, dest)).filter((r) => r.state === 'pending')
-          .length,
-        1,
-        'rows left in place',
-      );
-      await removeBlock(server, dest);
-      // retry refreshes the lifespan basis and re-queues
-      const before2 = (await listOutbox(server, dest))[0].addedMs;
-      await new Promise((r) => setTimeout(r, 10));
-      await retryDestination(server, dest);
-      const after = (await listOutbox(server, dest))[0].addedMs;
-      assert(after > before2, `retry refreshes expiry: ${before2} -> ${after}`);
-      steer.status = 200;
-      steer.body = { pdus: {} };
-      await waitFor(
-        async () =>
-          (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
-        8000,
-      );
-      // prune: the operator's delete door
-      await devSays(g.room, g.signer, 'prune me');
-      await waitFor(
-        async () =>
-          (await listOutbox(server, dest)).some((r) => r.state === 'pending'),
-        3000,
-      );
-      const n = await pruneDestination(server, dest);
-      assert(n >= 1);
-      assertEquals((await listOutbox(server, dest)).length, 0);
-    });
+    const turns = observeSenderWait();
+    try {
+      await withSetup(store, async ({ g, dest, sends, steer, sender }) => {
+        const server = await store.server();
+        steer.status = 500;
+        await devSays(g.room, g.signer, 'blocked soon');
+        assertEquals((await turns.after(0)).delay, 4000);
+        await addBlock(server, dest, 'test block');
+        const before = sends.length;
+        const count = turns.count();
+        sender.wake(dest);
+        assertEquals((await turns.after(count)).delay, 4000);
+        turns.advance();
+        await turns.drain();
+        assertEquals(
+          sends.length,
+          before,
+          'a blocked destination is not dialled',
+        );
+        assertEquals(
+          (await listOutbox(server, dest)).filter((r) => r.state === 'pending')
+            .length,
+          1,
+          'rows left in place',
+        );
+        await removeBlock(server, dest);
+        // retry refreshes the lifespan basis and re-queues
+        const before2 = (await listOutbox(server, dest))[0].addedMs;
+        await retryDestination(server, dest);
+        const after = (await listOutbox(server, dest))[0].addedMs;
+        assert(
+          after > before2,
+          `retry refreshes expiry: ${before2} -> ${after}`,
+        );
+        steer.status = 200;
+        steer.body = { pdus: {} };
+        sender.wake(dest);
+        await waitFor(
+          async () =>
+            (await listOutbox(server, dest)).every((r) => r.state === 'sent'),
+          8000,
+        );
+        // prune: the operator's delete door
+        await devSays(g.room, g.signer, 'prune me');
+        await waitFor(
+          async () =>
+            (await listOutbox(server, dest)).some((r) => r.state === 'pending'),
+          3000,
+        );
+        const n = await pruneDestination(server, dest);
+        assert(n >= 1);
+        assertEquals((await listOutbox(server, dest)).length, 0);
+      });
+    } finally {
+      turns.restore();
+    }
   });
 });
 
@@ -850,38 +882,43 @@ Deno.test('sender: an EDU-only change delivers within 1 s of its wake, no PDUs, 
 
 Deno.test('review sender: a persistent failed intent cannot bypass the peer backoff', async () => {
   await withStore(async (store) => {
-    await withSetup(store, async ({ dest, sender }) => {
-      const server = await store.server();
-      let calls = 0;
-      sender.setIntentProvider(() =>
-        Promise.resolve({
-          id: 'persistent',
-          run: () => {
-            calls++;
-            return Promise.reject(
-              new UpstreamError('transport', {
-                phase: 'connect',
-                reason: 'unreachable',
-              }),
-            );
-          },
-          failed: () => Promise.resolve(),
-        })
-      );
-      sender.wake(dest);
-      await waitFor(
-        async () => (await peerStatus(server, dest)).failures > 0,
-        3000,
-      );
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      await sender.stop();
-      assertEquals(
-        calls,
-        1,
-        'the retained intent must wait for its ladder rung',
-      );
-      assert((await peerStatus(server, dest)).nextAttemptMs > Date.now());
-    });
+    const turns = observeSenderWait();
+    try {
+      await withSetup(store, async ({ dest, sender }) => {
+        const server = await store.server();
+        let calls = 0;
+        sender.setIntentProvider(() =>
+          Promise.resolve({
+            id: 'persistent',
+            run: () => {
+              calls++;
+              return Promise.reject(
+                new UpstreamError('transport', {
+                  phase: 'connect',
+                  reason: 'unreachable',
+                }),
+              );
+            },
+            failed: () => Promise.resolve(),
+          })
+        );
+        sender.wake(dest);
+        assertEquals((await turns.after(0)).delay, 3600);
+        assert((await peerStatus(server, dest)).failures > 0);
+        const count = turns.count();
+        sender.wake(dest);
+        assertEquals((await turns.after(count)).delay, 3600);
+        await sender.stop();
+        assertEquals(
+          calls,
+          1,
+          'the retained intent must wait for its ladder rung',
+        );
+        assert((await peerStatus(server, dest)).nextAttemptMs > turns.now());
+      });
+    } finally {
+      turns.restore();
+    }
   });
 });
 
