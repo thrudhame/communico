@@ -10,13 +10,23 @@ import { roomSource } from '#engine/store/projection-sources.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { migrateRoomRules } from '#engine/tenant/pushrules.ts';
-async function catchUp(store: Store, tenant: Tenant, roomId: string) {
+async function catchUp(
+  store: Store,
+  tenant: Tenant,
+  roomId: string,
+  target?: number,
+) {
   const room = await openRoom(store, roomId),
     server = await store.server(),
     source = roomSource('client-room-rules', roomId);
+  const through = target ?? await room.tx((tx) => tx.changes.head());
   for (;;) {
     const mark = await get(server, source),
-      batch = await room.tx((tx) => tx.changes.after(mark, 500));
+      batch = await room.tx(async (tx) =>
+        (await tx.changes.after(mark, 500)).filter((change) =>
+          change.pos <= through
+        )
+      );
     if (batch.length === 0) return;
     for (const change of batch) {
       if (
@@ -71,8 +81,8 @@ async function catchUp(store: Store, tenant: Tenant, roomId: string) {
   }
 }
 export async function installRuleMigration(store: Store, tenant: Tenant) {
-  const dispose = onProjected((owner, room) =>
-    owner === store ? catchUp(store, tenant, room) : undefined
+  const dispose = onProjected((owner, room, through) =>
+    owner === store ? catchUp(store, tenant, room, through) : undefined
   );
   try {
     for (const room of await listRooms(store)) {
