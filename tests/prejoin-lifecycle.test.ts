@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { canonicalJson } from '#engine/canonical.ts';
+import { createHash } from 'node:crypto';
 import { setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import {
@@ -19,6 +20,9 @@ import { roomSchema } from '#engine/room/index.ts';
 import { installJoinAdmission } from '#engine/server/join-attempts.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
+import { membershipOperations } from '#engine/server/membership-operations.ts';
+import { bindMembershipDisplay } from '#engine/server/membership-selection.ts';
+import { verify } from '#engine/room/verify.ts';
 import {
   eventStreamMax,
   eventStreamTx,
@@ -457,6 +461,140 @@ Deno.test('prejoin: a local successor never recaptures the selected foreign sour
       JSON.parse(String(local[1].context_json)).some((
         dot: { source: string },
       ) => dot.source === 'home'),
+    );
+  }, 'edge'));
+
+Deno.test('prejoin: normalized multi-source display never becomes new local authorship', () =>
+  fixture(async (f) => {
+    const [original] = await f.deps.server.tx((conn) =>
+      membershipOperations(conn, f.user)
+    );
+    assert(original);
+    const raw = JSON.parse(JSON.parse(original.payload).eventJson) as Pdu;
+    raw.unsigned = { untrusted: true };
+    // A hash mismatch is normalized by the ordinary verifier, not by selecting
+    // whichever source happened to deliver a convenient raw JSON shape.
+    raw.content.displayname = 'not covered by the retained hash';
+    const normalized = await verify(structuredClone(raw), '11', f.deps.keys);
+    assertEquals(normalized.pdu.unsigned, undefined);
+    assertEquals(normalized.pdu.content.displayname, undefined);
+    await f.deps.server.tx(async (conn) => {
+      const payload = canonicalJson({
+        ...JSON.parse(original.payload),
+        eventJson: canonicalJson(raw),
+      });
+      await conn.execute(
+        'UPDATE domain_operations SET source=?,incarnation=?,operation_id=?,context_json=?,payload_json=?,payload_hash=? WHERE operation_id=?',
+        [
+          'home',
+          'home-store',
+          canonicalJson(['home', 'home-store', original.stream, 1]),
+          '[]',
+          payload,
+          createHash('sha256').update(payload).digest('hex'),
+          original.operationId,
+        ],
+      );
+      const [foreign] = await membershipOperations(conn, f.user);
+      const secondId = canonicalJson([
+        'third',
+        'third-store',
+        foreign.stream,
+        1,
+      ]);
+      await conn.execute(
+        'INSERT INTO domain_operations(operation_id,source,incarnation,stream,sequence,semantic_key,kind,context_json,payload_hash,payload_json,applied) SELECT ?,?,?,stream,sequence,semantic_key,kind,context_json,payload_hash,payload_json,applied FROM domain_operations WHERE operation_id=?',
+        [secondId, 'third', 'third-store', foreign.operationId],
+      );
+      await conn.execute(
+        'UPDATE prejoin_memberships SET event_json=? WHERE room_id=? AND user_id=?',
+        [canonicalJson(normalized.pdu), f.roomId, f.user],
+      );
+      await bindMembershipDisplay(
+        conn,
+        f.roomId,
+        f.user,
+        await membershipOperations(conn, f.user),
+      );
+    });
+    const before = await f.deps.server.tx((conn) =>
+      membershipOperations(conn, f.user)
+    );
+    await f.reopen();
+    await f.deps.server.tx((conn) =>
+      recordMembershipOperation(conn, f.roomId, f.user)
+    );
+    assertEquals(
+      await f.deps.server.tx((conn) => membershipOperations(conn, f.user)),
+      before,
+      'normalized display must retain both original source identities without a recaptured local fact',
+    );
+    const selected = await f.deps.server.query(
+      'SELECT operation_id FROM domain_frontiers ORDER BY operation_id',
+    );
+    assertEquals(
+      selected.map((row) => String(row.operation_id)),
+      before.map((op) => op.operationId).sort(),
+    );
+    // A saved binding is meaningful only with the same complete selection.
+    await assertRejects(
+      () =>
+        f.deps.server.tx(async (conn) => {
+          await conn.execute(
+            'DELETE FROM domain_frontiers WHERE operation_id=?',
+            [before[0].operationId],
+          );
+          await recordMembershipOperation(conn, f.roomId, f.user);
+        }),
+      Error,
+      'membership display binding unavailable',
+    );
+    await f.reject();
+    const after = await f.deps.server.tx((conn) =>
+      membershipOperations(conn, f.user)
+    );
+    assertEquals(after.length, before.length + 1);
+    const successor = after.find((op) => op.source === 'edge');
+    assert(successor);
+    assertEquals(JSON.parse(successor.payload).status, 'rejecting');
+    assertEquals(successor.context.map((dot) => dot.source).sort(), [
+      'home',
+      'third',
+    ]);
+  }, 'edge'));
+
+Deno.test('prejoin: display binding refuses an incomplete or stale subset without changing selection', () =>
+  fixture(async (f) => {
+    const selected = await f.deps.server.tx((conn) =>
+      membershipOperations(conn, f.user)
+    );
+    const before = await f.deps.server.query('SELECT * FROM domain_frontiers');
+    await assertRejects(
+      () =>
+        f.deps.server.tx((conn) =>
+          bindMembershipDisplay(conn, f.roomId, f.user, [])
+        ),
+      Error,
+      'membership display selection changed',
+    );
+    assertEquals(
+      await f.deps.server.query('SELECT * FROM domain_frontiers'),
+      before,
+    );
+    await assertRejects(
+      () =>
+        f.deps.server.tx((conn) =>
+          bindMembershipDisplay(conn, f.roomId, f.user, [{
+            ...selected[0],
+            payloadHash: 'changed',
+          }])
+        ),
+      Error,
+      'membership display selection changed',
+    );
+    assertEquals(
+      await f.deps.server.query('SELECT * FROM domain_frontiers'),
+      before,
     );
   }, 'edge'));
 

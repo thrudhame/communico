@@ -32,6 +32,26 @@ export type MembershipOperation = RegisterDot & {
   payload: string;
 };
 
+/** The display owner's normalized local value, without publication authority. */
+export function membershipStateOf(
+  row: Record<string, unknown>,
+): Omit<MembershipState, 'publication'> {
+  return {
+    roomId: String(row.room_id),
+    userId: String(row.user_id),
+    eventId: String(row.event_id),
+    roomVersion: String(row.room_version),
+    eventJson: canonicalJson(JSON.parse(String(row.event_json))),
+    inviteRoomState: canonicalJson(JSON.parse(String(row.invite_room_state))),
+    origin: String(row.origin),
+    status: String(row.status),
+    kind: String(row.kind) as MembershipState['kind'],
+    localLeaveJson: row.local_leave_json == null
+      ? null
+      : canonicalJson(JSON.parse(String(row.local_leave_json))),
+  };
+}
+
 function fromRow(row: Record<string, unknown>): MembershipOperation {
   return {
     operationId: String(row.operation_id),
@@ -119,20 +139,7 @@ export async function recordMembershipOperation(
     [roomId, userId],
   );
   if (!row) return;
-  const state: Omit<MembershipState, 'publication'> = {
-    roomId,
-    userId,
-    eventId: String(row.event_id),
-    roomVersion: String(row.room_version),
-    eventJson: canonicalJson(JSON.parse(String(row.event_json))),
-    inviteRoomState: canonicalJson(JSON.parse(String(row.invite_room_state))),
-    origin: String(row.origin),
-    status: String(row.status),
-    kind: String(row.kind) as MembershipState['kind'],
-    localLeaveJson: row.local_leave_json == null
-      ? null
-      : canonicalJson(JSON.parse(String(row.local_leave_json))),
-  };
+  const state = membershipStateOf(row);
   const semanticKey = canonicalJson(['membership', roomId, userId]);
   const stream = 'membership:' + userId;
   const retained = (await conn.query(
@@ -140,16 +147,33 @@ export async function recordMembershipOperation(
     [semanticKey],
   )).map(fromRow);
   const history = completeMembershipHistory(retained).ready;
-  const [selected] = await conn.query(
-    "SELECT o.payload_json FROM domain_frontiers f JOIN domain_operations o ON o.operation_id=f.operation_id WHERE f.semantic_key=? AND o.kind='membership'",
+  const selected = await conn.query(
+    "SELECT o.operation_id,o.payload_json FROM domain_frontiers f JOIN domain_operations o ON o.operation_id=f.operation_id WHERE f.semantic_key=? AND o.kind='membership' ORDER BY o.operation_id",
     [semanticKey],
   );
+  if (row.source_binding != null) {
+    const binding = JSON.parse(String(row.source_binding));
+    if (canonicalJson(binding.state) === canonicalJson(state)) {
+      const ids = selected.map((operation) => String(operation.operation_id));
+      const complete = new Set(
+        history.map((operation) => operation.operationId),
+      );
+      if (
+        !ids.length ||
+        canonicalJson(ids) !== canonicalJson(binding.operations) ||
+        ids.some((id) => !complete.has(id))
+      ) {
+        throw new Error('membership display binding unavailable');
+      }
+      return;
+    }
+  }
   // This reference belongs to the membership display owner, not a register
   // winner. A foreign operation already selected by that owner stays foreign;
   // capturing the old value before our successor must never re-author it.
-  if (selected) {
+  if (selected.length === 1) {
     const { publication: _publication, ...prior } = JSON.parse(
-      String(selected.payload_json),
+      String(selected[0].payload_json),
     ) as MembershipState;
     if (canonicalJson(prior) === canonicalJson(state)) return;
   }
@@ -245,5 +269,9 @@ export async function recordMembershipOperation(
   await conn.execute(
     'INSERT INTO domain_frontiers(semantic_key,operation_id) VALUES(?,?)',
     [semanticKey, operationId],
+  );
+  await conn.execute(
+    'UPDATE prejoin_memberships SET source_binding=NULL WHERE room_id=? AND user_id=?',
+    [roomId, userId],
   );
 }

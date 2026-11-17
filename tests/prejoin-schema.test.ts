@@ -39,10 +39,24 @@ Deno.test('prejoin v20 upgrade preserves v19 invite events, sequences and unboun
       schemas: { server: { ...serverSchema, version: 22 } },
     });
     await v22.close();
+    const v49 = await openStore(config, {
+      schemas: { server: { ...serverSchema, version: 49 } },
+    });
+    await v49.close();
     const current = await openStore(config, {
       schemas: { server: serverSchema },
     });
     const db = await current.server();
+    assertEquals(
+      await db.query(
+        'SELECT source_binding FROM prejoin_memberships ORDER BY seq',
+      ),
+      [
+        { source_binding: null },
+        { source_binding: null },
+        { source_binding: null },
+      ],
+    );
     assertEquals(
       await db.query(
         'SELECT local_leave_json FROM prejoin_memberships ORDER BY seq',

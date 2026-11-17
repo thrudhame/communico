@@ -437,7 +437,7 @@ CREATE INDEX event_index_local_participation ON event_index(room,local_join_user
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 49,
+  version: 50,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -491,6 +491,9 @@ export const serverSchema: SchemaProvider = {
     );
     await db.exec(OUTBOUND_INVITES_SQL);
     await db.exec(MEMBERSHIP_OPERATIONS_SQL);
+    await db.exec(
+      'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
+    );
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -565,5 +568,9 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
       ),
     47: (conn) => conn.exec(OUTBOUND_INVITES_SQL),
     48: (conn) => conn.exec(MEMBERSHIP_OPERATIONS_SQL),
+    49: (conn) =>
+      conn.exec(
+        'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
+      ),
   },
 };
