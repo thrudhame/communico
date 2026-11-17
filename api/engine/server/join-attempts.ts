@@ -1,4 +1,4 @@
-// Persist before send_join: an interrupted remote side effect must be undone
+// Persist exact signed work before send_join: an interrupted remote side effect must be undone
 // unless the exact join committed to room truth. Active calls are process-local;
 // after restart every retained attempt is eligible for reconciliation.
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -22,7 +22,7 @@ export type JoinAttempt = {
 };
 const active = new WeakMap<Store, Map<string, number>>();
 function key(a: JoinAttempt): string {
-  return JSON.stringify([a.roomId, a.userId]);
+  return JSON.stringify([a.roomId, a.userId, a.eventId]);
 }
 export function joinAttemptActive(store: Store, a: JoinAttempt): boolean {
   return active.get(store)?.has(key(a)) ?? false;
@@ -33,15 +33,23 @@ async function assertNoJoinCleanup(
   store: Store,
   roomId: string,
   userId: string,
+  eventId?: string,
 ): Promise<void> {
+  // Only this live exact attempt may complete through verified resident ingest.
+  // Neither another local join nor cold cleanup can borrow its continuation.
+  const continuing = eventId !== undefined && active.get(store)?.has(
+      JSON.stringify([roomId, userId, eventId]),
+    )
+    ? eventId
+    : null;
   const server = await store.server();
   const result = await withProjectionLock(() => {
     const inflight = prejoinLeaveActive(store, roomId, userId);
     return eventStreamTx(server, async (tx) => {
       if (!inflight) await settleSupersededPrejoin(tx, roomId, userId);
       const rows = await tx.query(
-        "SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? UNION ALL SELECT 1 FROM prejoin_memberships WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract')",
-        [roomId, userId, roomId, userId],
+        "SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? AND (? IS NULL OR event_id<>? OR join_json IS NULL OR leave_json IS NOT NULL) UNION ALL SELECT 1 FROM prejoin_memberships WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract')",
+        [roomId, userId, continuing, continuing, roomId, userId],
       );
       return { inflight, rows };
     });
@@ -57,13 +65,21 @@ async function assertNoJoinCleanup(
 export function installJoinAdmission(store: Store): void {
   setJoinAdmission(
     store,
-    (roomId, userId) => assertNoJoinCleanup(store, roomId, userId),
+    (roomId, userId, eventId) =>
+      assertNoJoinCleanup(store, roomId, userId, eventId),
   );
 }
 export async function beginJoinAttempt(
   store: Store,
   a: JoinAttempt,
+  signed: Pdu,
 ): Promise<void> {
+  if (
+    signed.event_id !== a.eventId || signed.room_id !== a.roomId ||
+    signed.sender !== a.userId || signed.state_key !== a.userId ||
+    signed.type !== 'm.room.member' || signed.content.membership !== 'join'
+  ) throw new Error('Join attempt does not match its signed event');
+  const json = JSON.stringify(signed);
   installJoinAdmission(store);
   let set = active.get(store);
   if (!set) active.set(store, set = new Map());
@@ -108,7 +124,7 @@ export async function beginJoinAttempt(
           );
         }
         await tx.execute(
-          'INSERT INTO federation_join_attempts(room_id,user_id,event_id,room_version,destination,added_ms) VALUES(?,?,?,?,?,?)',
+          'INSERT INTO federation_join_attempts(room_id,user_id,event_id,room_version,destination,added_ms,join_json) VALUES(?,?,?,?,?,?,?)',
           [
             a.roomId,
             a.userId,
@@ -116,6 +132,7 @@ export async function beginJoinAttempt(
             a.roomVersion,
             a.destination,
             a.addedMs,
+            json,
           ],
         );
       });
@@ -166,7 +183,7 @@ export async function saveJoinLeave(
 }
 export async function pendingJoinAttempts(
   server: Database,
-): Promise<JoinAttempt[]> {
+): Promise<(JoinAttempt & { signed: Pdu | null })[]> {
   return (await server.query(
     'SELECT * FROM federation_join_attempts ORDER BY added_ms,room_id,user_id',
   )).map((row) => ({
@@ -176,6 +193,11 @@ export async function pendingJoinAttempts(
     roomVersion: String(row.room_version),
     destination: String(row.destination),
     addedMs: Number(row.added_ms),
+    // Pre-upgrade attempts retain their original compensation obligation. They
+    // cannot acquire invented signed bytes or become a fresh join on recovery.
+    signed: row.join_json === null
+      ? null
+      : JSON.parse(String(row.join_json)) as Pdu,
   }));
 }
 export async function joinAttemptCommitted(

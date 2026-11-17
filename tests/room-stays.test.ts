@@ -21,6 +21,7 @@ import {
 import { sendLocal } from '#engine/room/ingest.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { joinRemote } from '#engine/room/join.ts';
+import { serverSchema } from '#engine/server/schema.ts';
 import { leave } from '#engine/room/membership.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import {
@@ -44,7 +45,7 @@ async function withStore(
 ): Promise<void> {
   const dir = await Deno.makeTempDir();
   const store = await openStore(config(dir), {
-    schemas: { room: roomSchema },
+    schemas: { room: roomSchema, server: serverSchema },
   });
   try {
     await fn(store);

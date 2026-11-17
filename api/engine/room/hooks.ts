@@ -15,7 +15,7 @@ export type RoomHooks = {
 let hooks: RoomHooks | null = null;
 const joinAdmissions = new WeakMap<
   Store,
-  (roomId: string, userId: string) => Promise<void>
+  (roomId: string, userId: string, eventId?: string) => Promise<void>
 >();
 
 export type RestrictedKnowledge = 'complete' | 'partial' | 'unavailable';
@@ -42,7 +42,11 @@ export async function restrictedKnowledge(
 
 export function setJoinAdmission(
   store: Store,
-  admission: (roomId: string, userId: string) => Promise<void>,
+  admission: (
+    roomId: string,
+    userId: string,
+    eventId?: string,
+  ) => Promise<void>,
 ): void {
   joinAdmissions.set(store, admission);
 }
@@ -52,8 +56,9 @@ export async function admitLocalJoin(
   store: Store,
   roomId: string,
   userId: string,
+  eventId?: string,
 ): Promise<void> {
-  await joinAdmissions.get(store)?.(roomId, userId);
+  await joinAdmissions.get(store)?.(roomId, userId, eventId);
 }
 
 export function setRoomHooks(next: RoomHooks): void {

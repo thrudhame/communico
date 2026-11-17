@@ -15,6 +15,9 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { assertRoomAcl } from '#engine/federation/acl.ts';
 import { joinRemote } from '#engine/room/join.ts';
+import { finalizeBuilt } from '#engine/room/build.ts';
+import { getRulebook } from '#engine/rulebook/index.ts';
+import { serverSchema } from '#engine/server/schema.ts';
 import { openRoom, type Room, roomSchema } from '#engine/room/index.ts';
 import { mapEntries } from '#engine/room/state.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
@@ -44,7 +47,7 @@ async function withStore(
 ): Promise<void> {
   const dir = await Deno.makeTempDir();
   const store = await openStore(config(dir), {
-    schemas: { room: roomSchema },
+    schemas: { room: roomSchema, server: serverSchema },
   });
   try {
     await fn(store);
@@ -142,10 +145,28 @@ Deno.test('join remote: candidate ACL refusal fails over, own-server refusal abo
           sendJoin: (event) => fr.acceptSendJoin(event),
         });
         const signer = await testSigner();
+        const cleaned: string[] = [];
         const deps = {
           fetcher,
           keys: fakeKeyResolver(fr.server, await testRemoteServer()),
           self: 'test',
+          leave: async (attempt: { userId: string; destination: string }) => {
+            const template = fr.makeLeaveAnswer(attempt.userId);
+            const leave = await finalizeBuilt(
+              {
+                ...template.event,
+                origin_server_ts: Date.now(),
+                hashes: { sha256: '' },
+                signatures: {},
+              },
+              getRulebook(template.roomVersion),
+              signer,
+            );
+            // This in-process resident applies the actual signed self-leave,
+            // just as its send_join adapter applies the actual signed join.
+            await fr.acceptSendJoin(leave);
+            cleaned.push(attempt.destination);
+          },
         };
         if (mode.startsWith('known')) {
           const room = await openRoom(store, fr.roomId, { create: true });
@@ -182,6 +203,10 @@ Deno.test('join remote: candidate ACL refusal fails over, own-server refusal abo
           assertEquals(calls.makeJoin.length, 2);
           assertEquals(calls.sendJoin.length, mode.startsWith('known') ? 1 : 2);
         }
+        assertEquals(
+          cleaned,
+          mode.startsWith('snapshot') ? ['blocked.test'] : [],
+        );
       }));
   }
 });

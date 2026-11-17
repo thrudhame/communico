@@ -848,7 +848,12 @@ export async function ingestRemote(
     const committed = await withRoomLock(room.id, async () => {
       deps.signal?.throwIfAborted();
       if (deps.localJoin !== undefined) {
-        await admitLocalJoin(room.store, room.id, deps.localJoin.userId);
+        await admitLocalJoin(
+          room.store,
+          room.id,
+          deps.localJoin.userId,
+          deps.localJoin.eventId,
+        );
       }
       return await room.tx(async (tx) => {
         deps.signal?.throwIfAborted();
