@@ -13,6 +13,8 @@ import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
 import { bindRole } from '#engine/facade/role.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { retainMembershipOperation } from '#engine/server/membership-history.ts';
+import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import type {
@@ -214,6 +216,55 @@ Deno.test('membership export: signs retained local source facts without a room r
       await f.es.export('alice'),
       [],
       'the source cut prevents duplicate export',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership source: retained incomplete foreign history cannot become asserted local causal knowledge', async () => {
+  const f = await fixture();
+  try {
+    const first = await source(f, 1, 'home');
+    const pending = await source(f, 3, 'home');
+    pending.context = [{
+      source: first.source,
+      incarnation: first.incarnation,
+      sequence: 2,
+    }];
+    const server = await f.edge.server();
+    await server.tx(async (conn) => {
+      await retainMembershipOperation(conn, first);
+      await retainMembershipOperation(conn, pending);
+      const state = JSON.parse(first.payload) as MembershipState;
+      await conn.execute(
+        'INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        [
+          state.roomId,
+          state.userId,
+          '$local',
+          '11',
+          state.eventJson,
+          '[]',
+          state.origin,
+          1,
+          'pending',
+          1,
+        ],
+      );
+      await recordMembershipOperation(conn, state.roomId, state.userId);
+    });
+    const [local] = await server.query(
+      "SELECT context_json FROM domain_operations WHERE source='edge_a'",
+    );
+    assertEquals(JSON.parse(String(local.context_json)), [{
+      source: first.source,
+      incarnation: first.incarnation,
+      sequence: 1,
+    }]);
+    assertEquals(
+      (await server.query('SELECT * FROM domain_operations')).length,
+      3,
     );
   } finally {
     await f.close();

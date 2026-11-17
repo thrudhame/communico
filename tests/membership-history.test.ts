@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
+import { membershipDisplay } from '#engine/server/membership-display.ts';
 import {
   checkedMembershipOperation,
   membershipHistory,
@@ -52,6 +53,165 @@ function dot(operation: MembershipOperation) {
   const { source, incarnation, sequence } = operation;
   return { source, incarnation, sequence };
 }
+
+function withState(
+  operation: MembershipOperation,
+  change: Partial<MembershipState>,
+) {
+  const payload = canonicalJson({
+    ...JSON.parse(operation.payload),
+    ...change,
+  });
+  return {
+    ...operation,
+    payload,
+    payloadHash: createHash('sha256').update(payload).digest('hex'),
+  };
+}
+
+Deno.test('membership display: concurrent distinct OOB invites converge by event ID in either arrival order', async () => {
+  const low = withState(fact('home'), { eventId: '$a' });
+  const high = withState(fact('edge'), { eventId: '$z' });
+  for (const order of [[low, high], [high, low]]) {
+    await fixture(async (server) => {
+      for (const operation of order) {
+        await server.tx((conn) => retainMembershipOperation(conn, operation));
+      }
+      const selected = await server.tx((conn) =>
+        membershipDisplay(conn, low.semanticKey, false)
+      );
+      assertEquals(selected.display, [high]);
+      assertEquals(selected.frontier.length, 2);
+      assertEquals(
+        (await server.query('SELECT * FROM domain_operations')).length,
+        2,
+      );
+      assertEquals(await server.query('SELECT * FROM prejoin_memberships'), []);
+      assertEquals(await server.query('SELECT * FROM domain_frontiers'), []);
+    });
+  }
+});
+
+Deno.test('membership display: causal successor wins before distinct event-ID ordering', async () => {
+  await fixture(async (server) => {
+    const first = withState(fact(), { eventId: '$z' });
+    const next = withState(fact('edge', 1, [dot(first)]), { eventId: '$a' });
+    for (const operation of [next, first]) {
+      await server.tx((conn) => retainMembershipOperation(conn, operation));
+    }
+    assertEquals(
+      (await server.tx((conn) =>
+        membershipDisplay(conn, first.semanticKey, false)
+      )).display,
+      [next],
+    );
+  });
+});
+
+Deno.test('membership display: concurrent same-event terminal facts suppress stale invites without hiding unrelated invites', async () => {
+  for (const status of ['rejecting', 'failed-retract', 'rejected', 'joined']) {
+    await fixture(async (server) => {
+      const stale = withState(fact(), { eventId: '$z' });
+      const terminal = withState(fact('edge'), { eventId: '$z', status });
+      const other = withState(fact('third'), { eventId: '$a' });
+      for (const operation of [terminal, other, stale]) {
+        await server.tx((conn) => retainMembershipOperation(conn, operation));
+      }
+      const selected = await server.tx((conn) =>
+        membershipDisplay(conn, stale.semanticKey, false)
+      );
+      assertEquals(selected.display, [other]);
+      assertEquals(selected.frontier.length, 3);
+    });
+  }
+});
+
+Deno.test('membership display: held rooms, incomplete history and uncompleted attempts never acquire OOB display authority', async () => {
+  await fixture(async (server) => {
+    const pending = fact();
+    const incomplete = withState(fact('edge', 2, [dot(fact('edge'))]), {
+      eventId: '$z',
+      status: 'pending',
+    });
+    const attempt = withState(fact('third'), {
+      eventId: '$y',
+      kind: 'knock',
+      status: 'attempting',
+    });
+    for (const operation of [pending, incomplete, attempt]) {
+      await server.tx((conn) => retainMembershipOperation(conn, operation));
+    }
+    assertEquals(
+      (await server.tx((conn) =>
+        membershipDisplay(conn, pending.semanticKey, false)
+      )).display,
+      [pending],
+    );
+    assertEquals(
+      (await server.tx((conn) =>
+        membershipDisplay(conn, pending.semanticKey, true)
+      )).display,
+      [],
+    );
+  });
+});
+
+Deno.test('membership display: same-event duplicates retain all candidate evidence without inventing another tie breaker', async () => {
+  await fixture(async (server) => {
+    const home = fact(), edge = fact('edge');
+    for (const operation of [home, edge]) {
+      await server.tx((conn) => retainMembershipOperation(conn, operation));
+    }
+    assertEquals(
+      (await server.tx((conn) =>
+        membershipDisplay(conn, home.semanticKey, false)
+      )).display,
+      [edge, home],
+    );
+  });
+});
+
+Deno.test('membership display: an unrelated successor cannot discard the tombstone needed to suppress a concurrent stale invitation', async () => {
+  await fixture(async (server) => {
+    const old = withState(fact(), { eventId: '$z' });
+    const terminal = withState(fact('home', 2, [dot(old)]), {
+      eventId: '$z',
+      status: 'rejected',
+    });
+    const next = withState(fact('home', 3, [dot(terminal)]), {
+      eventId: '$a',
+      status: 'pending',
+    });
+    const stale = withState(fact('edge'), { eventId: '$z' });
+    for (const operation of [stale, next, terminal, old]) {
+      await server.tx((conn) => retainMembershipOperation(conn, operation));
+    }
+    assertEquals(
+      (await server.tx((conn) =>
+        membershipDisplay(conn, old.semanticKey, false)
+      )).display,
+      [next],
+    );
+  });
+});
+
+Deno.test('membership display: an uncompleted copy of the same attempt does not erase an accepted pending fact', async () => {
+  for (const status of ['attempting', 'failed-attempt']) {
+    await fixture(async (server) => {
+      const accepted = withState(fact(), { kind: 'knock' });
+      const attempt = withState(fact('edge'), { kind: 'knock', status });
+      for (const operation of [attempt, accepted]) {
+        await server.tx((conn) => retainMembershipOperation(conn, operation));
+      }
+      assertEquals(
+        (await server.tx((conn) =>
+          membershipDisplay(conn, accepted.semanticKey, false)
+        )).display,
+        [accepted],
+      );
+    });
+  }
+});
 
 async function fixture(
   run: (

@@ -7,6 +7,7 @@ import { validEventUserId } from '#engine/ids.ts';
 import type { RegisterDot } from '#engine/facade/registers.ts';
 import type { Conn } from '#engine/store/db.ts';
 import {
+  completeMembershipHistory,
   type MembershipOperation,
   membershipOperations,
   type MembershipState,
@@ -229,32 +230,5 @@ export async function membershipHistory(
   const all = (await membershipOperations(conn, key[2])).filter((operation) =>
     operation.semanticKey === semanticKey
   );
-  const ready = new Set<string>();
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const operation of all) {
-      if (
-        ready.has(operation.operationId) ||
-        !operation.context.every((dot) =>
-          ready.has(identity(dot, operation.stream))
-        )
-      ) continue;
-      ready.add(operation.operationId);
-      changed = true;
-    }
-  }
-  const complete = all.filter((operation) => ready.has(operation.operationId));
-  const observed = new Set(
-    complete.flatMap((operation) =>
-      operation.context.map((dot) => identity(dot, operation.stream))
-    ),
-  );
-  return {
-    ready: complete,
-    pending: all.filter((operation) => !ready.has(operation.operationId)),
-    frontier: complete.filter((operation) =>
-      !observed.has(operation.operationId)
-    ),
-  };
+  return completeMembershipHistory(all);
 }

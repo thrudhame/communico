@@ -62,6 +62,41 @@ export async function membershipOperations(
   )).map(fromRow);
 }
 
+/** Source knowledge and display eligibility share the same transitive closure.
+ * A retained but incomplete import is evidence, not observed causal knowledge. */
+export function completeMembershipHistory(all: MembershipOperation[]) {
+  const identity = (dot: RegisterDot, stream: string) =>
+    canonicalJson([dot.source, dot.incarnation, stream, dot.sequence]);
+  const ready = new Set<string>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const operation of all) {
+      if (
+        ready.has(operation.operationId) ||
+        !operation.context.every((dot) =>
+          ready.has(identity(dot, operation.stream))
+        )
+      ) continue;
+      ready.add(operation.operationId);
+      changed = true;
+    }
+  }
+  const complete = all.filter((operation) => ready.has(operation.operationId));
+  const observed = new Set(
+    complete.flatMap((operation) =>
+      operation.context.map((dot) => identity(dot, operation.stream))
+    ),
+  );
+  return {
+    ready: complete,
+    pending: all.filter((operation) => !ready.has(operation.operationId)),
+    frontier: complete.filter((operation) =>
+      !observed.has(operation.operationId)
+    ),
+  };
+}
+
 /** Use this SAME Conn before and after a local lifecycle mutation. No-op retries
  * retain their identity; failed mutations roll back facts and counters together.
  * F1/standalone and foreign Matrix accounts have no semantic source authority. */
@@ -100,10 +135,11 @@ export async function recordMembershipOperation(
   };
   const semanticKey = canonicalJson(['membership', roomId, userId]);
   const stream = 'membership:' + userId;
-  const history = (await conn.query(
+  const retained = (await conn.query(
     "SELECT * FROM domain_operations WHERE kind='membership' AND semantic_key=? ORDER BY source,incarnation,sequence",
     [semanticKey],
   )).map(fromRow);
+  const history = completeMembershipHistory(retained).ready;
   const [selected] = await conn.query(
     "SELECT o.payload_json FROM domain_frontiers f JOIN domain_operations o ON o.operation_id=f.operation_id WHERE f.semantic_key=? AND o.kind='membership'",
     [semanticKey],
@@ -140,7 +176,7 @@ export async function recordMembershipOperation(
     ).map((operation) => operation.sequence),
   );
   if (
-    history.some((operation) =>
+    retained.some((operation) =>
       operation.context.some((dot) =>
         dot.source === source.node && dot.incarnation === source.incarnation &&
         !own.has(dot.sequence)
