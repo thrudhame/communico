@@ -16,6 +16,7 @@ import {
 } from './build.ts';
 import { openRoom, type Room, type RoomTx } from './index.ts';
 import { withRoomLock } from './lock.ts';
+import { restrictedKnowledge } from './hooks.ts';
 
 async function current(tx: RoomTx) {
   const stay = await tx.segments.openStay();
@@ -92,6 +93,7 @@ export async function joinedAllowedRoom(
   roomIds: readonly string[],
 ): Promise<boolean> {
   for (const id of roomIds) {
+    if (await restrictedKnowledge(store, id) === 'unavailable') continue;
     let room;
     try {
       room = await openRoom(store, id);
@@ -135,19 +137,29 @@ export async function withRestrictedAdmission<T>(
     let unknown = captured?.unknown ?? false;
     if (captured?.required) {
       for (const id of captured.rooms) {
+        const knowledge = await restrictedKnowledge(room.store, id);
+        if (knowledge === 'unavailable') {
+          unknown = true;
+          continue;
+        }
         let allowed;
         try {
           allowed = await openRoom(room.store, id);
         } catch (error) {
           if (!(error instanceof Deno.errors.NotFound)) throw error;
-          if (domainOf(user) !== self) unknown = true;
+          if (domainOf(user) !== self || knowledge === 'partial') {
+            unknown = true;
+          }
           continue;
         }
         proof = await witness(allowed, user);
         if (proof !== null) break;
         if (
-          domainOf(user) !== self &&
-          await allowed.tx((tx) => tx.segments.openStay()) === null
+          (domainOf(user) !== self || knowledge === 'partial') &&
+          await allowed.tx(async (tx) => {
+            const snapshot = await current(tx);
+            return snapshot.stay === null || snapshot.group === null;
+          })
         ) unknown = true;
       }
     }
@@ -157,6 +169,9 @@ export async function withRestrictedAdmission<T>(
         await before(stay !== null && group !== null);
       }
       if (proof !== null) {
+        if (
+          await restrictedKnowledge(room.store, proof.room.id) === 'unavailable'
+        ) return changed;
         const now = await witness(proof.room, user);
         if (
           now === null || now.stay !== proof.stay || now.group !== proof.group

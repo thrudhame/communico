@@ -16,6 +16,7 @@ import {
   restrictedResidents,
   withRestrictedAdmission,
 } from '#engine/room/restricted.ts';
+import { setRestrictedKnowledge } from '#engine/room/hooks.ts';
 
 const { matrix, registerTestUser, test } = httpSuite(
   'HTTP restricted membership',
@@ -117,6 +118,108 @@ test('versioned restricted authorization: eligibility, invite bypass, malformed 
       (await call('join/' + encoded, guest.access_token!)).status,
       403,
     );
+  }
+});
+
+test('partial local restricted admission returns unknown at HTTP and preserves actual membership', async () => {
+  const owner = await registerTestUser('partial-restricted-owner', 'pw');
+  const guest = await registerTestUser('partial-restricted-guest', 'pw');
+  const madeAllowed = await call('createRoom', owner.access_token!, {
+    preset: 'public_chat',
+  });
+  assertEquals(madeAllowed.status, 200);
+  const allowed = madeAllowed.body.room_id as string;
+  const allowedPath = 'rooms/' + encodeURIComponent(allowed);
+  assertEquals(
+    (await call('join/' + encodeURIComponent(allowed), guest.access_token!))
+      .status,
+    200,
+  );
+  const closedMade = await call('createRoom', owner.access_token!);
+  assertEquals(closedMade.status, 200);
+  const closed = closedMade.body.room_id as string;
+  assertEquals(
+    (await call(
+      'rooms/' + encodeURIComponent(closed) + '/leave',
+      owner.access_token!,
+    )).status,
+    200,
+  );
+  const missing = '!missing-allowed:' + theApp().tenant.serverName;
+  const targets: string[] = [];
+  for (const room_id of [missing, closed, allowed]) {
+    const made = await call('createRoom', owner.access_token!, {
+      room_version: '11',
+      initial_state: [{
+        type: 'm.room.join_rules',
+        state_key: '',
+        content: {
+          join_rule: 'restricted',
+          allow: [{ type: 'm.room_membership', room_id }],
+        },
+      }],
+    });
+    assertEquals(made.status, 200);
+    targets.push(made.body.room_id);
+  }
+  const store = theApp().store;
+  setRestrictedKnowledge(store, () => Promise.resolve('partial'));
+  try {
+    for (const id of targets.slice(0, 2)) {
+      const room = await requireRoom(id);
+      const before = await room.tx((tx) => tx.changes.head());
+      const result = await call(
+        'join/' + encodeURIComponent(id),
+        guest.access_token!,
+      );
+      assertEquals([result.status, result.body.errcode], [
+        400,
+        'M_UNABLE_TO_AUTHORISE_JOIN',
+      ]);
+      assertEquals(await room.tx((tx) => tx.changes.head()), before);
+      const membership = await call(
+        'rooms/' + encodeURIComponent(id) + '/state/m.room.member/' +
+          encodeURIComponent(guest.user_id!),
+        owner.access_token!,
+        {},
+        'GET',
+      );
+      assertEquals(membership.status, 404);
+    }
+    const id = targets[2];
+    assertEquals(
+      (await call('join/' + encodeURIComponent(id), guest.access_token!))
+        .status,
+      200,
+    );
+    const joined = await call(
+      'rooms/' + encodeURIComponent(id) + '/state/m.room.member/' +
+        encodeURIComponent(guest.user_id!),
+      owner.access_token!,
+      {},
+      'GET',
+    );
+    assertEquals(joined.status, 200);
+    assertEquals(joined.body.membership, 'join');
+    assertEquals(joined.body.join_authorised_via_users_server, owner.user_id);
+    assertEquals(
+      (await call(
+        allowedPath + '/state/m.room.member/' +
+          encodeURIComponent(guest.user_id!),
+        owner.access_token!,
+        {},
+        'GET',
+      )).body.membership,
+      'join',
+    );
+    setRestrictedKnowledge(store, () => Promise.resolve('complete'));
+    const denied = await call(
+      'join/' + encodeURIComponent(targets[0]),
+      guest.access_token!,
+    );
+    assertEquals([denied.status, denied.body.errcode], [403, 'M_FORBIDDEN']);
+  } finally {
+    setRestrictedKnowledge(store, () => Promise.resolve('complete'));
   }
 });
 

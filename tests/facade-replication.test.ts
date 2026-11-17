@@ -78,7 +78,7 @@ import {
 import { bounded } from './helpers/server-process.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
-import { setRoomHooks } from '#engine/room/hooks.ts';
+import { restrictedKnowledge, setRoomHooks } from '#engine/room/hooks.ts';
 import {
   importReplicaBoundary,
   importReplicaGenesis,
@@ -2853,6 +2853,15 @@ Deno.test('enrolled replica app composes ordinary reads and recovery without cre
     });
     assertEquals(theApp(), app);
     assertEquals(app.tenant.keyId, f.node.keyId);
+    assertEquals(
+      await restrictedKnowledge(app.store, f.source.roomId),
+      'partial',
+    );
+    assertEquals(
+      await restrictedKnowledge(app.store, '!unselected:logical.test'),
+      'unavailable',
+      'a missing local allowed room on this replica is not complete nonmembership',
+    );
     assertEquals(app.sender, null);
     for (
       const service of [

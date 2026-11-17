@@ -18,6 +18,28 @@ const joinAdmissions = new WeakMap<
   (roomId: string, userId: string) => Promise<void>
 >();
 
+export type RestrictedKnowledge = 'complete' | 'partial' | 'unavailable';
+const restrictedViews = new WeakMap<
+  Store,
+  (roomId: string) => Promise<RestrictedKnowledge>
+>();
+
+// The composition owner knows whether this store covers the whole logical
+// server. Room admission never reaches into an app or a replica coordinator.
+export function setRestrictedKnowledge(
+  store: Store,
+  view: (roomId: string) => Promise<RestrictedKnowledge>,
+): void {
+  restrictedViews.set(store, view);
+}
+
+export async function restrictedKnowledge(
+  store: Store,
+  roomId: string,
+): Promise<RestrictedKnowledge> {
+  return await restrictedViews.get(store)?.(roomId) ?? 'complete';
+}
+
 export function setJoinAdmission(
   store: Store,
   admission: (roomId: string, userId: string) => Promise<void>,
