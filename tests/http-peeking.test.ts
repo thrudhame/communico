@@ -3,6 +3,7 @@ import { httpSuite } from '#tests/http-app.ts';
 import { theApp } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { roomEvents } from '#engine/client/peeking.ts';
+import { observePeekingWait } from '#tests/support/peeking-turn.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP room peeking');
@@ -225,22 +226,31 @@ suite.test('bounded event pages do not skip and an armed poll cancels cleanly', 
       assertEquals(chunk(page), [id]);
       token = String(page.end);
     }
-    const controller = new AbortController();
-    const pending = roomEvents(
-      f.room,
-      f.b.user_id,
-      null,
-      token,
-      2000,
-      controller.signal,
-    );
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    controller.abort();
-    await assertRejects(() => pending, DOMException, 'aborted');
-    assertEquals(
-      chunk(await ok(events(f.room, token, 10), f.b.access_token!)),
-      [],
-    );
+    const observer = observePeekingWait();
+    try {
+      const pending = observer.start((signal) =>
+        roomEvents(f.room, f.b.user_id, null, token, 2000, signal)
+      );
+      await pending.capture();
+      pending.abort();
+      await assertRejects(() => pending.finish(), DOMException, 'aborted');
+      const timed = observer.start((signal) =>
+        call(
+          events(f.room, token, 10),
+          f.b.access_token!,
+          undefined,
+          'GET',
+          signal,
+        )
+      );
+      await timed.capture();
+      observer.elapse(10);
+      const result = await timed.finish();
+      assertEquals(result.status, 200);
+      assertEquals(chunk(result.body), []);
+    } finally {
+      await observer.close();
+    }
   } finally {
     setConfigForTests({});
   }
@@ -298,41 +308,65 @@ suite.test('room events resume, long-poll without lost wakeups, recheck access a
     base(f.room) + '/initialSync?limit=0',
     f.b.access_token!,
   );
-  let token = String((initial.messages as Json).end);
-  for (let i = 0; i < 3; i++) {
-    const poll = ok(events(f.room, token, 2000), f.b.access_token!);
-    const id = await f.send('wake-' + i);
-    const result = await poll;
-    assert(chunk(result).includes(id));
-    token = String(result.end);
+  const observer = observePeekingWait();
+  const poll = (token: string, timeout: number) =>
+    observer.start((signal) =>
+      call(
+        events(f.room, token, timeout),
+        f.b.access_token!,
+        undefined,
+        'GET',
+        signal,
+      )
+    );
+  try {
+    let token = String((initial.messages as Json).end);
+    for (let i = 0; i < 3; i++) {
+      const pending = poll(token, 2000);
+      await pending.capture();
+      const id = await f.send('wake-' + i);
+      const result = await pending.finish();
+      assertEquals(result.status, 200);
+      assert(chunk(result.body).includes(id));
+      token = String(result.body.end);
+    }
+    const timed = poll(token, 10);
+    await timed.capture();
+    observer.elapse(10);
+    const empty = await timed.finish();
+    assertEquals(empty.status, 200);
+    assertEquals(chunk(empty.body), []);
+    assertEquals(
+      (await call(events(f.room, 'invalid'), f.b.access_token!)).status,
+      400,
+    );
+    assertEquals((await call('events', f.b.access_token!)).status, 400);
+    assertEquals(
+      (await call(events(f.room, token, -1), f.b.access_token!)).status,
+      400,
+    );
+    const cancelled = poll(token, 2000);
+    await cancelled.capture();
+    cancelled.abort();
+    await assertRejects(() => cancelled.finish(), DOMException);
+    // The adapter can reject independently of its engine callback. Require the
+    // actual peeking owner to observe cancellation and settle as well.
+    const cancelledOwner = observer.start((signal) =>
+      roomEvents(f.room, f.b.user_id, null, token, 2000, signal)
+    );
+    await cancelledOwner.capture();
+    cancelledOwner.abort();
+    await assertRejects(() => cancelledOwner.finish(), DOMException);
+    const pending = poll(token, 2000);
+    await pending.capture();
+    await ok(
+      base(f.room) + '/state/m.room.history_visibility',
+      f.a.access_token!,
+      { history_visibility: 'joined' },
+      'PUT',
+    );
+    assertEquals((await pending.finish()).status, 403);
+  } finally {
+    await observer.close();
   }
-  const timed = await ok(events(f.room, token, 10), f.b.access_token!);
-  assertEquals(chunk(timed), []);
-  assertEquals(
-    (await call(events(f.room, 'invalid'), f.b.access_token!)).status,
-    400,
-  );
-  assertEquals((await call('events', f.b.access_token!)).status, 400);
-  assertEquals(
-    (await call(events(f.room, token, -1), f.b.access_token!)).status,
-    400,
-  );
-  const controller = new AbortController();
-  const cancelled = call(
-    events(f.room, token, 2000),
-    f.b.access_token!,
-    undefined,
-    'GET',
-    controller.signal,
-  );
-  controller.abort();
-  await assertRejects(() => cancelled, DOMException);
-  const pending = call(events(f.room, token, 2000), f.b.access_token!);
-  await ok(
-    base(f.room) + '/state/m.room.history_visibility',
-    f.a.access_token!,
-    { history_visibility: 'joined' },
-    'PUT',
-  );
-  assertEquals((await pending).status, 403);
 });

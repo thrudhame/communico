@@ -4,6 +4,8 @@ import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { waitForSync } from '#engine/sync-wait.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
 
 const deferred = () => {
   let resolve!: () => void;
@@ -12,6 +14,33 @@ const deferred = () => {
   });
   return { promise, resolve };
 };
+
+Deno.test('sync observer cleanup cancels a held capture before joining its owner', async () => {
+  const f = await fixture();
+  const entered = latch(), release = latch();
+  const turns = observeSyncWait();
+  const request = turns.start((signal) =>
+    waitForSync(f, { timeoutMs: 30000, signal }, async () => {
+      entered.release();
+      await release.wait;
+      return { relevant: false, value: 'held' };
+    })
+  );
+  try {
+    await watchdog(
+      entered.wait,
+      'capture is held inside the actual sync owner',
+    );
+    await watchdog(turns.close(), 'observer cancels before capture release');
+    assertEquals(release.released, false);
+    await assertRejects(() => request.result, DOMException);
+  } finally {
+    request.abort();
+    release.release();
+    await Promise.allSettled([request.result]);
+    await f.close();
+  }
+});
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'sync-wait-' });
   const store = await openStore({

@@ -2,6 +2,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { theApp } from '#engine/app.ts';
 import { httpSuite } from '#tests/http-app.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
 import { eduQueues } from '#engine/federation/edus.ts';
 import { fedCaller, remoteServer } from '#tests/http-federation.ts';
 import { seedServer } from '#tests/federation/doc-helper.ts';
@@ -22,12 +23,14 @@ async function call(
   token?: string,
   method = 'GET',
   body?: unknown,
+  signal?: AbortSignal,
 ) {
   const response = await suite.matrix(
     new Request('http://x' + path, {
       method,
       headers: token === undefined ? {} : { Authorization: 'Bearer ' + token },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     }),
   );
   return { status: response.status, body: await response.json() as Json };
@@ -248,30 +251,26 @@ for (const mode of ['selection', 'long poll']) {
         assertEquals(entry(after, roomId), {});
         return;
       }
-      let done = false;
-      const pending = call(
-        '/_matrix/client/v3/sync?timeout=2000&since=' + before.next_batch,
-        b.access_token!,
-      ).then((response) => {
-        done = true;
-        return response;
-      });
-      let stayedPending = false;
+      const turns = observeSyncWait();
+      const pending = turns.start((signal) =>
+        call(
+          '/_matrix/client/v3/sync?timeout=2000&since=' + before.next_batch,
+          b.access_token!,
+          'GET',
+          undefined,
+          signal,
+        )
+      );
       let result: Awaited<ReturnType<typeof call>>;
       try {
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await pending.capture();
         await receipt('m.read.private');
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        stayedPending = !done;
-      } finally {
+        await pending.sweep();
         await receipt('m.read');
-        result = await pending;
+        result = await pending.finish();
+      } finally {
+        await turns.close();
       }
-      assertEquals(
-        stayedPending,
-        true,
-        'private activity must not satisfy peer long-poll relevance',
-      );
       assertEquals(result.status, 200);
       assert(eventOf(result.body, roomId, 'm.receipt'));
     },
@@ -458,22 +457,30 @@ suite.test('presence joins fan out both ways; status/set_presence validation and
   assertEquals(got.body.presence, 'unavailable');
   assertEquals(got.body.status_msg, 'ready');
   const before = await sync(a.access_token!);
-  let done = false;
-  const waiting = call(
-    '/_matrix/client/v3/sync?timeout=3000&since=' + before.next_batch,
-    a.access_token!,
-  ).then((r) => {
-    done = true;
-    return r;
-  });
-  await new Promise((r) => setTimeout(r, 60));
-  await call(status(c.user_id), c.access_token!, 'PUT', { presence: 'online' });
-  await new Promise((r) => setTimeout(r, 60));
-  assertEquals(done, false);
-  const start = performance.now();
-  await call(status(b.user_id), b.access_token!, 'PUT', { presence: 'online' });
-  const result = await waiting;
-  assert(performance.now() - start < 450);
+  const turns = observeSyncWait();
+  const waiting = turns.start((signal) =>
+    call(
+      '/_matrix/client/v3/sync?timeout=3000&since=' + before.next_batch,
+      a.access_token!,
+      'GET',
+      undefined,
+      signal,
+    )
+  );
+  let result: Awaited<ReturnType<typeof call>>;
+  try {
+    await waiting.capture();
+    await call(status(c.user_id), c.access_token!, 'PUT', {
+      presence: 'online',
+    });
+    await waiting.sweep();
+    await call(status(b.user_id), b.access_token!, 'PUT', {
+      presence: 'online',
+    });
+    result = await waiting.finish();
+  } finally {
+    await turns.close();
+  }
   assert(presence(result.body).some((e) => e.sender === b.user_id));
 });
 
@@ -505,34 +512,32 @@ suite.test('sync presence changes preserve status and identical concurrent syncs
     original,
   );
   const before = await sync(b.access_token!);
-  let finished = false;
-  const waiting = call(
-    '/_matrix/client/v3/sync?timeout=1000&set_presence=online&since=' +
-      before.next_batch,
-    b.access_token!,
-  ).then((r) => {
-    finished = true;
-    return r;
-  });
-  let stayedPending = false;
+  const turns = observeSyncWait();
+  const waiting = turns.start((signal) =>
+    call(
+      '/_matrix/client/v3/sync?timeout=1000&set_presence=online&since=' +
+        before.next_batch,
+      b.access_token!,
+      'GET',
+      undefined,
+      signal,
+    )
+  );
+  let changed: Awaited<ReturnType<typeof call>>;
   try {
+    await waiting.capture();
     await sync(a.access_token!, '&set_presence=online');
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    stayedPending = !finished;
+    await waiting.sweep();
     await sync(a.access_token!, '&set_presence=unavailable');
+    changed = await waiting.finish();
   } finally {
-    const changed = await waiting;
-    assertEquals(
-      stayedPending,
-      true,
-      'identical set_presence cannot wake a co-member',
-    );
-    const observed = ((changed.body.presence as Json).events as Json[]).find((
-      e,
-    ) => e.sender === a.user_id);
-    assertEquals((observed?.content as Json)?.presence, 'unavailable');
-    assertEquals((observed?.content as Json)?.status_msg, 'ready');
+    await turns.close();
   }
+  const observed = ((changed.body.presence as Json).events as Json[]).find((
+    e,
+  ) => e.sender === a.user_id);
+  assertEquals((observed?.content as Json)?.presence, 'unavailable');
+  assertEquals((observed?.content as Json)?.status_msg, 'ready');
 });
 
 suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, never private or remote echoes', async () => {
@@ -806,76 +811,77 @@ suite.test('typing and receipt-only changes wake joined users without waking unr
   );
   assertEquals(sent.status, 200);
   let before = await sync(b.access_token!);
+  const turns = observeSyncWait();
   const wait = (since: unknown) =>
-    call(
-      '/_matrix/client/v3/sync?timeout=3000&since=' + since,
-      b.access_token!,
+    turns.start((signal) =>
+      call(
+        '/_matrix/client/v3/sync?timeout=3000&since=' + since,
+        b.access_token!,
+        'GET',
+        undefined,
+        signal,
+      )
     );
-  let finished = false;
-  const waiting = wait(before.next_batch).then((result) => {
-    finished = true;
-    return result;
-  });
-  await new Promise((r) => setTimeout(r, 60));
-  const other = await call(
-    '/_matrix/client/v3/createRoom',
-    c.access_token!,
-    'POST',
-    {},
-  );
-  assertEquals(other.status, 200);
-  await call(
-    '/_matrix/client/v3/rooms/' +
-      encodeURIComponent(String(other.body.room_id)) + '/typing/' +
-      encodeURIComponent(c.user_id),
-    c.access_token!,
-    'PUT',
-    { typing: true, timeout: 10000 },
-  );
-  await new Promise((r) => setTimeout(r, 60));
-  assertEquals(finished, false);
-  const start = performance.now();
-  assertEquals(
-    (await call(
+  try {
+    const waiting = wait(before.next_batch);
+    await waiting.capture();
+    const other = await call(
+      '/_matrix/client/v3/createRoom',
+      c.access_token!,
+      'POST',
+      {},
+    );
+    assertEquals(other.status, 200);
+    await call(
+      '/_matrix/client/v3/rooms/' +
+        encodeURIComponent(String(other.body.room_id)) + '/typing/' +
+        encodeURIComponent(c.user_id),
+      c.access_token!,
+      'PUT',
+      { typing: true, timeout: 10000 },
+    );
+    await waiting.sweep();
+    assertEquals(
+      (await call(
+        base + '/typing/' + encodeURIComponent(a.user_id),
+        a.access_token!,
+        'PUT',
+        { typing: true, timeout: 10000 },
+      )).status,
+      200,
+    );
+    const typed = await waiting.finish();
+    assertEquals(typed.status, 200);
+    assertEquals(
+      (eventOf(typed.body, roomId, 'm.typing')!.content as Json).user_ids,
+      [a.user_id],
+    );
+    await call(
       base + '/typing/' + encodeURIComponent(a.user_id),
       a.access_token!,
       'PUT',
-      { typing: true, timeout: 10000 },
-    )).status,
-    200,
-  );
-  const typed = await waiting;
-  assertEquals(typed.status, 200);
-  assert(performance.now() - start < 450);
-  assertEquals(
-    (eventOf(typed.body, roomId, 'm.typing')!.content as Json).user_ids,
-    [a.user_id],
-  );
-  await call(
-    base + '/typing/' + encodeURIComponent(a.user_id),
-    a.access_token!,
-    'PUT',
-    { typing: false },
-  );
-  before = await sync(b.access_token!);
-  const receiptWait = wait(before.next_batch);
-  await new Promise((r) => setTimeout(r, 60));
-  const receiptStart = performance.now();
-  assertEquals(
-    (await call(
-      base + '/receipt/m.read/' +
-        encodeURIComponent(String(sent.body.event_id)),
-      a.access_token!,
-      'POST',
-      {},
-    )).status,
-    200,
-  );
-  const read = await receiptWait;
-  assertEquals(read.status, 200);
-  assert(performance.now() - receiptStart < 450);
-  assert(eventOf(read.body, roomId, 'm.receipt'));
-  assertEquals((entry(read.body, roomId).timeline as Json).events, []);
+      { typing: false },
+    );
+    before = await sync(b.access_token!);
+    const receiptWait = wait(before.next_batch);
+    await receiptWait.capture();
+    assertEquals(
+      (await call(
+        base + '/receipt/m.read/' +
+          encodeURIComponent(String(sent.body.event_id)),
+        a.access_token!,
+        'POST',
+        {},
+      )).status,
+      200,
+    );
+    const read = await receiptWait.finish();
+    assertEquals(read.status, 200);
+    assert(eventOf(read.body, roomId, 'm.receipt'));
+    assertEquals((entry(read.body, roomId).timeline as Json).events, []);
+  } finally {
+    await turns.close();
+  }
 });
 
 suite.test('the keys upload stub retains its old authenticated shape', async () => {

@@ -3,6 +3,7 @@ import { httpSuite } from '#tests/http-app.ts';
 import { theApp } from '#engine/app.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
 
 const suite = httpSuite('HTTP timeline and sync operation contracts');
 type Json = Record<string, unknown>;
@@ -11,12 +12,14 @@ async function call(
   token: string,
   body?: unknown,
   method = body === undefined ? 'GET' : 'POST',
+  signal?: AbortSignal,
 ) {
   const response = await suite.matrix(
     new Request('http://x/_matrix/client/v3/' + path, {
       method,
       headers: { Authorization: 'Bearer ' + token },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     }),
   );
   return { status: response.status, body: await response.json() as Json };
@@ -170,17 +173,29 @@ suite.test('sync defaults presence to online at the real presence reader', async
 });
 suite.test('full_state with since ignores the long-poll timeout', async () => {
   const initial = await call('sync?set_presence=offline', token);
-  const start = performance.now();
-  const full = await call(
-    'sync?set_presence=offline&full_state=true&timeout=3000&since=' +
-      initial.body.next_batch,
-    token,
+  const turns = observeSyncWait();
+  const request = turns.start((signal) =>
+    call(
+      'sync?set_presence=offline&full_state=true&timeout=3000&since=' +
+        initial.body.next_batch,
+      token,
+      undefined,
+      'GET',
+      signal,
+    )
   );
+  let full: Awaited<ReturnType<typeof call>>;
+  try {
+    full = await request.finish();
+    assertEquals(
+      request.registrations,
+      0,
+      'full_state never enters the wait owner',
+    );
+  } finally {
+    await turns.close();
+  }
   assertEquals(full.status, 200);
-  assert(
-    performance.now() - start < 1500,
-    'full_state must not enter the 3000ms long poll',
-  );
   const joined = ((full.body.rooms as Json).join as Json)[room] as Json;
   assert(
     ((joined.state as Json).events as Json[]).some((e) =>

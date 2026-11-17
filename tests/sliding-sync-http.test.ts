@@ -11,12 +11,13 @@ import {
   wireOf,
 } from '#tests/fixtures/remote.ts';
 import { httpSuite } from '#tests/http-app.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
+import { watchdog } from '#tests/support/ordering.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP native sliding sync');
 const route = '/_matrix/client/unstable/org.matrix.simplified_msc3575/sync';
 const object = (value: unknown) => value as Json;
-const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function call(
   path: string,
@@ -290,45 +291,46 @@ suite.test('unrelated changes do not finish a selected-room poll, but room accou
   };
   const first = await f.sync(request);
   assertEquals(first.status, 200);
-  let settled = false;
-  const pending = f.sync(request, first.body.pos, 2000).then((value) => {
-    settled = true;
-    return value;
-  });
-  await wait(50);
-  assertEquals(settled, false);
-  assertEquals(
-    (await call(
-      '/_matrix/client/v3/user/' + encodeURIComponent(f.bob.user_id) +
-        '/account_data/org.example.unrelated',
-      f.bob.access_token!,
-      { value: 1 },
-      'PUT',
-    )).status,
-    200,
-  );
-  await wait(50);
-  assertEquals(settled, false);
-  assertEquals(
-    (await call(
-      '/_matrix/client/v3/user/' + encodeURIComponent(f.alice.user_id) +
-        '/rooms/' + encodeURIComponent(f.room) +
-        '/account_data/org.example.selected',
-      f.alice.access_token!,
+  const turns = observeSyncWait();
+  try {
+    const pending = turns.start((signal) =>
+      f.sync(request, first.body.pos, 2000, signal)
+    );
+    await pending.capture();
+    assertEquals(
+      (await call(
+        '/_matrix/client/v3/user/' + encodeURIComponent(f.bob.user_id) +
+          '/account_data/org.example.unrelated',
+        f.bob.access_token!,
+        { value: 1 },
+        'PUT',
+      )).status,
+      200,
+    );
+    await pending.sweep();
+    assertEquals(
+      (await call(
+        '/_matrix/client/v3/user/' + encodeURIComponent(f.alice.user_id) +
+          '/rooms/' + encodeURIComponent(f.room) +
+          '/account_data/org.example.selected',
+        f.alice.access_token!,
+        { value: 2 },
+        'PUT',
+      )).status,
+      200,
+    );
+    const result = await pending.finish();
+    assertEquals(result.status, 200);
+    const data = object(object(result.body.extensions).account_data);
+    assertEquals(
+      (object(data.rooms)[f.room] as Json[]).find((row) =>
+        row.type === 'org.example.selected'
+      )?.content,
       { value: 2 },
-      'PUT',
-    )).status,
-    200,
-  );
-  const result = await pending;
-  assertEquals(result.status, 200);
-  const data = object(object(result.body.extensions).account_data);
-  assertEquals(
-    (object(data.rooms)[f.room] as Json[]).find((row) =>
-      row.type === 'org.example.selected'
-    )?.content,
-    { value: 2 },
-  );
+    );
+  } finally {
+    await turns.close();
+  }
 });
 
 suite.test('typing starts and stops and public receipts wake selected-room polls without timeline delivery', async () => {
@@ -355,67 +357,93 @@ suite.test('typing starts and stops and public receipts wake selected-room polls
   const first = await f.sync(request);
   assertEquals(first.status, 200);
   const typingPath = roomPath + '/typing/' + encodeURIComponent(f.bob.user_id);
-  const started = f.sync(request, first.body.pos, 2000);
-  await wait(50);
-  assertEquals(
-    (await call(typingPath, f.bob.access_token!, {
-      typing: true,
-      timeout: 10000,
-    }, 'PUT')).status,
-    200,
-  );
-  const typing = await started;
-  assertEquals(typing.status, 200);
-  assertEquals(
-    object(object(object(object(typing.body.extensions).typing).rooms)[f.room])
-      .content,
-    { user_ids: [f.bob.user_id] },
-  );
-  const receiptWait = f.sync(request, typing.body.pos, 2000);
-  await wait(50);
-  assertEquals(
-    (await call(
-      roomPath + '/receipt/m.read/' + encodeURIComponent(target.eventId),
-      f.bob.access_token!,
-      {},
-    )).status,
-    200,
-  );
-  const receipts = await receiptWait;
-  assertEquals(receipts.status, 200);
-  const content = object(
-    object(
-      object(object(object(receipts.body.extensions).receipts).rooms)[f.room],
-    ).content,
-  );
-  assert(object(object(content[target.eventId])['m.read'])[f.bob.user_id]);
-  const stopWait = f.sync(request, receipts.body.pos, 2000);
-  await wait(50);
-  assertEquals(
-    (await call(typingPath, f.bob.access_token!, { typing: false }, 'PUT'))
-      .status,
-    200,
-  );
-  const stopped = await stopWait;
-  assertEquals(stopped.status, 200);
-  assertEquals(
-    object(object(object(object(stopped.body.extensions).typing).rooms)[f.room])
-      .content,
-    { user_ids: [] },
-  );
+  const turns = observeSyncWait();
+  try {
+    const started = turns.start((signal) =>
+      f.sync(request, first.body.pos, 2000, signal)
+    );
+    await started.capture();
+    assertEquals(
+      (await call(typingPath, f.bob.access_token!, {
+        typing: true,
+        timeout: 10000,
+      }, 'PUT')).status,
+      200,
+    );
+    const typing = await started.finish();
+    assertEquals(typing.status, 200);
+    assertEquals(
+      object(
+        object(object(object(typing.body.extensions).typing).rooms)[f.room],
+      )
+        .content,
+      { user_ids: [f.bob.user_id] },
+    );
+    const receiptWait = turns.start((signal) =>
+      f.sync(request, typing.body.pos, 2000, signal)
+    );
+    await receiptWait.capture();
+    assertEquals(
+      (await call(
+        roomPath + '/receipt/m.read/' + encodeURIComponent(target.eventId),
+        f.bob.access_token!,
+        {},
+      )).status,
+      200,
+    );
+    const receipts = await receiptWait.finish();
+    assertEquals(receipts.status, 200);
+    const content = object(
+      object(
+        object(object(object(receipts.body.extensions).receipts).rooms)[f.room],
+      ).content,
+    );
+    assert(object(object(content[target.eventId])['m.read'])[f.bob.user_id]);
+    const stopWait = turns.start((signal) =>
+      f.sync(request, receipts.body.pos, 2000, signal)
+    );
+    await stopWait.capture();
+    assertEquals(
+      (await call(typingPath, f.bob.access_token!, { typing: false }, 'PUT'))
+        .status,
+      200,
+    );
+    const stopped = await stopWait.finish();
+    assertEquals(stopped.status, 200);
+    assertEquals(
+      object(
+        object(object(object(stopped.body.extensions).typing).rooms)[f.room],
+      )
+        .content,
+      { user_ids: [] },
+    );
+  } finally {
+    await turns.close();
+  }
 });
 
 suite.test('aborting a wait rejects promptly and leaves the input position usable', async () => {
   const f = await fixture('http-sliding-abort');
   const first = await f.sync();
   assertEquals(first.status, 200);
-  const abort = new AbortController();
-  const pending = f.sync(f.request, first.body.pos, 30000, abort.signal);
-  await wait(50);
-  abort.abort();
-  await assertRejects(() => pending, DOMException);
-  const retry = await f.sync(f.request, first.body.pos);
-  assertEquals(retry.status, 200);
+  const turns = observeSyncWait();
+  try {
+    const pending = turns.start((signal) =>
+      f.sync(f.request, first.body.pos, 30000, signal)
+    );
+    const rejected = assertRejects(() => pending.result, DOMException);
+    void rejected.catch(() => undefined);
+    await pending.capture();
+    pending.abort();
+    await watchdog(rejected, 'cancelled sliding request rejects promptly');
+    const retry = await watchdog(
+      f.sync(f.request, first.body.pos),
+      'cancelled sliding request releases its input position',
+    );
+    assertEquals(retry.status, 200);
+  } finally {
+    await turns.close();
+  }
 });
 
 suite.test('acknowledged inbox pages do not keep encryption polls hot or consume on cancellation', async () => {
@@ -443,43 +471,55 @@ suite.test('acknowledged inbox pages do not keep encryption polls hot or consume
     ...request,
     extensions: { to_device: { enabled: true, since } },
   };
-  const abort = new AbortController();
-  let settled = false;
-  const pending = f.sync(next, first.body.pos, 30000, abort.signal).finally(
-    () => {
-      settled = true;
-    },
-  );
-  // Attach rejection handling before abort, preserving the real response promise.
-  const rejected = assertRejects(() => pending, DOMException);
-  await wait(100);
-  assertEquals(
-    settled,
-    false,
-    'a received page must not make every poll immediate',
-  );
-  abort.abort();
-  await rejected;
-  // The cancelled request must not have acknowledged its page. A no-since retry
-  // of the same issued input still receives the original byte-identical message.
-  const replay = await f.sync(request, first.body.pos);
-  assertEquals(
-    object(
-      (object(object(replay.body.extensions).to_device).events as Json[])[0]
-        .content,
-    ).body,
-    'ack-first',
-  );
-  const delivered = f.sync(next, replay.body.pos, 2000);
-  await wait(50);
-  assertEquals((await send('ack-tail')).status, 200);
-  const result = await delivered;
-  assertEquals(result.status, 200);
-  assertEquals(
-    (object(object(result.body.extensions).to_device).events as Json[])
-      .map((event) => object(event.content).body),
-    ['ack-tail'],
-  );
+  const turns = observeSyncWait();
+  try {
+    const pending = turns.start((signal) =>
+      f.sync(next, first.body.pos, 30000, signal)
+    );
+    // Attach rejection handling before abort, preserving the real response promise.
+    const rejected = assertRejects(() => pending.result, DOMException);
+    void rejected.catch(() => undefined);
+    await pending.capture();
+    await pending.sweep();
+    pending.abort();
+    await watchdog(
+      rejected,
+      'cancelled sliding inbox request rejects promptly',
+    );
+    // The cancelled request must not have acknowledged its page. A no-since retry
+    // of the same issued input still receives the original byte-identical message.
+    const replay = await watchdog(
+      f.sync(request, first.body.pos),
+      'cancelled sliding inbox preserves its issued input page',
+    );
+    assertEquals(
+      (object(object(replay.body.extensions).to_device).events as Json[])
+        .length,
+      1,
+      'cancellation cannot acknowledge the original inbox page',
+    );
+    assertEquals(
+      object(
+        (object(object(replay.body.extensions).to_device).events as Json[])[0]
+          .content,
+      ).body,
+      'ack-first',
+    );
+    const delivered = turns.start((signal) =>
+      f.sync(next, replay.body.pos, 2000, signal)
+    );
+    await delivered.capture();
+    assertEquals((await send('ack-tail')).status, 200);
+    const result = await delivered.finish();
+    assertEquals(result.status, 200);
+    assertEquals(
+      (object(object(result.body.extensions).to_device).events as Json[])
+        .map((event) => object(event.content).body),
+      ['ack-tail'],
+    );
+  } finally {
+    await turns.close();
+  }
 });
 
 suite.test('notification counts and count-only read changes reach zero-timeline room consumers', async () => {
@@ -501,33 +541,45 @@ suite.test('notification counts and count-only read changes reach zero-timeline 
   };
   const first = await f.sync(request);
   assertEquals(object(object(first.body.rooms)[f.room]).notification_count, 0);
-  const waiting = f.sync(request, first.body.pos, 2000);
-  await wait(50);
-  const message = await call(
-    roomPath + '/send/m.room.message/count-proof',
-    f.bob.access_token!,
-    { msgtype: 'm.text', body: 'notification consumer proof' },
-    'PUT',
-  );
-  assertEquals(message.status, 200);
-  const received = await waiting;
-  assertEquals(
-    object(object(received.body.rooms)[f.room]).notification_count,
-    1,
-  );
-  assertEquals(object(object(received.body.rooms)[f.room]).timeline, undefined);
-  const readWait = f.sync(request, received.body.pos, 2000);
-  await wait(50);
-  assertEquals(
-    (await call(
-      roomPath + '/receipt/m.read/' +
-        encodeURIComponent(String(message.body.event_id)),
-      f.alice.access_token!,
-      {},
-    )).status,
-    200,
-  );
-  const read = await readWait;
-  assertEquals(object(object(read.body.rooms)[f.room]).notification_count, 0);
-  assertEquals(object(object(read.body.rooms)[f.room]).timeline, undefined);
+  const turns = observeSyncWait();
+  try {
+    const waiting = turns.start((signal) =>
+      f.sync(request, first.body.pos, 2000, signal)
+    );
+    await waiting.capture();
+    const message = await call(
+      roomPath + '/send/m.room.message/count-proof',
+      f.bob.access_token!,
+      { msgtype: 'm.text', body: 'notification consumer proof' },
+      'PUT',
+    );
+    assertEquals(message.status, 200);
+    const received = await waiting.finish();
+    assertEquals(
+      object(object(received.body.rooms)[f.room]).notification_count,
+      1,
+    );
+    assertEquals(
+      object(object(received.body.rooms)[f.room]).timeline,
+      undefined,
+    );
+    const readWait = turns.start((signal) =>
+      f.sync(request, received.body.pos, 2000, signal)
+    );
+    await readWait.capture();
+    assertEquals(
+      (await call(
+        roomPath + '/receipt/m.read/' +
+          encodeURIComponent(String(message.body.event_id)),
+        f.alice.access_token!,
+        {},
+      )).status,
+      200,
+    );
+    const read = await readWait.finish();
+    assertEquals(object(object(read.body.rooms)[f.room]).notification_count, 0);
+    assertEquals(object(object(read.body.rooms)[f.room]).timeline, undefined);
+  } finally {
+    await turns.close();
+  }
 });
