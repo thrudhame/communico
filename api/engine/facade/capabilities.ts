@@ -8,7 +8,8 @@ export type Scope =
   | 'rooms'
   | 'ingress'
   | 'auth'
-  | 'domain';
+  | 'domain'
+  | 'clientrooms';
 type Rule = { method: string; path: RegExp; scope: Scope; action?: 'home' };
 const f = '/_matrix/federation/v1/';
 const k = '/_matrix/key/v2/';
@@ -154,6 +155,37 @@ const F2_TODEVICE: readonly Rule[] = [
   route('PUT', /^\/_matrix\/client\/v3\/sendToDevice\/[^/]+\/[^/]+$/, 'auth'),
 ];
 
+// B6's client room owners enforce their exact room/account cuts. This is not
+// the federation rooms scope: local clients still work with federation off.
+const F2_ROOMS: readonly Rule[] = [
+  route('POST', literal('/_matrix/client/v3/createRoom'), 'clientrooms'),
+  ...['send', 'redact'].map((name) =>
+    route(
+      'PUT',
+      new RegExp('^/_matrix/client/v3/rooms/[^/]+/' + name + '/[^/]+/[^/]+$'),
+      'clientrooms',
+    )
+  ),
+  route('GET', /^\/_matrix\/client\/v3\/rooms\/[^/]+\/state$/, 'clientrooms'),
+  ...['GET', 'PUT'].map((method) =>
+    route(
+      method,
+      /^\/_matrix\/client\/v3\/rooms\/[^/]+\/state\/[^/]+(?:\/[^/]*)?$/,
+      'clientrooms',
+    )
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/rooms\/[^/]+\/(?:event|context)\/[^/]+$/,
+    'clientrooms',
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/rooms\/[^/]+\/(?:messages|members|joined_members|initialSync)$/,
+    'clientrooms',
+  ),
+];
+
 const HOME_SERVICES = new Set([
   'recovery',
   'link-client',
@@ -198,6 +230,7 @@ export function capabilities(role: string, phase = 'f1') {
           ...F2_REGISTERS,
           ...F2_DEVICES,
           ...F2_TODEVICE,
+          ...F2_ROOMS,
         ]
         : F1_PUBLIC)
         .filter((rule) => rule.path.test(path));

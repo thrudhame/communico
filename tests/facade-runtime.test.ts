@@ -948,6 +948,162 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
         },
       );
     });
+    // Real public authoring while home is absent and federation is disabled.
+    // This room has never existed at home or in its exported inventory.
+    const fresh = await edgeApi('createRoom', {
+      room_version: '11',
+      // The corpus deliberately enables permissive encryption policy for its
+      // legacy fixtures; this client explicitly requests an encrypted room.
+      initial_state: [{
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      }],
+    }, 'POST');
+    assertEquals(fresh.status, 200, JSON.stringify(fresh.body));
+    const freshRoomPath = 'rooms/' + encodeURIComponent(fresh.body.room_id);
+    const freshEncryption = await edgeApi(
+      freshRoomPath + '/state/m.room.encryption',
+    );
+    assertEquals(
+      freshEncryption.status,
+      200,
+      JSON.stringify(freshEncryption.body),
+    );
+    assertEquals(freshEncryption.body.algorithm, 'm.megolm.v1.aes-sha2');
+    assertEquals(
+      (await edgeApi(freshRoomPath + '/joined_members')).body.joined[user] !==
+        undefined,
+      true,
+    );
+    const freshContent = {
+      algorithm: 'm.megolm.v1.aes-sha2',
+      ciphertext: 'public-edge-new-room',
+    };
+    const freshSendPath = freshRoomPath +
+      '/send/m.room.encrypted/public-original';
+    const freshEvent = await edgeApi(freshSendPath, freshContent, 'PUT');
+    assertEquals(freshEvent.status, 200, JSON.stringify(freshEvent.body));
+    assertEquals(await edgeApi(freshSendPath, freshContent, 'PUT'), freshEvent);
+    const edit = await edgeApi(
+      freshRoomPath + '/send/m.room.encrypted/public-edit',
+      {
+        algorithm: 'm.megolm.v1.aes-sha2',
+        ciphertext: 'public-edit',
+        'm.relates_to': {
+          rel_type: 'm.replace',
+          event_id: freshEvent.body.event_id,
+        },
+      },
+      'PUT',
+    );
+    assertEquals(edit.status, 200, JSON.stringify(edit.body));
+    const reaction = await edgeApi(
+      freshRoomPath + '/send/m.room.encrypted/public-reaction',
+      {
+        algorithm: 'm.megolm.v1.aes-sha2',
+        ciphertext: 'public-reaction',
+        'm.relates_to': {
+          rel_type: 'm.annotation',
+          event_id: freshEvent.body.event_id,
+          key: 'like',
+        },
+      },
+      'PUT',
+    );
+    assertEquals(reaction.status, 200, JSON.stringify(reaction.body));
+    for (const suffix of ['', '/']) {
+      assertEquals(
+        (await edgeApi(freshRoomPath + '/state/m.room.topic' + suffix, {
+          topic: 'offline-public',
+        }, 'PUT')).status,
+        200,
+      );
+      assertEquals(
+        (await edgeApi(freshRoomPath + '/state/m.room.topic' + suffix)).body,
+        { topic: 'offline-public' },
+      );
+    }
+    const freshRead = await edgeApi(
+      freshRoomPath + '/event/' + encodeURIComponent(freshEvent.body.event_id),
+    );
+    assertEquals(freshRead.status, 200);
+    assertEquals(freshRead.body.content, freshContent);
+    const context = await edgeApi(
+      freshRoomPath + '/context/' + encodeURIComponent(edit.body.event_id),
+    );
+    assertEquals(context.status, 200, JSON.stringify(context.body));
+    assertEquals(context.body.event.event_id, edit.body.event_id);
+    const messages = await edgeApi(freshRoomPath + '/messages?dir=b&limit=100');
+    assertEquals(messages.status, 200, JSON.stringify(messages.body));
+    assert(
+      messages.body.chunk.some((event: { event_id: string }) =>
+        event.event_id === freshEvent.body.event_id
+      ),
+    );
+    const redactPath = freshRoomPath + '/redact/' +
+      encodeURIComponent(reaction.body.event_id) + '/public-redact';
+    const redaction = await edgeApi(redactPath, {}, 'PUT');
+    assertEquals(redaction.status, 200, JSON.stringify(redaction.body));
+    assertEquals(await edgeApi(redactPath, {}, 'PUT'), redaction);
+    assertEquals(
+      (await edgeApi(
+        freshRoomPath + '/event/' + encodeURIComponent(reaction.body.event_id),
+      )).body.content,
+      {},
+    );
+    for (
+      const variant of [{ room_alias_name: 'must-stay-home' }, {
+        visibility: 'public',
+      }]
+    ) {
+      const refused = await edgeApi('createRoom', variant, 'POST');
+      assertEquals(refused.status, 503);
+      assertEquals(refused.body.errcode, 'M_UNAVAILABLE');
+    }
+    // Both replicas author independent encrypted and state branches under the
+    // same logical server while home has no running link process.
+    const edgeBranch = await edgeApi(
+      roomPath + '/send/m.room.encrypted/public-concurrent',
+      {
+        algorithm: 'm.megolm.v1.aes-sha2',
+        ciphertext: 'edge-concurrent-encrypted',
+      },
+      'PUT',
+    );
+    assertEquals(edgeBranch.status, 200, JSON.stringify(edgeBranch.body));
+    const edgeTopic = await edgeApi(roomPath + '/state/m.room.topic', {
+      topic: 'edge-concurrent-topic',
+    }, 'PUT');
+    assertEquals(edgeTopic.status, 200, JSON.stringify(edgeTopic.body));
+    const homeBranch = await (async () => {
+      const isolated = await open('home');
+      try {
+        const tenant = await openTenant(isolated, 'logical.test');
+        const room = await openRoom(isolated, roomId);
+        const message = await sendLocal(room, {
+          type: 'm.room.encrypted',
+          sender: user,
+          content: {
+            algorithm: 'm.megolm.v1.aes-sha2',
+            ciphertext: 'home-concurrent-encrypted',
+          },
+        }, tenant.signer());
+        assert(message.completion);
+        await projectThrough(isolated, message.completion);
+        const topic = await sendLocal(room, {
+          type: 'm.room.topic',
+          state_key: '',
+          sender: user,
+          content: { topic: 'home-concurrent-topic' },
+        }, tenant.signer());
+        assert(topic.completion);
+        await projectThrough(isolated, topic.completion);
+        return { message: message.eventId, topic: topic.eventId };
+      } finally {
+        await isolated.close();
+      }
+    })();
     assertEquals(await edgeApi(accountPath), {
       status: 200,
       body: { ciphertext: 'edge-recovered' },
@@ -1140,6 +1296,75 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
         'cold reverse room consumer: ' + JSON.stringify(reverseResponse),
         { cause },
       );
+    });
+    await until(async () => {
+      // Observe both eligible event sets before comparing resolved current
+      // state. An ACK is not a promise that its branch wins the topic.
+      for (
+        const id of [
+          edgeBranch.body.event_id,
+          edgeTopic.body.event_id,
+          homeBranch.message,
+          homeBranch.topic,
+        ]
+      ) {
+        const path = roomPath + '/event/' + encodeURIComponent(id);
+        const [homeRead, edgeRead] = await Promise.all([
+          api(path, undefined, registered.body.access_token),
+          edgeApi(path),
+        ]);
+        if (
+          homeRead.status !== 200 || edgeRead.status !== 200 ||
+          homeRead.body.event_id !== id || edgeRead.body.event_id !== id
+        ) return false;
+        assertEquals(homeRead.body.content, edgeRead.body.content);
+      }
+      const [homeState, edgeState] = await Promise.all([
+        api(
+          roomPath + '/state/m.room.topic',
+          undefined,
+          registered.body.access_token,
+        ),
+        edgeApi(roomPath + '/state/m.room.topic'),
+      ]);
+      return homeState.status === 200 && edgeState.status === 200 &&
+        ['home-concurrent-topic', 'edge-concurrent-topic'].includes(
+          homeState.body.topic,
+        ) &&
+        homeState.body.topic === edgeState.body.topic;
+    });
+    // The normal link workers bootstrap the new edge-originated room at home.
+    await until(async () => {
+      const value = await api(
+        freshRoomPath + '/event/' +
+          encodeURIComponent(freshEvent.body.event_id),
+        undefined,
+        registered.body.access_token,
+      );
+      return value.status === 200 &&
+        value.body.content.ciphertext === freshContent.ciphertext;
+    });
+    const freshHomeSuffix = await api(
+      freshRoomPath + '/send/m.room.encrypted/public-home-suffix',
+      {
+        algorithm: 'm.megolm.v1.aes-sha2',
+        ciphertext: 'home-after-public-bootstrap',
+      },
+      registered.body.access_token,
+      'PUT',
+    );
+    assertEquals(
+      freshHomeSuffix.status,
+      200,
+      JSON.stringify(freshHomeSuffix.body),
+    );
+    await until(async () => {
+      const value = await edgeApi(
+        freshRoomPath + '/event/' +
+          encodeURIComponent(freshHomeSuffix.body.event_id),
+      );
+      return value.status === 200 &&
+        value.body.content.ciphertext === 'home-after-public-bootstrap';
     });
     const suffix = await api(
       roomPath + '/send/m.room.encrypted/b6-return-suffix',
@@ -1830,7 +2055,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     assertEquals((await api('facade', 'register', {})).status, 503);
     assertEquals(
       (await api('facade', 'createRoom', {}, retried.body.access_token)).status,
-      404,
+      200,
     );
     await edge.stop();
     await configure('facade');
