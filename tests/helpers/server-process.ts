@@ -35,6 +35,7 @@ export async function serverProcess(
     dir?: string;
     exitBarrier?: string;
     fatal?: 'close' | 'hang' | 'second';
+    holdAdminAbort?: boolean;
   } = {},
 ) {
   const dir = options.dir ?? await Deno.makeTempDir({ prefix: 'life-' });
@@ -67,6 +68,9 @@ export async function serverProcess(
           DENO_COMMUNICO_TEST_FATAL_TRIGGER: `${dir}/fatal-trigger`,
           DENO_COMMUNICO_TEST_FATAL_MODE: options.fatal,
         }
+        : {}),
+      ...(options.holdAdminAbort
+        ? { DENO_COMMUNICO_TEST_HOLD_ADMIN_ABORT: '1' }
         : {}),
     },
     stdout: 'piped',
