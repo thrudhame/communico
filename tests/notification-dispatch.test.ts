@@ -299,3 +299,32 @@ Deno.test('committed stream notifications isolate observer exceptions', async (t
     );
   });
 });
+
+Deno.test('replica tenant hints preserve their source and key intent across a captured audience', async () => {
+  await withStore(async (store) => {
+    await store.server();
+    const seen: unknown[] = [];
+    let removeSecond = () => {};
+    const removeFirst = onTenantStream((owner, tenant, source, keys) => {
+      assertEquals(owner, store);
+      removeSecond();
+      seen.push(['first', tenant, source, keys]);
+    });
+    removeSecond = onTenantStream((_owner, tenant, source, keys) => {
+      seen.push(['second', tenant, source, keys]);
+    });
+    try {
+      tenantStreamCommitted(store, 'test', 'replica', true);
+      assertEquals(seen, [
+        ['first', 'test', 'replica', true],
+        ['second', 'test', 'replica', true],
+      ]);
+      seen.length = 0;
+      tenantStreamCommitted(store, 'test');
+      assertEquals(seen, [['first', 'test', 'local', false]]);
+    } finally {
+      removeFirst();
+      removeSecond();
+    }
+  });
+});

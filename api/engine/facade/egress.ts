@@ -74,6 +74,107 @@ export class EgressOwner {
     return { pairing, revision: grant.body.revision };
   }
 
+  private async check(conn: Conn, auth: { pairing: string; revision: number }) {
+    if (
+      !(await conn.query(
+        "SELECT 1 FROM facade_pairings WHERE id=? AND state='paired' AND revision=?",
+        [auth.pairing, auth.revision],
+      )).length
+    ) {
+      throw new LinkError('LINK_UNPAIRED', 'egress grant changed', 403);
+    }
+  }
+
+  /** Both home leases and local batches reserve the same durable destination.
+   * A local sender is not another egress owner and cannot pass a pending lease. */
+  private async reserve(
+    envelope: EgressEnvelope,
+    auth: { pairing: string; revision: number },
+  ) {
+    const body = object(JSON.parse(envelope.body));
+    if (
+      body.origin !==
+        (await this.pairings.active()).body.transcript.body.context.server ||
+      !Array.isArray(body.pdus) ||
+      (body.edus !== undefined && !Array.isArray(body.edus))
+    ) diverged('invalid frozen federation envelope');
+    const fence = crypto.randomUUID();
+    return await this.db.tx(async (conn) => {
+      await this.check(conn, auth);
+      const prior = await held(conn, envelope.destination, envelope.txnId);
+      if (prior) {
+        if (
+          prior.body !== envelope.body || prior.mode !== envelope.mode ||
+          prior.pairing !== auth.pairing
+        ) {
+          diverged('changed egress proposal');
+        }
+        return {
+          fence: String(prior.fence),
+          response: prior.result_json === null
+            ? null
+            : JSON.parse(String(prior.result_json)),
+        };
+      }
+      if (
+        (await conn.query(
+          'SELECT 1 FROM facade_egress WHERE destination=? AND result_json IS NULL',
+          [envelope.destination],
+        )).length
+      ) {
+        throw new LinkError(
+          'LINK_UNAVAILABLE',
+          'destination has an unresolved transaction',
+          503,
+        );
+      }
+      await conn.execute(
+        'INSERT INTO facade_egress(destination,txn_id,body,mode,pairing,fence) VALUES(?,?,?,?,?,?)',
+        [
+          envelope.destination,
+          envelope.txnId,
+          envelope.body,
+          envelope.mode,
+          auth.pairing,
+          fence,
+        ],
+      );
+      return { fence, response: null };
+    });
+  }
+
+  private async deliver(
+    envelope: EgressEnvelope,
+    auth: { pairing: string; revision: number },
+    grant: { fence: string; response: unknown },
+  ) {
+    if (grant.response !== null || envelope.mode !== 'facade') {
+      return grant.response;
+    }
+    const response = responseOf(await this.dispatch(envelope));
+    await this.db.tx(async (conn) => {
+      await this.check(conn, auth);
+      await this.finish(conn, envelope, auth.pairing, grant.fence, response);
+    });
+    return response;
+  }
+
+  /** Ordinary local sender callback. Completion precedes local outbox ACK, so a
+   * crash at that boundary reuses the saved response without another transport. */
+  async dispatchLocal(candidate: Parameters<Dispatch>[0]): Promise<unknown> {
+    const grant = await this.pairings.active();
+    const auth = {
+      pairing: grant.body.transcript.body.context.id,
+      revision: grant.body.revision,
+    };
+    const envelope: EgressEnvelope = { ...candidate, mode: 'facade' };
+    return await this.deliver(
+      envelope,
+      auth,
+      await this.reserve(envelope, auth),
+    );
+  }
+
   async apply(journal: Journal, stream: Stream): Promise<boolean> {
     const record = await journal.next('home', stream);
     if (!record) return false;
@@ -83,83 +184,10 @@ export class EgressOwner {
     if (record.stream !== 'egress:' + envelope.destination) {
       diverged('wrong egress stream');
     }
-    const check = async (conn: Conn) => {
-      if (
-        !(await conn.query(
-          "SELECT 1 FROM facade_pairings WHERE id=? AND state='paired' AND revision=?",
-          [auth.pairing, auth.revision],
-        )).length
-      ) {
-        throw new LinkError('LINK_UNPAIRED', 'egress grant changed', 403);
-      }
-    };
+    const check = (conn: Conn) => this.check(conn, auth);
     if (payload.kind === 'propose') {
-      const body = object(JSON.parse(envelope.body));
-      if (
-        body.origin !==
-          (await this.pairings.active()).body.transcript.body.context.server ||
-        !Array.isArray(body.pdus) ||
-        (body.edus !== undefined && !Array.isArray(body.edus))
-      ) {
-        diverged('invalid frozen federation envelope');
-      }
-      // Randomness is prepared outside the retryable transaction. Replays use
-      // the retained fence rather than minting another dispatch authority.
-      const fence = crypto.randomUUID();
-      const grant = await this.db.tx(async (conn) => {
-        await check(conn);
-        const prior = await held(conn, envelope.destination, envelope.txnId);
-        if (prior) {
-          if (
-            prior.body !== envelope.body || prior.mode !== envelope.mode ||
-            prior.pairing !== auth.pairing
-          ) diverged('changed egress proposal');
-          return {
-            fence: String(prior.fence),
-            response: prior.result_json === null
-              ? null
-              : JSON.parse(String(prior.result_json)),
-          };
-        }
-        if (
-          (await conn.query(
-            'SELECT 1 FROM facade_egress WHERE destination=? AND result_json IS NULL',
-            [envelope.destination],
-          )).length
-        ) {
-          throw new LinkError(
-            'LINK_UNAVAILABLE',
-            'destination has an unresolved transaction',
-            503,
-          );
-        }
-        await conn.execute(
-          'INSERT INTO facade_egress(destination,txn_id,body,mode,pairing,fence) VALUES(?,?,?,?,?,?)',
-          [
-            envelope.destination,
-            envelope.txnId,
-            envelope.body,
-            envelope.mode,
-            auth.pairing,
-            fence,
-          ],
-        );
-        return { fence, response: null };
-      });
-      let response = grant.response;
-      if (envelope.mode === 'facade' && response === null) {
-        response = responseOf(await this.dispatch(envelope));
-        await this.db.tx(async (conn) => {
-          await check(conn);
-          await this.finish(
-            conn,
-            envelope,
-            auth.pairing,
-            grant.fence,
-            response,
-          );
-        });
-      }
+      const grant = await this.reserve(envelope, auth);
+      const response = await this.deliver(envelope, auth, grant);
       return journal.apply('home', stream, async (conn, next) => {
         if (next.hash !== record.hash) diverged('egress apply changed');
         await check(conn);

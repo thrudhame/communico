@@ -49,12 +49,6 @@ export async function userDevices(user: string) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'no such user');
     }
     const response = await tx.e2ee.snapshot(lp, user, config().e2ee);
-    const signing = await tx.crossSigning.views(lp, user, '');
-    for (const usage of ['master', 'self_signing']) {
-      if (signing[usage + '_keys'] !== undefined) {
-        response[usage + '_key'] = signing[usage + '_keys'];
-      }
-    }
     bounded(response, config().e2ee.maxrequestbytes);
     return response;
   });

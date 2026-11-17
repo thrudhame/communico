@@ -8,6 +8,10 @@ import {
   matrixBase64,
 } from '#engine/signing-primitives.js';
 import type { Store } from '#engine/store/index.ts';
+import {
+  keyChangesCut,
+  publicKeysChangedAfter,
+} from '#engine/tenant/changes.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import {
@@ -24,6 +28,10 @@ import {
   validateSessionAuthority,
 } from '#engine/tenant/session-authority.ts';
 import { captureErasureCuts } from '#engine/tenant/erasure.ts';
+import {
+  pendingTenantProjection,
+  tenantChangesCommitted,
+} from '#engine/tenant/hooks.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControls } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
@@ -287,6 +295,9 @@ function accountAuthOf(
     credentials: row.credentials,
     phc: row.phc as string | null,
     deactivated: row.deactivated,
+    ...(Object.hasOwn(row, 'deviceStreamFloor')
+      ? { deviceStreamFloor: integer(row.deviceStreamFloor) }
+      : {}),
     authority: authorityCutOf(row.authority, localpart, {
       sources,
       complete: true,
@@ -456,18 +467,39 @@ export class AccountSnapshots {
         )
         ? await captureErasureCuts(this.store)
         : undefined;
-    await (await this.store.tenant(view.server)).tx(async (conn) => {
-      await requireControl(conn, view);
-      const identity = await tenantAuthority(conn);
-      if (
-        identity?.node !== 'home' || identity.edgeNode !== view.source ||
-        identity.edgeIncarnation !== view.incarnation ||
-        !await userByLocalpart(conn, view.localpart)
-      ) {
-        mismatch('session authority tenant is not the selected home');
-      }
-      await installSessionAuthority(conn, view.localpart, view.authority, cuts);
-    });
+    const { projectionRevision, publicKeysChanged } =
+      await (await this.store.tenant(view.server)).tx(
+        async (conn) => {
+          await requireControl(conn, view);
+          const identity = await tenantAuthority(conn);
+          if (
+            identity?.node !== 'home' || identity.edgeNode !== view.source ||
+            identity.edgeIncarnation !== view.incarnation ||
+            !await userByLocalpart(conn, view.localpart)
+          ) {
+            mismatch('session authority tenant is not the selected home');
+          }
+          const keyCut = await keyChangesCut(conn);
+          await installSessionAuthority(
+            conn,
+            view.localpart,
+            view.authority,
+            cuts,
+          );
+          return {
+            projectionRevision: await pendingTenantProjection(conn),
+            publicKeysChanged: await publicKeysChangedAfter(conn, keyCut),
+          };
+        },
+      );
+    await tenantChangesCommitted(
+      this.store,
+      view.server,
+      projectionRevision,
+      false,
+      'replica',
+      publicKeysChanged,
+    );
     return await journal.apply(context.node, stream, async (conn, current) => {
       await check(conn);
       if (current.hash !== record.hash) {
@@ -606,11 +638,26 @@ export class AccountSnapshots {
           )
           ? await captureErasureCuts(this.store)
           : undefined;
-        await (await this.store.tenant(view.server)).tx(async (conn) => {
-          if (await current(conn)) {
-            await publishAccountAuth(conn, view, record, cuts);
-          }
-        });
+        const { projectionRevision, publicKeysChanged } =
+          await (await this.store.tenant(view.server))
+            .tx(async (conn) => {
+              const keyCut = await keyChangesCut(conn);
+              if (await current(conn)) {
+                await publishAccountAuth(conn, view, record, cuts);
+              }
+              return {
+                projectionRevision: await pendingTenantProjection(conn),
+                publicKeysChanged: await publicKeysChangedAfter(conn, keyCut),
+              };
+            });
+        await tenantChangesCommitted(
+          this.store,
+          view.server,
+          projectionRevision,
+          false,
+          'replica',
+          publicKeysChanged,
+        );
         return {
           localpart: view.localpart,
           cut: view.sourceCut,
@@ -674,8 +721,11 @@ export function startAccountExports(options: {
       }
     })();
   };
-  const untenant = onTenantStream((store, name) => {
-    if (store === options.store && name === options.tenant.serverName) wake();
+  const untenant = onTenantStream((store, name, source) => {
+    if (
+      source === 'local' && store === options.store &&
+      name === options.tenant.serverName
+    ) wake();
   });
   const timer = setInterval(wake, options.pollseconds * 1000);
   let closed: Promise<void> | undefined;

@@ -1,7 +1,10 @@
 import { assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { acceptIngressEdu } from '#engine/facade/ingress-edus.ts';
 import { decodeToDevice } from '#engine/federation/todevice.ts';
-import { PermanentEduRefusal } from '#engine/federation/edus.ts';
+import {
+  PermanentEduRefusal,
+  ReliableEduError,
+} from '#engine/federation/edus.ts';
 
 const origin = 'remote.test', self = 'home.test';
 const direct = {
@@ -120,5 +123,100 @@ Deno.test('F1 explicitly expires volatile activity and delegates receipt marks w
     () => acceptIngressEdu(origin, self, receipt, unused),
     Error,
     'must not deliver at facade',
+  );
+});
+
+Deno.test('F2 device ingress delivers validated evidence locally but preserves F1 and later to-device boundaries', async () => {
+  const device = {
+    user_id: '@alice:remote.test',
+    device_id: 'A',
+    stream_id: 1,
+    prev_id: [],
+    deleted: true,
+  };
+  const signing = { user_id: '@alice:remote.test' };
+  const calls: unknown[] = [];
+  const edus = {
+    dispatch: (from: string, raw: unknown) => {
+      calls.push([from, raw]);
+      return Promise.resolve();
+    },
+  };
+  for (
+    const [type, content] of [
+      ['m.device_list_update', device],
+      ['m.signing_key_update', signing],
+    ] as const
+  ) {
+    const raw = { edu_type: type, content };
+    assertEquals(await acceptIngressEdu(origin, self, raw, edus, 'f2'), {
+      kind: 'retained',
+      type,
+    });
+    assertEquals(calls.at(-1), [origin, raw]);
+    const before = calls.length;
+    await acceptIngressEdu(origin, self, raw, edus, 'f1');
+    for (const user_id of ['@fake:elsewhere.test', '@local:home.test']) {
+      assertEquals(
+        (await acceptIngressEdu(
+          origin,
+          self,
+          { ...raw, content: { ...content, user_id } },
+          edus,
+          'f2',
+        )).kind,
+        'ignored',
+      );
+    }
+    assertEquals(calls.length, before);
+    await assertRejects(
+      () => acceptIngressEdu(origin, self, raw, unused, 'f2'),
+      Error,
+      'must not deliver',
+    );
+    await assertRejects(() =>
+      acceptIngressEdu(origin, self, raw, {
+        dispatch: () =>
+          Promise.reject(new ReliableEduError(new Error('disk full'))),
+      }, 'f2'), ReliableEduError);
+  }
+  assertEquals(
+    (await acceptIngressEdu(
+      origin,
+      self,
+      {
+        edu_type: 'm.device_list_update',
+        content: { ...device, stream_id: {} },
+      },
+      unused,
+      'f2',
+    )).kind,
+    'refused',
+  );
+  assertEquals(
+    (await acceptIngressEdu(
+      origin,
+      self,
+      {
+        edu_type: 'm.signing_key_update',
+        content: { ...signing, master_key: {} },
+      },
+      unused,
+      'f2',
+    )).kind,
+    'refused',
+  );
+  assertEquals(
+    (await acceptIngressEdu(
+      origin,
+      self,
+      {
+        edu_type: 'm.direct_to_device',
+        content: direct,
+      },
+      unused,
+      'f2',
+    )).kind,
+    'retained',
   );
 });

@@ -1,6 +1,5 @@
-// F1 has no facade-owned device inbox. Validate the normal wire inputs and
-// retain their original signed transaction for home target expansion. Volatile
-// activity is explicitly expired, not resurrected when a partition heals.
+// Retain original signed evidence for home. F2 also delivers device updates to
+// the local owner; F1 remains mailbox-only. To-device delivery belongs to B5.
 import { config } from '#engine/config.ts';
 import { deviceDelta } from '#engine/e2ee-remote.ts';
 import { publicSigning } from '#engine/e2ee-public-signing.ts';
@@ -21,6 +20,7 @@ export async function acceptIngressEdu(
   self: string,
   raw: unknown,
   edus: Pick<EduState, 'dispatch'>,
+  phase = 'f1',
 ): Promise<IngressEduDisposition> {
   const { type, content } = eduEnvelope(raw);
   try {
@@ -39,8 +39,9 @@ export async function acceptIngressEdu(
         if (type === 'm.device_list_update') {
           deviceDelta(content, config().e2ee);
         } else publicSigning(content, content.user_id, config().e2ee);
-        // Subordinate signature/previous-stream checks use home's actual learned
-        // keys/tracking at delivery, exactly as ordinary reliable acceptance.
+        // The existing service owns tracking, signatures and predecessor recovery
+        // at each replica. This child runs outside the mailbox transaction.
+        if (phase === 'f2') await dispatchTransactionEdu(origin, raw, edus);
         return { kind: 'retained', type };
       case 'm.receipt':
         await dispatchTransactionEdu(origin, raw, edus);

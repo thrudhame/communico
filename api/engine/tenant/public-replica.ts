@@ -9,6 +9,8 @@ import type { Conn } from '#engine/store/db.ts';
 import { changedColumns } from '#engine/store/changed.ts';
 import { signingViews } from './cross-signing.ts';
 import { deviceSnapshot, type Json, object } from './e2ee.ts';
+import { tenantAuthority } from './session-authority.ts';
+import { semanticKeyReader } from './key-bootstrap.ts';
 import {
   materializeProfile,
   profileOperations,
@@ -60,9 +62,9 @@ export async function readPublicReplica(
     'SELECT deactivated FROM users WHERE localpart=?',
     [localpart],
   );
-  return user?.deactivated === 1
-    ? null
-    : await storedPublicReplica(conn, localpart);
+  if (user?.deactivated === 1) return null;
+  if (await semanticKeyReader(conn, localpart)) return null;
+  return await storedPublicReplica(conn, localpart);
 }
 
 export async function exportPublicUser(
@@ -172,6 +174,16 @@ export async function installPublicUser(
 ): Promise<void> {
   const view = publicUserOf(raw, server);
   const localpart = splitId(view.userId).localpart;
+  // Account auth is the durable semantic transition, independently of which
+  // public stream arrived first. A selected F2 account retains F1 evidence but
+  // its domain/lifecycle owners alone materialize profile and erasure changes.
+  // Freshness controls admission, not a fallback to obsolete F1 write authority.
+  const authority = await tenantAuthority(conn);
+  const semantic = authority && authority.node !== 'home' &&
+    (await conn.query(
+        'SELECT 1 FROM account_auth_snapshots WHERE localpart=?',
+        [localpart],
+      )).length > 0;
   const held = await storedPublicReplica(conn, localpart);
   const encoded = canonicalJson(view);
   if (
@@ -188,7 +200,7 @@ export async function installPublicUser(
   }
   // Never silently turn a real owned account into a projection.
   if (
-    !held &&
+    !held && !semantic &&
     (await conn.query('SELECT 1 FROM users WHERE localpart=?', [localpart]))
       .length
   ) {
@@ -202,7 +214,7 @@ export async function installPublicUser(
     'SELECT deactivated FROM users WHERE localpart=?',
     [localpart],
   );
-  if (user?.deactivated !== 1) {
+  if (!semantic && user?.deactivated !== 1) {
     await conn.execute(
       'INSERT INTO users(localpart,display_name,avatar_url,deactivated) VALUES(?,NULL,NULL,?) ON CONFLICT(localpart) DO UPDATE SET deactivated=excluded.deactivated WHERE ' +
         changedColumns('users', 'deactivated'),
@@ -214,6 +226,7 @@ export async function installPublicUser(
       changedColumns('public_user_replicas', 'source_cut', 'snapshot_json'),
     [localpart, view.cut, encoded],
   );
+  if (semantic) return;
   // Terminal status fences profile restoration, not later privacy facts.
   // Like markErased, a terminal account retains its first erasure boundary.
   const terminal = user?.deactivated === 1;

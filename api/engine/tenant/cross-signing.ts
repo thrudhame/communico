@@ -4,6 +4,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import {
+  publicSigningPayload,
   type SigningUpload,
   signingUsages,
   verifySigningKey,
@@ -17,6 +18,16 @@ import {
   forgetKeySignatures,
   signatureView,
 } from '#engine/tenant/signature-view.ts';
+import {
+  ownerUnavailable,
+  tenantAuthority,
+} from '#engine/tenant/session-authority.ts';
+import { captureSigningOperations } from '#engine/tenant/signing-operations.ts';
+import { reconcileDevicePublications } from '#engine/tenant/changes.ts';
+import {
+  captureEmbeddedSignatures,
+  type SignatureOperation,
+} from '#engine/tenant/signature-operations.ts';
 
 export async function signingState(
   conn: Conn,
@@ -80,6 +91,17 @@ export async function signingViews(
     }
     return replica.signing;
   }
+  return await ownerSigningViews(conn, localpart, user, requester);
+}
+
+/** Owner-internal validation/rendering cannot depend on public bootstrap: it
+ * helps admit the very signing/signature facts that the declaration requires. */
+export async function ownerSigningViews(
+  conn: Conn,
+  localpart: string,
+  user: string,
+  requester: string,
+): Promise<Json> {
   const state = await signingState(conn, localpart), result: Json = {};
   for (const usage of signingUsages) {
     if (usage === 'user_signing' && requester !== user) continue;
@@ -104,6 +126,11 @@ export async function uploadSigningKeys(
   authenticated: boolean,
   maxEnvelopeBytes: number,
 ): Promise<void> {
+  // An authenticated facade session can append signatures, never replace the
+  // account's cross-signing identity. Enforce at the owning write, including a
+  // first upload that does not require UIA and direct TenantTx consumers.
+  const authority = await tenantAuthority(conn);
+  if (authority && authority.node !== 'home') ownerUnavailable();
   const old = await signingState(conn, localpart);
   if (
     needsSigningAuth(old, input) &&
@@ -179,6 +206,18 @@ export async function uploadSigningKeys(
   const publicChanged = ['master', 'self_signing'].some((u) =>
     old[u as keyof SigningUpload]?.json !== next[u as keyof SigningUpload]?.json
   );
+  for (const usage of signingUsages) {
+    const key = next[usage];
+    if (key && old[usage]?.json !== key.json) {
+      await captureEmbeddedSignatures(
+        conn,
+        localpart,
+        user,
+        key.public,
+        JSON.parse(key.json),
+      );
+    }
+  }
   await appendSigningChange(
     conn,
     localpart,
@@ -195,12 +234,16 @@ export async function appendSigningChange(
   publicChanged: boolean,
   maxEnvelopeBytes: number,
   subject = user,
+  signatureOperation?: SignatureOperation,
 ): Promise<void> {
   const next = await signingState(conn, localpart);
   const payload: Json = {
     kind: publicChanged ? 'public_signing' : 'private_signing',
     ...(publicChanged ? {} : { subject }),
   };
+  if (signatureOperation) payload.signatureOperation = signatureOperation;
+  const operations = await captureSigningOperations(conn, localpart);
+  if (operations.length) payload.signingOperation = operations.at(-1);
   if (publicChanged) {
     for (const usage of ['master', 'self_signing'] as const) {
       if (next[usage]) {
@@ -212,7 +255,7 @@ export async function appendSigningChange(
         );
       }
     }
-    const { kind: _kind, ...publicKeys } = payload;
+    const publicKeys = publicSigningPayload(payload);
     bounded(
       JSON.parse(encodeEnvelope(domainOf(user)!, Number.MAX_SAFE_INTEGER, [], [{
         edu_type: 'm.signing_key_update',
@@ -230,6 +273,7 @@ export async function appendSigningChange(
     0,
     canonicalJson(payload),
   ]);
+  if (publicChanged) await reconcileDevicePublications(conn, localpart);
 }
 
 export async function clearSigningKeys(

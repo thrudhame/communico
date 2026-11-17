@@ -45,6 +45,7 @@ const TRANSACTION_ATTEMPTS = 20;
 
 export class Conn {
   private active = true;
+  private writeVersion = 0;
 
   constructor(private readonly ffi: Turso, private readonly handle: number) {}
 
@@ -59,9 +60,19 @@ export class Conn {
     return this.ffi.query(this.handle, sql, values);
   }
 
+  /** Successful affected-row writes in this attempt, not global database work.
+   * Owner adapters use this to distinguish an empty mutation from retained work. */
+  get writes(): number {
+    this.check();
+    return this.writeVersion;
+  }
+
   execute(sql: string, values: readonly Value[] = []): Promise<number> {
     this.check();
-    return this.ffi.execute(this.handle, sql, values);
+    return this.ffi.execute(this.handle, sql, values).then((affected) => {
+      if (affected > 0) this.writeVersion++;
+      return affected;
+    });
   }
 
   exec(sql: string): Promise<void> {

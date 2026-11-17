@@ -20,13 +20,20 @@ import {
   remoteTargetMaterial,
   type SignatureSigner,
   signatureSigner,
+  signatureTargetMaterial,
   signatureView,
 } from '#engine/tenant/signature-view.ts';
-import { appendDeviceChange } from '#engine/tenant/changes.ts';
+import {
+  appendDeviceChange,
+  appendDeviceOverlayChange,
+} from '#engine/tenant/changes.ts';
+import { publicDeviceKeys } from '#engine/tenant/device-operations.ts';
 import { appendSigningChange } from '#engine/tenant/cross-signing.ts';
-import { signingViews } from '#engine/tenant/cross-signing.ts';
+import { ownerSigningViews } from '#engine/tenant/cross-signing.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { tenantAuthority } from '#engine/tenant/session-authority.ts';
+import { appendSignatureOperation } from '#engine/tenant/signature-operations.ts';
 
 export type SignatureTarget = {
   user: string;
@@ -61,20 +68,28 @@ export async function uploadSignatures(
       continue;
     }
     const targetLocalpart = localpartOf(target.user);
+    const authority = await tenantAuthority(conn);
     const masterRows = remote
       ? [{ key_json: JSON.stringify(target.remote!.json) }]
       : await conn.query(
         "SELECT key_json FROM cross_signing_keys WHERE localpart=? AND usage='master' AND key_id=?",
         [targetLocalpart, 'ed25519:' + target.id],
       );
+    const semantic = !masterRows.length && target.user === user && authority
+      ? await publicDeviceKeys(conn, targetLocalpart)
+      : null;
     const deviceRows = masterRows.length || target.user !== user
       ? []
+      : semantic !== null
+      ? semantic.filter((row) => row.device_id === target.id)
       : await conn.query(
         'SELECT k.key_json,k.generation FROM device_keys k JOIN devices d ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation WHERE k.localpart=? AND k.device_id=?',
         [targetLocalpart, target.id],
       );
     const row = masterRows[0] ?? deviceRows[0];
-    const material = remote
+    const material = authority
+      ? await signatureTargetMaterial(conn, target.json, target.user, target.id)
+      : remote
       ? remoteTargetMaterial(target.json, target.remote!.revision)
       : keyMaterial(target.json);
     if (
@@ -107,7 +122,10 @@ export async function uploadSignatures(
         : deviceRows.length
         ? 'self_signing'
         : null;
-      const allowed = usage === null
+      const signer = await signatureSigner(conn, localpart, key);
+      const allowed = authority
+        ? signer?.usage === (usage === null ? 'device' : usage)
+        : usage === null
         ? (await conn.query(
           'SELECT 1 FROM device_keys WHERE localpart=? AND device_id=?',
           [localpart, key.slice(8)],
@@ -123,7 +141,6 @@ export async function uploadSignatures(
         if (existing === signature) unchanged++;
         continue;
       }
-      const signer = await signatureSigner(conn, localpart, key);
       if (!signer) continue;
       if (remote && target.remote!.signers[key] !== signer.basis) continue;
       let valid = false;
@@ -172,7 +189,7 @@ export async function uploadSignatures(
             keys: augmented,
           };
         } else {
-          const views = await signingViews(conn, localpart, user, '');
+          const views = await ownerSigningViews(conn, localpart, user, '');
           content = {
             user_id: user,
             master_key: augmented,
@@ -230,12 +247,36 @@ export async function uploadSignatures(
       changed = true;
     }
     if (!changed) continue;
-    if (deviceRows.length) {
-      await appendDeviceChange(conn, {
+    const signatureOperation = await appendSignatureOperation(conn, localpart, {
+      user: target.user,
+      id: target.id,
+      json: target.json,
+      material,
+    }, signers);
+    if (deviceRows.length && row.generation === undefined) {
+      if (!signatureOperation) {
+        throw new Error('public device overlay lacks source intent');
+      }
+      const imported = deviceRows[0] as { display_name: string | null };
+      await appendDeviceOverlayChange(
+        conn,
         localpart,
-        deviceId: target.id,
-        generation: Number(row.generation),
-      });
+        target.id,
+        augmented,
+        imported.display_name,
+        signatureOperation,
+      );
+    } else if (deviceRows.length) {
+      await appendDeviceChange(
+        conn,
+        {
+          localpart,
+          deviceId: target.id,
+          generation: Number(row.generation),
+        },
+        false,
+        signatureOperation,
+      );
     } else {
       await appendSigningChange(
         conn,
@@ -244,6 +285,7 @@ export async function uploadSignatures(
         target.user === user,
         maxEnvelopeBytes,
         target.user,
+        signatureOperation,
       );
     }
   }

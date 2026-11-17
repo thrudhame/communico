@@ -54,10 +54,11 @@ export function projectTenant(store: Store, tenant: string): Promise<void> {
           const subject = '@' + row.localpart + ':' + tenant;
           if (
             payload.kind === 'public_signing' ||
-            payload.kind === 'private_signing'
+            payload.kind === 'private_signing' ||
+            payload.kind === 'imported_keys'
           ) {
             const seq = await nextDeviceSeq(conn);
-            if (payload.kind === 'public_signing') {
+            if (payload.kind === 'public_signing' || payload.public === true) {
               await publishDeviceChange(conn, seq, subject);
             } else {for (const scope of ['sync', 'keys']) {
                 await conn.execute(

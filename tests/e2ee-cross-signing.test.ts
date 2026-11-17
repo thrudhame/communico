@@ -8,6 +8,8 @@ import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { type SigningUpload, signingUpload } from '#engine/e2ee-signing.ts';
 import { config } from '#engine/config.ts';
+import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -36,6 +38,94 @@ const options = (dir: string) => ({
   checkpointlogbytes: 65536,
   maxopenfiles: 8,
   idleseconds: 300,
+});
+
+Deno.test('F2: cross-signing identity creation and replacement stay home-owned even with local UIA', async (t) => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(options(dir), {
+    schemas: { tenant: tenantSchema },
+  });
+  try {
+    for (const node of ['edge', 'home']) {
+      await t.step(node, async () => {
+        const server = node + '.test', user = '@a:' + server;
+        const tenant = await openTenant(store, server, { create: true });
+        await tenant.tx((tx) => tx.users.insert('a', 'A'));
+        const first = await masterFor(user), second = await masterFor(user);
+        // A pre-enrollment identity remains home-owned after activation too.
+        await tenant.tx((tx) =>
+          tx.crossSigning.upload('a', user, first, '{}', false)
+        );
+        const db = await store.tenant(server);
+        await db.tx((conn) =>
+          activateTenantAuthority(conn, {
+            node,
+            incarnation: node + '-store',
+            homeIncarnation: 'home-store',
+            edgeNode: 'edge',
+            edgeIncarnation: 'edge-store',
+          })
+        );
+        const before = await db.query('SELECT * FROM e2ee_changes');
+        const rotate = () =>
+          tenant.tx((tx) =>
+            tx.crossSigning.upload(
+              'a',
+              user,
+              second,
+              canonicalJson(first),
+              true,
+            )
+          );
+        if (node === 'home') {
+          await rotate();
+          assertEquals(
+            await tenant.tx((tx) => tx.crossSigning.state('a')),
+            second,
+          );
+        } else {
+          await assertRejects(
+            rotate,
+            MatrixError,
+            'operation owner unavailable',
+          );
+          await assertRejects(
+            () =>
+              tenant.tx((tx) =>
+                tx.crossSigning.upload(
+                  'a',
+                  user,
+                  {},
+                  canonicalJson(first),
+                  true,
+                )
+              ),
+            MatrixError,
+            'operation owner unavailable',
+          );
+          assertEquals(await db.query('SELECT * FROM e2ee_changes'), before);
+          assertEquals(
+            await tenant.tx((tx) => tx.crossSigning.state('a')),
+            first,
+          );
+          await tenant.tx((tx) => tx.users.insert('b', 'B'));
+          const fresh = await masterFor('@b:' + server);
+          await assertRejects(
+            () =>
+              tenant.tx((tx) =>
+                tx.crossSigning.upload('b', '@b:' + server, fresh, '{}', false)
+              ),
+            MatrixError,
+            'operation owner unavailable',
+          );
+          assertEquals(await tenant.tx((tx) => tx.crossSigning.state('b')), {});
+        }
+      });
+    }
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
 });
 
 Deno.test('cross-signing: concurrent first upload and stale UIA cannot replace newer keys', async () => {

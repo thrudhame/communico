@@ -66,8 +66,8 @@ export async function upsertDeviceRow(
     'INSERT INTO devices(device_id, localpart, generation, display_name) VALUES(?,?,?,?)',
     [deviceId, localpart, generation, displayName],
   );
-  await appendDeviceChange(conn, { localpart, deviceId, generation });
   await recordDeviceCreation(conn, localpart, deviceId, generation);
+  await appendDeviceChange(conn, { localpart, deviceId, generation });
 }
 
 export async function deviceById(

@@ -11,6 +11,12 @@ import type { Conn, Database } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
+import { domainOf } from '#engine/ids.ts';
+import { withRemoteSigningStates } from '#engine/server/remote-devices.ts';
+import {
+  RemoteSignatureCutMissing,
+  type RemoteSignatureCuts,
+} from '#engine/tenant/signature-bootstrap.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { Grant, Pairings, Signed } from './pairing.ts';
@@ -250,17 +256,53 @@ export async function exportOwnerControl(
       payload: signed,
     });
   });
-  await (await store.tenant(tenant.serverName)).tx(async (conn) => {
-    await install(conn, signed);
-    await activateTenantAuthority(conn, {
-      node: 'home',
-      incarnation: body.nodes[0].incarnation,
-      homeIncarnation: body.nodes[0].incarnation,
-      edgeNode: body.nodes[1].node,
-      edgeIncarnation: body.nodes[1].incarnation,
-    });
-  });
+  await withTenantAuthorityActivation(
+    server,
+    await store.tenant(tenant.serverName),
+    async (conn, remoteCuts) => {
+      await install(conn, signed);
+      await activateTenantAuthority(conn, {
+        node: 'home',
+        incarnation: body.nodes[0].incarnation,
+        homeIncarnation: body.nodes[0].incarnation,
+        edgeNode: body.nodes[1].node,
+        edgeIncarnation: body.nodes[1].incarnation,
+      }, remoteCuts);
+    },
+  );
   return record;
+}
+
+/** Keep the old remote visibility boundary stable through the one-time tenant
+ * activation. A concurrently admitted new subject retries after releasing all
+ * locks; neither file's transaction ever acquires the other file. */
+export async function withTenantAuthorityActivation<T>(
+  server: Database,
+  tenant: Database,
+  fn: (conn: Conn, cuts: RemoteSignatureCuts) => Promise<T>,
+): Promise<T> {
+  for (;;) {
+    const users = await tenant.tx(async (conn) => {
+      if ((await conn.query('SELECT 1 FROM tenant_authority')).length) {
+        return [];
+      }
+      const [identity] = await conn.query('SELECT server_name FROM tenant');
+      return (await conn.query(
+        'SELECT DISTINCT target_user FROM key_signatures',
+      ))
+        .map((row) => String(row.target_user))
+        .filter((user) => domainOf(user) !== identity.server_name);
+    });
+    try {
+      return await withRemoteSigningStates(
+        server,
+        users,
+        (cuts) => tenant.tx((conn) => fn(conn, cuts)),
+      );
+    } catch (error) {
+      if (!(error instanceof RemoteSignatureCutMissing)) throw error;
+    }
+  }
 }
 
 async function assertGrant(conn: Conn, grant: Grant, side: string) {

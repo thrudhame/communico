@@ -15,6 +15,19 @@ import { type EgressEnvelope, EgressOwner } from '#engine/facade/egress.ts';
 import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
 import type { Database } from '#engine/store/db.ts';
 import { HomeEgress } from '#engine/facade/home-egress.ts';
+import type { Dispatch } from '#engine/server/delivery.ts';
+import { startSender } from '#engine/federation/sender.ts';
+import { bounded } from './helpers/server-process.ts';
+
+function localDispatch(owner: EgressOwner): Dispatch {
+  const dispatch = Reflect.get(owner, 'dispatchLocal');
+  assertEquals(
+    typeof dispatch,
+    'function',
+    'destination owner must publish facade-authored work',
+  );
+  return dispatch.bind(owner);
+}
 
 const settings = (dir: string) => ({
   dir,
@@ -118,6 +131,7 @@ async function fixture(seedServer = serverSchema) {
     journal,
     owner,
     db: () => edge.server(),
+    store: () => edge,
     fail(value: boolean) {
       failure = value;
     },
@@ -132,6 +146,140 @@ async function fixture(seedServer = serverSchema) {
     },
   };
 }
+
+Deno.test('facade local egress waits for the exact home result, then publishes through the same destination slot', async () => {
+  const f = await fixture();
+  try {
+    const home = await f.append({ kind: 'propose', ...f.envelope });
+    await (await f.owner()).apply(await f.journal(), home);
+    const grant = (await (await f.journal()).result('home', 'in', home, home))!
+      .result as { fence: string };
+    const local = { ...f.envelope, txnId: 'local' };
+    const owner = await f.owner();
+    const dispatch = localDispatch(owner);
+    await assertRejects(() => dispatch(local));
+    assertEquals(f.sent, []);
+    const completed = await f.append({
+      kind: 'complete',
+      ...f.envelope,
+      fence: grant.fence,
+      response: { pdus: {} },
+    });
+    await (await f.owner()).apply(await f.journal(), completed);
+    assertEquals(await localDispatch(await f.owner())(local), { pdus: {} });
+    assertEquals(f.sent, [{ ...local, mode: 'facade' }]);
+    await f.reopen();
+    assertEquals(await localDispatch(await f.owner())(local), { pdus: {} });
+    assertEquals(
+      f.sent.length,
+      1,
+      'cold receipt replay must not dispatch again',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade local egress retains uncertain bytes across restart and blocks a newer home proposal', async () => {
+  const f = await fixture();
+  try {
+    const local = { ...f.envelope, txnId: 'local' };
+    f.fail(true);
+    await assertRejects(
+      () => f.owner().then((owner) => localDispatch(owner)(local)),
+      Error,
+      'uncertain',
+    );
+    const home = await f.append({ kind: 'propose', ...f.envelope });
+    await assertRejects(() =>
+      f.owner().then(async (owner) => owner.apply(await f.journal(), home))
+    );
+    await f.reopen();
+    await assertRejects(() =>
+      f.owner().then((owner) =>
+        localDispatch(owner)({ ...local, body: local.body + ' ' })
+      )
+    );
+    assertEquals(f.sent.length, 1);
+    f.fail(false);
+    assertEquals(await localDispatch(await f.owner())(local), { pdus: {} });
+    assertEquals(f.sent[0], f.sent[1]);
+    assertEquals(await (await f.owner()).apply(await f.journal(), home), true);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade local egress publishes an ordinary sender device EDU only after the home lease completes', async () => {
+  const f = await fixture();
+  let sender: ReturnType<typeof startSender> | undefined;
+  try {
+    const home = await f.append({ kind: 'propose', ...f.envelope });
+    await (await f.owner()).apply(await f.journal(), home);
+    const grant = (await (await f.journal()).result('home', 'in', home, home))!
+      .result as { fence: string };
+    const content = {
+      user_id: '@alice:logical.test',
+      device_id: 'PHONE',
+      stream_id: 8,
+      prev_id: [11, 6],
+      keys: { device_id: 'PHONE' },
+    };
+    await (await f.db()).tx((tx) =>
+      enqueueEdu(
+        tx,
+        'local-device',
+        'remote.test',
+        'm.device_list_update',
+        content,
+      )
+    );
+    const blocked = Promise.withResolvers<void>(),
+      delivered = Promise.withResolvers<void>();
+    const owner = await f.owner();
+    sender = startSender({
+      store: f.store(),
+      signer: f.node.signer(),
+      dispatch: async (envelope) => {
+        try {
+          return await owner.dispatchLocal(envelope);
+        } catch (error) {
+          blocked.resolve();
+          throw error;
+        }
+      },
+      onDelivered: () => {
+        delivered.resolve();
+        return Promise.resolve();
+      },
+    });
+    await bounded(blocked.promise);
+    assertEquals(f.sent, []);
+    const completed = await f.append({
+      kind: 'complete',
+      ...f.envelope,
+      fence: grant.fence,
+      response: { pdus: {} },
+    });
+    await owner.apply(await f.journal(), completed);
+    sender.wake('remote.test');
+    await bounded(delivered.promise);
+    assertEquals(f.sent.length, 1);
+    const envelope = f.sent[0] as EgressEnvelope;
+    assertEquals(JSON.parse(envelope.body).edus, [{
+      edu_type: 'm.device_list_update',
+      content,
+    }]);
+    assertEquals(
+      await (await f.db()).query('SELECT * FROM federation_batches'),
+      [],
+    );
+    assertEquals(await (await f.db()).query('SELECT * FROM edu_outbox'), []);
+  } finally {
+    await sender?.stop();
+    await f.close();
+  }
+});
 
 Deno.test('egress direct grant and result survive cold replay; exact fence is required before next transaction', async () => {
   const f = await fixture();

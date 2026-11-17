@@ -16,6 +16,7 @@ import {
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Database } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import type { Signer } from '#engine/room/signer.ts';
 import { onEventStream } from '#engine/server/stream.ts';
 import {
   acceptDeviceDelta,
@@ -38,6 +39,7 @@ export function deviceListService(
   db: Database,
   tenant: Tenant,
   edus: EduState,
+  signer: Signer = tenant.signer(),
 ): DeviceListService {
   type Flight = {
     run: Promise<void>;
@@ -121,7 +123,7 @@ export function deviceListService(
           cause: error,
         });
       }
-      const response = await federationRequest(db, tenant.signer(), {
+      const response = await federationRequest(db, signer, {
         destination: domainOf(user)!,
         method: 'GET',
         body: null,

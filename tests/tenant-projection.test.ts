@@ -9,6 +9,8 @@ import { roomSchema } from '#engine/room/index.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
 import { startPushSender } from '#engine/push/sender.ts';
+import { onTenantStream } from '#engine/tenant/streams.ts';
+import { hashPassword, loginUser } from '#engine/tenant/users.ts';
 
 installServerHooks();
 
@@ -65,6 +67,62 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('tenant projection: unchanged mutations and same-device login create no projection work or notices', async () => {
+  const f = await fixture();
+  let notices = 0;
+  const off = onTenantStream((store) => {
+    if (store === f.store) notices++;
+  });
+  try {
+    setTenantProjector(undefined);
+    await f.tenant.tx((tx) => tx.credentials.set('bob', hashPassword('pw')));
+    const db = await f.store.tenant('test');
+    const before = await db.query(
+      "SELECT value FROM counters WHERE name='projection_revision'",
+    );
+    await f.tenant.tx((tx) => tx.devices.upsert('B', 'bob', null));
+    assertEquals(
+      await f.pending(),
+      [],
+      'an unchanged device is not projection work',
+    );
+    await f.tenant.tx((tx) => tx.devices.rename('B', 'bob', 'same-name'));
+    await projectTenant(f.store, 'test');
+    const renamed = await db.query(
+      "SELECT value FROM counters WHERE name='projection_revision'",
+    );
+    assert(Number(renamed[0].value) > Number(before[0].value));
+    notices = 0;
+    await f.tenant.tx((tx) => tx.devices.rename('B', 'bob', 'same-name'));
+    await f.tenant.tx((tx) => tx.devices.delete('absent', 'bob'));
+    assertEquals(
+      await f.tenant.tx((tx) => tx.e2ee.claim('bob', 'B', 'curve25519')),
+      null,
+    );
+    await loginUser(f.tenant, {
+      localpart: 'bob',
+      password: 'pw',
+      deviceId: 'B',
+      refresh: false,
+    });
+    assertEquals(
+      await f.pending(),
+      [],
+      'same-device auth and empty consuming reads must not compete with imported authority',
+    );
+    assertEquals(
+      await db.query(
+        "SELECT value FROM counters WHERE name='projection_revision'",
+      ),
+      renamed,
+    );
+    assertEquals(notices, 0);
+  } finally {
+    off();
+    await f.close();
+  }
+});
 
 Deno.test('tenant projection: missed post-commit hook retains a durable revision and worker recovers registration and revocation', async () => {
   const f = await fixture();

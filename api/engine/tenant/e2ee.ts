@@ -1,16 +1,28 @@
 // Tenant-owned public keys and consuming pools. All writes use the caller's Conn.
 import type { Conn } from '#engine/store/db.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
-import { deviceById } from '#engine/tenant/devices.ts';
+import { deviceById, deviceExists } from '#engine/tenant/devices.ts';
 import { appendDeviceChange, poolChanged } from '#engine/tenant/changes.ts';
+import { captureEmbeddedSignatures } from '#engine/tenant/signature-operations.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Config } from '#engine/config-schema.ts';
 import { config } from '#engine/config.ts';
-import { forgetDeviceSignatures } from '#engine/tenant/cross-signing.ts';
+import {
+  forgetDeviceSignatures,
+  signingViews,
+} from '#engine/tenant/cross-signing.ts';
 import { signatureView } from '#engine/tenant/signature-view.ts';
 import { readPublicReplica } from './public-replica.ts';
+import { createHash } from 'node:crypto';
+import { assertDeviceOwner } from '#engine/tenant/session-authority.ts';
+import { publicDeviceKeys } from '#engine/tenant/device-operations.ts';
+import { checkpointDeviceSnapshot } from '#engine/tenant/device-stream.ts';
+
+export const KEY_CONSUMPTIONS_SQL = `
+CREATE TABLE key_consumptions(localpart TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL,algorithm TEXT NOT NULL,key_id TEXT NOT NULL,material_hash TEXT NOT NULL,PRIMARY KEY(localpart,device_id,generation,algorithm,key_id));
+`;
 
 export type Json = Record<string, unknown>;
 export type KeyLimits = Config['e2ee'];
@@ -136,10 +148,14 @@ function material(json: string): string {
   const { signatures: _s, unsigned: _u, ...body } = key;
   return canonicalJson(body);
 }
+function materialHash(json: string): string {
+  return createHash('sha256').update(material(json)).digest('hex');
+}
 export async function current(
   conn: Conn,
   device: DeviceIdentity,
 ): Promise<void> {
+  await assertDeviceOwner(conn, device.localpart, device.deviceId);
   const row = await deviceById(conn, device.deviceId, device.localpart);
   if (row === null || row.generation !== device.generation) {
     throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'device no longer exists');
@@ -175,11 +191,39 @@ export async function uploadKeys(
         'INSERT INTO device_keys VALUES(?,?,?,?) ON CONFLICT(localpart,device_id,generation) DO UPDATE SET key_json=excluded.key_json',
         [...args, input.device],
       );
+      const [tenant] = await conn.query('SELECT server_name FROM tenant');
+      await captureEmbeddedSignatures(
+        conn,
+        device.localpart,
+        '@' + device.localpart + ':' + tenant.server_name,
+        device.deviceId,
+        JSON.parse(input.device),
+      );
       await appendDeviceChange(conn, device);
     }
   }
   let changed = false;
+  // upload_pos identifies the accepted upload call, not iteration order within
+  // its key map. Retries retain existing cohorts; only new inventory joins this
+  // call's cohort, allocated on the same retrying owner transaction.
+  let cohort: number | undefined;
   for (const key of input.otks) {
+    // A lost claim response does not make its key available again. Upload is
+    // not a new identity for a consumed key in the same device incarnation.
+    const [consumed] = await conn.query(
+      'SELECT material_hash FROM key_consumptions WHERE localpart=? AND device_id=? AND generation=? AND algorithm=? AND key_id=?',
+      [...args, key.algorithm, key.id],
+    );
+    if (consumed) {
+      if (consumed.material_hash !== materialHash(key.json)) {
+        throw new MatrixError(
+          400,
+          'M_INVALID_PARAM',
+          'conflicting consumed one-time key',
+        );
+      }
+      continue;
+    }
     const old = await conn.query(
       'SELECT key_json FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=? AND algorithm=? AND key_id=?',
       [...args, key.algorithm, key.id],
@@ -194,12 +238,12 @@ export async function uploadKeys(
       }
       continue;
     }
-    const pos = await nextCounter(conn, 'key_upload');
+    cohort ??= await nextCounter(conn, 'key_upload');
     await conn.execute('INSERT INTO one_time_keys VALUES(?,?,?,?,?,?,?)', [
       ...args,
       key.algorithm,
       key.id,
-      pos,
+      cohort,
       key.json,
     ]);
     changed = true;
@@ -238,6 +282,7 @@ export async function keyStatus(
   conn: Conn,
   device: DeviceIdentity,
 ): Promise<{ counts: Record<string, number>; unused: string[]; seq: number }> {
+  await assertDeviceOwner(conn, device.localpart, device.deviceId);
   const args = identity(device);
   const counts: Record<string, number> = Object.create(null);
   // MSC4186 treats an omitted algorithm as unchanged, unlike ordinary sync.
@@ -275,6 +320,24 @@ export async function purgeRestoredKeyPools(conn: Conn): Promise<{
     if (!devices.length) break;
     for (const row of devices) {
       const owner = [row.localpart, row.device_id, row.generation];
+      // Restore burns every ambiguous pool identity before dropping inventory.
+      // A later client retry must not re-publish an already consumed old key.
+      for (
+        const key of await conn.query(
+          'SELECT algorithm,key_id,key_json FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=?',
+          owner,
+        )
+      ) {
+        await conn.execute(
+          'INSERT INTO key_consumptions VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING',
+          [
+            ...owner,
+            key.algorithm,
+            key.key_id,
+            materialHash(String(key.key_json)),
+          ],
+        );
+      }
       oneTimeKeys += await conn.execute(
         'DELETE FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=?',
         owner,
@@ -315,14 +378,19 @@ export async function queryKeys(
     limitEntries(Object.keys(result).length, maxKeys);
     return result;
   }
-  const rows = await conn.query(
-    'SELECT d.device_id,d.display_name,k.key_json FROM devices d JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation WHERE d.localpart=?' +
-      (deviceIds.length
-        ? ' AND d.device_id IN (' + deviceIds.map(() => '?').join(',') + ')'
-        : '') +
-      ' ORDER BY d.device_id LIMIT ?',
-    [localpart, ...deviceIds, maxKeys + 1],
-  );
+  const semantic = await publicDeviceKeys(conn, localpart);
+  const rows = semantic === null
+    ? await conn.query(
+      'SELECT d.device_id,d.display_name,k.key_json FROM devices d JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation WHERE d.localpart=?' +
+        (deviceIds.length
+          ? ' AND d.device_id IN (' + deviceIds.map(() => '?').join(',') + ')'
+          : '') +
+        ' ORDER BY d.device_id LIMIT ?',
+      [localpart, ...deviceIds, maxKeys + 1],
+    )
+    : semantic.filter((row) =>
+      !deviceIds.length || deviceIds.includes(row.device_id)
+    );
   limitEntries(rows.length, maxKeys);
   for (const row of rows) {
     if (deviceIds.length && !deviceIds.includes(String(row.device_id))) {
@@ -349,7 +417,23 @@ export async function queryKeys(
   return result;
 }
 
-/** The list and causal anchor are captured on the same tenant connection. */
+async function publicDeviceSnapshot(
+  conn: Conn,
+  localpart: string,
+  owner: string,
+  response: Json,
+): Promise<Json> {
+  const signing = await signingViews(conn, localpart, owner, '');
+  for (const usage of ['master', 'self_signing']) {
+    if (signing[usage + '_keys'] !== undefined) {
+      response[usage + '_key'] = signing[usage + '_keys'];
+    }
+  }
+  return response;
+}
+
+/** Render the complete federation response before naming its causal cut. The
+ * adapter must not attach mutable public signing material after retention. */
 export async function deviceSnapshot(
   conn: Conn,
   localpart: string,
@@ -362,8 +446,11 @@ export async function deviceSnapshot(
       throw new Error('public replica owner mismatch');
     }
     limitEntries((replica.devices.devices as unknown[]).length, limits.maxkeys);
-    bounded(replica.devices, limits.maxrequestbytes);
-    return replica.devices;
+    const response = await publicDeviceSnapshot(conn, localpart, owner, {
+      ...replica.devices,
+    });
+    bounded(response, limits.maxrequestbytes);
+    return response;
   }
   const keys = await queryKeys(conn, localpart, [], '', owner, limits.maxkeys);
   const rows = await conn.query(
@@ -381,11 +468,12 @@ export async function deviceSnapshot(
         : { device_display_name: unsigned.device_display_name }),
     };
   });
-  const response = {
+  const complete = await publicDeviceSnapshot(conn, localpart, owner, {
     user_id: owner,
     stream_id: rows.length ? Number(rows[0].value) : 0,
     devices,
-  };
+  });
+  const response = await checkpointDeviceSnapshot(conn, localpart, complete);
   bounded(response, limits.maxrequestbytes);
   return response;
 }
@@ -397,6 +485,8 @@ export async function claimKey(
   deviceId: string,
   algorithm: string,
 ): Promise<Json | null> {
+  if (!await deviceExists(conn, deviceId, localpart)) return null;
+  await assertDeviceOwner(conn, localpart, deviceId);
   const row = await deviceById(conn, deviceId, localpart);
   if (row === null) return null;
   const device = { localpart, deviceId, generation: row.generation },
@@ -406,6 +496,15 @@ export async function claimKey(
     [...args, algorithm],
   );
   if (keys.length) {
+    await conn.execute(
+      'INSERT INTO key_consumptions VALUES(?,?,?,?,?,?)',
+      [
+        ...args,
+        algorithm,
+        keys[0].key_id,
+        materialHash(String(keys[0].key_json)),
+      ],
+    );
     await conn.execute(
       'DELETE FROM one_time_keys WHERE localpart=? AND device_id=? AND generation=? AND algorithm=? AND key_id=?',
       [...args, algorithm, keys[0].key_id],

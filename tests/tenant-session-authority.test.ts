@@ -14,6 +14,10 @@ import {
 } from '#engine/tenant/auth.ts';
 import { deleteDevices } from '#engine/tenant/devices.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { config } from '#engine/config.ts';
+import { validateUpload } from '#engine/tenant/e2ee.ts';
+import { deviceIdentity } from '#engine/tenant/txns.ts';
+import { localClaim } from '#engine/e2ee.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import {
   activateTenantAuthority,
@@ -87,6 +91,42 @@ async function fixture() {
   };
 }
 
+Deno.test('session authority: retained facts and retired device mappings are not new reconciliation writes', async () => {
+  const f = await fixture();
+  try {
+    await f.edge.login('retired');
+    await deleteDevices(f.edge.tenant, 'alice', ['retired']);
+    const view = await f.edge.capture();
+    const mappings = await f.edge.db.query('SELECT * FROM authority_devices');
+    const redundant: string[] = [];
+    await f.edge.db.tx(async (conn) => {
+      const execute = conn.execute.bind(conn);
+      conn.execute = (sql, values) => {
+        if (
+          sql.startsWith('INSERT INTO authority_facts') ||
+          sql.startsWith('DELETE FROM ')
+        ) {
+          redundant.push(sql);
+        }
+        return execute(sql, values);
+      };
+      await installSessionAuthority(conn, 'alice', view);
+    });
+    assertEquals(
+      redundant,
+      [],
+      'immutable replay and retained incarnation history are not mutable lifecycle work',
+    );
+    assertEquals(
+      await f.edge.db.query('SELECT * FROM authority_devices'),
+      mappings,
+    );
+    assertEquals(await f.edge.capture(), view);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('session authority: first ingress owns supplied IDs and foreign recovery cannot confirm or rotate', async () => {
   const f = await fixture();
   try {
@@ -111,6 +151,104 @@ Deno.test('session authority: first ingress owns supplied IDs and foreign recove
     assertEquals(
       (await lookupToken(f.home.tenant, session.accessToken))?.device_id,
       'supplied-byte-for-byte',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('F2: whole-device pools refuse a live foreign owner before exhaustion and direct mutation', async () => {
+  const f = await fixture();
+  try {
+    await f.home.login('HOME');
+    await f.edge.install(await f.home.capture());
+    const device = await deviceIdentity(f.home.tenant, 'alice', 'HOME');
+    const input = validateUpload(
+      {
+        one_time_keys: { 'curve25519:once': 'once' },
+      },
+      '@alice:home.test',
+      'HOME',
+      config().e2ee,
+    );
+    await f.home.tenant.tx((tx) => tx.e2ee.upload(device, input));
+    await assertRejects(
+      () =>
+        f.edge.tenant.tx((tx) => tx.e2ee.claim('alice', 'HOME', 'curve25519')),
+      MatrixError,
+      'operation owner unavailable',
+    );
+    await assertRejects(
+      () => f.edge.tenant.tx((tx) => tx.e2ee.upload(device, input)),
+      MatrixError,
+      'operation owner unavailable',
+    );
+    assertEquals(await f.edge.db.query('SELECT * FROM one_time_keys'), []);
+    assertEquals(
+      await f.home.tenant.tx((tx) =>
+        tx.e2ee.claim('alice', 'HOME', 'curve25519')
+      ),
+      { 'curve25519:once': 'once' },
+    );
+    await deleteDevices(f.home.tenant, 'alice', ['HOME']);
+    await f.edge.install(await f.home.capture());
+    assertEquals(
+      await f.edge.tenant.tx((tx) =>
+        tx.e2ee.claim('alice', 'HOME', 'curve25519')
+      ),
+      null,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('F2: C-S returns available keys with a truthful owner failure while S2S rolls back incomplete claims', async () => {
+  const f = await fixture();
+  try {
+    await f.home.login('HOME');
+    await f.edge.install(await f.home.capture());
+    await f.edge.login('EDGE');
+    const device = await deviceIdentity(f.edge.tenant, 'alice', 'EDGE');
+    await f.edge.tenant.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload(
+          {
+            one_time_keys: {
+              'curve25519:first': 'first',
+              'curve25519:second': 'second',
+            },
+          },
+          '@alice:edge.test',
+          'EDGE',
+          config().e2ee,
+        ),
+      )
+    );
+    const request: import('#engine/e2ee.ts').Claim = [[
+      '@alice:edge.test',
+      { EDGE: 'curve25519', HOME: 'curve25519' },
+    ]];
+    assertEquals(await localClaim(f.edge.tenant, request, config().e2ee, {}), {
+      one_time_keys: {
+        '@alice:edge.test': { EDGE: { 'curve25519:first': 'first' } },
+      },
+      failures: {
+        'edge.test': { errcode: 'M_UNAVAILABLE', error: 'keys unavailable' },
+      },
+    });
+    await assertRejects(
+      () => localClaim(f.edge.tenant, request, config().e2ee),
+      MatrixError,
+      'operation owner unavailable',
+    );
+    assertEquals(
+      await f.edge.tenant.tx((tx) =>
+        tx.e2ee.claim('alice', 'EDGE', 'curve25519')
+      ),
+      { 'curve25519:second': 'second' },
+      'the rejected S2S answer must not consume its available prefix',
     );
   } finally {
     await f.close();

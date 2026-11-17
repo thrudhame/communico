@@ -70,11 +70,51 @@ export const DOMAIN_OPERATION_CAPABILITY: Capability = {
   type: 'domain-operation',
   version: 1,
 };
+export const DEVICE_OPERATION_CAPABILITY: Capability = {
+  type: 'device-operation',
+  version: 1,
+};
+export const SIGNING_OPERATION_CAPABILITY: Capability = {
+  type: 'signing-operation',
+  version: 1,
+};
+export const SIGNATURE_OPERATION_CAPABILITY: Capability = {
+  type: 'signature-operation',
+  version: 1,
+};
+export const KEY_BOOTSTRAP_CAPABILITY: Capability = {
+  type: 'key-bootstrap',
+  version: 1,
+};
+export const KEY_HISTORY_CAPABILITY: Capability = {
+  type: 'key-history',
+  version: 1,
+};
+export const DEVICE_PUBLICATION_CAPABILITY: Capability = {
+  type: 'device-publication',
+  version: 1,
+};
+export const KEY_BOOTSTRAP_V2_CAPABILITY: Capability = {
+  type: 'key-bootstrap',
+  version: 2,
+};
+export const KEY_HISTORY_V2_CAPABILITY: Capability = {
+  type: 'key-history',
+  version: 2,
+};
 export const LINK_SUPPORTED: readonly Capability[] = [
   ...LINK_CAPABILITIES,
   OWNER_CONTROL_CAPABILITY,
   ACCOUNT_AUTH_CAPABILITY,
   DOMAIN_OPERATION_CAPABILITY,
+  DEVICE_OPERATION_CAPABILITY,
+  SIGNING_OPERATION_CAPABILITY,
+  SIGNATURE_OPERATION_CAPABILITY,
+  KEY_BOOTSTRAP_CAPABILITY,
+  KEY_HISTORY_CAPABILITY,
+  DEVICE_PUBLICATION_CAPABILITY,
+  KEY_BOOTSTRAP_V2_CAPABILITY,
+  KEY_HISTORY_V2_CAPABILITY,
 ];
 
 function bad(message: string): never {
