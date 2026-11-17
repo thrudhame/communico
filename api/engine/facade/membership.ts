@@ -21,6 +21,7 @@ import {
   type MembershipOperation,
   membershipOperations,
   type MembershipState,
+  recordMembershipOperation,
 } from '#engine/server/membership-operations.ts';
 import { type DomainBinding, requireDomainControl } from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
@@ -37,7 +38,7 @@ import {
 import { signingFence } from './signing-authority.ts';
 
 type MembershipView = DomainBinding & {
-  kind: 'membership-operation';
+  kind: 'membership-operation' | 'membership-history';
   operation: MembershipOperation;
 };
 
@@ -47,8 +48,13 @@ function mismatch(message: string): never {
 
 function viewOf(raw: unknown): MembershipView {
   const row = object(raw);
+  if (
+    row.kind !== 'membership-operation' && row.kind !== 'membership-history'
+  ) {
+    mismatch('invalid membership record kind');
+  }
   const view: MembershipView = {
-    kind: 'membership-operation',
+    kind: row.kind,
     server: text(row.server),
     pairing: text(row.pairing),
     grantRevision: integer(row.grantRevision, 1),
@@ -63,8 +69,10 @@ function viewOf(raw: unknown): MembershipView {
   if (
     canonicalJson(view) !== canonicalJson(raw) ||
     checkLocalpart(view.localpart) !== view.localpart ||
-    view.operation.source !== view.source ||
-    view.operation.incarnation !== view.incarnation ||
+    (view.kind === 'membership-operation' &&
+      (view.operation.source !== view.source ||
+        view.operation.incarnation !== view.incarnation)) ||
+    (view.kind === 'membership-history' && view.source !== 'home') ||
     view.operation.stream !==
       'membership:@' + view.localpart + ':' + view.server
   ) mismatch('membership operation differs from signed source or account');
@@ -72,12 +80,14 @@ function viewOf(raw: unknown): MembershipView {
 }
 
 function operationId(view: MembershipView) {
-  return 'membership:' + createHash('sha256').update(canonicalJson([
-    view.pairing,
-    view.grantRevision,
-    view.ownerRevision,
-    view.operation.operationId,
-  ])).digest('hex');
+  return (view.kind === 'membership-history'
+    ? 'membership-history:'
+    : 'membership:') + createHash('sha256').update(canonicalJson([
+      view.pairing,
+      view.grantRevision,
+      view.ownerRevision,
+      view.operation.operationId,
+    ])).digest('hex');
 }
 
 /** Verify original signed evidence without countersigning or installing a room.
@@ -238,6 +248,9 @@ export class MembershipOperations {
       /* Invalid signatures cannot grant retained membership authority. */
     }
     if (!valid) mismatch('invalid membership operation signature');
+    if (view.kind === 'membership-history' && !this.node) {
+      mismatch('only home may attest membership history');
+    }
     await server.tx(async (conn) => {
       unchanged();
       await this.selected(conn, grant, view.localpart);
@@ -254,12 +267,10 @@ export class MembershipOperations {
     return state;
   }
 
-  /** Only committed immutable source facts are signed. A mutable display scan
-   * could erase an accepted invite/rejection before the link ever saw it. */
-  async export(localpart: string, pairing?: string): Promise<LinkRecord[]> {
+  private async exportBinding(localpart: string, pairing?: string) {
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
-    const server = await this.store.server(), unchanged = signingFence(server);
+    const server = await this.store.server();
     const control = await server.tx(async (conn) => {
       await this.selected(conn, grant, localpart);
       const [row] = await conn.query(
@@ -288,6 +299,84 @@ export class MembershipOperations {
       source: source.node,
       incarnation: source.incarnation,
     };
+    return { grant, source, binding };
+  }
+
+  /** Home separately attests exact retained history, including foreign dots and
+   * prior incarnations. This supplies evidence, not a scope-ready declaration or
+   * an application receipt. Ordinary export never echoes imported authorship. */
+  async bootstrap(localpart: string, pairing: string): Promise<LinkRecord[]> {
+    if (this.node) mismatch('only home may attest membership history');
+    const { grant, source, binding } = await this.exportBinding(
+      localpart,
+      pairing,
+    );
+    const server = await this.store.server(), unchanged = signingFence(server);
+    const operations = await server.tx(async (conn) => {
+      unchanged();
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      const userId = '@' + localpart + ':' + binding.server;
+      for (
+        const row of await conn.query(
+          'SELECT room_id FROM prejoin_memberships WHERE user_id=?',
+          [userId],
+        )
+      ) {
+        await recordMembershipOperation(conn, String(row.room_id), userId);
+      }
+      return await membershipOperations(conn, userId);
+    });
+    const records = await this.export(localpart, pairing);
+    for (const operation of operations) {
+      if (
+        operation.source === source.node &&
+        operation.incarnation === source.incarnation
+      ) continue;
+      const view = viewOf({
+        ...binding,
+        kind: 'membership-history',
+        operation,
+      });
+      const signed = {
+        body: view,
+        signature: await this.tenant.signer().sign(canonicalJson(view)),
+      };
+      records.push(
+        await server.tx(async (conn) => {
+          unchanged();
+          await this.selected(conn, grant, localpart);
+          await requireDomainControl(conn, view);
+          const record = await appendRecord(
+            conn,
+            grant.body.transcript.body.context.node,
+            {
+              source: view.source,
+              incarnation: view.pairing,
+              stream: operation.stream,
+              type: 'membership-operation',
+              version: 1,
+              operationId: operationId(view),
+              payload: signed,
+            },
+          );
+          unchanged();
+          return record;
+        }),
+      );
+    }
+    return records;
+  }
+
+  /** Only committed immutable source facts are signed. A mutable display scan
+   * could erase an accepted invite/rejection before the link ever saw it. */
+  async export(localpart: string, pairing?: string): Promise<LinkRecord[]> {
+    const { grant, source, binding } = await this.exportBinding(
+      localpart,
+      pairing,
+    );
+    const context = grant.body.transcript.body.context;
+    const server = await this.store.server(), unchanged = signingFence(server);
     const peer = this.node ? 'home' : context.node;
     const scope = 'membership-export:' + canonicalJson(binding);
     const operations = await server.tx(async (conn) => {

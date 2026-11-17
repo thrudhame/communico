@@ -815,3 +815,247 @@ Deno.test('membership admission: an accepted local-user knock keeps the remote r
     await f.close();
   }
 });
+
+Deno.test('membership history: home attests exact retained foreign dots without restamping or advancing a local source cut', async () => {
+  const f = await fixture();
+  try {
+    const { record, keys, operation, state } = await incoming(f);
+    await f.hs.retain(record, keys, f.bundle.id);
+    const before = await (await f.home.server()).query(
+      'SELECT * FROM counters',
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(records.length, 1);
+    const history = records[0];
+    const body = (history.payload as {
+      body: { kind: string; operation: MembershipOperation };
+    }).body;
+    assertEquals(body.kind, 'membership-history');
+    assertEquals(body.operation, operation);
+    assertEquals(history.source, 'home');
+    assertEquals(await f.es.retain(history, keys), state);
+    assertEquals(
+      await (await f.home.server()).query('SELECT * FROM counters'),
+      before,
+    );
+    assertEquals(await f.hs.export('alice', f.bundle.id), []);
+    assertEquals(
+      await (await f.edge.server()).query('SELECT * FROM prejoin_memberships'),
+      [],
+    );
+    assertEquals(
+      await (await f.edge.server()).query(
+        'SELECT * FROM membership_operations',
+      ),
+      [],
+    );
+    assertEquals(
+      (await f.hs.bootstrap('alice', f.bundle.id))[0],
+      history,
+      'exact bootstrap retries retain journal identity',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership history: old incarnations are retained only under exact current home attestation', async (t) => {
+  for (
+    const change of [
+      'accepted',
+      'ordinary',
+      'facade',
+      'signature',
+      'retired',
+      'unselected',
+    ] as const
+  ) {
+    await t.step(change, async () => {
+      const f = await fixture();
+      try {
+        const { keys, operation, state } = await incoming(f, 'home');
+        operation.source = 'retired_node';
+        operation.incarnation = 'old-incarnation';
+        operation.operationId = canonicalJson([
+          operation.source,
+          operation.incarnation,
+          operation.stream,
+          operation.sequence,
+        ]);
+        await (await f.home.server()).tx((conn) =>
+          retainMembershipOperation(conn, operation)
+        );
+        const records = await f.hs.bootstrap('alice', f.bundle.id);
+        const history = records.find((record) =>
+          (record.payload as { body: { kind: string } }).body.kind ===
+            'membership-history'
+        );
+        assert(history);
+        const signed = history.payload as {
+          body: Record<string, unknown>;
+          signature: string;
+        };
+        if (change === 'accepted') {
+          assertEquals(await f.es.retain(history, keys), state);
+          const saved = await (await f.edge.server()).tx((conn) =>
+            membershipHistory(conn, operation.semanticKey)
+          );
+          assert(
+            saved.ready.some((row) =>
+              canonicalJson(row) === canonicalJson(operation)
+            ),
+          );
+          return;
+        }
+        if (change === 'ordinary') signed.body.kind = 'membership-operation';
+        if (change === 'facade') {
+          signed.body.source = f.node.node;
+          signed.body.incarnation = f.node.incarnation;
+          history.source = f.node.node;
+          history.incarnation = f.node.incarnation;
+        }
+        if (change === 'signature') signed.signature = 'A'.repeat(86);
+        if (change === 'ordinary' || change === 'facade') {
+          signed.signature =
+            await (change === 'facade' ? f.node.signer() : f.ht.signer()).sign(
+              canonicalJson(signed.body),
+            );
+          history.operationId =
+            (change === 'ordinary' ? 'membership:' : 'membership-history:') +
+            createHash('sha256').update(canonicalJson([
+              signed.body.pairing,
+              signed.body.grantRevision,
+              signed.body.ownerRevision,
+              operation.operationId,
+            ])).digest('hex');
+        }
+        if (change === 'retired') {
+          await f.fp.retire(await f.hp.revoke(f.bundle.id), 'a'.repeat(64));
+        }
+        if (change === 'unselected') {
+          await (await f.edge.server()).execute(
+            "DELETE FROM facade_scopes WHERE scope='auth:@alice:logical.test'",
+          );
+        }
+        await assertRejects(() =>
+          (change === 'facade' ? f.hs : f.es).retain(history, keys, f.bundle.id)
+        );
+        const db = await f.edge.server();
+        assertEquals(
+          await db.query(
+            "SELECT * FROM domain_operations WHERE kind='membership'",
+          ),
+          [],
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('membership history: facade cannot declare bootstrap and home cannot export another account history', async () => {
+  const f = await fixture();
+  try {
+    await source(f);
+    await assertRejects(() => f.es.bootstrap('alice', f.bundle.id));
+    await assertRejects(() => f.hs.bootstrap('bob', f.bundle.id));
+    assertEquals(
+      await (await f.home.server()).query(
+        "SELECT * FROM facade_records WHERE stream LIKE 'membership:%'",
+      ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership history: source retirement during home attestation cannot append evidence or mark it applied', async () => {
+  const f = await fixture();
+  try {
+    const { record, keys } = await incoming(f);
+    await f.hs.retain(record, keys, f.bundle.id);
+    const signer = f.ht.signer();
+    let signed = false;
+    f.ht.signer = () => ({
+      ...signer,
+      sign: async (bytes: string) => {
+        const signature = await signer.sign(bytes);
+        signed = true;
+        await f.hp.revoke(f.bundle.id);
+        return signature;
+      },
+    });
+    await assertRejects(() => f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals(signed, true);
+    assertEquals(
+      await (await f.home.server()).query(
+        "SELECT * FROM facade_records WHERE stream LIKE 'membership:%'",
+      ),
+      [],
+    );
+    assertEquals(
+      await (await f.home.server()).query(
+        "SELECT applied FROM domain_operations WHERE kind='membership'",
+      ),
+      [{ applied: 0 }],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership history: attestation does not bypass actual PDU verification or account binding', async (t) => {
+  for (const change of ['pdu', 'account', 'payload'] as const) {
+    await t.step(change, async () => {
+      const f = await fixture();
+      try {
+        const { record, keys } = await incoming(f);
+        await f.hs.retain(record, keys, f.bundle.id);
+        const [history] = await f.hs.bootstrap('alice', f.bundle.id);
+        await (await f.edge.server()).execute(
+          "DELETE FROM domain_operations WHERE kind='membership'",
+        );
+        const signed = history.payload as {
+          body: { localpart: string; operation: MembershipOperation };
+          signature: string;
+        };
+        if (change === 'account') signed.body.localpart = 'bob';
+        else if (change === 'payload') {
+          signed.body.operation.payload = signed.body.operation.payload.replace(
+            'remote.test',
+            'forged.test',
+          );
+        } else {
+          const state = JSON.parse(signed.body.operation.payload);
+          const pdu = JSON.parse(state.eventJson);
+          pdu.signatures['remote.test']['ed25519:test'] = 'A'.repeat(86);
+          state.eventJson = canonicalJson(pdu);
+          signed.body.operation.payload = canonicalJson(state);
+          signed.body.operation.payloadHash = createHash('sha256').update(
+            signed.body.operation.payload,
+          ).digest('hex');
+        }
+        signed.signature = await f.ht.signer().sign(canonicalJson(signed.body));
+        await assertRejects(() => f.es.retain(history, keys));
+        // A fresh receiver cannot admit forged history; immutable collision
+        // rejection cannot accidentally stand in for actual PDU verification.
+        assertEquals(
+          await (await f.edge.server()).query(
+            "SELECT * FROM domain_operations WHERE kind='membership'",
+          ),
+          [],
+        );
+        assertEquals(
+          await (await f.edge.server()).query(
+            'SELECT * FROM prejoin_memberships',
+          ),
+          [],
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
