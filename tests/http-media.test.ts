@@ -4,6 +4,7 @@ import { config, serverName, setConfigForTests } from '#engine/config.ts';
 import { theApp } from '#engine/app.ts';
 import { getMedia } from '#engine/tenant/media.ts';
 import { httpSuite } from '#tests/http-app.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP media');
@@ -225,7 +226,29 @@ test('reserved upload publishes exactly once under concurrent PUTs', async (root
   Deno.open = async (name, options) => hold(await open(name, options), name);
   Deno.create = async (name) => hold(await create(name), name);
   let responses: Response[];
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  const queued = latch();
+  const get = Map.prototype.get;
+  let observed = false;
+  // The predecessor has two consumers: tail chaining and the actual await.
+  // Observing only Map.set or request start cannot prove waiter enrollment.
+  Map.prototype.get = function (key) {
+    const previous = get.call(this, key);
+    if (!observed && key === root + '/' + id && previous instanceof Promise) {
+      observed = true;
+      let consumers = 0;
+      return {
+        then(
+          resolve: (value: unknown) => unknown,
+          reject?: (error: unknown) => unknown,
+        ) {
+          if (++consumers === 2) queued.release();
+          return previous.then(resolve, reject);
+        },
+      };
+    }
+    return previous;
+  };
+  const pending: Promise<Response>[] = [];
   try {
     const one = request(
       path,
@@ -234,7 +257,8 @@ test('reserved upload publishes exactly once under concurrent PUTs', async (root
       bodies[0],
       'application/octet-stream',
     );
-    await started;
+    pending.push(one);
+    await watchdog(started, 'first reserved publisher opens its private part');
     const two = request(
       path,
       user.access_token!,
@@ -242,19 +266,26 @@ test('reserved upload publishes exactly once under concurrent PUTs', async (root
       bodies[1],
       'application/octet-stream',
     );
-    await Promise.race([
-      two,
-      new Promise<void>((resolve) => timer = setTimeout(resolve, 100)),
-    ]);
+    pending.push(two);
+    await watchdog(
+      queued.wait,
+      'second reserved publisher awaits its held predecessor',
+    );
     release();
     responses = await Promise.all([one, two]);
   } finally {
     release();
-    clearTimeout(timer);
+    await Promise.allSettled(pending);
+    Map.prototype.get = get;
     Deno.open = open;
     Deno.create = create;
   }
   const statuses = responses.map((response) => response.status);
+  assertEquals(
+    statuses,
+    [200, 409],
+    'held first publisher retains its reservation',
+  );
   const results = await Promise.all(
     responses.map((response) => response.json()),
   );
