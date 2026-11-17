@@ -16,7 +16,7 @@
 // per-destination loop performs on the ladder: the make_leave/send_leave
 // dance against the inviter first, then any server named in the
 // stripped state. No silent local-only fallback. The durable truth is
-// the invite row (the 4b outbox has no intent kind); the candidate
+// the local prejoin job, separate from display; the candidate
 // progress is in-memory — a restart resumes from the first candidate
 // (the inviter, always a correct first retry).
 //
@@ -73,12 +73,27 @@ import { domainOf, toWire } from './pdu.ts';
 import { prejoinState, validatePrejoin } from './prejoin.ts';
 import {
   beginPrejoinLeave,
+  prejoinLeaveActive,
   prejoinResult,
   savePrejoinResult,
+  settleSupersededPrejoin,
   visiblePrejoin,
 } from '#engine/server/prejoin.ts';
 import { performKnockAttempt } from './knocks.ts';
 import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
+import {
+  beginPrejoinJob,
+  createPrejoinJob,
+  type PrejoinJob,
+  prejoinJob,
+  prejoinJobId,
+  prejoinJobs,
+  type PrejoinWork,
+  prejoinWorkOf,
+  retractPrejoinKnock,
+  supersedePrejoinKnocks,
+  updatePrejoinJob,
+} from '#engine/server/prejoin-jobs.ts';
 import type {
   IntentJob,
   ReviewableIntentProvider,
@@ -458,48 +473,8 @@ async function performOutboundInvite(
 
 // --- INVITEE ---------------------------------------------------------------
 
-export type StoredInvite = {
-  kind: 'invite' | 'knock';
-  revision: number;
-  candidates: string[];
-  expiresMs: number | null;
-  leaveJson: string | null;
-  localLeaveJson: string | null;
-  roomId: string;
-  userId: string;
-  eventId: string;
-  roomVersion: string;
-  eventJson: string;
-  inviteRoomState: string;
-  origin: string;
-  receivedMs: number;
-  status: string;
-  seq: number;
-};
-
-// deno-lint-ignore no-explicit-any
-export function inviteOf(row: any): StoredInvite {
-  return {
-    kind: row.kind,
-    revision: Number(row.revision),
-    candidates: JSON.parse(String(row.candidates)),
-    expiresMs: row.expires_ms === null ? null : Number(row.expires_ms),
-    leaveJson: row.leave_json === null ? null : String(row.leave_json),
-    localLeaveJson: row.local_leave_json == null
-      ? null
-      : String(row.local_leave_json),
-    roomId: String(row.room_id),
-    userId: String(row.user_id),
-    eventId: String(row.event_id),
-    roomVersion: String(row.room_version),
-    eventJson: String(row.event_json),
-    inviteRoomState: String(row.invite_room_state),
-    origin: String(row.origin),
-    receivedMs: Number(row.received_ms),
-    status: String(row.status),
-    seq: Number(row.seq),
-  };
-}
+export type StoredInvite = PrejoinWork;
+export const inviteOf = prejoinWorkOf;
 
 export async function inviteFor(
   roomId: string,
@@ -744,6 +719,7 @@ export async function receiveInvite(
         );
         await applyInvitePush(tx, roomId, eventId, seq, publication, now);
         await recordMembershipOperation(tx, roomId, target);
+        await supersedePrejoinKnocks(tx, roomId, target);
         return await finish();
       });
     }));
@@ -770,8 +746,8 @@ export function candidatesOf(invite: StoredInvite, self: string): string[] {
 }
 
 // POST /rooms/#roomId/leave on a federation_invites room: local effect
-// at once (the row goes 'rejecting') — the intent itself is durable in
-// the row; the sender's loop performs the dance.
+// at once (the display goes 'rejecting'). The same transaction retains the
+// exact independent local job; the sender's loop performs the dance.
 export async function rejectInviteRemote(
   roomId: string,
   userId: string,
@@ -840,6 +816,11 @@ export async function rejectInviteRemote(
         ],
       );
       await recordMembershipOperation(tx, roomId, userId);
+      const [pending] = await tx.query(
+        'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+        [roomId, userId],
+      );
+      await createPrejoinJob(tx, inviteOf(pending));
       return candidatesOf(invite, deps.self);
     });
   });
@@ -1040,70 +1021,43 @@ export async function sendRemoteLeave(
 
 async function performRejectInvite(
   destination: string,
-  invite: StoredInvite,
+  job: PrejoinJob,
   deps: InviteDeps,
 ): Promise<void> {
+  const invite = job.work;
+  const releaseJob = beginPrejoinJob(deps.store, invite);
+  if (releaseJob === null) return;
   const release = beginPrejoinLeave(deps.store, invite.roomId, invite.userId);
   try {
     const signed = invite.leaveJson === null
       ? await prepareRemoteLeave(destination, invite, deps)
       : JSON.parse(invite.leaveJson) as Pdu;
     const active = await inviteTransition(deps.server, async (tx) => {
-      const rows = await tx.query(
-        `SELECT 1 FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND revision=? AND status='rejecting' AND ${
-          visiblePrejoin('p')
-        }`,
-        [invite.roomId, invite.userId, invite.revision],
-      );
-      if (!rows.length) return false;
-      await tx.execute(
-        'UPDATE prejoin_memberships SET leave_json=? WHERE room_id=? AND user_id=? AND revision=?',
-        [JSON.stringify(signed), invite.roomId, invite.userId, invite.revision],
-      );
-      return true;
+      return await updatePrejoinJob(tx, job, {
+        ...invite,
+        leaveJson: JSON.stringify(signed),
+      }, false);
     });
     if (!active) return;
     await sendRemoteLeave(destination, signed, invite.roomVersion, deps);
-    const { roomId, userId } = invite;
     // delivered: the row becomes 'rejected', and the SIGNED LEAVE becomes
     // the rendered event — the out-of-band leave section of /sync carries
     // it in state.events (stage 5; SyncLeftFrom wants a leave event there)
     await inviteTransition(deps.server, async (tx) => {
-      const pending = await tx.query(
-        `SELECT (${
-          visiblePrejoin('p')
-        }) AS visible FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND revision=? AND status='rejecting'`,
-        [roomId, userId, invite.eventId, invite.revision],
-      );
-      if (pending.length === 0) return;
-      await recordMembershipOperation(tx, roomId, userId);
-      if (Number(pending[0].visible) !== 1) {
-        await tx.execute(
-          "UPDATE prejoin_memberships SET status='rejected' WHERE room_id=? AND user_id=?",
-          [roomId, userId],
-        );
-        await recordMembershipOperation(tx, roomId, userId);
-        return;
-      }
-      const seq = await nextEventSeq(tx);
-      await tx.execute(
-        "UPDATE prejoin_memberships SET status = 'rejected', event_json = ?, seq = ? WHERE room_id = ? AND user_id = ?",
-        [
-          JSON.stringify(signed as unknown as Record<string, unknown>),
-          seq,
-          roomId,
-          userId,
-        ],
-      );
-      await recordMembershipOperation(tx, roomId, userId);
+      await updatePrejoinJob(tx, active, {
+        ...active.work,
+        status: 'rejected',
+        eventJson: JSON.stringify(signed),
+      }, true);
     });
   } finally {
     release();
+    releaseJob();
   }
 }
 
-// The sender's intent provider: 'rejecting' invites are the durable
-// intents; the current candidate index is in-memory (a restart resumes
+// The sender's intent provider reads local jobs, never imported display rows.
+// The current candidate index is in-memory (a restart resumes
 // from the inviter). One job per destination per wake.
 export function inviteIntentProvider(
   deps: InviteDeps,
@@ -1152,34 +1106,46 @@ export function inviteIntentProvider(
         failed: async () => {},
       } satisfies IntentJob;
     }
-    const rows = await server.query(
-      `SELECT * FROM prejoin_memberships p WHERE status IN ('rejecting','attempting') AND ${
-        visiblePrejoin('p')
-      } ORDER BY received_ms`,
-      [],
-    );
-    for (const raw of rows) {
-      const invite = inviteOf(raw);
+    for (const pending of await prejoinJobs(server)) {
+      if (
+        !prejoinLeaveActive(
+          deps.store,
+          pending.work.roomId,
+          pending.work.userId,
+        )
+      ) {
+        await inviteTransition(
+          server,
+          (tx) =>
+            settleSupersededPrejoin(
+              tx,
+              pending.work.roomId,
+              pending.work.userId,
+            ),
+        );
+      }
+      const job = await prejoinJob(server, pending.id);
+      if (!job || !['rejecting', 'attempting'].includes(job.work.status)) {
+        continue;
+      }
+      const invite = job.work;
       if (await deps.store.roomRetired(invite.roomId)) continue;
       if (invite.expiresMs !== null && Date.now() >= invite.expiresMs) {
         await inviteTransition(
           server,
           async (tx) => {
-            await recordMembershipOperation(tx, invite.roomId, invite.userId);
-            const changed = await tx.execute(
-              'UPDATE prejoin_memberships SET status=? WHERE room_id=? AND user_id=? AND revision=? AND status=?',
-              [
-                invite.status === 'attempting'
+            return await updatePrejoinJob(
+              tx,
+              job,
+              {
+                ...invite,
+                status: invite.status === 'attempting'
                   ? 'failed-attempt'
                   : 'failed-retract',
-                invite.roomId,
-                invite.userId,
-                invite.revision,
-                invite.status,
-              ],
+              },
+              true,
+              false,
             );
-            await recordMembershipOperation(tx, invite.roomId, invite.userId);
-            return changed;
           },
         );
         continue;
@@ -1187,15 +1153,14 @@ export function inviteIntentProvider(
       if (invite.status === 'attempting') {
         if (invite.origin !== destination) continue;
         return {
-          id: 'knock-attempt:' +
-            JSON.stringify([invite.roomId, invite.userId, invite.revision]),
+          id: 'knock-attempt:' + job.id,
           run: async () => {
             await performKnockAttempt(invite, deps);
           },
           failed: async () => {},
         } satisfies IntentJob;
       }
-      const key = JSON.stringify([invite.roomId, invite.userId]);
+      const key = job.id;
       const candidates = candidatesOf(invite, deps.self);
       const at = candidateIndex(invite, progress);
       if (candidates[at] !== destination) continue;
@@ -1204,11 +1169,10 @@ export function inviteIntentProvider(
         run: async () => {
           const active = await withProjectionLock(async () => {
             if (await deps.store.roomRetired(invite.roomId)) return false;
-            const current = await inviteFor(invite.roomId, invite.userId, deps);
-            return current?.eventId === invite.eventId &&
-              current.revision === invite.revision &&
-              current.status === 'rejecting' &&
-              candidateIndex(current, progress) === at;
+            const current = await prejoinJob(server, job.id);
+            return current?.work.revision === invite.revision &&
+              current.work.status === 'rejecting' &&
+              candidateIndex(current.work, progress) === at;
           });
           if (!active) return;
           await admit(server, destination, {
@@ -1216,18 +1180,13 @@ export function inviteIntentProvider(
             user: invite.userId,
             what: 'intent:reject-invite',
           });
-          await performRejectInvite(destination, invite, deps);
-          await withProjectionLock(async () => {
-            const current = await inviteFor(invite.roomId, invite.userId, deps);
-            if (current === null || current.eventId === invite.eventId) {
-              progress.delete(key);
-            }
-          });
+          await performRejectInvite(destination, job, deps);
+          progress.delete(key);
         },
         failed: () =>
           withProjectionLock(async () => {
             if (await deps.store.roomRetired(invite.roomId)) return;
-            const current = await inviteFor(invite.roomId, invite.userId, deps);
+            const current = (await prejoinJob(server, job.id))?.work;
             if (
               current?.eventId !== invite.eventId ||
               current.revision !== invite.revision ||
@@ -1262,7 +1221,7 @@ function candidateIndex(
   invite: StoredInvite,
   progress: InviteProgress,
 ): number {
-  const entry = progress.get(JSON.stringify([invite.roomId, invite.userId]));
+  const entry = progress.get(prejoinJobId(invite));
   return entry?.eventId === invite.eventId ? entry.at : 0;
 }
 
@@ -1272,11 +1231,7 @@ export async function listRejectIntents(
   self: string,
   progress: InviteProgress = new Map(),
 ): Promise<ReviewIntent[]> {
-  const rows = await server.query(
-    `SELECT * FROM prejoin_memberships p WHERE status IN ('rejecting','failed-retract','attempting','failed-attempt') AND ${
-      visiblePrejoin('p')
-    } ORDER BY received_ms, room_id, user_id`,
-  );
+  const jobs = await prejoinJobs(server);
   const outgoing = await server.query(
     'SELECT * FROM federation_invite_attempts ORDER BY added_ms,event_id',
   );
@@ -1296,9 +1251,9 @@ export async function listRejectIntents(
   }));
   return [
     ...invites,
-    ...rows.map((raw) => {
-      const invite = inviteOf(raw);
-      const key = JSON.stringify([invite.roomId, invite.userId]);
+    ...jobs.map((job) => {
+      const invite = job.work;
+      const key = job.id;
       const candidates = candidatesOf(invite, self);
       const at = candidateIndex(invite, progress);
       return {
@@ -1346,32 +1301,29 @@ export async function pruneRejectIntents(
         continue;
       }
       if (row.id.startsWith('knock-attempt:')) {
-        const [roomId, userId] = JSON.parse(
-          row.id.slice('knock-attempt:'.length),
-        ) as [string, string];
+        const job = await prejoinJob(tx, row.id.slice('knock-attempt:'.length));
+        if (!job) continue;
         // An ambiguous remote side effect cannot be discarded by prune. Turn
         // it into explicit compensating leave work, visible locally at once.
-        await recordMembershipOperation(tx, roomId, userId);
-        count += await tx.execute(
-          "UPDATE prejoin_memberships SET status='rejecting',revision=revision+1,seq=?,expires_ms=? WHERE room_id=? AND user_id=? AND status IN ('attempting','failed-attempt')",
-          [
-            await nextEventSeq(tx),
+        count += Number(
+          await retractPrejoinKnock(
+            tx,
+            job,
             Date.now() + config().federation.refusedmillihours * 3600,
-            roomId,
-            userId,
-          ],
+          ),
         );
-        await recordMembershipOperation(tx, roomId, userId);
         continue;
       }
       const key = row.id.slice('reject-invite:'.length);
-      const [roomId, userId] = JSON.parse(key) as [string, string];
-      await recordMembershipOperation(tx, roomId, userId);
-      count += await tx.execute(
-        "UPDATE prejoin_memberships SET status = 'rejected', revision=revision+1, seq = ? WHERE room_id = ? AND user_id = ? AND status IN ('rejecting','failed-retract')",
-        [await nextEventSeq(tx), roomId, userId],
+      const job = await prejoinJob(tx, key);
+      if (!job) continue;
+      count += Number(
+        (await updatePrejoinJob(tx, job, {
+          ...job.work,
+          status: 'rejected',
+          revision: job.work.revision + 1,
+        }, true)) !== null,
       );
-      await recordMembershipOperation(tx, roomId, userId);
       progress.delete(key);
     }
     return count;
@@ -1395,20 +1347,24 @@ export async function retryPrejoinIntents(
       const prefix = row.id.startsWith('knock-attempt:')
         ? 'knock-attempt:'
         : 'reject-invite:';
-      const [roomId, userId] = JSON.parse(row.id.slice(prefix.length)) as [
-        string,
-        string,
-      ];
-      await recordMembershipOperation(tx, roomId, userId);
-      await tx.execute(
-        "UPDATE prejoin_memberships SET status=CASE WHEN status='failed-attempt' THEN 'attempting' ELSE 'rejecting' END,revision=revision+1,expires_ms=? WHERE room_id=? AND user_id=? AND status IN ('failed-attempt','failed-retract')",
-        [
-          Date.now() + config().federation.refusedmillihours * 3600,
-          roomId,
-          userId,
-        ],
+      const job = await prejoinJob(tx, row.id.slice(prefix.length));
+      if (
+        !job || !['failed-attempt', 'failed-retract'].includes(job.work.status)
+      ) continue;
+      await updatePrejoinJob(
+        tx,
+        job,
+        {
+          ...job.work,
+          status: job.work.status === 'failed-attempt'
+            ? 'attempting'
+            : 'rejecting',
+          revision: job.work.revision + 1,
+          expiresMs: Date.now() + config().federation.refusedmillihours * 3600,
+        },
+        true,
+        false,
       );
-      await recordMembershipOperation(tx, roomId, userId);
     }
   });
 }

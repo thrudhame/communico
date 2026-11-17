@@ -9,7 +9,6 @@ import { roomEdges } from '#engine/room/edges.ts';
 import { advance } from '#engine/store/watermark.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { removeNotificationFacts } from '#engine/server/notifications.ts';
-import { visiblePrejoin } from './prejoin.ts';
 import {
   roomProjectionSources,
   roomSource,
@@ -64,9 +63,7 @@ export async function finishRoomRemoval(
       );
     }
     const pending = await tx.query(
-      `SELECT room_id,user_id,status FROM prejoin_memberships p WHERE room_id=? AND status IN ('rejecting','attempting','failed-attempt','failed-retract') AND ${
-        visiblePrejoin('p')
-      }`,
+      "SELECT job_id,status FROM prejoin_jobs WHERE room_id=? AND status IN ('rejecting','attempting','failed-attempt','failed-retract')",
       [roomId],
     );
     for (const row of pending) {
@@ -75,7 +72,7 @@ export async function finishRoomRemoval(
           (String(row.status).includes('attempt')
               ? 'knock-attempt:'
               : 'reject-invite:') +
-            JSON.stringify([String(row.room_id), String(row.user_id)])
+            String(row.job_id)
       );
       if (intent === undefined) {
         throw new Error('room removal missing prejoin delivery owner');
@@ -118,6 +115,7 @@ export async function finishRoomRemoval(
         'directory',
         'visibility',
         'prejoin_memberships',
+        'prejoin_jobs',
         'federation_invite_attempts',
         'rooms',
       ]

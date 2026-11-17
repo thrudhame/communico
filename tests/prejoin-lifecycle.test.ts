@@ -9,9 +9,11 @@ import {
   inviteIntentProvider,
   markInviteJoined,
   prejoinDeparture,
+  prepareRemoteLeave,
   pruneRejectIntents,
   receiveInvite,
   rejectInviteRemote,
+  retryPrejoinIntents,
 } from '#engine/federation/invites.ts';
 import { knockRemote, performKnockAttempt } from '#engine/federation/knocks.ts';
 import { toWire } from '#engine/federation/pdu.ts';
@@ -22,6 +24,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
 import { membershipOperations } from '#engine/server/membership-operations.ts';
 import { bindMembershipDisplay } from '#engine/server/membership-selection.ts';
+import { prejoinJobs, updatePrejoinJob } from '#engine/server/prejoin-jobs.ts';
 import { verify } from '#engine/room/verify.ts';
 import {
   eventStreamMax,
@@ -246,6 +249,203 @@ async function fixture(
     resetCaCertsForTests();
   }
 }
+
+// Start at the authenticated display owner's boundary, not at wire admission.
+// The later invitation was authored independently during the partition, so it
+// does not observe the local pending rejection or acquire its delivery job.
+async function concurrentInvite(
+  f: Parameters<Parameters<typeof fixture>[0]>[0],
+) {
+  await f.publishInvite();
+  return await f.deps.server.tx(async (tx) => {
+    const [latest] = await tx.query(
+      "SELECT * FROM domain_operations WHERE kind='membership' AND source='edge' ORDER BY sequence DESC LIMIT 1",
+    );
+    assert(latest);
+    const imported = canonicalJson(['home', 'home-store', latest.stream, 1]);
+    await tx.execute(
+      'UPDATE domain_operations SET operation_id=?,source=?,incarnation=?,sequence=1,context_json=? WHERE operation_id=?',
+      [imported, 'home', 'home-store', '[]', String(latest.operation_id)],
+    );
+    const operations = await membershipOperations(tx, f.user);
+    const selected = operations.filter((op) => op.operationId === imported);
+    await bindMembershipDisplay(tx, f.roomId, f.user, selected);
+    return JSON.parse(selected[0].payload).eventId as string;
+  });
+}
+
+Deno.test('prejoin jobs: a held rejection stays reviewable after concurrent foreign display replacement', () =>
+  fixture(async (f) => {
+    await f.reject('old local work');
+    const provider = inviteIntentProvider(f.deps);
+    const job = await provider(f.deps.server, f.origin);
+    assert(job);
+    const running = job.run();
+    try {
+      await f.sent;
+      const frozen = structuredClone(f.sentLeave());
+      const selected = await concurrentInvite(f);
+      assertEquals(
+        (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
+        selected,
+      );
+      const reviewed = await provider.review();
+      assert(
+        reviewed.some((row) =>
+          row.intent.what === 'reject-invite' && row.intent.user_id === f.user
+        ),
+        'display replacement erased the still-owned rejection job from review',
+      );
+      assertEquals(f.sentLeave(), frozen, 'prepared wire bytes changed');
+    } finally {
+      f.finish();
+      await running;
+    }
+  }, 'edge'));
+
+Deno.test('prejoin jobs: held completion authors only its prepared source successor, not the concurrent display', () =>
+  fixture(async (f) => {
+    await f.reject('old local work');
+    const prior = await inviteFor(f.roomId, f.user, f.deps);
+    assert(prior);
+    const job = await inviteIntentProvider(f.deps)(f.deps.server, f.origin);
+    assert(job);
+    const running = job.run();
+    let selected: string | null = null;
+    try {
+      await f.sent;
+      selected = await concurrentInvite(f);
+    } finally {
+      f.finish();
+      await running;
+    }
+    assert(selected);
+    const facts = await f.deps.server.tx((tx) =>
+      membershipOperations(tx, f.user)
+    );
+    const completed = facts.filter((op) =>
+      op.source === 'edge' && JSON.parse(op.payload).status === 'rejected'
+    );
+    assertEquals(
+      completed.length,
+      1,
+      'the acknowledged old job lost its completion',
+    );
+    assertEquals(JSON.parse(completed[0].payload).eventId, prior.eventId);
+    assertEquals(
+      completed[0].context.some((dot) => dot.source === 'home'),
+      false,
+    );
+    assertEquals(
+      (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
+      selected,
+    );
+    await f.reopen();
+    assertEquals(
+      (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
+      selected,
+    );
+  }, 'edge'));
+
+Deno.test('prejoin jobs: make_leave prepared later follows the resident current invitation', () =>
+  fixture(async (f) => {
+    await f.reject('old local work');
+    const prior = await inviteFor(f.roomId, f.user, f.deps);
+    assert(prior?.localLeaveJson);
+    const original = JSON.parse(prior.localLeaveJson) as Pdu;
+    const selected = await concurrentInvite(f);
+    const prepared = await prepareRemoteLeave(f.origin, prior, f.deps);
+    assertEquals(original.prev_events.includes(selected), false);
+    assert(
+      prepared.prev_events.includes(selected),
+      'ordinary make_leave uses the resident current DAG cut',
+    );
+    assert(
+      prepared.auth_events.includes(selected),
+      'current membership authorizes the fresh remote leave',
+    );
+    assertEquals(prepared.content.reason, 'old local work');
+    assertEquals(
+      (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
+      selected,
+    );
+  }, 'edge'));
+
+Deno.test('prejoin jobs: cold reopen retains local rejection independently of concurrent foreign display', () =>
+  fixture(async (f) => {
+    await f.reject('durable old work');
+    const selected = await concurrentInvite(f);
+    await f.reopen();
+    const provider = inviteIntentProvider(f.deps);
+    const job = await provider(f.deps.server, f.origin);
+    assert(
+      job,
+      'cold display replacement erased the local delivery obligation',
+    );
+    assertEquals(
+      (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
+      selected,
+    );
+    await assertRejects(() => admitLocalJoin(f.deps.store, f.roomId, f.user));
+    const running = job.run();
+    try {
+      await f.sent;
+      assert(f.sentLeave()?.prev_events.includes(selected));
+    } finally {
+      f.finish();
+      await running;
+    }
+    assertEquals(await prejoinJobs(f.deps.server), []);
+    assertEquals(
+      (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
+      selected,
+    );
+    await f.reopen();
+    assertEquals(await prejoinJobs(f.deps.server), []);
+    assertEquals(await provider(f.deps.server, f.origin), null);
+  }, 'edge'));
+
+Deno.test('prejoin jobs: expiry retry and prune retain exact old work without borrowing foreign display', () =>
+  fixture(async (f) => {
+    await f.reject('old owned reason');
+    const selected = await concurrentInvite(f);
+    const [original] = await prejoinJobs(f.deps.server);
+    assert(original);
+    await f.deps.server.tx((tx) =>
+      updatePrejoinJob(tx, original, {
+        ...original.work,
+        expiresMs: Date.now() - 1,
+      }, false)
+    );
+    const provider = inviteIntentProvider(f.deps);
+    assertEquals(await provider(f.deps.server, f.origin), null);
+    const [expired] = await prejoinJobs(f.deps.server);
+    assertEquals(expired.id, original.id);
+    assertEquals(expired.work.status, 'failed-retract');
+    assertEquals((await provider.review()).length, 1);
+    await retryPrejoinIntents(f.deps.server, 'test', f.origin);
+    const [retried] = await prejoinJobs(f.deps.server);
+    assertEquals(retried.id, original.id);
+    assertEquals(retried.work.eventId, original.work.eventId);
+    assertEquals(retried.work.localLeaveJson, original.work.localLeaveJson);
+    assertEquals(retried.work.status, 'rejecting');
+    assertEquals(
+      retried.source?.context.some((dot) => dot.source === 'home'),
+      false,
+    );
+    assertEquals(
+      (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
+      selected,
+    );
+    await assertRejects(() => admitLocalJoin(f.deps.store, f.roomId, f.user));
+    assertEquals(await pruneRejectIntents(f.deps.server, 'test', f.origin), 1);
+    assertEquals(await prejoinJobs(f.deps.server), []);
+    assertEquals(
+      (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
+      selected,
+    );
+    await admitLocalJoin(f.deps.store, f.roomId, f.user);
+  }, 'edge'));
 
 Deno.test('prejoin: typed source intent retains overwritten invitation and departure across cold reopen', () =>
   fixture(async (f) => {

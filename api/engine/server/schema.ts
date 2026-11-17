@@ -19,6 +19,10 @@ import {
 import { RECOVERY_SQL } from '#engine/server/recovery.ts';
 import { MEMBERSHIP_OPERATIONS_SQL } from '#engine/server/prejoin.ts';
 import {
+  migratePrejoinJobs,
+  PREJOIN_JOBS_SQL,
+} from '#engine/server/prejoin-jobs.ts';
+import {
   RECEIPT_ADMISSION_SQL,
   RECEIPT_GRAPH_SQL,
 } from '#engine/server/receipt-frontier.ts';
@@ -437,7 +441,7 @@ CREATE INDEX event_index_local_participation ON event_index(room,local_join_user
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 50,
+  version: 51,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -494,6 +498,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(
       'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
     );
+    await db.exec(PREJOIN_JOBS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -572,5 +577,9 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
       conn.exec(
         'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
       ),
+    50: async (conn) => {
+      await conn.exec(PREJOIN_JOBS_SQL);
+      await migratePrejoinJobs(conn);
+    },
   },
 };

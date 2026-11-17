@@ -48,7 +48,7 @@ async function assertNoJoinCleanup(
     return eventStreamTx(server, async (tx) => {
       if (!inflight) await settleSupersededPrejoin(tx, roomId, userId);
       const rows = await tx.query(
-        "SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? AND (? IS NULL OR event_id<>? OR join_json IS NULL OR leave_json IS NOT NULL) UNION ALL SELECT 1 FROM prejoin_memberships WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract')",
+        "SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? AND (? IS NULL OR event_id<>? OR join_json IS NULL OR leave_json IS NOT NULL) UNION ALL SELECT 1 FROM prejoin_jobs WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract')",
         [roomId, userId, continuing, continuing, roomId, userId],
       );
       return { inflight, rows };

@@ -1,5 +1,9 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { dirname } from '@std/path';
+import {
+  createPrejoinJob,
+  prejoinWorkOf,
+} from '#engine/server/prejoin-jobs.ts';
 import { X509Certificate } from 'node:crypto';
 import { closeApp, openApp } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
@@ -202,6 +206,13 @@ for (const boundary of ['unlink', 'server cleanup'] as const) {
            VALUES(?,'@rejecting:test','$rejecting','11','{}','[]','waiting.test',1,'rejecting',1)`,
           [g.roomId],
         );
+        await app.server.tx(async (tx) => {
+          const [row] = await tx.query(
+            "SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id='@rejecting:test'",
+            [g.roomId],
+          );
+          await createPrejoinJob(tx, prejoinWorkOf(row));
+        });
       }
       await app.server.execute(
         "INSERT INTO outbox(room,pos,destination,event,state,added_ms) VALUES(?,900,'remote.test',?,'pending',1)",
@@ -342,6 +353,15 @@ for (const race of ['new rejection', 'candidate failover'] as const) {
         ],
       );
       const wakes: string[] = [];
+      if (race === 'candidate failover') {
+        await app.server.tx(async (tx) => {
+          const [row] = await tx.query(
+            'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+            [g.roomId, user],
+          );
+          await createPrejoinJob(tx, prejoinWorkOf(row));
+        });
+      }
       const deps = {
         store: app.store,
         server: app.server,

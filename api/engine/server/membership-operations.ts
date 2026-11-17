@@ -221,11 +221,75 @@ export async function recordMembershipOperation(
       });
     }
   }
+  const operation = await appendMembershipFact(
+    conn,
+    { source: source.node, incarnation: source.incarnation },
+    stream,
+    semanticKey,
+    payload,
+    [...vector.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([, dot]) => dot),
+  );
+  await conn.execute('DELETE FROM domain_frontiers WHERE semantic_key=?', [
+    semanticKey,
+  ]);
+  await conn.execute(
+    'INSERT INTO domain_frontiers(semantic_key,operation_id) VALUES(?,?)',
+    [semanticKey, operation.operationId],
+  );
+  await conn.execute(
+    'UPDATE prejoin_memberships SET source_binding=NULL WHERE room_id=? AND user_id=?',
+    [roomId, userId],
+  );
+}
+
+/** Complete exact prepared work using its source cut, never current display.
+ * Allocating a later source sequence does not observe newly imported facts. */
+export async function appendMembershipSuccessor(
+  conn: Conn,
+  prior: MembershipOperation,
+  state: MembershipState,
+): Promise<MembershipOperation> {
+  if (
+    prior.semanticKey !==
+      canonicalJson(['membership', state.roomId, state.userId])
+  ) throw new Error('membership successor changed identity');
+  const context = prior.context.filter((dot) =>
+    dot.source !== prior.source || dot.incarnation !== prior.incarnation
+  );
+  context.push({
+    source: prior.source,
+    incarnation: prior.incarnation,
+    sequence: prior.sequence,
+  });
+  context.sort((a, b) => {
+    const left = canonicalJson([a.source, a.incarnation]);
+    const right = canonicalJson([b.source, b.incarnation]);
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  return await appendMembershipFact(
+    conn,
+    prior,
+    prior.stream,
+    prior.semanticKey,
+    canonicalJson(state),
+    context,
+  );
+}
+
+async function appendMembershipFact(
+  conn: Conn,
+  source: Pick<MembershipOperation, 'source' | 'incarnation'>,
+  stream: string,
+  semanticKey: string,
+  payload: string,
+  context: RegisterDot[],
+): Promise<MembershipOperation> {
   const counter = 'domain:' +
-    canonicalJson([source.node, source.incarnation, stream]);
+    canonicalJson([source.source, source.incarnation, stream]);
   const [observed] = await conn.query(
     "SELECT MAX(sequence) AS sequence FROM domain_operations WHERE kind='membership' AND source=? AND incarnation=? AND stream=?",
-    [source.node, source.incarnation, stream],
+    [source.source, source.incarnation, stream],
   );
   await conn.execute(
     'INSERT INTO counters(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=MAX(value,excluded.value)',
@@ -240,7 +304,7 @@ export async function recordMembershipOperation(
   );
   const sequence = Number(allocated.value);
   const operationId = canonicalJson([
-    source.node,
+    source.source,
     source.incarnation,
     stream,
     sequence,
@@ -249,29 +313,28 @@ export async function recordMembershipOperation(
     'INSERT INTO domain_operations(operation_id,source,incarnation,stream,sequence,semantic_key,kind,context_json,payload_hash,payload_json,applied) VALUES(?,?,?,?,?,?,?,?,?,?,1)',
     [
       operationId,
-      source.node,
+      source.source,
       source.incarnation,
       stream,
       sequence,
       semanticKey,
       'membership',
-      canonicalJson(
-        [...vector.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
-          .map(([, dot]) => dot),
-      ),
+      canonicalJson(context),
       createHash('sha256').update(payload).digest('hex'),
       payload,
     ],
   );
-  await conn.execute('DELETE FROM domain_frontiers WHERE semantic_key=?', [
+  return {
+    ...source,
+    source: source.source,
+    incarnation: source.incarnation,
+    sequence,
+    operationId,
+    stream,
     semanticKey,
-  ]);
-  await conn.execute(
-    'INSERT INTO domain_frontiers(semantic_key,operation_id) VALUES(?,?)',
-    [semanticKey, operationId],
-  );
-  await conn.execute(
-    'UPDATE prejoin_memberships SET source_binding=NULL WHERE room_id=? AND user_id=?',
-    [roomId, userId],
-  );
+    kind: 'membership',
+    context,
+    payloadHash: createHash('sha256').update(payload).digest('hex'),
+    payload,
+  };
 }

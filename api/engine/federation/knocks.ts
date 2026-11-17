@@ -19,7 +19,13 @@ import {
 } from './invites.ts';
 import { toWire } from './pdu.ts';
 import { validatePrejoin } from './prejoin.ts';
-import { visiblePrejoin } from '#engine/server/prejoin.ts';
+import {
+  beginPrejoinJob,
+  createPrejoinJob,
+  prejoinJob,
+  prejoinJobId,
+  updatePrejoinJob,
+} from '#engine/server/prejoin-jobs.ts';
 import { knockResponse, membershipTemplate } from './responses.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
@@ -31,14 +37,37 @@ export async function performKnockAttempt(
   attempt: StoredInvite,
   deps: InviteDeps,
 ): Promise<boolean> {
+  const release = beginPrejoinJob(deps.store, attempt);
+  if (release === null) return false;
+  try {
+    return await performKnockJob(attempt, deps);
+  } finally {
+    release();
+  }
+}
+
+async function performKnockJob(
+  attempt: StoredInvite,
+  deps: InviteDeps,
+): Promise<boolean> {
   const current = await inviteFor(attempt.roomId, attempt.userId, deps);
+  const job = await prejoinJob(deps.server, prejoinJobId(attempt));
   if (
-    current?.revision !== attempt.revision ||
-    current.eventId !== attempt.eventId || current.kind !== 'knock' ||
+    !job || job.work.revision !== attempt.revision ||
     await deps.store.roomRetired(attempt.roomId)
   ) return false;
-  if (current.status === 'pending') return true;
-  if (current.status !== 'attempting') return false;
+  const sameDisplay = () =>
+    current?.revision === attempt.revision &&
+    current.eventId === attempt.eventId && current.kind === 'knock';
+  if (job.work.status === 'pending') {
+    return sameDisplay() && current?.status === 'pending';
+  }
+  if (job.work.status !== 'attempting') return false;
+  const [published] = await deps.server.query(
+    'SELECT seq FROM memberships WHERE room=? AND user=?',
+    [attempt.roomId, attempt.userId],
+  );
+  if (published && Number(published.seq) >= attempt.seq) return false;
   const pdu = JSON.parse(attempt.eventJson) as Pdu;
   const answer = await federationRequest(deps.server, deps.signer, {
     room: { store: deps.store, id: attempt.roomId, participation: true },
@@ -64,27 +93,24 @@ export async function performKnockAttempt(
         if (await deps.store.roomRetired(attempt.roomId)) return false;
         await assertRoomAcl(deps.store, attempt.roomId, deps.self);
         return await eventStreamTx(deps.server, async (tx) => {
-          const rows = await tx.query(
-            `SELECT status FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND revision=? AND event_id=? AND kind='knock' AND ${
-              visiblePrejoin('p')
-            }`,
-            [attempt.roomId, attempt.userId, attempt.revision, attempt.eventId],
+          const changed = await updatePrejoinJob(tx, job, {
+            ...job.work,
+            status: 'pending',
+            inviteRoomState: JSON.stringify(stripped),
+            expiresMs: null,
+          }, true);
+          const [display] = await tx.query(
+            'SELECT event_id,revision,status,seq FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+            [attempt.roomId, attempt.userId],
           );
-          if (rows[0]?.status === 'pending') return true;
-          if (rows[0]?.status !== 'attempting') return false;
-          await recordMembershipOperation(tx, attempt.roomId, attempt.userId);
-          await tx.execute(
-            "UPDATE prejoin_memberships SET status='pending', invite_room_state=?, seq=?, expires_ms=NULL WHERE room_id=? AND user_id=? AND revision=?",
-            [
-              JSON.stringify(stripped),
-              await nextEventSeq(tx),
-              attempt.roomId,
-              attempt.userId,
-              attempt.revision,
-            ],
+          const [published] = await tx.query(
+            'SELECT seq FROM memberships WHERE room=? AND user=?',
+            [attempt.roomId, attempt.userId],
           );
-          await recordMembershipOperation(tx, attempt.roomId, attempt.userId);
-          return true;
+          return changed !== null && display?.event_id === attempt.eventId &&
+            Number(display.revision) === attempt.revision &&
+            display.status === 'pending' &&
+            (!published || Number(published.seq) < Number(display.seq));
         });
       }),
   );
@@ -230,7 +256,7 @@ export async function knockRemote(
                 ],
               );
               await recordMembershipOperation(tx, roomId, userId);
-              return {
+              const attempt = {
                 roomId,
                 userId,
                 eventId: String(pdu.event_id),
@@ -248,6 +274,8 @@ export async function knockRemote(
                 leaveJson: null,
                 localLeaveJson: null,
               } satisfies StoredInvite;
+              await createPrejoinJob(tx, attempt);
+              return attempt;
             });
           });
         },
