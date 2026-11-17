@@ -89,6 +89,7 @@ export async function finishRoomRemoval(
         'event_index',
         'receipt_dag_edges',
         'receipt_dag_nodes',
+        'receipt_membership_events',
         'feed',
         'memberships',
         'redactions',
