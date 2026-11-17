@@ -6,6 +6,11 @@ import {
   theApp,
 } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
+import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
+import { deviceListService } from '#engine/federation/device-lists.ts';
+import { eduState } from '#engine/federation/edus.ts';
+import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
+import { startFakeServer } from './federation/fake-server.ts';
 import { serveDeps } from '#engine/federation/context.ts';
 import { serveEvent } from '#engine/federation/serve.ts';
 import { admit } from '#engine/federation/gate.ts';
@@ -1167,6 +1172,216 @@ Deno.test('a received newer user scope is unavailable rather than absent before 
     await owner.requireScope('public:@alice:logical.test');
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('replica device composition borrows the node service and binds its dispatcher before ingress', async () => {
+  const f = await fixture();
+  const peer = await startFakeServer({
+    ourKeyDoc: () =>
+      Promise.resolve({
+        server_name: f.node.server,
+        verify_keys: { [f.node.keyId]: { key: f.node.publicKey } },
+      }),
+  });
+  let bound = false, stopped = false, recovered = '';
+  let theDispatcher: unknown;
+  let signatures = 0;
+  const guardedSigner = {
+    ...f.node.signer(),
+    sign: () => {
+      signatures++;
+      return Promise.reject(new Error('guarded device request refused'));
+    },
+  };
+  let recovery: ReturnType<typeof deviceListService> | undefined;
+  const deviceLists = {
+    recover: (user: string) => {
+      recovered = user;
+      return Promise.resolve();
+    },
+    start: () => {
+      throw new Error('borrower must not start the owner service');
+    },
+    stop: () => {
+      stopped = true;
+      return Promise.resolve();
+    },
+  };
+  const sender = {
+    wake() {},
+    contactHook: () => () => {},
+    setIntentProvider() {},
+    stop: () => {
+      stopped = true;
+      return Promise.resolve();
+    },
+    snapshot: () => [],
+    reviewIntents: () => Promise.resolve(null),
+    pruneIntents: () => Promise.resolve(null),
+  };
+  try {
+    const inventory = await f.directoryExport();
+    assert(inventory);
+    const journal = await f.journal();
+    await journal.receive('home', [inventory]);
+    assert(await (await f.directoryOwner()).apply(journal, inventory));
+    const tenant = await f.edgeTenant();
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const directory = await f.directoryOwner();
+    const app = await openReplicaApp(f.edgeStore(), tenant, {
+      requireScope: (scope, absent) => directory.requireScope(scope, absent),
+      prepareRoomScope: (room, absent) =>
+        directory.prepareRoomScope(room, absent),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: guardedSigner,
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+      deviceLists: (edus) => {
+        theDispatcher = edus;
+        edus.register('m.device_list_update', () => Promise.resolve(), true);
+        bound = true;
+        return Promise.resolve(deviceLists);
+      },
+      sender: () => Promise.resolve(sender),
+      ingress: (deps) => {
+        assert(bound);
+        assertEquals(deps.edus, theDispatcher);
+        return Promise.resolve({
+          stage: () => Promise.resolve(),
+          receive: () => Promise.resolve({ status: 200, body: {} }),
+        });
+      },
+    });
+    // The application exposes exactly the borrowed object, not a second worker.
+    assertEquals(app.deviceLists, deviceLists);
+    assertEquals(app.sender, sender);
+    await app.deviceLists.recover('@remote:elsewhere.test');
+    assertEquals(recovered, '@remote:elsewhere.test');
+    const remote = '@remote:' + peer.name;
+    for (
+      const request of [
+        () =>
+          queryKeys('@alice:logical.test', { device_keys: { [remote]: [] } }),
+        () =>
+          claimKeys('@alice:logical.test', {
+            one_time_keys: { [remote]: { D: 'signed_curve25519' } },
+          }),
+      ]
+    ) {
+      await assertRejects(request, Error, 'guarded device request refused');
+    }
+    assertEquals(signatures, 2);
+    assertEquals(recovered, remote);
+    // Remote snapshot recovery uses the same explicit signer, never tenant's
+    // raw identity. No wire request reaches the peer after authority refusal.
+    await app.server.tx((tx) =>
+      reconcileDeviceRoom(
+        tx,
+        '!devices:logical.test',
+        ['@alice:logical.test', remote],
+        false,
+        null,
+        1,
+        ['logical.test'],
+      )
+    );
+    recovery = deviceListService(
+      app.server,
+      tenant,
+      eduState(app.server, tenant.serverName, app.store),
+      guardedSigner,
+    );
+    await assertRejects(
+      () => recovery!.recover(remote),
+      Error,
+      'guarded device request refused',
+    );
+    assertEquals(signatures, 3);
+    assertEquals(peer.requests.length, 0);
+    // Owner stops the real recovery service before closing its shared store.
+    await recovery.stop();
+    recovery = undefined;
+    await closeApp();
+    assertEquals(stopped, false);
+  } finally {
+    await recovery?.stop();
+    await closeApp();
+    await peer.close();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('replica service acquisition releases a failed composition before retrying with a new dispatcher', async () => {
+  const f = await fixture();
+  let dispatcher: unknown, releases = 0, attempts = 0;
+  try {
+    const tenant = await f.edgeTenant();
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const service = {
+      recover: () => Promise.resolve(),
+      start() {},
+      stop: () => Promise.resolve(),
+    };
+    const access = {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+      deviceLists: (edus: ReturnType<typeof eduState>) => {
+        if (dispatcher && dispatcher !== edus) {
+          throw new Error('old dispatcher retained');
+        }
+        dispatcher = edus;
+        return Promise.resolve(service);
+      },
+      ingress: () => {
+        if (++attempts === 1) {
+          return Promise.reject(new Error('composition interrupted'));
+        }
+        return Promise.resolve({
+          stage: () => Promise.resolve(),
+          receive: () => Promise.resolve({ status: 200, body: {} }),
+        });
+      },
+      releaseServices: async () => {
+        await service.stop();
+        dispatcher = undefined;
+        releases++;
+      },
+    };
+    await assertRejects(
+      () => openReplicaApp(f.edgeStore(), tenant, access),
+      Error,
+      'composition interrupted',
+    );
+    assertEquals(
+      releases,
+      1,
+      'runtime owner must release services after failed acquisition',
+    );
+    const app = await openReplicaApp(f.edgeStore(), tenant, access);
+    assertEquals(app.deviceLists, service);
+    assertEquals(attempts, 2);
+    await closeApp();
+    assertEquals(
+      releases,
+      1,
+      'borrower does not stop successfully acquired owner services',
+    );
+  } finally {
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
   }
 });
 

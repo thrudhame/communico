@@ -138,6 +138,16 @@ const F2_REGISTERS: readonly Rule[] = [
   ),
 ];
 
+// B4 composes the existing device and remote-key owners. Client requests use
+// the authenticated ingress scope, independently of federation being enabled.
+const F2_DEVICES: readonly Rule[] = [
+  route('GET', /^\/_matrix\/client\/v3\/devices(?:\/[^/]+)?$/, 'auth'),
+  ...['upload', 'query', 'claim', 'signatures/upload'].map((name) =>
+    route('POST', literal('/_matrix/client/v3/keys/' + name), 'auth')
+  ),
+  route('POST', literal(f + 'user/keys/claim'), 'public'),
+];
+
 const HOME_SERVICES = new Set([
   'recovery',
   'link-client',
@@ -164,7 +174,10 @@ export function capabilities(role: string, phase = 'f1') {
   return {
     role,
     service(name: string): boolean {
-      if (role === 'facade' && phase === 'f2' && name === 'deactivation') {
+      if (
+        role === 'facade' && phase === 'f2' &&
+        ['deactivation', 'device-lists', 'federation-sender'].includes(name)
+      ) {
         return true;
       }
       return services.has(name);
@@ -174,7 +187,7 @@ export function capabilities(role: string, phase = 'f1') {
       const path = new URL(request.url).pathname;
       const matching =
         (phase === 'f2'
-          ? [...F1_PUBLIC, ...F2_AUTH, ...F2_REGISTERS]
+          ? [...F1_PUBLIC, ...F2_AUTH, ...F2_REGISTERS, ...F2_DEVICES]
           : F1_PUBLIC)
           .filter((rule) => rule.path.test(path));
       const rule = matching.find((rule) => rule.method === request.method);

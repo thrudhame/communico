@@ -34,7 +34,12 @@ import { acceptIngressEdu } from './ingress-edus.ts';
 import type { TransactionDeps } from '#engine/federation/transactions.ts';
 import type { Stream } from './protocol.ts';
 import { EgressOwner } from './egress.ts';
-import { dispatchBatch } from '#engine/federation/sender.ts';
+import {
+  dispatchBatch,
+  type Sender,
+  startSender,
+} from '#engine/federation/sender.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
 import {
   AccountSnapshots,
   exportSessionAuthority,
@@ -44,6 +49,12 @@ import { AuthLinkHealth, FacadeAuth } from './auth.ts';
 import { startDeactivationWork } from '#engine/deactivation.ts';
 import { startProfileFanout } from '#engine/profile-fanout.ts';
 import { DomainOperations } from './domain.ts';
+import { DeviceOperations, isKeyStream } from './devices.ts';
+import type { EduState } from '#engine/federation/edus.ts';
+import {
+  type DeviceListService,
+  deviceListService,
+} from '#engine/federation/device-lists.ts';
 
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
@@ -80,8 +91,12 @@ export async function openFacadeRuntime(
   let inbox: ReturnType<typeof startInboxWorker> | undefined;
   let mailbox: Mailbox | undefined;
   let authExports: ReturnType<typeof startAccountExports> | undefined;
+  let keyExports: ReturnType<typeof startAccountExports> | undefined;
   let deactivation: ReturnType<typeof startDeactivationWork> | undefined;
   let profileFanout: ReturnType<typeof startProfileFanout> | undefined;
+  let deviceLists: DeviceListService | undefined;
+  let deviceEdus: EduState | undefined;
+  let sender: Sender | undefined;
   const pairings = () => {
     if (!node) {
       throw new LinkError(
@@ -215,6 +230,26 @@ export async function openFacadeRuntime(
           ),
       });
     }
+    if (settings.phase === 'f2' && !keyExports) {
+      keyExports = startAccountExports({
+        store,
+        tenant,
+        pollseconds: settings.pollseconds,
+        users: async () =>
+          (await (await store.tenant(identity.server)).query(
+            'SELECT localpart FROM account_auth_snapshots ORDER BY localpart',
+          )).map((row) => String(row.localpart)),
+        emit: async (localpart) =>
+          await new DeviceOperations(store, tenant!, await pairings(), node!)
+            .exportChanges(localpart),
+        changed: () => notices.changed(),
+        failed: (error) =>
+          console.error(
+            'facade key export:',
+            error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
+          ),
+      });
+    }
   };
   const acceptConfigured = async () => {
     // A file bootstraps a binding, not a second live registry. Restart never
@@ -258,6 +293,9 @@ export async function openFacadeRuntime(
           : settings.phase === 'f2' && stream.stream.startsWith('domain:')
           ? await new DomainOperations(store, tenant!, await pairings(), node!)
             .apply(journal, stream)
+          : settings.phase === 'f2' && isKeyStream(stream)
+          ? await new DeviceOperations(store, tenant!, await pairings(), node!)
+            .apply(journal, stream)
           : stream.stream === 'directory'
           ? await new DirectoryReplicas(
             server,
@@ -292,6 +330,13 @@ export async function openFacadeRuntime(
     });
   }
   let closed: Promise<void> | undefined;
+  const releaseServices = async () => {
+    await sender?.stop();
+    sender = undefined;
+    await deviceLists?.stop();
+    deviceLists = undefined;
+    deviceEdus = undefined;
+  };
   return {
     store,
     server,
@@ -303,6 +348,63 @@ export async function openFacadeRuntime(
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),
     prepareSigner: async () => (await keyOwner()).prepareSigner(),
+    releaseServices,
+    async sender() {
+      if (!caps.service('federation-sender') || !config().federation.enabled) {
+        return undefined;
+      }
+      const signer = (await keyOwner()).requestSigner();
+      const binding = await pairings();
+      if (closed || !tenant) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'facade sender requires active enrollment',
+        );
+      }
+      if (sender) return sender;
+      const owner = new EgressOwner(
+        server,
+        binding,
+        (envelope) => dispatchBatch(server, signer, envelope),
+      );
+      sender = startSender({
+        store,
+        signer,
+        dispatch: (envelope) => owner.dispatchLocal(envelope),
+        onDelivered: () => projectTenant(store, identity.server),
+      });
+      return sender;
+    },
+    async deviceLists(edus: EduState) {
+      if (!caps.service('device-lists')) return undefined;
+      const signer = (await keyOwner()).requestSigner();
+      if (closed) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'facade is closing');
+      }
+      if (deviceLists) {
+        if (deviceEdus !== edus) {
+          throw new Error(
+            'facade device service already bound to another EDU state',
+          );
+        }
+        return deviceLists;
+      }
+      const granted = tenant;
+      if (!granted) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'device service requires enrollment',
+        );
+      }
+      // No await after the binding check: one runtime owns one service and its
+      // dispatcher, including recovery flights which must stop before the store.
+      deviceLists = deviceListService(server, granted, edus, signer);
+      deviceEdus = edus;
+      deviceLists.start();
+      return deviceLists;
+    },
     async profileFanout(localpart?: string) {
       if (!profileFanout) {
         throw new MatrixError(
@@ -325,7 +427,13 @@ export async function openFacadeRuntime(
         transaction,
         scopeState: (scope) => directory.scopeState(scope),
         acceptEdu: (origin, raw) =>
-          acceptIngressEdu(origin, identity.server, raw, transaction.edus),
+          acceptIngressEdu(
+            origin,
+            identity.server,
+            raw,
+            transaction.edus,
+            settings.phase,
+          ),
         changed: () => notices.changed(),
       });
       return mailbox;
@@ -462,9 +570,11 @@ export async function openFacadeRuntime(
     close: () =>
       closed ??= (async () => {
         await authExports?.close();
+        await keyExports?.close();
         await inbox?.close();
         await deactivation?.close();
         await profileFanout?.close();
+        await releaseServices();
         await store.close();
       })(),
   };

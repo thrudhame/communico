@@ -22,9 +22,17 @@ import { loadNode } from '#engine/facade/identity.ts';
 import { redact } from '#engine/eventid.ts';
 import {
   b64decode,
+  b64encodeStd,
+  exportPublicKeyRaw,
+  generateSigningKeypair,
   importPublicKeyFromRaw,
+  signJson,
   verifyJson,
 } from '#engine/signing-primitives.js';
+import { config } from '#engine/config.ts';
+import { validateUpload } from '#engine/tenant/e2ee.ts';
+import { deviceIdentity } from '#engine/tenant/txns.ts';
+import { publicDeviceValues } from '#engine/tenant/device-operations.ts';
 
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   setConfigForTests({ server: { name: 'logical.test' } });
@@ -696,6 +704,45 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     );
     assertEquals(sent.status, 200);
     const eventId = sent.body.event_id;
+    const user = '@outside:logical.test';
+    const homePair = await generateSigningKeypair() as CryptoKeyPair;
+    const homePublic = b64encodeStd(
+      await exportPublicKeyRaw(homePair.publicKey),
+    );
+    const homeDevice = registered.body.device_id;
+    const homeKey = {
+      user_id: user,
+      device_id: homeDevice,
+      algorithms: [],
+      keys: { ['ed25519:' + homeDevice]: homePublic },
+    };
+    await signJson(homeKey, user, 'ed25519:' + homeDevice, homePair.privateKey);
+    assertEquals(
+      (await api(
+        'keys/upload',
+        { device_keys: homeKey },
+        registered.body.access_token,
+      )).status,
+      200,
+    );
+    const masterPair = await generateSigningKeypair() as CryptoKeyPair;
+    const masterPublic = b64encodeStd(
+      await exportPublicKeyRaw(masterPair.publicKey),
+    );
+    const master = {
+      user_id: user,
+      usage: ['master'],
+      keys: { ['ed25519:' + masterPublic]: masterPublic },
+    };
+    await signJson(master, user, 'ed25519:' + homeDevice, homePair.privateKey);
+    assertEquals(
+      (await api(
+        'keys/device_signing/upload',
+        { master_key: master },
+        registered.body.access_token,
+      )).status,
+      200,
+    );
     const paired = await adminCall(tls.dir + '/home-auth.sock', 'facade/pair', {
       node: 'edge_a',
       url: `https://127.0.0.1:${linkPort}`,
@@ -725,12 +772,54 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           scope.scope === 'room:' + roomId && scope.ready
         );
     });
+    // Observe actual received/applied semantic streams, not merely the older F1
+    // public snapshot. No test calls the link exporters or importers directly.
+    await until(async () => {
+      const state =
+        (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status'))
+          .body.result;
+      return ['devices:', 'signing:', 'signatures:'].every((prefix) =>
+        state.streams.some((stream: {
+          stream: string;
+          received: { sequence: number; hash: string };
+          applied: { sequence: number; hash: string };
+        }) =>
+          stream.stream === prefix + user && stream.applied.sequence > 0 &&
+          stream.received.sequence === stream.applied.sequence &&
+          stream.received.hash === stream.applied.hash
+        )
+      );
+    });
     await home.stop();
     await edge.stop();
     const offline = await open('facade');
     let token: string;
+    const edgePair = await generateSigningKeypair() as CryptoKeyPair;
+    const edgePublic = b64encodeStd(
+      await exportPublicKeyRaw(edgePair.publicKey),
+    );
+    const signedByEdge = structuredClone(master);
+    await signJson(
+      signedByEdge,
+      user,
+      'ed25519:outside-device',
+      edgePair.privateKey,
+    );
     try {
       const tenant = await openTenant(offline, 'logical.test');
+      assertEquals(
+        (await (await offline.tenant('logical.test')).tx((conn) =>
+          publicDeviceValues(conn, 'outside')
+        )).find((op) => op.deviceId === homeDevice)
+          ?.value?.keys,
+        homeKey,
+      );
+      // The owner view, unlike F1's snapshot reader, includes the held identity
+      // and its exact original pre-enrollment device-signature basis.
+      const heldMaster = await tenant.tx((tx) =>
+        tx.crossSigning.state('outside')
+      );
+      assertEquals(JSON.parse(heldMaster.master!.json), master);
       assertEquals(
         await getAccountData(tenant, 'outside', '', 'm.secret_storage.key'),
         { ciphertext: 'home-baseline', fraction: 0.125 },
@@ -749,6 +838,40 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
         refresh: true,
       });
       token = session.accessToken;
+      const edgeKey = {
+        user_id: user,
+        device_id: 'outside-device',
+        algorithms: [],
+        keys: { 'ed25519:outside-device': edgePublic },
+      };
+      await signJson(
+        edgeKey,
+        user,
+        'ed25519:outside-device',
+        edgePair.privateKey,
+      );
+      const device = await deviceIdentity(tenant, 'outside', 'outside-device');
+      await tenant.tx((tx) =>
+        tx.e2ee.upload(
+          device,
+          validateUpload(
+            { device_keys: edgeKey },
+            user,
+            device.deviceId,
+            config().e2ee,
+          ),
+        )
+      );
+      assertEquals(
+        await tenant.tx((tx) =>
+          tx.keySignatures.upload('outside', user, [{
+            user,
+            id: masterPublic,
+            json: signedByEdge,
+          }])
+        ),
+        { failures: {} },
+      );
     } finally {
       await offline.close();
     }
@@ -967,6 +1090,21 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       } catch {
         return false;
       }
+    });
+    // A normal home Matrix consumer observes the cold-recovered facade overlay.
+    // Its device basis requires the independent authority and device streams;
+    // stream startup or a stored unverified signature alone cannot satisfy this.
+    await until(async () => {
+      const query = await api(
+        'keys/query',
+        { device_keys: { [user]: [] } },
+        registered.body.access_token,
+      );
+      return query.status === 200 && query.body.master_keys?.[user]
+            ?.signatures?.[user]?.['ed25519:outside-device'] ===
+          (signedByEdge as typeof signedByEdge & {
+            signatures: Record<string, Record<string, string>>;
+          }).signatures[user]['ed25519:outside-device'];
     });
     const before =
       (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body

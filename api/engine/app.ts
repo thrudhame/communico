@@ -108,6 +108,9 @@ export type ReplicaAccess = {
   passwordLogin?(): Promise<boolean>;
   keys: KeyStore;
   signer: Signer;
+  deviceLists?(edus: EduState): Promise<DeviceListService | undefined>;
+  sender?(): Promise<Sender | undefined>;
+  releaseServices?(): Promise<void>;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
   profileFanout?(localpart?: string): Promise<ProfileFanoutFailure[]>;
 };
@@ -218,10 +221,9 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
   }
 }
 
-/** Bind already-enrolled tenant/store capabilities to the ordinary read tree.
- * No owner-only service is constructed. Asking for one refuses at this common
- * service boundary, even if a future adapter accidentally bypasses route gates.
- * The caller retains the node/link lifecycle; closeApp drains its store as usual.
+/** Bind already-enrolled tenant/store capabilities to the ordinary endpoint tree.
+ * Only explicitly granted services are borrowed from the node lifecycle owner.
+ * Others refuse even if an adapter accidentally bypasses route gates.
  */
 export async function openReplicaApp(
   store: Store,
@@ -264,42 +266,55 @@ export async function openReplicaApp(
     );
   };
   const federationContacts = new PendingContacts(server);
-  const app: App = {
-    store,
-    server,
-    tenant,
-    federationKeys: replica.keys,
-    federationContacts,
-    federationEdus: eduState(server, tenant.serverName, store),
-    get federationIngress() {
-      return ingress;
-    },
-    sender: null,
-    replica,
-    profileFanout: replica.profileFanout
-      ? { drain: replica.profileFanout }
-      : undefined,
-    get deviceLists() {
-      return unavailable('device-lists');
-    },
-    get pushSender() {
-      return unavailable('push');
-    },
-    get media() {
-      return unavailable('media');
-    },
-    get delayedEvents() {
-      return unavailable('delayed');
-    },
-    close: () =>
-      drainResources([
-        () => federationContacts.close(),
-        () => store.close(),
-      ]),
-  };
-  const ingress = await replica.ingress?.(transactionDependencies(app));
-  current = app;
-  return app;
+  try {
+    const federationEdus = eduState(server, tenant.serverName, store);
+    const deviceLists = await replica.deviceLists?.(federationEdus);
+    const app: App = {
+      store,
+      server,
+      tenant,
+      federationKeys: replica.keys,
+      federationContacts,
+      federationEdus,
+      get federationIngress() {
+        return ingress;
+      },
+      sender: null,
+      replica,
+      profileFanout: replica.profileFanout
+        ? { drain: replica.profileFanout }
+        : undefined,
+      get deviceLists() {
+        return deviceLists ?? unavailable('device-lists');
+      },
+      get pushSender() {
+        return unavailable('push');
+      },
+      get media() {
+        return unavailable('media');
+      },
+      get delayedEvents() {
+        return unavailable('delayed');
+      },
+      close: () =>
+        drainResources([
+          () => federationContacts.close(),
+          () => store.close(),
+        ]),
+    };
+    const ingress = await replica.ingress?.(transactionDependencies(app));
+    app.sender = await replica.sender?.() ?? null;
+    current = app;
+    return app;
+  } catch (error) {
+    await drainResources([
+      () => federationContacts.close(),
+      async () => {
+        await replica.releaseServices?.();
+      },
+    ], [error]);
+    throw error;
+  }
 }
 
 /** The federation services of doltgres:main.ts's startSender() block:

@@ -167,7 +167,7 @@ Deno.test('one F1 capability manifest gates public requests before auth and excl
   });
 });
 
-Deno.test('F2 manifest enables delivered auth and registers without later capabilities', () => {
+Deno.test('F2 manifest enables delivered auth, registers and device keys without later capabilities', () => {
   const facade = capabilities('facade', 'f2');
   const request = (path: string, method: string) =>
     new Request('https://logical.test/_matrix/client/' + path, { method });
@@ -185,6 +185,12 @@ Deno.test('F2 manifest enables delivered auth and registers without later capabi
       ['v3/account/deactivate', 'POST'],
       ['v3/devices/target', 'DELETE'],
       ['v3/devices/target', 'PUT'],
+      ['v3/devices', 'GET'],
+      ['v3/devices/target', 'GET'],
+      ['v3/keys/upload', 'POST'],
+      ['v3/keys/query', 'POST'],
+      ['v3/keys/claim', 'POST'],
+      ['v3/keys/signatures/upload', 'POST'],
       ['v3/profile/%40alice%3Atest', 'GET'],
       ['v3/profile/%40alice%3Atest/displayname', 'GET'],
       ['v3/profile/%40alice%3Atest/org.test.field', 'PUT'],
@@ -221,8 +227,7 @@ Deno.test('F2 manifest enables delivered auth and registers without later capabi
     const [path, method] of [
       ['v3/sync', 'GET'],
       ['v3/createRoom', 'POST'],
-      ['v3/devices', 'GET'],
-      ['v3/keys/upload', 'POST'],
+      ['v3/keys/changes', 'GET'],
       ['v3/sendToDevice/m.test/txn', 'PUT'],
       ['v3/user/%40alice%3Atest/filter', 'POST'],
     ]
@@ -233,15 +238,29 @@ Deno.test('F2 manifest enables delivered auth and registers without later capabi
     405,
   );
   assertEquals(facade.service('deactivation'), true);
+  assertEquals(facade.service('device-lists'), true);
+  assertEquals(facade.service('federation-sender'), true);
+  assertEquals(
+    capabilities('facade', 'f1').service('federation-sender'),
+    false,
+  );
+  assertEquals(
+    facade.gate(
+      new Request(
+        'https://logical.test/_matrix/federation/v1/user/keys/claim',
+        { method: 'POST' },
+      ),
+      () => true,
+    ),
+    null,
+  );
   assertEquals(capabilities('facade', 'f1').service('deactivation'), false);
   for (
     const service of [
       'push',
       'delayed',
       'media',
-      'device-lists',
       'link-client',
-      'federation-sender',
     ]
   ) {
     assertEquals(facade.service(service), false);

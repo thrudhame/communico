@@ -5,10 +5,17 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { deleteDevice } from '#engine/tenant/devices.ts';
+import { appendImportedKeyNotice } from '#engine/tenant/changes.ts';
+import { recordTenantProjection } from '#engine/tenant/hooks.ts';
 import { deletePushersForToken } from '#engine/tenant/pushers.ts';
 import { deactivateUserRows } from '#engine/tenant/users.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
 import { authUnavailable } from '#engine/tenant/account-auth.ts';
+import {
+  legacySignatures,
+  type RemoteSignatureCuts,
+  retainLegacySignatures,
+} from '#engine/tenant/signature-bootstrap.ts';
 
 export const SESSION_AUTHORITY_SQL = `
 CREATE TABLE tenant_authority(singleton INTEGER PRIMARY KEY CHECK(singleton=1),node TEXT NOT NULL,incarnation TEXT NOT NULL,home_incarnation TEXT NOT NULL,edge_node TEXT NOT NULL,edge_incarnation TEXT NOT NULL);
@@ -84,12 +91,16 @@ export async function tenantAuthority(
 export async function activateTenantAuthority(
   conn: Conn,
   identity: AuthorityIdentity,
+  remoteSignatureCuts?: RemoteSignatureCuts,
 ): Promise<void> {
   const held = await tenantAuthority(conn);
   if (held && canonicalJson(held) !== canonicalJson(identity)) {
     ownerUnavailable();
   }
   if (!held) {
+    const signatures = identity.node === 'home'
+      ? await legacySignatures(conn, remoteSignatureCuts)
+      : [];
     await conn.execute('INSERT INTO tenant_authority VALUES(1,?,?,?,?,?)', [
       identity.node,
       identity.incarnation,
@@ -146,6 +157,7 @@ export async function activateTenantAuthority(
         }
       }
     }
+    await retainLegacySignatures(conn, signatures);
   }
 }
 
@@ -640,15 +652,35 @@ export async function installSessionAuthority(
       { node: identity.edgeNode, incarnation: identity.edgeIncarnation },
     ],
   });
+  const [beforeNews] = await conn.query(
+    "SELECT value FROM counters WHERE name='e2ee_changes'",
+  );
+  let changed = false, publicChanged = false;
+  const facts = new Map((await conn.query(
+    'SELECT id,payload FROM authority_facts WHERE localpart=?',
+    [localpart],
+  )).map((row) => [String(row.id), String(row.payload)]));
   for (const fact of view.facts) {
     const payload = canonicalJson(fact);
-    const [old] = await conn.query(
-      'SELECT payload FROM authority_facts WHERE id=?',
-      [fact.id],
-    );
-    if (old && old.payload !== payload) collision();
+    let old = facts.get(fact.id);
+    if (old === undefined) {
+      // IDs are global across accounts. Only new local facts need this lookup;
+      // retained immutable facts were already validated at their admission cut.
+      const [other] = await conn.query(
+        'SELECT payload FROM authority_facts WHERE id=?',
+        [fact.id],
+      );
+      if (other) old = String(other.payload);
+    }
+    if (old !== undefined) {
+      if (old !== payload) collision();
+      continue;
+    }
+    changed = true;
+    publicChanged ||= fact.kind === 'device' || fact.kind === 'delete' ||
+      fact.kind === 'deactivate';
     await conn.execute(
-      'INSERT INTO authority_facts VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING',
+      'INSERT INTO authority_facts VALUES(?,?,?,?,?,?,?)',
       [
         fact.id,
         fact.node,
@@ -659,33 +691,34 @@ export async function installSessionAuthority(
         payload,
       ],
     );
+    facts.set(fact.id, payload);
   }
+  const sessions = new Map((await conn.query(
+    'SELECT * FROM session_authority WHERE localpart=?',
+    [localpart],
+  )).map((row) => [String(row.hash), row]));
   for (const session of view.sessions) {
+    const old = sessions.get(session.hash) ?? (await conn.query(
+      'SELECT * FROM session_authority WHERE hash=?',
+      [session.hash],
+    ))[0];
     if (session.deviceId !== null) {
-      const [device] = await conn.query(
-        "SELECT payload FROM authority_facts WHERE id=? AND localpart=? AND kind='device'",
-        [session.deviceIncarnation, localpart],
-      );
+      const device = facts.get(session.deviceIncarnation!);
       if (!device) collision();
-      const fact = JSON.parse(String(device.payload)) as AuthorityFact;
+      const fact = JSON.parse(device) as AuthorityFact;
       if (
+        fact.kind !== 'device' ||
         fact.node !== session.node ||
         fact.incarnation !== session.incarnation ||
         fact.deviceId !== session.deviceId
       ) collision();
     }
     for (const barrier of session.barriers) {
+      const fact = facts.get(barrier);
       if (
-        !(await conn.query(
-          "SELECT id FROM authority_facts WHERE id=? AND localpart=? AND kind='barrier'",
-          [barrier, localpart],
-        )).length
+        !fact || (JSON.parse(fact) as AuthorityFact).kind !== 'barrier'
       ) collision();
     }
-    const [old] = await conn.query(
-      'SELECT * FROM session_authority WHERE hash=?',
-      [session.hash],
-    );
     const immutable = [
       session.node,
       session.incarnation,
@@ -737,27 +770,34 @@ export async function installSessionAuthority(
         ],
       );
     }
+    sessions.set(session.hash, {
+      hash: session.hash,
+      node: session.node,
+      incarnation: session.incarnation,
+      localpart,
+      device_id: session.deviceId,
+      device_incarnation: session.deviceIncarnation,
+      barriers: canonicalJson(session.barriers),
+      refresh: session.refresh ? 1 : 0,
+      access_hash: session.accessHash,
+      next_hash: session.nextHash,
+      revision: session.revision,
+    });
   }
-  for (
-    const row of await conn.query(
-      "SELECT payload FROM authority_facts WHERE localpart=? AND kind='delete'",
-      [localpart],
-    )
-  ) {
-    const deletion = JSON.parse(String(row.payload)) as AuthorityFact;
-    const [target] = await conn.query(
-      "SELECT payload FROM authority_facts WHERE id=? AND localpart=? AND kind='device'",
-      [deletion.target!, localpart],
-    );
+  for (const payload of facts.values()) {
+    const deletion = JSON.parse(payload) as AuthorityFact;
+    if (deletion.kind !== 'delete') continue;
+    const target = facts.get(deletion.target!);
     if (
       !target ||
-      (JSON.parse(String(target.payload)) as AuthorityFact).deviceId !==
+      (JSON.parse(target) as AuthorityFact).kind !== 'device' ||
+      (JSON.parse(target) as AuthorityFact).deviceId !==
         deletion.deviceId
     ) collision();
   }
   for (
     const mapping of await conn.query(
-      'SELECT * FROM authority_devices WHERE localpart=?',
+      'SELECT a.* FROM authority_devices a JOIN devices d ON d.localpart=a.localpart AND d.device_id=a.device_id WHERE a.localpart=?',
       [localpart],
     )
   ) {
@@ -825,6 +865,27 @@ export async function installSessionAuthority(
         }
         await conn.execute(`DELETE FROM ${table} WHERE token=?`, [hash]);
       }
+    }
+  }
+  if (changed) {
+    const [afterNews] = await conn.query(
+      "SELECT value FROM counters WHERE name='e2ee_changes'",
+    );
+    if (
+      publicChanged &&
+      Number(afterNews?.value ?? 0) === Number(beforeNews?.value ?? 0)
+    ) {
+      const [tenant] = await conn.query('SELECT server_name FROM tenant');
+      await appendImportedKeyNotice(
+        conn,
+        localpart,
+        '@' + localpart + ':' + tenant.server_name,
+        true,
+      );
+    } else {
+      // Local deletion/deactivation already retained its own key intent; all
+      // authority changes still need durable discovery for cancelled owner work.
+      await recordTenantProjection(conn);
     }
   }
 }

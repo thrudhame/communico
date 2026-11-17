@@ -1,6 +1,10 @@
 import type { Store } from '#engine/store/index.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
+import {
+  type TenantChangeSource,
+  tenantStreamCommitted,
+} from '#engine/tenant/streams.ts';
 
 // Durable truth is in the tenant transaction. This store-scoped index is only
 // a discovery hint, rebuilt by open/startup, so idle scans never open a tenant.
@@ -24,7 +28,9 @@ export async function recordTenantProjection(conn: Conn): Promise<number> {
   return value;
 }
 
-export async function pendingTenantProjection(db: Database): Promise<number> {
+export async function pendingTenantProjection(
+  db: Pick<Database, 'query'>,
+): Promise<number> {
   const rows = await db.query(
     "SELECT value FROM counters WHERE name='projection_pending'",
   );
@@ -75,5 +81,24 @@ export async function tenantCommitted(
     await project?.(store, tenant);
   } catch (error) {
     console.error('tenant projection pending for ' + tenant + ':', error);
+  }
+}
+
+/** Shared post-commit publication for normal tenant mutations and authenticated
+ * link imports. The durable revision is captured inside their owner transaction. */
+export async function tenantChangesCommitted(
+  store: Store,
+  tenant: string,
+  projectionRevision: number,
+  changed = false,
+  source: TenantChangeSource = 'local',
+  publicKeysChanged = false,
+): Promise<void> {
+  if (projectionRevision) {
+    rememberTenantProjection(store, tenant, projectionRevision);
+    await tenantCommitted(store, tenant);
+  }
+  if (changed || projectionRevision || publicKeysChanged) {
+    tenantStreamCommitted(store, tenant, source, publicKeysChanged);
   }
 }

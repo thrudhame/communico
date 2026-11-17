@@ -18,6 +18,19 @@ import { SESSION_AUTHORITY_SQL } from '#engine/tenant/session-authority.ts';
 import { UIA_BINDING_SQL } from '#engine/tenant/uia.ts';
 import { CLIENT_COMPLETION_SQL } from '#engine/tenant/completion.ts';
 import { PROFILE_FANOUT_SQL } from '#engine/tenant/profile-fanout.ts';
+import { KEY_CONSUMPTIONS_SQL } from '#engine/tenant/e2ee.ts';
+import { DEVICE_OPERATIONS_SQL } from '#engine/tenant/device-operations.ts';
+import {
+  DEVICE_CHECKPOINT_SQL,
+  DEVICE_STREAM_SQL,
+} from '#engine/tenant/device-stream.ts';
+import { SIGNING_OPERATIONS_SQL } from '#engine/tenant/signing-operations.ts';
+import { LINK_APPLICATIONS_SQL } from '#engine/tenant/link-applications.ts';
+import { SIGNATURE_OPERATIONS_SQL } from '#engine/tenant/signature-operations.ts';
+import {
+  DEVICE_CREATION_HISTORY_SQL,
+  KEY_BOOTSTRAP_SQL,
+} from '#engine/tenant/key-bootstrap.ts';
 import {
   BACKUP_ACCOUNTING_SQL,
   migrateBackupAccounting,
@@ -278,7 +291,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 29,
+  version: 38,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -306,8 +319,26 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(PROFILE_FANOUT_SQL);
     await db.exec(ACCOUNT_AUTH_PUBLICATION_SQL);
     await db.exec(CLIENT_COMPLETION_SQL);
+    await db.exec(KEY_CONSUMPTIONS_SQL);
+    await db.exec(DEVICE_OPERATIONS_SQL);
+    await db.exec(SIGNING_OPERATIONS_SQL);
+    await db.exec(LINK_APPLICATIONS_SQL);
+    await db.exec(SIGNATURE_OPERATIONS_SQL);
+    await db.exec(KEY_BOOTSTRAP_SQL);
+    await db.exec(DEVICE_CREATION_HISTORY_SQL);
+    await db.exec(DEVICE_STREAM_SQL);
+    await db.exec(DEVICE_CHECKPOINT_SQL);
   },
   migrations: {
+    37: (conn) => conn.exec(DEVICE_CHECKPOINT_SQL),
+    36: (conn) => conn.exec(DEVICE_STREAM_SQL),
+    35: (conn) => conn.exec(DEVICE_CREATION_HISTORY_SQL),
+    34: (conn) => conn.exec(KEY_BOOTSTRAP_SQL),
+    33: (conn) => conn.exec(SIGNATURE_OPERATIONS_SQL),
+    32: (conn) => conn.exec(LINK_APPLICATIONS_SQL),
+    31: (conn) => conn.exec(SIGNING_OPERATIONS_SQL),
+    30: (conn) => conn.exec(DEVICE_OPERATIONS_SQL),
+    29: (conn) => conn.exec(KEY_CONSUMPTIONS_SQL),
     28: (conn) => conn.exec(CLIENT_COMPLETION_SQL),
     27: (conn) => conn.exec(ACCOUNT_AUTH_PUBLICATION_SQL),
     26: (conn) => conn.exec(PROFILE_FANOUT_SQL),

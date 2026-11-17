@@ -70,6 +70,14 @@ const DEVICE_SUBSCRIPTIONS_SQL = `
 CREATE TABLE device_subscriptions(subject TEXT NOT NULL, destination TEXT NOT NULL, active INTEGER NOT NULL, epoch INTEGER NOT NULL, queued_stream INTEGER NOT NULL, sent_stream INTEGER, PRIMARY KEY(subject,destination));
 `;
 
+const DEVICE_PUBLICATIONS_SQL = `
+CREATE TABLE device_publications(subject TEXT NOT NULL,destination TEXT NOT NULL,epoch INTEGER NOT NULL,stream_id INTEGER NOT NULL,source TEXT NOT NULL,content TEXT NOT NULL,sent INTEGER NOT NULL,PRIMARY KEY(source,destination));
+CREATE UNIQUE INDEX device_publications_identity ON device_publications(subject,destination,epoch,stream_id) WHERE epoch>0;
+CREATE TABLE device_publication_predecessors(subject TEXT NOT NULL,destination TEXT NOT NULL,epoch INTEGER NOT NULL,stream_id INTEGER NOT NULL,previous_id INTEGER NOT NULL,PRIMARY KEY(subject,destination,epoch,stream_id,previous_id));
+CREATE INDEX device_publication_successors ON device_publication_predecessors(subject,destination,epoch,previous_id);
+CREATE TABLE device_publication_frontier(subject TEXT NOT NULL,destination TEXT NOT NULL,epoch INTEGER NOT NULL,stream_id INTEGER NOT NULL,PRIMARY KEY(subject,destination,epoch,stream_id));
+`;
+
 export const SERVER_SCHEMA_SQL = `
 -- Derived (S11/S12): rebuilt only by roll-forward replaying the rooms'
 -- change logs, keyed by (room, pos) so a replay changes nothing.
@@ -416,7 +424,7 @@ const FEDERATION_TXNS_RECEIVED_SQL =
   'CREATE INDEX federation_txns_received ON federation_txns(received_ms)';
 
 export const serverSchema: SchemaProvider = {
-  version: 42,
+  version: 43,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -461,6 +469,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FEDERATION_TXNS_RECEIVED_SQL);
     await db.exec(RECEIPT_GRAPH_SQL);
     await db.exec(RECEIPT_ADMISSION_SQL);
+    await db.exec(DEVICE_PUBLICATIONS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -514,6 +523,17 @@ export const serverSchema: SchemaProvider = {
       await conn.execute(
         "DELETE FROM watermarks WHERE source LIKE 'receipt-graph:%'",
       );
+    },
+    42: async (conn) => {
+      await conn.exec(DEVICE_PUBLICATIONS_SQL);
+      // The old scalar describes only the old serial chain's anchor. Preserve
+      // frozen bytes and exact pending identities, without inventing their
+      // lost subscription epochs or treating sent_stream as a global ACK.
+      await conn.exec(`
+INSERT INTO device_publication_frontier SELECT subject,destination,epoch,queued_stream FROM device_subscriptions;
+INSERT INTO device_publications SELECT json_extract(payload,'$.user_id'),destination,0,json_extract(payload,'$.stream_id'),source,payload,0 FROM edu_outbox WHERE edu_type='m.device_list_update';
+INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destination,p.epoch,p.stream_id,j.value FROM device_publications p,json_each(p.content,'$.prev_id') j;
+`);
     },
   },
 };
