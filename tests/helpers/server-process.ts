@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
+import { childDiagnostics } from './child-diagnostics.ts';
 
 export const pause = (ms: number) =>
   new Promise<void>((r) => setTimeout(r, ms));
@@ -50,6 +51,7 @@ export async function serverProcess(
       options.grace ?? 10
     }\n[store]\ndir="${dir}/store"\n[media]\nroot="${dir}/media"\n[admin]\nsocket="${socket}"\n[federation]\nenabled=false\n`,
   );
+  const diagnostics = await childDiagnostics();
   const child = new Deno.Command(Deno.execPath(), {
     args: options.exitBarrier || options.fatal
       ? [
@@ -87,8 +89,14 @@ export async function serverProcess(
   };
   const output = Promise.all([
     child.status,
-    collect(child.stdout, (s) => stdout += s),
-    collect(child.stderr, (s) => stderr += s),
+    collect(child.stdout, (s) => {
+      stdout += s;
+      diagnostics.stdout(s);
+    }),
+    collect(child.stderr, (s) => {
+      stderr += s;
+      diagnostics.stderr(s);
+    }),
   ]).then(([status]) => {
     ended = true;
     return { ...status, stdout, stderr };
@@ -131,7 +139,18 @@ export async function serverProcess(
     await dispose();
     throw error;
   }
-  return { dir, socket, config, port, child, output, api, waitLog, dispose };
+  return {
+    dir,
+    socket,
+    config,
+    port,
+    child,
+    output,
+    api,
+    waitLog,
+    dispose,
+    diagnostics,
+  };
 }
 
 export async function partialRequest(
