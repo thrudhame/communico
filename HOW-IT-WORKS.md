@@ -282,8 +282,11 @@ the next projection or startup rolls forward from its watermark.
 
 Each room has one store-lifetime projection capture owner. Independent rooms
 prepare immutable room facts outside the global mutation queue. The existing
-500-change page bounds capture, not writer ownership: uncontended changes batch,
-but queued writer demand ends the turn at the next complete change. A caller's
+500-change page bounds capture, extending only to finish its final event/effect
+unit. Uncontended units batch, but queued writer demand ends the turn after a
+complete event and its accepted membership, redaction and delivery effects.
+Policy inputs belong to that turn; its committed prefix reconciles once before
+the next queued writer runs. A caller's
 room capability and head are captured at admission, before waiting for an earlier
 room owner; later writes cannot enlarge that queued caller's obligation. Application rechecks both
 watermarks and the original room capability's incarnation before writing.
