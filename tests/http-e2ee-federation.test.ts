@@ -6,7 +6,7 @@ import { config, setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { wireKey } from '#tests/fixtures/e2ee-wire.ts';
-import { watchdog } from '#tests/support/ordering.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
 
 type Json = Record<string, unknown>;
 type KeyResponse = {
@@ -485,37 +485,91 @@ suite.test('the same deadline bounds admission and discovery before any consumin
   const query = server.query;
   try {
     for (const stage of ['admission', 'discovery']) {
-      let delayed = false;
+      const entered = latch(), release = latch();
       let peerReads = 0;
+      const schedule = globalThis.setTimeout;
+      const then = Promise.prototype.then;
+      const phases: Promise<unknown>[] = [];
+      let expire: (() => void) | undefined;
+      // Join the actual non-cancellable primitives observed by abortable, not
+      // an arbitrary event-loop turn after the public response has returned.
+      Promise.prototype.then = function (
+        this: Promise<unknown>,
+        fulfilled,
+        rejected,
+      ) {
+        const caller = new Error().stack?.split('\n')[2];
+        if (caller?.includes('/api/engine/net/abort.ts:')) {
+          phases.push(then.call(this, () => undefined, () => undefined));
+        }
+        return then.call(this, fulfilled, rejected);
+      } as typeof Promise.prototype.then;
+      globalThis.setTimeout = ((
+        handler: (...args: unknown[]) => void,
+        ms?: number,
+        ...args: unknown[]
+      ) => {
+        const caller = new Error().stack?.split('\n')[2];
+        if (ms !== 100 || !caller?.includes('/api/engine/client/e2ee.ts:')) {
+          return schedule(handler, ms, ...args);
+        }
+        assertEquals(expire, undefined, 'one total client deadline');
+        expire = () => handler(...args);
+        const id = schedule(() => undefined, 0);
+        clearTimeout(id);
+        return id;
+      }) as typeof setTimeout;
       server.query = async function (sql, values) {
         const target = stage === 'admission'
           ? sql === 'SELECT pattern FROM federation_blocks'
           : sql.includes('FROM federation_peers WHERE name = ?') &&
             ++peerReads === 2;
         if (target) {
-          delayed = true;
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          entered.release();
+          await release.wait;
         }
         return await query.call(this, sql, values);
       };
-      const started = performance.now();
-      const result = await post(a.access_token!, 'claim', {
-        timeout: 100,
-        one_time_keys: { ['@remote:' + fake.name]: { D: 'curve25519' } },
-      });
-      assert(delayed, 'did not exercise ' + stage);
-      assert(
-        performance.now() - started < 350,
-        stage + ' ignored the deadline',
-      );
-      assert(result.failures[fake.name]);
-      await new Promise((resolve) => setTimeout(resolve, 600));
-      assertEquals(
-        fake.requests.length,
-        0,
-        'late discovery started a consuming dial',
-      );
-      server.query = query;
+      let pending: Promise<KeyResponse> | undefined;
+      try {
+        pending = post(a.access_token!, 'claim', {
+          timeout: 100,
+          one_time_keys: { ['@remote:' + fake.name]: { D: 'curve25519' } },
+        });
+        void pending.catch(() => undefined);
+        await watchdog(entered.wait, stage + ' reaches its held query');
+        assert(expire, 'configured total deadline must be registered');
+        assert(phases.length > 0, 'observe actual abortable phase ownership');
+        expire();
+        const result = await watchdog(
+          pending,
+          stage + ' honors deadline while query remains held',
+        );
+        assert(result.failures[fake.name]);
+        release.release();
+        await watchdog(
+          Promise.allSettled(phases),
+          stage + ' late primitives drain',
+        );
+        assertEquals(
+          fake.requests.length,
+          0,
+          'late discovery started a consuming dial',
+        );
+      } finally {
+        release.release();
+        expire?.();
+        try {
+          await watchdog(
+            Promise.allSettled([...(pending ? [pending] : []), ...phases]),
+            stage + ' owned tasks drain',
+          );
+        } finally {
+          server.query = query;
+          globalThis.setTimeout = schedule;
+          Promise.prototype.then = then;
+        }
+      }
     }
   } finally {
     server.query = query;
