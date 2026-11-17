@@ -248,7 +248,7 @@ Deno.test('projection work: queued callers never inherit later room writes', asy
   });
 });
 
-Deno.test('projection work: a live backlog releases the writer between its existing pages', async () => {
+Deno.test('projection work: a live backlog releases the writer between complete capture pages', async () => {
   await withStore(async (store) => {
     const backlog = await genesis(store, { roomId: '!capture-backlog:test' });
     await bobJoins(backlog);
@@ -264,7 +264,14 @@ Deno.test('projection work: a live backlog releases the writer between its exist
       }, backlog.signer);
     }
     const changes = await backlog.room.tx((tx) => tx.changes.after(0, 1000));
-    const secondPage = changes.slice(500).find((c) => c.kind === 'event')!;
+    let pageEnd = 500;
+    while (
+      changes[pageEnd]?.event === changes[pageEnd - 1].event &&
+      !['event', 'transition', 'history', 'drop'].includes(
+        changes[pageEnd].kind,
+      )
+    ) pageEnd++;
+    const secondPage = changes.slice(pageEnd).find((c) => c.kind === 'event')!;
     const event = await sendLocal(other.room, {
       type: 'm.room.message',
       sender: other.creator,
@@ -280,7 +287,7 @@ Deno.test('projection work: a live backlog releases the writer between its exist
         (await db.query('SELECT position FROM watermarks WHERE source=?', [
           'room:' + backlog.roomId,
         ]))[0].position,
-        changes[499].pos,
+        changes[pageEnd - 1].pos,
       );
       assertEquals(
         (await db.query('SELECT event FROM feed WHERE event=?', [
@@ -494,7 +501,7 @@ Deno.test('projection work: room removal reconciles typing before notifying comp
   });
 });
 
-Deno.test('projection work: a capture page yields at the next durable change when another writer waits', async () => {
+Deno.test('projection work: a capture page yields at the next accepted unit when another writer waits', async () => {
   await withStore(async (store) => {
     const tenant = await openTenant(store, 'test', { create: true });
     await tenant.tx(async (tx) => {
@@ -514,32 +521,29 @@ Deno.test('projection work: a capture page yields at the next durable change whe
         }, g.signer),
       );
     }
-    const changes = await g.room.tx((tx) => tx.changes.after(0, 1000));
-    const first = changes.find((c) =>
-      c.kind === 'event' && c.event === events[0].eventId
-    )!;
+    const first = events[0].completion!;
     const db = await store.server();
-    const original = db.tx.bind(db);
+    const original = store.tenant.bind(store);
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     let held = false;
-    db.tx = (fn, options) =>
-      original((conn) => {
-        const execute = conn.execute.bind(conn);
-        conn.execute = async (sql, values = []) => {
-          const result = await execute(sql, values);
-          if (
-            !held && sql.startsWith('INSERT INTO feed(') &&
-            values.includes(events[0].eventId)
-          ) {
+    store.tenant = async (...args) => {
+      const file = await original(...args);
+      return {
+        ...file,
+        tx: async (fn, options) => {
+          const result = await file.tx(fn, options);
+          // Hold after the first policy snapshot, outside its transaction. The
+          // queued writer then determines this turn's complete accepted prefix.
+          if (!held) {
             held = true;
             entered.resolve();
             await release.promise;
           }
           return result;
-        };
-        return fn(conn);
-      }, options);
+        },
+      };
+    };
     const projecting = project(store, g.roomId);
     let between: Promise<void> = Promise.resolve();
     try {
@@ -557,7 +561,7 @@ Deno.test('projection work: a capture page yields at the next durable change whe
           (await db.query('SELECT position FROM watermarks WHERE source=?', [
             'room:' + g.roomId,
           ]))[0].position,
-          first.pos,
+          first.through,
         );
         // The rest of the already captured room page must not retain this
         // account's old policy across an intervening writer turn.
@@ -589,14 +593,90 @@ Deno.test('projection work: a capture page yields at the next durable change whe
     } finally {
       release.resolve();
       await Promise.allSettled([projecting, between]);
+      store.tenant = original;
+    }
+  });
+});
+
+Deno.test('projection work: a prepared prefix is not truncated by demand arriving during application', async () => {
+  await withStore(async (store) => {
+    const tenant = await openTenant(store, 'test', { create: true });
+    await tenant.tx(async (tx) => {
+      await tx.users.insert('dev', 'Dev');
+      await tx.users.insert('bob', 'Bob');
+    });
+    const g = await genesis(store, { roomId: '!writer-prepared-prefix:test' });
+    await bobJoins(g);
+    await project(store, g.roomId);
+    const write = (body: string) =>
+      sendLocal(g.room, {
+        type: 'm.room.message',
+        sender: g.creator,
+        content: { body, msgtype: 'm.text' },
+      }, g.signer);
+    const events: Awaited<ReturnType<typeof write>>[] = [];
+    for (const body of ['one', 'two', 'three']) events.push(await write(body));
+    const db = await store.server(), original = db.tx.bind(db);
+    let queued = false;
+    let between: Promise<void> = Promise.resolve();
+    db.tx = (fn, options) =>
+      original((conn) => {
+        const execute = conn.execute.bind(conn);
+        conn.execute = (sql, values = []) => {
+          if (
+            !queued && sql.startsWith('INSERT INTO feed(') &&
+            values.includes(events[0].eventId)
+          ) {
+            queued = true;
+            between = withProjectionLock(async () => {
+              assertEquals(
+                (await db.query(
+                  'SELECT event FROM feed WHERE room=? ORDER BY seq',
+                  [g.roomId],
+                ))
+                  .filter((row) =>
+                    events.some((event) => event.eventId === row.event)
+                  ).map((row) => row.event),
+                events.map((event) => event.eventId),
+                'new demand truncated the already prepared input prefix',
+              );
+              await tenant.tx((tx) => tx.users.markDeactivated('bob'));
+            });
+            void between.catch(() => {});
+          }
+          return execute(sql, values);
+        };
+        return fn(conn);
+      }, options);
+    try {
+      await project(store, g.roomId);
+      await between;
+    } finally {
+      await Promise.allSettled([between]);
       db.tx = original;
     }
+    const later = await write('new turn, fresh policy');
+    await project(store, g.roomId);
+    assertEquals(
+      (await db.query(
+        'SELECT event FROM push_evaluations WHERE user=? AND event IN (?,?,?,?) ORDER BY source_pos',
+        ['@bob:test', ...events.map((event) => event.eventId), later.eventId],
+      )).map((row) => row.event),
+      events.map((event) => event.eventId),
+      'policy must be recaptured for the next writer turn',
+    );
   });
 });
 
 Deno.test('projection work: a later change failure preserves earlier publication and resumes without duplicates', async () => {
   await withStore(async (store) => {
+    const tenant = await openTenant(store, 'test', { create: true });
+    await tenant.tx(async (tx) => {
+      await tx.users.insert('dev', 'Dev');
+      await tx.users.insert('bob', 'Bob');
+    });
     const g = await genesis(store, { roomId: '!writer-partial-replay:test' });
+    await bobJoins(g);
     await project(store, g.roomId);
     const events: Awaited<ReturnType<typeof sendLocal>>[] = [];
     for (const body of ['committed', 'retry']) {
@@ -610,19 +690,26 @@ Deno.test('projection work: a later change failure preserves earlier publication
     }
     const db = await store.server();
     const original = db.tx.bind(db);
+    const originalTenant = store.tenant.bind(store);
     let between: Promise<void> = Promise.resolve();
     let queued = false;
+    store.tenant = async (...args) => {
+      const file = await originalTenant(...args);
+      return {
+        ...file,
+        tx: (fn, options) => {
+          if (!queued) {
+            queued = true;
+            between = withProjectionLock(() => Promise.resolve());
+          }
+          return file.tx(fn, options);
+        },
+      };
+    };
     db.tx = (fn, options) =>
       original((conn) => {
         const execute = conn.execute.bind(conn);
         conn.execute = (sql, values = []) => {
-          if (
-            !queued && sql.startsWith('INSERT INTO feed(') &&
-            values.includes(events[0].eventId)
-          ) {
-            queued = true;
-            between = withProjectionLock(() => Promise.resolve());
-          }
           if (
             sql.startsWith('INSERT INTO feed(') &&
             values.includes(events[1].eventId)
@@ -644,9 +731,17 @@ Deno.test('projection work: a later change failure preserves earlier publication
         )).map((r) => r.event),
         [events[0].eventId],
       );
+      assertEquals(
+        (await db.query('SELECT position FROM watermarks WHERE source=?', [
+          'room:' + g.roomId,
+        ]))[0].position,
+        events[0].completion!.through,
+        'the earlier complete accepted prefix must survive',
+      );
     } finally {
       await between;
       db.tx = original;
+      store.tenant = originalTenant;
     }
     await Promise.all([project(store, g.roomId), project(store, g.roomId)]);
     assertEquals(
