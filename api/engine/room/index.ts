@@ -224,6 +224,19 @@ function bind(
       removeOf: (waiting: string) => waits.removeWaitsOf(conn, waiting),
     },
     changes: {
+      localParticipation: async (event: string, user: string) => {
+        const row = await rows.get(event);
+        const status = await events.getStatus(conn, event);
+        const pdu = row === null
+          ? null
+          : JSON.parse(row.pdu) as import('#engine/pdu.ts').Pdu;
+        if (
+          pdu?.type !== 'm.room.member' || pdu.sender !== user ||
+          pdu.state_key !== user || pdu.content?.membership !== 'join' ||
+          status?.standing !== 'accepted' || status.grounding !== 'grounded'
+        ) throw new Error('E_LOCAL_PARTICIPATION_IDENTITY');
+        await changes.recordLocalParticipation(conn, event, user);
+      },
       head: () => changes.head(conn),
       append: (kind: string, event: string | null, data: unknown) =>
         changes.appendChange(conn, kind, event, data),

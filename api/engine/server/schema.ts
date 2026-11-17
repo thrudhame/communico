@@ -425,8 +425,13 @@ const OUTBOX_PENDING_SQL =
 const FEDERATION_TXNS_RECEIVED_SQL =
   'CREATE INDEX federation_txns_received ON federation_txns(received_ms)';
 
+const LOCAL_PARTICIPATION_SQL = `
+ALTER TABLE event_index ADD COLUMN local_join_user TEXT;
+CREATE INDEX event_index_local_participation ON event_index(room,local_join_user) WHERE local_join_user IS NOT NULL;
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 45,
+  version: 46,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -474,6 +479,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(DEVICE_PUBLICATIONS_SQL);
     await db.exec(FACADE_INGRESS_PHASE_SQL);
     await db.exec(FACADE_INGRESS_POLICY_SQL);
+    await db.exec(LOCAL_PARTICIPATION_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -541,5 +547,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
     },
     43: (conn) => conn.exec(FACADE_INGRESS_PHASE_SQL),
     44: (conn) => conn.exec(FACADE_INGRESS_POLICY_SQL),
+    45: (conn) => conn.exec(LOCAL_PARTICIPATION_SQL),
   },
 };

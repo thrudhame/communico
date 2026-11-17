@@ -495,6 +495,7 @@ type Prepared =
     | { kind: 'redaction'; target: string }
     | { kind: 'delivery'; destinations: string[] }
     | { kind: 'signature' }
+    | { kind: 'local-participation'; user: string }
   );
 
 function eventPayloadOf(change: Change): EventPayload {
@@ -688,6 +689,24 @@ async function prepare(
             push: null,
             pushCapture: null,
           });
+          break;
+        }
+        case 'local-participation': {
+          const data = JSON.parse(change.data) as { user?: unknown };
+          const row = change.event === null
+            ? null
+            : await tx.events.get(change.event);
+          const status = change.event === null
+            ? null
+            : await tx.events.getStatus(change.event);
+          const pdu = row === null ? null : JSON.parse(row.pdu) as Pdu;
+          if (
+            typeof data.user !== 'string' || pdu?.type !== 'm.room.member' ||
+            pdu.sender !== data.user || pdu.state_key !== data.user ||
+            pdu.content?.membership !== 'join' ||
+            status?.standing !== 'accepted' || status.grounding !== 'grounded'
+          ) throw new Error('E_LOCAL_PARTICIPATION_IDENTITY');
+          out.push({ change, kind: 'local-participation', user: data.user });
           break;
         }
         case 'signature': {
@@ -913,6 +932,12 @@ async function apply(
 ): Promise<void> {
   const { change } = item;
   switch (item.kind) {
+    case 'local-participation':
+      await tx.execute(
+        'UPDATE event_index SET local_join_user=? WHERE room=? AND event=?',
+        [item.user, roomId, change.event],
+      );
+      return;
     // Signature evidence is export intent, never a new event, feed row, push,
     // membership transition or independent federation delivery obligation.
     case 'signature':

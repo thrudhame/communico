@@ -18,6 +18,7 @@ export async function installSnapshotBoundary(
     self: string;
     previousStay: number | null;
     preserveFrontier?: boolean;
+    localInitiator?: string;
   },
 ): Promise<void> {
   const eventId = String(input.event.event_id);
@@ -56,6 +57,15 @@ export async function installSnapshotBoundary(
     );
   }
   await tx.segments.setOpenedBy(stay, eventId);
+  if (input.localInitiator !== undefined) {
+    if (
+      input.event.type !== 'm.room.member' ||
+      input.event.sender !== input.localInitiator ||
+      input.event.state_key !== input.localInitiator ||
+      input.event.content?.membership !== 'join'
+    ) throw new Error('E_LOCAL_JOIN_IDENTITY');
+    await tx.changes.localParticipation(eventId, input.localInitiator);
+  }
 }
 
 /** Join and in-stay replica recovery use one verified outlier staging owner. */

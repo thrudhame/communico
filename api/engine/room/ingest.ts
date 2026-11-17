@@ -706,6 +706,14 @@ export async function ingestInTx(
     })
     : await tx.changes.append('event', eventId, payload);
 
+  if (
+    remote === null && standing === 'accepted' &&
+    pdu.type === 'm.room.member' && pdu.sender === pdu.state_key &&
+    pdu.content?.membership === 'join'
+  ) {
+    await tx.changes.localParticipation(eventId, String(pdu.sender));
+  }
+
   // Publication (R6/R7): the live stay's current state is the single
   // extremity's after-group or the resolution over the new frontier —
   // published only when it changed. The resolution's store is seeded

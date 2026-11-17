@@ -1023,6 +1023,15 @@ export async function ingestRemote(
             results.set(index, result);
           }
         }
+        if (deps.localJoin !== undefined) {
+          const { eventId, userId } = deps.localJoin;
+          const status = await tx.events.getStatus(eventId);
+          if (
+            status?.standing === 'accepted' && status.grounding === 'grounded'
+          ) {
+            await tx.changes.localParticipation(eventId, userId);
+          }
+        }
         const completed = outcomes.map((outcome, index) =>
           results.get(index) ?? outcome ??
             outcomeOf(null, 'refused', 'E_OUTCOME_MISSING')
