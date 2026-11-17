@@ -138,6 +138,24 @@ export async function captureCompletionCut(
   return { roomId, generation: state.generation, through: await head(conn) };
 }
 
+export async function captureAcceptedCut(
+  conn: Conn,
+  roomId: string,
+): Promise<CompletionCut | null> {
+  const state = await completionState(conn);
+  const [receipt] = await conn.query(
+    'SELECT through FROM completion_receipts ORDER BY through DESC LIMIT 1',
+  );
+  return receipt === undefined ||
+      Number(receipt.through) <= state.completedThrough
+    ? null
+    : {
+      roomId,
+      generation: state.generation,
+      through: Number(receipt.through),
+    };
+}
+
 export async function validateCompletionCut(
   conn: Conn,
   cut: CompletionCut,

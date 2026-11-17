@@ -268,6 +268,9 @@ completion under lifecycle serialization, reconciles satisfied client markers
 while the original generation remains held, then unlinks. Historical completed
 transaction receipts survive that intentional lifecycle; missing or replaced
 outstanding targets are never satisfied by an equal numeric position.
+Their exact completion rows carry a retirement witness written only after the
+original generation's completed publication is checked, so reuse of its room ID
+cannot turn an old receipt into an obligation on the replacement room.
 (`api/engine/room/{ingest,operator}.ts`, `server/removal.ts`)
 
 The room transaction records its mutations and delivery destinations in
@@ -313,13 +316,15 @@ body/name/topic text without altering the PDU.
 ## Client reads and sync
 
 Both ordinary and sliding sync first capture the authenticated device generation's
-pending cuts in one tenant read, release the transaction and await those exact
-publications. This precedes ordinary stream-head clamping and sliding list/lease
+pending cuts and their room audience's accepted cuts, release the transactions and
+await those exact publications. This precedes ordinary stream-head clamping and sliding list/lease
 selection, including timeout-zero, initial, full-state, list-only and encryption
 requests. Only successful rendering conditionally retires each captured revision;
 failed/cancelled consumers and concurrently higher revisions retain their markers.
-Shared authenticated effect-read admission uses the same publication boundary
-before event/relation/search/receipt selection, leaving marker retirement to sync.
+Shared effect-read admission captures the explicit room or the search/notification
+audience before event/relation/search/receipt/peek selection, regardless of sender,
+leaving client marker retirement to sync. A later acceptance cannot extend a
+captured target, and unrelated rooms or account reads acquire no global drain.
 Existing filters, visibility, limits and explicit historical tokens retain their
 meaning; completion does not inject an event into a filtered or trimmed response.
 (`api/engine/client/completion.ts`, `auth-context.ts`, `syncfeed.ts`, `sliding-sync/index.ts`)

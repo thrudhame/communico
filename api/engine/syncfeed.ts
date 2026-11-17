@@ -2,7 +2,10 @@
 // has no feed position and cannot enter a new timeline. R6 cuts use the
 // published state, never the last event's own DAG state.
 import { theApp } from '#engine/app.ts';
-import { clientCompletion } from '#engine/client/completion.ts';
+import {
+  clientCompletion,
+  completionAudience,
+} from '#engine/client/completion.ts';
 import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
 import { admitState } from '#engine/client/state-admission.ts';
 import { StateDelivery } from '#engine/client/state-delivery.ts';
@@ -322,7 +325,15 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       deviceId: i.deviceId,
       generation: i.deviceGeneration,
     };
-  const completion = await clientCompletion(theApp(), device, i.signal);
+  const completion = await clientCompletion(
+    theApp(),
+    device,
+    i.signal,
+    (await completionAudience(theApp(), i.userId)).filter((roomId) =>
+      (!i.filter.rooms || i.filter.rooms.includes(roomId)) &&
+      !i.filter.notRooms?.includes(roomId)
+    ),
+  );
   const response = await assembleSync(i);
   await completion.retire();
   return response;

@@ -7,9 +7,7 @@ import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { lookupToken, type TokenInfo } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
-import { clientCompletion } from '#engine/client/completion.ts';
-import { deviceIdentity } from '#engine/tenant/txns.ts';
-import { localpartOf } from '#engine/ids.ts';
+import { roomCompletion } from '#engine/client/completion.ts';
 
 export type AuthContext = TokenInfo & { tenant: Tenant; token: string };
 
@@ -25,25 +23,16 @@ export async function authorizeFull(
   if (info === null) {
     throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'token not recognized');
   }
-  // Authentication supplies the authoritative device generation to the shared
-  // read admission. Sync owns its later successful-render retirement; other
-  // effect consumers leave the satisfied marker for that owner. Neither send
-  // acceptance nor unrelated account commands acquire a publication barrier.
-  const effectRead =
-    request.method === 'GET' && !request.path.endsWith('/sync') ||
-    request.path.endsWith('/search') ||
-    /\/(receipt\/|read_markers$)/.test(request.path);
-  if (effectRead && info.device_id !== null) {
-    await clientCompletion(
-      theApp(),
-      await deviceIdentity(
-        tenant,
-        localpartOf(info.user_id),
-        info.device_id,
-        info.generation ?? undefined,
-      ),
-      request._raw.signal,
-    );
+  // Explicit room GET admission shares the same captured room boundary as sync
+  // and audience reads. Peeking and receipts own their boundary in the engine;
+  // search/notifications supply their actual audience there. Do not recapture
+  // their cuts here or wait behind unrelated private pending-room obligations.
+  const roomId = request.params.roomId;
+  if (
+    request.method === 'GET' && typeof roomId === 'string' &&
+    !request.path.endsWith('/initialSync')
+  ) {
+    await roomCompletion(theApp(), [roomId], request._raw.signal);
   }
   return { ...info, tenant, token };
 }

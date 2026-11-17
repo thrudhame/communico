@@ -9,6 +9,7 @@ import { backfill } from '#engine/room/history.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { makeFakeRoom } from '#tests/fixtures/remote-room.ts';
 import { fakeFetcher, fakeKeyResolver } from '#tests/fixtures/remote.ts';
+import { completeAccepted } from '#tests/complete-accepted.ts';
 const { matrix, registerTestUser, test } = httpSuite('HTTP room reads');
 type Json = Record<string, unknown>;
 async function call(
@@ -60,9 +61,11 @@ test('messages: five-part/bare stream tokens, bounds, c-token paging, filtered e
   const base = path(id);
   await send(id, A, 'm1');
   await send(id, A, 'm2');
+  await completeAccepted(theApp(), id);
   const s1 = await stream();
   await send(id, A, 'm3');
   await send(id, A, 'm4');
+  await completeAccepted(theApp(), id);
   const s2 = await stream();
   await send(id, A, 'm5');
   const get = (q: string) => call(base + '/messages?' + q, A);
