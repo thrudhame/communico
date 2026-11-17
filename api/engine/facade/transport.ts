@@ -13,6 +13,7 @@ import { config } from '#engine/config.ts';
 import { certificatePin, readProtectedFile } from './identity.ts';
 import { LinkError } from './protocol.ts';
 import { lines } from './notices.ts';
+import { requestFailure } from '#engine/request-diagnostics.ts';
 
 export type LinkTls = { cert: string; key: string; ca: string[] };
 export const LINK_PREFIX = '/_communico/link/v1/';
@@ -165,6 +166,9 @@ export async function startLinkTransport(options: {
           });
         }
       } catch (error) {
+        if (!ws && (!(error instanceof LinkError) || error.status >= 500)) {
+          requestFailure(incoming, error);
+        }
         if (!ws && !socket.destroyed) {
           const status = error instanceof LinkError ? error.status : 500;
           socket.end(
@@ -227,6 +231,9 @@ export async function startLinkTransport(options: {
           controller.signal,
         );
       } catch (error) {
+        if (!(error instanceof LinkError) || error.status >= 500) {
+          requestFailure(incoming, error);
+        }
         if (outgoing.headersSent) outgoing.destroy();
         else {
           outgoing.writeHead(error instanceof LinkError ? error.status : 500, {
