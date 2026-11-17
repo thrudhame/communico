@@ -82,6 +82,24 @@ export function onProjected(
   };
 }
 
+async function dispatchProjected(
+  store: Store,
+  roomId: string,
+  through: number,
+  audience: ReadonlyArray<(typeof projectedListeners)[number]> = [
+    ...projectedListeners,
+  ],
+): Promise<unknown[]> {
+  const results = await Promise.allSettled(
+    audience.map((fn) =>
+      Promise.resolve().then(() => fn(store, roomId, through))
+    ),
+  );
+  return results.flatMap((result) =>
+    result.status === 'rejected' ? [result.reason] : []
+  );
+}
+
 export function project(store: Store, roomId: string): Promise<void> {
   // Admission fixes this caller's obligation before an earlier room owner can
   // append more work. Keep the capability with its cut for lifecycle fencing.
@@ -105,11 +123,87 @@ export function projectThrough(
   return enqueueProjection(store, target.roomId, admitted);
 }
 
+// The owned completion service releases publication waiters independently of
+// required callbacks. Each committed prefix is observable outside the writer.
+export function publishThrough(
+  store: Store,
+  target: CompletionCut | CompletionTarget,
+  progress: () => Promise<void>,
+): Promise<void> {
+  const admitted = (async () => {
+    const room = await openRoom(store, target.roomId);
+    await room.tx((tx) => tx.completion.validate(target));
+    return { room, head: target.through, target, progress };
+  })();
+  return enqueueProjection(store, target.roomId, admitted);
+}
+
+const completing = new WeakMap<Store, Map<string, Promise<void>>>();
+
+function completionKey(target: CompletionCut | CompletionTarget): string {
+  return JSON.stringify([target.roomId, target.generation, target.through]);
+}
+
+export function completePublished(
+  store: Store,
+  target: CompletionCut | CompletionTarget,
+): Promise<void> {
+  let active = completing.get(store);
+  if (active === undefined) completing.set(store, active = new Map());
+  const key = completionKey(target);
+  const existing = active.get(key);
+  if (existing !== undefined) {
+    // Sharing callback ownership cannot share authority: validate each exact
+    // receipt even if another event/cut caller already owns these callbacks.
+    return openRoom(store, target.roomId).then(async (room) => {
+      await room.tx((tx) => tx.completion.validate(target));
+      await existing;
+    });
+  }
+  const task = Promise.resolve().then(() => finishPublished(store, target));
+  active.set(key, task);
+  const release = () => {
+    if (active.get(key) === task) active.delete(key);
+  };
+  void task.then(release, release);
+  return task;
+}
+
+async function finishPublished(
+  store: Store,
+  target: CompletionCut | CompletionTarget,
+): Promise<void> {
+  const room = await openRoom(store, target.roomId);
+  const completed = await room.tx(async (tx) => {
+    await tx.completion.validate(target);
+    return (await tx.completion.state()).completedThrough;
+  });
+  if (
+    await get(await store.server(), sourceOf(target.roomId)) < target.through
+  ) {
+    throw new Error('E_COMPLETION_UNPUBLISHED: ' + target.roomId);
+  }
+  if (completed >= target.through) return;
+  const errors = await dispatchProjected(store, target.roomId, target.through);
+  if (errors.length) {
+    throw new AggregateError(errors, 'E_COMPLETION_CALLBACK: ' + target.roomId);
+  }
+  await room.tx(async (tx) => {
+    await tx.completion.validate(target);
+    await tx.completion.complete(target.generation, target.through);
+  });
+}
+
 function enqueueProjection(
   store: Store,
   roomId: string,
   admitted: Promise<
-    { room: Room; head: number; target?: CompletionCut | CompletionTarget }
+    {
+      room: Room;
+      head: number;
+      target?: CompletionCut | CompletionTarget;
+      progress?: () => Promise<void>;
+    }
   >,
 ): Promise<void> {
   // A failed admission can settle while its predecessor still owns the queue.
@@ -121,8 +215,8 @@ function enqueueProjection(
   // concurrently. A failed page releases its owner for the next roll-forward.
   const run = (rooms.get(roomId) ?? Promise.resolve()).catch(() => {}).then(
     async () => {
-      const { room, head, target } = await admitted;
-      await projectRoom(store, roomId, room, head, target);
+      const { room, head, target, progress } = await admitted;
+      await projectRoom(store, roomId, room, head, target, progress);
     },
   );
   rooms.set(roomId, run);
@@ -139,6 +233,7 @@ async function projectRoom(
   room: Room,
   head: number,
   target?: CompletionCut | CompletionTarget,
+  progress?: () => Promise<void>,
 ): Promise<void> {
   const server = await store.server();
   capture: for (;;) {
@@ -166,6 +261,12 @@ async function projectRoom(
     const prepared = drop === 0
       ? []
       : await prepare(room, store, roomId, batch, localServers);
+    if (drop === 0) {
+      // Replayed retirement completes the already published prefix BEFORE the
+      // global writer/removal turn. Callbacks may themselves need that writer.
+      const cut = await room.tx((tx) => tx.completion.capture());
+      await completePublished(store, { ...cut, through: batch[0].pos - 1 });
+    }
     const current = async () => {
       // This logical handle fences retirement and the storage incarnation.
       // A drop/recreate cannot publish an earlier incarnation's captured page.
@@ -271,20 +372,63 @@ async function projectRoom(
         } as const;
       });
       if (outcome.kind === 'retry') continue capture;
+      await progress?.();
       if (outcome.kind === 'complete') {
+        if (progress !== undefined) return;
+        if (drop !== 0) {
+          // Durable completion and an explicit projection pass are different
+          // notifications. A repeated legacy pass still hints its captured
+          // audience; target completion/retirement never replay witnessed work.
+          const cut = target ??
+            {
+              ...await room.tx((tx) => tx.completion.capture()),
+              through: head,
+            };
+          try {
+            const completed = await room.tx((tx) => tx.completion.state());
+            if (
+              target === undefined &&
+              (completed.completedThrough >= head ||
+                completing.get(store)?.has(completionKey(cut)))
+            ) {
+              // An earlier callback flight has already captured its audience.
+              // This pass owns its new hint audience independently, while still
+              // retaining the original completion until its real settlement.
+              const failures = (await Promise.all([
+                dispatchProjected(store, roomId, head, outcome.listeners),
+                completePublished(store, cut).then(
+                  () => [],
+                  (error) => [error],
+                ),
+              ])).flat();
+              if (failures.length) {
+                throw new AggregateError(
+                  failures,
+                  'E_PROJECTION_CALLBACK: ' + roomId,
+                );
+              }
+            } else {
+              await completePublished(store, cut);
+            }
+          } catch (error) {
+            if (target !== undefined) throw error;
+            console.error(`projection listener failed for ${roomId}:`, error);
+          }
+          return;
+        }
         // Preserve acknowledged observer work (including rule migration) and
         // same-room ordering without blocking independent publication writers.
-        const failures: unknown[] = [];
-        await Promise.all(outcome.listeners.map(async (fn) => {
-          try {
-            await fn(store, roomId, head);
-          } catch (error) {
-            failures.push(error);
-            if (target === undefined) {
-              console.error(`projection listener failed for ${roomId}:`, error);
-            }
+        const failures = await dispatchProjected(
+          store,
+          roomId,
+          head,
+          outcome.listeners,
+        );
+        if (target === undefined) {
+          for (const error of failures) {
+            console.error(`projection listener failed for ${roomId}:`, error);
           }
-        }));
+        }
         if (target !== undefined) {
           if (failures.length) {
             throw new AggregateError(
@@ -292,10 +436,6 @@ async function projectRoom(
               `E_COMPLETION_CALLBACK: ${roomId}/${head}`,
             );
           }
-          await room.tx(async (tx) => {
-            await tx.completion.validate(target);
-            await tx.completion.complete(target.generation, target.through);
-          });
         }
         return;
       }

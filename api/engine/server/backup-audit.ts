@@ -223,6 +223,40 @@ export async function auditServer(
     let historicalUnheldReceipts = 0;
     for (const tenant of snapshot.files.filter((f) => f.kind === 'tenants')) {
       await snapshot.read(tenant, async (source) => {
+        for (
+          const table of ['transaction_completions', 'client_completion_cuts']
+        ) {
+          for await (const target of scan(source, table, '*')) {
+            if (table === 'transaction_completions' && target.retired === 1) {
+              continue;
+            }
+            const room = rooms.get(String(target.room_id));
+            if (room === undefined) {
+              // New exact receipts require the lifecycle's durable witness;
+              // legacy historical receipts below retain their old exception.
+              auditFailure('orphan pending completion');
+            }
+            await snapshot.read(room, async (held) => {
+              const [identity] = await held.query(
+                'SELECT generation FROM completion_state',
+              );
+              if (identity.generation !== target.room_generation) {
+                auditFailure('completion room generation');
+              }
+              const matching = await held.query(
+                table === 'transaction_completions'
+                  ? 'SELECT event FROM completion_receipts WHERE event=? AND through=?'
+                  : 'SELECT event FROM completion_receipts WHERE through=? LIMIT 1',
+                table === 'transaction_completions'
+                  ? [target.event_id, target.through]
+                  : [target.through],
+              );
+              if (matching.length === 0) {
+                auditFailure('completion target has no exact room receipt');
+              }
+            });
+          }
+        }
         for await (
           const intent of scan(
             source,
@@ -259,11 +293,22 @@ export async function auditServer(
                 const receipt of scan(
                   source,
                   'transactions',
-                  'event_id',
+                  'localpart,device_id,generation,endpoint,txn_id,event_id',
                   'completed=1 AND room_id=?',
                   [room_id],
                 )
               ) {
+                const retired = await source.query(
+                  'SELECT 1 FROM transaction_completions WHERE localpart=? AND device_id=? AND generation=? AND endpoint=? AND txn_id=? AND retired=1',
+                  [
+                    receipt.localpart,
+                    receipt.device_id,
+                    receipt.generation,
+                    receipt.endpoint,
+                    receipt.txn_id,
+                  ],
+                );
+                if (retired.length) continue;
                 if (
                   !(await r.query('SELECT id FROM events WHERE id=?', [
                     receipt.event_id,

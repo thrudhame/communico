@@ -2,6 +2,10 @@
 // has no feed position and cannot enter a new timeline. R6 cuts use the
 // published state, never the last event's own DAG state.
 import { theApp } from '#engine/app.ts';
+import {
+  clientCompletion,
+  completionAudience,
+} from '#engine/client/completion.ts';
 import { heldRoom, stateAtSeq } from '#engine/client/read.ts';
 import { admitState } from '#engine/client/state-admission.ts';
 import { StateDelivery } from '#engine/client/state-delivery.ts';
@@ -65,6 +69,7 @@ export interface SyncInputs {
   userId: string;
   deviceId: string | null;
   deviceGeneration?: number;
+  signal?: AbortSignal;
   since: StreamToken | null;
   timeoutMs: number;
   filter: RoomFilter;
@@ -302,13 +307,39 @@ async function waitForRelevant(
 ): Promise<void> {
   if (i.fullState || i.since === null || i.timeoutMs <= 0) return;
   const app = theApp();
-  await waitForSync(app, { timeoutMs: i.timeoutMs }, async () => ({
-    relevant: await relevantChanged(i, device),
-    value: undefined,
-  }));
+  await waitForSync(
+    app,
+    { timeoutMs: i.timeoutMs, signal: i.signal },
+    async () => ({
+      relevant: await relevantChanged(i, device),
+      value: undefined,
+    }),
+  );
 }
 
 export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
+  const device = i.deviceId === null || i.deviceGeneration === undefined
+    ? null
+    : {
+      localpart: localpartOf(i.userId),
+      deviceId: i.deviceId,
+      generation: i.deviceGeneration,
+    };
+  const completion = await clientCompletion(
+    theApp(),
+    device,
+    i.signal,
+    (await completionAudience(theApp(), i.userId)).filter((roomId) =>
+      (!i.filter.rooms || i.filter.rooms.includes(roomId)) &&
+      !i.filter.notRooms?.includes(roomId)
+    ),
+  );
+  const response = await assembleSync(i);
+  await completion.retire();
+  return response;
+}
+
+async function assembleSync(i: SyncInputs): Promise<Record<string, unknown>> {
   const app = theApp();
   const epoch = (await recoveryState(app.server))?.epoch;
   const recoveryReset = i.since !== null && i.since.epoch !== epoch;

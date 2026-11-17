@@ -6,6 +6,7 @@ import { roomVersionOf } from '#engine/room/build.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { project, withProjectionLock } from '#engine/server/project.ts';
 import { finishRoomRemoval, removalIntents } from '#engine/server/removal.ts';
+import { completionService } from '#engine/server/completion.ts';
 
 export type OperatorRoom = {
   room_id: string;
@@ -58,13 +59,42 @@ async function remove(
   why: string,
   cutoff: number | null,
 ): Promise<number | null> {
-  return await withRoomLock(roomId, async () => {
-    let room;
-    try {
-      room = await openRoom(app.store, roomId);
-    } catch (error) {
-      if (!(error instanceof Deno.errors.NotFound)) throw error;
-      if (cutoff !== null) return null;
+  for (;;) {
+    const result = await withRoomLock(roomId, async () => {
+      let room;
+      try {
+        room = await openRoom(app.store, roomId);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+        if (cutoff !== null) return null;
+        return await withProjectionLock(async () => {
+          const live = app.sender === null
+            ? null
+            : await app.sender.reviewIntents();
+          const intents = await removalIntents(
+            app.store,
+            app.tenant.serverName,
+            live,
+          );
+          return await finishRoomRemoval(
+            app.store,
+            roomId,
+            { why, intents },
+            null,
+          );
+        });
+      }
+      const target = await room.tx((tx) => tx.completion.capture());
+      const state = await room.tx((tx) => tx.completion.state());
+      if (state.completedThrough < target.through) return { target };
+      await project(app.store, roomId);
+      if (cutoff !== null) {
+        const offered = await app.server.query(
+          'SELECT purgeable_ms FROM directory WHERE room_id=? AND purgeable_ms IS NOT NULL AND purgeable_ms<=?',
+          [roomId, cutoff],
+        );
+        if (offered.length === 0) return null;
+      }
       return await withProjectionLock(async () => {
         const live = app.sender === null
           ? null
@@ -74,38 +104,26 @@ async function remove(
           app.tenant.serverName,
           live,
         );
-        return await finishRoomRemoval(
-          app.store,
-          roomId,
-          { why, intents },
-          null,
+        const removal = { why, intents };
+        const position = await room.tx((tx) =>
+          tx.changes.append('drop', null, removal)
         );
+        return await finishRoomRemoval(app.store, roomId, removal, position);
       });
-    }
-    await project(app.store, roomId);
-    if (cutoff !== null) {
-      const offered = await app.server.query(
-        'SELECT purgeable_ms FROM directory WHERE room_id=? AND purgeable_ms IS NOT NULL AND purgeable_ms<=?',
-        [roomId, cutoff],
-      );
-      if (offered.length === 0) return null;
-    }
-    return await withProjectionLock(async () => {
-      const live = app.sender === null
-        ? null
-        : await app.sender.reviewIntents();
-      const intents = await removalIntents(
-        app.store,
-        app.tenant.serverName,
-        live,
-      );
-      const removal = { why, intents };
-      const position = await room.tx((tx) =>
-        tx.changes.append('drop', null, removal)
-      );
-      return await finishRoomRemoval(app.store, roomId, removal, position);
     });
-  });
+    if (result !== null && typeof result === 'object') {
+      // Dependency completion can reacquire the room lock. Never wait under it;
+      // recheck the completed prefix after reacquiring lifecycle serialization.
+      await completionService(app.store).wait(
+        result.target,
+        'completion',
+        undefined,
+        app.tenant.serverName,
+      );
+      continue;
+    }
+    return result;
+  }
 }
 
 export async function dropOperatorRoom(app: App, roomId: string) {
