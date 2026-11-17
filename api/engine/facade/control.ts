@@ -117,6 +117,73 @@ async function homeRoster(
   };
 }
 
+/** Both replicas authenticate their logical server against complete retained
+ * home authority. Historical events use their validity floor, not today's
+ * publication/signing deadline; other servers keep ordinary key acquisition. */
+function approvedVerificationKeys(
+  db: Database,
+  signer: Signer,
+  load: () => Promise<{ roster: Roster | null; document: string | null }>,
+): KeyStore {
+  const remote = keyStore(db, { signer });
+  return {
+    ...remote,
+    getVerifyKey: async (name, keyId, floor, purpose, context) => {
+      if (name !== signer.serverName) {
+        return await remote.getVerifyKey(name, keyId, floor, purpose, context);
+      }
+      const unchanged = signingFence(db);
+      unchanged();
+      const { roster, document: raw } = await load();
+      const key = roster?.keys.find((key) => key.keyId === keyId);
+      let document: KeyDoc | null = null;
+      if (roster && raw !== null) {
+        try {
+          document = await completeDocument(JSON.parse(raw), roster);
+        } catch {
+          // An older partial publication confers no key authority.
+        }
+      }
+      if (
+        !roster || roster.server !== name || !key || !document ||
+        floor > document.valid_until_ts ||
+        (key.retiredAt !== null &&
+          (purpose === 'request' || floor > key.retiredAt))
+      ) {
+        throw new UpstreamError('validation', {
+          phase: 'key-lookup',
+          reason: 'local key unavailable for required purpose and validity',
+        });
+      }
+      const publicKey = await importPublicKeyFromRaw(
+        matrixBase64(key.publicKey, 32),
+      );
+      unchanged();
+      return publicKey;
+    },
+  };
+}
+
+export function homeVerificationKeys(
+  db: Database,
+  signer: Signer,
+  publicKey: string,
+): KeyStore {
+  return approvedVerificationKeys(db, signer, async () => {
+    const roster = await homeRoster(db, signer, publicKey);
+    const [held] = await db.query(
+      'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
+    );
+    return {
+      roster: Number(held.revision) === roster.revision &&
+          held.roster_json === canonicalJson(roster)
+        ? roster
+        : null,
+      document: held.document_json === null ? null : String(held.document_json),
+    };
+  });
+}
+
 /** Only this owner can create/refresh a publication. Network and crypto are
  * outside transactions; a changed home control cut discards the entire candidate.
  * Failed collection leaves the prior complete publication intact. */
@@ -477,50 +544,18 @@ export class FacadeKeys {
    * server (which may resolve back here). Remote keys retain ordinary acquisition.
    * This feeds the shared event verifier and request authentication unchanged. */
   verificationKeys(): KeyStore {
-    const remote = keyStore(this.db, { signer: this.requestSigner() });
-    return {
-      ...remote,
-      getVerifyKey: async (name, keyId, floor, purpose, context) => {
-        if (name !== this.signer.serverName) {
-          return await remote.getVerifyKey(
-            name,
-            keyId,
-            floor,
-            purpose,
-            context,
-          );
-        }
-        const grant = await this.pairings.active();
-        const [held] = await this.db.query(
-          'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
-        );
-        const roster = rosterAt(held, grant.body.revision);
-        const key = roster?.keys.find((key) => key.keyId === keyId);
-        let document: KeyDoc | null = null;
-        if (roster && held.document_json !== null) {
-          try {
-            document = await completeDocument(
-              JSON.parse(String(held.document_json)),
-              roster,
-            );
-          } catch {
-            /* An older partial publication confers no key authority. */
-          }
-        }
-        if (
-          !roster || roster.server !== name ||
-          !key || !document || floor > document.valid_until_ts ||
-          (key.retiredAt !== null &&
-            (purpose === 'request' || floor > key.retiredAt))
-        ) {
-          throw new UpstreamError('validation', {
-            phase: 'key-lookup',
-            reason: 'local key unavailable for required purpose and validity',
-          });
-        }
-        return await importPublicKeyFromRaw(matrixBase64(key.publicKey, 32));
-      },
-    };
+    return approvedVerificationKeys(this.db, this.requestSigner(), async () => {
+      const grant = await this.pairings.active();
+      const [held] = await this.db.query(
+        'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
+      );
+      return {
+        roster: rosterAt(held, grant.body.revision),
+        document: held.document_json === null
+          ? null
+          : String(held.document_json),
+      };
+    });
   }
 
   async contact(now = Date.now()): Promise<void> {

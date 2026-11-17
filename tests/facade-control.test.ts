@@ -4,9 +4,11 @@ import { canonicalJson } from '#engine/canonical.ts';
 import {
   exportKeyRoster,
   FacadeKeys,
+  homeVerificationKeys,
   publishKeyDocument,
 } from '#engine/facade/control.ts';
 import { homeKeyDocument } from '#engine/federation/keydoc.ts';
+import { signWithSigner } from '#engine/federation/keys.ts';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
@@ -95,6 +97,12 @@ async function fixture(seedServer = serverSchema) {
     server: () => edgeServer,
     journal,
     exportRoster,
+    homeKeys: async () =>
+      homeVerificationKeys(
+        await home.server(),
+        tenant.signer(),
+        tenant.publicB64,
+      ),
     async reenroll() {
       await fp.retire(await hp.revoke(bundle.id), 'a'.repeat(64));
       const next = await hp.create({
@@ -210,6 +218,118 @@ Deno.test('co-signed publication includes every current key and is served unchan
       (await f.journal().heads('home', 'in', record)).applied.sequence,
       1,
     );
+  } finally {
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('both room replicas resolve only complete current local rosters and retain historical event validity', async () => {
+  const f = await fixture();
+  try {
+    const record = await f.receive();
+    await f.keys().apply(f.journal(), record);
+    const complete = await f.keys().document();
+    const floor = Date.now() - 10000;
+    const expired = structuredClone(complete);
+    expired.valid_until_ts = floor + 1000;
+    expired.signatures = {};
+    await signWithSigner(
+      expired as unknown as Record<string, unknown>,
+      f.tenant.signer(),
+    );
+    await signWithSigner(
+      expired as unknown as Record<string, unknown>,
+      f.node.signer(),
+    );
+    for (const db of [await f.home.server(), f.server()]) {
+      const [saved] = await db.query(
+        'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
+      );
+      try {
+        for (
+          const invalid of [
+            'missing signature',
+            'stale roster',
+            'missing roster',
+            'missing document',
+            'corrupt document',
+          ]
+        ) {
+          const partial = structuredClone(complete);
+          delete partial.signatures['logical.test'][f.tenant.keyId];
+          await db.execute(
+            'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=? WHERE singleton=1',
+            [
+              invalid === 'stale roster' ? 0 : saved.revision,
+              invalid === 'missing roster' ? null : saved.roster_json,
+              invalid === 'missing document'
+                ? null
+                : invalid === 'corrupt document'
+                ? '{'
+                : invalid === 'missing signature'
+                ? canonicalJson(partial)
+                : saved.document_json,
+            ],
+          );
+          const verifier = db === f.server()
+            ? f.keys().verificationKeys()
+            : await f.homeKeys();
+          await assertRejects(
+            () =>
+              verifier.getVerifyKey(
+                'logical.test',
+                f.node.keyId,
+                floor,
+                'event',
+              ),
+            UpstreamError,
+          );
+        }
+        await db.execute(
+          'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=? WHERE singleton=1',
+          [saved.revision, saved.roster_json, canonicalJson(expired)],
+        );
+        const verifier = db === f.server()
+          ? f.keys().verificationKeys()
+          : await f.homeKeys();
+        assertEquals(
+          (await verifier.getVerifyKey(
+            'logical.test',
+            f.node.keyId,
+            floor,
+            'event',
+          ))
+            .algorithm.name,
+          'Ed25519',
+        );
+        await assertRejects(
+          () =>
+            verifier.getVerifyKey(
+              'logical.test',
+              f.node.keyId,
+              Date.now(),
+              'event',
+            ),
+          UpstreamError,
+        );
+        await assertRejects(
+          () =>
+            verifier.getVerifyKey(
+              'logical.test',
+              'ed25519:unknown',
+              floor,
+              'event',
+            ),
+          UpstreamError,
+        );
+      } finally {
+        await db.execute(
+          'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=? WHERE singleton=1',
+          [saved.revision, saved.roster_json, saved.document_json],
+        );
+      }
+    }
   } finally {
     await f.close();
     setConfigForTests({});
@@ -595,36 +715,39 @@ Deno.test('roster retirement is preserved, and changed or forged control cannot 
         expired_ts: retiredAt,
       });
       assertEquals(doc.verify_keys[node.keyId], undefined);
-      const verification = f.keys().verificationKeys();
-      assertEquals(
-        (await verification.getVerifyKey(
-          'logical.test',
-          node.keyId,
-          retiredAt,
-          'event',
-        )).algorithm.name,
-        'Ed25519',
-      );
-      await assertRejects(
-        () =>
-          verification.getVerifyKey(
+      for (
+        const verification of [f.keys().verificationKeys(), await f.homeKeys()]
+      ) {
+        assertEquals(
+          (await verification.getVerifyKey(
             'logical.test',
             node.keyId,
-            retiredAt + 1,
+            retiredAt,
             'event',
-          ),
-        UpstreamError,
-      );
-      await assertRejects(
-        () =>
-          verification.getVerifyKey(
-            'logical.test',
-            node.keyId,
-            retiredAt - 1,
-            'request',
-          ),
-        UpstreamError,
-      );
+          )).algorithm.name,
+          'Ed25519',
+        );
+        await assertRejects(
+          () =>
+            verification.getVerifyKey(
+              'logical.test',
+              node.keyId,
+              retiredAt + 1,
+              'event',
+            ),
+          UpstreamError,
+        );
+        await assertRejects(
+          () =>
+            verification.getVerifyKey(
+              'logical.test',
+              node.keyId,
+              retiredAt - 1,
+              'request',
+            ),
+          UpstreamError,
+        );
+      }
     } finally {
       await otherStore.close();
       await Deno.remove(otherDir, { recursive: true });

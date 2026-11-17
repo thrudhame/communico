@@ -33,6 +33,10 @@ import { config } from '#engine/config.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { publicDeviceValues } from '#engine/tenant/device-operations.ts';
+import { FacadeKeys } from '#engine/facade/control.ts';
+import { Pairings } from '#engine/facade/pairing.ts';
+import { sendLocal } from '#engine/room/ingest.ts';
+import { projectThrough } from '#engine/server/project.ts';
 
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   setConfigForTests({ server: { name: 'logical.test' } });
@@ -794,6 +798,8 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     await edge.stop();
     const offline = await open('facade');
     let token: string;
+    let edgeEventId: string;
+    let edgeKeyId: string;
     const edgePair = await generateSigningKeypair() as CryptoKeyPair;
     const edgePublic = b64encodeStd(
       await exportPublicKeyRaw(edgePair.publicKey),
@@ -807,6 +813,33 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     );
     try {
       const tenant = await openTenant(offline, 'logical.test');
+      const server = await offline.server();
+      const node = await loadNode(server, 'logical.test', 'edge_a');
+      edgeKeyId = node.keyId;
+      const pairings = new Pairings(
+        server,
+        node.signer(),
+        node.publicKey,
+        tls.facadePin,
+        node,
+      );
+      const room = await openRoom(offline, roomId);
+      const authored = await sendLocal(
+        room,
+        {
+          type: 'm.room.encrypted',
+          sender: user,
+          content: {
+            algorithm: 'm.megolm.v1.aes-sha2',
+            ciphertext: 'cold-edge-room-branch',
+          },
+        },
+        new FacadeKeys(server, node.signer(), node.publicKey, pairings)
+          .requestSigner(),
+      );
+      assert(authored.completion);
+      await projectThrough(offline, authored.completion);
+      edgeEventId = authored.eventId;
       assertEquals(
         (await (await offline.tenant('logical.test')).tx((conn) =>
           publicDeviceValues(conn, 'outside')
@@ -1083,6 +1116,68 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       ciphertext: 'edge-public',
     });
     home = await process(file('home'), 'federation: disabled');
+    // No test exporter/importer or logical-name HTTP key lookup participates.
+    // The cold runtime must export and verify the original facade-signed PDU.
+    let reverseResponse: Awaited<ReturnType<typeof api>> | undefined;
+    await until(async () => {
+      // The startup log precedes HTTP bind, just as at the earlier home starts.
+      let value: Awaited<ReturnType<typeof api>>;
+      try {
+        value = await api(
+          roomPath + '/event/' + encodeURIComponent(edgeEventId),
+          undefined,
+          registered.body.access_token,
+        );
+      } catch {
+        return false;
+      }
+      reverseResponse = value;
+      return value.status === 200 &&
+        value.body.event_id === edgeEventId &&
+        value.body.content.ciphertext === 'cold-edge-room-branch';
+    }).catch((cause) => {
+      throw new Error(
+        'cold reverse room consumer: ' + JSON.stringify(reverseResponse),
+        { cause },
+      );
+    });
+    const suffix = await api(
+      roomPath + '/send/m.room.encrypted/b6-return-suffix',
+      {
+        algorithm: 'm.megolm.v1.aes-sha2',
+        ciphertext: 'home-after-cold-edge-branch',
+      },
+      registered.body.access_token,
+      'PUT',
+    );
+    assertEquals(suffix.status, 200);
+    // Client room-read routes are a separate B6 activation contract. Capture
+    // the exact source room cut with home stopped, then observe normal workers
+    // applying that cut before checking the closed facade's room consumer.
+    await home.stop();
+    const suffixStore = await open('home');
+    let suffixCut: number;
+    let homeKeyId: string;
+    try {
+      homeKeyId = (await openTenant(suffixStore, 'logical.test')).keyId;
+      suffixCut = await (await openRoom(suffixStore, roomId)).tx((tx) =>
+        tx.changes.head()
+      );
+    } finally {
+      await suffixStore.close();
+    }
+    home = await process(file('home'), 'federation: disabled');
+    await until(async () => {
+      const state =
+        (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
+          .result;
+      return state.scopes.some((
+        scope: { scope: string; cut: number; ready: boolean },
+      ) =>
+        scope.scope === 'room:' + roomId && scope.ready &&
+        scope.cut >= suffixCut
+      );
+    });
     await until(async () => {
       try {
         const value = await api(
@@ -1176,6 +1271,20 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     await edge.stop();
     const delivered = await open('facade');
     try {
+      const room = await openRoom(delivered, roomId);
+      const returned = await room.tx((tx) =>
+        tx.events.get(suffix.body.event_id)
+      );
+      assert(returned);
+      assertEquals(
+        JSON.parse(returned.pdu).content.ciphertext,
+        'home-after-cold-edge-branch',
+      );
+      assertEquals(
+        (await room.tx((tx) => tx.events.getStatus(suffix.body.event_id)))
+          ?.standing,
+        'accepted',
+      );
       const tenant = await openTenant(delivered, 'logical.test');
       const device = await deviceIdentity(tenant, 'outside', 'outside-device');
       const page = await tenant.tx((tx) =>
@@ -1235,6 +1344,30 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     await edge.stop();
     const closedHome = await open('home'), closedEdge = await open('facade');
     try {
+      for (const store of [closedHome, closedEdge]) {
+        const room = await store.room(roomId);
+        const replica = await openRoom(store, roomId);
+        for (
+          const [id, keyId] of [
+            [edgeEventId, edgeKeyId],
+            [suffix.body.event_id, homeKeyId],
+          ]
+        ) {
+          const event = await replica.tx((tx) => tx.events.get(id));
+          assert(event);
+          assertEquals(
+            typeof JSON.parse(event.pdu).signatures['logical.test'][keyId],
+            'string',
+          );
+          assertEquals(
+            (await room.query(
+              "SELECT COUNT(*) AS n FROM changes WHERE kind='event' AND event=?",
+              [id],
+            ))[0].n,
+            1,
+          );
+        }
+      }
       const [received] = await (await closedHome.server()).query(
         "SELECT received,applied FROM facade_streams WHERE direction='in' AND stream='authority:@outside:logical.test'",
       );

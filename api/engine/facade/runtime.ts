@@ -21,7 +21,7 @@ import { Journal } from './journal.ts';
 import { linkHandler } from './link.ts';
 import { NoticeHub } from './notices.ts';
 import { Pairings, pairingStatus } from './pairing.ts';
-import { RoomReplicas } from './replication.ts';
+import { RoomReplicas, startRoomExports } from './replication.ts';
 import { PublicReplicas } from './public.ts';
 import { DirectoryReplicas } from './directory.ts';
 import { LINK_SUPPORTED, LinkError } from './protocol.ts';
@@ -99,6 +99,15 @@ export async function openFacadeRuntime(
   let deviceLists: DeviceListService | undefined;
   let deviceEdus: EduState | undefined;
   let sender: Sender | undefined;
+  let closed: Promise<void> | undefined;
+  let refreshing = Promise.resolve();
+  let roomExports: ReturnType<typeof startRoomExports> | undefined;
+  let roomBinding: string | undefined;
+  const releaseRoomExports = async () => {
+    await roomExports?.close();
+    roomExports = undefined;
+    roomBinding = undefined;
+  };
   const pairings = () => {
     if (!node) {
       throw new LinkError(
@@ -133,7 +142,8 @@ export async function openFacadeRuntime(
       await pairings(),
       node!,
     );
-  const refresh = async () => {
+  const refreshBinding = async () => {
+    if (closed) return;
     notices.changed();
     inbox?.wake();
     if (!node) return;
@@ -143,6 +153,7 @@ export async function openFacadeRuntime(
       grant = await owner.active();
     } catch (error) {
       if (error instanceof LinkError && error.code === 'LINK_UNPAIRED') {
+        await releaseRoomExports();
         return;
       }
       throw error;
@@ -272,6 +283,32 @@ export async function openFacadeRuntime(
           ),
       });
     }
+    if (settings.phase === 'f2') {
+      const binding = grant.body.transcript.body.context.id;
+      if (roomBinding !== binding) {
+        await releaseRoomExports();
+        roomExports = startRoomExports({
+          store,
+          self: identity.server,
+          peer: 'home',
+          pairing: binding,
+          version: 2,
+          changed: () => notices.changed(),
+          failed: (error) =>
+            console.error(
+              'facade room export:',
+              error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
+            ),
+        });
+        roomBinding = binding;
+      }
+      roomExports?.wake();
+    }
+  };
+  const refresh = () => {
+    const run = refreshing.then(refreshBinding);
+    refreshing = run.then(() => undefined, () => undefined);
+    return run;
   };
   const acceptConfigured = async () => {
     // A file bootstraps a binding, not a second live registry. Restart never
@@ -359,7 +396,6 @@ export async function openFacadeRuntime(
         ),
     });
   }
-  let closed: Promise<void> | undefined;
   const releaseServices = async () => {
     await sender?.stop();
     sender = undefined;
@@ -611,6 +647,8 @@ export async function openFacadeRuntime(
     keyDocument: async () => await (await keyOwner()).document(),
     close: () =>
       closed ??= (async () => {
+        await refreshing;
+        await releaseRoomExports();
         await authExports?.close();
         await keyExports?.close();
         await toDeviceExports?.close();
