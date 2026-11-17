@@ -1,5 +1,8 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { type GatewayPolicy, sendGateway } from '#engine/push/transport.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
+import { controlledDeadline } from '#tests/support/timers.ts';
 
 const policy = (): GatewayPolicy => ({
   blocklist: ['127.0.0.0/8', '10.0.0.0/8', '::1/128', '::ffff:0:0/96'],
@@ -78,16 +81,39 @@ Deno.test('push transport: bounded JSON, deadline/cancellation and required reje
   await assertRejects(() =>
     sendGateway(url, { content: 'x'.repeat(262145) }, signal, p)
   );
-  const started = Date.now();
-  await assertRejects(() =>
-    sendGateway(url, {}, signal, { ...p, timeoutMs: 25 }, {
-      resolve: () => new Promise(() => {}),
-      dial: () => {
-        throw new Error('not reached');
-      },
-    })
-  );
-  assert(Date.now() - started < 500);
+  const entered = latch(), release = latch();
+  const deadline = controlledDeadline(25);
+  let connections = 0;
+  let resolving: Promise<string[]> | undefined;
+  const pending = sendGateway(url, {}, signal, { ...p, timeoutMs: 25 }, {
+    resolve: () => {
+      entered.release();
+      resolving = release.wait.then(() => ['8.8.8.8']);
+      return resolving;
+    },
+    dial: () => {
+      connections++;
+      throw new Error('not reached');
+    },
+  }).then(() => 'unexpected success', (error) => error);
+  try {
+    await watchdog(entered.wait, 'push resolver enters before total deadline');
+    deadline.fire();
+    const error = await watchdog(
+      pending,
+      'total push deadline rejects while DNS stays held',
+    );
+    assert(error instanceof UpstreamError);
+    assertEquals(error.context.phase, 'deadline');
+    assertEquals(connections, 0);
+    assertEquals(release.released, false);
+  } finally {
+    release.release();
+    await resolving;
+    await pending;
+    deadline.restore();
+  }
+  assertEquals(connections, 0, 'late DNS completion must not dial');
   const cancel = new AbortController();
   cancel.abort();
   await assertRejects(() => sendGateway(url, {}, cancel.signal, p));

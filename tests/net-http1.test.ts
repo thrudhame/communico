@@ -5,6 +5,8 @@
 import { assert, assertEquals } from '@std/assert';
 import { http1Request } from '#engine/net/http1.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
+import { controlledTimeouts } from '#tests/support/timers.ts';
 
 type RawServer = {
   port: number;
@@ -294,30 +296,39 @@ Deno.test('http1: Content-Length over maxBytes errors immediately', async () => 
 });
 
 Deno.test('http1: EOF body over maxBytes errors after exactly maxBytes, before EOF', async () => {
+  const eof = latch(), sent = latch(), joined = latch();
+  const timers = controlledTimeouts(2000);
   const srv = serveRaw(async (conn) => {
-    await readRequest(conn);
-    await writeAll(
-      conn,
-      new TextEncoder().encode('HTTP/1.1 200 OK\r\n\r\n'),
-    );
-    await writeAll(conn, new Uint8Array(700));
-    await new Promise((r) => setTimeout(r, 300));
-    await writeAll(conn, new Uint8Array(700));
-    // the client must have errored and closed by now; a further write fails
-    await new Promise((r) => setTimeout(r, 300));
-    await writeAll(conn, new Uint8Array(700));
+    try {
+      await readRequest(conn);
+      await writeAll(conn, new TextEncoder().encode('HTTP/1.1 200 OK\r\n\r\n'));
+      await writeAll(conn, new Uint8Array(700));
+      await writeAll(conn, new Uint8Array(700));
+      sent.release();
+      await eof.wait;
+    } finally {
+      joined.release();
+    }
   });
-  const t0 = Date.now();
+  const pending = get(srv.port, { maxBytes: 1024 }).then(
+    () => 'unexpected success',
+    (error) => error,
+  );
   try {
-    await get(srv.port, { maxBytes: 1024 });
-    throw new Error('expected an error');
-  } catch (e) {
-    const ms = Date.now() - t0;
+    await watchdog(sent.wait, 'peer body bytes before withheld EOF');
+    const e = await watchdog(
+      pending,
+      'byte limit rejects while peer EOF is withheld',
+    );
     assert(e instanceof UpstreamError);
     assertEquals(e.category, 'validation');
     assertEquals(e.context.resourceLimit, true);
-    assert(ms < 900, `took ${ms}ms — did not stop after exactly maxBytes`);
+    assertEquals(eof.released, false, 'byte limit must not wait for EOF');
   } finally {
+    eof.release();
+    await pending;
+    await joined.wait;
+    timers.restore();
     srv.close();
   }
   await waitClosed(srv, 3000);
@@ -371,14 +382,21 @@ Deno.test('http1: connect timeout on a blackholed address', async () => {
 
 Deno.test('http1: the total deadline closes a stalled upgraded TLS connection', async () => {
   let peer: Deno.Conn | undefined;
+  const hello = latch(), closed = latch();
+  const timers = controlledTimeouts(100);
   const srv = serveRaw(async (conn) => {
     peer = conn;
     const buffer = new Uint8Array(4096);
-    while (
-      await conn.read(buffer) !== null
-    ) { /* consume ClientHello, never answer */ }
+    try {
+      assert((await conn.read(buffer))! > 0, 'actual ClientHello received');
+      hello.release();
+      while (await conn.read(buffer) !== null) { /* never answer handshake */ }
+    } catch (error) {
+      if (!(error instanceof Deno.errors.ConnectionReset)) throw error;
+    } finally {
+      closed.release();
+    }
   });
-  let timer: ReturnType<typeof setTimeout> | undefined;
   const pending = http1Request({
     connectIp: '127.0.0.1',
     port: srv.port,
@@ -393,22 +411,37 @@ Deno.test('http1: the total deadline closes a stalled upgraded TLS connection', 
     maxBytes: 1024,
   }).then(() => 'unexpected success', (error) => error);
   try {
-    const outcome = await Promise.race([
+    await watchdog(
+      hello.wait,
+      'TLS peer receives ClientHello before total deadline',
+    );
+    assertEquals(
+      timers.timers.length,
+      2,
+      'total and connect deadlines register independently',
+    );
+    assertEquals(
+      timers.timers[1].active,
+      false,
+      'TCP connect deadline is retired',
+    );
+    timers.timers[0].fire();
+    const outcome = await watchdog(
       pending,
-      new Promise<string>((resolve) => {
-        timer = setTimeout(() => resolve('stalled'), 750);
-      }),
-    ]);
+      'total deadline rejects unanswered TLS handshake',
+    );
     assert(outcome instanceof UpstreamError, String(outcome));
     assertEquals(outcome.category, 'transport');
+    assertEquals(outcome.context.phase, 'deadline');
     assert(outcome.message.includes('timeout'));
+    await watchdog(closed.wait, 'total deadline closes the actual TLS peer');
   } finally {
-    clearTimeout(timer);
     try {
       peer?.close();
     } catch { /* already closed */ }
     srv.close();
     await pending;
+    timers.restore();
     await waitClosed(srv, 3000);
   }
 });
