@@ -482,24 +482,40 @@ function collision(): never {
   throw new MatrixError(409, 'M_UNKNOWN', 'authority fact collision');
 }
 
-export async function installSessionAuthority(
-  conn: Conn,
+/** Decode before either comparing or installing authority. Complete home cuts
+ * carry their own dependencies; reverse cuts may refer to retained home facts. */
+export function validateSessionAuthority(
   localpart: string,
-  view: { facts: AuthorityFact[]; sessions: SessionFact[] },
-  erasureCuts?: Record<string, ErasureCut>,
-): Promise<void> {
-  const identity = await tenantAuthority(conn);
-  if (!identity) ownerUnavailable();
+  raw: unknown,
+  options: {
+    sources?: readonly { node: string; incarnation: string }[];
+    complete?: boolean;
+  } = {},
+): { facts: AuthorityFact[]; sessions: SessionFact[] } {
+  const object = (value: unknown) =>
+    value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!object(raw)) collision();
+  const view = raw as { facts: AuthorityFact[]; sessions: SessionFact[] };
+  if (
+    !Array.isArray(view.facts) || !Array.isArray(view.sessions) ||
+    canonicalJson(Object.keys(view).sort()) !==
+      canonicalJson(['facts', 'sessions'])
+  ) collision();
   const validSource = (node: string, incarnation: string) =>
-    (node === 'home' && incarnation === identity.homeIncarnation) ||
-    (node === identity.edgeNode && incarnation === identity.edgeIncarnation);
-  const digest = (raw: unknown): raw is string =>
-    typeof raw === 'string' && /^[0-9a-f]{64}$/.test(raw);
+    typeof node === 'string' && node.length > 0 &&
+    typeof incarnation === 'string' && incarnation.length > 0 &&
+    (!options.sources ||
+      options.sources.some((source) =>
+        source.node === node && source.incarnation === incarnation
+      ));
+  const digest = (value: unknown): value is string =>
+    typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+  const facts = new Map<string, AuthorityFact>();
   for (const fact of view.facts) {
     if (
-      !validSource(fact.node, fact.incarnation) ||
-      fact.localpart !== localpart ||
-      !Number.isSafeInteger(fact.seq) || fact.seq < 1 ||
+      !object(fact) || !validSource(fact.node, fact.incarnation) ||
+      fact.localpart !== localpart || !Number.isSafeInteger(fact.seq) ||
+      fact.seq < 1 ||
       fact.id !== canonicalJson([fact.node, fact.incarnation, fact.seq])
     ) collision();
     const common = {
@@ -532,7 +548,7 @@ export async function installSessionAuthority(
         expected = { ...common, kind: 'revoke', target: fact.target };
         break;
       case 'barrier':
-        expected = { ...common, kind: fact.kind };
+        expected = { ...common, kind: 'barrier' };
         break;
       case 'deactivate':
         if (typeof fact.erase !== 'boolean') collision();
@@ -541,8 +557,91 @@ export async function installSessionAuthority(
       default:
         collision();
     }
+    if (
+      canonicalJson(fact) !== canonicalJson(expected) ||
+      (facts.has(fact.id) &&
+        canonicalJson(facts.get(fact.id)) !== canonicalJson(fact))
+    ) collision();
+    facts.set(fact.id, fact);
+  }
+  const sessions = new Map<string, SessionFact>();
+  for (const session of view.sessions) {
+    if (
+      !object(session) || !validSource(session.node, session.incarnation) ||
+      session.localpart !== localpart || !digest(session.hash) ||
+      typeof session.refresh !== 'boolean' ||
+      !Number.isSafeInteger(session.revision) || session.revision < 1 ||
+      !Array.isArray(session.barriers) || session.barriers.some((id) =>
+        typeof id !== 'string'
+      ) ||
+      canonicalJson(session.barriers) !==
+        canonicalJson([...new Set(session.barriers)].sort()) ||
+      (session.deviceId !== null &&
+        (typeof session.deviceId !== 'string' || !session.deviceId)) ||
+      (session.deviceIncarnation !== null &&
+        typeof session.deviceIncarnation !== 'string') ||
+      (session.deviceId === null) !== (session.deviceIncarnation === null) ||
+      (session.refresh
+        ? !digest(session.accessHash)
+        : session.accessHash !== null) ||
+      (session.nextHash !== null &&
+        (!session.refresh || !digest(session.nextHash))) ||
+      canonicalJson(Object.keys(session).sort()) !== canonicalJson([
+          'hash',
+          'node',
+          'incarnation',
+          'localpart',
+          'deviceId',
+          'deviceIncarnation',
+          'barriers',
+          'refresh',
+          'accessHash',
+          'nextHash',
+          'revision',
+        ].sort()) ||
+      (sessions.has(session.hash) &&
+        canonicalJson(sessions.get(session.hash)) !== canonicalJson(session))
+    ) collision();
+    sessions.set(session.hash, session);
+    if (options.complete) {
+      const device = session.deviceIncarnation === null
+        ? undefined
+        : facts.get(session.deviceIncarnation);
+      if (
+        (session.deviceId !== null && (!device || device.kind !== 'device' ||
+          device.node !== session.node ||
+          device.incarnation !== session.incarnation ||
+          device.deviceId !== session.deviceId)) ||
+        session.barriers.some((id) => facts.get(id)?.kind !== 'barrier')
+      ) collision();
+    }
+  }
+  if (
+    options.complete && view.facts.some((fact) =>
+      fact.kind === 'delete' &&
+      (facts.get(fact.target!)?.kind !== 'device' ||
+        facts.get(fact.target!)?.deviceId !== fact.deviceId)
+    )
+  ) collision();
+  return view;
+}
+
+export async function installSessionAuthority(
+  conn: Conn,
+  localpart: string,
+  view: { facts: AuthorityFact[]; sessions: SessionFact[] },
+  erasureCuts?: Record<string, ErasureCut>,
+): Promise<void> {
+  const identity = await tenantAuthority(conn);
+  if (!identity) ownerUnavailable();
+  validateSessionAuthority(localpart, view, {
+    sources: [
+      { node: 'home', incarnation: identity.homeIncarnation },
+      { node: identity.edgeNode, incarnation: identity.edgeIncarnation },
+    ],
+  });
+  for (const fact of view.facts) {
     const payload = canonicalJson(fact);
-    if (payload !== canonicalJson(expected)) collision();
     const [old] = await conn.query(
       'SELECT payload FROM authority_facts WHERE id=?',
       [fact.id],
@@ -562,27 +661,6 @@ export async function installSessionAuthority(
     );
   }
   for (const session of view.sessions) {
-    if (
-      !validSource(session.node, session.incarnation) ||
-      session.localpart !== localpart ||
-      !digest(session.hash) || typeof session.refresh !== 'boolean' ||
-      !Number.isSafeInteger(session.revision) || session.revision < 1 ||
-      !Array.isArray(session.barriers) || session.barriers.some((id) =>
-        typeof id !== 'string'
-      ) ||
-      canonicalJson(session.barriers) !==
-        canonicalJson([...new Set(session.barriers)].sort()) ||
-      (session.deviceId !== null &&
-        (typeof session.deviceId !== 'string' || !session.deviceId)) ||
-      (session.deviceIncarnation !== null &&
-        typeof session.deviceIncarnation !== 'string') ||
-      (session.deviceId === null) !== (session.deviceIncarnation === null) ||
-      (session.refresh
-        ? !digest(session.accessHash)
-        : session.accessHash !== null) ||
-      (session.nextHash !== null &&
-        (!session.refresh || !digest(session.nextHash)))
-    ) collision();
     if (session.deviceId !== null) {
       const [device] = await conn.query(
         "SELECT payload FROM authority_facts WHERE id=? AND localpart=? AND kind='device'",

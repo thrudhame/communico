@@ -3,11 +3,16 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
+  accountAuthSupersedes,
   captureAccountAuth,
   installAccountAuth,
   requireAccountAuth,
 } from '#engine/tenant/account-auth.ts';
-import { registerUser, verifyUserPassword } from '#engine/tenant/users.ts';
+import {
+  loginUser,
+  registerUser,
+  verifyUserPassword,
+} from '#engine/tenant/users.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
 
@@ -204,6 +209,122 @@ Deno.test('account auth verifier and its exact freshness cut survive a cold reop
     } finally {
       await reopened.close();
     }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('auth freshness renewals advance the source cut without replaying installed semantic authority', async () => {
+  const f = await fixture();
+  try {
+    await loginUser(f.home, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'HOME',
+      refresh: true,
+    });
+    const first = await f.capture();
+    assertEquals(first.authority.facts.length > 0, true);
+    assertEquals(first.authority.sessions.length, 2);
+    await f.ed.tx((conn) => installAccountAuth(conn, first));
+    const facts = await f.ed.query('SELECT * FROM authority_facts ORDER BY id');
+    const sessions = await f.ed.query(
+      'SELECT * FROM session_authority ORDER BY hash',
+    );
+    const fresh = await f.capture(true, 1000002);
+    assertEquals(fresh.revision, first.revision);
+    assertEquals(fresh.sourceCut > first.sourceCut, true);
+    const replay: string[] = [];
+    await f.ed.tx(async (conn) => {
+      const query = conn.query.bind(conn), execute = conn.execute.bind(conn);
+      conn.query = (sql, values) => {
+        if (
+          /tenant_authority|authority_facts|session_authority|authority_devices/
+            .test(sql)
+        ) replay.push(sql);
+        return query(sql, values);
+      };
+      conn.execute = (sql, values) => {
+        if (!sql.startsWith('INSERT INTO account_auth_snapshots(')) {
+          replay.push(sql);
+        }
+        return execute(sql, values);
+      };
+      await installAccountAuth(conn, fresh);
+    });
+    assertEquals(replay, []);
+    assertEquals(
+      await f.ed.query('SELECT * FROM authority_facts ORDER BY id'),
+      facts,
+    );
+    assertEquals(
+      await f.ed.query('SELECT * FROM session_authority ORDER BY hash'),
+      sessions,
+    );
+    const [held] = await f.ed.query(
+      'SELECT source_cut,captured_ms FROM account_auth_snapshots WHERE localpart=?',
+      ['alice'],
+    );
+    assertEquals(held, {
+      source_cut: fresh.sourceCut,
+      captured_ms: fresh.capturedMs,
+    });
+    await f.require(permissive, false, true, 1000003);
+    assertEquals(await verifyUserPassword(f.edge, 'alice', 'pw'), true);
+    const disabled = await f.capture(false, 1000004);
+    assertEquals(disabled.revision > fresh.revision, true);
+    await f.ed.tx((conn) => installAccountAuth(conn, disabled));
+    assertEquals(await verifyUserPassword(f.edge, 'alice', 'pw'), false);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('snapshot supersession retains every authority fact and session within the same monotone binding', async () => {
+  const f = await fixture();
+  try {
+    await loginUser(f.home, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'HOME',
+      refresh: true,
+    });
+    const first = await f.capture();
+    const next = await f.capture(true, 1000002);
+    assertEquals(accountAuthSupersedes(first, next), true);
+    for (
+      const alter of [
+        (view: typeof next) => {
+          view.authority.facts = [];
+        },
+        (view: typeof next) => {
+          view.authority.sessions = [];
+        },
+        (view: typeof next) => {
+          view.ownerRevision++;
+        },
+        (view: typeof next) => {
+          view.grantRevision++;
+        },
+        (view: typeof next) => {
+          view.capturedMs = first.capturedMs - 1;
+        },
+        (view: typeof next) => {
+          view.sourceCut = first.sourceCut;
+        },
+        (view: typeof next) => {
+          view.authority.sessions[0].deviceId = 'other';
+        },
+      ]
+    ) {
+      const changed = structuredClone(next);
+      changed.revision++;
+      alter(changed);
+      assertEquals(accountAuthSupersedes(first, changed), false);
+    }
+    assertEquals(accountAuthSupersedes(first, { ...next, phc: null }), false);
+    const withdrawn = await f.capture(false, 1000003);
+    assertEquals(accountAuthSupersedes(next, withdrawn), true);
   } finally {
     await f.close();
   }
