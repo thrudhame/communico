@@ -11,7 +11,7 @@ import { controlledTimeouts } from '#tests/support/timers.ts';
 type RawServer = {
   port: number;
   openSockets: () => number;
-  close: () => void;
+  close: () => Promise<void>;
 };
 
 function serveRaw(
@@ -19,30 +19,45 @@ function serveRaw(
 ): RawServer {
   const listener = Deno.listen({ port: 0 });
   const port = (listener.addr as Deno.NetAddr).port;
-  let open = 0;
-  (async () => {
+  const connections = new Set<Deno.Conn>();
+  const handlers = new Set<Promise<void>>();
+  const accepting = (async () => {
     try {
       for await (const conn of listener) {
-        open++;
-        (async () => {
+        connections.add(conn);
+        const pending = (async () => {
           try {
             await handler(conn);
           } catch { /* client went away mid-handler */ }
           try {
             conn.close();
           } catch { /* already closed */ }
-          open--;
+          connections.delete(conn);
         })();
+        handlers.add(pending);
+        void pending.then(() => handlers.delete(pending));
       }
     } catch { /* listener closed */ }
   })();
   return {
     port,
-    openSockets: () => open,
-    close: () => {
+    openSockets: () => connections.size,
+    close: async () => {
       try {
         listener.close();
       } catch { /* already closed */ }
+      // Closing admission and all accepted connections precedes every join.
+      // No handler-entry latch is awaited when the request never connected.
+      await accepting;
+      for (const conn of connections) {
+        try {
+          conn.close();
+        } catch { /* already closed */ }
+      }
+      await watchdog(
+        Promise.allSettled([...handlers]),
+        'raw HTTP handlers drain',
+      );
     },
   };
 }
@@ -89,7 +104,12 @@ function writeAll(conn: Deno.Conn, data: Uint8Array): Promise<number> {
 
 function get(
   port: number,
-  opts: { maxBytes?: number; timeoutMs?: number; connectMs?: number } = {},
+  opts: {
+    maxBytes?: number;
+    timeoutMs?: number;
+    connectMs?: number;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<{ status: number; headers: Headers; body: Uint8Array }> {
   return http1Request({
     connectIp: '127.0.0.1',
@@ -103,8 +123,37 @@ function get(
     connectMs: opts.connectMs !== undefined ? opts.connectMs : 2000,
     timeoutMs: opts.timeoutMs !== undefined ? opts.timeoutMs : 2000,
     maxBytes: opts.maxBytes !== undefined ? opts.maxBytes : 1024 * 1024,
+    signal: opts.signal,
   });
 }
+
+Deno.test('raw HTTP fixture closes accepted connections before joining stalled headers', async () => {
+  const entered = latch(), joined = latch();
+  const controller = new AbortController();
+  const srv = serveRaw(async (conn) => {
+    try {
+      await readRequest(conn);
+      entered.release();
+      await conn.read(new Uint8Array(1));
+    } finally {
+      joined.release();
+    }
+  });
+  const pending = get(srv.port, { signal: controller.signal }).catch((error) =>
+    error
+  );
+  try {
+    await watchdog(entered.wait, 'raw peer enters before withheld headers');
+    await srv.close();
+    assertEquals(srv.openSockets(), 0, 'fixture joins every accepted handler');
+    await watchdog(pending, 'closing fixture releases stalled HTTP request');
+  } finally {
+    controller.abort();
+    await pending;
+    await watchdog(joined.wait, 'cancelled raw peer drains');
+    await srv.close();
+  }
+});
 
 async function waitClosed(srv: RawServer, budgetMs: number): Promise<void> {
   const deadline = Date.now() + budgetMs;
@@ -131,7 +180,7 @@ Deno.test('http1: GET round trip with Content-Length framing', async () => {
     assertEquals(new TextDecoder().decode(res.body), 'hello');
     assertEquals(res.headers.get('x-test'), 'yes');
   } finally {
-    srv.close();
+    await srv.close();
   }
   await waitClosed(srv, 3000);
 });
@@ -168,7 +217,7 @@ Deno.test('http1: POST with a body sends Content-Length and the bytes', async ()
     assertEquals(s.path, '/submit?x=1');
     assertEquals(new TextDecoder().decode(s.body), '{"a":1}');
   } finally {
-    srv.close();
+    await srv.close();
   }
   await waitClosed(srv, 3000);
 });
@@ -188,7 +237,7 @@ Deno.test('http1: valid chunked body is reassembled', async () => {
     const res = await get(srv.port);
     assertEquals(new TextDecoder().decode(res.body), 'hello world');
   } finally {
-    srv.close();
+    await srv.close();
   }
   await waitClosed(srv, 3000);
 });
@@ -210,7 +259,7 @@ Deno.test('http1: oversized headers error at the cap', async () => {
     assertEquals(e.category, 'validation');
     assert(e.message.includes('headers too large'));
   } finally {
-    srv.close();
+    await srv.close();
   }
   await waitClosed(srv, 3000);
 });
@@ -233,7 +282,7 @@ Deno.test('http1: malformed chunk size errors, no hang', async () => {
     assertEquals(e.category, 'protocol');
     assert(e.message.includes('bad chunk size'));
   } finally {
-    srv.close();
+    await srv.close();
   }
   await waitClosed(srv, 3000);
 });
@@ -267,7 +316,7 @@ Deno.test('http1: slow-loris body fires the total timeout', async () => {
     );
     assert(ms < 3000, `took ${ms}ms`);
   } finally {
-    srv.close();
+    await srv.close();
   }
   await waitClosed(srv, 3000);
 });
@@ -290,30 +339,28 @@ Deno.test('http1: Content-Length over maxBytes errors immediately', async () => 
     assertEquals(e.category, 'validation');
     assertEquals(e.context.resourceLimit, true);
   } finally {
-    srv.close();
+    await srv.close();
   }
   await waitClosed(srv, 3000);
 });
 
 Deno.test('http1: EOF body over maxBytes errors after exactly maxBytes, before EOF', async () => {
-  const eof = latch(), sent = latch(), joined = latch();
+  const eof = latch(), sent = latch();
+  const controller = new AbortController();
   const timers = controlledTimeouts(2000);
   const srv = serveRaw(async (conn) => {
-    try {
-      await readRequest(conn);
-      await writeAll(conn, new TextEncoder().encode('HTTP/1.1 200 OK\r\n\r\n'));
-      await writeAll(conn, new Uint8Array(700));
-      await writeAll(conn, new Uint8Array(700));
-      sent.release();
-      await eof.wait;
-    } finally {
-      joined.release();
-    }
+    await readRequest(conn);
+    await writeAll(conn, new TextEncoder().encode('HTTP/1.1 200 OK\r\n\r\n'));
+    await writeAll(conn, new Uint8Array(700));
+    await writeAll(conn, new Uint8Array(700));
+    sent.release();
+    await eof.wait;
   });
-  const pending = get(srv.port, { maxBytes: 1024 }).then(
-    () => 'unexpected success',
-    (error) => error,
-  );
+  const pending = get(srv.port, { maxBytes: 1024, signal: controller.signal })
+    .then(
+      () => 'unexpected success',
+      (error) => error,
+    );
   try {
     await watchdog(sent.wait, 'peer body bytes before withheld EOF');
     const e = await watchdog(
@@ -325,11 +372,14 @@ Deno.test('http1: EOF body over maxBytes errors after exactly maxBytes, before E
     assertEquals(e.context.resourceLimit, true);
     assertEquals(eof.released, false, 'byte limit must not wait for EOF');
   } finally {
-    eof.release();
-    await pending;
-    await joined.wait;
-    timers.restore();
-    srv.close();
+    try {
+      controller.abort();
+      eof.release();
+      await srv.close();
+      await watchdog(pending, 'cancelled EOF request drains');
+    } finally {
+      timers.restore();
+    }
   }
   await waitClosed(srv, 3000);
 });
@@ -350,7 +400,7 @@ Deno.test('http1: connection closed mid-headers errors', async () => {
     assertEquals(e.category, 'protocol');
     assertEquals(e.context.reason, 'upstream headers truncated');
   } finally {
-    srv.close();
+    await srv.close();
   }
   await waitClosed(srv, 3000);
 });
@@ -439,9 +489,12 @@ Deno.test('http1: the total deadline closes a stalled upgraded TLS connection', 
     try {
       peer?.close();
     } catch { /* already closed */ }
-    srv.close();
-    await pending;
-    timers.restore();
+    try {
+      await srv.close();
+      await watchdog(pending, 'cancelled TLS handshake drains');
+    } finally {
+      timers.restore();
+    }
     await waitClosed(srv, 3000);
   }
 });

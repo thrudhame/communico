@@ -72,6 +72,28 @@ const producer = async (out: WritableStream<Uint8Array>) => {
   await w.close();
   return { contentType: 'image/png', filename: 'a.png', size: 3 };
 };
+
+function waitForProducerAbort(signal: AbortSignal, notify = () => {}) {
+  signal.throwIfAborted();
+  return new Promise<never>((_resolve, reject) =>
+    signal.addEventListener('abort', () => {
+      notify();
+      reject(signal.reason);
+    }, { once: true })
+  );
+}
+
+Deno.test('media fake producer rejects cancellation that precedes its entry', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await watchdog(
+    assertRejects(
+      async () => await waitForProducerAbort(controller.signal),
+      DOMException,
+    ),
+    'pre-aborted fake media producer rejects',
+  );
+});
 async function fixture(
   fn: (
     cache: MediaCache,
@@ -257,12 +279,9 @@ Deno.test('media cache: distinct downloads obey the shared concurrency limit and
     let began!: () => void;
     const ready = new Promise<void>((r) => began = r);
     const pending = cache.fetch(identity('cancel.test'), 1, (_out, signal) => {
+      const pending = waitForProducerAbort(signal);
       began();
-      return new Promise((_resolve, reject) =>
-        signal.addEventListener('abort', () => reject(signal.reason), {
-          once: true,
-        })
-      );
+      return pending;
     });
     const rejected = assertRejects(() => pending);
     await ready;
@@ -280,14 +299,12 @@ Deno.test('media cache: one disconnected subscriber cannot cancel another; last 
     let began!: () => void;
     const ready = new Promise<void>((resolve) => began = resolve);
     const work = (_out: WritableStream<Uint8Array>, signal: AbortSignal) => {
+      const pending = waitForProducerAbort(signal, () => {
+        cancelled = true;
+        aborted.release();
+      });
       began();
-      return new Promise<never>((_resolve, reject) =>
-        signal.addEventListener('abort', () => {
-          cancelled = true;
-          aborted.release();
-          reject(signal.reason);
-        }, { once: true })
-      );
+      return pending;
     };
     const first = cache.fetch(identity(), 1, work, a.signal);
     const second = cache.fetch(identity(), 1, work, b.signal);

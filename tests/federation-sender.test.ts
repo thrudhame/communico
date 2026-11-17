@@ -769,12 +769,20 @@ Deno.test('sender: a block stops the loop, rows left for the operator; prune + r
         );
         await removeBlock(server, dest);
         // retry refreshes the lifespan basis and re-queues
+        // Projection has its own clock. Model publication later than the
+        // sender's current turn without depending on fixture setup duration.
+        await server.execute(
+          "UPDATE outbox SET added_ms=? WHERE destination=? AND state='pending'",
+          [turns.now() + 10000, dest],
+        );
         const before2 = (await listOutbox(server, dest))[0].addedMs;
+        turns.setTime(before2 + 1);
         await retryDestination(server, dest);
         const after = (await listOutbox(server, dest))[0].addedMs;
-        assert(
-          after > before2,
-          `retry refreshes expiry: ${before2} -> ${after}`,
+        assertEquals(
+          after,
+          before2 + 1,
+          'retry refreshes expiry from the controlled basis',
         );
         steer.status = 200;
         steer.body = { pdus: {} };

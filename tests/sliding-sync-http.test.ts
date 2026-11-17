@@ -435,7 +435,7 @@ suite.test('aborting a wait rejects promptly and leaves the input position usabl
     void rejected.catch(() => undefined);
     await pending.capture();
     pending.abort();
-    await rejected;
+    await watchdog(rejected, 'cancelled sliding request rejects promptly');
     const retry = await watchdog(
       f.sync(f.request, first.body.pos),
       'cancelled sliding request releases its input position',
@@ -482,7 +482,10 @@ suite.test('acknowledged inbox pages do not keep encryption polls hot or consume
     await pending.capture();
     await pending.sweep();
     pending.abort();
-    await rejected;
+    await watchdog(
+      rejected,
+      'cancelled sliding inbox request rejects promptly',
+    );
     // The cancelled request must not have acknowledged its page. A no-since retry
     // of the same issued input still receives the original byte-identical message.
     const replay = await watchdog(

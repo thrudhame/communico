@@ -7,6 +7,7 @@ import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { wireKey } from '#tests/fixtures/e2ee-wire.ts';
 import { latch, watchdog } from '#tests/support/ordering.ts';
+import { observeOriginWorkers } from '#tests/support/origin-workers.ts';
 
 type Json = Record<string, unknown>;
 type KeyResponse = {
@@ -274,6 +275,9 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
   const peers: Awaited<ReturnType<typeof startFakeServer>>[] = [];
   let active = 0, peak = 0;
   const ready = Promise.withResolvers<void>();
+  const release = latch();
+  const workers = observeOriginWorkers();
+  let pending: Promise<KeyResponse> | undefined;
   let arrivals = 0;
   try {
     for (let n = 0; n < 6; n++) {
@@ -296,12 +300,7 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
               if (arrivals === 4) {
                 ready.resolve();
               }
-              if (arrivals <= 4) {
-                await watchdog(
-                  ready.promise,
-                  'four origin workers reach TLS consumers',
-                );
-              }
+              await release.wait;
               const user = Object.keys(
                 (req.json() as { device_keys: Json }).device_keys,
               )[0];
@@ -338,7 +337,27 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
       e2ee: { maxrequestbytes: 1600 },
       federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
     });
-    const bytes = await post(a.access_token!, 'query', { device_keys });
+    pending = post(a.access_token!, 'query', { device_keys });
+    void pending.catch(() => undefined);
+    await watchdog(
+      workers.enrolled,
+      'origin owner enrolls its complete worker group',
+    );
+    assertEquals(
+      workers.count(),
+      4,
+      'exactly four origin workers, including the upper bound',
+    );
+    await watchdog(
+      ready.promise,
+      'four origin workers reach held TLS consumers',
+    );
+    assertEquals(arrivals, 4);
+    release.release();
+    const bytes = await watchdog(
+      pending,
+      'released origin responses reach key consumer',
+    );
     assertEquals(peak, 4, 'four origin workers overlap at the TLS consumer');
     assert(bytes.device_keys[a.user_id][a.device_id]);
     assert(Object.keys(bytes.device_keys).length > 1);
@@ -359,9 +378,21 @@ suite.test('shared response budgets preserve local keys and bound origin concurr
     assertEquals(Object.keys(count.failures).length, 3);
   } finally {
     ready.resolve();
-    await Promise.all(peers.map((p) => p.close()));
-    setConfigForTests(previous);
-    resetCaCertsForTests();
+    release.release();
+    try {
+      await watchdog(
+        Promise.allSettled(pending ? [pending] : []),
+        'origin query drains',
+      );
+    } finally {
+      workers.restore();
+      try {
+        await Promise.all(peers.map((p) => p.close()));
+      } finally {
+        setConfigForTests(previous);
+        resetCaCertsForTests();
+      }
+    }
   }
 });
 

@@ -56,6 +56,7 @@ export function observeSenderWait() {
   return {
     count: () => turns.length,
     now: () => clock,
+    setTime: (value: number) => clock = value,
     async after(count: number) {
       while (turns.length <= count) {
         await watchdog(

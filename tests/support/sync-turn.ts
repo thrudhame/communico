@@ -146,11 +146,11 @@ export function observeSyncWait() {
     async close() {
       try {
         closing = true;
+        for (const request of requests) request.abort.abort();
         for (const turn of timers.values()) turn.wake();
         while (timers.size > 0) {
           await watchdog(drained.wait, 'stream wait owner drains');
         }
-        for (const request of requests) request.abort.abort();
         await watchdog(
           Promise.allSettled(requests.map((request) => request.result)),
           'cancelled HTTP requests drain',

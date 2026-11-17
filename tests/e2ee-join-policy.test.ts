@@ -228,13 +228,14 @@ Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup
         },
       };
       const rejected = assertRejects(() => joinRemote(store, args));
+      void rejected.catch(() => undefined);
       if (mode === 'timeout') {
         await watchdog(
           lateJoinEntered.wait,
           'ambiguous send_join reaches remote',
         );
       }
-      await rejected;
+      await watchdog(rejected, 'send_join rejection settles');
       if (mode === 'timeout') {
         releaseLateJoin.release();
         assert(lateJoinResponse, 'send_join response is owned before release');
