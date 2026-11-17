@@ -5,9 +5,7 @@ import { Db } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
 import { Gate } from '#engine/store/gate.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
-
-const delay = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
+import { enrollment, latch, watchdog } from '#tests/support/ordering.ts';
 
 Deno.test('store gate: a missing expected log fails loudly after commit', async () => {
   const dir = await Deno.makeTempDir();
@@ -91,6 +89,12 @@ Deno.test('store gate: long reader delays checkpoint and new readers wait withou
   let ready!: () => void;
   const held = new Promise<void>((resolve) => release = resolve);
   const started = new Promise<void>((resolve) => ready = resolve);
+  const paused = latch();
+  db.gate.addEventListener('barrier', () => paused.release(), { once: true });
+  const queued = enrollment(
+    (db.gate as unknown as { waiters: (() => void)[] }).waiters,
+  );
+  const pending: Promise<unknown>[] = [];
   try {
     await db.exec('CREATE TABLE rows_test(id INTEGER PRIMARY KEY, body TEXT)');
     const reader = db.tx(async (tx) => {
@@ -98,16 +102,18 @@ Deno.test('store gate: long reader delays checkpoint and new readers wait withou
       ready();
       await held;
     });
+    pending.push(reader);
     await started;
     let committed = false;
     const writer = db.execute('INSERT INTO rows_test VALUES(1,?)', [
       'y'.repeat(70000),
     ])
       .then(() => committed = true);
-    const deadline = performance.now() + 5000;
-    while (!db.gate.stats().closed && performance.now() < deadline) {
-      await delay(1);
-    }
+    pending.push(writer);
+    await watchdog(
+      paused.wait,
+      'committed writer never closed checkpoint admission',
+    );
     assert(db.gate.stats().closed);
     assertEquals(db.gate.stats().active, 1);
     assertEquals(db.gate.stats().checkpointing, false);
@@ -119,7 +125,11 @@ Deno.test('store gate: long reader delays checkpoint and new readers wait withou
         assertEquals(rows, [{ n: 1 }]);
       },
     );
-    await delay(20);
+    pending.push(next);
+    await watchdog(
+      queued.wait,
+      'new reader never enrolled at the closed checkpoint gate',
+    );
     assertEquals(admitted, false);
     release();
     await Promise.all([reader, writer, next]);
@@ -127,6 +137,8 @@ Deno.test('store gate: long reader delays checkpoint and new readers wait withou
     assertEquals(db.gate.stats().completed, 1);
   } finally {
     release?.();
+    await Promise.allSettled(pending);
+    queued.restore();
     await db.close();
     ffi.close();
     await Deno.remove(dir, { recursive: true });

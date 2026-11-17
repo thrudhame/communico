@@ -53,35 +53,48 @@ Deno.test('store live snapshot: inactive source opening holds neither writer adm
   const open = Db.open;
   const entered = latch(), resume = latch();
   let intercepted = false;
+  let preparationPaused = false;
   Db.open = async (...args) => {
     if (
       !intercepted && args[1].startsWith(root + '/live/') &&
       args[1].endsWith(inactivePath)
     ) {
       intercepted = true;
+      preparationPaused = true;
       entered.release();
       await resume.wait;
+      preparationPaused = false;
     }
     return await open.apply(Db, args);
   };
   let snapshot: ReturnType<typeof store.snapshot> | undefined;
   let writes: Promise<unknown> | undefined;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
   try {
     snapshot = store.snapshot(root + '/out');
     await entered.wait;
-    let completed = false;
-    writes = Promise.all([
+    const operations = Promise.all([
       server.execute('INSERT INTO traffic VALUES(1,?)', ['x'.repeat(70000)]),
       active.query('SELECT value FROM id'),
       store.room('!created-during-preparation:test', { create: true }),
-    ]).then(() => completed = true);
-    await Promise.race([
-      writes,
-      new Promise((resolve) => setTimeout(resolve, 500)),
     ]);
+    writes = operations;
+    // The contract is progress before preparation resumes, not native/IO
+    // scheduling within 500ms. This guard only breaks a dependency deadlock.
+    const [inserted, rows] = await Promise.race([
+      operations,
+      new Promise<never>((_, reject) => {
+        watchdog = setTimeout(
+          () => reject(new Error('snapshot preparation progress watchdog')),
+          30000,
+        );
+      }),
+    ]);
+    assertEquals(inserted, 1);
+    assertEquals(rows, [{ value: '!active:test' }]);
     assert(
-      completed,
-      'snapshot preparation blocked active writers or pool metadata',
+      preparationPaused,
+      'operations must complete while inactive preparation is still paused',
     );
     resume.release();
     const cut = await snapshot;
@@ -90,9 +103,9 @@ Deno.test('store live snapshot: inactive source opening holds neither writer adm
       'final fence did not revalidate and prepare the new source',
     );
   } finally {
+    clearTimeout(watchdog);
     resume.release();
-    await writes;
-    await snapshot;
+    await Promise.allSettled([writes, snapshot]);
     Db.open = open;
     await store.close();
     await Deno.remove(root, { recursive: true });

@@ -2,6 +2,7 @@
 // tenant owner installs semantic state; journal ACK follows its durable commit.
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   importPublicKeyFromRaw,
   matrixBase64,
@@ -11,6 +12,7 @@ import type { Conn } from '#engine/store/db.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import {
   type AccountAuth,
+  accountAuthSupersedes,
   captureAccountAuth,
   publishAccountAuth,
 } from '#engine/tenant/account-auth.ts';
@@ -19,13 +21,21 @@ import {
   captureSessionAuthority,
   installSessionAuthority,
   tenantAuthority,
+  validateSessionAuthority,
 } from '#engine/tenant/session-authority.ts';
 import { captureErasureCuts } from '#engine/tenant/erasure.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControls } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
 import type { NodeIdentity } from './identity.ts';
-import { integer, LinkError, object, type Stream, text } from './protocol.ts';
+import {
+  integer,
+  LinkError,
+  type LinkRecord,
+  object,
+  type Stream,
+  text,
+} from './protocol.ts';
 import { applyReplicaScope } from './scopes.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
 
@@ -46,14 +56,38 @@ function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
 }
 
+function accountLocalpart(localpart: string): string {
+  try {
+    return checkLocalpart(localpart);
+  } catch (error) {
+    if (
+      !(error instanceof MatrixError) || error.status !== 400 ||
+      error.errcode !== 'M_INVALID_USERNAME'
+    ) throw error;
+    throw new LinkError('LINK_BAD_RECORD', 'invalid account localpart', 400);
+  }
+}
+
+function authorityCutOf(
+  raw: unknown,
+  localpart: string,
+  options: Parameters<typeof validateSessionAuthority>[2] = {},
+): AuthorityCut {
+  try {
+    return validateSessionAuthority(localpart, raw, options);
+  } catch (error) {
+    if (!(error instanceof MatrixError) || error.status !== 409) throw error;
+    throw new LinkError(
+      'LINK_BAD_RECORD',
+      'invalid session authority cut',
+      400,
+    );
+  }
+}
+
 function sessionAuthorityOf(raw: unknown): SessionAuthority {
-  const row = object(raw), authority = object(row.authority);
-  if (
-    row.kind !== 'session-authority' ||
-    !Array.isArray(authority.facts) || !Array.isArray(authority.sessions) ||
-    canonicalJson(Object.keys(authority).sort()) !==
-      canonicalJson(['facts', 'sessions'])
-  ) {
+  const row = object(raw);
+  if (row.kind !== 'session-authority') {
     throw new LinkError(
       'LINK_BAD_RECORD',
       'invalid session authority cut',
@@ -61,7 +95,7 @@ function sessionAuthorityOf(raw: unknown): SessionAuthority {
     );
   }
   const localpart = text(row.localpart);
-  if (checkLocalpart(localpart) !== localpart) {
+  if (accountLocalpart(localpart) !== localpart) {
     mismatch('invalid authority account');
   }
   const view: SessionAuthority = {
@@ -73,7 +107,7 @@ function sessionAuthorityOf(raw: unknown): SessionAuthority {
     localpart,
     source: text(row.source),
     incarnation: text(row.incarnation),
-    authority: authority as AuthorityCut,
+    authority: authorityCutOf(row.authority, localpart),
   };
   if (canonicalJson(view) !== canonicalJson(raw)) {
     mismatch('unexpected session authority material');
@@ -220,11 +254,14 @@ export async function exportSessionAuthority(
   });
 }
 
-function accountAuthOf(raw: unknown): AccountAuth {
+function accountAuthOf(
+  raw: unknown,
+  sources: readonly { node: string; incarnation: string }[],
+): AccountAuth {
   const row = object(raw);
   const localpart = text(row.localpart);
   if (
-    row.kind !== 'account-auth' || checkLocalpart(localpart) !== localpart ||
+    row.kind !== 'account-auth' || accountLocalpart(localpart) !== localpart ||
     typeof row.credentials !== 'boolean' ||
     typeof row.deactivated !== 'boolean' ||
     (row.phc !== null &&
@@ -250,21 +287,10 @@ function accountAuthOf(raw: unknown): AccountAuth {
     credentials: row.credentials,
     phc: row.phc as string | null,
     deactivated: row.deactivated,
-    authority: (() => {
-      const authority = object(row.authority);
-      if (
-        !Array.isArray(authority.facts) || !Array.isArray(authority.sessions) ||
-        canonicalJson(Object.keys(authority).sort()) !==
-          canonicalJson(['facts', 'sessions'])
-      ) {
-        throw new LinkError(
-          'LINK_BAD_RECORD',
-          'invalid session authority cut',
-          400,
-        );
-      }
-      return authority as AccountAuth['authority'];
-    })(),
+    authority: authorityCutOf(row.authority, localpart, {
+      sources,
+      complete: true,
+    }),
   };
   if (canonicalJson(view) !== canonicalJson(raw)) {
     throw new LinkError(
@@ -455,45 +481,87 @@ export class AccountSnapshots {
   }
 
   async apply(journal: Journal, stream: Stream): Promise<boolean> {
-    const record = await journal.next('home', stream);
-    if (!record) return false;
-    if (record.type !== 'account-auth' || record.version !== 1) {
-      throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not account auth');
-    }
-    const payload = object(record.payload), signed = object(payload.signed);
-    const view = accountAuthOf(signed.body);
+    const pending = await journal.pending('home', stream);
+    const first = pending[0];
+    if (!first) return false;
     const grant = await this.pairings.active();
     if (!this.owners) mismatch('account snapshots require facade ownership');
     const owner = await this.owners.ready();
     const context = grant.body.transcript.body.context;
-    if (
-      view.server !== this.tenant.serverName ||
-      view.server !== context.server || view.pairing !== context.id ||
-      view.grantRevision !== grant.body.revision ||
-      owner.pairing !== view.pairing
-    ) {
+    const verify = async (record: LinkRecord) => {
+      if (record.type !== 'account-auth' || record.version !== 1) {
+        throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not account auth');
+      }
+      const payload = object(record.payload), signed = object(payload.signed);
+      const view = accountAuthOf(signed.body, owner.nodes);
+      if (
+        view.server !== this.tenant.serverName ||
+        view.server !== context.server || view.pairing !== context.id ||
+        view.grantRevision !== grant.body.revision ||
+        owner.pairing !== view.pairing
+      ) {
+        throw new LinkError(
+          'LINK_IDENTITY_MISMATCH',
+          'account auth differs from enrolled authority',
+          403,
+        );
+      }
+      let valid = false;
+      try {
+        valid = await crypto.subtle.verify(
+          'Ed25519',
+          await importPublicKeyFromRaw(
+            matrixBase64(context.home.publicKey, 32),
+          ),
+          matrixBase64(text(signed.signature), 64),
+          new TextEncoder().encode(canonicalJson(view)),
+        );
+      } catch { /* Malformed signature grants no credential authority. */ }
+      if (!valid) {
+        throw new LinkError(
+          'LINK_IDENTITY_MISMATCH',
+          'invalid home account auth signature',
+          403,
+        );
+      }
+      return { record, view, after: integer(payload.after) };
+    };
+    const db = await this.store.server();
+    const [scope] = await db.query(
+      'SELECT pending_hash FROM facade_scopes WHERE incarnation=? AND scope=?',
+      [context.id, stream.stream],
+    );
+    // An interrupted cross-file application resumes its originally admitted
+    // finite prefix, even if receipt continued while it was being installed.
+    const end = scope?.pending_hash
+      ? pending.findIndex((record) => record.hash === scope.pending_hash)
+      : pending.length - 1;
+    if (end < 0) {
       throw new LinkError(
-        'LINK_IDENTITY_MISMATCH',
-        'account auth differs from enrolled authority',
-        403,
+        'LINK_DIVERGED',
+        'pending auth snapshot is not retained',
       );
     }
-    let valid = false;
-    try {
-      valid = await crypto.subtle.verify(
-        'Ed25519',
-        await importPublicKeyFromRaw(matrixBase64(context.home.publicKey, 32)),
-        matrixBase64(text(signed.signature), 64),
-        new TextEncoder().encode(canonicalJson(view)),
-      );
-    } catch { /* Malformed signature grants no credential authority. */ }
-    if (!valid) {
-      throw new LinkError(
-        'LINK_IDENTITY_MISMATCH',
-        'invalid home account auth signature',
-        403,
-      );
+    let selected = await verify(first);
+    const superseded: typeof selected[] = [];
+    for (const candidate of pending.slice(1, end + 1)) {
+      let next: typeof selected;
+      try {
+        next = await verify(candidate);
+      } catch (error) {
+        // A later invalid record cannot erase an earlier valid revocation. It
+        // remains pending and will receive its normal refusal on the next turn.
+        if (error instanceof LinkError) break;
+        throw error;
+      }
+      if (
+        next.after !== selected.view.sourceCut ||
+        !accountAuthSupersedes(selected.view, next.view)
+      ) break;
+      superseded.push(selected);
+      selected = next;
     }
+    const { record, view } = selected;
     // Control and auth streams progress independently. Only authenticated old
     // snapshots can be retired; future snapshots wait for their control. Repeat
     // in each owning transaction so an asynchronous control advance cannot
@@ -513,15 +581,24 @@ export class AccountSnapshots {
       return Number(activation.revision) === view.ownerRevision;
     };
     return await applyReplicaScope({
-      db: await this.store.server(),
+      db,
       pairings: this.pairings,
       self: this.tenant.serverName,
       journal,
       stream,
       record,
       scope: 'auth:@' + view.localpart + ':' + view.server,
-      after: integer(payload.after),
+      after: superseded[0]?.after ?? selected.after,
       cut: view.sourceCut,
+      superseded: superseded.map((entry) => ({
+        record: entry.record,
+        result: {
+          localpart: entry.view.localpart,
+          cut: entry.view.sourceCut,
+          revision: entry.view.revision,
+          supersededBy: record.sequence,
+        },
+      })),
       ready: current,
       apply: async () => {
         const cuts = view.authority.facts.some((fact) =>

@@ -14,6 +14,7 @@ import {
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
 
 Deno.test('discovery grammar: server-name syntax is not URL syntax or numeric coercion', () => {
   for (
@@ -283,42 +284,73 @@ for (const slow of ['AAAA', 'backup']) {
   Deno.test(
     'discovery latency: a usable primary does not await ' + slow,
     async () => {
-      const signal = AbortSignal.timeout(100);
+      const held = latch();
+      const entered = latch();
       const visited: string[] = [];
-      const answer = await resolveWith(
-        'primary.test:8448',
-        deps({
-          dnsA: () => Promise.resolve(['127.0.0.1']),
-          dnsAAAA: () =>
-            slow === 'AAAA' ? new Promise(() => {}) : Promise.resolve([]),
-        }),
-        slow === 'AAAA' ? signal : undefined,
-      );
-      assertEquals(answer.connectIp, '127.0.0.1');
-      if (slow === 'backup') {
-        const resolved = await resolveWith(
-          'srv.test',
-          deps({
-            dnsSrv: () =>
-              Promise.resolve([
-                { target: 'primary.test', port: 8449, priority: 0, weight: 1 },
-                { target: 'slow.test', port: 8450, priority: 1, weight: 1 },
-              ]),
-            dnsA: (host) => {
-              visited.push(host);
-              return host === 'slow.test'
-                ? new Promise(() => {})
-                : Promise.resolve(['127.0.0.1']);
-            },
-          }),
-          signal,
+      let resolved: Awaited<ReturnType<typeof resolveWith>> | undefined;
+      let resolving: ReturnType<typeof resolveWith> | undefined;
+      try {
+        resolving = slow === 'AAAA'
+          ? resolveWith(
+            'primary.test:8448',
+            deps({
+              dnsA: () => Promise.resolve(['127.0.0.1']),
+              dnsAAAA: async () => {
+                entered.release();
+                await held.wait;
+                return [];
+              },
+            }),
+          )
+          : resolveWith(
+            'srv.test',
+            deps({
+              dnsSrv: () =>
+                Promise.resolve([
+                  {
+                    target: 'primary.test',
+                    port: 8449,
+                    priority: 0,
+                    weight: 1,
+                  },
+                  { target: 'slow.test', port: 8450, priority: 1, weight: 1 },
+                ]),
+              dnsA: async (host) => {
+                visited.push(host);
+                if (host === 'slow.test') await held.wait;
+                return ['127.0.0.1'];
+              },
+            }),
+          );
+        if (slow === 'AAAA') {
+          await watchdog(
+            entered.wait,
+            'losing address family was never started',
+          );
+        }
+        resolved = await watchdog(
+          resolving,
+          'usable primary waited for held ' + slow,
         );
-        assertEquals(resolved.port, 8449);
+        assertEquals(resolved.connectIp, '127.0.0.1');
         assertEquals(
-          visited,
-          ['primary.test'],
-          'backup DNS is eligible only after the primary fails',
+          held.released,
+          false,
+          'held resolver resumed before primary',
         );
+        if (slow === 'backup') {
+          assertEquals(resolved.port, 8449);
+          assertEquals(
+            visited,
+            ['primary.test'],
+            'backup DNS is eligible only after the primary fails',
+          );
+        }
+      } finally {
+        held.release();
+        if (!resolved) resolved = await resolving?.catch(() => undefined);
+        const alternatives = resolved?.alternatives?.[Symbol.asyncIterator]();
+        await alternatives?.return?.();
       }
     },
   );

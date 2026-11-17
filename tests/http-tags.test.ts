@@ -1,5 +1,6 @@
-import { assert, assertEquals } from '@std/assert';
+import { assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP room tags and account-data stream');
@@ -8,12 +9,14 @@ async function call(
   token: string,
   method = 'GET',
   body?: unknown,
+  signal?: AbortSignal,
 ) {
   const response = await suite.matrix(
     new Request('http://x' + path, {
       method,
       headers: { Authorization: 'Bearer ' + token },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     }),
   );
   return { status: response.status, body: await response.json() as Json };
@@ -33,19 +36,28 @@ suite.test('tags share atomic account data and incremental sync, including concu
     '/rooms/' + encodeURIComponent(room);
   assertEquals((await call(base + '/tags', token)).body, { tags: {} });
   const initial = await call('/_matrix/client/v3/sync?timeout=0', token);
-  const waiting = call(
-    '/_matrix/client/v3/sync?timeout=5000&since=' + initial.body.next_batch,
-    token,
+  const turns = observeSyncWait();
+  const waiting = turns.start((signal) =>
+    call(
+      '/_matrix/client/v3/sync?timeout=5000&since=' + initial.body.next_batch,
+      token,
+      'GET',
+      undefined,
+      signal,
+    )
   );
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  const start = performance.now();
-  assertEquals(
-    (await call(base + '/tags/m.favourite', token, 'PUT', { order: 0.3 }))
-      .status,
-    200,
-  );
-  const next = await waiting;
-  assert(performance.now() - start < 1000, 'tag writes wake a waiting sync');
+  let next: Awaited<ReturnType<typeof call>>;
+  try {
+    await waiting.capture();
+    assertEquals(
+      (await call(base + '/tags/m.favourite', token, 'PUT', { order: 0.3 }))
+        .status,
+      200,
+    );
+    next = await waiting.finish();
+  } finally {
+    await turns.close();
+  }
   const entry = ((next.body.rooms as Json).join as Json)[room] as Json;
   assertEquals((entry.account_data as Json).events, [{
     type: 'm.tag',

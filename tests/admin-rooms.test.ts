@@ -14,6 +14,7 @@ import {
   rejectInviteRemote,
 } from '#engine/federation/invites.ts';
 import { fakeKeyResolver } from '#tests/fixtures/remote.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
 
 Deno.test('admin rooms offered list, age filter, drop cleanup and lease retirement', async () => {
   const dir = await Deno.makeTempDir();
@@ -379,14 +380,52 @@ for (const race of ['new rejection', 'candidate failover'] as const) {
       const dropping = adminCall(admin.path, 'rooms/drop', {
         roomId: g.roomId,
       });
+      const dropped = dropping.then((result) => result, (error) => ({ error }));
       await cut;
-      const racing = race === 'new rejection'
-        ? rejectInviteRemote(g.roomId, user, deps)
-        : job!.failed(new Error('failure after removal snapshot'));
-      // Keep the removal cut open while the competing real operation runs.
-      // A corrected owner queues that transition until cleanup finishes.
-      const raced = racing.then(() => null, (error) => error);
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      const enrolled = latch();
+      const then = Promise.prototype.then;
+      // Observe the actual publication owner's queue registration. The caller's
+      // async invocation alone does not prove it has reached that held owner.
+      Promise.prototype.then = function (
+        this: Promise<unknown>,
+        ...callbacks: Parameters<typeof then>
+      ) {
+        const stack = new Error().stack ?? '';
+        if (
+          stack.includes('/api/engine/server/project.ts:') &&
+          stack.includes('/api/engine/federation/invites.ts:')
+        ) enrolled.release();
+        return then.apply(this, callbacks);
+      } as typeof then;
+      let finished = false;
+      let raced: Promise<unknown> = Promise.resolve();
+      try {
+        const racing = race === 'new rejection'
+          ? rejectInviteRemote(g.roomId, user, deps)
+          : job!.failed(new Error('failure after removal snapshot'));
+        raced = racing.then(
+          () => {
+            finished = true;
+          },
+          (error) => {
+            finished = true;
+            return error;
+          },
+        );
+        await watchdog(
+          enrolled.wait,
+          'invite transition enrolls behind held removal cut',
+        );
+        assertEquals(
+          finished,
+          false,
+          'transition cannot finish through the held removal owner',
+        );
+      } finally {
+        Promise.prototype.then = then;
+        release();
+        await Promise.all([dropped, raced]);
+      }
       release();
       const result = await dropping;
       await raced;

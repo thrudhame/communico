@@ -1,24 +1,38 @@
 // Private receipts are user-scoped, including sync payloads and long-poll wakeups.
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP private receipts');
-async function call(path: string, token?: string, body?: unknown) {
+async function call(
+  path: string,
+  token?: string,
+  body?: unknown,
+  signal?: AbortSignal,
+) {
   const response = await suite.matrix(
     new Request('http://x/_matrix/client/v3/' + path, {
       method: body === undefined ? 'GET' : 'POST',
       headers: token === undefined ? {} : { Authorization: 'Bearer ' + token },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     }),
   );
   assertEquals(response.status, 200);
   return await response.json() as Json;
 }
-const sync = (token: string, since?: unknown, timeout = 0) =>
+const sync = (
+  token: string,
+  since?: unknown,
+  timeout = 0,
+  signal?: AbortSignal,
+) =>
   call(
     'sync?timeout=' + timeout + (since === undefined ? '' : '&since=' + since),
     token,
+    undefined,
+    signal,
   );
 function receipts(body: Json, room: string): Json[] {
   const joined = ((body.rooms as Json).join as Json)[room] as Json | undefined;
@@ -92,24 +106,25 @@ suite.test('private receipt wakes its owner, never another joined user', async (
   const { a, b, room, base, target } = await fixture('private-wake');
   const ownerBefore = await sync(a.access_token!);
   const observerBefore = await sync(b.access_token!);
-  let observerFinished = false;
-  const ownerWait = sync(a.access_token!, ownerBefore.next_batch, 3000);
-  const observerWait = sync(b.access_token!, observerBefore.next_batch, 3000)
-    .then((body) => {
-      observerFinished = true;
-      return body;
-    });
-  await new Promise((resolve) => setTimeout(resolve, 80));
-  await call(base + '/receipt/m.read.private/' + target, a.access_token!, {});
-  const owner = await ownerWait;
-  await new Promise((resolve) => setTimeout(resolve, 80));
-  const stayedPending = !observerFinished;
-  await call(base + '/receipt/m.read/' + target, a.access_token!, {});
-  const observer = await observerWait;
-  assert(
-    stayedPending,
-    'another user must not observe a private receipt through early sync completion',
+  const turns = observeSyncWait();
+  const ownerWait = turns.start((signal) =>
+    sync(a.access_token!, ownerBefore.next_batch, 3000, signal)
   );
+  let owner: Json, observer: Json;
+  try {
+    await ownerWait.capture();
+    const observerWait = turns.start((signal) =>
+      sync(b.access_token!, observerBefore.next_batch, 3000, signal)
+    );
+    await observerWait.capture();
+    await call(base + '/receipt/m.read.private/' + target, a.access_token!, {});
+    owner = await ownerWait.finish();
+    await observerWait.sweep();
+    await call(base + '/receipt/m.read/' + target, a.access_token!, {});
+    observer = await observerWait.finish();
+  } finally {
+    await turns.close();
+  }
   assert(
     JSON.stringify(receipts(owner, room)).includes('m.read.private'),
     JSON.stringify({

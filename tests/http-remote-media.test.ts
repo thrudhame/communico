@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals } from '@std/assert';
 import { config, serverName, setConfigForTests } from '#engine/config.ts';
 import { theApp } from '#engine/app.ts';
 import { startHttp } from '#tests/http-app.ts';
@@ -11,6 +11,8 @@ import { listCachedMedia } from '#engine/server/media.ts';
 import { addBlock, removeBlock } from '#engine/federation/peers.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { MediaCache } from '#engine/media/cache.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
+import { mediaDemand } from '#tests/support/media-demand.ts';
 
 Deno.test('HTTP remote media: recorded stock envelopes publish exact ciphertext, never partial data', async (t) => {
   const previous = config();
@@ -393,6 +395,8 @@ Deno.test('HTTP remote media: Location bytes remain private and the last disconn
     });
   });
   let cancelled = false;
+  const remoteClosed = latch();
+  let demand: ReturnType<typeof mediaDemand> | undefined;
   let began!: () => void;
   const started = new Promise<void>((r) => began = r);
   const fake = await startFakeServer({
@@ -429,6 +433,7 @@ Deno.test('HTTP remote media: Location bytes remain private and the last disconn
           },
           cancel() {
             cancelled = true;
+            remoteClosed.release();
           },
         }),
         { headers: { 'Content-Type': 'multipart/mixed; boundary=media' } },
@@ -464,27 +469,58 @@ Deno.test('HTTP remote media: Location bytes remain private and the last disconn
       false,
     );
     const a = new AbortController(), b = new AbortController();
+    demand = mediaDemand();
     const first = get('slow', a.signal), second = get('slow', b.signal);
-    const rejected = Promise.all([
-      assertRejects(() => first),
-      assertRejects(() => second),
-    ]);
-    await started;
-    await new Promise((r) => setTimeout(r, 30));
+    // Own both verdicts immediately, including during cleanup after an earlier
+    // ordering assertion fails. A second unhandled assertion hides that cause.
+    const firstVerdict = first.then(() => 'fulfilled', () => 'rejected');
+    const secondVerdict = second.then(() => 'fulfilled', () => 'rejected');
+    await watchdog(started, 'remote media producer enters');
+    await watchdog(
+      demand.joined,
+      'both HTTP callers enroll in the shared media owner',
+    );
     a.abort();
-    await new Promise((r) => setTimeout(r, 30));
+    assertEquals(
+      await watchdog(firstVerdict, 'first HTTP media subscriber leaves'),
+      'rejected',
+    );
+    await watchdog(
+      demand.firstLeft,
+      'first HTTP subscription actually leaves its server owner',
+    );
+    assertEquals(
+      demand.entry.users,
+      1,
+      'second HTTP subscriber retains demand',
+    );
+    assertEquals(demand.entry.controller.signal.aborted, false);
     assertEquals(cancelled, false);
     b.abort();
-    await rejected;
-    for (let n = 0; n < 100 && !cancelled; n++) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
+    assertEquals(
+      await watchdog(secondVerdict, 'last HTTP media subscriber leaves'),
+      'rejected',
+    );
+    await watchdog(
+      demand.lastLeft,
+      'last HTTP subscription actually leaves its server owner',
+    );
+    await watchdog(
+      remoteClosed.wait,
+      'last HTTP subscriber closes the actual remote stream',
+    );
+    await watchdog(
+      demand.entry.run.catch(() => {}),
+      'cancelled HTTP media producer fully settles',
+    );
     assertEquals(cancelled, true);
     assertEquals(
       fake.requests.filter((r) => r.path.endsWith('/slow')).length,
       1,
     );
   } finally {
+    await demand?.close();
+    demand?.restore();
     await fake.close();
     await cdn.shutdown();
     await cdn.finished;
