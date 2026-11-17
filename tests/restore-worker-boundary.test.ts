@@ -20,6 +20,8 @@ import { createBackup } from '#engine/backup/bundle.ts';
 import { restoreBackup } from '#engine/backup/restore.ts';
 import { readManifest } from '#engine/backup/manifest.ts';
 import { inventoryRestoredWork } from '#engine/backup/work.ts';
+import { completeAccepted } from '#tests/complete-accepted.ts';
+import { holdPublication } from '#tests/support/hold-publication.ts';
 
 type Json = Record<string, unknown>;
 
@@ -81,6 +83,7 @@ Deno.test('restored work: failed/incomplete report holds overdue commands and re
     server: serverSchema,
   };
   let preparedWorker: DelayedEvents | undefined;
+  let publication: ReturnType<typeof holdPublication> | undefined;
   let sourcePush: Awaited<ReturnType<typeof startPushSender>> | undefined;
   try {
     const app = await openApp(cfg.store);
@@ -152,6 +155,8 @@ Deno.test('restored work: failed/incomplete report holds overdue commands and re
     const prepared = await preparedWorker.schedule(
       schedule('exact prepared A'),
     );
+    // Tenant finish does not own projection. Hold the actual publication cut.
+    publication = holdPublication(app, room);
     await assertRejects(
       () => preparedWorker!.action(prepared.delay_id, 'send'),
       Error,
@@ -163,6 +168,15 @@ Deno.test('restored work: failed/incomplete report holds overdue commands and re
     );
     assert(submission?.pdu);
     const preparedEvent = String(submission.eventId);
+    await publication.entered;
+    assertEquals(
+      await app.server.query(
+        'SELECT event FROM feed WHERE room=? AND event=?',
+        [room, preparedEvent],
+      ),
+      [],
+      'A captures a committed room event before its held publication',
+    );
     await app.tenant.tx(async (tx) => {
       await tx.delayedEvents.action(overdue.delay_id, 'send', Date.now() - 1);
       await tx.delayedEvents.retry([prepared.delay_id], Date.now() - 1);
@@ -179,6 +193,10 @@ Deno.test('restored work: failed/incomplete report holds overdue commands and re
       id: file.id,
       path: file.path.slice('store/'.length),
     }));
+
+    publication.release();
+    publication.restore();
+    await completeAccepted(app, room, preparedEvent);
 
     // B really cancels A's command and acknowledges A's gateway jobs.
     await app.delayedEvents.action(overdue.delay_id, 'cancel');
@@ -282,8 +300,8 @@ Deno.test('restored work: failed/incomplete report holds overdue commands and re
     assert(
       pending.push.deliveries.some((row) => row.event === pendingPush.event_id),
     );
-    // The injected finish failure precedes afterRoomCommit/projection. Its
-    // future push is still room-owned work, not yet a server queue row at A.
+    // The prepared event publication was held across A. Its future push is
+    // still room-owned work, not yet a server queue row at that captured cut.
     assert(
       pending.rooms.some((entry) =>
         entry.id === room && Number(entry.unprojectedChanges) > 0
@@ -346,6 +364,8 @@ Deno.test('restored work: failed/incomplete report holds overdue commands and re
     );
     assertEquals(await Deno.readTextFile(reportPath), reportText);
   } finally {
+    publication?.release();
+    publication?.restore();
     await preparedWorker?.stop();
     await sourcePush?.stop();
     await closeApp();

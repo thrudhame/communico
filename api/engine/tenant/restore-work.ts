@@ -52,5 +52,22 @@ export async function restoredTenantWork(
       });
     }
   }
-  return { delayed, toDevice, submissions, unprojected };
+  const completionReceipts = await inventoryRows(
+    db,
+    'transaction_completions',
+    'localpart,device_id,generation,endpoint,txn_id,room_id,room_generation,event_id,through,retired',
+  );
+  const pendingCompletions = await inventoryRows(
+    db,
+    'client_completion_cuts',
+    'localpart,device_id,generation,room_id,room_generation,through,revision',
+  );
+  return {
+    delayed,
+    toDevice,
+    submissions,
+    unprojected,
+    completionReceipts,
+    pendingCompletions,
+  };
 }

@@ -1,6 +1,10 @@
 // A protocol coordinator over existing captured owners; no parallel room truth,
 // inbox or notification model. Reads/rendering never hold a write transaction.
 import { theApp } from '#engine/app.ts';
+import {
+  clientCompletion,
+  completionAudience,
+} from '#engine/client/completion.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { slidingListSnapshot } from '#engine/server/read.ts';
 import {
@@ -74,6 +78,12 @@ export async function slidingSync(input: {
     request.connId,
     signal,
     async () => {
+      const completion = await clientCompletion(app, device, signal, [
+        ...(Object.keys(request.lists).length
+          ? await completionAudience(app, input.userId)
+          : []),
+        ...Object.keys(request.subscriptions),
+      ]);
       const lease = await app.tenant.tx((tx) =>
         tx.slidingSync.begin(device, request.connId, request.pos)
       );
@@ -302,7 +312,7 @@ export async function slidingSync(input: {
           },
         };
       });
-      return await publishSlidingResponse({
+      const response = await publishSlidingResponse({
         tenant: app.tenant,
         device,
         lease,
@@ -310,6 +320,8 @@ export async function slidingSync(input: {
         toDevice: request.extensions.to_device,
         signal,
       });
+      await completion.retire();
+      return response;
     },
   );
 }

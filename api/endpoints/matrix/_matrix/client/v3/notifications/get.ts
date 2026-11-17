@@ -7,5 +7,6 @@ export default async function (
     context.state.user as string,
     (context.state.device as string | undefined) ?? null,
     request.query,
+    request._raw.signal,
   );
 }

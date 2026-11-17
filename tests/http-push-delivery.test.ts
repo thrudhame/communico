@@ -2,6 +2,7 @@ import { assert, assertEquals } from '@std/assert';
 import { startHttp } from '#tests/http-app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { startPushSender } from '#engine/push/sender.ts';
+import { completeAccepted } from '#tests/complete-accepted.ts';
 
 type Json = Record<string, unknown>;
 Deno.test('HTTP push delivery: real HTTPS consumer sees rich encrypted/plaintext, explicit minimal, retry, read-zero, rejected and logout lifecycle', async () => {
@@ -99,8 +100,8 @@ Deno.test('HTTP push delivery: real HTTPS consumer sees rich encrypted/plaintext
     await register();
     await delivery.tick();
     assertEquals(requests, []);
-    const send = async (r: string, type: string, body: Json, txn: string) =>
-      String(
+    const send = async (r: string, type: string, body: Json, txn: string) => {
+      const eventId = String(
         (await call(
           'rooms/' + encodeURIComponent(r) + '/send/' + type + '/' + txn,
           a.access_token!,
@@ -108,6 +109,10 @@ Deno.test('HTTP push delivery: real HTTPS consumer sees rich encrypted/plaintext
           'PUT',
         )).event_id,
       );
+      // This fixture explicitly drives one asynchronous gateway pass below.
+      await completeAccepted(http.app, r, eventId);
+      return eventId;
+    };
     const ciphertext = {
       algorithm: 'm.megolm.v1.aes-sha2',
       ciphertext: 'opaque-not-plaintext',
