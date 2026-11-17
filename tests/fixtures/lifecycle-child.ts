@@ -20,6 +20,19 @@ if (barrier) {
     return undefined as never;
   };
 }
+// Keep the runtime's automatic Unix-listener drop from supplying application
+// cleanup. Fatal exit must release the name through the socket's own lifetime.
+if (Deno.env.get('DENO_COMMUNICO_TEST_HOLD_ADMIN_ABORT') === '1') {
+  Deno.serve = new Proxy(Deno.serve, {
+    apply(serve, receiver, args) {
+      if (args[0]?.transport === 'unix') {
+        args[0] = { ...args[0], signal: undefined };
+        console.log('test: admin automatic abort held');
+      }
+      return Reflect.apply(serve, receiver, args);
+    },
+  });
+}
 await import('#root/main.ts');
 
 const trigger = Deno.env.get('DENO_COMMUNICO_TEST_FATAL_TRIGGER');
