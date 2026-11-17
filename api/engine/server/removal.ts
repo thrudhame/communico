@@ -52,6 +52,17 @@ export async function finishRoomRemoval(
     const byDestination = new Map(
       rows.map((r) => [String(r.destination), Number(r.n)]),
     );
+    const invites = await tx.query(
+      'SELECT destination,count(*) AS n FROM federation_invite_attempts WHERE room_id=? GROUP BY destination',
+      [roomId],
+    );
+    for (const row of invites) {
+      const destination = String(row.destination);
+      byDestination.set(
+        destination,
+        (byDestination.get(destination) ?? 0) + Number(row.n),
+      );
+    }
     const pending = await tx.query(
       `SELECT room_id,user_id,status FROM prejoin_memberships p WHERE room_id=? AND status IN ('rejecting','attempting','failed-attempt','failed-retract') AND ${
         visiblePrejoin('p')
@@ -107,6 +118,7 @@ export async function finishRoomRemoval(
         'directory',
         'visibility',
         'prejoin_memberships',
+        'federation_invite_attempts',
         'rooms',
       ]
     ) {

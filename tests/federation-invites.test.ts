@@ -8,7 +8,9 @@
 // local-only fallback); the second candidate from the stripped state is
 // tried. Rescind both ways. (doltgres tests/federation-invites.test.ts,
 // restored at the engine functions — /sync rendering is stage 5.)
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
+import { canonicalJson } from '#engine/canonical.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -23,6 +25,7 @@ import {
   markInviteJoined,
   receiveInvite,
   rejectInviteRemote,
+  retryPrejoinIntents,
 } from '#engine/federation/invites.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { keyStore } from '#engine/federation/keys.ts';
@@ -32,6 +35,7 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
+import { finishRoomRemoval } from '#engine/server/removal.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -105,6 +109,9 @@ async function waitFor(
 
 type InviteHost = {
   fake: FakeServer;
+  beforeReply?: () => Promise<void>;
+  changeEvent?: (event: Record<string, unknown>) => void;
+  response?: () => Response | null;
   inviteRequests: {
     room_version: unknown;
     event: Record<string, unknown>;
@@ -136,10 +143,16 @@ async function withInviteHost<T>(
         event: Record<string, unknown>;
         invite_room_state: Record<string, unknown>[];
       };
-      h.inviteRequests.push(body);
+      // Signing a response may mutate nested signature maps. Retain the actual
+      // incoming request, not an object the fake subsequently countersigns.
+      h.inviteRequests.push(structuredClone(body));
       // the fake signs the invite as the invitee's server — over the
       // redacted form without the id, like any v3+ signer
       return (async () => {
+        await h.beforeReply?.();
+        const override = h.response?.();
+        if (override) return override;
+        h.changeEvent?.(body.event);
         const { redact } = await import('#engine/eventid.ts');
         const redacted = redact(body.event, '11');
         delete redacted.event_id;
@@ -165,6 +178,431 @@ async function withInviteHost<T>(
     resetCaCertsForTests();
   }
 }
+
+Deno.test('inviter: signed attempt survives uncertain response and cold sender recovery', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: { room: roomSchema, server: serverSchema },
+  });
+  try {
+    await withInviteHost(async (h) => {
+      const g = await genesis(store, { roomId: '!invite-attempt:test' });
+      const target = `@zoe:${h.fake.name}`;
+      const depsFor = async (): Promise<InviteDeps> => {
+        const server = await store.server();
+        return {
+          store,
+          server,
+          signer: g.signer,
+          keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+          self: 'test',
+          wake: () => {},
+        };
+      };
+      let retained: Record<string, unknown>[] = [];
+      h.beforeReply = async () => {
+        // Capture the owning DB at the actual network consumer, before any reply.
+        try {
+          retained = await (await store.server()).query(
+            'SELECT * FROM federation_invite_attempts',
+          );
+        } catch {
+          retained = [];
+        }
+        if (h.inviteRequests.length === 1) {
+          await assertRejects(
+            () =>
+              inviteRemote(
+                g.roomId,
+                '@dev:test',
+                target,
+                'kept',
+                undefined,
+                firstDeps,
+              ),
+            MatrixError,
+            'active',
+          );
+          await assertRejects(
+            () =>
+              inviteRemote(
+                g.roomId,
+                '@dev:test',
+                target,
+                'changed',
+                undefined,
+                firstDeps,
+              ),
+            MatrixError,
+            'different',
+          );
+        }
+      };
+      h.response = () =>
+        Response.json({ errcode: 'M_UNKNOWN', error: 'lost result' }, {
+          status: 502,
+        });
+      const firstDeps = await depsFor();
+      await assertRejects(() =>
+        inviteRemote(
+          g.roomId,
+          '@dev:test',
+          target,
+          'kept',
+          undefined,
+          firstDeps,
+        )
+      );
+      assertEquals(
+        retained.length,
+        1,
+        'exact signed invite must commit before dispatch',
+      );
+      const frozen = JSON.parse(String(retained[0].request_json));
+      assertEquals(canonicalJson(frozen), canonicalJson(h.inviteRequests[0]));
+      assertEquals(
+        await g.room.tx((tx) => tx.events.get(String(retained[0].event_id))),
+        null,
+      );
+      const firstWire = canonicalJson(h.inviteRequests[0]);
+      await store.close();
+      store = await openStore(config(dir), {
+        schemas: { room: roomSchema, server: serverSchema },
+      });
+      const deps = await depsFor();
+      const provider = inviteIntentProvider(deps);
+      const pending = await provider.review();
+      assert(
+        pending.some((row) =>
+          row.intent.what === 'invite' && row.destination === h.fake.name
+        ),
+      );
+      const job = await provider(deps.server, h.fake.name);
+      assert(job, 'cold recovery must use the existing intent owner');
+      h.response = () => null;
+      // No manual wake: startup discovers the durable invitation even when no
+      // ordinary PDU/EDU is queued for this destination.
+      const sender = startSender({ store, signer: g.signer });
+      sender.setIntentProvider(provider);
+      try {
+        await waitFor(async () =>
+          (await deps.server.query('SELECT * FROM federation_invite_attempts'))
+            .length === 0
+        );
+      } finally {
+        await sender.stop();
+      }
+      assertEquals(h.inviteRequests.length, 2);
+      assertEquals(
+        canonicalJson(h.inviteRequests[1]),
+        firstWire,
+        'no timestamp, parents, state or signature rebuild',
+      );
+      const room = await openRoom(store, g.roomId);
+      const stored = await room.tx((tx) =>
+        tx.events.get(String(retained[0].event_id))
+      );
+      assert(stored);
+      const event = JSON.parse(stored.pdu);
+      assertEquals(event.content.reason, 'kept');
+      assert(event.signatures.test);
+      assert(event.signatures[h.fake.name]);
+      assertEquals(
+        await deps.server.query('SELECT * FROM federation_invite_attempts'),
+        [],
+      );
+      assertEquals(await provider(deps.server, h.fake.name), null);
+    });
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('inviter: same reference ID cannot hide changed immutable content', async () => {
+  await withStore(async (store) => {
+    await withInviteHost(async (h) => {
+      const g = await genesis(store, { roomId: '!invite-material:test' });
+      const server = await store.server();
+      h.changeEvent = (event) => {
+        (event.content as Record<string, unknown>).reason = 'substituted';
+      };
+      const deps: InviteDeps = {
+        store,
+        server,
+        signer: g.signer,
+        keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+        self: 'test',
+        wake: () => {},
+      };
+      const error = await assertRejects(() =>
+        inviteRemote(
+          g.roomId,
+          '@dev:test',
+          `@zoe:${h.fake.name}`,
+          'original',
+          undefined,
+          deps,
+        )
+      );
+      assert(error instanceof UpstreamError);
+      assertEquals(error.category, 'validation');
+      const request = h.inviteRequests[0];
+      const { eventIdFor } = await import('#engine/eventid.ts');
+      const id = await eventIdFor(request.event, '11');
+      assertEquals(await g.room.tx((tx) => tx.events.get(id)), null);
+    });
+  });
+});
+
+Deno.test('inviter: cold completion after response and ingest cuts never repeats remote work', async (t) => {
+  for (const cut of ['response', 'ingest']) {
+    await t.step(cut, async () => {
+      const dir = await Deno.makeTempDir();
+      let store = await openStore(config(dir), {
+        schemas: { room: roomSchema, server: serverSchema },
+      });
+      try {
+        await withInviteHost(async (h) => {
+          const g = await genesis(store, { roomId: '!invite-cut:test' });
+          const server = await store.server();
+          const fault = new Error('committed ' + cut + ' cut');
+          const faultServer = new Proxy(server, {
+            get(target, property) {
+              if (property === 'execute') {
+                return async (...args: Parameters<typeof server.execute>) => {
+                  if (
+                    cut === 'ingest' &&
+                    args[0].startsWith('DELETE FROM federation_invite_attempts')
+                  ) throw fault;
+                  const value = await target.execute(...args);
+                  if (
+                    cut === 'response' && args[0].includes('SET response_json=')
+                  ) {
+                    throw fault;
+                  }
+                  return value;
+                };
+              }
+              const value = Reflect.get(target, property);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          const deps: InviteDeps = {
+            store,
+            server: faultServer,
+            signer: g.signer,
+            keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+            self: 'test',
+            wake: () => {},
+          };
+          assertEquals(
+            await assertRejects(() =>
+              inviteRemote(
+                g.roomId,
+                '@dev:test',
+                `@zoe:${h.fake.name}`,
+                'saved',
+                undefined,
+                deps,
+              )
+            ),
+            fault,
+          );
+          const rows = await server.query(
+            'SELECT * FROM federation_invite_attempts',
+          );
+          assertEquals(rows.length, 1);
+          assert(rows[0].response_json !== null);
+          const id = String(rows[0].event_id);
+          await store.close();
+          store = await openStore(config(dir), {
+            schemas: { room: roomSchema, server: serverSchema },
+          });
+          const nextServer = await store.server();
+          const nextDeps = {
+            ...deps,
+            store,
+            server: nextServer,
+            keys: productionKeyResolver(
+              keyStore(nextServer, { signer: g.signer }),
+            ),
+          };
+          const provider = inviteIntentProvider(nextDeps);
+          const job = await provider(nextServer, h.fake.name);
+          assert(job);
+          await job.run();
+          assertEquals(
+            h.inviteRequests.length,
+            1,
+            'retained verified response or room commit completes without network',
+          );
+          const room = await openRoom(store, g.roomId);
+          const stored = await room.tx((tx) => tx.events.get(id));
+          assert(stored);
+          assertEquals(JSON.parse(stored.pdu).content.reason, 'saved');
+          assertEquals(
+            await nextServer.query(
+              'SELECT membership FROM memberships WHERE room=? AND user=?',
+              [g.roomId, `@zoe:${h.fake.name}`],
+            ),
+            [{ membership: 'invite' }],
+          );
+          assertEquals(
+            await nextServer.query(
+              'SELECT count(*) AS n FROM feed WHERE room=? AND event=?',
+              [g.roomId, id],
+            ),
+            [{ n: 1 }],
+          );
+          assertEquals(
+            await nextServer.query('SELECT * FROM federation_invite_attempts'),
+            [],
+          );
+          assertEquals(await provider(nextServer, h.fake.name), null);
+        });
+      } finally {
+        await store.close();
+        await Deno.remove(dir, { recursive: true });
+      }
+    });
+  }
+});
+
+Deno.test('inviter: explicit prune and room removal settle retained delivery ownership', async (t) => {
+  for (const mode of ['prune', 'remove']) {
+    await t.step(mode, async () => {
+      await withStore(async (store) => {
+        await withInviteHost(async (h) => {
+          const g = await genesis(store, { roomId: '!invite-remove:test' });
+          const server = await store.server();
+          const deps: InviteDeps = {
+            store,
+            server,
+            signer: g.signer,
+            keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+            self: 'test',
+            wake: () => {},
+          };
+          h.response = () =>
+            Response.json({ errcode: 'M_UNKNOWN', error: 'uncertain result' }, {
+              status: 502,
+            });
+          await assertRejects(() =>
+            inviteRemote(
+              g.roomId,
+              '@dev:test',
+              `@zoe:${h.fake.name}`,
+              undefined,
+              undefined,
+              deps,
+            )
+          );
+          const provider = inviteIntentProvider(deps);
+          assertEquals((await provider.review()).length, 1);
+          if (mode === 'prune') {
+            assertEquals(await provider.prune(h.fake.name), 1);
+          } else {assertEquals(
+              await finishRoomRemoval(store, g.roomId, {
+                why: 'explicit removal',
+                intents: await provider.review(),
+              }, null),
+              1,
+            );}
+          assertEquals(
+            await server.query('SELECT * FROM federation_invite_attempts'),
+            [],
+          );
+          assertEquals(await provider(server, h.fake.name), null);
+          assertEquals(await provider.review(), []);
+        });
+      });
+    });
+  }
+});
+
+Deno.test('inviter: unauthorized local membership never becomes remote work', async () => {
+  await withStore(async (store) => {
+    await withInviteHost(async (h) => {
+      const g = await genesis(store, { roomId: '!invite-auth:test' });
+      const server = await store.server();
+      const deps: InviteDeps = {
+        store,
+        server,
+        signer: g.signer,
+        keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+        self: 'test',
+        wake: () => {},
+      };
+      await assertRejects(
+        () =>
+          inviteRemote(
+            g.roomId,
+            '@outsider:test',
+            `@zoe:${h.fake.name}`,
+            undefined,
+            undefined,
+            deps,
+          ),
+        MatrixError,
+      );
+      assertEquals(h.inviteRequests.length, 0);
+      assertEquals(
+        await server.query('SELECT * FROM federation_invite_attempts'),
+        [],
+      );
+    });
+  });
+});
+
+Deno.test('inviter: definite missing-param refusal keeps exact intent for explicit retry', async () => {
+  await withStore(async (store) => {
+    await withInviteHost(async (h) => {
+      const g = await genesis(store, { roomId: '!invite-refusal:test' });
+      const server = await store.server();
+      const deps: InviteDeps = {
+        store,
+        server,
+        signer: g.signer,
+        keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+        self: 'test',
+        wake: () => {},
+      };
+      h.response = () =>
+        Response.json({
+          errcode: 'M_MISSING_PARAM',
+          error: 'missing remote configuration',
+        }, { status: 400 });
+      const error = await assertRejects(
+        () =>
+          inviteRemote(
+            g.roomId,
+            '@dev:test',
+            `@zoe:${h.fake.name}`,
+            undefined,
+            undefined,
+            deps,
+          ),
+        MatrixError,
+      );
+      assertEquals(error.status, 502);
+      const provider = inviteIntentProvider(deps);
+      assertEquals(await provider(server, h.fake.name), null);
+      assertEquals((await provider.review()).length, 1);
+      const before = canonicalJson(h.inviteRequests[0]);
+      await retryPrejoinIntents(server, 'test', h.fake.name);
+      const job = await provider(server, h.fake.name);
+      assert(job);
+      h.response = () => null;
+      await job.run();
+      assertEquals(canonicalJson(h.inviteRequests[1]), before);
+      assertEquals(
+        await server.query('SELECT * FROM federation_invite_attempts'),
+        [],
+      );
+    });
+  });
+});
 
 Deno.test('inviter: the /v2/invite shape, merged signatures, outbox to joined servers, the gate', async () => {
   await withStore(async (store) => {

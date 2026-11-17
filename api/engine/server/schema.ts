@@ -33,6 +33,11 @@ import {
   RUNTIME_IDENTITY_SQL,
 } from './facade-schema.ts';
 
+const OUTBOUND_INVITES_SQL = `
+CREATE TABLE federation_invite_attempts(room_id TEXT NOT NULL,sender TEXT NOT NULL,target TEXT NOT NULL,event_id TEXT NOT NULL UNIQUE,destination TEXT NOT NULL,request_json TEXT NOT NULL,response_json TEXT,status TEXT NOT NULL,added_ms INTEGER NOT NULL,PRIMARY KEY(room_id,sender,target));
+CREATE INDEX federation_invite_attempts_destination ON federation_invite_attempts(destination,status,added_ms);
+`;
+
 const DEVICE_CHANGES_SQL = `
 CREATE TABLE device_changes(seq INTEGER PRIMARY KEY NOT NULL, source TEXT NOT NULL, source_pos INTEGER NOT NULL, subject TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, stream_id INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(source,source_pos));
 CREATE INDEX device_changes_subject ON device_changes(subject,seq);
@@ -431,7 +436,7 @@ CREATE INDEX event_index_local_participation ON event_index(room,local_join_user
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 47,
+  version: 48,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -483,6 +488,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(
       'ALTER TABLE federation_join_attempts ADD COLUMN join_json TEXT',
     );
+    await db.exec(OUTBOUND_INVITES_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -555,5 +561,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
       conn.exec(
         'ALTER TABLE federation_join_attempts ADD COLUMN join_json TEXT',
       ),
+    47: (conn) => conn.exec(OUTBOUND_INVITES_SQL),
   },
 };

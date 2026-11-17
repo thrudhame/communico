@@ -27,9 +27,15 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { config } from '#engine/config.ts';
 import { eventIdFor, redact } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { verify } from '#engine/room/verify.ts';
+import { eventMaterial, verify } from '#engine/room/verify.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { buildInTx, finalizeBuilt, roomVersionOf } from '#engine/room/build.ts';
+import {
+  buildInTx,
+  checkDeclaredAuth,
+  finalizeBuilt,
+  loadRulebookStore,
+  roomVersionOf,
+} from '#engine/room/build.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
 import { ingestLocal } from '#engine/room/ingest.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
@@ -129,6 +135,41 @@ export async function countersign(
 
 // --- INVITER ---------------------------------------------------------------
 
+type OutboundInvite = {
+  roomId: string;
+  sender: string;
+  target: string;
+  eventId: string;
+  destination: string;
+  request: {
+    room_version: string;
+    event: Record<string, unknown>;
+    invite_room_state: unknown[];
+  };
+  response: Pdu | null;
+};
+function outboundInvite(row: Record<string, unknown>): OutboundInvite {
+  return {
+    roomId: String(row.room_id),
+    sender: String(row.sender),
+    target: String(row.target),
+    eventId: String(row.event_id),
+    destination: String(row.destination),
+    request: JSON.parse(String(row.request_json)),
+    response: row.response_json === null
+      ? null
+      : JSON.parse(String(row.response_json)),
+  };
+}
+// The existing sender owns cold recovery; a live synchronous caller is merely
+// another performer of that same durable operation, never a second attempt.
+const activeInvites = new WeakMap<Store, Set<string>>();
+function invitePerformers(store: Store): Set<string> {
+  let active = activeInvites.get(store);
+  if (!active) activeInvites.set(store, active = new Set());
+  return active;
+}
+
 export async function inviteRemote(
   roomId: string,
   sender: string,
@@ -149,112 +190,263 @@ export async function inviteRemote(
     user: sender,
     what: 'invite',
   });
-  // author the invite event (our signature), outside the room lock —
-  // a stale prev is harmless (the resolver orders forks)
   const content: Record<string, unknown> = { membership: 'invite' };
   if (reason !== undefined) content.reason = reason;
   if (opts?.isDirect === true) content.is_direct = true;
-  const version = await room.tx(async (tx) => {
-    const stay = await tx.segments.openStay();
-    if (stay === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
-    return await roomVersionOf(tx, stay.id);
-  });
-  const permit = await prepareSigner(deps.signer);
-  const pdu = await room.tx((tx) =>
-    buildInTx(tx, roomId, {
-      type: 'm.room.member',
-      state_key: target,
-      sender,
-      content,
-      origin_server_ts: Date.now(),
-    }, permit)
+  // Capture authority before the lock/room transaction, but do not require a new
+  // signing permit when continuing previously prepared work.
+  const existing = await deps.server.query(
+    'SELECT * FROM federation_invite_attempts WHERE room_id=? AND sender=? AND target=?',
+    [roomId, sender, target],
   );
-  const eventId = String(pdu.event_id);
-  const inviteRoomState = await prejoinState(room, sender);
-  let merged: Pdu;
+  const permit = existing.length ? null : await prepareSigner(deps.signer);
+  const attempt = await withRoomLock(roomId, async () => {
+    if (await deps.store.roomRetired(roomId)) {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
+    }
+    const rows = await deps.server.query(
+      'SELECT * FROM federation_invite_attempts WHERE room_id=? AND sender=? AND target=?',
+      [roomId, sender, target],
+    );
+    let saved: OutboundInvite;
+    if (rows.length) {
+      saved = outboundInvite(rows[0]);
+      if (
+        canonicalJson(saved.request.event.content) !== canonicalJson(content)
+      ) {
+        throw new MatrixError(
+          409,
+          'M_BAD_STATE',
+          'A different remote invite is pending',
+        );
+      }
+    } else {
+      if (permit === null) {
+        throw new MatrixError(
+          409,
+          'M_BAD_STATE',
+          'Remote invite completed concurrently',
+        );
+      }
+      const { version, pdu } = await room.tx(async (tx) => {
+        await assertAcl(tx, remote);
+        await assertAcl(tx, deps.self);
+        const stay = await tx.segments.openStay();
+        if (stay === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
+        const version = await roomVersionOf(tx, stay.id);
+        const pdu = await buildInTx(tx, roomId, {
+          type: 'm.room.member',
+          state_key: target,
+          sender,
+          content,
+          origin_server_ts: Date.now(),
+        }, permit);
+        // Local authorization precedes the remote side effect. The builder
+        // signs bytes; it does not by itself authorize their membership change.
+        const group = await tx.state.current(stay.id);
+        const current = group === null
+          ? new Map<string, string>()
+          : await tx.state.groupMap(group);
+        const evidence = await loadRulebookStore(tx, [...current.values()], [
+          pdu,
+        ]);
+        const rulebook = getRulebook(version);
+        const createId = current.get('m.room.create\0');
+        if (
+          !checkDeclaredAuth(
+            pdu,
+            rulebook,
+            evidence,
+            createId == null ? null : createId,
+          ).ok || !rulebook.checkAuthAgainstState(pdu, current, evidence).ok
+        ) {
+          throw new MatrixError(
+            403,
+            'M_FORBIDDEN',
+            'Remote invite is not authorized locally',
+          );
+        }
+        return { version, pdu };
+      });
+      const request = {
+        room_version: version,
+        event: toWire(pdu, version),
+        invite_room_state: await prejoinState(room, sender),
+      };
+      saved = {
+        roomId,
+        sender,
+        target,
+        eventId: String(pdu.event_id),
+        destination: remote,
+        request,
+        response: null,
+      };
+      await deps.server.execute(
+        "INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,'pending',?)",
+        [
+          roomId,
+          sender,
+          target,
+          saved.eventId,
+          remote,
+          JSON.stringify(request),
+          Date.now(),
+        ],
+      );
+    }
+    if (invitePerformers(deps.store).has(saved.eventId)) {
+      throw new MatrixError(409, 'M_BAD_STATE', 'Remote invite is active');
+    }
+    await deps.server.execute(
+      "UPDATE federation_invite_attempts SET status='pending' WHERE event_id=? AND status='failed'",
+      [saved.eventId],
+    );
+    invitePerformers(deps.store).add(saved.eventId);
+    return saved;
+  });
   try {
-    const res = await federationRequest(deps.server, deps.signer, {
-      room: { store: deps.store, id: roomId, participation: true },
-      destination: remote,
-      method: 'PUT',
-      path: `/_matrix/federation/v2/invite/${encodeURIComponent(roomId)}/${
-        encodeURIComponent(eventId)
-      }`,
-      body: new TextEncoder().encode(
-        JSON.stringify({
-          room_version: version,
-          event: toWire(pdu, version),
-          invite_room_state: inviteRoomState,
-        }),
-      ),
+    return await performOutboundInvite(attempt, deps);
+  } finally {
+    invitePerformers(deps.store).delete(attempt.eventId);
+    deps.wake(attempt.destination);
+  }
+}
+
+async function performOutboundInvite(
+  attempt: OutboundInvite,
+  deps: InviteDeps,
+): Promise<{ eventId: string }> {
+  const { roomId, eventId, destination: remote, request } = attempt;
+  const version = request.room_version;
+  const pdu = { ...request.event, event_id: eventId } as unknown as Pdu;
+  const room = await openRoom(deps.store, roomId);
+  // A crash after ingest but before settlement never re-authors or re-publishes.
+  const committed = await room.tx((tx) => tx.events.getStatus(eventId));
+  if (
+    committed?.standing === 'accepted' && committed.grounding === 'grounded'
+  ) {
+    await deps.server.execute(
+      'DELETE FROM federation_invite_attempts WHERE event_id=?',
+      [eventId],
+    );
+    return { eventId };
+  }
+  try {
+    let merged = attempt.response;
+    if (merged === null) {
+      const res = await federationRequest(deps.server, deps.signer, {
+        room: { store: deps.store, id: roomId, participation: true },
+        destination: remote,
+        method: 'PUT',
+        path: `/_matrix/federation/v2/invite/${encodeURIComponent(roomId)}/${
+          encodeURIComponent(eventId)
+        }`,
+        body: new TextEncoder().encode(JSON.stringify(request)),
+      });
+      merged = inviteResponse(res.json);
+    }
+    // the invitee's signature: our id unchanged, their signature verifies
+    const returnedId = await eventIdFor(
+      merged as unknown as Record<string, unknown>,
+      version,
+    );
+    merged.event_id = eventId;
+    if (
+      returnedId !== eventId || eventMaterial(merged) !== eventMaterial(pdu)
+    ) {
+      throw new UpstreamError('validation', {
+        phase: 'invite',
+        reason: 'the invitee changed the event',
+      });
+    }
+    let theirSigOk = false;
+    const mergedSigs = merged.signatures == null ? {} : merged.signatures;
+    const remoteKids = mergedSigs[remote] == null ? {} : mergedSigs[remote];
+    for (const kid of Object.keys(remoteKids)) {
+      if (
+        await deps.keys.verifyEventSignature({
+          server: remote,
+          keyId: kid,
+          pdu: merged,
+          roomVersion: version,
+          minValidUntilMs: 0,
+        })
+      ) {
+        theirSigOk = true;
+        break;
+      }
+    }
+    if (!theirSigOk) {
+      throw new UpstreamError('validation', {
+        phase: 'invite',
+        reason: 'bad invitee signature',
+      });
+    }
+    (merged as unknown as Record<string, unknown>).event_id = eventId;
+    // merge signatures (ours is already on the event — author signed it)
+    const ours = pdu.signatures == null ? {} : pdu.signatures;
+    for (const [server, signatures] of Object.entries(ours)) {
+      merged.signatures[server] = {
+        ...merged.signatures[server],
+        ...signatures,
+      };
+    }
+    const retained = await deps.server.execute(
+      'UPDATE federation_invite_attempts SET response_json=? WHERE event_id=?',
+      [JSON.stringify(merged), eventId],
+    );
+    if (retained !== 1) {
+      throw new MatrixError(
+        409,
+        'M_BAD_STATE',
+        'Remote invite was removed during dispatch',
+      );
+    }
+    // ingest as our own (we authored it — the strict local checks apply),
+    // so outbox rows go to the room's servers as for any local event; the
+    // invitee's server receives it only if it already has joined members
+    // (invites-v2.yaml:40-42)
+    const ingested = await ingestLocal(room, merged, deps.self, async (tx) => {
+      await assertAcl(tx, remote);
+      await assertAcl(tx, deps.self);
     });
-    merged = inviteResponse(res.json);
+    if (ingested.standing !== 'accepted') {
+      await deps.server.execute(
+        "UPDATE federation_invite_attempts SET status='failed' WHERE event_id=?",
+        [eventId],
+      );
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        'Remote invite no longer authorized locally',
+      );
+    }
+    await deps.server.execute(
+      'DELETE FROM federation_invite_attempts WHERE event_id=?',
+      [eventId],
+    );
+    return { eventId };
   } catch (e) {
-    // only 400 M_MISSING_PARAM becomes a 5xx to our client
-    // (invites-v2.yaml:171-173). Typed peer errors and local failures keep
-    // their provenance; public rendering owns the eventual HTTP mapping.
+    // Definite refusal/bad evidence remains inspectable, but does not make an
+    // autonomous retry loop. Explicit retry continues the same prepared PDU.
+    if (
+      (e instanceof FederationHttpError && e.remoteStatus < 500) ||
+      (e instanceof UpstreamError && e.category === 'validation')
+    ) {
+      await deps.server.execute(
+        "UPDATE federation_invite_attempts SET status='failed' WHERE event_id=?",
+        [eventId],
+      );
+    }
     if (
       e instanceof FederationHttpError && e.remoteStatus === 400 &&
       e.matrixBody && e.errcode === 'M_MISSING_PARAM'
     ) {
-      throw new MatrixError(
-        502,
-        'M_UNKNOWN',
-        String(e.responseBody().error),
-      );
+      throw new MatrixError(502, 'M_UNKNOWN', String(e.responseBody().error));
     }
-    throw e; // 403 M_FORBIDDEN and 400 M_INCOMPATIBLE_ROOM_VERSION pass through
+    throw e;
   }
-  // the invitee's signature: our id unchanged, their signature verifies
-  const returnedId = await eventIdFor(
-    merged as unknown as Record<string, unknown>,
-    version,
-  );
-  if (returnedId !== eventId) {
-    throw new UpstreamError('validation', {
-      phase: 'invite',
-      reason: 'the invitee changed the event',
-    });
-  }
-  let theirSigOk = false;
-  const mergedSigs = merged.signatures == null ? {} : merged.signatures;
-  const remoteKids = mergedSigs[remote] == null ? {} : mergedSigs[remote];
-  for (const kid of Object.keys(remoteKids)) {
-    if (
-      await deps.keys.verifyEventSignature({
-        server: remote,
-        keyId: kid,
-        pdu: merged,
-        roomVersion: version,
-        minValidUntilMs: 0,
-      })
-    ) {
-      theirSigOk = true;
-      break;
-    }
-  }
-  if (!theirSigOk) {
-    throw new UpstreamError('validation', {
-      phase: 'invite',
-      reason: 'bad invitee signature',
-    });
-  }
-  (merged as unknown as Record<string, unknown>).event_id = eventId;
-  // merge signatures (ours is already on the event — author signed it)
-  const ours = pdu.signatures == null ? {} : pdu.signatures;
-  merged.signatures = {
-    ...(merged.signatures == null ? {} : merged.signatures),
-    ...ours,
-  };
-  // ingest as our own (we authored it — the strict local checks apply),
-  // so outbox rows go to the room's servers as for any local event; the
-  // invitee's server receives it only if it already has joined members
-  // (invites-v2.yaml:40-42)
-  await ingestLocal(room, merged, deps.self, async (tx) => {
-    await assertAcl(tx, remote);
-    await assertAcl(tx, deps.self);
-  });
-  return { eventId };
 }
 
 // --- INVITEE ---------------------------------------------------------------
@@ -838,6 +1030,48 @@ export function inviteIntentProvider(
 ): ReviewableIntentProvider {
   const progress: InviteProgress = new Map();
   const provider = async (server: Db, destination: string) => {
+    const outgoing = await server.query(
+      "SELECT * FROM federation_invite_attempts WHERE destination=? AND status='pending' ORDER BY added_ms,event_id",
+      [destination],
+    );
+    for (const row of outgoing) {
+      const attempt = outboundInvite(row);
+      if (
+        invitePerformers(deps.store).has(attempt.eventId) ||
+        await deps.store.roomRetired(attempt.roomId)
+      ) continue;
+      return {
+        id: 'invite:' + attempt.eventId,
+        run: async () => {
+          const claimed = await withRoomLock(attempt.roomId, async () => {
+            if (
+              await deps.store.roomRetired(attempt.roomId) ||
+              invitePerformers(deps.store).has(attempt.eventId)
+            ) return false;
+            if (
+              !(await server.query(
+                "SELECT 1 FROM federation_invite_attempts WHERE event_id=? AND status='pending'",
+                [attempt.eventId],
+              )).length
+            ) return false;
+            invitePerformers(deps.store).add(attempt.eventId);
+            return true;
+          });
+          if (!claimed) return;
+          try {
+            await admit(server, destination, {
+              kind: 'outbound',
+              user: attempt.sender,
+              what: 'intent:invite',
+            });
+            await performOutboundInvite(attempt, deps);
+          } finally {
+            invitePerformers(deps.store).delete(attempt.eventId);
+          }
+        },
+        failed: async () => {},
+      } satisfies IntentJob;
+    }
     const rows = await server.query(
       `SELECT * FROM prejoin_memberships p WHERE status IN ('rejecting','attempting') AND ${
         visiblePrejoin('p')
@@ -957,32 +1191,53 @@ export async function listRejectIntents(
       visiblePrejoin('p')
     } ORDER BY received_ms, room_id, user_id`,
   );
-  return rows.map((raw) => {
-    const invite = inviteOf(raw);
-    const key = JSON.stringify([invite.roomId, invite.userId]);
-    const candidates = candidatesOf(invite, self);
-    const at = candidateIndex(invite, progress);
-    return {
-      id: (invite.status === 'attempting' || invite.status === 'failed-attempt'
-        ? 'knock-attempt:'
-        : 'reject-invite:') + key,
-      destination: candidates[at],
-      kind: 'intent',
-      eventId: null,
-      intent: {
-        what: invite.kind === 'invite'
-          ? 'reject-invite'
-          : invite.status.includes('attempt')
-          ? 'knock-attempt'
-          : 'retract-knock',
-        user_id: invite.userId,
-        candidates,
-      },
-      addedMs: invite.receivedMs,
-      expiresMs: invite.expiresMs,
-      inflightTxn: null,
-    };
-  });
+  const outgoing = await server.query(
+    'SELECT * FROM federation_invite_attempts ORDER BY added_ms,event_id',
+  );
+  const invites: ReviewIntent[] = outgoing.map((row) => ({
+    id: 'invite:' + String(row.event_id),
+    destination: String(row.destination),
+    kind: 'intent',
+    eventId: null,
+    intent: {
+      what: 'invite',
+      user_id: String(row.sender),
+      candidates: [String(row.destination)],
+    },
+    addedMs: Number(row.added_ms),
+    expiresMs: null,
+    inflightTxn: null,
+  }));
+  return [
+    ...invites,
+    ...rows.map((raw) => {
+      const invite = inviteOf(raw);
+      const key = JSON.stringify([invite.roomId, invite.userId]);
+      const candidates = candidatesOf(invite, self);
+      const at = candidateIndex(invite, progress);
+      return {
+        id:
+          (invite.status === 'attempting' || invite.status === 'failed-attempt'
+            ? 'knock-attempt:'
+            : 'reject-invite:') + key,
+        destination: candidates[at],
+        kind: 'intent' as const,
+        eventId: null,
+        intent: {
+          what: invite.kind === 'invite'
+            ? 'reject-invite'
+            : invite.status.includes('attempt')
+            ? 'knock-attempt'
+            : 'retract-knock',
+          user_id: invite.userId,
+          candidates,
+        },
+        addedMs: invite.receivedMs,
+        expiresMs: invite.expiresMs,
+        inflightTxn: null,
+      };
+    }),
+  ];
 }
 
 export async function pruneRejectIntents(
@@ -997,6 +1252,13 @@ export async function pruneRejectIntents(
     );
     let count = 0;
     for (const row of rows) {
+      if (row.id.startsWith('invite:')) {
+        count += await tx.execute(
+          'DELETE FROM federation_invite_attempts WHERE event_id=?',
+          [row.id.slice('invite:'.length)],
+        );
+        continue;
+      }
       if (row.id.startsWith('knock-attempt:')) {
         const [roomId, userId] = JSON.parse(
           row.id.slice('knock-attempt:'.length),
@@ -1032,8 +1294,13 @@ export async function retryPrejoinIntents(
   destination: string,
 ): Promise<void> {
   await inviteTransition(server, async (tx) => {
+    await tx.execute(
+      "UPDATE federation_invite_attempts SET status='pending' WHERE destination=? AND status='failed'",
+      [destination],
+    );
     const rows = await listRejectIntents(tx, self);
     for (const row of rows) {
+      if (row.id.startsWith('invite:')) continue;
       if (!row.intent.candidates.includes(destination)) continue;
       const prefix = row.id.startsWith('knock-attempt:')
         ? 'knock-attempt:'
