@@ -5,6 +5,7 @@ import {
   type InviteDeps,
   inviteFor,
   inviteIntentProvider,
+  prejoinDeparture,
   receiveInvite,
   rejectInviteRemote,
 } from '#engine/federation/invites.ts';
@@ -25,6 +26,7 @@ import { fakeKeyResolver } from '#tests/fixtures/remote.ts';
 import { testRemoteServer, testSigner } from '#tests/fixtures/signer.ts';
 import { assertAuthored } from '#tests/fixtures/authored.ts';
 import type { Pdu } from '#engine/pdu.ts';
+import type { Signer } from '#engine/room/signer.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -41,16 +43,19 @@ async function fixture(
     sentLeave: () => Pdu | null;
     sent: Promise<void>;
     finish: () => void;
+    reopen: () => Promise<void>;
   }) => Promise<void>,
 ) {
   const dir = await Deno.makeTempDir();
-  const store = await openStore({
+  const options = {
     dir,
     library: './.native/libturso_ffi.so',
     checkpointlogbytes: 65536,
     maxopenfiles: 8,
     idleseconds: 300,
-  }, { schemas: { room: roomSchema, server: serverSchema } });
+  };
+  const schemas = { room: roomSchema, server: serverSchema };
+  let store = await openStore(options, { schemas });
   setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
   resetCaCertsForTests();
   let signal!: () => void;
@@ -104,7 +109,7 @@ async function fixture(
       server: { name: fake.name, keyId: fake.keyId, kp: fake.kp },
     });
     const user = '@dev:test';
-    const server = await store.server();
+    let server = await store.server();
     const deps: InviteDeps = {
       store,
       server,
@@ -154,6 +159,13 @@ async function fixture(
       sentLeave: () => sentLeave,
       sent,
       finish,
+      reopen: async () => {
+        await store.close();
+        store = await openStore(options, { schemas });
+        deps.store = store;
+        deps.server = server = await store.server();
+        installJoinAdmission(store);
+      },
     });
   } finally {
     finish();
@@ -184,6 +196,168 @@ Deno.test('prejoin: repeated concurrent rejection retains one signed local depar
     assertEquals(await inviteFor(f.roomId, f.user, f.deps), before);
     assertEquals(before.revision, 2);
   }));
+
+// A facade's request signer opens the server file to capture its permit. Only
+// the returned byte signer may run inside that file's lifecycle transaction.
+function guardDepartureSigner(deps: InviteDeps) {
+  const server = deps.server;
+  const transact = server.tx.bind(server);
+  const signer = deps.signer;
+  let inTransaction = false;
+  let preparations = 0;
+  let signatures = 0;
+  let available = true;
+  server.tx = async (fn) => {
+    inTransaction = true;
+    try {
+      return await transact(fn);
+    } finally {
+      inTransaction = false;
+    }
+  };
+  deps.signer = {
+    serverName: signer.serverName,
+    keyId: signer.keyId,
+    sign: () => Promise.reject(new Error('raw request signer in departure')),
+    prepare: async () => {
+      assert(
+        !inTransaction,
+        'signing permit opens the server outside its transaction',
+      );
+      assert(available, 'new signing authority is unavailable');
+      await server.query('SELECT 1');
+      preparations++;
+      return {
+        serverName: signer.serverName,
+        keyId: signer.keyId,
+        sign: (bytes) => {
+          assert(
+            inTransaction,
+            'departure bytes signed at their atomic transition',
+          );
+          signatures++;
+          return signer.sign(bytes);
+        },
+      } satisfies Signer;
+    },
+  };
+  return {
+    counts: () => [preparations, signatures],
+    expire: () => available = false,
+    restore: () => server.tx = transact,
+  };
+}
+
+Deno.test('prejoin authority: rejection captures one permit outside its atomic transaction and cold retries need none', () =>
+  fixture(async (f) => {
+    const guarded = guardDepartureSigner(f.deps);
+    try {
+      await Promise.all(Array.from({ length: 4 }, () => f.reject('not now')));
+      assertEquals(guarded.counts(), [1, 1]);
+      const saved = await inviteFor(f.roomId, f.user, f.deps);
+      assert(saved?.localLeaveJson);
+      const local = JSON.parse(saved.localLeaveJson) as Pdu;
+      await assertAuthored(local);
+      assertEquals(local.content.reason, 'not now');
+      assertEquals(saved.revision, 2);
+      guarded.expire();
+      await f.reject('a retry cannot replace the reason');
+      assertEquals(await inviteFor(f.roomId, f.user, f.deps), saved);
+      assertEquals(guarded.counts(), [1, 1]);
+      guarded.restore();
+      await f.reopen();
+      const cut = await eventStreamMax(f.deps.server);
+      await f.reject();
+      assertEquals(await inviteFor(f.roomId, f.user, f.deps), saved);
+      assertEquals(await prejoinDeparture(saved, f.deps), local);
+      assertEquals(await eventStreamMax(f.deps.server), cut);
+      assertEquals(guarded.counts(), [1, 1]);
+      assertEquals(await f.deps.store.rooms(), []);
+    } finally {
+      guarded.restore();
+    }
+  }));
+
+Deno.test('prejoin authority: legacy departure materializes with a prepared permit once and retains its revision cut', () =>
+  fixture(async (f) => {
+    await f.reject();
+    await f.deps.server.execute(
+      'UPDATE prejoin_memberships SET local_leave_json=NULL WHERE room_id=? AND user_id=?',
+      [f.roomId, f.user],
+    );
+    const legacy = await inviteFor(f.roomId, f.user, f.deps);
+    assert(legacy);
+    const cut = await eventStreamMax(f.deps.server);
+    const guarded = guardDepartureSigner(f.deps);
+    try {
+      const leave = await prejoinDeparture(legacy, f.deps);
+      assert(leave);
+      await assertAuthored(leave);
+      assertEquals(guarded.counts(), [1, 1]);
+      assertEquals(
+        (await inviteFor(f.roomId, f.user, f.deps))?.revision,
+        legacy.revision,
+      );
+      assertEquals(await eventStreamMax(f.deps.server), cut);
+      guarded.expire();
+      // Even an old caller snapshot must read the already prepared departure
+      // before trying to acquire new signing authority.
+      assertEquals(await prejoinDeparture(legacy, f.deps), leave);
+      guarded.restore();
+      await f.reopen();
+      assertEquals(await prejoinDeparture(legacy, f.deps), leave);
+      assertEquals(await eventStreamMax(f.deps.server), cut);
+      assertEquals(guarded.counts(), [1, 1]);
+      await f.deps.server.execute(
+        'UPDATE prejoin_memberships SET revision=revision+1 WHERE room_id=? AND user_id=?',
+        [f.roomId, f.user],
+      );
+      assertEquals(await prejoinDeparture(legacy, f.deps), null);
+      assertEquals(guarded.counts(), [1, 1]);
+    } finally {
+      guarded.restore();
+    }
+  }));
+
+Deno.test('prejoin authority: unavailable permit or failed byte signing leaves rejection and legacy rows unchanged', async (t) => {
+  for (const legacy of [false, true]) {
+    for (const cut of ['prepare', 'sign']) {
+      await t.step(
+        `${legacy ? 'legacy' : 'rejection'} ${cut}`,
+        () =>
+          fixture(async (f) => {
+            if (legacy) {
+              await f.reject();
+              await f.deps.server.execute(
+                'UPDATE prejoin_memberships SET local_leave_json=NULL WHERE room_id=? AND user_id=?',
+                [f.roomId, f.user],
+              );
+            }
+            const before = await inviteFor(f.roomId, f.user, f.deps);
+            assert(before);
+            const head = await eventStreamMax(f.deps.server);
+            const signer = f.deps.signer;
+            const failure = () => Promise.reject(new Error(`failed ${cut}`));
+            f.deps.signer = {
+              ...signer,
+              sign: () => Promise.reject(new Error('raw signer is forbidden')),
+              prepare: cut === 'prepare'
+                ? failure
+                : () => Promise.resolve({ ...signer, sign: failure }),
+            };
+            await assertRejects(
+              () => legacy ? prejoinDeparture(before, f.deps) : f.reject(),
+              Error,
+              `failed ${cut}`,
+            );
+            assertEquals(await inviteFor(f.roomId, f.user, f.deps), before);
+            assertEquals(await eventStreamMax(f.deps.server), head);
+            assertEquals(await f.deps.store.rooms(), []);
+          }),
+      );
+    }
+  }
+});
 
 Deno.test('prejoin: late rejection completion cannot overtake a room publication', () =>
   fixture(async (f) => {

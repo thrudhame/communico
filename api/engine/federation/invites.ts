@@ -775,43 +775,68 @@ export async function rejectInviteRemote(
   deps: Pick<InviteDeps, 'store' | 'server' | 'signer' | 'self' | 'wake'>,
   reason?: string,
 ): Promise<void> {
-  const candidates = await inviteTransition(deps.server, async (tx) => {
+  const candidates = await withProjectionLock(async () => {
+    // The request signer reads durable server authority. Capture it before the
+    // server transaction, only when this lifecycle still needs a new departure.
+    // Prepared departures remain replayable without renewing signing authority.
     if (await deps.store.roomRetired(roomId)) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
     }
-    const rows = await tx.query(
-      'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+    const snapshot = await deps.server.query(
+      'SELECT status FROM prejoin_memberships WHERE room_id=? AND user_id=?',
       [roomId, userId],
     );
-    const invite = rows.length === 0 ? null : inviteOf(rows[0]);
-    if (invite === null || invite.status === 'joined') {
-      throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
-    }
-    // Client retries and durable account cleanup share this transition owner.
-    // Never replace a prepared departure or restart its remote intent/revision.
-    if (['rejecting', 'rejected', 'failed-retract'].includes(invite.status)) {
-      return invite.status === 'rejecting'
-        ? candidatesOf(invite, deps.self)
-        : [];
-    }
-    await withdrawInvitePush(tx, userId, roomId, invite.eventId);
-    const localLeave = await buildLocalPrejoinLeave(
-      invite,
-      deps.signer,
-      reason,
-    );
-    const seq = await nextEventSeq(tx);
-    await tx.execute(
-      "UPDATE prejoin_memberships SET status = 'rejecting', revision=revision+1, leave_json=NULL, local_leave_json=?, seq = ?, expires_ms=CASE WHEN kind='knock' THEN ? ELSE NULL END WHERE room_id = ? AND user_id = ?",
-      [
-        JSON.stringify(localLeave),
-        seq,
-        Date.now() + config().federation.refusedmillihours * 3600,
-        roomId,
-        userId,
-      ],
-    );
-    return candidatesOf(invite, deps.self);
+    const prepared = snapshot.length &&
+        !['joined', 'rejecting', 'rejected', 'failed-retract'].includes(
+          String(snapshot[0].status),
+        )
+      ? await prepareSigner(deps.signer)
+      : null;
+    return await eventStreamTx(deps.server, async (tx) => {
+      if (await deps.store.roomRetired(roomId)) {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
+      }
+      const rows = await tx.query(
+        'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+        [roomId, userId],
+      );
+      const invite = rows.length === 0 ? null : inviteOf(rows[0]);
+      if (invite === null || invite.status === 'joined') {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
+      }
+      // Client retries and durable account cleanup share this transition owner.
+      // Never replace a prepared departure or restart its remote intent/revision.
+      if (['rejecting', 'rejected', 'failed-retract'].includes(invite.status)) {
+        return invite.status === 'rejecting'
+          ? candidatesOf(invite, deps.self)
+          : [];
+      }
+      if (prepared === null) {
+        throw new MatrixError(
+          409,
+          'M_BAD_STATE',
+          'membership changed during rejection',
+        );
+      }
+      await withdrawInvitePush(tx, userId, roomId, invite.eventId);
+      const localLeave = await buildLocalPrejoinLeave(
+        invite,
+        prepared,
+        reason,
+      );
+      const seq = await nextEventSeq(tx);
+      await tx.execute(
+        "UPDATE prejoin_memberships SET status = 'rejecting', revision=revision+1, leave_json=NULL, local_leave_json=?, seq = ?, expires_ms=CASE WHEN kind='knock' THEN ? ELSE NULL END WHERE room_id = ? AND user_id = ?",
+        [
+          JSON.stringify(localLeave),
+          seq,
+          Date.now() + config().federation.refusedmillihours * 3600,
+          roomId,
+          userId,
+        ],
+      );
+      return candidatesOf(invite, deps.self);
+    });
   });
   // nothing ingested an event — wake the first candidate's loop directly
   if (candidates.length) deps.wake(candidates[0]);
@@ -866,8 +891,17 @@ export async function prejoinDeparture(
   }
   // Existing installations may have a pending intent without a local event.
   // Materialize once under the same revision owner; never synthesize per read.
-  return await withProjectionLock(() =>
-    deps.server.tx(async (tx) => {
+  return await withProjectionLock(async () => {
+    const snapshot = await deps.server.query(
+      'SELECT local_leave_json FROM prejoin_memberships WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
+      [invite.roomId, invite.userId, invite.revision, invite.seq],
+    );
+    if (snapshot.length === 0) return null;
+    if (snapshot[0].local_leave_json != null) {
+      return JSON.parse(String(snapshot[0].local_leave_json)) as Pdu;
+    }
+    const prepared = await prepareSigner(deps.signer);
+    return await deps.server.tx(async (tx) => {
       const rows = await tx.query(
         'SELECT local_leave_json FROM prejoin_memberships WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
         [invite.roomId, invite.userId, invite.revision, invite.seq],
@@ -876,7 +910,7 @@ export async function prejoinDeparture(
       if (rows[0]?.local_leave_json != null) {
         return JSON.parse(String(rows[0].local_leave_json)) as Pdu;
       }
-      const signed = await buildLocalPrejoinLeave(invite, deps.signer);
+      const signed = await buildLocalPrejoinLeave(invite, prepared);
       await tx.execute(
         'UPDATE prejoin_memberships SET local_leave_json=? WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
         [
@@ -888,8 +922,8 @@ export async function prejoinDeparture(
         ],
       );
       return signed;
-    })
-  );
+    });
+  });
 }
 
 // The reject-invite performer (ruling F): make_leave → fill → sign →
