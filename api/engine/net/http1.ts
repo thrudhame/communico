@@ -1,15 +1,16 @@
 // api/engine/net/http1.ts — HTTP/1.1 connection core, extracted from the
 // preview guard (api/engine/preview/guard.ts) and generalised: any method,
 // an optional request body, a TCP connect budget AND a whole-request
-// budget. Connect by IP; TLS via Deno.startTls({ hostname: sni, caCerts })
-// — for an IP peer `sni` is null and `hostname` is the IP (rustls verifies
-// the IP SAN and sends no SNI). `caCerts` EXTENDS Deno's bundled webpki
+// budget. Connect by IP; the shared TLS owner verifies DNS SNI or the
+// IP SAN without sending IP SNI. `caCerts` EXTENDS the bundled webpki
 // roots, never the OS store. Hand-written HTTP/1.1: Connection: close,
 // Content-Length when a body is present, chunked + EOF response bodies,
 // 64 KiB header cap. The total budget is enforced by closing the
 // connection when it fires — a pending read then errors, and the error is
 // reported as a timeout.
 import { abortable } from '#engine/net/abort.ts';
+import tls from 'node:tls';
+import { TlsConnection } from './tls-connection.ts';
 import { field, fieldText, trimOws } from './fields.ts';
 import {
   limit,
@@ -416,6 +417,12 @@ export async function http1Request(
   req: Http1Request,
 ): Promise<Http1Response> {
   req.signal?.throwIfAborted();
+  // Ordinary HTTP extends bundled roots only, not federation's system roots.
+  // Local trust preparation is outside network failure classification.
+  const trust = req.tls === null ? null : {
+    rejectUnauthorized: true,
+    ca: [...tls.getCACertificates('bundled'), ...req.tls.caCerts],
+  };
   const ac = new AbortController();
   const timeout = (phase: 'connect' | 'deadline' = 'deadline') =>
     ac.abort(
@@ -424,7 +431,7 @@ export async function http1Request(
         reason: 'upstream timeout',
       }),
     );
-  let conn: Deno.Conn | null = null;
+  let conn: WireConn | null = null;
   const cancel = () => {
     ac.abort(req.signal?.reason);
     try {
@@ -444,38 +451,46 @@ export async function http1Request(
     req.timeoutMs,
   );
   try {
-    const connectTimer = setTimeout(
-      () => timeout('connect'),
-      Math.min(req.connectMs, req.timeoutMs),
-    );
-    let tcp: Deno.TcpConn;
-    try {
-      tcp = await networkOperation('connect', ac.signal, () =>
-        Deno.connect({
-          hostname: connectHost(req.connectIp),
-          port: req.port,
-          signal: ac.signal,
-        }));
-    } finally {
-      clearTimeout(connectTimer);
-    }
-    conn = tcp;
-    let stream: WireConn = tcp;
     if (req.tls !== null) {
-      const identity = req.tls;
-      const tls = await networkOperation(
-        'tls',
-        ac.signal,
-        () =>
-          Deno.startTls(tcp, {
-            hostname: identity.sni !== null ? identity.sni : req.connectIp,
-            caCerts: identity.caCerts,
-          }),
+      await networkOperation('tls', ac.signal, async () => {
+        const connection = new TlsConnection({
+          connectIp: req.connectIp,
+          port: req.port,
+          sni: req.tls!.sni,
+          signal: ac.signal,
+          connectMs: Math.min(req.connectMs, req.timeoutMs),
+          connectUntil: 'connect',
+          connectPhase: 'connect',
+          connectError: () =>
+            new UpstreamError('transport', {
+              phase: 'connect',
+              reason: 'upstream timeout',
+            }),
+          trust: trust!,
+        });
+        conn = connection;
+        await connection.ready;
+      });
+    } else {
+      const connectTimer = setTimeout(
+        () => timeout('connect'),
+        Math.min(req.connectMs, req.timeoutMs),
       );
-      conn = tls;
-      await networkOperation('tls', ac.signal, () => tls.handshake());
-      stream = tls;
+      let tcp: Deno.TcpConn;
+      try {
+        tcp = await networkOperation('connect', ac.signal, () =>
+          Deno.connect({
+            hostname: connectHost(req.connectIp),
+            port: req.port,
+            signal: ac.signal,
+          }));
+      } finally {
+        clearTimeout(connectTimer);
+      }
+      conn = tcp;
     }
+    ac.signal.throwIfAborted();
+    const stream = conn!;
     const network: WireConn = {
       read: (p) => networkOperation('read', ac.signal, () => stream.read(p)),
       write: (p) => networkOperation('write', ac.signal, () => stream.write(p)),

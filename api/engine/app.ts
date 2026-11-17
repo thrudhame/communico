@@ -53,6 +53,7 @@ import {
   keyStore,
 } from '#engine/federation/keys.ts';
 import { type Sender, startSender } from '#engine/federation/sender.ts';
+import { PendingContacts } from '#engine/federation/pending-contacts.ts';
 import type { Dispatch } from '#engine/server/delivery.ts';
 import type { ReplicaRoomAdmission } from '#engine/facade/directory.ts';
 import { roomSchema } from '#engine/room/index.ts';
@@ -77,6 +78,7 @@ export type App = {
   // The tenant of the configured server name (one server, one tenant).
   readonly tenant: Tenant;
   readonly federationKeys: KeyStore;
+  readonly federationContacts: PendingContacts;
   readonly federationEdus: EduState;
   readonly federationIngress?: TransactionIngress;
   readonly deviceLists: DeviceListService;
@@ -150,6 +152,8 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
     await recoverRoomWaits(store, tenant.serverName);
     await tenant.tx((tx) => tx.slidingSync.prune());
     const server = await store.server();
+    const federationContacts = new PendingContacts(server);
+    services.push(() => federationContacts.close());
     const media = new MediaService(server, tenant);
     services.push(() => media.close());
     const stopRuleMigration = await installRuleMigration(store, tenant);
@@ -176,6 +180,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
       server,
       tenant,
       federationKeys: keyStore(server, { signer: tenant.signer() }),
+      federationContacts,
       federationEdus,
       deviceLists,
       sender: null,
@@ -258,11 +263,13 @@ export async function openReplicaApp(
       name + ' service unavailable at this ingress',
     );
   };
+  const federationContacts = new PendingContacts(server);
   const app: App = {
     store,
     server,
     tenant,
     federationKeys: replica.keys,
+    federationContacts,
     federationEdus: eduState(server, tenant.serverName, store),
     get federationIngress() {
       return ingress;
@@ -284,7 +291,11 @@ export async function openReplicaApp(
     get delayedEvents() {
       return unavailable('delayed');
     },
-    close: () => store.close(),
+    close: () =>
+      drainResources([
+        () => federationContacts.close(),
+        () => store.close(),
+      ]),
   };
   const ingress = await replica.ingress?.(transactionDependencies(app));
   current = app;

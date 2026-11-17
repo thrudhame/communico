@@ -842,6 +842,17 @@ event. Authenticated contact resets outbound backoff and wakes the queue.
 (`api/engine/federation/auth.ts:32-135`,
 `api/engine/federation/keyresolver.ts:17-46`)
 
+Verified unknown-origin contacts enqueue operator door-log diagnostics without
+waiting for persistence. The application owns one pending writer per peer/kind;
+each flush applies the accumulated count in one mutation, and shutdown drains
+all writers before storage closes. Independent peers, signature verification
+and request handling stay parallel. Abrupt crashes can lose all queued or
+uncommitted contact increments since a key's last successful flush, with no
+fixed numerical loss bound; these diagnostics are not user data. Persistence
+failures are reported and propagate from drain/shutdown, not authentication.
+Sender, operator-unlink and EDU refusal outcomes retain their direct atomic
+Conn writes. (`api/engine/federation/pending-contacts.ts`, `app.ts`)
+
 Resident `/state` and `/state_ids` read the event's own before-state, including
 imported boundaries; unknown state returns 404. Federation event/history
 serving has a separate server-principal policy: return full or version-redacted
