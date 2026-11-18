@@ -8,6 +8,7 @@ import {
 import { setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
+import { join as clientJoin } from '#engine/client/membership.ts';
 import { versionOf } from '#engine/client/room.ts';
 import {
   createRoom as createClientRoom,
@@ -2419,6 +2420,218 @@ Deno.test('replica device composition borrows the node service and binds its dis
   }
 });
 
+Deno.test('facade membership admission: every local owner refuses unavailable scope before a result or signature', async (t) => {
+  const f = await fixture();
+  const raw = f.node.signer();
+  let available = true, signatures = 0, revision = 0, retireOnSign = false;
+  const checkCurrent = () => {
+    if (!available) {
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'replica scope closed');
+    }
+  };
+  const signer = {
+    ...raw,
+    sign: async (bytes: string) => {
+      signatures++;
+      const signature = await raw.sign(bytes);
+      if (retireOnSign) revision++;
+      return signature;
+    },
+  };
+  try {
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: async (_room, _absent, user) => {
+        // Preparation is allowed to read server authority; room callbacks are not.
+        await (await f.edgeServer()).query('SELECT 1');
+        assert(user === '@alice:logical.test' || user === '@bob:logical.test');
+        checkCurrent();
+        const captured = revision;
+        const current = () => {
+          checkCurrent();
+          if (captured !== revision) {
+            throw new MatrixError(
+              503,
+              'M_UNAVAILABLE',
+              'replica scope changed',
+            );
+          }
+        };
+        return {
+          check: () => Promise.resolve(current()),
+          checkCurrent: current,
+        };
+      },
+      keys: keyStore(await f.edgeServer(), { signer }),
+      signer,
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+    });
+    const user = '@alice:logical.test', target = '@bob:logical.test';
+    const created = await createClientRoom({
+      creator: user,
+      preset: 'public_chat',
+    });
+    const room = await openRoom(app.store, created.roomId);
+    await localMembership.invite(room, user, target, signer);
+    await localMembership.ban(room, user, '@carol:logical.test', signer);
+    let saved: PreparedSubmission | null = null;
+    const submission = {
+      lookup: () => Promise.resolve(saved),
+      prepare: (pdu: Pdu) =>
+        Promise.resolve(saved = { eventId: String(pdu.event_id), pdu }),
+      finish: () => Promise.resolve(),
+    };
+    const member = {
+      type: 'm.room.member',
+      sender: user,
+      state_key: user,
+      content: { membership: 'join', displayname: 'retained member' },
+    };
+    const committed = await sendLocal(room, member, signer, submission);
+    const committedHead = await room.tx((tx) => tx.changes.head());
+    available = false;
+    const before = signatures;
+    await t.step('exact committed member receipt', async () => {
+      const replay = await sendLocal(
+        room,
+        { ...member, content: { membership: 'leave' } },
+        signer,
+        submission,
+      );
+      assertEquals(replay.eventId, committed.eventId);
+      assertEquals(replay.receipt, true);
+      assertEquals(signatures, before);
+      assertEquals(await room.tx((tx) => tx.changes.head()), committedHead);
+    });
+    const operations = {
+      clientJoin: () => clientJoin(room.id, user),
+      join: () => localMembership.join(room, user, signer),
+      residentJoin: () => localMembership.joinResident(room, user, signer),
+      reopen: () => localMembership.reopen(room, user, signer, {}),
+      leave: () => localMembership.leave(room, user, signer),
+      invite: () =>
+        localMembership.invite(room, user, '@dave:logical.test', signer),
+      kick: () => localMembership.kick(room, user, target, signer),
+      ban: () => localMembership.ban(room, user, target, signer),
+      unban: () =>
+        localMembership.unban(room, user, '@carol:logical.test', signer),
+      knock: () => localMembership.knock(room, user, signer),
+    };
+    for (const [name, operation] of Object.entries(operations)) {
+      await t.step(name, async () => {
+        await assertRejects(operation, MatrixError, 'replica scope closed');
+        assertEquals(signatures, before);
+      });
+    }
+    assertEquals(
+      (await localMembership.membershipOf(room, user))?.membership,
+      'join',
+    );
+    assertEquals(
+      (await localMembership.membershipOf(room, target))?.membership,
+      'invite',
+    );
+    assertEquals(
+      (await localMembership.membershipOf(room, '@carol:logical.test'))
+        ?.membership,
+      'ban',
+    );
+    available = true;
+    retireOnSign = true;
+    for (
+      const [name, operation] of Object.entries({
+        join: () => localMembership.join(room, target, signer),
+        leave: () => localMembership.leave(room, user, signer),
+        authoredMember: () => localMembership.ban(room, user, target, signer),
+      })
+    ) {
+      await t.step('commit fence ' + name, async () => {
+        await assertRejects(operation, MatrixError, 'replica scope changed');
+        assertEquals(
+          (await localMembership.membershipOf(room, user))?.membership,
+          'join',
+        );
+        assertEquals(
+          (await localMembership.membershipOf(room, target))?.membership,
+          'invite',
+        );
+      });
+    }
+    retireOnSign = false;
+    await localMembership.leave(room, user, signer);
+    retireOnSign = true;
+    await assertRejects(
+      () => localMembership.reopen(room, user, signer, {}),
+      MatrixError,
+      'replica scope changed',
+    );
+    assertEquals(
+      (await localMembership.membershipOf(room, user))?.membership,
+      'leave',
+    );
+    assertEquals(await room.tx((tx) => tx.segments.openStay()), null);
+  } finally {
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('facade membership admission: a client join cannot return a stale projected join after a committed departure', async () => {
+  const f = await fixture();
+  try {
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: () =>
+        Promise.resolve({ check: () => Promise.resolve(), checkCurrent() {} }),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+    });
+    const user = '@alice:logical.test';
+    const created = await createClientRoom({
+      creator: user,
+      preset: 'public_chat',
+    });
+    const room = await openRoom(app.store, created.roomId);
+    const previous = await localMembership.membershipOf(room, user);
+    assert(previous);
+    setRoomHooks({ project: () => Promise.resolve(), register: registerRoom });
+    await localMembership.leave(room, user, app.tenant.signer());
+    assertEquals(
+      (await projectedMembershipOf(app.server, room.id, user))?.eventId,
+      previous.eventId,
+    );
+    installServerHooks();
+    const rejoined = await clientJoin(room.id, user);
+    assertEquals(rejoined.created, true);
+    assert(rejoined.eventId !== previous.eventId);
+    assertEquals(
+      (await localMembership.membershipOf(room, user))?.membership,
+      'join',
+    );
+    assertEquals(
+      (await projectedMembershipOf(app.server, room.id, user))?.eventId,
+      rejoined.eventId,
+    );
+  } finally {
+    installServerHooks();
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
 Deno.test('facade authorship captures room permits and never exposes the raw tenant signer', async () => {
   const f = await fixture();
   let allowed = true, preparations = 0, signatures = 0;
@@ -2462,7 +2675,10 @@ Deno.test('facade authorship captures room permits and never exposes the raw ten
     });
     const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
       requireScope: () => Promise.resolve(),
-      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      // This fixture isolates signer authority; membership now also prepares
+      // its independent scope capability, which remains available here.
+      prepareRoomScope: () =>
+        Promise.resolve({ check: () => Promise.resolve(), checkCurrent() {} }),
       keys: keyStore(await f.edgeServer(), { signer: guarded }),
       signer: guarded,
       keyDocument: () => Promise.reject(new Error('unused')),

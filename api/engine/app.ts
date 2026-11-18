@@ -54,7 +54,10 @@ import { PendingContacts } from '#engine/federation/pending-contacts.ts';
 import type { Dispatch } from '#engine/server/delivery.ts';
 import type { ReplicaRoomAdmission } from '#engine/facade/directory.ts';
 import { roomSchema } from '#engine/room/index.ts';
-import { setRestrictedKnowledge } from '#engine/room/hooks.ts';
+import {
+  setMembershipAdmission,
+  setRestrictedKnowledge,
+} from '#engine/room/hooks.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import {
   installServerHooks,
@@ -262,6 +265,11 @@ export async function openReplicaApp(
   // A replica's missing local room is incomplete knowledge, not evidence that
   // a logical-local user is not joined. Its directory owns readiness; the room
   // core receives only the knowledge contract, never the application singleton.
+  setMembershipAdmission(
+    store,
+    (roomId, userId, allowAbsent) =>
+      replica.prepareRoomScope(roomId, allowAbsent, userId),
+  );
   setRestrictedKnowledge(store, async (roomId) => {
     try {
       await replica.requireScope('room:' + roomId);

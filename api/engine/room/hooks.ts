@@ -31,6 +31,48 @@ const joinAdmissions = new WeakMap<
   (roomId: string, userId: string, eventId?: string) => Promise<void>
 >();
 
+export type MembershipAdmission = { checkCurrent(): void };
+const membershipAdmissions = new WeakMap<
+  Store,
+  (
+    roomId: string,
+    userId: string,
+    allowAbsent: boolean,
+  ) => Promise<MembershipAdmission>
+>();
+
+// Preparation may read the composition's authority files. A room transaction
+// receives only its synchronous fence, never a server/tenant lookup callback.
+export function setMembershipAdmission(
+  store: Store,
+  admission: (
+    roomId: string,
+    userId: string,
+    allowAbsent: boolean,
+  ) => Promise<MembershipAdmission>,
+): void {
+  membershipAdmissions.set(store, admission);
+}
+
+export async function prepareMembershipAdmission(
+  store: Store,
+  roomId: string,
+  userId: string,
+  allowAbsent = false,
+): Promise<MembershipAdmission | undefined> {
+  return await membershipAdmissions.get(store)?.(roomId, userId, allowAbsent);
+}
+
+export async function withMembershipFence<T>(
+  admission: MembershipAdmission | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  admission?.checkCurrent();
+  const result = await operation();
+  admission?.checkCurrent();
+  return result;
+}
+
 export type RestrictedKnowledge = 'complete' | 'partial' | 'unavailable';
 const restrictedViews = new WeakMap<
   Store,
