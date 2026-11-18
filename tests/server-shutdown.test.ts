@@ -6,6 +6,60 @@ import { ServerLifetime } from '#root/api/server-lifetime.ts';
 import { fedCaller, remoteServer } from './http-federation.ts';
 import { bounded } from './helpers/server-process.ts';
 
+Deno.test('shutdown: expired drain cancels a returned streaming response before transport settlement', async () => {
+  const lifetime = new ServerLifetime();
+  const cancelled = Promise.withResolvers<void>();
+  const cancelDone = Promise.withResolvers<void>();
+  const server = Deno.serve(
+    {
+      hostname: '127.0.0.1',
+      port: 0,
+      onListen() {},
+      signal: lifetime.controller.signal,
+    },
+    lifetime.wrap('cs', () =>
+      new Response(
+        new ReadableStream({
+          pull(controller) {
+            controller.enqueue(new Uint8Array(65536));
+          },
+          async cancel() {
+            cancelled.resolve();
+            await cancelDone.promise;
+          },
+        }),
+      )),
+  );
+  const connection = await Deno.connect({
+    hostname: '127.0.0.1',
+    port: server.addr.port,
+  });
+  try {
+    await connection.write(new TextEncoder().encode(
+      'GET /download HTTP/1.1\r\nHost: localhost\r\n\r\n',
+    ));
+    const first = new Uint8Array(1024);
+    assert((await bounded(connection.read(first)))! > 0);
+    assert(new TextDecoder().decode(first).startsWith('HTTP/1.1 200'));
+    // The handler has returned, but this client stops reading its unbounded
+    // response. Operation cancellation must also own the already-returned body.
+    assertEquals(lifetime.count, 1);
+    assertEquals(await lifetime.drain(0), { cs: 1 });
+    const closing = lifetime.close();
+    await bounded(cancelled.promise, 1000);
+    // Transport abort cannot retire a still-running source cancellation child.
+    assertEquals(lifetime.count, 1);
+    cancelDone.resolve();
+    await bounded(closing, 1000);
+    assertEquals(lifetime.count, 0);
+  } finally {
+    cancelDone.resolve();
+    connection.close();
+    lifetime.abort();
+    await server.shutdown();
+  }
+});
+
 for (const finish of ['within grace', 'cancelled'] as const) {
   Deno.test(`shutdown: real federation send ${finish} retains its callback and gives a retryable wire outcome`, async () => {
     setConfigForTests({ federation: { enabled: true, mode: 'open' } });

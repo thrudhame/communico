@@ -1479,6 +1479,12 @@ shutdown retains the store until both handler and transport ownership settle.
 At grace expiry the listener cancels operation signals and derived body reads
 before closing transports. Fully read cancelled requests get retryable 503s;
 unread native bodies end in retryable transport EOF/reset, as in Synapse.
+Returned response streams share operation cancellation. Shutdown first waits
+for handler work, then aborts expired transports without waiting for delivery,
+so a client that stops reading cannot hold that phase open. A response already
+started ends retryably; newly rendered cancellation responses still get 503.
+Storage remains owned until transport settlement and asynchronous response-source
+cancellation have both completed.
 Clean storage closure exits successfully even when cancellation was needed;
 fatal rejection and storage-close failures retain their non-zero outcomes.
 (`api/server-lifetime.ts`, `main.ts`)

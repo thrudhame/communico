@@ -170,10 +170,7 @@ async function shutdown(): Promise<void> {
   if (forced) {
     console.error('shutdown: forced aborts', JSON.stringify(remaining));
   }
-  await lifetime.settled();
-  // Only expired drains retain unread native inputs. A normal drain must let
-  // HttpServer.shutdown flush its responses rather than aborting transports.
-  if (forced) lifetime.controller.abort();
+  await lifetime.close();
   await Promise.all([
     ...servers.map((server) => server.shutdown()),
     admin.shutdown(),
