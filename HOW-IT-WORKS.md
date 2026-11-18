@@ -324,6 +324,11 @@ await those exact publications. This precedes ordinary stream-head clamping and 
 selection, including timeout-zero, initial, full-state, list-only and encryption
 requests. Only successful rendering conditionally retires each captured revision;
 failed/cancelled consumers and concurrently higher revisions retain their markers.
+The pending-marker revision allocator is scoped to the device generation and
+room incarnation, not shared by independent sends across the tenant. It survives
+marker retirement to fence stale syncs and exact replay, and is removed with the
+device's receipts. Existing global revisions remain valid; first scoped use starts
+above the retained legacy ceiling without rewriting it.
 Shared effect-read admission captures the explicit room or the search/notification
 audience before event/relation/search/receipt/peek selection, regardless of sender,
 leaving client marker retirement to sync. A later acceptance cannot extend a
