@@ -912,6 +912,102 @@ Deno.test('room replication pins bootstrap, applies only durable semantic suffix
   }
 });
 
+Deno.test('operator reverse progress resolves the active enrollment after reenrolling the same node incarnation', async () => {
+  const f = await fixture();
+  try {
+    const initial = (await f.exports())!;
+    const edgeJournal = await f.journal();
+    await edgeJournal.receive('home', [initial]);
+    assert(await (await f.replicas()).apply(edgeJournal, initial));
+    const incoming = new Journal(await f.home.server(), LINK_SUPPORTED);
+    const owner = new RoomReplicas(
+      f.home,
+      f.homePairings,
+      f.tenant.serverName,
+      fakeKeyResolver(f.signing),
+    );
+    const oldReverse = (await exportRoomReplica(
+      f.edgeStore(),
+      await f.replica(),
+      f.tenant.serverName,
+      'home',
+      f.bundle.id,
+    ))!;
+    await incoming.receive(f.node.node, [oldReverse]);
+    assert(await owner.apply(incoming, oldReverse, f.bundle.id));
+    const edge = await f.edgePairings();
+    await edge.retire(await f.homePairings.revoke(f.bundle.id), 'a'.repeat(64));
+    const next = await f.homePairings.create({
+      node: f.node.node,
+      url: 'https://facade.test',
+      facadePin: 'b'.repeat(64),
+      expires: Date.now() + 60000,
+      required: [...LINK_CAPABILITIES],
+    });
+    await edge.accept(next);
+    const grant = await f.homePairings.grant(
+      next.id,
+      await edge.challenge(next.id, next.secret, 'a'.repeat(64)),
+    );
+    await f.homePairings.confirm(
+      next.id,
+      await edge.complete(next.id, grant, 'a'.repeat(64)),
+    );
+    assert(next.id !== f.bundle.id);
+    assertEquals(grant.body.transcript.body.incarnation, f.node.incarnation);
+    const pending = (await replicationProgress(
+      f.home,
+      f.tenant.serverName,
+      'home',
+      [oldReverse.stream],
+    )).streams.find((row) =>
+      row.direction === 'in' && row.source === f.node.node &&
+      row.incarnation === f.node.incarnation
+    )!;
+    assertEquals(pending.ready, false);
+    assertEquals(pending.published, null);
+    // The new enrollment owns its applied scope, while the source identity persists.
+    assert(
+      await exportRoomReplica(
+        f.home,
+        f.room,
+        f.tenant.serverName,
+        f.node.node,
+        next.id,
+      ),
+    );
+    const reverse = (await exportRoomReplica(
+      f.edgeStore(),
+      await f.replica(),
+      f.tenant.serverName,
+      'home',
+      next.id,
+    ))!;
+    await incoming.receive(f.node.node, [reverse]);
+    assert(await owner.apply(incoming, reverse, next.id));
+    const progress = await replicationProgress(
+      f.home,
+      f.tenant.serverName,
+      'home',
+      [reverse.stream],
+    );
+    const applied = progress.streams.find((row) =>
+      row.direction === 'in' && row.source === f.node.node &&
+      row.incarnation === f.node.incarnation
+    )!;
+    assertEquals(applied.ready, true);
+    assertEquals(applied.published, applied.applied);
+    assertEquals(
+      applied.applied.sourceCut,
+      (reverse.payload as {
+        manifest: { cut: number };
+      }).manifest.cut,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('room replication exports an enrolled facade suffix under its own source incarnation', async () => {
   const f = await fixture();
   try {
@@ -953,6 +1049,49 @@ Deno.test('room replication exports an enrolled facade suffix under its own sour
     assert(await owner.apply(incoming, reverse, f.bundle.id));
     assertEquals(await owner.apply(incoming, reverse, f.bundle.id), false);
     assertEquals(await f.room.tx((tx) => tx.changes.head()), head);
+
+    // Journal identity is the node incarnation, but scope completion belongs
+    // to the enrollment. The read-only operator view must resolve that binding.
+    assert(f.bundle.id !== f.node.incarnation);
+    const progress = await replicationProgress(
+      f.home,
+      f.tenant.serverName,
+      'home',
+      [reverse.stream],
+    );
+    const applied = progress.streams.find((row) =>
+      row.direction === 'in' && row.source === f.node.node &&
+      row.incarnation === f.node.incarnation
+    )!;
+    assertEquals(applied.ready, true);
+    assertEquals(applied.published, applied.applied);
+    assertEquals(
+      applied.applied.sourceCut,
+      (reverse.payload as {
+        manifest: { cut: number };
+      }).manifest.cut,
+    );
+    assertEquals(applied.declaredCut, null);
+
+    const foreignJournal = new Journal(await f.edgeServer(), LINK_SUPPORTED);
+    const foreign = await foreignJournal.append('home', {
+      source: f.node.node,
+      incarnation: 'unbound-node-incarnation',
+      stream: reverse.stream,
+      type: reverse.type,
+      version: reverse.version,
+      operationId: 'foreign-progress-binding',
+      payload: reverse.payload,
+    });
+    await incoming.receive(f.node.node, [foreign]);
+    const unbound = (await replicationProgress(
+      f.home,
+      f.tenant.serverName,
+      'home',
+      [reverse.stream],
+    )).streams.find((row) => row.incarnation === foreign.incarnation)!;
+    assertEquals(unbound.ready, false);
+    assertEquals(unbound.published, null);
 
     const branch = f.source.tipId;
     const homeEvent = await f.source.addEvent({

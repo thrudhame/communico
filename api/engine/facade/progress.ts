@@ -95,9 +95,13 @@ export async function replicationProgress(
         );
         ready = applied.sequence > 0;
       } else {
+        // Scope completion is enrollment-bound in both directions. Reverse
+        // journals instead carry the facade node incarnation; never mistake
+        // that source identity for the enrollment that owns its applied scope.
+        const enrollment = await scopeEnrollment(conn, role, row);
         const [held] = await conn.query(
           'SELECT ready,pending_hash FROM facade_scopes WHERE incarnation=? AND scope=?',
-          [row.incarnation, row.stream],
+          [enrollment, row.stream],
         );
         ready = held?.ready === 1 && held.pending_hash === null;
         if (ready) published = applied;
@@ -125,6 +129,24 @@ export async function replicationProgress(
     sources: sources.sort((a, b) => a.scope.localeCompare(b.scope)),
     streams,
   };
+}
+
+async function scopeEnrollment(
+  conn: Conn,
+  role: 'home' | 'facade',
+  row: Record<string, unknown>,
+): Promise<string | null> {
+  if (role === 'facade') {
+    return row.peer === 'home' && row.source === 'home'
+      ? String(row.incarnation)
+      : null;
+  }
+  if (row.peer !== row.source || row.source === 'home') return null;
+  const bindings = await conn.query(
+    "SELECT id FROM facade_pairings WHERE side='home' AND state='paired' AND node=? AND json_extract(grant_json,'$.body.transcript.body.incarnation')=?",
+    [String(row.source), String(row.incarnation)],
+  );
+  return bindings.length === 1 ? String(bindings[0].id) : null;
 }
 
 async function semanticCut(
