@@ -107,6 +107,68 @@ function operationId(view: MembershipView) {
     ])).digest('hex');
 }
 
+function bootstrapScope(binding: DomainBinding) {
+  return 'membership-bootstrap:' + canonicalJson(binding);
+}
+
+/** The directory describes journal positions, never source operation counters.
+ * Require a complete bootstrap under this exact grant/control/source binding,
+ * including an explicit empty bootstrap, before publishing that inventory. */
+export async function membershipExportPrefix(
+  conn: Conn,
+  grant: Grant,
+  localpart: string,
+): Promise<number> {
+  const context = grant.body.transcript.body.context;
+  const [row] = await conn.query(
+    'SELECT c.signed_json FROM facade_owner_activation a JOIN facade_owner_controls c ON c.pairing=a.pairing AND c.revision=a.revision WHERE a.pairing=?',
+    [context.id],
+  );
+  const control = row
+    ? JSON.parse(String(row.signed_json)).body as OwnerControl
+    : null;
+  const source = control?.nodes.find((node) => node.node === 'home');
+  const unavailable = (): never => {
+    throw new LinkError(
+      'LINK_UNAVAILABLE',
+      'directory awaits membership bootstrap',
+      503,
+    );
+  };
+  if (!source || !control) return unavailable();
+  const binding: DomainBinding = {
+    server: context.server,
+    pairing: context.id,
+    grantRevision: grant.body.revision,
+    ownerRevision: control.revision,
+    localpart,
+    source: source.node,
+    incarnation: source.incarnation,
+  };
+  await requireDomainControl(conn, binding);
+  const [declared] = await conn.query(
+    'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+    [context.node, context.id, bootstrapScope(binding)],
+  );
+  if (!declared) return unavailable();
+  const [head] = await conn.query(
+    "SELECT received FROM facade_streams WHERE peer=? AND direction='out' AND source='home' AND incarnation=? AND stream=?",
+    [
+      context.node,
+      context.id,
+      'membership:@' + localpart + ':' + context.server,
+    ],
+  );
+  const cut = Number(head?.received ?? 0);
+  if (cut < Number(declared.source_cut)) {
+    throw new LinkError(
+      'LINK_DIVERGED',
+      'membership bootstrap prefix regressed',
+    );
+  }
+  return cut;
+}
+
 /** A contiguous journal must never put a successor ahead of evidence needed to
  * apply that same head. Source counters retain their order across rooms too. */
 function bootstrapOrder(operations: MembershipOperation[]) {
@@ -580,6 +642,14 @@ export class MembershipOperations {
       unchanged();
       await this.selected(conn, grant, localpart);
       await requireDomainControl(conn, binding);
+      await conn.execute(
+        'DELETE FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+        [
+          grant.body.transcript.body.context.node,
+          pairing,
+          bootstrapScope(binding),
+        ],
+      );
       const userId = '@' + localpart + ':' + binding.server;
       for (
         const row of await conn.query(
@@ -608,6 +678,32 @@ export class MembershipOperations {
       const record = await this.append(view, grant, unchanged, true);
       if (record) records.push(record);
     }
+    // Only the completed ordered schedule may declare inventory completeness.
+    // A partial append, missing history or changed authority leaves no new
+    // declaration. This also commits the otherwise indistinguishable zero case.
+    await server.tx(async (conn) => {
+      unchanged();
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      const [head] = await conn.query(
+        "SELECT received FROM facade_streams WHERE peer=? AND direction='out' AND source='home' AND incarnation=? AND stream=?",
+        [
+          grant.body.transcript.body.context.node,
+          pairing,
+          'membership:@' + localpart + ':' + binding.server,
+        ],
+      );
+      await conn.execute(
+        'INSERT INTO facade_exports(peer,incarnation,scope,source_cut) VALUES(?,?,?,?) ON CONFLICT(peer,incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut',
+        [
+          grant.body.transcript.body.context.node,
+          pairing,
+          bootstrapScope(binding),
+          Number(head?.received ?? 0),
+        ],
+      );
+      unchanged();
+    });
     return records;
   }
 

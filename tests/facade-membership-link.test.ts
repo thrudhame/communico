@@ -9,6 +9,10 @@ import {
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { MembershipOperations } from '#engine/facade/membership.ts';
+import {
+  DirectoryReplicas,
+  exportDirectoryReplica,
+} from '#engine/facade/directory.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
@@ -516,6 +520,245 @@ async function incoming(
       : f.hs.export('alice', f.bundle.id));
   return { record, state, keys: fakeKeyResolver(remote), operation };
 }
+
+async function directoryFixture(f: Awaited<ReturnType<typeof fixture>>) {
+  // Directory inventory includes both accounts; selection must precede either
+  // account's membership bootstrap, even when that account has no facts.
+  await exportAccountAuth(f.home, f.ht, f.hp, f.bundle.id, 'bob', false);
+  const journal = new Journal(await f.edge.server(), [...LINK_SUPPORTED, {
+    type: 'membership-operation',
+    version: 1,
+  }]);
+  const owner = new DirectoryReplicas(
+    await f.edge.server(),
+    f.fp,
+    'logical.test',
+    'f2',
+  );
+  const publish = async (version: 1 | 2 = 2) => {
+    const record = await exportDirectoryReplica(
+      f.home,
+      f.ht,
+      f.node.node,
+      f.bundle.id,
+      version,
+    );
+    assert(record);
+    await journal.receive('home', [record]);
+    assert(await owner.apply(journal, record));
+    return record;
+  };
+  const bootstrap = async () => {
+    await f.hs.bootstrap('alice', f.bundle.id);
+    await f.hs.bootstrap('bob', f.bundle.id);
+  };
+  return { journal, owner, publish, bootstrap };
+}
+
+Deno.test('membership directory: missing bootstrap declaration is unavailable, explicit zero is complete', async () => {
+  const f = await fixture();
+  try {
+    const d = await directoryFixture(f);
+    await assertRejects(
+      () => exportDirectoryReplica(f.home, f.ht, f.node.node, f.bundle.id, 2),
+      Error,
+      'membership bootstrap',
+    );
+    await f.hs.bootstrap('alice', f.bundle.id);
+    await assertRejects(
+      () => exportDirectoryReplica(f.home, f.ht, f.node.node, f.bundle.id, 2),
+      Error,
+      'membership bootstrap',
+    );
+    await f.hs.bootstrap('bob', f.bundle.id);
+    const record = await d.publish();
+    assertEquals(record.version, 2);
+    const { cuts } =
+      (record.payload as { view: { cuts: Record<string, number> } }).view;
+    assertEquals(cuts['membership:@alice:logical.test'], 0);
+    assertEquals(cuts['membership:@bob:logical.test'], 0);
+    assertEquals(await d.owner.scopeState('rooms'), 'ready');
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership directory: historical journal prefix, not source counter, must actually apply', async () => {
+  const f = await fixture();
+  try {
+    const d = await directoryFixture(f);
+    const fact = await incoming(f, 'home');
+    // The already exported source fact is retained history on the current home;
+    // its original sequence is unrelated to its new journal position.
+    const operation = {
+      ...fact.operation,
+      incarnation: 'old-home',
+      sequence: 41,
+    };
+    operation.operationId = canonicalJson([
+      operation.source,
+      operation.incarnation,
+      operation.stream,
+      operation.sequence,
+    ]);
+    await (await f.home.server()).execute(
+      'UPDATE domain_operations SET operation_id=?,incarnation=?,sequence=? WHERE operation_id=?',
+      [
+        operation.operationId,
+        operation.incarnation,
+        operation.sequence,
+        fact.operation.operationId,
+      ],
+    );
+    const history = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(history.length, 1);
+    await f.hs.bootstrap('bob', f.bundle.id);
+    const record = await d.publish();
+    const { cuts } =
+      (record.payload as { view: { cuts: Record<string, number> } }).view;
+    assertEquals(cuts['membership:@alice:logical.test'], 2);
+    await assertRejects(
+      () => d.owner.scopeState('rooms'),
+      Error,
+      'replica unavailable',
+    );
+    await d.journal.receive('home', [fact.record, ...history]);
+    await lifecycleApplication(f.es)(d.journal, fact.record, fact.keys);
+    await assertRejects(
+      () => d.owner.scopeState('rooms'),
+      Error,
+      'replica unavailable',
+    );
+    await lifecycleApplication(f.es)(d.journal, history[0], fact.keys);
+    assertEquals(await d.owner.scopeState('rooms'), 'ready');
+    assertEquals(
+      (await invitesOf('@alice:logical.test', {
+        server: await f.edge.server(),
+      })).length,
+      1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership directory: received suffix blocks even an explicit zero inventory until its application', async () => {
+  const f = await fixture();
+  try {
+    const d = await directoryFixture(f);
+    await d.bootstrap();
+    await d.publish();
+    assertEquals(await d.owner.scopeState('rooms'), 'ready');
+    const fact = await incoming(f, 'home');
+    await d.journal.receive('home', [fact.record]);
+    await assertRejects(
+      () => d.owner.scopeState('rooms'),
+      Error,
+      'replica unavailable',
+    );
+    await lifecycleApplication(f.es)(d.journal, fact.record, fact.keys);
+    assertEquals(await d.owner.scopeState('rooms'), 'ready');
+    assertEquals(
+      (await invitesOf('@alice:logical.test', {
+        server: await f.edge.server(),
+      })).length,
+      1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership directory: a failed historical bootstrap cannot reuse an earlier empty declaration', async () => {
+  const f = await fixture();
+  try {
+    const d = await directoryFixture(f);
+    await d.bootstrap();
+    await d.publish();
+    const operation = await source(f, 1, 'home');
+    await (await f.home.server()).execute(
+      'UPDATE domain_operations SET context_json=? WHERE operation_id=?',
+      [
+        canonicalJson([{
+          source: 'retired',
+          incarnation: 'missing',
+          sequence: 1,
+        }]),
+        operation.operationId,
+      ],
+    );
+    await assertRejects(
+      () => f.hs.bootstrap('alice', f.bundle.id),
+      Error,
+      'historical predecessors',
+    );
+    await assertRejects(
+      () => exportDirectoryReplica(f.home, f.ht, f.node.node, f.bundle.id, 2),
+      Error,
+      'membership bootstrap',
+    );
+    assertEquals(
+      await (await f.home.server()).query(
+        "SELECT 1 FROM facade_exports WHERE scope LIKE 'membership-bootstrap:%' AND scope LIKE '%alice%'",
+      ),
+      [],
+    );
+    assertEquals(
+      (await d.journal.streams('home', 'in')).filter((s) =>
+        s.stream.startsWith('membership:')
+      ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership directory: F1 reader refuses v2 before receiving while F1 v1 never proves F2 completeness', async () => {
+  const f = await fixture();
+  try {
+    const d = await directoryFixture(f);
+    await d.publish(1);
+    const f1 = new DirectoryReplicas(
+      await f.edge.server(),
+      f.fp,
+      'logical.test',
+      'f1',
+    );
+    assertEquals(await f1.scopeState('rooms'), 'ready');
+    await assertRejects(
+      () => d.owner.scopeState('rooms'),
+      Error,
+      'replica unavailable',
+    );
+    await d.bootstrap();
+    const record = await exportDirectoryReplica(
+      f.home,
+      f.ht,
+      f.node.node,
+      f.bundle.id,
+      2,
+    );
+    assert(record);
+    await assertRejects(
+      async () =>
+        new Journal(await f.edge.server(), LINK_CAPABILITIES).receive('home', [
+          record,
+        ]),
+      Error,
+      'unsupported',
+    );
+    const [held] = await (await f.edge.server()).query(
+      "SELECT received,applied FROM facade_streams WHERE stream='directory' AND direction='in'",
+    );
+    assertEquals([held.received, held.applied], [1, 1]);
+    await d.journal.receive('home', [record]);
+    assert(await d.owner.apply(d.journal, record));
+    assertEquals(await d.owner.scopeState('rooms'), 'ready');
+  } finally {
+    await f.close();
+  }
+});
 
 type MembershipApplication = (
   journal: Journal,
