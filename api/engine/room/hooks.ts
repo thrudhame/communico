@@ -6,10 +6,23 @@
 // without the server schema) the writes stand alone — a later startup
 // roll-forward catches up.
 import type { Store } from '#engine/store/index.ts';
+import type { CompletionCut, CompletionTarget } from './completion.ts';
+import type { Room } from './index.ts';
 
 export type RoomHooks = {
   project: (store: Store, roomId: string) => Promise<void>;
   register: (store: Store, roomId: string) => Promise<unknown>;
+  enroll?: (
+    room: Room,
+    self: string,
+    target: CompletionCut | CompletionTarget,
+  ) => void;
+  complete?: (
+    room: Room,
+    self: string,
+    target: CompletionCut | CompletionTarget,
+    signal?: AbortSignal,
+  ) => Promise<void>;
 };
 
 let hooks: RoomHooks | null = null;
@@ -63,6 +76,37 @@ export async function admitLocalJoin(
 
 export function setRoomHooks(next: RoomHooks): void {
   hooks = next;
+}
+
+export function requireCompletionOwner(): void {
+  if (hooks?.enroll === undefined) {
+    throw new Error('E_COMPLETION_OWNER_MISSING');
+  }
+}
+
+export function enrollCompletion(
+  room: Room,
+  self: string,
+  target: CompletionCut | CompletionTarget,
+): boolean {
+  if (hooks?.enroll === undefined) return false;
+  hooks.enroll(room, self, target);
+  return true;
+}
+
+export function completeRoomWrite(
+  room: Room,
+  self: string,
+  signal?: AbortSignal,
+): Promise<void> | undefined {
+  const complete = hooks?.complete;
+  if (complete === undefined) return undefined;
+  return room.tx((tx) => tx.completion.capture()).then((target) => {
+    // The committed obligation belongs to the store even if this caller's
+    // signal was already cancelled before its completion wait is admitted.
+    enrollCompletion(room, self, target);
+    return complete(room, self, target, signal);
+  });
 }
 
 // After a successful room write: project. A projection failure is logged

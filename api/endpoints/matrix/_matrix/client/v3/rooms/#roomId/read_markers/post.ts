@@ -20,13 +20,22 @@ export default async function (
     }
   }
   if (typeof body['m.fully_read'] === 'string') {
-    await setFullyRead(roomId, userId, body['m.fully_read']);
+    await setFullyRead(
+      roomId,
+      userId,
+      body['m.fully_read'],
+      request._raw.signal,
+    );
   }
   if (typeof body['m.read'] === 'string') {
-    await setReceipt(roomId, userId, 'm.read', body['m.read']);
+    await setReceipt(roomId, userId, 'm.read', body['m.read'], {
+      signal: request._raw.signal,
+    });
   }
   if (typeof body['m.read.private'] === 'string') {
-    await setReceipt(roomId, userId, 'm.read.private', body['m.read.private']);
+    await setReceipt(roomId, userId, 'm.read.private', body['m.read.private'], {
+      signal: request._raw.signal,
+    });
   }
   return {};
 }

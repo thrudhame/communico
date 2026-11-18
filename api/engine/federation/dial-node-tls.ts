@@ -1,7 +1,7 @@
 // One outbound TLS transport for federation requests and discovery. CA trust
 // verifies the certificate chain and resolved server identity against system,
 // bundled and configured roots. Pin/keyname trust checks the peer key instead;
-// only this module may disable certificate-chain verification. The peer
+// only this policy selects disabled certificate-chain verification. The peer
 // certificate's SPKI SHA-256 is computed via node:crypto X509Certificate
 // (Deno's getPeerCertificate().pubkey is undefined for Ed25519 — only
 // RSA/EC); pinned peers match SPKI equality, key-is-name peers match the
@@ -15,6 +15,7 @@ import tls from 'node:tls';
 import { createHash, X509Certificate } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { abortable } from '#engine/net/abort.ts';
+import { TlsConnection } from '#engine/net/tls-connection.ts';
 import { networkOperation, UpstreamError } from '#engine/net/upstream-error.ts';
 import {
   type Http1Response,
@@ -46,74 +47,6 @@ export type DialOpts = {
   sink?: Http1WireOpts['sink'];
 };
 
-// node:tls TLSSocket → the WireConn shape
-class NodeTlsConn {
-  #sock: tls.TLSSocket;
-  #queue: Uint8Array[] = [];
-  #waiter: (() => void) | null = null;
-  #ended = false;
-  #err: unknown = null;
-
-  constructor(sock: tls.TLSSocket) {
-    this.#sock = sock;
-    sock.on('data', (d: Buffer) => {
-      sock.pause();
-      this.#queue.push(new Uint8Array(d.buffer, d.byteOffset, d.byteLength));
-      this.#poke();
-    });
-    sock.on('end', () => {
-      this.#ended = true;
-      this.#poke();
-    });
-    sock.on('close', () => {
-      this.#ended = true;
-      this.#poke();
-    });
-    sock.on('error', (e: unknown) => {
-      this.#err = e;
-      this.#ended = true;
-      this.#poke();
-    });
-    sock.pause();
-  }
-
-  #poke(): void {
-    const w = this.#waiter;
-    this.#waiter = null;
-    if (w !== null) w();
-  }
-
-  async read(p: Uint8Array): Promise<number | null> {
-    while (this.#queue.length === 0) {
-      if (this.#err !== null) throw this.#err;
-      if (this.#ended) return null;
-      await new Promise<void>((r) => {
-        this.#waiter = r;
-        this.#sock.resume();
-      });
-    }
-    const head = this.#queue[0];
-    const n = Math.min(p.length, head.length);
-    p.set(head.subarray(0, n));
-    this.#queue[0] = head.subarray(n);
-    if (this.#queue[0].length === 0) this.#queue.shift();
-    return n;
-  }
-
-  write(p: Uint8Array): Promise<number> {
-    return new Promise((resolve, reject) => {
-      this.#sock.write(
-        Buffer.from(p),
-        (e?: Error | null) => e ? reject(e) : resolve(p.length),
-      );
-    });
-  }
-
-  close(): void {
-    this.#sock.destroy();
-  }
-}
-
 // Configured PEM arrays are snapshots owned by resolve.ts. Its reset replaces
 // their identity; a WeakMap neither retains old configurations nor alters trust.
 const rootSnapshots = new WeakMap<string[], string[]>();
@@ -132,62 +65,15 @@ function caRoots(configured: string[]): string[] {
   return roots;
 }
 
-function connectWithDeadline(opts: {
-  connectIp: string;
-  port: number;
-  sni: string | null;
-  connectMs: number;
-  signal: AbortSignal;
-  trust: { rejectUnauthorized: boolean; ca?: string[] };
-}): Promise<tls.TLSSocket> {
-  opts.signal.throwIfAborted();
-  return new Promise((resolve, reject) => {
-    const sock = tls.connect({
-      host: opts.connectIp,
-      port: opts.port,
-      servername: opts.sni !== null ? opts.sni : undefined,
-      ...opts.trust,
-    });
-    const cleanup = () => {
-      clearTimeout(timer);
-      opts.signal.removeEventListener('abort', cancel);
-    };
-    const cancel = () => {
-      cleanup();
-      sock.destroy();
-      reject(opts.signal.reason);
-    };
-    opts.signal.addEventListener('abort', cancel, { once: true });
-    const timer = setTimeout(() => {
-      cleanup();
-      sock.destroy();
-      reject(
-        new UpstreamError('transport', {
-          phase: 'connect',
-          reason: 'upstream connect timeout',
-        }),
-      );
-    }, opts.connectMs);
-    sock.once('secureConnect', () => {
-      cleanup();
-      resolve(sock);
-    });
-    sock.once('error', (e: Error) => {
-      cleanup();
-      reject(e);
-    });
-  });
-}
-
 function spkiSha256(raw: Uint8Array): string {
   const x = new X509Certificate(raw);
   const spki = x.publicKey.export({ type: 'spki', format: 'der' });
   return createHash('sha256').update(spki).digest('hex');
 }
 
-function verifyIdentity(sock: tls.TLSSocket, trust: DialOpts['trust']): void {
+function verifyIdentity(conn: TlsConnection, trust: DialOpts['trust']): void {
   if (trust.kind === 'ca') return; // Chain and name were verified in the handshake.
-  const cert = sock.getPeerCertificate();
+  const cert = conn.peerCertificate();
   const raw = cert !== null && typeof cert === 'object'
     ? (cert as { raw?: Buffer }).raw
     : undefined;
@@ -243,7 +129,7 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
   const trust = opts.trust.kind === 'ca'
     ? { rejectUnauthorized: true, ca: caRoots(opts.trust.caCerts) }
     : { rejectUnauthorized: false };
-  let conn: NodeTlsConn | null = null;
+  const owner: { conn: TlsConnection | null } = { conn: null };
   const ac = new AbortController();
   const cancel = () => {
     ac.abort(
@@ -255,7 +141,7 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
         }),
     );
     try {
-      if (conn !== null) conn.close();
+      owner.conn?.close();
     } catch { /* already closed */ }
   };
   opts.signal?.addEventListener('abort', cancel, { once: true });
@@ -264,7 +150,6 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
     opts.timeoutMs,
   );
   try {
-    let sock: tls.TLSSocket | null = null;
     let failure: unknown;
     const addresses = async function* () {
       yield { connectIp: opts.connectIp, port: opts.port };
@@ -285,23 +170,37 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
     for await (const address of addresses()) {
       ac.signal.throwIfAborted();
       try {
-        sock = await networkOperation(
+        const connection = await networkOperation(
           'tls',
           ac.signal,
-          () =>
-            connectWithDeadline({
+          async () => {
+            const pending = new TlsConnection({
               ...address,
               sni: opts.sni,
               connectMs: opts.connectMs,
               signal: ac.signal,
               trust,
-            }),
+              connectUntil: 'secureConnect',
+              connectPhase: 'tls',
+              connectError: () =>
+                new UpstreamError('transport', {
+                  phase: 'connect',
+                  reason: 'upstream connect timeout',
+                }),
+            });
+            // Assign ownership synchronously, before awaiting the handshake.
+            owner.conn = pending;
+            await pending.ready;
+            return pending;
+          },
         );
-        verifyIdentity(sock, opts.trust);
+        // Policy/key inspection is not a network primitive. Preserve its
+        // existing local-error provenance outside networkOperation.
+        verifyIdentity(connection, opts.trust);
         break;
       } catch (error) {
-        sock?.destroy();
-        sock = null;
+        owner.conn?.close();
+        owner.conn = null;
         ac.signal.throwIfAborted();
         if (
           !(error instanceof UpstreamError) ||
@@ -310,16 +209,14 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
         failure = error;
       }
     }
-    if (sock === null) throw failure;
-    conn = new NodeTlsConn(sock);
+    const stream = owner.conn;
+    if (stream === null) throw failure;
     opts.signal?.throwIfAborted();
     ac.signal.throwIfAborted();
-    const connected = conn;
     const network: WireConn = {
-      read: (p) => networkOperation('read', ac.signal, () => connected.read(p)),
-      write: (p) =>
-        networkOperation('write', ac.signal, () => connected.write(p)),
-      close: () => connected.close(),
+      read: (p) => networkOperation('read', ac.signal, () => stream.read(p)),
+      write: (p) => networkOperation('write', ac.signal, () => stream.write(p)),
+      close: () => stream.close(),
     };
     return await http1Wire(network, {
       method: opts.method,
@@ -334,9 +231,9 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
   } finally {
     opts.signal?.removeEventListener('abort', cancel);
     clearTimeout(totalTimer);
-    if (conn !== null) {
+    if (owner.conn !== null) {
       try {
-        conn.close();
+        owner.conn.close();
       } catch { /* already closed */ }
     }
   }

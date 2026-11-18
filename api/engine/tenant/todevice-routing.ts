@@ -655,14 +655,14 @@ export async function resumePendingToDeviceRoutes(
   conn: Conn,
   recipient: string,
 ): Promise<void> {
+  const pending = await conn.query(
+    "SELECT payload_json FROM to_device_routes WHERE expanded=0 AND json_extract(payload_json,'$.recipient')=?",
+    [recipient],
+  );
+  if (!pending.length) return;
   const identity = await tenantAuthority(conn);
   if (!identity) return;
-  for (
-    const row of await conn.query(
-      "SELECT payload_json FROM to_device_routes WHERE expanded=0 AND json_extract(payload_json,'$.recipient')=?",
-      [recipient],
-    )
-  ) {
+  for (const row of pending) {
     await expandRoute(
       conn,
       identity,

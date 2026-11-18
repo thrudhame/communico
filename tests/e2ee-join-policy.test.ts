@@ -40,6 +40,7 @@ import { createRoom } from '#engine/room/create.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { ingestLocal, sendLocal } from '#engine/room/ingest.ts';
 import { productionFetcher } from '#engine/federation/fetcher.ts';
+import { latch, watchdog } from './support/ordering.ts';
 
 Deno.test('E6 remote leave fallback uses completed upstream endpoint status and preserves real refusals', async () => {
   const old = config();
@@ -149,6 +150,9 @@ Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup
   const user = '@anna:test';
   let mode = '503';
   let allowLeave = false;
+  const lateJoinEntered = latch();
+  const releaseLateJoin = latch();
+  let lateJoinResponse: Promise<Response> | undefined;
   let fr: Awaited<ReturnType<typeof makeFakeRoom>>;
   const memberships = new Map<string, string>();
   const fake = await startFakeServer({
@@ -171,9 +175,9 @@ Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup
         assert(req.verified);
         memberships.set(fr.roomId, 'join');
         if (mode === 'timeout') {
-          return new Promise<Response>((resolve) =>
-            setTimeout(() => resolve(Response.json({})), 400)
-          );
+          lateJoinEntered.release();
+          lateJoinResponse = releaseLateJoin.wait.then(() => Response.json({}));
+          return lateJoinResponse;
         }
         return mode === 'malformed'
           ? Response.json({})
@@ -223,7 +227,20 @@ Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup
             performJoinCleanup({ server, signer, store }, attempt),
         },
       };
-      await assertRejects(() => joinRemote(store, args));
+      const rejected = assertRejects(() => joinRemote(store, args));
+      void rejected.catch(() => undefined);
+      if (mode === 'timeout') {
+        await watchdog(
+          lateJoinEntered.wait,
+          'ambiguous send_join reaches remote',
+        );
+      }
+      await watchdog(rejected, 'send_join rejection settles');
+      if (mode === 'timeout') {
+        releaseLateJoin.release();
+        assert(lateJoinResponse, 'send_join response is owned before release');
+        await watchdog(lateJoinResponse, 'late send_join callback completes');
+      }
       assertEquals(
         (await pendingJoinAttempts(server)).filter((a) =>
           a.roomId === fr.roomId
@@ -237,7 +254,6 @@ Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup
         'cleanup is pending',
       );
     }
-    await new Promise((resolve) => setTimeout(resolve, 450));
     const before = await pendingJoinAttempts(await store.server());
     assertEquals(before.length, 6);
     await store.close();
@@ -264,6 +280,8 @@ Deno.test('E6 uncertain send_join outcomes and local MatrixErrors retain cleanup
     assertEquals(await pendingJoinAttempts(deps.server), []);
     assertEquals([...memberships.values()], Array(6).fill('leave'));
   } finally {
+    releaseLateJoin.release();
+    await lateJoinResponse;
     await store.close();
     await fake.close();
     setConfigForTests(old);

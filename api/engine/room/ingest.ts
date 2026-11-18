@@ -29,7 +29,12 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { domainOf } from '#engine/ids.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { admitLocalJoin } from '#engine/room/hooks.ts';
+import {
+  admitLocalJoin,
+  completeRoomWrite,
+  enrollCompletion,
+  requireCompletionOwner,
+} from '#engine/room/hooks.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { getRulebook, type StateMap } from '#engine/rulebook/index.ts';
 import {
@@ -132,6 +137,24 @@ export async function sendLocal(
   );
 }
 
+// Only client message composition selects acceptance. The existing helpers keep
+// their explicit completed return contract for dependent/internal operations.
+export async function acceptLocal(
+  room: Room,
+  partial: BuildPartial,
+  signer: Signer,
+  submission: LocalSubmission,
+): Promise<IngestLocalResult> {
+  return await submitLocal(
+    room,
+    signer,
+    (tx, permit) => buildInTx(tx, room.id, partial, permit),
+    submission,
+    localJoiningUser(partial),
+    false,
+  );
+}
+
 async function assertLocalAnnotation(
   tx: RoomTx,
   partial: BuildPartial,
@@ -175,7 +198,11 @@ export type LocalSubmission = {
   admit?(tx: RoomTx): Promise<void>;
   lookup(): Promise<PreparedSubmission | null>;
   prepare(pdu: Pdu): Promise<PreparedSubmission>;
-  finish(eventId: string, accepted: boolean): Promise<void>;
+  finish(
+    eventId: string,
+    accepted: boolean,
+    target?: CompletionTarget,
+  ): Promise<void>;
 };
 
 async function submissionReceipt(
@@ -219,64 +246,94 @@ async function submitLocal(
   build: (tx: RoomTx, signer: Signer) => Promise<Pdu>,
   submission?: LocalSubmission,
   joiningUser?: string,
+  completed = true,
 ): Promise<IngestLocalResult> {
-  const result = await withRoomLock(room.id, async () => {
-    if (joiningUser !== undefined) {
-      await admitLocalJoin(room.store, room.id, joiningUser);
-    }
-    if (submission === undefined) {
-      const permit = await prepareSigner(signer);
-      return await room.tx(async (tx) => {
-        const pdu = await build(tx, permit);
-        await assertLocalAnnotation(tx, pdu);
-        return await ingestInTx(tx, room.id, pdu, { self: signer.serverName });
-      });
-    }
-    let prepared = await submission.lookup();
-    if (prepared === null) {
-      const permit = await prepareSigner(signer);
-      const built = await room.tx(async (tx) => {
-        await submission.admit?.(tx);
-        const pdu = await build(tx, permit);
-        await assertLocalAnnotation(tx, pdu);
-        const stay = await tx.segments.openStay();
-        const group = stay === null ? null : await tx.state.current(stay.id);
-        await assertLocalEncryption(
-          tx,
-          group,
-          pdu as BuildPartial,
-          signer.serverName,
+  return await room.store.accept(async () => {
+    if (!completed) requireCompletionOwner();
+    let committed: IngestLocalResult | undefined;
+    let result: IngestLocalResult;
+    try {
+      result = await withRoomLock(room.id, async () => {
+        if (joiningUser !== undefined) {
+          await admitLocalJoin(room.store, room.id, joiningUser);
+        }
+        if (submission === undefined) {
+          const permit = await prepareSigner(signer);
+          committed = await room.tx(async (tx) => {
+            const pdu = await build(tx, permit);
+            await assertLocalAnnotation(tx, pdu);
+            return await ingestInTx(tx, room.id, pdu, {
+              self: signer.serverName,
+            });
+          });
+          return committed;
+        }
+        let prepared = await submission.lookup();
+        if (prepared === null) {
+          const permit = await prepareSigner(signer);
+          const built = await room.tx(async (tx) => {
+            await submission.admit?.(tx);
+            const pdu = await build(tx, permit);
+            await assertLocalAnnotation(tx, pdu);
+            const stay = await tx.segments.openStay();
+            const group = stay === null
+              ? null
+              : await tx.state.current(stay.id);
+            await assertLocalEncryption(
+              tx,
+              group,
+              pdu as BuildPartial,
+              signer.serverName,
+            );
+            return pdu;
+          });
+          prepared = await submission.prepare(built);
+        }
+        const result = await room.tx(async (tx) => {
+          const receipt = await submissionReceipt(
+            tx,
+            prepared.eventId,
+            prepared.pdu,
+          );
+          if (receipt !== null) return receipt;
+          await submission.admit?.(tx);
+          if (prepared.pdu === null) {
+            throw new Error('E_SUBMISSION_EVENT_MISSING: ' + prepared.eventId);
+          }
+          if (prepared.pdu.event_id !== prepared.eventId) {
+            throw new Error('E_SUBMISSION_ID_MISMATCH');
+          }
+          await assertLocalAnnotation(tx, prepared.pdu);
+          return await ingestInTx(tx, room.id, prepared.pdu, {
+            self: signer.serverName,
+          });
+        });
+        committed = result;
+        await submission.finish(
+          result.eventId,
+          result.standing !== 'rejected',
+          result.completion,
         );
-        return pdu;
+        return result;
       });
-      prepared = await submission.prepare(built);
+    } finally {
+      // Tenant finish may fail AFTER room commit. That durable room obligation is
+      // still enrolled; it never belongs to the response's successful lifetime.
+      if (committed?.completion !== undefined) {
+        enrollCompletion(
+          room,
+          signer.serverName,
+          committed.completion,
+        );
+      }
     }
-    const result = await room.tx(async (tx) => {
-      const receipt = await submissionReceipt(
-        tx,
-        prepared.eventId,
-        prepared.pdu,
-      );
-      if (receipt !== null) return receipt;
-      await submission.admit?.(tx);
-      if (prepared.pdu === null) {
-        throw new Error('E_SUBMISSION_EVENT_MISSING: ' + prepared.eventId);
-      }
-      if (prepared.pdu.event_id !== prepared.eventId) {
-        throw new Error('E_SUBMISSION_ID_MISMATCH');
-      }
-      await assertLocalAnnotation(tx, prepared.pdu);
-      return await ingestInTx(tx, room.id, prepared.pdu, {
-        self: signer.serverName,
-      });
-    });
-    await submission.finish(result.eventId, result.standing !== 'rejected');
+    // A wait naming this event (a redaction target, a missing prev) is
+    // re-run now that it has arrived (R10 — the 3c recheck driver).
+    if (completed) {
+      await afterLocalCommit(room, result.eventId, signer.serverName);
+    }
     return result;
   });
-  // A wait naming this event (a redaction target, a missing prev) is
-  // re-run now that it has arrived (R10 — the 3c recheck driver).
-  await afterLocalCommit(room, result.eventId, signer.serverName);
-  return result;
 }
 
 // Ingest an already-built local PDU: the per-room lock and the room
@@ -325,6 +382,11 @@ export async function afterRoomCommit(
   arrived: readonly string[] = [],
   signal?: AbortSignal,
 ): Promise<void> {
+  const owned = completeRoomWrite(room, self, signal);
+  if (owned !== undefined) {
+    await owned;
+    return;
+  }
   try {
     await resumeWaits(room, { self, signal }, arrived);
   } finally {

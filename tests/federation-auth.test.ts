@@ -17,6 +17,9 @@ import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { authenticateRequest } from '#engine/federation/auth.ts';
+import { PendingContacts } from '#engine/federation/pending-contacts.ts';
+import { Conn, type Database } from '#engine/store/db.ts';
+import { drainResources } from '#engine/lifetime.ts';
 import {
   type RequestEvidence,
   verifyRequestEvidence,
@@ -52,6 +55,7 @@ Deno.test('authenticated admission can retain the exact request and verifying ke
     const deps = {
       server,
       keys,
+      contacts: contactLog(server),
       onVerified: (value: RequestEvidence) => {
         evidence = value;
         order.push('verified');
@@ -143,6 +147,7 @@ Deno.test('admission evidence staging failure prevents contact side effects', as
           {
             server,
             keys,
+            contacts: contactLog(server),
             onVerified: () => Promise.reject(fault),
             onContact: () => {
               contacts++;
@@ -181,6 +186,7 @@ Deno.test('admission evidence preserves valid padded key documents and large ori
       {
         server,
         keys,
+        contacts: contactLog(server),
         onVerified: (value) => {
           proof = value;
           return Promise.resolve();
@@ -230,6 +236,7 @@ Deno.test('key-is-name admission evidence is verified from the name with no inve
       {
         server,
         keys,
+        contacts: contactLog(server),
         onVerified: (value) => {
           proof = value;
           return Promise.resolve();
@@ -264,12 +271,16 @@ Deno.test('key fault ownership: request authentication preserves local key looku
     const authorization = await headerFor(origin, 'PUT', TARGET);
     assertStrictEquals(
       await assertRejects(() =>
-        authenticateRequest({ server, keys }, OURS, {
-          method: 'PUT',
-          uri: TARGET,
-          authorization,
-          body: new Uint8Array(),
-        })
+        authenticateRequest(
+          { server, keys, contacts: contactLog(server) },
+          OURS,
+          {
+            method: 'PUT',
+            uri: TARGET,
+            authorization,
+            body: new Uint8Array(),
+          },
+        )
       ),
       fault,
     );
@@ -277,6 +288,13 @@ Deno.test('key fault ownership: request authentication preserves local key looku
 });
 
 type Origin = Awaited<ReturnType<typeof makeServer>>;
+
+const contactLogs = new WeakMap<Database, PendingContacts>();
+function contactLog(server: Database): PendingContacts {
+  const contacts = contactLogs.get(server);
+  if (contacts === undefined) throw new Error('contact log fixture is missing');
+  return contacts;
+}
 
 async function withStore(
   fn: (store: Store) => Promise<void>,
@@ -292,11 +310,17 @@ async function withStore(
     },
     { schemas: { server: serverSchema } },
   );
+  const server = await store.server();
+  const contacts = new PendingContacts(server);
+  contactLogs.set(server, contacts);
   try {
     await fn(store);
   } finally {
-    await store.close();
-    await Deno.remove(dir, { recursive: true });
+    await drainResources([
+      () => contacts.close(),
+      () => store.close(),
+      () => Deno.remove(dir, { recursive: true }),
+    ]);
   }
 }
 
@@ -380,6 +404,7 @@ async function attempt(
       {
         server,
         keys,
+        contacts: contactLog(server),
         onContact: (o) => {
           if (opts.contacts !== undefined) opts.contacts.push(o);
         },
@@ -394,6 +419,7 @@ async function attempt(
         ),
       },
     );
+    await contactLog(server).drain();
     return 'ok:' + verified;
   } catch (e) {
     if (e instanceof MatrixError) return `${(e as MatrixError).status}`;
@@ -423,35 +449,117 @@ Deno.test('auth: parallel authenticated requests all commit one origin door-log 
     await keys.getVerifyKey(origin.name, origin.keyId, Date.now(), 'request');
     const authorization = await headerFor(origin, 'PUT', TARGET);
     const count = 32;
+    const beforeConflicts = store.stats().server.conflicts;
+    let verified = 0;
+    let releaseVerified!: () => void;
+    const verifiedTogether = new Promise<void>((resolve) =>
+      releaseVerified = resolve
+    );
+    let releaseSnapshot!: () => void;
+    const snapshot = new Promise<void>((resolve) => releaseSnapshot = resolve);
+    let pendingReads = 0;
+    const query = Conn.prototype.query;
+    Conn.prototype.query = async function (sql, values = []) {
+      const rows = await query.call(this, sql, values);
+      if (
+        sql.startsWith(
+          'SELECT first_ms, last_ms, count FROM federation_pending',
+        ) &&
+        values[0] === origin.name
+      ) {
+        // With the old independent writers, two transactions must capture the
+        // same pending-row snapshot before either can mutate it. With the
+        // owned batcher, authentication finishes without waiting for this I/O.
+        pendingReads++;
+        if (pendingReads === 2) releaseSnapshot();
+        await snapshot;
+      }
+      return rows;
+    };
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => release = resolve);
+    const log = new PendingContacts({
+      ...server,
+      tx: async (fn, options) => {
+        await held;
+        return await server.tx(fn, options);
+      },
+    });
     const contacts: string[] = [];
-    const results = await Promise.allSettled(
-      Array.from({ length: count }, () =>
-        authenticateRequest(
-          {
-            server,
-            keys,
-            onContact: (o) => contacts.push(o),
-          },
-          OURS,
-          {
-            method: 'PUT',
-            uri: TARGET,
-            authorization,
-            body: new Uint8Array(),
-          },
-        )),
-    );
-    assertEquals(results.map((r) => r.status), Array(count).fill('fulfilled'));
-    assertEquals(
-      results.map((r) => r.status === 'fulfilled' ? r.value : null),
-      Array(count).fill(origin.name),
-    );
-    const rows = await listPending(server);
-    assertEquals(rows.length, 1);
-    assertEquals(rows[0].name, origin.name);
-    assertEquals(rows[0].verified, true);
-    assertEquals(rows[0].count, count);
-    assertEquals(contacts, Array(count).fill(origin.name));
+    try {
+      const deps = {
+        server,
+        keys,
+        contacts: log,
+        onVerified: () => {
+          // All N signatures have verified before their door-log admissions are
+          // released together; this is not a scheduler-speed contention test.
+          if (++verified === count) releaseVerified();
+          return verifiedTogether;
+        },
+        onContact: (o: string) => contacts.push(o),
+      };
+      const results = await Promise.allSettled(
+        Array.from({ length: count }, () =>
+          authenticateRequest(
+            deps,
+            OURS,
+            {
+              method: 'PUT',
+              uri: TARGET,
+              authorization,
+              body: new Uint8Array(),
+            },
+          )),
+      );
+      releaseSnapshot();
+      const beforeDrain = await listPending(server);
+      release();
+      await log.drain();
+      const afterConflicts = store.stats().server.conflicts;
+      const rows = await listPending(server);
+      console.log(
+        'PEERS_CONFLICT_CONTRACT',
+        JSON.stringify({
+          before: beforeConflicts,
+          after: afterConflicts,
+          verified,
+          fulfilled: results.filter((r) => r.status === 'fulfilled').length,
+          pendingReads,
+          pending: rows,
+        }),
+      );
+      assertEquals(verified, count);
+      assertEquals(
+        afterConflicts.conflicts - beforeConflicts.conflicts,
+        0,
+        'verified contact diagnostics must not create native write conflicts',
+      );
+      assertEquals(
+        results.map((r) => r.status),
+        Array(count).fill('fulfilled'),
+      );
+      assertEquals(
+        results.map((r) => r.status === 'fulfilled' ? r.value : null),
+        Array(count).fill(origin.name),
+      );
+      // Every authentication finished while diagnostic persistence was held.
+      assertEquals(beforeDrain, []);
+      assertEquals(rows.length, 1);
+      assertEquals(rows[0].name, origin.name);
+      assertEquals(rows[0].verified, true);
+      assertEquals(rows[0].count, count);
+      assertEquals(contacts, Array(count).fill(origin.name));
+    } finally {
+      releaseVerified();
+      releaseSnapshot();
+      release();
+      try {
+        await log.close();
+      } finally {
+        Conn.prototype.query = query;
+      }
+    }
   });
 });
 

@@ -64,17 +64,29 @@ export async function startAdminHandler(
       `admin socket must be owned by the server user with mode 0600: ${path}`,
     );
   }
+  const unlink = () => {
+    try {
+      const current = Deno.lstatSync(path);
+      if (current.ino === bound.ino && current.dev === bound.dev) {
+        Deno.removeSync(path);
+      }
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
+  };
+  // Cancellation can be followed immediately by fatal process exit. Do not
+  // leave the owned name to the runtime's asynchronous listener destruction.
+  const signal = lifetime?.controller.signal;
+  signal?.addEventListener('abort', unlink, { once: true });
+  if (signal?.aborted) unlink();
   return {
     path,
     async shutdown() {
-      await server.shutdown();
       try {
-        const current = await Deno.lstat(path);
-        if (current.ino === bound.ino && current.dev === bound.dev) {
-          await Deno.remove(path);
-        }
-      } catch (error) {
-        if (!(error instanceof Deno.errors.NotFound)) throw error;
+        await server.shutdown();
+      } finally {
+        signal?.removeEventListener('abort', unlink);
+        unlink();
       }
     },
   };

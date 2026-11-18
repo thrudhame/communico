@@ -14,6 +14,7 @@ export default async function (request: PathfinderRequest, context: Context) {
     {
       server: app.server,
       keys: app.federationKeys,
+      contacts: app.federationContacts,
       onContact: app.sender?.contactHook(),
       onVerified: app.federationIngress && txnId !== undefined
         ? (evidence) => app.federationIngress!.stage(txnId, evidence)

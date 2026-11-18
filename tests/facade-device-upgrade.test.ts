@@ -11,7 +11,7 @@ import {
 import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
 import { historicalTenantSchema } from '#tests/fixtures/tenant-schema-history.ts';
 
-Deno.test('F2 complete-view checkpoints upgrade tenant36 with no fabricated snapshots and match fresh schema', async () => {
+Deno.test('F2 complete-view checkpoints upgrade tenant37 with no fabricated snapshots and match fresh schema', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'facade-checkpoint-upgrade-' });
   const options = {
     dir,
@@ -21,7 +21,7 @@ Deno.test('F2 complete-view checkpoints upgrade tenant36 with no fabricated snap
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { tenant: historicalTenantSchema(36) },
+    schemas: { tenant: historicalTenantSchema(37) },
   });
   try {
     await openTenant(store, 'logical.test', { create: true });
@@ -46,7 +46,7 @@ Deno.test('F2 complete-view checkpoints upgrade tenant36 with no fabricated snap
   }
 });
 
-Deno.test('F2 wire frontier upgrades tenant35 without inventing original publication evidence', async () => {
+Deno.test('F2 wire frontier upgrades tenant36 without inventing original publication evidence', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'facade-device-wire-upgrade-' });
   const options = {
     dir,
@@ -56,7 +56,7 @@ Deno.test('F2 wire frontier upgrades tenant35 without inventing original publica
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { tenant: historicalTenantSchema(35) },
+    schemas: { tenant: historicalTenantSchema(36) },
   });
   try {
     await openTenant(store, 'logical.test', { create: true });
@@ -101,7 +101,7 @@ Deno.test('F2 public device schema upgrades the prior pool owner and retains imp
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { tenant: historicalTenantSchema(29) },
+    schemas: { tenant: historicalTenantSchema(30) },
   });
   try {
     let tenant = await openTenant(store, 'logical.test', { create: true });
@@ -165,7 +165,7 @@ Deno.test('F2 public device schema upgrades the prior pool owner and retains imp
   }
 });
 
-Deno.test('F2 key bootstrap upgrades tenant33 without manufacturing completeness and matches fresh schema', async () => {
+Deno.test('F2 key bootstrap upgrades tenant34 without manufacturing completeness and matches fresh schema', async () => {
   const dir = await Deno.makeTempDir({
     prefix: 'facade-key-bootstrap-upgrade-',
   });
@@ -177,7 +177,7 @@ Deno.test('F2 key bootstrap upgrades tenant33 without manufacturing completeness
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { tenant: historicalTenantSchema(33) },
+    schemas: { tenant: historicalTenantSchema(34) },
   });
   try {
     await openTenant(store, 'logical.test', { create: true });
@@ -200,7 +200,7 @@ Deno.test('F2 key bootstrap upgrades tenant33 without manufacturing completeness
   }
 });
 
-Deno.test('F2 passive device creation history upgrades tenant34 without manufacturing registry authority', async () => {
+Deno.test('F2 passive device creation history upgrades tenant35 without manufacturing registry authority', async () => {
   const dir = await Deno.makeTempDir({
     prefix: 'facade-device-history-upgrade-',
   });
@@ -212,7 +212,7 @@ Deno.test('F2 passive device creation history upgrades tenant34 without manufact
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { tenant: historicalTenantSchema(34) },
+    schemas: { tenant: historicalTenantSchema(35) },
   });
   try {
     await openTenant(store, 'logical.test', { create: true });

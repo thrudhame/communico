@@ -1,11 +1,12 @@
 // Force shutdown interleavings through existing database/transport seams.
-// Long timers remain real; a one-second assertion bounds every stop.
+// Long policy timers remain real; a broad watchdog bounds only deadlocks.
 import { assert, assertEquals } from '@std/assert';
 import { setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import {
   listOutbox,
   peerStatus,
+  type Sender,
   startSender,
 } from '#engine/federation/sender.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -17,6 +18,7 @@ import {
 } from '#engine/signing-primitives.js';
 import { startFakeServer } from './federation/fake-server.ts';
 import { testRemoteServer, testSigner } from './fixtures/signer.ts';
+import { watchdog } from '#tests/support/ordering.ts';
 
 const HOUR = 3_600_000;
 
@@ -27,20 +29,30 @@ function latch() {
 }
 
 async function bounded<T>(promise: Promise<T>): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  return await watchdog(promise, 'sender lifecycle owner never completed');
+}
+
+// Observe the existing stop owner's actual worker join during its synchronous
+// entry, then require that join to settle before the public stop result.
+function stopping(sender: Sender): Promise<void> {
+  const all = Promise.all;
+  let joined = false, drained = false;
+  Promise.all = ((values: Iterable<unknown>) => {
+    joined = true;
+    const done = all.call(Promise, [...values]);
+    void done.then(() => drained = true, () => drained = true);
+    return done;
+  }) as typeof Promise.all;
+  let result: Promise<void>;
   try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error('sender stop exceeded 1s')),
-          1000,
-        );
-      }),
-    ]);
+    result = sender.stop();
   } finally {
-    clearTimeout(timer);
+    Promise.all = all;
   }
+  assert(joined, 'sender stop must enroll its actual worker drain');
+  return result.then(() => {
+    assert(drained, 'sender stop returned before its actual worker drain');
+  });
 }
 
 async function withStore(fn: (store: Store) => Promise<void>) {
@@ -149,9 +161,9 @@ for (const mode of ['parked', 'late', 'late-multiple'] as const) {
       const sender = startSender({ store, signer: await testSigner() });
       try {
         await bounded(mode === 'parked' ? timers.registered : reached.promise);
-        const stopping = Promise.all([sender.stop(), sender.stop()]);
+        const stopped = Promise.all([stopping(sender), stopping(sender)]);
         release.resolve();
-        await bounded(stopping);
+        await bounded(stopped);
         assertEquals(
           timers.count(),
           mode === 'parked' ? destinations.length : 0,
@@ -159,7 +171,7 @@ for (const mode of ['parked', 'late', 'late-multiple'] as const) {
         assertEquals(timers.active.size, 0);
         // Delayed producer wakes and repeated stops cannot reopen the worker.
         for (const dest of destinations) sender.wake(dest);
-        await bounded(sender.stop());
+        await bounded(stopping(sender));
         assertEquals(timers.active.size, 0);
         assertEquals(
           (await listOutbox(await original())).map((r) => r.state),
@@ -196,9 +208,9 @@ Deno.test('sender stop: an intent prepared across stop is not started', async ()
     });
     try {
       await bounded(reached.promise);
-      const stopping = sender.stop();
+      const stopped = stopping(sender);
       release.resolve();
-      await bounded(stopping);
+      await bounded(stopped);
       assertEquals(runs, 0);
     } finally {
       release.resolve();
@@ -259,10 +271,9 @@ for (
       try {
         await bounded(reached.promise);
         let stopped = false;
-        const stopping = sender.stop().then(() => {
+        const stop = stopping(sender).then(() => {
           stopped = true;
         });
-        await Promise.resolve();
         assertEquals(
           stopped,
           false,
@@ -270,7 +281,7 @@ for (
         );
         const releasedAt = Date.now();
         release.resolve();
-        await bounded(stopping);
+        await bounded(stop);
         assertEquals(sends, phase === 'preparing' ? 0 : 1);
         const rows = await listOutbox(server);
         assertEquals(

@@ -11,6 +11,8 @@ import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { withRemoteSigningState } from '#engine/server/remote-devices.ts';
+import { latch, watchdog } from '#tests/support/ordering.ts';
+import { controlledTimeouts } from '#tests/support/timers.ts';
 import {
   b64encodeStd,
   exportPublicKeyRaw,
@@ -554,20 +556,55 @@ suite.test('remote master overlays stay private and reject signer or target chan
       },
     );
     await locked;
+    const deadline = controlledTimeouts(50);
+    const enrolled = latch();
+    const set = Map.prototype.set;
+    const lockKey = JSON.stringify([theApp().server.path, user]);
+    Reflect.set(Map.prototype, 'set', function (
+      this: Map<unknown, unknown>,
+      key: unknown,
+      value: unknown,
+    ) {
+      const result = set.call(this, key, value);
+      if (key === lockKey && value instanceof Promise) enrolled.release();
+      return result;
+    });
+    let deadlineQuery: Promise<Json> | undefined;
     try {
-      const started = performance.now();
-      const timed = await call(a.access_token!, 'keys/query', {
+      deadlineQuery = call(a.access_token!, 'keys/query', {
         timeout: 50,
         device_keys: { [user]: [] },
       });
-      assert(
-        performance.now() - started < 500,
-        'signing serialization must honor the query deadline',
+      void deadlineQuery.catch(() => undefined);
+      await watchdog(
+        enrolled.wait,
+        'query enrolls behind the held signing owner',
+      );
+      await watchdog(
+        deadline.registered,
+        'query registers its configured deadline',
+      );
+      assertEquals(deadline.timers.length, 1);
+      deadline.timers[0].fire();
+      const timed = await watchdog(
+        deadlineQuery,
+        'signing serialization honors the query deadline while its owner is held',
       );
       assert((timed.failures as Json)[fake.name]);
     } finally {
+      Map.prototype.set = set;
       releaseLock();
-      await protectedRead;
+      try {
+        await protectedRead;
+        await withRemoteSigningState(
+          theApp().server,
+          user,
+          () => Promise.resolve(),
+        );
+        await deadlineQuery?.catch(() => undefined);
+      } finally {
+        deadline.restore();
+      }
     }
     const plain = await query(c.access_token!, user);
     try {

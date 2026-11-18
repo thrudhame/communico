@@ -11,6 +11,7 @@ import {
   signingCollision,
 } from '#engine/tenant/cross-signing.ts';
 import { config } from '#engine/config.ts';
+import { forgetClientCompletions } from './completion.ts';
 import { deletePushersForToken } from '#engine/tenant/pushers.ts';
 import { uiaAction, type UiaAuthorization } from '#engine/tenant/uia.ts';
 import { cancelToDeviceTargets } from './todevice-routing.ts';
@@ -147,6 +148,7 @@ export async function deleteDevice(
 ): Promise<void> {
   // Sole device lifecycle deletion: all consumers revoke through this owner.
   if (record) await recordDeviceDeletion(conn, localpart, deviceId);
+  await forgetClientCompletions(conn, localpart, deviceId);
   await conn.execute(
     'DELETE FROM delayed_event_receipts WHERE localpart=? AND device_id=?',
     [localpart, deviceId],

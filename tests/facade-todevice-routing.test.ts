@@ -286,7 +286,7 @@ Deno.test('routed to-device: an acknowledged same-server send retains the other 
   }
 });
 
-Deno.test('routed to-device: tenant37 upgrade preserves legacy inbox and never manufactures routed targets or ACKs', async () => {
+Deno.test('routed to-device: tenant38 upgrade preserves legacy inbox and never manufactures routed targets or ACKs', async () => {
   const dir = await Deno.makeTempDir();
   const storage = {
     dir,
@@ -296,7 +296,7 @@ Deno.test('routed to-device: tenant37 upgrade preserves legacy inbox and never m
     idleseconds: 300,
   };
   let store = await openStore(storage, {
-    schemas: { tenant: historicalTenantSchema(37) },
+    schemas: { tenant: historicalTenantSchema(38) },
   });
   try {
     const tenant = await openTenant(store, 'upgrade-routing.test', {
@@ -353,7 +353,7 @@ Deno.test('routed to-device: tenant37 upgrade preserves legacy inbox and never m
   }
 });
 
-Deno.test('routed to-device: tenant38 admission upgrade preserves original routed hashes and fresh shape', async () => {
+Deno.test('routed to-device: tenant39 admission upgrade preserves original routed hashes and fresh shape', async () => {
   const dir = await Deno.makeTempDir();
   const storage = {
     dir,
@@ -363,7 +363,7 @@ Deno.test('routed to-device: tenant38 admission upgrade preserves original route
     idleseconds: 300,
   };
   let store = await openStore(storage, {
-    schemas: { tenant: historicalTenantSchema(38) },
+    schemas: { tenant: historicalTenantSchema(39) },
   });
   try {
     const db = await store.tenant('admission-upgrade.test', { create: true });

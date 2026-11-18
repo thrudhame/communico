@@ -17,7 +17,11 @@ async function call(
     }),
   );
   assertEquals(response.status, 200, await response.clone().text());
-  return await response.json() as Json;
+  const result = await response.json() as Json;
+  // These fixtures inspect another client's publication and frozen push verdicts.
+  // Send acceptance alone no longer establishes that publication boundary.
+  if (path.includes('/send/')) await call('sync?timeout=0', token);
+  return result;
 }
 const sync = (token: string, since?: unknown) =>
   call('sync' + (since ? '?since=' + since : ''), token);

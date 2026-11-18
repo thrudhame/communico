@@ -44,6 +44,7 @@ function bind(
     completion: {
       state: () => completion.completionState(conn),
       capture: () => completion.captureCompletionCut(conn, roomId),
+      accepted: () => completion.captureAcceptedCut(conn, roomId),
       receipt: (eventId: string) =>
         completion.completionReceipt(conn, roomId, eventId),
       record: (eventId: string) =>

@@ -249,6 +249,30 @@ rows. Ordinary room helpers still await their existing post-commit boundary.
 Backup audits and restored-work inspection retain the new identity, receipt and
 progress facts. (`api/engine/room/completion.ts`, `server/project.ts`)
 
+Device-backed local message sends return after the room event and the tenant's
+transaction receipt, exact completion target and client pending cut are durable.
+One store-owned completion service enrolls committed room targets even if tenant
+finish fails. It settles ready dependencies, publishes immutable prefixes and
+completes required callbacks independently of the HTTP request. Fixed smaller
+waiters can finish before later room work; cancellation removes only a waiter.
+Failures carry room/cut/cause, reject required waiters with 503 and remain logged
+and owned for automatic retry without another arrival. Schema-enabled startup
+discovers lost wakes and publication/completion gaps after the restore-report
+gate. Store shutdown closes new acceptance, drains admitted submissions and
+completion, then releases service callbacks and native storage.
+(`api/engine/server/{completion,startup}.ts`, `store/index.ts`, `tenant/completion.ts`)
+
+Internal local/state/membership/redaction, remote/history and replica helpers
+retain their awaited completion boundary. Explicit room retirement rechecks full
+completion under lifecycle serialization, reconciles satisfied client markers
+while the original generation remains held, then unlinks. Historical completed
+transaction receipts survive that intentional lifecycle; missing or replaced
+outstanding targets are never satisfied by an equal numeric position.
+Their exact completion rows carry a retirement witness written only after the
+original generation's completed publication is checked, so reuse of its room ID
+cannot turn an old receipt into an obligation on the replacement room.
+(`api/engine/room/{ingest,operator}.ts`, `server/removal.ts`)
+
 The room transaction records its mutations and delivery destinations in
 `changes`. After that transaction commits, an injected hook projects them
 into the server file. Projection failure leaves the room write committed;
@@ -302,6 +326,20 @@ body/name/topic text without altering the PDU.
 `api/engine/server/project.ts:578-587`, `api/engine/server/project.ts:419-467`)
 
 ## Client reads and sync
+
+Both ordinary and sliding sync first capture the authenticated device generation's
+pending cuts and their room audience's accepted cuts, release the transactions and
+await those exact publications. This precedes ordinary stream-head clamping and sliding list/lease
+selection, including timeout-zero, initial, full-state, list-only and encryption
+requests. Only successful rendering conditionally retires each captured revision;
+failed/cancelled consumers and concurrently higher revisions retain their markers.
+Shared effect-read admission captures the explicit room or the search/notification
+audience before event/relation/search/receipt/peek selection, regardless of sender,
+leaving client marker retirement to sync. A later acceptance cannot extend a
+captured target, and unrelated rooms or account reads acquire no global drain.
+Existing filters, visibility, limits and explicit historical tokens retain their
+meaning; completion does not inject an event into a filtered or trimmed response.
+(`api/engine/client/completion.ts`, `auth-context.ts`, `syncfeed.ts`, `sliding-sync/index.ts`)
 
 Client state disclosure has one admission owner, separate from raw state reads
 and event serialization. A grant names the room, viewer and exact publication
@@ -815,6 +853,17 @@ the required validity floor; failure to obtain or verify a key refuses the
 event. Authenticated contact resets outbound backoff and wakes the queue.
 (`api/engine/federation/auth.ts:32-135`,
 `api/engine/federation/keyresolver.ts:17-46`)
+
+Verified unknown-origin contacts enqueue operator door-log diagnostics without
+waiting for persistence. The application owns one pending writer per peer/kind;
+each flush applies the accumulated count in one mutation, and shutdown drains
+all writers before storage closes. Independent peers, signature verification
+and request handling stay parallel. Abrupt crashes can lose all queued or
+uncommitted contact increments since a key's last successful flush, with no
+fixed numerical loss bound; these diagnostics are not user data. Persistence
+failures are reported and propagate from drain/shutdown, not authentication.
+Sender, operator-unlink and EDU refusal outcomes retain their direct atomic
+Conn writes. (`api/engine/federation/pending-contacts.ts`, `app.ts`)
 
 Resident `/state` and `/state_ids` read the event's own before-state, including
 imported boundaries; unknown state returns 404. Federation event/history

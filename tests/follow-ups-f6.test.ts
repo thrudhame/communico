@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { startHttp } from '#tests/http-app.ts';
+import { completeAccepted } from '#tests/complete-accepted.ts';
 import { getRule, putRule, setRuleActions } from '#engine/tenant/pushrules.ts';
 import { setReceipt, streamMax } from '#engine/server/ephemeral.ts';
 import { setTyping, typingIn, typingSeq } from '#engine/typing.ts';
@@ -196,6 +197,7 @@ Deno.test('F6 receipt capacity cannot block notification projection of legacy re
       { body: 'still published', msgtype: 'm.text' },
       'PUT',
     );
+    await completeAccepted(http.app, room, sent.event_id);
     assertEquals(
       (await db.query(
         'SELECT event FROM notifications WHERE user=? AND event=?',

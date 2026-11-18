@@ -9,6 +9,9 @@ import { roomEdges } from '#engine/room/edges.ts';
 import { advance } from '#engine/store/watermark.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { removeNotificationFacts } from '#engine/server/notifications.ts';
+import { openRoom } from '#engine/room/index.ts';
+import { get } from '#engine/store/watermark.ts';
+import { reconcileRoomCompletions } from '#engine/tenant/completion.ts';
 import {
   roomProjectionSources,
   roomSource,
@@ -22,6 +25,29 @@ export async function finishRoomRemoval(
   removal: Removal,
   position: number | null,
 ): Promise<number> {
+  let completed = null;
+  try {
+    const room = await openRoom(store, roomId);
+    const state = await room.tx((tx) => tx.completion.state());
+    const published = await get(
+      await store.server(),
+      roomSource('room', roomId),
+    );
+    completed = {
+      roomId,
+      generation: state.generation,
+      through: Math.min(state.completedThrough, published),
+    };
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+  }
+  // The room lifecycle lock prevents a new accepted submission while these
+  // tenant transactions reconcile markers. Never unlink outstanding causal work.
+  for (const tenant of await store.tenants()) {
+    await (await store.tenant(tenant)).tx((tx) =>
+      reconcileRoomCompletions(tx, roomId, completed)
+    );
+  }
   await store.retireRoom(roomId);
   const db = await store.server();
   const localServers = await store.tenants();
@@ -97,6 +123,7 @@ export async function finishRoomRemoval(
         'event_index',
         'receipt_dag_edges',
         'receipt_dag_nodes',
+        'receipt_membership_events',
         'feed',
         'memberships',
         'redactions',

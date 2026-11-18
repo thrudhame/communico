@@ -387,7 +387,7 @@ Deno.test('F2 signing identity upgrades pre-enrollment keys and pins repeatable 
     idleseconds: 300,
   };
   let store = await openStore(options, {
-    schemas: { tenant: historicalTenantSchema(30) },
+    schemas: { tenant: historicalTenantSchema(31) },
   });
   try {
     let tenant = await openTenant(store, 'logical.test', { create: true });

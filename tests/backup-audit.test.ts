@@ -133,9 +133,14 @@ Deno.test('backup audit: projection lag is recoverable, projection ahead of the 
   const f = await fixture();
   try {
     const server = await f.app.store.server();
+    const room = await f.app.store.room(f.room);
+    // A completed callback witness cannot be ahead of publication. Rewinding
+    // only the old watermark now models corruption, not recoverable lag.
     await server.execute('UPDATE watermarks SET position=0 WHERE source=?', [
       'room:' + f.room,
     ]);
+    await assertRejects(f.audit, Error, 'completion progress past publication');
+    await room.execute('UPDATE completion_state SET completed_through=0');
     await f.audit();
     await server.execute(
       'UPDATE watermarks SET position=999999 WHERE source=?',

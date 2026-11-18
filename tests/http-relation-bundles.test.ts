@@ -29,6 +29,8 @@ async function ok(
 ) {
   const result = await call(path, token, body, method);
   assertEquals(result.status, 200, JSON.stringify(result.body));
+  // Bundles below are read by another client, not the sender's causal barrier.
+  if (path.includes('/send/')) await ok('v3/sync?timeout=0', token);
   return result.body;
 }
 const bundles = (event: Json) =>

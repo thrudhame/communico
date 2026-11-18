@@ -61,6 +61,9 @@ export const tableContracts = {
     ],
     // Room references and reliable outbox handoff: auditServer.
     sources: ['transactions', 'to_device_intents'],
+    // Client-owned exact completion targets and causal cuts: auditTenant checks
+    // client identity/revisions; auditServer checks their captured room truth.
+    completion: ['transaction_completions', 'client_completion_cuts'],
     // Complete opaque owner state, not reconstructible from room/server rows.
     retained: [
       'users',

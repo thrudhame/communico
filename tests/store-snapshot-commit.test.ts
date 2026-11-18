@@ -1,21 +1,17 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import { assertEquals, assertRejects } from '@std/assert';
 import { type Database, Db } from '#engine/store/db.ts';
 import { Turso } from '#engine/store/ffi.ts';
 import { openStore } from '#engine/store/index.ts';
 import { Admission } from '#engine/store/admission.ts';
-
-function latch() {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  return { wait: promise, release: () => resolve() };
-}
+import {
+  drainEnrollment,
+  enrollment,
+  latch,
+  watchdog,
+} from '#tests/support/ordering.ts';
 
 async function observed(task: Promise<unknown>, message: string) {
-  let completed = false;
-  await Promise.race([
-    task.then(() => completed = true),
-    new Promise((resolve) => setTimeout(resolve, 1000)),
-  ]);
-  assert(completed, message);
+  await watchdog(task, message);
 }
 
 async function fixture() {
@@ -67,6 +63,11 @@ Deno.test('store commit cut: staged writes and old readers do not delay the comm
       snapshot,
       'common cut waited for transaction bodies instead of commits',
     );
+    assertEquals(
+      resume.released,
+      false,
+      'transaction bodies resumed before the cut',
+    );
     const cut = await snapshot;
     const ffi = new Turso('./.native/libturso_ffi.so');
     try {
@@ -105,6 +106,10 @@ Deno.test('store commit cut: transaction bodies run during pinning but commits c
   );
   const prepare = Db.prototype.prepareReadSnapshot;
   const pinned = latch(), resume = latch(), body = latch();
+  const { admission } = store as unknown as {
+    admission: { waiters: (() => void)[] };
+  };
+  const commitWaiting = enrollment(admission.waiters);
   Db.prototype.prepareReadSnapshot = async function () {
     const prepared = await prepare.call(this);
     if (this.path !== server.path) return prepared;
@@ -129,6 +134,11 @@ Deno.test('store commit cut: transaction bodies run during pinning but commits c
       body.release();
     }).then(() => committed = true);
     await observed(body.wait, 'common cut blocked transaction bodies');
+    await observed(
+      commitWaiting.wait,
+      'native commit never enrolled at the pin fence',
+    );
+    assertEquals(resume.released, false);
     assertEquals(committed, false, 'native commit crossed the pin fence');
     resume.release();
     await Promise.all([snapshot, writing]);
@@ -146,6 +156,7 @@ Deno.test('store commit cut: transaction bodies run during pinning but commits c
   } finally {
     resume.release();
     await Promise.allSettled([snapshot, writing]);
+    commitWaiting.restore();
     Db.prototype.prepareReadSnapshot = prepare;
     await store.close();
     await Deno.remove(root, { recursive: true });
@@ -158,6 +169,9 @@ Deno.test('store commit cut: unpublished initialization stays outside the cut an
   let creation: Promise<unknown> | undefined;
   let snapshot: ReturnType<typeof store.snapshot> | undefined;
   let closing: Promise<void> | undefined;
+  const drain = drainEnrollment(
+    (store as unknown as { maintenance: Set<Promise<unknown>> }).maintenance,
+  );
   try {
     creation = store.initializeRoom('!staged:test', async (db: Database) => {
       await db.exec(
@@ -169,11 +183,16 @@ Deno.test('store commit cut: unpublished initialization stays outside the cut an
     await staged.wait;
     snapshot = store.snapshot(root + '/cut');
     await observed(snapshot, 'unpublished creation retained common admission');
+    assertEquals(resume.released, false);
     assertEquals((await snapshot).files.length, 1);
     let closed = false;
     closing = store.close().then(() => {
       closed = true;
     });
+    await observed(
+      drain.wait,
+      'shutdown never enrolled the accepted initialization drain',
+    );
     await assertRejects(
       () => store.room('!new:test', { create: true }),
       Error,
@@ -207,6 +226,7 @@ Deno.test('store commit cut: unpublished initialization stays outside the cut an
   } finally {
     resume.release();
     await Promise.allSettled([creation, snapshot, closing]);
+    drain.restore();
     await store.close();
     await Deno.remove(root, { recursive: true });
   }
@@ -233,6 +253,7 @@ Deno.test('store commit cut: uncommitted deferred DDL is excluded and can commit
       snapshot,
       'uncommitted DDL blocked logical snapshot acquisition',
     );
+    assertEquals(resume.released, false);
     const file = (await snapshot).files.find((file) =>
       file.id === '!schema:test'
     )!;
@@ -278,6 +299,9 @@ Deno.test('store commit cut: reopening a closing native owner retains its commit
   const root = await Deno.makeTempDir({ prefix: 'reopen-fence-' });
   const ffi = new Turso('./.native/libturso_ffi.so');
   const admission = new Admission();
+  const commitWaiting = enrollment(
+    (admission as unknown as { waiters: (() => void)[] }).waiters,
+  );
   const first = await Db.open(ffi, root + '/data.db', 65536, admission);
   await first.exec('CREATE TABLE traffic(n INTEGER PRIMARY KEY)');
   const closeFile = ffi.closeFile.bind(ffi);
@@ -314,7 +338,11 @@ Deno.test('store commit cut: reopening a closing native owner retains its commit
       committed = true;
     });
     await staged.wait;
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await watchdog(
+      commitWaiting.wait,
+      'reopened native commit never enrolled at the held fence',
+    );
+    assertEquals(resumePin.released, false);
     assertEquals(committed, false, 'reopened owner dropped commit admission');
     resumePin.release();
     await writing;
@@ -322,6 +350,7 @@ Deno.test('store commit cut: reopening a closing native owner retains its commit
     resumeClose.release();
     resumePin.release();
     await Promise.allSettled([closed, boundary, writing]);
+    commitWaiting.restore();
     ffi.closeFile = closeFile;
     await next?.close();
     await first.close();
