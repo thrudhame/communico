@@ -70,6 +70,7 @@ import { appendRecord, Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
 import { applyReplicaScope } from '#engine/facade/scopes.ts';
+import { replicationProgress } from '#engine/facade/progress.ts';
 import type { Database } from '#engine/store/db.ts';
 import {
   exportRoomReplica,
@@ -272,6 +273,72 @@ async function fixture(seedServer = serverSchema, version = '11') {
     },
   };
 }
+
+Deno.test('operator replication progress distinguishes exact source, publication, receipt and application cuts without writing', async () => {
+  const f = await fixture();
+  const scope = 'room:' + f.room.id;
+  const readHome = () =>
+    replicationProgress(f.home, f.tenant.serverName, 'home', [scope]);
+  const readEdge = () =>
+    replicationProgress(f.edgeStore(), f.tenant.serverName, 'facade', [scope]);
+  try {
+    const original = await f.room.tx((tx) => tx.changes.head());
+    assertEquals((await readHome()).sources, [{ scope, cut: original }]);
+    const record = (await f.exports())!;
+    const published = (await readHome()).streams[0];
+    assertEquals(published.published, {
+      sequence: record.sequence,
+      hash: record.hash,
+      sourceCut: original,
+    });
+    assertEquals(published.received, {
+      sequence: 0,
+      hash: '',
+      sourceCut: null,
+    });
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    const received = (await readEdge()).streams[0];
+    assertEquals(received.received, published.published);
+    assertEquals(received.applied, { sequence: 0, hash: '', sourceCut: null });
+    assertEquals(received.published, null);
+    assert(await (await f.replicas()).apply(journal, record));
+    const applied = (await readEdge()).streams[0];
+    assertEquals(applied.applied, published.published);
+    assertEquals(applied.published, published.published);
+    assertEquals(applied.ready, true);
+    assertEquals(applied.incarnation, f.bundle.id);
+    assertEquals(applied.source, 'home');
+    const next = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'private-body-never-in-status' },
+    });
+    await f.ingest([next]);
+    const target = (await readHome()).sources[0].cut;
+    assert(target > original);
+    assertEquals((await readEdge()).streams[0].applied, applied.applied);
+    // Status does not mint snapshots or move any durable export/application cut.
+    const before = await (await f.home.server()).query(
+      'SELECT * FROM facade_exports',
+    );
+    const first = await readHome();
+    assertEquals(await readHome(), first);
+    assertEquals(
+      await (await f.home.server()).query('SELECT * FROM facade_exports'),
+      before,
+    );
+    assert(!JSON.stringify(first).includes('private-body-never-in-status'));
+    assertEquals(
+      (await replicationProgress(f.home, f.tenant.serverName, 'home', [
+        'room:!missing:logical.test',
+      ])).sources,
+      [],
+    );
+    assertEquals((await readEdge()).sources, []);
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('replica signature evidence replays hash-redacted non-create events without duplicate news', async () => {
   const f = await fixture();

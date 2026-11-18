@@ -435,6 +435,46 @@ retained until DELETE. Only display names and avatars enter room membership.
 Avatar and timezone values must be strings but are otherwise accepted verbatim,
 matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
+## Facade replication progress
+
+Operators can inspect lag over the private admin Unix socket:
+
+```sh
+curl --unix-socket /path/to/admin.sock -H 'Content-Type: application/json' \
+  -d '{"scopes":["room:!room:example.org","public:@alice:example.org"]}' \
+  http://localhost/v1/facade/replication
+```
+
+Omit `scopes` to inspect every retained stream. This read-only operation never
+exports, wakes workers, allocates source positions or waits for another node.
+It returns identifiers and cuts only, not record bodies, credentials, keys or
+session data. It is not mounted on public Matrix listeners.
+
+`sources` reports the home's current room change heads and public-account
+projection revisions. Each capture is local to its owning database, not a
+cross-file atomic snapshot. Snapshot cuts allocated only during export (such
+as auth and directory) have no local mutation-head entry. A missing source or
+stream is unknown, not zero or ready.
+
+`streams` identifies each cut by `peer`, `direction`, `source`, `incarnation`
+and `scope`. Each stage contains the journal `sequence`, `hash` and semantic
+`sourceCut` (null when that record type has no scalar source watermark).
+On outgoing streams, `published` is the locally journaled export, while
+`received` and `applied` are the peer's durable acknowledgments. On incoming
+streams, they are local receipt, completed scope publication and journal
+application respectively. `published` is null while scope publication is not
+ready; `ready` never establishes coverage of a later source mutation.
+`declaredCut` is the scope watermark in the incoming applied directory, or null
+when not declared. Status retains old incarnations for diagnosis; never compare
+cuts across identities or confuse a journal sequence with a semantic source cut.
+
+To observe a home room mutation on a facade, capture its home `sources` cut
+after acceptance, then inspect that exact pairing/source/scope until the
+incoming ready publication and application source cuts cover it (and the
+directory declaration covers it for directory-gated reads). Later work cannot
+enlarge the captured target. Home client acknowledgments do not depend on this
+inspection or on an online facade.
+
 ## Facade signing-key retirement
 
 A facade signing key is trusted as a key of the whole Matrix server, not as a

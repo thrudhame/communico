@@ -10,6 +10,7 @@ import {
 } from '#engine/facade/identity.ts';
 import { Pairings, pairingStatus } from '#engine/facade/pairing.ts';
 import { integer, LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
+import { replicationProgress } from '#engine/facade/progress.ts';
 import { AdminError, type Body, type Operation, text } from './protocol.ts';
 
 type Dependencies = {
@@ -17,6 +18,7 @@ type Dependencies = {
   pairings(): Promise<Pairings>;
   initialize?(): Promise<unknown>;
   status?(): Promise<unknown>;
+  progress?(scopes?: readonly string[]): Promise<unknown>;
   changed?(): Promise<void>;
   tenant?(): Promise<Tenant | null>;
 };
@@ -50,6 +52,20 @@ export function facadeOperations(
         ? await deps.status()
         : await (await deps.pairings()).status(),
   };
+  if (deps.progress) {
+    operations['/v1/facade/replication'] = async (body) => {
+      if (
+        body.scopes !== undefined && (!Array.isArray(body.scopes) ||
+          body.scopes.some((scope) => typeof scope !== 'string' || !scope))
+      ) {
+        throw new AdminError(
+          'BAD_REQUEST',
+          'scopes must be an array of nonempty strings',
+        );
+      }
+      return await deps.progress!(body.scopes as string[] | undefined);
+    };
+  }
   const tenant = async () => {
     const owner = await deps.tenant?.();
     if (!owner) {
@@ -152,6 +168,8 @@ export function homeFacadeOperations(app: App): Record<string, Operation> {
     role: 'home',
     tenant: () => Promise.resolve(app.tenant),
     status: () => pairingStatus(app.server),
+    progress: (scopes) =>
+      replicationProgress(app.store, app.tenant.serverName, 'home', scopes),
     pairings: async () =>
       new Pairings(
         app.server,

@@ -22,6 +22,7 @@ import { linkHandler } from './link.ts';
 import { NoticeHub } from './notices.ts';
 import { Pairings, pairingStatus } from './pairing.ts';
 import { RoomReplicas, startRoomExports } from './replication.ts';
+import { replicationProgress } from './progress.ts';
 import { PublicReplicas } from './public.ts';
 import { DirectoryReplicas } from './directory.ts';
 import { LINK_SUPPORTED, LinkError } from './protocol.ts';
@@ -658,6 +659,8 @@ export async function openFacadeRuntime(
         publicKey: node.publicKey,
       };
     },
+    progress: (scopes?: readonly string[]) =>
+      replicationProgress(store, identity.server, 'facade', scopes),
     async status() {
       // Introspection reports one durable pairing cut, not a cached enrollment
       // flag followed by another active-authority lookup racing revocation.
