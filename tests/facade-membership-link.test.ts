@@ -460,6 +460,11 @@ async function incoming(
   roomId?: string,
   memberContent: Record<string, unknown> = {},
   corruptContent?: Record<string, unknown>,
+  initialStatus:
+    | 'pending'
+    | 'attempting'
+    | 'failed-attempt'
+    | 'rejecting' = 'pending',
 ) {
   const operation = await source(f, 1, side, roomId);
   const remote = await testRemoteServer(
@@ -467,6 +472,7 @@ async function incoming(
   );
   const state = JSON.parse(operation.payload) as MembershipState;
   state.kind = kind;
+  state.status = initialStatus;
   const pdu = await remoteEvent(state.roomId, remote, '11', {
     type: 'm.room.member',
     sender: kind === 'knock' ? state.userId : '@inviter:remote.test',
@@ -1204,6 +1210,345 @@ Deno.test('membership terminal: a verified causal rejection publishes real leave
     );
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('membership source intent: unperformed knock facts complete without foreign execution and cannot block their accepted successor', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys, operation: first } = await incoming(
+      f,
+      'edge',
+      'knock',
+      undefined,
+      {},
+      undefined,
+      'attempting',
+    );
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    let current = record, prior = first;
+    const counters = await db.query('SELECT * FROM counters ORDER BY name');
+    for (const status of ['attempting', 'failed-attempt', 'pending']) {
+      if (status !== 'attempting') {
+        state.status = status;
+        const next = await exportSuccessor(f, prior, state);
+        current = next.record;
+        prior = next.operation;
+      }
+      await journal.receive(current.source, [current]);
+      assertEquals(
+        await lifecycleApplication(f.hs)(journal, current, keys, f.bundle.id),
+        true,
+      );
+      assertEquals(
+        (await journal.heads(current.source, 'in', current)).applied.sequence,
+        current.sequence,
+      );
+      assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+      const displayed = await invitesOf(state.userId, { server: db });
+      if (status === 'pending') {
+        assertEquals(displayed.length, 1);
+        assertEquals(displayed[0].eventId, state.eventId);
+        assertEquals(displayed[0].kind, 'knock');
+        assertEquals(displayed[0].status, 'pending');
+      } else {
+        assertEquals(
+          displayed,
+          [],
+          'an unperformed foreign knock is not membership news',
+        );
+        assertEquals(
+          await db.query('SELECT * FROM counters ORDER BY name'),
+          counters,
+        );
+      }
+    }
+    assertEquals(
+      (await db.query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      )).length,
+      3,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership source intent: legacy retraction without a departure completes before its real signed leave successor', async () => {
+  for (const kind of ['invite', 'knock'] as const) {
+    const f = await fixture();
+    try {
+      const { record, state, keys, operation: first } = await incoming(
+        f,
+        'edge',
+        kind,
+        undefined,
+        {},
+        undefined,
+        'rejecting',
+      );
+      const db = await f.home.server();
+      const journal = new Journal(db, [...LINK_SUPPORTED, {
+        type: 'membership-operation',
+        version: 1,
+      }]);
+      const before = await db.query('SELECT * FROM counters ORDER BY name');
+      let current = record, prior = first;
+      for (const status of ['rejecting', 'failed-retract']) {
+        if (status !== 'rejecting') {
+          state.status = status;
+          const next = await exportSuccessor(f, prior, state);
+          current = next.record;
+          prior = next.operation;
+        }
+        await journal.receive(current.source, [current]);
+        assertEquals(
+          await lifecycleApplication(f.hs)(journal, current, keys, f.bundle.id),
+          true,
+        );
+        assertEquals(
+          (await journal.heads(current.source, 'in', current)).applied.sequence,
+          current.sequence,
+        );
+        assertEquals(
+          await invitesOf(state.userId, { server: db }),
+          [],
+          'unperformed retraction cannot fabricate leave news',
+        );
+        assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+        assertEquals(
+          await db.query('SELECT * FROM counters ORDER BY name'),
+          before,
+        );
+      }
+      const local = await testRemoteServer('logical.test');
+      const leave = await remoteEvent(state.roomId, local, '11', {
+        type: 'm.room.member',
+        sender: state.userId,
+        state_key: state.userId,
+        content: { membership: 'leave', reason: 'legacy rejection completed' },
+        prev_events: [state.eventId],
+      });
+      state.localLeaveJson = canonicalJson(leave);
+      const resolver = fakeKeyResolver(
+        await testRemoteServer('remote.test'),
+        local,
+      );
+      let position: number | null = null;
+      for (const status of ['failed-retract', 'rejected']) {
+        state.status = status;
+        const next = await exportSuccessor(f, prior, state);
+        await journal.receive(next.record.source, [next.record]);
+        assertEquals(
+          await lifecycleApplication(f.hs)(
+            journal,
+            next.record,
+            resolver,
+            f.bundle.id,
+          ),
+          true,
+        );
+        const displayed = await invitesOf(state.userId, { server: db });
+        assertEquals(displayed.length, 1);
+        if (position !== null) assertEquals(displayed[0].seq, position);
+        position = displayed[0].seq;
+        const departure = await prejoinDeparture(displayed[0], {
+          server: db,
+          signer: {
+            ...f.ht.signer(),
+            sign: () => {
+              throw new Error('receiver must never sign foreign legacy work');
+            },
+          },
+        });
+        assert(departure);
+        assertEquals(
+          renderPrejoinDeparture(departure, state.userId, 'client').event_id,
+          leave.event_id,
+        );
+        assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+        assertEquals(
+          (await journal.heads(next.record.source, 'in', next.record)).applied
+            .sequence,
+          next.record.sequence,
+        );
+        prior = next.operation;
+      }
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('membership terminal authority: actual local leave survives source job status transitions without another position', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys, operation: first } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+    const invite = (await invitesOf(state.userId, { server: db }))[0];
+    const local = await testRemoteServer('logical.test');
+    const leave = await remoteEvent(state.roomId, local, '11', {
+      type: 'm.room.member',
+      sender: state.userId,
+      state_key: state.userId,
+      content: { membership: 'leave', reason: 'local rejection' },
+      prev_events: [state.eventId],
+    });
+    state.localLeaveJson = canonicalJson(leave);
+    const resolver = fakeKeyResolver(
+      await testRemoteServer('remote.test'),
+      local,
+    );
+    let prior = first, seq: number | null = null;
+    for (const status of ['rejecting', 'failed-retract', 'rejected']) {
+      state.status = status;
+      const next = await exportSuccessor(f, prior, state);
+      await journal.receive(next.record.source, [next.record]);
+      await lifecycleApplication(f.hs)(
+        journal,
+        next.record,
+        resolver,
+        f.bundle.id,
+      );
+      const displayed = (await invitesOf(state.userId, { server: db }))[0];
+      assertEquals(displayed.status, status);
+      assert(displayed.seq > invite.seq);
+      if (seq !== null) assertEquals(displayed.seq, seq);
+      seq = displayed.seq;
+      const departure = await prejoinDeparture(displayed, {
+        server: db,
+        signer: {
+          ...f.ht.signer(),
+          sign: () => {
+            throw new Error('foreign leave must not be signed');
+          },
+        },
+      });
+      assert(departure);
+      assertEquals(
+        renderPrejoinDeparture(departure, state.userId, 'client').event_id,
+        leave.event_id,
+      );
+      assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+      assertEquals(
+        (await journal.heads(next.record.source, 'in', next.record)).applied
+          .sequence,
+        next.record.sequence,
+      );
+      prior = next.operation;
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership terminal authority: missing departure evidence cannot erase an unheld invite or acquire an applied ACK', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys, operation } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+    const before = await invitesOf(state.userId, { server: db });
+    const counters = await db.query('SELECT * FROM counters ORDER BY name');
+    state.status = 'rejected';
+    const next = await exportSuccessor(f, operation, state);
+    await journal.receive(next.record.source, [next.record]);
+    await assertRejects(
+      () => lifecycleApplication(f.hs)(journal, next.record, keys, f.bundle.id),
+      Error,
+      'display evidence',
+    );
+    assertEquals(await invitesOf(state.userId, { server: db }), before);
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      counters,
+    );
+    const heads = await journal.heads(next.record.source, 'in', next.record);
+    assertEquals(heads.received.sequence, next.record.sequence);
+    assertEquals(heads.applied.sequence, record.sequence);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership terminal authority: joined source evidence completes only behind authentic held DAG authority without an OOB join', async () => {
+  for (const held of [false, true]) {
+    const f = await fixture();
+    try {
+      const roomId = held
+        ? (await createRoom(
+          f.home,
+          { creator: '@alice:logical.test' },
+          f.ht.signer(),
+        )).roomId
+        : '!unheld:remote.test';
+      const { record, state, keys, operation } = await incoming(
+        f,
+        'edge',
+        'invite',
+        roomId,
+      );
+      const db = await f.home.server();
+      const journal = new Journal(db, [...LINK_SUPPORTED, {
+        type: 'membership-operation',
+        version: 1,
+      }]);
+      await journal.receive(record.source, [record]);
+      await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+      const before = await db.query('SELECT * FROM memberships');
+      const displayed = await invitesOf(state.userId, { server: db });
+      const counters = await db.query('SELECT * FROM counters ORDER BY name');
+      state.status = 'joined';
+      const next = await exportSuccessor(f, operation, state);
+      await journal.receive(next.record.source, [next.record]);
+      if (held) {
+        assertEquals(
+          await lifecycleApplication(f.hs)(
+            journal,
+            next.record,
+            keys,
+            f.bundle.id,
+          ),
+          true,
+        );
+      } else {
+        await assertRejects(
+          () =>
+            lifecycleApplication(f.hs)(journal, next.record, keys, f.bundle.id),
+          Error,
+          'display evidence',
+        );
+      }
+      assertEquals(await db.query('SELECT * FROM memberships'), before);
+      assertEquals(await invitesOf(state.userId, { server: db }), displayed);
+      assertEquals(
+        await db.query('SELECT * FROM counters ORDER BY name'),
+        counters,
+      );
+      assertEquals(
+        (await journal.heads(next.record.source, 'in', next.record)).applied
+          .sequence,
+        held ? next.record.sequence : record.sequence,
+      );
+      assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+    } finally {
+      await f.close();
+    }
   }
 });
 

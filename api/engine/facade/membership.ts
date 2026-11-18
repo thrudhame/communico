@@ -393,13 +393,6 @@ export class MembershipOperations {
         503,
       );
     }
-    if (!selection.display.length) {
-      throw new LinkError(
-        'LINK_UNAVAILABLE',
-        'membership application awaits display evidence',
-        503,
-      );
-    }
     // All validation and tenant policy capture happens before room/server locks.
     // Optional signature overlays join only after the shared verifier accepts them.
     const normalized: Awaited<ReturnType<typeof preparedState>>[] = [];
@@ -421,7 +414,11 @@ export class MembershipOperations {
         },
       });
     }
-    const state = normalized[0].state;
+    // A source lifecycle fact may have no OOB display (notably a completed
+    // join). Verified execution intent is retained without client news;
+    // completed outcomes need display evidence or locked receiver DAG authority.
+    const prepared = normalized[0] ?? await preparedState(view.operation, keys);
+    const state = prepared.state;
     const event = JSON.parse(state.eventJson) as Pdu;
     for (const other of normalized.slice(1)) {
       const pdu = JSON.parse(other.state.eventJson) as Pdu;
@@ -447,13 +444,19 @@ export class MembershipOperations {
     }
     state.eventJson = canonicalJson(event);
     const evidence: MembershipEvidence = {
-      ...normalized[0].evidence,
+      ...prepared.evidence,
       event: {
-        ...normalized[0].evidence.event,
+        ...prepared.evidence.event,
         signatures: event.signatures ?? {},
       },
     };
-    const publication = await prepareInvitePush(this.store, view.server, event);
+    const publication = selection.display.length
+      ? await prepareInvitePush(this.store, view.server, event)
+      : null;
+    const intentOnly = (state.kind === 'knock' &&
+      ['attempting', 'failed-attempt'].includes(state.status)) ||
+      (state.localLeaveJson === null &&
+        ['rejecting', 'failed-retract'].includes(state.status));
     const result = await withRoomLock(
       state.roomId,
       () =>
@@ -469,6 +472,13 @@ export class MembershipOperations {
             await (await openRoom(this.store, state.roomId)).tx(async (tx) =>
               (await tx.segments.openStay()) !== null
             );
+          if (!held && !selection.display.length && !intentOnly) {
+            throw new LinkError(
+              'LINK_UNAVAILABLE',
+              'membership application awaits display evidence',
+              503,
+            );
+          }
           return await eventStreamTx(server, async (conn) => {
             unchanged();
             const retained = await prejoinResult(
@@ -486,7 +496,8 @@ export class MembershipOperations {
             // A new receiver position cannot make old OOB evidence overtake a
             // newer normal publication or replace a held room's DAG authority.
             if (
-              !held && (!published || normalized.every((value) =>
+              !held && publication !== null &&
+              (!published || normalized.every((value) =>
                 value.state.publication?.eventId === published.event &&
                 value.state.publication.follows
               ))
