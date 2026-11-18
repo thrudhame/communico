@@ -13,7 +13,7 @@ import {
 import { checkDeclaredAuth } from './build.ts';
 import type { KeyResolver } from './deps.ts';
 import { orderEvents } from './order.ts';
-import { verify } from './verify.ts';
+import { prepareReceiptPack, verify } from './verify.ts';
 
 export type VerifiedSnapshot = {
   pack: Map<string, Pdu>;
@@ -48,34 +48,33 @@ export async function verifySnapshot(
   const pack = new Map<string, Pdu>();
   const residents = new Map<string, string>();
   const stateEventIds: string[] = [];
-  for (
-    const [events, state] of [[input.state, true], [
-      input.authChain,
-      false,
-    ]] as const
-  ) {
-    for (const raw of events) {
-      let admitted;
+  const receipts = await prepareReceiptPack(
+    [...input.state, ...input.authChain],
+    async (raw) => {
       const resident = input.residents?.get(String(raw.event_id)) ??
         input.resident;
       try {
         // The resident can vouch for our own events riding a snapshot back.
         // All other receipt checks still use the ordinary verifier.
-        admitted = await verify(raw, input.roomVersion, input.keys, {
+        const admitted = await verify(raw, input.roomVersion, input.keys, {
           roomId: input.roomId,
           localSnapshotFallback: { self: input.self, resident },
         });
+        return { admitted, resident };
       } catch (error) {
         if (!recoverableUpstream(error)) throw error;
-        continue;
+        return null;
       }
-      if (admitted === null) continue;
-      if (!pack.has(admitted.eventId)) {
-        pack.set(admitted.eventId, admitted.pdu);
-        residents.set(admitted.eventId, resident);
-      }
-      if (state) stateEventIds.push(admitted.eventId);
+    },
+  );
+  for (const [index, receipt] of receipts.entries()) {
+    if (receipt === null) continue;
+    const { admitted, resident } = receipt;
+    if (!pack.has(admitted.eventId)) {
+      pack.set(admitted.eventId, admitted.pdu);
+      residents.set(admitted.eventId, resident);
     }
+    if (index < input.state.length) stateEventIds.push(admitted.eventId);
   }
   const rejected = new Map([...pack.keys()].map((id) => [id, 'unchecked']));
   const packStore: EventStore = await withAuthProofs({

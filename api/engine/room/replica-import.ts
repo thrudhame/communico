@@ -16,7 +16,7 @@ import { importReplicaBoundary, importReplicaGenesis } from './replica.ts';
 import type { ReplicaRoom } from './replica-export.ts';
 import { stageSnapshotEvidence } from './snapshot-install.ts';
 import { verifySnapshot } from './snapshot.ts';
-import { type Verified, verify } from './verify.ts';
+import { prepareReceiptPack, type Verified, verify } from './verify.ts';
 import {
   prepareEventSignatures,
   type SignatureEvidence,
@@ -43,7 +43,7 @@ export async function importReplicaRoom(
   const residents = new Map(Object.entries(manifest.residents));
   const pack = new Map<string, Pdu>();
   const signatures = new Map<string, SignatureEvidence>();
-  for (const raw of manifest.events) {
+  const receipts = await prepareReceiptPack(manifest.events, async (raw) => {
     input.signal?.throwIfAborted();
     const options = {
       roomId: manifest.roomId,
@@ -54,6 +54,7 @@ export async function importReplicaRoom(
         : undefined,
     };
     let verified: Verified;
+    let evidence: SignatureEvidence | undefined;
     if (input.signatureUnion) {
       const prepared = await prepareEventSignatures(
         raw,
@@ -61,11 +62,14 @@ export async function importReplicaRoom(
         input.keys,
         options,
       );
-      signatures.set(prepared.eventId, prepared.evidence);
+      evidence = prepared.evidence;
       verified = prepared;
     } else {
       verified = await verify(raw, manifest.roomVersion, input.keys, options);
     }
+    return { raw, verified, evidence };
+  });
+  for (const { raw, verified, evidence } of receipts) {
     if (raw.event_id !== verified.eventId || pack.has(verified.eventId)) {
       throw new MatrixError(
         400,
@@ -73,6 +77,7 @@ export async function importReplicaRoom(
         'replica event identity collision',
       );
     }
+    if (evidence) signatures.set(verified.eventId, evidence);
     pack.set(verified.eventId, verified.pdu);
   }
   const event = (id: string): Pdu =>
