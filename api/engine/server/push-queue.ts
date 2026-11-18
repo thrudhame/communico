@@ -78,7 +78,7 @@ export async function applyPublicationPushQueue(
   ];
   const targets = users.length
     ? await tx.query(
-      "SELECT user,incarnation FROM push_targets WHERE state='active' AND user IN (SELECT value FROM json_each(?))",
+      "SELECT t.user,t.incarnation FROM json_each(?) j JOIN push_targets t ON t.user=CAST(j.value AS TEXT) WHERE t.state='active'",
       [JSON.stringify(users)],
     )
     : [];

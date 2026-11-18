@@ -1,7 +1,7 @@
 // Native companion to publication-capture-index.test.ts. Run in the assigned
 // execution guest against the qualified Turso core; JSON contains the actual
 // captured owner statements and fresh schema, not a hand-maintained SQL copy.
-// --scan removes the input casts as a mutation proof of the work-count guard.
+// --scan removes the input casts and keyed count update as a mutation proof.
 use std::{env, fs, sync::Arc};
 use turso_core::{Database, MemoryIO, SqliteDialect, Value};
 
@@ -17,6 +17,9 @@ fn measure(input: &serde_json::Value, count: usize, scan: bool) -> Vec<(u64, u64
     for sql in input["schema"].as_array().unwrap() {
         db.execute(sql.as_str().unwrap()).unwrap();
     }
+    for sql in input["setup"].as_array().unwrap() {
+        db.execute(sql.as_str().unwrap()).unwrap();
+    }
     db.execute("BEGIN").unwrap();
     for n in 0..count {
         db.execute(format!(r#"
@@ -30,6 +33,10 @@ INSERT INTO receipts VALUES('!old{n}','@old{n}','m.read','main','["$old{n}"]',0,
 INSERT INTO notification_horizons VALUES('@old{n}','!old{n}','main',{n});
 INSERT INTO notification_graph_reads VALUES('@old{n}','!old{n}','main','$old{n}');
 INSERT INTO notifications VALUES({n},'test','@old{n}','$old{n}','!old{n}',{n},'main','[]',0,0,NULL,0);
+INSERT INTO notification_counts VALUES('@old{n}','!old{n}','main',1,0);
+INSERT INTO notification_counts VALUES('@recipient','!old{n}','main',1,0);
+INSERT INTO notification_counts VALUES('@old{n}','!selected','main',1,0);
+INSERT INTO push_targets VALUES('test','@old{n}','app','key{n}','incarnation{n}','{{}}',0,'active');
 "#)).unwrap();
     }
     db.execute("COMMIT").unwrap();
@@ -50,6 +57,10 @@ INSERT INTO notifications VALUES({n},'test','@old{n}','$old{n}','!old{n}',{n},'m
                         "CAST(json_extract(j.value,'$.sender') AS TEXT)",
                         "json_extract(j.value,'$.sender')",
                     )
+                    .replace(
+                        "WHERE rowid IN (SELECT n.rowid FROM deltas d JOIN notification_counts n\n        ON n.user=d.user AND n.room=d.room AND n.thread='main')",
+                        "WHERE thread='main' AND EXISTS(SELECT 1 FROM deltas d WHERE d.user=notification_counts.user AND d.room=notification_counts.room)",
+                    )
             } else {
                 sql.to_string()
             };
@@ -57,7 +68,12 @@ INSERT INTO notifications VALUES({n},'test','@old{n}','$old{n}','!old{n}',{n},'m
             for (at, value) in query["values"].as_array().unwrap().iter().enumerate() {
                 stmt.bind_at(
                     (at + 1).try_into().unwrap(),
-                    Value::build_text(value.as_str().unwrap().to_string()),
+                    match value {
+                        serde_json::Value::String(text) => Value::build_text(text.to_string()),
+                        serde_json::Value::Number(n) => Value::from_i64(n.as_i64().unwrap()),
+                        serde_json::Value::Null => Value::Null,
+                        _ => panic!("unsupported bound value: {value}"),
+                    },
                 )
                 .unwrap();
             }

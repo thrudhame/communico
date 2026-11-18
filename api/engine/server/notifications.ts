@@ -553,14 +553,17 @@ export async function captureIndependentPushes(
     if (countDeltas.size) {
       // An INSERT's CHECK constraints precede conflict resolution. Negative
       // deltas are updates to existing nonnegative totals, never insert values.
+      // Probe the typed composite key, then update only those rowids. The native
+      // planner does not turn a composite IN predicate into indexed lookups.
       await tx.execute(
         `WITH deltas AS (
-        SELECT json_extract(value,'$.user') AS user,json_extract(value,'$.room') AS room,
+        SELECT CAST(json_extract(value,'$.user') AS TEXT) AS user,CAST(json_extract(value,'$.room') AS TEXT) AS room,
           json_extract(value,'$.unread') AS unread,json_extract(value,'$.highlight') AS highlight FROM json_each(?)
       ) UPDATE notification_counts SET
         unread=unread+(SELECT d.unread FROM deltas d WHERE d.user=notification_counts.user AND d.room=notification_counts.room),
         highlight=highlight+(SELECT d.highlight FROM deltas d WHERE d.user=notification_counts.user AND d.room=notification_counts.room)
-      WHERE thread='main' AND EXISTS(SELECT 1 FROM deltas d WHERE d.user=notification_counts.user AND d.room=notification_counts.room)`,
+      WHERE rowid IN (SELECT n.rowid FROM deltas d JOIN notification_counts n
+        ON n.user=d.user AND n.room=d.room AND n.thread='main')`,
         [JSON.stringify([...countDeltas.values()])],
       );
     }

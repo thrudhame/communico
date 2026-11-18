@@ -21,14 +21,24 @@ Deno.test('publication captures: only input keys drive retained-fact access', as
       values: readonly unknown[];
       plan: string[];
     }[] = [];
+    const setup = [
+      "INSERT INTO counters VALUES('notifications',10000)",
+      "INSERT INTO notifications VALUES(10000,'test','@sender','$earlier','!selected',1,'main','[]',1,0,NULL,0)",
+      "INSERT INTO notification_history VALUES(10000,'@sender','!selected',1,NULL)",
+      "INSERT INTO notification_counts VALUES('@sender','!selected','main',1,1)",
+      "INSERT INTO notification_counts VALUES('@recipient','!selected','thread',7,3)",
+    ];
+    for (const sql of setup) await db.execute(sql);
+    const scans: string[] = [];
     await db.tx(async (tx) => {
       const query = tx.query.bind(tx);
+      const execute = tx.execute.bind(tx);
       const measured = new Proxy(tx, {
         get(target, key) {
-          if (key === 'query') {
+          if (key === 'query' || key === 'execute') {
             return async (...args: Parameters<Conn['query']>) => {
               const [sql, values = []] = args;
-              if (sql.includes('json_each')) {
+              if (key === 'execute' || sql.includes('json_each')) {
                 const plans = await query('EXPLAIN QUERY PLAN ' + sql, values);
                 captures.push({
                   sql,
@@ -37,11 +47,15 @@ Deno.test('publication captures: only input keys drive retained-fact access', as
                 });
                 for (const { detail } of plans) {
                   const line = String(detail);
-                  assert(!/SCAN (?!json_each\b)/.test(line), line);
-                  assert(!line.includes('ephemeral_'), line);
+                  if (/SCAN (?!json_each\b|deltas\b)/.test(line)) {
+                    scans.push(line);
+                  }
+                  if (line.includes('ephemeral_')) scans.push(line);
                 }
               }
-              return await query(sql, values);
+              return key === 'execute'
+                ? await execute(sql, values)
+                : await query(sql, values);
             };
           }
           const value = Reflect.get(target, key);
@@ -57,7 +71,23 @@ Deno.test('publication captures: only input keys drive retained-fact access', as
           room: '!selected',
           event: '$new',
           pos: 1,
-          publication: { sender: '@sender', decisions: [] },
+          publication: {
+            sender: '@sender',
+            decisions: [{
+              tenant: 'test',
+              user: '@recipient',
+              ruleRevision: 0,
+              ignoreRevision: 0,
+              decision: {
+                ruleId: 'notify',
+                kind: 'underride',
+                notify: true,
+                highlight: true,
+                actions: ['notify'],
+                tweaks: {},
+              },
+            }],
+          },
         },
         {
           room: '!second',
@@ -67,8 +97,9 @@ Deno.test('publication captures: only input keys drive retained-fact access', as
         },
       ]);
       assert(apply !== null);
+      await apply([2, 3], 1000);
     });
-    assert(captures.length >= 4);
+    assert(captures.some((c) => c.sql.includes('UPDATE notification_counts')));
     // The native work-count companion consumes the real captured statements,
     // not copied SQL. Its small/large fixtures differ only in unrelated facts.
     const output = Deno.env.get('PUBLICATION_WORK_OUTPUT');
@@ -78,9 +109,24 @@ Deno.test('publication captures: only input keys drive retained-fact access', as
       );
       await Deno.writeTextFile(
         output,
-        JSON.stringify({ schema: schema.map((r) => r.sql), queries: captures }),
+        JSON.stringify({
+          schema: schema.map((r) => r.sql),
+          setup,
+          queries: captures,
+        }),
       );
     }
+    assertEquals(scans, []);
+    assertEquals(
+      await db.query(
+        'SELECT user,thread,unread,highlight FROM notification_counts ORDER BY user,thread',
+      ),
+      [
+        { user: '@recipient', thread: 'main', unread: 1, highlight: 1 },
+        { user: '@recipient', thread: 'thread', unread: 7, highlight: 3 },
+        { user: '@sender', thread: 'main', unread: 0, highlight: 0 },
+      ],
+    );
     assertEquals(
       (await db.query('SELECT COUNT(*) AS n FROM event_index'))[0].n,
       0,
