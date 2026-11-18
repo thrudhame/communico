@@ -54,8 +54,44 @@ export function sourceOf(roomId: string): string {
 }
 
 // Capture pagination, not writer ownership. Contention ends a transaction at
-// its next complete change; uncontended pages retain batched publication.
+// its next complete event/effect unit; uncontended pages batch complete units.
 const BATCH = 500;
+
+// Ingest appends an event/transition and its membership, redaction and delivery
+// effects together. Those rows are one publication unit, not competing writers.
+// A later event/transition starts another unit even if it names the same PDU;
+// standalone effects and history retain their own complete prefix semantics.
+function samePublicationUnit(
+  change: Change,
+  next: Change | undefined,
+): boolean {
+  return next !== undefined && change.event !== null &&
+    next.event === change.event && next.kind !== 'event' &&
+    next.kind !== 'transition' && next.kind !== 'history' &&
+    next.kind !== 'drop' && change.kind !== 'drop';
+}
+
+async function captureChanges(room: Room, mark: number, head: number) {
+  return await room.tx(async (tx) => {
+    // One lookahead identifies the page's final unit. If it crosses capture
+    // pagination, finish that unit, never extending this caller's fixed cut.
+    const batch = (await tx.changes.after(mark, BATCH + 1)).filter((c) =>
+      c.pos <= head
+    );
+    let end = Math.min(BATCH, batch.length);
+    while (end > 0 && samePublicationUnit(batch[end - 1], batch[end])) {
+      end++;
+      if (end === batch.length && batch[end - 1].pos < head) {
+        batch.push(
+          ...(await tx.changes.after(batch[end - 1].pos, BATCH)).filter(
+            (c) => c.pos <= head,
+          ),
+        );
+      }
+    }
+    return batch.slice(0, end);
+  });
+}
 
 // One publication/lifecycle mutation at a time. Immutable room preparation
 // belongs to each room's capture owner, never this shared writer turn. Failed
@@ -251,11 +287,7 @@ async function projectRoom(
     const device = seed === null
       ? await captureDevicePublication(store, room, mark)
       : null;
-    let batch = seed === null
-      ? await room.tx(async (tx) =>
-        (await tx.changes.after(mark, BATCH)).filter((c) => c.pos <= head)
-      )
-      : [];
+    let batch = seed === null ? await captureChanges(room, mark, head) : [];
     const drop = batch.findIndex((change) => change.kind === 'drop');
     if (drop > 0) batch = batch.slice(0, drop);
     const prepared = drop === 0
@@ -326,7 +358,7 @@ async function projectRoom(
           );
         } else if (index < prepared.length) {
           // Tenant reads cannot run inside a retryable server transaction.
-          // Stop preparing when demand appears, then commit a complete prefix.
+          // Stop preparing at a complete accepted unit when demand appears.
           // Unused policy decisions never escape this writer turn.
           const ready: Prepared[] = [];
           for (let at = index; at < prepared.length; at++) {
@@ -339,7 +371,10 @@ async function projectRoom(
                 }
                 : item,
             );
-            if (waitingWriters > 0) break;
+            if (
+              waitingWriters > 0 &&
+              !samePublicationUnit(item.change, prepared[at + 1]?.change)
+            ) break;
           }
           const addedMs = Date.now();
           const end = await eventStreamTx(server, async (tx) => {
@@ -347,7 +382,8 @@ async function projectRoom(
             for (const item of ready) {
               await apply(tx, roomId, item, addedMs, localServers);
               count++;
-              if (waitingWriters > 0) break;
+              // This prefix owns this turn's captured policy. New demand
+              // queues behind the complete prefix, never truncating its inputs.
             }
             // Relations, feed positions and graph evidence must all exist at
             // this committed cut before pending threaded marks are projected.
