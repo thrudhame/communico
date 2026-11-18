@@ -669,6 +669,76 @@ Deno.test('durable result is ACKed before a later operation blocks in the same s
   }
 });
 
+Deno.test('home application completion wakes another blocked incoming stream without another reconciliation', async () => {
+  const f = await fixture();
+  const blocked = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const completed = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const base = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      type: 'control',
+      version: 1,
+    };
+    const dependency = await f.fj.append('home', {
+      ...base,
+      stream: 'room:z-dependency',
+      operationId: 'dependency',
+      payload: 1,
+    });
+    const dependent = await f.fj.append('home', {
+      ...base,
+      stream: 'room:a-dependent',
+      operationId: 'dependent',
+      payload: 2,
+    });
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 100, maxBytes: 10000 },
+      failed: (error) => failures.push(error),
+      async apply(stream) {
+        const next = await f.hj.next('edge_a', stream);
+        if (!next) return false;
+        if (next.operationId === dependency.operationId) await release.promise;
+        if (
+          next.operationId === dependent.operationId &&
+          await f.hj.result('edge_a', 'in', dependency, dependency) === null
+        ) {
+          blocked.resolve();
+          throw new LinkError(
+            'LINK_UNAVAILABLE',
+            'dependent domain awaits application',
+          );
+        }
+        await f.hj.complete('edge_a', stream, next, { applied: next.payload });
+        if (next.operationId === dependent.operationId) completed.resolve();
+        return true;
+      },
+    });
+    await reconciler.reconcile();
+    await testDeadline(blocked.promise);
+    release.resolve();
+    await testDeadline(completed.promise);
+    await reconciler.drain();
+    assertEquals(failures.length, 1);
+    assertEquals(await f.fj.result('home', 'out', dependent, dependent), {
+      result: { applied: 2 },
+    });
+  } finally {
+    release.resolve();
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
 Deno.test('durable outgoing ACK progress wakes its consumer without waiting for a fault retry timer', async () => {
   const f = await fixture();
   const notifications: string[] = [];

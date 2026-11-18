@@ -9,6 +9,7 @@ import {
 } from '#engine/facade/accounts.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
+import { startInboxWorker } from '#engine/facade/worker.ts';
 import { replicationProgress } from '#engine/facade/progress.ts';
 import {
   MembershipOperations,
@@ -60,7 +61,7 @@ import {
   matrixBase64,
 } from '#engine/signing-primitives.js';
 
-async function fixture(historicalHome = false) {
+async function fixture(historicalHome = false, applyAccount = true) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-membership-link-' });
   const settings = (side: string) => ({
     dir: dir + '/' + side,
@@ -147,7 +148,9 @@ async function fixture(historicalHome = false) {
   await owners.apply(ej, control);
   const auth = await exportAccountAuth(home, ht, hp, bundle.id, 'alice', false);
   await ej.receive('home', [auth]);
-  await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
+  if (applyAccount) {
+    await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
+  }
   const es = new MembershipOperations(edge, et, fp, node);
   const hs = new MembershipOperations(home, ht, hp);
   return {
@@ -161,6 +164,9 @@ async function fixture(historicalHome = false) {
     bundle,
     es,
     hs,
+    ej,
+    owners,
+    auth,
     reopenHome: async () => {
       await home.close();
       home = await open('home');
@@ -1213,6 +1219,81 @@ Deno.test('membership upgrade: an enrolled historical installation freezes local
       beforeEvents,
     );
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership application: account completion wakes a blocked OOB stream without another receive or polling', async () => {
+  const f = await fixture(false, false);
+  const release = Promise.withResolvers<void>();
+  const blocked = Promise.withResolvers<void>();
+  const completed = Promise.withResolvers<void>();
+  let worker: ReturnType<typeof startInboxWorker> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const { record, state, keys } = await incoming(f, 'home');
+    const db = await f.edge.server();
+    await f.ej.receive('home', [record]);
+    const failures: unknown[] = [];
+    let emptyControlChecks = 0;
+    worker = startInboxWorker({
+      journal: f.ej,
+      peer: 'home',
+      pollseconds: 3600,
+      changed() {},
+      failed(error, stream) {
+        failures.push(error);
+        if (stream?.stream === record.stream) blocked.resolve();
+      },
+      async apply(stream) {
+        if (stream.stream === 'owner-control') emptyControlChecks++;
+        if (stream.stream === f.auth.stream) {
+          await release.promise;
+          return await new AccountSnapshots(f.edge, f.et, f.fp, f.owners)
+            .apply(f.ej, stream);
+        }
+        if (stream.stream === record.stream) {
+          const result = await f.es.apply(f.ej, stream, keys);
+          if (result) completed.resolve();
+          return result;
+        }
+        return false;
+      },
+    });
+    await blocked.promise;
+    assertEquals((await f.ej.heads('home', 'in', record)).applied.sequence, 0);
+    assertEquals(await invitesOf(state.userId, { server: db }), []);
+    release.resolve();
+    await Promise.race([
+      completed.promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(new Error('dependency completion did not wake membership')),
+          3000,
+        );
+      }),
+    ]);
+    assertEquals(
+      (await f.ej.heads('home', 'in', record)).applied.sequence,
+      record.sequence,
+    );
+    assertEquals(
+      (await invitesOf(state.userId, { server: db })).map((invite) =>
+        invite.eventId
+      ),
+      [state.eventId],
+    );
+    assertEquals(failures.length, 1);
+    assertEquals(
+      emptyControlChecks,
+      1,
+      'completed scopes are not rescanned on dependency progress',
+    );
+  } finally {
+    clearTimeout(timer);
+    release.resolve();
+    await worker?.close();
     await f.close();
   }
 });
