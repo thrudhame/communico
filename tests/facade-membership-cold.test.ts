@@ -296,6 +296,107 @@ Deno.test('membership cold composition: empty bootstrap and independent local in
         await store.close();
       }
     }
+    // Public membership runs on the independently booted facade while home is
+    // stopped and federation is disabled. No private method mounts these routes.
+    edge = await facadeProcess(
+      file('facade'),
+      'facade: link/local admin ready',
+    );
+    await edge.listening(edgePort);
+    const empty = await api(edgePort, 'login', {
+      type: 'm.login.password',
+      identifier: { type: 'm.id.user', user: 'empty' },
+      password: 'runtime-password',
+      device_id: 'MEMBER_EDGE',
+    });
+    assertEquals(empty.status, 200, JSON.stringify(empty));
+    const creatorToken = session.body.access_token;
+    const targetToken = empty.body.access_token;
+    const target = '@empty:logical.test';
+    const created = await api(edgePort, 'createRoom', {
+      room_version: '11',
+      initial_state: [{
+        type: 'm.room.join_rules',
+        state_key: '',
+        content: { join_rule: 'knock' },
+      }],
+    }, creatorToken);
+    assertEquals(created.status, 200, JSON.stringify(created));
+    const roomId = created.body.room_id;
+    const roomPath = 'rooms/' + encodeURIComponent(roomId);
+    const memberPath = roomPath + '/state/m.room.member/' +
+      encodeURIComponent(target);
+    const member = async (membership: string, reason: string) => {
+      const read = await api(edgePort, memberPath, undefined, creatorToken);
+      assertEquals(read.status, 200, JSON.stringify(read));
+      assertEquals(read.body.membership, membership);
+      assertEquals(read.body.reason, reason);
+    };
+    const act = async (name: string, token: string, body: unknown) => {
+      const result = await api(edgePort, roomPath + '/' + name, body, token);
+      assertEquals(result.status, 200, JSON.stringify(result));
+      return result;
+    };
+    const knocked = await api(edgePort, 'knock/' + encodeURIComponent(roomId), {
+      reason: 'public-knock',
+    }, targetToken);
+    assertEquals(knocked.status, 200, JSON.stringify(knocked));
+    assertEquals(knocked.body.room_id, roomId);
+    await member('knock', 'public-knock');
+    await act('invite', creatorToken, {
+      user_id: target,
+      reason: 'public-invite',
+    });
+    await member('invite', 'public-invite');
+    const joined = await api(edgePort, 'join/' + encodeURIComponent(roomId), {
+      reason: 'public-join',
+    }, targetToken);
+    assertEquals(joined.status, 200, JSON.stringify(joined));
+    assertEquals(joined.body.room_id, roomId);
+    await member('join', 'public-join');
+    const members = await api(
+      edgePort,
+      roomPath + '/joined_members',
+      undefined,
+      creatorToken,
+    );
+    assertEquals(members.status, 200, JSON.stringify(members));
+    assertEquals(
+      Object.keys(members.body.joined).sort(),
+      [target, user].sort(),
+    );
+    await act('kick', creatorToken, { user_id: target, reason: 'public-kick' });
+    await member('leave', 'public-kick');
+    await act('ban', creatorToken, { user_id: target, reason: 'public-ban' });
+    await member('ban', 'public-ban');
+    const forbidden = await api(edgePort, roomPath + '/join', {}, targetToken);
+    assertEquals(forbidden.status, 403, JSON.stringify(forbidden));
+    assertEquals(forbidden.body.errcode, 'M_FORBIDDEN');
+    await act('unban', creatorToken, {
+      user_id: target,
+      reason: 'public-unban',
+    });
+    await member('leave', 'public-unban');
+    await act('invite', creatorToken, {
+      user_id: target,
+      reason: 'public-reinvite',
+    });
+    await act('join', targetToken, { reason: 'public-rejoin' });
+    await member('join', 'public-rejoin');
+    await act('leave', targetToken, { reason: 'public-leave' });
+    await member('leave', 'public-leave');
+    assertEquals(
+      (await api(edgePort, roomPath + '/invite', { user_id: target })).status,
+      401,
+    );
+    const malformed = await api(
+      edgePort,
+      roomPath + '/invite',
+      {},
+      creatorToken,
+    );
+    assertEquals(malformed.status, 400, JSON.stringify(malformed));
+    await edge.stop();
   } finally {
     await home?.dispose();
     await edge?.dispose();
