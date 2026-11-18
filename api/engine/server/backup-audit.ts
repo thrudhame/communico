@@ -9,6 +9,7 @@ import {
 } from '#engine/backup/checks.ts';
 import type { Manifest } from '#engine/backup/manifest.ts';
 import { receiptMembership } from '#engine/server/receipt-frontier.ts';
+import { registerJson } from '#engine/facade/registers.ts';
 import {
   roomProjectionSources,
   tenantProjectionSources,
@@ -26,6 +27,46 @@ export async function auditServer(
 ) {
   return await snapshot.read(server, async (db) => {
     const heads = await counters(db);
+    // reports.report_id and its original semantic facts are durable identity,
+    // not reconstructed page numbers. Unenrolled legacy rows may remain null.
+    for await (const row of scan(db, 'reports', '*', 'report_id IS NOT NULL')) {
+      const reporter = String(row.reporter);
+      const name = reporter.slice(1, reporter.indexOf(':'));
+      for (
+        const kind of [
+          'report',
+          ...(row.resolved_ms === null ? [] : ['report-resolution']),
+        ]
+      ) {
+        const facts = await db.query(
+          'SELECT source,payload_json FROM domain_operations WHERE kind=? AND semantic_key=?',
+          [kind, JSON.stringify([kind, name, String(row.report_id)])],
+        );
+        const value = kind === 'report'
+          ? {
+            reportId: row.report_id,
+            kind: row.kind,
+            reporter: row.reporter,
+            roomId: row.room_id,
+            eventId: row.event_id,
+            userId: row.user_id,
+            reason: row.reason,
+            score: row.score,
+            receivedMs: row.received_ms,
+          }
+          : {
+            reportId: row.report_id,
+            resolvedMs: row.resolved_ms,
+            resolution: row.resolution,
+          };
+        if (
+          facts.length !== 1 ||
+          (kind === 'report-resolution' && facts[0].source !== 'home') ||
+          registerJson(String(facts[0].payload_json)) !==
+            registerJson(JSON.stringify(value))
+        ) auditFailure('report identity or source fact differs');
+      }
+    }
     for (
       const [counter, table, column] of [
         ['events', 'feed', 'seq'],

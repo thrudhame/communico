@@ -9,6 +9,49 @@ import { openStore } from '#engine/store/index.ts';
 import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import type { Database } from '#engine/store/db.ts';
+import { historicalServerSchema } from '#tests/fixtures/server-schema-history.ts';
+
+Deno.test('reports v51 upgrade retains legacy rows with fresh-schema identity index', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'reports-identity-upgrade-' });
+  const settings = (side: string) => ({
+    dir: dir + '/' + side,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  });
+  let old = await openStore(settings('old'), {
+    schemas: { server: historicalServerSchema(51) },
+  });
+  const fresh = await openStore(settings('fresh'), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    await (await old.server()).execute(
+      "INSERT INTO reports(kind,reporter,user_id,reason,received_ms) VALUES('user','@alice:test','@bob:test','legacy',123)",
+    );
+    await old.close();
+    old = await openStore(settings('old'), {
+      schemas: { server: serverSchema },
+    });
+    const row = (await listReports(await old.server())).reports[0];
+    assertEquals([row.reportId, row.reason, row.receivedMs], [
+      null,
+      'legacy',
+      123,
+    ]);
+    const schema =
+      "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='reports' AND name NOT LIKE 'sqlite_%' ORDER BY name";
+    assertEquals(
+      await (await old.server()).query(schema),
+      await (await fresh.server()).query(schema),
+    );
+  } finally {
+    await old.close();
+    await fresh.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('reports survive v21 upgrade, reopen and concurrent resolution without changing room truth', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'reports-store-' });

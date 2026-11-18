@@ -10,6 +10,22 @@ import { describePayload } from '#engine/backup/manifest.ts';
 import { roomProjectionSources } from '#engine/store/projection-sources.ts';
 import { recoverServer } from '#engine/server/startup.ts';
 
+Deno.test('backup audit: report distributed identity cannot lose its retained source fact', async () => {
+  const f = await fixture();
+  try {
+    await f.app.server.execute(
+      "INSERT INTO reports(report_id,kind,reporter,user_id,reason,received_ms) VALUES('orphan-source','user','@audit:test','@other:test','private',1)",
+    );
+    await assertRejects(
+      f.audit,
+      Error,
+      'report identity or source fact differs',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 async function fixture() {
   const root = await Deno.makeTempDir({ prefix: 'backup-audit-' });
   const storage = {

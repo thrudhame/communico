@@ -3,6 +3,13 @@ import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import {
+  importReportOperation,
+  listReports,
+  reportOperations,
+  resolveReport,
+  storeReport,
+} from '#engine/server/reports.ts';
+import {
   AccountSnapshots,
   exportAccountAuth,
 } from '#engine/facade/accounts.ts';
@@ -196,6 +203,268 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('facade reports: accepted submission retains an atomic immutable export fact', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await storeReport(db, {
+      kind: 'user',
+      reporter: '@alice:logical.test',
+      userId: '@bob:logical.test',
+      reason: 'private report',
+    });
+    const facts = await db.query(
+      "SELECT * FROM domain_operations WHERE kind='report'",
+    );
+    assertEquals(facts.length, 1, 'accepted report has no durable export fact');
+    const [row] = (await listReports(db)).reports;
+    assertEquals(
+      JSON.parse(String(facts[0].payload_json)).receivedMs,
+      row.receivedMs,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: resolution is refused by the server owner at facade ingress', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await storeReport(db, {
+      kind: 'user',
+      reporter: '@alice:logical.test',
+      userId: '@bob:logical.test',
+      reason: '',
+    });
+    const error = await assertRejects(
+      () => resolveReport(db, 1, 'illicit edge resolution'),
+      MatrixError,
+    );
+    assertEquals(error.status, 503);
+    assertEquals((await listReports(db)).reports[0].resolvedMs, null);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: signed append union preserves both integer-ID collisions and home resolution', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    for (
+      const [db, reason] of [[hd, 'home-private'], [
+        ed,
+        'edge-private',
+      ]] as const
+    ) {
+      await storeReport(db, {
+        kind: 'user',
+        reporter: '@alice:logical.test',
+        userId: '@bob:logical.test',
+        reason,
+      });
+    }
+    const home = (await listReports(hd)).reports[0],
+      edge = (await listReports(ed)).reports[0];
+    assertEquals(home.id, edge.id);
+    assertEquals(home.reportId === edge.reportId, false);
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    const imported = (await listReports(hd)).reports.find((r) =>
+      r.reportId === edge.reportId
+    )!;
+    assertEquals(imported.reason, 'edge-private');
+    assertEquals(imported.receivedMs, edge.receivedMs);
+    const resolution = await resolveReport(hd, imported.id, 'home-reviewed');
+    assertEquals(
+      await resolveReport(hd, imported.id, 'ignored second resolution'),
+      resolution,
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    await f.toEdge(records);
+    const rows = (await listReports(ed)).reports;
+    assertEquals(rows.length, 2);
+    const observed = rows.find((r) => r.reportId === edge.reportId)!;
+    assertEquals(observed.resolvedMs, resolution.resolvedMs);
+    assertEquals(observed.resolution, 'home-reviewed');
+    assertEquals(
+      (await ed.query(
+        "SELECT * FROM domain_operations WHERE kind='report-resolution'",
+      )).length,
+      1,
+    );
+    assertEquals(await ed.query('SELECT * FROM feed'), []);
+    assertEquals(await ed.query('SELECT * FROM outbox'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: resolution before submission, replay and protected diagnostics', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    await storeReport(hd, {
+      kind: 'room',
+      reporter: '@alice:logical.test',
+      roomId: '!held:logical.test',
+      reason: 'protected',
+    });
+    await resolveReport(hd, 1, 'resolved before transmission');
+    const facts = await hd.tx((conn) =>
+      reportOperations(conn, '@alice:logical.test')
+    );
+    const submission = facts.find((o) => o.kind === 'report')!,
+      resolution = facts.find((o) => o.kind === 'report-resolution')!;
+    const check = async () => {};
+    await importReportOperation(ed, resolution, check);
+    assertEquals((await listReports(ed)).reports, []);
+    await importReportOperation(ed, submission, check);
+    await importReportOperation(ed, resolution, check);
+    assertEquals(
+      (await listReports(ed)).reports[0].resolution,
+      'resolved before transmission',
+    );
+    for (
+      const invalid of [{
+        ...submission,
+        payload: '{"reason":"PRIVATE_REPORT_MARKER",',
+      }, { ...submission, semanticKey: '["report","PRIVATE_REPORT_MARKER",' }]
+    ) {
+      const error = await assertRejects(
+        () => importReportOperation(ed, invalid, check),
+        Error,
+      );
+      assertEquals(error.message, 'invalid report fact');
+    }
+    const forged = {
+      ...resolution,
+      source: f.node.node,
+      incarnation: f.node.incarnation,
+    };
+    await assertRejects(
+      () => importReportOperation(ed, forged, check),
+      Error,
+      'invalid report resolution',
+    );
+    assertEquals((await listReports(ed)).reports.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: source and import roll back their facts with the owned row', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    await ed.exec(
+      "CREATE TRIGGER report_fail BEFORE INSERT ON reports BEGIN SELECT RAISE(ABORT,'report rollback'); END",
+    );
+    await assertRejects(() =>
+      storeReport(ed, {
+        kind: 'room',
+        reporter: '@alice:logical.test',
+        roomId: '!r:logical.test',
+        reason: '',
+      })
+    );
+    assertEquals(
+      await ed.query("SELECT * FROM domain_operations WHERE kind='report'"),
+      [],
+    );
+    await storeReport(hd, {
+      kind: 'room',
+      reporter: '@alice:logical.test',
+      roomId: '!r:logical.test',
+      reason: '',
+    });
+    const fact = (await hd.tx((conn) =>
+      reportOperations(conn, '@alice:logical.test')
+    ))[0];
+    await assertRejects(() => importReportOperation(ed, fact, async () => {}));
+    assertEquals(
+      await ed.query("SELECT * FROM domain_operations WHERE kind='report'"),
+      [],
+    );
+    await ed.exec('DROP TRIGGER report_fail');
+    await importReportOperation(ed, fact, async () => {});
+    assertEquals((await listReports(ed)).reports.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: legacy home capture keeps original received and resolution cuts', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.server();
+    await hd.execute(
+      "INSERT INTO reports(kind,reporter,user_id,reason,received_ms,resolved_ms,resolution) VALUES('user',?,?,?,?,?,?)",
+      [
+        '@alice:logical.test',
+        '@bob:logical.test',
+        'old private reason',
+        10,
+        20,
+        'old resolution',
+      ],
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    const row = (await listReports(await f.edge.server())).reports[0];
+    assertEquals([row.receivedMs, row.resolvedMs, row.resolution], [
+      10,
+      20,
+      'old resolution',
+    ]);
+    const before = await hd.tx((conn) =>
+      reportOperations(conn, '@alice:logical.test')
+    );
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals(
+      await hd.tx((conn) => reportOperations(conn, '@alice:logical.test')),
+      before,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: resolution export failure rolls back its local result', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.home.server();
+    await storeReport(db, {
+      kind: 'room',
+      reporter: '@alice:logical.test',
+      roomId: '!r:logical.test',
+      reason: 'retained',
+    });
+    await db.exec(
+      "CREATE TRIGGER resolution_fail BEFORE INSERT ON domain_operations WHEN NEW.kind='report-resolution' BEGIN SELECT RAISE(ABORT,'resolution rollback'); END",
+    );
+    await assertRejects(() => resolveReport(db, 1, 'must roll back'));
+    assertEquals((await listReports(db)).reports[0].resolvedMs, null);
+    assertEquals(
+      await db.query(
+        "SELECT * FROM domain_operations WHERE kind='report-resolution'",
+      ),
+      [],
+    );
+    await db.exec('DROP TRIGGER resolution_fail');
+    assertEquals(
+      (await resolveReport(db, 1, 'committed')).resolution,
+      'committed',
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('directory scope retains selected local initiation without hiding unapplied home cuts', async (t) => {
   for (const mode of ['create', 'stock join']) {

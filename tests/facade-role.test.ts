@@ -237,6 +237,9 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       ['v3/user/%40alice%3Atest/filter', 'POST'],
       ['v3/user/%40alice%3Atest/filter/id', 'GET'],
       ['v3/user/%40alice%3Atest/openid/request_token', 'POST'],
+      ['v3/users/%40alice%3Atest/report', 'POST'],
+      ['v3/rooms/room/report', 'POST'],
+      ['v3/rooms/room/report/event', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true), null);
   for (

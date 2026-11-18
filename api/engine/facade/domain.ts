@@ -22,6 +22,11 @@ import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
 import { captureFilterOperations } from '#engine/tenant/filters.ts';
 import { captureOpenIdOperations } from '#engine/tenant/openid.ts';
 import { captureBackupOperations } from '#engine/tenant/key-backup.ts';
+import {
+  captureReportOperations,
+  importReportOperation,
+  reportOperations,
+} from '#engine/server/reports.ts';
 import { importReceiptOperation } from '#engine/server/ephemeral.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
@@ -50,6 +55,7 @@ export type DomainBootstrap = DomainBinding & {
   filters?: Fact[];
   openid?: Fact[];
   backups?: Fact[];
+  reports?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -98,6 +104,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     ...(row.filters !== undefined ? { filters: refs(row.filters) } : {}),
     ...(row.openid !== undefined ? { openid: refs(row.openid) } : {}),
     ...(row.backups !== undefined ? { backups: refs(row.backups) } : {}),
+    ...(row.reports !== undefined ? { reports: refs(row.reports) } : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -111,7 +118,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
 async function requireFacts(
   conn: Conn,
   view: DomainBootstrap,
-  file: 'tenant' | 'receipts' | 'filters' | 'openid' | 'backups',
+  file: 'tenant' | 'receipts' | 'filters' | 'openid' | 'backups' | 'reports',
 ) {
   const keys = new Set<string>();
   for (const fact of view[file] ?? []) {
@@ -145,6 +152,8 @@ async function requireFacts(
           ? ['openid']
           : file === 'backups'
           ? ['backup']
+          : file === 'reports'
+          ? ['report', 'report-resolution']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
             String(row.kind),
           )
@@ -236,7 +245,16 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
       ? 'account-data'
       : operation.kind;
     if (
-      !['account-data', 'profile', 'push-rules', 'filter', 'openid', 'backup']
+      ![
+        'account-data',
+        'profile',
+        'push-rules',
+        'filter',
+        'openid',
+        'backup',
+        'report',
+        'report-resolution',
+      ]
         .includes(
           String(expected),
         ) ||
@@ -397,6 +415,9 @@ export class DomainOperations {
       ...await db.tx((conn) =>
         receiptOperations(conn, '@' + localpart + ':' + context.server)
       ),
+      ...await db.tx((conn) =>
+        reportOperations(conn, '@' + localpart + ':' + context.server)
+      ),
     );
     const records = [];
     for (const operation of operations) {
@@ -482,11 +503,21 @@ export class DomainOperations {
         '@' + localpart + ':' + context.server,
       );
     });
+    const reportFacts = await server.tx(async (conn) => {
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      return await captureReportOperations(
+        conn,
+        '@' + localpart + ':' + context.server,
+      );
+    });
+    // Legacy capture must precede export, otherwise the completeness declaration
+    // could overtake the source records it names.
     const records = await this.export(localpart, pairing);
     // Ordinary export never echoes replica intent. Bootstrap separately attests
     // exactly the authentic history home retained, including a receiver's own
     // prior dots and prior incarnations. No dot, payload or context is rebased.
-    for (const operation of [...tenantFacts, ...receiptFacts]) {
+    for (const operation of [...tenantFacts, ...receiptFacts, ...reportFacts]) {
       if (
         operation.source === source.node &&
         operation.incarnation === source.incarnation
@@ -514,6 +545,7 @@ export class DomainOperations {
       filters: facts(tenantFacts.filter((op) => op.kind === 'filter')),
       openid: facts(tenantFacts.filter((op) => op.kind === 'openid')),
       backups: facts(tenantFacts.filter((op) => op.kind === 'backup')),
+      reports: facts(reportFacts),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -598,6 +630,7 @@ export class DomainOperations {
           );
         }
         await requireFacts(conn, view, 'receipts');
+        await requireFacts(conn, view, 'reports');
         await conn.execute(
           'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,1,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=1,pending_hash=NULL',
           [view.pairing, record.stream, record.sequence],
@@ -648,6 +681,16 @@ export class DomainOperations {
           incarnation: history ? view.operation.incarnation : view.incarnation,
           userId: '@' + view.localpart + ':' + view.server,
         },
+        check,
+        history,
+      );
+    } else if (
+      view.operation.kind === 'report' ||
+      view.operation.kind === 'report-resolution'
+    ) {
+      await importReportOperation(
+        await this.store.server(),
+        view.operation,
         check,
         history,
       );

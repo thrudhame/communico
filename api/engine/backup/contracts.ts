@@ -209,6 +209,8 @@ export const tableContracts = {
       'push_rejections',
       'push_delivery',
       'push_badges',
+      // Includes reports.report_id: original node identity, not local page IDs.
+      // Its immutable submission/resolution facts are retained in causal below.
       'reports',
       'restore_state',
       'facade_node',

@@ -43,6 +43,11 @@ CREATE TABLE federation_invite_attempts(room_id TEXT NOT NULL,sender TEXT NOT NU
 CREATE INDEX federation_invite_attempts_destination ON federation_invite_attempts(destination,status,added_ms);
 `;
 
+const REPORT_IDENTITY_SQL = `
+ALTER TABLE reports ADD COLUMN report_id TEXT;
+CREATE UNIQUE INDEX reports_identity ON reports(report_id);
+`;
+
 const DEVICE_CHANGES_SQL = `
 CREATE TABLE device_changes(seq INTEGER PRIMARY KEY NOT NULL, source TEXT NOT NULL, source_pos INTEGER NOT NULL, subject TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, stream_id INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(source,source_pos));
 CREATE INDEX device_changes_subject ON device_changes(subject,seq);
@@ -441,7 +446,7 @@ CREATE INDEX event_index_local_participation ON event_index(room,local_join_user
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 51,
+  version: 52,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -463,6 +468,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(PREJOIN_SQL);
     await db.exec(MEDIA_CACHE_SQL);
     await db.exec(REPORTS_SQL);
+    await db.exec(REPORT_IDENTITY_SQL);
     await db.exec(
       'ALTER TABLE prejoin_memberships ADD COLUMN local_leave_json TEXT',
     );
@@ -581,5 +587,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
       await conn.exec(PREJOIN_JOBS_SQL);
       await migratePrejoinJobs(conn);
     },
+    51: (conn) => conn.exec(REPORT_IDENTITY_SQL),
   },
 };

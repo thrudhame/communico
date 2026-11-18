@@ -448,6 +448,15 @@ version facts, so replication/storage cost includes that version's ciphertext;
 unchanged uploads do not add a fact. Old protected journal facts remain subject
 to the deployment's backup/retention protection.
 
+Content reports accepted at either ingress retain immutable node-namespaced
+identity and original receive metadata. The home-initiated signed link unions
+them without duplicating reports or creating room/sync/federation events. Local
+admin pagination numbers are not cross-node identities; `reportId` is. Only
+home can resolve a report, including through the private admin socket. Original
+home resolution metadata replicates independently and is safe to replay before
+its report. Unknown/nonlocal user reports retain the no-disclosure success
+response; that response does not imply a stored report or moderation action.
+
 Distributed OpenID credentials retain only digest/expiry facts in the signed
 semantic journal. Issuance commits that intent with the credential; imports
 preserve its original issuer and expiry, never create client sessions, and

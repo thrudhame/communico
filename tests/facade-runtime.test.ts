@@ -1076,6 +1076,47 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     }
     await edge.listening(facadePort);
     // Real public authoring while home is absent and federation is disabled.
+    const reportPaths = [
+      roomPath + '/report',
+      roomPath + '/report/' + encodeURIComponent(edgeEventId),
+      'users/' + encodeURIComponent(user) + '/report',
+    ];
+    for (const path of reportPaths) {
+      assertEquals(
+        await edgeApi(path, {
+          reason: 'cold-offline-private-report',
+          ...(path.includes('/report/') ? { score: -1 } : {}),
+        }, 'POST'),
+        { status: 200, body: {} },
+      );
+    }
+    assertEquals(
+      await edgeApi('users/%40nonexistent%3Alogical.test/report', {
+        reason: 'no disclosure',
+      }, 'POST'),
+      { status: 200, body: {} },
+    );
+    assertEquals(
+      await edgeApi('users/%40remote%3Aelsewhere.test/report', {
+        reason: 'no disclosure',
+      }, 'POST'),
+      { status: 200, body: {} },
+    );
+    const offlineReports =
+      (await adminCall(tls.dir + '/facade-auth.sock', 'reports/list')).body
+        .result.reports;
+    assertEquals(offlineReports.length, 3);
+    assertEquals(
+      new Set(offlineReports.map((r: { reportId: string }) => r.reportId)).size,
+      3,
+    );
+    assertEquals(
+      (await adminCall(tls.dir + '/facade-auth.sock', 'reports/resolve', {
+        id: offlineReports[0].id,
+        resolution: 'forbidden edge resolution',
+      })).status,
+      503,
+    );
     assertEquals(await edgeApi(filterPath + '/' + homeFilter.body.filter_id), {
       status: 200,
       body: homeFilterBody,
@@ -1515,6 +1556,44 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       source: 'edge_a',
       incarnation: edgeIncarnation,
     };
+    for (const report of offlineReports) {
+      await home.observations.fact({
+        ...edgeIdentity,
+        stream: 'domain:' + user,
+      }, (record) => {
+        const body = object(object(record.payload).body);
+        if (body.kind !== 'domain-operation') return false;
+        const operation = object(body.operation);
+        return operation.kind === 'report' &&
+          JSON.parse(String(operation.payload)).reportId === report.reportId;
+      });
+    }
+    const homeReports =
+      (await adminCall(tls.dir + '/home-auth.sock', 'reports/list')).body.result
+        .reports;
+    assertEquals(homeReports.length, 3);
+    for (const expected of offlineReports) {
+      const actual = homeReports.find((r: { reportId: string }) =>
+        r.reportId === expected.reportId
+      );
+      assert(actual);
+      assertEquals({ ...actual, id: expected.id }, expected);
+    }
+    const resolvedReport = await adminCall(
+      tls.dir + '/home-auth.sock',
+      'reports/resolve',
+      { id: homeReports[0].id, resolution: 'home-real-wire-resolution' },
+    );
+    assertEquals(resolvedReport.status, 200);
+    const homeResolution = resolvedReport.body.result;
+    await homeFact(edge, pairing, 'domain:' + user, (record) => {
+      const body = object(object(record.payload).body);
+      if (body.kind !== 'domain-operation') return false;
+      const operation = object(body.operation);
+      return operation.kind === 'report-resolution' &&
+        JSON.parse(String(operation.payload)).reportId ===
+          homeResolution.reportId;
+    });
     // Retain B6's actual consumers, but observe their exact applied facts using
     // main's causal helper. No timer or repeated HTTP request substitutes for
     // the import owner completing the original facade-signed event.
@@ -1802,6 +1881,15 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       status: 200,
       body: edgeFilterBody,
     });
+    assertEquals(
+      (await adminCall(tls.dir + '/facade-auth.sock', 'reports/list')).body
+        .result.reports,
+      offlineReports.map((report: { id: number; reportId: string }) =>
+        report.reportId === homeResolution.reportId
+          ? { ...homeResolution, id: report.id }
+          : report
+      ),
+    );
     assertEquals(await openIdInfo(homeOpenId.body.access_token), {
       status: 200,
       body: { sub: user },
