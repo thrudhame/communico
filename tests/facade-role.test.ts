@@ -7,6 +7,26 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 
+Deno.test('B8 filters mount only their delivered methods through domain admission', async () => {
+  const own = '/_matrix/client/v3/user/%40alice%3Alogical.test/filter';
+  const f2 = capabilities('facade', 'f2');
+  for (const [method, path] of [['POST', own], ['GET', own + '/filter-id']]) {
+    const request = new Request('https://facade.test' + path, { method });
+    assertEquals(f2.gate(request, () => true), null);
+    assertEquals(f2.gate(request, () => false)?.status, 503);
+    assertEquals(
+      capabilities('facade', 'f1').gate(request, () => true)?.status,
+      404,
+    );
+  }
+  const wrong = f2.gate(
+    new Request('https://facade.test' + own, { method: 'DELETE' }),
+    () => true,
+  )!;
+  assertEquals(wrong.status, 405);
+  assertEquals((await wrong.json()).errcode, 'M_UNRECOGNIZED');
+});
+
 Deno.test('runtime identity binds role, server and node before recovery and cannot regenerate a lost signer', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'facade-role-' });
   const options = {
@@ -214,6 +234,8 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       ['v3/user/%40alice%3Atest/rooms/room/tags/tag', 'DELETE'],
       ['v3/rooms/room/read_markers', 'POST'],
       ['v3/rooms/room/receipt/m.read/event', 'POST'],
+      ['v3/user/%40alice%3Atest/filter', 'POST'],
+      ['v3/user/%40alice%3Atest/filter/id', 'GET'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true), null);
   for (
@@ -228,7 +250,6 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
     const [path, method] of [
       ['v3/sync', 'GET'],
       ['v3/keys/changes', 'GET'],
-      ['v3/user/%40alice%3Atest/filter', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true)?.status, 404);
   assertEquals(

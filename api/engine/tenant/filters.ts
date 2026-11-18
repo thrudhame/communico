@@ -15,6 +15,133 @@ export async function clearFilters(
 import { MatrixError } from '#engine/matrix-error.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
+import {
+  importRegisterOperation,
+  registerJson,
+  type RegisterOperation,
+  registerOperations,
+  writeRegister,
+} from '#engine/facade/registers.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
+import { tenantAuthority } from './session-authority.ts';
+import { requireTenantDomainSource } from './domain-source.ts';
+import { Buffer } from 'node:buffer';
+
+function semanticKey(localpart: string, filterId: string): string {
+  return JSON.stringify(['filter', localpart, filterId]);
+}
+
+function issuerOf(filterId: string): [string, string] | null {
+  const match = /^f\.([A-Za-z0-9_-]+)\.([a-f0-9-]{36})$/.exec(filterId);
+  if (!match) return null;
+  try {
+    const value = JSON.parse(
+      Buffer.from(match[1], 'base64url').toString('utf8'),
+    );
+    if (
+      Array.isArray(value) && value.length === 2 &&
+      value.every((part) => typeof part === 'string' && part) &&
+      Buffer.from(JSON.stringify(value)).toString('base64url') === match[1]
+    ) return value as [string, string];
+  } catch { /* Malformed IDs are absent, not foreign authority. */ }
+  return null;
+}
+
+async function activeAccount(conn: Conn, localpart: string) {
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!user) throw new MatrixError(404, 'M_NOT_FOUND', 'unknown user');
+  return user.deactivated !== 1;
+}
+
+/** Immutable objects reuse the semantic fact journal, but never its winner
+ * selection: exactly one source dot and body may name each filter. */
+export async function filterOperations(
+  conn: Conn,
+  localpart: string,
+): Promise<RegisterOperation[]> {
+  const keys = await conn.query(
+    "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='filter' AND json_extract(semantic_key,'$[1]')=? ORDER BY semantic_key",
+    [localpart],
+  );
+  const result: RegisterOperation[] = [];
+  for (const row of keys) {
+    result.push(...await registerOperations(conn, String(row.semantic_key)));
+  }
+  return result;
+}
+
+export async function captureFilterOperations(conn: Conn, localpart: string) {
+  const authority = await tenantAuthority(conn);
+  if (authority?.node !== 'home') {
+    throw new Error('filter bootstrap requires home authority');
+  }
+  if (!await activeAccount(conn, localpart)) return [];
+  for (
+    const row of await conn.query(
+      'SELECT filter_id,filter FROM filters WHERE localpart=? ORDER BY filter_id',
+      [localpart],
+    )
+  ) {
+    const key = semanticKey(localpart, String(row.filter_id));
+    if ((await registerOperations(conn, key)).length) continue;
+    // Pre-enrollment numeric IDs belong to home. Never reauthor an imported
+    // namespaced object if its retained source fact is missing.
+    if (!/^\d+$/.test(String(row.filter_id))) {
+      throw new Error('filter source fact unavailable');
+    }
+    await writeRegister(
+      conn,
+      { source: authority.node, incarnation: authority.incarnation },
+      key,
+      'filter',
+      String(row.filter),
+    );
+  }
+  return await filterOperations(conn, localpart);
+}
+
+export async function importFilter(
+  conn: Conn,
+  operation: RegisterOperation,
+  history?: DomainHistoryProof,
+) {
+  let address: unknown, body: unknown;
+  try {
+    address = JSON.parse(operation.semanticKey);
+    body = JSON.parse(operation.payload);
+  } catch {
+    throw new Error('invalid filter operation');
+  }
+  if (
+    !Array.isArray(address) || address.length !== 3 ||
+    address[0] !== 'filter' ||
+    typeof address[1] !== 'string' || !address[1] ||
+    typeof address[2] !== 'string' ||
+    operation.semanticKey !== semanticKey(address[1], address[2]) ||
+    operation.kind !== 'filter' ||
+    operation.sequence !== 1 || !Array.isArray(operation.context) ||
+    operation.context.length !== 0
+  ) throw new Error('invalid filter operation');
+  const [, localpart, id] = address as string[];
+  const issuer = issuerOf(id);
+  if (
+    issuer
+      ? issuer[0] !== operation.source || issuer[1] !== operation.incarnation
+      : !/^\d+$/.test(id) || operation.source !== 'home'
+  ) throw new Error('invalid filter issuer');
+  await requireTenantDomainSource(conn, operation, localpart, history);
+  validateFilterDocument(body);
+  const before = await filterById(conn, localpart, id);
+  if (before !== null && registerJson(before) !== operation.payload) {
+    throw new Error('immutable filter differs');
+  }
+  await importRegisterOperation(conn, operation);
+  if (!await activeAccount(conn, localpart) || before !== null) return;
+  await insertFilter(conn, localpart, id, operation.payload);
+}
 
 export interface EventFilter extends RoomEventFilter {
   lazy_load_members?: boolean;
@@ -260,10 +387,10 @@ export async function storeFilter(
   localpart: string,
   filter: unknown,
 ): Promise<string> {
+  validateFilterDocument(filter);
   return await tenant.tx(async (tx) => {
-    const filterId = String(await tx.filters.count(localpart));
-    await tx.filters.insert(localpart, filterId, JSON.stringify(filter));
-    return filterId;
+    await tx.ingress.check({ kind: 'domain', localpart, feature: 'filters' });
+    return await tx.filters.create(localpart, filter);
   });
 }
 
@@ -273,8 +400,58 @@ export async function loadFilter(
   localpart: string,
   filterId: string,
 ): Promise<unknown | null> {
-  const filter = await tenant.tx((tx) => tx.filters.byId(localpart, filterId));
+  const filter = await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart, feature: 'filters' });
+    return await tx.filters.read(localpart, filterId);
+  });
   return filter === null ? null : JSON.parse(filter);
+}
+
+export async function createFilter(
+  conn: Conn,
+  localpart: string,
+  filter: unknown,
+): Promise<string> {
+  validateFilterDocument(filter);
+  if (!await activeAccount(conn, localpart)) {
+    throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account is deactivated');
+  }
+  const authority = await tenantAuthority(conn);
+  const id = authority
+    ? 'f.' +
+      Buffer.from(JSON.stringify([authority.node, authority.incarnation]))
+        .toString('base64url') +
+      '.' + crypto.randomUUID()
+    : String(await countFilters(conn, localpart));
+  const payload = JSON.stringify(filter);
+  if (authority) {
+    await writeRegister(
+      conn,
+      { source: authority.node, incarnation: authority.incarnation },
+      semanticKey(localpart, id),
+      'filter',
+      payload,
+    );
+  }
+  await insertFilter(conn, localpart, id, payload);
+  return id;
+}
+
+export async function readFilter(
+  conn: Conn,
+  localpart: string,
+  id: string,
+): Promise<string | null> {
+  const value = await filterById(conn, localpart, id);
+  if (value !== null) return value;
+  const authority = await tenantAuthority(conn), issuer = issuerOf(id);
+  if (
+    authority && issuer &&
+    (issuer[0] !== authority.node || issuer[1] !== authority.incarnation)
+  ) {
+    throw new MatrixError(503, 'M_UNAVAILABLE', 'filter replica unavailable');
+  }
+  return null;
 }
 
 // Resolve the /sync `filter` parameter: absent -> the default; a leading

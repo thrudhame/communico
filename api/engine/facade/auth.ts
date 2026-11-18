@@ -205,7 +205,8 @@ export class FacadeAuth {
             ? !current() || cut.ready !== 1 || cut.pending_hash !== null ||
               Number(cut.source_cut) < 1 ||
               Number(cut.received) !== Number(cut.applied) ||
-              cut.received_hash !== cut.applied_hash
+              cut.received_hash !== cut.applied_hash ||
+              (intent.feature === 'filters' && cut.filters_ready !== 1)
             : cut.ready !== 1 && cut.pending_hash === null)
         ) {
           unavailable();
@@ -294,7 +295,7 @@ export class FacadeAuth {
         body.nodes[1].incarnation !== this.node.incarnation
       ) authUnavailable();
       const scopes = await conn.query(
-        "SELECT s.scope,s.source_cut,s.ready,s.pending_hash,j.received,j.received_hash,j.applied,j.applied_hash FROM facade_scopes s JOIN facade_streams j ON j.incarnation=s.incarnation AND j.stream=s.scope AND j.peer='home' AND j.direction='in' AND j.source='home' WHERE s.incarnation=? AND (s.scope LIKE 'auth:%' OR s.scope LIKE 'domain:%')",
+        "SELECT s.scope,s.source_cut,s.ready,s.pending_hash,j.received,j.received_hash,j.applied,j.applied_hash,EXISTS(SELECT 1 FROM facade_scopes f WHERE f.incarnation=s.incarnation AND f.scope='filters:'||substr(s.scope,8) AND f.ready=1) AS filters_ready FROM facade_scopes s JOIN facade_streams j ON j.incarnation=s.incarnation AND j.stream=s.scope AND j.peer='home' AND j.direction='in' AND j.source='home' WHERE s.incarnation=? AND (s.scope LIKE 'auth:%' OR s.scope LIKE 'domain:%')",
         [pairing],
       );
       return { pairing, grantRevision: grant.body.revision, control, scopes };

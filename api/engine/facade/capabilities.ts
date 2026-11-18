@@ -216,6 +216,12 @@ const F2_MEMBERSHIP: readonly Rule[] = [
   ),
 ];
 
+// B8 adds each private surface only after its owning semantic contract exists.
+const F2_CLIENT_DATA: readonly Rule[] = [
+  route('POST', /^\/_matrix\/client\/v3\/user\/[^/]+\/filter$/, 'domain'),
+  route('GET', /^\/_matrix\/client\/v3\/user\/[^/]+\/filter\/[^/]+$/, 'domain'),
+];
+
 const HOME_SERVICES = new Set([
   'recovery',
   'link-client',
@@ -262,6 +268,7 @@ export function capabilities(role: string, phase = 'f1') {
           ...F2_TODEVICE,
           ...F2_ROOMS,
           ...F2_MEMBERSHIP,
+          ...F2_CLIENT_DATA,
         ]
         : F1_PUBLIC)
         .filter((rule) => rule.path.test(path));

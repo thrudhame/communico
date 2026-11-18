@@ -19,6 +19,7 @@ import {
 import { captureAccountDataOperations } from '#engine/tenant/accountdata.ts';
 import { captureProfileOperations } from '#engine/tenant/profiles.ts';
 import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
+import { captureFilterOperations } from '#engine/tenant/filters.ts';
 import { importReceiptOperation } from '#engine/server/ephemeral.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
@@ -42,6 +43,9 @@ export type DomainBootstrap = DomainBinding & {
   kind: 'domain-bootstrap';
   tenant: Fact[];
   receipts: Fact[];
+  // Absent on older F2 writers: those bootstraps remain valid for their
+  // original types, but cannot enable reads of an unproved filter inventory.
+  filters?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -87,6 +91,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     incarnation: text(row.incarnation),
     tenant: refs(row.tenant),
     receipts: refs(row.receipts),
+    ...(row.filters !== undefined ? { filters: refs(row.filters) } : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -100,10 +105,10 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
 async function requireFacts(
   conn: Conn,
   view: DomainBootstrap,
-  file: 'tenant' | 'receipts',
+  file: 'tenant' | 'receipts' | 'filters',
 ) {
   const keys = new Set<string>();
-  for (const fact of view[file]) {
+  for (const fact of view[file] ?? []) {
     const [row] = await conn.query(
       'SELECT semantic_key,kind,payload_hash,payload_json FROM domain_operations WHERE operation_id=?',
       [fact.operationId],
@@ -128,14 +133,16 @@ async function requireFacts(
       const key = JSON.parse(String(row.semantic_key));
       if (
         !Array.isArray(key) || key[1] !== view.localpart ||
-        !['account-data', 'tags', 'profile', 'push-rules'].includes(
-          String(row.kind),
-        )
+        !(file === 'filters'
+          ? ['filter']
+          : ['account-data', 'tags', 'profile', 'push-rules']).includes(
+            String(row.kind),
+          )
       ) mismatch('bootstrap tenant account differs');
       keys.add(String(row.semantic_key));
     }
   }
-  const retained = new Set(view[file].map((fact) => fact.operationId));
+  const retained = new Set((view[file] ?? []).map((fact) => fact.operationId));
   for (const key of keys) {
     if (
       (await readRegister(conn, key)).pending.some((op) =>
@@ -219,7 +226,9 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
       ? 'account-data'
       : operation.kind;
     if (
-      !['account-data', 'profile', 'push-rules'].includes(String(expected)) ||
+      !['account-data', 'profile', 'push-rules', 'filter'].includes(
+        String(expected),
+      ) ||
       !Array.isArray(key) || key[0] !== expected || key[1] !== localpart
     ) {
       mismatch('domain account not selected');
@@ -368,6 +377,7 @@ export class DomainOperations {
         ...await tx.accountData.operations(localpart),
         ...await tx.profiles.operations(localpart),
         ...await tx.pushRules.operations(localpart),
+        ...await tx.filters.operations(localpart),
       ];
     });
     operations.push(
@@ -445,6 +455,7 @@ export class DomainOperations {
           ...await captureAccountDataOperations(conn, localpart),
           ...await captureProfileOperations(conn, localpart),
           ...await capturePushRuleOperations(conn, localpart, context.server),
+          ...await captureFilterOperations(conn, localpart),
         ];
       },
     );
@@ -479,8 +490,9 @@ export class DomainOperations {
     const body = bootstrapOf({
       ...binding,
       kind: 'domain-bootstrap',
-      tenant: facts(tenantFacts),
+      tenant: facts(tenantFacts.filter((op) => op.kind !== 'filter')),
       receipts: facts(receiptFacts),
+      filters: facts(tenantFacts.filter((op) => op.kind === 'filter')),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -552,6 +564,7 @@ export class DomainOperations {
           Number(selected.grant_revision) !== view.grantRevision
         ) mismatch('bootstrap account not selected');
         await requireFacts(conn, view, 'tenant');
+        await requireFacts(conn, view, 'filters');
       });
       return await journal.apply(peer, stream, async (conn, current) => {
         await check(conn);
@@ -565,6 +578,15 @@ export class DomainOperations {
         await conn.execute(
           'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,1,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=1,pending_hash=NULL',
           [view.pairing, record.stream, record.sequence],
+        );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'filters:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.filters !== undefined ? 1 : 0,
+          ],
         );
         return { kind: 'domain-bootstrap', localpart: view.localpart };
       });
@@ -600,6 +622,8 @@ export class DomainOperations {
           await tx.profiles.import(view.operation, history);
         } else if (view.operation.kind === 'push-rules') {
           await tx.pushRules.import(view.operation, history);
+        } else if (view.operation.kind === 'filter') {
+          await tx.filters.import(view.operation, history);
         } else await tx.accountData.import(view.operation, history);
       });
     }

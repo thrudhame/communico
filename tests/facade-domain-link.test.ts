@@ -11,9 +11,14 @@ import {
   type DomainOperation,
   DomainOperations,
 } from '#engine/facade/domain.ts';
-import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
+import {
+  enrolledTenant,
+  initializeNode,
+  loadNode,
+} from '#engine/facade/identity.ts';
 import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { loadFilter, storeFilter } from '#engine/tenant/filters.ts';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
@@ -450,6 +455,129 @@ Deno.test('directory scope retains selected local initiation without hiding unap
         setConfigForTests({});
       }
     });
+  }
+});
+
+Deno.test('domain filters: signed bootstrap and suffix preserve immutable objects in both directions', async () => {
+  const f = await fixture();
+  try {
+    await f.ht.tx((tx) =>
+      tx.filters.insert('alice', '7', '{"room":{"timeline":{"limit":7}}}')
+    );
+    const id = await storeFilter(f.ht, 'alice', {
+      room: { timeline: { limit: 1 } },
+    });
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    assertEquals(await loadFilter(f.et, 'alice', '7'), {
+      room: { timeline: { limit: 7 } },
+    });
+    assertEquals(await loadFilter(f.et, 'alice', id), {
+      room: { timeline: { limit: 1 } },
+    });
+    const edgeId = await storeFilter(f.et, 'alice', {
+      room: { timeline: { limit: 2 } },
+    });
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(await loadFilter(f.ht, 'alice', edgeId), {
+      room: { timeline: { limit: 2 } },
+    });
+    const before = await f.et.tx((tx) => tx.streams.heads());
+    const homeCut = Math.max(...records.map((record) => record.sequence));
+    const suffixId = await storeFilter(f.ht, 'alice', {
+      account_data: { types: ['m.direct'] },
+    });
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > homeCut
+    );
+    await f.toEdge(suffix);
+    await f.toEdge(suffix);
+    assertEquals(await loadFilter(f.et, 'alice', suffixId), {
+      account_data: { types: ['m.direct'] },
+    });
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const server = await reopened.server();
+      const node = await loadNode(server, 'logical.test', 'edge_a');
+      const pairings = new Pairings(
+        server,
+        node.signer(),
+        node.publicKey,
+        'b'.repeat(64),
+        node,
+      );
+      const tenant = await enrolledTenant(
+        reopened,
+        pairings,
+        'logical.test',
+        'edge_a',
+      );
+      assertEquals(await loadFilter(tenant, 'alice', suffixId), {
+        account_data: { types: ['m.direct'] },
+      });
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain filters: old signed domain bootstrap cannot prove the new filter scope complete', async () => {
+  const f = await fixture();
+  try {
+    const records = structuredClone(await f.hs.bootstrap('alice', f.bundle.id));
+    const last = records.at(-1)!;
+    const payload = last.payload as {
+      body: DomainBootstrap & { filters?: unknown };
+      signature: string;
+    };
+    delete payload.body.filters;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    last.operationId = 'domain-bootstrap:' +
+      createHash('sha256').update(canonicalJson(payload.body)).digest('hex');
+    last.hash = recordHash({
+      source: last.source,
+      incarnation: last.incarnation,
+      stream: last.stream,
+      sequence: last.sequence,
+      type: last.type,
+      version: last.version,
+      operationId: last.operationId,
+      previous: last.previous,
+      payload: last.payload,
+    });
+    await f.toEdge(records);
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), null);
+    await assertRejects(
+      () => loadFilter(tenant, 'alice', '7'),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+  } finally {
+    await f.close();
   }
 });
 

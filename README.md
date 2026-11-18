@@ -437,6 +437,14 @@ matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
 ## Facade replication progress
 
+Distributed stored filters have immutable node/incarnation-namespaced IDs.
+Existing home numeric IDs keep their meaning. Filters replicate as protected
+per-user semantic facts; a missing foreign ID returns retryable 503 until its
+material is held, rather than pretending it is known absent. Filter admission
+requires the signed filter inventory and completed received domain prefix.
+An older domain bootstrap cannot enable that new scope. Import and retry do
+not create account-data news, and deactivation cannot resurrect cleared filters.
+
 Operators can inspect lag over the private admin Unix socket:
 
 ```sh

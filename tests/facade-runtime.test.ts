@@ -729,6 +729,14 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     );
     assertEquals(baselineResponse.status, 200);
     await baselineResponse.arrayBuffer();
+    const filterPath = 'user/%40outside%3Alogical.test/filter';
+    const homeFilterBody = { room: { timeline: { limit: 7 } } };
+    const homeFilter = await api(
+      filterPath,
+      homeFilterBody,
+      registered.body.access_token,
+    );
+    assertEquals(homeFilter.status, 200);
     const created = await api(
       'createRoom',
       { room_version: '11' },
@@ -1027,6 +1035,18 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     }
     await edge.listening(facadePort);
     // Real public authoring while home is absent and federation is disabled.
+    assertEquals(await edgeApi(filterPath + '/' + homeFilter.body.filter_id), {
+      status: 200,
+      body: homeFilterBody,
+    });
+    const edgeFilterBody = { room: { timeline: { limit: 3 } } };
+    const edgeFilter = await edgeApi(filterPath, edgeFilterBody, 'POST');
+    assertEquals(edgeFilter.status, 200);
+    assert(edgeFilter.body.filter_id !== homeFilter.body.filter_id);
+    assertEquals(await edgeApi(filterPath + '/' + edgeFilter.body.filter_id), {
+      status: 200,
+      body: edgeFilterBody,
+    });
     // This room has never existed at home or in its exported inventory.
     const fresh = await edgeApi('createRoom', {
       room_version: '11',
@@ -1628,6 +1648,10 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       'room:' + fresh.body.room_id,
     ]);
     await edge.listening(facadePort);
+    assertEquals(await edgeApi(filterPath + '/' + edgeFilter.body.filter_id), {
+      status: 200,
+      body: edgeFilterBody,
+    });
     for (const [id, content] of homeContents) {
       const edgeRead = await edgeApi(
         roomPath + '/event/' + encodeURIComponent(id),

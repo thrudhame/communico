@@ -824,6 +824,19 @@ function bind(
     },
     filters: {
       clear: (localpart: string) => filters.clearFilters(conn, localpart),
+      create: async (localpart: string, filter: unknown) => {
+        const id = await filters.createFilter(conn, localpart, filter);
+        changed();
+        return id;
+      },
+      read: (localpart: string, filterId: string) =>
+        filters.readFilter(conn, localpart, filterId),
+      operations: (localpart: string) =>
+        filters.filterOperations(conn, localpart),
+      import: (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => filters.importFilter(conn, operation, history),
       count: (localpart: string) => filters.countFilters(conn, localpart),
       insert: (localpart: string, filterId: string, filter: string) =>
         filters.insertFilter(conn, localpart, filterId, filter),

@@ -6,7 +6,7 @@ export type AuthIntent =
   | { kind: 'session'; hash: string; refresh: boolean }
   | { kind: 'password'; localpart: string }
   | { kind: 'account'; localpart: string }
-  | { kind: 'domain'; localpart: string }
+  | { kind: 'domain'; localpart: string; feature?: 'filters' }
   | { kind: 'device'; localpart: string; deviceId: string };
 
 export type PreparedIngressAuthority = {
