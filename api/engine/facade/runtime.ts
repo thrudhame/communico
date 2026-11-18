@@ -51,6 +51,12 @@ import { startProfileFanout } from '#engine/profile-fanout.ts';
 import { DomainOperations } from './domain.ts';
 import { DeviceOperations, isKeyStream } from './devices.ts';
 import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
+import { MembershipOperations } from './membership.ts';
+import {
+  type InviteDeps,
+  inviteIntentProvider,
+} from '#engine/federation/invites.ts';
+import { joinCleanupProvider } from '#engine/federation/join-cleanup.ts';
 import type { EduState } from '#engine/federation/edus.ts';
 import {
   type DeviceListService,
@@ -94,6 +100,7 @@ export async function openFacadeRuntime(
   let authExports: ReturnType<typeof startAccountExports> | undefined;
   let keyExports: ReturnType<typeof startAccountExports> | undefined;
   let toDeviceExports: ReturnType<typeof startAccountExports> | undefined;
+  let membershipExports: ReturnType<typeof startAccountExports> | undefined;
   let deactivation: ReturnType<typeof startDeactivationWork> | undefined;
   let profileFanout: ReturnType<typeof startProfileFanout> | undefined;
   let deviceLists: DeviceListService | undefined;
@@ -178,9 +185,10 @@ export async function openFacadeRuntime(
         tenant,
         pollseconds: settings.pollseconds,
         prepareSigner: async () => (await keyOwner()).prepareSigner(),
-        // OOB rejection is durable at its existing intent owner. B7 composes
-        // the performing sender; link observers are woken without a home RPC.
-        wake: () => notices.changed(),
+        wake: (destination) => {
+          sender?.wake(destination);
+          notices.changed();
+        },
         failed: (error) =>
           console.error(
             'facade deactivation pending:',
@@ -281,6 +289,31 @@ export async function openFacadeRuntime(
           ),
       });
     }
+    if (settings.phase === 'f2' && !membershipExports) {
+      membershipExports = startAccountExports({
+        store,
+        tenant,
+        pollseconds: settings.pollseconds,
+        users: async () =>
+          (await (await store.tenant(identity.server)).query(
+            'SELECT localpart FROM account_auth_snapshots ORDER BY localpart',
+          )).map((row) => String(row.localpart)),
+        emit: async (localpart) =>
+          await new MembershipOperations(
+            store,
+            tenant!,
+            await pairings(),
+            node!,
+          )
+            .export(localpart),
+        changed: () => notices.changed(),
+        failed: (error) =>
+          console.error(
+            'facade membership export:',
+            error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
+          ),
+      });
+    }
     if (settings.phase === 'f2') {
       const binding = grant.body.transcript.body.context.id;
       if (roomBinding !== binding) {
@@ -361,6 +394,20 @@ export async function openFacadeRuntime(
             node!,
           )
             .apply(journal, stream)
+          : settings.phase === 'f2' && stream.stream.startsWith('membership:')
+          ? await new MembershipOperations(
+            store,
+            tenant!,
+            await pairings(),
+            node!,
+          )
+            .apply(
+              journal,
+              stream,
+              productionKeyResolver(
+                (await keyOwner()).verificationKeys(),
+              ),
+            )
           : stream.stream === 'directory'
           ? await new DirectoryReplicas(
             server,
@@ -417,7 +464,8 @@ export async function openFacadeRuntime(
       if (!caps.service('federation-sender') || !config().federation.enabled) {
         return undefined;
       }
-      const signer = (await keyOwner()).requestSigner();
+      const authority = await keyOwner();
+      const signer = authority.requestSigner();
       const binding = await pairings();
       if (closed || !tenant) {
         throw new MatrixError(
@@ -438,6 +486,23 @@ export async function openFacadeRuntime(
         dispatch: (envelope) => owner.dispatchLocal(envelope),
         onDelivered: () => projectTenant(store, identity.server),
       });
+      const performingSender = sender;
+      const inviteDeps: InviteDeps = {
+        store,
+        server,
+        signer,
+        keys: productionKeyResolver(authority.verificationKeys()),
+        self: identity.server,
+        wake: (destination) => performingSender.wake(destination),
+      };
+      const intents = joinCleanupProvider(
+        inviteDeps,
+        inviteIntentProvider(inviteDeps),
+      );
+      performingSender.setIntentProvider(intents);
+      void intents.review().then((rows) => {
+        for (const row of rows) performingSender.wake(row.destination);
+      }).catch((error) => console.error('intent startup scan:', error));
       return sender;
     },
     async deviceLists(edus: EduState) {
@@ -650,6 +715,7 @@ export async function openFacadeRuntime(
         await authExports?.close();
         await keyExports?.close();
         await toDeviceExports?.close();
+        await membershipExports?.close();
         await inbox?.close();
         await deactivation?.close();
         await profileFanout?.close();

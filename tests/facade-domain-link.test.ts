@@ -18,6 +18,7 @@ import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
+import { MembershipOperations } from '#engine/facade/membership.ts';
 import { bindRole } from '#engine/facade/role.ts';
 import {
   LINK_CAPABILITIES,
@@ -206,6 +207,40 @@ Deno.test('directory scope retains selected local initiation without hiding unap
         if (!inventory) throw new Error('missing initial directory');
         await f.ej.receive('home', [inventory]);
         await owner.apply(f.ej, inventory);
+        // F1 inventories cannot prove an F2 membership scope complete. Preserve
+        // that refusal, then install the real explicit empty bootstraps before
+        // exercising local room initiation under an F2 inventory.
+        await assertRejects(
+          () => owner.scopeState('rooms'),
+          MatrixError,
+          'replica unavailable',
+        );
+        const memberships = new MembershipOperations(f.home, f.ht, f.hp);
+        for (const localpart of ['alice', 'bob']) {
+          // Alice's selected auth head is already delivered by fixture(). Do
+          // not append and skip a new head before its later suffix-hole probe.
+          if (localpart === 'bob') {
+            await exportAccountAuth(
+              f.home,
+              f.ht,
+              f.hp,
+              f.bundle.id,
+              localpart,
+              false,
+            );
+          }
+          await memberships.bootstrap(localpart, f.bundle.id);
+        }
+        const complete = await exportDirectoryReplica(
+          f.home,
+          f.ht,
+          f.node.node,
+          f.bundle.id,
+          2,
+        );
+        if (!complete) throw new Error('missing F2 directory');
+        await f.ej.receive('home', [complete]);
+        await owner.apply(f.ej, complete);
         const signer = await testSigner('logical.test');
         let roomId: string;
         if (mode === 'create') {
