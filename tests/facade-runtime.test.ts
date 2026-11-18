@@ -740,6 +740,33 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     const openIdPath = 'user/%40outside%3Alogical.test/openid/request_token';
     const homeOpenId = await api(openIdPath, {}, registered.body.access_token);
     assertEquals(homeOpenId.status, 200);
+    const backupMetadata = {
+      algorithm: 'opaque',
+      auth_data: { public_key: 'home-backup-key' },
+    };
+    const backupSession = {
+      first_message_index: 3,
+      forwarded_count: 0,
+      is_verified: true,
+      session_data: { ciphertext: 'retained-home-ciphertext' },
+    };
+    const homeBackup = await api(
+      'room_keys/version',
+      backupMetadata,
+      registered.body.access_token,
+    );
+    assertEquals(homeBackup.status, 200);
+    const backupVersion = homeBackup.body.version;
+    assertEquals(
+      (await api(
+        'room_keys/keys/!backup%3Alogical.test/session?version=' +
+          backupVersion,
+        backupSession,
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
     const openIdInfo = async (token?: string) => {
       const response = await fetch(
         `http://127.0.0.1:${facadePort}/_matrix/federation/v1/openid/userinfo`,
@@ -1075,6 +1102,69 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     });
     assertEquals((await openIdInfo()).body.errcode, 'M_MISSING_TOKEN');
     assertEquals((await openIdInfo('invalid')).body.errcode, 'M_UNKNOWN_TOKEN');
+    const expectedBackup = {
+      ...backupMetadata,
+      version: backupVersion,
+      count: 1,
+      etag: '1',
+    };
+    assertEquals(await edgeApi('room_keys/version'), {
+      status: 200,
+      body: expectedBackup,
+    });
+    assertEquals(await edgeApi('room_keys/version/' + backupVersion), {
+      status: 200,
+      body: expectedBackup,
+    });
+    assertEquals(await edgeApi('room_keys/keys?version=' + backupVersion), {
+      status: 200,
+      body: {
+        rooms: {
+          '!backup:logical.test': { sessions: { session: backupSession } },
+        },
+      },
+    });
+    assertEquals(
+      await edgeApi(
+        'room_keys/keys/!backup%3Alogical.test?version=' + backupVersion,
+      ),
+      { status: 200, body: { sessions: { session: backupSession } } },
+    );
+    assertEquals(
+      await edgeApi(
+        'room_keys/keys/!backup%3Alogical.test/session?version=' +
+          backupVersion,
+      ),
+      { status: 200, body: backupSession },
+    );
+    assertEquals((await edgeApi('room_keys/version/missing')).status, 404);
+    for (
+      const [path, method] of [
+        ['room_keys/version', 'POST'],
+        ['room_keys/version/' + backupVersion, 'PUT'],
+        ['room_keys/version/' + backupVersion, 'DELETE'],
+        ...[
+          'room_keys/keys',
+          'room_keys/keys/!backup%3Alogical.test',
+          'room_keys/keys/!backup%3Alogical.test/session',
+        ].flatMap((path) =>
+          ['PUT', 'DELETE'].map((
+            method,
+          ) => [path + '?version=' + backupVersion, method])
+        ),
+      ]
+    ) {
+      assertEquals(
+        await edgeApi(path, method === 'DELETE' ? undefined : {}, method),
+        {
+          status: 503,
+          body: {
+            errcode: 'M_UNAVAILABLE',
+            error: 'operation requires home ingress',
+          },
+        },
+      );
+    }
     assertEquals(
       (await api(
         'account/whoami',
@@ -1675,6 +1765,28 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     // An exact applied event proves material, not that a later received suffix
     // or directory has completed. Quiesce the producer and drain its finite
     // received cuts before exercising the facade's ordinary public read gates.
+    const backupSuffix = {
+      ...backupSession,
+      first_message_index: 1,
+      session_data: { ciphertext: 'retained-home-ciphertext-suffix' },
+    };
+    assertEquals(
+      (await api(
+        'room_keys/keys/!backup%3Alogical.test/session?version=' +
+          backupVersion,
+        backupSuffix,
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    await homeFact(edge, pairing, 'domain:' + user, (record) => {
+      const body = object(object(record.payload).body);
+      if (body.kind !== 'domain-operation') return false;
+      const operation = object(body.operation);
+      return operation.kind === 'backup' &&
+        String(operation.payload).includes('retained-home-ciphertext-suffix');
+    });
     await home.stop();
     await edge.stop();
     edge = await process(file('facade'), 'facade: link/local admin ready');
@@ -1698,6 +1810,17 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       status: 200,
       body: { sub: user },
     });
+    assertEquals(await edgeApi('room_keys/version'), {
+      status: 200,
+      body: { ...expectedBackup, etag: '2' },
+    });
+    assertEquals(
+      await edgeApi(
+        'room_keys/keys/!backup%3Alogical.test/session?version=' +
+          backupVersion,
+      ),
+      { status: 200, body: backupSuffix },
+    );
     for (const [id, content] of homeContents) {
       const edgeRead = await edgeApi(
         roomPath + '/event/' + encodeURIComponent(id),

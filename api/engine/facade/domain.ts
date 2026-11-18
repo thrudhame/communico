@@ -21,6 +21,7 @@ import { captureProfileOperations } from '#engine/tenant/profiles.ts';
 import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
 import { captureFilterOperations } from '#engine/tenant/filters.ts';
 import { captureOpenIdOperations } from '#engine/tenant/openid.ts';
+import { captureBackupOperations } from '#engine/tenant/key-backup.ts';
 import { importReceiptOperation } from '#engine/server/ephemeral.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
@@ -48,6 +49,7 @@ export type DomainBootstrap = DomainBinding & {
   // original types, but cannot enable reads of an unproved filter inventory.
   filters?: Fact[];
   openid?: Fact[];
+  backups?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -95,6 +97,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     receipts: refs(row.receipts),
     ...(row.filters !== undefined ? { filters: refs(row.filters) } : {}),
     ...(row.openid !== undefined ? { openid: refs(row.openid) } : {}),
+    ...(row.backups !== undefined ? { backups: refs(row.backups) } : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -108,7 +111,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
 async function requireFacts(
   conn: Conn,
   view: DomainBootstrap,
-  file: 'tenant' | 'receipts' | 'filters' | 'openid',
+  file: 'tenant' | 'receipts' | 'filters' | 'openid' | 'backups',
 ) {
   const keys = new Set<string>();
   for (const fact of view[file] ?? []) {
@@ -140,6 +143,8 @@ async function requireFacts(
           ? ['filter']
           : file === 'openid'
           ? ['openid']
+          : file === 'backups'
+          ? ['backup']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
             String(row.kind),
           )
@@ -231,9 +236,10 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
       ? 'account-data'
       : operation.kind;
     if (
-      !['account-data', 'profile', 'push-rules', 'filter', 'openid'].includes(
-        String(expected),
-      ) ||
+      !['account-data', 'profile', 'push-rules', 'filter', 'openid', 'backup']
+        .includes(
+          String(expected),
+        ) ||
       !Array.isArray(key) || key[0] !== expected || key[1] !== localpart
     ) {
       mismatch('domain account not selected');
@@ -384,6 +390,7 @@ export class DomainOperations {
         ...await tx.pushRules.operations(localpart),
         ...await tx.filters.operations(localpart),
         ...await tx.openid.operations(localpart),
+        ...await tx.keyBackup.operations(localpart),
       ];
     });
     operations.push(
@@ -463,6 +470,7 @@ export class DomainOperations {
           ...await capturePushRuleOperations(conn, localpart, context.server),
           ...await captureFilterOperations(conn, localpart),
           ...await captureOpenIdOperations(conn, localpart),
+          ...await captureBackupOperations(conn, localpart),
         ];
       },
     );
@@ -498,11 +506,14 @@ export class DomainOperations {
       ...binding,
       kind: 'domain-bootstrap',
       tenant: facts(
-        tenantFacts.filter((op) => !['filter', 'openid'].includes(op.kind)),
+        tenantFacts.filter((op) =>
+          !['filter', 'openid', 'backup'].includes(op.kind)
+        ),
       ),
       receipts: facts(receiptFacts),
       filters: facts(tenantFacts.filter((op) => op.kind === 'filter')),
       openid: facts(tenantFacts.filter((op) => op.kind === 'openid')),
+      backups: facts(tenantFacts.filter((op) => op.kind === 'backup')),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -576,6 +587,7 @@ export class DomainOperations {
         await requireFacts(conn, view, 'tenant');
         await requireFacts(conn, view, 'filters');
         await requireFacts(conn, view, 'openid');
+        await requireFacts(conn, view, 'backups');
       });
       return await journal.apply(peer, stream, async (conn, current) => {
         await check(conn);
@@ -606,6 +618,15 @@ export class DomainOperations {
             'openid:@' + view.localpart + ':' + view.server,
             record.sequence,
             view.openid !== undefined ? 1 : 0,
+          ],
+        );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'backups:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.backups !== undefined ? 1 : 0,
           ],
         );
         return { kind: 'domain-bootstrap', localpart: view.localpart };
@@ -646,6 +667,8 @@ export class DomainOperations {
           await tx.filters.import(view.operation, history);
         } else if (view.operation.kind === 'openid') {
           await tx.openid.import(view.operation, history);
+        } else if (view.operation.kind === 'backup') {
+          await tx.keyBackup.import(view.operation, history);
         } else await tx.accountData.import(view.operation, history);
       });
     }

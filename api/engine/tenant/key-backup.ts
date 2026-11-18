@@ -10,6 +10,16 @@ import {
   EMPTY_BACKUP_BYTES,
   forgetBackupEntries,
 } from '#engine/tenant/backup-accounting.ts';
+import {
+  importRegisterOperation,
+  registerJson,
+  type RegisterOperation,
+  registerOperations,
+  writeRegister,
+} from '#engine/facade/registers.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
+import { requireTenantDomainSource } from './domain-source.ts';
+import { tenantAuthority } from './session-authority.ts';
 
 type Limits = Config['e2ee'];
 export type Action = 'get' | 'put' | 'delete' | 'post';
@@ -101,6 +111,7 @@ export async function backupVersion(
   input: unknown,
   limits: Limits,
 ): Promise<Json> {
+  if (action !== 'get') await requireBackupWriter(conn, user);
   if (action === 'post') {
     const body = metadata(input, limits);
     const active = await conn.query(
@@ -120,6 +131,7 @@ export async function backupVersion(
       'INSERT INTO backup_versions(localpart,version_no,algorithm,auth_data,etag,deleted) VALUES(?,?,?,?,0,0)',
       [user, next, body.algorithm, JSON.stringify(body.auth_data)],
     );
+    await recordBackupVersion(conn, user, next);
     return { version: String(next) };
   }
   const row = await versionRow(conn, user, version);
@@ -129,6 +141,7 @@ export async function backupVersion(
       "UPDATE backup_versions SET deleted=1,auth_data='{}' WHERE localpart=? AND version_no=?",
       [user, row.version_no],
     );
+    if (!row.deleted) await recordBackupVersion(conn, user, row.version_no);
     return {};
   }
   if (row.deleted) throw missing();
@@ -142,6 +155,12 @@ export async function backupVersion(
       'UPDATE backup_versions SET auth_data=? WHERE localpart=? AND version_no=?',
       [JSON.stringify(body.auth_data), user, row.version_no],
     );
+    if (
+      registerJson(row.auth_data) !==
+        registerJson(JSON.stringify(body.auth_data))
+    ) {
+      await recordBackupVersion(conn, user, row.version_no);
+    }
     return {};
   }
   const result = {
@@ -240,6 +259,7 @@ export async function backupKeys(
   input: unknown,
   limits: Limits,
 ): Promise<Json> {
+  if (action !== 'get') await requireBackupWriter(conn, user);
   if (version === null) {
     throw new MatrixError(400, 'M_MISSING_PARAM', 'version is required');
   }
@@ -356,6 +376,7 @@ export async function backupKeys(
       'UPDATE backup_versions SET etag=? WHERE localpart=? AND version_no=?',
       [row.etag, user, row.version_no],
     );
+    await recordBackupVersion(conn, user, row.version_no);
   }
   return await stats(conn, user, row);
 }
@@ -367,4 +388,225 @@ export async function clearBackup(conn: Conn, user: string): Promise<void> {
     "UPDATE backup_versions SET deleted=1,auth_data='{}',session_count=0,restore_bytes=? WHERE localpart=?",
     [EMPTY_BACKUP_BYTES, user],
   );
+}
+
+function semanticKey(user: string, version: string) {
+  return JSON.stringify(['backup', user, version]);
+}
+
+async function requireBackupWriter(conn: Conn, user: string) {
+  const authority = await tenantAuthority(conn);
+  if (authority && authority.node !== 'home') {
+    throw new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'operation requires home ingress',
+    );
+  }
+  // Standalone conn-level accounting callers need not create a user row. A held
+  // terminal account, however, must never recreate its cleared private data.
+  const [account] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [user],
+  );
+  if (account?.deactivated === 1) {
+    throw new MatrixError(403, 'M_USER_DEACTIVATED', 'account is deactivated');
+  }
+}
+
+type BackupRevision = {
+  version: string;
+  algorithm: string;
+  auth_data: Json;
+  etag: string;
+  deleted: boolean;
+  rooms: Record<string, { sessions: Record<string, Session> }>;
+};
+
+async function heldRevision(
+  conn: Conn,
+  user: string,
+  version: number,
+): Promise<BackupRevision> {
+  const row = await versionRow(conn, user, String(version));
+  const rooms: BackupRevision['rooms'] = Object.create(null);
+  for (
+    const session of await conn.query(
+      'SELECT room_id,session_id,payload FROM backup_sessions WHERE localpart=? AND version_no=? ORDER BY room_id,session_id',
+      [user, version],
+    )
+  ) {
+    const room = String(session.room_id);
+    (rooms[room] ??= { sessions: Object.create(null) })
+      .sessions[String(session.session_id)] = JSON.parse(
+        String(session.payload),
+      );
+  }
+  return {
+    version: String(version),
+    algorithm: row.algorithm,
+    auth_data: JSON.parse(row.auth_data),
+    etag: String(row.etag),
+    deleted: row.deleted === 1,
+    rooms,
+  };
+}
+
+async function recordBackupVersion(conn: Conn, user: string, version: number) {
+  const authority = await tenantAuthority(conn);
+  if (!authority) return;
+  if (authority.node !== 'home') throw new Error('backup source is not home');
+  await writeRegister(
+    conn,
+    { source: authority.node, incarnation: authority.incarnation },
+    semanticKey(user, String(version)),
+    'backup',
+    JSON.stringify(await heldRevision(conn, user, version)),
+  );
+}
+
+export async function backupOperations(conn: Conn, user: string) {
+  const keys = await conn.query(
+    "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='backup' AND json_extract(semantic_key,'$[1]')=? ORDER BY semantic_key",
+    [user],
+  );
+  const operations: RegisterOperation[] = [];
+  for (const key of keys) {
+    operations.push(
+      ...await registerOperations(conn, String(key.semantic_key)),
+    );
+  }
+  return operations;
+}
+
+export async function captureBackupOperations(conn: Conn, user: string) {
+  if ((await tenantAuthority(conn))?.node !== 'home') {
+    throw new Error('backup bootstrap requires home authority');
+  }
+  const [account] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [user],
+  );
+  if (!account || account.deactivated === 1) return [];
+  for (
+    const row of await conn.query(
+      'SELECT version_no FROM backup_versions WHERE localpart=? ORDER BY version_no',
+      [user],
+    )
+  ) {
+    const version = Number(row.version_no);
+    if (
+      !(await registerOperations(conn, semanticKey(user, String(version))))
+        .length
+    ) {
+      await recordBackupVersion(conn, user, version);
+    }
+  }
+  return await backupOperations(conn, user);
+}
+
+function revisionOf(
+  operation: RegisterOperation,
+  limits: Limits,
+): { user: string; revision: BackupRevision } {
+  let key: unknown, raw: unknown;
+  try {
+    key = JSON.parse(operation.semanticKey);
+    raw = JSON.parse(operation.payload);
+  } catch {
+    // Parser diagnostics may quote protected metadata or ciphertext.
+    throw new Error('invalid backup revision');
+  }
+  const body = object(raw, 'backup revision');
+  if (
+    !Array.isArray(key) || key.length !== 3 || key[0] !== 'backup' ||
+    typeof key[1] !== 'string' || !key[1] || typeof key[2] !== 'string' ||
+    operation.semanticKey !== semanticKey(key[1], key[2]) ||
+    operation.kind !== 'backup' || operation.source !== 'home' ||
+    body.version !== key[2] ||
+    Object.keys(body).sort().join(',') !==
+      'algorithm,auth_data,deleted,etag,rooms,version'
+  ) {
+    throw new Error('invalid backup revision');
+  }
+  versionNumber(key[2]);
+  if (
+    typeof body.algorithm !== 'string' || !body.algorithm ||
+    typeof body.etag !== 'string' || !/^(0|[1-9][0-9]*)$/.test(body.etag) ||
+    !Number.isSafeInteger(Number(body.etag)) ||
+    typeof body.deleted !== 'boolean'
+  ) {
+    throw new Error('invalid backup metadata');
+  }
+  object(body.auth_data, 'auth_data');
+  const rooms = object(body.rooms, 'rooms');
+  for (const [room, raw] of Object.entries(rooms)) {
+    if (!room) throw new Error('invalid backup room');
+    const row = object(raw, 'room');
+    if (Object.keys(row).join(',') !== 'sessions') {
+      throw new Error('invalid backup room');
+    }
+    for (
+      const [id, value] of Object.entries(object(row.sessions, 'sessions'))
+    ) {
+      if (
+        !id ||
+        registerJson(JSON.stringify(sessionData(value, limits))) !==
+          registerJson(JSON.stringify(value))
+      ) throw new Error('invalid backup session');
+    }
+  }
+  if (
+    body.deleted &&
+    (Object.keys(rooms).length || Object.keys(body.auth_data as Json).length)
+  ) throw new Error('deleted backup has private data');
+  return { user: key[1], revision: body as unknown as BackupRevision };
+}
+
+/** A complete home-authored revision is a read projection, not a second backup
+ * writer: no quality comparison, version allocation or independent etag bump. */
+export async function importBackup(
+  conn: Conn,
+  operation: RegisterOperation,
+  limits: Limits,
+  history?: DomainHistoryProof,
+) {
+  const { user } = revisionOf(operation, limits);
+  await requireTenantDomainSource(conn, operation, user, history);
+  const result = await importRegisterOperation(conn, operation);
+  const [account] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [user],
+  );
+  if (!account) throw new Error('backup account unavailable');
+  if (account.deactivated === 1 || !result.changed || !result.winner) return;
+  const { revision } = revisionOf(result.winner, limits);
+  const version = Number(revision.version);
+  const [previous] = await conn.query(
+    'SELECT 1 FROM backup_versions WHERE localpart=? AND version_no=?',
+    [user, version],
+  );
+  if (previous) await forgetBackupEntries(conn, user, version);
+  await conn.execute(
+    'INSERT INTO backup_versions(localpart,version_no,algorithm,auth_data,etag,deleted,session_count,restore_bytes) VALUES(?,?,?,?,?,?,0,?) ON CONFLICT(localpart,version_no) DO UPDATE SET algorithm=excluded.algorithm,auth_data=excluded.auth_data,etag=excluded.etag,deleted=excluded.deleted,session_count=0,restore_bytes=excluded.restore_bytes',
+    [
+      user,
+      version,
+      revision.algorithm,
+      JSON.stringify(revision.auth_data),
+      Number(revision.etag),
+      revision.deleted ? 1 : 0,
+      EMPTY_BACKUP_BYTES,
+    ],
+  );
+  for (const [room, row] of Object.entries(revision.rooms)) {
+    for (const [id, data] of Object.entries(row.sessions)) {
+      const payload = JSON.stringify(data);
+      await conn.execute(
+        'INSERT INTO backup_sessions(localpart,version_no,room_id,session_id,payload) VALUES(?,?,?,?,?)',
+        [user, version, room, id, payload],
+      );
+      await accountSession(conn, user, version, room, id, payload);
+    }
+  }
 }

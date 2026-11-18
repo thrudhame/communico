@@ -321,6 +321,39 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
   }
 });
 
+Deno.test('F2 backup manifest enables all replica reads while every write stays home-only', async () => {
+  const facade = capabilities('facade', 'f2');
+  for (
+    const path of [
+      'version',
+      'version/1',
+      'keys',
+      'keys/room',
+      'keys/room/session',
+    ]
+  ) {
+    const url = 'https://logical.test/_matrix/client/v3/room_keys/' + path;
+    assertEquals(facade.gate(new Request(url), () => true), null);
+    assertEquals(facade.gate(new Request(url), () => false)?.status, 503);
+    assertEquals(
+      capabilities('facade', 'f1').gate(new Request(url), () => true)?.status,
+      404,
+    );
+    for (
+      const method of path.startsWith('version')
+        ? (path === 'version' ? ['POST'] : ['PUT', 'DELETE'])
+        : ['PUT', 'DELETE']
+    ) {
+      const refusal = facade.gate(new Request(url, { method }), () => true)!;
+      assertEquals(refusal.status, 503);
+      assertEquals(await refusal.json(), {
+        errcode: 'M_UNAVAILABLE',
+        error: 'operation requires home ingress',
+      });
+    }
+  }
+});
+
 Deno.test('F2 room authoring and reads use client scope, not federation availability', () => {
   const facade = capabilities('facade', 'f2');
   const f1 = capabilities('facade', 'f1');

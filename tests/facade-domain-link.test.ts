@@ -870,6 +870,204 @@ Deno.test('domain OpenID: unseen selected account and later inventory receipt ca
   }
 });
 
+Deno.test('domain backup: signed home revisions retain ciphertext, exact etags, deletes and consumer availability', async () => {
+  const f = await fixture();
+  const metadata = {
+    algorithm: 'opaque',
+    auth_data: { key: 'public', extension: 0.5 },
+  };
+  const data = {
+    first_message_index: 2,
+    forwarded_count: 0,
+    is_verified: false,
+    session_data: { ciphertext: 'private-ciphertext' },
+  };
+  try {
+    await f.ht.tx((tx) =>
+      tx.keyBackup.version('alice', 'post', undefined, metadata)
+    );
+    await f.ht.tx((tx) =>
+      tx.keyBackup.keys('alice', 'put', '1', '!backup:logical.test', 's', data)
+    );
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      { ...metadata, version: '1', count: 1, etag: '1' },
+    );
+    assertEquals(
+      await tenant.tx((tx) =>
+        tx.keyBackup.keys('alice', 'get', '1', '!backup:logical.test', 's')
+      ),
+      data,
+    );
+    const absent = await assertRejects(
+      () => tenant.tx((tx) => tx.keyBackup.version('alice', 'get', '999')),
+      MatrixError,
+    );
+    assertEquals(absent.status, 404);
+    const before = await tenant.tx((tx) => tx.streams.heads());
+    const previous = Math.max(
+      ...(await f.hs.export('alice', f.bundle.id)).map((record) =>
+        record.sequence
+      ),
+    );
+    await f.ht.tx((tx) =>
+      tx.keyBackup.keys('alice', 'delete', '1', '!backup:logical.test', 's')
+    );
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > previous
+    );
+    await f.ej.receive('home', suffix);
+    const pending = await assertRejects(
+      () => tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      MatrixError,
+    );
+    assertEquals(pending.status, 503);
+    for (const record of suffix) await f.es.apply(f.ej, record);
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      { ...metadata, version: '1', count: 0, etag: '2' },
+    );
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.keys('alice', 'get', '1')),
+      { rooms: {} },
+    );
+    await f.toEdge(suffix);
+    assertEquals(await tenant.tx((tx) => tx.streams.heads()), before);
+    // Original home dots are retained, never echoed as facade authorship.
+    assertEquals(
+      (await f.es.export('alice')).filter((record) =>
+        (record.payload as { body: DomainOperation }).body.operation.kind ===
+          'backup'
+      ),
+      [],
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const node = await loadNode(
+        await reopened.server(),
+        'logical.test',
+        'edge_a',
+      );
+      const pairing = new Pairings(
+        await reopened.server(),
+        node.signer(),
+        node.publicKey,
+        'b'.repeat(64),
+        node,
+      );
+      const reopenedTenant = await enrolledTenant(
+        reopened,
+        pairing,
+        'logical.test',
+        'edge_a',
+      );
+      assertEquals(
+        await reopenedTenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+        { ...metadata, version: '1', count: 0, etag: '2' },
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain backup: legacy home versions are captured but older signed manifests cannot prove inventory', async () => {
+  const f = await fixture();
+  try {
+    await (await f.home.tenant('logical.test')).tx((conn) =>
+      conn.execute(
+        'INSERT INTO backup_versions(localpart,version_no,algorithm,auth_data,etag,deleted) VALUES(?,?,?,?,?,0)',
+        ['alice', 7, 'legacy', '{"key":"legacy-public"}', 4],
+      )
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      {
+        version: '7',
+        algorithm: 'legacy',
+        auth_data: { key: 'legacy-public' },
+        etag: '4',
+        count: 0,
+      },
+    );
+    const original = records.at(-1)!;
+    const payload = structuredClone(original.payload) as {
+      body: DomainBootstrap;
+      signature: string;
+    };
+    delete payload.body.backups;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    const legacy = await appendRecordForBackup(f, payload);
+    await f.toEdge([legacy]);
+    const unavailable = await assertRejects(
+      () => tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      MatrixError,
+    );
+    assertEquals(unavailable.status, 503);
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), null);
+  } finally {
+    await f.close();
+  }
+});
+
+async function appendRecordForBackup(
+  f: Awaited<ReturnType<typeof fixture>>,
+  payload: { body: DomainBootstrap; signature: string },
+) {
+  return await (await f.home.server()).tx((conn) =>
+    appendRecord(conn, f.node.node, {
+      source: 'home',
+      incarnation: f.bundle.id,
+      stream: 'domain:@alice:logical.test',
+      type: 'domain-operation',
+      version: 1,
+      operationId: 'domain-bootstrap:' +
+        createHash('sha256').update(canonicalJson(payload.body)).digest('hex'),
+      payload,
+    })
+  );
+}
+
 Deno.test('domain link: semantic operations have an explicitly negotiated reader', () => {
   assertEquals(
     LINK_SUPPORTED.some((item) =>

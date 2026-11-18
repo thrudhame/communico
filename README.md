@@ -437,6 +437,17 @@ matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
 ## Facade replication progress
 
+Encrypted key backup is home-owned. F2 facade reads retain selected complete
+home version revisions, including their original etags and encrypted sessions;
+every backup mutation still requires home ingress, even while home is online.
+Reads require a signed backup inventory and the applied domain prefix. Missing
+inventory or received-but-unapplied changes are 503, not false missing backups.
+Imports never re-run quality selection or allocate versions/etags. Deactivation
+cannot restore cleared ciphertext. Changed enrolled versions retain complete
+version facts, so replication/storage cost includes that version's ciphertext;
+unchanged uploads do not add a fact. Old protected journal facts remain subject
+to the deployment's backup/retention protection.
+
 Distributed OpenID credentials retain only digest/expiry facts in the signed
 semantic journal. Issuance commits that intent with the credential; imports
 preserve its original issuer and expiry, never create client sessions, and

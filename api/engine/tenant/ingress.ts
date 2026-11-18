@@ -6,7 +6,11 @@ export type AuthIntent =
   | { kind: 'session'; hash: string; refresh: boolean }
   | { kind: 'password'; localpart: string }
   | { kind: 'account'; localpart: string }
-  | { kind: 'domain'; localpart: string; feature?: 'filters' | 'openid' }
+  | {
+    kind: 'domain';
+    localpart: string;
+    feature?: 'filters' | 'openid' | 'backups';
+  }
   | { kind: 'openid'; hash: string }
   | { kind: 'device'; localpart: string; deviceId: string };
 

@@ -219,6 +219,25 @@ const F2_MEMBERSHIP: readonly Rule[] = [
 // B8 adds each private surface only after its owning semantic contract exists.
 const F2_CLIENT_DATA: readonly Rule[] = [
   route(
+    'GET',
+    /^\/_matrix\/client\/v3\/room_keys\/(?:version(?:\/[^/]+)?|keys(?:\/[^/]+(?:\/[^/]+)?)?)$/,
+    'domain',
+  ),
+  route(
+    'POST',
+    /^\/_matrix\/client\/v3\/room_keys\/version$/,
+    'domain',
+    'home',
+  ),
+  ...['PUT', 'DELETE'].map((method) =>
+    route(
+      method,
+      /^\/_matrix\/client\/v3\/room_keys\/(?:version\/[^/]+|keys(?:\/[^/]+(?:\/[^/]+)?)?)$/,
+      'domain',
+      'home',
+    )
+  ),
+  route(
     'POST',
     /^\/_matrix\/client\/v3\/user\/[^/]+\/openid\/request_token$/,
     'domain',

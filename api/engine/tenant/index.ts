@@ -192,29 +192,42 @@ function bind(
     },
     keyBackup: {
       clear: (localpart: string) => keyBackup.clearBackup(conn, localpart),
-      version: (
+      operations: (localpart: string) =>
+        keyBackup.backupOperations(conn, localpart),
+      import: (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => keyBackup.importBackup(conn, operation, config().e2ee, history),
+      version: async (
         localpart: string,
         action: keyBackup.Action,
         version?: string,
         input?: unknown,
-      ) =>
-        keyBackup.backupVersion(
+      ) => {
+        if (action === 'get') {
+          await authorize({ kind: 'domain', localpart, feature: 'backups' });
+        }
+        return await keyBackup.backupVersion(
           conn,
           localpart,
           action,
           version,
           input,
           config().e2ee,
-        ),
-      keys: (
+        );
+      },
+      keys: async (
         localpart: string,
         action: keyBackup.Action,
         version: string | null,
         room?: string,
         session?: string,
         input?: unknown,
-      ) =>
-        keyBackup.backupKeys(
+      ) => {
+        if (action === 'get') {
+          await authorize({ kind: 'domain', localpart, feature: 'backups' });
+        }
+        return await keyBackup.backupKeys(
           conn,
           localpart,
           action,
@@ -223,7 +236,8 @@ function bind(
           session,
           input,
           config().e2ee,
-        ),
+        );
+      },
     },
     keySignatures: {
       basis: async (localpart: string) => {
