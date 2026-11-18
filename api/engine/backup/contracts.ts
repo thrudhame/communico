@@ -103,6 +103,8 @@ export const tableContracts = {
       'device_operations',
       'signing_operations',
       'signature_operations',
+      // Includes nullable per-receipt projection_revision, semantic result and
+      // publication hints. counters also retains the legacy projection cut.
       'facade_link_applications',
       'key_bootstrap_publications',
       'device_creation_history',

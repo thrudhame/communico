@@ -18,16 +18,17 @@ import {
   completeIngressToDevice,
   importToDeviceOperation,
   type ToDeviceIngressReceipt,
+  toDeviceMessageHash,
   type ToDeviceOperation,
 } from '#engine/tenant/todevice-routing.ts';
 import {
+  applyLinkApplication,
   linkApplication,
-  retainLinkApplication,
+  type LinkApplicationIdentity,
+  linkApplicationProjection,
 } from '#engine/tenant/link-applications.ts';
-import {
-  pendingTenantProjection,
-  tenantChangesCommitted,
-} from '#engine/tenant/hooks.ts';
+import { tenantChangesCommitted } from '#engine/tenant/hooks.ts';
+import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import { checkLocalpart } from '#engine/tenant/users.ts';
 import { syncStreamHeads } from '#engine/tenant/streams.ts';
 import { type DomainBinding, requireDomainControl } from './domain-control.ts';
@@ -82,6 +83,24 @@ function operationId(view: ToDeviceView) {
 
 function streamName(localpart: string, server: string) {
   return 'to-device:@' + localpart + ':' + server;
+}
+
+// These are local operation/capture identities, never wire records or authority.
+// Admission still runs before consulting their exact tenant completion witness.
+function captureIdentity(
+  source: string,
+  incarnation: string,
+  stream: string,
+  sequence: number,
+  input: unknown,
+): LinkApplicationIdentity {
+  return {
+    source,
+    incarnation,
+    stream,
+    sequence,
+    hash: createHash('sha256').update(canonicalJson(input)).digest('hex'),
+  };
 }
 
 export function isToDeviceStream(stream: Stream): boolean {
@@ -211,14 +230,18 @@ export class ToDeviceOperations {
         bindings.push(view);
       }
     });
-    const { result, pending, changed } =
-      await (await this.store.tenant(context.server)).tx(async (conn) => {
+    const application = await (await this.store.tenant(context.server)).tx(
+      async (conn) => {
         unchanged();
         for (const view of bindings) await this.tenantSelected(conn, view);
+        const identity = await tenantAuthority(conn);
+        if (!identity) mismatch('ingress source unavailable');
         const before = await syncStreamHeads(conn);
         const [beforeOperation] = await conn.query(
           'SELECT operation_id FROM to_device_operations ORDER BY rowid DESC LIMIT 1',
         );
+        // Completion witnesses do not replace the tenant's input/manifest
+        // validation. Replays still pass the original admission owner first.
         if (receipt) {
           await completeIngressToDevice(
             conn,
@@ -248,35 +271,60 @@ export class ToDeviceOperations {
             );
           }
         }
-        const result = receipt ??
-          await captureIngressToDevice(
-            conn,
-            origin,
-            input.id,
-            input.sender,
-            input.type,
-            context.server,
-            input.messages,
-          );
-        const pending = await pendingTenantProjection(conn);
-        const inboxChanged =
-          (await syncStreamHeads(conn)).inbox !== before.inbox;
+        const applied = await applyLinkApplication(
+          conn,
+          'local',
+          captureIdentity(
+            identity.node,
+            identity.incarnation,
+            'to-device-ingress:' + canonicalJson([origin, input.id]),
+            0,
+            toDeviceMessageHash(
+              input.sender,
+              input.type,
+              context.server,
+              input.messages,
+            ),
+          ),
+          async () => {
+            const result = receipt ??
+              await captureIngressToDevice(
+                conn,
+                origin,
+                input.id,
+                input.sender,
+                input.type,
+                context.server,
+                input.messages,
+              );
+            const inboxChanged =
+              (await syncStreamHeads(conn)).inbox !== before.inbox;
+            const [afterOperation] = await conn.query(
+              'SELECT operation_id FROM to_device_operations ORDER BY rowid DESC LIMIT 1',
+            );
+            const changed = inboxChanged ||
+              beforeOperation?.operation_id !== afterOperation?.operation_id;
+            return { result: { receipt: result, changed } };
+          },
+          true,
+        );
         const [afterOperation] = await conn.query(
           'SELECT operation_id FROM to_device_operations ORDER BY rowid DESC LIMIT 1',
         );
-        const changed = inboxChanged ||
+        const changed = (await syncStreamHeads(conn)).inbox !== before.inbox ||
           beforeOperation?.operation_id !== afterOperation?.operation_id;
         unchanged();
-        return { result, pending, changed };
-      });
+        return { ...applied, changed };
+      },
+    );
     await tenantChangesCommitted(
       this.store,
       context.server,
-      pending,
-      changed,
+      application.projectionRevision,
+      application.changed,
       receipt ? 'replica' : 'local',
     );
-    return result;
+    return application.result.receipt;
   }
 
   async export(localpart: string, pairing?: string) {
@@ -321,32 +369,52 @@ export class ToDeviceOperations {
       [peer, context.id, scope],
     );
     const after = exported ? Number(exported.source_cut) : 0;
-    const { operations, pending, inboxChanged } =
-      await (await this.store.tenant(binding.server)).tx(async (conn) => {
+    const application = await (await this.store.tenant(binding.server)).tx(
+      async (conn) => {
         unchanged();
         await this.tenantSelected(conn, binding);
         const before = await syncStreamHeads(conn);
-        const operations = await captureToDeviceOperations(
+        const applied = await applyLinkApplication(
           conn,
-          localpart,
-          after,
+          'local',
+          captureIdentity(
+            binding.source,
+            binding.incarnation,
+            'to-device-capture:' + scope,
+            after,
+            { binding, after },
+          ),
+          async () => {
+            const operations = await captureToDeviceOperations(
+              conn,
+              localpart,
+              after,
+            );
+            const inboxChanged =
+              (await syncStreamHeads(conn)).inbox !== before.inbox;
+            return {
+              result: { operations, inboxChanged },
+              retain: operations.length > 0 || inboxChanged,
+            };
+          },
+          true,
         );
-        const pending = await pendingTenantProjection(conn);
         const inboxChanged =
           (await syncStreamHeads(conn)).inbox !== before.inbox;
         unchanged();
-        return { operations, pending, inboxChanged };
-      });
+        return { ...applied, inboxChanged };
+      },
+    );
     // Capture can discharge an already-admitted selector as its scope arrives.
     await tenantChangesCommitted(
       this.store,
       binding.server,
-      pending,
-      inboxChanged,
+      application.projectionRevision,
+      application.inboxChanged,
       'replica',
     );
     const records = [];
-    for (const operation of operations) {
+    for (const operation of application.result.operations) {
       const view = viewOf({ ...binding, kind: 'to-device', operation });
       const signed = {
         body: view,
@@ -408,16 +476,21 @@ export class ToDeviceOperations {
       (!this.node && view.pairing !== pairing)
     ) mismatch('to-device completion differs from local scope');
     const tenant = await this.store.tenant(this.tenant.serverName);
-    const { prior, pending } = await tenant.tx(async (conn) => ({
-      prior: await linkApplication(conn, peer, record),
-      pending: await pendingTenantProjection(conn),
-    }));
+    const { prior, projectionRevision } = await tenant.tx(async (conn) => {
+      const prior = await linkApplication(conn, peer, record);
+      return {
+        prior,
+        projectionRevision: prior
+          ? await linkApplicationProjection(conn, prior)
+          : 0,
+      };
+    });
     if (prior) {
       const { inboxChanged, ...result } = object(prior.result);
       await tenantChangesCommitted(
         this.store,
         this.tenant.serverName,
-        pending,
+        projectionRevision,
         inboxChanged === true,
         'replica',
       );
@@ -458,30 +531,39 @@ export class ToDeviceOperations {
       await this.selected(conn, grant, view.localpart);
       await requireDomainControl(conn, view);
     });
-    const { result, projectionRevision, inboxChanged } = await tenant.tx(
+    const application = await tenant.tx(
       async (conn) => {
         unchanged();
         await this.tenantSelected(conn, view);
-        const before = await syncStreamHeads(conn);
-        await importToDeviceOperation(conn, view.operation, view, view.server);
-        const result = { operationId: view.operation.operationId };
-        const inboxChanged =
-          (await syncStreamHeads(conn)).inbox !== before.inbox;
-        await retainLinkApplication(conn, peer, record, {
-          ...result,
-          inboxChanged,
-        });
-        const projectionRevision = await pendingTenantProjection(conn);
+        const applied = await applyLinkApplication(
+          conn,
+          peer,
+          record,
+          async () => {
+            const before = await syncStreamHeads(conn);
+            await importToDeviceOperation(
+              conn,
+              view.operation,
+              view,
+              view.server,
+            );
+            const result = { operationId: view.operation.operationId };
+            const inboxChanged =
+              (await syncStreamHeads(conn)).inbox !== before.inbox;
+            return { result: { ...result, inboxChanged } };
+          },
+        );
         // Revocation before this admission cut rolls back fact, inbox and receipt.
         // A successful commit is immutable admitted work even across retirement.
         unchanged();
-        return { result, projectionRevision, inboxChanged };
+        return applied;
       },
     );
+    const { inboxChanged, ...result } = application.result;
     await tenantChangesCommitted(
       this.store,
       this.tenant.serverName,
-      projectionRevision,
+      application.projectionRevision,
       inboxChanged,
       'replica',
     );

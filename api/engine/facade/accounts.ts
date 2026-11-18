@@ -28,10 +28,8 @@ import {
   validateSessionAuthority,
 } from '#engine/tenant/session-authority.ts';
 import { captureErasureCuts } from '#engine/tenant/erasure.ts';
-import {
-  pendingTenantProjection,
-  tenantChangesCommitted,
-} from '#engine/tenant/hooks.ts';
+import { tenantChangesCommitted } from '#engine/tenant/hooks.ts';
+import { applyLinkApplication } from '#engine/tenant/link-applications.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControls } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
@@ -467,38 +465,47 @@ export class AccountSnapshots {
         )
         ? await captureErasureCuts(this.store)
         : undefined;
-    const { projectionRevision, publicKeysChanged } =
-      await (await this.store.tenant(view.server)).tx(
-        async (conn) => {
-          await requireControl(conn, view);
-          const identity = await tenantAuthority(conn);
-          if (
-            identity?.node !== 'home' || identity.edgeNode !== view.source ||
-            identity.edgeIncarnation !== view.incarnation ||
-            !await userByLocalpart(conn, view.localpart)
-          ) {
-            mismatch('session authority tenant is not the selected home');
-          }
-          const keyCut = await keyChangesCut(conn);
-          await installSessionAuthority(
-            conn,
-            view.localpart,
-            view.authority,
-            cuts,
-          );
-          return {
-            projectionRevision: await pendingTenantProjection(conn),
-            publicKeysChanged: await publicKeysChangedAfter(conn, keyCut),
-          };
-        },
-      );
+    const application = await (await this.store.tenant(view.server)).tx(
+      async (conn) => {
+        await requireControl(conn, view);
+        const identity = await tenantAuthority(conn);
+        if (
+          identity?.node !== 'home' || identity.edgeNode !== view.source ||
+          identity.edgeIncarnation !== view.incarnation ||
+          !await userByLocalpart(conn, view.localpart)
+        ) {
+          mismatch('session authority tenant is not the selected home');
+        }
+        return await applyLinkApplication(
+          conn,
+          context.node,
+          record,
+          async () => {
+            const keyCut = await keyChangesCut(conn);
+            await installSessionAuthority(
+              conn,
+              view.localpart,
+              view.authority,
+              cuts,
+            );
+            return {
+              result: {
+                localpart: view.localpart,
+                publicKeysChanged: await publicKeysChangedAfter(conn, keyCut),
+              },
+            };
+          },
+          true,
+        );
+      },
+    );
     await tenantChangesCommitted(
       this.store,
       view.server,
-      projectionRevision,
+      application.projectionRevision,
       false,
       'replica',
-      publicKeysChanged,
+      application.result.publicKeysChanged,
     );
     return await journal.apply(context.node, stream, async (conn, current) => {
       await check(conn);
@@ -638,28 +645,48 @@ export class AccountSnapshots {
           )
           ? await captureErasureCuts(this.store)
           : undefined;
-        const { projectionRevision, publicKeysChanged, inboxChanged } =
-          await (await this.store.tenant(view.server))
-            .tx(async (conn) => {
-              const keyCut = await keyChangesCut(conn);
-              const before = await syncStreamHeads(conn);
-              if (await current(conn)) {
-                await publishAccountAuth(conn, view, record, cuts);
-              }
-              return {
-                projectionRevision: await pendingTenantProjection(conn),
-                publicKeysChanged: await publicKeysChangedAfter(conn, keyCut),
-                inboxChanged:
-                  (await syncStreamHeads(conn)).inbox !== before.inbox,
-              };
-            });
+        const application = await (await this.store.tenant(view.server))
+          .tx(async (conn) => {
+            return await applyLinkApplication(
+              conn,
+              'home',
+              record,
+              async () => {
+                const keyCut = await keyChangesCut(conn);
+                const before = await syncStreamHeads(conn);
+                let projectionRevision = 0;
+                if (await current(conn)) {
+                  projectionRevision = await publishAccountAuth(
+                    conn,
+                    view,
+                    record,
+                    cuts,
+                  );
+                }
+                return {
+                  projectionRevision,
+                  result: {
+                    localpart: view.localpart,
+                    cut: view.sourceCut,
+                    revision: view.revision,
+                    publicKeysChanged: await publicKeysChangedAfter(
+                      conn,
+                      keyCut,
+                    ),
+                    inboxChanged:
+                      (await syncStreamHeads(conn)).inbox !== before.inbox,
+                  },
+                };
+              },
+            );
+          });
         await tenantChangesCommitted(
           this.store,
           view.server,
-          projectionRevision,
-          inboxChanged,
+          application.projectionRevision,
+          application.result.inboxChanged,
           'replica',
-          publicKeysChanged,
+          application.result.publicKeysChanged,
         );
         return {
           localpart: view.localpart,

@@ -34,14 +34,12 @@ import {
   type SignatureOperation,
 } from '#engine/tenant/signature-operations.ts';
 import {
+  applyLinkApplication,
   linkApplication,
-  retainLinkApplication,
+  linkApplicationProjection,
 } from '#engine/tenant/link-applications.ts';
 import { checkLocalpart } from '#engine/tenant/users.ts';
-import {
-  pendingTenantProjection,
-  tenantChangesCommitted,
-} from '#engine/tenant/hooks.ts';
+import { tenantChangesCommitted } from '#engine/tenant/hooks.ts';
 import {
   captureKeyHistory,
   type KeyBootstrap,
@@ -509,16 +507,21 @@ export class DeviceOperations {
       mismatch('device completion differs from local scope');
     }
     const tenant = await this.store.tenant(this.tenant.serverName);
-    const { prior, pending } = await tenant.tx(async (conn) => ({
-      prior: await linkApplication(conn, peer, record),
-      pending: await pendingTenantProjection(conn),
-    }));
+    const { prior, projectionRevision } = await tenant.tx(async (conn) => {
+      const prior = await linkApplication(conn, peer, record);
+      return {
+        prior,
+        projectionRevision: prior
+          ? await linkApplicationProjection(conn, prior)
+          : 0,
+      };
+    });
     if (prior) {
       const { publicKeysChanged, ...result } = object(prior.result);
       await tenantChangesCommitted(
         this.store,
         this.tenant.serverName,
-        pending,
+        projectionRevision,
         false,
         'replica',
         publicKeysChanged === true,
@@ -571,72 +574,86 @@ export class DeviceOperations {
       await requireDomainControl(conn, view);
     };
     await server.tx(check);
-    const { result, projectionRevision, publicKeysChanged } = await tenant.tx(
+    const application = await tenant.tx(
       async (conn) => {
         unchanged();
         await this.tenantSelected(conn, view);
-        const keyCut = await keyChangesCut(conn);
-        if (view.kind === 'key-bootstrap') {
-          await retainKeyBootstrap(conn, view, record.sequence, record.hash);
-        } else {
-          const kind = view.kind === 'key-history' ? view.keyKind : view.kind;
-          const expected = {
-            source: view.operation.source,
-            incarnation: view.operation.incarnation,
-            localpart: view.localpart,
-          };
-          if (kind === 'device-operation') {
-            await importDeviceOperation(
+        const applied = await applyLinkApplication(
+          conn,
+          peer,
+          record,
+          async () => {
+            const keyCut = await keyChangesCut(conn);
+            if (view.kind === 'key-bootstrap') {
+              await retainKeyBootstrap(
+                conn,
+                view,
+                record.sequence,
+                record.hash,
+              );
+            } else {
+              const kind = view.kind === 'key-history'
+                ? view.keyKind
+                : view.kind;
+              const expected = {
+                source: view.operation.source,
+                incarnation: view.operation.incarnation,
+                localpart: view.localpart,
+              };
+              if (kind === 'device-operation') {
+                await importDeviceOperation(
+                  conn,
+                  view.operation,
+                  expected,
+                  history,
+                );
+              } else if (kind === 'signing-operation') {
+                await importSigningOperation(
+                  conn,
+                  view.operation,
+                  expected,
+                  history,
+                );
+              } else if (kind === 'signature-operation') {
+                await importSignatureOperation(
+                  conn,
+                  view.operation,
+                  expected,
+                  history,
+                );
+              } else {
+                await importDevicePublication(
+                  conn,
+                  view.operation,
+                  expected,
+                  history,
+                );
+              }
+            }
+            const result = {
+              operationId: view.kind === 'key-bootstrap'
+                ? record.operationId
+                : view.operation.operationId,
+            };
+            const publicKeysChanged = await publicKeysChangedAfter(
               conn,
-              view.operation,
-              expected,
-              history,
+              keyCut,
             );
-          } else if (kind === 'signing-operation') {
-            await importSigningOperation(
-              conn,
-              view.operation,
-              expected,
-              history,
-            );
-          } else if (kind === 'signature-operation') {
-            await importSignatureOperation(
-              conn,
-              view.operation,
-              expected,
-              history,
-            );
-          } else {
-            await importDevicePublication(
-              conn,
-              view.operation,
-              expected,
-              history,
-            );
-          }
-        }
-        const result = {
-          operationId: view.kind === 'key-bootstrap'
-            ? record.operationId
-            : view.operation.operationId,
-        };
-        const publicKeysChanged = await publicKeysChangedAfter(conn, keyCut);
-        await retainLinkApplication(conn, peer, record, {
-          ...result,
-          publicKeysChanged,
-        });
-        const projectionRevision = await pendingTenantProjection(conn);
+            return { result: { ...result, publicKeysChanged } };
+          },
+        );
         // This synchronous fence is the admission cut. A retirement begun before
         // it rolls back fact + receipt. Once it passes, a successful owner commit
         // is admitted immutable work, even if revocation overlaps native COMMIT.
         unchanged();
-        return { result, projectionRevision, publicKeysChanged };
+        return applied;
       },
     );
+    const { publicKeysChanged, ...result } = application.result;
     await tenantChangesCommitted(
       this.store,
       this.tenant.serverName,
-      projectionRevision,
+      application.projectionRevision,
       false,
       'replica',
       publicKeysChanged,

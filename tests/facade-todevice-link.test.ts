@@ -27,7 +27,11 @@ import { deleteDevices, upsertDevice } from '#engine/tenant/devices.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
-import { pendingTenantProjection } from '#engine/tenant/hooks.ts';
+import {
+  pendingTenantProjection,
+  recordTenantProjection,
+  setTenantProjector,
+} from '#engine/tenant/hooks.ts';
 import { insertMessage } from '#engine/tenant/todevice.ts';
 import { acceptIngressEdu } from '#engine/facade/ingress-edus.ts';
 import { eduState } from '#engine/federation/edus.ts';
@@ -1284,7 +1288,9 @@ Deno.test('to-device link: server selection, tenant selection and tenant control
       assertEquals(await db.query('SELECT * FROM to_device_operations'), []);
       assertEquals(await db.query('SELECT * FROM to_device_inbox'), []);
       assertEquals(
-        await db.query('SELECT * FROM facade_link_applications'),
+        await db.query('SELECT * FROM facade_link_applications WHERE hash=?', [
+          record.hash,
+        ]),
         [],
       );
       assertEquals(
@@ -1342,7 +1348,9 @@ Deno.test('to-device link: signature, stream, source, scope, version and operati
       assertEquals(await db.query('SELECT * FROM to_device_operations'), []);
       assertEquals(await db.query('SELECT * FROM to_device_inbox'), []);
       assertEquals(
-        await db.query('SELECT * FROM facade_link_applications'),
+        await db.query('SELECT * FROM facade_link_applications WHERE hash=?', [
+          record.hash,
+        ]),
         [],
       );
     } finally {
@@ -1453,7 +1461,10 @@ Deno.test('to-device link: retirement before or during admission rolls back inbo
         assertEquals(await db.query('SELECT * FROM to_device_operations'), []);
         assertEquals(await db.query('SELECT * FROM to_device_inbox'), []);
         assertEquals(
-          await db.query('SELECT * FROM facade_link_applications'),
+          await db.query(
+            'SELECT * FROM facade_link_applications WHERE hash=?',
+            [record.hash],
+          ),
           [],
         );
         assertEquals(
@@ -1466,6 +1477,157 @@ Deno.test('to-device link: retirement before or during admission rolls back inbo
     }
   }
 });
+
+for (const phase of ['capture', 'new application', 'replay']) {
+  Deno.test(`to-device projection obligation: ${phase} does not adopt unrelated work`, async () => {
+    const f = await fixture();
+    try {
+      await send(f, 'home');
+      const source = await f.home.tenant('logical.test');
+      const unrelatedSource = phase === 'capture'
+        ? await source.tx(recordTenantProjection)
+        : 0;
+      let projections = 0;
+      setTenantProjector(() => {
+        projections++;
+        return Promise.resolve();
+      });
+      const records = await f.hs.export('alice', f.bundle.id);
+      if (phase === 'capture') {
+        assertEquals(
+          projections,
+          0,
+          'source capture owns no unrelated projection',
+        );
+        assertEquals(await pendingTenantProjection(source), unrelatedSource);
+        return;
+      }
+      const db = await f.edge.tenant('logical.test');
+      const unrelated = phase === 'new application'
+        ? await db.tx(recordTenantProjection)
+        : 0;
+      for (const record of records) {
+        await f.ej.receive('home', [record]);
+        const complete = f.ej.complete.bind(f.ej);
+        f.ej.complete = () => Promise.reject(new Error('projection ACK loss'));
+        await assertRejects(
+          () => f.es.apply(f.ej, record),
+          Error,
+          'projection ACK loss',
+        );
+        f.ej.complete = complete;
+        if (phase === 'new application') {
+          assertEquals(
+            projections,
+            0,
+            'new application owns no unrelated projection',
+          );
+          assertEquals(await pendingTenantProjection(db), unrelated);
+          continue;
+        }
+        const later = await db.tx(recordTenantProjection);
+        assertEquals(await f.es.apply(f.ej, record), true);
+        assertEquals(projections, 0, 'replay owns no later projection');
+        assertEquals(await pendingTenantProjection(db), later);
+      }
+      assert(records.length > 0);
+    } finally {
+      setTenantProjector(undefined);
+      await f.close();
+    }
+  });
+}
+
+for (const phase of ['ingress', 'ingress retry']) {
+  Deno.test(`to-device projection obligation: ${phase} keeps its own cut, not unrelated projection`, async () => {
+    const f = await fixture();
+    try {
+      const db = await f.edge.tenant('logical.test');
+      await projectTenant(f.edge, 'logical.test');
+      const earlier = phase === 'ingress'
+        ? await db.tx(recordTenantProjection)
+        : 0;
+      const raw = {
+        sender: '@remote:remote.test',
+        type: 'm.room_key',
+        message_id: 'projection-ingress',
+        messages: { '@alice:logical.test': { '*': { session_id: 'fresh' } } },
+      };
+      let projections = 0;
+      setTenantProjector(() => {
+        projections++;
+        return Promise.resolve();
+      });
+      const receipt = await f.es.ingress('remote.test', raw);
+      if (phase === 'ingress') {
+        assertEquals(projections, 0, 'ingress owns no earlier projection');
+        assertEquals(await pendingTenantProjection(db), earlier);
+        return;
+      }
+      const later = await db.tx(recordTenantProjection);
+      assertEquals(await f.es.ingress('remote.test', raw), receipt);
+      assertEquals(projections, 0, 'ingress retry owns no later projection');
+      assertEquals(await pendingTenantProjection(db), later);
+      assertEquals((await db.query('SELECT * FROM to_device_inbox')).length, 1);
+    } finally {
+      setTenantProjector(undefined);
+      await f.close();
+    }
+  });
+}
+
+for (
+  const phase of ['selector ordering', 'manifest ordering', 'forged manifest']
+) {
+  Deno.test(`to-device ingress receipt: ${phase} preserves exact replay validation`, async () => {
+    const f = await fixture();
+    try {
+      const content = {
+        sender: '@remote:remote.test',
+        type: 'm.room_key',
+        message_id: 'receipt-order',
+        messages: {
+          '@alice:logical.test': {
+            '*': { session_id: 'wildcard' },
+            PHONE: { session_id: 'phone' },
+          },
+        },
+      };
+      const receipt = await f.es.ingress('remote.test', content);
+      const records = await f.es.export('alice');
+      await f.hj.receive('edge_a', records);
+      for (const record of records) await f.hs.apply(f.hj, record, f.bundle.id);
+      await f.hs.ingress('remote.test', content, receipt, f.bundle.id);
+      const reordered = structuredClone(content);
+      reordered.messages['@alice:logical.test'] = Object.fromEntries(
+        Object.entries(content.messages['@alice:logical.test']).reverse(),
+      ) as typeof content.messages['@alice:logical.test'];
+      if (phase === 'selector ordering') {
+        assertEquals(await f.es.ingress('remote.test', reordered), receipt);
+        return;
+      }
+      const manifest = structuredClone(receipt);
+      manifest.routes.reverse();
+      if (phase === 'manifest ordering') {
+        assertEquals(
+          await f.hs.ingress('remote.test', content, manifest, f.bundle.id),
+          receipt,
+        );
+        return;
+      }
+      const forged = structuredClone(receipt);
+      forged.routes.pop();
+      const error = await assertRejects(
+        () => f.hs.ingress('remote.test', content, forged, f.bundle.id),
+        Error,
+        'identity changed',
+      );
+      assertEquals((error as Error & { status: number }).status, 400);
+    } finally {
+      await f.close();
+    }
+  });
+}
 
 Deno.test('to-device link: committed receipt survives retirement, ACK loss and cold replay without expansion to replacement', async () => {
   for (const side of ['home', 'edge'] as const) {

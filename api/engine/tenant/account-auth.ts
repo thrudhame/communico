@@ -26,6 +26,7 @@ import {
   captureDeviceStreamFloor,
   installDeviceStreamFloor,
 } from '#engine/tenant/device-stream.ts';
+import { pendingTenantProjection } from '#engine/tenant/hooks.ts';
 
 export const ACCOUNT_AUTH_SQL = `
 CREATE TABLE account_auth_sources(localpart TEXT PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,material_hash TEXT NOT NULL,captured_ms INTEGER NOT NULL);
@@ -287,15 +288,16 @@ export type AuthSnapshotBinding = {
   sourceCut?: number;
 };
 
-/** The verified receiver publishes admission with the installed owner state.
- * The server journal ACK is a recoverable projection, not a second commit point
- * that can be paired with a newer tenant snapshot by a concurrent request. */
+/** Publish admission with its installed owner state. The caller retains this
+ * obligation in its link application transaction. An exact old publication with
+ * no such receipt predates that metadata and needs conservative recovery. New
+ * replays use their receipt and never rediscover the tenant's pending marker. */
 export async function publishAccountAuth(
   conn: Conn,
   view: AccountAuth,
   cut: { sequence: number; hash: string },
   erasureCuts?: Record<string, ErasureCut>,
-): Promise<void> {
+): Promise<number> {
   const [held] = await conn.query(
     'SELECT pairing,source_cut,sequence,hash FROM account_auth_publications WHERE localpart=?',
     [view.localpart],
@@ -305,6 +307,9 @@ export async function publishAccountAuth(
     Number(held.source_cut) === view.sourceCut &&
     (Number(held.sequence) !== cut.sequence || held.hash !== cut.hash)
   ) authUnavailable();
+  const replay = held?.pairing === view.pairing &&
+    Number(held.source_cut) === view.sourceCut;
+  const before = await pendingTenantProjection(conn);
   await installAccountAuth(conn, view, erasureCuts);
   await conn.execute(
     'INSERT INTO account_auth_publications(localpart,pairing,grant_revision,owner_revision,source_cut,sequence,hash) VALUES(?,?,?,?,?,?,?) ON CONFLICT(localpart) DO UPDATE SET pairing=excluded.pairing,grant_revision=excluded.grant_revision,owner_revision=excluded.owner_revision,source_cut=excluded.source_cut,sequence=excluded.sequence,hash=excluded.hash',
@@ -318,6 +323,8 @@ export async function publishAccountAuth(
       cut.hash,
     ],
   );
+  const pending = await pendingTenantProjection(conn);
+  return replay || pending !== before ? pending : 0;
 }
 
 /** Read both halves at the caller's tenant transaction cut. Bare installation

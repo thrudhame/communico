@@ -56,6 +56,28 @@ export async function auditTenant(db: CapturedQuery, id: string) {
     fingerprint: createHash('sha256').update(pub).digest('hex'),
   };
   const heads = await counters(db);
+  // Receipt-owned projection cuts (NULL is legacy), and the upgrade's legacy
+  // capture witness, are retained obligations bounded by the tenant allocator.
+  for await (
+    const receipt of scan(
+      db,
+      'facade_link_applications',
+      'projection_revision',
+      'projection_revision IS NOT NULL',
+    )
+  ) {
+    if (
+      nonnegative(receipt.projection_revision, 'invalid link projection cut') >
+        (heads.projection_revision ?? 0)
+    ) {
+      auditFailure('link projection cut exceeds allocator');
+    }
+  }
+  if (
+    (heads.facade_projection_legacy ?? 0) > (heads.projection_revision ?? 0)
+  ) {
+    auditFailure('legacy link projection cut exceeds allocator');
+  }
   for (const table of new Set(Object.values(tenantProjectionSources))) {
     const [{ head }] = await db.query(
       `SELECT COALESCE(MAX(pos),0) AS head FROM ${table}`,
