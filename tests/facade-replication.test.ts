@@ -334,7 +334,18 @@ Deno.test('operator replication progress distinguishes exact source, publication
       ])).sources,
       [],
     );
-    assertEquals((await readEdge()).sources, []);
+    const replica = await f.replica();
+    assertEquals((await readEdge()).sources, [{
+      scope,
+      cut: await replica.tx((tx) => tx.changes.head()),
+    }]);
+    assertEquals(
+      (await replicationProgress(f.edgeStore(), f.tenant.serverName, 'facade', [
+        'public:@alice:' + f.tenant.serverName,
+        'room:!missing:logical.test',
+      ])).sources,
+      [],
+    );
   } finally {
     await f.close();
   }

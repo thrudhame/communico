@@ -450,8 +450,8 @@ exports, wakes workers, allocates source positions or waits for another node.
 It returns identifiers and cuts only, not record bodies, credentials, keys or
 session data. It is not mounted on public Matrix listeners.
 
-`sources` reports the home's current room change heads and public-account
-projection revisions. Each capture is local to its owning database, not a
+`sources` reports either role's current local room change heads and the home's
+public-account projection revisions. Each capture is local to its owning database, not a
 cross-file atomic snapshot. Snapshot cuts allocated only during export (such
 as auth and directory) have no local mutation-head entry. A missing source or
 stream is unknown, not zero or ready.
@@ -474,6 +474,12 @@ incoming ready publication and application source cuts cover it (and the
 directory declaration covers it for directory-gated reads). Later work cannot
 enlarge the captured target. Home client acknowledgments do not depend on this
 inspection or on an online facade.
+
+For a facade room mutation, capture that facade's local `sources` cut and
+observe its exact outgoing source/incarnation/scope at home's incoming applied
+cut. Reverse room streams have no home directory declaration. A facade S2S
+acknowledgment does not wait for an online home; home-client causality follows
+observation through home sync, not the timing of another ingress's response.
 
 ## Facade signing-key retirement
 

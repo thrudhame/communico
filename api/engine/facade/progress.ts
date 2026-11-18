@@ -29,16 +29,16 @@ export async function replicationProgress(
 > {
   const selected = (scope: string) => !scopes || scopes.includes(scope);
   const sources: { scope: string; cut: number }[] = [];
-  // Only the home is authoritative for these local mutation cuts. Opening a
-  // missing room/tenant for status must never provision one.
+  // Each role owns its local room mutation heads. Opening a missing room or
+  // tenant for status must never provision one; public account cuts stay home-owned.
+  for (const id of await store.rooms()) {
+    const scope = 'room:' + id;
+    if (!selected(scope)) continue;
+    const room = await openRoom(store, id);
+    const cut = await room.tx((tx) => tx.changes.head());
+    sources.push({ scope, cut });
+  }
   if (role === 'home') {
-    for (const id of await store.rooms()) {
-      const scope = 'room:' + id;
-      if (!selected(scope)) continue;
-      const room = await openRoom(store, id);
-      const cut = await room.tx((tx) => tx.changes.head());
-      sources.push({ scope, cut });
-    }
     if (!scopes || scopes.some((scope) => scope.startsWith('public:'))) {
       const inventory = await (await store.tenant(self)).tx(publicInventory);
       for (const localpart of inventory.users) {
