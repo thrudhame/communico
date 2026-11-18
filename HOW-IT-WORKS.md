@@ -1484,8 +1484,10 @@ Returned response streams share operation cancellation. Shutdown first waits
 for handler work, then aborts expired transports without waiting for delivery,
 so a client that stops reading cannot hold that phase open. A response already
 started ends retryably; newly rendered cancellation responses use 503 when the
-transport can still deliver it. An interrupted federation transaction has no
-cached success or partial effects, and retrying the same ID succeeds only once.
+transport can still deliver it. Cancellation before federation dispatch leaves
+no effects or cached success; retrying that ID applies the effects once and caches
+the completed answer. Cancellation after EDU dispatch does not roll back earlier
+EDU effects, which can repeat on retry; the replay cache covers completed sends.
 Storage remains owned until transport settlement and asynchronous response-source
 cancellation have both completed.
 Clean storage closure exits successfully even when cancellation was needed;
