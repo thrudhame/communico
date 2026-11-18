@@ -39,6 +39,7 @@ import {
 } from '#engine/room/build.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
 import { ingestLocal } from '#engine/room/ingest.ts';
+import { withMembershipFence } from '#engine/room/hooks.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
 import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import { getRulebook, supportedRoomVersions } from '#engine/rulebook/index.ts';
@@ -231,6 +232,9 @@ export async function inviteRemote(
     'SELECT * FROM federation_invite_attempts WHERE room_id=? AND sender=? AND target=?',
     [roomId, sender, target],
   );
+  const admission = existing.length
+    ? undefined
+    : await deps.prepareRoomScope?.(roomId, false, sender);
   const permit = existing.length ? null : await prepareSigner(deps.signer);
   const attempt = await withRoomLock(roomId, async () => {
     if (await deps.store.roomRetired(roomId)) {
@@ -260,46 +264,48 @@ export async function inviteRemote(
           'Remote invite completed concurrently',
         );
       }
-      const { version, pdu } = await room.tx(async (tx) => {
-        await assertAcl(tx, remote);
-        await assertAcl(tx, deps.self);
-        const stay = await tx.segments.openStay();
-        if (stay === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
-        const version = await roomVersionOf(tx, stay.id);
-        const pdu = await buildInTx(tx, roomId, {
-          type: 'm.room.member',
-          state_key: target,
-          sender,
-          content,
-          origin_server_ts: Date.now(),
-        }, permit);
-        // Local authorization precedes the remote side effect. The builder
-        // signs bytes; it does not by itself authorize their membership change.
-        const group = await tx.state.current(stay.id);
-        const current = group === null
-          ? new Map<string, string>()
-          : await tx.state.groupMap(group);
-        const evidence = await loadRulebookStore(tx, [...current.values()], [
-          pdu,
-        ]);
-        const rulebook = getRulebook(version);
-        const createId = current.get('m.room.create\0');
-        if (
-          !checkDeclaredAuth(
+      const { version, pdu } = await room.tx((tx) =>
+        withMembershipFence(admission, async () => {
+          await assertAcl(tx, remote);
+          await assertAcl(tx, deps.self);
+          const stay = await tx.segments.openStay();
+          if (stay === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
+          const version = await roomVersionOf(tx, stay.id);
+          const pdu = await buildInTx(tx, roomId, {
+            type: 'm.room.member',
+            state_key: target,
+            sender,
+            content,
+            origin_server_ts: Date.now(),
+          }, permit);
+          // Local authorization precedes the remote side effect. The builder
+          // signs bytes; it does not by itself authorize their membership change.
+          const group = await tx.state.current(stay.id);
+          const current = group === null
+            ? new Map<string, string>()
+            : await tx.state.groupMap(group);
+          const evidence = await loadRulebookStore(tx, [...current.values()], [
             pdu,
-            rulebook,
-            evidence,
-            createId == null ? null : createId,
-          ).ok || !rulebook.checkAuthAgainstState(pdu, current, evidence).ok
-        ) {
-          throw new MatrixError(
-            403,
-            'M_FORBIDDEN',
-            'Remote invite is not authorized locally',
-          );
-        }
-        return { version, pdu };
-      });
+          ]);
+          const rulebook = getRulebook(version);
+          const createId = current.get('m.room.create\0');
+          if (
+            !checkDeclaredAuth(
+              pdu,
+              rulebook,
+              evidence,
+              createId == null ? null : createId,
+            ).ok || !rulebook.checkAuthAgainstState(pdu, current, evidence).ok
+          ) {
+            throw new MatrixError(
+              403,
+              'M_FORBIDDEN',
+              'Remote invite is not authorized locally',
+            );
+          }
+          return { version, pdu };
+        })
+      );
       const request = {
         room_version: version,
         event: toWire(pdu, version),
@@ -314,18 +320,22 @@ export async function inviteRemote(
         request,
         response: null,
       };
-      await deps.server.execute(
-        "INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,'pending',?)",
-        [
-          roomId,
-          sender,
-          target,
-          saved.eventId,
-          remote,
-          JSON.stringify(request),
-          Date.now(),
-        ],
-      );
+      await deps.server.tx(async (tx) => {
+        await admission?.check(tx);
+        await withMembershipFence(admission, () =>
+          tx.execute(
+            "INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,'pending',?)",
+            [
+              roomId,
+              sender,
+              target,
+              saved.eventId,
+              remote,
+              JSON.stringify(request),
+              Date.now(),
+            ],
+          ));
+      });
     }
     if (invitePerformers(deps.store).has(saved.eventId)) {
       throw new MatrixError(409, 'M_BAD_STATE', 'Remote invite is active');
@@ -801,7 +811,10 @@ export function candidatesOf(invite: StoredInvite, self: string): string[] {
 export async function rejectInviteRemote(
   roomId: string,
   userId: string,
-  deps: Pick<InviteDeps, 'store' | 'server' | 'signer' | 'self' | 'wake'>,
+  deps: Pick<
+    InviteDeps,
+    'store' | 'server' | 'signer' | 'self' | 'wake' | 'prepareRoomScope'
+  >,
   reason?: string,
 ): Promise<void> {
   const candidates = await withProjectionLock(async () => {
@@ -815,12 +828,14 @@ export async function rejectInviteRemote(
       'SELECT status FROM prejoin_memberships WHERE room_id=? AND user_id=?',
       [roomId, userId],
     );
-    const prepared = snapshot.length &&
-        !['joined', 'rejecting', 'rejected', 'failed-retract'].includes(
-          String(snapshot[0].status),
-        )
-      ? await prepareSigner(deps.signer)
-      : null;
+    const fresh = snapshot.length &&
+      !['joined', 'rejecting', 'rejected', 'failed-retract'].includes(
+        String(snapshot[0].status),
+      );
+    const admission = fresh
+      ? await deps.prepareRoomScope?.(roomId, true, userId)
+      : undefined;
+    const prepared = fresh ? await prepareSigner(deps.signer) : null;
     return await eventStreamTx(deps.server, async (tx) => {
       if (await deps.store.roomRetired(roomId)) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
@@ -847,31 +862,34 @@ export async function rejectInviteRemote(
           'membership changed during rejection',
         );
       }
-      await recordMembershipOperation(tx, roomId, userId);
-      await withdrawInvitePush(tx, userId, roomId, invite.eventId);
-      const localLeave = await buildLocalPrejoinLeave(
-        invite,
-        prepared,
-        reason,
-      );
-      const seq = await nextEventSeq(tx);
-      await tx.execute(
-        "UPDATE prejoin_memberships SET status = 'rejecting', revision=revision+1, leave_json=NULL, local_leave_json=?, seq = ?, expires_ms=CASE WHEN kind='knock' THEN ? ELSE NULL END WHERE room_id = ? AND user_id = ?",
-        [
-          JSON.stringify(localLeave),
-          seq,
-          Date.now() + config().federation.refusedmillihours * 3600,
-          roomId,
-          userId,
-        ],
-      );
-      await recordMembershipOperation(tx, roomId, userId);
-      const [pending] = await tx.query(
-        'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
-        [roomId, userId],
-      );
-      await createPrejoinJob(tx, inviteOf(pending));
-      return candidatesOf(invite, deps.self);
+      await admission?.check(tx);
+      return await withMembershipFence(admission, async () => {
+        await recordMembershipOperation(tx, roomId, userId);
+        await withdrawInvitePush(tx, userId, roomId, invite.eventId);
+        const localLeave = await buildLocalPrejoinLeave(
+          invite,
+          prepared,
+          reason,
+        );
+        const seq = await nextEventSeq(tx);
+        await tx.execute(
+          "UPDATE prejoin_memberships SET status = 'rejecting', revision=revision+1, leave_json=NULL, local_leave_json=?, seq = ?, expires_ms=CASE WHEN kind='knock' THEN ? ELSE NULL END WHERE room_id = ? AND user_id = ?",
+          [
+            JSON.stringify(localLeave),
+            seq,
+            Date.now() + config().federation.refusedmillihours * 3600,
+            roomId,
+            userId,
+          ],
+        );
+        await recordMembershipOperation(tx, roomId, userId);
+        const [pending] = await tx.query(
+          'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+          [roomId, userId],
+        );
+        await createPrejoinJob(tx, inviteOf(pending));
+        return candidatesOf(invite, deps.self);
+      });
     });
   });
   // nothing ingested an event — wake the first candidate's loop directly

@@ -181,6 +181,171 @@ async function withInviteHost<T>(
   }
 }
 
+Deno.test('inviter: selected scope fences authoring and the durable network intent', async (t) => {
+  for (const phase of ['prepare', 'signing', 'intent', 'intent-final']) {
+    await t.step(phase, () =>
+      withStore(async (store) => {
+        await withInviteHost(async (host) => {
+          const g = await genesis(store, { roomId: '!invite-admission:test' });
+          const server = await store.server();
+          let current = phase !== 'prepare', signatures = 0, durable = 0;
+          let finalChecks = 0;
+          const checkCurrent = () => {
+            if (!current) {
+              throw new MatrixError(
+                503,
+                'M_UNAVAILABLE',
+                'invite scope retired',
+              );
+            }
+          };
+          const deps: InviteDeps = {
+            store,
+            server,
+            self: 'test',
+            wake: () => {},
+            keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+            signer: {
+              ...g.signer,
+              async sign(bytes) {
+                signatures++;
+                const signature = await g.signer.sign(bytes);
+                if (phase === 'signing') current = false;
+                return signature;
+              },
+            },
+            prepareRoomScope(room, absent, user) {
+              assertEquals([room, absent, user], [g.roomId, false, g.creator]);
+              checkCurrent();
+              return Promise.resolve({
+                async check(conn) {
+                  assertEquals(
+                    (await conn.query(
+                      'SELECT COUNT(*) AS n FROM federation_invite_attempts',
+                    ))[0].n,
+                    0,
+                  );
+                  durable++;
+                  if (phase === 'intent') current = false;
+                },
+                checkCurrent() {
+                  if (
+                    phase === 'intent-final' && durable && ++finalChecks === 2
+                  ) current = false;
+                  checkCurrent();
+                },
+              });
+            },
+          };
+          await assertRejects(
+            () =>
+              inviteRemote(
+                g.roomId,
+                g.creator,
+                `@zoe:${host.fake.name}`,
+                undefined,
+                undefined,
+                deps,
+              ),
+            MatrixError,
+            'invite scope retired',
+          );
+          assertEquals(host.inviteRequests, []);
+          assertEquals(signatures, phase === 'prepare' ? 0 : 1);
+          assertEquals(durable, phase.startsWith('intent') ? 1 : 0);
+          assertEquals(
+            await server.query('SELECT * FROM federation_invite_attempts'),
+            [],
+          );
+          const group = await g.room.tx(async (tx) => {
+            const stay = await tx.segments.openStay();
+            return await tx.state.current(stay!.id);
+          });
+          assertEquals(
+            await g.room.tx((tx) =>
+              tx.state.groupKey(
+                group!,
+                'm.room.member',
+                `@zoe:${host.fake.name}`,
+              )
+            ),
+            null,
+          );
+        });
+      }));
+  }
+});
+
+Deno.test('inviter: retained intent retries before new scope or event signing admission', async () => {
+  await withStore(async (store) => {
+    await withInviteHost(async (host) => {
+      const g = await genesis(store, { roomId: '!retained-admission:test' });
+      const server = await store.server();
+      let current = true, preparations = 0, durable = 0;
+      const checkCurrent = () => {
+        if (!current) throw new Error('no new scope');
+      };
+      const deps: InviteDeps = {
+        store,
+        server,
+        self: 'test',
+        signer: g.signer,
+        wake: () => {},
+        keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+        prepareRoomScope(room, absent, user) {
+          assertEquals([room, absent, user], [g.roomId, false, g.creator]);
+          preparations++;
+          checkCurrent();
+          return Promise.resolve({
+            checkCurrent,
+            async check(conn) {
+              await conn.query('SELECT * FROM federation_invite_attempts');
+              durable++;
+              checkCurrent();
+            },
+          });
+        },
+      };
+      const call = () =>
+        inviteRemote(
+          g.roomId,
+          g.creator,
+          `@zoe:${host.fake.name}`,
+          'kept',
+          undefined,
+          deps,
+        );
+      host.response = () =>
+        Response.json({ errcode: 'M_UNKNOWN', error: 'lost' }, { status: 502 });
+      await assertRejects(call);
+      assertEquals([preparations, durable], [1, 1]);
+      const [attempt] = await server.query(
+        'SELECT * FROM federation_invite_attempts',
+      );
+      assert(attempt);
+      current = false;
+      deps.signer = {
+        ...g.signer,
+        prepare: () => Promise.reject(new Error('no new event signing')),
+      };
+      host.response = () => null;
+      assertEquals(await call(), { eventId: String(attempt.event_id) });
+      assertEquals([preparations, durable], [1, 1]);
+      assertEquals(host.inviteRequests.length, 2);
+      assertEquals(host.inviteRequests[1], host.inviteRequests[0]);
+      assertEquals(
+        await server.query('SELECT * FROM federation_invite_attempts'),
+        [],
+      );
+      assertEquals(
+        (await g.room.tx((tx) => tx.events.getStatus(String(attempt.event_id))))
+          ?.standing,
+        'accepted',
+      );
+    });
+  });
+});
+
 Deno.test('inviter: signed attempt survives uncertain response and cold sender recovery', async () => {
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
@@ -1332,6 +1497,128 @@ Deno.test('invitee: same reference ID cannot replace retained immutable material
 });
 
 // --- REJECT ------------------------------------------------------------------
+
+Deno.test('reject: selected scope fences new departures, never retained retry ownership', async (t) => {
+  for (
+    const phase of ['prepare', 'signing', 'intent', 'intent-final', 'retry']
+  ) {
+    await t.step(phase, () =>
+      withStore(async (store) => {
+        const remote = await makeRemoteServer('remote.test');
+        const original = await inviteDepsFor(store, remote);
+        const roomId = '!reject-admission:remote.test', userId = '@dev:test';
+        const invite = await remoteInvite(remote, roomId, userId, ['$parent']);
+        await receiveInvite(
+          roomId,
+          String(invite.event_id),
+          {
+            room_version: '11',
+            event: wireOf(invite),
+            invite_room_state: [],
+          },
+          remote.name,
+          original,
+        );
+        const capture = async () => ({
+          display: await original.server.query(
+            'SELECT * FROM prejoin_memberships',
+          ),
+          jobs: await original.server.query('SELECT * FROM prejoin_jobs'),
+          facts: await original.server.query(
+            'SELECT * FROM membership_operations',
+          ),
+          counters: await original.server.query('SELECT * FROM counters'),
+        });
+        const before = await capture();
+        let current = phase !== 'prepare', signatures = 0, durable = 0;
+        let preparations = 0, finalChecks = 0;
+        const checkCurrent = () => {
+          if (!current) {
+            throw new MatrixError(
+              503,
+              'M_UNAVAILABLE',
+              'departure scope retired',
+            );
+          }
+        };
+        const deps: InviteDeps = {
+          ...original,
+          signer: {
+            ...original.signer,
+            async sign(bytes) {
+              signatures++;
+              const signature = await original.signer.sign(bytes);
+              if (phase === 'signing') current = false;
+              return signature;
+            },
+          },
+          prepareRoomScope(room, absent, user) {
+            assertEquals([room, absent, user], [roomId, true, userId]);
+            preparations++;
+            checkCurrent();
+            return Promise.resolve({
+              async check(conn) {
+                assertEquals(
+                  (await conn.query('SELECT status FROM prejoin_memberships'))[
+                    0
+                  ].status,
+                  'pending',
+                );
+                durable++;
+                if (phase === 'intent') current = false;
+              },
+              checkCurrent() {
+                if (phase === 'intent-final' && ++finalChecks === 2) {
+                  current = false;
+                }
+                checkCurrent();
+              },
+            });
+          },
+        };
+        const call = () => rejectInviteRemote(roomId, userId, deps, 'kept');
+        if (phase !== 'retry') {
+          await assertRejects(call, MatrixError, 'departure scope retired');
+          assertEquals(
+            await capture(),
+            before,
+            'no display, fact, job or stream publication on refusal',
+          );
+          assertEquals(
+            signatures,
+            ['prepare', 'intent'].includes(phase) ? 0 : 1,
+          );
+          return;
+        }
+        await call();
+        assertEquals(preparations, 1);
+        assertEquals(durable, 1);
+        assertEquals(signatures, 1);
+        const retained = await capture();
+        assertEquals(retained.display[0].status, 'rejecting');
+        assertEquals(
+          JSON.parse(String(retained.display[0].local_leave_json)).content
+            .reason,
+          'kept',
+        );
+        current = false;
+        deps.signer = {
+          ...deps.signer,
+          sign: () => Promise.reject(new Error('no new signature')),
+        };
+        for (const status of ['rejecting', 'rejected', 'failed-retract']) {
+          await deps.server.execute('UPDATE prejoin_memberships SET status=?', [
+            status,
+          ]);
+          const expected = await capture();
+          await call();
+          assertEquals(await capture(), expected);
+        }
+        assertEquals(preparations, 1);
+        assertEquals(signatures, 1);
+      }));
+  }
+});
 
 Deno.test('reject: local effect at once + the intent performs make/send_leave against the fake', async () => {
   await withStore(async (store) => {
