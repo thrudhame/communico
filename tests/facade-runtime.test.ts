@@ -737,6 +737,20 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       registered.body.access_token,
     );
     assertEquals(homeFilter.status, 200);
+    const openIdPath = 'user/%40outside%3Alogical.test/openid/request_token';
+    const homeOpenId = await api(openIdPath, {}, registered.body.access_token);
+    assertEquals(homeOpenId.status, 200);
+    const openIdInfo = async (token?: string) => {
+      const response = await fetch(
+        `http://127.0.0.1:${facadePort}/_matrix/federation/v1/openid/userinfo`,
+        {
+          headers: token === undefined
+            ? {}
+            : { authorization: 'Bearer ' + token },
+        },
+      );
+      return { status: response.status, body: await response.json() };
+    };
     const created = await api(
       'createRoom',
       { room_version: '11' },
@@ -1047,6 +1061,30 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       status: 200,
       body: edgeFilterBody,
     });
+    assertEquals(await openIdInfo(homeOpenId.body.access_token), {
+      status: 200,
+      body: { sub: user },
+    });
+    const edgeOpenId = await edgeApi(openIdPath, {}, 'POST');
+    assertEquals(edgeOpenId.status, 200);
+    assertEquals(edgeOpenId.body.token_type, 'Bearer');
+    assertEquals(edgeOpenId.body.matrix_server_name, 'logical.test');
+    assertEquals(await openIdInfo(edgeOpenId.body.access_token), {
+      status: 200,
+      body: { sub: user },
+    });
+    assertEquals((await openIdInfo()).body.errcode, 'M_MISSING_TOKEN');
+    assertEquals((await openIdInfo('invalid')).body.errcode, 'M_UNKNOWN_TOKEN');
+    assertEquals(
+      (await api(
+        'account/whoami',
+        undefined,
+        edgeOpenId.body.access_token,
+        'GET',
+        facadePort,
+      )).status,
+      401,
+    );
     // This room has never existed at home or in its exported inventory.
     const fresh = await edgeApi('createRoom', {
       room_version: '11',
@@ -1651,6 +1689,14 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     assertEquals(await edgeApi(filterPath + '/' + edgeFilter.body.filter_id), {
       status: 200,
       body: edgeFilterBody,
+    });
+    assertEquals(await openIdInfo(homeOpenId.body.access_token), {
+      status: 200,
+      body: { sub: user },
+    });
+    assertEquals(await openIdInfo(edgeOpenId.body.access_token), {
+      status: 200,
+      body: { sub: user },
     });
     for (const [id, content] of homeContents) {
       const edgeRead = await edgeApi(

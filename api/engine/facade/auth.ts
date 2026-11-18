@@ -10,6 +10,8 @@ import {
 } from '#engine/tenant/account-auth.ts';
 import type { PreparedIngressAuthority } from '#engine/tenant/ingress.ts';
 import { requireSessionAuthority } from '#engine/tenant/session-authority.ts';
+import { localpartOf } from '#engine/tenant/auth.ts';
+import { DirectoryReplicas } from './directory.ts';
 import type { NodeIdentity } from './identity.ts';
 import { receivedFence } from './journal.ts';
 import { noticeHeads } from './notices.ts';
@@ -154,16 +156,50 @@ export class FacadeAuth {
     // user-domain intents consume admission; unknown tokens keep their normal401.
     const received = receivedFence(this.server);
     const admission = await this.capture().catch(() => null);
-    return {
+    const prepared: PreparedIngressAuthority = {
       check: async (conn, intent) => {
         const unavailable: () => never = () => {
-          if (intent.kind !== 'domain') return authUnavailable();
+          if (intent.kind !== 'domain' && intent.kind !== 'openid') {
+            return authUnavailable();
+          }
           throw new MatrixError(
             503,
             'M_UNAVAILABLE',
             'domain snapshot unavailable',
           );
         };
+        if (intent.kind === 'openid') {
+          if (!admission) unavailable();
+          const held = await conn.query(
+            'SELECT localpart FROM openid_tokens WHERE token_hash=?',
+            [intent.hash],
+          );
+          // A missing legacy digest is known absent only after the selected
+          // inventories are complete. The bearer is never a client session.
+          const inventoryCurrent = () =>
+            received('home', {
+              source: 'home',
+              incarnation: admission.pairing,
+              stream: 'directory',
+            });
+          if (!held.length && (!admission.inventory || !inventoryCurrent())) {
+            unavailable();
+          }
+          const accounts = held.length
+            ? held
+            : admission.inventory!.users.map((user) => ({
+              localpart: localpartOf(user),
+            }));
+          for (const account of accounts) {
+            await prepared.check(conn, {
+              kind: 'domain',
+              localpart: String(account.localpart),
+              feature: 'openid',
+            });
+          }
+          if (!held.length && !inventoryCurrent()) unavailable();
+          return;
+        }
         let localpart: string;
         if (intent.kind === 'session') {
           await requireSessionAuthority(conn, intent.hash, intent.refresh);
@@ -206,7 +242,8 @@ export class FacadeAuth {
               Number(cut.source_cut) < 1 ||
               Number(cut.received) !== Number(cut.applied) ||
               cut.received_hash !== cut.applied_hash ||
-              (intent.feature === 'filters' && cut.filters_ready !== 1)
+              (intent.feature === 'filters' && cut.filters_ready !== 1) ||
+              (intent.feature === 'openid' && cut.openid_ready !== 1)
             : cut.ready !== 1 && cut.pending_hash === null)
         ) {
           unavailable();
@@ -269,11 +306,21 @@ export class FacadeAuth {
         );
       },
     };
+    return prepared;
   }
 
   private async capture() {
     const grant = await this.pairings.active();
     const pairing = grant.body.transcript.body.context.id;
+    // The directory owner proves the complete selected user set. Imported auth
+    // rows alone cannot prove absence: another user's private stream may lag.
+    // Missing inventory affects only OpenID absence, not independent auth work.
+    const inventory = await new DirectoryReplicas(
+      this.server,
+      this.pairings,
+      this.node.server,
+    )
+      .snapshot().catch(() => null);
     return await this.server.tx(async (conn) => {
       const [binding] = await conn.query(
         "SELECT state,grant_json FROM facade_pairings WHERE id=? AND side='facade'",
@@ -295,10 +342,16 @@ export class FacadeAuth {
         body.nodes[1].incarnation !== this.node.incarnation
       ) authUnavailable();
       const scopes = await conn.query(
-        "SELECT s.scope,s.source_cut,s.ready,s.pending_hash,j.received,j.received_hash,j.applied,j.applied_hash,EXISTS(SELECT 1 FROM facade_scopes f WHERE f.incarnation=s.incarnation AND f.scope='filters:'||substr(s.scope,8) AND f.ready=1) AS filters_ready FROM facade_scopes s JOIN facade_streams j ON j.incarnation=s.incarnation AND j.stream=s.scope AND j.peer='home' AND j.direction='in' AND j.source='home' WHERE s.incarnation=? AND (s.scope LIKE 'auth:%' OR s.scope LIKE 'domain:%')",
+        "SELECT s.scope,s.source_cut,s.ready,s.pending_hash,j.received,j.received_hash,j.applied,j.applied_hash,EXISTS(SELECT 1 FROM facade_scopes f WHERE f.incarnation=s.incarnation AND f.scope='filters:'||substr(s.scope,8) AND f.ready=1) AS filters_ready,EXISTS(SELECT 1 FROM facade_scopes o WHERE o.incarnation=s.incarnation AND o.scope='openid:'||substr(s.scope,8) AND o.ready=1) AS openid_ready FROM facade_scopes s JOIN facade_streams j ON j.incarnation=s.incarnation AND j.stream=s.scope AND j.peer='home' AND j.direction='in' AND j.source='home' WHERE s.incarnation=? AND (s.scope LIKE 'auth:%' OR s.scope LIKE 'domain:%')",
         [pairing],
       );
-      return { pairing, grantRevision: grant.body.revision, control, scopes };
+      return {
+        pairing,
+        grantRevision: grant.body.revision,
+        control,
+        scopes,
+        inventory,
+      };
     });
   }
 }

@@ -20,6 +20,7 @@ import { captureAccountDataOperations } from '#engine/tenant/accountdata.ts';
 import { captureProfileOperations } from '#engine/tenant/profiles.ts';
 import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
 import { captureFilterOperations } from '#engine/tenant/filters.ts';
+import { captureOpenIdOperations } from '#engine/tenant/openid.ts';
 import { importReceiptOperation } from '#engine/server/ephemeral.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
@@ -46,6 +47,7 @@ export type DomainBootstrap = DomainBinding & {
   // Absent on older F2 writers: those bootstraps remain valid for their
   // original types, but cannot enable reads of an unproved filter inventory.
   filters?: Fact[];
+  openid?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -92,6 +94,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     tenant: refs(row.tenant),
     receipts: refs(row.receipts),
     ...(row.filters !== undefined ? { filters: refs(row.filters) } : {}),
+    ...(row.openid !== undefined ? { openid: refs(row.openid) } : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -105,7 +108,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
 async function requireFacts(
   conn: Conn,
   view: DomainBootstrap,
-  file: 'tenant' | 'receipts' | 'filters',
+  file: 'tenant' | 'receipts' | 'filters' | 'openid',
 ) {
   const keys = new Set<string>();
   for (const fact of view[file] ?? []) {
@@ -135,6 +138,8 @@ async function requireFacts(
         !Array.isArray(key) || key[1] !== view.localpart ||
         !(file === 'filters'
           ? ['filter']
+          : file === 'openid'
+          ? ['openid']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
             String(row.kind),
           )
@@ -226,7 +231,7 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
       ? 'account-data'
       : operation.kind;
     if (
-      !['account-data', 'profile', 'push-rules', 'filter'].includes(
+      !['account-data', 'profile', 'push-rules', 'filter', 'openid'].includes(
         String(expected),
       ) ||
       !Array.isArray(key) || key[0] !== expected || key[1] !== localpart
@@ -378,6 +383,7 @@ export class DomainOperations {
         ...await tx.profiles.operations(localpart),
         ...await tx.pushRules.operations(localpart),
         ...await tx.filters.operations(localpart),
+        ...await tx.openid.operations(localpart),
       ];
     });
     operations.push(
@@ -456,6 +462,7 @@ export class DomainOperations {
           ...await captureProfileOperations(conn, localpart),
           ...await capturePushRuleOperations(conn, localpart, context.server),
           ...await captureFilterOperations(conn, localpart),
+          ...await captureOpenIdOperations(conn, localpart),
         ];
       },
     );
@@ -490,9 +497,12 @@ export class DomainOperations {
     const body = bootstrapOf({
       ...binding,
       kind: 'domain-bootstrap',
-      tenant: facts(tenantFacts.filter((op) => op.kind !== 'filter')),
+      tenant: facts(
+        tenantFacts.filter((op) => !['filter', 'openid'].includes(op.kind)),
+      ),
       receipts: facts(receiptFacts),
       filters: facts(tenantFacts.filter((op) => op.kind === 'filter')),
+      openid: facts(tenantFacts.filter((op) => op.kind === 'openid')),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -565,6 +575,7 @@ export class DomainOperations {
         ) mismatch('bootstrap account not selected');
         await requireFacts(conn, view, 'tenant');
         await requireFacts(conn, view, 'filters');
+        await requireFacts(conn, view, 'openid');
       });
       return await journal.apply(peer, stream, async (conn, current) => {
         await check(conn);
@@ -586,6 +597,15 @@ export class DomainOperations {
             'filters:@' + view.localpart + ':' + view.server,
             record.sequence,
             view.filters !== undefined ? 1 : 0,
+          ],
+        );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'openid:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.openid !== undefined ? 1 : 0,
           ],
         );
         return { kind: 'domain-bootstrap', localpart: view.localpart };
@@ -624,6 +644,8 @@ export class DomainOperations {
           await tx.pushRules.import(view.operation, history);
         } else if (view.operation.kind === 'filter') {
           await tx.filters.import(view.operation, history);
+        } else if (view.operation.kind === 'openid') {
+          await tx.openid.import(view.operation, history);
         } else await tx.accountData.import(view.operation, history);
       });
     }

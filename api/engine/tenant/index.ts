@@ -735,6 +735,16 @@ function bind(
         accountdata.accountDataMaxSeq(conn, localpart),
     },
     openid: {
+      issue: (localpart: string, now: number, expires: number) =>
+        openid.createOpenIdToken(conn, localpart, now, expires),
+      read: (token: string, hash: string, now: number) =>
+        openid.readOpenIdUser(conn, token, hash, now),
+      operations: (localpart: string) =>
+        openid.openIdOperations(conn, localpart),
+      import: (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => openid.importOpenId(conn, operation, history),
       insert: (hash: string, localpart: string, expires: number) =>
         openid.insertOpenId(conn, hash, localpart, expires),
       user: (hash: string, now: number) => openid.openIdUser(conn, hash, now),

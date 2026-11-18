@@ -437,6 +437,15 @@ matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
 ## Facade replication progress
 
+Distributed OpenID credentials retain only digest/expiry facts in the signed
+semantic journal. Issuance commits that intent with the credential; imports
+preserve its original issuer and expiry, never create client sessions, and
+cannot resurrect a deactivated account. Userinfo requires a complete selected
+OpenID inventory, independently of password replication or client device
+ownership. Missing other-issuer credentials return unavailable until replicated;
+known expired credentials remain unknown. Existing home bearers survive bootstrap
+unchanged. No bearer is exported.
+
 Distributed stored filters have immutable node/incarnation-namespaced IDs.
 Existing home numeric IDs keep their meaning. Filters replicate as protected
 per-user semantic facts; a missing foreign ID returns retryable 503 until its

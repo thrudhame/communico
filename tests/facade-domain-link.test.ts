@@ -19,6 +19,8 @@ import {
 import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { loadFilter, storeFilter } from '#engine/tenant/filters.ts';
+import { issueOpenIdToken, openIdUserInfo } from '#engine/tenant/openid.ts';
+import { hashToken, lookupToken } from '#engine/tenant/auth.ts';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
@@ -575,6 +577,293 @@ Deno.test('domain filters: old signed domain bootstrap cannot prove the new filt
       () => loadFilter(tenant, 'alice', '7'),
       MatrixError,
       'domain snapshot unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+async function completeOpenIdInventory(f: Awaited<ReturnType<typeof fixture>>) {
+  const auth = await exportAccountAuth(
+    f.home,
+    f.ht,
+    f.hp,
+    f.bundle.id,
+    'bob',
+    false,
+  );
+  await f.ej.receive('home', [auth]);
+  await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+  await f.toEdge(await f.hs.bootstrap('bob', f.bundle.id));
+  const directory = await exportDirectoryReplica(
+    f.home,
+    f.ht,
+    f.node.node,
+    f.bundle.id,
+  );
+  if (!directory) throw new Error('missing initial directory');
+  await f.ej.receive('home', [directory]);
+  await new DirectoryReplicas(await f.edge.server(), f.fp, 'logical.test')
+    .apply(f.ej, directory);
+}
+
+Deno.test('domain OpenID: signed bootstrap captures legacy digests and suffix imports keep the original issuer', async () => {
+  const f = await fixture();
+  try {
+    const now = Date.now(), legacy = '7'.repeat(64);
+    const legacyHash = await hashToken(legacy);
+    await f.ht.tx((tx) => tx.openid.insert(legacyHash, 'alice', now + 3600000));
+    const issued = await issueOpenIdToken(f.ht, 'alice', now);
+    const baseline = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(baseline);
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    for (const token of [legacy, issued.access_token]) {
+      assertEquals(await openIdUserInfo(tenant, token, now), {
+        sub: '@alice:logical.test',
+      });
+      assertEquals(await lookupToken(f.et, token), null);
+    }
+    const edgeToken = await issueOpenIdToken(tenant, 'alice', now);
+    const before = await f.et.tx((tx) => tx.streams.heads());
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(await openIdUserInfo(f.ht, edgeToken.access_token, now), {
+      sub: '@alice:logical.test',
+    });
+    const homeCut = Math.max(...baseline.map((record) => record.sequence));
+    const suffix = await issueOpenIdToken(f.ht, 'alice', now);
+    const records = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > homeCut
+    );
+    await f.toEdge(records);
+    await f.toEdge(records);
+    assertEquals(await openIdUserInfo(tenant, suffix.access_token, now), {
+      sub: '@alice:logical.test',
+    });
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+    await completeOpenIdInventory(f);
+    const unknown = await assertRejects(
+      () => openIdUserInfo(tenant, 'not-a-token'),
+      MatrixError,
+    );
+    assertEquals(unknown.errcode, 'M_UNKNOWN_TOKEN');
+    const exported = await f.hs.export('alice', f.bundle.id);
+    assertEquals(
+      exported.some((record) => {
+        const body = (record.payload as { body: DomainOperation }).body;
+        return body.kind === 'domain-operation' &&
+          body.operation.source === f.node.node;
+      }),
+      false,
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const coldNode = await loadNode(
+        await reopened.server(),
+        'logical.test',
+        'edge_a',
+      );
+      const pairings = new Pairings(
+        await reopened.server(),
+        coldNode.signer(),
+        coldNode.publicKey,
+        'b'.repeat(64),
+        coldNode,
+      );
+      const cold = await enrolledTenant(
+        reopened,
+        pairings,
+        'logical.test',
+        'edge_a',
+      );
+      for (
+        const token of [
+          legacy,
+          issued.access_token,
+          edgeToken.access_token,
+          suffix.access_token,
+        ]
+      ) {
+        assertEquals(await openIdUserInfo(cold, token, now), {
+          sub: '@alice:logical.test',
+        });
+      }
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain OpenID: older bootstrap does not prove missing legacy credentials absent or enable issuance', async () => {
+  const f = await fixture();
+  try {
+    await completeOpenIdInventory(f);
+    const records = structuredClone(await f.hs.bootstrap('alice', f.bundle.id));
+    const last = records.at(-1)!;
+    const payload = last.payload as {
+      body: DomainBootstrap;
+      signature: string;
+    };
+    delete payload.body.openid;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    last.operationId = 'domain-bootstrap:' +
+      createHash('sha256').update(canonicalJson(payload.body)).digest('hex');
+    last.hash = recordHash({
+      source: last.source,
+      incarnation: last.incarnation,
+      stream: last.stream,
+      sequence: last.sequence,
+      type: last.type,
+      version: last.version,
+      operationId: last.operationId,
+      previous: last.previous,
+      payload: last.payload,
+    });
+    await f.toEdge(records);
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    for (
+      const operation of [
+        () => openIdUserInfo(tenant, '7'.repeat(64)),
+        () => issueOpenIdToken(tenant, 'alice'),
+      ]
+    ) {
+      const error = await assertRejects(operation, MatrixError);
+      assertEquals(error.status, 503);
+      assertEquals(error.errcode, 'M_UNAVAILABLE');
+    }
+    assertEquals(await f.et.tx((tx) => tx.openid.operations('alice')), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain OpenID: unseen selected account and later inventory receipt cannot prove bearer absence', async () => {
+  const f = await fixture();
+  try {
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const directory = await exportDirectoryReplica(
+      f.home,
+      f.ht,
+      f.node.node,
+      f.bundle.id,
+    );
+    if (!directory) throw new Error('missing initial directory');
+    await f.ej.receive('home', [directory]);
+    await new DirectoryReplicas(await f.edge.server(), f.fp, 'logical.test')
+      .apply(f.ej, directory);
+    const authority = new FacadeAuth(
+      await f.edge.server(),
+      f.fp,
+      f.node,
+      new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+      {
+        replicatecredentials: false,
+        allowstaleauth: false,
+        authmaxstalehours: 1,
+      },
+    );
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      authority,
+    );
+    const legacy = '6'.repeat(64),
+      hash = await hashToken(legacy),
+      now = Date.now();
+    await f.ht.tx((tx) => tx.openid.insert(hash, 'bob', now + 3600000));
+    const pending = await assertRejects(
+      () => openIdUserInfo(tenant, legacy, now),
+      MatrixError,
+    );
+    assertEquals(
+      pending.status,
+      503,
+      'selected Bob has not supplied his private inventory',
+    );
+    const auth = await exportAccountAuth(
+      f.home,
+      f.ht,
+      f.hp,
+      f.bundle.id,
+      'bob',
+      false,
+    );
+    await f.ej.receive('home', [auth]);
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+    await f.toEdge(await f.hs.bootstrap('bob', f.bundle.id));
+    assertEquals(await openIdUserInfo(tenant, legacy, now), {
+      sub: '@bob:logical.test',
+    });
+    const unknown = await assertRejects(
+      () => openIdUserInfo(tenant, 'not-a-token'),
+      MatrixError,
+    );
+    assertEquals(unknown.errcode, 'M_UNKNOWN_TOKEN');
+    const prepared = await authority.prepare();
+    const received = await (await f.home.server()).tx((conn) =>
+      appendRecord(conn, f.node.node, {
+        source: directory.source,
+        incarnation: directory.incarnation,
+        stream: directory.stream,
+        type: directory.type,
+        version: directory.version,
+        operationId: 'openid-inventory-receive',
+        payload: directory.payload,
+      })
+    );
+    await f.ej.receive('home', [received]);
+    const invalidated = await assertRejects(
+      () =>
+        (f.edge.tenant('logical.test')).then((db) =>
+          db.tx((conn) =>
+            prepared.check(conn, { kind: 'openid', hash: '0'.repeat(64) })
+          )
+        ),
+      MatrixError,
+    );
+    assertEquals(
+      invalidated.status,
+      503,
+      'a newly received directory invalidates prepared absence',
     );
   } finally {
     await f.close();

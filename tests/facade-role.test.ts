@@ -236,6 +236,7 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       ['v3/rooms/room/receipt/m.read/event', 'POST'],
       ['v3/user/%40alice%3Atest/filter', 'POST'],
       ['v3/user/%40alice%3Atest/filter/id', 'GET'],
+      ['v3/user/%40alice%3Atest/openid/request_token', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true), null);
   for (
@@ -295,6 +296,19 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
     null,
   );
   assertEquals(capabilities('facade', 'f1').service('deactivation'), false);
+  const openid = new Request(
+    'https://logical.test/_matrix/federation/v1/openid/userinfo',
+  );
+  assertEquals(facade.gate(openid, () => true), null);
+  assertEquals(
+    capabilities('facade', 'f1').gate(openid, () => true)?.status,
+    404,
+  );
+  assertEquals(
+    facade.gate(new Request(openid.url, { method: 'POST' }), () => true)
+      ?.status,
+    405,
+  );
   for (
     const service of [
       'push',
