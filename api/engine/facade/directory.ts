@@ -252,6 +252,30 @@ export type ReplicaRoomAdmission = {
   checkCurrent(): void;
 };
 
+// The server retains the authenticated account/control application evidence.
+// Public inventory or an arbitrary room file alone is not account selection.
+function selectedAccountScope(
+  row: Record<string, unknown>,
+  pairing: string,
+  grantRevision: number,
+  self: string,
+): boolean {
+  if (
+    Number(row.ready) !== 1 || row.pending_hash !== null ||
+    Number(row.source_cut) < 1 || Number(row.applied) < 1 ||
+    row.received !== row.applied || row.received_hash !== row.applied_hash ||
+    Number(row.owner_applied) < 1 || row.owner_received !== row.owner_applied ||
+    row.owner_received_hash !== row.owner_applied_hash || !row.record_json
+  ) return false;
+  const record = JSON.parse(String(row.record_json));
+  const account = record.payload?.signed?.body;
+  return record.type === 'account-auth' && record.version === 1 &&
+    account?.pairing === pairing && account.grantRevision === grantRevision &&
+    account.ownerRevision === Number(row.owner_revision) &&
+    account.sourceCut === Number(row.source_cut) && account.server === self &&
+    '@' + account.localpart + ':' + self === row.local_join_user;
+}
+
 export class DirectoryReplicas {
   constructor(
     private readonly db: Database,
@@ -334,17 +358,31 @@ export class DirectoryReplicas {
   async prepareRoomScope(
     roomId: string,
     allowAbsent = false,
+    localUser?: string,
   ): Promise<ReplicaRoomAdmission> {
     const received = receivedFence(this.db), authority = signingFence(this.db);
     const grant = await this.pairings.active();
     const pairing = grant.body.transcript.body.context.id;
-    const view = await this.snapshot();
+    const snapshot = await this.currentSnapshot();
+    const view = snapshot?.view;
     const unavailable = (): never => {
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
     };
     if (!view) unavailable();
     const scope = 'room:' + roomId;
     const localAuth = new Set<string>();
+    if (localUser !== undefined) {
+      if (!view!.users.includes(localUser)) unavailable();
+      for (
+        const stream of [
+          'auth:' + localUser,
+          'membership:' + localUser,
+          'owner-control',
+        ]
+      ) {
+        localAuth.add(stream);
+      }
+    }
     const checkCurrent = () => {
       authority();
       for (const stream of ['directory', scope, ...localAuth]) {
@@ -363,6 +401,30 @@ export class DirectoryReplicas {
         binding?.state !== 'paired' ||
         binding.grant_json !== canonicalJson(grant)
       ) unavailable();
+      if (localUser !== undefined) {
+        const [account] = await conn.query(
+          "SELECT ? AS local_join_user,s.stream,s.received,s.received_hash,s.applied,s.applied_hash,v.source_cut,v.ready,v.pending_hash,r.record_json,a.revision AS owner_revision,c.received AS owner_received,c.applied AS owner_applied,c.received_hash AS owner_received_hash,c.applied_hash AS owner_applied_hash FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream LEFT JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied LEFT JOIN facade_owner_activation a ON a.pairing=s.incarnation LEFT JOIN facade_streams c ON c.peer=s.peer AND c.direction=s.direction AND c.source=s.source AND c.incarnation=s.incarnation AND c.stream='owner-control' WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
+          [localUser, pairing, 'auth:' + localUser],
+        );
+        if (
+          !account ||
+          !selectedAccountScope(
+            account,
+            pairing,
+            grant.body.revision,
+            this.self,
+          )
+        ) unavailable();
+        const membership = 'membership:' + localUser;
+        if (snapshot!.version !== 2) unavailable();
+        await this.scopeStateAt(
+          conn,
+          membership,
+          pairing,
+          grant.body.revision,
+          view!.cuts[membership],
+        );
+      }
       const state = await this.scopeStateAt(
         conn,
         scope,
@@ -432,27 +494,9 @@ export class DirectoryReplicas {
     if (scope.startsWith('room:')) {
       const local = await this.localScopesAt(conn, pairing, scope.slice(5));
       for (const row of local) {
-        if (
-          Number(row.ready) !== 1 || row.pending_hash !== null ||
-          Number(row.source_cut) < 1 || Number(row.applied) < 1 ||
-          row.received !== row.applied ||
-          row.received_hash !== row.applied_hash ||
-          Number(row.owner_applied) < 1 ||
-          row.owner_received !== row.owner_applied ||
-          row.owner_received_hash !== row.owner_applied_hash ||
-          !row.record_json
-        ) continue;
-        const record = JSON.parse(String(row.record_json));
-        const account = record.payload?.signed?.body;
-        if (
-          record.type !== 'account-auth' || record.version !== 1 ||
-          account?.pairing !== pairing ||
-          account.grantRevision !== grantRevision ||
-          account.ownerRevision !== Number(row.owner_revision) ||
-          account.sourceCut !== Number(row.source_cut) ||
-          account.server !== this.self ||
-          '@' + account.localpart + ':' + this.self !== row.local_join_user
-        ) continue;
+        if (!selectedAccountScope(row, pairing, grantRevision, this.self)) {
+          continue;
+        }
         localAuth?.add(String(row.stream));
         localAuth?.add('owner-control');
         return 'ready';

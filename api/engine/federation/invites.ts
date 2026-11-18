@@ -113,7 +113,11 @@ export type InviteDeps = {
   wake: (destination: string) => void;
   // Replica composition supplies new-work admission. Durable checks belong to
   // the server file; room callbacks use only the synchronous receive fence.
-  prepareRoomScope?: (roomId: string) => Promise<{
+  prepareRoomScope?: (
+    roomId: string,
+    allowAbsent?: boolean,
+    localUser?: string,
+  ) => Promise<{
     check(conn: Conn): Promise<void>;
     checkCurrent(): void;
   }>;
@@ -525,13 +529,23 @@ export async function invitesOf(
 }
 
 // Do we participate in the room (a room file with an open stay)?
-async function participating(store: Store, roomId: string): Promise<boolean> {
+async function participating(
+  deps: InviteDeps,
+  roomId: string,
+): Promise<boolean> {
   let room: Room;
   try {
-    room = await openRoom(store, roomId);
+    room = await openRoom(deps.store, roomId);
   } catch (e) {
-    if (e instanceof Deno.errors.NotFound) return false;
-    throw e;
+    if (!(e instanceof Deno.errors.NotFound)) throw e;
+    if (!deps.prepareRoomScope) return false;
+    try {
+      await deps.prepareRoomScope(roomId);
+    } catch (error) {
+      if (error instanceof MatrixError && error.status === 404) return false;
+      throw error;
+    }
+    throw new MatrixError(503, 'M_UNAVAILABLE', 'room replica unavailable');
   }
   return await room.tx(async (tx) => (await tx.segments.openStay()) !== null);
 }
@@ -547,12 +561,14 @@ export async function receiveInvite(
   const operation = canonicalJson([origin, 'invite', roomId, eventId]);
   // Keep new-work ACL ordering, but completed authenticated work remains
   // replayable after a later ACL change, departure or room removal.
-  if (
-    !(await deps.server.query(
-      'SELECT 1 FROM membership_operations WHERE operation=?',
-      [operation],
-    )).length
-  ) await assertRoomAcl(deps.store, roomId, origin);
+  const completed = (await deps.server.query(
+    'SELECT 1 FROM membership_operations WHERE operation=?',
+    [operation],
+  )).length !== 0;
+  let admission = completed
+    ? undefined
+    : await deps.prepareRoomScope?.(roomId, true);
+  if (!completed) await assertRoomAcl(deps.store, roomId, origin);
   const body = (raw == null ? {} : raw) as {
     room_version?: unknown;
     event?: unknown;
@@ -592,6 +608,9 @@ export async function receiveInvite(
   const target = String(pdu.state_key == null ? '' : pdu.state_key);
   if (!target.endsWith(':' + deps.self)) {
     throw new MatrixError(400, 'M_BAD_JSON', 'state_key is not a local user');
+  }
+  if (!completed) {
+    admission = await deps.prepareRoomScope?.(roomId, true, target);
   }
   if (domainOf(String(pdu.sender)) !== origin) {
     throw new MatrixError(400, 'M_BAD_JSON', 'sender is not the origin');
@@ -639,6 +658,10 @@ export async function receiveInvite(
   ])).digest('hex');
   const retained = await prejoinResult(deps.server, operation, inputHash);
   if (retained !== null) return retained;
+  if (admission === undefined) {
+    admission = await deps.prepareRoomScope?.(roomId, true, target);
+  }
+  if (admission) await deps.server.tx(admission.check);
   // Full create validation is shared with knocks. Legacy malformed hints are
   // filtered; v12 identity is strict. TODO Admin UI: compatibility warning.
   const stripped = await validatePrejoin(
@@ -656,6 +679,7 @@ export async function receiveInvite(
   );
   const signed = prepared.pdu;
   await countersign(signed, roomVersion, await prepareSigner(deps.signer));
+  admission?.checkCurrent();
   const response = { event: toWire(signed, roomVersion) };
   // store: a room we HOLD does nothing else (the event arrives by /send
   // too, invites-v2.yaml:40-42); otherwise the out-of-band row so the
@@ -664,14 +688,24 @@ export async function receiveInvite(
     withProjectionLock(async () => {
       const retained = await prejoinResult(deps.server, operation, inputHash);
       if (retained !== null) return retained;
+      if (admission) await deps.server.tx(admission.check);
       await assertRoomAcl(deps.store, roomId, origin);
       if (await deps.store.roomRetired(roomId)) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
       }
-      if (await participating(deps.store, roomId)) {
-        return await deps.server.tx((tx) =>
-          savePrejoinResult(tx, operation, roomId, inputHash, response)
-        );
+      if (await participating(deps, roomId)) {
+        return await deps.server.tx(async (tx) => {
+          await admission?.check(tx);
+          const result = await savePrejoinResult(
+            tx,
+            operation,
+            roomId,
+            inputHash,
+            response,
+          );
+          admission?.checkCurrent();
+          return result;
+        });
       }
       const publication = await prepareInvitePush(
         deps.store,
@@ -680,8 +714,18 @@ export async function receiveInvite(
       );
       const now = Date.now();
       return await eventStreamTx(deps.server, async (tx) => {
-        const finish = () =>
-          savePrejoinResult(tx, operation, roomId, inputHash, response);
+        await admission?.check(tx);
+        const finish = async () => {
+          const result = await savePrejoinResult(
+            tx,
+            operation,
+            roomId,
+            inputHash,
+            response,
+          );
+          admission?.checkCurrent();
+          return result;
+        };
         const evaluated = await tx.query(
           'SELECT 1 FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
           [deps.self, target, eventId],

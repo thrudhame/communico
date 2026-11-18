@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import { renderPrejoinDeparture } from '#engine/client/render.ts';
 import {
   AccountSnapshots,
@@ -554,6 +555,54 @@ async function directoryFixture(f: Awaited<ReturnType<typeof fixture>>) {
   };
   return { journal, owner, publish, bootstrap };
 }
+
+Deno.test('membership directory: prepared local-user room admission binds selection and membership prefix', async () => {
+  const f = await fixture();
+  try {
+    const d = await directoryFixture(f);
+    await d.bootstrap();
+    await d.publish();
+    const room = '!new-invite:remote.test';
+    // Bob is in public inventory but his selected account has not been applied.
+    const denied = await assertRejects(
+      () => d.owner.prepareRoomScope(room, true, '@bob:logical.test'),
+      MatrixError,
+    );
+    assertEquals(denied.status, 503);
+    const absent = await assertRejects(
+      () => d.owner.prepareRoomScope(room, true, '@unselected:logical.test'),
+      MatrixError,
+    );
+    assertEquals(absent.status, 503);
+    const admission = await d.owner.prepareRoomScope(
+      room,
+      true,
+      '@alice:logical.test',
+    );
+    await (await f.edge.server()).tx(admission.check);
+    admission.checkCurrent();
+    const fact = await incoming(f, 'home');
+    await d.journal.receive('home', [fact.record]);
+    const changed = await assertRejects(
+      async () => (await f.edge.server()).tx(admission.check),
+      MatrixError,
+    );
+    assertEquals(changed.status, 503);
+    await assertRejects(
+      () => d.owner.prepareRoomScope(room, true, '@alice:logical.test'),
+      MatrixError,
+    );
+    await lifecycleApplication(f.es)(d.journal, fact.record, fact.keys);
+    const restored = await d.owner.prepareRoomScope(
+      room,
+      true,
+      '@alice:logical.test',
+    );
+    await (await f.edge.server()).tx(restored.check);
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('membership directory: missing bootstrap declaration is unavailable, explicit zero is complete', async () => {
   const f = await fixture();

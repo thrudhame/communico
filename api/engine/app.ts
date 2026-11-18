@@ -100,6 +100,7 @@ export type ReplicaAccess = {
   prepareRoomScope(
     roomId: string,
     allowAbsent?: boolean,
+    localUser?: string,
   ): Promise<ReplicaRoomAdmission>;
   keyDocument(): Promise<KeyDoc>;
   publicRooms(): Promise<boolean>;

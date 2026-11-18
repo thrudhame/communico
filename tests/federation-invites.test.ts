@@ -847,6 +847,144 @@ Deno.test('invitee: the validation matrix, the countersigned answer, the stored 
   });
 });
 
+Deno.test('invitee: a required missing room file cannot become an out-of-band invite', async () => {
+  await withStore(async (store) => {
+    const srv = await makeRemoteServer('remote.test');
+    const original = await inviteDepsFor(store, srv);
+    const roomId = '!missing-required:remote.test';
+    const invite = await remoteInvite(srv, roomId, '@dev:test', ['$p1']);
+    const deps = {
+      ...original,
+      prepareRoomScope: () =>
+        Promise.resolve({
+          check: () => Promise.resolve(),
+          checkCurrent() {},
+        }),
+    };
+    const error = await assertRejects(
+      () =>
+        receiveInvite(
+          roomId,
+          String(invite.event_id),
+          {
+            room_version: '11',
+            event: wireOf(invite),
+            invite_room_state: [],
+          },
+          srv.name,
+          deps,
+        ),
+      MatrixError,
+    );
+    assertEquals(error.status, 503);
+    assertEquals(await inviteFor(roomId, '@dev:test', deps), null);
+    assertEquals(
+      await deps.server.query('SELECT * FROM membership_operations'),
+      [],
+    );
+  });
+});
+
+Deno.test('invitee: new work requires selected account and room scope through publication, exact replay does not', async () => {
+  await withStore(async (store) => {
+    const srv = await makeRemoteServer('remote.test');
+    const original = await inviteDepsFor(store, srv);
+    const roomId = '!scope-invite:remote.test', target = '@dev:test';
+    const invite = await remoteInvite(srv, roomId, target, ['$p1']);
+    const eventId = String(invite.event_id);
+    const body = {
+      room_version: '11',
+      event: wireOf(invite),
+      invite_room_state: [],
+    };
+    let current = false, invalidate = false, preparations = 0, checks = 0;
+    const checkCurrent = () => {
+      if (!current) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'invite scope changed');
+      }
+    };
+    const deps = {
+      ...original,
+      prepareRoomScope: (room: string, absent?: boolean, user?: string) => {
+        if (!absent) {
+          return Promise.reject(
+            new MatrixError(404, 'M_NOT_FOUND', 'scope not found'),
+          );
+        }
+        assertEquals([room, absent], [roomId, true]);
+        assert(user === undefined || user === target);
+        preparations++;
+        checkCurrent();
+        return Promise.resolve({
+          checkCurrent,
+          check: async (conn: Conn) => {
+            assertEquals(
+              (await conn.query(
+                "SELECT name FROM sqlite_schema WHERE name='membership_operations'",
+              )).length,
+              1,
+            );
+            checks++;
+            checkCurrent();
+          },
+        });
+      },
+      keys: {
+        ...original.keys,
+        verifyEventSignature: async (
+          ...args: Parameters<typeof original.keys.verifyEventSignature>
+        ) => {
+          const valid = await original.keys.verifyEventSignature(...args);
+          if (invalidate) current = false;
+          return valid;
+        },
+      },
+    };
+    const call = () =>
+      receiveInvite(roomId, eventId, structuredClone(body), srv.name, deps);
+    await assertRejects(call, MatrixError, 'invite scope changed');
+    assertEquals(await inviteFor(roomId, target, deps), null);
+    assertEquals(
+      await deps.server.query('SELECT * FROM membership_operations'),
+      [],
+    );
+    current = true;
+    invalidate = true;
+    await assertRejects(call, MatrixError, 'invite scope changed');
+    assertEquals(await inviteFor(roomId, target, deps), null);
+    assertEquals(
+      await deps.server.query('SELECT * FROM membership_operations'),
+      [],
+    );
+    current = true;
+    invalidate = false;
+    const response = await call();
+    assert(preparations >= 3);
+    assert(checks > 0);
+    assertEquals((await inviteFor(roomId, target, deps))?.eventId, eventId);
+    const rows = await deps.server.query('SELECT * FROM membership_operations');
+    const counts = await deps.server.query(
+      "SELECT * FROM counters WHERE name='events'",
+    );
+    const prepared = preparations;
+    current = false;
+    deps.signer = {
+      ...deps.signer,
+      sign: () => Promise.reject(new Error('no fresh signer')),
+    };
+    assertEquals(await call(), response);
+    assertEquals(preparations, prepared);
+    assertEquals(
+      await deps.server.query('SELECT * FROM membership_operations'),
+      rows,
+    );
+    assertEquals(
+      await deps.server.query("SELECT * FROM counters WHERE name='events'"),
+      counts,
+    );
+  });
+});
+
 Deno.test('invitee: cold replay retains its signed response without resurrecting superseded OOB state', async () => {
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
@@ -903,6 +1041,10 @@ Deno.test('invitee: cold replay retains its signed response without resurrecting
       schemas: { room: roomSchema, server: serverSchema },
     });
     deps = await inviteDepsFor(store, srv);
+    deps.prepareRoomScope = () =>
+      Promise.reject(
+        new MatrixError(503, 'M_UNAVAILABLE', 'scope no longer served'),
+      );
     deps.signer = {
       ...deps.signer,
       sign: () =>

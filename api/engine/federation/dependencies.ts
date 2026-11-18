@@ -16,7 +16,8 @@ export function inviteDependencies(app: App): InviteDeps {
     self: app.tenant.serverName,
     wake: (destination) => app.sender?.wake(destination),
     prepareRoomScope: app.replica
-      ? (roomId) => app.replica!.prepareRoomScope(roomId)
+      ? (roomId, allowAbsent, localUser) =>
+        app.replica!.prepareRoomScope(roomId, allowAbsent, localUser)
       : undefined,
   };
 }
