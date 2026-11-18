@@ -52,18 +52,45 @@ Deno.test('SIGTERM drains admin JSON and CS upload before closing the store', as
   }
 });
 
-Deno.test('shutdown deadline aborts unread bodies and exits non-zero with counts', async () => {
+Deno.test('shutdown deadline closes unread transports retryably and closes the store successfully', async () => {
   const server = await serverProcess({ grace: 1 });
   const request = await partialRequest(
     server,
     '/v1/status',
     '{"unfinished":true}',
   );
+  const response = (async () => {
+    const reader = request.conn.readable.getReader();
+    let wire = '';
+    try {
+      for (;;) {
+        const { value, done } = await bounded(reader.read());
+        if (done) return wire;
+        wire += new TextDecoder().decode(value);
+      }
+    } catch (error) {
+      if (
+        error instanceof Deno.errors.ConnectionReset ||
+        error instanceof Deno.errors.ConnectionAborted
+      ) return wire;
+      throw error;
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+  // The wire may settle before process output; retain its rejection for the
+  // assertion below instead of creating an unhandled test-side promise.
+  void response.catch(() => {});
   try {
     await pause(100);
     server.child.kill('SIGINT');
     const out = await bounded(server.output, 10000);
-    assert(out.code !== 0);
+    assertEquals(out.code, 0, out.stderr);
+    const wire = await bounded(response);
+    // Synapse stops listeners (synapse/server.py:461-469), then closes active
+    // transports (synapse/http/site.py:927-938). An unread body at grace expiry
+    // likewise ends in retryable EOF/reset, not a promised HTTP response.
+    assertEquals(wire, '');
     assert(
       out.stderr.includes('shutdown: forced aborts {"admin":1}'),
       out.stderr,
@@ -71,7 +98,11 @@ Deno.test('shutdown deadline aborts unread bodies and exits non-zero with counts
     assert(out.stdout.includes('shutdown: store closed'));
     assertEquals(await Deno.lstat(server.socket).catch(() => null), null);
   } finally {
-    request.conn.close();
+    try {
+      request.conn.close();
+    } catch (error) {
+      assert(error instanceof Deno.errors.BadResource, String(error));
+    }
     await server.dispose();
   }
 });
