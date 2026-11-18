@@ -14,6 +14,7 @@ export async function bindMembershipDisplay(
   roomId: string,
   userId: string,
   selected: MembershipOperation[],
+  provenance?: { event: boolean; localLeave: boolean },
 ): Promise<void> {
   const semanticKey = canonicalJson(['membership', roomId, userId]);
   const actual = (await membershipDisplay(conn, semanticKey, false)).display;
@@ -46,7 +47,15 @@ export async function bindMembershipDisplay(
   const operations = actual.map((operation) => operation.operationId).sort();
   await conn.execute(
     'UPDATE prejoin_memberships SET source_binding=? WHERE room_id=? AND user_id=?',
-    [canonicalJson({ state, operations }), roomId, userId],
+    [
+      canonicalJson({
+        state,
+        operations,
+        ...(provenance ? { provenance } : {}),
+      }),
+      roomId,
+      userId,
+    ],
   );
   await conn.execute('DELETE FROM domain_frontiers WHERE semantic_key=?', [
     semanticKey,

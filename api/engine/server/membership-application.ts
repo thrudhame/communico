@@ -1,7 +1,11 @@
 // Materialization owns receiver-local publication, never foreign work or source
 // authorship. The link adapter supplies verified, normalized selected evidence.
 import { canonicalJson } from '#engine/canonical.ts';
-import { eventMaterial } from '#engine/room/verify.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  compatibleEventMaterial,
+  type SignatureEvidence,
+} from '#engine/room/signatures.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import type { Conn } from '#engine/store/db.ts';
 import { membershipDisplay } from './membership-display.ts';
@@ -15,23 +19,65 @@ import { nextEventSeq } from './stream.ts';
 import { applyInvitePush, withdrawInvitePush } from './notifications.ts';
 import type { PushPublication } from './push-project.ts';
 
+export type MembershipEvidence = {
+  event: SignatureEvidence;
+  localLeave: SignatureEvidence | null;
+  provenance: { event: boolean; localLeave: boolean };
+};
+
 // Signature overlays and stripped hints enrich evidence for an existing event;
 // they do not create another membership transition, position or push decision.
 function publicationMaterial(state: Omit<MembershipState, 'publication'>) {
+  const event = JSON.parse(state.eventJson) as Pdu;
+  const departure = ['leave', 'ban'].includes(String(event.content?.membership))
+    ? event
+    : state.localLeaveJson === null
+    ? null
+    : JSON.parse(state.localLeaveJson) as Pdu;
+  const displayed = state.status === 'pending' ? event : departure;
   return canonicalJson({
-    ...state,
-    inviteRoomState: null,
-    eventJson: eventMaterial(JSON.parse(state.eventJson) as Pdu),
-    localLeaveJson: state.localLeaveJson === null
-      ? null
-      : eventMaterial(JSON.parse(state.localLeaveJson) as Pdu),
+    roomId: state.roomId,
+    userId: state.userId,
+    roomVersion: state.roomVersion,
+    eventId: displayed?.event_id ?? null,
+    membership: displayed?.content?.membership ?? null,
   });
+}
+
+async function retainAcceptedEvent(
+  accepted: Pdu,
+  evidence: SignatureEvidence,
+  hashRedacted: boolean,
+): Promise<Pdu> {
+  if (!await compatibleEventMaterial(accepted, evidence, hashRedacted)) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'membership changes a retained event',
+    );
+  }
+  const pdu = structuredClone(accepted);
+  for (const [server, entries] of Object.entries(evidence.signatures)) {
+    for (const [key, signature] of Object.entries(entries)) {
+      const prior = pdu.signatures?.[server]?.[key];
+      if (prior !== undefined && prior <= signature) continue;
+      pdu.signatures ??= {};
+      Object.defineProperty(pdu.signatures, server, {
+        value: { ...pdu.signatures[server], [key]: signature },
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+  }
+  return pdu;
 }
 
 export async function materializeMembershipDisplay(
   conn: Conn,
   selected: MembershipOperation[],
   state: MembershipState,
+  evidence: MembershipEvidence,
   publication: PushPublication,
   now: number,
 ): Promise<void> {
@@ -55,6 +101,41 @@ export async function materializeMembershipDisplay(
     [state.roomId, state.userId],
   );
   const { publication: _sourcePublication, ...value } = state;
+  const provenance = { ...evidence.provenance };
+  if (previous) {
+    const prior = membershipStateOf(previous);
+    const binding = previous.source_binding == null
+      ? null
+      : JSON.parse(String(previous.source_binding));
+    const priorProvenance = binding &&
+        canonicalJson(binding.state) === canonicalJson(prior)
+      ? binding.provenance
+      : null;
+    const event = JSON.parse(prior.eventJson) as Pdu;
+    if (event.event_id === evidence.event.eventId) {
+      value.eventJson = canonicalJson(
+        await retainAcceptedEvent(
+          event,
+          evidence.event,
+          priorProvenance?.event === true,
+        ),
+      );
+      provenance.event = priorProvenance?.event === true;
+    }
+    if (prior.localLeaveJson !== null && evidence.localLeave !== null) {
+      const leave = JSON.parse(prior.localLeaveJson) as Pdu;
+      if (leave.event_id === evidence.localLeave.eventId) {
+        value.localLeaveJson = canonicalJson(
+          await retainAcceptedEvent(
+            leave,
+            evidence.localLeave,
+            priorProvenance?.localLeave === true,
+          ),
+        );
+        provenance.localLeave = priorProvenance?.localLeave === true;
+      }
+    }
+  }
   const same = previous &&
     canonicalJson(membershipStateOf(previous)) === canonicalJson(value);
   if (!same) {
@@ -85,17 +166,17 @@ export async function materializeMembershipDisplay(
         state.userId,
         state.eventId,
         state.roomVersion,
-        state.eventJson,
+        value.eventJson,
         state.inviteRoomState,
         state.origin,
         news ? now : Number(previous.received_ms),
         state.status,
         seq,
         state.kind,
-        state.localLeaveJson,
+        value.localLeaveJson,
       ],
     );
-    if (news && state.kind === 'invite') {
+    if (news && state.kind === 'invite' && state.status === 'pending') {
       await applyInvitePush(
         conn,
         state.roomId,
@@ -111,5 +192,6 @@ export async function materializeMembershipDisplay(
     state.roomId,
     state.userId,
     selected,
+    provenance,
   );
 }

@@ -34,18 +34,41 @@ export async function membershipDisplay(
       .filter((state) => terminal.has(state.status))
       .map((state) => state.eventId),
   );
-  const candidates = facts.filter(({ state }) =>
+  const pending = facts.filter(({ state }) =>
     state.status === 'pending' && !suppressed.has(state.eventId)
   );
+  const departureId = (state: MembershipState): string | null => {
+    if (!['rejecting', 'failed-retract', 'rejected'].includes(state.status)) {
+      return null;
+    }
+    const event = JSON.parse(state.eventJson);
+    const leave = ['leave', 'ban'].includes(event.content?.membership)
+      ? event
+      : state.localLeaveJson === null
+      ? null
+      : JSON.parse(state.localLeaveJson);
+    return leave && ['leave', 'ban'].includes(leave.content?.membership) &&
+        typeof leave.event_id === 'string'
+      ? leave.event_id
+      : null;
+  };
+  // A distinct concurrent pending invitation remains visible. Otherwise retain
+  // actual terminal leave news, never a fabricated departure or OOB join.
+  const candidates = pending.length
+    ? pending
+    : facts.filter(({ state }) => departureId(state) !== null);
+  const displayId = (state: MembershipState) =>
+    pending.length ? state.eventId : departureId(state)!;
   let eventId: string | null = null;
   for (const { state } of candidates) {
-    if (eventId === null || state.eventId > eventId) eventId = state.eventId;
+    const id = displayId(state);
+    if (eventId === null || id > eventId) eventId = id;
   }
   // Same-event evidence stays together for normal PDU/signature validation;
   // there is no source-dot, payload-hash or imported-sequence tie breaker.
   return {
     ...history,
-    display: candidates.filter(({ state }) => state.eventId === eventId)
+    display: candidates.filter(({ state }) => displayId(state) === eventId)
       .map(({ operation }) => operation),
   };
 }

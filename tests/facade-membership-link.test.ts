@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
+import { renderPrejoinDeparture } from '#engine/client/render.ts';
 import {
   AccountSnapshots,
   exportAccountAuth,
@@ -17,12 +18,16 @@ import {
   countersign,
   inviteIntentProvider,
   invitesOf,
+  prejoinDeparture,
 } from '#engine/federation/invites.ts';
 import { createRoom } from '#engine/room/create.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { retainMembershipOperation } from '#engine/server/membership-history.ts';
-import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
+import {
+  appendMembershipSuccessor,
+  recordMembershipOperation,
+} from '#engine/server/membership-operations.ts';
 import { membershipHistory } from '#engine/server/membership-history.ts';
 import { fakeKeyResolver, remoteEvent } from '#tests/fixtures/remote.ts';
 import { testRemoteServer, testSigner } from '#tests/fixtures/signer.ts';
@@ -453,6 +458,8 @@ async function incoming(
   side: 'home' | 'edge' = 'edge',
   kind: 'invite' | 'knock' = 'invite',
   roomId?: string,
+  memberContent: Record<string, unknown> = {},
+  corruptContent?: Record<string, unknown>,
 ) {
   const operation = await source(f, 1, side, roomId);
   const remote = await testRemoteServer(
@@ -464,9 +471,10 @@ async function incoming(
     type: 'm.room.member',
     sender: kind === 'knock' ? state.userId : '@inviter:remote.test',
     state_key: state.userId,
-    content: { membership: kind },
+    content: { ...memberContent, membership: kind },
     prev_events: [],
   });
+  if (corruptContent) pdu.content = { ...pdu.content, ...corruptContent };
   state.eventId = String(pdu.event_id);
   state.eventJson = canonicalJson(pdu);
   operation.payload = canonicalJson(state);
@@ -497,6 +505,19 @@ function lifecycleApplication(owner: MembershipOperations) {
   }).apply;
   assert(apply, 'membership lifecycle application is unavailable');
   return apply.bind(owner);
+}
+
+async function exportSuccessor(
+  f: Awaited<ReturnType<typeof fixture>>,
+  prior: MembershipOperation,
+  state: MembershipState,
+) {
+  const operation = await (await f.edge.server()).tx((conn) =>
+    appendMembershipSuccessor(conn, prior, state)
+  );
+  const records = await f.es.export('alice');
+  assertEquals(records.length, 1);
+  return { operation, record: records[0] };
 }
 
 Deno.test('membership application: authenticated OOB facts reach ordinary invite consumers in both roles before applied ACK', async () => {
@@ -889,6 +910,360 @@ Deno.test('membership evidence: a valid signature enrichment updates exact evide
       counters,
     );
     assert(JSON.parse(displayed[0].eventJson).signatures['overlay.test']);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership evidence: a hash-mismatched known invite cannot replace accepted content or publish another position', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys, operation: first } = await incoming(
+      f,
+      'edge',
+      'invite',
+      undefined,
+      { displayname: 'Authentic Alice' },
+    );
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+    const before = await invitesOf(state.userId, { server: db });
+    assertEquals(before.length, 1);
+    assertEquals(
+      JSON.parse(before[0].eventJson).content.displayname,
+      'Authentic Alice',
+    );
+    const counters = await db.query('SELECT * FROM counters ORDER BY name');
+    const pdu = JSON.parse(state.eventJson);
+    pdu.content.displayname = 'Tampered Alice';
+    await countersign(pdu, '11', await testSigner('overlay.test'));
+    state.eventJson = canonicalJson(pdu);
+    const next = await source(f, 2);
+    next.context = [{
+      source: first.source,
+      incarnation: first.incarnation,
+      sequence: first.sequence,
+    }];
+    next.payload = canonicalJson(state);
+    next.payloadHash = createHash('sha256').update(next.payload).digest('hex');
+    await (await f.edge.server()).execute(
+      'UPDATE domain_operations SET payload_json=?,payload_hash=?,context_json=? WHERE operation_id=?',
+      [
+        next.payload,
+        next.payloadHash,
+        canonicalJson(next.context),
+        next.operationId,
+      ],
+    );
+    const [successor] = await f.es.export('alice');
+    await journal.receive(successor.source, [successor]);
+    const remote = await testRemoteServer('remote.test');
+    const overlay = await testRemoteServer('overlay.test');
+    await assertRejects(
+      () =>
+        lifecycleApplication(f.hs)(
+          journal,
+          successor,
+          fakeKeyResolver(
+            // The optional signature is genuine, but it cannot authorize changed
+            // full material for an already accepted event (same as room import).
+            remote,
+            overlay,
+          ),
+          f.bundle.id,
+        ),
+    );
+    const displayed = await invitesOf(state.userId, { server: db });
+    assertEquals(displayed.length, 1);
+    assertEquals(displayed[0].eventId, before[0].eventId);
+    assertEquals(
+      displayed[0].seq,
+      before[0].seq,
+      'a redacted receipt for a known event is not new lifecycle news',
+    );
+    const accepted = JSON.parse(displayed[0].eventJson);
+    assertEquals(accepted.content.displayname, 'Authentic Alice');
+    assertEquals(accepted.signatures['overlay.test'], undefined);
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      counters,
+    );
+    assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+    assertEquals(
+      (await db.query(
+        "SELECT DISTINCT source FROM domain_operations WHERE kind='membership'",
+      )).map((row) => row.source),
+      [successor.source],
+    );
+    const [bound] = await db.query(
+      'SELECT source_binding FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+      [state.roomId, state.userId],
+    );
+    assertEquals(
+      JSON.parse(JSON.parse(String(bound.source_binding)).state.eventJson)
+        .content.displayname,
+      'Authentic Alice',
+    );
+    assertEquals(
+      (await journal.heads(successor.source, 'in', successor)).applied.sequence,
+      record.sequence,
+    );
+    assertEquals(
+      (await journal.heads(successor.source, 'in', successor)).received
+        .sequence,
+      successor.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership evidence: cold hash-redaction provenance permits compatible overlays without replacing accepted bytes', async () => {
+  for (const originalContent of [{}, { displayname: 'Authentic Alice' }]) {
+    const f = await fixture();
+    try {
+      const { record, state, keys, operation: first } = await incoming(
+        f,
+        'edge',
+        'invite',
+        undefined,
+        originalContent,
+        { displayname: 'Corrupted receipt' },
+      );
+      let db = await f.home.server();
+      let journal = new Journal(db, [...LINK_SUPPORTED, {
+        type: 'membership-operation',
+        version: 1,
+      }]);
+      await journal.receive(record.source, [record]);
+      await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+      const before = await invitesOf(state.userId, { server: db });
+      assertEquals(before.length, 1);
+      const accepted = JSON.parse(before[0].eventJson);
+      assertEquals(accepted.content, { membership: 'invite' });
+      const counters = await db.query('SELECT * FROM counters ORDER BY name');
+      const reopened = await f.reopenHome();
+      db = await reopened.home.server();
+      journal = new Journal(db, [...LINK_SUPPORTED, {
+        type: 'membership-operation',
+        version: 1,
+      }]);
+      const raw = JSON.parse(state.eventJson);
+      await countersign(raw, '11', await testSigner('overlay.test'));
+      state.eventJson = canonicalJson(raw);
+      const second = await exportSuccessor(f, first, state);
+      await journal.receive(second.record.source, [second.record]);
+      const mergedKeys = fakeKeyResolver(
+        await testRemoteServer('remote.test'),
+        await testRemoteServer('overlay.test'),
+      );
+      await lifecycleApplication(reopened.owner)(
+        journal,
+        second.record,
+        mergedKeys,
+        f.bundle.id,
+      );
+      const enriched = await invitesOf(state.userId, { server: db });
+      assertEquals(enriched[0].seq, before[0].seq);
+      const enrichedEvent = JSON.parse(enriched[0].eventJson);
+      assertEquals(enrichedEvent.content, accepted.content);
+      assert(enrichedEvent.signatures['overlay.test']);
+      raw.content = { ...originalContent, membership: 'invite' };
+      state.eventJson = canonicalJson(raw);
+      const third = await exportSuccessor(f, second.operation, state);
+      await journal.receive(third.record.source, [third.record]);
+      await lifecycleApplication(reopened.owner)(
+        journal,
+        third.record,
+        mergedKeys,
+        f.bundle.id,
+      );
+      assertEquals(await invitesOf(state.userId, { server: db }), enriched);
+      assertEquals(
+        await db.query('SELECT * FROM counters ORDER BY name'),
+        counters,
+      );
+      const [bound] = await db.query(
+        'SELECT source_binding FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+        [state.roomId, state.userId],
+      );
+      assertEquals(
+        JSON.parse(String(bound.source_binding)).provenance.event,
+        true,
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('membership terminal: a verified causal rejection publishes real leave news without signing, jobs or source echo', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys, operation: first } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+    const before = await invitesOf(state.userId, { server: db });
+    assertEquals(before.length, 1);
+    const leave = await remoteEvent(
+      state.roomId,
+      await testRemoteServer('remote.test'),
+      '11',
+      {
+        type: 'm.room.member',
+        sender: '@inviter:remote.test',
+        state_key: state.userId,
+        content: { membership: 'leave', reason: 'authentic rescind' },
+        prev_events: [state.eventId],
+      },
+    );
+    state.status = 'rejected';
+    state.eventJson = canonicalJson(leave);
+    const next = await source(f, 2);
+    next.context = [{
+      source: first.source,
+      incarnation: first.incarnation,
+      sequence: first.sequence,
+    }];
+    next.payload = canonicalJson(state);
+    next.payloadHash = createHash('sha256').update(next.payload).digest('hex');
+    await (await f.edge.server()).execute(
+      'UPDATE domain_operations SET payload_json=?,payload_hash=?,context_json=? WHERE operation_id=?',
+      [
+        next.payload,
+        next.payloadHash,
+        canonicalJson(next.context),
+        next.operationId,
+      ],
+    );
+    const [successor] = await f.es.export('alice');
+    await journal.receive(successor.source, [successor]);
+    await lifecycleApplication(f.hs)(journal, successor, keys, f.bundle.id);
+    const displayed = await invitesOf(state.userId, { server: db });
+    assertEquals(
+      displayed.length,
+      1,
+      'terminal membership is published, not deleted',
+    );
+    assertEquals(displayed[0].eventId, state.eventId);
+    assertEquals(displayed[0].status, 'rejected');
+    assert(displayed[0].seq > before[0].seq);
+    const departure = await prejoinDeparture(displayed[0], {
+      server: db,
+      signer: {
+        ...f.ht.signer(),
+        sign: () => {
+          throw new Error('import must not sign a departure');
+        },
+      },
+    });
+    assert(departure);
+    assertEquals(
+      renderPrejoinDeparture(departure, state.userId, 'client'),
+      {
+        event_id: leave.event_id,
+        type: 'm.room.member',
+        sender: leave.sender,
+        state_key: state.userId,
+        content: leave.content,
+        origin_server_ts: leave.origin_server_ts,
+      },
+    );
+    await db.tx((conn) =>
+      recordMembershipOperation(conn, state.roomId, state.userId)
+    );
+    assertEquals(
+      (await db.query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      )).length,
+      2,
+    );
+    assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+    const counters = await db.query('SELECT * FROM counters ORDER BY name');
+    assertEquals(
+      await lifecycleApplication(f.hs)(journal, successor, keys, f.bundle.id),
+      false,
+    );
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      counters,
+    );
+    assertEquals(
+      (await journal.heads(successor.source, 'in', successor)).applied.sequence,
+      successor.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership terminal: rejection suppresses only its original invitation and preserves a distinct concurrent invite', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys, operation: first } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+    const other = await incoming(f, 'home', 'invite', state.roomId, {
+      displayname: 'Distinct concurrent invite',
+    });
+    assert(other.state.eventId !== state.eventId);
+    const leave = await remoteEvent(
+      state.roomId,
+      await testRemoteServer('remote.test'),
+      '11',
+      {
+        type: 'm.room.member',
+        sender: '@inviter:remote.test',
+        state_key: state.userId,
+        content: { membership: 'leave' },
+        prev_events: [state.eventId],
+      },
+    );
+    state.status = 'rejected';
+    state.eventJson = canonicalJson(leave);
+    const terminal = await exportSuccessor(f, first, state);
+    await journal.receive(terminal.record.source, [terminal.record]);
+    await lifecycleApplication(f.hs)(
+      journal,
+      terminal.record,
+      keys,
+      f.bundle.id,
+    );
+    const displayed = await invitesOf(state.userId, { server: db });
+    assertEquals(displayed.length, 1);
+    assertEquals(displayed[0].eventId, other.state.eventId);
+    assertEquals(displayed[0].status, 'pending');
+    assertEquals(
+      (await db.query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      )).length,
+      3,
+    );
+    await db.tx((conn) =>
+      recordMembershipOperation(conn, state.roomId, state.userId)
+    );
+    assertEquals(
+      (await db.query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      )).length,
+      3,
+    );
+    assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
   } finally {
     await f.close();
   }

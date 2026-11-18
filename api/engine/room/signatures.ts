@@ -6,7 +6,7 @@ import { b64encodeStd, matrixBase64 } from '#engine/signing-primitives.js';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import type { KeyResolver } from './deps.ts';
-import { eventMaterial, verify } from './verify.ts';
+import { contentHashMatches, eventMaterial, verify } from './verify.ts';
 export { eventMaterial } from './verify.ts';
 
 export const EVENT_SIGNATURES_SQL = `
@@ -26,6 +26,21 @@ export type SignatureEvidence = {
     Record<string, Readonly<Record<string, string>>>
   >;
 };
+
+/** Accepted event bytes are immutable. A genuinely hash-redacted receipt may
+ * learn compatible signatures, but a full accepted event cannot be replaced
+ * with a newly redacted or corrupted copy sharing its reference identity. */
+export async function compatibleEventMaterial(
+  accepted: Pdu,
+  evidence: SignatureEvidence,
+  hashRedacted = false,
+): Promise<boolean> {
+  const material = eventMaterial(accepted);
+  return material === evidence.material ||
+    (material === evidence.redactedMaterial &&
+      accepted.type !== 'm.room.create' &&
+      (hashRedacted || !await contentHashMatches(accepted)));
+}
 
 export async function prepareEventSignatures(
   raw: Pdu,

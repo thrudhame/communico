@@ -7,14 +7,19 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { domainOf } from '#engine/ids.ts';
-import { verify } from '#engine/room/verify.ts';
-import { eventMaterial } from '#engine/room/verify.ts';
-import { prepareEventSignatures } from '#engine/room/signatures.ts';
+import { wasHashRedacted } from '#engine/room/verify.ts';
+import {
+  compatibleEventMaterial,
+  prepareEventSignatures,
+} from '#engine/room/signatures.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { validatePrejoin } from '#engine/federation/prejoin.ts';
 import { membershipDisplay } from '#engine/server/membership-display.ts';
-import { materializeMembershipDisplay } from '#engine/server/membership-application.ts';
+import {
+  materializeMembershipDisplay,
+  type MembershipEvidence,
+} from '#engine/server/membership-application.ts';
 import { prejoinResult, savePrejoinResult } from '#engine/server/prejoin.ts';
 import { withProjectionLock } from '#engine/server/project.ts';
 import { prepareInvitePush } from '#engine/server/push-project.ts';
@@ -139,13 +144,13 @@ function bootstrapOrder(operations: MembershipOperation[]) {
 
 /** Verify original signed evidence without countersigning or installing a room.
  * A terminal row may render a leave while retaining the original invite ID. */
-async function verifiedState(
+async function preparedState(
   operation: MembershipOperation,
   keys: KeyResolver,
-): Promise<MembershipState> {
+): Promise<{ state: MembershipState; evidence: MembershipEvidence }> {
   const state = JSON.parse(operation.payload) as MembershipState;
   const inRoom = async (raw: string) => {
-    const { pdu } = await verify(
+    const prepared = await prepareEventSignatures(
       JSON.parse(raw) as Pdu,
       state.roomVersion,
       keys,
@@ -153,12 +158,17 @@ async function verifiedState(
         roomId: state.roomId,
       },
     );
-    if (pdu.room_id !== undefined && pdu.room_id !== state.roomId) {
+    if (
+      prepared.pdu.room_id !== undefined &&
+      prepared.pdu.room_id !== state.roomId
+    ) {
       mismatch('membership PDU differs from retained room');
     }
-    return pdu;
+    prepared.pdu.signatures = structuredClone(prepared.evidence.signatures);
+    return prepared;
   };
-  const event = await inRoom(state.eventJson);
+  const receipt = await inRoom(state.eventJson);
+  const event = receipt.pdu;
   const membership = event.content?.membership;
   const original = membership === state.kind;
   if (
@@ -172,8 +182,11 @@ async function verifiedState(
     (state.kind === 'knock' && original && event.sender !== state.userId)
   ) mismatch('membership PDU differs from retained lifecycle');
   let localLeaveJson = state.localLeaveJson;
+  const departure = localLeaveJson === null
+    ? null
+    : await inRoom(localLeaveJson);
   if (localLeaveJson !== null) {
-    const leave = await inRoom(localLeaveJson);
+    const leave = departure!.pdu;
     if (
       leave.type !== 'm.room.member' || leave.state_key !== state.userId ||
       leave.sender !== state.userId || leave.content?.membership !== 'leave'
@@ -182,7 +195,17 @@ async function verifiedState(
   }
   // The immutable operation retains original evidence. Only the verifier's
   // normalized PDU can subsequently supply a materialized display.
-  return { ...state, eventJson: canonicalJson(event), localLeaveJson };
+  return {
+    state: { ...state, eventJson: canonicalJson(event), localLeaveJson },
+    evidence: {
+      event: receipt.evidence,
+      localLeave: departure?.evidence ?? null,
+      provenance: {
+        event: wasHashRedacted(event),
+        localLeave: departure !== null && wasHashRedacted(departure.pdu),
+      },
+    },
+  };
 }
 
 export class MembershipOperations {
@@ -303,7 +326,7 @@ export class MembershipOperations {
       await this.selected(conn, grant, view.localpart);
       await requireDomainControl(conn, view);
     });
-    const state = await verifiedState(view.operation, keys);
+    const prepared = await preparedState(view.operation, keys);
     await server.tx(async (conn) => {
       unchanged();
       await this.selected(conn, grant, view.localpart);
@@ -311,7 +334,7 @@ export class MembershipOperations {
       await retainMembershipOperation(conn, view.operation);
       unchanged();
     });
-    return state;
+    return prepared.state;
   }
 
   /** Semantic completion precedes journal ACK. The exact saved record can
@@ -379,34 +402,36 @@ export class MembershipOperations {
     }
     // All validation and tenant policy capture happens before room/server locks.
     // Optional signature overlays join only after the shared verifier accepts them.
-    const normalized: MembershipState[] = [];
+    const normalized: Awaited<ReturnType<typeof preparedState>>[] = [];
     for (const operation of selection.display) {
-      const state = await verifiedState(operation, keys);
-      const prepared = await prepareEventSignatures(
-        JSON.parse(state.eventJson) as Pdu,
-        state.roomVersion,
-        keys,
-        { roomId: state.roomId },
-      );
-      prepared.pdu.signatures = structuredClone(prepared.evidence.signatures);
+      const prepared = await preparedState(operation, keys);
+      const state = prepared.state;
       normalized.push({
-        ...state,
-        eventJson: canonicalJson(prepared.pdu),
-        inviteRoomState: canonicalJson(
-          await validatePrejoin(
-            JSON.parse(state.inviteRoomState),
-            state.roomId,
-            state.roomVersion,
-            keys,
+        ...prepared,
+        state: {
+          ...state,
+          inviteRoomState: canonicalJson(
+            await validatePrejoin(
+              JSON.parse(state.inviteRoomState),
+              state.roomId,
+              state.roomVersion,
+              keys,
+            ),
           ),
-        ),
+        },
       });
     }
-    const state = normalized[0];
+    const state = normalized[0].state;
     const event = JSON.parse(state.eventJson) as Pdu;
     for (const other of normalized.slice(1)) {
-      const pdu = JSON.parse(other.eventJson) as Pdu;
-      if (eventMaterial(pdu) !== eventMaterial(event)) {
+      const pdu = JSON.parse(other.state.eventJson) as Pdu;
+      if (
+        !await compatibleEventMaterial(
+          event,
+          other.evidence.event,
+          normalized[0].evidence.provenance.event,
+        )
+      ) {
         throw new LinkError(
           'LINK_DIVERGED',
           'selected membership event material changed',
@@ -421,6 +446,13 @@ export class MembershipOperations {
       }
     }
     state.eventJson = canonicalJson(event);
+    const evidence: MembershipEvidence = {
+      ...normalized[0].evidence,
+      event: {
+        ...normalized[0].evidence.event,
+        signatures: event.signatures ?? {},
+      },
+    };
     const publication = await prepareInvitePush(this.store, view.server, event);
     const result = await withRoomLock(
       state.roomId,
@@ -455,14 +487,15 @@ export class MembershipOperations {
             // newer normal publication or replace a held room's DAG authority.
             if (
               !held && (!published || normalized.every((value) =>
-                value.publication?.eventId === published.event &&
-                value.publication.follows
+                value.state.publication?.eventId === published.event &&
+                value.state.publication.follows
               ))
             ) {
               await materializeMembershipDisplay(
                 conn,
                 selection.display,
                 state,
+                evidence,
                 publication,
                 Date.now(),
               );
