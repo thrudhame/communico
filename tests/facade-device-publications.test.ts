@@ -3,6 +3,7 @@ import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { fanoutDeviceChange } from '#engine/server/device-federation.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import {
   completeBatch,
   freezeBatch,
@@ -358,15 +359,7 @@ Deno.test('F2 device publication upgrade preserves multiple legacy frozen resets
   const dir = await Deno.makeTempDir({ prefix: 'device-publication-upgrade-' });
   let store = await openStore(options(dir), {
     schemas: {
-      server: {
-        version: 42,
-        apply: async (db) => {
-          await serverSchema.apply(db);
-          await db.exec(
-            'DROP TABLE device_publications; DROP TABLE device_publication_predecessors; DROP TABLE device_publication_frontier',
-          );
-        },
-      },
+      server: historicalServerSchema(42),
     },
   });
   try {
