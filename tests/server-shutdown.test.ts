@@ -1,4 +1,4 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertMatch } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { closeApp, openApp } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
@@ -60,7 +60,9 @@ Deno.test('shutdown: expired drain cancels a returned streaming response before 
   }
 });
 
-for (const finish of ['within grace', 'cancelled'] as const) {
+for (
+  const finish of ['within grace', 'cancelled', 'close while held'] as const
+) {
   Deno.test(`shutdown: real federation send ${finish} retains its callback and gives a retryable wire outcome`, async () => {
     setConfigForTests({ federation: { enabled: true, mode: 'open' } });
     const dir = await Deno.makeTempDir({ prefix: 'shutdown-' });
@@ -75,6 +77,11 @@ for (const finish of ['within grace', 'cancelled'] as const) {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const cancelled = Promise.withResolvers<void>();
+    const effects: Record<string, unknown>[] = [];
+    app.federationEdus.register('test.shutdown', (_origin, content) => {
+      effects.push(content);
+      return Promise.resolve();
+    }, true);
     const query = app.server.query.bind(app.server);
     let held = false;
     app.server.query = async (sql, params) => {
@@ -108,18 +115,24 @@ for (const finish of ['within grace', 'cancelled'] as const) {
       peer,
     );
     const path = '/_matrix/federation/v1/send/shutdown-owned';
-    const body = { origin: peer.name, origin_server_ts: 1, pdus: [], edus: [] };
+    const body = {
+      origin: peer.name,
+      origin_server_ts: 1,
+      pdus: [],
+      edus: [{ edu_type: 'test.shutdown', content: { effect: 'once' } }],
+    };
     const run = send('PUT', path, body);
     // Observe a negative wire result without an unhandled rejection in the red run.
     const result = Promise.allSettled([run]);
     let drain: Promise<Record<string, number>> | undefined;
+    let closing: Promise<void> | undefined;
     try {
       await bounded(entered.promise);
-      drain = lifetime.drain(finish === 'cancelled' ? 0 : 60);
+      drain = lifetime.drain(finish === 'within grace' ? 60 : 0);
       const refused = await fetch(base + '/_matrix/client/versions');
       assertEquals(refused.status, 503);
       await refused.body?.cancel();
-      if (finish === 'cancelled') {
+      if (finish !== 'within grace') {
         await bounded(cancelled.promise);
         assertEquals(
           lifetime.count,
@@ -127,39 +140,63 @@ for (const finish of ['within grace', 'cancelled'] as const) {
           'cancellation cannot release a live store capability',
         );
       }
+      // Synapse stops listeners then loses connections at forced shutdown.
+      // Once grace expires, 503 delivery may race the transport's EOF/reset;
+      // transaction effects and retryability, not a second flush wait, govern.
+      if (finish === 'close while held') closing = lifetime.close();
       release.resolve();
       const [outcome] = await bounded(result);
-      assertEquals(outcome.status, 'fulfilled');
-      assert(outcome.status === 'fulfilled');
-      assertEquals(outcome.value.status, finish === 'cancelled' ? 503 : 200);
-      if (finish === 'cancelled') {
-        assertEquals(outcome.value.body.errcode, 'M_UNKNOWN');
+      if (finish === 'close while held' && outcome.status === 'rejected') {
+        assert(outcome.reason instanceof TypeError);
+        assert(outcome.reason.cause instanceof Error);
+        assertMatch(
+          outcome.reason.cause.message,
+          /connection (closed|reset)|EOF|broken pipe/i,
+        );
+      } else {
+        assertEquals(outcome.status, 'fulfilled');
+        assert(outcome.status === 'fulfilled');
+        assertEquals(
+          outcome.value.status,
+          finish === 'within grace' ? 200 : 503,
+        );
+        if (finish !== 'within grace') {
+          assertEquals(outcome.value.body.errcode, 'M_UNKNOWN');
+        }
       }
+      if (closing) await bounded(closing);
       await bounded(drain);
       await bounded(lifetime.settled());
       const cached = await query(
         'SELECT response FROM federation_txns WHERE txn_id=?',
         ['shutdown-owned'],
       );
-      assertEquals(cached.length, finish === 'cancelled' ? 0 : 1);
+      assertEquals(cached.length, finish === 'within grace' ? 1 : 0);
+      assertEquals(
+        effects,
+        finish === 'within grace' ? [{ effect: 'once' }] : [],
+      );
       // A stopped server must not turn an interrupted send into cached success.
       // The same transaction is retryable at the actual engine boundary.
-      if (finish === 'cancelled') {
+      if (finish !== 'within grace') {
         const { receiveTransaction } = await import(
           '#engine/federation/transactions.ts'
         );
         const { transactionDeps } = await import(
           '#engine/federation/context.ts'
         );
-        assertEquals(
-          (await receiveTransaction(
-            peer.name,
-            'shutdown-owned',
-            body,
-            transactionDeps(),
-          )).status,
-          200,
-        );
+        for (let retry = 0; retry < 2; retry++) {
+          assertEquals(
+            (await receiveTransaction(
+              peer.name,
+              'shutdown-owned',
+              body,
+              transactionDeps(),
+            )).status,
+            200,
+          );
+          assertEquals(effects, [{ effect: 'once' }]);
+        }
         assertEquals(
           (await query('SELECT response FROM federation_txns WHERE txn_id=?', [
             'shutdown-owned',
@@ -171,6 +208,7 @@ for (const finish of ['within grace', 'cancelled'] as const) {
       release.resolve();
       await result;
       if (drain) await drain;
+      if (closing) await closing;
       await server.shutdown();
       app.server.query = query;
       await closeApp();

@@ -1477,12 +1477,15 @@ disconnects and forced listener aborts. Graceful drain still permits readable
 bodies to finish. Transport completion alone cannot release a running callback;
 shutdown retains the store until both handler and transport ownership settle.
 At grace expiry the listener cancels operation signals and derived body reads
-before closing transports. Fully read cancelled requests get retryable 503s;
-unread native bodies end in retryable transport EOF/reset, as in Synapse.
+before closing transports. Fully read cancelled requests get retryable 503s
+when delivery completes within grace; after forced transport closure, EOF/reset
+is also retryable, as in Synapse. Unread native bodies likewise end in EOF/reset.
 Returned response streams share operation cancellation. Shutdown first waits
 for handler work, then aborts expired transports without waiting for delivery,
 so a client that stops reading cannot hold that phase open. A response already
-started ends retryably; newly rendered cancellation responses still get 503.
+started ends retryably; newly rendered cancellation responses use 503 when the
+transport can still deliver it. An interrupted federation transaction has no
+cached success or partial effects, and retrying the same ID succeeds only once.
 Storage remains owned until transport settlement and asynchronous response-source
 cancellation have both completed.
 Clean storage closure exits successfully even when cancellation was needed;
