@@ -383,20 +383,28 @@ for (const race of ['new rejection', 'candidate failover'] as const) {
       const dropped = dropping.then((result) => result, (error) => ({ error }));
       await cut;
       const enrolled = latch();
-      const then = Promise.prototype.then;
+      const push = Array.prototype.push;
       // Observe the actual publication owner's queue registration. The caller's
       // async invocation alone does not prove it has reached that held owner.
-      Promise.prototype.then = function (
-        this: Promise<unknown>,
-        ...callbacks: Parameters<typeof then>
+      Array.prototype.push = function <T>(
+        this: T[],
+        ...values: T[]
       ) {
-        const stack = new Error().stack ?? '';
+        const length = push.apply(this, values);
         if (
-          stack.includes('/api/engine/server/project.ts:') &&
-          stack.includes('/api/engine/federation/invites.ts:')
-        ) enrolled.release();
-        return then.apply(this, callbacks);
-      } as typeof then;
+          values.some((value) =>
+            value !== null && typeof value === 'object' &&
+            'kind' in value && value.kind === 'lifecycle'
+          )
+        ) {
+          const stack = new Error().stack ?? '';
+          if (
+            stack.includes('/api/engine/server/project.ts:') &&
+            stack.includes('/api/engine/federation/invites.ts:')
+          ) enrolled.release();
+        }
+        return length;
+      } as typeof push;
       let finished = false;
       let raced: Promise<unknown> = Promise.resolve();
       try {
@@ -422,7 +430,7 @@ for (const race of ['new rejection', 'candidate failover'] as const) {
           'transition cannot finish through the held removal owner',
         );
       } finally {
-        Promise.prototype.then = then;
+        Array.prototype.push = push;
         release();
         await Promise.all([dropped, raced]);
       }

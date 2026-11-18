@@ -2,6 +2,10 @@
 // Queue lifetime never determines notification counts or listing membership.
 import type { Conn } from '#engine/store/db.ts';
 import { visiblePrejoin, visibleRoomMembership } from './prejoin.ts';
+import {
+  insertPublicationRows,
+  reservePublicationCounter,
+} from './publication-rows.ts';
 
 async function revision(tx: Conn): Promise<number> {
   await tx.execute(
@@ -56,6 +60,80 @@ export async function enqueuePush(
     [incarnation, seq, user, room, event, now],
   );
   await queueBadge(tx, user, incarnation);
+}
+
+/** Ordered badge calls retain their exact revisions even when their writes
+ * coalesce. No sender/maintenance owner can observe an intermediate tx state. */
+export async function applyPublicationPushQueue(
+  tx: Conn,
+  badges: readonly { user: string; incarnation?: string }[],
+  deliveries:
+    readonly (readonly [string, number, string, string, string, number])[],
+  now: number,
+): Promise<void> {
+  const users = [
+    ...new Set(
+      badges.filter((b) => b.incarnation === undefined).map((b) => b.user),
+    ),
+  ];
+  const targets = users.length
+    ? await tx.query(
+      "SELECT t.user,t.incarnation FROM json_each(?) j JOIN push_targets t ON t.user=CAST(j.value AS TEXT) WHERE t.state='active'",
+      [JSON.stringify(users)],
+    )
+    : [];
+  const operations = badges.map((badge) => ({
+    user: badge.user,
+    targets: badge.incarnation === undefined
+      ? targets.filter((t) => t.user === badge.user).map((t) =>
+        String(t.incarnation)
+      )
+      : [badge.incarnation],
+  })).filter((op) => op.targets.length);
+  await insertPublicationRows(tx, 'push_delivery', [
+    'incarnation',
+    'notification_seq',
+    'user',
+    'room',
+    'event',
+    'created_ms',
+    'state',
+    'attempts',
+    'next_ms',
+  ], deliveries.map((d) => [...d, 'pending', 0, 0]));
+  if (!operations.length) return;
+  const first = await reservePublicationCounter(
+    tx,
+    'push_badges',
+    operations.length,
+  );
+  const final = new Map<string, (string | number)[]>();
+  for (let at = 0; at < operations.length; at++) {
+    const op = operations[at];
+    for (const incarnation of op.targets) {
+      final.set(incarnation, [incarnation, op.user, first + at, 0, 0, 0, now]);
+    }
+  }
+  await insertPublicationRows(
+    tx,
+    'push_badges',
+    [
+      'incarnation',
+      'user',
+      'revision',
+      'sent_revision',
+      'attempts',
+      'next_ms',
+      'created_ms',
+    ],
+    [...final.values()],
+    `ON CONFLICT(incarnation) DO UPDATE SET
+    created_ms=CASE WHEN revision<=MAX(sent_revision,expired_revision) THEN excluded.created_ms ELSE created_ms END,
+    attempts=CASE WHEN revision<=MAX(sent_revision,expired_revision) THEN 0 ELSE attempts END,
+    next_ms=CASE WHEN revision<=MAX(sent_revision,expired_revision) THEN 0 ELSE next_ms END,
+    error=CASE WHEN revision<=MAX(sent_revision,expired_revision) THEN NULL ELSE error END,
+    revision=excluded.revision`,
+  );
 }
 
 export async function cancelPushTarget(

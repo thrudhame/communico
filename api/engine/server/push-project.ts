@@ -32,6 +32,13 @@ export type PushPublication = {
 };
 
 type Recipient = { tenant: string; user: string; displayName: string | null };
+type CapturedPolicy = {
+  ignored: Record<string, unknown>;
+  rules: Awaited<ReturnType<typeof rulesetAt>>;
+  ruleRevision: number;
+  ignoreRevision: number;
+  pusherIncarnations: string[];
+};
 export type PushCapture = {
   context: Omit<PushContext, 'userId' | 'displayName'>;
   recipients: Recipient[];
@@ -51,48 +58,82 @@ async function prepareDecisions(
   context: Omit<PushContext, 'userId' | 'displayName'>,
   recipients: Recipient[],
 ): Promise<PushPublication> {
-  const decisions: PublicationDecision[] = [];
-  for (const name of new Set(recipients.map((r) => r.tenant))) {
+  return (await prepareCapturedPushes(store, [{ context, recipients }]))[0];
+}
+
+/** A ready independent-room prefix shares each tenant's fresh policy snapshot.
+ * Immutable event/recipient contexts stay separate; only repeated account,
+ * rule and routing reads share the owning tenant attempt. */
+export async function prepareCapturedPushes(
+  store: Store,
+  captures: readonly PushCapture[],
+): Promise<PushPublication[]> {
+  const publications = captures.map((capture) => ({
+    sender: String(capture.context.event.sender),
+    decisions: [] as PublicationDecision[],
+  }));
+  for (
+    const name of new Set(
+      captures.flatMap((c) => c.recipients.map((r) => r.tenant)),
+    )
+  ) {
     const tenant = await openTenant(store, name);
-    decisions.push(
-      ...await tenant.tx(async (tx) => {
-        const out: PublicationDecision[] = [];
+    const decisions = await tenant.tx(async (tx) => {
+      const policies = new Map<string, CapturedPolicy | null>();
+      const out: { index: number; decision: PublicationDecision }[] = [];
+      for (let index = 0; index < captures.length; index++) {
+        const { context, recipients } = captures[index];
         for (const recipient of recipients.filter((r) => r.tenant === name)) {
           const lp = localpartOf(recipient.user);
-          const account = await tx.users.byLocalpart(lp);
-          if (account === null || account.deactivated) continue;
-          const ignored = await tx.accountData.snapshot(
-            lp,
-            '',
-            'm.ignored_user_list',
-          );
-          const value = ignored?.content as {
-            ignored_users?: Record<string, unknown>;
-          } | undefined;
-          const rules = await rulesetAt(tx, lp, name);
-          out.push({
-            tenant: name,
-            user: recipient.user,
-            ruleRevision: await tx.pushRules.streamSeq(lp),
-            ignoreRevision: ignored?.seq ?? 0,
-            pusherIncarnations: await tx.pushers.incarnations(lp),
-            decision: Object.hasOwn(
-                value?.ignored_users ?? {},
-                String(context.event.sender),
-              )
+          if (!policies.has(lp)) {
+            const account = await tx.users.byLocalpart(lp);
+            const ignored = account === null || account.deactivated
               ? null
-              : evaluate(rules, {
-                ...context,
-                userId: recipient.user,
-                displayName: recipient.displayName,
-              }),
+              : await tx.accountData.snapshot(lp, '', 'm.ignored_user_list');
+            policies.set(
+              lp,
+              account === null || account.deactivated ? null : {
+                ignored: (ignored?.content as {
+                  ignored_users?: Record<string, unknown>;
+                } | undefined)?.ignored_users ?? {},
+                rules: await rulesetAt(tx, lp, name),
+                ruleRevision: await tx.pushRules.streamSeq(lp),
+                ignoreRevision: ignored?.seq ?? 0,
+                pusherIncarnations: await tx.pushers.incarnations(lp),
+              },
+            );
+          }
+          const policy = policies.get(lp);
+          if (policy == null) continue;
+          out.push({
+            index,
+            decision: {
+              tenant: name,
+              user: recipient.user,
+              ruleRevision: policy.ruleRevision,
+              ignoreRevision: policy.ignoreRevision,
+              pusherIncarnations: [...policy.pusherIncarnations],
+              decision: Object.hasOwn(
+                  policy.ignored,
+                  String(context.event.sender),
+                )
+                ? null
+                : evaluate(policy.rules, {
+                  ...context,
+                  userId: recipient.user,
+                  displayName: recipient.displayName,
+                }),
+            },
           });
         }
-        return out;
-      }),
-    );
+      }
+      return out;
+    });
+    for (const { index, decision } of decisions) {
+      publications[index].decisions.push(decision);
+    }
   }
-  return { sender: String(context.event.sender), decisions };
+  return publications;
 }
 
 /** Stripped invite state is incomplete: never invent member counts or power. */
