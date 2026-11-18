@@ -481,6 +481,15 @@ cut. Reverse room streams have no home directory declaration. A facade S2S
 acknowledgment does not wait for an online home; home-client causality follows
 observation through home sync, not the timing of another ingress's response.
 
+The private facade status reports `keyRoster.lastHome` as diagnostic contact
+time, not authentication, signing authority or a replication acknowledgment.
+Authenticated requests never wait for this diagnostic write. Pending times
+coalesce by maximum and drain before orderly shutdown closes storage; a
+successful drain persists the exact maximum accepted time. An abrupt crash
+can lose queued or uncommitted contact observations, with no fixed count
+bound. Persistence failures are reported and make shutdown fail; a failed
+writer retains its facts but does not restart on later contacts.
+
 ## Facade signing-key retirement
 
 A facade signing key is trusted as a key of the whole Matrix server, not as a

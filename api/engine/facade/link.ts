@@ -200,7 +200,7 @@ export function linkHandler(options: {
   limits: PageLimits;
   notices?: NoticeHub;
   changed?(): Promise<void>;
-  contacted?(): Promise<void>;
+  contacted?(): void;
   reconciling?(): (pairing: string, heads: unknown) => void;
   connected?(pairing: string, signal: AbortSignal): void;
   signKeyDocument?(raw: unknown): Promise<string>;
@@ -251,7 +251,7 @@ export function linkHandler(options: {
         403,
       );
     }
-    await options.contacted?.();
+    options.contacted?.();
     const response = (value: Record<string, unknown>) =>
       Response.json({
         protocol: LINK_VERSION,

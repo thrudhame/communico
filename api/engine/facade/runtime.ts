@@ -2,6 +2,8 @@
 // public Matrix listener, or home-only worker is needed for local enrollment.
 import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { drainResources } from '#engine/lifetime.ts';
+import { ContactObservations } from '#engine/federation/pending-contacts.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -132,6 +134,14 @@ export async function openFacadeRuntime(
     const owner = await pairings();
     return new FacadeKeys(server, node!.signer(), node!.publicKey, owner);
   };
+  // Contact time is operator diagnostics, never authority or a link ACK barrier.
+  // Share the existing observation writer across all lightweight key owners.
+  // Abrupt crashes may lose queued/uncommitted times; orderly close drains them.
+  const contacts = new ContactObservations<number>(
+    async (_key, latest) => await (await keyOwner()).contact(latest),
+    Math.max,
+    (error) => console.error('facade contact diagnostics:', error),
+  );
   const roomOwner = async () =>
     new RoomReplicas(
       store,
@@ -708,7 +718,7 @@ export async function openFacadeRuntime(
         },
         notices,
         changed: refresh,
-        contacted: async () => await (await keyOwner()).contact(),
+        contacted: () => contacts.observe(server.path, Date.now()),
         reconciling: () => authHealth.reconciliation(),
         connected: (pairing, signal) => authHealth.connected(pairing, signal),
         signKeyDocument: async (raw) => await (await keyOwner()).cosign(raw),
@@ -728,7 +738,7 @@ export async function openFacadeRuntime(
         await deactivation?.close();
         await profileFanout?.close();
         await releaseServices();
-        await store.close();
+        await drainResources([() => contacts.close(), () => store.close()]);
       })(),
   };
 }
