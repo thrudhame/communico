@@ -4,7 +4,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { finalizeBuilt } from '#engine/room/build.ts';
 import { assertKnownJoinEncryption } from '#engine/room/encryption-policy.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
-import { admitLocalJoin } from '#engine/room/hooks.ts';
+import { admitLocalJoin, withMembershipFence } from '#engine/room/hooks.ts';
 import { getRulebook, supportedRoomVersions } from '#engine/rulebook/index.ts';
 import { withProjectionLock } from '#engine/server/project.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
@@ -141,6 +141,8 @@ export async function knockRemote(
   if (previous?.kind === 'invite' && previous.status === 'pending') {
     throw new MatrixError(403, 'M_FORBIDDEN', 'already invited');
   }
+  const admission = await deps.prepareRoomScope?.(roomId, true, userId);
+  admission?.checkCurrent();
   let last: unknown = new MatrixError(
     404,
     'M_NOT_FOUND',
@@ -148,6 +150,7 @@ export async function knockRemote(
   );
   for (const destination of via.slice(0, 8)) {
     try {
+      admission?.checkCurrent();
       await admit(deps.server, destination, {
         kind: 'outbound',
         user: userId,
@@ -166,6 +169,7 @@ export async function knockRemote(
           }?` + versions.map((v) => 'ver=' + v).join('&'),
         body: null,
       });
+      admission?.checkCurrent();
       const { roomVersion: version, event } = membershipTemplate(
         made.json,
         'make-knock',
@@ -194,6 +198,7 @@ export async function knockRemote(
         getRulebook(version),
         deps.signer,
       );
+      admission?.checkCurrent();
       const attempt = await withRoomLock(
         roomId,
         async () => {
@@ -207,75 +212,78 @@ export async function knockRemote(
               );
             }
             return await eventStreamTx(deps.server, async (tx) => {
-              const rows = await tx.query(
-                'SELECT revision FROM prejoin_memberships WHERE room_id=? AND user_id=?',
-                [roomId, userId],
-              );
-              if (
-                Number(rows[0]?.revision == null ? 0 : rows[0].revision) !==
-                  previousRevision
-              ) {
-                throw new MatrixError(
-                  409,
-                  'M_BAD_STATE',
-                  'membership changed during knock',
+              await admission?.check(tx);
+              return await withMembershipFence(admission, async () => {
+                const rows = await tx.query(
+                  'SELECT revision FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+                  [roomId, userId],
                 );
-              }
-              const authoritative = await tx.query(
-                "SELECT 1 FROM memberships WHERE room=? AND user=? AND membership IN ('join','invite','ban') AND seq>?",
-                [roomId, userId, previous == null ? 0 : previous.seq],
-              );
-              if (authoritative.length) {
-                throw new MatrixError(
-                  409,
-                  'M_BAD_STATE',
-                  'membership changed during knock',
+                if (
+                  Number(rows[0]?.revision == null ? 0 : rows[0].revision) !==
+                    previousRevision
+                ) {
+                  throw new MatrixError(
+                    409,
+                    'M_BAD_STATE',
+                    'membership changed during knock',
+                  );
+                }
+                const authoritative = await tx.query(
+                  "SELECT 1 FROM memberships WHERE room=? AND user=? AND membership IN ('join','invite','ban') AND seq>?",
+                  [roomId, userId, previous == null ? 0 : previous.seq],
                 );
-              }
-              const revision = previousRevision + 1;
-              await recordMembershipOperation(tx, roomId, userId);
-              const now = Date.now();
-              const seq = await nextEventSeq(tx);
-              const expires = now +
-                config().federation.refusedmillihours * 3600;
-              await tx.execute(
-                `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq,kind,revision,candidates,expires_ms)
+                if (authoritative.length) {
+                  throw new MatrixError(
+                    409,
+                    'M_BAD_STATE',
+                    'membership changed during knock',
+                  );
+                }
+                const revision = previousRevision + 1;
+                await recordMembershipOperation(tx, roomId, userId);
+                const now = Date.now();
+                const seq = await nextEventSeq(tx);
+                const expires = now +
+                  config().federation.refusedmillihours * 3600;
+                await tx.execute(
+                  `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq,kind,revision,candidates,expires_ms)
             VALUES(?,?,?,?,?,'[]',?,?,'attempting',?,'knock',?,?,?) ON CONFLICT(room_id,user_id) DO UPDATE SET event_id=excluded.event_id,room_version=excluded.room_version,event_json=excluded.event_json,invite_room_state='[]',origin=excluded.origin,received_ms=excluded.received_ms,status='attempting',seq=excluded.seq,kind='knock',revision=excluded.revision,candidates=excluded.candidates,leave_json=NULL,local_leave_json=NULL,expires_ms=excluded.expires_ms`,
-                [
+                  [
+                    roomId,
+                    userId,
+                    String(pdu.event_id),
+                    version,
+                    JSON.stringify(pdu),
+                    destination,
+                    now,
+                    seq,
+                    revision,
+                    JSON.stringify(via),
+                    expires,
+                  ],
+                );
+                await recordMembershipOperation(tx, roomId, userId);
+                const attempt = {
                   roomId,
                   userId,
-                  String(pdu.event_id),
-                  version,
-                  JSON.stringify(pdu),
-                  destination,
-                  now,
+                  eventId: String(pdu.event_id),
+                  roomVersion: version,
+                  eventJson: JSON.stringify(pdu),
+                  inviteRoomState: '[]',
+                  origin: destination,
+                  receivedMs: now,
+                  status: 'attempting',
                   seq,
+                  kind: 'knock',
                   revision,
-                  JSON.stringify(via),
-                  expires,
-                ],
-              );
-              await recordMembershipOperation(tx, roomId, userId);
-              const attempt = {
-                roomId,
-                userId,
-                eventId: String(pdu.event_id),
-                roomVersion: version,
-                eventJson: JSON.stringify(pdu),
-                inviteRoomState: '[]',
-                origin: destination,
-                receivedMs: now,
-                status: 'attempting',
-                seq,
-                kind: 'knock',
-                revision,
-                candidates: via,
-                expiresMs: expires,
-                leaveJson: null,
-                localLeaveJson: null,
-              } satisfies StoredInvite;
-              await createPrejoinJob(tx, attempt);
-              return attempt;
+                  candidates: via,
+                  expiresMs: expires,
+                  leaveJson: null,
+                  localLeaveJson: null,
+                } satisfies StoredInvite;
+                await createPrejoinJob(tx, attempt);
+                return attempt;
+              });
             });
           });
         },
