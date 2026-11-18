@@ -52,7 +52,7 @@ import { startProfileFanout } from '#engine/profile-fanout.ts';
 import { DomainOperations } from './domain.ts';
 import { DeviceOperations, isKeyStream } from './devices.ts';
 import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
-import { MembershipOperations } from './membership.ts';
+import { MembershipOperations, startMembershipExports } from './membership.ts';
 import {
   type InviteDeps,
   inviteIntentProvider,
@@ -291,8 +291,9 @@ export async function openFacadeRuntime(
       });
     }
     if (settings.phase === 'f2' && !membershipExports) {
-      membershipExports = startAccountExports({
+      membershipExports = startMembershipExports({
         store,
+        server,
         tenant,
         pollseconds: settings.pollseconds,
         users: async () =>

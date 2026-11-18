@@ -35,7 +35,7 @@ import { exportOwnerControl } from './ownership.ts';
 import { DomainOperations } from './domain.ts';
 import { DeviceOperations, isKeyStream } from './devices.ts';
 import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
-import { MembershipOperations } from './membership.ts';
+import { MembershipOperations, startMembershipExports } from './membership.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -351,8 +351,9 @@ export async function startHomeLinks(
       );
       membershipExports.set(
         id,
-        startAccountExports({
+        startMembershipExports({
           store: app.store,
+          server: app.server,
           tenant: app.tenant,
           pollseconds: settings.pollseconds,
           users: () => app.tenant.tx((tx) => tx.publicReplica.users()),

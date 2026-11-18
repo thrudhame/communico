@@ -9,7 +9,10 @@ import {
 } from '#engine/facade/accounts.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
-import { MembershipOperations } from '#engine/facade/membership.ts';
+import {
+  MembershipOperations,
+  startMembershipExports,
+} from '#engine/facade/membership.ts';
 import {
   DirectoryReplicas,
   exportDirectoryReplica,
@@ -24,6 +27,7 @@ import {
   inviteIntentProvider,
   invitesOf,
   prejoinDeparture,
+  receiveInvite,
 } from '#engine/federation/invites.ts';
 import { createRoom } from '#engine/room/create.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
@@ -33,7 +37,7 @@ import {
   prejoinJobs,
   prejoinWorkOf,
 } from '#engine/server/prejoin-jobs.ts';
-import { nextEventSeq } from '#engine/server/stream.ts';
+import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { retainMembershipOperation } from '#engine/server/membership-history.ts';
 import {
@@ -240,6 +244,114 @@ async function source(
   );
   return op;
 }
+
+async function membershipExportWake(side: 'home' | 'edge') {
+  const f = await fixture();
+  const store = f[side], tenant = side === 'home' ? f.ht : f.et;
+  const server = await store.server();
+  const first = Promise.withResolvers<void>();
+  const published = Promise.withResolvers<void>();
+  let scans = 0;
+  let eventId: string | undefined;
+  const errors: unknown[] = [];
+  const worker = startMembershipExports({
+    store,
+    server,
+    tenant,
+    pollseconds: 3600,
+    users: () => {
+      scans++;
+      return Promise.resolve(['alice']);
+    },
+    emit: async () => {
+      const records = side === 'home'
+        ? await f.hs.bootstrap('alice', f.bundle.id)
+        : await f.es.export('alice');
+      if (
+        eventId &&
+        records.some((record) =>
+          JSON.stringify(record.payload).includes(eventId!)
+        )
+      ) {
+        published.resolve();
+      }
+    },
+    changed: () => first.resolve(),
+    failed: (error) => {
+      errors.push(error);
+      published.reject(error);
+      first.reject(error);
+    },
+  });
+  try {
+    await first.promise;
+    const before = scans;
+    await eventStreamTx(
+      await f[side === 'home' ? 'edge' : 'home'].server(),
+      () => Promise.resolve(),
+    );
+    assertEquals(scans, before, 'another store cannot wake this source');
+    await assertRejects(() =>
+      eventStreamTx(server, () => {
+        throw new Error('rollback wake diagnostic');
+      })
+    );
+    assertEquals(
+      scans,
+      before,
+      'rollback cannot notify a committed membership source',
+    );
+    const remote = await testRemoteServer('remote.test');
+    const roomId = '!wake:remote.test';
+    const event = await remoteEvent(roomId, remote, '11', {
+      type: 'm.room.member',
+      sender: '@inviter:remote.test',
+      state_key: '@alice:logical.test',
+      content: { membership: 'invite' },
+      prev_events: [],
+    });
+    eventId = String(event.event_id);
+    await receiveInvite(
+      roomId,
+      eventId,
+      { room_version: '11', event, invite_room_state: [] },
+      remote.name,
+      {
+        store,
+        server,
+        self: tenant.serverName,
+        signer: tenant.signer(),
+        keys: fakeKeyResolver(remote),
+        wake() {},
+      },
+    );
+    // eventStreamTx has completed its synchronous post-commit notifications.
+    // A scheduled exporter has already entered users(), even if emit is held.
+    assert(
+      scans > before,
+      'server membership commit must admit an export scan without a timer',
+    );
+    await published.promise;
+    assertEquals(errors, []);
+    await worker.close();
+    const closed = scans;
+    await eventStreamTx(server, () => Promise.resolve());
+    assertEquals(
+      scans,
+      closed,
+      'closed exporter removes its server subscription',
+    );
+  } finally {
+    await worker.close();
+    await f.close();
+  }
+}
+
+Deno.test('membership export: server-owned OOB commit wakes its exporter without a poll or tenant mutation', async (t) => {
+  for (const side of ['home', 'edge'] as const) {
+    await t.step(side, () => membershipExportWake(side));
+  }
+});
 
 Deno.test('membership export: signs retained local source facts without a room replica or foreign publication authority', async () => {
   const f = await fixture();

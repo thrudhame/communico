@@ -1,7 +1,7 @@
 // Membership source export is separate from room-DAG replication and admission.
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
-import type { Conn } from '#engine/store/db.ts';
+import type { Conn, Database } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
@@ -23,7 +23,7 @@ import {
 import { prejoinResult, savePrejoinResult } from '#engine/server/prejoin.ts';
 import { withProjectionLock } from '#engine/server/project.ts';
 import { prepareInvitePush } from '#engine/server/push-project.ts';
-import { eventStreamTx } from '#engine/server/stream.ts';
+import { eventStreamTx, onEventStream } from '#engine/server/stream.ts';
 import {
   checkedMembershipOperation,
   retainMembershipOperation,
@@ -53,6 +53,26 @@ import {
   text,
 } from './protocol.ts';
 import { signingFence } from './signing-authority.ts';
+import { startAccountExports } from './accounts.ts';
+
+/** Membership source facts live in the server file, not the tenant stream.
+ * Both roles retain the fair account worker's tenant/periodic recovery while
+ * scheduling server-owned OOB commits at their actual post-commit boundary. */
+export function startMembershipExports(
+  options: Parameters<typeof startAccountExports>[0] & { server: Database },
+) {
+  const worker = startAccountExports(options);
+  const unstream = onEventStream((path) => {
+    if (path === options.server.path) worker.wake();
+  });
+  return {
+    wake: worker.wake,
+    close: () => {
+      unstream();
+      return worker.close();
+    },
+  };
+}
 
 type MembershipView = DomainBinding & {
   kind: 'membership-operation' | 'membership-history';

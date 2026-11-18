@@ -659,6 +659,12 @@ values, never restores omitted fields, and drops incompatible nested shapes.
 Private provenance is never included in client hints. Legacy malformed create hints are filtered,
 while v12 requires a valid create tied to the room identity.
 
+Both runtime roles schedule membership export from the owning server file's
+post-commit event-stream notification, in addition to tenant changes and periodic
+recovery. The membership exporter owns and removes that exact-store subscription;
+auth and device exporters do not acquire unrelated server wake feedback.
+(`api/engine/facade/membership.ts`)
+
 OOB rejection intent persists a real locally signed departure membership,
 separate from the later federation make_leave result (server schema v23).
 The caller's leave reason, including an empty string, belongs to that durable
