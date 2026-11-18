@@ -23,6 +23,13 @@ import {
 import { createRoom } from '#engine/room/create.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import {
+  prejoinJobId,
+  prejoinJobs,
+  prejoinWorkOf,
+} from '#engine/server/prejoin-jobs.ts';
+import { nextEventSeq } from '#engine/server/stream.ts';
+import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
 import { retainMembershipOperation } from '#engine/server/membership-history.ts';
 import {
   appendMembershipSuccessor,
@@ -43,19 +50,31 @@ import {
   matrixBase64,
 } from '#engine/signing-primitives.js';
 
-async function fixture() {
+async function fixture(historicalHome = false) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-membership-link-' });
-  const open = (side: string) =>
-    openStore({
-      dir: dir + '/' + side,
-      library: './.native/libturso_ffi.so',
-      checkpointlogbytes: 65536,
-      maxopenfiles: 8,
-      idleseconds: 300,
-    }, {
-      schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+  const settings = (side: string) => ({
+    dir: dir + '/' + side,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  });
+  const open = (side: string, version = serverSchema.version) =>
+    openStore(settings(side), {
+      schemas: {
+        server: { ...serverSchema, version },
+        tenant: tenantSchema,
+        room: roomSchema,
+      },
     });
-  let home = await open('home');
+  if (historicalHome) {
+    const legacy = await openStore(settings('home'), {
+      schemas: { server: { version: 13, apply: (db) => db.exec(SERVER_V13) } },
+    });
+    await legacy.server();
+    await legacy.close();
+  }
+  let home = await open('home', historicalHome ? 50 : serverSchema.version);
   const edge = await open('edge');
   await bindRole(home, { role: 'home', server: 'logical.test', node: '' });
   await bindRole(edge, {
@@ -525,6 +544,159 @@ async function exportSuccessor(
   assertEquals(records.length, 1);
   return { operation, record: records[0] };
 }
+
+Deno.test('membership upgrade: an enrolled historical installation freezes local work and never promotes foreign display into a job', async () => {
+  const f = await fixture(true);
+  try {
+    const { record, state: foreign, keys, operation } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, [...LINK_SUPPORTED, {
+      type: 'membership-operation',
+      version: 1,
+    }]);
+    await journal.receive(record.source, [record]);
+    await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+    const local = await testRemoteServer('logical.test');
+    const foreignLeave = await remoteEvent(foreign.roomId, local, '11', {
+      type: 'm.room.member',
+      sender: foreign.userId,
+      state_key: foreign.userId,
+      content: { membership: 'leave' },
+      prev_events: [foreign.eventId],
+    });
+    foreign.status = 'failed-retract';
+    foreign.localLeaveJson = canonicalJson(foreignLeave);
+    const next = await exportSuccessor(f, operation, foreign);
+    await journal.receive(next.record.source, [next.record]);
+    await lifecycleApplication(f.hs)(
+      journal,
+      next.record,
+      fakeKeyResolver(await testRemoteServer('remote.test'), local),
+      f.bundle.id,
+    );
+    const [bound] = await db.query(
+      'SELECT * FROM prejoin_memberships WHERE room_id=?',
+      [foreign.roomId],
+    );
+    assert(bound.source_binding !== null);
+    const remote = await testRemoteServer('remote.test');
+    const roomId = '!legacy-local:remote.test', userId = '@alice:logical.test';
+    const invite = await remoteEvent(roomId, remote, '11', {
+      type: 'm.room.member',
+      sender: '@inviter:remote.test',
+      state_key: userId,
+      content: { membership: 'invite' },
+      prev_events: [],
+    });
+    const leave = await remoteEvent(roomId, local, '11', {
+      type: 'm.room.member',
+      sender: userId,
+      state_key: userId,
+      content: { membership: 'leave', reason: 'existing local work' },
+      prev_events: [String(invite.event_id)],
+    });
+    // Actual pre-jobs schema rows, not a current-schema store with a fake pragma.
+    // This is the pre-upgrade local execution intent that migration 50 owns.
+    await db.tx(async (conn) => {
+      const seq = await nextEventSeq(conn);
+      await conn.execute(
+        `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq,kind,revision,candidates,local_leave_json)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          roomId,
+          userId,
+          String(invite.event_id),
+          '11',
+          canonicalJson(invite),
+          '[]',
+          'remote.test',
+          100,
+          'rejecting',
+          seq,
+          'invite',
+          7,
+          '["remote.test"]',
+          canonicalJson(leave),
+        ],
+      );
+    });
+    const [old] = await db.query(
+      'SELECT * FROM prejoin_memberships WHERE room_id=?',
+      [roomId],
+    );
+    const expectedWork = prejoinWorkOf(old);
+    const beforeEvents = await db.query(
+      "SELECT value FROM counters WHERE name='events'",
+    );
+    assertEquals(
+      await db.query(
+        "SELECT * FROM domain_operations WHERE source='home' AND kind='membership'",
+      ),
+      [],
+    );
+    assertEquals(
+      await db.query("SELECT * FROM sqlite_master WHERE name='prejoin_jobs'"),
+      [],
+    );
+    const reopened = await f.reopenHome();
+    const current = await reopened.home.server();
+    const jobs = await prejoinJobs(current);
+    assertEquals(jobs.length, 1);
+    assertEquals(jobs[0].id, prejoinJobId(expectedWork));
+    assertEquals(jobs[0].work, expectedWork);
+    assert(jobs[0].source !== null);
+    assertEquals(jobs[0].source.source, 'home');
+    const expected: MembershipState = {
+      roomId,
+      userId,
+      eventId: String(invite.event_id),
+      roomVersion: '11',
+      eventJson: canonicalJson(invite),
+      inviteRoomState: '[]',
+      origin: 'remote.test',
+      status: 'rejecting',
+      kind: 'invite',
+      localLeaveJson: canonicalJson(leave),
+      publication: null,
+    };
+    assertEquals(jobs[0].source.payload, canonicalJson(expected));
+    assertEquals(
+      jobs[0].source.payloadHash,
+      createHash('sha256').update(canonicalJson(expected)).digest('hex'),
+    );
+    assertEquals(
+      await current.query('SELECT * FROM prejoin_memberships WHERE room_id=?', [
+        foreign.roomId,
+      ]),
+      [bound],
+    );
+    assertEquals(
+      await current.query("SELECT value FROM counters WHERE name='events'"),
+      beforeEvents,
+    );
+    assertEquals(
+      (await current.query(
+        "SELECT * FROM domain_operations WHERE source='home' AND kind='membership'",
+      )).length,
+      1,
+    );
+    const twice = await f.reopenHome();
+    const cold = await twice.home.server();
+    assertEquals(await prejoinJobs(cold), jobs);
+    assertEquals(
+      await cold.query('SELECT * FROM prejoin_memberships WHERE room_id=?', [
+        foreign.roomId,
+      ]),
+      [bound],
+    );
+    assertEquals(
+      await cold.query("SELECT value FROM counters WHERE name='events'"),
+      beforeEvents,
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('membership application: authenticated OOB facts reach ordinary invite consumers in both roles before applied ACK', async () => {
   for (const side of ['edge', 'home'] as const) {
