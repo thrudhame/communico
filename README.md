@@ -450,8 +450,10 @@ exports, wakes workers, allocates source positions or waits for another node.
 It returns identifiers and cuts only, not record bodies, credentials, keys or
 session data. It is not mounted on public Matrix listeners.
 
-`sources` reports either role's current local room change heads and the home's
-public-account projection revisions. Each capture is local to its owning database, not a
+`sources` reports either role's current local room change heads, current local
+OOB membership operation heads, and the home's public-account projection revisions.
+Membership sources include the current transport `source` and `incarnation`;
+retained foreign/history facts are not local authorship. Each capture is local to its owning database, not a
 cross-file atomic snapshot. Snapshot cuts allocated only during export (such
 as auth and directory) have no local mutation-head entry. A missing source or
 stream is unknown, not zero or ready.
@@ -467,6 +469,15 @@ ready; `ready` never establishes coverage of a later source mutation.
 `declaredCut` is the scope watermark in the incoming applied directory, or null
 when not declared. Status retains old incarnations for diagnosis; never compare
 cuts across identities or confuse a journal sequence with a semantic source cut.
+
+For `membership:@user:server`, semantic cuts cover current-source operations
+through the contiguous journal prefix. Interleaved history never advances that
+source counter. Readiness uses the actual journal completion under the active
+enrollment, not a room scope or a displayed prejoin row. On a facade, membership
+`published` additionally covers only the prefix declared by its applied directory;
+the directory's `declaredCut` remains a journal position. Pending membership may
+refuse new admission with HTTP 503 and the Matrix `errcode`/`error` JSON object;
+receipt is not application. Inspection never changes this admission contract.
 
 To observe a home room mutation on a facade, capture its home `sources` cut
 after acceptance, then inspect that exact pairing/source/scope until the

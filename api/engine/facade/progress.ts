@@ -6,6 +6,12 @@ import { openRoom } from '#engine/room/index.ts';
 import { publicInventory } from '#engine/tenant/public-replica.ts';
 
 type ProgressCut = { sequence: number; hash: string; sourceCut: number | null };
+type SourceCut = {
+  scope: string;
+  cut: number;
+  source?: string;
+  incarnation?: string;
+};
 type ProgressStream = {
   peer: string;
   direction: string;
@@ -25,10 +31,10 @@ export async function replicationProgress(
   role: 'home' | 'facade',
   scopes?: readonly string[],
 ): Promise<
-  { sources: { scope: string; cut: number }[]; streams: ProgressStream[] }
+  { sources: SourceCut[]; streams: ProgressStream[] }
 > {
   const selected = (scope: string) => !scopes || scopes.includes(scope);
-  const sources: { scope: string; cut: number }[] = [];
+  const sources: SourceCut[] = [];
   // Each role owns its local room mutation heads. Opening a missing room or
   // tenant for status must never provision one; public account cuts stay home-owned.
   for (const id of await store.rooms()) {
@@ -48,6 +54,27 @@ export async function replicationProgress(
     }
   }
   const streams = await (await store.server()).tx(async (conn) => {
+    // OOB heads belong to the current local source, not retained foreign or
+    // historical operations. Bind the capture to its current transport too.
+    for (
+      const row of await conn.query(
+        'WITH local_identity AS (' + (role === 'home'
+          ? 'SELECT node,incarnation FROM publication_domain WHERE singleton=1'
+          : 'SELECT node_id AS node,incarnation FROM facade_node WHERE singleton=1') +
+          ") SELECT o.stream AS scope,MAX(o.sequence) AS cut,p.node,p.incarnation,b.id FROM domain_operations o JOIN local_identity p ON o.source=p.node AND o.incarnation=p.incarnation JOIN facade_pairings b ON b.side=? AND b.state='paired' WHERE o.kind='membership' GROUP BY o.stream,p.node,p.incarnation,b.id",
+        [role],
+      )
+    ) {
+      const scope = String(row.scope);
+      if (selected(scope)) {
+        sources.push({
+          scope,
+          cut: Number(row.cut),
+          source: String(row.node),
+          incarnation: String(role === 'home' ? row.id : row.incarnation),
+        });
+      }
+    }
     const result: ProgressStream[] = [];
     for (
       const row of await conn.query(
@@ -55,7 +82,9 @@ export async function replicationProgress(
       )
     ) {
       const scope = String(row.stream);
-      if (!selected(scope)) continue;
+      if (!selected(scope)) {
+        continue;
+      }
       const identity = [
         row.peer,
         row.direction,
@@ -63,13 +92,23 @@ export async function replicationProgress(
         row.incarnation,
         row.stream,
       ];
+      const membership = scope.startsWith('membership:');
+      const membershipSource = membership
+        ? await membershipBinding(conn, role, row)
+        : null;
       const cut = async (
         sequence: number,
         hash: string,
       ): Promise<ProgressCut> => ({
         sequence,
         hash,
-        sourceCut: await semanticCut(conn, identity, sequence),
+        sourceCut: await semanticCut(
+          conn,
+          identity,
+          sequence,
+          membership,
+          membershipSource,
+        ),
       });
       const received = await cut(
         Number(row.received),
@@ -93,7 +132,8 @@ export async function replicationProgress(
           Number(ack?.applied ?? 0),
           String(ack?.applied_hash ?? ''),
         );
-        ready = applied.sequence > 0;
+        ready = applied.sequence > 0 &&
+          (!membership || membershipSource !== null);
       } else {
         // Scope completion is enrollment-bound in both directions. Reverse
         // journals instead carry the facade node incarnation; never mistake
@@ -103,13 +143,31 @@ export async function replicationProgress(
           'SELECT ready,pending_hash FROM facade_scopes WHERE incarnation=? AND scope=?',
           [enrollment, row.stream],
         );
-        ready = held?.ready === 1 && held.pending_hash === null;
-        if (ready) published = applied;
+        ready = membership
+          ? membershipSource !== null && applied.sourceCut !== null
+          : held?.ready === 1 && held.pending_hash === null;
+        if (ready) {
+          published = applied;
+        }
       }
       const [declared] = await conn.query(
         "SELECT c.value AS cut FROM facade_streams s JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied JOIN json_each(json_extract(r.record_json,'$.payload.view.cuts')) c ON c.key=? WHERE s.peer=? AND s.direction='in' AND s.source=? AND s.incarnation=? AND s.stream='directory'",
         [scope, row.peer, row.source, row.incarnation],
       );
+      if (membership && row.direction === 'in' && role === 'facade') {
+        // Directory declarations use JOURNAL positions, never operation counters.
+        // Convert that prefix through the same current-source semantic mapping.
+        const position = Math.min(applied.sequence, Number(declared?.cut ?? 0));
+        const [record] = position
+          ? await conn.query(
+            'SELECT hash FROM facade_records WHERE peer=? AND direction=? AND source=? AND incarnation=? AND stream=? AND sequence=?',
+            [...identity, position] as (string | number)[],
+          )
+          : [];
+        published = ready && record
+          ? await cut(position, String(record.hash))
+          : null;
+      }
       result.push({
         peer: String(row.peer),
         direction: String(row.direction),
@@ -129,6 +187,35 @@ export async function replicationProgress(
     sources: sources.sort((a, b) => a.scope.localeCompare(b.scope)),
     streams,
   };
+}
+
+async function membershipBinding(
+  conn: Conn,
+  role: 'home' | 'facade',
+  row: Record<string, unknown>,
+): Promise<string | null> {
+  const forward = row.source === 'home';
+  const incoming = row.direction === 'in';
+  if (
+    forward !== (role === 'facade' ? incoming : !incoming) ||
+    (incoming && row.peer !== row.source) ||
+    (!incoming && !forward && row.peer !== 'home')
+  ) return null;
+  const bindings = await conn.query(
+    "SELECT c.signed_json FROM facade_pairings p JOIN facade_owner_activation a ON a.pairing=p.id JOIN facade_owner_controls c ON c.pairing=a.pairing AND c.revision=a.revision WHERE p.side=? AND p.state='paired' AND " +
+      (forward
+        ? 'p.id=?' + (incoming ? '' : ' AND p.node=?')
+        : "p.node=? AND json_extract(p.grant_json,'$.body.transcript.body.incarnation')=?"),
+    forward
+      ? [role, String(row.incarnation), ...incoming ? [] : [String(row.peer)]]
+      : [role, String(row.source), String(row.incarnation)],
+  );
+  if (bindings.length !== 1) return null;
+  const body = JSON.parse(String(bindings[0].signed_json)).body;
+  const source = (body.nodes as { node: string; incarnation: string }[]).find((
+    source,
+  ) => source.node === row.source);
+  return source?.incarnation ?? null;
 }
 
 async function scopeEnrollment(
@@ -153,8 +240,23 @@ async function semanticCut(
   conn: Conn,
   identity: unknown[],
   sequence: number,
+  membership = false,
+  sourceIncarnation: string | null = null,
 ): Promise<number | null> {
   if (!sequence) return null;
+  if (membership) {
+    if (sourceIncarnation === null) return null;
+    const [row] = await conn.query(
+      "SELECT MAX(json_extract(record_json,'$.payload.body.operation.sequence')) AS cut FROM facade_records WHERE peer=? AND direction=? AND source=? AND incarnation=? AND stream=? AND sequence<=? AND json_extract(record_json,'$.payload.body.kind')='membership-operation' AND json_extract(record_json,'$.payload.body.source')=source AND json_extract(record_json,'$.payload.body.incarnation')=? AND json_extract(record_json,'$.payload.body.operation.source')=source AND json_extract(record_json,'$.payload.body.operation.incarnation')=?",
+      [
+        ...identity,
+        sequence,
+        sourceIncarnation,
+        sourceIncarnation,
+      ] as (string | number)[],
+    );
+    return typeof row?.cut === 'number' ? row.cut : null;
+  }
   // Explicit scalar allowlist: credentials, bodies, keys and arbitrary record
   // payloads never cross this inspection boundary (including account-auth).
   const [row] = await conn.query(

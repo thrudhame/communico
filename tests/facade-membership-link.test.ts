@@ -9,6 +9,7 @@ import {
 } from '#engine/facade/accounts.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
+import { replicationProgress } from '#engine/facade/progress.ts';
 import {
   MembershipOperations,
   startMembershipExports,
@@ -792,6 +793,19 @@ Deno.test('membership directory: historical journal prefix, not source counter, 
     );
     await lifecycleApplication(f.es)(d.journal, history[0], fact.keys);
     assertEquals(await d.owner.scopeState('rooms'), 'ready');
+    const scope = fact.operation.stream;
+    assertEquals(
+      (await replicationProgress(f.home, 'logical.test', 'home', [scope]))
+        .sources,
+      [],
+    );
+    const status =
+      (await replicationProgress(f.edge, 'logical.test', 'facade', [scope]))
+        .streams.find((row) => row.direction === 'in')!;
+    assertEquals(status.applied.sequence, 2);
+    assertEquals(status.applied.sourceCut, 1); // History 41 must not impersonate current authorship.
+    assertEquals(status.published?.sourceCut, 1);
+    assertEquals(status.declaredCut, 2); // Directory uses the journal prefix.
     assertEquals(
       (await invitesOf('@alice:logical.test', {
         server: await f.edge.server(),
@@ -934,6 +948,107 @@ function lifecycleApplication(owner: MembershipOperations) {
   }).apply;
   assert(apply, 'membership lifecycle application is unavailable');
   return apply.bind(owner);
+}
+
+for (const side of ['home', 'edge'] as const) {
+  Deno.test(`membership progress: ${side} knock cut waits for actual completion, not receipt or display`, async () => {
+    const f = await fixture();
+    const release = Promise.withResolvers<void>();
+    let applying: Promise<boolean> | undefined;
+    try {
+      const d = await directoryFixture(f);
+      await d.bootstrap();
+      await d.publish();
+      const fact = await incoming(f, side, 'knock');
+      const scope = fact.operation.stream;
+      const destination = side === 'home' ? f.edge : f.home;
+      const role = side === 'home' ? 'facade' : 'home';
+      const sourceStatus = await replicationProgress(
+        f[side],
+        'logical.test',
+        side === 'home' ? 'home' : 'facade',
+        [scope],
+      );
+      assertEquals(sourceStatus.sources, [{
+        scope,
+        cut: 1,
+        source: side === 'home' ? 'home' : f.node.node,
+        incarnation: side === 'home' ? f.bundle.id : f.node.incarnation,
+      }]);
+      const journal = side === 'home'
+        ? d.journal
+        : new Journal(await f.home.server(), LINK_SUPPORTED);
+      await journal.receive(fact.record.source, [fact.record]);
+      const inspect = async () =>
+        (await replicationProgress(destination, 'logical.test', role, [scope]))
+          .streams.find((row) => row.direction === 'in')!;
+      assertEquals((await inspect()).received.sourceCut, 1);
+      assertEquals((await inspect()).applied.sourceCut, null);
+      if (side === 'home') {
+        const error = await assertRejects(
+          () =>
+            d.owner.prepareRoomScope(
+              fact.state.roomId,
+              true,
+              fact.state.userId,
+            ),
+          MatrixError,
+        );
+        assertEquals(error.status, 503);
+        assertEquals(error.responseBody(), {
+          errcode: 'M_UNAVAILABLE',
+          error: 'replica unavailable',
+        });
+        assertEquals(error.body, error.responseBody());
+      }
+      const held = Promise.withResolvers<void>();
+      const complete = journal.complete.bind(journal);
+      journal.complete = async (...args) => {
+        held.resolve();
+        await release.promise;
+        return complete(...args);
+      };
+      applying = lifecycleApplication(side === 'home' ? f.es : f.hs)(
+        journal,
+        fact.record,
+        fact.keys,
+        side === 'home' ? undefined : f.bundle.id,
+      );
+      await held.promise;
+      assertEquals((await inspect()).applied.sourceCut, null);
+      assertEquals((await inspect()).ready, false);
+      release.resolve();
+      assertEquals(await applying, true);
+      if (side === 'home') await d.publish();
+      const applied = await inspect();
+      assertEquals(applied.ready, true);
+      assertEquals(applied.applied.sourceCut, 1);
+      assertEquals(applied.published?.sourceCut, 1);
+      assertEquals(
+        (await invitesOf(fact.state.userId, {
+          server: await destination.server(),
+        }))[0].kind,
+        'knock',
+      );
+      const before = await (await destination.server()).query(
+        'SELECT total_changes() AS n',
+      );
+      await inspect();
+      assertEquals(
+        await (await destination.server()).query('SELECT total_changes() AS n'),
+        before,
+      );
+      await (await destination.server()).execute(
+        "UPDATE facade_pairings SET state='revoked'",
+      );
+      assertEquals((await inspect()).ready, false);
+      assertEquals((await inspect()).applied.sourceCut, null);
+    } finally {
+      release.resolve();
+      await applying;
+      await f.close();
+    }
+  });
 }
 
 async function exportSuccessor(
