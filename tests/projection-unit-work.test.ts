@@ -66,6 +66,7 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
     let baselineReads = 0, receiptReconciliations = 0, eventApplies = 0;
     let policySnapshots = 0,
       tenantTransactions = 0,
+      publicationTransactions = 0,
       notificationReconciliations = 0;
     store.tenant = async (...args) => {
       const db = await originalTenant(...args);
@@ -114,7 +115,8 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
       return originalQuery(sql, values);
     };
     server.tx = (fn, options) =>
-      originalTx((conn) => {
+      originalTx(async (conn) => {
+        const previousTurns = turns.length;
         const execute = conn.execute.bind(conn), query = conn.query.bind(conn);
         conn.query = (sql, values) => {
           if (
@@ -138,7 +140,9 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
           }
           return result;
         };
-        return fn(conn);
+        const value = await fn(conn);
+        if (turns.length > previousTurns) publicationTransactions++;
+        return value;
       }, options);
     const started = performance.now();
     try {
@@ -185,8 +189,8 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
     assertEquals(notificationReconciliations, turns.length);
     assertEquals(
       policySnapshots,
-      24,
-      'unused mutable policy was captured again in later writer turns',
+      publicationTransactions,
+      'each committed ready-room group owns exactly one fresh tenant policy snapshot',
     );
     assertEquals(baselineReads, turns.length * 3 + rooms.length * 4);
     assertEquals(eventApplies, 24);
