@@ -16,6 +16,7 @@ import { ingestInTx, sendLocal } from '#engine/room/ingest.ts';
 import { verify } from '#engine/room/verify.ts';
 import { config } from '#engine/config.ts';
 import { openStore } from '#engine/store/index.ts';
+import type { Conn } from '#engine/store/db.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { setRoomHooks } from '#engine/room/hooks.ts';
 import { project } from '#engine/server/project.ts';
@@ -114,6 +115,353 @@ async function fixture(knock = false) {
     },
   };
 }
+
+Deno.test('resident membership templates refuse incomplete replica scope before reading room state', async () => {
+  const f = await fixture(true);
+  try {
+    const deps = {
+      ...await f.deps(),
+      prepareRoomScope: () =>
+        Promise.reject(
+          new MatrixError(503, 'M_UNAVAILABLE', 'test scope unavailable'),
+        ),
+    };
+    const head = await f.changes();
+    const signatures = f.signatures();
+    for (const make of [makeJoin, makeKnock, makeLeave]) {
+      const error = await assertRejects(
+        () => make(f.roomId, guest, f.remote.name, ['11'], deps),
+        MatrixError,
+      );
+      assertEquals(error.status, 503);
+    }
+    assertEquals(await f.changes(), head);
+    assertEquals(f.signatures(), signatures);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('resident membership rechecks prepared scope after network verification without blocking completed replay', async () => {
+  const f = await fixture();
+  try {
+    const original = await f.deps();
+    const made = await makeJoin(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      original,
+    );
+    const join = await signTemplate(made.event, f.remote);
+    const wire = toWire(join, '11');
+    let current = true, invalidate = true, durableChecks = 0, preparations = 0;
+    const checkCurrent = () => {
+      if (!current) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'test scope changed');
+      }
+    };
+    const deps = {
+      ...original,
+      prepareRoomScope: (roomId: string) => {
+        assertEquals(roomId, f.roomId);
+        preparations++;
+        checkCurrent();
+        return Promise.resolve({
+          checkCurrent,
+          check: async (conn: Conn) => {
+            // The durable check belongs to the server file, never a room callback.
+            const rows = await conn.query(
+              "SELECT name FROM sqlite_schema WHERE name='membership_operations'",
+            );
+            assertEquals(rows.length, 1);
+            durableChecks++;
+            checkCurrent();
+          },
+        });
+      },
+      keys: {
+        verifyEventSignature: async (
+          args: Parameters<typeof original.keys.verifyEventSignature>[0],
+        ) => {
+          const answer = await original.keys.verifyEventSignature(args);
+          if (invalidate && preparations > 0) current = false;
+          return answer;
+        },
+      },
+    };
+    const head = await f.changes();
+    const error = await assertRejects(
+      () =>
+        sendJoin(
+          f.roomId,
+          String(join.event_id),
+          wire,
+          f.remote.name,
+          'v2',
+          deps,
+        ),
+      MatrixError,
+    );
+    assertEquals(error.status, 503);
+    assertEquals(
+      await f.changes(),
+      head,
+      'an invalidated cut cannot publish a join',
+    );
+    assertEquals(
+      await (await f.room()).tx((tx) =>
+        tx.membershipReceipts.has(
+          JSON.stringify([f.remote.name, 'join', join.event_id]),
+        )
+      ),
+      false,
+    );
+    current = true;
+    invalidate = false;
+    const first = await sendJoin(
+      f.roomId,
+      String(join.event_id),
+      wire,
+      f.remote.name,
+      'v2',
+      deps,
+    );
+    assert(
+      durableChecks > 0,
+      'new mutation rechecks durable scope on the server connection',
+    );
+    const completedHead = await f.changes();
+    const prepared = preparations;
+    current = false;
+    f.expire();
+    assertEquals(
+      await sendJoin(
+        f.roomId,
+        String(join.event_id),
+        wire,
+        f.remote.name,
+        'v2',
+        deps,
+      ),
+      first,
+    );
+    assertEquals(
+      preparations,
+      prepared,
+      'exact authenticated completion needs no new scope admission',
+    );
+    assertEquals(await f.changes(), completedHead);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('resident knock and leave new work requires scope while exact results survive its loss', async () => {
+  const f = await fixture(true);
+  try {
+    const original = await f.deps();
+    let unavailable = true;
+    const checkCurrent = () => {
+      if (unavailable) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'test scope unavailable');
+      }
+    };
+    const deps = {
+      ...original,
+      prepareRoomScope: () => {
+        checkCurrent();
+        return Promise.resolve({
+          checkCurrent,
+          check: () => Promise.resolve(checkCurrent()),
+        });
+      },
+    };
+    const knocked = await makeKnock(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      original,
+    );
+    const knock = await signTemplate(knocked.event, f.remote);
+    const knockWire = toWire(knock, '11');
+    const head = await f.changes();
+    const deniedKnock = await assertRejects(
+      () =>
+        sendKnock(
+          f.roomId,
+          String(knock.event_id),
+          knockWire,
+          f.remote.name,
+          deps,
+        ),
+      MatrixError,
+    );
+    assertEquals(deniedKnock.status, 503);
+    assertEquals(await f.changes(), head);
+    unavailable = false;
+    const result = await sendKnock(
+      f.roomId,
+      String(knock.event_id),
+      knockWire,
+      f.remote.name,
+      deps,
+    );
+    unavailable = true;
+    assertEquals(
+      await sendKnock(
+        f.roomId,
+        String(knock.event_id),
+        knockWire,
+        f.remote.name,
+        deps,
+      ),
+      result,
+    );
+    const leaving = await makeLeave(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      original,
+    );
+    const leave = await signTemplate(leaving.event, f.remote);
+    const leaveWire = toWire(leave, '11');
+    const knockedHead = await f.changes();
+    const deniedLeave = await assertRejects(
+      () =>
+        sendLeave(
+          f.roomId,
+          String(leave.event_id),
+          leaveWire,
+          f.remote.name,
+          'v2',
+          deps,
+        ),
+      MatrixError,
+    );
+    assertEquals(deniedLeave.status, 503);
+    assertEquals(await f.changes(), knockedHead);
+    unavailable = false;
+    assertEquals(
+      await sendLeave(
+        f.roomId,
+        String(leave.event_id),
+        leaveWire,
+        f.remote.name,
+        'v1',
+        deps,
+      ),
+      [200, {}],
+    );
+    unavailable = true;
+    const completedHead = await f.changes();
+    const signatures = f.signatures();
+    f.expire();
+    assertEquals(
+      await sendLeave(
+        f.roomId,
+        String(leave.event_id),
+        leaveWire,
+        f.remote.name,
+        'v2',
+        deps,
+      ),
+      {},
+    );
+    assertEquals(f.signatures(), signatures);
+    assertEquals(await f.changes(), completedHead);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('resident new work cannot classify incomplete room evidence as a malformed event', async () => {
+  const f = await fixture();
+  try {
+    const deps = {
+      ...await f.deps(),
+      prepareRoomScope: () =>
+        Promise.reject(
+          new MatrixError(503, 'M_UNAVAILABLE', 'test scope unavailable'),
+        ),
+    };
+    const head = await f.changes();
+    for (const membership of ['join', 'knock', 'leave'] as const) {
+      const error = await assertRejects(
+        () =>
+          membership === 'knock'
+            ? sendKnock(f.roomId, '$new', {}, f.remote.name, deps)
+            : membership === 'join'
+            ? sendJoin(f.roomId, '$new', {}, f.remote.name, 'v2', deps)
+            : sendLeave(f.roomId, '$new', {}, f.remote.name, 'v2', deps),
+        MatrixError,
+      );
+      assertEquals(error.status, 503);
+      const absent = '!absent:logical.test';
+      const missing = await assertRejects(
+        () =>
+          membership === 'knock'
+            ? sendKnock(absent, '$new', {}, f.remote.name, deps)
+            : membership === 'join'
+            ? sendJoin(absent, '$new', {}, f.remote.name, 'v2', deps)
+            : sendLeave(absent, '$new', {}, f.remote.name, 'v2', deps),
+        MatrixError,
+      );
+      assertEquals(
+        missing.status,
+        503,
+        'a missing required file is not known absence',
+      );
+    }
+    assertEquals(await f.changes(), head);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('resident membership distinguishes directory-proved absence from a missing required replica file', async () => {
+  const f = await fixture();
+  try {
+    const absent = '!absent:logical.test';
+    for (const knownAbsent of [true, false]) {
+      const deps = {
+        ...await f.deps(),
+        prepareRoomScope: () => {
+          if (knownAbsent) {
+            throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
+          }
+          return Promise.resolve({
+            checkCurrent() {},
+            check: () => Promise.resolve(),
+          });
+        },
+      };
+      for (const make of [makeJoin, makeKnock, makeLeave]) {
+        const error = await assertRejects(
+          () => make(absent, guest, f.remote.name, ['11'], deps),
+          MatrixError,
+        );
+        assertEquals(error.status, knownAbsent ? 404 : 503);
+      }
+      for (const membership of ['join', 'knock', 'leave'] as const) {
+        const error = await assertRejects(
+          () =>
+            membership === 'knock'
+              ? sendKnock(absent, '$new', {}, f.remote.name, deps)
+              : membership === 'join'
+              ? sendJoin(absent, '$new', {}, f.remote.name, 'v2', deps)
+              : sendLeave(absent, '$new', {}, f.remote.name, 'v2', deps),
+          MatrixError,
+        );
+        assertEquals(error.status, knownAbsent ? 404 : 503);
+      }
+    }
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('membership receipts pin the pre-join response across later room writes and cold retry', async () => {
   const f = await fixture();

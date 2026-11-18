@@ -15,6 +15,9 @@ export function inviteDependencies(app: App): InviteDeps {
     keys: productionKeyResolver(app.federationKeys),
     self: app.tenant.serverName,
     wake: (destination) => app.sender?.wake(destination),
+    prepareRoomScope: app.replica
+      ? (roomId) => app.replica!.prepareRoomScope(roomId)
+      : undefined,
   };
 }
 

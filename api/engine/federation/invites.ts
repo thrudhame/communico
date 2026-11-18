@@ -111,6 +111,12 @@ export type InviteDeps = {
   self: string;
   // the sender's public wake (the reject intent queues on the loop)
   wake: (destination: string) => void;
+  // Replica composition supplies new-work admission. Durable checks belong to
+  // the server file; room callbacks use only the synchronous receive fence.
+  prepareRoomScope?: (roomId: string) => Promise<{
+    check(conn: Conn): Promise<void>;
+    checkCurrent(): void;
+  }>;
 };
 
 // OOB invite transitions share projection's lifecycle lane. A removal captures

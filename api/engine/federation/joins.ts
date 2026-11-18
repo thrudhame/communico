@@ -36,6 +36,27 @@ import {
 import { prejoinStateInTx } from './prejoin.ts';
 import { joinResponse } from './join-response.ts';
 
+async function membershipRoom(
+  deps: InviteDeps,
+  roomId: string,
+  scopePrepared = false,
+) {
+  try {
+    return await heldRoom(deps.store, roomId);
+  } catch (error) {
+    if (
+      error instanceof MatrixError && error.status === 404 &&
+      deps.prepareRoomScope
+    ) {
+      // A directory-proved absence throws404 from preparation. A complete
+      // required scope without its file is unavailable, not known absence.
+      if (!scopePrepared) await deps.prepareRoomScope(roomId);
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'room replica unavailable');
+    }
+    throw error;
+  }
+}
+
 async function template(
   roomId: string,
   userId: string,
@@ -47,11 +68,13 @@ async function template(
   if (domainOf(userId) !== origin) {
     throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is not on ${origin}`);
   }
-  const room = await heldRoom(deps.store, roomId);
+  const admission = await deps.prepareRoomScope?.(roomId);
+  const room = await membershipRoom(deps, roomId, admission !== undefined);
   const build = async (
     tx: Parameters<Parameters<typeof room.tx>[0]>[0],
     authorizer: string | null = null,
   ) => {
+    admission?.checkCurrent();
     await assertAcl(tx, origin);
     const snapshot = await currentSnapshot(tx);
     const { version, stay } = snapshot;
@@ -159,6 +182,7 @@ async function template(
         }
       }
     }
+    admission?.checkCurrent();
     return {
       room_version: version,
       event: {
@@ -175,9 +199,21 @@ async function template(
       },
     };
   };
-  return membership === 'join'
-    ? await withRestrictedAdmission(room, userId, deps.self, build)
-    : await room.tx((tx) => build(tx));
+  const recheck = async () => {
+    if (admission) await deps.server.tx(admission.check);
+  };
+  if (membership === 'join') {
+    return await withRestrictedAdmission(
+      room,
+      userId,
+      deps.self,
+      build,
+      undefined,
+      recheck,
+    );
+  }
+  await recheck();
+  return await room.tx((tx) => build(tx));
 }
 
 export function makeJoin(
@@ -227,8 +263,12 @@ async function sendMembership(
   deps: InviteDeps,
   omitMembers = false,
 ) {
-  const room = await heldRoom(deps.store, roomId);
+  const room = await membershipRoom(deps, roomId);
   const operation = canonicalJson([origin, membership, eventId]);
+  // Presence of a room file proves no replica cut. Only completed operation
+  // identities may reach authentication/replay without new-work admission.
+  const completed = await room.tx((tx) => tx.membershipReceipts.has(operation));
+  let admission = completed ? undefined : await deps.prepareRoomScope?.(roomId);
   const version = await room.tx(async (tx) => {
     // A completed operation is replayable after an ACL update. New work keeps
     // the normal current-ACL admission order, including malformed requests.
@@ -303,6 +343,14 @@ async function sendMembership(
     tx.membershipReceipts.get(operation, inputHash)
   );
   if (retained !== null) return await finish(retained);
+  // If an observed receipt disappeared, its existence is not an admission for
+  // a second mutation. The normal retained-material collision check ran above.
+  if (admission === undefined) {
+    admission = await deps.prepareRoomScope?.(roomId);
+  }
+  const recheck = async () => {
+    if (admission) await deps.server.tx(admission.check);
+  };
   const prepared =
     await (membership === 'join'
       ? verifyJoinForCountersign(pdu, version, deps.keys, deps.self, roomId)
@@ -311,6 +359,7 @@ async function sendMembership(
         throw new MatrixError(403, 'M_FORBIDDEN', String(error));
       });
   const nominated = prepared.pdu.content?.join_authorised_via_users_server;
+  admission?.checkCurrent();
   if (membership === 'join') {
     await withRestrictedAdmission(
       room,
@@ -326,8 +375,10 @@ async function sendMembership(
         }
       },
       typeof nominated === 'string' ? nominated : undefined,
+      recheck,
     );
   }
+  admission?.checkCurrent();
   await countersign(prepared.pdu, version, deps.signer);
   // Keys/network stay outside the publication lock. Our freshly added
   // signature is verified locally; every other required signer uses resolver.
@@ -340,6 +391,16 @@ async function sendMembership(
   const publish = async (tx: Parameters<Parameters<typeof room.tx>[0]>[0]) => {
     const retained = await tx.membershipReceipts.get(operation, inputHash);
     if (retained !== null) return retained;
+    admission?.checkCurrent();
+    const save = async (response: Record<string, unknown>) => {
+      const saved = await tx.membershipReceipts.save(
+        operation,
+        inputHash,
+        response,
+      );
+      admission?.checkCurrent();
+      return saved;
+    };
     await assertAcl(tx, origin);
     const snapshot = await currentSnapshot(tx);
     if (
@@ -374,12 +435,15 @@ async function sendMembership(
         `membership rejected (${result.reason})`,
       );
     }
+    admission?.checkCurrent();
     if (membership === 'leave') {
-      return await tx.membershipReceipts.save(operation, inputHash, {});
+      return await save({});
     }
     if (membership === 'knock') {
-      return await tx.membershipReceipts.save(operation, inputHash, {
-        knock_room_state: await prejoinStateInTx(tx, pdu.sender),
+      const state = await prejoinStateInTx(tx, pdu.sender);
+      admission?.checkCurrent();
+      return await save({
+        knock_room_state: state,
       });
     }
     // Pin the event's actual pre-state, not a later current-state projection.
@@ -410,7 +474,8 @@ async function sendMembership(
         ),
       ].sort(),
     };
-    return await tx.membershipReceipts.save(operation, inputHash, response);
+    admission?.checkCurrent();
+    return await save(response);
   };
   const answer = membership === 'join'
     ? await withRestrictedAdmission(
@@ -419,8 +484,12 @@ async function sendMembership(
       deps.self,
       publish,
       typeof nominated === 'string' ? nominated : undefined,
+      recheck,
     )
-    : await withRoomLock(roomId, () => room.tx(publish));
+    : await withRoomLock(roomId, async () => {
+      await recheck();
+      return await room.tx(publish);
+    });
   return await finish(answer);
 }
 
