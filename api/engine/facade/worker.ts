@@ -172,10 +172,13 @@ export class JournalReconciler {
       const progressed = !sameCut(ack.received, next.received) ||
         !sameCut(ack.applied, next.applied);
       ack = next;
+      // Receipt can advance before the receiver's application commits. Drain
+      // toward this page's source head, not the old hello's applied cut; a
+      // no-progress response still yields rather than spinning on blocked work.
       if (
         !progressed ||
         (ack.received.sequence >= page.head.sequence &&
-          ack.applied.sequence >= (remote?.applied.sequence ?? 0))
+          ack.applied.sequence >= page.head.sequence)
       ) break;
     }
   }
