@@ -29,7 +29,11 @@ import {
   ungroundedPrevs,
 } from '#engine/room/build.ts';
 import { fetchOrNull, type RemoteDeps } from '#engine/room/deps.ts';
-import { admitLocalJoin } from '#engine/room/hooks.ts';
+import {
+  admitLocalJoin,
+  prepareMembershipAdmission,
+  withMembershipFence,
+} from '#engine/room/hooks.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
 import { afterRoomCommit, ingestInTx } from '#engine/room/ingest.ts';
 import type { Room, RoomTx } from '#engine/room/index.ts';
@@ -687,6 +691,14 @@ export async function ingestRemote(
     );
     if (prior) return prior;
   }
+  const admission = deps.localJoin === undefined
+    ? undefined
+    : await prepareMembershipAdmission(
+      room.store,
+      room.id,
+      deps.localJoin.userId,
+      true,
+    );
   const version = await room.tx(async (tx) => {
     deps.signal?.throwIfAborted();
     const stay = await tx.segments.openStay();
@@ -855,200 +867,205 @@ export async function ingestRemote(
           deps.localJoin.eventId,
         );
       }
-      return await room.tx(async (tx) => {
-        deps.signal?.throwIfAborted();
-        if (operationId !== undefined) {
-          const prior = await tx.remoteBatches.get(operationId, inputHash);
-          if (prior) return { grounded: [], outcomes: prior };
-        }
-        const grounded: string[] = [];
-        const results = new Map<number, RemoteOutcome>();
-        // Revalidation (G8): the fetch phase ran unlocked — the stay, the
-        // version and the extremities are re-read inside the lock
-        const stay = await tx.segments.openStay();
-        if (stay === null) {
-          throw new Error('E_ROOM_ARCHIVED: no open stay for ' + room.id);
-        }
-        const lockedVersion = await roomVersionOf(tx, stay.id);
-        const createId = await roomCreateId(tx, stay.id);
-        const rulebook = getRulebook(lockedVersion);
-
-        // The ingest set: pushed PDUs and fetched live events, deduplicated
-        // (a pushed PDU wins over its fetched copy), in depth/topology
-        // order — deterministic, so tests pin results
-        const merged = new Map<string, VerifiedItem>();
-        for (const [id, item] of acc.live) merged.set(id, item);
-        for (const item of items) merged.set(item.eventId, item);
-
-        // Evidence: verified fetched events, stored with grounding evidence
-        // after their own auth check against their auth events (held +
-        // pack); corrupted gap tips are standing rejected records. Neither
-        // is ever state-at-event (G2), positioned or published.
-        const pack = new Map<string, Pdu>([
-          ...acc.evidence,
-          ...acc.corrupted,
-        ]);
-        const candidates = new Map<string, VerifiedItem>();
-        for (const [eventId, pdu] of pack) {
-          candidates.set(eventId, {
-            eventId,
-            pdu,
-            index: -1,
-            source: 'pulled',
-            oversized: false,
-          });
-        }
-        for (const [id, item] of merged) candidates.set(id, item);
-        const ordered = orderEvents([...candidates.values()], [
-          'prev_events',
-          'auth_events',
-        ], (item) => [...(acc.boundaries.get(item.eventId)?.values() ?? [])]);
-        const localRejected = new Set<string>(candidates.keys());
-        const store = await loadRulebookStore(
-          tx,
-          [
-            ...pack.keys(),
-            ...[...pack.values()].flatMap((pdu) => pdu.auth_events ?? []),
-            ...[...acc.boundaries.values()].flatMap((map) => [...map.values()]),
-          ],
-          [...candidates.values()].map((item) => item.pdu),
-          localRejected,
-        );
-        for (const item of ordered) {
+      return await room.tx((tx) =>
+        withMembershipFence(admission, async () => {
           deps.signal?.throwIfAborted();
-          const { eventId: id, pdu } = item;
-          // A preceding accepted ACL event in this batch changes admission now,
-          // not on the next transaction. Refuse only this room's remaining PDUs.
-          if (!await aclAllows(tx, origin)) {
-            for (const index of outcomeIndex.get(id) ?? []) {
-              results.set(
-                index,
-                outcomeOf(id, 'refused', 'server denied by room ACL'),
+          if (operationId !== undefined) {
+            const prior = await tx.remoteBatches.get(operationId, inputHash);
+            if (prior) return { grounded: [], outcomes: prior };
+          }
+          const grounded: string[] = [];
+          const results = new Map<number, RemoteOutcome>();
+          // Revalidation (G8): the fetch phase ran unlocked — the stay, the
+          // version and the extremities are re-read inside the lock
+          const stay = await tx.segments.openStay();
+          if (stay === null) {
+            throw new Error('E_ROOM_ARCHIVED: no open stay for ' + room.id);
+          }
+          const lockedVersion = await roomVersionOf(tx, stay.id);
+          const createId = await roomCreateId(tx, stay.id);
+          const rulebook = getRulebook(lockedVersion);
+
+          // The ingest set: pushed PDUs and fetched live events, deduplicated
+          // (a pushed PDU wins over its fetched copy), in depth/topology
+          // order — deterministic, so tests pin results
+          const merged = new Map<string, VerifiedItem>();
+          for (const [id, item] of acc.live) merged.set(id, item);
+          for (const item of items) merged.set(item.eventId, item);
+
+          // Evidence: verified fetched events, stored with grounding evidence
+          // after their own auth check against their auth events (held +
+          // pack); corrupted gap tips are standing rejected records. Neither
+          // is ever state-at-event (G2), positioned or published.
+          const pack = new Map<string, Pdu>([
+            ...acc.evidence,
+            ...acc.corrupted,
+          ]);
+          const candidates = new Map<string, VerifiedItem>();
+          for (const [eventId, pdu] of pack) {
+            candidates.set(eventId, {
+              eventId,
+              pdu,
+              index: -1,
+              source: 'pulled',
+              oversized: false,
+            });
+          }
+          for (const [id, item] of merged) candidates.set(id, item);
+          const ordered = orderEvents([...candidates.values()], [
+            'prev_events',
+            'auth_events',
+          ], (item) => [...(acc.boundaries.get(item.eventId)?.values() ?? [])]);
+          const localRejected = new Set<string>(candidates.keys());
+          const store = await loadRulebookStore(
+            tx,
+            [
+              ...pack.keys(),
+              ...[...pack.values()].flatMap((pdu) => pdu.auth_events ?? []),
+              ...[...acc.boundaries.values()].flatMap((
+                map,
+              ) => [...map.values()]),
+            ],
+            [...candidates.values()].map((item) => item.pdu),
+            localRejected,
+          );
+          for (const item of ordered) {
+            deps.signal?.throwIfAborted();
+            const { eventId: id, pdu } = item;
+            // A preceding accepted ACL event in this batch changes admission now,
+            // not on the next transaction. Refuse only this room's remaining PDUs.
+            if (!await aclAllows(tx, origin)) {
+              for (const index of outcomeIndex.get(id) ?? []) {
+                results.set(
+                  index,
+                  outcomeOf(id, 'refused', 'server denied by room ACL'),
+                );
+              }
+              continue;
+            }
+            localRejected.delete(id);
+            const candidateBoundary = acc.boundaries.get(id);
+            const boundary = candidateBoundary !== undefined &&
+                !await invalidRecoveryAncestry(tx, [id], acc, deps.signal)
+              ? candidateBoundary
+              : undefined;
+            const needsBoundary = boundary !== undefined &&
+              (await ungroundedPrevs(tx, pdu.prev_events ?? [])).length > 0;
+            const invalidBoundary = needsBoundary &&
+              !authorizedBoundary(boundary, store, createId);
+            if (!merged.has(id) || invalidBoundary) {
+              if ((await tx.events.get(id)) !== null) continue; // first-writer
+              const corrupted = acc.corrupted.has(id) || invalidBoundary;
+              const chain = corrupted
+                ? null
+                : checkDeclaredAuth(pdu, rulebook, store, createId);
+              const rejected = corrupted || chain === null || !chain.ok;
+              if (rejected) localRejected.add(id);
+              await tx.events.insert(
+                id,
+                pdu,
+              );
+              await tx.events.setStatus(id, {
+                standing: rejected ? 'rejected' : 'accepted',
+                grounding: 'evidence',
+                origin,
+                received_ts: Date.now(),
+              });
+              await tx.changes.append('event', id, {
+                standing: rejected ? 'rejected' : 'accepted',
+                reason: rejected && !corrupted ? 'auth' : null,
+                rule: corrupted
+                  ? 'unverifiable'
+                  : chain !== null && !chain.ok
+                  ? chain.rule
+                  : null,
+                type: String(pdu.type),
+                state_key: pdu.state_key ?? null,
+                sender: String(pdu.sender),
+                depth: pdu.depth,
+                origin_server_ts: pdu.origin_server_ts,
+                stay: null,
+                offset: null,
+                grounding: 'evidence',
+                origin,
+              });
+              if (!merged.has(id)) continue;
+            }
+            // Invalid imported state leaves the event as non-grounding evidence.
+            // The normal receipt path reports its stored rejection; children
+            // remain pending instead of inheriting that invalid state.
+            if (id === deps.localJoin?.eventId) {
+              if (
+                pdu.sender !== deps.localJoin.userId ||
+                pdu.state_key !== pdu.sender ||
+                pdu.content?.membership !== 'join'
+              ) {
+                throw new Error('E_LOCAL_JOIN_IDENTITY');
+              }
+              await assertAcl(tx, deps.self);
+              await assertLocalEncryption(
+                tx,
+                await tx.state.current(stay.id),
+                pdu,
+                deps.self,
               );
             }
-            continue;
-          }
-          localRejected.delete(id);
-          const candidateBoundary = acc.boundaries.get(id);
-          const boundary = candidateBoundary !== undefined &&
-              !await invalidRecoveryAncestry(tx, [id], acc, deps.signal)
-            ? candidateBoundary
-            : undefined;
-          const needsBoundary = boundary !== undefined &&
-            (await ungroundedPrevs(tx, pdu.prev_events ?? [])).length > 0;
-          const invalidBoundary = needsBoundary &&
-            !authorizedBoundary(boundary, store, createId);
-          if (!merged.has(id) || invalidBoundary) {
-            if ((await tx.events.get(id)) !== null) continue; // first-writer
-            const corrupted = acc.corrupted.has(id) || invalidBoundary;
-            const chain = corrupted
-              ? null
-              : checkDeclaredAuth(pdu, rulebook, store, createId);
-            const rejected = corrupted || chain === null || !chain.ok;
-            if (rejected) localRejected.add(id);
-            await tx.events.insert(
-              id,
-              pdu,
-            );
-            await tx.events.setStatus(id, {
-              standing: rejected ? 'rejected' : 'accepted',
-              grounding: 'evidence',
-              origin,
-              received_ts: Date.now(),
+            const res = await ingestInTx(tx, room.id, item.pdu, {
+              remote: {
+                origin,
+                self: deps.self,
+                oversized: item.oversized,
+                ungroundedMs: deps.ungroundedMs,
+                boundary: invalidBoundary ? undefined : boundary,
+              },
             });
-            await tx.changes.append('event', id, {
-              standing: rejected ? 'rejected' : 'accepted',
-              reason: rejected && !corrupted ? 'auth' : null,
-              rule: corrupted
-                ? 'unverifiable'
-                : chain !== null && !chain.ok
-                ? chain.rule
-                : null,
-              type: String(pdu.type),
-              state_key: pdu.state_key ?? null,
-              sender: String(pdu.sender),
-              depth: pdu.depth,
-              origin_server_ts: pdu.origin_server_ts,
-              stay: null,
-              offset: null,
-              grounding: 'evidence',
-              origin,
-            });
-            if (!merged.has(id)) continue;
-          }
-          // Invalid imported state leaves the event as non-grounding evidence.
-          // The normal receipt path reports its stored rejection; children
-          // remain pending instead of inheriting that invalid state.
-          if (id === deps.localJoin?.eventId) {
+            if (res.standing === 'rejected') localRejected.add(id);
+            if (res.grounding === 'grounded') grounded.push(item.eventId);
+            const result = res.receipt
+              ? outcomeOf(item.eventId, 'known')
+              : !res.stored
+              ? outcomeOf(item.eventId, 'dropped')
+              : res.grounding === 'pending'
+              ? outcomeOf(item.eventId, 'pending')
+              : {
+                eventId: item.eventId,
+                outcome: res.standing,
+                reason: res.reason,
+                rule: res.rule,
+                error: null,
+              };
             if (
-              pdu.sender !== deps.localJoin.userId ||
-              pdu.state_key !== pdu.sender || pdu.content?.membership !== 'join'
+              res.grounding === 'pending' && acc.unavailablePrevs.has(id)
             ) {
-              throw new Error('E_LOCAL_JOIN_IDENTITY');
+              result.error =
+                'Your server is not divulging the referenced prev_events';
             }
-            await assertAcl(tx, deps.self);
-            await assertLocalEncryption(
-              tx,
-              await tx.state.current(stay.id),
-              pdu,
-              deps.self,
-            );
+            for (const index of outcomeIndex.get(item.eventId) ?? []) {
+              results.set(index, result);
+            }
           }
-          const res = await ingestInTx(tx, room.id, item.pdu, {
-            remote: {
-              origin,
-              self: deps.self,
-              oversized: item.oversized,
-              ungroundedMs: deps.ungroundedMs,
-              boundary: invalidBoundary ? undefined : boundary,
-            },
-          });
-          if (res.standing === 'rejected') localRejected.add(id);
-          if (res.grounding === 'grounded') grounded.push(item.eventId);
-          const result = res.receipt
-            ? outcomeOf(item.eventId, 'known')
-            : !res.stored
-            ? outcomeOf(item.eventId, 'dropped')
-            : res.grounding === 'pending'
-            ? outcomeOf(item.eventId, 'pending')
-            : {
-              eventId: item.eventId,
-              outcome: res.standing,
-              reason: res.reason,
-              rule: res.rule,
-              error: null,
-            };
-          if (
-            res.grounding === 'pending' && acc.unavailablePrevs.has(id)
-          ) {
-            result.error =
-              'Your server is not divulging the referenced prev_events';
+          if (deps.localJoin !== undefined) {
+            const { eventId, userId } = deps.localJoin;
+            const status = await tx.events.getStatus(eventId);
+            if (
+              status?.standing === 'accepted' && status.grounding === 'grounded'
+            ) {
+              await tx.changes.localParticipation(eventId, userId);
+            }
           }
-          for (const index of outcomeIndex.get(item.eventId) ?? []) {
-            results.set(index, result);
-          }
-        }
-        if (deps.localJoin !== undefined) {
-          const { eventId, userId } = deps.localJoin;
-          const status = await tx.events.getStatus(eventId);
-          if (
-            status?.standing === 'accepted' && status.grounding === 'grounded'
-          ) {
-            await tx.changes.localParticipation(eventId, userId);
-          }
-        }
-        const completed = outcomes.map((outcome, index) =>
-          results.get(index) ?? outcome ??
-            outcomeOf(null, 'refused', 'E_OUTCOME_MISSING')
-        );
-        deps.signal?.throwIfAborted();
-        return {
-          grounded,
-          outcomes: operationId === undefined
-            ? completed
-            : await tx.remoteBatches.save(operationId, inputHash, completed),
-        };
-      });
+          const completed = outcomes.map((outcome, index) =>
+            results.get(index) ?? outcome ??
+              outcomeOf(null, 'refused', 'E_OUTCOME_MISSING')
+          );
+          deps.signal?.throwIfAborted();
+          return {
+            grounded,
+            outcomes: operationId === undefined
+              ? completed
+              : await tx.remoteBatches.save(operationId, inputHash, completed),
+          };
+        })
+      );
     });
 
     arrived = [

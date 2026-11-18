@@ -15,6 +15,9 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { assertRoomAcl } from '#engine/federation/acl.ts';
 import { joinRemote } from '#engine/room/join.ts';
+import { setMembershipAdmission } from '#engine/room/hooks.ts';
+import { ingestRemote } from '#engine/room/remote.ts';
+import type { Conn } from '#engine/store/db.ts';
 import { finalizeBuilt } from '#engine/room/build.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -58,6 +61,207 @@ async function withStore(
 }
 
 const ANNA = '@anna:test';
+
+Deno.test('join remote: selected scope fences network intent and final room commits', async (t) => {
+  for (
+    const phase of [
+      'before-network',
+      'signing',
+      'intent',
+      'intent-final',
+      'response',
+      'snapshot-final',
+      'resident-final',
+    ]
+  ) {
+    await t.step(phase, () =>
+      withStore(async (store) => {
+        const fr = await makeFakeRoom({ roomId: '!scope-join:remote.test' });
+        const signer = await testSigner();
+        const { deps, calls } = await joinDepsFor(fr);
+        const resident = phase === 'resident-final';
+        if (resident) {
+          await joinRemote(store, {
+            roomId: fr.roomId,
+            user: ANNA,
+            via: [fr.server.name],
+            signer,
+            deps,
+          });
+        }
+        const user = resident ? '@bea:test' : ANNA;
+        const makeBefore = calls.makeJoin.length;
+        const sendBefore = calls.sendJoin.length;
+        let current = phase !== 'before-network';
+        let preparations = 0;
+        let durableChecks = 0;
+        const unavailable = () => {
+          throw new MatrixError(
+            503,
+            'M_UNAVAILABLE',
+            'selected scope unavailable',
+          );
+        };
+        setMembershipAdmission(
+          store,
+          (roomId, localUser, allowAbsent) => {
+            assertEquals([roomId, localUser, allowAbsent], [
+              fr.roomId,
+              user,
+              true,
+            ]);
+            if (!current) unavailable();
+            preparations++;
+            const final = phase.endsWith('-final') &&
+              preparations >= (resident ? 3 : 2);
+            let checks = 0;
+            return Promise.resolve({
+              async check(conn: Conn) {
+                // This must be the intent's existing server connection, not a nested read.
+                await conn.query(
+                  'SELECT COUNT(*) AS n FROM federation_join_attempts',
+                );
+                durableChecks++;
+                if (phase === 'intent') unavailable();
+                if (phase === 'intent-final') current = false;
+              },
+              checkCurrent() {
+                if (final && ++checks === 2) current = false;
+                if (!current) unavailable();
+              },
+            });
+          },
+        );
+        const originalSend = deps.fetcher.sendJoin;
+        deps.fetcher.sendJoin = async (...args) => {
+          const result = await originalSend(...args);
+          if (phase === 'response') current = false;
+          return result;
+        };
+        let signatures = 0;
+        const error = await assertRejects(
+          () =>
+            joinRemote(store, {
+              roomId: fr.roomId,
+              user,
+              via: [fr.server.name],
+              signer: {
+                ...signer,
+                async sign(bytes) {
+                  signatures++;
+                  const result = await signer.sign(bytes);
+                  if (phase === 'signing') current = false;
+                  return result;
+                },
+              },
+              deps,
+            }),
+          MatrixError,
+          'selected scope unavailable',
+        );
+        assertEquals(error.status, 503);
+        const beforeIntent = [
+          'before-network',
+          'signing',
+          'intent',
+          'intent-final',
+        ].includes(
+          phase,
+        );
+        assertEquals(
+          calls.makeJoin.length - makeBefore,
+          phase === 'before-network' ? 0 : 1,
+        );
+        assertEquals(calls.sendJoin.length - sendBefore, beforeIntent ? 0 : 1);
+        assertEquals(signatures, phase === 'before-network' ? 0 : 1);
+        if (phase.startsWith('intent')) assertEquals(durableChecks, 1);
+        const attempts = await (await store.server()).query(
+          'SELECT user_id FROM federation_join_attempts',
+        );
+        assertEquals(attempts.length, beforeIntent ? 0 : 1);
+        // A remotely uncertain join keeps its cleanup obligation, never local participation.
+        try {
+          const room = await openRoom(store, fr.roomId);
+          await room.tx(async (tx) => {
+            const stay = await tx.segments.openStay();
+            if (!resident) assertEquals(stay, null);
+            if (stay !== null) {
+              const group = await tx.state.current(stay.id);
+              assertEquals(
+                group === null
+                  ? null
+                  : await tx.state.groupKey(group, 'm.room.member', user),
+                null,
+              );
+            }
+            const local = (await tx.changes.after(0, 10000)).filter((change) =>
+              change.kind === 'local-participation' &&
+              JSON.parse(change.data).user === user
+            );
+            assertEquals(local, []);
+          });
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+        }
+      }));
+  }
+});
+
+Deno.test('join remote: committed batch receipt precedes new local scope admission', async () => {
+  await withStore(async (store) => {
+    const fr = await makeFakeRoom({ roomId: '!scope-replay:remote.test' });
+    const { deps } = await joinDepsFor(fr);
+    const result = await joinRemote(store, {
+      roomId: fr.roomId,
+      user: ANNA,
+      via: [fr.server.name],
+      signer: await testSigner(),
+      deps,
+    });
+    const room = await openRoom(store, fr.roomId);
+    const pdu = await room.tx(async (tx) =>
+      JSON.parse((await tx.events.get(result.eventId))!.pdu) as Pdu
+    );
+    let current = true, preparations = 0;
+    setMembershipAdmission(store, (_room, user, absent) => {
+      assertEquals([user, absent], [ANNA, true]);
+      preparations++;
+      const checkCurrent = () => {
+        if (!current) {
+          throw new MatrixError(
+            503,
+            'M_UNAVAILABLE',
+            'selected scope unavailable',
+          );
+        }
+      };
+      checkCurrent();
+      return Promise.resolve({ checkCurrent });
+    });
+    const call = () =>
+      ingestRemote(
+        room,
+        [pdu],
+        fr.server.name,
+        {
+          ...deps,
+          limits: { waitMs: 0, limit: 100, budgetMs: 8000 },
+          ungroundedMs: 0,
+          localJoin: { eventId: result.eventId, userId: ANNA },
+        },
+        'pulled',
+        'scope-replay',
+      );
+    const first = await call();
+    assertEquals(first[0].outcome, 'known');
+    const head = await room.tx((tx) => tx.changes.head());
+    const prepared = preparations;
+    current = false;
+    assertEquals(await call(), first);
+    assertEquals(preparations, prepared);
+    assertEquals(await room.tx((tx) => tx.changes.head()), head);
+  });
+});
 
 Deno.test('key fault ownership: remote join preserves local faults and never tries another resident', async () => {
   for (const phase of ['make-join', 'snapshot', 'returned-signature']) {

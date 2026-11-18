@@ -6,6 +6,7 @@
 // without the server schema) the writes stand alone — a later startup
 // roll-forward catches up.
 import type { Store } from '#engine/store/index.ts';
+import type { Conn } from '#engine/store/db.ts';
 import type { CompletionCut, CompletionTarget } from './completion.ts';
 import type { Room } from './index.ts';
 
@@ -31,7 +32,10 @@ const joinAdmissions = new WeakMap<
   (roomId: string, userId: string, eventId?: string) => Promise<void>
 >();
 
-export type MembershipAdmission = { checkCurrent(): void };
+export type MembershipAdmission = {
+  check?(conn: Conn): Promise<void>;
+  checkCurrent(): void;
+};
 const membershipAdmissions = new WeakMap<
   Store,
   (

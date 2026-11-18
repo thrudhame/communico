@@ -4,7 +4,12 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
-import { setJoinAdmission } from '#engine/room/hooks.ts';
+import {
+  type MembershipAdmission,
+  prepareMembershipAdmission,
+  setJoinAdmission,
+  withMembershipFence,
+} from '#engine/room/hooks.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Database } from '#engine/store/db.ts';
 import type { Pdu } from '#engine/pdu.ts';
@@ -73,12 +78,19 @@ export async function beginJoinAttempt(
   store: Store,
   a: JoinAttempt,
   signed: Pdu,
+  prepared?: MembershipAdmission,
 ): Promise<void> {
   if (
     signed.event_id !== a.eventId || signed.room_id !== a.roomId ||
     signed.sender !== a.userId || signed.state_key !== a.userId ||
     signed.type !== 'm.room.member' || signed.content.membership !== 'join'
   ) throw new Error('Join attempt does not match its signed event');
+  const admission = prepared ?? await prepareMembershipAdmission(
+    store,
+    a.roomId,
+    a.userId,
+    true,
+  );
   const json = JSON.stringify(signed);
   installJoinAdmission(store);
   let set = active.get(store);
@@ -110,32 +122,35 @@ export async function beginJoinAttempt(
         }
       }
       const server = await store.server();
-      await server.tx(async (tx) => {
-        if (
-          (await tx.query(
-            'SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=?',
-            [a.roomId, a.userId],
-          )).length
-        ) {
-          throw new MatrixError(
-            409,
-            'M_BAD_STATE',
-            'A remote join cleanup is pending',
+      await server.tx((tx) =>
+        withMembershipFence(admission, async () => {
+          await admission?.check?.(tx);
+          if (
+            (await tx.query(
+              'SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=?',
+              [a.roomId, a.userId],
+            )).length
+          ) {
+            throw new MatrixError(
+              409,
+              'M_BAD_STATE',
+              'A remote join cleanup is pending',
+            );
+          }
+          await tx.execute(
+            'INSERT INTO federation_join_attempts(room_id,user_id,event_id,room_version,destination,added_ms,join_json) VALUES(?,?,?,?,?,?,?)',
+            [
+              a.roomId,
+              a.userId,
+              a.eventId,
+              a.roomVersion,
+              a.destination,
+              a.addedMs,
+              json,
+            ],
           );
-        }
-        await tx.execute(
-          'INSERT INTO federation_join_attempts(room_id,user_id,event_id,room_version,destination,added_ms,join_json) VALUES(?,?,?,?,?,?,?)',
-          [
-            a.roomId,
-            a.userId,
-            a.eventId,
-            a.roomVersion,
-            a.destination,
-            a.addedMs,
-            json,
-          ],
-        );
-      });
+        })
+      );
     });
   } catch (error) {
     releaseJoinAttempt(store, a);
