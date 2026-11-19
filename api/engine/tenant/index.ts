@@ -902,29 +902,59 @@ function bind(
         media.markMediaUploaded(conn, mediaId, meta),
     },
     delayedEvents: {
+      newId: () => delayedEvents.newId(conn),
+      requireOwner: (id: string) => delayedEvents.requireOwner(conn, id),
+      operations: (localpart: string) =>
+        delayedEvents.operations(conn, localpart),
       get: (id: string) => delayedEvents.get(conn, id),
       list: (localpart: string) => delayedEvents.list(conn, localpart),
       receipt: (receipt: delayedEvents.DelayReceipt) =>
         delayedEvents.receipt(conn, receipt),
-      add: (
+      add: async (
         event: delayedEvents.DelayedEvent,
         limit: number,
         receipt?: delayedEvents.DelayReceipt,
-      ) => delayedEvents.add(conn, event, limit, receipt),
-      remove: (id: string) => delayedEvents.remove(conn, id),
-      action: (
+      ) => {
+        const id = await delayedEvents.add(conn, event, limit, receipt);
+        changed();
+        return id;
+      },
+      remove: async (
+        id: string,
+        standing?: import('#engine/room/events.ts').Standing,
+      ) => {
+        await delayedEvents.remove(conn, id, standing);
+        changed();
+      },
+      action: async (
         id: string,
         action: 'cancel' | 'restart' | 'send',
         now: number,
-      ) => delayedEvents.action(conn, id, action, now),
+      ) => {
+        await delayedEvents.action(conn, id, action, now);
+        changed();
+      },
       next: () => delayedEvents.next(conn),
-      retry: (ids: readonly string[], due: number) =>
-        delayedEvents.retry(conn, ids, due),
+      retry: async (ids: readonly string[], due: number) => {
+        await delayedEvents.retry(conn, ids, due);
+        changed();
+      },
       due: (now: number) => delayedEvents.due(conn, now),
-      claim: (id: string, now: number) => delayedEvents.claim(conn, id, now),
+      claim: async (id: string, now: number) => {
+        const event = await delayedEvents.claim(conn, id, now);
+        if (event) changed();
+        return event;
+      },
       submission: (id: string) => delayedEvents.submission(conn, id),
-      prepare: (id: string, pdu: Pdu) => delayedEvents.prepare(conn, id, pdu),
-      finish: (id: string) => delayedEvents.finish(conn, id),
+      prepare: async (id: string, pdu: Pdu) => {
+        const submission = await delayedEvents.prepare(conn, id, pdu);
+        changed();
+        return submission;
+      },
+      finish: async (id: string) => {
+        await delayedEvents.finish(conn, id);
+        changed();
+      },
     },
     completion: {
       pending: (device: devices.DeviceIdentity) =>

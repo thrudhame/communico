@@ -31,6 +31,7 @@ import { clearProfileRows } from '#engine/tenant/profiles.ts';
 import { clearAccountData } from '#engine/tenant/accountdata.ts';
 import { clearFilters } from '#engine/tenant/filters.ts';
 import { clearPushRules } from '#engine/tenant/pushrules.ts';
+import { removeAll as removeDelayedEvents } from '#engine/tenant/delayed-events.ts';
 import { markErased } from '#engine/tenant/erasure.ts';
 import { recordDeactivation } from '#engine/tenant/session-authority.ts';
 import { config } from '#engine/config.ts';
@@ -150,9 +151,7 @@ export async function markDeactivated(
 ): Promise<void> {
   const old = await userByLocalpart(conn, localpart);
   if (old === null || old.deactivated) return;
-  await conn.execute('DELETE FROM delayed_events WHERE localpart=?', [
-    localpart,
-  ]);
+  await removeDelayedEvents(conn, localpart);
   await conn.execute('DELETE FROM delayed_event_receipts WHERE localpart=?', [
     localpart,
   ]);

@@ -7,6 +7,136 @@ import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { DeviceIdentity } from './devices.ts';
 import type { PreparedSubmission } from '#engine/room/ingest.ts';
+import type { Standing } from '#engine/room/events.ts';
+import { Buffer } from 'node:buffer';
+import {
+  readRegister,
+  registerJson,
+  type RegisterOperation,
+  registerOperations,
+  writeRegister,
+} from '#engine/facade/registers.ts';
+import { ownerUnavailable, tenantAuthority } from './session-authority.ts';
+
+function ownerPrefix(node: string, incarnation: string): string {
+  return 'd.' +
+    Buffer.from(JSON.stringify([node, incarnation])).toString('base64url') +
+    '.';
+}
+
+/** Legacy bearer IDs predate enrollment and belong to home. An opaque ID is a
+ * routing hint only: current tenant authority, never the hint, permits writes. */
+export async function requireOwner(conn: Conn, id: string): Promise<void> {
+  const authority = await tenantAuthority(conn);
+  if (!authority) return;
+  if (id.startsWith('d.')) {
+    if (!id.startsWith(ownerPrefix(authority.node, authority.incarnation))) {
+      ownerUnavailable();
+    }
+  } else if (authority.node !== 'home') ownerUnavailable();
+}
+
+export async function newId(conn: Conn): Promise<string> {
+  const authority = await tenantAuthority(conn);
+  return (authority ? ownerPrefix(authority.node, authority.incarnation) : '') +
+    crypto.randomUUID();
+}
+
+function semanticKey(localpart: string, id: string): string {
+  return JSON.stringify(['delayed-event', localpart, id]);
+}
+
+export async function operations(
+  conn: Conn,
+  localpart: string,
+): Promise<RegisterOperation[]> {
+  const keys = await conn.query(
+    "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='delayed-event' AND json_extract(semantic_key,'$[1]')=? ORDER BY semantic_key",
+    [localpart],
+  );
+  const result: RegisterOperation[] = [];
+  for (const row of keys) {
+    result.push(...await registerOperations(conn, String(row.semantic_key)));
+  }
+  return result;
+}
+
+/** Original schedule/submission/receipt evidence commits with every native
+ * transition. The journal retains terminal facts after executable rows vanish.
+ * Foreign copies will remain journal facts, never scheduler rows. */
+async function retain(
+  conn: Conn,
+  id: string,
+  terminal?: 'cancelled' | 'completed',
+  standing: Standing | null = null,
+): Promise<void> {
+  const authority = await tenantAuthority(conn);
+  if (!authority) return;
+  await requireOwner(conn, id);
+  const [row] = await conn.query('SELECT * FROM delayed_events WHERE id=?', [
+    id,
+  ]);
+  if (!row) return;
+  const key = semanticKey(String(row.localpart), id);
+  const before = await readRegister(conn, key);
+  const phase = terminal ?? String(row.phase);
+  const payload = registerJson(JSON.stringify({
+    event: { ...eventOf(row), phase },
+    eventId: row.event_id,
+    pdu: row.pending_pdu === null ? null : JSON.parse(String(row.pending_pdu)),
+    completed: row.completed === 1,
+    // Completion bookkeeping alone does not distinguish accepted/soft-failed/
+    // rejected room outcomes. Only the actual ingest result may supply this.
+    standing,
+    receipts: await conn.query(
+      'SELECT localpart,device_id,generation,endpoint,txn_id FROM delayed_event_receipts WHERE delay_id=? ORDER BY localpart,device_id,generation,endpoint,txn_id',
+      [id],
+    ),
+  }));
+  if (before.winner?.payload === payload) return;
+  if (before.winner) {
+    const old = JSON.parse(before.winner.payload).event.phase;
+    if (old === 'cancelled' || old === 'completed') {
+      throw new Error('delayed event is terminal');
+    }
+  }
+  await writeRegister(
+    conn,
+    { source: authority.node, incarnation: authority.incarnation },
+    key,
+    'delayed-event',
+    payload,
+  );
+}
+
+async function localRows(conn: Conn, rows: Row[]): Promise<Row[]> {
+  const authority = await tenantAuthority(conn);
+  if (!authority) return rows;
+  const prefix = ownerPrefix(authority.node, authority.incarnation);
+  return rows.filter((row) =>
+    String(row.id).startsWith(prefix) ||
+    (authority.node === 'home' && !String(row.id).startsWith('d.'))
+  );
+}
+
+async function ownerSelection(conn: Conn) {
+  const authority = await tenantAuthority(conn);
+  if (!authority) return { sql: '1', params: [] as (string | number)[] };
+  const prefix = ownerPrefix(authority.node, authority.incarnation);
+  return {
+    sql: "(substr(id,1,?)=? OR (?='home' AND substr(id,1,2)!='d.'))",
+    params: [prefix.length, prefix, authority.node],
+  };
+}
+
+export async function removeAll(conn: Conn, localpart: string): Promise<void> {
+  for (const event of await list(conn, localpart)) await remove(conn, event.id);
+  // Imported or old-incarnation rows are never local execution authority, but
+  // account retirement must still clear any retained private materialization.
+  await conn.execute('DELETE FROM delayed_events WHERE localpart=?', [
+    localpart,
+  ]);
+}
 
 export type DelayedEvent = {
   id: string;
@@ -51,6 +181,7 @@ export async function get(
   conn: Conn,
   id: string,
 ): Promise<DelayedEvent | null> {
+  await requireOwner(conn, id);
   const rows = await conn.query('SELECT * FROM delayed_events WHERE id=?', [
     id,
   ]);
@@ -60,9 +191,12 @@ export async function list(
   conn: Conn,
   localpart: string,
 ): Promise<DelayedEvent[]> {
-  return (await conn.query(
-    'SELECT * FROM delayed_events WHERE localpart=? ORDER BY due_ms,id',
-    [localpart],
+  return (await localRows(
+    conn,
+    await conn.query(
+      'SELECT * FROM delayed_events WHERE localpart=? ORDER BY due_ms,id',
+      [localpart],
+    ),
   )).map(eventOf);
 }
 export async function receipt(
@@ -74,7 +208,10 @@ export async function receipt(
     'SELECT delay_id FROM delayed_event_receipts WHERE localpart=? AND device_id=? AND generation=? AND endpoint=? AND txn_id=?',
     [d.localpart, d.deviceId, d.generation, r.endpoint, r.txnId],
   );
-  return rows.length ? String(rows[0].delay_id) : null;
+  if (!rows.length) return null;
+  const id = String(rows[0].delay_id);
+  await requireOwner(conn, id);
+  return id;
 }
 export async function add(
   conn: Conn,
@@ -82,6 +219,7 @@ export async function add(
   limit: number,
   r?: DelayReceipt,
 ): Promise<string> {
+  await requireOwner(conn, event.id);
   if (r) {
     const existing = await receipt(conn, r);
     if (existing !== null) return existing;
@@ -123,9 +261,25 @@ export async function add(
       [d.localpart, d.deviceId, d.generation, r.endpoint, r.txnId, event.id],
     );
   }
+  await retain(conn, event.id);
   return event.id;
 }
-export async function remove(conn: Conn, id: string): Promise<void> {
+export async function remove(
+  conn: Conn,
+  id: string,
+  standing?: Standing,
+): Promise<void> {
+  await requireOwner(conn, id);
+  const [row] = await conn.query(
+    'SELECT completed FROM delayed_events WHERE id=?',
+    [id],
+  );
+  await retain(
+    conn,
+    id,
+    row?.completed === 1 ? 'completed' : 'cancelled',
+    standing,
+  );
   await conn.execute('DELETE FROM delayed_events WHERE id=?', [id]);
 }
 export async function action(
@@ -137,6 +291,7 @@ export async function action(
   const event = await get(conn, id);
   if (event === null || event.phase !== 'pending') notFound();
   if (action === 'cancel') return await remove(conn, id);
+  await retain(conn, id);
   await conn.execute(
     "UPDATE delayed_events SET since_ms=?,due_ms=? WHERE id=? AND phase='pending'",
     [
@@ -145,10 +300,15 @@ export async function action(
       id,
     ],
   );
+  await retain(conn, id);
 }
 export async function next(conn: Conn): Promise<number | null> {
-  const rows = await conn.query('SELECT MIN(due_ms) AS n FROM delayed_events');
-  return rows[0].n === null ? null : Number(rows[0].n);
+  const owner = await ownerSelection(conn);
+  const [row] = await conn.query(
+    'SELECT MIN(due_ms) AS n FROM delayed_events WHERE ' + owner.sql,
+    owner.params,
+  );
+  return row.n === null ? null : Number(row.n);
 }
 export async function retry(
   conn: Conn,
@@ -156,17 +316,24 @@ export async function retry(
   due: number,
 ): Promise<void> {
   if (ids.length === 0) return;
+  for (const id of ids) {
+    await requireOwner(conn, id);
+    await retain(conn, id);
+  }
   await conn.execute(
     `UPDATE delayed_events SET due_ms=? WHERE phase='sending' AND id IN (${
       ids.map(() => '?').join(',')
     })`,
     [due, ...ids],
   );
+  for (const id of ids) await retain(conn, id);
 }
 export async function due(conn: Conn, now: number): Promise<DelayedEvent[]> {
+  const owner = await ownerSelection(conn);
   return (await conn.query(
-    'SELECT * FROM delayed_events WHERE due_ms<=? ORDER BY due_ms,id LIMIT 32',
-    [now],
+    'SELECT * FROM delayed_events WHERE due_ms<=? AND ' + owner.sql +
+      ' ORDER BY due_ms,id LIMIT 32',
+    [now, ...owner.params],
   )).map(eventOf);
 }
 export async function claim(
@@ -178,18 +345,21 @@ export async function claim(
   // Selection is only a hint. A concurrent heartbeat may have restarted the
   // deadline before this transaction acquired the command.
   if (event === null || event.due > now) return null;
+  await retain(conn, id);
   await conn.execute(
     "UPDATE delayed_events SET phase='sending' WHERE id=? AND phase!='sending'",
     [
       id,
     ],
   );
+  await retain(conn, id);
   return event;
 }
 export async function submission(
   conn: Conn,
   id: string,
 ): Promise<PreparedSubmission | null> {
+  await requireOwner(conn, id);
   const rows = await conn.query(
     'SELECT event_id,pending_pdu FROM delayed_events WHERE id=?',
     [id],
@@ -207,17 +377,23 @@ export async function prepare(
   id: string,
   pdu: Pdu,
 ): Promise<PreparedSubmission> {
+  await requireOwner(conn, id);
+  await retain(conn, id);
   await conn.execute(
     'UPDATE delayed_events SET event_id=?,pending_pdu=? WHERE id=? AND event_id IS NULL',
     [String(pdu.event_id), canonicalJson(pdu), id],
   );
   const result = await submission(conn, id);
   if (result === null) throw new Error('E_DELAYED_SUBMISSION_MISSING');
+  await retain(conn, id);
   return result;
 }
 export async function finish(conn: Conn, id: string): Promise<void> {
+  await requireOwner(conn, id);
+  await retain(conn, id);
   await conn.execute(
     'UPDATE delayed_events SET completed=1,pending_pdu=NULL WHERE id=? AND (completed!=1 OR pending_pdu IS NOT NULL)',
     [id],
   );
+  await retain(conn, id);
 }

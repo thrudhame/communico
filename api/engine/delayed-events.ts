@@ -151,10 +151,10 @@ export class DelayedEvents {
         };
       });
       const now = Date.now();
-      return await tenant.tx((tx) =>
+      return await tenant.tx(async (tx) =>
         tx.delayedEvents.add(
           {
-            id: crypto.randomUUID(),
+            id: await tx.delayedEvents.newId(),
             localpart,
             roomId: input.roomId,
             type: input.type,
@@ -192,6 +192,9 @@ export class DelayedEvents {
     return true;
   }
   async list(userId: string, id?: string) {
+    if (id !== undefined) {
+      await this.#app.tenant.tx((tx) => tx.delayedEvents.requireOwner(id));
+    }
     const events = await this.#app.tenant.tx((tx) =>
       tx.delayedEvents.list(localpartOf(userId))
     );
@@ -278,7 +281,7 @@ export class DelayedEvents {
         tenant.signer(),
         submission,
       );
-      await tenant.tx((tx) => tx.delayedEvents.remove(id));
+      await tenant.tx((tx) => tx.delayedEvents.remove(id, result.standing));
       if (result.standing !== 'accepted') {
         throw new MatrixError(
           403,

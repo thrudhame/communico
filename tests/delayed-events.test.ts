@@ -13,6 +13,7 @@ import { tenantSchema } from '#engine/tenant/index.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { changedByOther } from '#engine/room/state.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
+import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
 
 async function setup(name: string) {
   const dir = await Deno.makeTempDir({ prefix: 'delayed-' });
@@ -96,6 +97,108 @@ Deno.test('delayed: persisted schedule/restart/cancel and overdue startup delive
       null,
     );
   } finally {
+    await f.cleanup();
+  }
+});
+
+Deno.test('delayed: enrolled owner cold-replays the prepared event and retains completion evidence', async () => {
+  const f = await setup('delay-enrolled');
+  await (await f.app.store.tenant(f.app.tenant.serverName)).tx((conn) =>
+    activateTenantAuthority(conn, {
+      node: 'home',
+      incarnation: 'home-store',
+      homeIncarnation: 'home-store',
+      edgeNode: 'edge',
+      edgeIncarnation: 'edge-store',
+    })
+  );
+  let fail = true;
+  const worker = new DelayedEvents({
+    store: f.app.store,
+    tenant: {
+      ...f.app.tenant,
+      tx: (fn) =>
+        f.app.tenant.tx((tx) =>
+          fn({
+            ...tx,
+            delayedEvents: {
+              ...tx.delayedEvents,
+              finish: async (id: string) => {
+                if (fail) {
+                  fail = false;
+                  throw new Error('enrolled finish gap');
+                }
+                await tx.delayedEvents.finish(id);
+              },
+            },
+          })
+        ),
+    },
+  });
+  try {
+    const { delay_id: id } = await worker.schedule({
+      ...schedule(f.room, f.user),
+      stateKey: null,
+      type: 'm.room.encrypted',
+      content: { algorithm: 'test', ciphertext: 'enrolled-exact' },
+    });
+    assert(id.startsWith('d.'));
+    await assertRejects(
+      () => worker.action(id, 'send'),
+      Error,
+      'enrolled finish gap',
+    );
+    const prepared = await f.app.tenant.tx((tx) =>
+      tx.delayedEvents.submission(id)
+    );
+    assert(prepared?.pdu);
+    const room = await openRoom(f.app.store, f.room);
+    const firstHead = await room.tx((tx) => tx.changes.head());
+    const facts = await f.app.tenant.tx((tx) =>
+      tx.delayedEvents.operations('delay-enrolled')
+    );
+    assert(
+      facts.some((fact) =>
+        JSON.parse(fact.payload).eventId === prepared.eventId
+      ),
+    );
+    await worker.stop();
+    await closeApp();
+    const app = await openApp(f.storage);
+    const deadline = Date.now() + 5000;
+    while (
+      await app.tenant.tx((tx) => tx.delayedEvents.get(id)) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assertEquals(await app.tenant.tx((tx) => tx.delayedEvents.get(id)), null);
+    const reopened = await openRoom(app.store, f.room);
+    assertEquals(await reopened.tx((tx) => tx.changes.head()), firstHead);
+    assertEquals(
+      (await reopened.tx((tx) => tx.events.get(prepared.eventId)))?.id,
+      prepared.eventId,
+    );
+    const retained = await app.tenant.tx((tx) =>
+      tx.delayedEvents.operations('delay-enrolled')
+    );
+    assertEquals(JSON.parse(retained.at(-1)!.payload).event.phase, 'completed');
+    assertEquals(
+      JSON.parse(retained.at(-1)!.payload).eventId,
+      prepared.eventId,
+    );
+    assertEquals(
+      JSON.parse(retained.at(-1)!.payload).standing,
+      'accepted',
+      'scheduler did not retain its actual accepted result',
+    );
+    assert(
+      retained.some((fact) =>
+        JSON.parse(fact.payload).pdu?.event_id === prepared.eventId
+      ),
+    );
+  } finally {
+    await worker.stop();
     await f.cleanup();
   }
 });
@@ -404,6 +507,15 @@ Deno.test('delayed: non-string actions never mutate an existing command', async 
 
 Deno.test('delayed: a prepared PDU soft-failed after power change is not successful delivery', async () => {
   const f = await setup('delay-soft-owner');
+  await (await f.app.store.tenant(f.app.tenant.serverName)).tx((conn) =>
+    activateTenantAuthority(conn, {
+      node: 'home',
+      incarnation: 'home-store',
+      homeIncarnation: 'home-store',
+      edgeNode: 'edge',
+      edgeIncarnation: 'edge-store',
+    })
+  );
   const worker = new DelayedEvents(f.app);
   try {
     const b = await registerUser(f.app.tenant, {
@@ -450,6 +562,10 @@ Deno.test('delayed: a prepared PDU soft-failed after power change is not success
       'M_NOT_FOUND',
     );
     assertEquals(await f.app.tenant.tx((tx) => tx.delayedEvents.get(id)), null);
+    const retained = await f.app.tenant.tx((tx) =>
+      tx.delayedEvents.operations('delay-soft-writer')
+    );
+    assertEquals(JSON.parse(retained.at(-1)!.payload).standing, 'soft_failed');
   } finally {
     await worker.stop();
     await f.cleanup();
