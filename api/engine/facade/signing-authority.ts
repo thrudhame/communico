@@ -3,6 +3,15 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Database } from '#engine/store/db.ts';
 
+/** The same retryable dependency at journal and public Matrix consumers. */
+export class VerificationUnavailable extends MatrixError {
+  readonly code = 'LINK_UNAVAILABLE';
+
+  constructor(message: string) {
+    super(503, 'M_UNAVAILABLE', message);
+  }
+}
+
 type Fence = { revision: number; writing: number };
 const fences = new Map<string, WeakRef<Fence>>();
 const collected = new FinalizationRegistry<string>((path) => {
@@ -19,17 +28,31 @@ function fenceFor(db: Database): Fence {
   return fence;
 }
 
-export function signingFence(db: Database): () => void {
+function authorityFence(db: Database, changed: () => Error): () => void {
   const fence = fenceFor(db), revision = fence.revision;
   return () => {
     if (fence.writing || fence.revision !== revision) {
-      throw new MatrixError(
-        503,
-        'M_UNAVAILABLE',
-        'facade signing authority changed',
-      );
+      throw changed();
     }
   };
+}
+
+export function signingFence(db: Database): () => void {
+  return authorityFence(db, () =>
+    new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'facade signing authority changed',
+    ));
+}
+
+/** Verification waits for the authority owner, never rejects a PDU merely
+ * because its approved control cut is still being installed. */
+export function verificationFence(db: Database): () => void {
+  return authorityFence(
+    db,
+    () => new VerificationUnavailable('facade verification authority changed'),
+  );
 }
 
 export async function changeSigningAuthority<T>(
