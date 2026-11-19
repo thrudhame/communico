@@ -419,6 +419,14 @@ zero to clear badges. Logout, device/token revocation, account deactivation and
 matching gateway `rejected` verdicts cancel the corresponding registration's
 work. Invalid responses and HTTP/TLS errors retry; they never delete a pusher.
 
+With F2 facades, `append=false` immediately removes matching app ID/pushkey
+registrations for other accounts held at that ingress. Home applies the same
+cross-account removal when it receives the original registration; its removals
+return through each affected selected account's signed stream. An unseen old
+pusher can still receive notifications during a partition until that exchange
+finishes. Same-account registrations are exempt, and refresh/replay is not a new
+replacement request. No unselected account's registration is sent to the facade.
+
 Account deactivation accepts `erase: true`: local readers who gained visibility
 only afterward receive room-version-pruned copies, while earlier visibility is
 preserved. This is not physical deletion, a federation erasure request or a set

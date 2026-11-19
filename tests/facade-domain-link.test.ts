@@ -63,6 +63,10 @@ import {
   upsertPusherRow,
 } from '#engine/tenant/pushers.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
+import {
+  captureSessionAuthority,
+  installSessionAuthority,
+} from '#engine/tenant/session-authority.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
 import { startPushSender } from '#engine/push/sender.ts';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
@@ -240,6 +244,107 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('domain pushers: append=false reaches home and affected selected accounts without disclosing unselected registrations', async () => {
+  const f = await fixture();
+  try {
+    await f.ht.tx((tx) => tx.users.insert('charlie', 'Charlie'));
+    const input = {
+      app_id: 'shared-app',
+      pushkey: 'shared-key',
+      kind: 'http',
+      app_display_name: 'App',
+      device_display_name: 'Home',
+      lang: 'en',
+      append: true,
+      data: { url: 'https://push.test/_matrix/push/v1/notify' },
+    };
+    for (const user of ['alice', 'bob', 'charlie']) {
+      await setPusher(f.ht, user, await issueToken(f.ht, user, 'HOME'), {
+        ...input,
+        device_display_name: user + '-private-registration',
+      });
+    }
+    const token = await issueToken(f.et, 'alice', 'EDGE_PUSH');
+    await setPusher(f.et, 'alice', token, { ...input, append: false });
+    assertEquals((await listPushers(f.ht, 'bob')).length, 1, 'partition delay');
+    const hd = await f.home.tenant('logical.test');
+    const ed = await f.edge.tenant('logical.test');
+    const session = await ed.tx((conn) =>
+      captureSessionAuthority(conn, 'alice')
+    );
+    await hd.tx((conn) => installSessionAuthority(conn, 'alice', session));
+    const reverse = await f.es.export('alice');
+    for (const record of reverse) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(
+      (await listPushers(f.ht, 'alice')).length,
+      1,
+      'same-account exemption',
+    );
+    assertEquals(
+      await listPushers(f.ht, 'bob'),
+      [],
+      'unseen Bob pusher survived home application',
+    );
+    assertEquals(await listPushers(f.ht, 'charlie'), []);
+    const aliceRecords = await f.hs.export('alice', f.bundle.id);
+    assertEquals(
+      JSON.stringify(aliceRecords).includes('bob-private-registration'),
+      false,
+    );
+    assertEquals(
+      JSON.stringify(aliceRecords).includes('charlie-private-registration'),
+      false,
+    );
+    await assertRejects(
+      () => f.hs.export('bob', f.bundle.id),
+      LinkError,
+      'domain account not selected',
+    );
+    const auth = await exportAccountAuth(
+      f.home,
+      f.ht,
+      f.hp,
+      f.bundle.id,
+      'bob',
+      false,
+    );
+    await f.ej.receive('home', [auth]);
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+    const records = await f.hs.bootstrap('bob', f.bundle.id);
+    assertEquals(
+      JSON.stringify(records).includes('charlie-private-registration'),
+      false,
+    );
+    await f.toEdge(records);
+    assertEquals(await listPushers(f.et, 'bob'), []);
+    assertEquals(
+      await ed.query("SELECT * FROM users WHERE localpart='charlie'"),
+      [],
+    );
+    assertEquals(
+      await ed.query(
+        "SELECT * FROM domain_operations WHERE json_extract(semantic_key,'$[1]')='charlie'",
+      ),
+      [],
+    );
+    assertEquals(
+      (await ed.query(
+        "SELECT * FROM domain_operations WHERE kind='pusher' AND json_extract(semantic_key,'$[1]')='bob' AND payload_json='null'",
+      )).length,
+      1,
+    );
+    assertEquals(
+      await ed.query("SELECT * FROM pushers WHERE localpart='bob'"),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('domain pushers: signed inventory retains registration and deletion without executable targets', async () => {
   const f = await fixture();

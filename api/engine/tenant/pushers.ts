@@ -378,8 +378,10 @@ function pusherOperation(operation: RegisterOperation) {
       typeof body.accessHash !== 'string' ||
       !/^[a-f0-9]{64}$/.test(body.accessHash) ||
       !Number.isSafeInteger(body.addedMs) || Number(body.addedMs) < 0 ||
+      (body.removeOthers !== undefined && body.removeOthers !== true) ||
       Object.keys(body).sort().join(',') !==
-        'accessHash,addedMs,registration' ||
+        ('accessHash,addedMs,registration' +
+          (body.removeOthers === true ? ',removeOthers' : '')) ||
       Object.keys(registration).sort().join(',') !==
         'app_display_name,app_id,data,device_display_name,kind,lang,profile_tag,pushkey'
     ) {
@@ -393,6 +395,7 @@ function pusherOperation(operation: RegisterOperation) {
       registration: PusherRow;
       accessHash: string;
       addedMs: number;
+      removeOthers?: true;
     },
   };
 }
@@ -407,7 +410,12 @@ export async function importPusherOperation(
 ): Promise<boolean> {
   const { key, value } = pusherOperation(operation);
   const [, localpart, appId, pushkey, incarnation] = key;
-  await requireTenantDomainSource(conn, operation, localpart, history);
+  const authority = await requireTenantDomainSource(
+    conn,
+    operation,
+    localpart,
+    history,
+  );
   if (value) {
     const [session] = await conn.query(
       'SELECT * FROM session_authority WHERE hash=?',
@@ -434,6 +442,7 @@ export async function importPusherOperation(
         (held.source !== operation.source ||
           held.incarnation !== operation.incarnation ||
           previous.addedMs !== value.addedMs ||
+          previous.removeOthers !== value.removeOthers ||
           registerJson(JSON.stringify(previous.registration)) !==
             registerJson(JSON.stringify(value.registration)))
       ) {
@@ -441,7 +450,19 @@ export async function importPusherOperation(
       }
     }
   }
-  await importRegisterOperation(conn, operation);
+  const { inserted } = await importRegisterOperation(conn, operation);
+  let replaced = false;
+  // The original request, not refresh/replay, executes cross-account effects
+  // once at home. Its receipt and affected-account tombstones commit together.
+  // Facades only receive removals on each selected account's ordinary stream.
+  if (
+    inserted && value?.removeOthers && operation.sequence === 1 &&
+    authority.node === 'home' && operation.source !== 'home'
+  ) {
+    const before = conn.writes;
+    await deleteOtherPusherUsers(conn, localpart, appId, pushkey);
+    replaced = conn.writes !== before;
+  }
   for (const choice of await pusherChoiceOperations(conn, localpart)) {
     await validatePusherChoiceReference(conn, choice);
   }
@@ -449,7 +470,8 @@ export async function importPusherOperation(
     op,
   ) => op.payload === 'null');
   if (!removed) {
-    return await reconcilePusherChoice(conn, localpart, appId, pushkey);
+    return await reconcilePusherChoice(conn, localpart, appId, pushkey) ||
+      replaced;
   }
   const rows = await conn.query(
     'SELECT * FROM pushers WHERE localpart=? AND app_id=? AND pushkey=? AND incarnation=?',
@@ -460,7 +482,7 @@ export async function importPusherOperation(
     'DELETE FROM pushers WHERE localpart=? AND app_id=? AND pushkey=? AND incarnation=?',
     [localpart, appId, pushkey, incarnation],
   );
-  return rows.length !== 0;
+  return rows.length !== 0 || replaced;
 }
 
 /** This is protected semantic source intent, not the executable sender target
@@ -470,6 +492,7 @@ async function recordPusherOperation(
   conn: Conn,
   row: Record<string, unknown>,
   deleted: boolean,
+  removeOthers?: boolean,
 ): Promise<void> {
   const authority = await tenantAuthority(conn);
   if (!authority) return;
@@ -488,16 +511,23 @@ async function recordPusherOperation(
       session.incarnation !== authority.incarnation
     ) ownerUnavailable();
   }
+  const key = JSON.stringify([
+    'pusher',
+    row.localpart,
+    row.app_id,
+    row.pushkey,
+    row.incarnation,
+  ]);
+  if (!deleted && removeOthers === undefined) {
+    // Refresh retains the original request intent without executing it again.
+    removeOthers = (await registerOperations(conn, key)).some((op) =>
+      pusherOperation(op).value?.removeOthers === true
+    );
+  }
   await writeRegister(
     conn,
     { source: authority.node, incarnation: authority.incarnation },
-    JSON.stringify([
-      'pusher',
-      row.localpart,
-      row.app_id,
-      row.pushkey,
-      row.incarnation,
-    ]),
+    key,
     'pusher',
     JSON.stringify(
       deleted ? null : {
@@ -513,6 +543,7 @@ async function recordPusherOperation(
         },
         accessHash: row.access_token,
         addedMs: row.added_ms,
+        ...(removeOthers ? { removeOthers: true } : {}),
       },
     ),
   );
@@ -765,7 +796,7 @@ export async function upsertPusherRow(
     access_token: accessHash,
     data: JSON.stringify(pusher.data),
   };
-  await recordPusherOperation(conn, row, false);
+  await recordPusherOperation(conn, row, false, !pusher.append);
   await recordPusherChoice(conn, row);
   await recordPusherChange(conn, row, false);
 }
