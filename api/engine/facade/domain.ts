@@ -30,6 +30,7 @@ import {
   type DomainBinding,
   type DomainHistory,
   DomainHistoryProof,
+  requireAccountExport,
   requireAccountSelection,
   requireDomainControl,
 } from './domain-control.ts';
@@ -277,12 +278,14 @@ export class DomainOperations {
     if (row?.state !== 'paired' || row.grant_json !== canonicalJson(grant)) {
       mismatch('domain exchange grant changed');
     }
-    if (
-      !this.node && !(await conn.query(
-        'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, context.id, 'auth:@' + localpart + ':' + context.server],
-      )).length
-    ) mismatch('domain account not selected');
+    if (!this.node) {
+      await requireAccountExport(conn, {
+        peer: context.node,
+        pairing: context.id,
+        server: context.server,
+        localpart,
+      });
+    }
   }
 
   private async tenantSelected(localpart: string, grant: Grant) {

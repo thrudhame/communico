@@ -46,7 +46,10 @@ import {
 } from './protocol.ts';
 import { applyReplicaScope } from './scopes.ts';
 import { onTenantStream } from '#engine/tenant/streams.ts';
-import { requireAccountSelection } from './domain-control.ts';
+import {
+  requireAccountExport,
+  requireAccountSelection,
+} from './domain-control.ts';
 
 type AuthorityCut = AccountAuth['authority'];
 type SessionAuthority = {
@@ -450,11 +453,12 @@ export class AccountSnapshots {
     const check = async (conn: Conn) => {
       await assertBinding(conn, grant, 'home');
       await requireControl(conn, view);
-      const [selected] = await conn.query(
-        'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, pairing, 'auth:@' + view.localpart + ':' + view.server],
-      );
-      if (!selected) mismatch('session authority account not selected');
+      await requireAccountExport(conn, {
+        peer: context.node,
+        pairing,
+        server: view.server,
+        localpart: view.localpart,
+      });
     };
     await (await this.store.server()).tx(check);
     const cuts =
