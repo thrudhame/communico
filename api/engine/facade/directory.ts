@@ -11,6 +11,7 @@ import {
   peerPolicyOf,
 } from '#engine/federation/policy-replica.ts';
 import { splitId } from '#engine/ids.ts';
+import { validRoomId } from '#engine/room/identity.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   type DirectoryFacts,
@@ -57,8 +58,10 @@ function manifestOf(raw: unknown, self: string): DirectoryReplica {
     const values = raw.map(text);
     if (
       values.some((id) =>
-        !id.startsWith(sigil) || !splitId(id).localpart ||
-        !splitId(id).server || (sigil === '@' && splitId(id).server !== self)
+        sigil === '!'
+          ? !validRoomId(id)
+          : !id.startsWith(sigil) || !splitId(id).localpart ||
+            splitId(id).server !== self
       ) || new Set(values).size !== values.length
     ) {
       throw new LinkError('LINK_BAD_RECORD', 'invalid scope inventory', 400);

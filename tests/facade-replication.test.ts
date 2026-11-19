@@ -70,6 +70,7 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { roomOf } from '#engine/server/read.ts';
+import { directoryFactsOf } from '#engine/server/public-replica.ts';
 import { recoverServer } from '#engine/server/startup.ts';
 import { project } from '#engine/server/project.ts';
 import { openStore } from '#engine/store/index.ts';
@@ -80,8 +81,10 @@ import {
   makeRemoteServer,
 } from './fixtures/remote.ts';
 import { makeFakeRoom } from './fixtures/remote-room.ts';
+import { createRoom } from '#engine/room/create.ts';
+import { object, recordHash } from '#engine/facade/protocol.ts';
 
-async function fixture(seedServer = serverSchema) {
+async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-replication-' });
   const open = (name: string, schema = serverSchema) =>
     openStore({
@@ -112,14 +115,14 @@ async function fixture(seedServer = serverSchema) {
       await edge.server(),
       node.signer(),
       node.publicKey,
-      'b'.repeat(64),
+      facadePin,
       node,
     );
   const fp = await edgePairings();
   const bundle = await hp.create({
     node: node.node,
     url: 'https://facade.test',
-    facadePin: 'b'.repeat(64),
+    facadePin,
     expires: Date.now() + 60000,
     required: [...LINK_CAPABILITIES],
   });
@@ -164,6 +167,7 @@ async function fixture(seedServer = serverSchema) {
   const replicas = async () =>
     new RoomReplicas(edge, await edgePairings(), signing.name, keys);
   return {
+    dir,
     home,
     source,
     room,
@@ -226,6 +230,143 @@ async function fixture(seedServer = serverSchema) {
     },
   };
 }
+
+Deno.test('ordinary v12 room directory inventory applies without an upgrade journal', async () => {
+  const f = await fixture();
+  try {
+    const created = await createRoom(f.home, {
+      creator: '@ordinary:logical.test',
+      version: '12',
+      alias: 'ordinary',
+      visibility: 'public',
+    }, f.tenant.signer());
+    await registerAlias(
+      await f.home.server(),
+      '#ordinary:logical.test',
+      created.roomId,
+      '@ordinary:logical.test',
+    );
+    await setVisibility(await f.home.server(), created.roomId, 'public');
+    assert(!created.roomId.includes(':'));
+    const server = await f.home.server();
+    const journalTables = await server.query(
+      "SELECT name FROM sqlite_master WHERE name='room_upgrades'",
+    );
+    assertEquals(
+      journalTables.length
+        ? await server.query('SELECT * FROM room_upgrades')
+        : [],
+      [],
+    );
+    const record = await f.directoryExport();
+    assert(record);
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    const owner = await f.directoryOwner();
+    assert(await owner.apply(journal, record));
+    assert((await owner.snapshot())?.rooms.includes(created.roomId));
+    const directory = (await owner.snapshot())!.directory;
+    assertEquals(
+      directory.aliases.find((entry) =>
+        entry.alias === '#ordinary:logical.test'
+      )?.roomId,
+      created.roomId,
+    );
+    assertEquals(
+      directory.publication.find((entry) => entry.roomId === created.roomId)
+        ?.visibility,
+      'public',
+    );
+    assertEquals(
+      directoryFactsOf({
+        ...directory,
+        forgotten: [{ user: '@ordinary:logical.test', roomId: created.roomId }],
+      }, 'logical.test').forgotten[0].roomId,
+      created.roomId,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('directory inventory rejects malformed room identities', async (t) => {
+  for (
+    const id of [
+      '!bad',
+      '!',
+      '!room:',
+      '!:server',
+      '@room:server',
+      '!' + 'x'.repeat(42),
+      '!' + '/'.repeat(43),
+    ]
+  ) {
+    await t.step(id, async () => {
+      for (
+        const facts of [
+          {
+            aliases: [{
+              alias: '#bad:logical.test',
+              roomId: id,
+              creator: null,
+            }],
+            publication: [],
+            forgotten: [],
+          },
+          {
+            aliases: [],
+            publication: [{
+              roomId: id,
+              visibility: 'public',
+              purgeable: null,
+            }],
+            forgotten: [],
+          },
+          {
+            aliases: [],
+            publication: [],
+            forgotten: [{ user: '@ordinary:logical.test', roomId: id }],
+          },
+        ]
+      ) {
+        assertThrows(
+          () => directoryFactsOf(facts, 'logical.test'),
+          MatrixError,
+          'invalid public directory facts',
+        );
+      }
+      const f = await fixture();
+      try {
+        const record = await f.directoryExport();
+        assert(record);
+        const payload = object(record.payload), view = object(payload.view);
+        const bad = {
+          ...record,
+          payload: {
+            ...payload,
+            view: { ...view, rooms: [id], cuts: { ['room:' + id]: 0 } },
+          },
+        };
+        const { hash, ...unsigned } = bad;
+        assert(hash);
+        bad.hash = recordHash(unsigned);
+        const journal = await f.journal();
+        await journal.receive('home', [bad]);
+        await assertRejects(
+          () => f.directoryOwner().then((owner) => owner.apply(journal, bad)),
+          Error,
+          'invalid scope inventory',
+        );
+        assertEquals(
+          (await journal.heads('home', 'in', bad)).applied.sequence,
+          0,
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('room replication pins bootstrap, applies only durable semantic suffixes, and completes readiness with its journal result', async () => {
   const f = await fixture();
