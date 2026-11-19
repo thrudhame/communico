@@ -403,18 +403,18 @@ export async function recordRefreshReplacement(
   );
 }
 
-export async function requireSessionAuthority(
+/** Validate retained provenance and terminal facts without granting execution
+ * at this ingress. Foreign session copies remain recovery-only material. */
+export async function retainedSessionAuthority(
   conn: Conn,
   hash: string,
   refresh: boolean,
-): Promise<void> {
-  const identity = await tenantAuthority(conn);
-  if (!identity) return;
+) {
   const [session] = await conn.query(
     'SELECT * FROM session_authority WHERE hash=? AND refresh=?',
     [hash, refresh ? 1 : 0],
   );
-  if (!session) return; // Unknown digests retain the normal lookup's null/401.
+  if (!session) return null;
   if (
     (await conn.query(
       "SELECT id FROM authority_facts WHERE localpart=? AND kind='revoke' AND json_extract(payload,'$.target')=?",
@@ -454,6 +454,18 @@ export async function requireSessionAuthority(
       )).length
     ) invalid();
   }
+  return session;
+}
+
+export async function requireSessionAuthority(
+  conn: Conn,
+  hash: string,
+  refresh: boolean,
+): Promise<void> {
+  const identity = await tenantAuthority(conn);
+  if (!identity) return;
+  const session = await retainedSessionAuthority(conn, hash, refresh);
+  if (!session) return; // Unknown digests retain the normal lookup's null/401.
   if (
     session.node !== identity.node ||
     session.incarnation !== identity.incarnation

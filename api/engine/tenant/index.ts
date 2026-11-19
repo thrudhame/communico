@@ -637,11 +637,16 @@ function bind(
     pushers: {
       operations: (localpart: string) =>
         pushers.pusherOperations(conn, localpart),
+      choices: (localpart: string) =>
+        pushers.pusherChoiceOperations(conn, localpart),
       import: async (
         operation: import('#engine/facade/registers.ts').RegisterOperation,
         history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
       ) => {
-        if (await pushers.importPusherOperation(conn, operation, history)) {
+        const canceled = operation.kind === 'pusher-choice'
+          ? await pushers.importPusherChoice(conn, operation, history)
+          : await pushers.importPusherOperation(conn, operation, history);
+        if (canceled) {
           changed();
         }
       },

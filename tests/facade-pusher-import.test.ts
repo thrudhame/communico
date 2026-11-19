@@ -311,7 +311,9 @@ Deno.test('pusher import: legacy home capture is idempotent, keeps added time an
     await setPusher(f.ht, 'alice', f.token, input);
     const before = await f.hd.query('SELECT * FROM pushers');
     const changes = await f.hd.query('SELECT * FROM pusher_changes');
-    await f.hd.execute("DELETE FROM domain_operations WHERE kind='pusher'");
+    await f.hd.execute(
+      "DELETE FROM domain_operations WHERE kind IN ('pusher','pusher-choice')",
+    );
     const ops = await f.hd.tx((conn) => capturePusherOperations(conn, 'alice'));
     assertEquals(ops.length, 1);
     assertEquals(JSON.parse(ops[0].payload).addedMs, before[0].added_ms);

@@ -22,7 +22,11 @@ import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
 import { captureFilterOperations } from '#engine/tenant/filters.ts';
 import { captureOpenIdOperations } from '#engine/tenant/openid.ts';
 import { captureBackupOperations } from '#engine/tenant/key-backup.ts';
-import { capturePusherOperations } from '#engine/tenant/pushers.ts';
+import {
+  capturePusherOperations,
+  pusherChoiceOperations,
+  requirePusherChoices,
+} from '#engine/tenant/pushers.ts';
 import {
   captureReportOperations,
   importReportOperation,
@@ -65,6 +69,7 @@ export type DomainBootstrap = DomainBinding & {
   reports?: Fact[];
   forget?: Fact[];
   pushers?: Fact[];
+  pusherChoices?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -116,6 +121,9 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     ...(row.reports !== undefined ? { reports: refs(row.reports) } : {}),
     ...(row.forget !== undefined ? { forget: refs(row.forget) } : {}),
     ...(row.pushers !== undefined ? { pushers: refs(row.pushers) } : {}),
+    ...(row.pusherChoices !== undefined
+      ? { pusherChoices: refs(row.pusherChoices) }
+      : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -137,7 +145,8 @@ async function requireFacts(
     | 'backups'
     | 'reports'
     | 'forget'
-    | 'pushers',
+    | 'pushers'
+    | 'pusherChoices',
 ) {
   const keys = new Set<string>();
   for (const fact of view[file] ?? []) {
@@ -177,6 +186,8 @@ async function requireFacts(
           ? ['forget']
           : file === 'pushers'
           ? ['pusher']
+          : file === 'pusherChoices'
+          ? ['pusher-choice']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
             String(row.kind),
           )
@@ -279,6 +290,7 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
         'report-resolution',
         'forget',
         'pusher',
+        'pusher-choice',
       ]
         .includes(
           String(expected),
@@ -435,6 +447,7 @@ export class DomainOperations {
         ...await tx.openid.operations(localpart),
         ...await tx.keyBackup.operations(localpart),
         ...await tx.pushers.operations(localpart),
+        ...await tx.pushers.choices(localpart),
       ];
     });
     operations.push(
@@ -522,6 +535,7 @@ export class DomainOperations {
           ...await captureOpenIdOperations(conn, localpart),
           ...await captureBackupOperations(conn, localpart),
           ...await capturePusherOperations(conn, localpart),
+          ...await pusherChoiceOperations(conn, localpart),
         ];
       },
     );
@@ -584,7 +598,9 @@ export class DomainOperations {
       kind: 'domain-bootstrap',
       tenant: facts(
         tenantFacts.filter((op) =>
-          !['filter', 'openid', 'backup', 'pusher'].includes(op.kind)
+          !['filter', 'openid', 'backup', 'pusher', 'pusher-choice'].includes(
+            op.kind,
+          )
         ),
       ),
       receipts: facts(receiptFacts),
@@ -594,6 +610,9 @@ export class DomainOperations {
       reports: facts(reportFacts),
       forget: facts(forgetFacts),
       pushers: facts(tenantFacts.filter((op) => op.kind === 'pusher')),
+      pusherChoices: facts(
+        tenantFacts.filter((op) => op.kind === 'pusher-choice'),
+      ),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -669,6 +688,10 @@ export class DomainOperations {
         await requireFacts(conn, view, 'openid');
         await requireFacts(conn, view, 'backups');
         await requireFacts(conn, view, 'pushers');
+        await requireFacts(conn, view, 'pusherChoices');
+        if (view.pusherChoices !== undefined) {
+          await requirePusherChoices(conn, view.localpart);
+        }
       });
       return await journal.apply(peer, stream, async (conn, current) => {
         await check(conn);
@@ -734,7 +757,9 @@ export class DomainOperations {
             view.pairing,
             'pushers:@' + view.localpart + ':' + view.server,
             record.sequence,
-            view.pushers !== undefined ? 1 : 0,
+            view.pushers !== undefined && view.pusherChoices !== undefined
+              ? 1
+              : 0,
           ],
         );
         return { kind: 'domain-bootstrap', localpart: view.localpart };
@@ -794,7 +819,7 @@ export class DomainOperations {
           await tx.openid.import(view.operation, history);
         } else if (view.operation.kind === 'backup') {
           await tx.keyBackup.import(view.operation, history);
-        } else if (view.operation.kind === 'pusher') {
+        } else if (['pusher', 'pusher-choice'].includes(view.operation.kind)) {
           await tx.pushers.import(view.operation, history);
         } else await tx.accountData.import(view.operation, history);
       });

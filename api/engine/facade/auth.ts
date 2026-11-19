@@ -244,7 +244,8 @@ export class FacadeAuth {
               cut.received_hash !== cut.applied_hash ||
               (intent.feature === 'filters' && cut.filters_ready !== 1) ||
               (intent.feature === 'openid' && cut.openid_ready !== 1) ||
-              (intent.feature === 'backups' && cut.backups_ready !== 1)
+              (intent.feature === 'backups' && cut.backups_ready !== 1) ||
+              (intent.feature === 'pushers' && cut.pushers_ready !== 1)
             : cut.ready !== 1 && cut.pending_hash === null)
         ) {
           unavailable();
@@ -343,7 +344,7 @@ export class FacadeAuth {
         body.nodes[1].incarnation !== this.node.incarnation
       ) authUnavailable();
       const scopes = await conn.query(
-        "SELECT s.scope,s.source_cut,s.ready,s.pending_hash,j.received,j.received_hash,j.applied,j.applied_hash,EXISTS(SELECT 1 FROM facade_scopes f WHERE f.incarnation=s.incarnation AND f.scope='filters:'||substr(s.scope,8) AND f.ready=1) AS filters_ready,EXISTS(SELECT 1 FROM facade_scopes o WHERE o.incarnation=s.incarnation AND o.scope='openid:'||substr(s.scope,8) AND o.ready=1) AS openid_ready,EXISTS(SELECT 1 FROM facade_scopes b WHERE b.incarnation=s.incarnation AND b.scope='backups:'||substr(s.scope,8) AND b.ready=1) AS backups_ready FROM facade_scopes s JOIN facade_streams j ON j.incarnation=s.incarnation AND j.stream=s.scope AND j.peer='home' AND j.direction='in' AND j.source='home' WHERE s.incarnation=? AND (s.scope LIKE 'auth:%' OR s.scope LIKE 'domain:%')",
+        "SELECT s.scope,s.source_cut,s.ready,s.pending_hash,j.received,j.received_hash,j.applied,j.applied_hash,EXISTS(SELECT 1 FROM facade_scopes f WHERE f.incarnation=s.incarnation AND f.scope='filters:'||substr(s.scope,8) AND f.ready=1) AS filters_ready,EXISTS(SELECT 1 FROM facade_scopes o WHERE o.incarnation=s.incarnation AND o.scope='openid:'||substr(s.scope,8) AND o.ready=1) AS openid_ready,EXISTS(SELECT 1 FROM facade_scopes b WHERE b.incarnation=s.incarnation AND b.scope='backups:'||substr(s.scope,8) AND b.ready=1) AS backups_ready,EXISTS(SELECT 1 FROM facade_scopes p WHERE p.incarnation=s.incarnation AND p.scope='pushers:'||substr(s.scope,8) AND p.ready=1) AS pushers_ready FROM facade_scopes s JOIN facade_streams j ON j.incarnation=s.incarnation AND j.stream=s.scope AND j.peer='home' AND j.direction='in' AND j.source='home' WHERE s.incarnation=? AND (s.scope LIKE 'auth:%' OR s.scope LIKE 'domain:%')",
         [pairing],
       );
       return {

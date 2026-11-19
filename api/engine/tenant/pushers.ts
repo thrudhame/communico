@@ -9,6 +9,7 @@ import { validatePusher } from '#engine/push/registration.ts';
 import {
   ownerUnavailable,
   requireSessionAuthority,
+  retainedSessionAuthority,
   tenantAuthority,
 } from '#engine/tenant/session-authority.ts';
 import {
@@ -36,6 +37,267 @@ export async function pusherOperations(conn: Conn, localpart: string) {
   return result;
 }
 
+export async function pusherChoiceOperations(conn: Conn, localpart: string) {
+  const result: RegisterOperation[] = [];
+  for (
+    const row of await conn.query(
+      "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='pusher-choice' AND json_extract(semantic_key,'$[1]')=? ORDER BY semantic_key",
+      [localpart],
+    )
+  ) result.push(...await registerOperations(conn, String(row.semantic_key)));
+  return result;
+}
+
+function choiceKey(localpart: string, appId: string, pushkey: string) {
+  return JSON.stringify(['pusher-choice', localpart, appId, pushkey]);
+}
+
+/** A choice references one immutable source put, not its mutable refresh winner.
+ * The reference binds the issuer and semantic key even before its fact arrives. */
+function pusherChoice(operation: RegisterOperation) {
+  let key: unknown, value: unknown, reference: unknown;
+  try {
+    key = JSON.parse(operation.semanticKey);
+    value = JSON.parse(operation.payload);
+    reference = value === null ? null : JSON.parse(value as string);
+  } catch {
+    throw new Error('invalid pusher choice');
+  }
+  if (
+    !Array.isArray(key) || key.length !== 4 || key[0] !== 'pusher-choice' ||
+    !key.every((part) => typeof part === 'string') || !key[1] ||
+    JSON.stringify(key) !== operation.semanticKey ||
+    operation.kind !== 'pusher-choice'
+  ) {
+    throw new Error('invalid pusher choice');
+  }
+  let registrationKey: string | null = null, incarnation: string | null = null;
+  if (value !== null) {
+    if (
+      typeof value !== 'string' || !Array.isArray(reference) ||
+      reference.length !== 4 ||
+      reference[0] !== operation.source ||
+      reference[1] !== operation.incarnation ||
+      typeof reference[2] !== 'string' ||
+      !reference[2].startsWith('register:') ||
+      !Number.isSafeInteger(reference[3]) || reference[3] < 1 ||
+      JSON.stringify(reference) !== value
+    ) {
+      throw new Error('invalid pusher choice');
+    }
+    let target: unknown;
+    try {
+      target = JSON.parse(reference[2].slice('register:'.length));
+    } catch {
+      throw new Error('invalid pusher choice');
+    }
+    if (
+      !Array.isArray(target) || target.length !== 5 || target[0] !== 'pusher' ||
+      target.slice(1, 4).some((part, i) => part !== key[i + 1]) ||
+      typeof target[4] !== 'string' || !/^[a-f0-9-]{36}$/.test(target[4]) ||
+      'register:' + JSON.stringify(target) !== reference[2]
+    ) {
+      throw new Error('invalid pusher choice');
+    }
+    registrationKey = reference[2].slice('register:'.length);
+    incarnation = target[4];
+  }
+  return {
+    key: key as string[],
+    value: value as string | null,
+    registrationKey,
+    incarnation,
+  };
+}
+
+async function recordPusherChoice(
+  conn: Conn,
+  row: Record<string, unknown>,
+  deleted = false,
+) {
+  const authority = await tenantAuthority(conn);
+  if (!authority) return;
+  let reference: string | null = null;
+  if (!deleted) {
+    const key = JSON.stringify([
+      'pusher',
+      row.localpart,
+      row.app_id,
+      row.pushkey,
+      row.incarnation,
+    ]);
+    const put = (await readRegister(conn, key)).winner;
+    if (
+      !put || put.payload === 'null' || put.source !== authority.node ||
+      put.incarnation !== authority.incarnation
+    ) {
+      throw new Error('pusher selection source unavailable');
+    }
+    reference = put.operationId;
+  }
+  await writeRegister(
+    conn,
+    { source: authority.node, incarnation: authority.incarnation },
+    choiceKey(String(row.localpart), String(row.app_id), String(row.pushkey)),
+    'pusher-choice',
+    JSON.stringify(reference),
+  );
+}
+
+type PusherSelection = {
+  ready: boolean;
+  incarnation?: string;
+  value?: NonNullable<ReturnType<typeof pusherOperation>['value']>;
+};
+
+/** One verdict for public recovery reads, target enumeration and last send
+ * admission. Removal never chooses the next retained contender. */
+async function selectedPusher(
+  conn: Conn,
+  localpart: string,
+  appId: string,
+  pushkey: string,
+): Promise<PusherSelection> {
+  const [account] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (account?.deactivated === 1) return { ready: true };
+  const view = await readRegister(conn, choiceKey(localpart, appId, pushkey));
+  if (view.pending.length) return { ready: false };
+  if (!view.winner) {
+    // An observed removal may arrive without any choice/put. It cannot select
+    // a sender; completely fenced old registrations need no active choice.
+    const keys = await conn.query(
+      "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='pusher' AND json_extract(semantic_key,'$[1]')=? AND json_extract(semantic_key,'$[2]')=? AND json_extract(semantic_key,'$[3]')=?",
+      [localpart, appId, pushkey],
+    );
+    for (const row of keys) {
+      if (
+        !(await registerOperations(conn, String(row.semantic_key))).some((op) =>
+          op.payload === 'null'
+        )
+      ) return { ready: false };
+    }
+    const native = await conn.query(
+      'SELECT 1 FROM pushers WHERE localpart=? AND app_id=? AND pushkey=?',
+      [localpart, appId, pushkey],
+    );
+    return { ready: !native.length };
+  }
+  const choice = pusherChoice(view.winner);
+  if (choice.value === null) return { ready: true };
+  const operations = await registerOperations(conn, choice.registrationKey!);
+  const original = operations.find((op) => op.operationId === choice.value);
+  if (!original) return { ready: false };
+  if (!pusherOperation(original).value) {
+    throw new Error('pusher choice references removal');
+  }
+  if (operations.some((op) => op.payload === 'null')) return { ready: true };
+  const current = await readRegister(conn, choice.registrationKey!);
+  if (current.pending.length || !current.winner) return { ready: false };
+  const value = pusherOperation(current.winner).value!;
+  try {
+    const session = await retainedSessionAuthority(
+      conn,
+      value.accessHash,
+      false,
+    );
+    if (!session) return { ready: false };
+  } catch (error) {
+    if (!(error instanceof MatrixError) || error.status !== 401) throw error;
+    return { ready: true };
+  }
+  return { ready: true, incarnation: choice.incarnation!, value };
+}
+
+async function validatePusherChoiceReference(
+  conn: Conn,
+  operation: RegisterOperation,
+) {
+  const choice = pusherChoice(operation);
+  if (choice.value === null) return true;
+  const original = (await registerOperations(conn, choice.registrationKey!))
+    .find((op) => op.operationId === choice.value);
+  if (!original) return false;
+  if (!pusherOperation(original).value) {
+    throw new Error('pusher choice references removal');
+  }
+  return true;
+}
+
+/** Import can cancel native execution, never instantiate a foreign sender or
+ * mint a new semantic fact. Missing dependencies fence sends until recovered. */
+async function reconcilePusherChoice(
+  conn: Conn,
+  localpart: string,
+  appId: string,
+  pushkey: string,
+) {
+  const selected = await selectedPusher(conn, localpart, appId, pushkey);
+  if (!selected.ready) return false;
+  const rows = await conn.query(
+    'SELECT * FROM pushers WHERE localpart=? AND app_id=? AND pushkey=?',
+    [localpart, appId, pushkey],
+  );
+  let changed = false;
+  for (const row of rows) {
+    if (row.incarnation === selected.incarnation) continue;
+    await recordPusherChange(conn, row, true);
+    await conn.execute(
+      'DELETE FROM pushers WHERE localpart=? AND app_id=? AND pushkey=? AND incarnation=?',
+      [localpart, appId, pushkey, row.incarnation],
+    );
+    changed = true;
+  }
+  return changed;
+}
+
+export async function importPusherChoice(
+  conn: Conn,
+  operation: RegisterOperation,
+  history?: DomainHistoryProof,
+) {
+  const { key } = pusherChoice(operation);
+  await requireTenantDomainSource(conn, operation, key[1], history);
+  await validatePusherChoiceReference(conn, operation);
+  await importRegisterOperation(conn, operation);
+  return await reconcilePusherChoice(conn, key[1], key[2], key[3]);
+}
+
+/** A signed inventory needs both causal closure and all selected references. */
+export async function requirePusherChoices(conn: Conn, localpart: string) {
+  for (const operation of await pusherChoiceOperations(conn, localpart)) {
+    if (!await validatePusherChoiceReference(conn, operation)) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'pusher selection unavailable',
+        503,
+      );
+    }
+  }
+  const keys = await conn.query(
+    "SELECT DISTINCT json_extract(semantic_key,'$[2]') AS app_id,json_extract(semantic_key,'$[3]') AS pushkey FROM domain_operations WHERE kind IN ('pusher','pusher-choice') AND json_extract(semantic_key,'$[1]')=?",
+    [localpart],
+  );
+  for (const row of keys) {
+    if (
+      !(await selectedPusher(
+        conn,
+        localpart,
+        String(row.app_id),
+        String(row.pushkey),
+      )).ready
+    ) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'pusher selection unavailable',
+        503,
+      );
+    }
+  }
+}
+
 export async function capturePusherOperations(conn: Conn, localpart: string) {
   const authority = await tenantAuthority(conn);
   if (authority?.node !== 'home') {
@@ -61,6 +323,14 @@ export async function capturePusherOperations(conn: Conn, localpart: string) {
     ]);
     if (!(await registerOperations(conn, key)).length) {
       await recordPusherOperation(conn, row, false);
+    }
+    if (
+      !(await registerOperations(
+        conn,
+        choiceKey(localpart, String(row.app_id), String(row.pushkey)),
+      )).length
+    ) {
+      await recordPusherChoice(conn, row);
     }
   }
   return await pusherOperations(conn, localpart);
@@ -172,10 +442,15 @@ export async function importPusherOperation(
     }
   }
   await importRegisterOperation(conn, operation);
+  for (const choice of await pusherChoiceOperations(conn, localpart)) {
+    await validatePusherChoiceReference(conn, choice);
+  }
   const removed = (await registerOperations(conn, operation.semanticKey)).some((
     op,
   ) => op.payload === 'null');
-  if (!removed) return false;
+  if (!removed) {
+    return await reconcilePusherChoice(conn, localpart, appId, pushkey);
+  }
   const rows = await conn.query(
     'SELECT * FROM pushers WHERE localpart=? AND app_id=? AND pushkey=? AND incarnation=?',
     [localpart, appId, pushkey, incarnation],
@@ -420,6 +695,9 @@ export async function deletePusherRow(
   pushkey: string,
 ): Promise<void> {
   await deleteMatching(conn, { localpart, appId, pushkey });
+  // Preserve explicit group removal even if its registration was not held at
+  // this ingress. A later observed put may supersede this causal null normally.
+  await recordPusherChoice(conn, { localpart, app_id: appId, pushkey }, true);
 }
 
 /** Rejection of an old in-flight request cannot remove a new registration. */
@@ -488,6 +766,7 @@ export async function upsertPusherRow(
     data: JSON.stringify(pusher.data),
   };
   await recordPusherOperation(conn, row, false);
+  await recordPusherChoice(conn, row);
   await recordPusherChange(conn, row, false);
 }
 
@@ -495,6 +774,30 @@ export async function pushersOfUser(
   conn: Conn,
   localpart: string,
 ): Promise<PusherRow[]> {
+  if (await tenantAuthority(conn)) {
+    const keys = await conn.query(
+      "SELECT DISTINCT json_extract(semantic_key,'$[2]') AS app_id,json_extract(semantic_key,'$[3]') AS pushkey FROM domain_operations WHERE kind IN ('pusher','pusher-choice') AND json_extract(semantic_key,'$[1]')=? ORDER BY app_id,pushkey",
+      [localpart],
+    );
+    const result: PusherRow[] = [];
+    for (const row of keys) {
+      const selected = await selectedPusher(
+        conn,
+        localpart,
+        String(row.app_id),
+        String(row.pushkey),
+      );
+      if (!selected.ready) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'pusher selection unavailable',
+        );
+      }
+      if (selected.value) result.push(selected.value.registration);
+    }
+    return result;
+  }
   const rows = await conn.query(
     'SELECT app_id, pushkey, kind, app_display_name, device_display_name, profile_tag, lang, data FROM pushers WHERE localpart = ?',
     [localpart],
@@ -515,10 +818,24 @@ export async function pusherIncarnations(
   conn: Conn,
   localpart: string,
 ): Promise<string[]> {
-  return (await conn.query(
-    "SELECT incarnation FROM pushers WHERE localpart=? AND kind='http'",
-    [localpart],
-  )).map((row) => String(row.incarnation));
+  const result: string[] = [];
+  for (
+    const row of await conn.query(
+      "SELECT app_id,pushkey,incarnation FROM pushers WHERE localpart=? AND kind='http'",
+      [localpart],
+    )
+  ) {
+    if (
+      await pusherIsCurrent(
+        conn,
+        localpart,
+        String(row.app_id),
+        String(row.pushkey),
+        String(row.incarnation),
+      )
+    ) result.push(String(row.incarnation));
+  }
+  return result;
 }
 
 /** Send admission reads account, registration and its current token/device
@@ -531,14 +848,35 @@ export async function pusherIsCurrent(
   pushkey: string,
   incarnation: string,
 ): Promise<boolean> {
-  return (await conn.query(
-    `SELECT 1 FROM pushers p JOIN users u ON u.localpart=p.localpart
+  const [native] = await conn.query(
+    `SELECT p.access_token FROM pushers p JOIN users u ON u.localpart=p.localpart
     JOIN access_tokens a ON a.token=p.access_token AND a.localpart=p.localpart
     WHERE p.localpart=? AND p.app_id=? AND p.pushkey=? AND p.incarnation=?
     AND p.kind='http' AND u.deactivated=0 AND (a.device_id IS NULL OR EXISTS (
       SELECT 1 FROM devices d WHERE d.localpart=a.localpart AND d.device_id=a.device_id AND d.generation=a.generation))`,
     [localpart, appId, pushkey, incarnation],
-  )).length !== 0;
+  );
+  if (!native) return false;
+  if (await tenantAuthority(conn)) {
+    try {
+      await requireSessionAuthority(conn, String(native.access_token), false);
+    } catch (error) {
+      if (
+        !(error instanceof MatrixError) || ![401, 503].includes(error.status)
+      ) throw error;
+      return false;
+    }
+    const selected = await selectedPusher(conn, localpart, appId, pushkey);
+    if (!selected.ready) {
+      throw new MatrixError(
+        503,
+        'M_UNAVAILABLE',
+        'pusher selection unavailable',
+      );
+    }
+    if (selected.incarnation !== incarnation) return false;
+  }
+  return true;
 }
 
 // --- tenant-level behaviour --------------------------------------------------
@@ -599,5 +937,8 @@ export async function listPushers(
   tenant: Tenant,
   localpart: string,
 ): Promise<PusherRow[]> {
-  return await tenant.tx((tx) => tx.pushers.ofUser(localpart));
+  return await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'domain', localpart, feature: 'pushers' });
+    return await tx.pushers.ofUser(localpart);
+  });
 }

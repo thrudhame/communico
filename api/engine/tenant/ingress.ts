@@ -9,7 +9,7 @@ export type AuthIntent =
   | {
     kind: 'domain';
     localpart: string;
-    feature?: 'filters' | 'openid' | 'backups';
+    feature?: 'filters' | 'openid' | 'backups' | 'pushers';
   }
   | { kind: 'openid'; hash: string }
   | { kind: 'device'; localpart: string; deviceId: string };

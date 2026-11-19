@@ -57,6 +57,7 @@ import { loadFilter, storeFilter } from '#engine/tenant/filters.ts';
 import { issueOpenIdToken, openIdUserInfo } from '#engine/tenant/openid.ts';
 import { hashToken, issueToken, lookupToken } from '#engine/tenant/auth.ts';
 import {
+  listPushers,
   recordPusherChange,
   setPusher,
   upsertPusherRow,
@@ -266,12 +267,17 @@ Deno.test('domain pushers: signed inventory retains registration and deletion wi
     await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
     const records = await f.hs.bootstrap('alice', f.bundle.id);
     const baseline = records.at(-1)!.payload as {
-      body: { pushers?: unknown[] };
+      body: { pushers?: unknown[]; pusherChoices?: unknown[] };
     };
     assertEquals(
       baseline.body.pushers?.length,
       1,
       'signed bootstrap omits pusher inventory',
+    );
+    assertEquals(
+      baseline.body.pusherChoices?.length,
+      1,
+      'signed bootstrap omits pusher choice inventory',
     );
     await f.toEdge(records);
     const ed = await f.edge.tenant('logical.test');
@@ -285,6 +291,7 @@ Deno.test('domain pushers: signed inventory retains registration and deletion wi
     );
     assertEquals(await ed.query('SELECT * FROM pushers'), []);
     assertEquals(await ed.query('SELECT * FROM pusher_changes'), []);
+    assertEquals((await listPushers(f.et, 'alice'))[0]?.app_id, 'import-app');
     await projectTenant(f.edge, 'logical.test');
     assertEquals(
       await (await f.edge.server()).query('SELECT * FROM push_targets'),
@@ -298,6 +305,7 @@ Deno.test('domain pushers: signed inventory retains registration and deletion wi
     );
     await setPusher(f.ht, 'alice', token, { ...pusher, kind: null });
     await f.toEdge(await f.hs.export('alice', f.bundle.id));
+    assertEquals(await listPushers(f.et, 'alice'), []);
     assertEquals(
       (await ed.query("SELECT * FROM domain_operations WHERE kind='pusher'"))
         .length,
@@ -358,6 +366,56 @@ Deno.test('domain pushers: old signed bootstrap leaves an empty inventory unread
         "SELECT ready FROM facade_scopes WHERE scope='pushers:@alice:logical.test'",
       ))[0]?.ready,
       0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain pushers: pusher-only signed inventory cannot enable retained public reads', async () => {
+  const f = await fixture();
+  try {
+    const records = structuredClone(await f.hs.bootstrap('alice', f.bundle.id));
+    const last = records.at(-1)!;
+    const payload = last.payload as {
+      body: DomainBootstrap & { pusherChoices?: unknown };
+      signature: string;
+    };
+    delete payload.body.pusherChoices;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    last.operationId = 'domain-bootstrap:' +
+      createHash('sha256').update(canonicalJson(payload.body)).digest('hex');
+    const { hash: _, ...unsigned } = last;
+    last.hash = recordHash(unsigned);
+    await f.toEdge(records);
+    assertEquals(
+      (await (await f.edge.server()).query(
+        "SELECT ready FROM facade_scopes WHERE scope='pushers:@alice:logical.test'",
+      ))[0]?.ready,
+      0,
+    );
+    const authority = new FacadeAuth(
+      await f.edge.server(),
+      f.fp,
+      f.node,
+      new AuthLinkHealth({ notify: 'poll', pollseconds: 5 }),
+      {
+        replicatecredentials: true,
+        allowstaleauth: true,
+        authmaxstalehours: 0,
+      },
+    );
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      authority,
+    );
+    await assertRejects(
+      () => listPushers(tenant, 'alice'),
+      MatrixError,
+      'domain snapshot unavailable',
     );
   } finally {
     await f.close();
