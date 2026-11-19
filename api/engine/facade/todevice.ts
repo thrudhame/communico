@@ -31,7 +31,11 @@ import { tenantChangesCommitted } from '#engine/tenant/hooks.ts';
 import { tenantAuthority } from '#engine/tenant/session-authority.ts';
 import { checkLocalpart } from '#engine/tenant/users.ts';
 import { syncStreamHeads } from '#engine/tenant/streams.ts';
-import { type DomainBinding, requireDomainControl } from './domain-control.ts';
+import {
+  type DomainBinding,
+  requireAccountSelection,
+  requireDomainControl,
+} from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
@@ -169,14 +173,7 @@ export class ToDeviceOperations {
   private async tenantSelected(conn: Conn, view: DomainBinding) {
     await requireDomainControl(conn, view);
     if (!this.node) return;
-    const [row] = await conn.query(
-      'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
-      [view.localpart],
-    );
-    if (
-      row?.pairing !== view.pairing ||
-      Number(row.grant_revision) !== view.grantRevision
-    ) mismatch('to-device account not selected');
+    await requireAccountSelection(conn, view);
   }
 
   /** Original ingress and semantic source intents meet at the existing tenant

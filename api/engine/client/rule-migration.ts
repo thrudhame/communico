@@ -10,7 +10,7 @@ import { roomSource } from '#engine/store/projection-sources.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { migrateRoomRules } from '#engine/tenant/pushrules.ts';
-async function catchUp(
+export async function reconcileRoomRules(
   store: Store,
   tenant: Tenant,
   roomId: string,
@@ -82,11 +82,13 @@ async function catchUp(
 }
 export async function installRuleMigration(store: Store, tenant: Tenant) {
   const dispose = onProjected((owner, room, through) =>
-    owner === store ? catchUp(store, tenant, room, through) : undefined
+    owner === store
+      ? reconcileRoomRules(store, tenant, room, through)
+      : undefined
   );
   try {
     for (const room of await listRooms(store)) {
-      await catchUp(store, tenant, room);
+      await reconcileRoomRules(store, tenant, room);
     }
     return dispose;
   } catch (e) {

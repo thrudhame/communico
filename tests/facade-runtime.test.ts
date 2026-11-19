@@ -16,7 +16,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { lookupAlias } from '#engine/server/aliases.ts';
-import { listedRooms } from '#engine/server/directory.ts';
+import { listedRooms, visibility } from '#engine/server/directory.ts';
 import { makeServer, seedServer } from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
 import { setConfigForTests } from '#engine/config.ts';
@@ -780,7 +780,11 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     };
     const created = await api(
       'createRoom',
-      { room_version: '11' },
+      {
+        room_version: '11',
+        room_alias_name: 'upgrade-home-boundary',
+        visibility: 'public',
+      },
       registered.body.access_token,
     );
     assertEquals(created.status, 200);
@@ -1348,6 +1352,67 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       assertEquals(refused.status, 503);
       assertEquals(refused.body.errcode, 'M_UNAVAILABLE');
     }
+    const boundaryRooms = await edgeApi('joined_rooms');
+    assertEquals(await edgeApi(roomPath + '/upgrade', { new_version: '12' }), {
+      status: 503,
+      body: {
+        errcode: 'M_UNAVAILABLE',
+        error: 'operation requires home ingress',
+      },
+    });
+    assertEquals(await edgeApi('joined_rooms'), boundaryRooms);
+    assertEquals(
+      (await edgeApi(roomPath + '/state/m.room.tombstone')).status,
+      404,
+    );
+    // The remaining B8 inventory still owes these client directory read routes.
+    // Assert their retained owner state at the next stopped cut below instead.
+    const upgradeSeed = await edgeApi('createRoom', {
+      room_version: '11',
+      initial_state: [{
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      }],
+    }, 'POST');
+    assertEquals(upgradeSeed.status, 200);
+    const upgradePath = 'rooms/' +
+      encodeURIComponent(upgradeSeed.body.room_id) + '/upgrade';
+    const upgraded = await edgeApi(upgradePath, { new_version: '12' }, 'POST');
+    assertEquals(upgraded.status, 200, JSON.stringify(upgraded));
+    assertEquals(
+      await edgeApi(upgradePath, { new_version: '12' }, 'POST'),
+      upgraded,
+    );
+    const replacementPath = 'rooms/' +
+      encodeURIComponent(upgraded.body.replacement_room);
+    assertEquals(
+      (await edgeApi(replacementPath + '/state/m.room.create')).body.predecessor
+        .room_id,
+      upgradeSeed.body.room_id,
+    );
+    assertEquals(
+      (await edgeApi(replacementPath + '/state/m.room.encryption')).body
+        .algorithm,
+      'm.megolm.v1.aes-sha2',
+    );
+    const upgradeTombstone = await edgeApi(
+      'rooms/' + encodeURIComponent(upgradeSeed.body.room_id) +
+        '/state/m.room.tombstone',
+    );
+    assertEquals(
+      upgradeTombstone.body.replacement_room,
+      upgraded.body.replacement_room,
+    );
+    const upgradedEvent = await edgeApi(
+      replacementPath + '/send/m.room.encrypted/upgrade-offline',
+      {
+        algorithm: 'm.megolm.v1.aes-sha2',
+        ciphertext: 'offline-upgraded-room',
+      },
+      'PUT',
+    );
+    assertEquals(upgradedEvent.status, 200);
     // Both replicas author independent encrypted and state branches under the
     // same logical server while home has no running link process.
     const edgeBranch = await edgeApi(
@@ -1518,6 +1583,17 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       await edge.stop();
       const held = await open('facade');
       const server = await held.server();
+      assertEquals(
+        await server.query('SELECT * FROM room_upgrades WHERE old_room_id=?', [
+          roomId,
+        ]),
+        [],
+      );
+      assertEquals(
+        await lookupAlias(server, '#upgrade-home-boundary:logical.test'),
+        roomId,
+      );
+      assertEquals(await visibility(server, roomId), 'public');
       const before = await server.query(
         "SELECT operation_id FROM domain_operations WHERE kind='receipt' ORDER BY operation_id",
       );
@@ -1672,6 +1748,21 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       ),
     );
     await edgeRoomFact(freshEvent.body.event_id, fresh.body.room_id);
+    await edgeRoomFact(
+      upgradedEvent.body.event_id,
+      upgraded.body.replacement_room,
+    );
+    const homeUpgradeRead = await api(
+      replacementPath + '/event/' +
+        encodeURIComponent(upgradedEvent.body.event_id),
+      undefined,
+      registered.body.access_token,
+    );
+    assertEquals(homeUpgradeRead.status, 200, JSON.stringify(homeUpgradeRead));
+    assertEquals(
+      homeUpgradeRead.body.content.ciphertext,
+      'offline-upgraded-room',
+    );
     const freshHomeRead = await api(
       freshRoomPath + '/event/' + encodeURIComponent(freshEvent.body.event_id),
       undefined,
@@ -1900,6 +1991,24 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     assertEquals(
       (await edgeApi(forgottenPath + '/messages?dir=b')).status,
       403,
+    );
+    assertEquals(
+      await edgeApi(upgradePath, { new_version: '12' }, 'POST'),
+      upgraded,
+    );
+    assertEquals(
+      await edgeApi(
+        'rooms/' + encodeURIComponent(upgradeSeed.body.room_id) +
+          '/state/m.room.tombstone',
+      ),
+      upgradeTombstone,
+    );
+    assertEquals(
+      (await edgeApi(
+        replacementPath + '/event/' +
+          encodeURIComponent(upgradedEvent.body.event_id),
+      )).body.content.ciphertext,
+      'offline-upgraded-room',
     );
     assertEquals((await edgeApi(forgottenPath + '/join', {})).status, 200);
     assertEquals(

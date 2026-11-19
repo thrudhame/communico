@@ -96,6 +96,36 @@ export async function requireDomainSources(
   }
 }
 
+/** Auth and semantic streams drain independently. Absence is a dependency,
+ * never implicit selection; a retained conflicting selection is not a retry.
+ * Call in the owning tenant transaction before reading or installing facts. */
+export async function requireAccountSelection(
+  conn: Conn,
+  view: Pick<DomainBinding, 'localpart' | 'pairing' | 'grantRevision'>,
+) {
+  const [row] = await conn.query(
+    'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
+    [view.localpart],
+  );
+  if (!row) {
+    throw new LinkError(
+      'LINK_UNAVAILABLE',
+      'account not selected: awaiting auth snapshot',
+      503,
+    );
+  }
+  if (
+    row.pairing !== view.pairing ||
+    Number(row.grant_revision) !== view.grantRevision
+  ) {
+    throw new LinkError(
+      'LINK_IDENTITY_MISMATCH',
+      'account not selected by enrolled authority',
+      403,
+    );
+  }
+}
+
 /** Check in the SAME file transaction as the semantic mutation. */
 export async function requireDomainControl(conn: Conn, view: DomainBinding) {
   const [row] = await conn.query(

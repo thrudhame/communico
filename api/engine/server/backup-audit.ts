@@ -27,6 +27,20 @@ export async function auditServer(
 ) {
   return await snapshot.read(server, async (db) => {
     const heads = await counters(db);
+    for await (const row of scan(db, 'room_upgrades', '*')) {
+      const plan = JSON.parse(String(row.plan_json));
+      if (
+        !Number.isInteger(row.phase) || Number(row.phase) < 0 ||
+        Number(row.phase) > 4 ||
+        typeof plan.oldPower !== 'object' || plan.oldPower === null ||
+        (plan.prepared !== null && (
+          plan.prepared.roomId !== row.replacement_room ||
+          plan.prepared.options?.creator !== row.user_id ||
+          plan.prepared.createPdu?.content?.predecessor?.room_id !==
+            row.old_room_id
+        ))
+      ) auditFailure('room upgrade intent identity differs');
+    }
     // Native and fallback projections retain the original semantic identity.
     // A null pointer is a pre-semantic local evaluation, never an imported one.
     for await (
