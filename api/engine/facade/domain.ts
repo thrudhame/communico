@@ -22,6 +22,7 @@ import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
 import { captureFilterOperations } from '#engine/tenant/filters.ts';
 import { captureOpenIdOperations } from '#engine/tenant/openid.ts';
 import { captureBackupOperations } from '#engine/tenant/key-backup.ts';
+import { capturePusherOperations } from '#engine/tenant/pushers.ts';
 import {
   captureReportOperations,
   importReportOperation,
@@ -63,6 +64,7 @@ export type DomainBootstrap = DomainBinding & {
   backups?: Fact[];
   reports?: Fact[];
   forget?: Fact[];
+  pushers?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -113,6 +115,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     ...(row.backups !== undefined ? { backups: refs(row.backups) } : {}),
     ...(row.reports !== undefined ? { reports: refs(row.reports) } : {}),
     ...(row.forget !== undefined ? { forget: refs(row.forget) } : {}),
+    ...(row.pushers !== undefined ? { pushers: refs(row.pushers) } : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -133,7 +136,8 @@ async function requireFacts(
     | 'openid'
     | 'backups'
     | 'reports'
-    | 'forget',
+    | 'forget'
+    | 'pushers',
 ) {
   const keys = new Set<string>();
   for (const fact of view[file] ?? []) {
@@ -171,6 +175,8 @@ async function requireFacts(
           ? ['report', 'report-resolution']
           : file === 'forget'
           ? ['forget']
+          : file === 'pushers'
+          ? ['pusher']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
             String(row.kind),
           )
@@ -272,6 +278,7 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
         'report',
         'report-resolution',
         'forget',
+        'pusher',
       ]
         .includes(
           String(expected),
@@ -427,6 +434,7 @@ export class DomainOperations {
         ...await tx.filters.operations(localpart),
         ...await tx.openid.operations(localpart),
         ...await tx.keyBackup.operations(localpart),
+        ...await tx.pushers.operations(localpart),
       ];
     });
     operations.push(
@@ -513,6 +521,7 @@ export class DomainOperations {
           ...await captureFilterOperations(conn, localpart),
           ...await captureOpenIdOperations(conn, localpart),
           ...await captureBackupOperations(conn, localpart),
+          ...await capturePusherOperations(conn, localpart),
         ];
       },
     );
@@ -575,7 +584,7 @@ export class DomainOperations {
       kind: 'domain-bootstrap',
       tenant: facts(
         tenantFacts.filter((op) =>
-          !['filter', 'openid', 'backup'].includes(op.kind)
+          !['filter', 'openid', 'backup', 'pusher'].includes(op.kind)
         ),
       ),
       receipts: facts(receiptFacts),
@@ -584,6 +593,7 @@ export class DomainOperations {
       backups: facts(tenantFacts.filter((op) => op.kind === 'backup')),
       reports: facts(reportFacts),
       forget: facts(forgetFacts),
+      pushers: facts(tenantFacts.filter((op) => op.kind === 'pusher')),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -658,6 +668,7 @@ export class DomainOperations {
         await requireFacts(conn, view, 'filters');
         await requireFacts(conn, view, 'openid');
         await requireFacts(conn, view, 'backups');
+        await requireFacts(conn, view, 'pushers');
       });
       return await journal.apply(peer, stream, async (conn, current) => {
         await check(conn);
@@ -717,6 +728,15 @@ export class DomainOperations {
             view.backups !== undefined ? 1 : 0,
           ],
         );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'pushers:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.pushers !== undefined ? 1 : 0,
+          ],
+        );
         return { kind: 'domain-bootstrap', localpart: view.localpart };
       });
     }
@@ -774,6 +794,8 @@ export class DomainOperations {
           await tx.openid.import(view.operation, history);
         } else if (view.operation.kind === 'backup') {
           await tx.keyBackup.import(view.operation, history);
+        } else if (view.operation.kind === 'pusher') {
+          await tx.pushers.import(view.operation, history);
         } else await tx.accountData.import(view.operation, history);
       });
     }

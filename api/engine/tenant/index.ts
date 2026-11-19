@@ -635,6 +635,16 @@ function bind(
       drop: (session: string) => uia.deleteUiaSession(conn, session),
     },
     pushers: {
+      operations: (localpart: string) =>
+        pushers.pusherOperations(conn, localpart),
+      import: async (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => {
+        if (await pushers.importPusherOperation(conn, operation, history)) {
+          changed();
+        }
+      },
       isCurrent: (
         localpart: string,
         appId: string,

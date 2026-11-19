@@ -1,4 +1,4 @@
-import { assertEquals, assertRejects, assertThrows } from '@std/assert';
+import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { setConfigForTests } from '#engine/config.ts';
@@ -239,6 +239,190 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('domain pushers: signed inventory retains registration and deletion without executable targets', async () => {
+  const f = await fixture();
+  try {
+    const token = await issueToken(f.ht, 'alice', 'PUSH_IMPORT');
+    const pusher = {
+      app_id: 'import-app',
+      pushkey: 'import-key',
+      kind: 'http',
+      app_display_name: 'App',
+      device_display_name: 'Home',
+      lang: 'en',
+      data: { url: 'https://push.test/_matrix/push/v1/notify' },
+    };
+    await setPusher(f.ht, 'alice', token, pusher);
+    const auth = await exportAccountAuth(
+      f.home,
+      f.ht,
+      f.hp,
+      f.bundle.id,
+      'alice',
+      false,
+    );
+    await f.ej.receive('home', [auth]);
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const baseline = records.at(-1)!.payload as {
+      body: { pushers?: unknown[] };
+    };
+    assertEquals(
+      baseline.body.pushers?.length,
+      1,
+      'signed bootstrap omits pusher inventory',
+    );
+    await f.toEdge(records);
+    const ed = await f.edge.tenant('logical.test');
+    const [put] = await ed.query(
+      "SELECT * FROM domain_operations WHERE kind='pusher'",
+    );
+    assert(put, 'signed import lost protected recovery fact');
+    assert(
+      !String(put.payload_json).includes(token),
+      'bearer leaked into recovery fact',
+    );
+    assertEquals(await ed.query('SELECT * FROM pushers'), []);
+    assertEquals(await ed.query('SELECT * FROM pusher_changes'), []);
+    await projectTenant(f.edge, 'logical.test');
+    assertEquals(
+      await (await f.edge.server()).query('SELECT * FROM push_targets'),
+      [],
+    );
+    assertEquals(
+      (await (await f.edge.server()).query(
+        "SELECT ready FROM facade_scopes WHERE scope='pushers:@alice:logical.test'",
+      ))[0]?.ready,
+      1,
+    );
+    await setPusher(f.ht, 'alice', token, { ...pusher, kind: null });
+    await f.toEdge(await f.hs.export('alice', f.bundle.id));
+    assertEquals(
+      (await ed.query("SELECT * FROM domain_operations WHERE kind='pusher'"))
+        .length,
+      2,
+    );
+    assertEquals(await ed.query('SELECT * FROM pushers'), []);
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const cold = await reopened.tenant('logical.test');
+      assertEquals(
+        (await cold.query(
+          "SELECT * FROM domain_operations WHERE kind='pusher'",
+        )).length,
+        2,
+      );
+      assertEquals(await cold.query('SELECT * FROM pushers'), []);
+      assertEquals(
+        await (await reopened.server()).query('SELECT * FROM push_targets'),
+        [],
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain pushers: old signed bootstrap leaves an empty inventory unready', async () => {
+  const f = await fixture();
+  try {
+    const records = structuredClone(await f.hs.bootstrap('alice', f.bundle.id));
+    const last = records.at(-1)!;
+    const payload = last.payload as {
+      body: DomainBootstrap & { pushers?: unknown };
+      signature: string;
+    };
+    delete payload.body.pushers;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    last.operationId = 'domain-bootstrap:' +
+      createHash('sha256').update(canonicalJson(payload.body)).digest('hex');
+    last.hash = recordHash({
+      source: last.source,
+      incarnation: last.incarnation,
+      stream: last.stream,
+      sequence: last.sequence,
+      type: last.type,
+      version: last.version,
+      operationId: last.operationId,
+      previous: last.previous,
+      payload: last.payload,
+    });
+    await f.toEdge(records);
+    const db = await f.edge.server();
+    assertEquals(
+      (await db.query(
+        "SELECT ready FROM facade_scopes WHERE scope='pushers:@alice:logical.test'",
+      ))[0]?.ready,
+      0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain pushers: a signed pending removal cannot prove complete inventory before its causal history arrives', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.tenant('logical.test');
+    const [identity] = await hd.query(
+      'SELECT node,incarnation FROM tenant_authority',
+    );
+    const source = {
+      source: String(identity.node),
+      incarnation: String(identity.incarnation),
+    };
+    const key = JSON.stringify([
+      'pusher',
+      'alice',
+      'app',
+      'key',
+      crypto.randomUUID(),
+    ]);
+    const first = await hd.tx((conn) =>
+      writeRegister(conn, source, key, 'pusher', 'null')
+    );
+    await hd.tx((conn) => writeRegister(conn, source, key, 'pusher', 'null'));
+    // Missing retained source history, not a skipped link hash-chain record.
+    await hd.execute('DELETE FROM domain_operations WHERE operation_id=?', [
+      first.operation.operationId,
+    ]);
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records.slice(0, -1));
+    const baseline = records.at(-1)!;
+    await f.ej.receive('home', [baseline]);
+    await assertRejects(
+      () => f.es.apply(f.ej, baseline),
+      LinkError,
+      'awaits causal history',
+    );
+    assertEquals(
+      await (await f.edge.server()).query(
+        "SELECT * FROM facade_scopes WHERE scope='pushers:@alice:logical.test' AND ready=1",
+      ),
+      [],
+    );
+    await f.et.tx((tx) => tx.pushers.import(first.operation));
+    await f.es.apply(f.ej, baseline);
+    assertEquals(
+      (await (await f.edge.server()).query(
+        "SELECT ready FROM facade_scopes WHERE scope='pushers:@alice:logical.test'",
+      ))[0]?.ready,
+      1,
+    );
+    assertEquals(
+      await (await f.edge.tenant('logical.test')).query(
+        'SELECT * FROM pushers',
+      ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('facade pusher authority: registration and background delivery stay at the session issuer', async (t) => {
   for (

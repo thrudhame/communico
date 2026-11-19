@@ -11,7 +11,181 @@ import {
   requireSessionAuthority,
   tenantAuthority,
 } from '#engine/tenant/session-authority.ts';
-import { writeRegister } from '#engine/facade/registers.ts';
+import {
+  importRegisterOperation,
+  registerJson,
+  type RegisterOperation,
+  registerOperations,
+  writeRegister,
+} from '#engine/facade/registers.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
+import { LinkError } from '#engine/facade/protocol.ts';
+import { requireTenantDomainSource } from './domain-source.ts';
+
+/** Protected recovery facts are intentionally separate from executable rows. */
+export async function pusherOperations(conn: Conn, localpart: string) {
+  const keys = await conn.query(
+    "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='pusher' AND json_extract(semantic_key,'$[1]')=? ORDER BY semantic_key",
+    [localpart],
+  );
+  const result: RegisterOperation[] = [];
+  for (const row of keys) {
+    result.push(...await registerOperations(conn, String(row.semantic_key)));
+  }
+  return result;
+}
+
+export async function capturePusherOperations(conn: Conn, localpart: string) {
+  const authority = await tenantAuthority(conn);
+  if (authority?.node !== 'home') {
+    throw new Error('pusher bootstrap requires home authority');
+  }
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!user) throw new Error('pusher bootstrap account unavailable');
+  if (user.deactivated === 1) return [];
+  for (
+    const row of await conn.query('SELECT * FROM pushers WHERE localpart=?', [
+      localpart,
+    ])
+  ) {
+    const key = JSON.stringify([
+      'pusher',
+      localpart,
+      row.app_id,
+      row.pushkey,
+      row.incarnation,
+    ]);
+    if (!(await registerOperations(conn, key)).length) {
+      await recordPusherOperation(conn, row, false);
+    }
+  }
+  return await pusherOperations(conn, localpart);
+}
+
+function pusherOperation(operation: RegisterOperation) {
+  let key: unknown, value: unknown;
+  try {
+    key = JSON.parse(operation.semanticKey);
+    value = JSON.parse(registerJson(operation.payload));
+  } catch {
+    throw new Error('invalid pusher operation');
+  }
+  if (
+    !Array.isArray(key) || key.length !== 5 || key[0] !== 'pusher' ||
+    !key.every((part) => typeof part === 'string') || !key[1] ||
+    !/^[a-f0-9-]{36}$/.test(key[4]) ||
+    JSON.stringify(key) !== operation.semanticKey || operation.kind !== 'pusher'
+  ) {
+    throw new Error('invalid pusher operation');
+  }
+  if (value !== null) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('invalid pusher operation');
+    }
+    const body = value as Record<string, unknown>;
+    const registration = body.registration as PusherRow;
+    if (
+      !registration || typeof registration !== 'object' ||
+      Array.isArray(registration) ||
+      [
+        'app_id',
+        'pushkey',
+        'kind',
+        'app_display_name',
+        'device_display_name',
+        'lang',
+      ].some((k) =>
+        typeof (registration as unknown as Record<string, unknown>)[k] !==
+          'string'
+      ) ||
+      registration.app_id !== key[2] || registration.pushkey !== key[3] ||
+      (registration.profile_tag !== null &&
+        typeof registration.profile_tag !== 'string') ||
+      typeof body.accessHash !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(body.accessHash) ||
+      !Number.isSafeInteger(body.addedMs) || Number(body.addedMs) < 0 ||
+      Object.keys(body).sort().join(',') !==
+        'accessHash,addedMs,registration' ||
+      Object.keys(registration).sort().join(',') !==
+        'app_display_name,app_id,data,device_display_name,kind,lang,profile_tag,pushkey'
+    ) {
+      throw new Error('invalid pusher operation');
+    }
+    validatePusher(registration);
+  }
+  return {
+    key: key as string[],
+    value: value as null | {
+      registration: PusherRow;
+      accessHash: string;
+      addedMs: number;
+    },
+  };
+}
+
+/** Import may cancel an exact native incarnation, never create a runnable
+ * registration. Null is a monotone fence even while causal closure is pending.
+ * All facts stay retained for recovery; refresh cannot undo that fence. */
+export async function importPusherOperation(
+  conn: Conn,
+  operation: RegisterOperation,
+  history?: DomainHistoryProof,
+): Promise<boolean> {
+  const { key, value } = pusherOperation(operation);
+  const [, localpart, appId, pushkey, incarnation] = key;
+  await requireTenantDomainSource(conn, operation, localpart, history);
+  if (value) {
+    const [session] = await conn.query(
+      'SELECT * FROM session_authority WHERE hash=?',
+      [value.accessHash],
+    );
+    if (!session && !history) {
+      throw new LinkError(
+        'LINK_UNAVAILABLE',
+        'pusher import awaits session provenance',
+        503,
+      );
+    }
+    if (
+      session && (session.localpart !== localpart || session.refresh !== 0 ||
+        session.node !== operation.source ||
+        session.incarnation !== operation.incarnation)
+    ) {
+      throw new Error('pusher session provenance differs');
+    }
+    for (const held of await registerOperations(conn, operation.semanticKey)) {
+      const previous = pusherOperation(held).value;
+      if (
+        previous &&
+        (held.source !== operation.source ||
+          held.incarnation !== operation.incarnation ||
+          previous.addedMs !== value.addedMs ||
+          registerJson(JSON.stringify(previous.registration)) !==
+            registerJson(JSON.stringify(value.registration)))
+      ) {
+        throw new Error('immutable pusher registration differs');
+      }
+    }
+  }
+  await importRegisterOperation(conn, operation);
+  const removed = (await registerOperations(conn, operation.semanticKey)).some((
+    op,
+  ) => op.payload === 'null');
+  if (!removed) return false;
+  const rows = await conn.query(
+    'SELECT * FROM pushers WHERE localpart=? AND app_id=? AND pushkey=? AND incarnation=?',
+    [localpart, appId, pushkey, incarnation],
+  );
+  for (const row of rows) await recordPusherChange(conn, row, true);
+  await conn.execute(
+    'DELETE FROM pushers WHERE localpart=? AND app_id=? AND pushkey=? AND incarnation=?',
+    [localpart, appId, pushkey, incarnation],
+  );
+  return rows.length !== 0;
+}
 
 /** This is protected semantic source intent, not the executable sender target
  * projection below. Lifecycle removals address one immutable incarnation;
