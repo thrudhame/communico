@@ -195,9 +195,12 @@ export class DelayedEvents {
     if (id !== undefined) {
       await this.#app.tenant.tx((tx) => tx.delayedEvents.requireOwner(id));
     }
-    const events = await this.#app.tenant.tx((tx) =>
-      tx.delayedEvents.list(localpartOf(userId))
-    );
+    const { events, replicas } = await this.#app.tenant.tx(async (tx) => ({
+      events: await tx.delayedEvents.list(localpartOf(userId)),
+      replicas: id === undefined
+        ? await tx.delayedEvents.replicas(localpartOf(userId))
+        : [],
+    }));
     const out: ReturnType<typeof response>[] = [];
     for (const event of events) {
       if (id !== undefined && event.id !== id) continue;
@@ -212,6 +215,7 @@ export class DelayedEvents {
       });
     }
     if (id !== undefined) return out[0] ?? notFound();
+    out.push(...replicas.map((event) => response(event, true)));
     return { delayed_events: out };
   }
   async action(id: string, action: unknown): Promise<Record<string, never>> {

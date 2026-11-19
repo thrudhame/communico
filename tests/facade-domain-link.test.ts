@@ -71,6 +71,7 @@ import { queueBadge } from '#engine/server/push-queue.ts';
 import { applyPushPublication } from '#engine/server/notifications.ts';
 import { notificationOperations } from '#engine/server/notification-operations.ts';
 import { onEventStream } from '#engine/server/stream.ts';
+import { DelayedEvents } from '#engine/delayed-events.ts';
 import { startPushSender } from '#engine/push/sender.ts';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
@@ -247,6 +248,267 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('domain schedules: signed inventory and suffix retain account-wide replicas without executable jobs', async () => {
+  const f = await fixture();
+  try {
+    const event = {
+      id: 'legacy-home-schedule',
+      localpart: 'alice',
+      roomId: '!not-held:logical.test',
+      type: 'm.room.encrypted',
+      stateKey: '',
+      content: { ciphertext: 'original' },
+      delay: 60000,
+      since: 1000,
+      due: 61000,
+      roomPos: 999999,
+      stateEvent: '$source-state',
+      phase: 'pending',
+    };
+    await f.ht.tx((tx) =>
+      tx.delayedEvents.add({
+        ...event,
+        id: 'bob-private-schedule',
+        localpart: 'bob',
+        content: { ciphertext: 'unselected-bob-secret' },
+      }, 10)
+    );
+    // An existing standalone schedule has no semantic fact until enrollment.
+    const homeDb = await f.home.tenant('logical.test');
+    await homeDb.execute(
+      'INSERT INTO delayed_events(id,localpart,room_id,type,state_key,content,delay_ms,since_ms,due_ms,room_pos,state_event) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+      [
+        event.id,
+        event.localpart,
+        event.roomId,
+        event.type,
+        event.stateKey,
+        JSON.stringify(event.content),
+        event.delay,
+        event.since,
+        event.due,
+        event.roomPos,
+        event.stateEvent,
+      ],
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const body =
+      (records.at(-1)!.payload as { body: Record<string, unknown> }).body;
+    assertEquals(
+      (body.schedules as unknown[])?.length,
+      1,
+      'missing schedule inventory',
+    );
+    assert(!JSON.stringify(records).includes('unselected-bob-secret'));
+    await f.toEdge(records);
+    const worker = new DelayedEvents({ tenant: f.et, store: f.edge });
+    try {
+      const listed = await worker.list('@alice:logical.test');
+      assertEquals('delayed_events' in listed ? listed.delayed_events : [], [{
+        delay_id: event.id,
+        room_id: event.roomId,
+        type: event.type,
+        state_key: '',
+        content: event.content,
+        delay_ms: event.delay,
+        delayed_since_ts: event.since,
+        delay: event.delay,
+        running_since: event.since,
+      }]);
+      const ed = await f.edge.tenant('logical.test');
+      assertEquals(await ed.query('SELECT * FROM delayed_events'), []);
+      assertEquals(await ed.query('SELECT * FROM delayed_event_receipts'), []);
+      assertEquals(await f.et.tx((tx) => tx.delayedEvents.due(999999)), []);
+      assertEquals(await f.es.export('alice'), []);
+      await assertRejects(
+        () => worker.list('@alice:logical.test', event.id),
+        MatrixError,
+        'operation owner unavailable',
+      );
+      await assertRejects(
+        () => worker.action(event.id, 'cancel'),
+        MatrixError,
+        'operation owner unavailable',
+      );
+      await f.ht.tx((tx) => tx.delayedEvents.action(event.id, 'cancel', 2000));
+      await f.toEdge(await f.hs.export('alice', f.bundle.id));
+      assertEquals(await worker.list('@alice:logical.test'), {
+        delayed_events: [],
+      });
+      const homeFacts = await f.ht.tx((tx) =>
+        tx.delayedEvents.operations('alice')
+      );
+      assertEquals(
+        (await ed.query(
+          "SELECT operation_id FROM domain_operations WHERE kind='delayed-event'",
+        )).length,
+        homeFacts.length,
+      );
+      const edgeId = await f.et.tx((tx) => tx.delayedEvents.newId());
+      await f.et.tx((tx) => tx.delayedEvents.add({ ...event, id: edgeId }, 10));
+      const reverse = await f.es.export('alice');
+      assertEquals(reverse.length, 1);
+      for (const record of reverse) {
+        await f.hj.receive('edge_a', [record]);
+        await f.hs.apply(f.hj, record, f.bundle.id);
+      }
+      const homeWorker = new DelayedEvents({ tenant: f.ht, store: f.home });
+      try {
+        const homeList = await homeWorker.list('@alice:logical.test');
+        assertEquals(
+          'delayed_events' in homeList
+            ? homeList.delayed_events.map((e) => e.delay_id)
+            : [],
+          [edgeId],
+        );
+        await assertRejects(
+          () => homeWorker.action(edgeId, 'send'),
+          MatrixError,
+          'operation owner unavailable',
+        );
+      } finally {
+        await homeWorker.stop();
+      }
+      assertEquals(
+        await homeDb.query('SELECT id FROM delayed_events WHERE localpart=?', [
+          'alice',
+        ]),
+        [],
+      );
+      const homeExport = await f.hs.export('alice', f.bundle.id);
+      assert(
+        homeExport.every((r) =>
+          (r.payload as { body: DomainOperation }).body.operation.source ===
+            'home'
+        ),
+      );
+      await f.et.tx((tx) => tx.delayedEvents.remove(edgeId));
+      for (const record of await f.es.export('alice')) {
+        await f.hj.receive('edge_a', [record]);
+        await f.hs.apply(f.hj, record, f.bundle.id);
+      }
+      // Home can attest the receiver's retained originals during bootstrap;
+      // replay must not rebase them or recreate a local executable schedule.
+      await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+      const edgeFacts = await f.et.tx((tx) =>
+        tx.delayedEvents.operations('alice')
+      );
+      await f.edge.close();
+      const cold = await f.open('edge');
+      try {
+        const node = await loadNode(
+          await cold.server(),
+          'logical.test',
+          'edge_a',
+        );
+        const pairings = new Pairings(
+          await cold.server(),
+          node.signer(),
+          node.publicKey,
+          'b'.repeat(64),
+          node,
+        );
+        const tenant = await enrolledTenant(
+          cold,
+          pairings,
+          'logical.test',
+          'edge_a',
+        );
+        const restarted = new DelayedEvents({ tenant, store: cold });
+        try {
+          assertEquals(await restarted.list('@alice:logical.test'), {
+            delayed_events: [],
+          });
+          assertEquals(
+            await tenant.tx((tx) => tx.delayedEvents.operations('alice')),
+            edgeFacts,
+          );
+          assertEquals(await tenant.tx((tx) => tx.delayedEvents.next()), null);
+        } finally {
+          await restarted.stop();
+        }
+      } finally {
+        await cold.close();
+      }
+    } finally {
+      await worker.stop();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain schedules: absent inventory differs from an explicit empty inventory', async (t) => {
+  for (const present of [false, true]) {
+    await t.step(String(present), async () => {
+      const f = await fixture();
+      try {
+        const records = structuredClone(
+          await f.hs.bootstrap('alice', f.bundle.id),
+        );
+        const last = records.at(-1)!;
+        const payload = last.payload as {
+          body: DomainBootstrap & { schedules?: unknown[] };
+          signature: string;
+        };
+        if (present) {
+          payload.body.schedules = [];
+        } else delete payload.body.schedules;
+        payload.signature = await f.ht.signer().sign(
+          canonicalJson(payload.body),
+        );
+        last.operationId = 'domain-bootstrap:' +
+          createHash('sha256').update(canonicalJson(payload.body)).digest(
+            'hex',
+          );
+        const { hash: _, ...unsigned } = last;
+        last.hash = recordHash(unsigned);
+        await f.toEdge(records);
+        assertEquals(
+          (await (await f.edge.server()).query(
+            "SELECT ready FROM facade_scopes WHERE scope='schedules:@alice:logical.test'",
+          ))[0]?.ready,
+          present ? 1 : 0,
+        );
+        const authority = new FacadeAuth(
+          await f.edge.server(),
+          f.fp,
+          f.node,
+          new AuthLinkHealth({ notify: 'poll', pollseconds: 5 }),
+          {
+            replicatecredentials: true,
+            allowstaleauth: true,
+            authmaxstalehours: 0,
+          },
+        );
+        const tenant = await enrolledTenant(
+          f.edge,
+          f.fp,
+          'logical.test',
+          'edge_a',
+          authority,
+        );
+        const worker = new DelayedEvents({ tenant, store: f.edge });
+        try {
+          if (present) {
+            assertEquals(await worker.list('@alice:logical.test'), {
+              delayed_events: [],
+            });
+          } else {await assertRejects(
+              () => worker.list('@alice:logical.test'),
+              MatrixError,
+              'domain snapshot unavailable',
+            );}
+        } finally {
+          await worker.stop();
+        }
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('domain notifications: signed selected-account inventory and suffix preserve originals without dispatch across reopen', async () => {
   const f = await fixture();

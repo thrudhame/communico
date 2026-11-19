@@ -10,6 +10,7 @@ import type { PreparedSubmission } from '#engine/room/ingest.ts';
 import type { Standing } from '#engine/room/events.ts';
 import { Buffer } from 'node:buffer';
 import {
+  importRegisterOperation,
   readRegister,
   registerJson,
   type RegisterOperation,
@@ -17,6 +18,8 @@ import {
   writeRegister,
 } from '#engine/facade/registers.ts';
 import { ownerUnavailable, tenantAuthority } from './session-authority.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
+import { requireTenantDomainSource } from './domain-source.ts';
 
 function ownerPrefix(node: string, incarnation: string): string {
   return 'd.' +
@@ -106,6 +109,209 @@ async function retain(
     key,
     'delayed-event',
     payload,
+  );
+}
+
+export async function captureOperations(conn: Conn, localpart: string) {
+  const authority = await tenantAuthority(conn);
+  if (authority?.node !== 'home') {
+    throw new Error('delayed bootstrap requires home authority');
+  }
+  for (
+    const row of await conn.query(
+      'SELECT id FROM delayed_events WHERE localpart=? ORDER BY id',
+      [localpart],
+    )
+  ) {
+    const id = String(row.id);
+    if ((await registerOperations(conn, semanticKey(localpart, id))).length) {
+      continue;
+    }
+    // Only legacy home rows may lack their atomic source fact. Never recreate
+    // another incarnation's authorship from a materialized executable row.
+    if (id.startsWith('d.')) throw new Error('delayed source fact unavailable');
+    await retain(conn, id);
+  }
+  return await operations(conn, localpart);
+}
+
+function factOf(
+  operation: RegisterOperation,
+): {
+  event: DelayedEvent;
+  eventId: string | null;
+  pdu: Pdu | null;
+  completed: boolean;
+  standing: Standing | null;
+  receipts: Record<string, unknown>[];
+} {
+  const bad = () => {
+    throw new Error('invalid delayed event operation');
+  };
+  let key, body;
+  try {
+    key = JSON.parse(operation.semanticKey);
+    body = JSON.parse(operation.payload);
+  } catch {
+    return bad();
+  }
+  if (
+    !Array.isArray(key) || key.length !== 3 || key[0] !== 'delayed-event' ||
+    typeof key[1] !== 'string' || !key[1] || typeof key[2] !== 'string' ||
+    !key[2] ||
+    operation.semanticKey !== semanticKey(key[1], key[2]) ||
+    operation.kind !== 'delayed-event' ||
+    !body || typeof body !== 'object' || Array.isArray(body)
+  ) return bad();
+  const e = body.event;
+  if (
+    !e || typeof e !== 'object' || Array.isArray(e) || e.id !== key[2] ||
+    e.localpart !== key[1] ||
+    typeof e.roomId !== 'string' || !e.roomId.startsWith('!') ||
+    typeof e.type !== 'string' || !e.type ||
+    !(e.stateKey === null || typeof e.stateKey === 'string') ||
+    !e.content || typeof e.content !== 'object' || Array.isArray(e.content) ||
+    ![e.delay, e.since, e.due, e.roomPos].every((n) =>
+      Number.isSafeInteger(n) && n >= 0
+    ) ||
+    !(e.stateEvent === null || typeof e.stateEvent === 'string') ||
+    !['pending', 'sending', 'cancelled', 'completed'].includes(e.phase) ||
+    !(body.eventId === null || typeof body.eventId === 'string') ||
+    !(body.pdu === null ||
+      (typeof body.pdu === 'object' && !Array.isArray(body.pdu) &&
+        body.pdu.event_id === body.eventId && body.pdu.room_id === e.roomId)) ||
+    typeof body.completed !== 'boolean' ||
+    (body.completed && (body.eventId === null || body.pdu !== null)) ||
+    (e.phase === 'completed' && !body.completed) ||
+    !(body.standing === null ||
+      ['accepted', 'soft_failed', 'rejected'].includes(body.standing)) ||
+    (body.standing !== null && e.phase !== 'completed') ||
+    !Array.isArray(body.receipts) ||
+    body.receipts.some((r: Record<string, unknown>) =>
+      !r || r.localpart !== key[1] || typeof r.device_id !== 'string' ||
+      !Number.isSafeInteger(r.generation) || Number(r.generation) < 1 ||
+      typeof r.endpoint !== 'string' || typeof r.txn_id !== 'string'
+    )
+  ) return bad();
+  if (
+    e.id.startsWith('d.')
+      ? !e.id.startsWith(ownerPrefix(operation.source, operation.incarnation))
+      : operation.source !== 'home'
+  ) return bad();
+  // One issuer owns this schedule's entire history. The register is retention
+  // and dependency tracking here, not multiwriter winner arbitration.
+  if (
+    !Array.isArray(operation.context) ||
+    (operation.sequence === 1
+      ? operation.context.length !== 0
+      : operation.context.length !== 1 ||
+        operation.context[0].source !== operation.source ||
+        operation.context[0].incarnation !== operation.incarnation ||
+        operation.context[0].sequence !== operation.sequence - 1)
+  ) return bad();
+  return body;
+}
+
+export async function importOperation(
+  conn: Conn,
+  operation: RegisterOperation,
+  history?: DomainHistoryProof,
+) {
+  const fact = factOf(operation);
+  await requireTenantDomainSource(
+    conn,
+    operation,
+    fact.event.localpart,
+    history,
+  );
+  await importRegisterOperation(conn, operation);
+  const all = await registerOperations(conn, operation.semanticKey);
+  let terminal = false;
+  let immutable: string | undefined;
+  let prepared: ReturnType<typeof factOf> | undefined;
+  for (const retained of all) {
+    const current = factOf(retained);
+    const e = current.event;
+    const command = registerJson(JSON.stringify([
+      e.id,
+      e.localpart,
+      e.roomId,
+      e.type,
+      e.stateKey,
+      e.content,
+      e.delay,
+      e.roomPos,
+      e.stateEvent,
+      current.receipts,
+    ]));
+    if (
+      retained.source !== operation.source ||
+      retained.incarnation !== operation.incarnation || terminal ||
+      (immutable !== undefined && immutable !== command) ||
+      (prepared && (current.eventId !== prepared.eventId ||
+        (prepared.completed && !current.completed) ||
+        (prepared.pdu !== null && current.pdu !== null &&
+          registerJson(JSON.stringify(prepared.pdu)) !==
+            registerJson(JSON.stringify(current.pdu)))))
+    ) {
+      throw new Error(
+        'delayed event is terminal or its original command changed',
+      );
+    }
+    immutable = command;
+    if (current.eventId !== null) prepared = current;
+    terminal = ['cancelled', 'completed'].includes(current.event.phase);
+  }
+  if (terminal) {
+    // An original local terminal fact also fences a stale executable backup.
+    // This retirement is a projection, never a new authored transition.
+    await conn.execute('DELETE FROM delayed_events WHERE id=?', [
+      fact.event.id,
+    ]);
+  }
+}
+
+/** Protected replicas are account-wide read evidence only. Do not open their
+ * rooms, interpret roomPos locally, install receipts or create executable jobs. */
+export async function replicas(
+  conn: Conn,
+  localpart: string,
+): Promise<DelayedEvent[]> {
+  const [user] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!user || user.deactivated === 1) return [];
+  const executable = new Set(
+    (await conn.query('SELECT id FROM delayed_events WHERE localpart=?', [
+      localpart,
+    ])).map((r) => String(r.id)),
+  );
+  const all = await operations(conn, localpart);
+  const groups = new Map<string, RegisterOperation[]>();
+  for (const op of all) {
+    const rows = groups.get(op.semanticKey) ?? [];
+    rows.push(op);
+    groups.set(op.semanticKey, rows);
+  }
+  const result: DelayedEvent[] = [];
+  for (const [key, rows] of groups) {
+    // Authenticated cancellation/completion cannot be resurrected by a replayed
+    // predecessor, even while its other predecessors are still in flight.
+    if (
+      rows.some((op) =>
+        ['cancelled', 'completed'].includes(factOf(op).event.phase)
+      )
+    ) continue;
+    const view = await readRegister(conn, key);
+    if (!view.winner || view.pending.length) continue;
+    const fact = factOf(view.winner);
+    if (fact.event.phase === 'pending' && !executable.has(fact.event.id)) {
+      result.push(fact.event);
+    }
+  }
+  return result.sort((a, b) =>
+    a.due - b.due || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
   );
 }
 

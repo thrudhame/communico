@@ -2,7 +2,8 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
-import { registerOperations } from '#engine/facade/registers.ts';
+import { registerOperations, writeRegister } from '#engine/facade/registers.ts';
+import { importOperation, replicas } from '#engine/tenant/delayed-events.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
@@ -207,6 +208,18 @@ Deno.test('facade delayed: exact preparation and terminal completion survive exe
       'completion lost the actual rejected result',
     );
     assertEquals(facts.map((fact) => fact.sequence), [1, 2, 3, 4, 5]);
+    for (const fact of facts.toReversed()) {
+      await f.home.tx((tx) => tx.delayedEvents.import(fact));
+    }
+    assertEquals(
+      await f.home.tx((tx) => tx.delayedEvents.operations('alice')),
+      facts,
+    );
+    assertEquals(
+      await f.home.tx((tx) => tx.delayedEvents.replicas('alice')),
+      [],
+    );
+    assertEquals(await f.home.tx((tx) => tx.delayedEvents.next()), null);
     await assertRejects(
       () => f.edge.tx((tx) => tx.delayedEvents.add(event(id), 10)),
       Error,
@@ -313,6 +326,180 @@ Deno.test('facade delayed: send transaction retry retains its original cancelled
     assertEquals(await f.edge.tx((tx) => tx.delayedEvents.get(retryId)), null);
     assertEquals(await f.edge.tx((tx) => tx.delayedEvents.due(100000)), []);
     assertEquals(await f.edge.tx((tx) => tx.delayedEvents.next()), null);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade delayed replicas: reordered originals retain terminal evidence without creating execution or local receipts', async () => {
+  for (const order of [[0, 1, 2], [2, 0, 1], [1, 2, 0]]) {
+    const f = await fixture();
+    try {
+      const id = await f.home.tx((tx) => tx.delayedEvents.newId());
+      await f.home.tx((tx) => tx.delayedEvents.add(event(id), 10));
+      await f.home.tx((tx) => tx.delayedEvents.action(id, 'restart', 2000));
+      await f.home.tx((tx) => tx.delayedEvents.remove(id));
+      const facts = await f.home.tx((tx) =>
+        tx.delayedEvents.operations('alice')
+      );
+      assertEquals(facts.length, 3);
+      const ed = await f.stores[1].tenant('logical.test');
+      for (const index of order) {
+        await ed.tx((conn) => importOperation(conn, facts[index]));
+        await ed.tx((conn) => importOperation(conn, facts[index]));
+        const known = await ed.tx((conn) => replicas(conn, 'alice'));
+        if (order.slice(0, order.indexOf(index) + 1).includes(2)) {
+          assertEquals(known, []);
+        }
+        assertEquals(await f.edge.tx((tx) => tx.delayedEvents.due(999999)), []);
+        assertEquals(await ed.query('SELECT * FROM delayed_events'), []);
+        assertEquals(
+          await ed.query('SELECT * FROM delayed_event_receipts'),
+          [],
+        );
+      }
+      assertEquals(
+        await f.edge.tx((tx) => tx.delayedEvents.operations('alice')),
+        facts,
+      );
+      assertEquals(await ed.tx((conn) => replicas(conn, 'bob')), []);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('facade delayed replicas: forged issuer, changed source history and post-terminal resurrection roll back', async () => {
+  const f = await fixture();
+  try {
+    const id = await f.home.tx((tx) => tx.delayedEvents.newId());
+    await f.home.tx((tx) => tx.delayedEvents.add(event(id), 10));
+    const [original] = await f.home.tx((tx) =>
+      tx.delayedEvents.operations('alice')
+    );
+    const ed = await f.stores[1].tenant('logical.test');
+    const forged = await (await f.stores[0].tenant('logical.test')).tx((conn) =>
+      writeRegister(
+        conn,
+        { source: 'edge', incarnation: 'edge-store' },
+        original.semanticKey,
+        'delayed-event',
+        original.payload,
+      )
+    );
+    await assertRejects(
+      () => ed.tx((conn) => importOperation(conn, forged.operation)),
+      Error,
+      'invalid delayed event',
+    );
+    await ed.tx((conn) => importOperation(conn, original));
+    const changed = structuredClone(original);
+    changed.payload = changed.payload.replace('retained', 'substituted');
+    await assertRejects(
+      () => ed.tx((conn) => importOperation(conn, changed)),
+      Error,
+      'hash',
+    );
+    assertEquals(
+      (await ed.tx((conn) => replicas(conn, 'alice')))[0].content,
+      event().content,
+    );
+    // A validly hashed source dot is still not permission to revive a terminal
+    // command. Build the adversarial history only in the source test fixture.
+    const source = await f.stores[0].tenant('logical.test');
+    await source.execute('DELETE FROM domain_operations WHERE source=?', [
+      'edge',
+    ]);
+    await f.home.tx((tx) => tx.delayedEvents.remove(id));
+    const facts = await f.home.tx((tx) => tx.delayedEvents.operations('alice'));
+    await ed.tx((conn) => importOperation(conn, facts.at(-1)!));
+    const resurrect = await source.tx((conn) =>
+      writeRegister(
+        conn,
+        { source: 'home', incarnation: 'home-store' },
+        original.semanticKey,
+        'delayed-event',
+        original.payload,
+      )
+    );
+    await assertRejects(
+      () => ed.tx((conn) => importOperation(conn, resurrect.operation)),
+      Error,
+      'terminal',
+    );
+    assertEquals(await ed.tx((conn) => replicas(conn, 'alice')), []);
+    assertEquals(
+      await f.edge.tx((tx) => tx.delayedEvents.operations('alice')),
+      facts,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade delayed replicas: immutable command and truthful terminal result are checked across source facts', async () => {
+  for (const change of ['content', 'false-completion']) {
+    const f = await fixture();
+    try {
+      const id = await f.home.tx((tx) => tx.delayedEvents.newId());
+      await f.home.tx((tx) => tx.delayedEvents.add(event(id), 10));
+      const [original] = await f.home.tx((tx) =>
+        tx.delayedEvents.operations('alice')
+      );
+      await f.edge.tx((tx) => tx.delayedEvents.import(original));
+      const payload = JSON.parse(original.payload);
+      if (change === 'content') {
+        payload.event.content = { ciphertext: 'different-command' };
+      } else payload.event.phase = 'completed';
+      const source = await f.stores[0].tenant('logical.test');
+      const altered = await source.tx((conn) =>
+        writeRegister(
+          conn,
+          { source: 'home', incarnation: 'home-store' },
+          original.semanticKey,
+          'delayed-event',
+          JSON.stringify(payload),
+        )
+      );
+      await assertRejects(
+        () => f.edge.tx((tx) => tx.delayedEvents.import(altered.operation)),
+        Error,
+        'delayed event',
+      );
+      assertEquals(
+        (await f.edge.tx((tx) => tx.delayedEvents.operations('alice'))).length,
+        1,
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('facade delayed replicas: account retirement hides original pending facts and their replay', async () => {
+  const f = await fixture();
+  try {
+    const id = await f.home.tx((tx) => tx.delayedEvents.newId());
+    await f.home.tx((tx) => tx.delayedEvents.add(event(id), 10));
+    const [original] = await f.home.tx((tx) =>
+      tx.delayedEvents.operations('alice')
+    );
+    await f.edge.tx((tx) => tx.delayedEvents.import(original));
+    assertEquals(
+      (await f.edge.tx((tx) => tx.delayedEvents.replicas('alice'))).length,
+      1,
+    );
+    await f.edge.tx((tx) => tx.users.markDeactivated('alice'));
+    await f.edge.tx((tx) => tx.delayedEvents.import(original));
+    assertEquals(
+      await f.edge.tx((tx) => tx.delayedEvents.replicas('alice')),
+      [],
+    );
+    assertEquals(
+      await f.edge.tx((tx) => tx.delayedEvents.operations('alice')),
+      [original],
+    );
+    assertEquals(await f.edge.tx((tx) => tx.delayedEvents.due(999999)), []);
   } finally {
     await f.close();
   }

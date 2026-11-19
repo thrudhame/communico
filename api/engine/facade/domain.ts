@@ -22,6 +22,7 @@ import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
 import { captureFilterOperations } from '#engine/tenant/filters.ts';
 import { captureOpenIdOperations } from '#engine/tenant/openid.ts';
 import { captureBackupOperations } from '#engine/tenant/key-backup.ts';
+import { captureOperations as captureDelayedOperations } from '#engine/tenant/delayed-events.ts';
 import {
   capturePusherOperations,
   pusherChoiceOperations,
@@ -76,6 +77,7 @@ export type DomainBootstrap = DomainBinding & {
   pushers?: Fact[];
   pusherChoices?: Fact[];
   notifications?: Fact[];
+  schedules?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -133,6 +135,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     ...(row.notifications !== undefined
       ? { notifications: refs(row.notifications) }
       : {}),
+    ...(row.schedules !== undefined ? { schedules: refs(row.schedules) } : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -156,7 +159,8 @@ async function requireFacts(
     | 'forget'
     | 'pushers'
     | 'pusherChoices'
-    | 'notifications',
+    | 'notifications'
+    | 'schedules',
 ) {
   const keys = new Set<string>();
   for (const fact of view[file] ?? []) {
@@ -200,6 +204,8 @@ async function requireFacts(
           ? ['pusher-choice']
           : file === 'notifications'
           ? ['notification']
+          : file === 'schedules'
+          ? ['delayed-event']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
             String(row.kind),
           )
@@ -304,6 +310,7 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
         'pusher',
         'pusher-choice',
         'notification',
+        'delayed-event',
       ]
         .includes(
           String(expected),
@@ -461,6 +468,7 @@ export class DomainOperations {
         ...await tx.keyBackup.operations(localpart),
         ...await tx.pushers.operations(localpart),
         ...await tx.pushers.choices(localpart),
+        ...await tx.delayedEvents.operations(localpart),
       ];
     });
     operations.push(
@@ -552,6 +560,7 @@ export class DomainOperations {
           ...await captureBackupOperations(conn, localpart),
           ...await capturePusherOperations(conn, localpart),
           ...await pusherChoiceOperations(conn, localpart),
+          ...await captureDelayedOperations(conn, localpart),
         ];
       },
     );
@@ -623,7 +632,14 @@ export class DomainOperations {
       kind: 'domain-bootstrap',
       tenant: facts(
         tenantFacts.filter((op) =>
-          !['filter', 'openid', 'backup', 'pusher', 'pusher-choice'].includes(
+          ![
+            'filter',
+            'openid',
+            'backup',
+            'pusher',
+            'pusher-choice',
+            'delayed-event',
+          ].includes(
             op.kind,
           )
         ),
@@ -639,6 +655,7 @@ export class DomainOperations {
         tenantFacts.filter((op) => op.kind === 'pusher-choice'),
       ),
       notifications: facts(notificationFacts),
+      schedules: facts(tenantFacts.filter((op) => op.kind === 'delayed-event')),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -715,6 +732,7 @@ export class DomainOperations {
         await requireFacts(conn, view, 'backups');
         await requireFacts(conn, view, 'pushers');
         await requireFacts(conn, view, 'pusherChoices');
+        await requireFacts(conn, view, 'schedules');
         if (view.pusherChoices !== undefined) {
           await requirePusherChoices(conn, view.localpart);
         }
@@ -798,6 +816,15 @@ export class DomainOperations {
               : 0,
           ],
         );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'schedules:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.schedules !== undefined ? 1 : 0,
+          ],
+        );
         return { kind: 'domain-bootstrap', localpart: view.localpart };
       });
     }
@@ -864,6 +891,8 @@ export class DomainOperations {
           await tx.keyBackup.import(view.operation, history);
         } else if (['pusher', 'pusher-choice'].includes(view.operation.kind)) {
           await tx.pushers.import(view.operation, history);
+        } else if (view.operation.kind === 'delayed-event') {
+          await tx.delayedEvents.import(view.operation, history);
         } else await tx.accountData.import(view.operation, history);
       });
     }

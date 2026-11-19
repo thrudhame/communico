@@ -906,6 +906,14 @@ function bind(
       requireOwner: (id: string) => delayedEvents.requireOwner(conn, id),
       operations: (localpart: string) =>
         delayedEvents.operations(conn, localpart),
+      import: (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => delayedEvents.importOperation(conn, operation, history),
+      replicas: async (localpart: string) => {
+        await authorize({ kind: 'domain', localpart, feature: 'schedules' });
+        return await delayedEvents.replicas(conn, localpart);
+      },
       get: (id: string) => delayedEvents.get(conn, id),
       list: (localpart: string) => delayedEvents.list(conn, localpart),
       receipt: (receipt: delayedEvents.DelayReceipt) =>
