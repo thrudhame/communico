@@ -26,7 +26,12 @@ import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import { homePublicKeys, type Pairings } from './pairing.ts';
-import { changeSigningAuthority, signingFence } from './signing-authority.ts';
+import {
+  changeSigningAuthority,
+  signingFence,
+  verificationFence,
+  VerificationUnavailable,
+} from './signing-authority.ts';
 import {
   integer,
   LinkError,
@@ -489,12 +494,25 @@ export class FacadeKeys {
             context,
           );
         }
+        const unchanged = verificationFence(this.db);
+        unchanged();
         const grant = await this.pairings.active();
         const [held] = await this.db.query(
           'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
         );
+        unchanged();
         const roster = rosterAt(held, grant.body.revision);
-        const key = roster?.keys.find((key) => key.keyId === keyId);
+        if (roster === null) {
+          throw new VerificationUnavailable('key roster not ready');
+        }
+        const key = roster.keys.find((key) =>
+          key.keyId === keyId &&
+          (key.retiredAt === null ||
+            (purpose !== 'request' && floor <= key.retiredAt))
+        );
+        if (roster.server === name && key && held.document_json === null) {
+          throw new VerificationUnavailable('key document not ready');
+        }
         let document: KeyDoc | null = null;
         if (roster && held.document_json !== null) {
           try {
@@ -506,18 +524,21 @@ export class FacadeKeys {
             /* An older partial publication confers no key authority. */
           }
         }
+        unchanged();
         if (
           !roster || roster.server !== name ||
-          !key || !document || floor > document.valid_until_ts ||
-          (key.retiredAt !== null &&
-            (purpose === 'request' || floor > key.retiredAt))
+          !key || !document || floor > document.valid_until_ts
         ) {
           throw new UpstreamError('validation', {
             phase: 'key-lookup',
             reason: 'local key unavailable for required purpose and validity',
           });
         }
-        return await importPublicKeyFromRaw(matrixBase64(key.publicKey, 32));
+        const publicKey = await importPublicKeyFromRaw(
+          matrixBase64(key.publicKey, 32),
+        );
+        unchanged();
+        return publicKey;
       },
     };
   }

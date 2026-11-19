@@ -9,6 +9,7 @@ import {
   type Stream,
 } from '#engine/facade/protocol.ts';
 import type { Journal } from '#engine/facade/journal.ts';
+import { VerificationUnavailable } from '#engine/facade/signing-authority.ts';
 import { bounded, pause } from './server-process.ts';
 import { childDiagnostics } from './child-diagnostics.ts';
 
@@ -46,15 +47,17 @@ export function facadeFailure(
   scope?: ObservationScope,
 ): FacadeObservation {
   return {
-    kind: error instanceof LinkError && error.code === 'LINK_UNAVAILABLE'
+    kind: (error instanceof LinkError && error.code === 'LINK_UNAVAILABLE') ||
+        error instanceof VerificationUnavailable
       ? 'blocked'
       : 'failure',
     operation,
-    error: error instanceof LinkError
-      ? error.code
-      : error instanceof Error
-      ? error.name
-      : 'unknown error',
+    error:
+      error instanceof LinkError || error instanceof VerificationUnavailable
+        ? error.code
+        : error instanceof Error
+        ? error.name
+        : 'unknown error',
     ...(scope ? { scope } : {}),
   };
 }
