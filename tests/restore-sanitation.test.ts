@@ -190,6 +190,7 @@ Deno.test('restore sanitation: purge consuming pools and old delivery authority,
           inboxReceipts: 1,
           slidingConnections: 1,
           slidingPositions: 1,
+          quarantinedDelayedEvents: 0,
         });
         await candidate.tx(file, async (conn) => {
           const status = await keyStatus(conn, f.device);
@@ -311,6 +312,7 @@ Deno.test('restore sanitation: consuming pools are fully purged across keyset ba
             inboxReceipts: 0,
             slidingConnections: 0,
             slidingPositions: 0,
+            quarantinedDelayedEvents: 0,
           });
         });
       },

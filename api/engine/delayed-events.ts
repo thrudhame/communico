@@ -11,7 +11,11 @@ import { withRoomLock } from '#engine/room/lock.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
-import { type DelayedEvent, notFound } from '#engine/tenant/delayed-events.ts';
+import {
+  type DelayedEvent,
+  notFound,
+  requireUnfenced,
+} from '#engine/tenant/delayed-events.ts';
 
 export function delayedEventsEnabled(): boolean {
   const limits = config().delayedevents;
@@ -208,6 +212,11 @@ export class DelayedEvents {
         const current = await this.#app.tenant.tx((tx) =>
           tx.delayedEvents.get(event.id)
         );
+        if (current?.phase === 'quarantined') {
+          if (id !== undefined) requireUnfenced(current.phase);
+          out.push(response(current, true));
+          return;
+        }
         if (
           current !== null && current.phase === 'pending' &&
           !await this.#reconcile(current)
@@ -234,6 +243,7 @@ export class DelayedEvents {
         const event = await this.#app.tenant.tx((tx) =>
           tx.delayedEvents.get(id)
         );
+        if (event !== null) requireUnfenced(event.phase);
         if (
           event === null || event.phase !== 'pending' ||
           await this.#reconcile(event)

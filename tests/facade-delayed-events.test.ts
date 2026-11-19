@@ -8,6 +8,10 @@ import { registerUser } from '#engine/tenant/users.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
 import type { Pdu } from '#engine/pdu.ts';
+import { copyPrivate } from '#engine/store/files.ts';
+import { withCandidateStore } from '#engine/store/candidate.ts';
+import { sanitizeRestoredTenant } from '#engine/tenant/restore.ts';
+import * as delayed from '#engine/tenant/delayed-events.ts';
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-delayed-' });
@@ -36,6 +40,7 @@ async function fixture() {
     tenants.push(tenant);
   }
   return {
+    dir,
     home: tenants[0],
     edge: tenants[1],
     stores,
@@ -88,6 +93,93 @@ Deno.test('facade delayed: acknowledgment retains the schedule fact atomically',
   }
 });
 
+Deno.test('facade delayed restore: a pending backup cannot execute before the surviving terminal suffix', async () => {
+  const f = await fixture();
+  try {
+    const id = await f.edge.tx((tx) => tx.delayedEvents.newId());
+    const receipt = {
+      device: { localpart: 'alice', deviceId: 'edge-device', generation: 1 },
+      endpoint: JSON.stringify(['!held:logical.test', 'm.room.encrypted']),
+      txnId: 'restore-once',
+    };
+    await f.edge.tx((tx) => tx.delayedEvents.add(event(id), 10, receipt));
+    const cutFacts = await f.edge.tx((tx) =>
+      tx.delayedEvents.operations('alice')
+    );
+    const cut = await f.stores[1].snapshot(f.dir + '/archive');
+    await copyPrivate(f.dir + '/archive', f.dir + '/candidate');
+    // The live issuer advances AFTER the backup, and its original facts survive
+    // elsewhere. The restored copy cannot infer this from its pending row.
+    await f.edge.tx((tx) => tx.delayedEvents.claim(id, 999999));
+    await f.edge.tx((tx) =>
+      tx.delayedEvents.prepare(id, {
+        event_id: '$after-backup',
+        room_id: event(id).roomId,
+      } as Pdu)
+    );
+    await f.edge.tx((tx) => tx.delayedEvents.finish(id));
+    await f.edge.tx((tx) => tx.delayedEvents.remove(id, 'accepted'));
+    const terminal = await f.edge.tx((tx) =>
+      tx.delayedEvents.operations('alice')
+    );
+    await withCandidateStore(
+      {
+        library: './.native/libturso_ffi.so',
+        checkpointlogbytes: 65536,
+      },
+      f.dir + '/candidate',
+      cut.files,
+      { tenant: tenantSchema },
+      async (candidate) => {
+        const file = candidate.files.find((file) => file.kind === 'tenants')!;
+        await candidate.tx(file, async (conn) => {
+          await sanitizeRestoredTenant(conn);
+          assertEquals(
+            await delayed.due(conn, 999999),
+            [],
+            'restored schedule is runnable before suffix recovery',
+          );
+          assertEquals(await delayed.next(conn), null);
+          assertEquals(await delayed.claim(conn, id, 999999), null);
+          assertEquals(await delayed.operations(conn, 'alice'), cutFacts);
+          assertEquals(await delayed.receipt(conn, receipt), id);
+          assertEquals((await delayed.get(conn, id))!.phase, 'quarantined');
+          for (
+            const mutate of [
+              () => delayed.action(conn, id, 'send', 999999),
+              () => delayed.action(conn, id, 'restart', 999999),
+              () => delayed.action(conn, id, 'cancel', 999999),
+              () => delayed.remove(conn, id),
+              () => delayed.retry(conn, [id], 999999),
+              () => delayed.prepare(conn, id, {} as Pdu),
+              () => delayed.finish(conn, id),
+            ]
+          ) {
+            const error = await assertRejects(mutate, MatrixError);
+            assertEquals(error.status, 503);
+          }
+          // Repeated sanitation and an old pending snapshot are not a release.
+          await sanitizeRestoredTenant(conn);
+          await delayed.importOperation(conn, cutFacts[0]);
+          assertEquals(await delayed.due(conn, 999999), []);
+          for (const op of terminal.toReversed()) {
+            await delayed.importOperation(conn, op);
+          }
+          assertEquals(await delayed.get(conn, id), null);
+          assertEquals(
+            await delayed.operations(conn, 'alice'),
+            terminal,
+            'restore retirement authored an echo',
+          );
+          assertEquals(await delayed.receipt(conn, receipt), id);
+        });
+      },
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('facade delayed: foreign delay bearer refuses at its owner boundary', async () => {
   const f = await fixture();
   const worker = new DelayedEvents({ tenant: f.edge, store: f.stores[1] });
@@ -107,6 +199,83 @@ Deno.test('facade delayed: foreign delay bearer refuses at its owner boundary', 
     );
   } finally {
     await worker.stop();
+    await f.close();
+  }
+});
+
+Deno.test('facade delayed restore: quarantine is atomic, preserves evidence and does not change standalone restoration', async () => {
+  const f = await fixture();
+  try {
+    const raw = await f.stores[0].tenant('logical.test');
+    const id = 'legacy-home-schedule';
+    await f.home.tx((tx) => tx.delayedEvents.add(event(id), 10));
+    await f.home.tx((tx) => tx.delayedEvents.claim(id, 999999));
+    const facts = await f.home.tx((tx) => tx.delayedEvents.operations('alice'));
+    await assertRejects(
+      () =>
+        raw.tx(async (conn) => {
+          await sanitizeRestoredTenant(conn);
+          assertEquals(await delayed.due(conn, 999999), []);
+          throw new Error('candidate rollback');
+        }),
+      Error,
+      'candidate rollback',
+    );
+    assertEquals(
+      (await f.home.tx((tx) => tx.delayedEvents.get(id)))!.phase,
+      'sending',
+    );
+    assertEquals(
+      (await f.home.tx((tx) => tx.delayedEvents.due(999999))).length,
+      1,
+    );
+    await raw.tx(sanitizeRestoredTenant);
+    assertEquals(
+      (await f.home.tx((tx) => tx.delayedEvents.get(id)))!.phase,
+      'quarantined',
+    );
+    const worker = new DelayedEvents({ tenant: f.home, store: f.stores[0] });
+    try {
+      const listing = await worker.list('@alice:logical.test');
+      assert('delayed_events' in listing);
+      assertEquals(listing.delayed_events.length, 1);
+      for (
+        const request of [
+          () => worker.list('@alice:logical.test', id),
+          () => worker.action(id, 'send'),
+          () => worker.action(id, 'cancel'),
+        ]
+      ) {
+        const error = await assertRejects(request, MatrixError);
+        assertEquals(error.status, 503);
+      }
+      await worker.drain();
+      assertEquals(await f.home.tx((tx) => tx.delayedEvents.due(999999)), []);
+    } finally {
+      await worker.stop();
+    }
+    await f.home.tx((tx) => tx.users.markDeactivated('alice'));
+    assertEquals(await f.home.tx((tx) => tx.delayedEvents.get(id)), null);
+    assertEquals(
+      await f.home.tx((tx) => tx.delayedEvents.operations('alice')),
+      facts,
+    );
+
+    // A standalone homeserver has no independently advancing schedule replica.
+    const standalone = await f.stores[1].tenant('logical.test');
+    await standalone.execute('DELETE FROM tenant_authority');
+    await f.edge.tx((tx) => tx.delayedEvents.add(event('standalone'), 10));
+    await standalone.tx(sanitizeRestoredTenant);
+    assertEquals(
+      (await f.edge.tx((tx) => tx.delayedEvents.get('standalone')))!.phase,
+      'pending',
+    );
+    assertEquals(
+      (await f.edge.tx((tx) => tx.delayedEvents.claim('standalone', 999999)))!
+        .id,
+      'standalone',
+    );
+  } finally {
     await f.close();
   }
 });

@@ -45,6 +45,27 @@ export async function newId(conn: Conn): Promise<string> {
     crypto.randomUUID();
 }
 
+/** A restored enrolled store cannot prove that a pending command did not run
+ * after its backup cut. Keep its evidence and receipts, but never resume it
+ * from that old row alone. Original terminal imports retire it without echo.
+ * Ordinary restart never invokes this private-candidate sanitation boundary. */
+export async function quarantineRestoredSchedules(conn: Conn): Promise<number> {
+  if (!await tenantAuthority(conn)) return 0;
+  return await conn.execute(
+    "UPDATE delayed_events SET phase='quarantined' WHERE phase!='quarantined'",
+  );
+}
+
+export function requireUnfenced(phase: string): void {
+  if (phase === 'quarantined') {
+    throw new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'restored delayed event requires reconciliation',
+    );
+  }
+}
+
 function semanticKey(localpart: string, id: string): string {
   return JSON.stringify(['delayed-event', localpart, id]);
 }
@@ -80,6 +101,7 @@ async function retain(
     id,
   ]);
   if (!row) return;
+  requireUnfenced(String(row.phase));
   const key = semanticKey(String(row.localpart), id);
   const before = await readRegister(conn, key);
   const phase = terminal ?? String(row.phase);
@@ -336,7 +358,11 @@ async function ownerSelection(conn: Conn) {
 }
 
 export async function removeAll(conn: Conn, localpart: string): Promise<void> {
-  for (const event of await list(conn, localpart)) await remove(conn, event.id);
+  for (const event of await list(conn, localpart)) {
+    // The account tombstone itself retires ambiguous commands. Do not invent a
+    // successor schedule fact from a rolled-back source sequence.
+    if (event.phase !== 'quarantined') await remove(conn, event.id);
+  }
   // Imported or old-incarnation rows are never local execution authority, but
   // account retirement must still clear any retained private materialization.
   await conn.execute('DELETE FROM delayed_events WHERE localpart=?', [
@@ -495,7 +521,9 @@ export async function action(
   now: number,
 ): Promise<void> {
   const event = await get(conn, id);
-  if (event === null || event.phase !== 'pending') notFound();
+  if (event === null) notFound();
+  requireUnfenced(event.phase);
+  if (event.phase !== 'pending') notFound();
   if (action === 'cancel') return await remove(conn, id);
   await retain(conn, id);
   await conn.execute(
@@ -511,7 +539,8 @@ export async function action(
 export async function next(conn: Conn): Promise<number | null> {
   const owner = await ownerSelection(conn);
   const [row] = await conn.query(
-    'SELECT MIN(due_ms) AS n FROM delayed_events WHERE ' + owner.sql,
+    "SELECT MIN(due_ms) AS n FROM delayed_events WHERE phase IN ('pending','sending') AND " +
+      owner.sql,
     owner.params,
   );
   return row.n === null ? null : Number(row.n);
@@ -537,7 +566,8 @@ export async function retry(
 export async function due(conn: Conn, now: number): Promise<DelayedEvent[]> {
   const owner = await ownerSelection(conn);
   return (await conn.query(
-    'SELECT * FROM delayed_events WHERE due_ms<=? AND ' + owner.sql +
+    "SELECT * FROM delayed_events WHERE phase IN ('pending','sending') AND due_ms<=? AND " +
+      owner.sql +
       ' ORDER BY due_ms,id LIMIT 32',
     [now, ...owner.params],
   )).map(eventOf);
@@ -550,7 +580,10 @@ export async function claim(
   const event = await get(conn, id);
   // Selection is only a hint. A concurrent heartbeat may have restarted the
   // deadline before this transaction acquired the command.
-  if (event === null || event.due > now) return null;
+  if (
+    event === null || event.due > now ||
+    !['pending', 'sending'].includes(event.phase)
+  ) return null;
   await retain(conn, id);
   await conn.execute(
     "UPDATE delayed_events SET phase='sending' WHERE id=? AND phase!='sending'",
