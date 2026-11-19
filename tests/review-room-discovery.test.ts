@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { dirname, join } from '@std/path';
 import { startHttp } from '#tests/http-app.ts';
+import { setConfigForTests } from '#engine/config.ts';
 import { genesis } from '#tests/fixtures/genesis.ts';
 import { registerRoom } from '#engine/server/registry.ts';
 import { summaryAccessible } from '#engine/client/discovery.ts';
@@ -10,9 +11,13 @@ import {
 } from '#engine/room/operator.ts';
 
 Deno.test('summary admission: native reads return only the exact origin, including ports and IPv6', async () => {
+  setConfigForTests({ server: { name: 'test' } });
   const http = await startHttp();
   try {
-    const g = await genesis(http.app.store, { roomId: '!origin-summary:test' });
+    const g = await genesis(http.app.store, {
+      roomId: '!origin-summary:test',
+      signer: http.app.tenant.signer(),
+    });
     const server = http.app.server;
     await server.tx(async (tx) => {
       for (let i = 0; i < 200; i++) {
@@ -69,13 +74,18 @@ Deno.test('summary admission: native reads return only the exact origin, includi
     }
   } finally {
     await http.close();
+    setConfigForTests({});
   }
 });
 
 Deno.test('review discovery: an absent database is skipped without creating an empty file', async () => {
+  setConfigForTests({ server: { name: 'test' } });
   const http = await startHttp();
   try {
-    const g = await genesis(http.app.store, { roomId: '!healthy:test' });
+    const g = await genesis(http.app.store, {
+      roomId: '!healthy:test',
+      signer: http.app.tenant.signer(),
+    });
     const db = await http.app.store.room(g.roomId);
     const absent = join(dirname(dirname(db.path)), 'empty');
     await Deno.mkdir(absent);
@@ -86,14 +96,19 @@ Deno.test('review discovery: an absent database is skipped without creating an e
     );
   } finally {
     await http.close();
+    setConfigForTests({});
   }
 });
 
 Deno.test('review discovery: one stale registry entry cannot break offered listing or purge', async () => {
+  setConfigForTests({ server: { name: 'test' } });
   const http = await startHttp();
   try {
     const app = http.app;
-    const g = await genesis(app.store, { roomId: '!healthy:test' });
+    const g = await genesis(app.store, {
+      roomId: '!healthy:test',
+      signer: app.tenant.signer(),
+    });
     await registerRoom(app.store, g.roomId);
     await registerRoom(app.store, '!absent:test');
     for (const id of [g.roomId, '!absent:test']) {
@@ -114,5 +129,6 @@ Deno.test('review discovery: one stale registry entry cannot break offered listi
     }]);
   } finally {
     await http.close();
+    setConfigForTests({});
   }
 });

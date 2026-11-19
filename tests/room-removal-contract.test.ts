@@ -1,6 +1,7 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { dropOperatorRoom } from '#engine/room/operator.ts';
 import { startHttp } from '#tests/http-app.ts';
+import { setConfigForTests } from '#engine/config.ts';
 import { genesis } from '#tests/fixtures/genesis.ts';
 
 // Independent of removal.ts: a new room-keyed server table must choose its
@@ -50,11 +51,13 @@ const retained = [
 ];
 
 Deno.test('operator unlink clears every registered per-room server table', async () => {
+  setConfigForTests({ server: { name: 'test' } });
   const http = await startHttp();
   try {
     const app = http.app;
-    const gone = await genesis(app.store, { roomId: '!gone:test' });
-    const kept = await genesis(app.store, { roomId: '!kept:test' });
+    const signer = app.tenant.signer();
+    const gone = await genesis(app.store, { roomId: '!gone:test', signer });
+    const kept = await genesis(app.store, { roomId: '!kept:test', signer });
     const tables = new Map<
       string,
       { name: string; type: string; notnull: number; dflt_value: unknown }[]
@@ -160,5 +163,6 @@ Deno.test('operator unlink clears every registered per-room server table', async
     }
   } finally {
     await http.close();
+    setConfigForTests({});
   }
 });
