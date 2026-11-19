@@ -146,6 +146,44 @@ Deno.test('inbox rejections fail their own tail without poisoning independent st
   assertEquals(await independent, expected);
 });
 
+Deno.test('a recovered inbox prefix does not poison a later finite tail or clear a newer refusal', async () => {
+  const observations = new FacadeObservations();
+  const first = record('directory'), next = record('directory', 2);
+  const scope = {
+    peer: 'home',
+    source: first.source,
+    incarnation: first.incarnation,
+    stream: first.stream,
+    after: 0,
+  };
+  observations.accept({
+    kind: 'failure',
+    operation: 'inbox directory',
+    error: 'LINK_BAD_RECORD',
+    scope,
+  });
+  observations.accept({ kind: 'applied', peer: 'home', record: first });
+  const pending = observations.fact(
+    scope,
+    (record) => record.hash === next.hash,
+  ).catch((error) => error);
+  observations.accept({ kind: 'applied', peer: 'home', record: next });
+  assertEquals(await pending, next);
+  const newer = { ...scope, after: 2 };
+  observations.accept({
+    kind: 'failure',
+    operation: 'inbox directory',
+    error: 'LINK_DIVERGED',
+    scope: newer,
+  });
+  observations.accept({ kind: 'applied', peer: 'home', record: first });
+  await assertRejects(
+    () => observations.fact(scope, (record) => record.sequence === 3),
+    Error,
+    'LINK_DIVERGED',
+  );
+});
+
 Deno.test('facade observations bind fact completion to the peer and source incarnation', async () => {
   const observations = new FacadeObservations();
   const expected = record();

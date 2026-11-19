@@ -19,6 +19,7 @@ import {
   FacadeHealthConnections,
   type FacadeObservation,
   observationPrefix,
+  type ObservationScope,
   observeJournalApplication,
   publicationCommand,
 } from '#tests/helpers/facade-process.ts';
@@ -37,7 +38,7 @@ function failure(
   operation: string,
   error: unknown,
   kind: 'failure' | 'blocked' = 'failure',
-  scope?: import('#engine/facade/protocol.ts').Stream & { peer: string },
+  scope?: ObservationScope,
 ) {
   emit({
     kind,
@@ -54,7 +55,7 @@ function failure(
 // Domain validation can refuse before entering Journal.apply/complete. Observe
 // the inbox owner's complete failure boundary, not only its transaction subset.
 const inboxFailed = InboxWorker.prototype.failed;
-InboxWorker.prototype.failed = function (error, stream) {
+InboxWorker.prototype.failed = function (error, stream, after) {
   // Independent streams may legitimately await their control/history facts.
   // Retain that typed retry observation without declaring a terminal refusal.
   failure(
@@ -63,9 +64,9 @@ InboxWorker.prototype.failed = function (error, stream) {
     error instanceof LinkError && error.code === 'LINK_UNAVAILABLE'
       ? 'blocked'
       : 'failure',
-    stream ? { ...stream, peer: this.peer } : undefined,
+    stream ? { ...stream, peer: this.peer, after } : undefined,
   );
-  inboxFailed.call(this, error, stream);
+  inboxFailed.call(this, error, stream, after);
 };
 
 for (const name of JSON.parse(Deno.env.get('FACADE_TEST_HOLDS') ?? '[]')) {

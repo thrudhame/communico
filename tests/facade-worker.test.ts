@@ -95,8 +95,9 @@ Deno.test('inbox reports the original pre-apply rejection without blocking anoth
       through++;
       return Promise.resolve(true);
     },
-    failed: (error, stream) => {
+    failed: (error, stream, after) => {
       assertEquals(stream, streams[0]);
+      assertEquals(after, 0);
       failed.resolve(error);
     },
     changed: () => applied.resolve(),

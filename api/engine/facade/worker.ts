@@ -322,7 +322,7 @@ type InboxOptions = {
   pollseconds: number;
   apply(stream: Stream): Promise<boolean>;
   changed(): void;
-  failed(error: unknown, stream?: Stream): void;
+  failed(error: unknown, stream?: Stream, after?: number): void;
 };
 
 export function startInboxWorker(options: InboxOptions) {
@@ -339,8 +339,8 @@ export class InboxWorker {
 
   /** One failure boundary includes domain validation before Journal.apply as
    * well as transaction failures. Callers must not infer failure from logging. */
-  failed(error: unknown, stream?: Stream): void {
-    this.options.failed(error, stream);
+  failed(error: unknown, stream?: Stream, after?: number): void {
+    this.options.failed(error, stream, after);
   }
 
   constructor(private readonly options: InboxOptions) {
@@ -372,8 +372,9 @@ export class InboxWorker {
                   try {
                     do {
                       rerun.delete(id);
+                      let applied: number | undefined;
                       try {
-                        let applied = (await options.journal.heads(
+                        applied = (await options.journal.heads(
                           options.peer,
                           'in',
                           stream,
@@ -395,7 +396,7 @@ export class InboxWorker {
                           options.changed();
                         }
                       } catch (error) {
-                        this.failed(error, stream);
+                        this.failed(error, stream, applied);
                       }
                     } while (!stopped && rerun.delete(id));
                   } finally {

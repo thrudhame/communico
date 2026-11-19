@@ -8,6 +8,7 @@ import { bounded, pause } from './server-process.ts';
 import { childDiagnostics } from './child-diagnostics.ts';
 
 export const observationPrefix = 'facade-test: ';
+export type ObservationScope = Stream & { peer: string; after?: number };
 export type FacadeObservation =
   | { kind: 'applied'; peer: string; record: LinkRecord }
   | { kind: 'pairing'; id: string; state: 'paired' | 'revoked' }
@@ -27,7 +28,7 @@ export type FacadeObservation =
     kind: 'failure' | 'blocked';
     operation: string;
     error: string;
-    scope?: Stream & { peer: string };
+    scope?: ObservationScope;
   };
 
 export type PublicationCommand =
@@ -128,11 +129,22 @@ export class FacadeObservations {
   private readonly history: FacadeObservation[] = [];
   private readonly waiting = new Set<{
     matches(event: FacadeObservation): boolean;
-    failureMatches(scope: Stream & { peer: string }): boolean;
+    failureMatches(scope: ObservationScope): boolean;
     resolve(event: FacadeObservation): void;
     reject(error: Error): void;
   }>();
   private failure: Error | undefined;
+
+  private recovered(scope: ObservationScope): boolean {
+    const after = scope.after;
+    return after !== undefined &&
+      this.history.some((event) =>
+        event.kind === 'applied' && event.peer === scope.peer &&
+        event.record.source === scope.source &&
+        event.record.incarnation === scope.incarnation &&
+        event.record.stream === scope.stream && event.record.sequence > after
+      );
+  }
 
   accept(event: FacadeObservation) {
     if (event.kind === 'failure') {
@@ -140,6 +152,7 @@ export class FacadeObservations {
       if (!event.scope) this.close(error);
       else {
         this.history.push(event);
+        if (this.recovered(event.scope)) return;
         for (const pending of this.waiting) {
           if (pending.failureMatches(event.scope)) {
             this.waiting.delete(pending);
@@ -171,7 +184,7 @@ export class FacadeObservations {
   wait(
     matches: (event: FacadeObservation) => boolean,
     after = 0,
-    failureMatches: (scope: Stream & { peer: string }) => boolean = () => false,
+    failureMatches: (scope: ObservationScope) => boolean = () => false,
   ) {
     if (this.failure) return Promise.reject(this.failure);
     const history = this.history.slice(after);
@@ -180,7 +193,8 @@ export class FacadeObservations {
     // A later durable completion supersedes an earlier rejected attempt. If
     // this caller's fact is still missing, retain and surface its own refusal.
     const refusal = history.find((event) =>
-      event.kind === 'failure' && event.scope && failureMatches(event.scope)
+      event.kind === 'failure' && event.scope && failureMatches(event.scope) &&
+      !this.recovered(event.scope)
     );
     if (refusal && (refusal.kind === 'failure')) {
       return Promise.reject(
