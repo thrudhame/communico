@@ -2,12 +2,18 @@
 // and in memory; diagnostics must never print their credential-bearing payloads.
 import { assert, assertEquals } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
-import type { Cut, LinkRecord, Stream } from '#engine/facade/protocol.ts';
+import {
+  type Cut,
+  LinkError,
+  type LinkRecord,
+  type Stream,
+} from '#engine/facade/protocol.ts';
 import type { Journal } from '#engine/facade/journal.ts';
 import { bounded, pause } from './server-process.ts';
 import { childDiagnostics } from './child-diagnostics.ts';
 
 export const observationPrefix = 'facade-test: ';
+export type ObservationScope = Stream & { peer: string; after?: number };
 export type FacadeObservation =
   | { kind: 'applied'; peer: string; record: LinkRecord }
   | { kind: 'pairing'; id: string; state: 'paired' | 'revoked' }
@@ -23,11 +29,55 @@ export type FacadeObservation =
     hash?: string;
   }
   | { kind: 'publication'; name: string; state: 'armed' | 'held' | 'released' }
-  | { kind: 'failure'; operation: string; error: string };
+  | {
+    kind: 'failure' | 'blocked';
+    operation: string;
+    error: string;
+    scope?: ObservationScope;
+  };
 
 export type PublicationCommand =
   | { action: 'hold' | 'release'; name: string }
   | { action: 'fence'; id: string };
+
+export function facadeFailure(
+  operation: string,
+  error: unknown,
+  scope?: ObservationScope,
+): FacadeObservation {
+  return {
+    kind: error instanceof LinkError && error.code === 'LINK_UNAVAILABLE'
+      ? 'blocked'
+      : 'failure',
+    operation,
+    error: error instanceof LinkError
+      ? error.code
+      : error instanceof Error
+      ? error.name
+      : 'unknown error',
+    ...(scope ? { scope } : {}),
+  };
+}
+
+type FailureReporter = (
+  operation: string,
+  error: unknown,
+  scope?: ObservationScope,
+) => void;
+
+export function applicationScope(
+  peer: string,
+  stream: Stream,
+  after?: number,
+): ObservationScope {
+  return {
+    peer,
+    source: stream.source,
+    incarnation: stream.incarnation,
+    stream: stream.stream,
+    after,
+  };
+}
 const publications = new Map<
   string,
   ReturnType<typeof Promise.withResolvers<void>>
@@ -72,12 +122,14 @@ export function publicationCommand(
 export function observeJournalApplication(
   apply: Journal['apply'],
   completed: (peer: string, record: LinkRecord) => void,
-  failure: (operation: string, error: unknown) => void,
+  failure: FailureReporter,
 ): Journal['apply'] {
   return async function (this: Journal, ...args) {
     const [peer, stream, handler] = args;
     let committed: LinkRecord | undefined;
+    let after: number | undefined;
     try {
+      after = (await this.heads(peer, 'in', stream)).applied.sequence;
       args[2] = async (conn, record) => {
         committed = undefined;
         const result = await handler(conn, record);
@@ -88,7 +140,42 @@ export function observeJournalApplication(
       if (result && committed) completed(peer, committed);
       return result;
     } catch (error) {
-      failure('journal apply ' + stream.stream, error);
+      failure(
+        'journal apply ' + stream.stream,
+        error,
+        applicationScope(peer, stream, after),
+      );
+      throw error;
+    }
+  };
+}
+
+export function observeJournalCompletion(
+  complete: Journal['complete'],
+  completed: (peer: string, record: LinkRecord) => void,
+  failure: FailureReporter,
+): Journal['complete'] {
+  return async function (this: Journal, peer, stream, cut, result) {
+    let after: number | undefined;
+    try {
+      after = (await this.heads(peer, 'in', stream)).applied.sequence;
+      const heads = await complete.call(this, peer, stream, cut, result);
+      const page = await this.page(peer, 'in', stream, cut.sequence - 1, {
+        maxItems: 1,
+        maxBytes: Number.MAX_SAFE_INTEGER,
+      });
+      const record = page.records[0];
+      if (!record || record.hash !== cut.hash) {
+        throw new Error('completed record disappeared');
+      }
+      completed(peer, record);
+      return heads;
+    } catch (error) {
+      failure(
+        'journal complete ' + stream.stream,
+        error,
+        applicationScope(peer, stream, after),
+      );
       throw error;
     }
   };
@@ -123,14 +210,37 @@ export class FacadeObservations {
   private readonly history: FacadeObservation[] = [];
   private readonly waiting = new Set<{
     matches(event: FacadeObservation): boolean;
+    failureMatches(scope: ObservationScope): boolean;
     resolve(event: FacadeObservation): void;
     reject(error: Error): void;
   }>();
   private failure: Error | undefined;
 
+  private recovered(scope: ObservationScope): boolean {
+    const after = scope.after;
+    return after !== undefined &&
+      this.history.some((event) =>
+        event.kind === 'applied' && event.peer === scope.peer &&
+        event.record.source === scope.source &&
+        event.record.incarnation === scope.incarnation &&
+        event.record.stream === scope.stream && event.record.sequence > after
+      );
+  }
+
   accept(event: FacadeObservation) {
     if (event.kind === 'failure') {
-      this.close(new Error(`${event.operation}: ${event.error}`));
+      const error = new Error(`${event.operation}: ${event.error}`);
+      if (!event.scope) this.close(error);
+      else {
+        this.history.push(event);
+        if (this.recovered(event.scope)) return;
+        for (const pending of this.waiting) {
+          if (pending.failureMatches(event.scope)) {
+            this.waiting.delete(pending);
+            pending.reject(error);
+          }
+        }
+      }
       return;
     }
     this.history.push(event);
@@ -152,12 +262,28 @@ export class FacadeObservations {
     return this.history.length;
   }
 
-  wait(matches: (event: FacadeObservation) => boolean, after = 0) {
+  wait(
+    matches: (event: FacadeObservation) => boolean,
+    after = 0,
+    failureMatches: (scope: ObservationScope) => boolean = () => false,
+  ) {
     if (this.failure) return Promise.reject(this.failure);
-    const held = this.history.slice(after).find(matches);
+    const history = this.history.slice(after);
+    const held = history.find(matches);
     if (held) return Promise.resolve(held);
+    // A later durable completion supersedes an earlier rejected attempt. If
+    // this caller's fact is still missing, retain and surface its own refusal.
+    const refusal = history.find((event) =>
+      event.kind === 'failure' && event.scope && failureMatches(event.scope) &&
+      !this.recovered(event.scope)
+    );
+    if (refusal && (refusal.kind === 'failure')) {
+      return Promise.reject(
+        new Error(`${refusal.operation}: ${refusal.error}`),
+      );
+    }
     return new Promise<FacadeObservation>((resolve, reject) => {
-      this.waiting.add({ matches, resolve, reject });
+      this.waiting.add({ matches, failureMatches, resolve, reject });
     });
   }
 
@@ -171,6 +297,7 @@ export class FacadeObservations {
         event.kind === 'applied' && event.record.stream === stream &&
         matches(event.record),
       after,
+      (scope) => scope.stream === stream,
     );
     assert(event.kind === 'applied');
     return event.record;
@@ -188,6 +315,10 @@ export class FacadeObservations {
         event.record.incarnation === identity.incarnation &&
         event.record.stream === identity.stream && matches(event.record),
       after,
+      (scope) =>
+        scope.peer === identity.peer && scope.source === identity.source &&
+        scope.incarnation === identity.incarnation &&
+        scope.stream === identity.stream,
     );
     assert(event.kind === 'applied');
     return event.record;
