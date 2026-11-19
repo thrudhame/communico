@@ -329,3 +329,231 @@ Deno.test('pusher import: legacy home capture is idempotent, keeps added time an
     await f.close();
   }
 });
+
+Deno.test('pusher removal: kind=null retires observed foreign registrations and survives late refresh', async () => {
+  const f = await fixture();
+  try {
+    await setPusher(f.ht, 'alice', f.token, input);
+    const refresh = await issueRefreshToken(f.ht, 'alice', 'PUSH', f.token);
+    const rotated = await consumeRefreshToken(f.ht, refresh);
+    const [put, moved] = await f.ht.tx((tx) => tx.pushers.operations('alice'));
+    await f.syncSessions();
+    await f.et.tx((tx) => tx.pushers.import(put));
+    const edgeToken = await issueToken(f.et, 'alice', 'EDGE');
+    await setPusher(f.et, 'alice', edgeToken, { ...input, kind: null });
+    const nulls = (await f.et.tx((tx) => tx.pushers.operations('alice')))
+      .filter((op) => op.payload === 'null');
+    assertEquals(nulls.length, 1);
+    assertEquals(nulls[0].semanticKey, put.semanticKey);
+    assertEquals(nulls[0].source, 'edge');
+    assertEquals(nulls[0].context.length, 1);
+    await f.et.tx((tx) => tx.pushers.import(moved));
+    await f.ht.tx((tx) => tx.pushers.import(nulls[0]));
+    assertEquals(await f.hd.query('SELECT * FROM pushers'), []);
+    assertEquals(await f.ed.query('SELECT * FROM pushers'), []);
+    const before = await f.et.tx((tx) => tx.pushers.operations('alice'));
+    await setPusher(f.et, 'alice', edgeToken, { ...input, kind: null });
+    assertEquals(await f.et.tx((tx) => tx.pushers.operations('alice')), before);
+    await setPusher(f.ht, 'alice', rotated.accessToken, input);
+    const [replacement] = await f.hd.query('SELECT * FROM pushers');
+    await f.ht.tx((tx) => tx.pushers.import(nulls[0]));
+    assertEquals(await f.hd.query('SELECT * FROM pushers'), [replacement]);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('pusher removal: replacement retires the observed foreign incarnation, never another account with append=true', async () => {
+  const f = await fixture();
+  try {
+    const bob = await issueToken(f.ht, 'bob', 'BOB');
+    for (const [user, token] of [['alice', f.token], ['bob', bob]]) {
+      await setPusher(f.ht, user, token, input);
+      const view = await f.hd.tx((conn) => captureSessionAuthority(conn, user));
+      await f.ed.tx((conn) => installSessionAuthority(conn, user, view));
+      for (const op of await f.ht.tx((tx) => tx.pushers.operations(user))) {
+        await f.et.tx((tx) => tx.pushers.import(op));
+      }
+    }
+    const edgeToken = await issueToken(f.et, 'alice', 'EDGE');
+    await setPusher(f.et, 'alice', edgeToken, input);
+    const nulls = (await f.et.tx((tx) => tx.pushers.operations('alice')))
+      .filter((op) => op.payload === 'null');
+    assertEquals(nulls.length, 1);
+    assertEquals(
+      (await f.et.tx((tx) => tx.pushers.operations('bob')))
+        .filter((op) => op.payload === 'null'),
+      [],
+    );
+    await f.ht.tx((tx) => tx.pushers.import(nulls[0]));
+    assertEquals(await f.hd.query('SELECT localpart FROM pushers'), [{
+      localpart: 'bob',
+    }]);
+    assertEquals(await f.ed.query('SELECT localpart FROM pushers'), [{
+      localpart: 'alice',
+    }]);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('pusher removal: observed-other-user and terminal-account removal include protected facts', async (t) => {
+  for (const action of ['other-user', 'user', 'token'] as const) {
+    await t.step(action, async () => {
+      const f = await fixture();
+      try {
+        await setPusher(f.ht, 'alice', f.token, input);
+        const [put] = await f.ht.tx((tx) => tx.pushers.operations('alice'));
+        await f.syncSessions();
+        await f.et.tx((tx) => tx.pushers.import(put));
+        if (action === 'other-user') {
+          const bob = await issueToken(f.et, 'bob', 'BOB');
+          await setPusher(f.et, 'bob', bob, { ...input, append: false });
+        } else if (action === 'user') {
+          await f.et.tx((tx) => tx.pushers.deleteForUser('alice'));
+        } else {
+          const { hashToken } = await import('#engine/tenant/auth.ts');
+          const hash = await hashToken(f.token);
+          await f.et.tx((tx) => tx.pushers.deleteForToken(hash));
+        }
+        const nulls = (await f.et.tx((tx) => tx.pushers.operations('alice')))
+          .filter((op) => op.payload === 'null');
+        assertEquals(nulls.length, 1);
+        await f.ht.tx((tx) => tx.pushers.import(nulls[0]));
+        assertEquals(await f.hd.query('SELECT * FROM pushers'), []);
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('pusher removal: a pending foreign refresh is observed and fenced before its predecessor arrives', async () => {
+  const f = await fixture();
+  try {
+    await setPusher(f.ht, 'alice', f.token, input);
+    const refresh = await issueRefreshToken(f.ht, 'alice', 'PUSH', f.token);
+    await consumeRefreshToken(f.ht, refresh);
+    const [put, moved] = await f.ht.tx((tx) => tx.pushers.operations('alice'));
+    await f.syncSessions();
+    await f.et.tx((tx) => tx.pushers.import(moved));
+    const edgeToken = await issueToken(f.et, 'alice', 'EDGE');
+    await setPusher(f.et, 'alice', edgeToken, { ...input, kind: null });
+    const nulls = (await f.et.tx((tx) => tx.pushers.operations('alice')))
+      .filter((op) => op.payload === 'null');
+    assertEquals(nulls.length, 1);
+    await f.et.tx((tx) => tx.pushers.import(put));
+    await f.ht.tx((tx) => tx.pushers.import(nulls[0]));
+    assertEquals(await f.hd.query('SELECT * FROM pushers'), []);
+    assertEquals(await f.ed.query('SELECT * FROM pushers'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('pusher removal: historical token revocation preserves the refreshed foreign registration', async () => {
+  const f = await fixture();
+  try {
+    await setPusher(f.ht, 'alice', f.token, input);
+    const refresh = await issueRefreshToken(f.ht, 'alice', 'PUSH', f.token);
+    const rotated = await consumeRefreshToken(f.ht, refresh);
+    await f.syncSessions();
+    for (const op of await f.ht.tx((tx) => tx.pushers.operations('alice'))) {
+      await f.et.tx((tx) => tx.pushers.import(op));
+    }
+    const { hashToken } = await import('#engine/tenant/auth.ts');
+    const oldHash = await hashToken(f.token);
+    const newHash = await hashToken(rotated.accessToken);
+    const before = await f.et.tx((tx) => tx.pushers.operations('alice'));
+    await f.et.tx((tx) => tx.pushers.deleteForToken(oldHash));
+    assertEquals(await f.et.tx((tx) => tx.pushers.operations('alice')), before);
+    await f.et.tx((tx) => tx.pushers.deleteForToken(newHash));
+    const nulls = (await f.et.tx((tx) => tx.pushers.operations('alice')))
+      .filter((op) => op.payload === 'null');
+    assertEquals(nulls.length, 1);
+    await f.ht.tx((tx) => tx.pushers.import(nulls[0]));
+    assertEquals(await f.hd.query('SELECT * FROM pushers'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('pusher removal: retained cancellation failure rolls back native cancellation and replacement too', async (t) => {
+  for (const action of ['remove', 'replace'] as const) {
+    await t.step(action, async () => {
+      const f = await fixture();
+      try {
+        await setPusher(f.ht, 'alice', f.token, input);
+        await f.syncSessions();
+        const [foreign] = await f.ht.tx((tx) => tx.pushers.operations('alice'));
+        const edgeToken = await issueToken(f.et, 'alice', 'EDGE');
+        await setPusher(f.et, 'alice', edgeToken, input);
+        await f.et.tx((tx) => tx.pushers.import(foreign));
+        const rows = await f.ed.query('SELECT * FROM pushers');
+        const changes = await f.ed.query('SELECT * FROM pusher_changes');
+        const operations = await f.et.tx((tx) =>
+          tx.pushers.operations('alice')
+        );
+        const incarnation = JSON.parse(foreign.semanticKey)[4];
+        await f.ed.exec(
+          `CREATE TRIGGER refuse_foreign_removal BEFORE INSERT ON domain_operations
+           WHEN NEW.payload_json='null' AND json_extract(NEW.semantic_key,'$[4]')='${incarnation}'
+           BEGIN SELECT RAISE(ABORT,'fixture retained cancellation failure'); END`,
+        );
+        await assertRejects(() =>
+          setPusher(f.et, 'alice', edgeToken, {
+            ...input,
+            kind: action === 'remove' ? null : 'http',
+          })
+        );
+        assertEquals(await f.ed.query('SELECT * FROM pushers'), rows);
+        assertEquals(await f.ed.query('SELECT * FROM pusher_changes'), changes);
+        assertEquals(
+          await f.et.tx((tx) => tx.pushers.operations('alice')),
+          operations,
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('pusher removal: importing terminal authority cancels execution without authoring new pusher history', async (t) => {
+  for (const native of [false, true]) {
+    await t.step(
+      native ? 'issuer-local row' : 'foreign recovery only',
+      async () => {
+        const f = await fixture();
+        try {
+          await setPusher(f.ht, 'alice', f.token, input);
+          await f.syncSessions();
+          const [put] = await f.ht.tx((tx) => tx.pushers.operations('alice'));
+          await f.et.tx((tx) => tx.pushers.import(put));
+          const { deactivateUser } = await import('#engine/tenant/users.ts');
+          const source = native ? f.et : f.ht;
+          const target = native ? f.ht : f.et;
+          const sourceDb = native ? f.ed : f.hd;
+          const targetDb = native ? f.hd : f.ed;
+          await deactivateUser(source, 'alice');
+          const before = await target.tx((tx) =>
+            tx.pushers.operations('alice')
+          );
+          const view = await sourceDb.tx((conn) =>
+            captureSessionAuthority(conn, 'alice')
+          );
+          await targetDb.tx((conn) =>
+            installSessionAuthority(conn, 'alice', view)
+          );
+          assertEquals(await targetDb.query('SELECT * FROM pushers'), []);
+          assertEquals(
+            await target.tx((tx) => tx.pushers.operations('alice')),
+            before,
+          );
+        } finally {
+          await f.close();
+        }
+      },
+    );
+  }
+});

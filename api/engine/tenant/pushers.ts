@@ -13,6 +13,7 @@ import {
 } from '#engine/tenant/session-authority.ts';
 import {
   importRegisterOperation,
+  readRegister,
   registerJson,
   type RegisterOperation,
   registerOperations,
@@ -267,16 +268,89 @@ export async function recordPusherChange(
   );
 }
 
+type PusherMatch = {
+  localpart?: string;
+  notLocalpart?: string;
+  appId?: string;
+  pushkey?: string;
+  incarnation?: string;
+  accessHash?: string;
+};
+
+function pusherWhere(match: PusherMatch, semantic = false) {
+  const columns = semantic
+    ? {
+      localpart: "json_extract(semantic_key,'$[1]')",
+      notLocalpart: "json_extract(semantic_key,'$[1]')",
+      appId: "json_extract(semantic_key,'$[2]')",
+      pushkey: "json_extract(semantic_key,'$[3]')",
+      incarnation: "json_extract(semantic_key,'$[4]')",
+      accessHash: null,
+    }
+    : {
+      localpart: 'localpart',
+      notLocalpart: 'localpart',
+      appId: 'app_id',
+      pushkey: 'pushkey',
+      incarnation: 'incarnation',
+      accessHash: 'access_token',
+    };
+  const terms: string[] = semantic ? ["kind='pusher'"] : [];
+  const args: string[] = [];
+  for (const name of Object.keys(columns) as (keyof PusherMatch)[]) {
+    if (match[name] === undefined || columns[name] === null) continue;
+    terms.push(columns[name] + (name === 'notLocalpart' ? '<>?' : '=?'));
+    args.push(match[name]!);
+  }
+  return { where: terms.join(' AND '), args };
+}
+
+/** Registrations have one removal owner whether locally executable or retained
+ * only as foreign recovery facts. Observe pending puts too: an exact-incarnation
+ * null is a fence even without that put's complete causal ancestry. */
+async function retirePusherOperations(conn: Conn, match: PusherMatch) {
+  const { where, args } = pusherWhere(match, true);
+  const keys = await conn.query(
+    'SELECT DISTINCT semantic_key FROM domain_operations WHERE ' + where,
+    args,
+  );
+  for (const row of keys) {
+    const key = String(row.semantic_key);
+    const operations = await registerOperations(conn, key);
+    if (operations.some((op) => op.payload === 'null')) continue;
+    if (match.accessHash !== undefined) {
+      // A revoked predecessor digest must not remove an incarnation already
+      // moved by refresh. Historical digests are not current token ownership.
+      const view = await readRegister(conn, key);
+      if (
+        !view.winner ||
+        pusherOperation(view.winner).value?.accessHash !== match.accessHash
+      ) continue;
+    }
+    const [, localpart, app_id, pushkey, incarnation] =
+      pusherOperation(operations[0]).key;
+    await recordPusherOperation(conn, {
+      localpart,
+      app_id,
+      pushkey,
+      incarnation,
+    }, true);
+  }
+}
+
 async function deleteMatching(
   conn: Conn,
-  where: string,
-  args: (string | number)[],
+  match: PusherMatch,
+  record = true,
 ): Promise<void> {
+  // Imported authority projects cancellation, not another local source fact.
+  const { where, args } = pusherWhere(match);
   const rows = await conn.query('SELECT * FROM pushers WHERE ' + where, args);
   for (const row of rows) {
-    await recordPusherOperation(conn, row, true);
+    if (record) await recordPusherOperation(conn, row, true);
     await recordPusherChange(conn, row, true);
   }
+  if (record) await retirePusherOperations(conn, match);
   await conn.execute('DELETE FROM pushers WHERE ' + where, args);
 }
 
@@ -301,15 +375,17 @@ export async function movePusherToken(
 export async function deletePushersForToken(
   conn: Conn,
   accessHash: string,
+  record = true,
 ): Promise<void> {
-  await deleteMatching(conn, 'access_token = ?', [accessHash]);
+  await deleteMatching(conn, { accessHash }, record);
 }
 
 export async function deletePushersOfUser(
   conn: Conn,
   localpart: string,
+  record = true,
 ): Promise<void> {
-  await deleteMatching(conn, 'localpart = ?', [localpart]);
+  await deleteMatching(conn, { localpart }, record);
 }
 
 export type PusherRow = {
@@ -343,11 +419,7 @@ export async function deletePusherRow(
   appId: string,
   pushkey: string,
 ): Promise<void> {
-  await deleteMatching(conn, 'localpart = ? AND app_id = ? AND pushkey = ?', [
-    localpart,
-    appId,
-    pushkey,
-  ]);
+  await deleteMatching(conn, { localpart, appId, pushkey });
 }
 
 /** Rejection of an old in-flight request cannot remove a new registration. */
@@ -358,11 +430,7 @@ export async function deleteRejectedPusher(
   pushkey: string,
   incarnation: string,
 ): Promise<void> {
-  await deleteMatching(
-    conn,
-    'localpart=? AND app_id=? AND pushkey=? AND incarnation=?',
-    [localpart, appId, pushkey, incarnation],
-  );
+  await deleteMatching(conn, { localpart, appId, pushkey, incarnation });
 }
 
 export async function upsertPusherRow(
@@ -380,6 +448,11 @@ export async function upsertPusherRow(
       [localpart, pusher.app_id, pusher.pushkey],
     )
   ) await recordPusherOperation(conn, row, true);
+  await retirePusherOperations(conn, {
+    localpart,
+    appId: pusher.app_id,
+    pushkey: pusher.pushkey,
+  });
   const incarnation = crypto.randomUUID();
   const added = Date.now();
   await conn.execute(
@@ -518,11 +591,7 @@ export async function deleteOtherPusherUsers(
   appId: string,
   pushkey: string,
 ): Promise<void> {
-  await deleteMatching(conn, 'localpart<>? AND app_id=? AND pushkey=?', [
-    localpart,
-    appId,
-    pushkey,
-  ]);
+  await deleteMatching(conn, { notLocalpart: localpart, appId, pushkey });
 }
 
 /** The caller's pushers — never returns access_token. */

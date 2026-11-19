@@ -857,7 +857,7 @@ export async function installSessionAuthority(
           throw error;
         }
         if (table === 'access_tokens') {
-          await deletePushersForToken(conn, hash);
+          await deletePushersForToken(conn, hash, false);
           await conn.execute(
             'DELETE FROM refresh_tokens WHERE access_token=?',
             [hash],

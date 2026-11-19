@@ -503,7 +503,7 @@ export async function deactivateUserRows(
     await recordDeactivation(conn, localpart, erasureCuts !== undefined);
   }
   if (erasureCuts !== undefined) await markErased(conn, localpart, erasureCuts);
-  await deletePushersOfUser(conn, localpart);
+  await deletePushersOfUser(conn, localpart, !imported);
   await clearOpenId(conn, localpart);
   await deleteRefreshTokensOfUser(conn, localpart, !imported);
   await deleteAccessTokensOfUser(conn, localpart, !imported);
