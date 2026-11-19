@@ -45,6 +45,7 @@ import {
 import { projectTenant } from '#engine/server/project-tenant.ts';
 import { startNotificationHistory } from '#engine/server/notification-history.ts';
 import { type PushSender, startPushSender } from '#engine/push/sender.ts';
+import { DelayedEvents } from '#engine/delayed-events.ts';
 import {
   AccountSnapshots,
   exportSessionAuthority,
@@ -112,6 +113,7 @@ export async function openFacadeRuntime(
   let deviceEdus: EduState | undefined;
   let sender: Sender | undefined;
   let pushSender: Promise<PushSender> | undefined;
+  let delayedEvents: DelayedEvents | undefined;
   let closed: Promise<void> | undefined;
   let refreshing = Promise.resolve();
   let roomExports: ReturnType<typeof startRoomExports> | undefined;
@@ -459,6 +461,11 @@ export async function openFacadeRuntime(
   const releaseServices = async () => {
     await drainResources([
       async () => {
+        const service = delayedEvents;
+        delayedEvents = undefined;
+        await service?.stop();
+      },
+      async () => {
         const pending = pushSender;
         pushSender = undefined;
         await (await pending)?.stop();
@@ -488,6 +495,23 @@ export async function openFacadeRuntime(
     requestSigner: async () => (await keyOwner()).requestSigner(),
     prepareSigner: async () => (await keyOwner()).prepareSigner(),
     releaseServices,
+    async delayedEvents(granted: Tenant) {
+      if (!caps.service('delayed')) return undefined;
+      await (await pairings()).active();
+      if (closed || !tenant) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'delayed service requires enrollment',
+        );
+      }
+      return delayedEvents ??= new DelayedEvents({ store, tenant: granted }, {
+        admitRoom: async (roomId) => {
+          await new DirectoryReplicas(server, await pairings(), identity.server)
+            .requireScope('room:' + roomId);
+        },
+      });
+    },
     async pushSender() {
       if (!caps.service('push')) return undefined;
       if (closed || !tenant) {

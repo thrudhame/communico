@@ -142,6 +142,17 @@ function bind(
       await requireSessionAuthority(conn, intent.hash, intent.refresh);
     }
   };
+  const admittedDelay = async (id: string) => {
+    const event = await delayedEvents.get(conn, id);
+    if (event) {
+      await authorize({
+        kind: 'domain',
+        localpart: event.localpart,
+        feature: 'schedules',
+      });
+    }
+    return event;
+  };
   const mutation = async <T>(operation: () => Promise<T>): Promise<T> => {
     const before = conn.writes;
     const value = await operation();
@@ -914,15 +925,29 @@ function bind(
         await authorize({ kind: 'domain', localpart, feature: 'schedules' });
         return await delayedEvents.replicas(conn, localpart);
       },
-      get: (id: string) => delayedEvents.get(conn, id),
-      list: (localpart: string) => delayedEvents.list(conn, localpart),
-      receipt: (receipt: delayedEvents.DelayReceipt) =>
-        delayedEvents.receipt(conn, receipt),
+      get: admittedDelay,
+      list: async (localpart: string) => {
+        await authorize({ kind: 'domain', localpart, feature: 'schedules' });
+        return await delayedEvents.list(conn, localpart);
+      },
+      receipt: async (receipt: delayedEvents.DelayReceipt) => {
+        await authorize({
+          kind: 'domain',
+          localpart: receipt.device.localpart,
+          feature: 'schedules',
+        });
+        return await delayedEvents.receipt(conn, receipt);
+      },
       add: async (
         event: delayedEvents.DelayedEvent,
         limit: number,
         receipt?: delayedEvents.DelayReceipt,
       ) => {
+        await authorize({
+          kind: 'domain',
+          localpart: event.localpart,
+          feature: 'schedules',
+        });
         const id = await delayedEvents.add(conn, event, limit, receipt);
         changed();
         return id;
@@ -931,6 +956,7 @@ function bind(
         id: string,
         standing?: import('#engine/room/events.ts').Standing,
       ) => {
+        await admittedDelay(id);
         await delayedEvents.remove(conn, id, standing);
         changed();
       },
@@ -939,6 +965,7 @@ function bind(
         action: 'cancel' | 'restart' | 'send',
         now: number,
       ) => {
+        await admittedDelay(id);
         await delayedEvents.action(conn, id, action, now);
         changed();
       },
@@ -949,17 +976,23 @@ function bind(
       },
       due: (now: number) => delayedEvents.due(conn, now),
       claim: async (id: string, now: number) => {
+        await admittedDelay(id);
         const event = await delayedEvents.claim(conn, id, now);
         if (event) changed();
         return event;
       },
-      submission: (id: string) => delayedEvents.submission(conn, id),
+      submission: async (id: string) => {
+        await admittedDelay(id);
+        return await delayedEvents.submission(conn, id);
+      },
       prepare: async (id: string, pdu: Pdu) => {
+        await admittedDelay(id);
         const submission = await delayedEvents.prepare(conn, id, pdu);
         changed();
         return submission;
       },
       finish: async (id: string) => {
+        await admittedDelay(id);
         await delayedEvents.finish(conn, id);
         changed();
       },

@@ -12,6 +12,7 @@ import { copyPrivate } from '#engine/store/files.ts';
 import { withCandidateStore } from '#engine/store/candidate.ts';
 import { sanitizeRestoredTenant } from '#engine/tenant/restore.ts';
 import * as delayed from '#engine/tenant/delayed-events.ts';
+import { capabilities } from '#engine/facade/capabilities.ts';
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-delayed-' });
@@ -67,6 +68,102 @@ function event(id: string = crypto.randomUUID()) {
     phase: 'pending',
   };
 }
+
+Deno.test('facade delayed activation: only F2 grants the service and management adapters', () => {
+  const path = '/_matrix/client/unstable/org.matrix.msc4140/delayed_events';
+  for (const phase of ['f1', 'f2']) {
+    const caps = capabilities('facade', phase);
+    assertEquals(caps.service('delayed'), phase === 'f2');
+    for (
+      const [method, suffix] of [
+        ['GET', ''],
+        ['GET', '/id'],
+        ['POST', '/id'],
+        ['POST', '/id/cancel'],
+      ]
+    ) {
+      const refusal = caps.gate(
+        new Request('http://x' + path + suffix, { method }),
+        () => true,
+      );
+      assertEquals(refusal?.status ?? 200, phase === 'f2' ? 200 : 404);
+    }
+  }
+});
+
+Deno.test('facade delayed activation: native owner gates reads, mutations and claim before effects', async () => {
+  const f = await fixture();
+  try {
+    const id = await f.edge.tx((tx) => tx.delayedEvents.newId());
+    const input = event(id);
+    await f.edge.tx((tx) => tx.delayedEvents.add(input, 10));
+    const before = await f.edge.tx((tx) =>
+      tx.delayedEvents.operations('alice')
+    );
+    const guarded = await openTenant(f.stores[1], 'logical.test', {
+      ingress: {
+        check(_conn, intent) {
+          if (intent.kind === 'domain' && intent.feature === 'schedules') {
+            throw new MatrixError(
+              503,
+              'M_UNAVAILABLE',
+              'schedule snapshot unavailable',
+            );
+          }
+          return Promise.resolve();
+        },
+      },
+    });
+    for (
+      const work of [
+        () => guarded.tx((tx) => tx.delayedEvents.get(id)),
+        () => guarded.tx((tx) => tx.delayedEvents.list('alice')),
+        () => guarded.tx((tx) => tx.delayedEvents.claim(id, 999999)),
+        () => guarded.tx((tx) => tx.delayedEvents.action(id, 'send', 999999)),
+        () =>
+          guarded.tx((tx) =>
+            tx.delayedEvents.add({ ...input, id: id + 'new' }, 10)
+          ),
+      ]
+    ) {
+      await assertRejects(work, MatrixError, 'schedule snapshot unavailable');
+      assertEquals(await f.edge.tx((tx) => tx.delayedEvents.get(id)), input);
+      assertEquals(
+        await f.edge.tx((tx) => tx.delayedEvents.operations('alice')),
+        before,
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade delayed activation: missing room scope retains the unclaimed native schedule', async () => {
+  const f = await fixture();
+  const scheduler = new DelayedEvents({ tenant: f.edge, store: f.stores[1] }, {
+    admitRoom(roomId) {
+      assertEquals(roomId, event().roomId);
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'room replica unavailable');
+    },
+  });
+  try {
+    const id = await f.edge.tx((tx) => tx.delayedEvents.newId());
+    const input = event(id);
+    await f.edge.tx((tx) => tx.delayedEvents.add(input, 10));
+    const before = await f.edge.tx((tx) =>
+      tx.delayedEvents.operations('alice')
+    );
+    await scheduler.drain();
+    assertEquals(await f.edge.tx((tx) => tx.delayedEvents.get(id)), input);
+    assertEquals(
+      await f.edge.tx((tx) => tx.delayedEvents.operations('alice')),
+      before,
+    );
+  } finally {
+    await scheduler.stop();
+    await f.close();
+  }
+});
 
 Deno.test('facade delayed: acknowledgment retains the schedule fact atomically', async () => {
   const f = await fixture();

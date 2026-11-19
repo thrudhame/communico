@@ -44,6 +44,7 @@ export async function startFacade(lifetime: ServerLifetime) {
           signer: await runtime.requestSigner(),
           deviceLists: runtime.deviceLists,
           pushSender: runtime.pushSender,
+          delayedEvents: runtime.delayedEvents,
           sender: runtime.sender,
           releaseServices: runtime.releaseServices,
           ingress: runtime.ingress,

@@ -112,6 +112,7 @@ export type ReplicaAccess = {
   signer: Signer;
   deviceLists?(edus: EduState): Promise<DeviceListService | undefined>;
   pushSender?(): Promise<PushSender | undefined>;
+  delayedEvents?(tenant: Tenant): Promise<DelayedEvents | undefined>;
   sender?(): Promise<Sender | undefined>;
   releaseServices?(): Promise<void>;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
@@ -297,12 +298,14 @@ export async function openReplicaApp(
     const federationEdus = eduState(server, tenant.serverName, store);
     const deviceLists = await replica.deviceLists?.(federationEdus);
     const pushSender = await replica.pushSender?.();
+    const grantedTenant = { ...tenant, signer: () => replica.signer };
+    const delayedEvents = await replica.delayedEvents?.(grantedTenant);
     const app: App = {
       store,
       server,
       // Public clients may not recover the provisioned raw key by reaching
       // through the tenant. Link coordinators keep their own node identity.
-      tenant: { ...tenant, signer: () => replica.signer },
+      tenant: grantedTenant,
       federationKeys: replica.keys,
       federationContacts,
       federationEdus,
@@ -324,7 +327,7 @@ export async function openReplicaApp(
         return unavailable('media');
       },
       get delayedEvents() {
-        return unavailable('delayed');
+        return delayedEvents ?? unavailable('delayed');
       },
       close: () =>
         drainResources([
@@ -335,6 +338,7 @@ export async function openReplicaApp(
     const ingress = await replica.ingress?.(transactionDependencies(app));
     app.sender = await replica.sender?.() ?? null;
     current = app;
+    delayedEvents?.wake();
     return app;
   } catch (error) {
     await drainResources([

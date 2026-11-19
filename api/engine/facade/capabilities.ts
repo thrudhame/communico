@@ -218,6 +218,16 @@ const F2_MEMBERSHIP: readonly Rule[] = [
 
 // B8 adds each private surface only after its owning semantic contract exists.
 const F2_CLIENT_DATA: readonly Rule[] = [
+  route(
+    'GET',
+    /^\/_matrix\/client\/unstable\/org\.matrix\.msc4140\/delayed_events(?:\/[^/]+)?$/,
+    'domain',
+  ),
+  route(
+    'POST',
+    /^\/_matrix\/client\/unstable\/org\.matrix\.msc4140\/delayed_events\/[^/]+(?:\/[^/]+)?$/,
+    'domain',
+  ),
   route('GET', literal('/_matrix/client/v3/notifications'), 'domain'),
   route('GET', literal('/_matrix/client/v3/pushers'), 'domain'),
   route('POST', literal('/_matrix/client/v3/pushers/set'), 'domain'),
@@ -285,9 +295,10 @@ export function capabilities(role: string, phase = 'f1') {
     service(name: string): boolean {
       if (
         role === 'facade' && phase === 'f2' &&
-        ['deactivation', 'device-lists', 'federation-sender', 'push'].includes(
-          name,
-        )
+        ['deactivation', 'device-lists', 'federation-sender', 'push', 'delayed']
+          .includes(
+            name,
+          )
       ) {
         return true;
       }

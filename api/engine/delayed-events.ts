@@ -69,7 +69,12 @@ export class DelayedEvents {
   // Per-command management and timeout share a serialization boundary. Room
   // mutations retain their own lock; this map never encloses a tenant tx.
   #locks = new Map<string, Promise<unknown>>();
-  constructor(app: Pick<App, 'tenant' | 'store'>) {
+  constructor(
+    app: Pick<App, 'tenant' | 'store'>,
+    private admission: {
+      admitRoom?(roomId: string): Promise<void>;
+    } = {},
+  ) {
     this.#app = app;
   }
   async #locked<T>(id: string, fn: () => Promise<T>): Promise<T> {
@@ -190,6 +195,7 @@ export class DelayedEvents {
   }
   async #reconcile(e: DelayedEvent): Promise<boolean> {
     if (e.phase !== 'pending' || e.stateKey === null) return false;
+    await this.admission.admitRoom?.(e.roomId);
     const room = await openRoom(this.#app.store, e.roomId);
     if (!await room.tx((tx) => this.#cancelled(e, tx))) return false;
     await this.#app.tenant.tx((tx) => tx.delayedEvents.remove(e.id));
@@ -264,6 +270,9 @@ export class DelayedEvents {
   }
   async #deliver(id: string) {
     const { tenant, store } = this.#app;
+    const current = await tenant.tx((tx) => tx.delayedEvents.get(id));
+    if (current === null) return;
+    await this.admission.admitRoom?.(current.roomId);
     const e = await tenant.tx((tx) => tx.delayedEvents.claim(id, Date.now()));
     if (e === null) return;
     try {

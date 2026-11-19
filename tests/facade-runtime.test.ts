@@ -2118,7 +2118,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   const [homePort, facadePort, linkPort] = ports;
   const bundlefile = tls.dir + '/public-auth-bundle.json';
   const file = (side: string) => tls.dir + '/' + side + '-public-auth.toml';
-  const configure = async (side: string, extra = '') => {
+  const configure = async (side: string, extra = '', maxDelay = 60000) => {
     await Deno.writeTextFile(
       file(side),
       `[server]\nname="logical.test"\nrole="${side}"\nport=${
@@ -2130,6 +2130,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
           ? `nodes=["edge_a"]\npairfile="${bundlefile}"\n`
           : '') +
         extra +
+        `\n[delayedevents]\nmaxdelayms=${maxDelay}\n` +
         '\n[push]\ncacerts=["tests/fixtures/tls/ca.crt"]\nallowlist=["127.0.0.1/32"]\n',
     );
   };
@@ -2483,8 +2484,188 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       'PUT',
     );
     assertEquals(silent.status, 200);
+    timings.phase('offline native delayed owner and cold disabled scheduling');
+    const management = '../unstable/org.matrix.msc4140/delayed_events';
+    const waitDelayedState = async (key: string, marker: string) => {
+      let result;
+      const deadline = Date.now() + 10000;
+      do {
+        result = await api(
+          'facade',
+          pushRoomPath + '/state/test.delayed/' + key,
+          undefined,
+          senderSession.body.access_token,
+        );
+        if (result.status === 200) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      } while (Date.now() < deadline);
+      assertEquals(result, { status: 200, body: { marker } });
+    };
+    const delayPath = pushRoomPath + '/send/m.room.encrypted/cold-delay';
+    const delayed = await api(
+      'facade',
+      delayPath + '?org.matrix.msc4140.delay=60000',
+      { ...ciphertext, ciphertext: 'cold-delayed-ciphertext' },
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(delayed.status, 200, JSON.stringify(delayed));
+    assertEquals(delayed.body.event_id, undefined);
+    const delayId = delayed.body.delay_id;
+    assertEquals(
+      (await api(
+        'facade',
+        delayPath + '?org.matrix.msc4140.delay=60000',
+        { ignored: 'stable receipt' },
+        senderSession.body.access_token,
+        'PUT',
+      )).body,
+      delayed.body,
+    );
+    const listedDelay = await api(
+      'facade',
+      management,
+      undefined,
+      senderSession.body.access_token,
+    );
+    assertEquals(listedDelay.status, 200);
+    assertEquals(
+      listedDelay.body.delayed_events.filter((item: { delay_id: string }) =>
+        item.delay_id === delayId
+      ).length,
+      1,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        management + '/' + delayId,
+        undefined,
+        session.body.access_token,
+      )).status,
+      404,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        management + '/' + delayId + '/restart',
+        {},
+        registered.body.access_token,
+      )).status,
+      503,
+    );
+    assertEquals(
+      (await api('facade', management + '/legacy-home-id', { action: 'send' }))
+        .status,
+      503,
+    );
+    assertEquals(
+      (await api('facade', management + '/' + delayId + '/restart', {})).status,
+      200,
+    );
+    const cancelled = await api(
+      'facade',
+      pushRoomPath +
+        '/state/test.delayed/cancelled?org.matrix.msc4140.delay=60000',
+      { marker: 'must-not-run' },
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(cancelled.status, 200);
+    assertEquals(
+      (await api(
+        'facade',
+        management + '/' + cancelled.body.delay_id + '/cancel',
+        {},
+      )).status,
+      200,
+    );
+    const dueWhileStopped = await api(
+      'facade',
+      pushRoomPath + '/state/test.delayed/cold?org.matrix.msc4140.delay=2000',
+      { marker: 'cold-with-new-scheduling-disabled' },
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(dueWhileStopped.status, 200);
     await edge.stop();
+    await new Promise((resolve) => setTimeout(resolve, 2100));
+    await configure('facade', '', 0);
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    await waitDelayedState('cold', 'cold-with-new-scheduling-disabled');
+    assertEquals(
+      (await api(
+        'facade',
+        pushRoomPath + '/state/test.delayed/cancelled',
+        undefined,
+        senderSession.body.access_token,
+      )).status,
+      404,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        management + '/' + delayId,
+        undefined,
+        senderSession.body.access_token,
+      )).body.content.ciphertext,
+      'cold-delayed-ciphertext',
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        delayPath + '-disabled?org.matrix.msc4140.delay=1',
+        ciphertext,
+        senderSession.body.access_token,
+        'PUT',
+      )).status,
+      403,
+    );
+    assertEquals(
+      (await api('facade', management + '/' + delayId, { action: 'send' }))
+        .status,
+      200,
+    );
+    const delayedMessages = await api(
+      'facade',
+      pushRoomPath + '/messages?dir=b&limit=100',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(delayedMessages.status, 200);
+    const delayedVisible = delayedMessages.body.chunk.filter((
+      item: { content: { ciphertext?: string } },
+    ) => item.content.ciphertext === 'cold-delayed-ciphertext');
+    assertEquals(
+      delayedVisible.length,
+      1,
+      'delayed command did not reach the actual room consumer exactly once',
+    );
+    assertEquals(
+      (await api('facade', management + '/' + delayId + '/send', {})).status,
+      404,
+    );
+    await edge.stop();
+    await configure('facade');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    const automatic = await api(
+      'facade',
+      pushRoomPath + '/state/test.delayed/automatic?org.matrix.msc4140.delay=0',
+      { marker: 'automatic-after-bind' },
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(automatic.status, 200, JSON.stringify(automatic));
+    await waitDelayedState('automatic', 'automatic-after-bind');
+    assertEquals(
+      (await api(
+        'facade',
+        delayPath + '?org.matrix.msc4140.delay=60000',
+        ciphertext,
+        senderSession.body.access_token,
+        'PUT',
+      )).body,
+      delayed.body,
+    );
     const restoredHistory = await api(
       'facade',
       'notifications',
