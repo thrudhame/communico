@@ -111,6 +111,7 @@ export type ReplicaAccess = {
   keys: KeyStore;
   signer: Signer;
   deviceLists?(edus: EduState): Promise<DeviceListService | undefined>;
+  pushSender?(): Promise<PushSender | undefined>;
   sender?(): Promise<Sender | undefined>;
   releaseServices?(): Promise<void>;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
@@ -295,6 +296,7 @@ export async function openReplicaApp(
   try {
     const federationEdus = eduState(server, tenant.serverName, store);
     const deviceLists = await replica.deviceLists?.(federationEdus);
+    const pushSender = await replica.pushSender?.();
     const app: App = {
       store,
       server,
@@ -316,7 +318,7 @@ export async function openReplicaApp(
         return deviceLists ?? unavailable('device-lists');
       },
       get pushSender() {
-        return unavailable('push');
+        return pushSender ?? unavailable('push');
       },
       get media() {
         return unavailable('media');

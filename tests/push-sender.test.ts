@@ -27,6 +27,7 @@ import { renderEvent } from '#engine/client/render.ts';
 import { putAccountData } from '#engine/tenant/accountdata.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { sendGateway } from '#engine/push/transport.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 
 type Json = Record<string, unknown>;
 async function fixture() {
@@ -113,6 +114,114 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('push sender: last ingress admission refuses an unavailable grant without canceling durable work', async () => {
+  const f = await fixture();
+  let denied = true;
+  const admissions: unknown[] = [];
+  const tenant = await openTenant(f.store, 'test', {
+    ingress: {
+      check(_conn, intent) {
+        admissions.push(intent);
+        // Rendering's generic domain read can succeed before the pusher
+        // inventory/grant admission becomes unavailable at the final send cut.
+        if (
+          denied && intent.kind === 'domain' && intent.feature === 'pushers'
+        ) {
+          throw new MatrixError(
+            503,
+            'M_UNAVAILABLE',
+            'domain snapshot unavailable',
+          );
+        }
+        return Promise.resolve();
+      },
+    },
+  });
+  const requests: unknown[] = [];
+  const sender = await startPushSender({
+    store: f.store,
+    tenant,
+    automatic: false,
+    send: (_url, payload) => {
+      requests.push(payload);
+      return Promise.resolve([]);
+    },
+  });
+  try {
+    const event = await f.send('retained while authority unavailable');
+    await assertRejects(
+      () => sender.tick(),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+    assertEquals(requests, []);
+    assertEquals(
+      admissions.filter((intent) =>
+        (intent as { feature?: string }).feature === 'pushers'
+      ),
+      [{ kind: 'domain', localpart: 'bob', feature: 'pushers' }],
+    );
+    const db = await f.store.server();
+    assertEquals(
+      (await db.query('SELECT state FROM push_targets'))[0].state,
+      'active',
+    );
+    assertEquals(
+      (await db.query('SELECT state FROM push_delivery'))[0].state,
+      'pending',
+    );
+    denied = false;
+    await sender.tick();
+    assertEquals(requests.length, 1);
+    assertEquals(
+      (requests[0] as Json).notification &&
+        ((requests[0] as Json).notification as Json).event_id,
+      event,
+    );
+    assertEquals(
+      (await db.query('SELECT state FROM push_delivery'))[0].state,
+      'sent',
+    );
+    const [native] = await (await f.store.tenant('test')).query(
+      'SELECT incarnation FROM pushers',
+    );
+    denied = true;
+    await assertRejects(
+      () =>
+        tenant.tx((tx) =>
+          tx.pushers.isCurrent('bob', 'app', 'key', String(native.incarnation))
+        ),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+    await db.tx((tx) => queueBadge(tx, '@bob:test'));
+    await assertRejects(
+      () => sender.tick(),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+    assertEquals(
+      requests.length,
+      1,
+      'badge-only send bypassed the final owner admission',
+    );
+    const [badge] = await db.query(
+      'SELECT revision,sent_revision FROM push_badges',
+    );
+    assert(Number(badge.revision) > Number(badge.sent_revision));
+    denied = false;
+    await sender.tick();
+    assertEquals(requests.length, 2);
+    assertEquals(
+      ((requests[1] as Json).notification as Json).event_id,
+      undefined,
+    );
+  } finally {
+    await sender.stop();
+    await f.close();
+  }
+});
 
 Deno.test('standalone renderer: explicit tenant owns ignored users and nested thread consumers without an app singleton', async () => {
   const f = await fixture();

@@ -7,6 +7,40 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 
+Deno.test('B8 push surfaces mount only at F2 and share the domain gate without federation', () => {
+  for (
+    const [method, path] of [
+      ['GET', 'notifications'],
+      ['GET', 'pushers'],
+      ['POST', 'pushers/set'],
+    ]
+  ) {
+    const request = new Request(
+      'https://facade.test/_matrix/client/v3/' + path,
+      { method },
+    );
+    let required: string | undefined;
+    const f2 = capabilities('facade', 'f2');
+    assertEquals(
+      f2.gate(request, (scope) => {
+        required = scope;
+        return true;
+      }),
+      null,
+    );
+    assertEquals(required, 'domain');
+    assertEquals(f2.gate(request, () => false)?.status, 503);
+    assertEquals(
+      capabilities('facade', 'f1').gate(request, () => true)?.status,
+      404,
+    );
+    const wrong = new Request(request.url, { method: 'DELETE' });
+    assertEquals(f2.gate(wrong, () => true)?.status, 405);
+  }
+  assertEquals(capabilities('facade', 'f2').service('push'), true);
+  assertEquals(capabilities('facade', 'f1').service('push'), false);
+});
+
 Deno.test('B8 filters mount only their delivered methods through domain admission', async () => {
   const own = '/_matrix/client/v3/user/%40alice%3Alogical.test/filter';
   const f2 = capabilities('facade', 'f2');
@@ -241,6 +275,9 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       ['v3/rooms/room/report', 'POST'],
       ['v3/rooms/room/forget', 'POST'],
       ['v3/rooms/room/report/event', 'POST'],
+      ['v3/notifications', 'GET'],
+      ['v3/pushers', 'GET'],
+      ['v3/pushers/set', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true), null);
   for (
@@ -265,6 +302,7 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
   assertEquals(facade.service('deactivation'), true);
   assertEquals(facade.service('device-lists'), true);
   assertEquals(facade.service('federation-sender'), true);
+  assertEquals(facade.service('push'), true);
   const send = request('v3/sendToDevice/m.room.encrypted/client-txn', 'PUT');
   const scopes: string[] = [];
   assertEquals(
@@ -315,7 +353,6 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
   );
   for (
     const service of [
-      'push',
       'delayed',
       'media',
       'link-client',

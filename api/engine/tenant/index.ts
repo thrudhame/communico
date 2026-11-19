@@ -650,13 +650,21 @@ function bind(
           changed();
         }
       },
-      isCurrent: (
+      isCurrent: async (
         localpart: string,
         appId: string,
         pushkey: string,
         incarnation: string,
-      ) =>
-        pushers.pusherIsCurrent(conn, localpart, appId, pushkey, incarnation),
+      ) => {
+        await authorize({ kind: 'domain', localpart, feature: 'pushers' });
+        return await pushers.pusherIsCurrent(
+          conn,
+          localpart,
+          appId,
+          pushkey,
+          incarnation,
+        );
+      },
       moveToken: (oldHash: string, newHash: string) =>
         pushers.movePusherToken(conn, oldHash, newHash),
       deleteForToken: (accessHash: string) =>

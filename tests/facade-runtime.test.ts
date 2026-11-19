@@ -2086,6 +2086,29 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   const timings = new ColdAuthTimings();
   timings.phase('configure and enroll');
   const tls = await facadeTls();
+  const deliveries: Record<string, unknown>[] = [];
+  let gatewayChanged = Promise.withResolvers<void>();
+  const gateway = Deno.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    cert: await Deno.readTextFile('tests/fixtures/tls/localhost.crt'),
+    key: await Deno.readTextFile('tests/fixtures/tls/localhost.key'),
+    onListen() {},
+  }, async (request) => {
+    assertEquals(new URL(request.url).pathname, '/_matrix/push/v1/notify');
+    assertEquals(request.headers.get('authorization'), null);
+    deliveries.push((await request.json()).notification);
+    gatewayChanged.resolve();
+    gatewayChanged = Promise.withResolvers<void>();
+    return Response.json({ rejected: [] });
+  });
+  const delivered = async (eventId: string) => {
+    for (;;) {
+      const found = deliveries.find((value) => value.event_id === eventId);
+      if (found) return found;
+      await gatewayChanged.promise;
+    }
+  };
   const ports: number[] = [];
   for (let i = 0; i < 3; i++) {
     const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
@@ -2106,7 +2129,8 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
         (side === 'home'
           ? `nodes=["edge_a"]\npairfile="${bundlefile}"\n`
           : '') +
-        extra,
+        extra +
+        '\n[push]\ncacerts=["tests/fixtures/tls/ca.crt"]\nallowlist=["127.0.0.1/32"]\n',
     );
   };
   await configure('home');
@@ -2295,6 +2319,202 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     assertEquals(
       (await api('facade', 'account/whoami', undefined, 'unknown')).status,
       401,
+    );
+    timings.phase('offline push and saved notifications');
+    await finiteTail(edge, tls.dir + '/facade-public-auth.sock', [
+      'domain:@outside:logical.test',
+      'domain:@departure:logical.test',
+    ]);
+    for (
+      const [path, body] of [['notifications', undefined], [
+        'pushers',
+        undefined,
+      ], ['pushers/set', {}]] as const
+    ) {
+      assertEquals(
+        (await api('facade', path, body, registered.body.access_token)).status,
+        503,
+      );
+      assertEquals((await api('facade', path, body, 'unknown')).status, 401);
+    }
+    const pushRegistration = {
+      app_id: 'cold-app',
+      pushkey: 'cold-key',
+      kind: 'http',
+      app_display_name: 'Cold app',
+      device_display_name: 'Outside',
+      lang: 'en',
+      data: {
+        url: `https://127.0.0.1:${gateway.addr.port}/_matrix/push/v1/notify`,
+      },
+    };
+    assertEquals(
+      await api(
+        'facade',
+        'pushers/set',
+        pushRegistration,
+        session.body.access_token,
+      ),
+      { status: 200, body: {} },
+    );
+    assertEquals(
+      await api('facade', 'pushers', undefined, session.body.access_token),
+      { status: 200, body: { pushers: [pushRegistration] } },
+    );
+    const senderSession = await api('facade', 'login', {
+      ...login('push-sender-edge'),
+      identifier: { type: 'm.id.user', user: 'departure' },
+    });
+    assertEquals(senderSession.status, 200);
+    const pushRoomPath = 'rooms/' +
+      encodeURIComponent(departureRoom.body.room_id);
+    assertEquals(
+      (await api(
+        'facade',
+        pushRoomPath + '/join',
+        {},
+        session.body.access_token,
+      )).status,
+      200,
+    );
+    const ciphertext = {
+      algorithm: 'm.megolm.v1.aes-sha2',
+      ciphertext: 'cold-push-ciphertext',
+      session_id: 'cold-session',
+    };
+    const pushed = await api(
+      'facade',
+      pushRoomPath + '/send/m.room.encrypted/cold-push',
+      ciphertext,
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(pushed.status, 200);
+    const wire = await delivered(pushed.body.event_id);
+    assertEquals(wire.content, ciphertext);
+    assertEquals(
+      (wire.devices as Record<string, unknown>[]).map((device) =>
+        device.pushkey
+      ),
+      ['cold-key'],
+    );
+    const history = await api(
+      'facade',
+      'notifications',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(history.status, 200, JSON.stringify(history));
+    const saved = history.body.notifications.find((
+      item: { event: { event_id: string } },
+    ) => item.event.event_id === pushed.body.event_id);
+    assert(saved);
+    assertEquals(saved.read, false);
+    assertEquals(saved.event.content, ciphertext);
+    assertEquals(saved.event.room_id, undefined);
+    assertEquals(saved.event.signatures, undefined);
+    const mute = 'pushrules/global/override/cold-mute';
+    assertEquals(
+      (await api(
+        'facade',
+        mute,
+        { conditions: [], actions: ['dont_notify'] },
+        session.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    const silent = await api(
+      'facade',
+      pushRoomPath + '/send/m.room.encrypted/cold-muted',
+      ciphertext,
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(silent.status, 200);
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    const restoredHistory = await api(
+      'facade',
+      'notifications',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(restoredHistory.status, 200);
+    const restored = restoredHistory.body.notifications.filter((
+      item: { event: { event_id: string } },
+    ) => item.event.event_id === pushed.body.event_id);
+    assertEquals(restored.length, 1);
+    assertEquals({
+      actions: restored[0].actions,
+      read: restored[0].read,
+      ts: restored[0].ts,
+      content: restored[0].event.content,
+    }, {
+      actions: saved.actions,
+      read: saved.read,
+      ts: saved.ts,
+      content: saved.event.content,
+    });
+    assertEquals(
+      restoredHistory.body.notifications.some((
+        item: { event: { event_id: string } },
+      ) => item.event.event_id === silent.body.event_id),
+      false,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        pushRoomPath + '/receipt/m.read.private/' +
+          encodeURIComponent(pushed.body.event_id),
+        {},
+        session.body.access_token,
+      )).status,
+      200,
+    );
+    const readHistory = await api(
+      'facade',
+      'notifications',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(
+      readHistory.body.notifications.find((
+        item: { event: { event_id: string } },
+      ) => item.event.event_id === pushed.body.event_id).read,
+      true,
+    );
+    assertEquals(
+      await api('facade', 'pushers/set', {
+        app_id: 'cold-app',
+        pushkey: 'cold-key',
+        kind: null,
+      }, session.body.access_token),
+      { status: 200, body: {} },
+    );
+    assertEquals(
+      await api('facade', 'pushers', undefined, session.body.access_token),
+      { status: 200, body: { pushers: [] } },
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        mute,
+        undefined,
+        session.body.access_token,
+        'DELETE',
+      )).status,
+      200,
+    );
+    // Leave the pre-existing deactivation proof's original membership unchanged.
+    assertEquals(
+      (await api(
+        'facade',
+        pushRoomPath + '/leave',
+        {},
+        session.body.access_token,
+      )).status,
+      200,
     );
     const toDevicePath = 'sendToDevice/m.room_key_request/public-owner-send';
     const originalRequest = {
@@ -2871,6 +3091,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   } finally {
     await home?.dispose();
     await edge?.dispose();
+    await gateway.shutdown();
     await tls.close();
   }
 });
