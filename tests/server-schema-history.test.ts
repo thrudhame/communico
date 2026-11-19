@@ -53,7 +53,7 @@ Deno.test('historical server fixture seeds fixed v35 without borrowing later sch
   }
 });
 
-Deno.test('outbound invite attempt migration appends to v47 with fresh-schema equivalence', async () => {
+Deno.test('outbound invite attempt migration appends to v48 with fresh-schema equivalence', async () => {
   const root = await Deno.makeTempDir();
   const settings = (name: string) => ({
     dir: root + '/' + name,
@@ -63,7 +63,7 @@ Deno.test('outbound invite attempt migration appends to v47 with fresh-schema eq
     idleseconds: 300,
   });
   let old = await openStore(settings('old'), {
-    schemas: { server: historicalServerSchema(47) },
+    schemas: { server: historicalServerSchema(48) },
   });
   const fresh = await openStore(settings('fresh'), {
     schemas: { server: serverSchema },
@@ -98,7 +98,7 @@ Deno.test('outbound invite attempt migration appends to v47 with fresh-schema eq
   }
 });
 
-Deno.test('inbound membership receipt migration appends to v48 without invented receipts', async () => {
+Deno.test('inbound membership receipt migration appends to v49 without invented receipts', async () => {
   const root = await Deno.makeTempDir();
   const settings = (name: string) => ({
     dir: root + '/' + name,
@@ -108,7 +108,7 @@ Deno.test('inbound membership receipt migration appends to v48 without invented 
     idleseconds: 300,
   });
   let old = await openStore(settings('old'), {
-    schemas: { server: historicalServerSchema(48) },
+    schemas: { server: historicalServerSchema(49) },
   });
   const fresh = await openStore(settings('fresh'), {
     schemas: { server: serverSchema },

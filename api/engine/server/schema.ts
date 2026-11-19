@@ -452,8 +452,18 @@ CREATE TABLE notification_retired_users(user TEXT PRIMARY KEY NOT NULL);
 CREATE INDEX notification_operations_event ON domain_operations(json_extract(payload_json,'$.room'),json_extract(payload_json,'$.event')) WHERE kind='notification';
 `;
 
+// Publication captures probe the input event/room sets, including references
+// recorded against another room. Existing composite keys have other prefixes.
+const PUBLICATION_CAPTURE_SQL = `
+CREATE INDEX relations_target ON relations(relates_to);
+CREATE INDEX notification_receipt_refs_room ON notification_receipt_refs(room,event);
+CREATE INDEX push_evaluations_event ON push_evaluations(event);
+CREATE INDEX notification_own_events_event ON notification_own_events(event);
+CREATE INDEX notification_horizons_room ON notification_horizons(room);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 53,
+  version: 54,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -500,6 +510,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(RECEIPT_GRAPH_SQL);
     await db.exec(RECEIPT_ADMISSION_SQL);
     await db.exec(DEVICE_PUBLICATIONS_SQL);
+    await db.exec(PUBLICATION_CAPTURE_SQL);
     await db.exec(FACADE_INGRESS_PHASE_SQL);
     await db.exec(FACADE_INGRESS_POLICY_SQL);
     await db.exec(LOCAL_PARTICIPATION_SQL);
@@ -567,6 +578,7 @@ export const serverSchema: SchemaProvider = {
         "DELETE FROM watermarks WHERE source LIKE 'receipt-graph:%'",
       );
     },
+    43: (conn) => conn.exec(PUBLICATION_CAPTURE_SQL),
     42: async (conn) => {
       await conn.exec(DEVICE_PUBLICATIONS_SQL);
       // The old scalar describes only the old serial chain's anchor. Preserve
@@ -578,24 +590,24 @@ INSERT INTO device_publications SELECT json_extract(payload,'$.user_id'),destina
 INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destination,p.epoch,p.stream_id,j.value FROM device_publications p,json_each(p.content,'$.prev_id') j;
 `);
     },
-    43: (conn) => conn.exec(FACADE_INGRESS_PHASE_SQL),
-    44: (conn) => conn.exec(FACADE_INGRESS_POLICY_SQL),
-    45: (conn) => conn.exec(LOCAL_PARTICIPATION_SQL),
-    46: (conn) =>
+    44: (conn) => conn.exec(FACADE_INGRESS_PHASE_SQL),
+    45: (conn) => conn.exec(FACADE_INGRESS_POLICY_SQL),
+    46: (conn) => conn.exec(LOCAL_PARTICIPATION_SQL),
+    47: (conn) =>
       conn.exec(
         'ALTER TABLE federation_join_attempts ADD COLUMN join_json TEXT',
       ),
-    47: (conn) => conn.exec(OUTBOUND_INVITES_SQL),
-    48: (conn) => conn.exec(MEMBERSHIP_OPERATIONS_SQL),
-    49: (conn) =>
+    48: (conn) => conn.exec(OUTBOUND_INVITES_SQL),
+    49: (conn) => conn.exec(MEMBERSHIP_OPERATIONS_SQL),
+    50: (conn) =>
       conn.exec(
         'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
       ),
-    50: async (conn) => {
+    51: async (conn) => {
       await conn.exec(PREJOIN_JOBS_SQL);
       await migratePrejoinJobs(conn);
     },
-    51: (conn) => conn.exec(REPORT_IDENTITY_SQL),
-    52: (conn) => conn.exec(NOTIFICATION_CONTEXT_SQL),
+    52: (conn) => conn.exec(REPORT_IDENTITY_SQL),
+    53: (conn) => conn.exec(NOTIFICATION_CONTEXT_SQL),
   },
 };

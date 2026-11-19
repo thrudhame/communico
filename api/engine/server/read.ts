@@ -44,6 +44,29 @@ export async function redactionsOf(
 
 // --- the feed --------------------------------------------------------------
 
+export async function relevantFeedChanged(
+  db: Pick<Db, 'query'>,
+  userId: string,
+  since: number,
+): Promise<boolean> {
+  const rows = await db.query(
+    // Relevance asks for one fact after the cut, not the retained maximum.
+    // Memberships drive room/seq seeks, including retained leave/ban rows.
+    `SELECT EXISTS (
+       SELECT 1 FROM memberships m WHERE m.user=? AND EXISTS (
+         SELECT 1 FROM feed f WHERE f.room=m.room AND f.seq>?
+       )
+     ) OR EXISTS (
+       SELECT 1 FROM prejoin_memberships p WHERE user_id=? AND seq>?
+       AND status NOT IN ('attempting','failed-attempt') AND ${
+      visiblePrejoin('p')
+    }
+     ) AS changed`,
+    [userId, since, userId, since],
+  );
+  return Number(rows[0].changed) !== 0;
+}
+
 export type FeedRow = {
   seq: number;
   room: string;

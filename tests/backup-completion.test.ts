@@ -252,6 +252,49 @@ Deno.test('backup client completion: exact tenant targets join the captured room
         assert(!JSON.stringify(work).includes('private target body'));
       },
     );
+    await t.step(
+      'scoped completion ceiling and legacy markers both audit without a global hot write',
+      async () => {
+        const [scoped] = await db.query(
+          'SELECT name,value FROM counters WHERE name LIKE \'["client_completion",%\'',
+        );
+        assert(scoped);
+        await db.execute(
+          "INSERT INTO counters(name,value) VALUES('client_completion',1000)",
+        );
+        // A global ceiling must not hide corruption of an existing scoped one.
+        await db.execute('UPDATE counters SET value=0 WHERE name=?', [
+          scoped.name,
+        ]);
+        try {
+          await assertRejects(audit, Error, 'completion revision');
+        } finally {
+          await db.execute('UPDATE counters SET value=? WHERE name=?', [
+            scoped.value,
+            scoped.name,
+          ]);
+        }
+        await audit();
+        // Supported pre-change snapshots have no scoped allocator at all.
+        await db.execute('DELETE FROM counters WHERE name=?', [scoped.name]);
+        try {
+          await audit();
+          await db.execute(
+            "UPDATE counters SET value=0 WHERE name='client_completion'",
+          );
+          await assertRejects(audit, Error, 'completion revision');
+        } finally {
+          await db.execute('INSERT INTO counters(name,value) VALUES(?,?)', [
+            scoped.name,
+            scoped.value,
+          ]);
+          await db.execute(
+            "DELETE FROM counters WHERE name='client_completion'",
+          );
+        }
+        await audit();
+      },
+    );
     for (
       const [name, sql, repair, args] of [
         [

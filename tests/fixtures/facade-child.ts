@@ -5,6 +5,7 @@ import { Pairings } from '#engine/facade/pairing.ts';
 import { AuthLinkHealth } from '#engine/facade/auth.ts';
 import { FacadeKeys } from '#engine/facade/control.ts';
 import { HomeEgress } from '#engine/facade/home-egress.ts';
+import { InboxWorker } from '#engine/facade/worker.ts';
 import { noticeHeads } from '#engine/facade/notices.ts';
 import {
   type Cut,
@@ -13,11 +14,15 @@ import {
   text,
 } from '#engine/facade/protocol.ts';
 import {
+  applicationScope,
   beforeFacadePublication,
+  facadeFailure,
   FacadeHealthConnections,
   type FacadeObservation,
   observationPrefix,
+  type ObservationScope,
   observeJournalApplication,
+  observeJournalCompletion,
   publicationCommand,
 } from '#tests/helpers/facade-process.ts';
 
@@ -31,13 +36,27 @@ function emit(event: FacadeObservation) {
     written += Deno.stdout.writeSync(bytes.subarray(written));
   }
 }
-function failure(operation: string, error: unknown) {
-  emit({
-    kind: 'failure',
-    operation,
-    error: error instanceof Error ? error.name : 'unknown error',
-  });
+function failure(
+  operation: string,
+  error: unknown,
+  scope?: ObservationScope,
+) {
+  emit(facadeFailure(operation, error, scope));
 }
+
+// Domain validation can refuse before entering Journal.apply/complete. Observe
+// the inbox owner's complete failure boundary, not only its transaction subset.
+const inboxFailed = InboxWorker.prototype.failed;
+InboxWorker.prototype.failed = function (error, stream, after) {
+  // Independent streams may legitimately await their control/history facts.
+  // Retain that typed retry observation without declaring a terminal refusal.
+  failure(
+    'inbox ' + (stream?.stream ?? 'scan'),
+    error,
+    stream ? applicationScope(this.peer, stream, after) : undefined,
+  );
+  inboxFailed.call(this, error, stream, after);
+};
 
 for (const name of JSON.parse(Deno.env.get('FACADE_TEST_HOLDS') ?? '[]')) {
   publicationCommand({ action: 'hold', name }, emit);
@@ -148,25 +167,11 @@ HomeEgress.prototype.dispatch = async function (...args) {
   emit({ kind: 'egress', ...args[0] });
   return result;
 };
-const complete = Journal.prototype.complete;
-Journal.prototype.complete = async function (peer, stream, cut, result) {
-  try {
-    const heads = await complete.call(this, peer, stream, cut, result);
-    const page = await this.page(peer, 'in', stream, cut.sequence - 1, {
-      maxItems: 1,
-      maxBytes: Number.MAX_SAFE_INTEGER,
-    });
-    const record = page.records[0];
-    if (!record || record.hash !== cut.hash) {
-      throw new Error('completed record disappeared');
-    }
-    completed(peer, record);
-    return heads;
-  } catch (error) {
-    failure('journal complete ' + stream.stream, error);
-    throw error;
-  }
-};
+Journal.prototype.complete = observeJournalCompletion(
+  Journal.prototype.complete,
+  completed,
+  failure,
+);
 // A cold restart can already hold the required completion. Observe its durable
 // record through the real journal owner, never open a competing store instance.
 const streams = Journal.prototype.streams;
