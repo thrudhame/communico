@@ -6,6 +6,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { validatePusher } from '#engine/push/registration.ts';
+import { requireSessionAuthority } from '#engine/tenant/session-authority.ts';
 
 export async function recordPusherChange(
   conn: Conn,
@@ -125,6 +126,7 @@ export async function upsertPusherRow(
   pusher: PusherInput & { kind: string },
   accessHash: string,
 ): Promise<void> {
+  await requireSessionAuthority(conn, accessHash, false);
   const incarnation = crypto.randomUUID();
   const added = Date.now();
   await conn.execute(
@@ -223,6 +225,7 @@ export async function setPusher(
   validatePusher(pusher);
   const hash = await hashToken(token);
   await tenant.tx(async (tx) => {
+    await tx.ingress.check({ kind: 'session', hash, refresh: false });
     const access = await tx.tokens.byHash(hash);
     if (
       !access || access.localpart !== localpart ||

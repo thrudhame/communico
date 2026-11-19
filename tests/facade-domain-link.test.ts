@@ -55,7 +55,15 @@ import {
 import { buildInTx } from '#engine/room/build.ts';
 import { loadFilter, storeFilter } from '#engine/tenant/filters.ts';
 import { issueOpenIdToken, openIdUserInfo } from '#engine/tenant/openid.ts';
-import { hashToken, lookupToken } from '#engine/tenant/auth.ts';
+import { hashToken, issueToken, lookupToken } from '#engine/tenant/auth.ts';
+import {
+  recordPusherChange,
+  setPusher,
+  upsertPusherRow,
+} from '#engine/tenant/pushers.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
+import { queueBadge } from '#engine/server/push-queue.ts';
+import { startPushSender } from '#engine/push/sender.ts';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
@@ -231,6 +239,111 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('facade pusher authority: registration and background delivery stay at the session issuer', async (t) => {
+  for (
+    const mode of [
+      'native registration',
+      'native row upsert',
+      'background sender',
+    ]
+  ) {
+    await t.step(mode, async () => {
+      const f = await fixture();
+      try {
+        const token = await issueToken(f.ht, 'alice', 'HOME_PUSH');
+        const pusher = {
+          app_id: 'app',
+          pushkey: 'key',
+          kind: 'http',
+          app_display_name: 'App',
+          device_display_name: 'Home',
+          lang: 'en',
+          data: { url: 'https://push.test/_matrix/push/v1/notify' },
+        };
+        await setPusher(f.ht, 'alice', token, pusher);
+        const auth = await exportAccountAuth(
+          f.home,
+          f.ht,
+          f.hp,
+          f.bundle.id,
+          'alice',
+          false,
+        );
+        await f.ej.receive('home', [auth]);
+        await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(
+          f.ej,
+          auth,
+        );
+        const ed = await f.edge.tenant('logical.test'),
+          hd = await f.home.tenant('logical.test');
+        if (mode === 'native registration') {
+          await assertRejects(
+            () => setPusher(f.et, 'alice', token, pusher),
+            MatrixError,
+            'operation owner unavailable',
+          );
+          assertEquals(await ed.query('SELECT * FROM pushers'), []);
+          assertEquals(await ed.query('SELECT * FROM pusher_changes'), []);
+        } else if (mode === 'native row upsert') {
+          const hash = await hashToken(token);
+          await assertRejects(
+            () => ed.tx((tx) => upsertPusherRow(tx, 'alice', pusher, hash)),
+            MatrixError,
+            'operation owner unavailable',
+          );
+          assertEquals(await ed.query('SELECT * FROM pushers'), []);
+        } else {
+          // Pre-existing protected replica state must never become sender authority.
+          const [row] = await hd.query('SELECT * FROM pushers');
+          const columns = Object.keys(row);
+          await ed.tx(async (tx) => {
+            await tx.execute(
+              'INSERT INTO pushers(' + columns.join(',') + ') VALUES(' +
+                columns.map(() => '?').join(',') + ')',
+              columns.map((key) => row[key]),
+            );
+            await recordPusherChange(tx, row, false);
+          });
+          const sent = { home: 0, edge: 0 };
+          for (const side of ['home', 'edge'] as const) {
+            const store = f[side], tenant = side === 'home' ? f.ht : f.et;
+            await projectTenant(store, 'logical.test');
+            await (await store.server()).tx((tx) =>
+              queueBadge(tx, '@alice:logical.test')
+            );
+            const sender = await startPushSender({
+              store,
+              tenant,
+              automatic: false,
+              send: () => {
+                sent[side]++;
+                return Promise.resolve([]);
+              },
+            });
+            try {
+              await sender.tick();
+            } finally {
+              await sender.stop();
+            }
+          }
+          assertEquals(
+            sent.home,
+            1,
+            'issuer did not send its own registration',
+          );
+          assertEquals(
+            sent.edge,
+            0,
+            'replica independently sent the same registration',
+          );
+        }
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('facade forget: F2 directory import preserves receiver purgeability and local-only rooms', async () => {
   const f = await fixture();
